@@ -16,6 +16,7 @@ import {
   canViewItem,
   canEditItem,
   canManageOrgFeature,
+  isFeatureEffectivelyEnabled,
   listOrgVisibleItems,
 } from "../services/orgShareService";
 import { extractVariables } from "../utils/templateParser";
@@ -31,7 +32,11 @@ router.get("/", async (req, res) => {
     const user = await userDb.getUserById(userId);
     const orgId = user?.orgId;
     const org = orgId ? await orgDb.getOrgById(orgId) : null;
-    const enabled = org?.shareSettings?.htmlTemplates?.enabled === true;
+    const enabled = isFeatureEffectivelyEnabled(
+      { userId, orgId, orgRole: user?.orgRole as "owner" | "member" | undefined },
+      org,
+      "htmlTemplates",
+    );
 
     const [ownTemplatesRaw, publicTemplatesRaw, fanout] = await Promise.all([
       htmlTemplateService.getTemplatesByOwner(userId),

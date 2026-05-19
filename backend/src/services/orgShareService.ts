@@ -18,6 +18,20 @@ function configFor(org: OrgLike | null, f: Feature) {
   return (org.shareSettings as any)[f] as { enabled?: boolean; editors: string[] } | undefined;
 }
 
+// Permission model
+// ──────────────────────────────────────────────────────────────────────────
+// `enabled` controls visibility for **plain members only** — when true, every
+// org member sees the item via fanout. Editors and the org owner always see
+// and manage org items regardless of `enabled`. Always-on features (BG/MS)
+// ignore `enabled` entirely.
+
+function isEditorOrAdmin(user: UserLike, org: OrgLike | null, feature: Feature): boolean {
+  if (!user.orgId || !org) return false;
+  if (user.orgRole === "owner") return true;
+  const cfg = configFor(org, feature);
+  return Array.isArray(cfg?.editors) && cfg!.editors.includes(user.userId);
+}
+
 export function canViewItem(
   item: ItemLike, user: UserLike, org: OrgLike | null, ownerOrgId: string | undefined, feature: Feature,
 ): boolean {
@@ -25,7 +39,8 @@ export function canViewItem(
   if (!user.orgId || !org || !ownerOrgId) return false;
   if (ownerOrgId !== user.orgId) return false;
   if (isAlwaysOnFeature(feature)) return true;
-  return configFor(org, feature)?.enabled === true;
+  if (isEditorOrAdmin(user, org, feature)) return true;       // editors/admin always see
+  return configFor(org, feature)?.enabled === true;            // plain members: only when shared
 }
 
 export function canEditItem(
@@ -34,26 +49,32 @@ export function canEditItem(
   if (item.userId && item.userId === user.userId) return true;
   if (!user.orgId || !org || !ownerOrgId) return false;
   if (ownerOrgId !== user.orgId) return false;
-  if (user.orgRole === "owner") return true;
-  const cfg = configFor(org, feature);
-  if (!cfg) return false;
-  if (!isAlwaysOnFeature(feature) && cfg.enabled !== true) return false;
-  return Array.isArray(cfg.editors) && cfg.editors.includes(user.userId);
+  return isEditorOrAdmin(user, org, feature);
 }
 
 // Whether `user` may create new items of `feature` in `org`.
-// - Solo users (no orgId)            → allowed (no org to gate against).
-// - Org owners                       → allowed.
-// - Listed editors + feature enabled → allowed (always-on features ignore the enabled gate).
-// - Everyone else                    → denied.
+// - Solo users (no orgId) → allowed (no org to gate against).
+// - Org owners / listed editors → allowed regardless of `enabled` toggle.
+// - Everyone else → denied.
 export function canManageOrgFeature(user: UserLike, org: OrgLike | null, feature: Feature): boolean {
   if (!user.orgId) return true;
   if (!org) return false;
-  if (user.orgRole === "owner") return true;
-  const cfg = configFor(org, feature);
-  if (!cfg) return false;
-  if (!isAlwaysOnFeature(feature) && cfg.enabled !== true) return false;
-  return Array.isArray(cfg.editors) && cfg.editors.includes(user.userId);
+  return isEditorOrAdmin(user, org, feature);
+}
+
+// Whether `user` should receive the org-wide fanout for `feature`. Editors and
+// the org owner always do; plain members only when sharing is enabled.
+// Used by list endpoints to compute the `featureEnabled` arg passed to
+// listOrgVisibleItems.
+export function isFeatureEffectivelyEnabled(
+  user: UserLike,
+  org: OrgLike | null,
+  feature: Feature,
+): boolean {
+  if (!org) return false;
+  if (isAlwaysOnFeature(feature)) return true;
+  if (isEditorOrAdmin(user, org, feature)) return true;
+  return configFor(org, feature)?.enabled === true;
 }
 
 // Caps used by list-merge endpoints (per spec §5.4)

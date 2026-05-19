@@ -27,7 +27,7 @@ import {
   updateLandingPageContext,
   INTEGRATIONS,
 } from "../services/v0Service";
-import { canEditItem, canManageOrgFeature } from "../services/orgShareService";
+import { canEditItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { listDomains, CustomDomainRecord } from "../services/customDomainService";
 
 const router = Router();
@@ -382,7 +382,11 @@ router.get("/generated", async (req, res: Response) => {
     const user = await userDb.getUserById(userId);
     const orgId = user?.orgId;
     const org = orgId ? await orgDb.getOrgById(orgId) : null;
-    const lpEnabled = org?.shareSettings?.landingPages?.enabled === true;
+    const lpEnabled = isFeatureEffectivelyEnabled(
+      { userId, orgId, orgRole: user?.orgRole as "owner" | "member" | undefined },
+      org,
+      "landingPages",
+    );
 
     const [ownPages, orgPages] = await Promise.all([
       getLandingPagesByOwner(userId),

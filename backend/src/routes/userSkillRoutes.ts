@@ -2,7 +2,7 @@ import express from "express";
 import { skillService, Skill } from "../services/skillService";
 import { emailService } from "../services/emailService";
 import { userDb, orgDb } from "../services/db";
-import { canEditItem } from "../services/orgShareService";
+import { canEditItem, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 
 const router = express.Router();
 
@@ -13,7 +13,11 @@ router.get("/", async (req, res) => {
     const user = await userDb.getUserById(userId);
     const orgId = user?.orgId;
     const org = orgId ? await orgDb.getOrgById(orgId) : null;
-    const skillsEnabled = org?.shareSettings?.skills?.enabled === true;
+    const skillsEnabled = isFeatureEffectivelyEnabled(
+      { userId, orgId, orgRole: user?.orgRole as "owner" | "member" | undefined },
+      org,
+      "skills",
+    );
 
     const [ownSkills, publicSkills, systemSkills, orgSkills] = await Promise.all([
       skillService.getSkillsByOwner(userId),

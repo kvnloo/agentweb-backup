@@ -2,7 +2,11 @@ import express from "express";
 import { workPlanService, WorkPlan } from "../services/workPlanService";
 import { emailService } from "../services/emailService";
 import { userDb, orgDb } from "../services/db";
-import { canEditItem, listOrgVisibleItems } from "../services/orgShareService";
+import {
+  canEditItem,
+  isFeatureEffectivelyEnabled,
+  listOrgVisibleItems,
+} from "../services/orgShareService";
 
 const router = express.Router();
 
@@ -13,7 +17,11 @@ router.get("/", async (req, res) => {
     const user = await userDb.getUserById(userId);
     const orgId = user?.orgId;
     const org = orgId ? await orgDb.getOrgById(orgId) : null;
-    const enabled = org?.shareSettings?.workPlans?.enabled === true;
+    const enabled = isFeatureEffectivelyEnabled(
+      { userId, orgId, orgRole: user?.orgRole as "owner" | "member" | undefined },
+      org,
+      "workPlans",
+    );
 
     const [ownPlans, publicPlans, fanout] = await Promise.all([
       workPlanService.getWorkPlansByOwner(userId),

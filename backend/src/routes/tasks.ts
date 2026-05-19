@@ -7,7 +7,7 @@ import multer from 'multer';
 import { RequestHandler as ExpressRequestHandler } from 'express-serve-static-core';
 import { isAdmin } from '../middleware/admin';
 import { userDb } from '../services/db';
-import { canViewItem, canEditItem } from '../services/orgShareService';
+import { canViewItem, canEditItem, isFeatureEffectivelyEnabled } from '../services/orgShareService';
 import { emailService } from '../services/emailService';
 import { Storage, Bucket } from '@google-cloud/storage';
 import OpenAI from 'openai';
@@ -1078,7 +1078,11 @@ router.get('/knowledge-base/all', authenticateToken, async (req: Request, res: R
 
     if (caller?.orgId) {
       const org = await orgDb.getOrgById(caller.orgId);
-      const kbEnabled = org?.shareSettings?.knowledgeBase?.enabled === true;
+      const kbEnabled = isFeatureEffectivelyEnabled(
+        { userId, orgId: caller.orgId, orgRole: caller.orgRole as "owner" | "member" | undefined },
+        org,
+        "knowledgeBase",
+      );
       if (kbEnabled) {
         // Fanout: fetch KB-tasks for each org member (excluding caller)
         const members = await orgDb.getOrgMembers(caller.orgId);
