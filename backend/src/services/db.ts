@@ -6443,8 +6443,11 @@ export const crmDb = {
   ): Promise<void> {
     const tableName = `${TABLE_PREFIX}AW-Leads`;
     const key = { listId, leadId };
+    const safeCustomFields = options.customFields === undefined
+      ? undefined
+      : sanitizeCustomFields(options.customFields, { source: 'db.setLeadFields', listId, leadId });
     const hasMetaKeys = Object.keys(options.enrichmentMetadata ?? {}).length > 0;
-    const hasCustomKeys = Object.keys(options.customFields ?? {}).length > 0;
+    const hasCustomKeys = Object.keys(safeCustomFields ?? {}).length > 0;
     const hasTopLevel = Object.keys(options.topLevel ?? {}).length > 0;
     const hasRemoveMeta = (options.removeEnrichmentMetadataKeys ?? []).length > 0;
     const hasRemoveCustom = (options.removeCustomFieldKeys ?? []).length > 0;
@@ -6524,7 +6527,7 @@ export const crmDb = {
     }
 
     idx = 0;
-    for (const [k, v] of Object.entries(options.customFields ?? {})) {
+    for (const [k, v] of Object.entries(safeCustomFields ?? {})) {
       attrNames[`#cf${idx}`] = k;
       attrValues[`:cf${idx}`] = v;
       setClauses.push(ine
