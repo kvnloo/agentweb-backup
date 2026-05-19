@@ -93,8 +93,7 @@ describe('crmDb.batchCreateLeads — customFields sanitizer (new-lead path)', ()
     await crmDb.batchCreateLeads('list-1', [
       {
         email: 'c@b.com',
-        // @ts-expect-error — intentionally pass an array
-        customFields: ['a', 'b'],
+        customFields: ['a', 'b'] as any,
       },
     ]);
 

@@ -82,8 +82,7 @@ describe('crmDb.createLead — customFields sanitizer', () => {
   it('coerces an array customFields to {} and logs the error', async () => {
     await crmDb.createLead('list-1', {
       email: 'c@b.com',
-      // @ts-expect-error — intentionally pass an array
-      customFields: ['a', 'b'],
+      customFields: ['a', 'b'] as any,
     });
 
     expect(lastPutItem().customFields).toEqual({});
