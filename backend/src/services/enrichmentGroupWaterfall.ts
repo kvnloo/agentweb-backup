@@ -29,14 +29,18 @@ import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
 // Fields directly mappable from a Unipile profile raw response without LLM.
 // Remaining fields after direct map still go through extractFieldsViaLLM.
 
+// Root-level fields directly readable from the Unipile profile without job selection.
+// Job-dependent fields (title, tenure_at_company, prior_companies, education,
+// recent_role_change_date) are intentionally excluded — the LLM step receives the
+// full raw profile + lead.company context and can pick the correct work_experience
+// entry without the false-positive risk of heuristic string matching.
 export const UNIPILE_PERSON_COVERAGE: Record<string, string[]> = {
-  person_identity: ['first_name', 'last_name', 'title', 'location', 'linkedin_url', 'email', 'phone'],
-  person_career:   ['tenure_at_company', 'prior_companies', 'education', 'recent_role_change_date'],
+  person_identity: ['first_name', 'last_name', 'location', 'linkedin_url', 'email', 'phone'],
 };
 
-/** Direct map from Unipile raw profile JSON → CRM field names.
+/** Direct map from Unipile raw profile JSON → CRM field names (root-level only).
  *  Field names verified against real Unipile /api/v1/users response. */
-function mapUnipilePersonToCrmFields(raw: any, leadCompany?: string): Record<string, string> {
+function mapUnipilePersonToCrmFields(raw: any): Record<string, string> {
   const out: Record<string, string> = {};
   if (raw.first_name)  out.first_name  = raw.first_name;
   if (raw.last_name)   out.last_name   = raw.last_name;
@@ -44,56 +48,6 @@ function mapUnipilePersonToCrmFields(raw: any, leadCompany?: string): Record<str
   if (raw.public_identifier) {
     out.linkedin_url = `https://www.linkedin.com/in/${raw.public_identifier}`;
   }
-
-  const we: any[] = Array.isArray(raw.work_experience) ? raw.work_experience : [];
-  const currentJobs = we.filter((e) => !e.end);
-
-  // Smart current-job selection: if lead has a company name, prefer the entry
-  // whose company matches — handles people with multiple concurrent roles.
-  let current: any = null;
-  if (currentJobs.length === 1) {
-    current = currentJobs[0];
-  } else if (currentJobs.length > 1 && leadCompany) {
-    const norm = leadCompany.toLowerCase().trim();
-    current = currentJobs.find((e) =>
-      typeof e.company === 'string' && e.company.toLowerCase().includes(norm),
-    ) ?? currentJobs[0];
-  } else if (currentJobs.length > 1) {
-    current = currentJobs[0];
-  }
-
-  // title: prefer structured position from work_experience, fall back to headline
-  if (current?.position) out.title = current.position;
-  else if (raw.headline)  out.title = raw.headline;
-
-  // tenure_at_company from current job start date (format: "M/D/YYYY")
-  if (current?.start) {
-    const start = new Date(current.start);
-    if (!isNaN(start.getTime())) {
-      const months = Math.floor((Date.now() - start.getTime()) / (1000 * 60 * 60 * 24 * 30));
-      const years  = Math.floor(months / 12);
-      const rem    = months % 12;
-      out.tenure_at_company = years > 0 ? `${years}y ${rem}m` : `${rem}m`;
-    }
-  }
-
-  // prior_companies — past entries only, field name is `company` not `company_name`
-  const prior = we
-    .filter((e) => !!e.end && typeof e.company === 'string')
-    .map((e) => e.company as string)
-    .filter(Boolean);
-  if (prior.length) out.prior_companies = prior.join(', ');
-
-  // education — field name is `school` not `school_name`; no separate field_of_study
-  const ed: any[] = Array.isArray(raw.education) ? raw.education : [];
-  if (ed.length) {
-    const top   = ed[0];
-    const parts = [top.school, top.degree].filter(Boolean);
-    if (parts.length) out.education = parts.join(', ');
-  }
-
-  // recent_role_change_date — start date of current role (sales signal: new exec = buying window)
-  if (current?.start) out.recent_role_change_date = current.start;
 
   // contact_info — available on Sales Navigator / Recruiter accounts; empty arrays on normal accounts
   const ci = raw.contact_info;
@@ -517,7 +471,7 @@ export async function runWaterfall(
       if (profileRaw) {
         // Step 1: direct map known Unipile profile fields (no LLM cost)
         const directCoverage = UNIPILE_PERSON_COVERAGE[groupName] ?? [];
-        const directMapped = mapUnipilePersonToCrmFields(profileRaw, lead.company ?? undefined);
+        const directMapped = mapUnipilePersonToCrmFields(profileRaw);
         for (const f of remaining) {
           if (!directCoverage.includes(f)) continue;
           const value = directMapped[f];
