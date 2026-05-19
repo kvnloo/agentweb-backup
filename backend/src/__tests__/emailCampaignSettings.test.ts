@@ -18,14 +18,16 @@ const mockedAuthenticateToken = authenticateToken as jest.MockedFunction<typeof 
 // Mock htmlTemplateService (used by the new /api/html-templates routes)
 jest.mock('../services/htmlTemplateService', () => ({
   htmlTemplateService: {
-    createTemplate:      jest.fn(),
-    getTemplate:         jest.fn(),
-    getTemplatesByOwner: jest.fn(),
-    getPublicTemplates:  jest.fn(),
-    updateTemplate:      jest.fn(),
-    deleteTemplate:      jest.fn(),
+    createTemplate:       jest.fn(),
+    getTemplate:          jest.fn(),
+    getPublicTemplate:    jest.fn(),
+    getTemplatesByOwner:  jest.fn(),
+    getPublicTemplates:   jest.fn(),
+    updateTemplate:       jest.fn(),
+    deleteTemplate:       jest.fn(),
+    transferAllTemplates: jest.fn(),
+    deleteAllTemplates:   jest.fn(),
   },
-  HtmlTemplate: {} as any,
 }));
 
 // Mock userDb / orgDb (used by the new /api/html-templates routes)
@@ -85,6 +87,7 @@ describe('Email Campaign Settings API', () => {
     // Reset html-template service mocks
     mockedHtmlTemplateService.createTemplate.mockReset();
     mockedHtmlTemplateService.getTemplate.mockReset();
+    (mockedHtmlTemplateService as any).getPublicTemplate?.mockReset?.();
     mockedHtmlTemplateService.getTemplatesByOwner.mockReset();
     mockedHtmlTemplateService.getPublicTemplates.mockReset();
     mockedHtmlTemplateService.updateTemplate.mockReset();
@@ -470,22 +473,18 @@ describe('Email Campaign Settings API', () => {
   });
 
   describe('POST /api/html-templates', () => {
-    // Removed: "should update an existing template with new variables" — POST is no longer used for updates; PUT /:id is covered in orgSharedHtmlTemplates.test.ts
-    // Removed: "should extract variables when not provided in request" — variables are not returned in the new HtmlTemplate schema
-    // Removed: "should handle array variables correctly" — same reason as above
-    // Removed: "should return 401 when user is not authenticated" — auth is now mount-level middleware, not route-level
-
     it('creates a new template with valid body', async () => {
       mockedHtmlTemplateService.createTemplate.mockResolvedValue({
-        templateId: 't-new',
-        userId: 'test-user-123',
-        name: 'test_template',
+        template_id: 't-new',
+        template_name: 'test_template',
         type: ['email'],
-        html: '<h1>{{title}}</h1>',
+        html_content: '<h1>{{title}}</h1>',
         subject: 'Test',
-        createdAt: '2026-05-19T00:00:00.000Z',
-        updatedAt: '2026-05-19T00:00:00.000Z',
-      } as any);
+        variables: ['title'],
+        arrayVariables: [],
+        created_at: '2026-05-19T00:00:00.000Z',
+        updated_at: '2026-05-19T00:00:00.000Z',
+      });
 
       const res = await request(app).post('/api/html-templates').send({
         template_name: 'test_template',
@@ -496,7 +495,7 @@ describe('Email Campaign Settings API', () => {
 
       expect(res.status).toBe(201);
       expect(res.body.success).toBe(true);
-      expect(res.body.template.templateId).toBe('t-new');
+      expect(res.body.template.template_id).toBe('t-new');
       expect(mockedHtmlTemplateService.createTemplate).toHaveBeenCalledTimes(1);
     });
 
@@ -513,8 +512,6 @@ describe('Email Campaign Settings API', () => {
   });
 
   describe('GET /api/html-templates', () => {
-    // Removed: "should add type=email to templates when type is missing" — type is required at create-time in the new schema; legacy backfill no longer applies
-
     it('returns empty result when no templates exist', async () => {
       mockedHtmlTemplateService.getTemplatesByOwner.mockResolvedValue([]);
 
@@ -527,48 +524,44 @@ describe('Email Campaign Settings API', () => {
     it("returns the caller's templates", async () => {
       mockedHtmlTemplateService.getTemplatesByOwner.mockResolvedValue([
         {
-          templateId: 't-1',
-          userId: 'test-user-123',
-          name: 'tpl1',
+          template_id: 't-1',
+          template_name: 'tpl1',
           type: ['email'],
-          html: '<h1>{{title}}</h1>',
+          html_content: '<h1>{{title}}</h1>',
           subject: 'Subject',
-          createdAt: '2026-05-19T00:00:00.000Z',
-          updatedAt: '2026-05-19T00:00:00.000Z',
+          variables: ['title'],
+          arrayVariables: [],
+          created_at: '2026-05-19T00:00:00.000Z',
+          updated_at: '2026-05-19T00:00:00.000Z',
         },
-      ] as any);
+      ]);
 
       const res = await request(app).get('/api/html-templates');
 
       expect(res.status).toBe(200);
       expect(res.body.items).toHaveLength(1);
-      expect(res.body.items[0].name).toBe('tpl1');
+      expect(res.body.items[0].template_name).toBe('tpl1');
       expect(res.body.truncated).toBe(false);
     });
   });
 
   describe('DELETE /api/html-templates/:templateId', () => {
     it('deletes an existing template owned by caller', async () => {
-      mockedHtmlTemplateService.getTemplate.mockResolvedValue({
-        templateId: 't-1',
-        userId: 'test-user-123',
-        name: 'tpl1',
-        type: ['email'],
-        html: '<p>x</p>',
-        createdAt: '2026-05-19T00:00:00.000Z',
-        updatedAt: '2026-05-19T00:00:00.000Z',
-      } as any);
-      mockedHtmlTemplateService.deleteTemplate.mockResolvedValue(undefined);
+      mockedHtmlTemplateService.deleteTemplate.mockResolvedValue(true);
 
       const res = await request(app).delete('/api/html-templates/t-1');
 
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
-      expect(mockedHtmlTemplateService.deleteTemplate).toHaveBeenCalledWith('t-1');
+      expect(mockedHtmlTemplateService.deleteTemplate).toHaveBeenCalledWith(
+        't-1',
+        'test-user-123',
+        'test@example.com',
+      );
     });
 
     it('returns 404 when template does not exist', async () => {
-      mockedHtmlTemplateService.getTemplate.mockResolvedValue(null);
+      mockedHtmlTemplateService.deleteTemplate.mockResolvedValue(false);
 
       const res = await request(app).delete('/api/html-templates/missing');
 

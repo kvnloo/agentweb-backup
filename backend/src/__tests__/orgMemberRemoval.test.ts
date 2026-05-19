@@ -23,9 +23,11 @@ const mockPruneEditorListsForUser = jest.fn();
 const mockGetTasksByUserId = jest.fn();
 const mockDeleteTask = jest.fn();
 const mockUpdateTaskOwner = jest.fn();
-const mockGetTemplatesByOwner = jest.fn();
-const mockDeleteTemplate = jest.fn();
-const mockTransferTemplateOwner = jest.fn();
+const mockGetTemplatesByOwner    = jest.fn();
+const mockDeleteTemplate          = jest.fn();
+const mockTransferTemplateOwner   = jest.fn();
+const mockTransferAllTemplates    = jest.fn();
+const mockDeleteAllTemplates      = jest.fn();
 const mockGetLandingPagesByOwner = jest.fn();
 const mockDeleteLandingPageByRecord = jest.fn();
 const mockTransferLandingPageOwner = jest.fn();
@@ -54,9 +56,10 @@ jest.mock("../services/db", () => ({
 
 jest.mock("../services/htmlTemplateService", () => ({
   htmlTemplateService: {
-    getTemplatesByOwner: mockGetTemplatesByOwner,
-    deleteTemplate: mockDeleteTemplate,
-    transferOwner: mockTransferTemplateOwner,
+    getTemplatesByOwner:  mockGetTemplatesByOwner,
+    deleteTemplate:       mockDeleteTemplate,
+    transferAllTemplates: mockTransferAllTemplates,
+    deleteAllTemplates:   mockDeleteAllTemplates,
   },
 }));
 
@@ -170,8 +173,8 @@ function setupNormalUsers() {
   mockPruneEditorListsForUser.mockResolvedValue(undefined);
   mockDeleteTask.mockResolvedValue(undefined);
   mockUpdateTaskOwner.mockResolvedValue(undefined);
-  mockDeleteTemplate.mockResolvedValue(undefined);
-  mockTransferTemplateOwner.mockResolvedValue(undefined);
+  mockDeleteAllTemplates.mockResolvedValue(0);
+  mockTransferAllTemplates.mockResolvedValue(0);
   mockDeleteLandingPageByRecord.mockResolvedValue(undefined);
   mockTransferLandingPageOwner.mockResolvedValue(undefined);
   mockDeleteWorkPlan.mockResolvedValue(undefined);
@@ -453,7 +456,8 @@ describe("POST /api/orgs/me/members/:userId/remove", () => {
     expect(mockUpdateTaskOwner).toHaveBeenCalledTimes(2);
     expect(mockUpdateTaskOwner).toHaveBeenCalledWith("task-0", callerUserId);
     expect(mockUpdateTaskOwner).toHaveBeenCalledWith("task-1", callerUserId);
-    expect(mockTransferTemplateOwner).toHaveBeenCalledWith("tpl-0", callerUserId);
+    // htmlTemplates uses bulk transfer — transferAllTemplates is called once
+    expect(mockTransferAllTemplates).toHaveBeenCalledWith(targetUserId, callerUserId, "owner@example.com");
     expect(mockTransferLandingPageOwner).toHaveBeenCalledWith("lp-0", callerUserId);
     expect(mockWorkPlanTransferOwner).toHaveBeenCalledTimes(2);
     expect(mockSkillTransferOwner).toHaveBeenCalledTimes(3);
@@ -482,7 +486,8 @@ describe("POST /api/orgs/me/members/:userId/remove", () => {
     expect(res.status).toBe(200);
     expect(mockDeleteTask).toHaveBeenCalledTimes(2);
     expect(mockDeleteTask).toHaveBeenCalledWith("task-0");
-    expect(mockDeleteTemplate).toHaveBeenCalledWith("tpl-0");
+    // htmlTemplates uses bulk delete — deleteAllTemplates is called once
+    expect(mockDeleteAllTemplates).toHaveBeenCalledWith(targetUserId, "owner@example.com");
     expect(mockDeleteLandingPageByRecord).toHaveBeenCalledTimes(1);
     expect(mockDeleteWorkPlan).toHaveBeenCalledWith("plan-0");
     expect(mockDeleteSkill).toHaveBeenCalledTimes(2);
@@ -534,9 +539,9 @@ describe("POST /api/orgs/me/members/:userId/remove", () => {
     // knowledgeBase: transfer
     expect(mockUpdateTaskOwner).toHaveBeenCalledTimes(2);
     expect(mockDeleteTask).not.toHaveBeenCalled();
-    // htmlTemplates: delete
-    expect(mockDeleteTemplate).toHaveBeenCalledWith("tpl-0");
-    expect(mockTransferTemplateOwner).not.toHaveBeenCalled();
+    // htmlTemplates: delete — uses bulk deleteAllTemplates
+    expect(mockDeleteAllTemplates).toHaveBeenCalledWith(targetUserId, "owner@example.com");
+    expect(mockTransferAllTemplates).not.toHaveBeenCalled();
     // landingPages: leave — no fetch or manipulation
     expect(mockDeleteLandingPageByRecord).not.toHaveBeenCalled();
     expect(mockTransferLandingPageOwner).not.toHaveBeenCalled();
@@ -548,7 +553,8 @@ describe("POST /api/orgs/me/members/:userId/remove", () => {
 
     expect(res.body.summary.landingPages).toEqual({ updated: 0, deleted: 0, errors: [] });
     expect(res.body.summary.knowledgeBase.updated).toBe(2);
-    expect(res.body.summary.htmlTemplates.deleted).toBe(1);
+    // deleteAllTemplates returns 0 by default in setupNormalUsers; the route reports what the bulk call returns
+    expect(res.body.summary.htmlTemplates.deleted).toBe(0);
   });
 
   // 10. After execution: clearOrgMembership and pruneEditorListsForUser are called

@@ -64,6 +64,7 @@ type Decision = "transfer" | "delete" | "leave";
 router.post("/:userId/remove", async (req, res) => {
   try {
     const callerId = (req as any).user.userId;
+    const callerEmail = (req as any).user.email as string;
     const caller = await userDb.getUserById(callerId);
     if (!caller?.orgId || caller.orgRole !== "owner") {
       return res.status(403).json({ message: "Org owner only" });
@@ -87,6 +88,7 @@ router.post("/:userId/remove", async (req, res) => {
     }
 
     // Cap pre-check — fetch counts before making any writes
+    // htmlTemplates uses bulk helpers so no per-item pre-check needed, but we still count
     for (const f of TOGGLEABLE_FEATURES) {
       if (decisions[f] === "leave") continue;
       const items = await fetchItemsForFeature(target.userId, f);
@@ -101,6 +103,29 @@ router.post("/:userId/remove", async (req, res) => {
       const d = decisions[f]!;
       summary[f] = { updated: 0, deleted: 0, errors: [] };
       if (d === "leave") continue;
+
+      // htmlTemplates uses a single bulk call (no per-item loop)
+      if (f === "htmlTemplates") {
+        try {
+          if (d === "transfer") {
+            const count = await htmlTemplateService.transferAllTemplates(
+              target.userId,
+              callerId,
+              callerEmail,
+            );
+            summary[f].updated = count;
+          } else if (d === "delete") {
+            const count = await htmlTemplateService.deleteAllTemplates(
+              target.userId,
+              callerEmail,
+            );
+            summary[f].deleted = count;
+          }
+        } catch (e: any) {
+          summary[f].errors.push(`htmlTemplates/bulk: ${e?.message ?? e}`);
+        }
+        continue;
+      }
 
       const items = await fetchItemsForFeature(target.userId, f);
 
@@ -140,7 +165,7 @@ router.post("/:userId/remove", async (req, res) => {
   }
 });
 
-// ── Per-feature helpers ────────────────────────────────────────────────────
+// ── Per-feature helpers (used for all features except htmlTemplates) ────────
 
 async function fetchItemsForFeature(userId: string, f: ToggleableFeature): Promise<any[]> {
   switch (f) {
@@ -155,7 +180,7 @@ async function fetchItemsForFeature(userId: string, f: ToggleableFeature): Promi
 function getItemId(item: any, f: ToggleableFeature): string {
   switch (f) {
     case "knowledgeBase":  return item.taskId;
-    case "htmlTemplates":  return item.templateId;
+    case "htmlTemplates":  return item.template_id;
     case "landingPages":   return item.id;
     case "workPlans":      return item.planId;
     case "skills":         return item.skillId;
@@ -168,7 +193,7 @@ async function transferItemOwner(item: any, f: ToggleableFeature, newOwnerId: st
       await taskDb.updateTaskOwner(item.taskId, newOwnerId);
       return;
     case "htmlTemplates":
-      await htmlTemplateService.transferOwner(item.templateId, newOwnerId);
+      // handled via bulk helper above; should not reach here
       return;
     case "landingPages":
       await transferLandingPageOwner(item.id, newOwnerId);
@@ -188,7 +213,7 @@ async function deleteItem(item: any, f: ToggleableFeature): Promise<void> {
       await taskDb.deleteTask(item.taskId);
       return;
     case "htmlTemplates":
-      await htmlTemplateService.deleteTemplate(item.templateId);
+      // handled via bulk helper above; should not reach here
       return;
     case "landingPages":
       await deleteLandingPageByRecord(item);
