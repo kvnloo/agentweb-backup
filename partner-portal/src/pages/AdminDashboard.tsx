@@ -3777,7 +3777,13 @@ export default function AdminDashboard() {
               if (u.subscription_status !== "trialing" || !u.current_period_end) return false;
               return new Date(u.current_period_end).getTime() < now.getTime();
             });
-            const hasAttention = pastDue.length > 0 || trialEnding.length > 0 || trialExpired.length > 0;
+            const subscriptionExpired = contextUsers.filter(u => {
+              if (u.subscriptionType === "Free") return false;
+              if (u.subscription_status !== "canceled" && u.subscription_status !== "canceling") return false;
+              if (!u.current_period_end) return false;
+              return new Date(u.current_period_end).getTime() < now.getTime();
+            });
+            const hasAttention = pastDue.length > 0 || trialEnding.length > 0 || trialExpired.length > 0 || subscriptionExpired.length > 0;
             if (!hasAttention) return null;
             return (
               <Paper variant="outlined" sx={{ mb: 3, p: 2, borderColor: "error.light", bgcolor: "error.50" }}>
@@ -3816,6 +3822,18 @@ export default function AdminDashboard() {
                         <Chip label={u._daysLeft === 0 ? "Today!" : `${u._daysLeft}d left`} size="small" color={u._daysLeft <= 2 ? "error" : "warning"} variant="outlined" />
                         <Typography variant="body2" sx={{ fontWeight: 500 }}>{u.email}</Typography>
                         <Typography variant="caption" color="text.secondary">{u.supportNote || u.subscriptionType || ""} · ends {format(new Date(u.current_period_end!), "MMM d")}</Typography>
+                      </Box>
+                    ))}
+                  </Box>
+                )}
+                {subscriptionExpired.length > 0 && (
+                  <Box sx={{ mt: trialEnding.length > 0 ? 1.5 : 0 }}>
+                    <Typography variant="caption" sx={{ fontWeight: 600, color: "warning.main" }}>SUBSCRIPTION ENDED — MOVE TO FREE TIER</Typography>
+                    {subscriptionExpired.sort((a, b) => new Date(a.current_period_end!).getTime() - new Date(b.current_period_end!).getTime()).map(u => (
+                      <Box key={u.userId} sx={{ display: "flex", alignItems: "center", gap: 1, py: 0.5 }}>
+                        <Chip label="Ended" size="small" color="warning" variant="outlined" />
+                        <Typography variant="body2" sx={{ fontWeight: 500 }}>{u.email}</Typography>
+                        <Typography variant="caption" color="text.secondary">{u.subscriptionType || ""} · ended {format(new Date(u.current_period_end!), "MMM d")}</Typography>
                       </Box>
                     ))}
                   </Box>
