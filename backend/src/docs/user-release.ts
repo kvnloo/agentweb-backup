@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-19',
     changes: [
+      'Fixed: Social Media Posts and Bug Reports Now Work Correctly with Gemini Models',
+      '- Social media posts created by Gemini-powered sessions were rendering as blank (undefined content and platform labels) in the generated HTML',
+      '- Bug reports submitted via Gemini sessions were failing with a Notion API error because issue fields were undefined',
+      '- Both tools now correctly handle Gemini\'s behavior of serializing array items as JSON strings instead of objects',
+    ],
+  },
+  {
+    date: '2026-05-19',
+    changes: [
       'CRM: LinkedIn Connection Indicator on Leads',
       '- The LinkedIn icon on each lead now shows a green dot when that lead is a 1st-degree LinkedIn connection with your connected outreach account',
       '- Connection status is checked automatically after loading each lead list — no manual refresh needed',
