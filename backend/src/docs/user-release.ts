@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-19',
     changes: [
+      'Fixed: Fathom Connection Status Now Consistent on Connected Accounts Page',
+      '- The top summary card and the detailed account list now both reflect the same live connection status for Fathom',
+      '- Previously, the top card could show "Connected" while the bottom list showed "Disconnected" when a Fathom token was revoked server-side',
+    ],
+  },
+  {
+    date: '2026-05-19',
+    changes: [
       'New: Gemini 3.5 Flash Available in Agent Mode',
       '- Google\'s latest Gemini 3.5 Flash model is now available in the Agent Mode model selector',
     ],
