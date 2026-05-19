@@ -341,8 +341,12 @@ describe("POST /api/user-skills — new skill gets orgId stamped", () => {
     jest.clearAllMocks();
   });
 
-  it("stamps the orgId from the user's record onto the new skill", async () => {
-    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId });
+  it("stamps the orgId from the user's record onto the new skill (editor allowed)", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "member" });
+    mockGetOrgById.mockResolvedValue({
+      orgId: mockOrgId,
+      shareSettings: { skills: { enabled: false, editors: [mockUserId] } },
+    });
     mockCreateSkill.mockResolvedValue({ ...mySkill, skillId: "skill-new" });
     mockUpdateSkill.mockResolvedValue(undefined);
 
@@ -368,5 +372,58 @@ describe("POST /api/user-skills — new skill gets orgId stamped", () => {
     expect(res.status).toBe(201);
     const call = mockUpdateSkill.mock.calls[0][0];
     expect(call.orgId).toBeUndefined();
+  });
+});
+
+describe("POST /api/user-skills — org-level create gating", () => {
+  beforeEach(() => { jest.clearAllMocks(); });
+
+  it("org owner can create regardless of toggle", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "owner" });
+    mockGetOrgById.mockResolvedValue({
+      orgId: mockOrgId,
+      shareSettings: { skills: { enabled: false, editors: [] } },
+    });
+    mockCreateSkill.mockResolvedValue({ ...mySkill, skillId: "owner-skill" });
+    mockUpdateSkill.mockResolvedValue(undefined);
+
+    const res = await request(app)
+      .post("/api/user-skills")
+      .send({ name: "Owner Skill", description: "d" });
+
+    expect(res.status).toBe(201);
+    expect(mockCreateSkill).toHaveBeenCalledTimes(1);
+  });
+
+  it("listed editor can create even when enabled=false", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "member" });
+    mockGetOrgById.mockResolvedValue({
+      orgId: mockOrgId,
+      shareSettings: { skills: { enabled: false, editors: [mockUserId] } },
+    });
+    mockCreateSkill.mockResolvedValue({ ...mySkill, skillId: "editor-skill" });
+    mockUpdateSkill.mockResolvedValue(undefined);
+
+    const res = await request(app)
+      .post("/api/user-skills")
+      .send({ name: "Editor Skill", description: "d" });
+
+    expect(res.status).toBe(201);
+    expect(mockCreateSkill).toHaveBeenCalledTimes(1);
+  });
+
+  it("non-editor org member gets 403 on create", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "member" });
+    mockGetOrgById.mockResolvedValue({
+      orgId: mockOrgId,
+      shareSettings: { skills: { enabled: true, editors: [] } },
+    });
+
+    const res = await request(app)
+      .post("/api/user-skills")
+      .send({ name: "Member Attempt", description: "d" });
+
+    expect(res.status).toBe(403);
+    expect(mockCreateSkill).not.toHaveBeenCalled();
   });
 });

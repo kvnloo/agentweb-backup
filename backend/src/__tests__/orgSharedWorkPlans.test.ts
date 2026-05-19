@@ -431,8 +431,12 @@ describe("DELETE /api/user-work-plans/:planId — editor-based DELETE restrictio
 });
 
 describe("POST /api/user-work-plans — new plan gets orgId stamped", () => {
-  it("stamps the orgId from the user's record onto the new plan", async () => {
-    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId });
+  it("stamps the orgId from the user's record onto the new plan (editor allowed)", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "member" });
+    mockGetOrgById.mockResolvedValue({
+      orgId: mockOrgId,
+      shareSettings: { workPlans: { enabled: false, editors: [mockUserId] } },
+    });
     mockCreateWorkPlan.mockResolvedValue({ ...myPlan, planId: "plan-new" });
 
     const res = await request(app)
@@ -456,5 +460,54 @@ describe("POST /api/user-work-plans — new plan gets orgId stamped", () => {
     expect(res.status).toBe(201);
     const call = mockCreateWorkPlan.mock.calls[0][0];
     expect(call.orgId).toBeUndefined();
+  });
+});
+
+describe("POST /api/user-work-plans — org-level create gating", () => {
+  it("org owner can create regardless of toggle", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "owner" });
+    mockGetOrgById.mockResolvedValue({
+      orgId: mockOrgId,
+      shareSettings: { workPlans: { enabled: false, editors: [] } },
+    });
+    mockCreateWorkPlan.mockResolvedValue({ ...myPlan, planId: "owner-plan" });
+
+    const res = await request(app)
+      .post("/api/user-work-plans")
+      .send({ title: "Owner Plan", steps: [{ title: "S" }] });
+
+    expect(res.status).toBe(201);
+    expect(mockCreateWorkPlan).toHaveBeenCalledTimes(1);
+  });
+
+  it("listed editor can create (even when enabled=false)", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "member" });
+    mockGetOrgById.mockResolvedValue({
+      orgId: mockOrgId,
+      shareSettings: { workPlans: { enabled: false, editors: [mockUserId] } },
+    });
+    mockCreateWorkPlan.mockResolvedValue({ ...myPlan, planId: "editor-plan" });
+
+    const res = await request(app)
+      .post("/api/user-work-plans")
+      .send({ title: "Editor Plan", steps: [{ title: "S" }] });
+
+    expect(res.status).toBe(201);
+    expect(mockCreateWorkPlan).toHaveBeenCalledTimes(1);
+  });
+
+  it("non-editor org member gets 403 on create", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "member" });
+    mockGetOrgById.mockResolvedValue({
+      orgId: mockOrgId,
+      shareSettings: { workPlans: { enabled: true, editors: [] } },
+    });
+
+    const res = await request(app)
+      .post("/api/user-work-plans")
+      .send({ title: "Member Attempt", steps: [{ title: "S" }] });
+
+    expect(res.status).toBe(403);
+    expect(mockCreateWorkPlan).not.toHaveBeenCalled();
   });
 });
