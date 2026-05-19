@@ -821,16 +821,33 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       };
     },
 
-    evaluateSmartField: async ({ fieldName, condition, depValues }) => {
+    evaluateSmartField: async ({ lead, fieldName, condition, depValues }) => {
       const {
         buildSmartFieldEvalSystemPrompt,
         buildSmartFieldEvalUserPrompt,
       } = await import('./enrichmentPrompts');
       try {
+        const sanitize = (s: string) => s.replace(/["\n`]/g, ' ').trim();
+        const raw: Record<string, string> = {
+          name: [lead.firstName, lead.lastName].filter(Boolean).join(' '),
+          firstName: lead.firstName || '',
+          lastName: lead.lastName || '',
+          company: lead.company || '',
+          title: lead.title || '',
+          emailDomain: lead.emailDomain || '',
+          website: lead.website || '',
+          linkedin: lead.linkedin || '',
+        };
+        const nativeValues = Object.fromEntries(
+          Object.entries(raw)
+            .filter(([, v]) => v)
+            .map(([k, v]) => [k, sanitize(v.slice(0, 200))])
+        );
+        const mergedDepValues = { ...nativeValues, ...depValues };
         const llm = createLLMService(EXTRACT_MODEL, 0.0);
         const result = await llm.generateJSONContent<{ value: string | null; reasoning: string }>(
           buildSmartFieldEvalSystemPrompt(),
-          buildSmartFieldEvalUserPrompt(fieldName, condition, depValues),
+          buildSmartFieldEvalUserPrompt(fieldName, condition, mergedDepValues),
         );
         return {
           value: result?.value != null ? String(result.value) : null,
