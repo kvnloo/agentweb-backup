@@ -423,3 +423,76 @@ describe("DELETE /api/landing-pages/v0/generated/:id — ownership and org-owner
     expect(mockDeleteLandingPageByRecord).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Tests: POST /api/landing-pages/v0/generate — org-level create gating
+// ---------------------------------------------------------------------------
+describe("POST /api/landing-pages/v0/generate — org-level create gating", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    currentMockUser = { userId: mockUserId, email: "user1@example.com", isAdmin: false };
+  });
+
+  // The generate route does not return 201 — actual page creation goes through
+  // v0Service and may take several seconds. We only care about gating: a denied
+  // call must return 403 before any v0 work happens. An allowed call may proceed
+  // and fail later (we don't mock the full happy path here — we just assert
+  // status != 403, which is sufficient for the gating contract.)
+  it("solo user (no orgId) is not 403 on generate", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId }); // no orgId
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Build me a landing page", name: "Solo LP" });
+
+    expect(res.status).not.toBe(403);
+  });
+
+  it("org owner is not 403 on generate (even with sharing disabled)", async () => {
+    currentMockUser = { userId: mockOrgOwnerId, email: "orgowner@example.com", isAdmin: false };
+    mockGetUserById.mockResolvedValue({ userId: mockOrgOwnerId, orgId: mockOrgId, orgRole: "owner" });
+    mockGetOrgById.mockResolvedValue(makeOrg(false, []));
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Owner LP", name: "Owner LP" });
+
+    expect(res.status).not.toBe(403);
+  });
+
+  it("listed editor (sharing enabled) is not 403 on generate", async () => {
+    currentMockUser = { userId: mockEditorId, email: "editor@example.com", isAdmin: false };
+    mockGetUserById.mockResolvedValue({ userId: mockEditorId, orgId: mockOrgId, orgRole: "member" });
+    mockGetOrgById.mockResolvedValue(makeOrg(true, [mockEditorId]));
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Editor LP", name: "Editor LP" });
+
+    expect(res.status).not.toBe(403);
+  });
+
+  it("non-editor org member gets 403 on generate", async () => {
+    currentMockUser = { userId: "user-plain", email: "plain@example.com", isAdmin: false };
+    mockGetUserById.mockResolvedValue({ userId: "user-plain", orgId: mockOrgId, orgRole: "member" });
+    mockGetOrgById.mockResolvedValue(makeOrg(true, [mockEditorId])); // caller not in editors
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Member attempt", name: "Member LP" });
+
+    expect(res.status).toBe(403);
+  });
+
+  it("editor cannot create when shareSettings.landingPages.enabled is false (403)", async () => {
+    currentMockUser = { userId: mockEditorId, email: "editor@example.com", isAdmin: false };
+    mockGetUserById.mockResolvedValue({ userId: mockEditorId, orgId: mockOrgId, orgRole: "member" });
+    mockGetOrgById.mockResolvedValue(makeOrg(false, [mockEditorId]));
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Disabled-editor attempt", name: "X" });
+
+    expect(res.status).toBe(403);
+  });
+});

@@ -270,6 +270,82 @@ describe("POST /api/html-templates — create", () => {
     expect(res.status).toBe(201);
     expect(mockCreateTemplate).toHaveBeenCalledTimes(1);
   });
+
+  // ── Org-level create gating ─────────────────────────────────────────────
+  it("solo user (no orgId) can create — no gating", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId }); // no orgId
+    mockCreateTemplate.mockResolvedValue({ ...myTpl, template_id: "solo-tpl" });
+
+    const res = await request(app).post("/api/html-templates").send({
+      template_name: "Solo Template",
+      type: ["email"],
+      html_content: "<p>x</p>",
+    });
+
+    expect(res.status).toBe(201);
+    expect(mockCreateTemplate).toHaveBeenCalledTimes(1);
+  });
+
+  it("org owner can always create", async () => {
+    mockGetUserById.mockResolvedValue({ userId: orgOwnerUserId, orgId: mockOrgId, orgRole: "owner" });
+    mockGetOrgById.mockResolvedValue(orgDisabled); // even with sharing disabled
+    mockCreateTemplate.mockResolvedValue({ ...myTpl, template_id: "owner-tpl" });
+
+    const res = await request(orgOwnerApp).post("/api/html-templates").send({
+      template_name: "Owner Template",
+      type: ["email"],
+      html_content: "<p>x</p>",
+    });
+
+    expect(res.status).toBe(201);
+    expect(mockCreateTemplate).toHaveBeenCalledTimes(1);
+  });
+
+  it("listed editor can create when shareSettings.htmlTemplates.enabled is true", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockEditorId, orgId: mockOrgId, orgRole: "member" });
+    mockGetOrgById.mockResolvedValue(orgEnabled); // enabled + editors=[editorId]
+    mockCreateTemplate.mockResolvedValue({ ...myTpl, template_id: "editor-tpl" });
+
+    const res = await request(editorApp).post("/api/html-templates").send({
+      template_name: "Editor Template",
+      type: ["email"],
+      html_content: "<p>x</p>",
+    });
+
+    expect(res.status).toBe(201);
+    expect(mockCreateTemplate).toHaveBeenCalledTimes(1);
+  });
+
+  it("non-editor org member gets 403 on create", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "member" });
+    mockGetOrgById.mockResolvedValue(orgEnabled); // user-1 not in editors
+
+    const res = await request(app).post("/api/html-templates").send({
+      template_name: "Member Attempt",
+      type: ["email"],
+      html_content: "<p>x</p>",
+    });
+
+    expect(res.status).toBe(403);
+    expect(mockCreateTemplate).not.toHaveBeenCalled();
+  });
+
+  it("editor cannot create when shareSettings.htmlTemplates.enabled is false (403)", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockEditorId, orgId: mockOrgId, orgRole: "member" });
+    mockGetOrgById.mockResolvedValue({
+      ...orgDisabled,
+      shareSettings: { htmlTemplates: { enabled: false, editors: [mockEditorId] } },
+    });
+
+    const res = await request(editorApp).post("/api/html-templates").send({
+      template_name: "Editor Disabled",
+      type: ["email"],
+      html_content: "<p>x</p>",
+    });
+
+    expect(res.status).toBe(403);
+    expect(mockCreateTemplate).not.toHaveBeenCalled();
+  });
 });
 
 // ────────────────────────────────────────────────────────────────────────────
