@@ -5872,6 +5872,7 @@ export class AgentModeService {
   public async updateMarketStrategy(updateData: any, userId: string): Promise<any> {
     try {
       const { userDb, orgDb } = await import('./db');
+      const { canEditItem } = await import('./orgShareService');
       const user = await userDb.getUserById(userId);
       if (!user) {
         return {
@@ -5881,22 +5882,25 @@ export class AgentModeService {
         };
       }
 
-      // Check org membership - only owners can update, members are rejected
-      const isOrgOwner = user.orgId && user.orgRole === 'owner';
-      const isOrgMember = user.orgId && user.orgRole !== 'owner';
-
-      if (isOrgMember) {
-        return {
-          success: false,
-          message: 'Only the org owner can update market strategy',
-          error: 'Permission denied'
-        };
-      }
-
-      // Get existing market strategy from org (if owner) or personal
+      // Org members: only the org owner or a listed marketingStrategy editor
+      // may update. Solo users are unaffected.
       let existingMarketStrategy: any;
-      if (isOrgOwner) {
-        const org = await orgDb.getOrgById(user.orgId!);
+      if (user.orgId) {
+        const org = await orgDb.getOrgById(user.orgId);
+        const allowed = canEditItem(
+          { userId: org?.ownerUserId } as any,
+          { userId, orgId: user.orgId, orgRole: user.orgRole as 'owner' | 'member' | undefined },
+          org ?? null,
+          user.orgId,
+          'marketingStrategy',
+        );
+        if (!allowed) {
+          return {
+            success: false,
+            message: 'Market strategy is managed by your org admin',
+            error: 'Permission denied'
+          };
+        }
         existingMarketStrategy = org?.marketStrategy;
       } else {
         existingMarketStrategy = user.marketStrategy;
@@ -5955,8 +5959,8 @@ export class AgentModeService {
       };
 
       // Update org-level or personal market strategy
-      if (isOrgOwner) {
-        await orgDb.updateOrg(user.orgId!, { marketStrategy: marketStrategyData });
+      if (user.orgId) {
+        await orgDb.updateOrg(user.orgId, { marketStrategy: marketStrategyData });
       } else {
         await userDb.updateUser(userId, { marketStrategy: marketStrategyData });
       }
@@ -9078,6 +9082,7 @@ Format the response as JSON with this structure:
   public async updateBrandGuidelines(updateData: any, userId: string): Promise<any> {
     try {
       const { userDb, orgDb } = await import('./db');
+      const { canEditItem } = await import('./orgShareService');
       const user = await userDb.getUserById(userId);
       if (!user) {
         return {
@@ -9087,22 +9092,25 @@ Format the response as JSON with this structure:
         };
       }
 
-      // Check org membership - only owners can update, members are rejected
-      const isOrgOwner = user.orgId && user.orgRole === 'owner';
-      const isOrgMember = user.orgId && user.orgRole !== 'owner';
-
-      if (isOrgMember) {
-        return {
-          success: false,
-          message: 'Only the org owner can update brand guidelines',
-          error: 'Permission denied'
-        };
-      }
-
-      // Get existing brand guidelines from org (if owner) or personal
+      // Org members: only the org owner or a listed brandGuidelines editor
+      // may update. Solo users are unaffected.
       let existingBrand: any;
-      if (isOrgOwner) {
-        const org = await orgDb.getOrgById(user.orgId!);
+      if (user.orgId) {
+        const org = await orgDb.getOrgById(user.orgId);
+        const allowed = canEditItem(
+          { userId: org?.ownerUserId } as any,
+          { userId, orgId: user.orgId, orgRole: user.orgRole as 'owner' | 'member' | undefined },
+          org ?? null,
+          user.orgId,
+          'brandGuidelines',
+        );
+        if (!allowed) {
+          return {
+            success: false,
+            message: 'Brand guidelines are managed by your org admin',
+            error: 'Permission denied'
+          };
+        }
         existingBrand = org?.brandGuidelines;
       } else {
         existingBrand = user.brandGuidelines;
@@ -9133,8 +9141,8 @@ Format the response as JSON with this structure:
         };
 
         // Update org or user with initial brand guidelines
-        if (isOrgOwner) {
-          await orgDb.updateOrg(user.orgId!, { brandGuidelines: initialBrandGuidelines });
+        if (user.orgId) {
+          await orgDb.updateOrg(user.orgId, { brandGuidelines: initialBrandGuidelines });
         } else {
           await userDb.updateUser(userId, { brandGuidelines: initialBrandGuidelines });
         }
@@ -9262,8 +9270,8 @@ Format the response as JSON with this structure:
         updatedAt: new Date().toISOString()
       };
 
-      if (isOrgOwner) {
-        await orgDb.updateOrg(user.orgId!, { brandGuidelines: updatedGuidelines });
+      if (user.orgId) {
+        await orgDb.updateOrg(user.orgId, { brandGuidelines: updatedGuidelines });
       } else {
         await userDb.updateUser(userId, { brandGuidelines: updatedGuidelines });
       }
@@ -19207,6 +19215,26 @@ Please generate a complete, professional HTML document that properly formats and
     types?: string[]
   ): Promise<any> {
     try {
+      // Org-level create gating: only org owner or listed htmlTemplates editor
+      const { userDb, orgDb } = await import('./db');
+      const { canManageOrgFeature } = await import('./orgShareService');
+      const caller = await userDb.getUserById(userId);
+      if (caller?.orgId) {
+        const org = await orgDb.getOrgById(caller.orgId);
+        const allowed = canManageOrgFeature(
+          { userId, orgId: caller.orgId, orgRole: caller.orgRole as 'owner' | 'member' | undefined },
+          org,
+          'htmlTemplates',
+        );
+        if (!allowed) {
+          return {
+            success: false,
+            message: 'Templates are managed by your org admin',
+            error: 'Permission denied'
+          };
+        }
+      }
+
       // Read HTML content from source (either S3 URL or direct HTML content)
       let htmlContent = htmlSource;
 

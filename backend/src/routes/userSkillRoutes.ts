@@ -2,7 +2,11 @@ import express from "express";
 import { skillService, Skill } from "../services/skillService";
 import { emailService } from "../services/emailService";
 import { userDb, orgDb } from "../services/db";
-import { canEditItem, isFeatureEffectivelyEnabled } from "../services/orgShareService";
+import {
+  canEditItem,
+  canManageOrgFeature,
+  isFeatureEffectivelyEnabled,
+} from "../services/orgShareService";
 
 const router = express.Router();
 
@@ -63,6 +67,19 @@ router.post("/", async (req, res) => {
 
     const user = await userDb.getUserById(userId);
     const orgId = user?.orgId;
+
+    // Org-level create gating: only org owner or listed skills editor
+    if (orgId) {
+      const org = await orgDb.getOrgById(orgId);
+      const allowed = canManageOrgFeature(
+        { userId, orgId, orgRole: user?.orgRole as "owner" | "member" | undefined },
+        org,
+        "skills",
+      );
+      if (!allowed) {
+        return res.status(403).json({ message: "Skills are managed by your org admin" });
+      }
+    }
 
     const skill = await skillService.createSkill(
       name,

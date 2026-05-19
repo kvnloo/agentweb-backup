@@ -4,6 +4,7 @@ import { emailService } from "../services/emailService";
 import { userDb, orgDb } from "../services/db";
 import {
   canEditItem,
+  canManageOrgFeature,
   isFeatureEffectivelyEnabled,
   listOrgVisibleItems,
 } from "../services/orgShareService";
@@ -85,6 +86,19 @@ router.post("/", async (req, res) => {
 
     const user = await userDb.getUserById(userId);
     const orgId = user?.orgId;
+
+    // Org-level create gating: only org owner or listed workPlans editor
+    if (orgId) {
+      const org = await orgDb.getOrgById(orgId);
+      const allowed = canManageOrgFeature(
+        { userId, orgId, orgRole: user?.orgRole as "owner" | "member" | undefined },
+        org,
+        "workPlans",
+      );
+      if (!allowed) {
+        return res.status(403).json({ message: "Work plans are managed by your org admin" });
+      }
+    }
 
     const plan = await workPlanService.createWorkPlan({
       title,
