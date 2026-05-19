@@ -41,7 +41,7 @@ export const UNIPILE_PERSON_COVERAGE: Record<string, string[]> = {
 
 /** Direct map from Unipile raw profile JSON → CRM field names (root-level only).
  *  Field names verified against real Unipile /api/v1/users response. */
-function mapUnipilePersonToCrmFields(raw: any): Record<string, string> {
+function mapUnipilePersonToCrmFields(raw: Record<string, any>): Record<string, string> {
   const out: Record<string, string> = {};
   if (raw.first_name)  out.first_name  = raw.first_name;
   if (raw.last_name)   out.last_name   = raw.last_name;
