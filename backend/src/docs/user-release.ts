@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-19',
+    changes: [
+      'Improved: Research Reports Page Loads Faster for Large Accounts',
+      '- The Reports page previously froze or timed out for accounts with hundreds of reports and sessions',
+      '- Reports now load progressively — the first 30 appear immediately, with more loading automatically as you scroll',
+      '- Search and filters still work across all reports at once, bypassing the scroll limit',
+    ],
+  },
+  {
     date: '2026-05-18',
     changes: [
       'Improved: Emma Can Now Return Timestamped Transcripts and Scene Breakdowns from Videos',
