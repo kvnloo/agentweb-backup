@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-19',
     changes: [
+      'CRM: LinkedIn Connection Indicator on Leads',
+      '- The LinkedIn icon on each lead now shows a green dot when that lead is a 1st-degree LinkedIn connection with your connected outreach account',
+      '- Connection status is checked automatically after loading each lead list — no manual refresh needed',
+      '- Hover the icon to see "LinkedIn — 1st-degree connection" tooltip',
+      'Drip Sequences: LinkedIn Auto-Enroll and Exit Conditions',
+      '- New sequence setting: "Auto-enroll when lead accepts LinkedIn invite" — leads are automatically enrolled into the sequence when they accept your LinkedIn connection request (checked every 10 minutes)',
+      '- New exit condition: "Exit when lead replies on LinkedIn" — the sequence stops sending to a lead as soon as they reply to any LinkedIn message',
+      '- LinkedIn connection data is cached in a dedicated store, enabling fast lookups and supporting future features without touching lead records',
       'Improved: Research Reports Page Loads Faster for Large Accounts',
       '- The Reports page previously froze or timed out for accounts with hundreds of reports and sessions',
       '- Reports now load progressively — the first 30 appear immediately, with more loading automatically as you scroll',
