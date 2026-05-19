@@ -149,11 +149,21 @@ describe('FathomApiService', () => {
       expect(result).toBe(false);
     });
 
-    it('should return false when Fathom API is unreachable', async () => {
+    it('should return null when Fathom API is unreachable (network error)', async () => {
       mockFetch.mockRejectedValueOnce(new Error('DNS lookup failed'));
 
       const result = await service.validateApiKey();
-      expect(result).toBe(false);
+      expect(result).toBeNull();
+    });
+
+    it('should return null for 5xx responses (Fathom server error, not auth failure)', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+      });
+
+      const result = await service.validateApiKey();
+      expect(result).toBeNull();
     });
   });
 });
