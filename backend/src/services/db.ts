@@ -4909,12 +4909,6 @@ export const crmDb = {
       reason: string;
       matchedIcpTitle?: string;
       matchedAt: string;
-      categoryMatches?: Array<{
-        icpTitle: string;
-        isMatch: boolean;
-        score: number;
-        reason: string;
-      }>;
     } | null;
     lastAutoSendAt?: string | null;
     status?: string | null;

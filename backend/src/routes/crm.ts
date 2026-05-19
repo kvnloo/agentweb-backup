@@ -3531,13 +3531,13 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
 
           const systemPrompt = `You are an expert business analyst helping to identify Ideal Customer Profile (ICP) matches.
 
-Your task is to analyze each lead against EACH ICP category defined in the market strategy and determine how well they match.
+Your task is to analyze each lead against the ICP categories defined in the market strategy and decide whether the lead is a genuine match for any one of them.
 
-For each lead, evaluate it against every ICP category and provide:
-1. "icpTitle": string (exact title of the ICP category from the market strategy)
-2. "isMatch": boolean (true if this lead is a genuine match for this ICP category, false otherwise)
-3. "score": number (0-100, how well the lead fits this ICP category)
-4. "reason": string (1-2 sentences explaining the match or lack thereof)
+For each lead, pick the single best-fitting ICP category and determine:
+1. "isMatch": boolean — true only if this lead is a genuine match for that category, false otherwise
+2. "matchedIcpTitle": string — the exact title of the best-fitting ICP category (include this field only when isMatch is true)
+3. "score": number — 0-100 confidence score (even when isMatch is false, provide the best score you found across all categories)
+4. "reason": string — 1-2 sentences explaining why the lead matches (if isMatch true) or why no category was a sufficient match (if isMatch false)
 
 Consider factors like:
 - Job title and seniority level
@@ -3553,10 +3553,16 @@ Return your analysis as a JSON array, one object per lead:
 [
   {
     "index": 1,
-    "categoryMatches": [
-      { "icpTitle": "SaaS CTOs", "isMatch": true, "score": 85, "reason": "Senior decision-maker in target industry with clear technical buying authority." },
-      { "icpTitle": "Enterprise CFOs", "isMatch": false, "score": 22, "reason": "Finance-focused role with no indicators of technical budget ownership." }
-    ]
+    "isMatch": true,
+    "matchedIcpTitle": "SaaS CTOs",
+    "score": 85,
+    "reason": "Senior decision-maker in target industry with clear technical buying authority."
+  },
+  {
+    "index": 2,
+    "isMatch": false,
+    "score": 31,
+    "reason": "Lead's role and company stage do not align with any of the defined ICP categories."
   },
   ...
 ]`;
@@ -3578,12 +3584,10 @@ Please analyze each lead and return a JSON array with your assessment.`;
             // Call LLM
             const response = await llmService.generateJSONContent<Array<{
               index: number;
-              categoryMatches: Array<{
-                icpTitle: string;
-                isMatch: boolean;
-                score: number;
-                reason: string;
-              }>;
+              isMatch: boolean;
+              matchedIcpTitle?: string;
+              score: number;
+              reason: string;
             }>>(escapedSystemPrompt, escapedUserPrompt, 'json');
 
             // Update each lead with ICP match result
@@ -3592,38 +3596,20 @@ Please analyze each lead and return a JSON array with your assessment.`;
               if (leadIndex >= 0 && leadIndex < chunk.length) {
                 const lead = chunk[leadIndex];
 
-                // Coerce non-finite LLM scores ("abc", null, NaN, undefined)
-                // to 0 BEFORE clamping. `Math.max(0, NaN)` returns NaN, which
-                // DynamoDB rejects on write and breaks comparisons silently;
-                // `cat.score ?? 0` only catches null/undefined.
-                const rawCategoryMatches = result.categoryMatches || [];
-                const categoryMatches = rawCategoryMatches.map(cat => {
-                  const n = typeof cat.score === 'number' && Number.isFinite(cat.score) ? cat.score : 0;
-                  return { ...cat, score: Math.min(100, Math.max(0, n)) };
-                });
-                if (rawCategoryMatches.length === 0) {
-                  // Almost always means the LLM returned the old top-level
-                  // {isMatch, score, reason} shape instead of categoryMatches.
-                  // Without this log the regression looks like "every lead is
-                  // a bad fit" in the UI.
-                  console.warn(`[crm] match-icps: LLM returned empty categoryMatches for lead ${lead.leadId} — possible schema regression`);
-                }
-                const winner = categoryMatches.length > 0
-                  ? categoryMatches.reduce((best, cat) => cat.score > best.score || (cat.score === best.score && cat.icpTitle < best.icpTitle) ? cat : best)
-                  : { icpTitle: '', isMatch: false, score: 0, reason: 'Insufficient lead data to evaluate against ICP categories.' };
-
-                const isMatch = winner.isMatch;
-                const matchedIcpTitle = isMatch ? winner.icpTitle : undefined;
+                // Coerce non-finite LLM scores to 0 before clamping.
+                const rawScore = typeof result.score === 'number' && Number.isFinite(result.score) ? result.score : 0;
+                const score = Math.min(100, Math.max(0, rawScore));
+                const isMatch = result.isMatch === true;
+                const matchedIcpTitle = isMatch ? result.matchedIcpTitle : undefined;
 
                 // Update lead in DynamoDB
                 await crmDb.updateLead(listId, lead.leadId, {
                   icpMatch: {
                     isMatch,
-                    score: winner.score,
-                    reason: winner.reason,
+                    score,
+                    reason: result.reason || '',
                     matchedIcpTitle,
                     matchedAt: new Date().toISOString(),
-                    categoryMatches,
                   },
                 });
 

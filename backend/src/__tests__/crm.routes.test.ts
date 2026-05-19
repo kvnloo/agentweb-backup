@@ -787,54 +787,24 @@ describe('CRM Routes', () => {
       r.route?.path === '/lists/:listId/leads/match-icps' && r.route?.methods?.post
     );
 
-    it('should use gpt-5.2-chat for ICP matching', async () => {
-      const mockList = {
-        listId: 'list1',
-        name: 'Test List',
-        userId: 'test-user-id',
-      };
-
+    it('persists flat LLM result when lead matches an ICP category', async () => {
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
       (userDb.getUserById as jest.Mock).mockResolvedValue({
         userId: 'test-user-id',
         marketStrategy: {
           businessOverview: 'B2B SaaS',
-          icp: [
-            {
-              title: 'SaaS founders',
-              description: 'Early-stage SaaS founders',
-              valueProposition: 'Automation',
-            },
-          ],
+          icp: [{ title: 'SaaS founders', description: 'Early-stage SaaS founders', valueProposition: 'Automation' }],
         },
       });
       (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
-        items: [
-          {
-            leadId: 'lead1',
-            firstName: 'John',
-            lastName: 'Doe',
-            email: 'john@example.com',
-            company: 'Acme',
-            title: 'Founder',
-          },
-        ],
+        items: [{ leadId: 'lead1', firstName: 'John', lastName: 'Doe', email: 'john@example.com', company: 'Acme', title: 'Founder' }],
         lastEvaluatedKey: null,
       });
 
       const mockLlmService = {
         generateJSONContent: jest.fn().mockResolvedValue([
-          {
-            index: 1,
-            categoryMatches: [
-              {
-                icpTitle: 'SaaS founders',
-                isMatch: true,
-                score: 88,
-                reason: 'Founder aligns with ICP.',
-              },
-            ],
-          },
+          { index: 1, isMatch: true, matchedIcpTitle: 'SaaS founders', score: 88, reason: 'Founder aligns with ICP.' },
         ]),
       };
       (createLLMService as jest.Mock).mockReturnValue(mockLlmService);
@@ -851,28 +821,17 @@ describe('CRM Routes', () => {
       expect(createLLMService).toHaveBeenCalledWith('gpt-5.2-chat', 1);
       expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', {
         icpMatch: {
-          isMatch: true,   // LLM returned isMatch=true
+          isMatch: true,
           score: 88,
           reason: 'Founder aligns with ICP.',
           matchedIcpTitle: 'SaaS founders',
           matchedAt: expect.any(String),
-          categoryMatches: [
-            {
-              icpTitle: 'SaaS founders',
-              isMatch: true,
-              score: 88,
-              reason: 'Founder aligns with ICP.',
-            },
-          ],
         },
       });
-      expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({
-        success: true,
-        processedCount: 1,
-      }));
+      expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({ success: true, processedCount: 1 }));
     });
 
-    it('should clamp out-of-range scores to 0-100', async () => {
+    it('persists isMatch=false and no matchedIcpTitle when LLM finds no match', async () => {
       const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
       (userDb.getUserById as jest.Mock).mockResolvedValue({
@@ -889,12 +848,45 @@ describe('CRM Routes', () => {
 
       const mockLlmService = {
         generateJSONContent: jest.fn().mockResolvedValue([
-          {
-            index: 1,
-            categoryMatches: [
-              { icpTitle: 'SaaS founders', isMatch: true, score: 150, reason: 'Over max score.' },
-            ],
-          },
+          { index: 1, isMatch: false, score: 32, reason: 'Role does not align with any ICP category.' },
+        ]),
+      };
+      (createLLMService as jest.Mock).mockReturnValue(mockLlmService);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { mode: 'match' };
+      mockRequest.body = {};
+
+      const handler = findMatchIcpsPostHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      const updateCall = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
+      expect(updateCall.icpMatch.isMatch).toBe(false);
+      expect(updateCall.icpMatch.score).toBe(32);
+      expect(updateCall.icpMatch.reason).toBe('Role does not align with any ICP category.');
+      expect(updateCall.icpMatch.matchedIcpTitle).toBeUndefined();
+    });
+
+    it('clamps out-of-range scores to 0-100', async () => {
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id',
+        marketStrategy: {
+          businessOverview: 'B2B SaaS',
+          icp: [{ title: 'SaaS founders', description: 'Early-stage', valueProposition: 'Automation' }],
+        },
+      });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [{ leadId: 'lead1', firstName: 'John', lastName: 'Doe', email: 'john@example.com' }],
+        lastEvaluatedKey: null,
+      });
+
+      const mockLlmService = {
+        generateJSONContent: jest.fn().mockResolvedValue([
+          { index: 1, isMatch: true, matchedIcpTitle: 'SaaS founders', score: 150, reason: 'Over max score.' },
         ]),
       };
       (createLLMService as jest.Mock).mockReturnValue(mockLlmService);
@@ -913,95 +905,7 @@ describe('CRM Routes', () => {
       }));
     });
 
-    it('should use fallback reason when LLM returns empty categoryMatches', async () => {
-      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
-      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
-      (userDb.getUserById as jest.Mock).mockResolvedValue({
-        userId: 'test-user-id',
-        marketStrategy: {
-          businessOverview: 'B2B SaaS',
-          icp: [{ title: 'SaaS founders', description: 'Early-stage', valueProposition: 'Automation' }],
-        },
-      });
-      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
-        items: [{ leadId: 'lead1', firstName: 'John', lastName: 'Doe', email: 'john@example.com' }],
-        lastEvaluatedKey: null,
-      });
-
-      const mockLlmService = {
-        generateJSONContent: jest.fn().mockResolvedValue([
-          { index: 1, categoryMatches: [] },
-        ]),
-      };
-      (createLLMService as jest.Mock).mockReturnValue(mockLlmService);
-
-      mockRequest.params = { listId: 'list1' };
-      mockRequest.query = { mode: 'match' };
-      mockRequest.body = {};
-
-      const handler = findMatchIcpsPostHandler();
-      if (handler && handler.route) {
-        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
-      }
-
-      expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', expect.objectContaining({
-        icpMatch: expect.objectContaining({
-          isMatch: false,
-          score: 0,
-          reason: 'Insufficient lead data to evaluate against ICP categories.',
-        }),
-      }));
-    });
-
-    it('persists isMatch=false and no matchedIcpTitle when LLM returns isMatch=false for winner', async () => {
-      // Winner (highest score) has isMatch=false from LLM.
-      // matchedIcpTitle must stay undefined so the frontend doesn't render a
-      // stale title on a non-match.
-      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
-      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
-      (userDb.getUserById as jest.Mock).mockResolvedValue({
-        userId: 'test-user-id',
-        marketStrategy: {
-          businessOverview: 'B2B SaaS',
-          icp: [{ title: 'SaaS founders', description: 'Early-stage', valueProposition: 'Automation' }],
-        },
-      });
-      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
-        items: [{ leadId: 'lead1', firstName: 'John', lastName: 'Doe', email: 'john@example.com' }],
-        lastEvaluatedKey: null,
-      });
-
-      const mockLlmService = {
-        generateJSONContent: jest.fn().mockResolvedValue([
-          {
-            index: 1,
-            categoryMatches: [
-              { icpTitle: 'SaaS founders', isMatch: false, score: 49, reason: 'Wrong segment.' },
-            ],
-          },
-        ]),
-      };
-      (createLLMService as jest.Mock).mockReturnValue(mockLlmService);
-
-      mockRequest.params = { listId: 'list1' };
-      mockRequest.query = { mode: 'match' };
-      mockRequest.body = {};
-
-      const handler = findMatchIcpsPostHandler();
-      if (handler && handler.route) {
-        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
-      }
-
-      const updateCall = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
-      expect(updateCall.icpMatch.isMatch).toBe(false);
-      expect(updateCall.icpMatch.score).toBe(49);
-      expect(updateCall.icpMatch.matchedIcpTitle).toBeUndefined();
-    });
-
     it('coerces non-numeric scores (string, NaN) to 0 so DDB writes do not fail', async () => {
-      // `cat.score ?? 0` only catches null/undefined. A string like "high" or
-      // NaN survives the ?? then poisons Math.max with NaN, which would crash
-      // the DDB write for the whole chunk. Coercion must use Number.isFinite.
       const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
       (userDb.getUserById as jest.Mock).mockResolvedValue({
@@ -1018,12 +922,7 @@ describe('CRM Routes', () => {
 
       const mockLlmService = {
         generateJSONContent: jest.fn().mockResolvedValue([
-          {
-            index: 1,
-            categoryMatches: [
-              { icpTitle: 'SaaS founders', isMatch: false, score: 'high' as unknown as number, reason: 'LLM hallucinated string score.' },
-            ],
-          },
+          { index: 1, isMatch: false, score: 'high' as unknown as number, reason: 'LLM hallucinated string score.' },
         ]),
       };
       (createLLMService as jest.Mock).mockReturnValue(mockLlmService);
@@ -1040,55 +939,6 @@ describe('CRM Routes', () => {
       const updateCall = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
       expect(updateCall.icpMatch.score).toBe(0);
       expect(Number.isNaN(updateCall.icpMatch.score)).toBe(false);
-      // Stored categoryMatches must also have the coerced score so the
-      // frontend doesn't read NaN out of DynamoDB later.
-      expect(updateCall.icpMatch.categoryMatches[0].score).toBe(0);
-    });
-
-    it('breaks score ties by icpTitle alphabetical order for deterministic winner selection', async () => {
-      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
-      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
-      (userDb.getUserById as jest.Mock).mockResolvedValue({
-        userId: 'test-user-id',
-        marketStrategy: {
-          businessOverview: 'B2B SaaS',
-          icp: [
-            { title: 'Beta Category', description: 'Second alpha', valueProposition: 'B' },
-            { title: 'Alpha Category', description: 'First alpha', valueProposition: 'A' },
-          ],
-        },
-      });
-      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
-        items: [{ leadId: 'lead1', firstName: 'John', lastName: 'Doe', email: 'john@example.com' }],
-        lastEvaluatedKey: null,
-      });
-
-      const mockLlmService = {
-        generateJSONContent: jest.fn().mockResolvedValue([
-          {
-            index: 1,
-            categoryMatches: [
-              { icpTitle: 'Beta Category', isMatch: true, score: 75, reason: 'Good fit.' },
-              { icpTitle: 'Alpha Category', isMatch: true, score: 75, reason: 'Also good fit.' },
-            ],
-          },
-        ]),
-      };
-      (createLLMService as jest.Mock).mockReturnValue(mockLlmService);
-
-      mockRequest.params = { listId: 'list1' };
-      mockRequest.query = { mode: 'match' };
-      mockRequest.body = {};
-
-      const handler = findMatchIcpsPostHandler();
-      if (handler && handler.route) {
-        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
-      }
-
-      const updateCall = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
-      // "Alpha Category" < "Beta Category" alphabetically — must win the tie.
-      expect(updateCall.icpMatch.matchedIcpTitle).toBe('Alpha Category');
-      expect(updateCall.icpMatch.score).toBe(75);
     });
   });
 
