@@ -498,3 +498,85 @@ describe("POST /api/landing-pages/v0/generate — org-level create gating", () =
     expect(res.status).not.toBe(403);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Tests: editor-can-edit applies to ALL edit endpoints, not just PATCH /context.
+// Regression coverage for the H1 bug where each route used getLandingPage(id, userId)
+// (owner-scoped) instead of getLandingPageById + canEditItem.
+// ---------------------------------------------------------------------------
+describe("Landing page edit endpoints — editor permission across routes", () => {
+  const { iterateLandingPage, deployLandingPage } = jest.requireMock("../services/v0Service");
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    currentMockUser = { userId: mockEditorId, email: "editor@example.com", isAdmin: false };
+    // Editor's identity (caller)
+    mockGetUserById.mockImplementation(async (id: string) => {
+      if (id === mockEditorId) {
+        return { userId: mockEditorId, orgId: mockOrgId, orgRole: "member" };
+      }
+      if (id === mockUserId) {
+        // Page owner — same org
+        return { userId: mockUserId, orgId: mockOrgId, orgRole: "member" };
+      }
+      if (id === mockOutsiderId) {
+        return { userId: mockOutsiderId, orgId: mockDiffOrgId, orgRole: "member" };
+      }
+      return null;
+    });
+    mockGetOrgById.mockResolvedValue(makeOrg(true, [mockEditorId]));
+    mockGetLandingPageById.mockResolvedValue({ ...myPage, githubRepoUrl: "https://github.com/foo/bar", vercelProjectId: "vp-1" });
+  });
+
+  it("POST /:id/iterate — editor can iterate another member's page", async () => {
+    (iterateLandingPage as jest.Mock).mockResolvedValue({ ...myPage, status: "draft" });
+    const res = await request(app)
+      .post(`/api/landing-pages/v0/generated/${myPage.id}/iterate`)
+      .send({ message: "tweak hero" });
+    expect(res.status).toBe(200);
+    // Service must be invoked with the PAGE OWNER's userId (not the caller's)
+    expect(iterateLandingPage).toHaveBeenCalledWith(myPage.id, mockUserId, "tweak hero");
+  });
+
+  it("POST /:id/deploy — editor can deploy another member's page", async () => {
+    (deployLandingPage as jest.Mock).mockResolvedValue({ ...myPage, status: "deployed" });
+    const res = await request(app).post(`/api/landing-pages/v0/generated/${myPage.id}/deploy`).send({});
+    expect(res.status).toBe(200);
+    expect(deployLandingPage).toHaveBeenCalledWith(myPage.id, mockUserId);
+  });
+
+  it("GET /:id — editor can read another member's page", async () => {
+    const res = await request(app).get(`/api/landing-pages/v0/generated/${myPage.id}`);
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe(myPage.id);
+  });
+
+  it("plain member with toggle on can view but not edit", async () => {
+    currentMockUser = { userId: mockOrgMemberId, email: "member@example.com", isAdmin: false };
+    mockGetUserById.mockImplementation(async (id: string) => {
+      if (id === mockOrgMemberId) return { userId: mockOrgMemberId, orgId: mockOrgId, orgRole: "member" };
+      if (id === mockUserId) return { userId: mockUserId, orgId: mockOrgId, orgRole: "member" };
+      return null;
+    });
+    mockGetOrgById.mockResolvedValue(makeOrg(true, [])); // enabled but no editors
+
+    // View OK
+    const view = await request(app).get(`/api/landing-pages/v0/generated/${myPage.id}`);
+    expect(view.status).toBe(200);
+
+    // Edit denied with 403
+    const edit = await request(app)
+      .post(`/api/landing-pages/v0/generated/${myPage.id}/iterate`)
+      .send({ message: "hack" });
+    expect(edit.status).toBe(403);
+  });
+
+  it("cross-org caller cannot view (404)", async () => {
+    currentMockUser = { userId: mockOutsiderId, email: "outsider@example.com", isAdmin: false };
+    mockGetOrgById.mockImplementation(async (id: string) =>
+      id === mockOrgId ? makeOrg(true, [mockEditorId]) : null,
+    );
+    const res = await request(app).get(`/api/landing-pages/v0/generated/${myPage.id}`);
+    expect(res.status).toBe(404);
+  });
+});
