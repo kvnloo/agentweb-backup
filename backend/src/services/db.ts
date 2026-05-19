@@ -4955,7 +4955,10 @@ export const crmDb = {
 
       if (updates.customFields !== undefined) {
         setExpressions.push('customFields = :customFields');
-        expressionAttributeValues[':customFields'] = updates.customFields;
+        expressionAttributeValues[':customFields'] = sanitizeCustomFields(
+          updates.customFields,
+          { source: 'db.updateLead', listId, leadId },
+        );
       }
 
       if (updates.enrichmentMetadata !== undefined) {
