@@ -14,18 +14,21 @@ jest.mock('../middleware/auth');
 const mockedAuthenticateToken = authenticateToken as jest.MockedFunction<typeof authenticateToken>;
 
 /**
- * TEMPORARILY SKIPPED — superseded by org-sharing rewrite.
- *
- * The `/api/html-templates` route was rewritten in commit 94e4c192 to use the
- * new `AW-HtmlTemplates` table via `htmlTemplateService`. The behavior these
- * tests assert is now covered by:
+ * Note: the inner `describe` blocks for `/api/html-templates` POST/GET/DELETE
+ * are marked `.skip` because that route was rewritten in commit 94e4c192 to
+ * use the new `AW-HtmlTemplates` table via `htmlTemplateService`. The new
+ * behavior is covered by:
  *   - backend/src/__tests__/orgSharedHtmlTemplates.test.ts (28 tests)
  *   - backend/src/__tests__/htmlTemplateService.test.ts (9 tests)
  *
- * Decide whether to delete this file or rewrite it against the new shape
- * before merging the org-sharing PR.
+ * Decide whether to delete those `describe.skip` blocks or rewrite them
+ * against the new shape before merging the org-sharing PR.
+ *
+ * The `/api/settings/customer/email-campaign-tasks` tests (everything above
+ * the html-templates blocks) are NOT skipped — they test an unrelated
+ * per-user settings feature and remain in force.
  */
-describe.skip('Email Campaign Settings API', () => {
+describe('Email Campaign Settings API', () => {
   let app: express.Application;
 
   beforeEach(() => {
@@ -421,7 +424,7 @@ describe.skip('Email Campaign Settings API', () => {
     });
   });
 
-  describe('POST /api/html-templates', () => {
+  describe.skip('POST /api/html-templates', () => {
     it('should create a new template with variables from request body', async () => {
       mockedSettingsService.getSetting.mockResolvedValue(null);
       mockedSettingsService.setSetting.mockResolvedValue({
@@ -612,7 +615,7 @@ describe.skip('Email Campaign Settings API', () => {
     });
   });
 
-  describe('GET /api/html-templates', () => {
+  describe.skip('GET /api/html-templates', () => {
     it('should return empty array when no templates exist', async () => {
       mockedSettingsService.getSetting.mockResolvedValue(null);
 
@@ -694,7 +697,7 @@ describe.skip('Email Campaign Settings API', () => {
     });
   });
 
-  describe('DELETE /api/html-templates/:templateId', () => {
+  describe.skip('DELETE /api/html-templates/:templateId', () => {
     it('should delete an existing template', async () => {
       const mockTemplates = [
         {
