@@ -38,9 +38,11 @@ jest.mock('../services/db', () => ({
 
 // Also mock orgShareService (imported by htmlTemplates route)
 jest.mock('../services/orgShareService', () => ({
-  canViewItem:         jest.fn().mockReturnValue(true),
-  canEditItem:         jest.fn().mockReturnValue(true),
-  listOrgVisibleItems: jest.fn().mockResolvedValue({ items: [], truncated: false }),
+  canViewItem:                 jest.fn().mockReturnValue(true),
+  canEditItem:                 jest.fn().mockReturnValue(true),
+  canManageOrgFeature:         jest.fn().mockReturnValue(true),
+  isFeatureEffectivelyEnabled: jest.fn().mockReturnValue(false),
+  listOrgVisibleItems:         jest.fn().mockResolvedValue({ items: [], truncated: false }),
 }));
 
 const mockedHtmlTemplateService = htmlTemplateService as jest.Mocked<typeof htmlTemplateService>;
