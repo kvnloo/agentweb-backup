@@ -16,8 +16,10 @@ jest.mock('../utils/secretsManager', () => ({
 
 // Mock connectedAccountsDb
 const mockGetAccountsByUserId = jest.fn();
+const mockGetAccountsByUserIdIncludingOrgShared = jest.fn();
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: (...args: any[]) => mockGetAccountsByUserId(...args),
+  getAccountsByUserIdIncludingOrgShared: (...args: any[]) => mockGetAccountsByUserIdIncludingOrgShared(...args),
 }));
 
 // Mock linkedInOutreachService
@@ -70,8 +72,8 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     jest.clearAllMocks();
     service = new AgentModeService();
 
-    // Default: user owns the account
-    mockGetAccountsByUserId.mockResolvedValue([
+    // Default: user owns the account (or it is org-shared)
+    mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
       { platform: 'unipile', account_id: 'test-account-id' },
     ]);
   });
@@ -190,8 +192,8 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(mockSendMessage).not.toHaveBeenCalled();
     });
 
-    it('returns error when account is not owned by user', async () => {
-      mockGetAccountsByUserId.mockResolvedValue([
+    it('returns error when account is not owned or org-shared', async () => {
+      mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
         { platform: 'unipile', account_id: 'different-account' },
       ]);
 
@@ -335,8 +337,8 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       linkedin: 'https://www.linkedin.com/in/johndoe/',
     };
 
-    it('returns error when account is not owned by user', async () => {
-      mockGetAccountsByUserId.mockResolvedValue([
+    it('returns error when account is not owned or org-shared', async () => {
+      mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
         { platform: 'unipile', account_id: 'different-account' },
       ]);
 
