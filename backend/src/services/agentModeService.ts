@@ -25,6 +25,7 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData } from '../utils/llmService';
 import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
+import { mergeCustomFields } from '../utils/customFieldsGuard';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -7871,10 +7872,11 @@ export class AgentModeService {
 
       // Merge custom fields with existing ones
       if (Object.keys(customFieldUpdates).length > 0) {
-        dbUpdates.customFields = {
-          ...(lead.customFields || {}),
-          ...customFieldUpdates
-        };
+        dbUpdates.customFields = mergeCustomFields(
+          lead.customFields,
+          customFieldUpdates,
+          { source: 'agentMode.updateLead', listId, leadId },
+        );
       }
 
       // Auto-create status change engagement if status changed
@@ -22328,7 +22330,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (parsed) lead.company = parsed;
         }
         if (item.location) {
-          lead.customFields = { ...(lead.customFields ?? {}), location: item.location };
+          lead.customFields = mergeCustomFields(
+            lead.customFields,
+            { location: item.location },
+            { source: 'agentMode.importLeadsFromSearch' },
+          );
         }
         // sys is sidecar — see Phase 0b lead.system top-level field.
         const sys: Record<string, any> = {};

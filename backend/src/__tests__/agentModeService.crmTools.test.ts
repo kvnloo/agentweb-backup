@@ -878,6 +878,34 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.success).toBe(false);
       expect(result.message).toBe('Access denied');
     });
+
+    it('drops a corrupted (string) existing customFields and keeps only the patch', async () => {
+      // Simulates a pre-fix corrupt lead whose customFields was stored as a
+      // raw JSON string. Without the guard, `{ ...stringValue, ...patch }`
+      // produces char-indexed keys. With mergeCustomFields, the corrupted
+      // side is sanitized away and only the patch survives.
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue({
+        ...mockLead,
+        customFields: '{"firstName":"David"}' as any,
+      });
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+
+      const result = await service.updateLead(listId, leadId, { newField: 'newValue' }, userId);
+
+      expect(result.success).toBe(true);
+      const callArgs = (mockCrmDb.updateLead as jest.Mock).mock.calls[0];
+      const writtenCustomFields = callArgs[2].customFields;
+      expect(writtenCustomFields).toEqual({ newField: 'newValue' });
+      // No numeric-string keys from the corrupted string side
+      expect(Object.keys(writtenCustomFields).some((k) => /^\d+$/.test(k))).toBe(false);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('[customFieldsGuard]'),
+        expect.objectContaining({ source: 'agentMode.updateLead', listId, leadId, type: 'string' }),
+      );
+      errorSpy.mockRestore();
+    });
   });
 
   // ─── deleteLeads ───────────────────────────────────────────────────────

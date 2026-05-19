@@ -5,6 +5,7 @@ import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
 import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey } from "../utils/leadSchema";
+import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import type { AttributionTouch } from "../types/attribution";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
@@ -4359,7 +4360,7 @@ export const crmDb = {
         title: leadData.title || '',
         notes: leadData.notes || '',
         companyLinkedin: leadData.companyLinkedin?.trim() || '',
-        customFields: leadData.customFields || {},
+        customFields: sanitizeCustomFields(leadData.customFields, { source: 'db.createLead', listId }),
         engagements: [],
         isICP: 0,
         isEngaged: 0,
@@ -4982,7 +4983,10 @@ export const crmDb = {
 
       if (updates.customFields !== undefined) {
         setExpressions.push('customFields = :customFields');
-        expressionAttributeValues[':customFields'] = updates.customFields;
+        expressionAttributeValues[':customFields'] = sanitizeCustomFields(
+          updates.customFields,
+          { source: 'db.updateLead', listId, leadId },
+        );
       }
 
       if (updates.enrichmentMetadata !== undefined) {
@@ -5385,7 +5389,7 @@ export const crmDb = {
             title: lead.title || '',
             notes: lead.notes || '',
             companyLinkedin: lead.companyLinkedin?.trim() || '',
-            customFields: lead.customFields || {},
+            customFields: sanitizeCustomFields(lead.customFields, { source: 'db.batchCreateLeads.newLead', listId, leadId }),
             syncMetadata: lead.syncMetadata || {},
             engagements: [], // Initialize with empty array
             isICP: 0,
@@ -5590,10 +5594,11 @@ export const crmDb = {
             // Only update if the merged result is different from existing
             if (existingStr !== mergedStr) {
               // Use the actual merged customFields (not normalized) for the update
-              const mergedCustomFields = {
-                ...existingCustomFields,
-                ...newCustomFields,
-              };
+              const mergedCustomFields = mergeCustomFields(
+                existingCustomFields,
+                newCustomFields,
+                { source: 'db.batchCreateLeads.merge', listId, leadId: existingLead.leadId },
+              );
               updates.customFields = mergedCustomFields;
               changed = true;
             }
@@ -6466,8 +6471,11 @@ export const crmDb = {
   ): Promise<void> {
     const tableName = `${TABLE_PREFIX}AW-Leads`;
     const key = { listId, leadId };
+    const safeCustomFields = options.customFields === undefined
+      ? undefined
+      : sanitizeCustomFields(options.customFields, { source: 'db.setLeadFields', listId, leadId });
     const hasMetaKeys = Object.keys(options.enrichmentMetadata ?? {}).length > 0;
-    const hasCustomKeys = Object.keys(options.customFields ?? {}).length > 0;
+    const hasCustomKeys = Object.keys(safeCustomFields ?? {}).length > 0;
     const hasTopLevel = Object.keys(options.topLevel ?? {}).length > 0;
     const hasRemoveMeta = (options.removeEnrichmentMetadataKeys ?? []).length > 0;
     const hasRemoveCustom = (options.removeCustomFieldKeys ?? []).length > 0;
@@ -6547,7 +6555,7 @@ export const crmDb = {
     }
 
     idx = 0;
-    for (const [k, v] of Object.entries(options.customFields ?? {})) {
+    for (const [k, v] of Object.entries(safeCustomFields ?? {})) {
       attrNames[`#cf${idx}`] = k;
       attrValues[`:cf${idx}`] = v;
       setClauses.push(ine

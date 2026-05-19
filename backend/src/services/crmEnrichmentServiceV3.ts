@@ -25,6 +25,7 @@ import {
   copySiblingConfigFields,
   type SiblingFieldMappingTable,
 } from './enrichmentSiblingConfigFields';
+import { mergeCustomFields } from '../utils/customFieldsGuard';
 
 // ─── Socket progress options ─────────────────────────────────────────────────
 //
@@ -451,7 +452,11 @@ async function processLead(
       if ((enrichedLead as any)[f.field] !== undefined) {
         (enrichedLead as any)[f.field] = f.value;
       } else {
-        enrichedLead.customFields = { ...enrichedLead.customFields, [f.field]: f.value };
+        enrichedLead.customFields = mergeCustomFields(
+          enrichedLead.customFields,
+          { [f.field]: f.value },
+          { source: 'crmEnrichmentV3.tier0b', listId: input.listId, leadId: lead.leadId },
+        );
       }
     }
     console.log(`[v3][lead ${lead.leadId}] tier0b filled ${tier0bResult.fills.length} config field(s) from siblings`);
