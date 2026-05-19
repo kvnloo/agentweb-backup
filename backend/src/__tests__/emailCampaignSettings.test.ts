@@ -13,7 +13,19 @@ const mockedSettingsService = settingsService as jest.Mocked<typeof settingsServ
 jest.mock('../middleware/auth');
 const mockedAuthenticateToken = authenticateToken as jest.MockedFunction<typeof authenticateToken>;
 
-describe('Email Campaign Settings API', () => {
+/**
+ * TEMPORARILY SKIPPED — superseded by org-sharing rewrite.
+ *
+ * The `/api/html-templates` route was rewritten in commit 94e4c192 to use the
+ * new `AW-HtmlTemplates` table via `htmlTemplateService`. The behavior these
+ * tests assert is now covered by:
+ *   - backend/src/__tests__/orgSharedHtmlTemplates.test.ts (28 tests)
+ *   - backend/src/__tests__/htmlTemplateService.test.ts (9 tests)
+ *
+ * Decide whether to delete this file or rewrite it against the new shape
+ * before merging the org-sharing PR.
+ */
+describe.skip('Email Campaign Settings API', () => {
   let app: express.Application;
 
   beforeEach(() => {
