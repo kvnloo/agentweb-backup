@@ -16,6 +16,7 @@ import { emmaEmailService } from '../services/emmaEmailService';
 import { TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
 import { isDoNotContact } from '../utils/leadContactStatus';
 import { normalizeAttribution } from '../types/attribution';
+import { mergeCustomFields } from '../utils/customFieldsGuard';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
 
@@ -780,7 +781,11 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
           });
 
           if (Object.keys(customFieldUpdates).length > 0) {
-            updates.customFields = { ...lead.customFields, ...customFieldUpdates };
+            updates.customFields = mergeCustomFields(
+              lead.customFields,
+              customFieldUpdates,
+              { source: 'webhooks.hubspot.legacy', listId: list.listId, leadId: lead.leadId },
+            );
           }
 
           if (Object.keys(updates).length > 0) {
