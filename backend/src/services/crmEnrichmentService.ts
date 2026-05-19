@@ -1272,6 +1272,7 @@ export class CrmEnrichmentService {
       const domain =
         lead.emailDomain ||
         (lead.website ? CrmEnrichmentService.extractDomain(lead.website) : null) ||
+        (lead.email ? CrmEnrichmentService.extractDomain(lead.email) : null) ||
         null;
       const isPersonalDomain = domain ? CrmEnrichmentService.isPersonalDomain(domain) : false;
       if (domain && !isPersonalDomain) {
