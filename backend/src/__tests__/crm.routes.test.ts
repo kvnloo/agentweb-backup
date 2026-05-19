@@ -851,7 +851,7 @@ describe('CRM Routes', () => {
       expect(createLLMService).toHaveBeenCalledWith('gpt-5.2-chat', 1);
       expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', {
         icpMatch: {
-          isMatch: true,   // score 88 >= threshold 70
+          isMatch: true,   // LLM returned isMatch=true
           score: 88,
           reason: 'Founder aligns with ICP.',
           matchedIcpTitle: 'SaaS founders',
@@ -953,8 +953,8 @@ describe('CRM Routes', () => {
       }));
     });
 
-    it('persists isMatch=false and no matchedIcpTitle when winner score is below threshold', async () => {
-      // Coverage gap from initial PR: winner exists but score < 50 (threshold).
+    it('persists isMatch=false and no matchedIcpTitle when LLM returns isMatch=false for winner', async () => {
+      // Winner (highest score) has isMatch=false from LLM.
       // matchedIcpTitle must stay undefined so the frontend doesn't render a
       // stale title on a non-match.
       const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
