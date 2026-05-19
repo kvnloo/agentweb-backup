@@ -4,7 +4,7 @@ import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
-import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles, checkEmailFormat } from '../utils/emailVariables';
+import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles, checkEmailFormat, injectColorSchemeMeta } from '../utils/emailVariables';
 import axios from 'axios';
 import { assertPublicHostname, SsrfBlockedError } from '../utils/ssrfGuard';
 import { signUnsubscribeUrl } from '../utils/unsubscribeUrl';
@@ -5272,8 +5272,10 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
     const eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
     const eligibleCount = eligibleLeads.length;
 
-    // Run format verification on the HTML content
-    const formatWarnings = checkEmailFormat(htmlContent || '');
+    // Auto-fix dark mode: inject color-scheme opt-out before format check so
+    // the warning doesn't fire for issues we've already resolved.
+    const processedHtml = injectColorSchemeMeta(htmlContent || '');
+    const formatWarnings = checkEmailFormat(processedHtml);
 
     if (variables.length === 0) {
       // No variables used — all eligible leads are ready
@@ -5380,8 +5382,11 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       skippedUndeliverable = beforeCount - eligibleLeads.length;
     }
 
+    // Apply dark-mode fix once before per-lead substitution.
+    const sendHtml = injectColorSchemeMeta(htmlContent || '');
+
     // Filter out leads missing required variable values
-    const allTemplate = (subject || '') + (htmlContent || '');
+    const allTemplate = (subject || '') + (sendHtml || '');
     const variables = extractVariables(allTemplate);
     let skippedMissingVars = 0;
     if (variables.length > 0) {
@@ -5405,7 +5410,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       try {
         // Substitute variables in subject and content
         const personalizedSubject = substituteVariables(subject, lead);
-        let personalizedHtml = substituteVariables(htmlContent, lead);
+        let personalizedHtml = substituteVariables(sendHtml, lead);
         const personalizedText = textContent ? substituteVariables(textContent, lead) : undefined;
 
         // Inject unsubscribe URL — updates existing link or appends footer if none found
@@ -5510,10 +5515,11 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
 
     const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test group email</div>`;
 
+    const testBaseHtml = injectColorSchemeMeta(htmlContent);
     // Inject banner: inside <body> for full HTML documents, or prepend for fragments
-    const withBanner = /<body\b/i.test(htmlContent)
-      ? htmlContent.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`)
-      : testBanner + htmlContent;
+    const withBanner = /<body\b/i.test(testBaseHtml)
+      ? testBaseHtml.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`)
+      : testBanner + testBaseHtml;
     // Wire up unsubscribe URL with the real portal domain
     const testHtml = injectUnsubscribeUrl(withBanner, testUnsubscribeUrl, unsubscribeFooterHtml);
     const from = `${senderName} <${senderEmail}>`;

@@ -30,7 +30,7 @@ const mockBuildSmartFieldEvalSystemPrompt = jest.fn(() => 'SYSTEM');
 
 jest.mock('../services/enrichmentPrompts', () => ({
   ...jest.requireActual('../services/enrichmentPrompts'),
-  buildSmartFieldEvalUserPrompt: (...args: any[]) =>
+  buildSmartFieldEvalUserPrompt: (...args: Parameters<typeof mockBuildSmartFieldEvalUserPrompt>) =>
     mockBuildSmartFieldEvalUserPrompt(...args),
   buildSmartFieldEvalSystemPrompt: () =>
     mockBuildSmartFieldEvalSystemPrompt(),

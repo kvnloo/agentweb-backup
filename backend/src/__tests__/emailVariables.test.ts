@@ -1,4 +1,4 @@
-import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, hasUnsafeEmailStyles, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls, checkEmailFormat } from '../utils/emailVariables';
+import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, hasUnsafeEmailStyles, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls, checkEmailFormat, injectColorSchemeMeta } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
 
 jest.mock('../utils/llmService');
@@ -405,6 +405,14 @@ describe('checkEmailFormat', () => {
     expect(cw?.severity).toBe('warning');
   });
 
+  it('should warn dark-mode-contrast for common dark grays (#333, #444, #555, #666)', () => {
+    for (const color of ['#333333', '#444444', '#555555', '#666666', '#333', '#555']) {
+      const html = `<html><body><div style="background-color:#ffffff"><p style="color:${color}">Text</p></div></body></html>`;
+      const codes = checkEmailFormat(html).map((w) => w.code);
+      expect(codes).toContain('dark-mode-contrast');
+    }
+  });
+
   it('should NOT warn dark-mode-contrast when dark mode query is present even with dark text on light bg', () => {
     const html = `<html><head><style>@media (prefers-color-scheme: dark) { body { background: #000; } }</style></head><body><div style="background-color:#fff"><p style="color:#000">Text</p></div></body></html>`;
     const warnings = checkEmailFormat(html);
@@ -465,5 +473,27 @@ describe('inlineEmailStyles', () => {
     const result = await inlineEmailStyles(htmlWithClasses);
     expect(result.wasFixed).toBe(false);
     expect(result.html).toBe(htmlWithClasses);
+  });
+});
+
+describe('injectColorSchemeMeta', () => {
+  it('injects meta tag after <head>', () => {
+    const html = '<html><head><title>Test</title></head><body>Hi</body></html>';
+    const result = injectColorSchemeMeta(html);
+    expect(result).toContain('<head><meta name="color-scheme" content="light">');
+  });
+
+  it('is a no-op when color-scheme meta already present', () => {
+    const html = '<html><head><meta name="color-scheme" content="light"></head><body>Hi</body></html>';
+    expect(injectColorSchemeMeta(html)).toBe(html);
+  });
+
+  it('is a no-op when no <head> tag', () => {
+    const html = '<body>No head tag</body>';
+    expect(injectColorSchemeMeta(html)).toBe(html);
+  });
+
+  it('handles empty string', () => {
+    expect(injectColorSchemeMeta('')).toBe('');
   });
 });

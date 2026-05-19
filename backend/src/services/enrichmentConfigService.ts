@@ -409,6 +409,10 @@ export async function setEnrichmentConfig(
     ),
   };
 
+  // Fire the DB read immediately — independent of the LLM steps below.
+  // Awaited in Step 3a; running it here overlaps the read with LLM I/O.
+  const storedConfigPromise = deps.readListConfig(input.listId).catch(() => null);
+
   // Step 2: LLM fallback for fields the heuristic couldn't resolve. One LLM
   // call total per save (not per enrichment run) — cheap. LLM matches opaque
   // names like `stag` → `funding_stage` based on the user's instruction text.
@@ -441,7 +445,7 @@ export async function setEnrichmentConfig(
   // these. Load from DB (authoritative) and re-attach for fields that match by
   // name. If no stored config exists (new list), nothing to restore.
   {
-    const storedConfig = await deps.readListConfig(input.listId).catch(() => null);
+    const storedConfig = await storedConfigPromise;
     const storedByName = new Map(
       (storedConfig?.fields ?? []).map(f => [f.name, f]),
     );
