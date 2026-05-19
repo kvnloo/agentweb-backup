@@ -11,6 +11,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-19',
     changes: [
+      'New: Gemini 3.5 Flash Available in Agent Mode',
+      '- Google\'s latest Gemini 3.5 Flash model is now available in the Agent Mode model selector',
+    ],
+  },
+  {
+    date: '2026-05-19',
+    changes: [
       'New: Contractor Account Type',
       '- Admins can now grant users the Contractor role from the Users tab in the Admin page',
       '- A new Contractors tab in the Admin page lets admins assign specific customer accounts to each contractor',

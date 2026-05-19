@@ -1387,6 +1387,7 @@ export class AgentModeService {
     'gemini-3-flash-preview': { client: null, supportsTemperature: true },
     'gemini-3.1-pro-preview': { client: null, supportsTemperature: true },
     'gemini-3.1-flash-lite': { client: null, supportsTemperature: true },
+    'gemini-3.5-flash': { client: null, supportsTemperature: true },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
@@ -1559,6 +1560,7 @@ export class AgentModeService {
       'gemini-3-flash-preview': [0.15, 0.6],
       'gemini-3.1-pro-preview': [1.25, 10],
       'gemini-3.1-flash-lite': [0.075, 0.3],
+      'gemini-3.5-flash': [0.15, 0.6],
     };
     const [inputPrice, outputPrice] = pricing[model] || [3, 15]; // Default to Sonnet pricing
     // Cache reads are 10% of input price; cache writes are 125% of input price
