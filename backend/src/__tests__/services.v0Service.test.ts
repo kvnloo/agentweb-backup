@@ -133,6 +133,7 @@ import {
   BrandContext,
   remapFilesForSubPage,
   ensurePageMetadataTitle,
+  buildPageSlug,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig } from "../services/v0Service";
@@ -1248,5 +1249,45 @@ describe("v0Service - loadDefaultTemplateOutline fallback", () => {
     const prompt = mockChatsCreate.mock.calls[0][0].message;
     expect(prompt).toContain("DESIGN INSPIRATION");
     expect(mockGetSetting).not.toHaveBeenCalled();
+  });
+});
+
+// =============================================================================
+// buildPageSlug
+// =============================================================================
+describe("v0Service - buildPageSlug", () => {
+  it("FAIL: name that truncates at exactly 30 chars on a hyphen produces no trailing hyphen", () => {
+    // "Premium dark landing page for Open Future Forum" → after replace → "premium-dark-landing-page-for-"
+    // slice(0,30) = "premium-dark-landing-page-for-" — the fix strips the trailing hyphen
+    const result = buildPageSlug('Premium dark landing page for Open Future Forum — "Forum Select"');
+    expect(result).not.toMatch(/-$/);
+    expect(result).toBe("premium-dark-landing-page-for");
+  });
+
+  it("FAIL: name that would produce leading hyphen after truncation has it stripped", () => {
+    // Contrived: if first char after truncation is a hyphen
+    const result = buildPageSlug("---abc");
+    expect(result).not.toMatch(/^-/);
+  });
+
+  it("FAIL: name with consecutive special chars produces single hyphens", () => {
+    const result = buildPageSlug("hello   world---page");
+    expect(result).toBe("hello-world-page");
+  });
+
+  it("SUCCESS: normal name is lowercased and slugified", () => {
+    const result = buildPageSlug("My Landing Page");
+    expect(result).toBe("my-landing-page");
+  });
+
+  it("SUCCESS: name within 30 chars is not truncated", () => {
+    const result = buildPageSlug("Short Name");
+    expect(result).toBe("short-name");
+  });
+
+  it("SUCCESS: name longer than 30 chars is truncated cleanly", () => {
+    const result = buildPageSlug("a".repeat(40));
+    expect(result.length).toBeLessThanOrEqual(30);
+    expect(result).not.toMatch(/^-|-$/);
   });
 });
