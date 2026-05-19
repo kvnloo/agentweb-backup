@@ -556,6 +556,19 @@ export interface Organization {
   maxMembers: number;
   createdAt: string;
   updatedAt: string;
+  shareSettings?: OrgShareSettings;
+  secrets?: Record<string, string>; // Encrypted per-org secrets (key → encrypted value)
+}
+
+export interface OrgShareSettings {
+  knowledgeBase: { enabled: boolean; editors: string[] };
+  htmlTemplates: { enabled: boolean; editors: string[] };
+  landingPages: { enabled: boolean; editors: string[] };
+  workPlans: { enabled: boolean; editors: string[] };
+  skills: { enabled: boolean; editors: string[] };
+  // Always shared with org—only editors are configurable, enabled is implicit
+  brandGuidelines: { editors: string[] };
+  marketingStrategy: { editors: string[] };
 }
 
 interface UserInteraction {
@@ -1254,6 +1267,21 @@ class UserDB {
       this.handleError(error, "getUserByResetToken");
       return null;
     }
+  }
+
+  /**
+   * Remove orgId and orgRole from a user record (used when removing a member from an org).
+   */
+  async clearOrgMembership(userId: string): Promise<void> {
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) {
+      throw new Error(`User with ID '${userId}' not found or has no email.`);
+    }
+    await this.docClient.update({
+      TableName: this.tableName,
+      Key: { email: user.email },
+      UpdateExpression: "REMOVE orgId, orgRole",
+    }).promise();
   }
 }
 
@@ -7176,28 +7204,36 @@ export const orgDb = {
   },
 
   async getOrgMembers(orgId: string): Promise<User[]> {
-    const allItems: any[] = [];
+    const allItems: User[] = [];
     let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
     do {
-      const result = await dynamodb.scan({
+      const result = await dynamodb.query({
         TableName: `${TABLE_PREFIX}AW-Users`,
-        FilterExpression: "orgId = :orgId AND NOT begins_with(userId, :tombstone)",
+        IndexName: "OrgIdIndex",
+        KeyConditionExpression: "orgId = :orgId",
+        FilterExpression: "NOT begins_with(userId, :tombstone)",
         ExpressionAttributeValues: { ":orgId": orgId, ":tombstone": "deleted_" },
         ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
       }).promise();
-      allItems.push(...(result.Items || []));
+      for (const item of result.Items || []) {
+        if (typeof item.userId === "string" && !item.userId.startsWith("deleted_")) {
+          allItems.push(item as User);
+        }
+      }
       lastEvaluatedKey = result.LastEvaluatedKey;
     } while (lastEvaluatedKey);
-    return allItems as User[];
+    return allItems;
   },
 
   async getOrgMemberCount(orgId: string): Promise<number> {
     let total = 0;
     let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
     do {
-      const result = await dynamodb.scan({
+      const result = await dynamodb.query({
         TableName: `${TABLE_PREFIX}AW-Users`,
-        FilterExpression: "orgId = :orgId AND NOT begins_with(userId, :tombstone)",
+        IndexName: "OrgIdIndex",
+        KeyConditionExpression: "orgId = :orgId",
+        FilterExpression: "NOT begins_with(userId, :tombstone)",
         ExpressionAttributeValues: { ":orgId": orgId, ":tombstone": "deleted_" },
         Select: "COUNT",
         ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
@@ -7227,7 +7263,120 @@ export const orgDb = {
     return null;
   },
 
+  async updateShareSettings(orgId: string, settings: OrgShareSettings): Promise<void> {
+    await dynamodb.update({
+      TableName: ORGS_TABLE,
+      Key: { orgId },
+      UpdateExpression: "SET shareSettings = :s, updatedAt = :u",
+      ExpressionAttributeValues: {
+        ":s": settings,
+        ":u": new Date().toISOString(),
+      },
+    }).promise();
+  },
+
+  async pruneEditorListsForUser(orgId: string, removedUserId: string): Promise<void> {
+    const got = await dynamodb.get({
+      TableName: ORGS_TABLE,
+      Key: { orgId },
+    }).promise();
+    const org = got.Item as Organization | undefined;
+    if (!org?.shareSettings) return;
+    const ss = org.shareSettings;
+    const strip = (arr: string[]) => arr.filter((uid) => uid !== removedUserId);
+    const next: OrgShareSettings = {
+      knowledgeBase:     { ...ss.knowledgeBase,     editors: strip(ss.knowledgeBase.editors) },
+      htmlTemplates:     { ...ss.htmlTemplates,     editors: strip(ss.htmlTemplates.editors) },
+      landingPages:      { ...ss.landingPages,      editors: strip(ss.landingPages.editors) },
+      workPlans:         { ...ss.workPlans,         editors: strip(ss.workPlans.editors) },
+      skills:            { ...ss.skills,            editors: strip(ss.skills.editors) },
+      brandGuidelines:   { editors: strip(ss.brandGuidelines.editors) },
+      marketingStrategy: { editors: strip(ss.marketingStrategy.editors) },
+    };
+    await this.updateShareSettings(orgId, next);
+  },
+
   ORG_MAX_MEMBERS,
+
+  /**
+   * Persist an encrypted secret value to the org record.
+   * Uses an atomic UpdateExpression so it does not clobber other secrets.
+   */
+  async setOrgSecret(orgId: string, key: string, encryptedValue: string): Promise<void> {
+    const params = {
+      TableName: ORGS_TABLE,
+      Key: { orgId },
+      UpdateExpression: "SET #secrets.#key = :val, #updatedAt = :updatedAt",
+      ExpressionAttributeNames: {
+        "#secrets": "secrets",
+        "#key": key,
+        "#updatedAt": "updatedAt",
+      },
+      ExpressionAttributeValues: {
+        ":val": encryptedValue,
+        ":updatedAt": new Date().toISOString(),
+      },
+      // If secrets map doesn't exist yet, the nested set will fail.
+      // We use a conditional expression + fallback to initialise the map.
+      ConditionExpression: "attribute_exists(#secrets)",
+    };
+
+    try {
+      await dynamodb.update(params).promise();
+    } catch (err: any) {
+      if (err.code === "ConditionalCheckFailedException") {
+        // secrets map does not exist — create it now
+        await dynamodb.update({
+          TableName: ORGS_TABLE,
+          Key: { orgId },
+          UpdateExpression: "SET #secrets = :secretsMap, #updatedAt = :updatedAt",
+          ExpressionAttributeNames: {
+            "#secrets": "secrets",
+            "#updatedAt": "updatedAt",
+          },
+          ExpressionAttributeValues: {
+            ":secretsMap": { [key]: encryptedValue },
+            ":updatedAt": new Date().toISOString(),
+          },
+        }).promise();
+      } else {
+        throw err;
+      }
+    }
+  },
+
+  /**
+   * Retrieve a single encrypted secret from the org record.
+   * Returns null if the org doesn't exist or the key is absent.
+   */
+  async getOrgSecret(orgId: string, key: string): Promise<string | null> {
+    const org = await this.getOrgById(orgId);
+    if (!org?.secrets) return null;
+    return (org.secrets as Record<string, string>)[key] ?? null;
+  },
+
+  /**
+   * Remove a single secret key from the org record.
+   */
+  async removeOrgSecret(orgId: string, key: string): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: ORGS_TABLE,
+        Key: { orgId },
+        UpdateExpression: "REMOVE #secrets.#key SET #updatedAt = :updatedAt",
+        ExpressionAttributeNames: {
+          "#secrets": "secrets",
+          "#key": key,
+          "#updatedAt": "updatedAt",
+        },
+        ExpressionAttributeValues: {
+          ":updatedAt": new Date().toISOString(),
+        },
+      }).promise();
+    } catch {
+      // If secrets map or key doesn't exist, that's fine — already absent.
+    }
+  },
 };
 
 // ─── Schedule Templates ──────────────────────────────────────────────────────

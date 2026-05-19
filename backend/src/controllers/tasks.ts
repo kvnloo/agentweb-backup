@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { taskDb } from '../services/db';
+import { taskDb, orgDb } from '../services/db';
 import { userDb } from '../services/db';
 import { scheduleDb } from '../services/db';
 import { chatbotDb } from '../services/chatbotService';
@@ -10,6 +10,7 @@ import { S3 } from 'aws-sdk';
 import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import { getAssetTypeFromFilename } from '../services/approvalDb';
+import { canViewItem, canEditItem } from '../services/orgShareService';
 
 const s3 = new S3();
 
@@ -181,8 +182,38 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const tasks = await taskDb.getTasksByUserId(userId);
-    res.json(tasks);
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    const orgId = user.orgId;
+    const org = orgId ? await orgDb.getOrgById(orgId) : null;
+    const enabled = org?.shareSettings?.knowledgeBase?.enabled === true;
+
+    const ownTasks: any[] = (await taskDb.getTasksByUserId(userId)) || [];
+    let orgTasks: any[] = [];
+
+    if (orgId && enabled) {
+      const members = await orgDb.getOrgMembers(orgId);
+      const others = members
+        .map((m: any) => m.userId as string)
+        .filter((uid: string) => uid !== userId);
+      const perMember = await Promise.all(
+        others.map((uid: string) => taskDb.getTasksByUserId(uid).then((t: any) => t || []))
+      );
+      orgTasks = perMember.flat();
+    }
+
+    const seen = new Set<string>();
+    const all = [...ownTasks, ...orgTasks].filter((t: any) => {
+      if (seen.has(t.taskId)) return false;
+      seen.add(t.taskId);
+      return true;
+    });
+
+    // Preserve existing array response shape for backward compatibility with callers
+    res.json(all);
   } catch (error) {
     console.error('Error in getTasks:', error);
     res.status(500).json({ message: 'Error fetching tasks' });
@@ -209,7 +240,25 @@ export const getTask = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ message: 'User not found' });
     }
 
-    if (!user.isAdmin && task.userId !== userId) {
+    // Admins can always access any task
+    if (user.isAdmin) {
+      return res.json(task);
+    }
+
+    // Resolve org context for org-share permission check
+    const ownerUser = task.userId !== userId ? await userDb.getUserById(task.userId) : null;
+    const ownerOrgId = ownerUser?.orgId ?? user.orgId;
+    const org = (user.orgId && ownerOrgId === user.orgId)
+      ? await orgDb.getOrgById(user.orgId)
+      : null;
+
+    if (!canViewItem(
+      { userId: task.userId },
+      { userId, orgId: user.orgId, orgRole: user.orgRole },
+      org,
+      ownerOrgId,
+      'knowledgeBase',
+    )) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -241,9 +290,23 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ message: 'User not found' });
     }
 
-    // Verify task belongs to user or user is admin
-    if (!user.isAdmin && task.userId !== userId) {
-      return res.status(403).json({ message: 'Access denied' });
+    // Resolve org context for org-share permission check
+    if (!user.isAdmin) {
+      const ownerUser = task.userId !== userId ? await userDb.getUserById(task.userId) : null;
+      const ownerOrgId = ownerUser?.orgId ?? user.orgId;
+      const org = (user.orgId && ownerOrgId === user.orgId)
+        ? await orgDb.getOrgById(user.orgId)
+        : null;
+
+      if (!canEditItem(
+        { userId: task.userId },
+        { userId, orgId: user.orgId, orgRole: user.orgRole },
+        org,
+        ownerOrgId,
+        'knowledgeBase',
+      )) {
+        return res.status(403).json({ message: 'Access denied' });
+      }
     }
 
     // Build updates object based on what's provided
@@ -426,9 +489,30 @@ export const deleteTask = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    // Verify task belongs to user
+    // Owner can always delete their own task; others need org-level permission
     if (task.userId !== userId) {
-      return res.status(403).json({ message: 'Access denied' });
+      const user = await userDb.getUserById(userId);
+      if (!user) {
+        return res.status(401).json({ message: 'User not found' });
+      }
+
+      // Admins can delete any task
+      if (user.isAdmin) {
+        // fall through to deletion
+      } else if (user.orgRole === 'owner' && user.orgId) {
+        // Org owners can delete same-org member tasks when knowledgeBase sharing is enabled
+        const ownerUser = await userDb.getUserById(task.userId);
+        if (ownerUser?.orgId !== user.orgId) {
+          return res.status(403).json({ message: 'Access denied' });
+        }
+        const org = await orgDb.getOrgById(user.orgId);
+        if (org?.shareSettings?.knowledgeBase?.enabled !== true) {
+          return res.status(403).json({ message: 'Access denied' });
+        }
+        // fall through to deletion
+      } else {
+        return res.status(403).json({ message: 'Access denied' });
+      }
     }
 
     // Update task status to archived instead of deleting

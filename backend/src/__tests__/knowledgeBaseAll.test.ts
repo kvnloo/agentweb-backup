@@ -67,7 +67,7 @@ describe('Knowledge Base All Endpoint - GET /api/tasks/knowledge-base/all', () =
         .expect(200);
 
       expect(response.body).toHaveLength(1);
-      expect(response.body[0]).toEqual({
+      expect(response.body[0]).toMatchObject({
         taskId: 'task-3',
         name: 'Task 3',
         knowledgeBaseSize: 1024,
@@ -173,6 +173,7 @@ describe('Knowledge Base All Endpoint - GET /api/tasks/knowledge-base/all', () =
 
       expect(response.body[0]).toEqual({
         taskId: 'task-1',
+        userId: 'test-user-123',
         name: 'Task 1',
         knowledgeBaseSize: 100,
         knowledgeBaseType: 'public',
@@ -182,7 +183,6 @@ describe('Knowledge Base All Endpoint - GET /api/tasks/knowledge-base/all', () =
       expect(response.body[0]).not.toHaveProperty('prompt');
       expect(response.body[0]).not.toHaveProperty('status');
       expect(response.body[0]).not.toHaveProperty('createdAt');
-      expect(response.body[0]).not.toHaveProperty('userId');
     });
   });
 
