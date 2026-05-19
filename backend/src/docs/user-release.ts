@@ -30,6 +30,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-19',
     changes: [
+      'CRM: Company Accounts — Group Contacts by Organization',
+      '- Added a new "Companies" tab in CRM for account-based marketing (ABM) workflows',
+      '- Create a Company account with name, domain, industry, deal stage (Prospect → Closed Won/Lost), deal value, website, and notes',
+      '- Assign multiple contacts from any list to a Company — each contact\'s detail panel now has a "Company Account" section for one-click assignment or removal',
+      '- The Company detail view shows all assigned contacts grouped together, enabling true multi-contact account management (e.g. all Warp contacts in one place)',
+      '- Deal stage and deal value are tracked at the account level, separate from individual contact deals',
+    ],
+  },
+  {
+    date: '2026-05-19',
+    changes: [
       'CRM: LinkedIn Connection Indicator on Leads',
       '- The LinkedIn icon on each lead now shows a green dot when that lead is a 1st-degree LinkedIn connection with your connected outreach account',
       '- Connection status is checked automatically after loading each lead list — no manual refresh needed',

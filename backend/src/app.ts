@@ -31,6 +31,7 @@ import seoRoutes from "./routes/seo";
 import funnelRoutes from "./routes/funnel";
 import gtmPlanRoutes from "./routes/gtmPlan";
 import crmRoutes from "./routes/crm";
+import crmCompaniesRoutes from "./routes/crmCompanies";
 import sequenceRoutes from "./routes/sequences";
 import crmPublicRoutes from "./routes/crmPublic";
 import subscriptionRoutes from "./routes/subscription";
@@ -262,6 +263,7 @@ app.use("/api/crm", crmWebhookRoutes);  // per-list webhook URLs — must be aft
 import apolloWebhookRoutes from "./routes/apolloWebhook";
 app.use("/api/crm/webhooks/apollo", apolloWebhookRoutes);
 app.use("/api/crm/sequences", sequenceRoutes);
+app.use("/api/crm/companies", crmCompaniesRoutes);
 app.use("/api/crm", crmRoutes);
 app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/books", booksRoutes);
