@@ -1044,6 +1044,52 @@ describe('CRM Routes', () => {
       // frontend doesn't read NaN out of DynamoDB later.
       expect(updateCall.icpMatch.categoryMatches[0].score).toBe(0);
     });
+
+    it('breaks score ties by icpTitle alphabetical order for deterministic winner selection', async () => {
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id',
+        marketStrategy: {
+          businessOverview: 'B2B SaaS',
+          icp: [
+            { title: 'Beta Category', description: 'Second alpha', valueProposition: 'B' },
+            { title: 'Alpha Category', description: 'First alpha', valueProposition: 'A' },
+          ],
+        },
+      });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [{ leadId: 'lead1', firstName: 'John', lastName: 'Doe', email: 'john@example.com' }],
+        lastEvaluatedKey: null,
+      });
+
+      const mockLlmService = {
+        generateJSONContent: jest.fn().mockResolvedValue([
+          {
+            index: 1,
+            categoryMatches: [
+              { icpTitle: 'Beta Category', isMatch: true, score: 75, reason: 'Good fit.' },
+              { icpTitle: 'Alpha Category', isMatch: true, score: 75, reason: 'Also good fit.' },
+            ],
+          },
+        ]),
+      };
+      (createLLMService as jest.Mock).mockReturnValue(mockLlmService);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { mode: 'match' };
+      mockRequest.body = {};
+
+      const handler = findMatchIcpsPostHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      const updateCall = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
+      // "Alpha Category" < "Beta Category" alphabetically — must win the tie.
+      expect(updateCall.icpMatch.matchedIcpTitle).toBe('Alpha Category');
+      expect(updateCall.icpMatch.score).toBe(75);
+    });
   });
 
   describe('POST /api/crm/lists/:listId/leads/enrich-web', () => {

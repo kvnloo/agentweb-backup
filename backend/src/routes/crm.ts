@@ -3374,13 +3374,6 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
 });
 
 /**
- * Score above which a lead is considered a match for an ICP category.
- * Interpolated into the LLM prompt AND used to compute the persisted
- * `isMatch` from the winning category's score — single source of truth so
- * the prompt and the backend can't drift apart on what "match" means.
- */
-
-/**
  * @route POST /api/crm/lists/:listId/leads/match-icps
  * @desc Match leads against ICPs using AI
  * @access Private
@@ -3616,7 +3609,7 @@ Please analyze each lead and return a JSON array with your assessment.`;
                   console.warn(`[crm] match-icps: LLM returned empty categoryMatches for lead ${lead.leadId} — possible schema regression`);
                 }
                 const winner = categoryMatches.length > 0
-                  ? categoryMatches.reduce((best, cat) => cat.score > best.score ? cat : best)
+                  ? categoryMatches.reduce((best, cat) => cat.score > best.score || (cat.score === best.score && cat.icpTitle < best.icpTitle) ? cat : best)
                   : { icpTitle: '', isMatch: false, score: 0, reason: 'Insufficient lead data to evaluate against ICP categories.' };
 
                 const isMatch = winner.isMatch;
