@@ -80,7 +80,12 @@ router.get("/", async (req, res) => {
       return true;
     });
 
-    res.json({ items: all, truncated: fanout.truncated });
+    const typeFilter = req.query.type as string | undefined;
+    const filtered = typeFilter
+      ? all.filter((t: any) => Array.isArray(t.type) && t.type.includes(typeFilter))
+      : all;
+
+    res.json({ items: filtered, truncated: fanout.truncated });
   } catch (error) {
     console.error("[HTML TEMPLATES] Error listing templates:", error);
     res.status(500).json({ error: "Failed to get templates" });
