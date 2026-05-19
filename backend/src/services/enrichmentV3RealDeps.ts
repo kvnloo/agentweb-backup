@@ -814,6 +814,27 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       };
     },
 
+    evaluateSmartField: async ({ fieldName, condition, depValues }) => {
+      const {
+        buildSmartFieldEvalSystemPrompt,
+        buildSmartFieldEvalUserPrompt,
+      } = await import('./enrichmentPrompts');
+      try {
+        const llm = createLLMService(EXTRACT_MODEL, 0.0);
+        const result = await llm.generateJSONContent<{ value: string | null; reasoning: string }>(
+          buildSmartFieldEvalSystemPrompt(),
+          buildSmartFieldEvalUserPrompt(fieldName, condition, depValues),
+        );
+        return {
+          value: result?.value != null ? String(result.value) : null,
+          reasoning: result?.reasoning ?? '',
+        };
+      } catch (err) {
+        console.warn('[v3 deps] evaluateSmartField failed:', (err as Error).message);
+        return { value: null, reasoning: '' };
+      }
+    },
+
     runCriticOverWebFills: runCriticReal,
 
     setLeadFields: async ({ listId, leadId, topLevel, customFields, enrichmentMetadata, ifNotExists }) => {

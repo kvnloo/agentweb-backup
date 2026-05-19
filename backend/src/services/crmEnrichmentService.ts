@@ -29,6 +29,7 @@ import { resolveFieldAliases } from './enrichmentFieldAliasService';
 import { getOrCreateClustersForFields, type FieldCluster } from './enrichmentClusterService';
 import { getUnipileSearchParamService } from './unipileSearchParamServiceFactory';
 import { enrichLog } from '../utils/enrichmentLogger';
+import { isApolloServiceReady, getApolloService } from './apolloService';
 
 /**
  * Stage 3 rollout flag — gates the LinkedIn company-id resolver + confidence
@@ -138,6 +139,11 @@ export interface EnrichmentJobSpec {
    *  in loadAndFilterLeads and passed through to runSpecialists. Optional: when
    *  absent, defaults apply (standard fields ON, extended fields OFF). */
   enrichmentFieldConfig?: import('./enrichmentFieldConfig').EnrichmentFieldConfig;
+  /** When true, attempts Apollo org enrichment as Tier 1 before web search.
+   *  If Apollo returns technology_names, those are fed to the LLM and web
+   *  search is skipped. Falls back to web search when Apollo is unavailable,
+   *  lead has no domain, or Apollo returns no tech data. */
+  apolloTechStack?: boolean;
 }
 
 interface EnrichmentPreviewResult {
@@ -453,6 +459,23 @@ export class CrmEnrichmentService {
     return false;
   }
 
+  static isPersonalDomain(domain: string): boolean {
+    const d = domain.toLowerCase().trim();
+    if (!d) return false;
+    if (CrmEnrichmentService.PERSONAL_EMAIL_DOMAINS.has(d)) return true;
+    if (CrmEnrichmentService.isInstitutionalDomain(d)) return true;
+    return false;
+  }
+
+  static extractDomain(website: string): string | null {
+    try {
+      const url = new URL(website.includes('://') ? website : `https://${website}`);
+      return url.hostname.replace(/^www\./, '').trim() || null;
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Substitute {{placeholder}} tokens in a search query template with actual lead field values.
    * Multi-space gaps left by empty substitutions are collapsed to a single space.
@@ -503,7 +526,7 @@ export class CrmEnrichmentService {
     });
 
     const isPersonalDomain = emailDomain
-      ? CrmEnrichmentService.isPersonalEmailDomain(`x@${emailDomain}`)
+      ? CrmEnrichmentService.isPersonalDomain(emailDomain)
       : false;
     const businessDomain = isPersonalDomain ? '' : emailDomain;
 
@@ -665,7 +688,7 @@ export class CrmEnrichmentService {
     if (hasCompanyLinkedinField) {
       const emailDomain = lead.email ? (String(lead.email).split('@')[1] || '').trim() : '';
       const isPersonalDomain = emailDomain
-        ? CrmEnrichmentService.isPersonalEmailDomain(`x@${emailDomain}`)
+        ? CrmEnrichmentService.isPersonalDomain(emailDomain)
         : false;
       const companyTerm = (!isPersonalDomain && emailDomain) || String(lead.company || '').trim();
       if (companyTerm) {
@@ -1239,7 +1262,40 @@ export class CrmEnrichmentService {
     type Unit = { webContext: string; linkedinContext: string; fields: string[]; label: string };
     const units: Unit[] = [];
 
-    if (llmWebSearchFields.length > 0) {
+    // ── Tier 1: Apollo tech stack (optional) ─────────────────────────────────
+    // Fires before web search when spec.apolloTechStack is true. Extracts domain
+    // from emailDomain or website, calls matchOrg, and if technology_names are
+    // returned builds a single LLM unit from the Apollo list — skipping web search.
+    // Falls back to web search on any failure or empty result.
+    let apolloTechStackContext: string | null = null;
+    if (spec.apolloTechStack && llmWebSearchFields.length > 0 && isApolloServiceReady()) {
+      const domain =
+        lead.emailDomain ||
+        (lead.website ? CrmEnrichmentService.extractDomain(lead.website) : null) ||
+        null;
+      const isPersonalDomain = domain ? CrmEnrichmentService.isPersonalDomain(domain) : false;
+      if (domain && !isPersonalDomain) {
+        try {
+          const orgResult = await getApolloService().matchOrg(domain);
+          const techStack = orgResult.organization?.techStack;
+          if (techStack && techStack.length > 0) {
+            apolloTechStackContext = `Apollo technology data for ${domain}:\n${techStack.join(', ')}`;
+            console.log(`[CrmEnrichment][enrichLead] apollo tech stack HIT domain=${domain} lead=${lead.leadId} tools=${techStack.length}`);
+          } else {
+            console.log(`[CrmEnrichment][enrichLead] apollo tech stack MISS domain=${domain} lead=${lead.leadId}, falling back to web search`);
+          }
+        } catch (err: any) {
+          console.warn(`[CrmEnrichment][enrichLead] apollo tech stack error domain=${domain} lead=${lead.leadId}: ${err?.message}`);
+        }
+      } else {
+        console.log(`[CrmEnrichment][enrichLead] apollo tech stack SKIP lead=${lead.leadId} reason=${!domain ? 'no-domain' : 'personal-domain'}`);
+      }
+      if (apolloTechStackContext) {
+        units.push({ webContext: apolloTechStackContext, linkedinContext: '', fields: llmWebSearchFields, label: 'apollo:tech_stack' });
+      }
+    }
+
+    if (llmWebSearchFields.length > 0 && !apolloTechStackContext) {
       const { byGroup, ungrouped } = splitFieldsByGroup(llmWebSearchFields, { aliases: spec.fieldAliases });
 
       for (const [groupName, groupFields] of byGroup) {
@@ -1620,7 +1676,9 @@ export class CrmEnrichmentService {
       for (const lead of sampleLeads) {
         console.log(`[CrmEnrichment][preview] enriching sample lead ${lead.leadId} (${lead.email || lead.company || ''})`);
         try {
-          const { fields } = await this.enrichLead(lead, spec, linkedInAccountId, enrichConfig);
+          // Disable apolloTechStack in preview — Apollo org calls burn real credits.
+          const previewSpec = spec.apolloTechStack ? { ...spec, apolloTechStack: false } : spec;
+          const { fields } = await this.enrichLead(lead, previewSpec, linkedInAccountId, enrichConfig);
           console.log(`[CrmEnrichment][preview] lead ${lead.leadId} enriched OK fields=${JSON.stringify(Object.keys(fields))}`);
           samples.push({ leadId: lead.leadId, lead, enrichedFields: fields });
         } catch (err) {

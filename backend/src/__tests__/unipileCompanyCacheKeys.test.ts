@@ -55,6 +55,22 @@ describe('extractCompanyIdentifierFromInput', () => {
     expect(extractCompanyIdentifierFromInput('https://www.linkedin.com/company/microsoft/?utm=x'))
       .toBe('microsoft');
   });
+
+  it('extracts identifier from a /school/ URL', () => {
+    expect(extractCompanyIdentifierFromInput('http://www.linkedin.com/school/ucsandiego'))
+      .toBe('ucsandiego');
+  });
+
+  it('extracts identifier from a /school/ URL with trailing slash', () => {
+    expect(extractCompanyIdentifierFromInput('https://www.linkedin.com/school/mit/'))
+      .toBe('mit');
+  });
+
+  it('does not return full URL for school URLs (regression guard)', () => {
+    const result = extractCompanyIdentifierFromInput('http://www.linkedin.com/school/ucsandiego');
+    expect(result).not.toContain('http');
+    expect(result).not.toContain('linkedin.com');
+  });
 });
 
 describe('buildUnipileCompanyCanonicalKey', () => {

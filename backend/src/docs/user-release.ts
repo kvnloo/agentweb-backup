@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-16
+// Last updated: 2026-05-18
 
 export interface UserReleaseNote {
   date: string;
@@ -17,6 +17,60 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Brand Guidelines and Marketing Strategy remain always shared with the org; admins can now grant edit access to specific members',
       '- Each feature has a per-feature editor list — designated members can edit shared items even if they don\'t own them',
       '- When a member is removed from an org, the admin chooses per feature whether to transfer items, delete them, or leave them with the departing member',
+      'CRM: LinkedIn Connection Indicator on Leads',
+      '- The LinkedIn icon on each lead now shows a green dot when that lead is a 1st-degree LinkedIn connection with your connected outreach account',
+      '- Connection status is checked automatically after loading each lead list — no manual refresh needed',
+      '- Hover the icon to see "LinkedIn — 1st-degree connection" tooltip',
+      'Drip Sequences: LinkedIn Auto-Enroll and Exit Conditions',
+      '- New sequence setting: "Auto-enroll when lead accepts LinkedIn invite" — leads are automatically enrolled into the sequence when they accept your LinkedIn connection request (checked every 10 minutes)',
+      '- New exit condition: "Exit when lead replies on LinkedIn" — the sequence stops sending to a lead as soon as they reply to any LinkedIn message',
+      '- LinkedIn connection data is cached in a dedicated store, enabling fast lookups and supporting future features without touching lead records',
+      'Improved: Research Reports Page Loads Faster for Large Accounts',
+      '- The Reports page previously froze or timed out for accounts with hundreds of reports and sessions',
+      '- Reports now load progressively — the first 30 appear immediately, with more loading automatically as you scroll',
+      '- Search and filters still work across all reports at once, bypassing the scroll limit',
+    ],
+  },
+  {
+    date: '2026-05-18',
+    changes: [
+      'Improved: Emma Can Now Return Timestamped Transcripts and Scene Breakdowns from Videos',
+      '- When asking Emma to analyze a video for scripting or content repurposing, you can now request a timestamped spoken-word transcript (every line with start/end time in seconds)',
+      '- Emma can also return a scene-by-scene breakdown with titles, descriptions, and timestamps — useful for identifying B-roll opportunities, cut points, or content segments',
+      '- You can focus analysis on a specific time range (e.g. "analyze the segment from 0:30 to 1:15") without re-processing the full video',
+      '- Works on direct video file URLs (mp4, mov, webm, etc.) and YouTube links',
+      '- Duration is now returned as part of the structured analysis',
+    ],
+  },
+  {
+    date: '2026-05-18',
+    changes: [
+      'Fixed: Org-Shared LinkedIn Outreach Accounts Now Visible to All Team Members',
+      '- When a team member connected a LinkedIn Outreach (Unipile) account and shared it with the organization, other team members could not see or use the account',
+      '- The connected accounts list was only returning the calling user\'s personal accounts, ignoring org-shared accounts from teammates',
+      '- Org-shared accounts are now included for all members of the same organization',
+    ],
+  },
+  {
+    date: '2026-05-18',
+    changes: [
+      'CRM Group Email: Format Verification Before Sending',
+      '- The "Prepare for Sending" step now checks your email HTML for common issues before you send',
+      '- Warns if dark mode handling is missing (add <meta name="color-scheme" content="light"> to opt iOS Mail out of color inversion)',
+      '- Warns if dark text on a light background has no dark mode protection — the cause of unreadable text seen in Apple Mail / iOS dark mode',
+      '- Warns if CSS class rules outside @media blocks are present (Gmail strips these, breaking layout)',
+      'CRM Group Email: "Load from URL" Now Instant',
+      '- Loading an email HTML file from a URL in the Group Email composer no longer hangs',
+      '- Previously took up to 80+ seconds due to an unnecessary LLM call on every load; now returns in under 1 second',
+    ],
+  },
+  {
+    date: '2026-05-18',
+    changes: [
+      'Fixed: CRM Lead Enrichment and Field Edits Now Work for All Leads',
+      '- A subset of leads imported before a data-quality fix had empty strings stored for email, LinkedIn URL, or name+company key fields',
+      '- DynamoDB rejected any write to these leads — silently blocking enrichment updates and CRM field edits',
+      '- All affected leads (~158k) have been repaired; enrichment and manual edits now work correctly across the entire CRM',
     ],
   },
   {

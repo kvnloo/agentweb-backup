@@ -1,4 +1,4 @@
-import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, hasUnsafeEmailStyles, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
+import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, hasUnsafeEmailStyles, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls, checkEmailFormat } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
 
 jest.mock('../utils/llmService');
@@ -220,6 +220,16 @@ describe('hasUnsafeEmailStyles', () => {
     const html = '<head><style>body{}</style><style>.btn { color: white; }</style></head>';
     expect(hasUnsafeEmailStyles(html)).toBe(true);
   });
+
+  it('should return false for class rules only inside @media blocks (responsive + dark mode)', () => {
+    const html = '<html><head><style>@media only screen and (max-width:480px){.wrapper{width:100%!important;}} @media (prefers-color-scheme:dark){.dm-card{background:#000!important;}}</style></head></html>';
+    expect(hasUnsafeEmailStyles(html)).toBe(false);
+  });
+
+  it('should return true when class rules exist both inside and outside @media', () => {
+    const html = '<html><head><style>.header{background:purple;} @media(max-width:480px){.wrapper{width:100%;}}</style></head></html>';
+    expect(hasUnsafeEmailStyles(html)).toBe(true);
+  });
 });
 
 describe('rewriteS3ImageUrls', () => {
@@ -339,6 +349,83 @@ describe('normalizeYoutubeUrls', () => {
     const result = normalizeYoutubeUrls(html);
     expect(result).toContain('https://www.youtube.com/watch?v=testId123');
     expect(result).not.toContain('youtu.be');
+  });
+});
+
+describe('checkEmailFormat', () => {
+  it('should return empty array for empty string', () => {
+    expect(checkEmailFormat('')).toEqual([]);
+  });
+
+  it('should warn about class-based CSS (error severity)', () => {
+    const html = '<html><head><style>.btn { color: white; }</style></head><body></body></html>';
+    const warnings = checkEmailFormat(html);
+    const codes = warnings.map((w) => w.code);
+    expect(codes).toContain('class-based-css');
+    const csWarn = warnings.find((w) => w.code === 'class-based-css');
+    expect(csWarn?.severity).toBe('error');
+  });
+
+  it('should warn no-dark-mode when @media prefers-color-scheme: dark is absent', () => {
+    const html = '<html><body><p style="color:#111">Hello</p></body></html>';
+    const warnings = checkEmailFormat(html);
+    const codes = warnings.map((w) => w.code);
+    expect(codes).toContain('no-dark-mode');
+  });
+
+  it('should NOT warn no-dark-mode when @media prefers-color-scheme: dark is present', () => {
+    const html = `<html><head><style>@media (prefers-color-scheme: dark) { body { background: #000; } }</style></head><body></body></html>`;
+    const warnings = checkEmailFormat(html);
+    const codes = warnings.map((w) => w.code);
+    expect(codes).not.toContain('no-dark-mode');
+    expect(codes).not.toContain('dark-mode-contrast');
+  });
+
+  it('should NOT warn no-dark-mode when color-scheme opt-out meta tag is present', () => {
+    const html = `<html><head><meta name="color-scheme" content="light"></head><body><div style="background-color:#fff"><p style="color:#000">Text</p></div></body></html>`;
+    const warnings = checkEmailFormat(html);
+    const codes = warnings.map((w) => w.code);
+    expect(codes).not.toContain('no-dark-mode');
+    expect(codes).not.toContain('dark-mode-contrast');
+  });
+
+  it('should NOT warn no-dark-mode when color-scheme meta has light only supported-color-schemes', () => {
+    const html = `<html><head><meta name="color-scheme" content="light only"></head><body></body></html>`;
+    const warnings = checkEmailFormat(html);
+    const codes = warnings.map((w) => w.code);
+    expect(codes).not.toContain('no-dark-mode');
+  });
+
+  it('should warn dark-mode-contrast when dark text on light bg without dark mode query', () => {
+    const html = '<html><body><div style="background-color:#ffffff"><p style="color:#111111">Text</p></div></body></html>';
+    const warnings = checkEmailFormat(html);
+    const codes = warnings.map((w) => w.code);
+    expect(codes).toContain('dark-mode-contrast');
+    const cw = warnings.find((w) => w.code === 'dark-mode-contrast');
+    expect(cw?.severity).toBe('warning');
+  });
+
+  it('should NOT warn dark-mode-contrast when dark mode query is present even with dark text on light bg', () => {
+    const html = `<html><head><style>@media (prefers-color-scheme: dark) { body { background: #000; } }</style></head><body><div style="background-color:#fff"><p style="color:#000">Text</p></div></body></html>`;
+    const warnings = checkEmailFormat(html);
+    const codes = warnings.map((w) => w.code);
+    expect(codes).not.toContain('dark-mode-contrast');
+  });
+
+  it('should NOT warn dark-mode-contrast when color-scheme opt-out is present', () => {
+    const html = `<html><head><meta name="color-scheme" content="light"></head><body><div style="background-color:#fff"><p style="color:#000">Text</p></div></body></html>`;
+    const warnings = checkEmailFormat(html);
+    const codes = warnings.map((w) => w.code);
+    expect(codes).not.toContain('dark-mode-contrast');
+  });
+
+  it('should return only no-dark-mode warning for a plain HTML email with no inline style colors', () => {
+    const html = '<html><body><p>Hello world</p></body></html>';
+    const warnings = checkEmailFormat(html);
+    const codes = warnings.map((w) => w.code);
+    expect(codes).toContain('no-dark-mode');
+    expect(codes).not.toContain('class-based-css');
+    expect(codes).not.toContain('dark-mode-contrast');
   });
 });
 

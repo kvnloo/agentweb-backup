@@ -30,15 +30,17 @@ export function extractCompanyIdentifierFromInput(input: string | undefined | nu
   const trimmed = String(input).trim();
   if (!trimmed) return null;
 
-  // /company/{identifier} URL form — peel the segment after /company/.
-  const marker = '/company/';
-  const idx = trimmed.indexOf(marker);
-  if (idx >= 0) {
-    let tail = trimmed.substring(idx + marker.length);
-    // Strip trailing slash and any further path/query/fragment segments.
-    tail = tail.split('/')[0].split('?')[0].split('#')[0];
-    if (!tail) return null;
-    return tail.toLowerCase();
+  // LinkedIn org-like URL forms: /company/, /school/, /showcase/, etc.
+  // Peel the segment after the path marker.
+  for (const marker of ['/company/', '/school/', '/showcase/']) {
+    const idx = trimmed.indexOf(marker);
+    if (idx >= 0) {
+      let tail = trimmed.substring(idx + marker.length);
+      // Strip trailing slash and any further path/query/fragment segments.
+      tail = tail.split('/')[0].split('?')[0].split('#')[0];
+      if (!tail) continue;
+      return tail.toLowerCase();
+    }
   }
 
   // Bare vanity name OR URN — return verbatim, lowercased.

@@ -2174,12 +2174,15 @@ async function getExecutionsWithAssets(
       const cachedSessions = activeSessions.filter(s => s.assetCache !== undefined && s.assetScanIndex !== undefined);
       const uncachedSessions = activeSessions.filter(s => s.assetCache === undefined || s.assetScanIndex === undefined);
 
-      // Background-warm uncached sessions (fire-and-forget)
+      // Background-warm uncached sessions (fire-and-forget).
+      // Cap at 50 per request to avoid thundering-herd on large accounts.
+      const MAX_WARM_PER_REQUEST = 50;
       if (uncachedSessions.length > 0) {
+        const sessionsToWarm = uncachedSessions.slice(0, MAX_WARM_PER_REQUEST);
         (async () => {
           try {
-            for (let i = 0; i < uncachedSessions.length; i += BATCH_SIZE) {
-              const batch = uncachedSessions.slice(i, i + BATCH_SIZE);
+            for (let i = 0; i < sessionsToWarm.length; i += BATCH_SIZE) {
+              const batch = sessionsToWarm.slice(i, i + BATCH_SIZE);
               await Promise.all(batch.map(async (session) => {
                 try {
                   const messages = await chatbotDb.getMessagesFromMessagesTable(session.sessionId);

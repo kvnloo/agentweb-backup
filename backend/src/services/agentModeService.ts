@@ -3507,7 +3507,10 @@ export class AgentModeService {
       return {
         success: actualResult.success,
         description: actualResult.description,
-        videoUrl: actualResult.videoUrl
+        videoUrl: actualResult.videoUrl,
+        ...(actualResult.transcript !== undefined ? { transcript: actualResult.transcript } : {}),
+        ...(actualResult.scenes !== undefined ? { scenes: actualResult.scenes } : {}),
+        ...(actualResult.duration !== undefined ? { duration: actualResult.duration } : {})
       };
     }
 
@@ -4929,7 +4932,16 @@ export class AgentModeService {
     }
   }
 
-  public async describeVideo(videoFileUrl: string, prompt?: string): Promise<any> {
+  public async describeVideo(
+    videoFileUrl: string,
+    prompt?: string,
+    options?: {
+      return_transcript?: boolean;
+      return_scenes?: boolean;
+      start_time?: string;
+      end_time?: string;
+    }
+  ): Promise<any> {
     let tempDirPath: string | null = null;
     let uploadedFileName: string | null = null;
     let aiClient: any = null;
@@ -4970,7 +4982,37 @@ export class AgentModeService {
       aiClient = new GoogleGenAI({ apiKey: geminiApiKey.trim() });
 
       const modelName = 'gemini-3-flash-preview';
-      const analysisPrompt = prompt || 'Please describe this video in detail. Focus on key events, visual elements, and any spoken content.';
+
+      // Build structured prompt based on requested output fields
+      const wantTranscript = options?.return_transcript === true;
+      const wantScenes = options?.return_scenes === true;
+      const wantStructured = wantTranscript || wantScenes;
+      const timeRange = (options?.start_time || options?.end_time)
+        ? `Focus your analysis on the segment from ${options.start_time || 'the beginning'} to ${options.end_time || 'the end'} of the video.`
+        : '';
+
+      let analysisPrompt: string;
+      if (wantStructured) {
+        const fields: string[] = ['description: a concise overall description of the video'];
+        if (wantTranscript) {
+          fields.push('transcript: an array of objects with {start: number (seconds), end: number (seconds), text: string} for all spoken content');
+        }
+        if (wantScenes) {
+          fields.push('scenes: an array of objects with {start: number (seconds), end: number (seconds), title: string, description: string} identifying distinct scene segments');
+        }
+        fields.push('duration: total video duration in seconds as a number');
+        analysisPrompt = [
+          prompt || 'Analyze this video thoroughly.',
+          timeRange,
+          `Return ONLY a JSON object (no markdown fences) with these fields: ${fields.join('; ')}.`
+        ].filter(Boolean).join(' ');
+      } else {
+        analysisPrompt = [
+          prompt || 'Please describe this video in detail. Focus on key events, visual elements, and any spoken content.',
+          timeRange
+        ].filter(Boolean).join(' ');
+      }
+
       const url = new URL(videoFileUrl);
       const hostname = (url.hostname || '').toLowerCase();
       const isYoutube = hostname.includes('youtube.com') || hostname.includes('youtu.be');
@@ -5101,18 +5143,42 @@ export class AgentModeService {
         contents
       });
 
-      const description = response.text;
+      const rawText = response.text;
 
-      if (!description) {
+      if (!rawText) {
         return {
           success: false,
           message: 'No description returned from Gemini'
         };
       }
 
+      // When structured output was requested, try to parse JSON from Gemini
+      if (wantStructured) {
+        try {
+          // Strip optional markdown code fences Gemini may add despite instructions
+          const jsonText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+          const parsed = JSON.parse(jsonText);
+          return {
+            success: true,
+            description: parsed.description || rawText,
+            ...(wantTranscript && parsed.transcript !== undefined ? { transcript: parsed.transcript } : {}),
+            ...(wantScenes && parsed.scenes !== undefined ? { scenes: parsed.scenes } : {}),
+            ...(parsed.duration !== undefined ? { duration: parsed.duration } : {}),
+            videoUrl: videoFileUrl
+          };
+        } catch {
+          // Gemini returned non-JSON despite instruction — fall back to plain description
+          return {
+            success: true,
+            description: rawText,
+            videoUrl: videoFileUrl
+          };
+        }
+      }
+
       return {
         success: true,
-        description,
+        description: rawText,
         videoUrl: videoFileUrl
       };
     } catch (error) {
@@ -20657,9 +20723,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   // List connected accounts helper
   async listConnectedAccounts(userId: string, platform: string = 'all'): Promise<any> {
     try {
-      const { getAccountsByUserId, isTokenValid } = await import('./connectedAccountsDb');
+      const { getAccountsByUserIdIncludingOrgShared, isTokenValid } = await import('./connectedAccountsDb');
 
-      let accounts = await getAccountsByUserId(userId);
+      let accounts = await getAccountsByUserIdIncludingOrgShared(userId);
 
       if (platform && platform !== 'all') {
         accounts = accounts.filter(acc => acc.platform === platform);
@@ -21247,15 +21313,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     const { profile_url, provider_id, message } = args;
     console.log(`[AgentMode] linkedinOutreach called: action=${action}, account_id=${account_id}`);
 
-    // Write actions must use an account owned by the calling user.
-    // This prevents an LLM from reusing a shared/enrichment account_id it may have
-    // seen in a prior get-profile tool call to send invitations or messages.
+    // Write actions must use an account that is either owned by the calling user or
+    // explicitly shared with the org (sharedWithOrg: true). This prevents an LLM from
+    // reusing a shared enrichment account_id from a prior get-profile call.
     const WRITE_ACTIONS = ['send-invite', 'send-message', 'send-inmail', 'cancel-invitation', 'accept-invitation'];
     if (WRITE_ACTIONS.includes(action)) {
-      const { getAccountsByUserId } = await import('./connectedAccountsDb');
-      const userAccounts = await getAccountsByUserId(userId);
-      const owned = userAccounts.some((a: any) => a.platform === 'unipile' && a.account_id === account_id);
-      if (!owned) {
+      const { getAccountsByUserIdIncludingOrgShared } = await import('./connectedAccountsDb');
+      const userAccounts = await getAccountsByUserIdIncludingOrgShared(userId);
+      const authorized = userAccounts.some((a: any) => a.platform === 'unipile' && a.account_id === account_id);
+      if (!authorized) {
         return { success: false, error: `Account ${account_id} is not connected to your profile. Connect a LinkedIn Outreach account in Settings to use this action.` };
       }
     }
