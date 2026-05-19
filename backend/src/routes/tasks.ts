@@ -2,11 +2,12 @@ import express, { Request, RequestHandler, Response } from 'express';
 import cors from 'cors';
 import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, generateShareToken, getExecutionWithToken, sendExecutionEmail, uploadFileToExecution, getPlacidEditorToken, generateFromTemplateToExecution, listPlacidTemplates, createRevisionExecution, updateReport, getTaskExecutionPublic } from '../controllers/tasks';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
-import { taskDb, subscriberDb } from '../services/db';
+import { taskDb, subscriberDb, orgDb } from '../services/db';
 import multer from 'multer';
 import { RequestHandler as ExpressRequestHandler } from 'express-serve-static-core';
 import { isAdmin } from '../middleware/admin';
 import { userDb } from '../services/db';
+import { canViewItem, canEditItem } from '../services/orgShareService';
 import { emailService } from '../services/emailService';
 import { Storage, Bucket } from '@google-cloud/storage';
 import OpenAI from 'openai';
@@ -1018,8 +1019,48 @@ async function getFileSize(bucket: Bucket, filePath: string): Promise<number> {
   return parseInt(String(metadata.size));
 }
 
+// ─── KB auth helper ──────────────────────────────────────────────────────────
+// Resolves the caller + owner org context once and returns canView/canEdit
+// helpers pre-bound to the "knowledgeBase" feature.
+async function resolveKbAuthContext(callerId: string, ownerUserId: string) {
+  const caller = await userDb.getUserById(callerId);
+  let ownerOrgId: string | undefined;
+  let org = null;
+  if (ownerUserId === callerId) {
+    ownerOrgId = caller?.orgId;
+    if (caller?.orgId) org = await orgDb.getOrgById(caller.orgId);
+  } else {
+    const owner = await userDb.getUserById(ownerUserId);
+    ownerOrgId = owner?.orgId;
+    if (caller?.orgId && ownerOrgId === caller.orgId) {
+      org = await orgDb.getOrgById(caller.orgId);
+    }
+  }
+  return {
+    caller,
+    org,
+    ownerOrgId,
+    canView: () =>
+      canViewItem(
+        { userId: ownerUserId },
+        { userId: callerId, orgId: caller?.orgId, orgRole: caller?.orgRole },
+        org,
+        ownerOrgId,
+        'knowledgeBase',
+      ),
+    canEdit: () =>
+      canEditItem(
+        { userId: ownerUserId },
+        { userId: callerId, orgId: caller?.orgId, orgRole: caller?.orgRole },
+        org,
+        ownerOrgId,
+        'knowledgeBase',
+      ),
+  };
+}
+
 // Knowledge Base routes
-// Get all knowledge bases for the authenticated user
+// Get all knowledge bases for the authenticated user (+ org members when sharing enabled)
 router.get('/knowledge-base/all', authenticateToken, async (req: Request, res: Response) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
@@ -1028,12 +1069,43 @@ router.get('/knowledge-base/all', authenticateToken, async (req: Request, res: R
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    // Use the common function to get tasks with knowledge base
-    const knowledgeBaseTasks = await taskDb.getTasksWithKnowledgeBase(userId);
+    // Always fetch caller's own KB-tasks
+    const ownTasks = await taskDb.getTasksWithKnowledgeBase(userId);
 
-    // Map to return only necessary fields for the API response
-    const response = knowledgeBaseTasks.map((task: any) => ({
+    // Check if org sharing is enabled for knowledgeBase
+    const caller = await userDb.getUserById(userId);
+    let allTasks = [...ownTasks];
+
+    if (caller?.orgId) {
+      const org = await orgDb.getOrgById(caller.orgId);
+      const kbEnabled = org?.shareSettings?.knowledgeBase?.enabled === true;
+      if (kbEnabled) {
+        // Fanout: fetch KB-tasks for each org member (excluding caller)
+        const members = await orgDb.getOrgMembers(caller.orgId);
+        const otherMemberIds = members
+          .map((m: any) => m.userId)
+          .filter((uid: string) => uid !== userId);
+
+        const perMember = await Promise.all(
+          otherMemberIds.map((uid: string) => taskDb.getTasksWithKnowledgeBase(uid))
+        );
+        allTasks = [...ownTasks, ...perMember.flat()];
+      }
+    }
+
+    // Dedupe by taskId
+    const seen = new Set<string>();
+    const deduped = allTasks.filter((task: any) => {
+      if (seen.has(task.taskId)) return false;
+      seen.add(task.taskId);
+      return true;
+    });
+
+    // Map to return only necessary fields; include userId so the frontend can
+    // show "Shared by" and correctly target PATCH/DELETE requests.
+    const response = deduped.map((task: any) => ({
       taskId: task.taskId,
+      userId: task.userId,
       name: task.name,
       knowledgeBaseSize: task.knowledgeBaseSize,
       knowledgeBaseType: task.knowledgeBaseType,
@@ -1062,8 +1134,12 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
-      return res.status(403).json({ message: 'Not authorized to access this task' });
+    const isAdminUser = (req as AuthenticatedRequest).user?.isAdmin;
+    if (!isAdminUser) {
+      const auth = await resolveKbAuthContext(userId, task.userId);
+      if (!auth.canView()) {
+        return res.status(403).json({ message: 'Not authorized to access this task' });
+      }
     }
 
     // Include knowledgeBaseFiles in the response
@@ -1152,8 +1228,12 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
-      return res.status(403).json({ message: 'Not authorized to modify this task' });
+    const isAdminUser = (req as AuthenticatedRequest).user?.isAdmin;
+    if (!isAdminUser) {
+      const auth = await resolveKbAuthContext(userId, task.userId);
+      if (!auth.canEdit()) {
+        return res.status(403).json({ message: 'Not authorized to modify this task' });
+      }
     }
 
     // Set knowledgeBaseType to 'private' if not defined
@@ -1203,6 +1283,9 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
 });
 
 // Update knowledge base from execution
+// NOTE: This is a machine-to-machine endpoint called by the agent engine after an
+// execution completes. It uses owner-only (or admin) access intentionally —
+// org editors should not be able to trigger automated KB rewrites on foreign tasks.
 router.post('/:taskId/executions/:executionId/update-knowledge-base', authenticateToken, async (req: Request, res: Response) => {
   try {
     const { taskId, executionId } = req.params;
@@ -1351,8 +1434,12 @@ router.post('/:taskId/knowledge-base/files', authenticateToken, upload.array('fi
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
-      return res.status(403).json({ message: 'Not authorized to modify this task' });
+    const isAdminUserFiles = (req as AuthenticatedRequest).user?.isAdmin;
+    if (!isAdminUserFiles) {
+      const auth = await resolveKbAuthContext(userId, task.userId);
+      if (!auth.canEdit()) {
+        return res.status(403).json({ message: 'Not authorized to modify this task' });
+      }
     }
 
     // File processor functions are imported at the top
@@ -1511,8 +1598,12 @@ router.delete('/:taskId/knowledge-base/files/:fileKey', authenticateToken, async
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
-      return res.status(403).json({ message: 'Not authorized to modify this task' });
+    const isAdminUserFileDelete = (req as AuthenticatedRequest).user?.isAdmin;
+    if (!isAdminUserFileDelete) {
+      const auth = await resolveKbAuthContext(userId, task.userId);
+      if (!auth.canEdit()) {
+        return res.status(403).json({ message: 'Not authorized to modify this task' });
+      }
     }
 
     // Decode the file key (it's URL encoded)
@@ -1572,7 +1663,8 @@ router.delete('/:taskId/knowledge-base/files/:fileKey', authenticateToken, async
   }
 });
 
-// Delete knowledge base endpoint
+// Delete knowledge base endpoint (clear entire KB content)
+// Access: owner OR org admin (orgRole==="owner") only. Editors CANNOT wipe a foreign KB.
 router.delete('/:taskId/knowledge-base', authenticateToken, async (req: Request, res: Response) => {
   try {
     const { taskId } = req.params;
@@ -1587,8 +1679,17 @@ router.delete('/:taskId/knowledge-base', authenticateToken, async (req: Request,
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
-      return res.status(403).json({ message: 'Not authorized to modify this task' });
+    const isAdminUser = (req as AuthenticatedRequest).user?.isAdmin;
+    if (!isAdminUser) {
+      // Only the task owner or an org admin (orgRole==="owner") may clear the KB.
+      // Editors can upload/edit files but cannot wipe the entire KB.
+      if (task.userId !== userId) {
+        const auth = await resolveKbAuthContext(userId, task.userId);
+        const callerOrgRole = auth.caller?.orgRole;
+        if (!auth.canView() || callerOrgRole !== 'owner') {
+          return res.status(403).json({ message: 'Not authorized to modify this task' });
+        }
+      }
     }
 
     if (!task.knowledgeBaseType) {
@@ -1643,9 +1744,13 @@ router.put('/:id/knowledge-base-type', authenticateToken, async (req: Request, r
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    // Check if user owns the task
-    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
-      return res.status(403).json({ message: 'Not authorized to modify this task' });
+    // Check if user owns the task (or is an org editor / admin)
+    const isAdminUserKbType = (req as AuthenticatedRequest).user?.isAdmin;
+    if (!isAdminUserKbType) {
+      const auth = await resolveKbAuthContext(userId, task.userId);
+      if (!auth.canEdit()) {
+        return res.status(403).json({ message: 'Not authorized to modify this task' });
+      }
     }
 
     // Only move files if type is actually changing
