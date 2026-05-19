@@ -227,8 +227,8 @@ interface User {
   lastActiveAt?: string;
   displayName?: string;
   supportNote?: string;
-  role?: "partner" | "customer" | "free"; // For single role from API
-  roles?: ("partner" | "customer" | "free")[];
+  role?: "partner" | "customer" | "free" | "contractor"; // For single role from API
+  roles?: ("partner" | "customer" | "free" | "contractor")[];
   taskCount?: number;
   workflowCount?: number;
   chatSessionCount?: number;
