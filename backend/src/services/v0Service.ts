@@ -516,11 +516,13 @@ async function addPageToExistingRepo(
 
   console.log(`[V0 SERVICE] Adding new page /${slug} to existing repo ${repoFullName} via v0 generation`);
 
-  // Use the existing page's deployed URL as the base
+  // Use the custom domain if available, otherwise the vercel deployed URL origin.
+  // customDomainUrl takes priority because it's the public-facing address.
   let baseUrl = `https://${repoName}.vercel.app`;
-  if (existingPage.deployedUrl) {
+  const urlForBase = existingPage.customDomainUrl || existingPage.deployedUrl;
+  if (urlForBase) {
     try {
-      const parsed = new URL(existingPage.deployedUrl);
+      const parsed = new URL(urlForBase);
       baseUrl = parsed.origin;
     } catch {
       // URL parse failed — fall back to repo-name-based URL

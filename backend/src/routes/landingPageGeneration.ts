@@ -473,7 +473,10 @@ router.get("/generated", async (req, res: Response) => {
           if (!page.customDomainUrl && page.vercelProjectId) {
             const domain = latestByProject.get(page.vercelProjectId);
             if (domain) {
-              page.customDomainUrl = `https://${domain.domain}`;
+              // Sub-pages have a slug and live at /{slug} under the custom domain
+              page.customDomainUrl = page.slug
+                ? `https://${domain.domain}/${page.slug}`
+                : `https://${domain.domain}`;
             }
           }
         }
