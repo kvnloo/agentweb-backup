@@ -507,6 +507,21 @@ createTestAccount().then(async () => {
         console.error('[dripWorker] Failed to initialize:', error);
       }
 
+      // LinkedIn Connection Sync — runs every 10 minutes
+      // Polls Unipile for accepted connections, upserts into AW-UnipileConnections cache,
+      // and activates any awaiting_connection drip enrollments.
+      try {
+        const { runLinkedInConnectionSync } = await import('./cron/linkedInConnectionSyncCron');
+        const LI_CONN_INTERVAL_MS = 10 * 60 * 1000;
+        runLinkedInConnectionSync().catch(e => console.error('[linkedInConnectionSync] Error on first run:', e));
+        setInterval(() => {
+          runLinkedInConnectionSync().catch(e => console.error('[linkedInConnectionSync] Error:', e));
+        }, LI_CONN_INTERVAL_MS);
+        console.log('[linkedInConnectionSync] Initialized — running every 10 minutes');
+      } catch (error) {
+        console.error('[linkedInConnectionSync] Failed to initialize:', error);
+      }
+
       // Onboarding stuck-user detector — DISABLED 2026-05-07. Was posting one
       // Notion oncall task per day grouped by stage. The cron itself is well-
       // designed but the broader telemetry pipeline (incl. per-event UI Error

@@ -1971,6 +1971,7 @@ const main = async () => {
     await createOAuthSessionsTable();
     await createDripSequencesTable();
     await createSequenceEnrollmentsTable();
+    await createUnipileConnectionsTable();
     await createDripCampaignsTable();
     await createDripSendsTable();
     await createEnrichmentHistoryTable();
@@ -2413,6 +2414,42 @@ const createCharactersTable = async () => {
         Projection: {
           ProjectionType: 'ALL',
         },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+const createUnipileConnectionsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-UnipileConnections`,
+    AttributeDefinitions: [
+      { AttributeName: 'accountId', AttributeType: 'S' },
+      { AttributeName: 'memberId', AttributeType: 'S' },
+      { AttributeName: 'publicProfileUrl', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'accountId', KeyType: 'HASH' },
+      { AttributeName: 'memberId', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'publicProfileUrl-index',
+        KeySchema: [
+          { AttributeName: 'publicProfileUrl', KeyType: 'HASH' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
       },
     ],
     BillingMode: 'PAY_PER_REQUEST',
