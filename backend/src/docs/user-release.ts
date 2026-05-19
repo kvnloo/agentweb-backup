@@ -81,6 +81,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-19',
     changes: [
+      'Fixed: Uploading an HTML File to Create a Landing Page Now Works',
+      '- Using the "Upload HTML" template option and clicking Generate previously failed with "Generation failed"',
+      '- Large HTML files were being sent verbatim to the AI generator, exceeding its prompt size limits',
+      '- Uploaded HTML is now condensed automatically (extracting design tokens, section structure, and layout patterns) before generation — matching how saved templates are handled',
+    ],
+  },
+  {
+    date: '2026-05-19',
+    changes: [
       'CRM: LinkedIn Connection Indicator on Leads',
       '- The LinkedIn icon on each lead now shows a green dot when that lead is a 1st-degree LinkedIn connection with your connected outreach account',
       '- Connection status is checked automatically after loading each lead list — no manual refresh needed',
