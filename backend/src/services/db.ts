@@ -5,6 +5,7 @@ import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
 import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey } from "../utils/leadSchema";
+import { mergeCustomFields } from "../utils/customFieldsGuard";
 import type { AttributionTouch } from "../types/attribution";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
@@ -5562,10 +5563,11 @@ export const crmDb = {
             // Only update if the merged result is different from existing
             if (existingStr !== mergedStr) {
               // Use the actual merged customFields (not normalized) for the update
-              const mergedCustomFields = {
-                ...existingCustomFields,
-                ...newCustomFields,
-              };
+              const mergedCustomFields = mergeCustomFields(
+                existingCustomFields,
+                newCustomFields,
+                { source: 'db.batchCreateLeads.merge', listId, leadId: existingLead.leadId },
+              );
               updates.customFields = mergedCustomFields;
               changed = true;
             }
