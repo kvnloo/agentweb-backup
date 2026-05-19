@@ -5,7 +5,7 @@ import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
 import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey } from "../utils/leadSchema";
-import { mergeCustomFields } from "../utils/customFieldsGuard";
+import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import type { AttributionTouch } from "../types/attribution";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
@@ -4332,7 +4332,7 @@ export const crmDb = {
         title: leadData.title || '',
         notes: leadData.notes || '',
         companyLinkedin: leadData.companyLinkedin?.trim() || '',
-        customFields: leadData.customFields || {},
+        customFields: sanitizeCustomFields(leadData.customFields, { source: 'db.createLead', listId }),
         engagements: [],
         isICP: 0,
         isEngaged: 0,
