@@ -300,18 +300,21 @@ export const getAccountsByUserIdIncludingOrgShared = async (userId: string): Pro
   }
 
   const ownAccounts = normalizeAccounts((user as User).connected_accounts);
+  console.log(`[getAccountsByUserIdIncludingOrgShared] userId=${userId} orgId=${(user as User).orgId} ownAccounts=${ownAccounts.length}`);
 
   if (!(user as User).orgId) {
     return ownAccounts;
   }
 
   const members = await orgDb.getOrgMembers((user as User).orgId!);
+  console.log(`[getAccountsByUserIdIncludingOrgShared] org members count=${members.length}`);
   const seen = new Set(ownAccounts.map(a => a.account_id));
   const sharedAccounts: ConnectedAccount[] = [];
 
   for (const member of members) {
     if (member.userId === userId) continue;
     const memberAccounts = normalizeAccounts(member.connected_accounts);
+    console.log(`[getAccountsByUserIdIncludingOrgShared] member=${member.userId} accounts=${memberAccounts.length} shared=${memberAccounts.filter(a => a.sharedWithOrg).map(a => a.account_id).join(',')}`);
     for (const account of memberAccounts) {
       if (account.sharedWithOrg && !seen.has(account.account_id)) {
         seen.add(account.account_id);
@@ -320,6 +323,7 @@ export const getAccountsByUserIdIncludingOrgShared = async (userId: string): Pro
     }
   }
 
+  console.log(`[getAccountsByUserIdIncludingOrgShared] returning total=${ownAccounts.length + sharedAccounts.length} (own=${ownAccounts.length} shared=${sharedAccounts.length})`);
   return [...ownAccounts, ...sharedAccounts];
 };
 

@@ -18,6 +18,7 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
 
   try {
     const accounts = await getAccountsByUserIdIncludingOrgShared(userId);
+    console.log(`[connected-accounts] userId=${userId} total accounts=${accounts.length} platforms=${accounts.map(a => a.platform).join(',')}`);
 
     // Check real connection status for Unipile accounts in a single paginated call
     const unipileAccountIds = accounts
