@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-18
+// Last updated: 2026-05-19
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,16 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-05-19',
+    changes: [
+      'New: Contractor Account Type',
+      '- Admins can now grant users the Contractor role from the Users tab in the Admin page',
+      '- A new Contractors tab in the Admin page lets admins assign specific customer accounts to each contractor',
+      '- Contractors can log in to the partner portal and access their assigned customer portals via the Contractor Accesses page',
+      '- Contractor portal sessions show a "Contractor View" indicator in the header (distinct from admin delegated access)',
+    ],
+  },
   {
     date: '2026-05-19',
     changes: [

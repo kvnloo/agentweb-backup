@@ -61,6 +61,7 @@ import FunnelTab from "../components/admin/FunnelTab";
 import AlertEmailsTab from "../components/admin/AlertEmailsTab";
 import OnboardingTab from "../components/admin/OnboardingTab";
 import ConnectedAccountsTab from "../components/admin/ConnectedAccountsTab";
+import ContractorsTab from "../components/admin/ContractorsTab";
 import {
   UserGrowthChart,
   TaskGrowthChart,
@@ -226,8 +227,8 @@ interface User {
   lastActiveAt?: string;
   displayName?: string;
   supportNote?: string;
-  role?: "partner" | "customer" | "free"; // For single role from API
-  roles?: ("partner" | "customer" | "free")[];
+  role?: "partner" | "customer" | "free" | "contractor"; // For single role from API
+  roles?: ("partner" | "customer" | "free" | "contractor")[];
   taskCount?: number;
   workflowCount?: number;
   chatSessionCount?: number;
@@ -720,6 +721,7 @@ export default function AdminDashboard() {
     'alert-emails': 19,
     'onboarding': 20,
     'connected-accounts': 21,
+    'contractors': 22,
   };
   
   // Get initial tab value from URL or default to Users
@@ -785,7 +787,7 @@ export default function AdminDashboard() {
   const [scoreOverrideReason, setScoreOverrideReason] = useState("");
   const [roleDialogOpen, setRoleDialogOpen] = useState(false);
   const [selectedUserRoles, setSelectedUserRoles] = useState<
-    ("partner" | "customer" | "free")[]
+    ("partner" | "customer" | "free" | "contractor")[]
   >([]);
   const [editingNoteEmail, setEditingNoteEmail] = useState<string | null>(null);
   const [currentNoteText, setCurrentNoteText] = useState("");
@@ -1946,7 +1948,7 @@ export default function AdminDashboard() {
     setChatDialogOpen(true);
   };
 
-  const handleRoleCheckboxChange = (role: "partner" | "customer" | "free") => {
+  const handleRoleCheckboxChange = (role: "partner" | "customer" | "free" | "contractor") => {
     setSelectedUserRoles((prevRoles) =>
       prevRoles.includes(role)
         ? prevRoles.filter((r) => r !== role)
@@ -3050,6 +3052,7 @@ export default function AdminDashboard() {
             <Tab label="Alert Emails" {...a11yProps(18)} />
             <Tab label="Onboarding" {...a11yProps(20)} />
             <Tab label="Connected Accounts" {...a11yProps(21)} />
+            <Tab label="Contractors" {...a11yProps(22)} />
           </Tabs>
         </Box>
 
@@ -6154,6 +6157,10 @@ export default function AdminDashboard() {
         <TabPanel value={tabValue} index={21}>
           <ConnectedAccountsTab />
         </TabPanel>
+
+        <TabPanel value={tabValue} index={22}>
+          <ContractorsTab />
+        </TabPanel>
       </Paper>
 
       {/* Satisfaction Score Override Popover */}
@@ -6314,6 +6321,16 @@ export default function AdminDashboard() {
               />
             }
             label="Free Access"
+          />
+          <FormControlLabel
+            control={
+              <Checkbox
+                checked={selectedUserRoles.includes("contractor")}
+                onChange={() => handleRoleCheckboxChange("contractor")}
+                name="contractorRole"
+              />
+            }
+            label="Contractor Access"
           />
         </DialogContent>
         <DialogActions>
