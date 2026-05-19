@@ -837,6 +837,68 @@ describe('runEnrichment — socket progress events', () => {
     expect(finalProgress.processedCount).toBe(2);
     expect(finalProgress.progress).toBe(100);
   });
+
+  it('progress message says "skipped" (not "failed") for identity-resolution failures, failedCount=0', async () => {
+    const socketEmit = jest.fn();
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      resolveIdentity: jest.fn().mockResolvedValue({ ok: false, reason: 'no_identity_signal' }),
+    });
+
+    await runEnrichment(makeInput(), deps, { userId: USER_ID, socketEmit });
+
+    const chunkProgress = socketEmit.mock.calls.filter(
+      ([, event, payload]) => event === 'crm-enrichment-progress' && payload.progress === 100,
+    );
+    expect(chunkProgress.length).toBeGreaterThanOrEqual(1);
+    const msg: string = chunkProgress[chunkProgress.length - 1][2].message;
+    expect(msg).toMatch(/skipped/i);
+    expect(msg).not.toMatch(/failed/i);
+    expect(chunkProgress[chunkProgress.length - 1][2].failedCount).toBe(0);
+  });
+
+  it('progress message says "failed" for hard failures (llmOrParse), failedCount=N', async () => {
+    const socketEmit = jest.fn();
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      resolveIdentity: jest.fn().mockRejectedValue(new Error('provider timeout')),
+    });
+
+    await runEnrichment(makeInput(), deps, { userId: USER_ID, socketEmit });
+
+    const chunkProgress = socketEmit.mock.calls.filter(
+      ([, event, payload]) => event === 'crm-enrichment-progress' && payload.progress === 100,
+    );
+    expect(chunkProgress.length).toBeGreaterThanOrEqual(1);
+    const payload = chunkProgress[chunkProgress.length - 1][2];
+    expect(payload.message).toMatch(/failed/i);
+    expect(payload.message).not.toMatch(/skipped/i);
+    expect(payload.failedCount).toBe(1);
+  });
+
+  it('progress message shows both "skipped" and "failed" when both categories present', async () => {
+    const socketEmit = jest.fn();
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([
+        makeLead({ leadId: 'lead-skip' }),
+        makeLead({ leadId: 'lead-fail' }),
+      ]),
+      resolveIdentity: jest.fn()
+        .mockResolvedValueOnce({ ok: false, reason: 'no_identity_signal' })
+        .mockRejectedValueOnce(new Error('provider timeout')),
+    });
+
+    await runEnrichment(makeInput(), deps, { userId: USER_ID, socketEmit });
+
+    const chunkProgress = socketEmit.mock.calls.filter(
+      ([, event, payload]) => event === 'crm-enrichment-progress' && payload.progress === 100,
+    );
+    expect(chunkProgress.length).toBeGreaterThanOrEqual(1);
+    const payload = chunkProgress[chunkProgress.length - 1][2];
+    expect(payload.message).toMatch(/skipped/i);
+    expect(payload.message).toMatch(/failed/i);
+    expect(payload.failedCount).toBe(1);
+  });
 });
 
 // ─── Smart fields ─────────────────────────────────────────────────────────────

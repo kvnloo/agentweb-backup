@@ -907,15 +907,18 @@ export async function runEnrichment(
     }
 
     const completedSoFar = Math.min(i + CONCURRENCY, leads.length);
-    const failedSoFar =
-      identityResolutionFailed + llmOrParseFailed + searchWebFailed + updateFailed;
+    const skippedSoFar = identityResolutionFailed;
+    const hardFailedSoFar = llmOrParseFailed + searchWebFailed + updateFailed;
+    const parts = [`${processed} enriched`];
+    if (skippedSoFar > 0) parts.push(`${skippedSoFar} skipped`);
+    if (hardFailedSoFar > 0) parts.push(`${hardFailedSoFar} failed`);
     emitToRooms(progressEvent, {
       runId,
       listId: input.listId,
-      message: `Enriching ${completedSoFar}/${leads.length} (${processed} enriched, ${failedSoFar} failed)`,
+      message: `Enriching ${completedSoFar}/${leads.length} (${parts.join(', ')})`,
       progress: leads.length === 0 ? 100 : Math.round((completedSoFar / leads.length) * 100),
       processedCount: processed,
-      failedCount: failedSoFar,
+      failedCount: hardFailedSoFar,
       totalToProcess: leads.length,
     });
   }
