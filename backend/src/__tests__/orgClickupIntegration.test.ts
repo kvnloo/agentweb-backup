@@ -76,14 +76,14 @@ const mockGetOrgSecret = jest.fn((_orgId: string, key: string) => {
 
 jest.mock("../services/db", () => ({
   userDb: {
-    getUserById: (...args: any[]) => mockGetUserById(...args),
-    updateUser: (...args: any[]) => mockUpdateUser(...args),
+    getUserById: mockGetUserById,
+    updateUser: mockUpdateUser,
   },
   orgDb: {
-    getOrgById: (...args: any[]) => mockGetOrgById(...args),
-    setOrgSecret: (...args: any[]) => mockSetOrgSecret(...args),
-    removeOrgSecret: (...args: any[]) => mockRemoveOrgSecret(...args),
-    getOrgSecret: (...args: any[]) => mockGetOrgSecret(...args),
+    getOrgById: mockGetOrgById,
+    setOrgSecret: mockSetOrgSecret,
+    removeOrgSecret: mockRemoveOrgSecret,
+    getOrgSecret: mockGetOrgSecret,
   },
 }));
 
@@ -96,8 +96,8 @@ const mockDecryptPassword = jest.fn((enc: string) => {
 });
 
 jest.mock("../utils/crypto", () => ({
-  encryptPassword: (...args: any[]) => mockEncryptPassword(...args),
-  decryptPassword: (...args: any[]) => mockDecryptPassword(...args),
+  encryptPassword: mockEncryptPassword,
+  decryptPassword: mockDecryptPassword,
 }));
 
 // ── ClickUp API mock ──────────────────────────────────────────────────────────
