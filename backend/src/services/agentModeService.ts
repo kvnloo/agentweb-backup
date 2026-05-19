@@ -13637,11 +13637,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return google.drive({ version: 'v3', auth });
   }
 
-  // Helper: get Google Drive shared folders for a user
+  // Helper: get Google Drive shared folders for a caller.
+  // If the caller belongs to an org, returns the org's folder list; otherwise the user's own list.
   private async getUserGoogleDriveFolders(userId: string): Promise<Array<{ folderId: string; name: string }>> {
-    const { userDb } = await import('./db');
+    const { userDb, orgDb } = await import('./db');
     const user = await userDb.getUserById(userId);
-    return user?.googleDriveFolders || [];
+    if (user?.orgId) {
+      const org = await orgDb.getOrgById(user.orgId);
+      return Array.isArray(org?.googleDriveFolders) ? org!.googleDriveFolders : [];
+    }
+    return Array.isArray(user?.googleDriveFolders) ? user!.googleDriveFolders : [];
   }
 
   public async searchKnowledgeBase(query: string, maxResults: number = 5, userId?: string): Promise<any> {
