@@ -7854,10 +7854,11 @@ export class AgentModeService {
 
       // Merge custom fields with existing ones
       if (Object.keys(customFieldUpdates).length > 0) {
-        dbUpdates.customFields = {
-          ...(lead.customFields || {}),
-          ...customFieldUpdates
-        };
+        dbUpdates.customFields = mergeCustomFields(
+          lead.customFields,
+          customFieldUpdates,
+          { source: 'agentMode.updateLead', listId, leadId },
+        );
       }
 
       // Auto-create status change engagement if status changed
