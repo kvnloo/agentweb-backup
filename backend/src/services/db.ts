@@ -5358,7 +5358,7 @@ export const crmDb = {
             title: lead.title || '',
             notes: lead.notes || '',
             companyLinkedin: lead.companyLinkedin?.trim() || '',
-            customFields: lead.customFields || {},
+            customFields: sanitizeCustomFields(lead.customFields, { source: 'db.batchCreateLeads.newLead', listId, leadId }),
             syncMetadata: lead.syncMetadata || {},
             engagements: [], // Initialize with empty array
             isICP: 0,
