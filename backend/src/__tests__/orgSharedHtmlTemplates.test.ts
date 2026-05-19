@@ -219,6 +219,50 @@ describe("GET /api/html-templates — org sharing", () => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────
+// GET /?type=… — filter by template type
+// ────────────────────────────────────────────────────────────────────────────
+describe("GET /api/html-templates — type filter", () => {
+  const emailTpl: any = { ...myTpl, template_id: "email-only", type: ["email"] };
+  const lpTpl:    any = { ...myTpl, template_id: "lp-only",    type: ["landing_page"] };
+  const bothTpl:  any = { ...myTpl, template_id: "both",       type: ["email", "landing_page"] };
+
+  beforeEach(() => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId }); // solo user — skip fanout
+    mockGetTemplatesByOwner.mockImplementation((uid: string) =>
+      uid === mockUserId ? Promise.resolve([emailTpl, lpTpl, bothTpl]) : Promise.resolve([]),
+    );
+    mockGetPublicTemplates.mockResolvedValue([]);
+  });
+
+  it("returns only email-typed templates when ?type=email", async () => {
+    const res = await request(app).get("/api/html-templates?type=email");
+    expect(res.status).toBe(200);
+    const ids = res.body.items.map((t: any) => t.template_id).sort();
+    expect(ids).toEqual(["both", "email-only"]);
+  });
+
+  it("returns only landing_page-typed templates when ?type=landing_page", async () => {
+    const res = await request(app).get("/api/html-templates?type=landing_page");
+    expect(res.status).toBe(200);
+    const ids = res.body.items.map((t: any) => t.template_id).sort();
+    expect(ids).toEqual(["both", "lp-only"]);
+  });
+
+  it("returns an empty list when ?type=<unknown>", async () => {
+    const res = await request(app).get("/api/html-templates?type=bogus");
+    expect(res.status).toBe(200);
+    expect(res.body.items).toEqual([]);
+  });
+
+  it("returns all templates when no ?type is provided", async () => {
+    const res = await request(app).get("/api/html-templates");
+    expect(res.status).toBe(200);
+    const ids = res.body.items.map((t: any) => t.template_id).sort();
+    expect(ids).toEqual(["both", "email-only", "lp-only"]);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
 // POST / — create template
 // ────────────────────────────────────────────────────────────────────────────
 describe("POST /api/html-templates — create", () => {
