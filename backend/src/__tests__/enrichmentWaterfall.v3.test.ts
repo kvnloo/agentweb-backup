@@ -979,10 +979,10 @@ describe('runWaterfall — Tier 3.5c (Unipile person enrichment)', () => {
     education: [{ school: 'MIT', degree: 'MBA' }],
   };
 
-  it('fires for person group when Apollo misses fields; direct-maps known fields', async () => {
+  it('fires for person group when Apollo misses fields; direct-maps root-level fields', async () => {
     const deps = makeDeps({
       findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null, personProfileRaw }),
-      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: {}, missing: [] }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: { title: 'VP Marketing' }, missing: [] }),
     });
     const result = await runWaterfall(
       makeInput({
@@ -993,11 +993,13 @@ describe('runWaterfall — Tier 3.5c (Unipile person enrichment)', () => {
       deps,
     );
 
+    // Root-level fields direct-mapped
     expect(result.fields.find(f => f.field === 'first_name')?.value).toBe('Jane');
     expect(result.fields.find(f => f.field === 'last_name')?.value).toBe('Doe');
-    expect(result.fields.find(f => f.field === 'title')?.value).toBe('VP Marketing');
     expect(result.fields.find(f => f.field === 'location')?.value).toBe('San Francisco, California, United States');
     expect(result.fields.find(f => f.field === 'linkedin_url')?.value).toBe('https://www.linkedin.com/in/jane-doe-acme');
+    // title is job-dependent — comes from LLM
+    expect(result.fields.find(f => f.field === 'title')?.value).toBe('VP Marketing');
     expect(result.fields.every(f => f.meta.source === 'api' && f.meta.provider === 'unipile')).toBe(true);
   });
 
@@ -1065,33 +1067,41 @@ describe('runWaterfall — Tier 3.5c (Unipile person enrichment)', () => {
     }
   });
 
-  it('maps tenure_at_company and prior_companies for person_career group', async () => {
-    jest.setSystemTime(new Date('2026-01-01T00:00:00.000Z').getTime());
+  it('delegates job-dependent career fields to LLM for person_career group', async () => {
     const deps = makeDeps({
       findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null, personProfileRaw }),
-      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: {}, missing: [] }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({
+        filled: { tenure_at_company: '2y 0m', prior_companies: 'OldCo', education: 'MIT, MBA' },
+        missing: [],
+      }),
     });
     const result = await runWaterfall(
       makeInput({ groupName: 'person_career', requestedFields: ['tenure_at_company', 'prior_companies', 'education'] }),
       deps,
     );
 
+    // All career fields come from LLM (full raw profile passed as context)
+    expect(deps.extractFieldsViaLLM).toHaveBeenCalled();
+    const llmFields = (deps.extractFieldsViaLLM as jest.Mock).mock.calls[0][0].fields;
+    expect(llmFields).toContain('tenure_at_company');
+    expect(llmFields).toContain('prior_companies');
+    expect(llmFields).toContain('education');
+    expect(result.fields.find(f => f.field === 'tenure_at_company')?.value).toBe('2y 0m');
     expect(result.fields.find(f => f.field === 'prior_companies')?.value).toBe('OldCo');
     expect(result.fields.find(f => f.field === 'education')?.value).toBe('MIT, MBA');
-    expect(result.fields.find(f => f.field === 'tenure_at_company')?.value).toBeDefined();
   });
 
-  it('smart company match — picks correct job when multiple concurrent roles', async () => {
+  it('passes full raw profile to LLM so it can pick the correct job among multiple concurrent roles', async () => {
     const multiJobProfile = {
       ...personProfileRaw,
       work_experience: [
-        { company: 'SideProject', position: 'Advisor', start: '1/1/2024', end: null, company_id: '333' },
-        { company: 'Acme', position: 'VP Marketing', start: '1/1/2023', end: null, company_id: '111' },
+        { company: 'SideProject', position: 'Advisor', start: '1/1/2024', end: null },
+        { company: 'Acme', position: 'VP Marketing', start: '1/1/2023', end: null },
       ],
     };
     const deps = makeDeps({
       findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null, personProfileRaw: multiJobProfile }),
-      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: {}, missing: [] }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: { title: 'VP Marketing' }, missing: [] }),
     });
     const result = await runWaterfall(
       makeInput({
@@ -1102,6 +1112,10 @@ describe('runWaterfall — Tier 3.5c (Unipile person enrichment)', () => {
       deps,
     );
 
+    // LLM receives full profile JSON — it picks the correct job entry using lead.company context
+    const llmCall = (deps.extractFieldsViaLLM as jest.Mock).mock.calls[0][0];
+    expect(llmCall.sourceContext).toContain('SideProject');
+    expect(llmCall.sourceContext).toContain('Acme');
     expect(result.fields.find(f => f.field === 'title')?.value).toBe('VP Marketing');
   });
 
@@ -1131,16 +1145,17 @@ describe('runWaterfall — Tier 3.5c (Unipile person enrichment)', () => {
     expect(result.missing).toContain('first_name');
   });
 
-  it('maps recent_role_change_date from current work_experience start', async () => {
+  it('delegates recent_role_change_date to LLM (job-dependent field)', async () => {
     const deps = makeDeps({
       findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null, personProfileRaw }),
-      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: {}, missing: [] }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: { recent_role_change_date: '1/1/2023' }, missing: [] }),
     });
     const result = await runWaterfall(
       makeInput({ groupName: 'person_career', requestedFields: ['recent_role_change_date'] }),
       deps,
     );
 
+    expect(deps.extractFieldsViaLLM).toHaveBeenCalled();
     expect(result.fields.find(f => f.field === 'recent_role_change_date')?.value).toBe('1/1/2023');
   });
 
@@ -1184,15 +1199,15 @@ describe('runWaterfall — Tier 3.5c (Unipile person enrichment)', () => {
 // ─── UNIPILE_PERSON_COVERAGE map ──────────────────────────────────────────────
 
 describe('UNIPILE_PERSON_COVERAGE', () => {
-  it('covers identity fields', () => {
+  it('covers root-level identity fields only (job-dependent fields delegated to LLM)', () => {
     expect(UNIPILE_PERSON_COVERAGE.person_identity).toEqual(
-      expect.arrayContaining(['first_name', 'last_name', 'title', 'location', 'linkedin_url']),
+      expect.arrayContaining(['first_name', 'last_name', 'location', 'linkedin_url']),
     );
+    // title is job-dependent — must NOT be in direct-map coverage
+    expect(UNIPILE_PERSON_COVERAGE.person_identity).not.toContain('title');
   });
 
-  it('covers career fields', () => {
-    expect(UNIPILE_PERSON_COVERAGE.person_career).toEqual(
-      expect.arrayContaining(['tenure_at_company', 'prior_companies', 'education', 'recent_role_change_date']),
-    );
+  it('person_career has no direct-map entry — all career fields go to LLM', () => {
+    expect(UNIPILE_PERSON_COVERAGE.person_career).toBeUndefined();
   });
 });
