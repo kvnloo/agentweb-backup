@@ -11,9 +11,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-19',
     changes: [
-      'Fixed: Fathom Connection Status Now Consistent on Connected Accounts Page',
-      '- The top summary card and the detailed account list now both reflect the same live connection status for Fathom',
-      '- Previously, the top card could show "Connected" while the bottom list showed "Disconnected" when a Fathom token was revoked server-side',
+      'Fixed: Fathom No Longer Shows "Disconnected" Due to Temporary API Errors',
+      '- Fathom accounts were incorrectly shown as "Disconnected" when the Fathom API was temporarily unavailable or slow',
+      '- The connection status check now only marks an account as disconnected on definitive auth failures (invalid/revoked token), not on network errors or server issues',
+      '- A 5-second timeout prevents the Connected Accounts page from hanging when Fathom is slow to respond',
     ],
   },
   {
