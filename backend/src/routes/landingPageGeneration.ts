@@ -16,6 +16,7 @@ import {
   deleteLandingPageByRecord,
   updateLandingPageGtm,
   BrandContext,
+  GeneratedLandingPage,
   getDeploymentStatus,
   getPreviewDeploymentUrl,
   triggerVercelDeployment,
@@ -27,7 +28,7 @@ import {
   updateLandingPageContext,
   INTEGRATIONS,
 } from "../services/v0Service";
-import { canEditItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
+import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { listDomains, CustomDomainRecord } from "../services/customDomainService";
 
 const router = Router();
@@ -50,6 +51,55 @@ const VALID_BRANCH_RE = /^draft\/[a-zA-Z0-9_-]{8,64}$/;
 
 function validateBranchName(branch: string): boolean {
   return branch === "main" || VALID_BRANCH_RE.test(branch);
+}
+
+/**
+ * Fetch a landing page and authorize the caller for view or edit.
+ * Owner always passes. Otherwise checks shareSettings.landingPages via
+ * canViewItem (read endpoints) or canEditItem (write endpoints), which
+ * permits editors listed in shareSettings.landingPages.editors and the
+ * org owner. Editors are still denied delete elsewhere (owner-only).
+ *
+ * On non-owner view denial we return 404 (not 403) to avoid leaking
+ * existence of pages outside the caller's scope.
+ */
+async function authorizeLandingPageAccess(
+  pageId: string,
+  callerUserId: string,
+  mode: "view" | "edit",
+): Promise<
+  | { ok: true; page: GeneratedLandingPage }
+  | { ok: false; status: number; error: string }
+> {
+  const page = await getLandingPageById(pageId);
+  if (!page) return { ok: false, status: 404, error: "Landing page not found" };
+  if (page.userId === callerUserId) return { ok: true, page };
+
+  const [user, pageOwner] = await Promise.all([
+    userDb.getUserById(callerUserId),
+    userDb.getUserById(page.userId),
+  ]);
+  const ownerOrgId = pageOwner?.orgId;
+  const org =
+    user?.orgId && user.orgId === ownerOrgId
+      ? await orgDb.getOrgById(user.orgId)
+      : null;
+  const callerLike = {
+    userId: callerUserId,
+    orgId: user?.orgId,
+    orgRole: user?.orgRole as "owner" | "member" | undefined,
+  };
+  const itemLike = { userId: page.userId };
+  const allowed =
+    mode === "edit"
+      ? canEditItem(itemLike, callerLike, org, ownerOrgId, "landingPages")
+      : canViewItem(itemLike, callerLike, org, ownerOrgId, "landingPages");
+  if (!allowed) {
+    return mode === "edit"
+      ? { ok: false, status: 403, error: "Not authorized to edit this landing page" }
+      : { ok: false, status: 404, error: "Landing page not found" };
+  }
+  return { ok: true, page };
 }
 
 /**
@@ -328,8 +378,10 @@ router.post("/generated/:id/deploy", rateLimiter, async (req, res: Response) => 
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const { id } = req.params;
-    const result = await deployLandingPage(id, userId);
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+
+    const result = await deployLandingPage(auth.page.id, auth.page.userId);
     res.json(result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error deploying:", error);
@@ -349,7 +401,6 @@ router.post("/generated/:id/iterate", rateLimiter, async (req, res: Response) =>
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const { id } = req.params;
     const { message } = req.body;
     if (!message || typeof message !== "string") {
       return res.status(400).json({ error: "message is required and must be a string" });
@@ -359,7 +410,10 @@ router.post("/generated/:id/iterate", rateLimiter, async (req, res: Response) =>
       return res.status(400).json({ error: `message must not exceed ${MAX_INPUT_LENGTH} characters` });
     }
 
-    const result = await iterateLandingPage(id, userId, message);
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+
+    const result = await iterateLandingPage(auth.page.id, auth.page.userId, message);
     res.json(result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error iterating:", error);
@@ -446,12 +500,10 @@ router.get("/generated/:id", async (req, res: Response) => {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const page = await getLandingPage(req.params.id, userId);
-    if (!page) {
-      return res.status(404).json({ error: "Landing page not found" });
-    }
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "view");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
 
-    res.json(page);
+    res.json(auth.page);
   } catch (error) {
     console.error("[LP GENERATION] Error getting page:", error);
     res.status(500).json({ error: "Failed to get landing page" });
@@ -512,10 +564,9 @@ router.post("/generated/:id/duplicate", async (req, res: Response) => {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const original = await getLandingPage(req.params.id, userId);
-    if (!original) {
-      return res.status(404).json({ error: "Landing page not found" });
-    }
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "view");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const original = auth.page;
 
     const { name } = req.body;
     const newName = name || `${original.name} (copy)`;
@@ -575,10 +626,9 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const page = await getLandingPage(req.params.id, userId);
-    if (!page) {
-      return res.status(404).json({ error: "Landing page not found" });
-    }
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const page = auth.page;
 
     if (!page.githubRepoUrl) {
       return res.status(400).json({ error: "Landing page has no GitHub repository" });
@@ -787,7 +837,10 @@ router.get("/generated/:id/deployment-status", async (req, res: Response) => {
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const result = await getDeploymentStatus(req.params.id, userId);
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "view");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+
+    const result = await getDeploymentStatus(auth.page.id, auth.page.userId);
     res.json(result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error checking deployment status:", error);
@@ -804,8 +857,9 @@ router.get("/generated/:id/files", async (req, res: Response) => {
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const page = await getLandingPage(req.params.id, userId);
-    if (!page) return res.status(404).json({ error: "Landing page not found" });
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "view");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const page = auth.page;
     if (!page.githubRepoUrl) return res.status(400).json({ error: "No GitHub repository" });
 
     const match = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
@@ -861,8 +915,9 @@ router.get("/generated/:id/file-content", async (req, res: Response) => {
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const page = await getLandingPage(req.params.id, userId);
-    if (!page) return res.status(404).json({ error: "Landing page not found" });
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "view");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const page = auth.page;
     if (!page.githubRepoUrl) return res.status(400).json({ error: "No GitHub repository" });
 
     const filePath = req.query.path as string;
@@ -923,8 +978,9 @@ router.get("/generated/:id/commits", async (req, res: Response) => {
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const page = await getLandingPage(req.params.id, userId);
-    if (!page) return res.status(404).json({ error: "Landing page not found" });
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "view");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const page = auth.page;
     if (!page.githubRepoUrl) return res.status(400).json({ error: "No GitHub repository" });
 
     const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
@@ -1000,8 +1056,9 @@ router.get("/generated/:id/file-at-commit", async (req, res: Response) => {
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const page = await getLandingPage(req.params.id, userId);
-    if (!page) return res.status(404).json({ error: "Landing page not found" });
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "view");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const page = auth.page;
     if (!page.githubRepoUrl) return res.status(400).json({ error: "No GitHub repository" });
 
     const filePath = req.query.path as string;
@@ -1053,8 +1110,9 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const page = await getLandingPage(req.params.id, userId);
-    if (!page) return res.status(404).json({ error: "Landing page not found" });
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const page = auth.page;
     if (!page.githubRepoUrl) return res.status(400).json({ error: "No GitHub repository" });
 
     const { branch } = req.body;
@@ -1151,8 +1209,9 @@ router.post("/generated/:id/gtm", editRateLimiter, async (req, res: Response) =>
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const page = await getLandingPage(req.params.id, userId);
-    if (!page) return res.status(404).json({ error: "Landing page not found" });
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const page = auth.page;
     if (!page.githubRepoUrl) return res.status(400).json({ error: "Landing page has no GitHub repository" });
 
     const { gtmContainerId } = req.body as { gtmContainerId?: string };
@@ -1244,7 +1303,7 @@ router.post("/generated/:id/gtm", editRateLimiter, async (req, res: Response) =>
     );
 
     // 5. Persist gtmContainerId in DynamoDB
-    await updateLandingPageGtm(page.id, userId, containerId);
+    await updateLandingPageGtm(page.id, page.userId, containerId);
 
     // Trigger Vercel re-deploy if we have a project ID
     const vercelProjectId = await resolveVercelProjectId(page);
@@ -1272,8 +1331,9 @@ router.get("/generated/:id/preview-url", async (req, res: Response) => {
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const page = await getLandingPage(req.params.id, userId);
-    if (!page) return res.status(404).json({ error: "Landing page not found" });
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "view");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const page = auth.page;
 
     const vercelProjectId = await resolveVercelProjectId(page);
     if (!vercelProjectId) return res.status(400).json({ error: "No Vercel project" });
@@ -1304,8 +1364,9 @@ router.get("/generated/:id/integrations", editRateLimiter, async (req: Request, 
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const page = await getLandingPage(req.params.id, userId);
-    if (!page) return res.status(404).json({ error: "Landing page not found" });
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "view");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const page = auth.page;
 
     const vercelProjectId = await resolveVercelProjectId(page);
     if (!vercelProjectId) {
@@ -1348,8 +1409,9 @@ router.put("/generated/:id/integrations", editRateLimiter, async (req: Request, 
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const page = await getLandingPage(req.params.id, userId);
-    if (!page) return res.status(404).json({ error: "Landing page not found" });
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const page = auth.page;
 
     const vercelProjectId = await resolveVercelProjectId(page);
     if (!vercelProjectId) {
