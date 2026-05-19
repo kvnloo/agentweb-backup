@@ -114,8 +114,35 @@ emmaToolRegistry.register({
     const { skillService } = await import('../services/skillService');
     const { getAllowedSkills } = await import('../services/subscriptionService');
 
+    // Best-effort user + org lookup. Powers two things:
+    //  (1) Org-shared skill fanout — only when `shareSettings.skills` is
+    //      effectively enabled for this caller (plain members need
+    //      enabled=true; editors and the org owner always get fanout).
+    //  (2) The admin virtual-skill check below.
+    // If any lookup fails, fall back to non-org behavior — published + own
+    // skills still list.
+    let currentUser: any = null;
+    let userOrgId: string | undefined;
+    try {
+      const { userDb, orgDb } = await import('../services/db');
+      const { isFeatureEffectivelyEnabled } = await import('../services/orgShareService');
+      currentUser = await userDb.getUserById(userId);
+      const candidateOrgId = currentUser?.orgId;
+      if (candidateOrgId) {
+        const org = await orgDb.getOrgById(candidateOrgId);
+        const effectivelyEnabled = isFeatureEffectivelyEnabled(
+          { userId, orgId: candidateOrgId, orgRole: currentUser?.orgRole },
+          org,
+          'skills',
+        );
+        if (effectivelyEnabled) userOrgId = candidateOrgId;
+      }
+    } catch {
+      // best-effort: degrade to non-org behavior
+    }
+
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-      skillService.getSkillsAvailableToUser(userId),
+      skillService.getSkillsAvailableToUser(userId, userOrgId),
       getAllowedSkills(userId)
     ]);
 
@@ -147,24 +174,20 @@ emmaToolRegistry.register({
       });
     }
 
-    // Add __admin_tools__ virtual skill for admin users or admin delegated access
-    try {
-      const { userDb } = await import('../services/db');
-      const currentUser = await userDb.getUserById(userId);
-      const hasAdminAccess = currentUser?.isAdmin === true || context?.isDelegatedAdmin === true;
-      if (hasAdminAccess) {
-        const { agentModeService } = await import('../services/agentModeService');
-        const adminToolNamesList = agentModeService.getAdminToolNames();
-        availableSkills.push({
-          skillId: '__admin_tools__',
-          name: 'Admin Tools',
-          description: 'Admin-only tools: manage predefined work plans, skill definitions, chat history, and client health assessment. WARNING: These tools modify production configuration — use with extra care.',
-          toolNames: adminToolNamesList,
-          toolCount: adminToolNamesList.length
-        });
-      }
-    } catch {
-      // Skip admin tools if user lookup fails
+    // Add __admin_tools__ virtual skill for admin users or admin delegated access.
+    // Reuses currentUser from the lookup above; if that lookup failed, currentUser
+    // is null and admin tools are skipped (unless delegated-admin context says otherwise).
+    const hasAdminAccess = currentUser?.isAdmin === true || context?.isDelegatedAdmin === true;
+    if (hasAdminAccess) {
+      const { agentModeService } = await import('../services/agentModeService');
+      const adminToolNamesList = agentModeService.getAdminToolNames();
+      availableSkills.push({
+        skillId: '__admin_tools__',
+        name: 'Admin Tools',
+        description: 'Admin-only tools: manage predefined work plans, skill definitions, chat history, and client health assessment. WARNING: These tools modify production configuration — use with extra care.',
+        toolNames: adminToolNamesList,
+        toolCount: adminToolNamesList.length
+      });
     }
 
     return {

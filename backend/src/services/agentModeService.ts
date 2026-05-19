@@ -2886,11 +2886,25 @@ export class AgentModeService {
 
   public async listSkills(userId: string, sessionId: string): Promise<any> {
     try {
+      // Best-effort org fanout: only attach orgId when `shareSettings.skills`
+      // is effectively enabled for this caller (plain members need
+      // enabled=true; editors and the org owner always get fanout). Any
+      // lookup failure degrades to non-org behavior.
       let sessionUserOrgId: string | undefined;
       try {
-        const { userDb: uDb } = await import('./db');
+        const { userDb: uDb, orgDb } = await import('./db');
+        const { isFeatureEffectivelyEnabled } = await import('./orgShareService');
         const sessionUser = await uDb.getUserById(userId);
-        sessionUserOrgId = sessionUser?.orgId;
+        const candidateOrgId = sessionUser?.orgId;
+        if (candidateOrgId) {
+          const org = await orgDb.getOrgById(candidateOrgId);
+          const effectivelyEnabled = isFeatureEffectivelyEnabled(
+            { userId, orgId: candidateOrgId, orgRole: sessionUser?.orgRole },
+            org,
+            'skills',
+          );
+          if (effectivelyEnabled) sessionUserOrgId = candidateOrgId;
+        }
       } catch { /* skip — org-sharing is best-effort */ }
       const publishedSkills = await skillService.getSkillsAvailableToUser(userId, sessionUserOrgId);
 
