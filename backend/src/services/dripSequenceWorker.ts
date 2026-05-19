@@ -201,6 +201,14 @@ async function sendLinkedInStep(
 
   await linkedInOutreachService.sendMessage(accountId, linkedInUrl, true, messageText);
   console.log(`[dripWorker] Sent LinkedIn step ${step.stepNumber} to ${linkedInUrl} (account: ${accountId})`);
+
+  // Cache the provider_id so reply-exit checks don't need to re-resolve the URL
+  if (!enrollment.linkedInProviderId) {
+    try {
+      const providerId = await linkedInOutreachService.resolveProviderId(linkedInUrl, true, accountId);
+      if (providerId) await dripSequenceDb.setEnrollmentLinkedInProviderId(enrollment.enrollmentId, providerId);
+    } catch { /* non-critical */ }
+  }
 }
 
 async function checkExitConditions(
@@ -239,6 +247,34 @@ async function checkExitConditions(
       return false;
     });
     if (engaged) return 'engagement';
+  }
+
+  // Check LinkedIn reply exit — fetch messages and look for inbound after enrollment
+  if (exitConditions.onLinkedInReply) {
+    const linkedInUrl = lead?.linkedin?.trim() || enrollment.leadEmail;
+    if (linkedInUrl?.includes('linkedin.com')) {
+      try {
+        const accountId = await linkedInOutreachService.resolveAccountId(enrollment.userId);
+        if (accountId) {
+          const providerId = enrollment.linkedInProviderId
+            || await linkedInOutreachService.resolveProviderId(linkedInUrl, true, accountId).catch(() => null);
+          if (providerId) {
+            const messages = await linkedInOutreachService.getMessagesWithContact(providerId, accountId);
+            const enrolledAt = new Date(enrollment.enrolledAt).getTime();
+            const hasReply = messages.some(
+              (m) => m.is_sender === 0 && new Date(m.timestamp).getTime() > enrolledAt,
+            );
+            if (hasReply) {
+              console.log(`[dripWorker] Enrollment ${enrollment.enrollmentId} exited: LinkedIn reply detected from ${linkedInUrl}`);
+              return 'engagement';
+            }
+          }
+        }
+      } catch (err) {
+        console.error(`[dripWorker] LinkedIn reply check failed for enrollment ${enrollment.enrollmentId}:`, err);
+        // Don't exit on error — fail open (continue sending)
+      }
+    }
   }
 
   return null;

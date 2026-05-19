@@ -52,7 +52,8 @@ export type SequenceStatus = 'draft' | 'active' | 'paused' | 'archived';
 export type EnrollmentTriggerType =
   | 'manual'
   | 'lifecycle_change'
-  | 'list_membership';
+  | 'list_membership'
+  | 'linkedin_connection_accepted';
 
 export type LeadLifecycle =
   | 'unknown'
@@ -127,6 +128,7 @@ export interface DripSequence {
   exitConditions: {
     onLifecycleChange?: LeadLifecycle[];        // exit when lead reaches these stages
     onEmailEngagement?: EmailEngagementEvent[];  // exit on engagement events
+    onLinkedInReply?: boolean;                   // exit when lead replies to any LinkedIn message
     onUnsubscribe: boolean;                      // always enforced
   };
 
@@ -179,6 +181,8 @@ export interface SequenceEnrollment {
   status: EnrollmentStatus;
   exitReason?: ExitReason;
 
+  linkedInProviderId?: string;       // Unipile provider_id of the lead; cached on first LinkedIn step send
+
   enrolledAt: string;
   lastEmailSentAt?: string;
   lastLinkedInSentAt?: string;
@@ -191,7 +195,7 @@ export interface CreateEnrollmentInput {
   listId: string;
   leadId: string;
   leadEmail: string;
-  startAt?: string;   // override first send time; defaults to now
+  startAt?: string;            // override first send time; defaults to now
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -359,6 +363,7 @@ async function deleteSequence(sequenceId: string, userId: string): Promise<void>
 // ─── Enrollments ─────────────────────────────────────────────────────────────
 
 async function enrollLead(input: CreateEnrollmentInput): Promise<SequenceEnrollment> {
+  const ts = now();
   const enrollment: SequenceEnrollment = {
     enrollmentId: generateEnrollmentId(),
     sequenceId: input.sequenceId,
@@ -367,9 +372,9 @@ async function enrollLead(input: CreateEnrollmentInput): Promise<SequenceEnrollm
     leadId: input.leadId,
     leadEmail: input.leadEmail,
     currentStep: 0,
-    nextSendAt: input.startAt ?? now(),
+    nextSendAt: input.startAt ?? ts,
     status: 'active',
-    enrolledAt: now(),
+    enrolledAt: ts,
   };
 
   await dynamodb.put({
@@ -572,6 +577,19 @@ async function getEnrollmentStats(sequenceId: string): Promise<{
 }
 
 /**
+ * Store the Unipile provider_id on an enrollment once it is first resolved
+ * (on connection invite send or first LinkedIn message send).
+ */
+async function setEnrollmentLinkedInProviderId(enrollmentId: string, linkedInProviderId: string): Promise<void> {
+  await dynamodb.update({
+    TableName: ENROLLMENTS_TABLE,
+    Key: { enrollmentId },
+    UpdateExpression: 'SET linkedInProviderId = :pid',
+    ExpressionAttributeValues: { ':pid': linkedInProviderId },
+  }).promise();
+}
+
+/**
  * Returns all active sequences for a user that have autoEnrollListIds containing listId.
  * Called when a new lead is added to a list to auto-enroll them.
  */
@@ -583,6 +601,17 @@ async function getSequencesByAutoEnrollList(userId: string, listId: string): Pro
       Array.isArray(s.autoEnrollListIds) &&
       s.autoEnrollListIds.includes(listId),
   );
+}
+
+/** Scan for all active sequences with a specific enrollmentTrigger.type across all users. */
+async function getAllSequencesByTriggerType(triggerType: EnrollmentTriggerType): Promise<DripSequence[]> {
+  const result = await dynamodb.scan({
+    TableName: SEQUENCES_TABLE,
+    FilterExpression: '#status = :active AND enrollmentTrigger.#type = :trigger',
+    ExpressionAttributeNames: { '#status': 'status', '#type': 'type' },
+    ExpressionAttributeValues: { ':active': 'active', ':trigger': triggerType },
+  }).promise();
+  return (result.Items ?? []) as DripSequence[];
 }
 
 // ─── Error classes ────────────────────────────────────────────────────────────
@@ -611,6 +640,7 @@ export const dripSequenceDb = {
   updateSequence,
   deleteSequence,
   getSequencesByAutoEnrollList,
+  getAllSequencesByTriggerType,
 
   // Enrollments
   enrollLead,
@@ -621,6 +651,7 @@ export const dripSequenceDb = {
   listEnrollmentsForSequence,
   getDueEnrollments,
   getAllDueEnrollments,
+  setEnrollmentLinkedInProviderId,
   advanceEnrollment,
   completeEnrollment,
   exitEnrollment,

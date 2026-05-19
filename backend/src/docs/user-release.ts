@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-18
+// Last updated: 2026-05-19
 
 export interface UserReleaseNote {
   date: string;
@@ -11,6 +11,33 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-19',
     changes: [
+      'New: Contractor Account Type',
+      '- Admins can now grant users the Contractor role from the Users tab in the Admin page',
+      '- A new Contractors tab in the Admin page lets admins assign specific customer accounts to each contractor',
+      '- Contractors can log in to the partner portal and access their assigned customer portals via the Contractor Accesses page',
+      '- Contractor portal sessions show a "Contractor View" indicator in the header (distinct from admin delegated access)',
+    ],
+  },
+  {
+    date: '2026-05-19',
+    changes: [
+      'Fixed: Social Media Posts and Bug Reports Now Work Correctly with Gemini Models',
+      '- Social media posts created by Gemini-powered sessions were rendering as blank (undefined content and platform labels) in the generated HTML',
+      '- Bug reports submitted via Gemini sessions were failing with a Notion API error because issue fields were undefined',
+      '- Both tools now correctly handle Gemini\'s behavior of serializing array items as JSON strings instead of objects',
+    ],
+  },
+  {
+    date: '2026-05-19',
+    changes: [
+      'CRM: LinkedIn Connection Indicator on Leads',
+      '- The LinkedIn icon on each lead now shows a green dot when that lead is a 1st-degree LinkedIn connection with your connected outreach account',
+      '- Connection status is checked automatically after loading each lead list — no manual refresh needed',
+      '- Hover the icon to see "LinkedIn — 1st-degree connection" tooltip',
+      'Drip Sequences: LinkedIn Auto-Enroll and Exit Conditions',
+      '- New sequence setting: "Auto-enroll when lead accepts LinkedIn invite" — leads are automatically enrolled into the sequence when they accept your LinkedIn connection request (checked every 10 minutes)',
+      '- New exit condition: "Exit when lead replies on LinkedIn" — the sequence stops sending to a lead as soon as they reply to any LinkedIn message',
+      '- LinkedIn connection data is cached in a dedicated store, enabling fast lookups and supporting future features without touching lead records',
       'Improved: Research Reports Page Loads Faster for Large Accounts',
       '- The Reports page previously froze or timed out for accounts with hundreds of reports and sessions',
       '- Reports now load progressively — the first 30 appear immediately, with more loading automatically as you scroll',

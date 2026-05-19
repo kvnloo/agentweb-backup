@@ -1,0 +1,117 @@
+/**
+ * AW-UnipileConnections — cache of all LinkedIn 1st-degree connections per Unipile account.
+ *
+ * Table schema:
+ *   PK: accountId       (Unipile account ID)
+ *   SK: memberId        (LinkedIn member_id — stable, unlike public URLs)
+ *
+ *   GSI: publicProfileUrl-index
+ *     PK: publicProfileUrl   — lets the drip worker check "is this lead already connected?"
+ *
+ * The table is populated by the linkedInConnectionSyncCron which polls getAllRelations
+ * every 10 minutes per Unipile account. It is read-only for the rest of the application.
+ */
+
+import AWS from 'aws-sdk';
+import dotenv from 'dotenv';
+import path from 'path';
+
+dotenv.config({ path: path.resolve(__dirname, '../../.env') });
+
+AWS.config.update({
+  region: process.env.AWS_REGION || 'us-west-2',
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+});
+
+const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+const TABLE = `${TABLE_PREFIX}AW-UnipileConnections`;
+
+export interface UnipileConnection {
+  accountId: string;        // Unipile account ID (PK)
+  memberId: string;         // LinkedIn member_id — stable identifier (SK)
+  publicProfileUrl: string; // e.g. "https://www.linkedin.com/in/johndoe/" (GSI key)
+  memberUrn: string;
+  connectionUrn: string;
+  firstName: string;
+  lastName: string;
+  headline: string;
+  connectedAt: number;      // UNIX timestamp from Unipile created_at
+  syncedAt: string;         // ISO — when this record was last written
+}
+
+/** Upsert a single connection record. Idempotent — safe to call on every cron run. */
+export async function upsertConnection(conn: UnipileConnection): Promise<void> {
+  await dynamodb.put({
+    TableName: TABLE,
+    Item: conn,
+  }).promise();
+}
+
+/** Upsert many connections in parallel batches. */
+export async function upsertConnections(conns: UnipileConnection[]): Promise<void> {
+  const BATCH = 25;
+  for (let i = 0; i < conns.length; i += BATCH) {
+    await Promise.all(conns.slice(i, i + BATCH).map(upsertConnection));
+  }
+}
+
+/**
+ * Look up whether a LinkedIn profile URL is a 1st-degree connection for ANY
+ * Unipile account. Returns the first matching record, or null if not connected.
+ * Used by the drip worker and enrollment logic.
+ */
+export async function getConnectionByProfileUrl(publicProfileUrl: string): Promise<UnipileConnection | null> {
+  const normalized = normalizeLinkedInUrl(publicProfileUrl);
+  const result = await dynamodb.query({
+    TableName: TABLE,
+    IndexName: 'publicProfileUrl-index',
+    KeyConditionExpression: 'publicProfileUrl = :url',
+    ExpressionAttributeValues: { ':url': normalized },
+    Limit: 1,
+  }).promise();
+  return (result.Items?.[0] as UnipileConnection) ?? null;
+}
+
+/**
+ * Look up whether a LinkedIn profile URL is a 1st-degree connection for a
+ * specific Unipile accountId. Returns the record, or null.
+ */
+export async function getConnectionByProfileUrlAndAccount(
+  publicProfileUrl: string,
+  accountId: string,
+): Promise<UnipileConnection | null> {
+  const normalized = normalizeLinkedInUrl(publicProfileUrl);
+  const result = await dynamodb.query({
+    TableName: TABLE,
+    IndexName: 'publicProfileUrl-index',
+    KeyConditionExpression: 'publicProfileUrl = :url',
+    FilterExpression: 'accountId = :aid',
+    ExpressionAttributeValues: { ':url': normalized, ':aid': accountId },
+    Limit: 5,
+  }).promise();
+  return (result.Items?.[0] as UnipileConnection) ?? null;
+}
+
+/** Get the timestamp of the most recently synced connection for an account. */
+export async function getLatestConnectedAt(accountId: string): Promise<number | null> {
+  const result = await dynamodb.query({
+    TableName: TABLE,
+    KeyConditionExpression: 'accountId = :aid',
+    ExpressionAttributeValues: { ':aid': accountId },
+    ProjectionExpression: 'connectedAt',
+    ScanIndexForward: false,
+    Limit: 1,
+  }).promise();
+  const item = result.Items?.[0] as Pick<UnipileConnection, 'connectedAt'> | undefined;
+  return item?.connectedAt ?? null;
+}
+
+/** Normalize a LinkedIn URL to lowercase with trailing slash for consistent GSI keys. */
+export function normalizeLinkedInUrl(url: string): string {
+  let u = url.trim().toLowerCase();
+  if (!u.endsWith('/')) u += '/';
+  return u;
+}

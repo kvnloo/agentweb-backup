@@ -19,6 +19,7 @@ describe("Layout html templates navigation", () => {
     mockUseAuth.mockReturnValue({
       user: { isAdmin: true },
       logout: jest.fn(),
+      hasRole: jest.fn().mockReturnValue(false),
     });
 
     render(
@@ -40,6 +41,7 @@ describe("Layout html templates navigation", () => {
     mockUseAuth.mockReturnValue({
       user: { isAdmin: false },
       logout: jest.fn(),
+      hasRole: jest.fn().mockReturnValue(false),
     });
 
     render(

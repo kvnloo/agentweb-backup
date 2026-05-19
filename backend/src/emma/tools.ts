@@ -6239,7 +6239,9 @@ emmaToolRegistry.register({
     const { settingsService } = await import('../services/settingsService');
     const productIssueEmails = await settingsService.getJsonArraySetting('product_issue_emails', ['founders@agentweb.pro']);
 
-    for (const issue of args.issues) {
+    for (const rawIssue of args.issues) {
+      // Gemini may serialize array items as JSON strings instead of objects — normalize
+      const issue = typeof rawIssue === 'string' ? JSON.parse(rawIssue) : rawIssue;
       try {
         const issueContext: Record<string, any> = {
           'User Name': user.displayName || user.email,

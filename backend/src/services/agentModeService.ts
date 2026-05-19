@@ -17703,8 +17703,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         .use(remarkBreaks) // Convert line breaks to <br> tags
         .use(remarkHtml, { sanitize: false }); // Convert to HTML
 
+      // Gemini may serialize array items as JSON strings instead of objects — normalize
+      const normalizedPosts = posts.map(p => (typeof p === 'string' ? JSON.parse(p) : p));
+
       // Generate HTML for each post
-      const postsHtml = posts.map((post, index) => {
+      const postsHtml = normalizedPosts.map((post, index) => {
         const postNumber = index + 1;
         // Map post types to display labels
         const typeLabelMap: Record<string, string> = {
@@ -20678,9 +20681,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   // List connected accounts helper
   async listConnectedAccounts(userId: string, platform: string = 'all'): Promise<any> {
     try {
-      const { getAccountsByUserId, isTokenValid } = await import('./connectedAccountsDb');
+      const { getAccountsByUserIdIncludingOrgShared, isTokenValid } = await import('./connectedAccountsDb');
 
-      let accounts = await getAccountsByUserId(userId);
+      let accounts = await getAccountsByUserIdIncludingOrgShared(userId);
 
       if (platform && platform !== 'all') {
         accounts = accounts.filter(acc => acc.platform === platform);
@@ -21268,15 +21271,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     const { profile_url, provider_id, message } = args;
     console.log(`[AgentMode] linkedinOutreach called: action=${action}, account_id=${account_id}`);
 
-    // Write actions must use an account owned by the calling user.
-    // This prevents an LLM from reusing a shared/enrichment account_id it may have
-    // seen in a prior get-profile tool call to send invitations or messages.
+    // Write actions must use an account that is either owned by the calling user or
+    // explicitly shared with the org (sharedWithOrg: true). This prevents an LLM from
+    // reusing a shared enrichment account_id from a prior get-profile call.
     const WRITE_ACTIONS = ['send-invite', 'send-message', 'send-inmail', 'cancel-invitation', 'accept-invitation'];
     if (WRITE_ACTIONS.includes(action)) {
-      const { getAccountsByUserId } = await import('./connectedAccountsDb');
-      const userAccounts = await getAccountsByUserId(userId);
-      const owned = userAccounts.some((a: any) => a.platform === 'unipile' && a.account_id === account_id);
-      if (!owned) {
+      const { getAccountsByUserIdIncludingOrgShared } = await import('./connectedAccountsDb');
+      const userAccounts = await getAccountsByUserIdIncludingOrgShared(userId);
+      const authorized = userAccounts.some((a: any) => a.platform === 'unipile' && a.account_id === account_id);
+      if (!authorized) {
         return { success: false, error: `Account ${account_id} is not connected to your profile. Connect a LinkedIn Outreach account in Settings to use this action.` };
       }
     }

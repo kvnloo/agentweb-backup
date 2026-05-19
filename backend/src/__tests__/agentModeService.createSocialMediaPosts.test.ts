@@ -383,6 +383,63 @@ describe('AgentModeService - create_social_media_posts function', () => {
     });
   });
 
+  describe('Gemini JSON-string serialization', () => {
+    it('should handle array items serialized as JSON strings by Gemini', async () => {
+      // Gemini sometimes sends array items as JSON strings instead of objects
+      const postsAsStrings = [
+        JSON.stringify({ type: 'linkedin', content: 'LinkedIn post from Gemini' }),
+        JSON.stringify({ type: 'x/twitter', content: 'Twitter post from Gemini' }),
+      ] as any;
+
+      mockUploadFileToS3.mockResolvedValue({
+        success: true,
+        url: 'https://s3.example.com/posts.html'
+      });
+
+      const result = await (agentModeService as any).createSocialMediaPosts(
+        postsAsStrings,
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.postsCount).toBe(2);
+
+      const uploadCall = mockUploadFileToS3.mock.calls[0];
+      const htmlContent = uploadCall[0];
+      expect(htmlContent).toContain('data-type="linkedin"');
+      expect(htmlContent).toContain('data-type="x/twitter"');
+      expect(htmlContent).not.toContain('data-type="undefined"');
+      expect(htmlContent).toContain('LinkedIn post from Gemini');
+    });
+
+    it('should handle mixed array of objects and JSON strings', async () => {
+      const mixedPosts = [
+        { type: 'linkedin', content: 'Regular object post' },
+        JSON.stringify({ type: 'instagram', content: 'String-serialized post' }),
+      ] as any;
+
+      mockUploadFileToS3.mockResolvedValue({
+        success: true,
+        url: 'https://s3.example.com/posts.html'
+      });
+
+      const result = await (agentModeService as any).createSocialMediaPosts(
+        mixedPosts,
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.postsCount).toBe(2);
+
+      const htmlContent = mockUploadFileToS3.mock.calls[0][0];
+      expect(htmlContent).not.toContain('undefined');
+      expect(htmlContent).toContain('Regular object post');
+      expect(htmlContent).toContain('String-serialized post');
+    });
+  });
+
   describe('Post Content Handling', () => {
     it('should handle posts with empty content', async () => {
       const mockPosts = [

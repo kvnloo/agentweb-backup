@@ -28,7 +28,7 @@ interface User {
   lastActiveAt?: string;
   displayName?: string;
   supportNote?: string;
-  roles?: ("partner" | "customer" | "free")[];
+  roles?: ("partner" | "customer" | "free" | "contractor")[];
   taskCount?: number;
   workflowCount?: number;
   chatSessionCount?: number;
