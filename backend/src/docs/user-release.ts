@@ -11,12 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-19',
     changes: [
-      'Org-wide sharing for KB, Templates, Landing Pages, Work Plans, and Skills',
-      '- Org admins can now decide which features are shared with their organization via Settings → Org Sharing',
-      '- Five feature areas are toggleable: Knowledge Bases, HTML Templates, Landing Pages, Work Plans, and Skills',
-      '- Brand Guidelines and Marketing Strategy remain always shared with the org; admins can now grant edit access to specific members',
-      '- Each feature has a per-feature editor list — designated members can edit shared items even if they don\'t own them',
-      '- When a member is removed from an org, the admin chooses per feature whether to transfer items, delete them, or leave them with the departing member',
+      'Fixed: Social Media Posts and Bug Reports Now Work Correctly with Gemini Models',
+      '- Social media posts created by Gemini-powered sessions were rendering as blank (undefined content and platform labels) in the generated HTML',
+      '- Bug reports submitted via Gemini sessions were failing with a Notion API error because issue fields were undefined',
+      '- Both tools now correctly handle Gemini\'s behavior of serializing array items as JSON strings instead of objects',
+    ],
+  },
+  {
+    date: '2026-05-19',
+    changes: [
       'CRM: LinkedIn Connection Indicator on Leads',
       '- The LinkedIn icon on each lead now shows a green dot when that lead is a 1st-degree LinkedIn connection with your connected outreach account',
       '- Connection status is checked automatically after loading each lead list — no manual refresh needed',
