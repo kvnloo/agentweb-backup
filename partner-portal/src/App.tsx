@@ -20,6 +20,8 @@ import PrivateRoute from './components/PrivateRoute';
 import AdminRoute from './components/AdminRoute';
 import PartnerRoute from './components/PartnerRoute';
 import CustomerRoute from './components/CustomerRoute';
+import ContractorRoute from './components/ContractorRoute';
+import ContractorAccesses from './pages/ContractorAccesses';
 import Profile from './pages/Profile';
 import Config from './pages/Config';
 import Workflows from './pages/Workflows';
@@ -242,13 +244,21 @@ export default function App() {
                         </PartnerRoute>
                       }
                     />
-                    <Route 
-                      path="marketing/*" 
+                    <Route
+                      path="contractor-accesses"
+                      element={
+                        <ContractorRoute>
+                          <ContractorAccesses />
+                        </ContractorRoute>
+                      }
+                    />
+                    <Route
+                      path="marketing/*"
                       element={
                         <CustomerRoute>
                           <Marketing />
                         </CustomerRoute>
-                      } 
+                      }
                     />
                   </Route>
                 </Routes>
