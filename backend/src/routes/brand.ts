@@ -11,6 +11,7 @@ import {
   buildReadyPatch,
   logCompletionMetric,
 } from "../services/brandBuildStatusService";
+import { canEditItem } from "../services/orgShareService";
 
 const router = Router();
 const dynamodb = new DynamoDB.DocumentClient();
@@ -269,10 +270,11 @@ router.post(
       // Brand guidelines for org members are stored at the org level, so reading from the user
       // record would cause existing org-level attachments (like logos) to be lost when saving.
       let existingBrandGuidelines = user.brandGuidelines;
+      let postOrg: Awaited<ReturnType<typeof orgDb.getOrgById>> | undefined;
       if (user.orgId) {
-        const org = await orgDb.getOrgById(user.orgId);
-        if (org?.brandGuidelines) {
-          existingBrandGuidelines = org.brandGuidelines;
+        postOrg = await orgDb.getOrgById(user.orgId);
+        if (postOrg?.brandGuidelines) {
+          existingBrandGuidelines = postOrg.brandGuidelines;
         }
       }
 
@@ -357,10 +359,17 @@ router.post(
         `[BRAND DEBUG] About to update user with email: ${user.email}`
       );
 
-      // If user is in an org, save to org (owner only); otherwise save to user
+      // If user is in an org, save to org (admin or listed editor only); otherwise save to user
       if (user.orgId) {
-        if (user.orgRole !== "owner") {
-          return res.status(403).json({ error: "Only the org owner can update brand guidelines" });
+        const allowed = canEditItem(
+          { userId: postOrg?.ownerUserId } as any,
+          { userId: user.userId, orgId: user.orgId, orgRole: user.orgRole as "owner" | "member" | undefined },
+          postOrg ?? null,
+          user.orgId,
+          "brandGuidelines",
+        );
+        if (!allowed) {
+          return res.status(403).json({ message: "Not authorized to edit brand guidelines" });
         }
         await orgDb.updateOrg(user.orgId, { brandGuidelines: brandGuidelinesData });
         console.log(`[BRAND DEBUG] Updated org ${user.orgId} brand guidelines`);
@@ -480,10 +489,17 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
     let brandGuidelines: any;
     let isOrgLevel = false;
     if (user.orgId) {
-      if (user.orgRole !== "owner") {
-        return res.status(403).json({ error: "Only the org owner can delete brand assets" });
-      }
       const org = await orgDb.getOrgById(user.orgId);
+      const allowed = canEditItem(
+        { userId: org?.ownerUserId } as any,
+        { userId: user.userId, orgId: user.orgId, orgRole: user.orgRole as "owner" | "member" | undefined },
+        org ?? null,
+        user.orgId,
+        "brandGuidelines",
+      );
+      if (!allowed) {
+        return res.status(403).json({ message: "Not authorized to edit brand guidelines" });
+      }
       if (org?.brandGuidelines) {
         brandGuidelines = org.brandGuidelines;
         isOrgLevel = true;

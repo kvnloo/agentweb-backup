@@ -131,6 +131,21 @@ export class WorkPlanService {
     }).promise();
   }
 
+  /**
+   * Transfer ownership of a work plan to a new user (used when removing a member from an org).
+   */
+  async transferOwner(planId: string, newOwnerId: string): Promise<void> {
+    await dynamodb.update({
+      TableName: this.tableName,
+      Key: { planId },
+      UpdateExpression: "SET ownerId = :newOwner, updatedAt = :now",
+      ExpressionAttributeValues: {
+        ":newOwner": newOwnerId,
+        ":now": new Date().toISOString(),
+      },
+    }).promise();
+  }
+
   async getAllWorkPlans(): Promise<WorkPlan[]> {
     try {
       const items = await paginatedScan(dynamodb, { TableName: this.tableName });
@@ -153,13 +168,12 @@ export class WorkPlanService {
     return (result.Items as WorkPlan[]) || [];
   }
 
-  async getWorkPlansByOrg(orgId: string): Promise<WorkPlan[]> {
-    const result = await dynamodb.scan({
-      TableName: this.tableName,
-      FilterExpression: 'orgId = :orgId',
-      ExpressionAttributeValues: { ':orgId': orgId },
-    }).promise();
-    return (result.Items as WorkPlan[]) || [];
+  async getWorkPlansByOrg(orgId: string, callerUserId: string = ""): Promise<WorkPlan[]> {
+    const { orgDb } = await import("./db");
+    const members = await orgDb.getOrgMembers(orgId);
+    const others = members.map((m: { userId: string }) => m.userId).filter((uid: string) => uid !== callerUserId);
+    const perMember = await Promise.all(others.map((uid: string) => this.getWorkPlansByOwner(uid)));
+    return perMember.flat();
   }
 
   async getWorkPlansByVisibility(visibility: WorkPlanVisibility): Promise<WorkPlan[]> {

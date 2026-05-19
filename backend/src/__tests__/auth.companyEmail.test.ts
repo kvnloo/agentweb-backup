@@ -70,7 +70,7 @@ jest.mock('jsonwebtoken', () => ({
 }));
 
 import { register } from '../controllers/auth';
-import { isCompanyEmail } from '../utils/validation';
+import { isCompanyEmail, normalizeEmailList } from '../utils/validation';
 
 function makeApp() {
   const app = express();
@@ -145,6 +145,43 @@ describe('isCompanyEmail utility', () => {
 
   it('returns true for a .co domain', () => {
     expect(isCompanyEmail('carol@startup.co')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// normalizeEmailList utility — branch coverage for the various LLM input shapes
+// ---------------------------------------------------------------------------
+
+describe('normalizeEmailList utility', () => {
+  it('returns [] for null/undefined/empty', () => {
+    expect(normalizeEmailList(null)).toEqual([]);
+    expect(normalizeEmailList(undefined)).toEqual([]);
+    expect(normalizeEmailList('')).toEqual([]);
+    expect(normalizeEmailList('   ')).toEqual([]);
+    expect(normalizeEmailList(42)).toEqual([]);
+  });
+
+  it('wraps a single string in an array', () => {
+    expect(normalizeEmailList('  a@b.com  ')).toEqual(['a@b.com']);
+  });
+
+  it('filters out invalid + non-string elements', () => {
+    expect(normalizeEmailList(['a@b.com', 'not-an-email', '', '   ', 42, null])).toEqual(['a@b.com']);
+  });
+
+  it('parses a stringified JSON array element', () => {
+    expect(normalizeEmailList(['["a@b.com", "c@d.com"]'])).toEqual(['a@b.com', 'c@d.com']);
+  });
+
+  it('ignores stringified JSON whose payload is not an array', () => {
+    // Leading `[` triggers the JSON branch, but the parsed value is an object,
+    // so nothing is pushed.
+    expect(normalizeEmailList(['[42, 17]'])).toEqual([]);
+  });
+
+  it('falls through to email validation when the stringified value is not valid JSON', () => {
+    // Leading `[` triggers the JSON path; SyntaxError → falls through and validates as an email.
+    expect(normalizeEmailList(['[totally-broken'])).toEqual([]);
   });
 });
 

@@ -49,10 +49,12 @@ jest.mock("../middleware/auth", () => ({
 
 jest.mock("../services/db", () => ({
   userDb: { getUserById: jest.fn() },
+  orgDb: { getOrgById: jest.fn() },
   crmDb: {},
 }));
 
 const mockGetLandingPage = jest.fn();
+const mockGetLandingPageById = jest.fn();
 const mockGetPreviewDeploymentUrl = jest.fn();
 
 jest.mock("../services/v0Service", () => ({
@@ -60,13 +62,25 @@ jest.mock("../services/v0Service", () => ({
   deployLandingPage: jest.fn(),
   iterateLandingPage: jest.fn(),
   getLandingPage: (...args: any[]) => mockGetLandingPage(...args),
+  getLandingPageById: (...args: any[]) => mockGetLandingPageById(...args),
+  getLandingPagesByOwner: jest.fn().mockResolvedValue([]),
+  getLandingPagesByOrg: jest.fn().mockResolvedValue([]),
   listLandingPages: jest.fn().mockResolvedValue([]),
   deleteLandingPage: jest.fn(),
+  deleteLandingPageByRecord: jest.fn(),
+  updateLandingPageGtm: jest.fn(),
+  updateLandingPageContext: jest.fn(),
   buildBrandEnrichedPrompt: jest.fn(),
   getDeploymentStatus: jest.fn(),
   getPreviewDeploymentUrl: (...args: any[]) => mockGetPreviewDeploymentUrl(...args),
   resolveVercelProjectId: jest.fn().mockImplementation((page: any) => Promise.resolve(page.vercelProjectId || null)),
+  triggerVercelDeployment: jest.fn(),
+  getProjectEnvVars: jest.fn().mockResolvedValue({}),
+  upsertEnvVar: jest.fn(),
+  deleteEnvVar: jest.fn(),
+  extractTemplateOutline: jest.fn(),
   BrandContext: {},
+  INTEGRATIONS: { recaptcha: { siteKey: { envKey: "X" }, secretKey: { envKey: "Y" } } },
 }));
 
 jest.mock("../utils/secretsManager", () => ({
@@ -103,6 +117,9 @@ beforeEach(() => {
   jest.clearAllMocks();
   _resetRateLimitState();
   mockGetLandingPage.mockResolvedValue(TEST_PAGE);
+  // Routes go through authorizeLandingPageAccess (uses getLandingPageById)
+  // for read+edit — owner fast-path passes when page.userId matches caller.
+  mockGetLandingPageById.mockResolvedValue(TEST_PAGE);
 });
 
 // =============================================================================

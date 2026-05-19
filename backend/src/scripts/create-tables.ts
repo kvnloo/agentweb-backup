@@ -30,7 +30,8 @@ const createUsersTable = async () => {
     TableName: `${TABLE_PREFIX}AW-Users`,
     AttributeDefinitions: [
       { AttributeName: 'email', AttributeType: 'S' },
-      { AttributeName: 'userId', AttributeType: 'S' }
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'orgId', AttributeType: 'S' }
     ],
     KeySchema: [
       { AttributeName: 'email', KeyType: 'HASH' } // Use email as primary key
@@ -53,6 +54,19 @@ const createUsersTable = async () => {
         IndexName: 'EmailIndex',
         KeySchema: [
           { AttributeName: 'email', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      },
+      {
+        IndexName: 'OrgIdIndex',
+        KeySchema: [
+          { AttributeName: 'orgId', KeyType: 'HASH' }
         ],
         Projection: {
           ProjectionType: 'ALL'

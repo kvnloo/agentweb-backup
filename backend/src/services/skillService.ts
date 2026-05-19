@@ -191,7 +191,7 @@ export class SkillService {
     const [publishedSkills, userSkills, orgSkills] = await Promise.all([
       this.getPublishedSkills(),
       this.getSkillsByOwner(userId),
-      orgId ? this.getSkillsByOrg(orgId) : Promise.resolve([]),
+      orgId ? this.getSkillsByOrg(orgId, userId) : Promise.resolve([]),
     ]);
 
     const seen = new Set(publishedSkills.map(s => s.skillId));
@@ -365,17 +365,16 @@ export class SkillService {
     }
   }
 
-  async getSkillsByOrg(orgId: string): Promise<Skill[]> {
+  async getSkillsByOrg(orgId: string, callerUserId: string): Promise<Skill[]> {
     try {
-      const result = await dynamodb.scan({
-        TableName: this.tableName,
-        FilterExpression: 'orgId = :orgId',
-        ExpressionAttributeValues: { ':orgId': orgId },
-      }).promise();
-      return (result.Items || []).map(item => this.normalizeSkill(item));
+      const { orgDb } = await import("./db");
+      const members = await orgDb.getOrgMembers(orgId);
+      const others = members.map((m: { userId: string }) => m.userId).filter((uid: string) => uid !== callerUserId);
+      const perMember = await Promise.all(others.map((uid: string) => this.getSkillsByOwner(uid)));
+      return perMember.flat();
     } catch (error) {
       console.error(`Error getting skills for org ${orgId}:`, error);
-      throw error;
+      return [];
     }
   }
 
@@ -450,6 +449,26 @@ export class SkillService {
       await dynamodb.delete(params).promise();
     } catch (error) {
       console.error(`Error deleting skill ${skillId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Transfer ownership of a skill to a new user (used when removing a member from an org).
+   */
+  async transferOwner(skillId: string, newOwnerId: string): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { skillId },
+        UpdateExpression: "SET userId = :newOwner, updatedAt = :now",
+        ExpressionAttributeValues: {
+          ":newOwner": newOwnerId,
+          ":now": new Date().toISOString(),
+        },
+      }).promise();
+    } catch (error) {
+      console.error(`Error transferring skill ${skillId} to ${newOwnerId}:`, error);
       throw error;
     }
   }

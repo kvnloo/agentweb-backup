@@ -2887,11 +2887,25 @@ export class AgentModeService {
 
   public async listSkills(userId: string, sessionId: string): Promise<any> {
     try {
+      // Best-effort org fanout: only attach orgId when `shareSettings.skills`
+      // is effectively enabled for this caller (plain members need
+      // enabled=true; editors and the org owner always get fanout). Any
+      // lookup failure degrades to non-org behavior.
       let sessionUserOrgId: string | undefined;
       try {
-        const { userDb: uDb } = await import('./db');
+        const { userDb: uDb, orgDb } = await import('./db');
+        const { isFeatureEffectivelyEnabled } = await import('./orgShareService');
         const sessionUser = await uDb.getUserById(userId);
-        sessionUserOrgId = sessionUser?.orgId;
+        const candidateOrgId = sessionUser?.orgId;
+        if (candidateOrgId) {
+          const org = await orgDb.getOrgById(candidateOrgId);
+          const effectivelyEnabled = isFeatureEffectivelyEnabled(
+            { userId, orgId: candidateOrgId, orgRole: sessionUser?.orgRole },
+            org,
+            'skills',
+          );
+          if (effectivelyEnabled) sessionUserOrgId = candidateOrgId;
+        }
       } catch { /* skip — org-sharing is best-effort */ }
       const publishedSkills = await skillService.getSkillsAvailableToUser(userId, sessionUserOrgId);
 
@@ -5939,6 +5953,7 @@ export class AgentModeService {
   public async updateMarketStrategy(updateData: any, userId: string): Promise<any> {
     try {
       const { userDb, orgDb } = await import('./db');
+      const { canEditItem } = await import('./orgShareService');
       const user = await userDb.getUserById(userId);
       if (!user) {
         return {
@@ -5948,22 +5963,25 @@ export class AgentModeService {
         };
       }
 
-      // Check org membership - only owners can update, members are rejected
-      const isOrgOwner = user.orgId && user.orgRole === 'owner';
-      const isOrgMember = user.orgId && user.orgRole !== 'owner';
-
-      if (isOrgMember) {
-        return {
-          success: false,
-          message: 'Only the org owner can update market strategy',
-          error: 'Permission denied'
-        };
-      }
-
-      // Get existing market strategy from org (if owner) or personal
+      // Org members: only the org owner or a listed marketingStrategy editor
+      // may update. Solo users are unaffected.
       let existingMarketStrategy: any;
-      if (isOrgOwner) {
-        const org = await orgDb.getOrgById(user.orgId!);
+      if (user.orgId) {
+        const org = await orgDb.getOrgById(user.orgId);
+        const allowed = canEditItem(
+          { userId: org?.ownerUserId } as any,
+          { userId, orgId: user.orgId, orgRole: user.orgRole as 'owner' | 'member' | undefined },
+          org ?? null,
+          user.orgId,
+          'marketingStrategy',
+        );
+        if (!allowed) {
+          return {
+            success: false,
+            message: 'Market strategy is managed by your org admin',
+            error: 'Permission denied'
+          };
+        }
         existingMarketStrategy = org?.marketStrategy;
       } else {
         existingMarketStrategy = user.marketStrategy;
@@ -6022,8 +6040,8 @@ export class AgentModeService {
       };
 
       // Update org-level or personal market strategy
-      if (isOrgOwner) {
-        await orgDb.updateOrg(user.orgId!, { marketStrategy: marketStrategyData });
+      if (user.orgId) {
+        await orgDb.updateOrg(user.orgId, { marketStrategy: marketStrategyData });
       } else {
         await userDb.updateUser(userId, { marketStrategy: marketStrategyData });
       }
@@ -9146,6 +9164,7 @@ Format the response as JSON with this structure:
   public async updateBrandGuidelines(updateData: any, userId: string): Promise<any> {
     try {
       const { userDb, orgDb } = await import('./db');
+      const { canEditItem } = await import('./orgShareService');
       const user = await userDb.getUserById(userId);
       if (!user) {
         return {
@@ -9155,22 +9174,25 @@ Format the response as JSON with this structure:
         };
       }
 
-      // Check org membership - only owners can update, members are rejected
-      const isOrgOwner = user.orgId && user.orgRole === 'owner';
-      const isOrgMember = user.orgId && user.orgRole !== 'owner';
-
-      if (isOrgMember) {
-        return {
-          success: false,
-          message: 'Only the org owner can update brand guidelines',
-          error: 'Permission denied'
-        };
-      }
-
-      // Get existing brand guidelines from org (if owner) or personal
+      // Org members: only the org owner or a listed brandGuidelines editor
+      // may update. Solo users are unaffected.
       let existingBrand: any;
-      if (isOrgOwner) {
-        const org = await orgDb.getOrgById(user.orgId!);
+      if (user.orgId) {
+        const org = await orgDb.getOrgById(user.orgId);
+        const allowed = canEditItem(
+          { userId: org?.ownerUserId } as any,
+          { userId, orgId: user.orgId, orgRole: user.orgRole as 'owner' | 'member' | undefined },
+          org ?? null,
+          user.orgId,
+          'brandGuidelines',
+        );
+        if (!allowed) {
+          return {
+            success: false,
+            message: 'Brand guidelines are managed by your org admin',
+            error: 'Permission denied'
+          };
+        }
         existingBrand = org?.brandGuidelines;
       } else {
         existingBrand = user.brandGuidelines;
@@ -9201,8 +9223,8 @@ Format the response as JSON with this structure:
         };
 
         // Update org or user with initial brand guidelines
-        if (isOrgOwner) {
-          await orgDb.updateOrg(user.orgId!, { brandGuidelines: initialBrandGuidelines });
+        if (user.orgId) {
+          await orgDb.updateOrg(user.orgId, { brandGuidelines: initialBrandGuidelines });
         } else {
           await userDb.updateUser(userId, { brandGuidelines: initialBrandGuidelines });
         }
@@ -9330,8 +9352,8 @@ Format the response as JSON with this structure:
         updatedAt: new Date().toISOString()
       };
 
-      if (isOrgOwner) {
-        await orgDb.updateOrg(user.orgId!, { brandGuidelines: updatedGuidelines });
+      if (user.orgId) {
+        await orgDb.updateOrg(user.orgId, { brandGuidelines: updatedGuidelines });
       } else {
         await userDb.updateUser(userId, { brandGuidelines: updatedGuidelines });
       }
@@ -13705,11 +13727,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return google.drive({ version: 'v3', auth });
   }
 
-  // Helper: get Google Drive shared folders for a user
+  // Helper: get Google Drive shared folders for a caller.
+  // If the caller belongs to an org, returns the org's folder list; otherwise the user's own list.
   private async getUserGoogleDriveFolders(userId: string): Promise<Array<{ folderId: string; name: string }>> {
-    const { userDb } = await import('./db');
+    const { userDb, orgDb } = await import('./db');
     const user = await userDb.getUserById(userId);
-    return user?.googleDriveFolders || [];
+    if (user?.orgId) {
+      const org = await orgDb.getOrgById(user.orgId);
+      return Array.isArray(org?.googleDriveFolders) ? org!.googleDriveFolders : [];
+    }
+    return Array.isArray(user?.googleDriveFolders) ? user!.googleDriveFolders : [];
   }
 
   public async searchKnowledgeBase(query: string, maxResults: number = 5, userId?: string): Promise<any> {
@@ -14072,22 +14099,45 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Get all public knowledge bases from all users
       const publicKnowledgeBaseTasks = await taskDb.getAllPublicKnowledgeBaseTasks();
 
-      // Combine both lists, removing duplicates (in case user has public KBs)
-      const taskIdSet = new Set<string>();
-
-      // Add user's task IDs to set first
-      for (const task of userKnowledgeBaseTasks || []) {
-        taskIdSet.add(task.taskId);
+      // Fan out to same-org members' KBs when shareSettings.knowledgeBase is
+      // effectively enabled for the caller (editors and the org owner always
+      // see fanout; plain members only when the toggle is on).
+      let orgKnowledgeBaseTasks: any[] = [];
+      try {
+        const { userDb, orgDb } = await import('./db');
+        const { isFeatureEffectivelyEnabled } = await import('./orgShareService');
+        const caller = await userDb.getUserById(userId);
+        if (caller?.orgId) {
+          const org = await orgDb.getOrgById(caller.orgId);
+          const enabled = isFeatureEffectivelyEnabled(
+            { userId, orgId: caller.orgId, orgRole: caller.orgRole as 'owner' | 'member' | undefined },
+            org,
+            'knowledgeBase',
+          );
+          if (enabled) {
+            const members = await orgDb.getOrgMembers(caller.orgId);
+            const otherMembers = members.filter((m: any) => m.userId !== userId);
+            const perMember = await Promise.all(
+              otherMembers.map((m: any) => taskDb.getTasksWithKnowledgeBase(m.userId).catch(() => [])),
+            );
+            orgKnowledgeBaseTasks = perMember.flat();
+          }
+        }
+      } catch (e) {
+        console.error('[agentModeService] org KB fanout failed:', e);
       }
 
-      const allKnowledgeBaseTasks = [...(userKnowledgeBaseTasks || [])];
-
-      // Add public knowledge bases that are not already in the user's list
-      for (const publicTask of publicKnowledgeBaseTasks || []) {
-        if (!taskIdSet.has(publicTask.taskId)) {
-          taskIdSet.add(publicTask.taskId);
-          allKnowledgeBaseTasks.push(publicTask);
-        }
+      // Combine all lists, removing duplicates by taskId
+      const taskIdSet = new Set<string>();
+      const allKnowledgeBaseTasks: any[] = [];
+      for (const task of [
+        ...(userKnowledgeBaseTasks || []),
+        ...orgKnowledgeBaseTasks,
+        ...(publicKnowledgeBaseTasks || []),
+      ]) {
+        if (taskIdSet.has(task.taskId)) continue;
+        taskIdSet.add(task.taskId);
+        allKnowledgeBaseTasks.push(task);
       }
 
       // If kb_type filter is set and doesn't include platform KBs, skip them entirely
@@ -14549,10 +14599,38 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return { success: false, message: `Knowledge base "${kbIdentifier}" not found` };
     }
 
-    // Auth check: allow access if the knowledge base is public, otherwise check ownership
+    // Auth check: allow public KBs, otherwise owner or any same-org member when
+    // shareSettings.knowledgeBase is effectively enabled (editors + owners always
+    // pass; plain members only when toggle is on). Mirrors the GET /knowledge-base
+    // route so Emma can read the same items the UI shows.
     const isPublic = task.knowledgeBaseType === 'public';
     if (!isPublic && task.userId !== userId) {
-      return { success: false, message: 'Not authorized to access this knowledge base file' };
+      let kbAuthorized = false;
+      try {
+        const { userDb, orgDb } = await import('./db');
+        const { canViewItem } = await import('./orgShareService');
+        const [caller, owner] = await Promise.all([
+          userDb.getUserById(userId),
+          userDb.getUserById(task.userId),
+        ]);
+        const ownerOrgId = owner?.orgId;
+        const callerOrgId = caller?.orgId;
+        if (callerOrgId && ownerOrgId && callerOrgId === ownerOrgId) {
+          const org = await orgDb.getOrgById(callerOrgId);
+          kbAuthorized = canViewItem(
+            { userId: task.userId },
+            { userId, orgId: callerOrgId, orgRole: caller?.orgRole as 'owner' | 'member' | undefined },
+            org,
+            ownerOrgId,
+            'knowledgeBase',
+          );
+        }
+      } catch (e) {
+        console.error('[agentModeService] org KB authorization check failed:', e);
+      }
+      if (!kbAuthorized) {
+        return { success: false, message: 'Not authorized to access this knowledge base file' };
+      }
     }
 
     // Default file size check — skip if the KB has a URL set (size=0 can be stale metadata)
@@ -19273,6 +19351,26 @@ Please generate a complete, professional HTML document that properly formats and
     types?: string[]
   ): Promise<any> {
     try {
+      // Org-level create gating: only org owner or listed htmlTemplates editor
+      const { userDb, orgDb } = await import('./db');
+      const { canManageOrgFeature } = await import('./orgShareService');
+      const caller = await userDb.getUserById(userId);
+      if (caller?.orgId) {
+        const org = await orgDb.getOrgById(caller.orgId);
+        const allowed = canManageOrgFeature(
+          { userId, orgId: caller.orgId, orgRole: caller.orgRole as 'owner' | 'member' | undefined },
+          org,
+          'htmlTemplates',
+        );
+        if (!allowed) {
+          return {
+            success: false,
+            message: 'Templates are managed by your org admin',
+            error: 'Permission denied'
+          };
+        }
+      }
+
       // Read HTML content from source (either S3 URL or direct HTML content)
       let htmlContent = htmlSource;
 
