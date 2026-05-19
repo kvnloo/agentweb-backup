@@ -627,6 +627,67 @@ describe("v0Service - deleteLandingPage", () => {
     // deleteLandingPage now does a soft-delete (archive) via update, not a hard delete
     expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
+
+  it("SUCCESS: failed root page with no githubRepoUrl can be deleted", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "root-fail",
+            userId: "user-1",
+            name: "Failed Page",
+            status: "failed",
+            isRootPage: true,
+            // no githubRepoUrl — never deployed
+          },
+        }),
+    });
+
+    await expect(
+      deleteLandingPage("root-fail", "user-1")
+    ).resolves.toBeUndefined();
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("FAIL: failed root page WITH githubRepoUrl cannot be deleted", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "root-fail-deployed",
+            userId: "user-1",
+            name: "Failed But Deployed",
+            status: "failed",
+            isRootPage: true,
+            githubRepoUrl: "https://github.com/AgentWebPro/lp-test",
+          },
+        }),
+    });
+
+    await expect(
+      deleteLandingPage("root-fail-deployed", "user-1")
+    ).rejects.toThrow("Cannot delete the root landing page");
+  });
+
+  it("FAIL: deployed root page cannot be deleted", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "root-deployed",
+            userId: "user-1",
+            name: "Deployed Page",
+            status: "deployed",
+            isRootPage: true,
+            githubRepoUrl: "https://github.com/AgentWebPro/lp-test",
+          },
+        }),
+    });
+
+    await expect(
+      deleteLandingPage("root-deployed", "user-1")
+    ).rejects.toThrow("Cannot delete the root landing page");
+  });
 });
 
 // =============================================================================
@@ -1145,6 +1206,31 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     expect(result.status).toBe("deployed");
     // At least 2 Vercel polling calls after the GitHub GET ref call
     expect(mockAxiosGet).toHaveBeenCalledTimes(3); // 1 GitHub ref + 2 Vercel polls
+  });
+
+  it("SUCCESS: sub-page deployedUrl uses customDomainUrl as base when existingPage has one", async () => {
+    // Site record has a custom domain — sub-page URL should use that as origin
+    const siteWithCustomDomain = {
+      ...existingSiteRecord,
+      customDomainUrl: "https://my-brand.agentwebforms.com",
+    };
+    mockQuery.mockReturnValueOnce({
+      promise: () => Promise.resolve({ Items: [siteWithCustomDomain] }),
+    });
+    await setupV0Mocks();
+    setupGitHubMocks();
+    setupVercelDeploySuccessMock();
+
+    const result = await generateLandingPage(
+      "user-1",
+      "Create pricing page",
+      "Pricing Page",
+      {}
+    );
+
+    expect(result.status).toBe("deployed");
+    expect(result.deployedUrl).toContain("https://my-brand.agentwebforms.com/");
+    expect(result.deployedUrl).not.toContain("vercel.app");
   });
 });
 
