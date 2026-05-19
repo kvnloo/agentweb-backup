@@ -330,12 +330,15 @@ describe("POST /api/html-templates — create", () => {
     expect(mockCreateTemplate).not.toHaveBeenCalled();
   });
 
-  it("editor cannot create when shareSettings.htmlTemplates.enabled is false (403)", async () => {
+  it("editor can create even when shareSettings.htmlTemplates.enabled is false", async () => {
+    // `enabled` only gates visibility for plain members; editors have create
+    // rights regardless of the toggle.
     mockGetUserById.mockResolvedValue({ userId: mockEditorId, orgId: mockOrgId, orgRole: "member" });
     mockGetOrgById.mockResolvedValue({
       ...orgDisabled,
       shareSettings: { htmlTemplates: { enabled: false, editors: [mockEditorId] } },
     });
+    mockCreateTemplate.mockResolvedValue({ ...myTpl, template_id: "editor-disabled-tpl" });
 
     const res = await request(editorApp).post("/api/html-templates").send({
       template_name: "Editor Disabled",
@@ -343,8 +346,8 @@ describe("POST /api/html-templates — create", () => {
       html_content: "<p>x</p>",
     });
 
-    expect(res.status).toBe(403);
-    expect(mockCreateTemplate).not.toHaveBeenCalled();
+    expect(res.status).toBe(201);
+    expect(mockCreateTemplate).toHaveBeenCalledTimes(1);
   });
 });
 

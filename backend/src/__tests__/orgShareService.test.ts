@@ -1,5 +1,6 @@
 import {
-  canViewItem, canEditItem, isAlwaysOnFeature,
+  canViewItem, canEditItem, canManageOrgFeature, isAlwaysOnFeature,
+  isFeatureEffectivelyEnabled,
   Feature,
   listOrgVisibleItems, MEMBER_FANOUT_CAP,
 } from "../services/orgShareService";
@@ -50,6 +51,59 @@ describe("canViewItem", () => {
   it("solo user blocked from all non-own access", () => {
     expect(canViewItem(item, solo as any, null, undefined, "htmlTemplates")).toBe(false);
   });
+  it("editor sees other-member items even when sharing is disabled", () => {
+    // landingPages has enabled=false, no editors in orgA — extend the org
+    // for this scenario with an editor entry.
+    const orgWithEditor = {
+      ...orgA,
+      shareSettings: {
+        ...orgA.shareSettings!,
+        landingPages: { enabled: false, editors: ["u-editor"] },
+      },
+    };
+    expect(canViewItem(item, editor, orgWithEditor as any, ownerOrgId, "landingPages")).toBe(true);
+  });
+  it("org admin sees all items even when sharing is disabled", () => {
+    expect(canViewItem(item, admin, orgA, ownerOrgId, "knowledgeBase")).toBe(true);
+  });
+});
+
+describe("canManageOrgFeature", () => {
+  it("solo user can always manage", () => {
+    expect(canManageOrgFeature(solo as any, null, "htmlTemplates")).toBe(true);
+  });
+  it("org admin can manage regardless of toggle", () => {
+    const orgOff = { ...orgA, shareSettings: { ...orgA.shareSettings!, landingPages: { enabled: false, editors: [] } } };
+    expect(canManageOrgFeature(admin, orgOff as any, "landingPages")).toBe(true);
+  });
+  it("listed editor can manage even when feature.enabled=false", () => {
+    const orgOff = { ...orgA, shareSettings: { ...orgA.shareSettings!, landingPages: { enabled: false, editors: ["u-editor"] } } };
+    expect(canManageOrgFeature(editor, orgOff as any, "landingPages")).toBe(true);
+  });
+  it("non-editor org member blocked", () => {
+    expect(canManageOrgFeature(member, orgA, "htmlTemplates")).toBe(false);
+  });
+});
+
+describe("isFeatureEffectivelyEnabled", () => {
+  it("plain member: follows enabled toggle", () => {
+    expect(isFeatureEffectivelyEnabled(member, orgA, "htmlTemplates")).toBe(true);  // enabled=true
+    expect(isFeatureEffectivelyEnabled(member, orgA, "knowledgeBase")).toBe(false); // enabled=false
+  });
+  it("editor: always true (even when toggle is off)", () => {
+    const orgWithEditor = {
+      ...orgA,
+      shareSettings: { ...orgA.shareSettings!, knowledgeBase: { enabled: false, editors: ["u-editor"] } },
+    };
+    expect(isFeatureEffectivelyEnabled(editor, orgWithEditor as any, "knowledgeBase")).toBe(true);
+  });
+  it("admin: always true (even when toggle is off)", () => {
+    expect(isFeatureEffectivelyEnabled(admin, orgA, "knowledgeBase")).toBe(true);
+  });
+  it("always-on features: always true", () => {
+    expect(isFeatureEffectivelyEnabled(member, orgA, "brandGuidelines")).toBe(true);
+    expect(isFeatureEffectivelyEnabled(member, orgA, "marketingStrategy")).toBe(true);
+  });
 });
 
 describe("canEditItem", () => {
@@ -60,10 +114,12 @@ describe("canEditItem", () => {
     expect(canEditItem(item, admin, orgA, ownerOrgId, "knowledgeBase")).toBe(true);
     expect(canEditItem(item, admin, orgA, ownerOrgId, "brandGuidelines")).toBe(true);
   });
-  it("toggleable feature: editor allowed only when enabled", () => {
+  it("toggleable feature: editor allowed regardless of enabled toggle", () => {
     expect(canEditItem(item, editor, orgA, ownerOrgId, "htmlTemplates")).toBe(true);
+    // Editor still has rights when sharing is disabled — `enabled` only
+    // controls visibility for plain members, not editor rights.
     const orgDisabled = { ...orgA, shareSettings: { ...orgA.shareSettings!, htmlTemplates: { enabled: false, editors: ["u-editor"] } } };
-    expect(canEditItem(item, editor, orgDisabled, ownerOrgId, "htmlTemplates")).toBe(false);
+    expect(canEditItem(item, editor, orgDisabled, ownerOrgId, "htmlTemplates")).toBe(true);
   });
   it("always-on feature: editor allowed regardless of any enabled flag", () => {
     const bgEditor = { userId: "u-bg-editor", orgId: "org-A", orgRole: "member" as const };

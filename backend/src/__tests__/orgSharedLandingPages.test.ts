@@ -484,15 +484,17 @@ describe("POST /api/landing-pages/v0/generate — org-level create gating", () =
     expect(res.status).toBe(403);
   });
 
-  it("editor cannot create when shareSettings.landingPages.enabled is false (403)", async () => {
+  it("editor can create even when shareSettings.landingPages.enabled is false", async () => {
+    // `enabled` only gates visibility for plain members; editors have create
+    // rights regardless of the toggle.
     currentMockUser = { userId: mockEditorId, email: "editor@example.com", isAdmin: false };
     mockGetUserById.mockResolvedValue({ userId: mockEditorId, orgId: mockOrgId, orgRole: "member" });
     mockGetOrgById.mockResolvedValue(makeOrg(false, [mockEditorId]));
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Disabled-editor attempt", name: "X" });
+      .send({ prompt: "Disabled-editor allowed", name: "X" });
 
-    expect(res.status).toBe(403);
+    expect(res.status).not.toBe(403);
   });
 });
