@@ -32,7 +32,7 @@ router.get("/", async (req, res) => {
     const org = orgId ? await orgDb.getOrgById(orgId) : null;
     const enabled = org?.shareSettings?.htmlTemplates?.enabled === true;
 
-    const [ownTemplates, publicTemplates, fanout] = await Promise.all([
+    const [ownTemplatesRaw, publicTemplatesRaw, fanout] = await Promise.all([
       htmlTemplateService.getTemplatesByOwner(userId),
       htmlTemplateService.getPublicTemplates(),
       orgId
@@ -43,18 +43,31 @@ router.get("/", async (req, res) => {
             getOwnerItems: async () => [],
             getMemberIds: async () =>
               (await orgDb.getOrgMembers(orgId)).map((m: any) => m.userId),
-            getItemsForOwner: (uid: string) =>
-              htmlTemplateService.getTemplatesByOwner(uid),
+            // Stamp each fanout item with the owner's userId so the frontend
+            // can render "Shared by ..." and target PATCH/DELETE correctly.
+            getItemsForOwner: async (uid: string) =>
+              (await htmlTemplateService.getTemplatesByOwner(uid)).map((t) => ({
+                ...t,
+                userId: uid,
+              })),
             getId: (t: any) => t.template_id,
           })
         : Promise.resolve({ items: [], truncated: false }),
     ]);
 
+    // Stamp own templates with the caller's userId, public ones with the sentinel.
+    const ownTemplates = ownTemplatesRaw.map((t) => ({ ...t, userId }));
+    const publicTemplates = publicTemplatesRaw.map((t) => ({
+      ...t,
+      userId: "__public__",
+      isPublic: true,
+    }));
+
     const seen = new Set<string>();
     const all = [
       ...ownTemplates,
       ...fanout.items,
-      ...publicTemplates.map((t) => ({ ...t, isPublic: true })),
+      ...publicTemplates,
     ].filter((t) => {
       if (seen.has(t.template_id)) return false;
       seen.add(t.template_id);
