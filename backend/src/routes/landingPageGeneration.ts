@@ -27,7 +27,7 @@ import {
   updateLandingPageContext,
   INTEGRATIONS,
 } from "../services/v0Service";
-import { canEditItem } from "../services/orgShareService";
+import { canEditItem, canManageOrgFeature } from "../services/orgShareService";
 import { listDomains, CustomDomainRecord } from "../services/customDomainService";
 
 const router = Router();
@@ -187,6 +187,21 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) {
       return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    // Org-level create gating: in an org, only the org owner or a listed
+    // editor (when landingPages sharing is enabled) may generate new pages.
+    const caller = await userDb.getUserById(userId);
+    if (caller?.orgId) {
+      const org = await orgDb.getOrgById(caller.orgId);
+      const allowed = canManageOrgFeature(
+        { userId, orgId: caller.orgId, orgRole: caller.orgRole as "owner" | "member" | undefined },
+        org,
+        "landingPages",
+      );
+      if (!allowed) {
+        return res.status(403).json({ error: "Landing pages are managed by your org admin" });
+      }
     }
 
     const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_id } = req.body;

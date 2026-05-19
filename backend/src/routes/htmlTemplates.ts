@@ -15,6 +15,7 @@ import { userDb, orgDb } from "../services/db";
 import {
   canViewItem,
   canEditItem,
+  canManageOrgFeature,
   listOrgVisibleItems,
 } from "../services/orgShareService";
 import { extractVariables } from "../utils/templateParser";
@@ -173,6 +174,22 @@ router.get("/:templateId", async (req, res) => {
 router.post("/", async (req, res) => {
   try {
     const { userId, email } = (req as any).user;
+
+    // Org-level create gating: when caller belongs to an org, only the org
+    // owner or a listed editor (when htmlTemplates sharing is enabled) may
+    // create templates. Solo users are unaffected.
+    const caller = await userDb.getUserById(userId);
+    if (caller?.orgId) {
+      const org = await orgDb.getOrgById(caller.orgId);
+      const allowed = canManageOrgFeature(
+        { userId, orgId: caller.orgId, orgRole: caller.orgRole as "owner" | "member" | undefined },
+        org,
+        "htmlTemplates",
+      );
+      if (!allowed) {
+        return res.status(403).json({ error: "Templates are managed by your org admin" });
+      }
+    }
 
     // Accept both legacy field names (template_name/html_content) and short names
     const template_name = req.body.template_name || req.body.name;
