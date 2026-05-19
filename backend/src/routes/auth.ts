@@ -61,7 +61,8 @@ router.get('/me', authenticateToken, async (req, res) => {
       response.delegateInfo = {
         isDelegated: true,
         adminEmail: authenticatedReq.delegateInfo.adminEmail,
-        adminUserId: authenticatedReq.delegateInfo.adminUserId
+        adminUserId: authenticatedReq.delegateInfo.adminUserId,
+        isContractor: authenticatedReq.delegateInfo.isContractor,
       };
     }
 

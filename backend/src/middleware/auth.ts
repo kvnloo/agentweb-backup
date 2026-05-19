@@ -13,6 +13,7 @@ export interface AuthenticatedRequest extends Request {
     adminUserId: string;
     adminEmail: string;
     isDelegated: boolean;
+    isContractor?: boolean;
   };
 }
 
@@ -34,10 +35,10 @@ export interface UserPayload {
 
 // Common function to extract user from request token (returns null if no token or invalid)
 // Also returns the decoded payload for delegate info if needed
-export async function getUserFromToken(req: Request): Promise<{ 
+export async function getUserFromToken(req: Request): Promise<{
   user: { userId: string; email: string; isAdmin: boolean; roles?: ('partner' | 'customer' | 'free')[] } | null;
   decoded?: UserPayload;
-  adminUser?: { userId: string; email: string };
+  adminUser?: { userId: string; email: string; isContractor?: boolean };
 }> {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -54,11 +55,24 @@ export async function getUserFromToken(req: Request): Promise<{
 
     // Handle delegate access tokens
     if (decoded.delegateAccess) {
-      // This is a delegate token - admin accessing as another user
+      // This is a delegate token - admin or contractor accessing as another user
       const adminUser = await userDb.getUserById(decoded.delegateAccess.adminUserId);
       const targetUser = await userDb.getUserById(decoded.delegateAccess.targetUserId);
-      
-      if (!adminUser || !targetUser || !adminUser.isAdmin) {
+
+      if (!adminUser || !targetUser) {
+        return { user: null };
+      }
+
+      const isAdmin = adminUser.isAdmin;
+      const isContractor = adminUser.roles?.includes('contractor');
+
+      // Contractors may only delegate to users in their assigned list
+      if (!isAdmin && isContractor) {
+        const assignedIds: string[] = (adminUser as any).contractorAssignedUserIds || [];
+        if (!assignedIds.includes(decoded.delegateAccess.targetUserId)) {
+          return { user: null };
+        }
+      } else if (!isAdmin && !isContractor) {
         return { user: null };
       }
 
@@ -66,13 +80,14 @@ export async function getUserFromToken(req: Request): Promise<{
         user: {
           userId: targetUser.userId,
           email: targetUser.email,
-          isAdmin: targetUser.isAdmin || false, // Use target user's actual admin status
+          isAdmin: targetUser.isAdmin || false,
           roles: (targetUser.roles && targetUser.roles.length > 0 ? targetUser.roles : ['customer']) as ('partner' | 'customer' | 'free')[]
         },
         decoded,
         adminUser: {
           userId: adminUser.userId,
-          email: adminUser.email
+          email: adminUser.email,
+          isContractor: !!isContractor && !isAdmin,
         }
       };
     } else if (decoded._svc) {
@@ -137,7 +152,8 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
     authReq.delegateInfo = {
       adminUserId: result.adminUser.userId,
       adminEmail: result.adminUser.email,
-      isDelegated: true
+      isDelegated: true,
+      isContractor: result.adminUser.isContractor,
     };
   }
 
