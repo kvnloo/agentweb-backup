@@ -557,6 +557,7 @@ export interface Organization {
   createdAt: string;
   updatedAt: string;
   shareSettings?: OrgShareSettings;
+  secrets?: Record<string, string>; // Encrypted per-org secrets (key → encrypted value)
 }
 
 export interface OrgShareSettings {
@@ -7294,6 +7295,86 @@ export const orgDb = {
   },
 
   ORG_MAX_MEMBERS,
+
+  /**
+   * Persist an encrypted secret value to the org record.
+   * Uses an atomic UpdateExpression so it does not clobber other secrets.
+   */
+  async setOrgSecret(orgId: string, key: string, encryptedValue: string): Promise<void> {
+    const params = {
+      TableName: ORGS_TABLE,
+      Key: { orgId },
+      UpdateExpression: "SET #secrets.#key = :val, #updatedAt = :updatedAt",
+      ExpressionAttributeNames: {
+        "#secrets": "secrets",
+        "#key": key,
+        "#updatedAt": "updatedAt",
+      },
+      ExpressionAttributeValues: {
+        ":val": encryptedValue,
+        ":updatedAt": new Date().toISOString(),
+      },
+      // If secrets map doesn't exist yet, the nested set will fail.
+      // We use a conditional expression + fallback to initialise the map.
+      ConditionExpression: "attribute_exists(#secrets)",
+    };
+
+    try {
+      await dynamodb.update(params).promise();
+    } catch (err: any) {
+      if (err.code === "ConditionalCheckFailedException") {
+        // secrets map does not exist — create it now
+        await dynamodb.update({
+          TableName: ORGS_TABLE,
+          Key: { orgId },
+          UpdateExpression: "SET #secrets = :secretsMap, #updatedAt = :updatedAt",
+          ExpressionAttributeNames: {
+            "#secrets": "secrets",
+            "#updatedAt": "updatedAt",
+          },
+          ExpressionAttributeValues: {
+            ":secretsMap": { [key]: encryptedValue },
+            ":updatedAt": new Date().toISOString(),
+          },
+        }).promise();
+      } else {
+        throw err;
+      }
+    }
+  },
+
+  /**
+   * Retrieve a single encrypted secret from the org record.
+   * Returns null if the org doesn't exist or the key is absent.
+   */
+  async getOrgSecret(orgId: string, key: string): Promise<string | null> {
+    const org = await this.getOrgById(orgId);
+    if (!org?.secrets) return null;
+    return (org.secrets as Record<string, string>)[key] ?? null;
+  },
+
+  /**
+   * Remove a single secret key from the org record.
+   */
+  async removeOrgSecret(orgId: string, key: string): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: ORGS_TABLE,
+        Key: { orgId },
+        UpdateExpression: "REMOVE #secrets.#key SET #updatedAt = :updatedAt",
+        ExpressionAttributeNames: {
+          "#secrets": "secrets",
+          "#key": key,
+          "#updatedAt": "updatedAt",
+        },
+        ExpressionAttributeValues: {
+          ":updatedAt": new Date().toISOString(),
+        },
+      }).promise();
+    } catch {
+      // If secrets map or key doesn't exist, that's fine — already absent.
+    }
+  },
 };
 
 // ─── Schedule Templates ──────────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { userDb } from './db';
+import { userDb, orgDb } from './db';
 import { decryptPassword } from '../utils/crypto';
 
 const CLICKUP_API_V2 = 'https://api.clickup.com/api/v2';
@@ -51,10 +51,31 @@ export interface ClickUpTask {
 
 /**
  * Get the decrypted ClickUp access token for a user.
- * Returns null if no token is stored or decryption fails.
+ *
+ * Resolution order:
+ *   1. If the user belongs to an org, check org.secrets.clickup_access_token first.
+ *   2. Fall back to user.secrets.clickup_access_token (solo users or per-user tokens).
+ *
+ * Returns null if no token is found or decryption fails.
  */
 export async function getAccessToken(userId: string): Promise<string | null> {
   const user = await userDb.getUserById(userId);
+
+  // 1. Org-level token takes precedence
+  if (user?.orgId) {
+    try {
+      const org = await orgDb.getOrgById(user.orgId);
+      const orgEncrypted = (org?.secrets as Record<string, string> | undefined)?.clickup_access_token;
+      if (orgEncrypted) {
+        const decrypted = decryptPassword(orgEncrypted);
+        return decrypted.password;
+      }
+    } catch {
+      // fall through to user-level token
+    }
+  }
+
+  // 2. Per-user token fallback
   const secrets = (user?.secrets as Record<string, string>) || {};
   if (!secrets.clickup_access_token) return null;
   try {
