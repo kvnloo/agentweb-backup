@@ -47,6 +47,11 @@ jest.mock("../components/CustomerRoute", () => ({
   default: ({ children }: { children: React.ReactNode }) => <>{children}</>,
 }));
 
+jest.mock("../components/ContractorRoute", () => ({
+  __esModule: true,
+  default: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+}));
+
 jest.mock("../pages/Login", () => () => <div>Login</div>);
 jest.mock("../pages/Register", () => () => <div>Register</div>);
 jest.mock("../pages/Tasks", () => () => <div>Tasks</div>);
@@ -74,6 +79,7 @@ jest.mock("../pages/ClientHealth", () => () => <div>ClientHealth</div>);
 jest.mock("../pages/PromptTemplates", () => () => <div>PromptTemplates</div>);
 jest.mock("../pages/Api", () => () => <div>Api</div>);
 jest.mock("../pages/marketing", () => () => <div>Marketing</div>);
+jest.mock("../pages/ContractorAccesses", () => () => <div>ContractorAccesses</div>);
 
 describe("App html-templates route", () => {
   it("renders HtmlTemplates at /html-templates through PartnerRoute", () => {

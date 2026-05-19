@@ -93,6 +93,15 @@ const TABLE_PREFIX =
   process.env.NODE_ENV === "development" ? "Dev-" : "";
 const TABLE_NAME = `${TABLE_PREFIX}AW-LandingPages`;
 
+/** Convert a page name to a URL-safe slug, max 30 chars, no leading/trailing hyphens. */
+export function buildPageSlug(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .slice(0, 30)
+    .replace(/^-|-$/g, "");
+}
+
 export interface GeneratedLandingPage {
   id: string;
   userId: string;
@@ -497,11 +506,7 @@ async function addPageToExistingRepo(
   const now = new Date().toISOString();
 
   // Create a slug for the new page route
-  const slug = name
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "")
-    .slice(0, 30);
+  const slug = buildPageSlug(name);
 
   const repoMatch = existingPage.githubRepoUrl!.match(/github\.com\/([^\/]+)\/([^\/]+)/);
   if (!repoMatch) throw new Error("Invalid GitHub repo URL on existing page");
@@ -1091,11 +1096,7 @@ export async function deployLandingPage(
 
     // Step 3: Create GitHub repo and push files (validation already passed)
     console.log("[V0 SERVICE] Step 3: Creating GitHub repo and pushing files");
-    const slug = record.name
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-|-$/g, "")
-      .slice(0, 30);
+    const slug = buildPageSlug(record.name);
     const repoName = `lp-${slug}-${id.slice(0, 8)}`;
     const { githubRepoUrl, repoFullName } = await createGitHubRepoAndPush(repoName, zipBuffer, record.name);
 
@@ -1169,6 +1170,18 @@ export async function deployLandingPage(
       const domainRecord = await addSubdomain(userId, vercelProjectId, subdomain);
       customDomain = domainRecord.domain;
       console.log(`[V0 SERVICE] Auto-assigned subdomain: ${customDomain}`);
+      // Persist customDomainUrl so it's available on subsequent fetches without relying on enrichment
+      await dynamodb
+        .update({
+          TableName: TABLE_NAME,
+          Key: { id },
+          UpdateExpression: "SET customDomainUrl = :customUrl, updatedAt = :updatedAt",
+          ExpressionAttributeValues: {
+            ":customUrl": `https://${customDomain}`,
+            ":updatedAt": new Date().toISOString(),
+          },
+        })
+        .promise();
     } catch (subdomainErr: any) {
       // Non-fatal — the Vercel URL still works
       console.warn(`[V0 SERVICE] Could not auto-assign subdomain: ${subdomainErr.message}`);

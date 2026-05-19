@@ -66,7 +66,7 @@ export interface User {
   lastLoginTime?: string;
   lastActiveAt?: string; // Updated when user creates a chat session (non-delegated); more accurate than lastLoginTime for DAU/WAU/MAU
   supportNote?: string;
-  roles?: ("partner" | "customer" | "free")[];
+  roles?: ("partner" | "customer" | "free" | "contractor")[];
   displayName?: string;
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID

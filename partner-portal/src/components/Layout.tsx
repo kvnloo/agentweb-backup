@@ -14,12 +14,12 @@ import {
   Alert
 } from '@mui/material';
 import AccountCircle from '@mui/icons-material/AccountCircle';
-import { useAuth } from '../contexts/AuthContext';
+import { useAuth, UserRole } from '../contexts/AuthContext';
 import logo from '../assets/logo.svg';
 import ChatSupport from './ChatSupport';
 
 export default function Layout() {
-  const { user, logout } = useAuth();
+  const { user, logout, hasRole } = useAuth();
   const [anchorEl, setAnchorEl] = React.useState<null | HTMLElement>(null);
   const location = useLocation();
   const isHomePage = location.pathname === '/';
@@ -224,6 +224,16 @@ export default function Layout() {
                   >
                     Config
                   </Button>
+                  {hasRole('contractor') && (
+                    <Button
+                      color="primary"
+                      component={RouterLink}
+                      to="/contractor-accesses"
+                      variant={isActivePath('/contractor-accesses') ? 'contained' : 'text'}
+                    >
+                      Contractor Accesses
+                    </Button>
+                  )}
                   {user.isAdmin && (
                     <Button
                       color="primary"

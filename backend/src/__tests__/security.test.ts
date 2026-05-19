@@ -241,6 +241,7 @@ describe('Security Tests', () => {
         adminUserId: 'admin-123',
         adminEmail: 'admin@example.com',
         isDelegated: true,
+        isContractor: false,
       });
     });
 
@@ -277,6 +278,7 @@ describe('Security Tests', () => {
         adminUserId: 'admin-123',
         adminEmail: 'admin@example.com',
         isDelegated: true,
+        isContractor: false,
       });
     });
   });

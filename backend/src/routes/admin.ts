@@ -3071,7 +3071,7 @@ router.put("/users/:userId/role", async (req, res) => {
     const { roles } = req.body; // Expect an array of roles
 
     // Validate roles
-    const validRolesSet = new Set(["partner", "customer", "free"]);
+    const validRolesSet = new Set(["partner", "customer", "free", "contractor"]);
 
     if (!Array.isArray(roles) || roles.some((r) => !validRolesSet.has(r))) {
       return res.status(400).json({
