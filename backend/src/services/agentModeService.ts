@@ -17701,8 +17701,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         .use(remarkBreaks) // Convert line breaks to <br> tags
         .use(remarkHtml, { sanitize: false }); // Convert to HTML
 
+      // Gemini may serialize array items as JSON strings instead of objects — normalize
+      const normalizedPosts = posts.map(p => (typeof p === 'string' ? JSON.parse(p) : p));
+
       // Generate HTML for each post
-      const postsHtml = posts.map((post, index) => {
+      const postsHtml = normalizedPosts.map((post, index) => {
         const postNumber = index + 1;
         // Map post types to display labels
         const typeLabelMap: Record<string, string> = {
