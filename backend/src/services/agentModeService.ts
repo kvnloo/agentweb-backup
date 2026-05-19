@@ -14097,22 +14097,45 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Get all public knowledge bases from all users
       const publicKnowledgeBaseTasks = await taskDb.getAllPublicKnowledgeBaseTasks();
 
-      // Combine both lists, removing duplicates (in case user has public KBs)
-      const taskIdSet = new Set<string>();
-
-      // Add user's task IDs to set first
-      for (const task of userKnowledgeBaseTasks || []) {
-        taskIdSet.add(task.taskId);
+      // Fan out to same-org members' KBs when shareSettings.knowledgeBase is
+      // effectively enabled for the caller (editors and the org owner always
+      // see fanout; plain members only when the toggle is on).
+      let orgKnowledgeBaseTasks: any[] = [];
+      try {
+        const { userDb, orgDb } = await import('./db');
+        const { isFeatureEffectivelyEnabled } = await import('./orgShareService');
+        const caller = await userDb.getUserById(userId);
+        if (caller?.orgId) {
+          const org = await orgDb.getOrgById(caller.orgId);
+          const enabled = isFeatureEffectivelyEnabled(
+            { userId, orgId: caller.orgId, orgRole: caller.orgRole as 'owner' | 'member' | undefined },
+            org,
+            'knowledgeBase',
+          );
+          if (enabled) {
+            const members = await orgDb.getOrgMembers(caller.orgId);
+            const otherMembers = members.filter((m: any) => m.userId !== userId);
+            const perMember = await Promise.all(
+              otherMembers.map((m: any) => taskDb.getTasksWithKnowledgeBase(m.userId).catch(() => [])),
+            );
+            orgKnowledgeBaseTasks = perMember.flat();
+          }
+        }
+      } catch (e) {
+        console.error('[agentModeService] org KB fanout failed:', e);
       }
 
-      const allKnowledgeBaseTasks = [...(userKnowledgeBaseTasks || [])];
-
-      // Add public knowledge bases that are not already in the user's list
-      for (const publicTask of publicKnowledgeBaseTasks || []) {
-        if (!taskIdSet.has(publicTask.taskId)) {
-          taskIdSet.add(publicTask.taskId);
-          allKnowledgeBaseTasks.push(publicTask);
-        }
+      // Combine all lists, removing duplicates by taskId
+      const taskIdSet = new Set<string>();
+      const allKnowledgeBaseTasks: any[] = [];
+      for (const task of [
+        ...(userKnowledgeBaseTasks || []),
+        ...orgKnowledgeBaseTasks,
+        ...(publicKnowledgeBaseTasks || []),
+      ]) {
+        if (taskIdSet.has(task.taskId)) continue;
+        taskIdSet.add(task.taskId);
+        allKnowledgeBaseTasks.push(task);
       }
 
       // If kb_type filter is set and doesn't include platform KBs, skip them entirely
@@ -14574,10 +14597,38 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return { success: false, message: `Knowledge base "${kbIdentifier}" not found` };
     }
 
-    // Auth check: allow access if the knowledge base is public, otherwise check ownership
+    // Auth check: allow public KBs, otherwise owner or any same-org member when
+    // shareSettings.knowledgeBase is effectively enabled (editors + owners always
+    // pass; plain members only when toggle is on). Mirrors the GET /knowledge-base
+    // route so Emma can read the same items the UI shows.
     const isPublic = task.knowledgeBaseType === 'public';
     if (!isPublic && task.userId !== userId) {
-      return { success: false, message: 'Not authorized to access this knowledge base file' };
+      let kbAuthorized = false;
+      try {
+        const { userDb, orgDb } = await import('./db');
+        const { canViewItem } = await import('./orgShareService');
+        const [caller, owner] = await Promise.all([
+          userDb.getUserById(userId),
+          userDb.getUserById(task.userId),
+        ]);
+        const ownerOrgId = owner?.orgId;
+        const callerOrgId = caller?.orgId;
+        if (callerOrgId && ownerOrgId && callerOrgId === ownerOrgId) {
+          const org = await orgDb.getOrgById(callerOrgId);
+          kbAuthorized = canViewItem(
+            { userId: task.userId },
+            { userId, orgId: callerOrgId, orgRole: caller?.orgRole as 'owner' | 'member' | undefined },
+            org,
+            ownerOrgId,
+            'knowledgeBase',
+          );
+        }
+      } catch (e) {
+        console.error('[agentModeService] org KB authorization check failed:', e);
+      }
+      if (!kbAuthorized) {
+        return { success: false, message: 'Not authorized to access this knowledge base file' };
+      }
     }
 
     // Default file size check — skip if the KB has a URL set (size=0 can be stale metadata)
