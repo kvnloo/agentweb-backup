@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-20',
     changes: [
+      'Fixed: Scheduled Chats No Longer Send Duplicate Emails When Email Notifications Are Configured',
+      '- When a scheduled chat had email notifications configured, the AI sometimes also added a notify_session step inside the prompt, causing two emails per run',
+      '- The schedule tool now explicitly instructs the AI to omit any email-sending step from the prompt when email_notifications is already set on the schedule',
+      '- Users will receive exactly one email per scheduled run going forward',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
       'New: Organization-Wide Emma Memory',
       '- Organizations can now maintain a shared memory that Emma uses across all member conversations',
       '- Go to Settings → Organization → Organization Memory to add, edit, or delete org-wide facts',
