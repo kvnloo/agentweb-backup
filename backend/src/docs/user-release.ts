@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-20',
     changes: [
+      'Fixed: Emma Can Now Read Word Documents (.docx)',
+      '- Emma was unable to process Word documents uploaded as attachments — the file content came through as garbled binary data',
+      '- Emma can now read and understand the full text content of .docx and .doc files',
+      '- Use Emma to summarize, reformat, or build on any Word document you attach to a conversation',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
       'Fixed: CRM Enrichment No Longer Produces Fake LinkedIn URLs',
       '- The v3 enrichment pipeline could occasionally fabricate a plausible-looking LinkedIn URL for a lead even when no LinkedIn URL was present in any data source',
       '- The LLM extraction step now receives explicit per-field instructions for LinkedIn fields: it must only copy a URL that appears verbatim in the provided data and must return null if none is found',
