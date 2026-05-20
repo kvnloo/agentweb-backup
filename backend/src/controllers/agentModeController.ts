@@ -1663,54 +1663,43 @@ export async function generateSessionResponse(
     }
   );
 
-  // Add all response messages to session (includes assistant responses and tool calls).
-  // Strip base64 image data URIs from tool result content before persisting — they are
-  // ~300KB each and would exceed the DynamoDB 400KB item limit.
-  if (response.responseMessages.length > 0) {
-    const persistableMessages = response.responseMessages.map((msg: any) => {
-      if (msg.role === 'tool' && Array.isArray(msg.content)) {
-        const strippedContent = msg.content
-          .filter((item: any) => item.type !== 'image_url')
-          .map((item: any) => item.text ?? item)
-          .join('\n') || '[screenshot captured]';
-        return { ...msg, content: strippedContent };
-      }
-      return msg;
-    });
-    // Wrap in try/catch so a DynamoDB save failure does not discard the generated response.
-    // The caller (e.g. Slack handler) still receives response.content and can deliver it to the user.
-    try {
-      await chatbotDb.addMessagesToSession(sessionId, persistableMessages);
-    } catch (saveError) {
-      console.error('AgentMode: Failed to persist response messages to session — response will still be returned to caller:', saveError);
-    }
-  }
-
-  // If this session is linked to a GTM work item, update status to pending_review after AI responds
-  if (updatedSession.gtmWorkItem) {
-    try {
-      await updateGtmWorkItemStatus(updatedSession.gtmWorkItem, 'pending_review');
-    } catch (error) {
-      console.error('GTM status sync: Failed to set pending_review:', error);
-    }
-  }
-
-  // If cancelled, add a stopped indicator message
+  // If the user clicked Stop, discard the response entirely — don't persist anything.
+  // The user message was already saved before the LLM call; the assistant response is dropped
+  // so a page reload shows the user message with no ghost response from a cancelled turn.
   if (response.cancelled) {
-    const stoppedMessage: ChatMessage = {
-      role: 'assistant',
-      content: response.content || 'Generation was stopped.',
-      timestamp: new Date().toISOString(),
-      metadata: {
-        timestamp: new Date().toISOString(),
-        stopped: true,
-      },
-    };
-    // Only add if we didn't already have response messages (avoid duplicate content)
-    if (response.responseMessages.length === 0) {
-      await chatbotDb.addMessageToSession(sessionId, stoppedMessage);
-    }
     clearCancel(sessionId);
+  } else {
+    // Add all response messages to session (includes assistant responses and tool calls).
+    // Strip base64 image data URIs from tool result content before persisting — they are
+    // ~300KB each and would exceed the DynamoDB 400KB item limit.
+    if (response.responseMessages.length > 0) {
+      const persistableMessages = response.responseMessages.map((msg: any) => {
+        if (msg.role === 'tool' && Array.isArray(msg.content)) {
+          const strippedContent = msg.content
+            .filter((item: any) => item.type !== 'image_url')
+            .map((item: any) => item.text ?? item)
+            .join('\n') || '[screenshot captured]';
+          return { ...msg, content: strippedContent };
+        }
+        return msg;
+      });
+      // Wrap in try/catch so a DynamoDB save failure does not discard the generated response.
+      // The caller (e.g. Slack handler) still receives response.content and can deliver it to the user.
+      try {
+        await chatbotDb.addMessagesToSession(sessionId, persistableMessages);
+      } catch (saveError) {
+        console.error('AgentMode: Failed to persist response messages to session — response will still be returned to caller:', saveError);
+      }
+    }
+
+    // If this session is linked to a GTM work item, update status to pending_review after AI responds
+    if (updatedSession.gtmWorkItem) {
+      try {
+        await updateGtmWorkItemStatus(updatedSession.gtmWorkItem, 'pending_review');
+      } catch (error) {
+        console.error('GTM status sync: Failed to set pending_review:', error);
+      }
+    }
   }
 
   // Get the updated session to include workPlan if it was modified
@@ -2050,6 +2039,20 @@ export const agentModeController = {
       // Clear old progress store (but keep active connections)
       // Don't call cleanupProgress here as it removes active SSE connections
       progressStore.delete(sessionId);
+
+      // Cancel generation immediately when the client disconnects (e.g. Stop button aborts the fetch).
+      // This fires before /stop reaches the backend and ensures the worker receives the cancel signal
+      // while it still has a live sessionToRequestId mapping. Also emit SSE 'complete' so the frontend
+      // SSE stream clears the "Thinking..." state on reload instead of showing it indefinitely.
+      req.on('close', () => {
+        if (!res.headersSent) {
+          console.log(`AgentMode: Client disconnected for session ${sessionId} — signalling cancellation`);
+          requestCancel(sessionId);
+          generateMarketingResponseWorkerService.cancelSession(sessionId);
+          emitProgress(sessionId, { iteration: 0, status: 'complete' });
+          progressStore.delete(sessionId);
+        }
+      });
 
       // Use llmModel from request, session, or default
       const modelToUse = llmModel || session.llmModel || agentModeService.default_model;
@@ -4936,6 +4939,15 @@ export const agentModeController = {
       // Use session's llmModel if available, otherwise use default
       const defaultModel = await agentModeService.getDefaultModel();
       const modelToUse = session.llmModel || defaultModel;
+
+      // Cancel generation immediately when the client disconnects
+      req.on('close', () => {
+        if (!res.headersSent) {
+          console.log(`AgentMode: Client disconnected for conversable session ${session.sessionId} — signalling cancellation`);
+          requestCancel(session.sessionId);
+          generateMarketingResponseWorkerService.cancelSession(session.sessionId);
+        }
+      });
 
       // Generate AI response using the same function as regular users
       const response = await generateSessionResponse(

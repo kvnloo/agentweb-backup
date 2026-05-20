@@ -1962,6 +1962,16 @@ export class AgentModeService {
         // Yield control back to event loop after LLM call to allow health checks and other requests
         // This prevents blocking the main thread during long-running generateResponse operations
         await new Promise(resolve => setImmediate(resolve));
+
+        // Check cancellation after the LLM returns — for single-shot responses the pre-iteration
+        // check fires before the LLM call starts, so a Stop that arrives mid-call is only visible here.
+        if (isCancelled?.()) {
+          console.log(`AgentMode: Generation cancelled for session ${sessionId} after LLM returned (iteration ${iteration})`);
+          wasCancelled = true;
+          if (!content) content = 'Generation was stopped.';
+          break;
+        }
+
         responseMessage = response.choices[0].message;
 
         // Ensure content is always a string (Gemini can return undefined/null content

@@ -122,6 +122,7 @@ describe('AgentModeController - Error Handling', () => {
         path: '/api/agent-mode/generate',
         ip: '127.0.0.1',
         socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -151,6 +152,7 @@ describe('AgentModeController - Error Handling', () => {
           sessionId: mockSessionId,
           userMessage: 'Test message',
         },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -187,6 +189,7 @@ describe('AgentModeController - Error Handling', () => {
         path: '/api/agent-mode/generate',
         ip: '127.0.0.1',
         socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -229,6 +232,7 @@ describe('AgentModeController - Error Handling', () => {
           sessionId: mockSessionId,
           userMessage: 'Test message',
         },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -271,6 +275,7 @@ describe('AgentModeController - Error Handling', () => {
         path: '/api/agent-mode/generate',
         ip: '127.0.0.1',
         socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -312,6 +317,7 @@ describe('AgentModeController - Error Handling', () => {
         path: '/api/agent-mode/generate',
         ip: '127.0.0.1',
         socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -369,6 +375,7 @@ describe('AgentModeController - Error Handling', () => {
         path: '/api/agent-mode/generate',
         ip: '127.0.0.1',
         socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -407,6 +414,7 @@ describe('AgentModeController - Error Handling', () => {
         path: '/api/agent-mode/generate',
         ip: '127.0.0.1',
         socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -445,6 +453,7 @@ describe('AgentModeController - Error Handling', () => {
         path: '/api/agent-mode/ishare/test-session-123/generate',
         ip: '127.0.0.1',
         socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -488,6 +497,7 @@ describe('AgentModeController - Error Handling', () => {
         path: '/api/agent-mode/ishare/test-session-123/generate',
         ip: '127.0.0.1',
         socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -535,6 +545,7 @@ describe('AgentModeController - Error Handling', () => {
         path: '/api/agent-mode/ishare/test-session-123/generate',
         ip: '127.0.0.1',
         socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -589,6 +600,7 @@ describe('AgentModeController - Error Handling', () => {
         path: '/api/agent-mode/generate',
         ip: '127.0.0.1',
         socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -623,6 +635,7 @@ describe('AgentModeController - Error Handling', () => {
         path: '/api/agent-mode/ishare/test-session-123/generate',
         ip: '127.0.0.1',
         socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -684,6 +697,7 @@ describe('AgentModeController - Error Handling', () => {
         path: '/api/agent-mode/generate',
         ip: '127.0.0.1',
         socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -736,6 +750,7 @@ describe('AgentModeController - Error Handling', () => {
         path: '/api/agent-mode/generate',
         ip: '127.0.0.1',
         socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -789,6 +804,7 @@ describe('AgentModeController - Error Handling', () => {
         path: '/api/agent-mode/generate',
         ip: '127.0.0.1',
         socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -826,6 +842,7 @@ describe('AgentModeController - Error Handling', () => {
         path: '/api/agent-mode/generate',
         ip: '127.0.0.1',
         socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -869,6 +886,7 @@ describe('AgentModeController - Error Handling', () => {
         path: '/api/agent-mode/generate',
         ip: '127.0.0.1',
         socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -904,6 +922,7 @@ describe('AgentModeController - Error Handling', () => {
           sessionId: mockSessionId,
           userMessage: 'Test message',
         },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -932,6 +951,7 @@ describe('AgentModeController - Error Handling', () => {
         path: '/api/agent-mode/generate',
         ip: '127.0.0.1',
         socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -956,6 +976,7 @@ describe('AgentModeController - Error Handling', () => {
       path: '/api/agent-mode/generate',
       ip: '127.0.0.1',
       socket: { remoteAddress: '127.0.0.1' },
+      on: jest.fn(),
     } as unknown as Request);
 
     const makeRes = () => ({ json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response);
