@@ -39,6 +39,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Fathom accounts were incorrectly shown as "Disconnected" when the Fathom API was temporarily unavailable or slow',
       '- The connection status check now only marks an account as disconnected on definitive auth failures (invalid/revoked token), not on network errors or server issues',
       '- A 5-second timeout prevents the Connected Accounts page from hanging when Fathom is slow to respond',
+    ],
+  },
   {
     date: '2026-05-19',
     changes: [
