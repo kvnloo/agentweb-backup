@@ -1433,7 +1433,8 @@ export async function generateSessionResponse(
   attachments?: any[],
   isInteractiveShare?: boolean,
   pageContext?: { currentUrl?: string; structuredContext?: string; screenshot?: string },
-  isDelegatedAccess?: boolean
+  isDelegatedAccess?: boolean,
+  ishareSenderInfo?: { ip?: string; userAgent?: string }
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -1503,7 +1504,14 @@ export async function generateSessionResponse(
       portalType: (session.portalType || 'agent') as 'agent',
       timestamp: new Date().toISOString(),
       attachments: attachments || [],
-      ...(pageContext?.currentUrl ? { currentUrl: pageContext.currentUrl } : {})
+      ...(pageContext?.currentUrl ? { currentUrl: pageContext.currentUrl } : {}),
+      ...(isInteractiveShare ? {
+        ishareSender: {
+          isAnonymous: true as const,
+          ...(ishareSenderInfo?.ip ? { ip: ishareSenderInfo.ip } : {}),
+          ...(ishareSenderInfo?.userAgent ? { userAgent: ishareSenderInfo.userAgent } : {}),
+        }
+      } : {})
     }
   };
 
@@ -2725,13 +2733,20 @@ export const agentModeController = {
       const modelToUse = session.llmModel || defaultModel;
 
       // Use the same generateSessionResponse logic as the regular generateResponse
+      const ishareSenderInfo = {
+        ip: req.ip || (req.headers?.['x-forwarded-for'] as string | undefined)?.split(',')[0].trim(),
+        userAgent: req.headers?.['user-agent'] as string | undefined,
+      };
       const response = await generateSessionResponse(
         session.sessionId,
         userMessage,
         session.userId,
         modelToUse,
         attachments,
-        true // isInteractiveShare - block admin tools for security
+        true, // isInteractiveShare - block admin tools for security
+        undefined, // pageContext
+        undefined, // isDelegatedAccess
+        ishareSenderInfo
       );
 
       // Clear progress store after completion (keep connections open for future messages)

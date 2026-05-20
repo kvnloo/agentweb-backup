@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-20',
     changes: [
+      'Fixed: iShare Messages Now Correctly Attributed as Anonymous',
+      '- Messages submitted by visitors via interactive share (iShare) links were previously stored identically to messages from the session owner, with no way to distinguish the source',
+      '- Each message sent through an iShare link now records the sender as anonymous in the message metadata, along with the visitor\'s IP address and browser info when available',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
       'Fixed: LinkedIn Connection Sync No Longer Errors on Leads Without Email Addresses',
       '- The LinkedIn connection sync cron was throwing a DynamoDB validation error when processing leads that have no email address',
       '- Leads without an email are now skipped during LinkedIn-triggered sequence enrollment',
