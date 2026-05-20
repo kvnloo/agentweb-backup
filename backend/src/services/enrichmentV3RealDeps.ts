@@ -442,6 +442,45 @@ async function fetchWebForGroupReal(
 
 // ─── LLM extraction (Tier 3 over Apollo / Tier 4 over web) ────────────────────
 
+export function buildFieldGuidanceV3(fields: string[], configFieldsByName: Record<string, { instruction?: string } | undefined>): string {
+  return fields.map(name => {
+    const fl = name.toLowerCase();
+    const instr = configFieldsByName[name]?.instruction || '';
+    let guidance: string;
+    if (/company_linkedin|company.*linkedin|linkedin.*company/.test(fl)) {
+      guidance = `ONLY copy a LinkedIn company page URL that appears verbatim in the source data above. The URL must start with "https://www.linkedin.com/company/". Do NOT construct, guess, or complete a URL. Return null if no exact /company/ URL is present in the data.`;
+    } else if (/linkedin/.test(fl)) {
+      guidance = `ONLY copy a linkedin.com/in/ URL that appears verbatim in the provided data. Do NOT construct, guess, or complete a URL — even if you think you know the person's LinkedIn handle. Do NOT use /pub/dir/ or /search/ URLs. Return null if no exact /in/ URL is present in the data.`;
+    } else if (instr) {
+      guidance = instr;
+    } else {
+      guidance = `Return only what is explicitly stated in the provided data. Return null if not present.`;
+    }
+    return `- ${name}: ${guidance}`;
+  }).join('\n');
+}
+
+export function rejectHallucinatedLinkedInUrls(filled: Record<string, string>, sourceContext: string): Record<string, string> {
+  const normalizedSource = sourceContext.toLowerCase().replace(/\s+/g, ' ').trim();
+  const result: Record<string, string> = {};
+  for (const [field, value] of Object.entries(filled)) {
+    if (/linkedin/i.test(field)) {
+      const slugMatch = value.match(/linkedin\.com\/(in|company)\/([^/?#\s]+)/i);
+      if (!slugMatch) {
+        console.warn(`[v3 deps] Rejected LinkedIn URL "${value}" for field "${field}" — no valid /in/ or /company/ path`);
+        continue;
+      }
+      const slug = slugMatch[2].toLowerCase();
+      if (!normalizedSource.includes(slug)) {
+        console.warn(`[v3 deps] Rejected hallucinated LinkedIn URL "${value}" for field "${field}" — slug "${slug}" not in source data`);
+        continue;
+      }
+    }
+    result[field] = value;
+  }
+  return result;
+}
+
 async function extractFieldsViaLLMReal(input: {
   tier: 'apollo' | 'web';
   sourceContext: string;
@@ -452,10 +491,7 @@ async function extractFieldsViaLLMReal(input: {
 }): Promise<{ filled: Record<string, string>; missing: string[] }> {
   if (input.fields.length === 0) return { filled: {}, missing: [] };
 
-  const fieldGuide = input.fields.map(name => {
-    const instr = input.configFieldsByName[name]?.instruction || '';
-    return `- ${name}${instr ? `: ${instr}` : ''}`;
-  }).join('\n');
+  const fieldGuide = buildFieldGuidanceV3(input.fields, input.configFieldsByName);
 
   const leadContext = JSON.stringify({
     email: input.lead.email,
@@ -503,7 +539,9 @@ async function extractFieldsViaLLMReal(input: {
         missing.push(field);
       }
     }
-    return { filled, missing };
+    const verified = rejectHallucinatedLinkedInUrls(filled, input.sourceContext);
+    const verifiedMissing = input.fields.filter(f => !(f in verified));
+    return { filled: verified, missing: [...new Set([...missing, ...verifiedMissing])] };
   } catch (err) {
     console.warn('[v3 deps] extractFieldsViaLLM failed:', (err as Error).message);
     return { filled: {}, missing: input.fields };

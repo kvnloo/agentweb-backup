@@ -8,7 +8,7 @@
  * when email is absent but name + (website or emailDomain) are present.
  */
 
-import { buildOrchestratorDeps, buildIdentityDeps } from '../services/enrichmentV3RealDeps';
+import { buildOrchestratorDeps, buildIdentityDeps, buildFieldGuidanceV3, rejectHallucinatedLinkedInUrls } from '../services/enrichmentV3RealDeps';
 import * as apolloServiceModule from '../services/apolloService';
 import type { ApolloService } from '../services/apolloService';
 import { createApolloFetchContext } from '../services/enrichmentGroupWaterfall';
@@ -362,5 +362,71 @@ describe('apolloBrokerChain adapter — personal domain guard', () => {
 
     expect(findEmail).toHaveBeenCalled();
     expect(result?.email).toBe('jane@acme.com');
+  });
+});
+
+// ─── LinkedIn hallucination guard tests ───────────────────────────────────────
+
+describe('buildFieldGuidanceV3 — LinkedIn field-specific guidance', () => {
+  it('emits /in/ restriction for a linkedin_url field', () => {
+    const guide = buildFieldGuidanceV3(['linkedin_url'], {});
+    expect(guide).toContain('ONLY copy a linkedin.com/in/ URL that appears verbatim');
+    expect(guide).toContain('Do NOT construct, guess, or complete a URL');
+  });
+
+  it('emits /company/ restriction for a company_linkedin_url field', () => {
+    const guide = buildFieldGuidanceV3(['company_linkedin_url'], {});
+    expect(guide).toContain('ONLY copy a LinkedIn company page URL');
+    expect(guide).toContain('https://www.linkedin.com/company/');
+  });
+
+  it('emits /company/ restriction for a company_linkedin field', () => {
+    const guide = buildFieldGuidanceV3(['company_linkedin'], {});
+    expect(guide).toContain('ONLY copy a LinkedIn company page URL');
+  });
+
+  it('uses user instruction for non-LinkedIn fields', () => {
+    const guide = buildFieldGuidanceV3(['job_title'], { job_title: { instruction: 'Current role only' } });
+    expect(guide).toContain('Current role only');
+    expect(guide).not.toContain('linkedin.com');
+  });
+});
+
+describe('rejectHallucinatedLinkedInUrls', () => {
+  it('keeps a linkedin_url whose slug appears in source', () => {
+    const source = 'Profile: https://www.linkedin.com/in/jane-doe-acme';
+    const result = rejectHallucinatedLinkedInUrls({ linkedin_url: 'https://www.linkedin.com/in/jane-doe-acme' }, source);
+    expect(result.linkedin_url).toBe('https://www.linkedin.com/in/jane-doe-acme');
+  });
+
+  it('rejects a linkedin_url whose slug does NOT appear in source', () => {
+    const source = 'Jane Doe works at Acme Corp. No LinkedIn URL present.';
+    const result = rejectHallucinatedLinkedInUrls({ linkedin_url: 'https://www.linkedin.com/in/jane-doe-acme' }, source);
+    expect(result.linkedin_url).toBeUndefined();
+  });
+
+  it('rejects a company_linkedin_url whose slug is not in source', () => {
+    const source = 'Acme Corp is a software company.';
+    const result = rejectHallucinatedLinkedInUrls({ company_linkedin_url: 'https://www.linkedin.com/company/acme-corp' }, source);
+    expect(result.company_linkedin_url).toBeUndefined();
+  });
+
+  it('keeps a company_linkedin_url whose slug appears in source', () => {
+    const source = 'Visit our page: https://www.linkedin.com/company/acme-corp';
+    const result = rejectHallucinatedLinkedInUrls({ company_linkedin_url: 'https://www.linkedin.com/company/acme-corp' }, source);
+    expect(result.company_linkedin_url).toBe('https://www.linkedin.com/company/acme-corp');
+  });
+
+  it('does not reject non-LinkedIn fields', () => {
+    const source = 'Contact: john@acme.com';
+    const result = rejectHallucinatedLinkedInUrls({ email: 'john@acme.com', title: 'Engineer' }, source);
+    expect(result.email).toBe('john@acme.com');
+    expect(result.title).toBe('Engineer');
+  });
+
+  it('rejects a URL with a non-/in/ path for a linkedin field', () => {
+    const source = 'Shared linkedin.com/pub/dir/jane-doe link';
+    const result = rejectHallucinatedLinkedInUrls({ linkedin_url: 'https://www.linkedin.com/pub/dir/jane-doe' }, source);
+    expect(result.linkedin_url).toBeUndefined();
   });
 });
