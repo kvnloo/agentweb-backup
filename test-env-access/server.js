@@ -574,6 +574,15 @@ async function processQueue() {
         console.error(`[relay] Failed to post error comment:`, commentErr);
       }
 
+      // On timeout (exit 143), set status to In Review so the user knows to check in.
+      if (/exited with code 143/.test(errMsg)) {
+        try {
+          await updateNotionStatus(notionPageId, "In Review");
+        } catch (statusErr) {
+          console.error(`[relay] Failed to set In Review status after timeout:`, statusErr);
+        }
+      }
+
       // If Claude crashed (non-zero exit, but NOT 143=SIGTERM/timeout), re-queue the
       // prompt so the user's message isn't lost.  Post the error comment above
       // so the user knows what happened, then retry after a short delay.
@@ -704,7 +713,7 @@ function runClaude(prompt) {
         uid: 1000, // ec2-user UID
         gid: 1000,
         env: { ...process.env, HOME: "/home/ec2-user" },
-        timeout: 60 * 60 * 1000, // 60 minutes
+        timeout: 2 * 60 * 60 * 1000, // 2 hours
       }
     );
 
