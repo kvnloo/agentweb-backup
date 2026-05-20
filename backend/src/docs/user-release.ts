@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-20',
     changes: [
+      'Fixed: CRM Enrichment No Longer Produces Fake LinkedIn URLs',
+      '- The v3 enrichment pipeline could occasionally fabricate a plausible-looking LinkedIn URL for a lead even when no LinkedIn URL was present in any data source',
+      '- The LLM extraction step now receives explicit per-field instructions for LinkedIn fields: it must only copy a URL that appears verbatim in the provided data and must return null if none is found',
+      '- A post-extraction guard additionally checks that the URL\'s slug literally appears in the source text, rejecting any hallucinated URL before it reaches the lead record',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
       'Fixed: Subscription End Date Now Correctly Reflects Latest Payment',
       '- The admin Users tab was showing a stale subscription end date even after a payment was processed',
       '- Payments now sync the subscription period end date from Stripe immediately',
