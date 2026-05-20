@@ -42,10 +42,19 @@ export const UNIPILE_PERSON_COVERAGE: Record<string, string[]> = {
 /** Direct map from Unipile raw profile JSON → CRM field names (root-level only).
  *  Field names verified against real Unipile /api/v1/users response. */
 function mapUnipilePersonToCrmFields(raw: Record<string, any>): Record<string, string> {
+  const clean = (v: unknown): string | undefined => {
+    if (typeof v !== 'string') return undefined;
+    const s = v.replace(/\s*\n\s*/g, ' ').trim();
+    return s || undefined;
+  };
+
   const out: Record<string, string> = {};
-  if (raw.first_name)  out.first_name  = raw.first_name;
-  if (raw.last_name)   out.last_name   = raw.last_name;
-  if (raw.location)    out.location    = raw.location;
+  const firstName = clean(raw.first_name);
+  const lastName = clean(raw.last_name);
+  const location = clean(raw.location);
+  if (firstName)  out.first_name  = firstName;
+  if (lastName)   out.last_name   = lastName;
+  if (location)   out.location    = location;
   if (raw.public_identifier) {
     out.linkedin_url = `https://www.linkedin.com/in/${raw.public_identifier}`;
   }
@@ -55,8 +64,8 @@ function mapUnipilePersonToCrmFields(raw: Record<string, any>): Record<string, s
   if (ci) {
     const emails: any[] = Array.isArray(ci.emails) ? ci.emails : [];
     const phones: any[] = Array.isArray(ci.phones) ? ci.phones : [];
-    const email = emails[0]?.address ?? emails[0]?.value ?? null;
-    const phone = phones[0]?.number ?? phones[0]?.value ?? null;
+    const email = clean(emails[0]?.address ?? emails[0]?.value);
+    const phone = clean(phones[0]?.number ?? phones[0]?.value);
     if (email) out.email = email;
     if (phone) out.phone = phone;
   }
@@ -463,7 +472,6 @@ export async function runWaterfall(
   // name+company search to fetch company data.
   // For person groups: reuses the profile fetched during company lookup (zero
   // extra API calls) or fetches directly from lead.linkedin when available.
-  let unipileCompanyFills = 0;
   if (deps.findUnipileCompany && remaining.length > 0) {
     const entityType = groupEntityType(groupName);
     if (entityType === 'company') {
@@ -484,7 +492,7 @@ export async function runWaterfall(
           const entry = llmResult.filled[f];
           if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
             filled.push({ field: f, value: entry.value, meta: metaUnipile() });
-            unipileCompanyFills += 1;
+            unipileFills += 1;
           }
         }
         remaining = remaining.filter(f => !llmFilledHasValue(llmResult.filled[f]));
@@ -507,7 +515,7 @@ export async function runWaterfall(
           const value = directMapped[f];
           if (typeof value === 'string' && value.length > 0) {
             filled.push({ field: f, value, meta: metaUnipile() });
-            unipileCompanyFills += 1;
+            unipileFills += 1;
           }
         }
         remaining = remaining.filter(f => !filled.find(x => x.field === f));
@@ -526,7 +534,7 @@ export async function runWaterfall(
             const entry = llmResult.filled[f];
             if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
               filled.push({ field: f, value: entry.value, meta: metaUnipile() });
-              unipileCompanyFills += 1;
+              unipileFills += 1;
             }
           }
           remaining = remaining.filter(f => !llmFilledHasValue(llmResult.filled[f]));
@@ -541,7 +549,7 @@ export async function runWaterfall(
       missing: [],
       tierFills: {
         crm: crmHits.length,
-        apollo: apolloHits.length + tier3Fills + unipileFills + unipileCompanyFills,
+        apollo: apolloHits.length + tier3Fills + unipileFills,
         web: 0,
         missing: 0,
       },
@@ -575,7 +583,7 @@ export async function runWaterfall(
     missing: remaining,
     tierFills: {
       crm: crmHits.length,
-      apollo: apolloHits.length + tier3Fills + unipileFills + unipileCompanyFills,
+      apollo: apolloHits.length + tier3Fills + unipileFills,
       web: webFills,
       missing: remaining.length,
     },

@@ -960,7 +960,7 @@ export async function runEnrichment(
 
     const completedSoFar = Math.min(i + CONCURRENCY, leads.length);
     const skippedSoFar = identityResolutionFailed;
-    const hardFailedSoFar = llmOrParseFailed + searchWebFailed + updateFailed;
+    const hardFailedSoFar = llmOrParseFailed + updateFailed;
     const parts = [`${processed} enriched`];
     if (skippedSoFar > 0) parts.push(`${skippedSoFar} skipped`);
     if (hardFailedSoFar > 0) parts.push(`${hardFailedSoFar} failed`);
