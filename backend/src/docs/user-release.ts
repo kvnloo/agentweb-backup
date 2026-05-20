@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-20',
     changes: [
+      'Fixed: Subscription End Date Now Correctly Reflects Latest Payment',
+      '- The admin Users tab was showing a stale subscription end date even after a payment was processed',
+      '- Payments now sync the subscription period end date from Stripe immediately',
+      '- The manual admin re-sync also now correctly overwrites stale end dates',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
       'Fixed: Scheduled Chats No Longer Send Duplicate Emails When Email Notifications Are Configured',
       '- When a scheduled chat had email notifications configured, the AI sometimes also added a notify_session step inside the prompt, causing two emails per run',
       '- The schedule tool now explicitly instructs the AI to omit any email-sending step from the prompt when email_notifications is already set on the schedule',
