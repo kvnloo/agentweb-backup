@@ -95,28 +95,30 @@ describe('syncSubscriptionFromStripe — additive-only', () => {
     );
   });
 
-  // ─── Test 2: Does NOT overwrite existing subscription_status ───
-  it('does NOT overwrite existing subscription_status', async () => {
+  // ─── Test 2: Does NOT overwrite existing subscription_status, but DOES overwrite current_period_end ───
+  it('does NOT overwrite existing subscription_status but always overwrites current_period_end', async () => {
     const user = {
       userId: 'user-2',
       stripe_customer_id: 'cus_2',
-      subscription_status: 'past_due', // webhook wrote this
+      subscription_status: 'past_due', // webhook wrote this — should be preserved
       stripe_subscription_id: 'sub_webhook_456',
       subscriptionType: 'Super Premium',
       has_payment_method: true,
-      current_period_end: '2025-01-01T00:00:00.000Z',
+      current_period_end: '2025-01-01T00:00:00.000Z', // stale — should be overwritten
     };
     mockGetUserById.mockResolvedValue(user);
-    // Stripe says "active" but webhook already set "past_due" — webhook wins
     mockSubscriptionsList.mockResolvedValue({
       data: [makeStripeSub({ status: 'active' })],
     });
 
     const result = await syncSubscriptionFromStripe('user-2', 'cus_2');
 
-    // Should return null because nothing needed updating
-    expect(result).toBeNull();
-    expect(mockUpdateUser).not.toHaveBeenCalled();
+    // current_period_end is always overwritten with Stripe's live value
+    expect(result).not.toBeNull();
+    const updateCall = mockUpdateUser.mock.calls[0][1];
+    expect(updateCall).toHaveProperty('current_period_end');
+    // subscription_status must NOT be overwritten — webhook value wins
+    expect(updateCall).not.toHaveProperty('subscription_status');
   });
 
   // ─── Test 3: Fills null stripe_subscription_id but skips non-null ───
@@ -173,8 +175,8 @@ describe('syncSubscriptionFromStripe — additive-only', () => {
     expect(updateCall).toHaveProperty('current_period_end');
   });
 
-  // ─── Test 5: Lazy sync after webhook — webhook data preserved ───
-  it('preserves webhook-written data after webhook fires', async () => {
+  // ─── Test 5: Lazy sync after webhook — webhook data preserved except current_period_end ───
+  it('preserves webhook-written status/type but always refreshes current_period_end', async () => {
     // Simulate: webhook already wrote correct state
     const user = {
       userId: 'user-5',
@@ -183,7 +185,7 @@ describe('syncSubscriptionFromStripe — additive-only', () => {
       stripe_subscription_id: 'sub_webhook_789',
       subscriptionType: 'Basic',
       has_payment_method: false,
-      current_period_end: '2025-06-01T00:00:00.000Z',
+      current_period_end: '2025-06-01T00:00:00.000Z', // stale — always overwritten
     };
     mockGetUserById.mockResolvedValue(user);
     // Stripe API returns slightly different data (e.g., active instead of trialing)
@@ -197,9 +199,13 @@ describe('syncSubscriptionFromStripe — additive-only', () => {
 
     const result = await syncSubscriptionFromStripe('user-5', 'cus_5');
 
-    // Nothing should be overwritten — all fields already set by webhook
-    expect(result).toBeNull();
-    expect(mockUpdateUser).not.toHaveBeenCalled();
+    // current_period_end is always overwritten — even when set by a webhook
+    expect(result).not.toBeNull();
+    const updateCall = mockUpdateUser.mock.calls[0][1];
+    expect(updateCall).toHaveProperty('current_period_end');
+    // Webhook-written fields for status/type must NOT be touched
+    expect(updateCall).not.toHaveProperty('subscription_status');
+    expect(updateCall).not.toHaveProperty('subscriptionType');
   });
 
   // ─── Test 6: Partial null — only null fields get filled ───
