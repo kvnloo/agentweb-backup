@@ -795,7 +795,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
 
           // Approach 1: person LinkedIn URL → profile → current work_experience company_id (2 API calls)
           // Profile raw data is preserved for person field enrichment (no extra API call).
-          if (!companyIdentifier && lead.linkedin) {
+          if (!companyIdentifier && lead.linkedin?.includes('/in/')) {
             try {
               const profileResult = await getUnipileProfileService().getProfile(lead.linkedin, accountId);
               if (profileResult?.found && profileResult.rawData) {

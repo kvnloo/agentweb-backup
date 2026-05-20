@@ -156,7 +156,7 @@ function normalizeLinkedInUrl(url: string): string {
 
     // Only accept linkedin.com domains
     if (!urlObj.hostname.endsWith('linkedin.com')) {
-      return normalized; // Return as-is if not a LinkedIn URL
+      return '';
     }
 
     // Extract pathname and clean it
@@ -168,16 +168,15 @@ function normalizeLinkedInUrl(url: string): string {
     // Only accept /in/ profile URLs (not company pages, etc.)
     const match = pathname.match(/^\/in\/([a-zA-Z0-9_-]+)/);
     if (!match) {
-      return normalized; // Return as-is if not a valid /in/ profile URL
+      return '';
     }
 
     const username = match[1];
 
     // Return canonical format
     return `https://www.linkedin.com/in/${username}`;
-  } catch (error) {
-    // If URL parsing fails, return cleaned version
-    return url.trim().toLowerCase().replace(/\/$/, '');
+  } catch {
+    return '';
   }
 }
 
