@@ -137,6 +137,31 @@ This file captures patterns and mistakes to avoid. Updated after corrections fro
   - **Fix:** When showing "user activities" for an admin, use `AW-ChatSessions` (user chatting with AI), NOT task executions (subagent automation). Task counts in the admin UI labeled "Tasks / Workflows" represent automation setups, not user engagement sessions.
   - **Date:** 2026-04-09
 
+## CRM / Outreach Safety
+
+### CRITICAL: Always scope outreach operations to the configured list — never fan out to all user lists
+- **Lesson:** When implementing any feature that sends messages, emails, or takes actions on leads, ALWAYS filter to the exact list(s) explicitly configured for that operation. Never iterate over all lists a user owns as a "convenience" fallback.
+- **Why:** `enrollNewConnections` fetched ALL of a user's lead lists via `getLeadListsByUserId()` instead of only the lists in `seq.autoEnrollListIds`. This caused 6 people from unrelated lists to receive unsolicited LinkedIn outreach messages. Real messages were sent to real people who were not in the intended campaign list. This is damaging — it erodes trust with contacts, can be flagged as spam, and is impossible to fully undo once sent.
+- **The error pattern to avoid:**
+  ```typescript
+  // WRONG — iterates every list the user owns
+  const lists = await crmDb.getLeadListsByUserId(seq.userId);
+  for (const list of lists) { /* search and act */ }
+
+  // RIGHT — filter to only the explicitly configured lists
+  const lists = await crmDb.getLeadListsByUserId(seq.userId);
+  for (const list of lists) {
+    if (seq.targetListIds?.length && !seq.targetListIds.includes(list.listId)) continue;
+    /* search and act */
+  }
+  ```
+- **Rule:** Any function that dispatches outreach (LinkedIn messages, emails, enrollments, invitations) MUST:
+  1. Have a clearly named scope parameter (`listId`, `targetListIds`, `autoEnrollListIds`, etc.)
+  2. Enforce that scope before touching any lead record
+  3. Never default to "all lists" as a fallback — if the scope is unset, fail loudly or require explicit opt-in
+- **Test requirement:** Every outreach-dispatching function must have a test that asserts leads outside the configured list are NOT contacted.
+- **Date:** 2026-05-20
+
 ## Code Patterns
 
 ### DynamoDB Queries
