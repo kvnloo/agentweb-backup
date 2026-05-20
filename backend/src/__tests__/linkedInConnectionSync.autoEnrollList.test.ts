@@ -86,8 +86,8 @@ describe('enrollNewConnections - autoEnrollListIds filter', () => {
     mockDripDb.getAllSequencesByTriggerType.mockResolvedValue([SEQUENCE_WITH_FILTER] as any);
     mockCrmDb.getLeadListsByUserId.mockResolvedValue([CORRECT_LIST, WRONG_LIST] as any);
     mockCrmDb.getLeadsByListId.mockImplementation(async (listId: string) => {
-      if (listId === 'list-correct') return { items: [MATCHING_LEAD], lastEvaluatedKey: null };
-      return { items: [MATCHING_LEAD], lastEvaluatedKey: null }; // same lead in wrong list too
+      if (listId === 'list-correct') return { items: [MATCHING_LEAD], lastEvaluatedKey: null, hasMore: false };
+      return { items: [MATCHING_LEAD], lastEvaluatedKey: null, hasMore: false }; // same lead in wrong list too
     });
 
     await enrollNewConnections([NEW_CONNECTION]);
@@ -101,7 +101,7 @@ describe('enrollNewConnections - autoEnrollListIds filter', () => {
   it('does not query leads from lists not in autoEnrollListIds', async () => {
     mockDripDb.getAllSequencesByTriggerType.mockResolvedValue([SEQUENCE_WITH_FILTER] as any);
     mockCrmDb.getLeadListsByUserId.mockResolvedValue([CORRECT_LIST, WRONG_LIST] as any);
-    mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false } as any);
 
     await enrollNewConnections([NEW_CONNECTION]);
 
@@ -113,7 +113,7 @@ describe('enrollNewConnections - autoEnrollListIds filter', () => {
   it('searches all lists when autoEnrollListIds is not set', async () => {
     mockDripDb.getAllSequencesByTriggerType.mockResolvedValue([SEQUENCE_NO_FILTER] as any);
     mockCrmDb.getLeadListsByUserId.mockResolvedValue([CORRECT_LIST, WRONG_LIST] as any);
-    mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false } as any);
 
     await enrollNewConnections([NEW_CONNECTION]);
 
@@ -125,7 +125,7 @@ describe('enrollNewConnections - autoEnrollListIds filter', () => {
   it('skips enrollment when lead is already enrolled', async () => {
     mockDripDb.getAllSequencesByTriggerType.mockResolvedValue([SEQUENCE_WITH_FILTER] as any);
     mockCrmDb.getLeadListsByUserId.mockResolvedValue([CORRECT_LIST] as any);
-    mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [MATCHING_LEAD], lastEvaluatedKey: null } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [MATCHING_LEAD], lastEvaluatedKey: null, hasMore: false } as any);
     mockDripDb.getExistingEnrollment.mockResolvedValue({ enrollmentId: 'existing' } as any);
 
     await enrollNewConnections([NEW_CONNECTION]);
