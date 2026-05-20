@@ -586,6 +586,20 @@ describe("GET /api/landing-pages/v0/generated", () => {
     expect(res.status).toBe(200);
     expect(res.body.pages[0].customDomainUrl).toBeUndefined();
   });
+
+  it("FAIL: sub-page with slug enriched from AW-CustomDomains → customDomainUrl includes /{slug}", async () => {
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([
+      { id: "page-sub", name: "Pricing", vercelProjectId: "proj-1", slug: "pricing-page", status: "deployed" },
+    ]);
+    mockListDomainsForPages.mockResolvedValueOnce([
+      { id: "dom-1", domain: "mysite.agentwebforms.com", vercelProjectId: "proj-1", status: "active", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    expect(res.body.pages[0].customDomainUrl).toBe("https://mysite.agentwebforms.com/pricing-page");
+  });
 });
 
 // =============================================================================

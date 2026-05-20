@@ -78,17 +78,28 @@ router.post("/subdomain", async (req, res: Response) => {
     const result = await addSubdomain(userId, vercelProjectId, subdomain);
 
     // If a landing page ID was provided, persist customDomainUrl on the record.
+    // For sub-pages (those with a slug), the URL must include the slug path.
     // This is non-fatal: if it fails (e.g. ConditionalCheckFailed), the subdomain
     // was still successfully added to Vercel, so we return 201 regardless.
     if (landingPageId && typeof landingPageId === "string") {
       try {
+        // Fetch the page to check for a slug (sub-pages need /{slug} appended)
+        const pageResult = await dynamodb.get({
+          TableName: LANDING_PAGES_TABLE,
+          Key: { id: landingPageId },
+        }).promise();
+        const slug = pageResult.Item?.slug;
+        const customDomainUrl = slug
+          ? `https://${result.domain}/${slug}`
+          : `https://${result.domain}`;
+
         await dynamodb.update({
           TableName: LANDING_PAGES_TABLE,
           Key: { id: landingPageId },
           ConditionExpression: "userId = :uid",
           UpdateExpression: "SET customDomainUrl = :url, updatedAt = :now",
           ExpressionAttributeValues: {
-            ":url": `https://${result.domain}`,
+            ":url": customDomainUrl,
             ":uid": userId,
             ":now": new Date().toISOString(),
           },
