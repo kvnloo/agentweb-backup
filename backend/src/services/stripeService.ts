@@ -659,7 +659,7 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
     updateData.subscription_amount = invoice.amount_paid;
   }
 
-  // Sync current_period_end from the subscription so the admin Users tab shows the correct end date
+  // Sync current_period_end from the live subscription so the admin Users tab shows the correct end date
   const subIdToFetch = subscriptionId || user.stripe_subscription_id;
   if (subIdToFetch) {
     try {
