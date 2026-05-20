@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-19
+// Last updated: 2026-05-20
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,18 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-05-20',
+    changes: [
+      'Fixed: Landing Page Sub-Pages Now Show the Correct Custom Domain URL',
+      '- Sub-pages (additional pages added to a landing page site) were displaying the Vercel URL instead of the custom domain URL',
+      '- Sub-page URLs now correctly use the custom domain as the base (e.g. mycustomdomain.com/pricing instead of lp-xyz.vercel.app/pricing)',
+      '- When assigning a custom subdomain, sub-pages now store the full URL including their page path',
+      'Fixed: Failed Landing Pages Can Now Be Deleted',
+      '- Landing pages that failed during generation (before any GitHub repo was created) could not be deleted from the UI, forcing users to regenerate without being able to clean up the failed record',
+      '- The delete button now appears for failed landing pages that were never deployed, matching existing backend support',
+    ],
+  },
   {
     date: '2026-05-19',
     changes: [
