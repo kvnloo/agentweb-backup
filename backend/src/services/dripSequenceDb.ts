@@ -513,6 +513,16 @@ async function getAllDueEnrollments(): Promise<SequenceEnrollment[]> {
   return (result.Items ?? []) as SequenceEnrollment[];
 }
 
+/** Bump nextSendAt without changing currentStep (used for retry backoff). */
+async function snoozeEnrollment(enrollmentId: string, retryAt: string): Promise<void> {
+  await dynamodb.update({
+    TableName: ENROLLMENTS_TABLE,
+    Key: { enrollmentId },
+    UpdateExpression: 'SET nextSendAt = :next',
+    ExpressionAttributeValues: { ':next': retryAt },
+  }).promise();
+}
+
 async function advanceEnrollment(
   enrollmentId: string,
   nextStep: number,
@@ -653,6 +663,7 @@ export const dripSequenceDb = {
   getDueEnrollments,
   getAllDueEnrollments,
   setEnrollmentLinkedInProviderId,
+  snoozeEnrollment,
   advanceEnrollment,
   completeEnrollment,
   exitEnrollment,
