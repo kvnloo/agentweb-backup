@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-20',
     changes: [
+      'Fixed: Scheduled Chat Error — Social Listening Research and Similar Schedules Now Retry on Intermittent Bedrock Errors',
+      '- Scheduled chats occasionally failed with "I encountered an issue processing your request" due to a transient Bedrock infrastructure error (HTTP 400 with no error body)',
+      '- This error was incorrectly treated as a permanent failure and not retried',
+      '- The fix adds "400 status code (no body)" to the list of transient Bedrock errors that trigger automatic retry, preventing spurious failures on intermittent AWS infrastructure issues',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
       'New: Native Account Owner and Additional POC Emails on CRM Lead Records',
       '- Each CRM lead now has a native "Account Owner" field that maps to an org team member (e.g. Harsha, Matt, Fangfang)',
       '- Select an account owner from the dropdown in the lead detail panel — options are pulled from your org\'s members',
