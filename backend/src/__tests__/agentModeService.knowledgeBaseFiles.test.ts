@@ -1,5 +1,5 @@
 import { AgentModeService } from '../services/agentModeService';
-import { taskDb } from '../services/db';
+import { taskDb, userDb, orgDb } from '../services/db';
 import { Storage } from '@google-cloud/storage';
 import { getGCSPPrivateKey } from '../utils/secretsManager';
 
@@ -9,6 +9,8 @@ jest.mock('@google-cloud/storage');
 jest.mock('../utils/secretsManager');
 
 const mockedTaskDb = taskDb as jest.Mocked<typeof taskDb>;
+const mockedUserDb = userDb as jest.Mocked<typeof userDb>;
+const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
 const mockedStorage = Storage as jest.MockedClass<typeof Storage>;
 const mockedGetGCSPPrivateKey = getGCSPPrivateKey as jest.MockedFunction<typeof getGCSPPrivateKey>;
 
@@ -421,6 +423,75 @@ describe('AgentModeService - Knowledge Base Files', () => {
       expect(mockResponse.files[0]).toHaveProperty('kb_identifier');
       expect(mockResponse.files[0]).toHaveProperty('file_name');
       expect(mockResponse.files[0]).toHaveProperty('content');
+    });
+  });
+
+  // The org's shared Google Drive folders must only be exposed to a member when
+  // the knowledgeBase sharing feature is effectively enabled for them. Otherwise
+  // a plain member of an org with KB sharing OFF would still see them via Emma.
+  describe('getUserGoogleDriveFolders - org sharing gate', () => {
+    const orgFolders = [{ folderId: 'org-folder-1', name: 'Org Folder' }];
+    const personalFolders = [{ folderId: 'personal-1', name: 'Personal Folder' }];
+
+    const orgWith = (enabled: boolean, editors: string[] = []) => ({
+      orgId: 'org-1',
+      ownerUserId: 'owner',
+      googleDriveFolders: orgFolders,
+      shareSettings: { knowledgeBase: { enabled, editors } },
+    });
+
+    afterEach(() => {
+      mockedUserDb.getUserById.mockReset();
+      mockedOrgDb.getOrgById.mockReset();
+    });
+
+    it("returns the user's own folders for a solo user (no org)", async () => {
+      mockedUserDb.getUserById.mockResolvedValue({ userId: 'solo', googleDriveFolders: personalFolders } as any);
+
+      const result = await (agentModeService as any).getUserGoogleDriveFolders('solo');
+      expect(result).toEqual(personalFolders);
+    });
+
+    it('returns the org folders for the org owner even when KB sharing is OFF', async () => {
+      mockedUserDb.getUserById.mockResolvedValue({ userId: 'owner', orgId: 'org-1', orgRole: 'owner' } as any);
+      mockedOrgDb.getOrgById.mockResolvedValue(orgWith(false) as any);
+
+      const result = await (agentModeService as any).getUserGoogleDriveFolders('owner');
+      expect(result).toEqual(orgFolders);
+    });
+
+    it('returns the org folders for a KB editor even when KB sharing is OFF', async () => {
+      mockedUserDb.getUserById.mockResolvedValue({ userId: 'editor', orgId: 'org-1', orgRole: 'member' } as any);
+      mockedOrgDb.getOrgById.mockResolvedValue(orgWith(false, ['editor']) as any);
+
+      const result = await (agentModeService as any).getUserGoogleDriveFolders('editor');
+      expect(result).toEqual(orgFolders);
+    });
+
+    it('returns the org folders for a plain member when KB sharing is ON', async () => {
+      mockedUserDb.getUserById.mockResolvedValue({ userId: 'member', orgId: 'org-1', orgRole: 'member' } as any);
+      mockedOrgDb.getOrgById.mockResolvedValue(orgWith(true) as any);
+
+      const result = await (agentModeService as any).getUserGoogleDriveFolders('member');
+      expect(result).toEqual(orgFolders);
+    });
+
+    it('does NOT return the org folders for a plain member when KB sharing is OFF', async () => {
+      mockedUserDb.getUserById.mockResolvedValue({ userId: 'member', orgId: 'org-1', orgRole: 'member' } as any);
+      mockedOrgDb.getOrgById.mockResolvedValue(orgWith(false) as any);
+
+      const result = await (agentModeService as any).getUserGoogleDriveFolders('member');
+      expect(result).toEqual([]);
+    });
+
+    it("falls back to a plain member's personal folders when KB sharing is OFF", async () => {
+      mockedUserDb.getUserById.mockResolvedValue({
+        userId: 'member', orgId: 'org-1', orgRole: 'member', googleDriveFolders: personalFolders,
+      } as any);
+      mockedOrgDb.getOrgById.mockResolvedValue(orgWith(false) as any);
+
+      const result = await (agentModeService as any).getUserGoogleDriveFolders('member');
+      expect(result).toEqual(personalFolders);
     });
   });
 });

@@ -459,5 +459,67 @@ describe("Foreplay org-wide integration", () => {
       const result = await getAccessToken(OWNER_USER_ID);
       expect(result).toBeNull();
     });
+
+    // ── KB-sharing gate: the org token is entitlement-gated ──────────────────
+    // A plain org member may only consume the org's Foreplay token when the
+    // knowledgeBase sharing feature is effectively enabled for them.
+    it("returns the org token for a plain member when knowledgeBase sharing is ON", async () => {
+      mockOrg.shareSettings.knowledgeBase.enabled = true;
+      mockOrg.secrets = { foreplay_api_token: `encrypted:org-shared-token:${ORG_ID}` };
+      delete mockUsers[MEMBER_USER_ID].secrets;
+
+      const result = await getAccessToken(MEMBER_USER_ID);
+      expect(result).toBe("org-shared-token");
+    });
+
+    it("skips the org token for a plain member when knowledgeBase sharing is OFF — falls through to the platform key", async () => {
+      mockOrg.shareSettings.knowledgeBase.enabled = false;
+      mockOrg.secrets = { foreplay_api_token: `encrypted:org-shared-token:${ORG_ID}` };
+      delete mockUsers[MEMBER_USER_ID].secrets;
+
+      const result = await getAccessToken(MEMBER_USER_ID);
+      expect(result).toBe("platform-wide-key");
+    });
+
+    it("returns null for a plain member with sharing OFF when no personal or platform key exists", async () => {
+      mockOrg.shareSettings.knowledgeBase.enabled = false;
+      mockOrg.secrets = { foreplay_api_token: `encrypted:org-shared-token:${ORG_ID}` };
+      delete mockUsers[MEMBER_USER_ID].secrets;
+      mockGetForeplayApiKey.mockImplementationOnce(() => Promise.resolve(null));
+
+      const result = await getAccessToken(MEMBER_USER_ID);
+      expect(result).toBeNull();
+    });
+
+    it("falls back to a plain member's personal token when knowledgeBase sharing is OFF", async () => {
+      mockOrg.shareSettings.knowledgeBase.enabled = false;
+      mockOrg.secrets = { foreplay_api_token: `encrypted:org-shared-token:${ORG_ID}` };
+      mockUsers[MEMBER_USER_ID].secrets = {
+        foreplay_api_token: `encrypted:member-personal-token:${MEMBER_USER_ID}`,
+      };
+
+      const result = await getAccessToken(MEMBER_USER_ID);
+      expect(result).toBe("member-personal-token");
+
+      delete mockUsers[MEMBER_USER_ID].secrets;
+    });
+
+    it("returns the org token for the org owner even when knowledgeBase sharing is OFF", async () => {
+      mockOrg.shareSettings.knowledgeBase.enabled = false;
+      mockOrg.secrets = { foreplay_api_token: `encrypted:org-shared-token:${ORG_ID}` };
+      delete mockUsers[OWNER_USER_ID].secrets;
+
+      const result = await getAccessToken(OWNER_USER_ID);
+      expect(result).toBe("org-shared-token");
+    });
+
+    it("returns the org token for a KB editor even when knowledgeBase sharing is OFF", async () => {
+      mockOrg.shareSettings.knowledgeBase.enabled = false;
+      mockOrg.secrets = { foreplay_api_token: `encrypted:org-shared-token:${ORG_ID}` };
+      delete mockUsers[EDITOR_USER_ID].secrets;
+
+      const result = await getAccessToken(EDITOR_USER_ID);
+      expect(result).toBe("org-shared-token");
+    });
   });
 });

@@ -413,5 +413,57 @@ describe("ClickUp org-wide integration", () => {
       const result = await getAccessToken(SOLO_USER_ID);
       expect(result).toBeNull();
     });
+
+    // ── KB-sharing gate: the org token is entitlement-gated ──────────────────
+    // A plain org member may only consume the org's ClickUp token when the
+    // knowledgeBase sharing feature is effectively enabled for them.
+    it("returns the org token for a plain member when knowledgeBase sharing is ON", async () => {
+      mockOrg.shareSettings.knowledgeBase.enabled = true;
+      mockOrg.secrets = { clickup_access_token: `encrypted:org-shared-token:${ORG_ID}` };
+      delete mockUsers[MEMBER_USER_ID].secrets;
+
+      const result = await getAccessToken(MEMBER_USER_ID);
+      expect(result).toBe("org-shared-token");
+    });
+
+    it("does NOT return the org token for a plain member when knowledgeBase sharing is OFF", async () => {
+      mockOrg.shareSettings.knowledgeBase.enabled = false;
+      mockOrg.secrets = { clickup_access_token: `encrypted:org-shared-token:${ORG_ID}` };
+      delete mockUsers[MEMBER_USER_ID].secrets;
+
+      const result = await getAccessToken(MEMBER_USER_ID);
+      expect(result).toBeNull();
+    });
+
+    it("falls back to a plain member's personal token when knowledgeBase sharing is OFF", async () => {
+      mockOrg.shareSettings.knowledgeBase.enabled = false;
+      mockOrg.secrets = { clickup_access_token: `encrypted:org-shared-token:${ORG_ID}` };
+      mockUsers[MEMBER_USER_ID].secrets = {
+        clickup_access_token: `encrypted:member-personal-token:${MEMBER_USER_ID}`,
+      };
+
+      const result = await getAccessToken(MEMBER_USER_ID);
+      expect(result).toBe("member-personal-token");
+
+      delete mockUsers[MEMBER_USER_ID].secrets;
+    });
+
+    it("returns the org token for the org owner even when knowledgeBase sharing is OFF", async () => {
+      mockOrg.shareSettings.knowledgeBase.enabled = false;
+      mockOrg.secrets = { clickup_access_token: `encrypted:org-shared-token:${ORG_ID}` };
+      delete mockUsers[OWNER_USER_ID].secrets;
+
+      const result = await getAccessToken(OWNER_USER_ID);
+      expect(result).toBe("org-shared-token");
+    });
+
+    it("returns the org token for a KB editor even when knowledgeBase sharing is OFF", async () => {
+      mockOrg.shareSettings.knowledgeBase.enabled = false;
+      mockOrg.secrets = { clickup_access_token: `encrypted:org-shared-token:${ORG_ID}` };
+      delete mockUsers[EDITOR_USER_ID].secrets;
+
+      const result = await getAccessToken(EDITOR_USER_ID);
+      expect(result).toBe("org-shared-token");
+    });
   });
 });
