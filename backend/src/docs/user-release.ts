@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-20',
     changes: [
+      'Fixed: Subscription End Date Now Correctly Reflects Latest Payment',
+      '- The admin Users tab was showing a stale subscription end date even after a payment was processed',
+      '- Payments now sync the subscription period end date from Stripe immediately',
+      '- The manual admin re-sync also now correctly overwrites stale end dates',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
       'Fixed: LinkedIn Connection Sync No Longer Errors on Leads Without Email Addresses',
       '- The LinkedIn connection sync cron was throwing a DynamoDB validation error when processing leads that have no email address',
       '- Leads without an email are now skipped during LinkedIn-triggered sequence enrollment',
