@@ -5494,6 +5494,10 @@ export const crmDb = {
           if (lead.system && Object.keys(lead.system).length > 0) {
             item.system = lead.system;
           }
+          const nameCompanyKey = computeNameCompanyKey(lead.firstName, lead.lastName, lead.company);
+          if (nameCompanyKey) {
+            item.nameCompanyKey = nameCompanyKey;
+          }
 
           return {
             PutRequest: {
