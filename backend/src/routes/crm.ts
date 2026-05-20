@@ -3403,6 +3403,14 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
       return res.status(403).json({ message: 'Access denied' });
     }
 
+    // Validate socketId belongs to the authenticated user
+    if (socketId) {
+      const callerSocket = io.sockets.sockets.get(socketId);
+      if (!callerSocket || (callerSocket.data.user as any)?.userId !== userId) {
+        return res.status(400).json({ message: 'Invalid socketId' });
+      }
+    }
+
     // Helper function to emit progress
     const emitProgress = (message: string, progress: number) => {
       if (socketId) {
@@ -3466,16 +3474,29 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
       });
     } else if (mode === 'match') {
       if (leadsToProcess.length === 0) {
-        return res.json({
+        res.status(202).json({
           success: true,
           message: 'No leads to process',
           processedCount: 0,
         });
+        if (socketId) {
+          io.to(socketId).emit('icp-match-complete', { processedCount: 0 });
+        }
+        return;
       }
 
-      // Import LLMService
-      const { createLLMService } = await import('../utils/llmService');
+      // Return 202 immediately — processing runs detached so the HTTP connection
+      // is freed before the load-balancer 60s timeout. Progress and completion
+      // are delivered via Socket.IO events on the caller's socketId.
+      res.status(202).json({
+        success: true,
+        message: 'ICP matching started',
+        totalLeadsToProcess: leadsToProcess.length,
+      });
 
+      // Detached async — intentionally not awaited
+      (async () => {
+      const { createLLMService } = await import('../utils/llmService');
       emitProgress('Starting ICP matching...', 0);
 
       // Split leads into 5 chunks for parallel processing
@@ -3520,6 +3541,7 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
             if (lead.icpMatch) {
               data.previousMatch = {
                 isMatch: lead.icpMatch.isMatch,
+                matchedIcpTitle: lead.icpMatch.matchedIcpTitle,
                 score: lead.icpMatch.score,
                 reason: lead.icpMatch.reason,
                 matchedAt: lead.icpMatch.matchedAt,
@@ -3611,6 +3633,7 @@ Please analyze each lead and return a JSON array with your assessment.`;
                     matchedIcpTitle,
                     matchedAt: new Date().toISOString(),
                   },
+                  skipFieldNamesUpdate: true,
                 });
 
                 chunkProcessedCount++;
@@ -3636,11 +3659,17 @@ Please analyze each lead and return a JSON array with your assessment.`;
 
       emitProgress('ICP matching complete!', 100);
 
-      res.json({
-        success: true,
-        message: `Successfully matched ${processedCount} leads`,
-        processedCount,
-        totalLeadsProcessed: leadsToProcess.length,
+      if (socketId) {
+        io.to(socketId).emit('icp-match-complete', {
+          processedCount,
+          totalLeadsProcessed: leadsToProcess.length,
+        });
+      }
+      })().catch((err: any) => {
+        console.error('[ICP Match] Fatal error in detached processing:', err);
+        if (socketId) {
+          io.to(socketId).emit('icp-match-error', { message: err.message || 'ICP matching failed' });
+        }
       });
     } else {
       res.status(400).json({ message: 'Invalid mode parameter. Use "preview" or "match"' });

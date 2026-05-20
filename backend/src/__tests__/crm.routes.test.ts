@@ -7,6 +7,11 @@ jest.mock('../server', () => ({
       emit: jest.fn(),
     }),
     emit: jest.fn(),
+    sockets: {
+      sockets: {
+        get: jest.fn(),
+      },
+    },
   },
   app: {},
 }));
@@ -817,6 +822,8 @@ describe('CRM Routes', () => {
       if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
+      // Flush detached async IIFE (route returns 202 immediately, processing runs after)
+      await new Promise(setImmediate);
 
       expect(createLLMService).toHaveBeenCalledWith('gpt-5.2-chat', 1);
       expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', {
@@ -827,8 +834,10 @@ describe('CRM Routes', () => {
           matchedIcpTitle: 'SaaS founders',
           matchedAt: expect.any(String),
         },
+        skipFieldNamesUpdate: true,
       });
-      expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({ success: true, processedCount: 1 }));
+      expect(mockResponse.status).toHaveBeenCalledWith(202);
+      expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({ success: true, totalLeadsToProcess: 1 }));
     });
 
     it('persists isMatch=false and no matchedIcpTitle when LLM finds no match', async () => {
@@ -861,6 +870,7 @@ describe('CRM Routes', () => {
       if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
+      await new Promise(setImmediate);
 
       const updateCall = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
       expect(updateCall.icpMatch.isMatch).toBe(false);
@@ -899,6 +909,7 @@ describe('CRM Routes', () => {
       if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
+      await new Promise(setImmediate);
 
       expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', expect.objectContaining({
         icpMatch: expect.objectContaining({ score: 100 }),
@@ -935,10 +946,127 @@ describe('CRM Routes', () => {
       if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
+      await new Promise(setImmediate);
 
       const updateCall = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
       expect(updateCall.icpMatch.score).toBe(0);
       expect(Number.isNaN(updateCall.icpMatch.score)).toBe(false);
+    });
+
+    it('returns processedCount:0 and does not write DDB when LLM returns non-array', async () => {
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id',
+        marketStrategy: {
+          businessOverview: 'B2B SaaS',
+          icp: [{ title: 'SaaS founders', description: 'Early-stage', valueProposition: 'Automation' }],
+        },
+      });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [{ leadId: 'lead1', firstName: 'John', lastName: 'Doe', email: 'john@example.com' }],
+        lastEvaluatedKey: null,
+      });
+
+      const mockLlmService = {
+        generateJSONContent: jest.fn().mockResolvedValue({ error: 'malformed' }),
+      };
+      (createLLMService as jest.Mock).mockReturnValue(mockLlmService);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { mode: 'match' };
+      mockRequest.body = {};
+
+      const handler = findMatchIcpsPostHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      await new Promise(setImmediate);
+
+      expect(crmDb.updateLead).not.toHaveBeenCalled();
+      expect(mockResponse.status).toHaveBeenCalledWith(202);
+      expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({ success: true, totalLeadsToProcess: 1 }));
+    });
+
+    it('returns processedCount:0 and does not write DDB when LLM call rejects', async () => {
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id',
+        marketStrategy: {
+          businessOverview: 'B2B SaaS',
+          icp: [{ title: 'SaaS founders', description: 'Early-stage', valueProposition: 'Automation' }],
+        },
+      });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [{ leadId: 'lead1', firstName: 'John', lastName: 'Doe', email: 'john@example.com' }],
+        lastEvaluatedKey: null,
+      });
+
+      const mockLlmService = {
+        generateJSONContent: jest.fn().mockRejectedValue(new Error('LLM API timeout')),
+      };
+      (createLLMService as jest.Mock).mockReturnValue(mockLlmService);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { mode: 'match' };
+      mockRequest.body = {};
+
+      const handler = findMatchIcpsPostHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      await new Promise(setImmediate);
+
+      expect(crmDb.updateLead).not.toHaveBeenCalled();
+      expect(mockResponse.status).toHaveBeenCalledWith(202);
+      expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({ success: true, totalLeadsToProcess: 1 }));
+    });
+
+    it('returns 400 when socketId does not belong to the authenticated user', async () => {
+      const { io } = require('../server');
+      // Simulate socketId present but owned by a different user
+      io.sockets.sockets.get.mockReturnValue({ data: { user: { userId: 'other-user-id' } } });
+
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { mode: 'match' };
+      mockRequest.body = { socketId: 'sock-other-user' };
+
+      const handler = findMatchIcpsPostHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'Invalid socketId' });
+      expect(crmDb.updateLead).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 when socketId is not a connected socket', async () => {
+      const { io } = require('../server');
+      // Simulate socketId not found in connected sockets
+      io.sockets.sockets.get.mockReturnValue(undefined);
+
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { mode: 'match' };
+      mockRequest.body = { socketId: 'nonexistent-socket' };
+
+      const handler = findMatchIcpsPostHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'Invalid socketId' });
+      expect(crmDb.updateLead).not.toHaveBeenCalled();
     });
   });
 
