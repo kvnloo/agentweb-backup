@@ -645,7 +645,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
     runWaterfall: (input) => pureRunWaterfall(input, {
       fetchApolloOrg: async (lead) => {
         if (!isApolloServiceReady()) return null;
-        const domain = lead.emailDomain || extractDomain(lead.email) || extractDomain(lead.website);
+        const domain = lead.emailDomain || (lead.email ? lead.email.split('@')[1]?.trim() || null : null) || extractDomain(lead.website);
         if (!domain) return null;
         try {
           const result = await getApolloService().matchOrg(domain);
