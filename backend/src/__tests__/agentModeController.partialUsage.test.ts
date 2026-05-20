@@ -86,7 +86,8 @@ describe('AgentModeController - Partial Usage on Error', () => {
     path: '/api/agent-mode/generate',
     ip: '127.0.0.1',
     socket: { remoteAddress: '127.0.0.1' },
-  } as unknown as Request;
+    on: jest.fn(),
+      } as unknown as Request;
 
   const mockRes = {
     json: jest.fn(),

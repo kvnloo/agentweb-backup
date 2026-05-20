@@ -98,6 +98,7 @@ describe('AgentModeController - ishare Model Selection', () => {
       const mockReq = {
         params: { shareId: mockSessionId },
         query: { conversable: mockConversableToken }
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -124,6 +125,7 @@ describe('AgentModeController - ishare Model Selection', () => {
       const mockReq = {
         params: { shareId: mockSessionId },
         query: { conversable: mockConversableToken }
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -157,6 +159,7 @@ describe('AgentModeController - ishare Model Selection', () => {
           llmModel: 'gpt-4', // Different model in request body - should be ignored
           attachments: []
         }
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -187,6 +190,7 @@ describe('AgentModeController - ishare Model Selection', () => {
           llmModel: 'gpt-4', // Request body model should be ignored
           attachments: []
         }
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -216,6 +220,7 @@ describe('AgentModeController - ishare Model Selection', () => {
           userMessage: 'Test message',
           attachments: []
         }
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
@@ -239,6 +244,7 @@ describe('AgentModeController - ishare Model Selection', () => {
           userMessage: 'Test message',
           attachments: []
         }
+        on: jest.fn(),
       } as unknown as Request;
 
       const mockRes = {
