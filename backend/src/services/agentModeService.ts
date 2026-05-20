@@ -3013,6 +3013,10 @@ export class AgentModeService {
     'save_memory',
     'delete_memory',
 
+    // Org Memory (shared facts for all org members)
+    'save_org_memory',
+    'delete_org_memory',
+
     // Scheduled Chat Management
     'list_scheduled_chats',
     'manage_scheduled_chat',

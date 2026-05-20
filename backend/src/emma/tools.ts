@@ -1,6 +1,6 @@
 import { agentModeService } from '../services/agentModeService';
 import { emmaToolRegistry } from './registry';
-import { accountMemoryDb, userDb } from '../services/db';
+import { accountMemoryDb, orgMemoryDb, userDb } from '../services/db';
 import { crmDb } from '../services/db';
 import { askCrm, AskCrmLead } from '../services/askCrmService';
 import { getAccountSummary } from '../services/accountSummaryService';
@@ -5409,6 +5409,100 @@ emmaToolRegistry.register({
 
     await accountMemoryDb.deleteMemory(userId, args.memoryId);
     return { success: true, message: `Memory ${args.memoryId} deleted.` };
+  }
+});
+
+// ─── Org Memory Tools ────────────────────────────────────────
+
+emmaToolRegistry.register({
+  name: 'save_org_memory',
+  definition: {
+    name: 'save_org_memory',
+    description: 'Save a fact about this organization for all org members to share in future sessions. Use this when you learn something important about the company, its strategy, shared workflows, or team preferences that every member should know. Categories: preference (team likes/dislikes), history (past decisions), insight (business learnings), workflow (shared process patterns).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        content: {
+          type: 'string',
+          description: 'The org-wide fact to remember (max 2000 chars). Be specific and actionable.'
+        },
+        category: {
+          type: 'string',
+          enum: ['preference', 'history', 'insight', 'workflow'],
+          description: 'Category for the memory fact.'
+        }
+      },
+      required: ['content', 'category']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const { userDb, orgDb } = await import('../services/db');
+    const user = await userDb.getUserById(userId);
+    if (!user?.orgId) {
+      return { success: false, message: 'User is not a member of any organization.' };
+    }
+
+    const org = await orgDb.getOrgById(user.orgId);
+    if (!org) {
+      return { success: false, message: 'Organization not found.' };
+    }
+    if (org.orgMemoryEnabled === false) {
+      return { success: false, message: 'Organization memory is disabled.' };
+    }
+
+    const memory = await orgMemoryDb.addMemory(
+      user.orgId,
+      args.category,
+      args.content,
+      userId
+    );
+    return {
+      success: true,
+      memoryId: memory.memoryId,
+      message: `Saved org memory: "${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`
+    };
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'delete_org_memory',
+  definition: {
+    name: 'delete_org_memory',
+    description: 'Delete a specific org memory by its ID. Use this when an org-wide fact is no longer accurate or relevant. Only org owners can delete org memories.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        memoryId: {
+          type: 'string',
+          description: 'The ID of the org memory to delete.'
+        }
+      },
+      required: ['memoryId']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const { userDb, orgDb } = await import('../services/db');
+    const user = await userDb.getUserById(userId);
+    if (!user?.orgId) {
+      return { success: false, message: 'User is not a member of any organization.' };
+    }
+
+    const org = await orgDb.getOrgById(user.orgId);
+    if (!org) {
+      return { success: false, message: 'Organization not found.' };
+    }
+    if (org.ownerUserId !== userId) {
+      return { success: false, message: 'Only the org owner can delete org memories.' };
+    }
+
+    await orgMemoryDb.deleteMemory(user.orgId, args.memoryId);
+    return { success: true, message: `Org memory ${args.memoryId} deleted.` };
   }
 });
 
