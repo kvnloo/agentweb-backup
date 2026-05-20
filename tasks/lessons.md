@@ -116,6 +116,15 @@ This file captures patterns and mistakes to avoid. Updated after corrections fro
   - **How to diagnose:** `ss -tlnp | grep 5175` — if nothing listening, `test-env-access` is down
   - **Date:** 2026-05-20
 
+## Data Safety
+
+### Never Delete Test Accounts or Any User Account
+- **Lesson:** Never delete user accounts from DynamoDB — especially `test@example.com` and `test1@example.com`
+  - **Why:** Deleting a user row wipes the account entirely. The `createUser` condition (`attribute_not_exists(email)`) only protects against overwrite if the row exists — once deleted, anyone can re-register with the same email and create a blank account, losing all historical data (tasks, sessions, org membership, configs).
+  - **What happened:** `test@example.com` was deleted (mechanism unknown — no CloudTrail trail was configured), then someone signed up fresh with the same email, replacing the original admin account that owned the AgentWeb org with 283 tasks and 2409 chat sessions.
+  - **Fix:** If an account needs to be "reset", deactivate it (`isActive: false`) or clear specific fields — never delete the row. If you must delete a test account for a specific reason, recreate it immediately via `npm run create-admin` and restore the userId.
+  - **Date:** 2026-05-20
+
 ## Domain Terminology
 
 ### "Tasks" = Web Automation Subagent Activities (NOT User Activities)
