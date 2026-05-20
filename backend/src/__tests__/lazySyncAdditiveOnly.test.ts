@@ -1,5 +1,5 @@
 /**
- * Lazy Sync Additive-Only Tests
+ * Lazy Sync Additive-Only Tests (current_period_end always overwrites)
  *
  * Verifies that syncSubscriptionFromStripe() only fills NULL fields
  * and never overwrites existing (webhook-written) data in DynamoDB.
