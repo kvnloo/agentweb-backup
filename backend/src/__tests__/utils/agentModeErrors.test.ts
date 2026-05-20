@@ -307,6 +307,18 @@ describe('agentModeErrors utils', () => {
       });
       expect(isTransientLLMError(err)).toBe(false);
     });
+
+    it('should treat "400 status code (no body)" as transient — Bedrock infrastructure error', () => {
+      // AWS SDK emits this when Bedrock returns a 400 HTTP response with no parseable body,
+      // indicating a transient infrastructure issue rather than a client validation error.
+      const err = new Error('400 status code (no body)');
+      expect(isTransientLLMError(err)).toBe(true);
+    });
+
+    it('should treat other "N status code (no body)" variants as transient', () => {
+      expect(isTransientLLMError(new Error('503 status code (no body)'))).toBe(true);
+      expect(isTransientLLMError(new Error('502 status code (no body)'))).toBe(true);
+    });
   });
 
   describe('isContextLimitError — originalMessage path', () => {
