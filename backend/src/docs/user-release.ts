@@ -6616,6 +6616,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-20',
+    changes: [
+      'Improved: LinkedIn Steps in Sequences Now Require a Connected Outreach Account',
+      '- When adding a LinkedIn step to a Sequence, you now see a "Send from" dropdown showing your connected LinkedIn Outreach accounts',
+      '- If no account is connected, a clear warning appears on the step and saving is blocked until you connect one in Settings → Connected Accounts',
+      '- If an account is connected but expired or disconnected, the pre-save check tells you to reconnect before the sequence can go active',
+    ],
+  },
+  {
     date: '2026-05-13',
     changes: [
       'Fixed: Send LinkedIn Message in CRM No Longer Fails with a Validation Error',
