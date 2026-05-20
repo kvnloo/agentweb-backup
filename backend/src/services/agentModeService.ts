@@ -15911,6 +15911,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             error: xlsxError instanceof Error ? xlsxError.message : 'Excel parsing failed'
           };
         }
+      } else if (['docx', 'doc'].includes(extension) ||
+        contentType.includes('wordprocessingml') || contentType.includes('msword')) {
+        // Handle Word documents
+        try {
+          const mammoth = require('mammoth');
+          const result = await mammoth.extractRawText({ buffer });
+          extractedContent = result.value;
+          fileType = 'document';
+          console.log(`AgentMode: Successfully parsed Word document, extracted ${extractedContent.length} characters`);
+        } catch (docxError) {
+          console.error('AgentMode: Error parsing Word document:', docxError);
+          return {
+            success: false,
+            message: 'Failed to parse Word document. The file may be corrupted or in an unsupported format.',
+            error: docxError instanceof Error ? docxError.message : 'Word document parsing failed'
+          };
+        }
       } else if (['txt', 'md', 'csv', 'json', 'xml', 'html', 'htm', 'js', 'css', 'log', 'yml', 'yaml'].includes(extension)) {
         // Handle text-based files
         try {
