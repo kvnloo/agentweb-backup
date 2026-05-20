@@ -664,7 +664,7 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
   if (subIdToFetch) {
     try {
       const s = getStripeOrThrow();
-      const subscription = await s.subscriptions.retrieve(subIdToFetch);
+      const subscription = await s.subscriptions.retrieve(subIdToFetch) as any;
       if (subscription.current_period_end) {
         updateData.current_period_end = new Date(subscription.current_period_end * 1000).toISOString();
       }
