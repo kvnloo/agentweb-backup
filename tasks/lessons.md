@@ -108,6 +108,14 @@ This file captures patterns and mistakes to avoid. Updated after corrections fro
   - **Monitoring service:** `test-env-access` is the one that polls Notion for new comments and re-triggers Claude. If it's not running, new comments won't be processed.
   - **Date:** 2026-04-02
 
+### Don't Add a Polling Loop — Restart test-env-access Instead
+- **Lesson:** When Notion comments aren't being picked up (status stuck on "In Review" after user replies), the fix is to restart the `test-env-access` tmux session — NOT to add a polling loop to `.claude-run.sh`
+  - **Why:** The comment relay already works via webhook: Notion → backend `/webhooks/notion-dev-env` → `relayPromptToEC2()` → port 5175 on EC2 → `test-env-access/server.js` → spawns Claude with `--resume`. Adding a polling loop to `.claude-run.sh` creates a **duplicate trigger** — both the webhook and the loop pick up the same comment and fire two Claude runs.
+  - **Root cause of missing comments:** `test-env-access` not running (it's stopped/crash after instance restart)
+  - **Fix:** `tmux new-session -d -s test-env-access -c /home/ec2-user/agentweb/test-env-access "node server.js 2>&1 | tee -a /var/log/test-env/test-env-access.log; exec bash"`
+  - **How to diagnose:** `ss -tlnp | grep 5175` — if nothing listening, `test-env-access` is down
+  - **Date:** 2026-05-20
+
 ## Domain Terminology
 
 ### "Tasks" = Web Automation Subagent Activities (NOT User Activities)
