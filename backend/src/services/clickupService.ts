@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { userDb, orgDb } from './db';
 import { decryptPassword } from '../utils/crypto';
+import { isFeatureEffectivelyEnabled } from './orgShareService';
 
 const CLICKUP_API_V2 = 'https://api.clickup.com/api/v2';
 const CLICKUP_API_V3 = 'https://api.clickup.com/api/v3';
@@ -53,22 +54,35 @@ export interface ClickUpTask {
  * Get the decrypted ClickUp access token for a user.
  *
  * Resolution order:
- *   1. If the user belongs to an org, check org.secrets.clickup_access_token first.
+ *   1. If the user belongs to an org AND is entitled to the org's knowledgeBase
+ *      feature (org owner, KB editor, or sharing toggle on), use the org token.
  *   2. Fall back to user.secrets.clickup_access_token (solo users or per-user tokens).
  *
  * Returns null if no token is found or decryption fails.
+ *
+ * SECURITY: this is an authorization boundary. The org token must NOT be handed
+ * to a plain org member when shareSettings.knowledgeBase is off — otherwise they
+ * could read the org's ClickUp data the admin chose to keep private. Any new
+ * caller that needs the org token must go through this gate.
  */
 export async function getAccessToken(userId: string): Promise<string | null> {
   const user = await userDb.getUserById(userId);
 
-  // 1. Org-level token takes precedence
+  // 1. Org-level token — gated on the caller's knowledgeBase entitlement.
   if (user?.orgId) {
     try {
       const org = await orgDb.getOrgById(user.orgId);
-      const orgEncrypted = (org?.secrets as Record<string, string> | undefined)?.clickup_access_token;
-      if (orgEncrypted) {
-        const decrypted = decryptPassword(orgEncrypted);
-        return decrypted.password;
+      const entitled = isFeatureEffectivelyEnabled(
+        { userId, orgId: user.orgId, orgRole: user.orgRole as 'owner' | 'member' | undefined },
+        org,
+        'knowledgeBase',
+      );
+      if (entitled) {
+        const orgEncrypted = (org?.secrets as Record<string, string> | undefined)?.clickup_access_token;
+        if (orgEncrypted) {
+          const decrypted = decryptPassword(orgEncrypted);
+          return decrypted.password;
+        }
       }
     } catch {
       // fall through to user-level token

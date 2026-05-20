@@ -13733,10 +13733,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // If the caller belongs to an org, returns the org's folder list; otherwise the user's own list.
   private async getUserGoogleDriveFolders(userId: string): Promise<Array<{ folderId: string; name: string }>> {
     const { userDb, orgDb } = await import('./db');
+    const { isFeatureEffectivelyEnabled } = await import('./orgShareService');
     const user = await userDb.getUserById(userId);
     if (user?.orgId) {
       const org = await orgDb.getOrgById(user.orgId);
-      return Array.isArray(org?.googleDriveFolders) ? org!.googleDriveFolders : [];
+      // SECURITY: the org's shared Drive folders are gated on the caller's
+      // knowledgeBase entitlement. A plain member of an org with KB sharing off
+      // must not see them — fall through to the caller's own personal folders.
+      const entitled = isFeatureEffectivelyEnabled(
+        { userId, orgId: user.orgId, orgRole: user.orgRole as 'owner' | 'member' | undefined },
+        org,
+        'knowledgeBase',
+      );
+      if (entitled) {
+        return Array.isArray(org?.googleDriveFolders) ? org!.googleDriveFolders : [];
+      }
     }
     return Array.isArray(user?.googleDriveFolders) ? user!.googleDriveFolders : [];
   }
