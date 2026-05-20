@@ -64,6 +64,8 @@ export type LeadRole = (typeof LEAD_ROLES)[number];
 export interface LeadCrmExtensions {
   domain?: string;
   accountOwnerUserId?: string;
+  /** Additional POC emails (non-org users). Stored as a list on the lead record. */
+  pocEmails?: string[];
   priority?: LeadPriority;
   expectedClose?: string; // ISO date string
   closedDate?: string; // ISO date string — auto-set on stage=Won/Lost
@@ -202,6 +204,7 @@ export function buildLeadCrmFields(
   if (domain) out.domain = domain;
 
   if (ext.accountOwnerUserId) out.accountOwnerUserId = ext.accountOwnerUserId;
+  if (ext.pocEmails && ext.pocEmails.length > 0) out.pocEmails = ext.pocEmails;
   if (ext.priority) out.priority = ext.priority;
   if (ext.expectedClose) out.expectedClose = ext.expectedClose;
   if (ext.closedDate) out.closedDate = ext.closedDate;
@@ -266,6 +269,13 @@ export function buildLeadCrmUpdateFragments(ext: LeadCrmExtensions): {
       removeFields.push('dealIds');
     } else {
       setFields.push({ attr: 'dealIds', placeholder: ':crmDealIds', value: ext.dealIds });
+    }
+  }
+  if (ext.pocEmails !== undefined) {
+    if (ext.pocEmails.length === 0) {
+      removeFields.push('pocEmails');
+    } else {
+      setFields.push({ attr: 'pocEmails', placeholder: ':crmPocEmails', value: ext.pocEmails });
     }
   }
 

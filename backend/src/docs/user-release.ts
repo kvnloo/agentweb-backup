@@ -11,6 +11,18 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-20',
     changes: [
+      'New: Native Account Owner and Additional POC Emails on CRM Lead Records',
+      '- Each CRM lead now has a native "Account Owner" field that maps to an org team member (e.g. Harsha, Matt, Fangfang)',
+      '- Select an account owner from the dropdown in the lead detail panel — options are pulled from your org\'s members',
+      '- Add extra Point of Contact (POC) emails per lead using the new tag-input field: type an email and press Enter or comma to add, click × to remove',
+      '- Filter leads by account owner in the Filters popover; active filter shows as a pill in the list header',
+      '- Toggle the "Account Owner" column on in Configure Display Fields to show and sort by owner in the lead table',
+      '- Fixes: the previous Account Owner field was stored as a custom field and not properly recognized by the system — it now uses a native field consistent with the data model',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
       'Fixed: Landing Page Sub-Pages Now Show the Correct Custom Domain URL',
       '- Sub-pages (additional pages added to a landing page site) were displaying the Vercel URL instead of the custom domain URL',
       '- Sub-page URLs now correctly use the custom domain as the base (e.g. mycustomdomain.com/pricing instead of lp-xyz.vercel.app/pricing)',
