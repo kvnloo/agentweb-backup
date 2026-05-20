@@ -1712,7 +1712,7 @@ export class AgentModeService {
 
       // Inject account memory context (cross-session knowledge)
       try {
-        const { userDb } = await import('./db');
+        const { userDb, orgMemoryDb, orgDb } = await import('./db');
         const memoryUser = await userDb.getUserById(userId);
         if (memoryUser?.memoryEnabled !== false) {
           const recentMemories = await accountMemoryDb.getRecentMemories(userId, 20);
@@ -1724,6 +1724,23 @@ export class AgentModeService {
               role: 'assistant',
               content: `Account Memory (facts from previous sessions):\n${memoryLines.join('\n')}`
             });
+          }
+        }
+
+        // Inject org-wide memory if the user belongs to an org
+        if (memoryUser?.orgId) {
+          const org = await orgDb.getOrgById(memoryUser.orgId);
+          if (org && org.orgMemoryEnabled !== false) {
+            const recentOrgMemories = await orgMemoryDb.getRecentOrgMemories(memoryUser.orgId, 20);
+            if (recentOrgMemories.length > 0) {
+              const orgMemoryLines = recentOrgMemories.map(
+                (m: any) => `- [${m.category}] ${m.content}`
+              );
+              messages.push({
+                role: 'assistant',
+                content: `Organization Memory (shared facts for "${org.name}"):\n${orgMemoryLines.join('\n')}`
+              });
+            }
           }
         }
       } catch (err) {
@@ -2995,6 +3012,10 @@ export class AgentModeService {
     // Account Memory (cross-session knowledge)
     'save_memory',
     'delete_memory',
+
+    // Org Memory (shared facts for all org members)
+    'save_org_memory',
+    'delete_org_memory',
 
     // Scheduled Chat Management
     'list_scheduled_chats',
