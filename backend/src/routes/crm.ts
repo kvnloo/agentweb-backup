@@ -1635,11 +1635,11 @@ router.put('/lists/:listId/enrichment-config', async (req: Request, res: Respons
 
     const config = req.body;
     try {
-      const saved = await svcSetEnrichmentConfig(
+      const { config: saved, warnings } = await svcSetEnrichmentConfig(
         { listId, userId, config },
         enrichmentConfigDeps,
       );
-      return res.json({ config: saved, isDefault: false });
+      return res.json({ config: saved, isDefault: false, warnings });
     } catch (validationError: any) {
       if (validationError?.name === 'ConfigValidationError') {
         return res.status(400).json({ message: validationError.message });

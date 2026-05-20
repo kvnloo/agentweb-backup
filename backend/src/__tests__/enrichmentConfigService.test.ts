@@ -44,6 +44,46 @@ function makeDeps(overrides: Partial<ConfigServiceDeps> = {}): ConfigServiceDeps
 // ─── getEnrichmentConfig ──────────────────────────────────────────────────────
 
 describe('getEnrichmentConfig', () => {
+  it('returns knownColumns = standard columns + list schema (minus excluded/reserved)', async () => {
+    // knownColumns is the set of field names that will auto-resurface on next
+    // dialog open. Frontend uses it to hide the trash icon for these rows —
+    // delete is meaningful only for manually-added saved-only fields.
+    const deps = makeDeps({
+      readListConfig: jest.fn().mockResolvedValue(null),
+      loadListFieldNames: jest.fn().mockResolvedValue([
+        'industry', 'tech_stack',
+        'leadId', 'enrichmentMetadata',         // truly reserved → filtered
+      ]),
+    });
+
+    const result = await getEnrichmentConfig({ listId: LIST_ID, userId: USER_ID }, deps);
+    expect(result.knownColumns).toEqual(expect.arrayContaining([
+      'firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'notes',  // standard
+      'industry', 'tech_stack',                                                              // list custom
+    ]));
+    expect(result.knownColumns).not.toContain('leadId');
+    expect(result.knownColumns).not.toContain('enrichmentMetadata');
+  });
+
+  it('knownColumns excludes manually-added saved-only fields', async () => {
+    // A saved config with a manual `stag` field (not in list.fieldNames, not
+    // standard). knownColumns must NOT include it — that's how the frontend
+    // knows the trash icon should appear for this row.
+    const stored = validConfig({
+      fields: [
+        { name: 'stag', type: 'string', instruction: 'funding stage', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+    const deps = makeDeps({
+      readListConfig: jest.fn().mockResolvedValue(stored),
+      loadListFieldNames: jest.fn().mockResolvedValue(['industry']),
+    });
+
+    const result = await getEnrichmentConfig({ listId: LIST_ID, userId: USER_ID }, deps);
+    expect(result.knownColumns).toContain('industry');
+    expect(result.knownColumns).not.toContain('stag');
+  });
+
   it('returns the stored config merged with standard candidates when one exists', async () => {
     // After merge, the result includes saved fields PLUS the standard
     // candidate fields the saved config might not have explicitly listed.
@@ -327,7 +367,8 @@ describe('setEnrichmentConfig — happy path', () => {
     const writeCall = (deps.writeListConfig as jest.Mock).mock.calls[0];
     expect(writeCall[0]).toBe(LIST_ID);
     expect(writeCall[1].fields).toHaveLength(1);
-    expect(result.fields[0]?.name).toBe('industry');
+    expect(result.config.fields[0]?.name).toBe('industry');
+    expect(result.warnings).toEqual([]);
   });
 
   it('stamps updatedAt and updatedBy at write time, overwriting client-provided values', async () => {
@@ -345,8 +386,8 @@ describe('setEnrichmentConfig — happy path', () => {
       deps,
     );
 
-    expect(result.updatedBy).toBe(USER_ID);
-    expect(new Date(result.updatedAt).getTime()).toBeGreaterThanOrEqual(before);
+    expect(result.config.updatedBy).toBe(USER_ID);
+    expect(new Date(result.config.updatedAt).getTime()).toBeGreaterThanOrEqual(before);
   });
 });
 
@@ -433,7 +474,7 @@ describe('setEnrichmentConfig — validation', () => {
       ],
     });
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
-    expect(saved.fields[0].aliasFor).toBe('first_name');
+    expect(saved.config.fields[0].aliasFor).toBe('first_name');
   });
 
   it('auto-infers aliasFor via camelCase → snake_case conversion for canonical-shaped names', async () => {
@@ -444,7 +485,7 @@ describe('setEnrichmentConfig — validation', () => {
       ],
     });
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
-    expect(saved.fields[0].aliasFor).toBe('company_linkedin_url');
+    expect(saved.config.fields[0].aliasFor).toBe('company_linkedin_url');
   });
 
   it('does NOT auto-infer aliasFor when the field name is already canonical', async () => {
@@ -455,7 +496,7 @@ describe('setEnrichmentConfig — validation', () => {
       ],
     });
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
-    expect(saved.fields[0].aliasFor).toBeUndefined();
+    expect(saved.config.fields[0].aliasFor).toBeUndefined();
   });
 
   it('auto-infers aliasFor via synonym map (funding_round → funding_stage)', async () => {
@@ -466,7 +507,7 @@ describe('setEnrichmentConfig — validation', () => {
       ],
     });
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
-    expect(saved.fields[0].aliasFor).toBe('funding_stage');
+    expect(saved.config.fields[0].aliasFor).toBe('funding_stage');
   });
 
   it('auto-infers aliasFor via synonym map for "tech" → tech_stack', async () => {
@@ -477,7 +518,7 @@ describe('setEnrichmentConfig — validation', () => {
       ],
     });
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
-    expect(saved.fields[0].aliasFor).toBe('tech_stack');
+    expect(saved.config.fields[0].aliasFor).toBe('tech_stack');
   });
 
   it('falls back to LLM for opaque names where the heuristic returned undefined', async () => {
@@ -501,7 +542,7 @@ describe('setEnrichmentConfig — validation', () => {
       { name: 'stag', instruction: 'company funding stage' },
     ]);
 
-    const byName = Object.fromEntries(saved.fields.map(f => [f.name, f]));
+    const byName = Object.fromEntries(saved.config.fields.map(f => [f.name, f]));
     expect(byName.firstName.aliasFor).toBe('first_name');   // heuristic
     expect(byName.stag.aliasFor).toBe('funding_stage');      // LLM
   });
@@ -520,7 +561,7 @@ describe('setEnrichmentConfig — validation', () => {
       ],
     });
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
-    expect(saved.fields[0].aliasFor).toBeUndefined();
+    expect(saved.config.fields[0].aliasFor).toBeUndefined();
   });
 
   it('saves successfully if the LLM throws (heuristic results stand)', async () => {
@@ -536,7 +577,7 @@ describe('setEnrichmentConfig — validation', () => {
       ],
     });
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
-    const byName = Object.fromEntries(saved.fields.map(f => [f.name, f]));
+    const byName = Object.fromEntries(saved.config.fields.map(f => [f.name, f]));
     expect(byName.firstName.aliasFor).toBe('first_name');   // heuristic still applied
     expect(byName.stag.aliasFor).toBeUndefined();            // LLM failed, no inference
   });
@@ -562,7 +603,7 @@ describe('setEnrichmentConfig — validation', () => {
       ],
     });
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
-    expect(saved.fields[0].aliasFor).toBeUndefined();
+    expect(saved.config.fields[0].aliasFor).toBeUndefined();
     // Future: LLM fallback would set this to 'funding_stage'.
   });
 
@@ -575,7 +616,7 @@ describe('setEnrichmentConfig — validation', () => {
       ],
     });
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
-    expect(saved.fields[0].aliasFor).toBe('funding_stage');
+    expect(saved.config.fields[0].aliasFor).toBe('funding_stage');
   });
 
   it('never assigns aliasFor to emailDomain even when client sends one', async () => {
@@ -592,7 +633,7 @@ describe('setEnrichmentConfig — validation', () => {
       ],
     });
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
-    expect(saved.fields.find(f => f.name === 'emailDomain')?.aliasFor).toBeUndefined();
+    expect(saved.config.fields.find(f => f.name === 'emailDomain')?.aliasFor).toBeUndefined();
   });
 
   it("accepts a valid aliasFor pointing at a real FIELD_GROUPS field", async () => {
@@ -621,10 +662,11 @@ describe('setEnrichmentConfig — validation', () => {
     ).rejects.toThrow(/aliasFor.*not a known canonical field/i);
   });
 
-  it('rejects two fields that map to the same canonical name (collision)', async () => {
-    // Real user scenario: default `email` field + user-added `Email` field
-    // both auto-route to canonical `email`. Without this check, the
-    // waterfall fills one and the other silently misses its value.
+  it('returns a warning (does not throw) when two fields map to the same canonical name', async () => {
+    // Old CRM lists frequently have data in BOTH `company` and `company_name`
+    // (or `email` + `Email`). We allow the collision and fan out fills to all
+    // user-facing names, but surface a warning so the user knows both columns
+    // will receive the same enriched value.
     const deps = makeDeps();
     const config = validConfig({
       fields: [
@@ -634,28 +676,87 @@ describe('setEnrichmentConfig — validation', () => {
           overwritePolicy: 'fill_if_empty', aliasFor: 'email' },
       ],
     });
-    await expect(
-      setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps),
-    ).rejects.toThrow(/both map to 'email'/i);
+    const result = await setEnrichmentConfig(
+      { listId: LIST_ID, userId: USER_ID, config },
+      deps,
+    );
+    expect(result.config.fields).toHaveLength(2);
+    // Backend emits just the duplicate-group descriptor; the frontend wraps it
+    // with a shared "duplicate fields detected" header + explainer.
+    expect(result.warnings).toEqual([`'email' and 'Email'`]);
   });
 
-  it("rejects collision between a self-canonical name and an inferred alias", async () => {
-    // `email` (its name IS canonical) + `Email` (aliasFor inferred → 'email')
-    // both route to canonical 'email' at run time. Catch it regardless of
-    // whether either field has an explicit aliasFor set.
+  it('returns a warning for the self-canonical + inferred-alias collision case', async () => {
+    // `email` (self-canonical) + `Email` (aliasFor inferred → 'email')
+    // both route to canonical 'email'. Warn, don't throw.
     const deps = makeDeps();
     const config = validConfig({
       fields: [
-        // No explicit aliasFor — name itself is canonical
         { name: 'email', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
-        // Inferred alias via camelCase
         { name: 'Email', type: 'string', instruction: '', include: true,
           overwritePolicy: 'fill_if_empty', aliasFor: 'email' },
       ],
     });
-    await expect(
-      setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps),
-    ).rejects.toThrow(/both map to 'email'/i);
+    const result = await setEnrichmentConfig(
+      { listId: LIST_ID, userId: USER_ID, config },
+      deps,
+    );
+    expect(result.warnings).toEqual([`'email' and 'Email'`]);
+  });
+
+  it('returns a warning for the standard-column + self-canonical case (company + company_name)', async () => {
+    // The exact scenario from the screenshot: `company` is a STANDARD_DATA_ALIAS
+    // pointing to canonical `company_name`, and `company_name` is itself
+    // canonical. Old lists have data in both — allow the save with a warning.
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        { name: 'company',      type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty', aliasFor: 'company_name' },
+        { name: 'company_name', type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+    const result = await setEnrichmentConfig(
+      { listId: LIST_ID, userId: USER_ID, config },
+      deps,
+    );
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings).toEqual([`'company' and 'company_name'`]);
+  });
+
+  it('returns one warning per canonical when three fields collide on the same canonical', async () => {
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        { name: 'email',  type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+        { name: 'Email',  type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty', aliasFor: 'email' },
+        { name: 'e_mail', type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty', aliasFor: 'email' },
+      ],
+    });
+    const result = await setEnrichmentConfig(
+      { listId: LIST_ID, userId: USER_ID, config },
+      deps,
+    );
+    expect(result.warnings).toEqual([`'email', 'Email', and 'e_mail'`]);
+  });
+
+  it('returns no warnings when there are no canonical collisions', async () => {
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        { name: 'email',   type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+        { name: 'company', type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty', aliasFor: 'company_name' },
+      ],
+    });
+    const result = await setEnrichmentConfig(
+      { listId: LIST_ID, userId: USER_ID, config },
+      deps,
+    );
+    expect(result.warnings).toEqual([]);
   });
 
   it('rejects when schemaVersion is not 1', async () => {
@@ -756,7 +857,7 @@ describe('setEnrichmentConfig — smart field classification', () => {
 
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
 
-    const qualField = saved.fields.find(f => f.name === 'isQualified');
+    const qualField = saved.config.fields.find(f => f.name === 'isQualified');
     expect(qualField?.smartCondition).toBe('true when series A or later and total funding > $1M');
     expect(qualField?.smartDependencies).toEqual(['funding_stage', 'total_funding']);
   });
@@ -776,7 +877,7 @@ describe('setEnrichmentConfig — smart field classification', () => {
 
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
 
-    const field = saved.fields.find(f => f.name === 'industry');
+    const field = saved.config.fields.find(f => f.name === 'industry');
     expect(field?.smartCondition).toBeUndefined();
     expect(field?.smartDependencies).toBeUndefined();
   });
@@ -847,7 +948,7 @@ describe('setEnrichmentConfig — smart field classification', () => {
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
 
     // Should be re-classified with new instruction and new deps
-    const field = saved.fields.find(f => f.name === 'isQualified');
+    const field = saved.config.fields.find(f => f.name === 'isQualified');
     expect(field?.smartCondition).toBe('NEW condition: large company with > 500 employees');
     expect(field?.smartDependencies).toEqual(['employee_count']);
   });
@@ -875,7 +976,7 @@ describe('setEnrichmentConfig — smart field classification', () => {
 
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
 
-    const field = saved.fields.find(f => f.name === 'industry');
+    const field = saved.config.fields.find(f => f.name === 'industry');
     expect(field?.smartCondition).toBeUndefined();
     expect(field?.smartDependencies).toBeUndefined();
   });
@@ -912,9 +1013,9 @@ describe('setEnrichmentConfig — smart field classification', () => {
 
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
 
-    expect(saved.fields.find(f => f.name === 'isQualified')?.type).toBe('boolean');
-    expect(saved.fields.find(f => f.name === 'companyScore')?.type).toBe('number');
-    expect(saved.fields.find(f => f.name === 'industry')?.type).toBe('string');
+    expect(saved.config.fields.find(f => f.name === 'isQualified')?.type).toBe('boolean');
+    expect(saved.config.fields.find(f => f.name === 'companyScore')?.type).toBe('number');
+    expect(saved.config.fields.find(f => f.name === 'industry')?.type).toBe('string');
   });
 
   it('sets date type for date fields', async () => {
@@ -931,7 +1032,7 @@ describe('setEnrichmentConfig — smart field classification', () => {
     });
 
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
-    expect(saved.fields.find(f => f.name === 'foundedYear')?.type).toBe('date');
+    expect(saved.config.fields.find(f => f.name === 'foundedYear')?.type).toBe('date');
   });
 
   it('sets enum type and enumOptions for categorical fields', async () => {
@@ -948,7 +1049,7 @@ describe('setEnrichmentConfig — smart field classification', () => {
     });
 
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
-    const field = saved.fields.find(f => f.name === 'companyTier');
+    const field = saved.config.fields.find(f => f.name === 'companyTier');
     expect(field?.type).toBe('enum');
     expect(field?.enumOptions).toEqual(['A', 'B', 'C']);
   });
@@ -968,7 +1069,7 @@ describe('setEnrichmentConfig — smart field classification', () => {
 
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
     // enum with no options is useless — original type preserved
-    expect(saved.fields.find(f => f.name === 'companyTier')?.type).toBe('string');
+    expect(saved.config.fields.find(f => f.name === 'companyTier')?.type).toBe('string');
   });
 
   it('filters blank strings out of LLM-returned enumOptions', async () => {
@@ -983,7 +1084,7 @@ describe('setEnrichmentConfig — smart field classification', () => {
     });
 
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
-    expect(saved.fields.find(f => f.name === 'tier')?.enumOptions).toEqual(['A', 'B']);
+    expect(saved.config.fields.find(f => f.name === 'tier')?.enumOptions).toEqual(['A', 'B']);
   });
 
   it('clears stale enumOptions when type changes away from enum', async () => {
@@ -998,7 +1099,7 @@ describe('setEnrichmentConfig — smart field classification', () => {
     });
 
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
-    const field = saved.fields.find(f => f.name === 'tier');
+    const field = saved.config.fields.find(f => f.name === 'tier');
     expect(field?.type).toBe('string');
     expect(field?.enumOptions).toBeUndefined();
   });
@@ -1019,7 +1120,7 @@ describe('setEnrichmentConfig — smart field classification', () => {
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
 
     // Invalid type rejected → original type preserved
-    expect(saved.fields.find(f => f.name === 'isQualified')?.type).toBe('string');
+    expect(saved.config.fields.find(f => f.name === 'isQualified')?.type).toBe('string');
   });
 
   it('silently drops smartDependencies that are not valid canonical field names', async () => {
@@ -1046,7 +1147,7 @@ describe('setEnrichmentConfig — smart field classification', () => {
 
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
 
-    const field = saved.fields.find(f => f.name === 'isQualified');
+    const field = saved.config.fields.find(f => f.name === 'isQualified');
     expect(field?.smartDependencies).toEqual(['funding_stage']);
     expect(field?.smartDependencies).not.toContain('made_up_field_xyz');
   });
@@ -1096,7 +1197,7 @@ describe('setEnrichmentConfig — smart field classification', () => {
 
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
 
-    const field = saved.fields.find(f => f.name === 'industry');
+    const field = saved.config.fields.find(f => f.name === 'industry');
     expect(field?.notSmartInstruction).toBe('company industry');
     expect(field?.smartCondition).toBeUndefined();
   });
@@ -1187,7 +1288,7 @@ describe('setEnrichmentConfig — smart field classification', () => {
 
     const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
 
-    const field = saved.fields.find(f => f.name === 'score');
+    const field = saved.config.fields.find(f => f.name === 'score');
     expect(field?.smartCondition).toBe('1-100 score based on employee count');
     expect(field?.notSmartInstruction).toBeUndefined();
   });
