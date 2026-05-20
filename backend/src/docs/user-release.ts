@@ -11,6 +11,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-20',
     changes: [
+      'New: Organization-Wide Emma Memory',
+      '- Organizations can now maintain a shared memory that Emma uses across all member conversations',
+      '- Go to Settings → Organization → Organization Memory to add, edit, or delete org-wide facts',
+      '- All org members can view and add memories; only the org owner can edit, delete, or disable',
+      '- Emma will automatically save org-relevant facts during conversations using her new save_org_memory tool',
+      '- Org memories appear alongside personal memories in every chat session for all members',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
       'New: GPT-5.4 Nano Available as an AI Model for CRM Email Drafting',
       '- GPT-5.4 Nano is now selectable in the Draft Email dialog in CRM',
       '- Use it as a faster, lighter alternative to GPT-5.4 for generating personalized email drafts',
