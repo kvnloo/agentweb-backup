@@ -231,11 +231,15 @@ export function normalizeLinkedInUrl(url: string | null | undefined): string {
   if (!url || typeof url !== 'string') return '';
   const trimmed = url.trim().toLowerCase();
   if (!trimmed) return '';
-  return trimmed
+  const normalized = trimmed
     .replace(/^https?:\/\/(?:www\.)?/, 'https://www.')   // canonical scheme + www
     .split('?')[0]                                        // drop query (miniProfileUrn etc.)
     .split('#')[0]                                        // drop fragment
     .replace(/\/+$/, '');                                 // drop any trailing slashes
+  // Only accept personal profile URLs — /in/<username>. Company pages, schools,
+  // showcase pages etc. are not valid personal LinkedIn identifiers.
+  if (normalized.includes('linkedin.com') && !normalized.includes('/in/')) return '';
+  return normalized;
 }
 
 function normalizeName(name: string): string {
