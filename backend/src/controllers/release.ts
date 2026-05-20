@@ -8,6 +8,16 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2026-05-19",
+    changes: [
+      "Org-wide Sharing Controls (Customer Portal)",
+      "- Org admins can now configure which feature areas are shared across their organization via Settings → Org Sharing in the customer portal",
+      "- Toggleable sharing for five areas: Knowledge Bases, HTML Templates, Landing Pages, Work Plans, and Skills",
+      "- Brand Guidelines and Marketing Strategy remain always org-shared; admins can now designate per-feature editors from their member list",
+      "- New backend endpoints: GET/PATCH /api/orgs/me/share-settings (admin-only)",
+    ],
+  },
+  {
     date: "2026-03-09",
     changes: [
       "Notion Attachments in Dev Environments",

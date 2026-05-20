@@ -3,7 +3,7 @@ import axios from 'axios';
 import { buildApiUrl } from '../config';
 
 // Define the possible user roles
-export type UserRole = 'partner' | 'customer';
+export type UserRole = 'partner' | 'customer' | 'contractor';
 
 interface User {
   userId: string;
@@ -11,7 +11,7 @@ interface User {
   isAdmin: boolean;
   isOAuthUser: boolean;
   createdAt: string;
-  roles: ('partner' | 'customer')[];
+  roles: ('partner' | 'customer' | 'contractor')[];
   subscriptionType?: string;
 }
 

@@ -11,6 +11,7 @@ jest.mock('unipile-node-sdk', () => ({
 // Mock dependencies
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: jest.fn(),
+  getAccountsByUserIdIncludingOrgShared: jest.fn(),
   getAccountById: jest.fn(),
   isTokenValid: jest.fn(),
 }));
@@ -23,13 +24,14 @@ jest.mock('../services/socialPlatformService', () => ({
 
 // Import after mocks
 import { AgentModeService } from '../services/agentModeService';
-import { getAccountsByUserId, getAccountById, isTokenValid } from '../services/connectedAccountsDb';
+import { getAccountsByUserId, getAccountsByUserIdIncludingOrgShared, getAccountById, isTokenValid } from '../services/connectedAccountsDb';
 import { socialPlatformService } from '../services/socialPlatformService';
 
 describe('AgentModeService - Social Media Tools', () => {
   let service: AgentModeService;
 
   const mockGetAccountsByUserId = getAccountsByUserId as jest.MockedFunction<typeof getAccountsByUserId>;
+  const mockGetAccountsByUserIdIncludingOrgShared = getAccountsByUserIdIncludingOrgShared as jest.MockedFunction<typeof getAccountsByUserIdIncludingOrgShared>;
   const mockGetAccountById = getAccountById as jest.MockedFunction<typeof getAccountById>;
   const mockIsTokenValid = isTokenValid as jest.MockedFunction<typeof isTokenValid>;
   const mockSocialPlatformService = socialPlatformService as jest.Mocked<typeof socialPlatformService>;
@@ -70,19 +72,19 @@ describe('AgentModeService - Social Media Tools', () => {
 
   describe('listConnectedAccounts', () => {
     it('should return all connected accounts for user', async () => {
-      mockGetAccountsByUserId.mockResolvedValue([mockLinkedInAccount, mockTwitterAccount] as any);
+      mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([mockLinkedInAccount, mockTwitterAccount] as any);
       mockIsTokenValid.mockResolvedValue(true);
 
       const result = await service.listConnectedAccounts('user-123');
 
-      expect(mockGetAccountsByUserId).toHaveBeenCalledWith('user-123');
+      expect(mockGetAccountsByUserIdIncludingOrgShared).toHaveBeenCalledWith('user-123');
       expect(result.success).toBe(true);
       expect(result.accounts).toHaveLength(2);
       expect(result.message).toBe('Found 2 connected account(s)');
     });
 
     it('should filter accounts by platform when specified', async () => {
-      mockGetAccountsByUserId.mockResolvedValue([mockLinkedInAccount, mockTwitterAccount] as any);
+      mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([mockLinkedInAccount, mockTwitterAccount] as any);
       mockIsTokenValid.mockResolvedValue(true);
 
       const result = await service.listConnectedAccounts('user-123', 'linkedin');
@@ -93,7 +95,7 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should include token validity status for each account', async () => {
-      mockGetAccountsByUserId.mockResolvedValue([mockLinkedInAccount] as any);
+      mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
       mockIsTokenValid.mockResolvedValue(false); // expired token
 
       const result = await service.listConnectedAccounts('user-123');
@@ -103,7 +105,7 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should return empty array when no accounts found', async () => {
-      mockGetAccountsByUserId.mockResolvedValue([]);
+      mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([]);
 
       const result = await service.listConnectedAccounts('user-123');
 
@@ -113,7 +115,7 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should handle errors gracefully', async () => {
-      mockGetAccountsByUserId.mockRejectedValue(new Error('Database error'));
+      mockGetAccountsByUserIdIncludingOrgShared.mockRejectedValue(new Error('Database error'));
 
       const result = await service.listConnectedAccounts('user-123');
 
@@ -239,7 +241,7 @@ describe('AgentModeService - Social Media Tools', () => {
         { limit: 10 }
       );
 
-      expect(mockAdapter.listPosts).toHaveBeenCalledWith(mockLinkedInAccount, { limit: 10 }, 'user-123');
+      expect(mockAdapter.listPosts).toHaveBeenCalledWith(mockLinkedInAccount, { limit: 10, force_reload: false }, 'user-123');
       expect(result.success).toBe(true);
       expect(result.posts).toHaveLength(2);
       expect(result.message).toContain('Successfully loaded');
@@ -326,7 +328,7 @@ describe('AgentModeService - Social Media Tools', () => {
       expect(result.message).toBe('Account not found or access denied');
     });
 
-    it('should return success with 0 posts when adapter fails due to expired token (account stays visible)', async () => {
+    it('should return failure with the real error when adapter fails due to expired token', async () => {
       mockGetAccountsByUserId.mockResolvedValue([mockLinkedInAccount as any]);
       mockAdapter.listPosts.mockRejectedValue(new Error('LinkedIn access token expired. Please reconnect your account.'));
 
@@ -335,10 +337,9 @@ describe('AgentModeService - Social Media Tools', () => {
         'urn:li:organization:123456'
       );
 
-      // Account is still included in summaries (with 0 posts) even when listPosts fails
-      expect(result.success).toBe(true);
-      expect(result.posts).toHaveLength(0);
-      expect(result.message).toContain('Successfully loaded 0 posts');
+      // When listPosts throws and there are no cached posts, the real error is surfaced
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('LinkedIn access token expired');
     });
 
     it('should handle empty posts list', async () => {

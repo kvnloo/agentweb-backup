@@ -1,5 +1,6 @@
 import { crmDb } from "./db";
 import { settingsService } from "./settingsService";
+import { mergeCustomFields } from '../utils/customFieldsGuard';
 
 export interface UserCrmUpdateFields {
   subscriptionType?: string;
@@ -142,7 +143,11 @@ export async function syncUserUpdateToLeadList(
     if (Object.keys(customFieldsPatch).length === 0) return;
 
     await crmDb.updateLead(parsed.listId, existingLead.leadId, {
-      customFields: { ...(existingLead.customFields || {}), ...customFieldsPatch },
+      customFields: mergeCustomFields(
+        existingLead.customFields,
+        customFieldsPatch,
+        { source: 'crmAutoSync.syncUserUpdate', listId: parsed.listId, leadId: existingLead.leadId },
+      ),
     });
   } catch (error) {
     console.error("[crmAutoSync] Failed to sync user update to lead list:", error);

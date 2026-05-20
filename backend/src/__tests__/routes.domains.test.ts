@@ -150,6 +150,46 @@ describe("Domain API Routes", () => {
       expect(res.status).toBe(201);
       expect(res.body.domain).toBe("mysite.agentwebforms.com");
     });
+
+    it("SUCCESS: root page (no slug) gets customDomainUrl without path", async () => {
+      mockAddSubdomain.mockResolvedValueOnce({
+        id: "dom-new",
+        domain: "mysite.agentwebforms.com",
+        type: "subdomain",
+        status: "active",
+      });
+      // DB get returns root page (no slug)
+      mockDynamoInstance.get.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Item: { id: "page-root", userId: "test-user-123" } }),
+      });
+
+      await request(app)
+        .post("/api/domains/subdomain")
+        .send({ vercelProjectId: "proj-1", subdomain: "mysite", landingPageId: "page-root" });
+
+      const updateCall = mockDynamoInstance.update.mock.calls[0][0];
+      expect(updateCall.ExpressionAttributeValues[":url"]).toBe("https://mysite.agentwebforms.com");
+    });
+
+    it("SUCCESS: sub-page (has slug) gets customDomainUrl with /{slug} path", async () => {
+      mockAddSubdomain.mockResolvedValueOnce({
+        id: "dom-new",
+        domain: "mysite.agentwebforms.com",
+        type: "subdomain",
+        status: "active",
+      });
+      // DB get returns sub-page with a slug
+      mockDynamoInstance.get.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Item: { id: "page-sub", userId: "test-user-123", slug: "pricing-page" } }),
+      });
+
+      await request(app)
+        .post("/api/domains/subdomain")
+        .send({ vercelProjectId: "proj-1", subdomain: "mysite", landingPageId: "page-sub" });
+
+      const updateCall = mockDynamoInstance.update.mock.calls[0][0];
+      expect(updateCall.ExpressionAttributeValues[":url"]).toBe("https://mysite.agentwebforms.com/pricing-page");
+    });
   });
 
   describe("POST /api/domains/custom", () => {

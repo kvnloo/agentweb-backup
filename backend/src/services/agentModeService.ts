@@ -25,6 +25,7 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData } from '../utils/llmService';
 import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
+import { mergeCustomFields } from '../utils/customFieldsGuard';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -1246,7 +1247,9 @@ export class AgentModeService {
             });
           }
         }
-        if (contentBlocks.length === 0) contentBlocks.push({ text: '' });
+        // Bedrock rejects blank text blocks — use a non-empty placeholder if the assistant
+        // message has neither text content nor tool calls (e.g. stored with empty content field).
+        if (contentBlocks.length === 0) contentBlocks.push({ text: '...' });
       } else if (msg.role === 'tool') {
         // Tool results become user messages with toolResult blocks
         role = 'user';
@@ -1284,9 +1287,10 @@ export class AgentModeService {
               }
             }
           }
-          if (toolResultContent.length === 0) toolResultContent = [{ text: '' }];
+          // Bedrock rejects empty text blocks — fall back to a placeholder
+          if (toolResultContent.length === 0) toolResultContent = [{ text: '(empty)' }];
         } else {
-          toolResultContent = [{ text: String(msg.content || '') }];
+          toolResultContent = [{ text: String(msg.content || '(empty)') }];
         }
         contentBlocks.push({
           toolResult: {
@@ -1366,7 +1370,7 @@ export class AgentModeService {
           blocks.push({ text: JSON.stringify(item) });
         }
       }
-      return blocks.length > 0 ? blocks : [{ text: '' }];
+      return blocks.length > 0 ? blocks : [{ text: '.' }];
     }
     return [{ text: String(content) }];
   }
@@ -1383,6 +1387,7 @@ export class AgentModeService {
     'gemini-3-flash-preview': { client: null, supportsTemperature: true },
     'gemini-3.1-pro-preview': { client: null, supportsTemperature: true },
     'gemini-3.1-flash-lite': { client: null, supportsTemperature: true },
+    'gemini-3.5-flash': { client: null, supportsTemperature: true },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
@@ -1555,6 +1560,7 @@ export class AgentModeService {
       'gemini-3-flash-preview': [0.15, 0.6],
       'gemini-3.1-pro-preview': [1.25, 10],
       'gemini-3.1-flash-lite': [0.075, 0.3],
+      'gemini-3.5-flash': [0.15, 0.6],
     };
     const [inputPrice, outputPrice] = pricing[model] || [3, 15]; // Default to Sonnet pricing
     // Cache reads are 10% of input price; cache writes are 125% of input price
@@ -2144,6 +2150,18 @@ export class AgentModeService {
               continue;
             }
 
+            // Block context-restricted tools even if LLM hallucinates the call from history
+            if (excludeTools?.includes(toolCall.function.name)) {
+              (messages as any[]).push({
+                tool_call_id: toolCall.id,
+                role: 'tool',
+                name: toolCall.function.name,
+                content: JSON.stringify({ error: `Tool "${toolCall.function.name}" is not available in this context.` }),
+                metadata: { timestamp: new Date().toISOString() }
+              });
+              continue;
+            }
+
             if (publishedSkills.length > 0 && sessionAssociatedSkillIds.length > 0 && !allowedToolNames.has(toolCall.function.name)) {
               const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
               (messages as any[]).push({
@@ -2454,7 +2472,17 @@ export class AgentModeService {
         ...(backupModelUsed ? { backupModelUsed: true, originalModel: originalLlmModel, backupModel: llmModel } : {})
       };
     } catch (error: any) {
-      console.error('AgentMode: Response generation failed:', error);
+      // Log with full detail so Bedrock validation errors (e.g. "Input is too long") are visible
+      const errorMsg = error?.message || String(error);
+      const bedrockMsg = error?.$response?.body ? String(error.$response.body).slice(0, 500) : undefined;
+      console.error('AgentMode: Response generation failed:', {
+        message: errorMsg,
+        name: error?.name,
+        code: error?.code,
+        httpStatus: error?.status ?? error?.$metadata?.httpStatusCode,
+        bedrockBody: bedrockMsg,
+        sessionId,
+      });
 
       // Determine user-friendly message based on error type
       let userMessage: string;
@@ -2462,13 +2490,15 @@ export class AgentModeService {
         || (typeof error?.code === 'string' && ['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'ECONNABORTED'].includes(error.code));
       // Bedrock errors surface httpStatusCode via $metadata rather than a top-level status field
       const httpStatus = error?.status ?? error?.$metadata?.httpStatusCode;
+      // Check for context-limit patterns in the raw error message before falling through to generic 400
+      const isContextLimit = /input is too long|context length|context window|token limit|too many tokens|prompt is too long|exceeds.*context|exceeded.*tokens|maximum.*tokens|messages.*exceed|request too large/i.test(errorMsg);
       if (error?.code === 'content_filter' || error?.error?.code === 'ResponsibleAIPolicyViolation') {
         userMessage = 'I apologize, but I cannot respond to that request as it may violate content policies. Please try rephrasing your question or asking about something else.';
       } else if (httpStatus === 429) {
         userMessage = 'I\'m currently experiencing high demand. Please wait a moment and try again.';
       } else if (isTimeout) {
         userMessage = 'Your request took longer than expected. Please try again.';
-      } else if (httpStatus === 400) {
+      } else if (isContextLimit || httpStatus === 400) {
         userMessage = 'I encountered an issue processing your request. Please try rephrasing your question.';
       } else {
         userMessage = 'I apologize, but I encountered an error processing your request. Please try again.';
@@ -2691,6 +2721,13 @@ export class AgentModeService {
       if (msg.role === 'assistant' && !msg.content && !(msg as any).tool_calls) {
         continue;
       }
+      // Skip assistant messages that have tool_calls in the DB but whose tool results are
+      // not present in the context window (unresolved tool calls) AND have no text content.
+      // Sending them as plain assistant messages with empty content causes Bedrock 400:
+      // "The text field in the ContentBlock object is blank."
+      if (msg.role === 'assistant' && !msg.content && (msg as any).tool_calls?.length > 0 && !resolvedToolCallIndices.has(sliceIdx)) {
+        continue;
+      }
       // Skip error messages — they carry no useful context for the LLM and accumulate
       // when a session enters a crash loop
       if (msg.role === 'assistant' && (msg as any).metadata?.isErrorMessage) {
@@ -2852,11 +2889,25 @@ export class AgentModeService {
 
   public async listSkills(userId: string, sessionId: string): Promise<any> {
     try {
+      // Best-effort org fanout: only attach orgId when `shareSettings.skills`
+      // is effectively enabled for this caller (plain members need
+      // enabled=true; editors and the org owner always get fanout). Any
+      // lookup failure degrades to non-org behavior.
       let sessionUserOrgId: string | undefined;
       try {
-        const { userDb: uDb } = await import('./db');
+        const { userDb: uDb, orgDb } = await import('./db');
+        const { isFeatureEffectivelyEnabled } = await import('./orgShareService');
         const sessionUser = await uDb.getUserById(userId);
-        sessionUserOrgId = sessionUser?.orgId;
+        const candidateOrgId = sessionUser?.orgId;
+        if (candidateOrgId) {
+          const org = await orgDb.getOrgById(candidateOrgId);
+          const effectivelyEnabled = isFeatureEffectivelyEnabled(
+            { userId, orgId: candidateOrgId, orgRole: sessionUser?.orgRole },
+            org,
+            'skills',
+          );
+          if (effectivelyEnabled) sessionUserOrgId = candidateOrgId;
+        }
       } catch { /* skip — org-sharing is best-effort */ }
       const publishedSkills = await skillService.getSkillsAvailableToUser(userId, sessionUserOrgId);
 
@@ -2978,6 +3029,11 @@ export class AgentModeService {
     // header but has no tool to retrieve the full content.
     'search_tool_response',
     'read_tool_response',
+
+    // Data Analysis — core analytical primitive needed by scheduled reports and
+    // ad-hoc analysis tasks. Must be available even when no skill is installed
+    // so that scheduled chats with empty requiredFunctionCalls can still call it.
+    'perform_data_analysis',
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
@@ -3001,9 +3057,11 @@ export class AgentModeService {
       skill.toolNames?.forEach((t: string) => associatedToolNames.add(t));
     });
 
-    // Build exclusion set: foundation tools + admin-only tools
+    // Build exclusion set: foundation tools + admin-only tools + page-context-only tools
     const excludedTools = new Set<string>(AgentModeService.FOUNDATION_TOOLS);
     ADMIN_SKILL_TOOL_NAMES.forEach(t => excludedTools.add(t));
+    // get_visual_context is page-embedded Emma only — never expose in Agent Mode or __other_skills__
+    excludedTools.add('get_visual_context');
 
     // Get all registered tools and find those not in any skill
     const allTools = this.toolRegistry.getAllTools();
@@ -3452,7 +3510,10 @@ export class AgentModeService {
       return {
         success: actualResult.success,
         description: actualResult.description,
-        videoUrl: actualResult.videoUrl
+        videoUrl: actualResult.videoUrl,
+        ...(actualResult.transcript !== undefined ? { transcript: actualResult.transcript } : {}),
+        ...(actualResult.scenes !== undefined ? { scenes: actualResult.scenes } : {}),
+        ...(actualResult.duration !== undefined ? { duration: actualResult.duration } : {})
       };
     }
 
@@ -4874,7 +4935,16 @@ export class AgentModeService {
     }
   }
 
-  public async describeVideo(videoFileUrl: string, prompt?: string): Promise<any> {
+  public async describeVideo(
+    videoFileUrl: string,
+    prompt?: string,
+    options?: {
+      return_transcript?: boolean;
+      return_scenes?: boolean;
+      start_time?: string;
+      end_time?: string;
+    }
+  ): Promise<any> {
     let tempDirPath: string | null = null;
     let uploadedFileName: string | null = null;
     let aiClient: any = null;
@@ -4915,7 +4985,37 @@ export class AgentModeService {
       aiClient = new GoogleGenAI({ apiKey: geminiApiKey.trim() });
 
       const modelName = 'gemini-3-flash-preview';
-      const analysisPrompt = prompt || 'Please describe this video in detail. Focus on key events, visual elements, and any spoken content.';
+
+      // Build structured prompt based on requested output fields
+      const wantTranscript = options?.return_transcript === true;
+      const wantScenes = options?.return_scenes === true;
+      const wantStructured = wantTranscript || wantScenes;
+      const timeRange = (options?.start_time || options?.end_time)
+        ? `Focus your analysis on the segment from ${options.start_time || 'the beginning'} to ${options.end_time || 'the end'} of the video.`
+        : '';
+
+      let analysisPrompt: string;
+      if (wantStructured) {
+        const fields: string[] = ['description: a concise overall description of the video'];
+        if (wantTranscript) {
+          fields.push('transcript: an array of objects with {start: number (seconds), end: number (seconds), text: string} for all spoken content');
+        }
+        if (wantScenes) {
+          fields.push('scenes: an array of objects with {start: number (seconds), end: number (seconds), title: string, description: string} identifying distinct scene segments');
+        }
+        fields.push('duration: total video duration in seconds as a number');
+        analysisPrompt = [
+          prompt || 'Analyze this video thoroughly.',
+          timeRange,
+          `Return ONLY a JSON object (no markdown fences) with these fields: ${fields.join('; ')}.`
+        ].filter(Boolean).join(' ');
+      } else {
+        analysisPrompt = [
+          prompt || 'Please describe this video in detail. Focus on key events, visual elements, and any spoken content.',
+          timeRange
+        ].filter(Boolean).join(' ');
+      }
+
       const url = new URL(videoFileUrl);
       const hostname = (url.hostname || '').toLowerCase();
       const isYoutube = hostname.includes('youtube.com') || hostname.includes('youtu.be');
@@ -5046,18 +5146,42 @@ export class AgentModeService {
         contents
       });
 
-      const description = response.text;
+      const rawText = response.text;
 
-      if (!description) {
+      if (!rawText) {
         return {
           success: false,
           message: 'No description returned from Gemini'
         };
       }
 
+      // When structured output was requested, try to parse JSON from Gemini
+      if (wantStructured) {
+        try {
+          // Strip optional markdown code fences Gemini may add despite instructions
+          const jsonText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+          const parsed = JSON.parse(jsonText);
+          return {
+            success: true,
+            description: parsed.description || rawText,
+            ...(wantTranscript && parsed.transcript !== undefined ? { transcript: parsed.transcript } : {}),
+            ...(wantScenes && parsed.scenes !== undefined ? { scenes: parsed.scenes } : {}),
+            ...(parsed.duration !== undefined ? { duration: parsed.duration } : {}),
+            videoUrl: videoFileUrl
+          };
+        } catch {
+          // Gemini returned non-JSON despite instruction — fall back to plain description
+          return {
+            success: true,
+            description: rawText,
+            videoUrl: videoFileUrl
+          };
+        }
+      }
+
       return {
         success: true,
-        description,
+        description: rawText,
         videoUrl: videoFileUrl
       };
     } catch (error) {
@@ -5516,10 +5640,19 @@ export class AgentModeService {
       const statusCode = (error as any)?.response?.status;
       const isPayloadTooLarge = statusCode === 413 ||
         /payload size exceeds|request too large|too large|exceeds.*limit/i.test(errorMessage);
+      const isTimeout = (error as any)?.code === 'ECONNABORTED' ||
+        /timeout|timed out|ETIMEDOUT/i.test(errorMessage);
       if (isPayloadTooLarge) {
         return {
           success: false,
           message: `The data payload sent to Gemini was too large. IMPORTANT: Do NOT retry perform_data_analysis with inline data. You MUST first call save_file to upload the dataset as a .csv or .txt file and get an S3 URL, then call perform_data_analysis with that URL in file_urls and a short analysis_instruction (no inline data).`,
+          error: errorMessage
+        };
+      }
+      if (isTimeout) {
+        return {
+          success: false,
+          message: `The data analysis timed out — the dataset or analysis task is too large for a single call. Break it into smaller pieces: (1) split the data into smaller subsets, (2) call perform_data_analysis separately for each subset with a focused analysis_instruction, then (3) synthesize the individual results into a final summary.`,
           error: errorMessage
         };
       }
@@ -5822,6 +5955,7 @@ export class AgentModeService {
   public async updateMarketStrategy(updateData: any, userId: string): Promise<any> {
     try {
       const { userDb, orgDb } = await import('./db');
+      const { canEditItem } = await import('./orgShareService');
       const user = await userDb.getUserById(userId);
       if (!user) {
         return {
@@ -5831,22 +5965,25 @@ export class AgentModeService {
         };
       }
 
-      // Check org membership - only owners can update, members are rejected
-      const isOrgOwner = user.orgId && user.orgRole === 'owner';
-      const isOrgMember = user.orgId && user.orgRole !== 'owner';
-
-      if (isOrgMember) {
-        return {
-          success: false,
-          message: 'Only the org owner can update market strategy',
-          error: 'Permission denied'
-        };
-      }
-
-      // Get existing market strategy from org (if owner) or personal
+      // Org members: only the org owner or a listed marketingStrategy editor
+      // may update. Solo users are unaffected.
       let existingMarketStrategy: any;
-      if (isOrgOwner) {
-        const org = await orgDb.getOrgById(user.orgId!);
+      if (user.orgId) {
+        const org = await orgDb.getOrgById(user.orgId);
+        const allowed = canEditItem(
+          { userId: org?.ownerUserId } as any,
+          { userId, orgId: user.orgId, orgRole: user.orgRole as 'owner' | 'member' | undefined },
+          org ?? null,
+          user.orgId,
+          'marketingStrategy',
+        );
+        if (!allowed) {
+          return {
+            success: false,
+            message: 'Market strategy is managed by your org admin',
+            error: 'Permission denied'
+          };
+        }
         existingMarketStrategy = org?.marketStrategy;
       } else {
         existingMarketStrategy = user.marketStrategy;
@@ -5905,8 +6042,8 @@ export class AgentModeService {
       };
 
       // Update org-level or personal market strategy
-      if (isOrgOwner) {
-        await orgDb.updateOrg(user.orgId!, { marketStrategy: marketStrategyData });
+      if (user.orgId) {
+        await orgDb.updateOrg(user.orgId, { marketStrategy: marketStrategyData });
       } else {
         await userDb.updateUser(userId, { marketStrategy: marketStrategyData });
       }
@@ -7737,10 +7874,11 @@ export class AgentModeService {
 
       // Merge custom fields with existing ones
       if (Object.keys(customFieldUpdates).length > 0) {
-        dbUpdates.customFields = {
-          ...(lead.customFields || {}),
-          ...customFieldUpdates
-        };
+        dbUpdates.customFields = mergeCustomFields(
+          lead.customFields,
+          customFieldUpdates,
+          { source: 'agentMode.updateLead', listId, leadId },
+        );
       }
 
       // Auto-create status change engagement if status changed
@@ -9028,6 +9166,7 @@ Format the response as JSON with this structure:
   public async updateBrandGuidelines(updateData: any, userId: string): Promise<any> {
     try {
       const { userDb, orgDb } = await import('./db');
+      const { canEditItem } = await import('./orgShareService');
       const user = await userDb.getUserById(userId);
       if (!user) {
         return {
@@ -9037,22 +9176,25 @@ Format the response as JSON with this structure:
         };
       }
 
-      // Check org membership - only owners can update, members are rejected
-      const isOrgOwner = user.orgId && user.orgRole === 'owner';
-      const isOrgMember = user.orgId && user.orgRole !== 'owner';
-
-      if (isOrgMember) {
-        return {
-          success: false,
-          message: 'Only the org owner can update brand guidelines',
-          error: 'Permission denied'
-        };
-      }
-
-      // Get existing brand guidelines from org (if owner) or personal
+      // Org members: only the org owner or a listed brandGuidelines editor
+      // may update. Solo users are unaffected.
       let existingBrand: any;
-      if (isOrgOwner) {
-        const org = await orgDb.getOrgById(user.orgId!);
+      if (user.orgId) {
+        const org = await orgDb.getOrgById(user.orgId);
+        const allowed = canEditItem(
+          { userId: org?.ownerUserId } as any,
+          { userId, orgId: user.orgId, orgRole: user.orgRole as 'owner' | 'member' | undefined },
+          org ?? null,
+          user.orgId,
+          'brandGuidelines',
+        );
+        if (!allowed) {
+          return {
+            success: false,
+            message: 'Brand guidelines are managed by your org admin',
+            error: 'Permission denied'
+          };
+        }
         existingBrand = org?.brandGuidelines;
       } else {
         existingBrand = user.brandGuidelines;
@@ -9083,8 +9225,8 @@ Format the response as JSON with this structure:
         };
 
         // Update org or user with initial brand guidelines
-        if (isOrgOwner) {
-          await orgDb.updateOrg(user.orgId!, { brandGuidelines: initialBrandGuidelines });
+        if (user.orgId) {
+          await orgDb.updateOrg(user.orgId, { brandGuidelines: initialBrandGuidelines });
         } else {
           await userDb.updateUser(userId, { brandGuidelines: initialBrandGuidelines });
         }
@@ -9212,8 +9354,8 @@ Format the response as JSON with this structure:
         updatedAt: new Date().toISOString()
       };
 
-      if (isOrgOwner) {
-        await orgDb.updateOrg(user.orgId!, { brandGuidelines: updatedGuidelines });
+      if (user.orgId) {
+        await orgDb.updateOrg(user.orgId, { brandGuidelines: updatedGuidelines });
       } else {
         await userDb.updateUser(userId, { brandGuidelines: updatedGuidelines });
       }
@@ -9534,8 +9676,11 @@ Format the response as JSON with this structure:
       });
 
       // 5. Update task with KB metadata
+      // Use max(contentSize, 1) so that size=0 never silently excludes this KB from search results.
+      // The actual content is in GCS; size=0 is a stale-metadata bug, not an empty file.
+      const sizeToStore = Math.max(contentSize, 1);
       await taskDb.updateTask(taskId, {
-        knowledgeBaseSize: contentSize,
+        knowledgeBaseSize: sizeToStore,
         knowledgeBase: url,
         knowledgeBaseUpdatedAt: now
       });
@@ -9712,7 +9857,7 @@ Format the response as JSON with this structure:
 
       if (isMainKB) {
         await taskDb.updateTask(taskId, {
-          knowledgeBaseSize: finalSize,
+          knowledgeBaseSize: Math.max(finalSize, 1),
           knowledgeBase: url,
           knowledgeBaseUpdatedAt: now
         });
@@ -9736,7 +9881,7 @@ Format the response as JSON with this structure:
         const totalSize = kbFiles.reduce((sum: number, f: any) => sum + (f.size || 0), 0);
         await taskDb.updateTask(taskId, {
           knowledgeBaseFiles: kbFiles,
-          knowledgeBaseSize: totalSize,
+          knowledgeBaseSize: Math.max(totalSize, 1),
           knowledgeBaseUpdatedAt: now
         });
       }
@@ -9876,7 +10021,7 @@ Format the response as JSON with this structure:
       const totalSize = kbFiles.reduce((sum: number, f: any) => sum + (f.size || 0), 0);
       await taskDb.updateTask(taskId, {
         knowledgeBaseFiles: kbFiles,
-        knowledgeBaseSize: totalSize,
+        knowledgeBaseSize: Math.max(totalSize, 1),
         knowledgeBaseUpdatedAt: new Date().toISOString()
       });
 
@@ -13550,10 +13695,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (isBrowserRunCode && safeMessage.includes('ReferenceError')) {
       return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The browser_run_code sandbox only has \`page\` in scope. All variables must be declared inside the async function body. Do NOT reference external variables, imports, or closures. Rewrite the function to be fully self-contained:\n\`\`\`js\nasync (page) => {\n  // All logic here — no outside variables\n  const result = await page.evaluate(() => { ... });\n  return result;\n}\n\`\`\``;
     }
+    // Data analysis timeout — LLM must break the analysis into smaller chunks
+    // (checked before too-large to avoid "too large for a single call" matching the wrong branch)
+    if (toolName === 'perform_data_analysis' &&
+        (safeMessage.includes('timed out') || safeMessage.includes('timeout') || safeMessage.includes('too large for a single call'))) {
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: The analysis timed out because the dataset or task is too large. Break it into smaller pieces: split the data by date range or category, call perform_data_analysis separately for each subset with a focused instruction, then combine the partial results into a final summary.`;
+    }
     // Data analysis "too large" errors — LLM must use save_file, not keep retrying with inline data
     if (toolName === 'perform_data_analysis' &&
         (safeMessage.includes('too large') || safeMessage.includes('exceeds'))) {
       return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: Do NOT retry perform_data_analysis with inline data. You MUST use the save_file tool first to upload the dataset as a .csv or .txt file and get an S3 URL, then call perform_data_analysis with that URL in file_urls and a short analysis_instruction (no inline data).`;
+    }
+    // LinkedIn invite message too long — tell the LLM to shorten and retry, not report success
+    if (toolName === 'linkedin_outreach' && safeMessage.toLowerCase().includes('too long')) {
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: The invitation message exceeded LinkedIn's 300-character limit. Do NOT report this as a success. Shorten the message to 300 characters or fewer (trim filler words, remove the sign-off line, keep only the core personalisation) and retry the send-invite call immediately.`;
     }
     return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
   }
@@ -13574,11 +13729,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return google.drive({ version: 'v3', auth });
   }
 
-  // Helper: get Google Drive shared folders for a user
+  // Helper: get Google Drive shared folders for a caller.
+  // If the caller belongs to an org, returns the org's folder list; otherwise the user's own list.
   private async getUserGoogleDriveFolders(userId: string): Promise<Array<{ folderId: string; name: string }>> {
-    const { userDb } = await import('./db');
+    const { userDb, orgDb } = await import('./db');
     const user = await userDb.getUserById(userId);
-    return user?.googleDriveFolders || [];
+    if (user?.orgId) {
+      const org = await orgDb.getOrgById(user.orgId);
+      return Array.isArray(org?.googleDriveFolders) ? org!.googleDriveFolders : [];
+    }
+    return Array.isArray(user?.googleDriveFolders) ? user!.googleDriveFolders : [];
   }
 
   public async searchKnowledgeBase(query: string, maxResults: number = 5, userId?: string): Promise<any> {
@@ -13749,7 +13909,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (!foreplayToken) {
         return {
           success: false,
-          message: 'No Foreplay account connected. Connect your Foreplay account in Knowledge Base settings.',
+          message: 'Foreplay is not configured. The platform-wide Foreplay API key is missing from AWS Secrets Manager — an admin needs to add it. Users can also connect their own Foreplay account in Knowledge Base settings.',
           results: [],
           totalResults: 0
         };
@@ -13839,6 +13999,91 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
+  // Search Foreplay discovery database (millions of ads, costs credits per result).
+  public async searchForeplayDiscovery(
+    query: string | undefined,
+    options: {
+      maxResults?: number;
+      companyName?: string;
+      format?: string[];
+      platform?: string[];
+      niche?: string[];
+      live?: boolean;
+      sort?: string;
+    } = {},
+    userId?: string
+  ): Promise<any> {
+    try {
+      if (!userId) {
+        return { success: false, message: 'User ID required to search Foreplay discovery.', results: [], totalResults: 0 };
+      }
+
+      // Build the effective query: combine company_name + query if both provided
+      const effectiveQuery = [options.companyName, query].filter(Boolean).join(' ') || undefined;
+      if (!effectiveQuery) {
+        return { success: false, message: 'Provide a company_name or query to search Foreplay discovery.', results: [], totalResults: 0 };
+      }
+
+      const foreplayToken = await getForeplayAccessToken(userId);
+      if (!foreplayToken) {
+        return {
+          success: false,
+          message: 'Foreplay is not configured. The platform-wide Foreplay API key is missing from AWS Secrets Manager — an admin needs to add it. Users can also connect their own Foreplay account in Knowledge Base settings.',
+          results: [],
+          totalResults: 0
+        };
+      }
+
+      const limit = Math.min(options.maxResults || 10, 20);
+      const result = await searchForeplayDiscoveryAds(foreplayToken, {
+        query: effectiveQuery,
+        limit,
+        format: options.format,
+        platform: options.platform,
+        niche: options.niche,
+        live: options.live,
+        sort: options.sort,
+      });
+
+      // When a company_name is specified, filter results to only that brand
+      const ads = options.companyName
+        ? result.ads.filter(ad => (ad.brandName || '').toLowerCase().includes(options.companyName!.toLowerCase()))
+        : result.ads;
+
+      const results = ads.map(ad => ({
+        content: (() => {
+          const c = formatForeplayAdAsMarkdown(ad);
+          return c.length > 5000 ? c.substring(0, 5000) + '\n\n[Content truncated]' : c;
+        })(),
+        source: `foreplay-discovery/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
+      }));
+
+      const searchLabel = options.companyName
+        ? (query ? `"${options.companyName}" + "${query}"` : `"${options.companyName}"`)
+        : `"${query}"`;
+
+      return {
+        success: true,
+        message: results.length > 0
+          ? `Found ${results.length} ads in Foreplay discovery database for ${searchLabel}${result.cursor ? ' (more available)' : ''}`
+          : `No ads found in Foreplay discovery database for ${searchLabel}`,
+        query: effectiveQuery,
+        companyName: options.companyName,
+        results,
+        totalResults: results.length,
+        hasMore: !!result.cursor,
+        note: 'Each result costs 1 Foreplay credit. Discovery searches Foreplay\'s full database of millions of ads, not just your saved swipefile.'
+      };
+    } catch (error) {
+      console.error('AgentMode: Error searching Foreplay discovery:', error);
+      return {
+        success: false,
+        message: 'Failed to search Foreplay discovery. Please try again.',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
   // List all knowledge base files for a user
   public async listKnowledgeBaseFiles(userId: string, options?: {
     modified_after?: string;  // ISO 8601 date string, e.g. "2026-04-15"
@@ -13856,22 +14101,45 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Get all public knowledge bases from all users
       const publicKnowledgeBaseTasks = await taskDb.getAllPublicKnowledgeBaseTasks();
 
-      // Combine both lists, removing duplicates (in case user has public KBs)
-      const taskIdSet = new Set<string>();
-
-      // Add user's task IDs to set first
-      for (const task of userKnowledgeBaseTasks || []) {
-        taskIdSet.add(task.taskId);
+      // Fan out to same-org members' KBs when shareSettings.knowledgeBase is
+      // effectively enabled for the caller (editors and the org owner always
+      // see fanout; plain members only when the toggle is on).
+      let orgKnowledgeBaseTasks: any[] = [];
+      try {
+        const { userDb, orgDb } = await import('./db');
+        const { isFeatureEffectivelyEnabled } = await import('./orgShareService');
+        const caller = await userDb.getUserById(userId);
+        if (caller?.orgId) {
+          const org = await orgDb.getOrgById(caller.orgId);
+          const enabled = isFeatureEffectivelyEnabled(
+            { userId, orgId: caller.orgId, orgRole: caller.orgRole as 'owner' | 'member' | undefined },
+            org,
+            'knowledgeBase',
+          );
+          if (enabled) {
+            const members = await orgDb.getOrgMembers(caller.orgId);
+            const otherMembers = members.filter((m: any) => m.userId !== userId);
+            const perMember = await Promise.all(
+              otherMembers.map((m: any) => taskDb.getTasksWithKnowledgeBase(m.userId).catch(() => [])),
+            );
+            orgKnowledgeBaseTasks = perMember.flat();
+          }
+        }
+      } catch (e) {
+        console.error('[agentModeService] org KB fanout failed:', e);
       }
 
-      const allKnowledgeBaseTasks = [...(userKnowledgeBaseTasks || [])];
-
-      // Add public knowledge bases that are not already in the user's list
-      for (const publicTask of publicKnowledgeBaseTasks || []) {
-        if (!taskIdSet.has(publicTask.taskId)) {
-          taskIdSet.add(publicTask.taskId);
-          allKnowledgeBaseTasks.push(publicTask);
-        }
+      // Combine all lists, removing duplicates by taskId
+      const taskIdSet = new Set<string>();
+      const allKnowledgeBaseTasks: any[] = [];
+      for (const task of [
+        ...(userKnowledgeBaseTasks || []),
+        ...orgKnowledgeBaseTasks,
+        ...(publicKnowledgeBaseTasks || []),
+      ]) {
+        if (taskIdSet.has(task.taskId)) continue;
+        taskIdSet.add(task.taskId);
+        allKnowledgeBaseTasks.push(task);
       }
 
       // If kb_type filter is set and doesn't include platform KBs, skip them entirely
@@ -14282,6 +14550,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const pdfParse = require('pdf-parse');
       const pdfData = await pdfParse(content, { pagerender: pdfPageRender });
       return pdfData.text || '';
+    } else if (['xlsx', 'xls', 'xlsm', 'xlsb'].includes(extension) ||
+      mimeType.includes('spreadsheetml') || mimeType.includes('ms-excel')) {
+      const XLSX = require('xlsx');
+      const workbook = XLSX.read(content, { type: 'buffer' });
+      const lines: string[] = [];
+      for (const sheetName of workbook.SheetNames) {
+        const sheet = workbook.Sheets[sheetName];
+        const csv = XLSX.utils.sheet_to_csv(sheet, { blankrows: false });
+        if (csv.trim()) {
+          lines.push(`Sheet: ${sheetName}`);
+          lines.push(csv);
+        }
+      }
+      return lines.join('\n\n');
     } else if (['txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'log'].includes(extension) ||
       mimeType.startsWith('text/') ||
       mimeType.startsWith('application/vnd.google-apps.')) {
@@ -14319,17 +14601,45 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return { success: false, message: `Knowledge base "${kbIdentifier}" not found` };
     }
 
-    // Auth check: allow access if the knowledge base is public, otherwise check ownership
+    // Auth check: allow public KBs, otherwise owner or any same-org member when
+    // shareSettings.knowledgeBase is effectively enabled (editors + owners always
+    // pass; plain members only when toggle is on). Mirrors the GET /knowledge-base
+    // route so Emma can read the same items the UI shows.
     const isPublic = task.knowledgeBaseType === 'public';
     if (!isPublic && task.userId !== userId) {
-      return { success: false, message: 'Not authorized to access this knowledge base file' };
+      let kbAuthorized = false;
+      try {
+        const { userDb, orgDb } = await import('./db');
+        const { canViewItem } = await import('./orgShareService');
+        const [caller, owner] = await Promise.all([
+          userDb.getUserById(userId),
+          userDb.getUserById(task.userId),
+        ]);
+        const ownerOrgId = owner?.orgId;
+        const callerOrgId = caller?.orgId;
+        if (callerOrgId && ownerOrgId && callerOrgId === ownerOrgId) {
+          const org = await orgDb.getOrgById(callerOrgId);
+          kbAuthorized = canViewItem(
+            { userId: task.userId },
+            { userId, orgId: callerOrgId, orgRole: caller?.orgRole as 'owner' | 'member' | undefined },
+            org,
+            ownerOrgId,
+            'knowledgeBase',
+          );
+        }
+      } catch (e) {
+        console.error('[agentModeService] org KB authorization check failed:', e);
+      }
+      if (!kbAuthorized) {
+        return { success: false, message: 'Not authorized to access this knowledge base file' };
+      }
     }
 
-    // Default file size check
+    // Default file size check — skip if the KB has a URL set (size=0 can be stale metadata)
     const size = typeof task.knowledgeBaseSize === 'string'
       ? parseInt(task.knowledgeBaseSize)
       : task.knowledgeBaseSize || 0;
-    if (fileName === 'knowledge-base.txt' && size === 0) {
+    if (fileName === 'knowledge-base.txt' && size === 0 && !task.knowledgeBase) {
       return { success: false, message: `Knowledge base file "${fileName}" is empty or does not exist` };
     }
 
@@ -14375,6 +14685,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         const pdfParse = require('pdf-parse');
         const pdfData = await pdfParse(content, { pagerender: pdfPageRender });
         contentStr = pdfData.text || '';
+      } else if (['xlsx', 'xls', 'xlsm', 'xlsb'].includes(extension) ||
+        contentType.includes('spreadsheetml') || contentType.includes('ms-excel')) {
+        const XLSX = require('xlsx');
+        const workbook = XLSX.read(content, { type: 'buffer' });
+        const lines: string[] = [];
+        for (const sheetName of workbook.SheetNames) {
+          const sheet = workbook.Sheets[sheetName];
+          const csv = XLSX.utils.sheet_to_csv(sheet, { blankrows: false });
+          if (csv.trim()) {
+            lines.push(`Sheet: ${sheetName}`);
+            lines.push(csv);
+          }
+        }
+        contentStr = lines.join('\n\n');
       } else if (['txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'log'].includes(extension) || contentType.startsWith('text/')) {
         contentStr = content.toString('utf-8');
       } else {
@@ -14770,6 +15094,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     'read_market_strategy': 50000,
     'search_tool_response': 20000,
     'read_tool_response': 60000,
+    'read_brand_guidelines': 15000,
+    'read_knowledge_base_files': 10000,
+    'read_page_source': 8000,
+  };
+
+  // Tool call argument fields to trim in old assistant messages when context is large.
+  // Maps tool name -> list of argument field names that can be truncated.
+  private static readonly LARGE_TOOL_ARG_TRIM: Record<string, { fields: string[]; limit: number }> = {
+    'create_blog_article': { fields: ['content_draft'], limit: 500 },
+    'update_html_file': { fields: ['html_content', 'css_content'], limit: 200 },
   };
 
   trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
@@ -14786,6 +15120,29 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // Most recent N tool results: keep at full size
     const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
 
+    // Track which assistant messages are "old" (all their tool_calls have been resolved
+    // and are not in the preserve set). We identify these to trim large argument fields.
+    const oldAssistantIndices = new Set<number>();
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      if (msg.role === 'assistant' && msg.tool_calls?.length) {
+        // Find the tool result indices for this assistant message's tool calls
+        const toolCallIds = new Set(msg.tool_calls.map((tc: any) => tc.id));
+        let allOld = true;
+        for (let j = i + 1; j < messages.length; j++) {
+          if (messages[j].role === 'tool' && toolCallIds.has(messages[j].tool_call_id)) {
+            if (preserveSet.has(j)) {
+              allOld = false;
+              break;
+            }
+          }
+        }
+        if (allOld) {
+          oldAssistantIndices.add(i);
+        }
+      }
+    }
+
     // Shallow-copy the array; only deep-copy messages that need modification
     const result = messages.map((msg, idx) => {
       if (
@@ -14800,6 +15157,35 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           return { ...msg, content: `[Tool: ${msg.name} — ${preview}...]` };
         }
       }
+
+      // Trim large tool call arguments in old assistant messages to prevent context overflow
+      if (msg.role === 'assistant' && oldAssistantIndices.has(idx) && msg.tool_calls?.length) {
+        let modified = false;
+        const newToolCalls = msg.tool_calls.map((tc: any) => {
+          const trimSpec = AgentModeService.LARGE_TOOL_ARG_TRIM[tc.function?.name];
+          if (!trimSpec) return tc;
+          let args: Record<string, any>;
+          try {
+            args = JSON.parse(tc.function.arguments || '{}');
+          } catch {
+            return tc;
+          }
+          let changed = false;
+          for (const field of trimSpec.fields) {
+            if (typeof args[field] === 'string' && args[field].length > trimSpec.limit) {
+              args[field] = args[field].slice(0, trimSpec.limit) + '[…trimmed]';
+              changed = true;
+            }
+          }
+          if (!changed) return tc;
+          modified = true;
+          return { ...tc, function: { ...tc.function, arguments: JSON.stringify(args) } };
+        });
+        if (modified) {
+          return { ...msg, tool_calls: newToolCalls };
+        }
+      }
+
       return msg;
     });
 
@@ -15434,8 +15820,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       // Fetch the file content
       const response = await axios.get(fileUrl, {
-        timeout: 30000, // 30 seconds timeout for larger files
-        responseType: 'arraybuffer', // Use arraybuffer to handle binary files
+        timeout: 30000,
+        responseType: 'arraybuffer',
         headers: {
           'User-Agent': 'AgentWeb-Backend/1.0',
         },
@@ -15467,6 +15853,32 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             error: pdfError instanceof Error ? pdfError.message : 'PDF parsing failed'
           };
         }
+      } else if (['xlsx', 'xls', 'xlsm', 'xlsb'].includes(extension) ||
+        contentType.includes('spreadsheetml') || contentType.includes('ms-excel')) {
+        // Handle Excel/spreadsheet files
+        try {
+          const XLSX = require('xlsx');
+          const workbook = XLSX.read(buffer, { type: 'buffer' });
+          const lines: string[] = [];
+          for (const sheetName of workbook.SheetNames) {
+            const sheet = workbook.Sheets[sheetName];
+            const csv = XLSX.utils.sheet_to_csv(sheet, { blankrows: false });
+            if (csv.trim()) {
+              lines.push(`Sheet: ${sheetName}`);
+              lines.push(csv);
+            }
+          }
+          extractedContent = lines.join('\n\n');
+          fileType = 'spreadsheet';
+          console.log(`AgentMode: Successfully parsed Excel file (${workbook.SheetNames.length} sheet(s)), extracted ${extractedContent.length} characters`);
+        } catch (xlsxError) {
+          console.error('AgentMode: Error parsing Excel file:', xlsxError);
+          return {
+            success: false,
+            message: 'Failed to parse Excel file. The file may be corrupted or in an unsupported format.',
+            error: xlsxError instanceof Error ? xlsxError.message : 'Excel parsing failed'
+          };
+        }
       } else if (['txt', 'md', 'csv', 'json', 'xml', 'html', 'htm', 'js', 'css', 'log', 'yml', 'yaml'].includes(extension)) {
         // Handle text-based files
         try {
@@ -15491,30 +15903,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           console.error('AgentMode: Error reading file as text:', textError);
           return {
             success: false,
-            message: `Unsupported file type (${extension}). Only text files, PDFs, and common document formats are supported.`,
+            message: `Unsupported file type (${extension}). Only text files, PDFs, spreadsheets, and common document formats are supported.`,
             error: 'Unsupported file type'
           };
         }
       }
 
-      // Limit content size to prevent overwhelming the LLM and session storage
-      const maxContentLength = 50000; // 50KB limit for tool results
-      if (extractedContent.length > maxContentLength) {
-        extractedContent = extractedContent.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]';
-        console.log(`AgentMode: Content truncated to ${maxContentLength} characters`);
-      }
-
-      // Format the file content for LLM consumption
-      const formattedContent = this.formatFileContent({
-        success: true,
-        content: extractedContent,
-        file_type: fileType,
-        file_size: buffer.length,
-        content_length: extractedContent.length,
-        file_url: fileUrl
-      });
-
-      // Compute content hash for integrity verification
       const contentHash = createHash('sha256').update(extractedContent).digest('hex');
       console.log(`AgentMode: Computed content hash: ${contentHash}`);
 
@@ -17389,8 +17783,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         .use(remarkBreaks) // Convert line breaks to <br> tags
         .use(remarkHtml, { sanitize: false }); // Convert to HTML
 
+      // Gemini may serialize array items as JSON strings instead of objects — normalize
+      const normalizedPosts = posts.map(p => (typeof p === 'string' ? JSON.parse(p) : p));
+
       // Generate HTML for each post
-      const postsHtml = posts.map((post, index) => {
+      const postsHtml = normalizedPosts.map((post, index) => {
         const postNumber = index + 1;
         // Map post types to display labels
         const typeLabelMap: Record<string, string> = {
@@ -18956,6 +19353,26 @@ Please generate a complete, professional HTML document that properly formats and
     types?: string[]
   ): Promise<any> {
     try {
+      // Org-level create gating: only org owner or listed htmlTemplates editor
+      const { userDb, orgDb } = await import('./db');
+      const { canManageOrgFeature } = await import('./orgShareService');
+      const caller = await userDb.getUserById(userId);
+      if (caller?.orgId) {
+        const org = await orgDb.getOrgById(caller.orgId);
+        const allowed = canManageOrgFeature(
+          { userId, orgId: caller.orgId, orgRole: caller.orgRole as 'owner' | 'member' | undefined },
+          org,
+          'htmlTemplates',
+        );
+        if (!allowed) {
+          return {
+            success: false,
+            message: 'Templates are managed by your org admin',
+            error: 'Permission denied'
+          };
+        }
+      }
+
       // Read HTML content from source (either S3 URL or direct HTML content)
       let htmlContent = htmlSource;
 
@@ -20364,9 +20781,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   // List connected accounts helper
   async listConnectedAccounts(userId: string, platform: string = 'all'): Promise<any> {
     try {
-      const { getAccountsByUserId, isTokenValid } = await import('./connectedAccountsDb');
+      const { getAccountsByUserIdIncludingOrgShared, isTokenValid } = await import('./connectedAccountsDb');
 
-      let accounts = await getAccountsByUserId(userId);
+      let accounts = await getAccountsByUserIdIncludingOrgShared(userId);
 
       if (platform && platform !== 'all') {
         accounts = accounts.filter(acc => acc.platform === platform);
@@ -20776,7 +21193,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   async loadConnectedAccountPosts(
     userId: string,
     accountId: string,
-    options: { limit?: number; include_metrics?: boolean } = {}
+    options: { limit?: number; include_metrics?: boolean; force_reload?: boolean } = {}
   ): Promise<any> {
     console.log('[AgentMode] loadConnectedAccountPosts called:', {
       userId,
@@ -20801,6 +21218,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         accountId,
         limit: options.limit || 10,
         includeMetrics: options.include_metrics !== false,
+        forceReload: options.force_reload === true,
       });
 
       // If the account wasn't processed (adapter threw), treat as failure
@@ -20808,6 +21226,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return {
           success: false,
           message: 'Failed to load posts',
+        };
+      }
+
+      // If the account errored (0 posts + error field), surface the real error
+      const accountResult = result.accounts.find(a => a.accountId === accountId);
+      if (accountResult?.error && result.posts.length === 0) {
+        return {
+          success: false,
+          message: `Failed to load posts: ${accountResult.error}`,
+          error: accountResult.error,
         };
       }
 
@@ -20943,15 +21371,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     const { profile_url, provider_id, message } = args;
     console.log(`[AgentMode] linkedinOutreach called: action=${action}, account_id=${account_id}`);
 
-    // Write actions must use an account owned by the calling user.
-    // This prevents an LLM from reusing a shared/enrichment account_id it may have
-    // seen in a prior get-profile tool call to send invitations or messages.
+    // Write actions must use an account that is either owned by the calling user or
+    // explicitly shared with the org (sharedWithOrg: true). This prevents an LLM from
+    // reusing a shared enrichment account_id from a prior get-profile call.
     const WRITE_ACTIONS = ['send-invite', 'send-message', 'send-inmail', 'cancel-invitation', 'accept-invitation'];
     if (WRITE_ACTIONS.includes(action)) {
-      const { getAccountsByUserId } = await import('./connectedAccountsDb');
-      const userAccounts = await getAccountsByUserId(userId);
-      const owned = userAccounts.some((a: any) => a.platform === 'unipile' && a.account_id === account_id);
-      if (!owned) {
+      const { getAccountsByUserIdIncludingOrgShared } = await import('./connectedAccountsDb');
+      const userAccounts = await getAccountsByUserIdIncludingOrgShared(userId);
+      const authorized = userAccounts.some((a: any) => a.platform === 'unipile' && a.account_id === account_id);
+      if (!authorized) {
         return { success: false, error: `Account ${account_id} is not connected to your profile. Connect a LinkedIn Outreach account in Settings to use this action.` };
       }
     }
@@ -21904,7 +22332,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (parsed) lead.company = parsed;
         }
         if (item.location) {
-          lead.customFields = { ...(lead.customFields ?? {}), location: item.location };
+          lead.customFields = mergeCustomFields(
+            lead.customFields,
+            { location: item.location },
+            { source: 'agentMode.importLeadsFromSearch' },
+          );
         }
         // sys is sidecar — see Phase 0b lead.system top-level field.
         const sys: Record<string, any> = {};

@@ -30,7 +30,8 @@ const createUsersTable = async () => {
     TableName: `${TABLE_PREFIX}AW-Users`,
     AttributeDefinitions: [
       { AttributeName: 'email', AttributeType: 'S' },
-      { AttributeName: 'userId', AttributeType: 'S' }
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'orgId', AttributeType: 'S' }
     ],
     KeySchema: [
       { AttributeName: 'email', KeyType: 'HASH' } // Use email as primary key
@@ -53,6 +54,19 @@ const createUsersTable = async () => {
         IndexName: 'EmailIndex',
         KeySchema: [
           { AttributeName: 'email', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      },
+      {
+        IndexName: 'OrgIdIndex',
+        KeySchema: [
+          { AttributeName: 'orgId', KeyType: 'HASH' }
         ],
         Projection: {
           ProjectionType: 'ALL'
@@ -1141,7 +1155,8 @@ const createLeadsTable = async () => {
       { AttributeName: 'status', AttributeType: 'S' },
       { AttributeName: 'linkedin', AttributeType: 'S' },
       { AttributeName: 'nameCompanyKey', AttributeType: 'S' },
-      { AttributeName: 'updatedAt', AttributeType: 'S' }
+      { AttributeName: 'updatedAt', AttributeType: 'S' },
+      { AttributeName: 'companyId', AttributeType: 'S' }
     ],
     KeySchema: [
       { AttributeName: 'listId', KeyType: 'HASH' },
@@ -1237,6 +1252,20 @@ const createLeadsTable = async () => {
         KeySchema: [
           { AttributeName: 'nameCompanyKey', KeyType: 'HASH' },
           { AttributeName: 'updatedAt', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      },
+      {
+        IndexName: 'companyId-index',
+        KeySchema: [
+          { AttributeName: 'companyId', KeyType: 'HASH' },
+          { AttributeName: 'leadId', KeyType: 'RANGE' }
         ],
         Projection: {
           ProjectionType: 'ALL'
@@ -1971,11 +2000,13 @@ const main = async () => {
     await createOAuthSessionsTable();
     await createDripSequencesTable();
     await createSequenceEnrollmentsTable();
+    await createUnipileConnectionsTable();
     await createDripCampaignsTable();
     await createDripSendsTable();
     await createEnrichmentHistoryTable();
     await createEnrichmentRawCacheTable();
     await createCharactersTable();
+    await createCRMCompaniesTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -2416,6 +2447,88 @@ const createCharactersTable = async () => {
       },
     ],
     BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+const createUnipileConnectionsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-UnipileConnections`,
+    AttributeDefinitions: [
+      { AttributeName: 'accountId', AttributeType: 'S' },
+      { AttributeName: 'memberId', AttributeType: 'S' },
+      { AttributeName: 'publicProfileUrl', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'accountId', KeyType: 'HASH' },
+      { AttributeName: 'memberId', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'publicProfileUrl-index',
+        KeySchema: [
+          { AttributeName: 'publicProfileUrl', KeyType: 'HASH' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+const createCRMCompaniesTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-CRMCompanies`,
+    AttributeDefinitions: [
+      { AttributeName: 'companyId', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'createdAt', AttributeType: 'S' },
+      { AttributeName: 'domain', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'companyId', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'userId-createdAt-index',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+        ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 },
+      },
+      {
+        IndexName: 'domain-index',
+        KeySchema: [
+          { AttributeName: 'domain', KeyType: 'HASH' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+        ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 },
+      },
+    ],
+    ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 },
   };
 
   try {

@@ -3,10 +3,11 @@ import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { authenticateToken } from '../middleware/auth';
-import { userDb } from '../services/db';
+import { userDb, orgDb } from '../services/db';
 import { encryptPassword } from '../utils/crypto';
 import { getAccessToken, getWorkspaces, listDocs, listTasks } from '../services/clickupService';
 import { getClickUpConfig } from '../config/integrations';
+import { canEditItem } from '../services/orgShareService';
 
 const router = express.Router();
 
@@ -170,7 +171,7 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
 });
 
 // ============================================
-// POST /connect — Persist OAuth token to user secrets
+// POST /connect — Persist OAuth token to user or org secrets
 // ============================================
 router.post('/connect', authenticateToken, async (req: any, res) => {
   const { tokenSessionId } = req.body;
@@ -186,18 +187,37 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
   }
 
   try {
-    // Verify by fetching workspaces
-    const workspaces = await getWorkspaces(access_token);
-
-    // Store token in user secrets (same field as PAT flow)
-    const encryptedToken = encryptPassword(access_token, userId);
     const user = await userDb.getUserById(userId);
+    const orgId = user?.orgId;
+
+    if (orgId) {
+      // Org user: gate on KB-editor or owner permission
+      const org = await orgDb.getOrgById(orgId);
+      const userLike = { userId, orgId, orgRole: user?.orgRole as "owner" | "member" | undefined };
+      const itemLike = { userId: org?.ownerUserId }; // treat org itself as the item
+      if (!canEditItem(itemLike, userLike, org, orgId, "knowledgeBase")) {
+        return res.status(403).json({ error: 'Only org admins or KB editors can connect ClickUp for the org' });
+      }
+
+      // Verify by fetching workspaces
+      const workspaces = await getWorkspaces(access_token);
+
+      // Store token in org secrets
+      const encryptedToken = encryptPassword(access_token, orgId);
+      await orgDb.setOrgSecret(orgId, 'clickup_access_token', encryptedToken);
+
+      console.log(`[ClickUp OAuth] Token saved for org ${orgId} by user ${userId}`);
+      return res.json({ success: true, workspaces });
+    }
+
+    // Solo user: store per-user (original behaviour)
+    const workspaces = await getWorkspaces(access_token);
+    const encryptedToken = encryptPassword(access_token, userId);
     const existingSecrets = (user?.secrets as Record<string, string>) || {};
     await userDb.updateUser(userId, { secrets: { ...existingSecrets, clickup_access_token: encryptedToken } });
 
     console.log(`[ClickUp OAuth] Token saved for user ${userId}`);
-
-    res.json({ success: true, workspaces });
+    return res.json({ success: true, workspaces });
   } catch (error: any) {
     console.error('[ClickUp OAuth /connect]', error);
     res.status(500).json({ error: 'Failed to connect ClickUp account' });
@@ -205,7 +225,7 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
 });
 
 // ============================================
-// POST /save-token — Save a ClickUp Personal API Token
+// POST /save-token — Save a ClickUp Personal API Token (org or user)
 // ============================================
 router.post('/save-token', authenticateToken, async (req: any, res) => {
   const { token: clickupToken } = req.body;
@@ -235,16 +255,34 @@ router.post('/save-token', authenticateToken, async (req: any, res) => {
       throw apiError;
     }
 
-    // Encrypt and save token to user secrets
-    const encryptedToken = encryptPassword(clickupToken.trim(), userId);
     const user = await userDb.getUserById(userId);
+    const orgId = user?.orgId;
+
+    if (orgId) {
+      // Org user: gate on KB-editor or owner permission
+      const org = await orgDb.getOrgById(orgId);
+      const userLike = { userId, orgId, orgRole: user?.orgRole as "owner" | "member" | undefined };
+      const itemLike = { userId: org?.ownerUserId };
+      if (!canEditItem(itemLike, userLike, org, orgId, "knowledgeBase")) {
+        return res.status(403).json({ error: 'Only org admins or KB editors can connect ClickUp for the org' });
+      }
+
+      // Encrypt and save token to org secrets
+      const encryptedToken = encryptPassword(clickupToken.trim(), orgId);
+      await orgDb.setOrgSecret(orgId, 'clickup_access_token', encryptedToken);
+
+      console.log(`[ClickUp] Token saved for org ${orgId} by user ${userId}`);
+      return res.json({ success: true, workspaces });
+    }
+
+    // Solo user: store per-user (original behaviour)
+    const encryptedToken = encryptPassword(clickupToken.trim(), userId);
     const existingSecrets = (user?.secrets as Record<string, string>) || {};
     const updatedSecrets = { ...existingSecrets, clickup_access_token: encryptedToken };
     await userDb.updateUser(userId, { secrets: updatedSecrets });
 
     console.log(`[ClickUp] Token saved for user ${userId}`);
-
-    res.json({ success: true, workspaces });
+    return res.json({ success: true, workspaces });
   } catch (error: any) {
     console.error('[ClickUp] Error saving token:', error);
     res.status(500).json({ error: 'Failed to save ClickUp token' });
@@ -319,23 +357,36 @@ router.get('/workspace/:teamId/tasks', authenticateToken, async (req: any, res) 
 });
 
 // ============================================
-// POST /disconnect — Remove ClickUp token from user secrets
+// POST /disconnect — Remove ClickUp token from org or user secrets
 // ============================================
 router.post('/disconnect', authenticateToken, async (req: any, res) => {
   const userId = req.user.userId;
 
   try {
     const user = await userDb.getUserById(userId);
+    const orgId = user?.orgId;
+
+    if (orgId) {
+      // Org user: gate on KB-editor or owner permission
+      const org = await orgDb.getOrgById(orgId);
+      const userLike = { userId, orgId, orgRole: user?.orgRole as "owner" | "member" | undefined };
+      const itemLike = { userId: org?.ownerUserId };
+      if (!canEditItem(itemLike, userLike, org, orgId, "knowledgeBase")) {
+        return res.status(403).json({ error: 'Only org admins or KB editors can disconnect ClickUp for the org' });
+      }
+
+      await orgDb.removeOrgSecret(orgId, 'clickup_access_token');
+      console.log(`[ClickUp Disconnect] Token removed for org ${orgId} by user ${userId}`);
+      return res.json({ success: true });
+    }
+
+    // Solo user: remove per-user token (original behaviour)
     const existingSecrets = (user?.secrets as Record<string, string>) || {};
-
-    // Remove clickup_access_token
     const { clickup_access_token, ...remainingSecrets } = existingSecrets;
-
     await userDb.updateUser(userId, { secrets: remainingSecrets });
 
     console.log(`[ClickUp Disconnect] Token removed for user ${userId}`);
-
-    res.json({ success: true });
+    return res.json({ success: true });
   } catch (error: any) {
     console.error('[ClickUp Disconnect] Error:', error);
     res.status(500).json({ error: 'Failed to disconnect ClickUp' });

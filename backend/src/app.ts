@@ -31,6 +31,7 @@ import seoRoutes from "./routes/seo";
 import funnelRoutes from "./routes/funnel";
 import gtmPlanRoutes from "./routes/gtmPlan";
 import crmRoutes from "./routes/crm";
+import crmCompaniesRoutes from "./routes/crmCompanies";
 import sequenceRoutes from "./routes/sequences";
 import crmPublicRoutes from "./routes/crmPublic";
 import subscriptionRoutes from "./routes/subscription";
@@ -74,6 +75,8 @@ import imageReportsRoutes from "./routes/imageReports";
 import clientHealthRoutes from "./routes/clientHealth";
 import leadMagnetRoutes from "./routes/leadMagnet";
 import orgRoutes from "./routes/org";
+import orgShareSettingsRoutes from "./routes/orgShareSettings";
+import orgMemberRemovalRoutes from "./routes/orgMemberRemoval";
 import testAccountsRoutes from "./routes/testAccounts";
 import onboardingEventsRoutes from "./routes/onboardingEvents";
 import brandBuildRoutes from "./routes/brandBuild";
@@ -81,6 +84,7 @@ import adGenRoutes from "./routes/adGen";
 import onboardingStepsRoutes from "./routes/onboardingSteps";
 import usersRoutes from "./routes/users";
 import charactersRoutes from "./routes/characters";
+import contractorRoutes from "./routes/contractor";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
 
@@ -234,7 +238,7 @@ app.use("/api/stripe", stripeRoutes);
 app.use("/api/brand", brandRoutes);
 app.use("/api/landing-pages/v0", landingPageGenerationRoutes);
 app.use("/api/landing-pages", landingPagesRoutes);
-app.use("/api/html-templates", htmlTemplatesRoutes);
+app.use("/api/html-templates", authenticateToken, htmlTemplatesRoutes);
 app.use("/api/domains", domainRoutes);
 app.use("/api/market-strategy", marketStrategyRoutes);
 app.use("/api/slack", slackRoutes);
@@ -259,6 +263,7 @@ app.use("/api/crm", crmWebhookRoutes);  // per-list webhook URLs — must be aft
 import apolloWebhookRoutes from "./routes/apolloWebhook";
 app.use("/api/crm/webhooks/apollo", apolloWebhookRoutes);
 app.use("/api/crm/sequences", sequenceRoutes);
+app.use("/api/crm/companies", crmCompaniesRoutes);
 app.use("/api/crm", crmRoutes);
 app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/books", booksRoutes);
@@ -305,7 +310,10 @@ app.use("/batch-review", batchReviewPublicRouter);
 app.use("/api/image-reports", imageReportsRoutes);
 app.use("/api/lead-magnet", leadMagnetRoutes);
 app.use("/api/org", orgRoutes);
+app.use("/api/orgs/me/share-settings", authenticateToken, orgShareSettingsRoutes);
+app.use("/api/orgs/me/members", authenticateToken, orgMemberRemovalRoutes);
 app.use("/api/characters", charactersRoutes);
+app.use("/api/contractor", contractorRoutes);
 
 
 // Agent API documentation (public, no auth)

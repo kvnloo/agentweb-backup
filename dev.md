@@ -1,3 +1,37 @@
+## perform_data_analysis: Unknown Tool Errors and Timeout in Scheduled Reports (2026-05-15)
+
+### Problem
+
+Session `a01ef8a3-436b-403e-96c1-6590488e57e9` ("Scheduled: Daily User Activity Report") scored 2/10. The judge reported repeated "Unknown tool" errors and a timeout during `perform_data_analysis`.
+
+### Investigation
+
+The schedule had run successfully on May 10, 11, 13 — all completed without calling `perform_data_analysis`. On May 14 the same Gemini model non-deterministically decided to use it for the first time.
+
+**What actually happened in the failing run (from `calledFunctions` and `failedFunctions`):**
+
+1. `get_chat_history`, `list_all_clients` — succeeded, output offloaded to S3
+2. `__other_skills__:read_tool_response` × 3 — **"Unknown tool" errors**. The LLM hallucinated skill-prefixed tool names (e.g. `__other_skills__:read_tool_response`) before installing the skill. These show up in `failedFunctions` as `__other_skills__:read_tool_response`.
+3. `install_skills` — LLM self-corrected and installed `__other_skills__`
+4. `read_tool_response`, `search_tool_response` × many — worked after install
+5. `perform_data_analysis` — **timed out** on the large dataset (all 24h of session data sent as a single payload)
+
+The root cause has two parts:
+- `perform_data_analysis` was not in `FOUNDATION_TOOLS` and not in any published production skill. It lived in `__other_skills__`, which requires explicit `install_skills` to access. In sessions with no `requiredFunctionCalls`, skills are not auto-installed, so the LLM had to discover and install `__other_skills__` on its own — leading to the hallucinated prefixed tool names while it was figuring out the skill system.
+- Once the tool was accessible, calling it with a full 24-hour dataset in a single request hit the 20-minute Gemini timeout.
+
+### Fix
+
+**Done by Rui in the partner portal (no code change):** Added `perform_data_analysis` to the `foundation_tools` setting in `AW-Settings`. This makes it immediately available in every session without requiring skill installation, consistent with other analytical primitives like `search_web` and `search_tool_response`.
+
+**Code change (PR #1548):** Also improved timeout error handling — when the Gemini API call times out, the LLM now receives guidance to break the analysis into smaller subsets (by date range or category) rather than retrying the same large payload. Also fixed a condition ordering bug in `formatToolError` where timeout messages containing "too large for a single call" were misclassified as payload-too-large errors.
+
+### Why `perform_data_analysis` Belongs in Foundation Tools
+
+More scheduled reports and workflows are now using this tool organically. Keeping it in `__other_skills__` means any session that hasn't explicitly installed that skill will hit the same install-then-call friction, with the attendant hallucinated-prefix errors. It's a core analytical primitive — same category as `search_web`, `save_memory`, `search_tool_response`.
+
+---
+
 ## DynamoDB Versioning for Brand Guidelines & Market Strategy (2026-05-14)
 
 ### Problem
@@ -4439,3 +4473,27 @@ Decoding the raw email HTML revealed the logo `<img>` (converted from SVG) had `
 **Superhuman:** We contacted Superhuman support to report the SVG sanitization behavior. **Awaiting their response.** No fix has been applied at our end for this issue. If Superhuman confirms this is by design (i.e., SVGs will always have styles stripped), the mitigation would be to convert SVGs to PNGs server-side before sending (already prototyped: `convertEmailSvgsToPng` in `emailVariables.ts` using `sharp` + content-addressed S3 keys — `email-svgs/<sha256>.png`).
 
 **Slashy:** A server-side fix was applied: `removeInvertedImgFilters()` in `emailVariables.ts` strips `filter:brightness(0) invert(1)` from `<img>` style attributes before send. This ensures the logo renders in its original colors on all clients. Trade-off: on clients that correctly render the purple header (Gmail, Apple Mail), the logo now appears dark against the purple background rather than white — acceptable since it remains legible. The proper long-term fix is a white-variant logo asset that does not rely on CSS filters.
+
+## Session Judge Scoring — Bug-Reported Sessions (2026-05-16)
+
+### Background
+
+Session satisfaction scores were being computed too low for sessions where the assistant hit a known platform bug. The judge LLM was seeing friction and failures without understanding that the issue had been formally escalated — so it scored the session as if the user's problem was simply unresolved.
+
+### Signal: `report_product_issues` Tool Call
+
+The reliable signal that a bug was reported is the presence of `report_product_issues` in the serialized transcript's `[called tools: ...]` line. This is more deterministic than trying to parse natural-language acknowledgments ("I've filed a bug", etc.).
+
+### Fix
+
+The scoring judge prompt was updated (both the hardcoded `DEFAULT_SCORING_SYSTEM_PROMPT` in `sessionScoringService.ts` and the live prompt managed via the admin Settings → Scoring Judges page) to include:
+
+> **IMPORTANT: Bug reported during session:**
+> - If the transcript contains `[called tools: report_product_issues]`, a bug was formally reported
+> - Treat the problematic behavior as a known platform limitation, not an assistant failure
+> - Score the overall session as satisfied (score ≥ 4) unless the user expressed strong dissatisfaction **after** the tool was called
+> - Dimension scores (e.g. `outputQuality`) may still reflect pre-report friction
+
+### Live Prompt State
+
+The prompt was manually updated in both dev and prod via the admin Scoring Judges page. No migration or deploy is needed — the page writes directly to the `default-scoring-prompt` DynamoDB setting at runtime. Custom judges were also updated to match.

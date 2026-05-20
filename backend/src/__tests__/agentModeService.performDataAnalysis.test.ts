@@ -389,4 +389,55 @@ describe('AgentModeService.performDataAnalysis', () => {
     expect(promptText).toContain('altair');
     expect(promptText.toLowerCase()).toContain('do not use altair');
   });
+
+  test('returns chunking guidance when axios times out (ECONNABORTED)', async () => {
+    const timeoutError = new Error('timeout of 1200000ms exceeded');
+    (timeoutError as any).code = 'ECONNABORTED';
+    mockedAxiosPost.mockRejectedValueOnce(timeoutError);
+
+    const result = await (service as any).performDataAnalysis([], 'Analyze the dataset.', 'user-1');
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('timed out');
+    expect(result.message).toContain('smaller pieces');
+  });
+
+  test('returns chunking guidance when error message contains "timeout"', async () => {
+    mockedAxiosPost.mockRejectedValueOnce(new Error('Request timeout after 20 minutes'));
+
+    const result = await (service as any).performDataAnalysis([], 'Analyze the dataset.', 'user-1');
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('timed out');
+  });
+});
+
+describe('perform_data_analysis in DEFAULT_FOUNDATION_TOOLS', () => {
+  it('should include perform_data_analysis in DEFAULT_FOUNDATION_TOOLS so scheduled sessions can access it without explicit skill install', () => {
+    expect(AgentModeService.DEFAULT_FOUNDATION_TOOLS).toContain('perform_data_analysis');
+  });
+});
+
+describe('formatToolError for perform_data_analysis', () => {
+  let svc: AgentModeService;
+
+  beforeEach(() => {
+    svc = new AgentModeService();
+  });
+
+  it('returns timeout-chunking guidance when error message mentions timeout', () => {
+    const result = (svc as any).formatToolError('perform_data_analysis', 'timeout of 1200000ms exceeded');
+    expect(result).toContain('smaller pieces');
+    expect(result).not.toContain('save_file');
+  });
+
+  it('returns timeout-chunking guidance when error message says timed out', () => {
+    const result = (svc as any).formatToolError('perform_data_analysis', 'The analysis timed out — the dataset or analysis task is too large for a single call.');
+    expect(result).toContain('smaller pieces');
+  });
+
+  it('returns save_file guidance when error message says too large (payload, not timeout)', () => {
+    const result = (svc as any).formatToolError('perform_data_analysis', 'The data payload sent to Gemini was too large.');
+    expect(result).toContain('save_file');
+  });
 });

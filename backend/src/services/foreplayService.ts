@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { userDb } from './db';
+import { userDb, orgDb } from './db';
 import { decryptPassword } from '../utils/crypto';
 import { getForeplayApiKey } from '../utils/secretsManager';
 
@@ -84,11 +84,32 @@ export function clearForeplayCacheForToken(token: string): void {
 
 /**
  * Get the Foreplay API token for a user.
- * Returns the user's own token if configured, otherwise falls back to the
- * platform-wide key stored in Secrets Manager. Returns null only if neither exists.
+ *
+ * Resolution order:
+ *   1. If the user belongs to an org, check org.secrets.foreplay_api_token first.
+ *   2. Fall back to user.secrets.foreplay_api_token (solo users or per-user tokens).
+ *   3. Fall back to platform-wide key from Secrets Manager.
+ *
+ * Returns null only if none of the above exist.
  */
 export async function getAccessToken(userId: string): Promise<string | null> {
   const user = await userDb.getUserById(userId);
+
+  // 1. Org-level token takes precedence
+  if (user?.orgId) {
+    try {
+      const org = await orgDb.getOrgById(user.orgId);
+      const orgEncrypted = (org?.secrets as Record<string, string> | undefined)?.foreplay_api_token;
+      if (orgEncrypted) {
+        const decrypted = decryptPassword(orgEncrypted);
+        return decrypted.password;
+      }
+    } catch {
+      // fall through to user-level token
+    }
+  }
+
+  // 2. Per-user token fallback
   const secrets = (user?.secrets as Record<string, string>) || {};
   if (secrets.foreplay_api_token) {
     try {
@@ -98,6 +119,8 @@ export async function getAccessToken(userId: string): Promise<string | null> {
       // fall through to platform key
     }
   }
+
+  // 3. Platform-wide key from Secrets Manager
   return getForeplayApiKey();
 }
 

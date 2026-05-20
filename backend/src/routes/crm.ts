@@ -4,7 +4,7 @@ import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
-import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles } from '../utils/emailVariables';
+import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles, checkEmailFormat } from '../utils/emailVariables';
 import axios from 'axios';
 import { assertPublicHostname, SsrfBlockedError } from '../utils/ssrfGuard';
 import { signUnsubscribeUrl } from '../utils/unsubscribeUrl';
@@ -139,6 +139,34 @@ const enrichmentConfigDeps: ConfigServiceDeps = {
       return result ?? {};
     } catch (err) {
       console.warn('[crm] llmInferAliases failed:', (err as Error).message);
+      return {};
+    }
+  },
+
+  llmClassifySmartFields: async (fields) => {
+    if (fields.length === 0) return {};
+    const { FIELD_GROUPS } = await import('../services/enrichmentGroups');
+    const { createLLMService: mkLLM } = await import('../utils/llmService');
+    const {
+      buildSmartFieldClassificationSystemPrompt,
+      buildSmartFieldClassificationUserPrompt,
+    } = await import('../services/enrichmentPrompts');
+
+    const canonicalFieldList = Object.entries(FIELD_GROUPS)
+      .map(([group, cfg]) => `  ${group}: ${cfg.fields.join(', ')}`)
+      .join('\n');
+
+    try {
+      const llm = mkLLM(process.env.CRM_ENRICH_V3_CLASSIFY_MODEL || process.env.CRM_ENRICH_V3_ALIAS_MODEL || 'gpt-5-chat-2', 0.0);
+      const result = await llm.generateJSONContent<
+        Record<string, { isSmartField: boolean; dependencies: string[]; fieldType?: 'string' | 'number' | 'boolean' | 'date' | 'enum'; enumOptions?: string[] }>
+      >(
+        buildSmartFieldClassificationSystemPrompt(canonicalFieldList),
+        buildSmartFieldClassificationUserPrompt(fields),
+      );
+      return result ?? {};
+    } catch (err) {
+      console.warn('[crm] llmClassifySmartFields failed:', (err as Error).message);
       return {};
     }
   },
@@ -913,6 +941,41 @@ router.get('/leads/:leadId/enrichment', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('Error in GET /api/crm/leads/:leadId/enrichment:', error);
     return res.status(500).json({ message: error.message || 'Enrichment failed' });
+  }
+});
+
+/**
+ * @route GET /api/crm/org-members
+ * @desc Return org members for the current user's org (for account owner dropdown)
+ * @access Private
+ */
+router.get('/org-members', async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(401).json({ message: 'Unauthorized' });
+
+    if (!user.orgId) {
+      // No org — return just the current user as the only member
+      return res.json({
+        success: true,
+        members: [{ userId: user.userId, email: user.email, displayName: user.displayName ?? null }],
+      });
+    }
+
+    const members = await orgDb.getOrgMembers(user.orgId);
+    const safeMembers = members.map((m) => ({
+      userId: m.userId,
+      email: m.email,
+      displayName: m.displayName ?? null,
+    }));
+
+    return res.json({ success: true, members: safeMembers });
+  } catch (err) {
+    console.error('[CRM] GET /org-members error:', err);
+    return res.status(500).json({ message: 'Internal server error' });
   }
 });
 
@@ -3921,6 +3984,7 @@ router.post('/lists/:listId/leads/enrich-tech-stack', async (req: Request, res: 
       sources: ['web_search' as const],
       forceOverwrite: forceEnrich,
       leadIds,
+      apolloTechStack: true,
     };
 
     if (mode === 'preview') {
@@ -4062,6 +4126,131 @@ router.post('/lists/:listId/leads/:leadId/sync-linkedin-messages', async (req: R
   } catch (error: any) {
     console.error('Error syncing LinkedIn messages:', error);
     return res.status(500).json({ message: error.message || 'Failed to sync LinkedIn messages' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/:leadId/sync-linkedin-connection
+ * @desc Check whether this lead has accepted our LinkedIn connection request and activate
+ *       any awaiting_connection enrollment for this lead.
+ * @access Private
+ */
+router.post('/lists/:listId/leads/:leadId/sync-linkedin-connection', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId, leadId } = req.params;
+
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list || (list as any).userId !== userId) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    const lead = await crmDb.getLeadById(listId, leadId);
+    if (!lead) return res.status(404).json({ message: 'Lead not found' });
+
+    const leadLinkedIn = (lead.linkedin as string | undefined)?.trim().toLowerCase();
+    if (!leadLinkedIn) {
+      return res.status(400).json({ message: 'Lead has no LinkedIn URL' });
+    }
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const accountId = await linkedInOutreachService.resolveAccountId(userId);
+    if (!accountId) {
+      return res.status(400).json({ message: 'No LinkedIn account connected' });
+    }
+
+    const { syncConnectionsForAccount } = await import('../cron/linkedInConnectionSyncCron');
+    const { getConnectionByProfileUrl } = await import('../services/unipileConnectionsDb');
+
+    // Refresh the cache for this account (quick, not full sync)
+    await syncConnectionsForAccount(accountId);
+
+    // Check if this specific lead is now connected
+    const connection = await getConnectionByProfileUrl(leadLinkedIn);
+    const isConnected = !!connection;
+
+    return res.json({ isConnected, syncedAt: new Date().toISOString() });
+  } catch (error: any) {
+    console.error('Error syncing LinkedIn connection:', error);
+    return res.status(500).json({ message: error.message || 'Failed to sync LinkedIn connection' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/check-linkedin-connections
+ * @desc Given a list of LinkedIn profile URLs, returns which ones are already 1st-degree
+ *       connections in the AW-UnipileConnections cache. Used to render connection status
+ *       indicators on leads in the CRM table.
+ * @body { urls: string[] }
+ * @access Private
+ */
+router.post('/lists/:listId/check-linkedin-connections', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    const { urls } = req.body;
+
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+    if (!Array.isArray(urls) || urls.length === 0) return res.json({ connected: [] });
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list || (list as any).userId !== userId) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    const { getConnectionByProfileUrl } = await import('../services/unipileConnectionsDb');
+
+    const connected: string[] = [];
+    await Promise.all(urls.map(async (url: string) => {
+      const conn = await getConnectionByProfileUrl(url).catch(() => null);
+      if (conn) connected.push(url.trim().toLowerCase().replace(/\/?$/, '/'));
+    }));
+
+    return res.json({ connected });
+  } catch (error: any) {
+    console.error('Error checking LinkedIn connections:', error);
+    return res.status(500).json({ message: error.message || 'Failed to check LinkedIn connections' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/sync-linkedin-connections
+ * @desc Full resync of LinkedIn connections for this list — checks all awaiting_connection
+ *       enrollments in the list and activates any whose lead has connected.
+ * @access Private
+ */
+router.post('/lists/:listId/sync-linkedin-connections', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list || (list as any).userId !== userId) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const accountId = await linkedInOutreachService.resolveAccountId(userId);
+    if (!accountId) {
+      return res.status(400).json({ message: 'No LinkedIn account connected' });
+    }
+
+    const { syncConnectionsForAccount } = await import('../cron/linkedInConnectionSyncCron');
+
+    // Full sync — paginate through all connections for this account
+    const synced = await syncConnectionsForAccount(accountId, { fullSync: true });
+
+    return res.json({ synced: synced.length, syncedAt: new Date().toISOString() });
+  } catch (error: any) {
+    console.error('Error syncing LinkedIn connections for list:', error);
+    return res.status(500).json({ message: error.message || 'Failed to sync LinkedIn connections' });
   }
 });
 
@@ -5083,6 +5272,9 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
     const eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
     const eligibleCount = eligibleLeads.length;
 
+    // Run format verification on the HTML content
+    const formatWarnings = checkEmailFormat(htmlContent || '');
+
     if (variables.length === 0) {
       // No variables used — all eligible leads are ready
       return res.json({
@@ -5091,6 +5283,7 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
         notReadyCount: 0,
         variables: [],
         variableCoverage: {},
+        formatWarnings,
       });
     }
 
@@ -5120,6 +5313,7 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
       notReadyCount: eligibleCount - readyCount,
       variables,
       variableCoverage,
+      formatWarnings,
     });
   } catch (error) {
     console.error('Error preparing group email:', error);
@@ -5481,14 +5675,10 @@ router.post('/lists/:listId/group-email/load-from-url', async (req: Request, res
       bodyContent = bodyContent.substring(0, 200000);
     }
 
-    // Convert class-based CSS to inline styles now so the stored HTML is email-client-safe.
-    // Doing this at import time avoids the LLM call at every test-send or real send.
-    const { html: inlinedContent } = await inlineEmailStyles(bodyContent);
-
     return res.json({
       success: true,
       title: extractedTitle,
-      message: inlinedContent,
+      message: bodyContent,
     });
   } catch (error: any) {
     console.error('Error loading HTML from URL:', error.message || error);

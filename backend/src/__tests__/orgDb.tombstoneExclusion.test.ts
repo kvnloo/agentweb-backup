@@ -11,19 +11,19 @@
  * record so the data is clean at the source.
  */
 
-const mockScanPromise = jest.fn();
-const mockScan = jest.fn(() => ({ promise: mockScanPromise }));
+const mockQueryPromise = jest.fn();
+const mockQuery = jest.fn(() => ({ promise: mockQueryPromise }));
 const mockUpdatePromise = jest.fn();
 const mockUpdate = jest.fn(() => ({ promise: mockUpdatePromise }));
 const mockPutPromise = jest.fn();
 const mockPut = jest.fn(() => ({ promise: mockPutPromise }));
 
 const mockDocClientInstance = {
-  scan: mockScan,
+  scan: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({ Items: [], Count: 0 }) })),
   put: mockPut,
   get: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({ Item: undefined }) })),
   update: mockUpdate,
-  query: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({ Items: [] }) })),
+  query: mockQuery,
   delete: jest.fn(() => ({ promise: jest.fn() })),
 };
 
@@ -46,8 +46,8 @@ jest.mock('aws-sdk', () => ({
 
 import { orgDb, userDb } from '../services/db';
 
-function lastScanParams(): Record<string, any> | null {
-  const calls = mockScan.mock.calls as unknown as Array<[Record<string, any>]>;
+function lastQueryParams(): Record<string, any> | null {
+  const calls = mockQuery.mock.calls as unknown as Array<[Record<string, any>]>;
   return calls.length > 0 ? calls[calls.length - 1][0] : null;
 }
 
@@ -60,7 +60,7 @@ const ORG_ID = 'org-abc-123';
 
 beforeEach(() => {
   jest.clearAllMocks();
-  mockScanPromise.mockResolvedValue({ Items: [], Count: 0 });
+  mockQueryPromise.mockResolvedValue({ Items: [], Count: 0 });
   mockUpdatePromise.mockResolvedValue({});
   mockPutPromise.mockResolvedValue({});
 });
@@ -70,23 +70,24 @@ describe('orgDb.getOrgMembers', () => {
   it('includes NOT begins_with tombstone guard in FilterExpression', async () => {
     await orgDb.getOrgMembers(ORG_ID);
 
-    const params = lastScanParams()!;
+    const params = lastQueryParams()!;
     expect(params).not.toBeNull();
     expect(params.FilterExpression).toMatch(/NOT begins_with\(userId, :tombstone\)/);
     expect(params.ExpressionAttributeValues[':tombstone']).toBe('deleted_');
   });
 
-  it('still filters by orgId', async () => {
+  it('uses OrgIdIndex GSI and KeyConditionExpression for orgId', async () => {
     await orgDb.getOrgMembers(ORG_ID);
 
-    const params = lastScanParams()!;
-    expect(params.FilterExpression).toMatch(/orgId = :orgId/);
+    const params = lastQueryParams()!;
+    expect(params.IndexName).toBe('OrgIdIndex');
+    expect(params.KeyConditionExpression).toMatch(/orgId = :orgId/);
     expect(params.ExpressionAttributeValues[':orgId']).toBe(ORG_ID);
   });
 
   it('returns only non-tombstoned members (integration-style)', async () => {
     // Simulate DynamoDB correctly applying the filter (returns only live users)
-    mockScanPromise.mockResolvedValueOnce({
+    mockQueryPromise.mockResolvedValueOnce({
       Items: [
         { userId: 'cc5d58e9-123', email: 'nico@provenlabs.ai', orgId: ORG_ID, orgRole: 'owner' },
       ],
@@ -97,21 +98,22 @@ describe('orgDb.getOrgMembers', () => {
     expect(members[0].email).toBe('nico@provenlabs.ai');
   });
 
-  it('does not return tombstoned member even if scan leaks one (defence-in-depth is at DB filter)', async () => {
+  it('does not return tombstoned member even if query leaks one (defence-in-depth is at DB filter)', async () => {
     // The fix is in the FilterExpression sent to DynamoDB, so if DynamoDB
     // correctly applies the filter there should be no tombstoned records.
     // This test verifies the FilterExpression is correct so DynamoDB will exclude them.
     await orgDb.getOrgMembers(ORG_ID);
 
-    const params = lastScanParams()!;
+    const params = lastQueryParams()!;
     const filter: string = params.FilterExpression;
     // Both conditions must be present
-    expect(filter).toContain('orgId = :orgId');
     expect(filter).toContain('NOT begins_with(userId, :tombstone)');
+    // orgId is now in KeyConditionExpression (GSI query), not FilterExpression
+    expect(params.KeyConditionExpression).toContain('orgId = :orgId');
   });
 
   it('handles pagination and applies tombstone guard on every page', async () => {
-    mockScanPromise
+    mockQueryPromise
       .mockResolvedValueOnce({
         Items: [{ userId: 'user-1', orgId: ORG_ID }],
         LastEvaluatedKey: { email: 'a@b.com' },
@@ -123,7 +125,7 @@ describe('orgDb.getOrgMembers', () => {
     const members = await orgDb.getOrgMembers(ORG_ID);
     expect(members).toHaveLength(2);
 
-    const allCalls = (mockScan.mock.calls as unknown as Array<[Record<string, any>]>);
+    const allCalls = (mockQuery.mock.calls as unknown as Array<[Record<string, any>]>);
     expect(allCalls).toHaveLength(2);
     for (const [params] of allCalls) {
       expect(params.FilterExpression).toMatch(/NOT begins_with\(userId, :tombstone\)/);
@@ -136,28 +138,29 @@ describe('orgDb.getOrgMemberCount', () => {
   it('includes NOT begins_with tombstone guard in FilterExpression', async () => {
     await orgDb.getOrgMemberCount(ORG_ID);
 
-    const params = lastScanParams()!;
+    const params = lastQueryParams()!;
     expect(params.FilterExpression).toMatch(/NOT begins_with\(userId, :tombstone\)/);
     expect(params.ExpressionAttributeValues[':tombstone']).toBe('deleted_');
   });
 
-  it('still filters by orgId', async () => {
+  it('uses OrgIdIndex GSI and KeyConditionExpression for orgId', async () => {
     await orgDb.getOrgMemberCount(ORG_ID);
 
-    const params = lastScanParams()!;
-    expect(params.FilterExpression).toMatch(/orgId = :orgId/);
+    const params = lastQueryParams()!;
+    expect(params.IndexName).toBe('OrgIdIndex');
+    expect(params.KeyConditionExpression).toMatch(/orgId = :orgId/);
     expect(params.ExpressionAttributeValues[':orgId']).toBe(ORG_ID);
   });
 
   it('uses SELECT COUNT', async () => {
     await orgDb.getOrgMemberCount(ORG_ID);
 
-    const params = lastScanParams()!;
+    const params = lastQueryParams()!;
     expect(params.Select).toBe('COUNT');
   });
 
   it('returns the total count from DynamoDB', async () => {
-    mockScanPromise.mockResolvedValueOnce({ Count: 2 });
+    mockQueryPromise.mockResolvedValueOnce({ Count: 2 });
 
     const count = await orgDb.getOrgMemberCount(ORG_ID);
     expect(count).toBe(2);

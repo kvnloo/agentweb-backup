@@ -5,6 +5,7 @@ import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
 import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey } from "../utils/leadSchema";
+import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import type { AttributionTouch } from "../types/attribution";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
@@ -66,7 +67,7 @@ export interface User {
   lastLoginTime?: string;
   lastActiveAt?: string; // Updated when user creates a chat session (non-delegated); more accurate than lastLoginTime for DAU/WAU/MAU
   supportNote?: string;
-  roles?: ("partner" | "customer" | "free")[];
+  roles?: ("partner" | "customer" | "free" | "contractor")[];
   displayName?: string;
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
@@ -556,6 +557,19 @@ export interface Organization {
   maxMembers: number;
   createdAt: string;
   updatedAt: string;
+  shareSettings?: OrgShareSettings;
+  secrets?: Record<string, string>; // Encrypted per-org secrets (key → encrypted value)
+}
+
+export interface OrgShareSettings {
+  knowledgeBase: { enabled: boolean; editors: string[] };
+  htmlTemplates: { enabled: boolean; editors: string[] };
+  landingPages: { enabled: boolean; editors: string[] };
+  workPlans: { enabled: boolean; editors: string[] };
+  skills: { enabled: boolean; editors: string[] };
+  // Always shared with org—only editors are configurable, enabled is implicit
+  brandGuidelines: { editors: string[] };
+  marketingStrategy: { editors: string[] };
 }
 
 interface UserInteraction {
@@ -1255,6 +1269,21 @@ class UserDB {
       return null;
     }
   }
+
+  /**
+   * Remove orgId and orgRole from a user record (used when removing a member from an org).
+   */
+  async clearOrgMembership(userId: string): Promise<void> {
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) {
+      throw new Error(`User with ID '${userId}' not found or has no email.`);
+    }
+    await this.docClient.update({
+      TableName: this.tableName,
+      Key: { email: user.email },
+      UpdateExpression: "REMOVE orgId, orgRole",
+    }).promise();
+  }
 }
 
 // Initialize and export userDb instance
@@ -1403,7 +1432,7 @@ export const taskDb = {
           ":userId": userId,
         },
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, emailFriendlyHtml, repairImageEmbedding, #adm, category, description, templateId, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, knowledgeBaseFiles, createVideo, videoModel, imageModel, requireApproval, slackChannel, sendHtmlReportOnly",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, emailFriendlyHtml, repairImageEmbedding, #adm, category, description, templateId, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, knowledgeBaseFiles, createVideo, videoModel, imageModel, requireApproval, slackChannel, sendHtmlReportOnly",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -2127,12 +2156,15 @@ export const taskDb = {
       }
 
       // Filter tasks with non-empty knowledge base (either main content OR files)
+      // Also include tasks that have a knowledgeBase URL set even if size=0
+      // (size can be incorrectly 0 due to a race condition or update failure)
       const tasksWithKnowledgeBase = tasks.filter((task: any) => {
         const size = typeof task.knowledgeBaseSize === 'string'
           ? parseInt(task.knowledgeBaseSize)
           : task.knowledgeBaseSize || 0;
+        const hasKnowledgeBaseUrl = !!task.knowledgeBase;
         const hasFiles = task.knowledgeBaseFiles && task.knowledgeBaseFiles.length > 0;
-        return size > 0 || hasFiles;
+        return size > 0 || hasKnowledgeBaseUrl || hasFiles;
       });
 
       // Map to return standardized fields
@@ -4284,6 +4316,7 @@ export const crmDb = {
     // CRM Unification v1 extensions (A1)
     domain?: string;
     accountOwnerUserId?: string;
+    pocEmails?: string[];
     priority?: 'Low' | 'Medium' | 'High';
     expectedClose?: string;
     closedDate?: string;
@@ -4328,7 +4361,7 @@ export const crmDb = {
         title: leadData.title || '',
         notes: leadData.notes || '',
         companyLinkedin: leadData.companyLinkedin?.trim() || '',
-        customFields: leadData.customFields || {},
+        customFields: sanitizeCustomFields(leadData.customFields, { source: 'db.createLead', listId }),
         engagements: [],
         isICP: 0,
         isEngaged: 0,
@@ -4400,6 +4433,7 @@ export const crmDb = {
       const crmFields = buildLeadCrmFields(emailValue, {
         domain: leadData.domain,
         accountOwnerUserId: leadData.accountOwnerUserId,
+        pocEmails: leadData.pocEmails,
         priority: leadData.priority,
         expectedClose: leadData.expectedClose,
         closedDate: leadData.closedDate,
@@ -4826,6 +4860,7 @@ export const crmDb = {
     contactStatusUpdatedAt?: string;
     contactStatusUpdatedBy?: string;
     accountOwnerUserId?: string | null;
+    pocEmails?: string[] | null;
     syncMetadata?: Record<string, any>;
     /** Enrichment metadata sidecar — keyed by field name (custom or standard). See utils/enrichedFieldValue.ts. */
     enrichmentMetadata?: Record<string, any>;
@@ -4866,6 +4901,16 @@ export const crmDb = {
         } else {
           setExpressions.push('accountOwnerUserId = :accountOwnerUserId');
           expressionAttributeValues[':accountOwnerUserId'] = String(updates.accountOwnerUserId);
+        }
+      }
+
+      // CRM extension: pocEmails. Supports null/empty => REMOVE.
+      if (updates.pocEmails !== undefined) {
+        if (updates.pocEmails === null || updates.pocEmails.length === 0) {
+          removeExpressions.push('pocEmails');
+        } else {
+          setExpressions.push('pocEmails = :pocEmails');
+          expressionAttributeValues[':pocEmails'] = updates.pocEmails;
         }
       }
 
@@ -4951,7 +4996,10 @@ export const crmDb = {
 
       if (updates.customFields !== undefined) {
         setExpressions.push('customFields = :customFields');
-        expressionAttributeValues[':customFields'] = updates.customFields;
+        expressionAttributeValues[':customFields'] = sanitizeCustomFields(
+          updates.customFields,
+          { source: 'db.updateLead', listId, leadId },
+        );
       }
 
       if (updates.enrichmentMetadata !== undefined) {
@@ -5354,7 +5402,7 @@ export const crmDb = {
             title: lead.title || '',
             notes: lead.notes || '',
             companyLinkedin: lead.companyLinkedin?.trim() || '',
-            customFields: lead.customFields || {},
+            customFields: sanitizeCustomFields(lead.customFields, { source: 'db.batchCreateLeads.newLead', listId, leadId }),
             syncMetadata: lead.syncMetadata || {},
             engagements: [], // Initialize with empty array
             isICP: 0,
@@ -5559,10 +5607,11 @@ export const crmDb = {
             // Only update if the merged result is different from existing
             if (existingStr !== mergedStr) {
               // Use the actual merged customFields (not normalized) for the update
-              const mergedCustomFields = {
-                ...existingCustomFields,
-                ...newCustomFields,
-              };
+              const mergedCustomFields = mergeCustomFields(
+                existingCustomFields,
+                newCustomFields,
+                { source: 'db.batchCreateLeads.merge', listId, leadId: existingLead.leadId },
+              );
               updates.customFields = mergedCustomFields;
               changed = true;
             }
@@ -6435,15 +6484,20 @@ export const crmDb = {
   ): Promise<void> {
     const tableName = `${TABLE_PREFIX}AW-Leads`;
     const key = { listId, leadId };
+    const safeCustomFields = options.customFields === undefined
+      ? undefined
+      : sanitizeCustomFields(options.customFields, { source: 'db.setLeadFields', listId, leadId });
     const hasMetaKeys = Object.keys(options.enrichmentMetadata ?? {}).length > 0;
-    const hasCustomKeys = Object.keys(options.customFields ?? {}).length > 0;
+    const hasCustomKeys = Object.keys(safeCustomFields ?? {}).length > 0;
     const hasTopLevel = Object.keys(options.topLevel ?? {}).length > 0;
     const hasRemoveMeta = (options.removeEnrichmentMetadataKeys ?? []).length > 0;
     const hasRemoveCustom = (options.removeCustomFieldKeys ?? []).length > 0;
     if (!hasTopLevel && !hasMetaKeys && !hasCustomKeys && !hasRemoveMeta && !hasRemoveCustom) return;
 
-    // Step 1: ensure parent maps exist so document-path SETs don't throw.
-    if (hasMetaKeys || hasCustomKeys) {
+    // Step 1: ensure parent maps exist so document-path SETs/REMOVEs don't throw.
+    // REMOVE on a nested path (e.g. customFields.key) also requires the parent
+    // map to exist — bootstrap whenever we touch either map at all.
+    if (hasMetaKeys || hasCustomKeys || hasRemoveMeta || hasRemoveCustom) {
       try {
         await dynamodb.update({
           TableName: tableName,
@@ -6514,7 +6568,7 @@ export const crmDb = {
     }
 
     idx = 0;
-    for (const [k, v] of Object.entries(options.customFields ?? {})) {
+    for (const [k, v] of Object.entries(safeCustomFields ?? {})) {
       attrNames[`#cf${idx}`] = k;
       attrValues[`:cf${idx}`] = v;
       setClauses.push(ine
@@ -7064,6 +7118,36 @@ export const socialEngagementTrackingDb = {
       throw error;
     }
   },
+
+  // Fetch the most recent N generated comment/reply texts for an account.
+  // Used to inject comment history into LLM prompts to prevent repetitive outputs.
+  async getRecentGeneratedTexts(engagingAccountId: string, limit: number = 10): Promise<string[]> {
+    try {
+      const params: AWS.DynamoDB.DocumentClient.QueryInput = {
+        TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
+        IndexName: 'EngagingAccountIndex',
+        KeyConditionExpression: 'engagingAccountId = :engagingAccountId',
+        FilterExpression: 'attribute_exists(generatedText) AND #status = :completed',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: {
+          ':engagingAccountId': engagingAccountId,
+          ':completed': 'completed',
+        },
+        ScanIndexForward: false,
+        Limit: limit * 3, // over-fetch to account for items without generatedText filtered out
+      };
+
+      const result = await dynamodb.query(params).promise();
+      const texts = (result.Items || [])
+        .map((i: any) => i.generatedText as string)
+        .filter(Boolean)
+        .slice(0, limit);
+      return texts;
+    } catch (error) {
+      console.warn('[socialEngagementTrackingDb] getRecentGeneratedTexts failed, skipping history:', error);
+      return [];
+    }
+  },
 };
 
 // ==================== Organization DB Operations ====================
@@ -7141,28 +7225,36 @@ export const orgDb = {
   },
 
   async getOrgMembers(orgId: string): Promise<User[]> {
-    const allItems: any[] = [];
+    const allItems: User[] = [];
     let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
     do {
-      const result = await dynamodb.scan({
+      const result = await dynamodb.query({
         TableName: `${TABLE_PREFIX}AW-Users`,
-        FilterExpression: "orgId = :orgId AND NOT begins_with(userId, :tombstone)",
+        IndexName: "OrgIdIndex",
+        KeyConditionExpression: "orgId = :orgId",
+        FilterExpression: "NOT begins_with(userId, :tombstone)",
         ExpressionAttributeValues: { ":orgId": orgId, ":tombstone": "deleted_" },
         ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
       }).promise();
-      allItems.push(...(result.Items || []));
+      for (const item of result.Items || []) {
+        if (typeof item.userId === "string" && !item.userId.startsWith("deleted_")) {
+          allItems.push(item as User);
+        }
+      }
       lastEvaluatedKey = result.LastEvaluatedKey;
     } while (lastEvaluatedKey);
-    return allItems as User[];
+    return allItems;
   },
 
   async getOrgMemberCount(orgId: string): Promise<number> {
     let total = 0;
     let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
     do {
-      const result = await dynamodb.scan({
+      const result = await dynamodb.query({
         TableName: `${TABLE_PREFIX}AW-Users`,
-        FilterExpression: "orgId = :orgId AND NOT begins_with(userId, :tombstone)",
+        IndexName: "OrgIdIndex",
+        KeyConditionExpression: "orgId = :orgId",
+        FilterExpression: "NOT begins_with(userId, :tombstone)",
         ExpressionAttributeValues: { ":orgId": orgId, ":tombstone": "deleted_" },
         Select: "COUNT",
         ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
@@ -7192,7 +7284,120 @@ export const orgDb = {
     return null;
   },
 
+  async updateShareSettings(orgId: string, settings: OrgShareSettings): Promise<void> {
+    await dynamodb.update({
+      TableName: ORGS_TABLE,
+      Key: { orgId },
+      UpdateExpression: "SET shareSettings = :s, updatedAt = :u",
+      ExpressionAttributeValues: {
+        ":s": settings,
+        ":u": new Date().toISOString(),
+      },
+    }).promise();
+  },
+
+  async pruneEditorListsForUser(orgId: string, removedUserId: string): Promise<void> {
+    const got = await dynamodb.get({
+      TableName: ORGS_TABLE,
+      Key: { orgId },
+    }).promise();
+    const org = got.Item as Organization | undefined;
+    if (!org?.shareSettings) return;
+    const ss = org.shareSettings;
+    const strip = (arr: string[]) => arr.filter((uid) => uid !== removedUserId);
+    const next: OrgShareSettings = {
+      knowledgeBase:     { ...ss.knowledgeBase,     editors: strip(ss.knowledgeBase.editors) },
+      htmlTemplates:     { ...ss.htmlTemplates,     editors: strip(ss.htmlTemplates.editors) },
+      landingPages:      { ...ss.landingPages,      editors: strip(ss.landingPages.editors) },
+      workPlans:         { ...ss.workPlans,         editors: strip(ss.workPlans.editors) },
+      skills:            { ...ss.skills,            editors: strip(ss.skills.editors) },
+      brandGuidelines:   { editors: strip(ss.brandGuidelines.editors) },
+      marketingStrategy: { editors: strip(ss.marketingStrategy.editors) },
+    };
+    await this.updateShareSettings(orgId, next);
+  },
+
   ORG_MAX_MEMBERS,
+
+  /**
+   * Persist an encrypted secret value to the org record.
+   * Uses an atomic UpdateExpression so it does not clobber other secrets.
+   */
+  async setOrgSecret(orgId: string, key: string, encryptedValue: string): Promise<void> {
+    const params = {
+      TableName: ORGS_TABLE,
+      Key: { orgId },
+      UpdateExpression: "SET #secrets.#key = :val, #updatedAt = :updatedAt",
+      ExpressionAttributeNames: {
+        "#secrets": "secrets",
+        "#key": key,
+        "#updatedAt": "updatedAt",
+      },
+      ExpressionAttributeValues: {
+        ":val": encryptedValue,
+        ":updatedAt": new Date().toISOString(),
+      },
+      // If secrets map doesn't exist yet, the nested set will fail.
+      // We use a conditional expression + fallback to initialise the map.
+      ConditionExpression: "attribute_exists(#secrets)",
+    };
+
+    try {
+      await dynamodb.update(params).promise();
+    } catch (err: any) {
+      if (err.code === "ConditionalCheckFailedException") {
+        // secrets map does not exist — create it now
+        await dynamodb.update({
+          TableName: ORGS_TABLE,
+          Key: { orgId },
+          UpdateExpression: "SET #secrets = :secretsMap, #updatedAt = :updatedAt",
+          ExpressionAttributeNames: {
+            "#secrets": "secrets",
+            "#updatedAt": "updatedAt",
+          },
+          ExpressionAttributeValues: {
+            ":secretsMap": { [key]: encryptedValue },
+            ":updatedAt": new Date().toISOString(),
+          },
+        }).promise();
+      } else {
+        throw err;
+      }
+    }
+  },
+
+  /**
+   * Retrieve a single encrypted secret from the org record.
+   * Returns null if the org doesn't exist or the key is absent.
+   */
+  async getOrgSecret(orgId: string, key: string): Promise<string | null> {
+    const org = await this.getOrgById(orgId);
+    if (!org?.secrets) return null;
+    return (org.secrets as Record<string, string>)[key] ?? null;
+  },
+
+  /**
+   * Remove a single secret key from the org record.
+   */
+  async removeOrgSecret(orgId: string, key: string): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: ORGS_TABLE,
+        Key: { orgId },
+        UpdateExpression: "REMOVE #secrets.#key SET #updatedAt = :updatedAt",
+        ExpressionAttributeNames: {
+          "#secrets": "secrets",
+          "#key": key,
+          "#updatedAt": "updatedAt",
+        },
+        ExpressionAttributeValues: {
+          ":updatedAt": new Date().toISOString(),
+        },
+      }).promise();
+    } catch {
+      // If secrets map or key doesn't exist, that's fine — already absent.
+    }
+  },
 };
 
 // ─── Schedule Templates ──────────────────────────────────────────────────────

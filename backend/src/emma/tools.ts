@@ -114,8 +114,35 @@ emmaToolRegistry.register({
     const { skillService } = await import('../services/skillService');
     const { getAllowedSkills } = await import('../services/subscriptionService');
 
+    // Best-effort user + org lookup. Powers two things:
+    //  (1) Org-shared skill fanout — only when `shareSettings.skills` is
+    //      effectively enabled for this caller (plain members need
+    //      enabled=true; editors and the org owner always get fanout).
+    //  (2) The admin virtual-skill check below.
+    // If any lookup fails, fall back to non-org behavior — published + own
+    // skills still list.
+    let currentUser: any = null;
+    let userOrgId: string | undefined;
+    try {
+      const { userDb, orgDb } = await import('../services/db');
+      const { isFeatureEffectivelyEnabled } = await import('../services/orgShareService');
+      currentUser = await userDb.getUserById(userId);
+      const candidateOrgId = currentUser?.orgId;
+      if (candidateOrgId) {
+        const org = await orgDb.getOrgById(candidateOrgId);
+        const effectivelyEnabled = isFeatureEffectivelyEnabled(
+          { userId, orgId: candidateOrgId, orgRole: currentUser?.orgRole },
+          org,
+          'skills',
+        );
+        if (effectivelyEnabled) userOrgId = candidateOrgId;
+      }
+    } catch {
+      // best-effort: degrade to non-org behavior
+    }
+
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-      skillService.getSkillsAvailableToUser(userId),
+      skillService.getSkillsAvailableToUser(userId, userOrgId),
       getAllowedSkills(userId)
     ]);
 
@@ -147,24 +174,20 @@ emmaToolRegistry.register({
       });
     }
 
-    // Add __admin_tools__ virtual skill for admin users or admin delegated access
-    try {
-      const { userDb } = await import('../services/db');
-      const currentUser = await userDb.getUserById(userId);
-      const hasAdminAccess = currentUser?.isAdmin === true || context?.isDelegatedAdmin === true;
-      if (hasAdminAccess) {
-        const { agentModeService } = await import('../services/agentModeService');
-        const adminToolNamesList = agentModeService.getAdminToolNames();
-        availableSkills.push({
-          skillId: '__admin_tools__',
-          name: 'Admin Tools',
-          description: 'Admin-only tools: manage predefined work plans, skill definitions, chat history, and client health assessment. WARNING: These tools modify production configuration — use with extra care.',
-          toolNames: adminToolNamesList,
-          toolCount: adminToolNamesList.length
-        });
-      }
-    } catch {
-      // Skip admin tools if user lookup fails
+    // Add __admin_tools__ virtual skill for admin users or admin delegated access.
+    // Reuses currentUser from the lookup above; if that lookup failed, currentUser
+    // is null and admin tools are skipped (unless delegated-admin context says otherwise).
+    const hasAdminAccess = currentUser?.isAdmin === true || context?.isDelegatedAdmin === true;
+    if (hasAdminAccess) {
+      const { agentModeService } = await import('../services/agentModeService');
+      const adminToolNamesList = agentModeService.getAdminToolNames();
+      availableSkills.push({
+        skillId: '__admin_tools__',
+        name: 'Admin Tools',
+        description: 'Admin-only tools: manage predefined work plans, skill definitions, chat history, and client health assessment. WARNING: These tools modify production configuration — use with extra care.',
+        toolNames: adminToolNamesList,
+        toolCount: adminToolNamesList.length
+      });
     }
 
     return {
@@ -187,7 +210,7 @@ Actions:
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
 - list-received-invitations: (exact action string: "list-received-invitations") List pending connection requests received from others. Returns paginated results with sender info.
-- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended.
+- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended. IMPORTANT: message must be 300 characters or fewer — LinkedIn rejects longer notes. Always count characters before sending; if over limit, trim the message first.
 - send-message: Send a direct message. Requires profile_url or provider_id. message required. Only works for 1st-degree connections or open profiles. When sending to a CRM lead, always provide list_id and lead_id — the system enforces that update-conversation-history was called within the last 24 hours before allowing a send.
 - send-inmail: Send a LinkedIn InMail to any profile regardless of connection degree (2nd/3rd-degree connections). Requires profile_url or provider_id, message (body), and subject. Requires a LinkedIn Premium account with available InMail credits. Use this when send-message is not possible due to connection degree restrictions. list_id and lead_id are optional but recommended for CRM persistence.
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
@@ -221,7 +244,7 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         message: {
           type: 'string',
-          description: 'Message content. Required for send-message and send-inmail; recommended for send-invite.'
+          description: 'Message content. Required for send-message and send-inmail; recommended for send-invite. For send-invite: must be 300 characters or fewer (LinkedIn hard limit).'
         },
         subject: {
           type: 'string',
@@ -3385,13 +3408,14 @@ emmaToolRegistry.register({
   name: 'list_connected_account_posts',
   definition: {
     name: 'list_connected_account_posts',
-    description: 'List posts from a connected social media account with optional metrics',
+    description: 'List posts from a connected social media account with optional metrics. For company pages, posts are cached locally for 1 day to reduce API calls — use force_reload to bypass the cache and fetch the latest posts from LinkedIn.',
     inputSchema: {
       type: 'object',
       properties: {
         account_id: { type: 'string', description: 'The connected account ID' },
         limit: { type: 'number', description: 'Maximum number of posts to return', default: 10 },
-        include_metrics: { type: 'boolean', description: 'Whether to include per-post metrics (likes, comments, etc.)', default: false }
+        include_metrics: { type: 'boolean', description: 'Whether to include per-post metrics (likes, comments, etc.)', default: false },
+        force_reload: { type: 'boolean', description: 'Force a fresh fetch from LinkedIn API, bypassing the local cache. Use this when the cached posts may be outdated.', default: false }
       },
       required: ['account_id']
     }
@@ -3402,7 +3426,8 @@ emmaToolRegistry.register({
       args.account_id,
       {
         limit: args.limit,
-        include_metrics: args.include_metrics
+        include_metrics: args.include_metrics,
+        force_reload: args.force_reload
       }
     );
   }
@@ -3804,7 +3829,7 @@ emmaToolRegistry.register({
   name: "describe_video",
   definition: {
     name: "describe_video",
-    description: 'Analyze and describe a video from a URL using Gemini. Use this when the user mentions a video, asks to "read" a video, or when you need to understand video content (mp4, mov, avi, webm, mkv, etc.). Always prefer this over read_file_content for video files.',
+    description: 'Analyze and describe a video from a URL using Gemini. Accepts direct video file URLs (mp4, mov, avi, webm, mkv, etc.) AND YouTube URLs (youtube.com or youtu.be). Always prefer this over read_file_content for video files. For scripting and content repurposing, set return_transcript=true to get a timestamped spoken-word transcript, and/or return_scenes=true to get a structured scene-by-scene breakdown. Use start_time/end_time to focus on a specific segment.',
     inputSchema: {
       type: "object",
       properties: {
@@ -3816,13 +3841,34 @@ emmaToolRegistry.register({
           type: 'string',
           description: 'Custom prompt/instructions for analyzing the video. Specify what aspects to focus on (e.g., key events, narration, visual details, or timing).',
           default: 'Please describe this video in detail. Focus on key events, visual elements, and any spoken content.'
+        },
+        return_transcript: {
+          type: 'boolean',
+          description: 'When true, returns a timestamped transcript of all spoken content as an array of {start, end, text} objects. Use for scripting, captioning, or content repurposing workflows.'
+        },
+        return_scenes: {
+          type: 'boolean',
+          description: 'When true, returns scene segmentation as an array of {start, end, title, description} objects identifying distinct video segments. Use for scene planning or B-roll identification.'
+        },
+        start_time: {
+          type: 'string',
+          description: 'Focus analysis on a time range starting at this timestamp (e.g. "0:30", "1:15"). Use together with end_time for targeted segment analysis.'
+        },
+        end_time: {
+          type: 'string',
+          description: 'Focus analysis on a time range ending at this timestamp (e.g. "2:00", "3:45"). Use together with start_time for targeted segment analysis.'
         }
       },
       required: ["video_file_url"]
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.describeVideo(args.video_file_url, args.prompt);
+    return await agentModeService.describeVideo(args.video_file_url, args.prompt, {
+      return_transcript: args.return_transcript,
+      return_scenes: args.return_scenes,
+      start_time: args.start_time,
+      end_time: args.end_time
+    });
   }
 });
 
@@ -4356,24 +4402,71 @@ emmaToolRegistry.register({
   name: "search_ads_knowledge_base",
   definition: {
     name: "search_ads_knowledge_base",
-    description: "Search the user's Foreplay ad library (swipefile + boards) for ads the user has SAVED/bookmarked. Use this for ad creative inspiration or finding specific saved ads by brand, headline, or description. IMPORTANT: This only searches the user's own saved collection — it does NOT search the public Meta/Facebook Ads Library for ads currently running by any company. For finding a specific company's currently-running Meta ads, use Playwright to browse https://www.facebook.com/ads/library/ with the company's Facebook Page ID (view_all_page_id=PAGE_ID) — do NOT use keyword search (q=) as that returns false positives. Do NOT use search_knowledge_base for Foreplay ad searches.",
+    description: "Search Foreplay ad library. Defaults to the user's saved swipefile + boards (free). Set source='discovery' to search Foreplay's global database of millions of ads — use this for competitive intelligence or finding ads from a specific company. IMPORTANT: discovery mode costs 1 Foreplay credit per result — keep max_results small (5–10). For finding a specific company's currently-running Meta ads, use source='discovery' with company_name. Do NOT use search_knowledge_base for Foreplay ad searches. IMPORTANT: This does NOT search the public Meta/Facebook Ads Library — for that, use Playwright to browse https://www.facebook.com/ads/library/.",
     inputSchema: {
       type: "object",
       properties: {
         query: {
           type: "string",
-          description: "Search query (e.g. brand name, headline keyword, ad type)"
+          description: "Search query — keyword, headline, ad copy, or niche (e.g. 'checkout', 'SaaS onboarding', 'skincare'). Optional when company_name is provided."
+        },
+        source: {
+          type: "string",
+          enum: ["swipefile", "discovery"],
+          description: "Where to search. 'swipefile' (default) = user's own saved ads, free. 'discovery' = Foreplay's global database of millions of ads, costs 1 credit per result."
+        },
+        company_name: {
+          type: "string",
+          description: "Company or brand name to search ads for (e.g. 'Nike', 'Shopify'). Only used when source='discovery'. Can be combined with query."
         },
         max_results: {
           type: "number",
-          description: "Max results to return (default 5)",
+          description: "Max results to return. Default 5 for swipefile, 10 for discovery (max 20).",
           default: 5
+        },
+        format: {
+          type: "array",
+          items: { type: "string", enum: ["image", "video", "carousel", "dco"] },
+          description: "Filter by ad format. Only applies to source='discovery'."
+        },
+        platform: {
+          type: "array",
+          items: { type: "string", enum: ["facebook", "instagram"] },
+          description: "Filter by publisher platform. Only applies to source='discovery'."
+        },
+        niche: {
+          type: "array",
+          items: { type: "string" },
+          description: "Filter by niche tags (e.g. ['ecommerce', 'saas']). Only applies to source='discovery'."
+        },
+        live: {
+          type: "boolean",
+          description: "If true, return only currently-running ads. If false, return only stopped ads. Only applies to source='discovery'."
+        },
+        sort: {
+          type: "string",
+          enum: ["newest", "oldest", "longest_running"],
+          description: "Sort order. Only applies to source='discovery'."
         }
-      },
-      required: ["query"]
+      }
     }
   },
   execute: async (args: any, context?: any) => {
+    if (args.source === 'discovery') {
+      return await agentModeService.searchForeplayDiscovery(
+        args.query,
+        {
+          maxResults: args.max_results || 10,
+          companyName: args.company_name,
+          format: args.format,
+          platform: args.platform,
+          niche: args.niche,
+          live: args.live,
+          sort: args.sort,
+        },
+        context?.userId
+      );
+    }
     return await agentModeService.searchForeplayAds(args.query, args.max_results || 5, context?.userId);
   }
 });
@@ -4633,7 +4726,7 @@ emmaToolRegistry.register({
   name: "read_file_content",
   definition: {
     name: "read_file_content",
-    description: 'Read and extract text content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, and other common formats. Do NOT use this for image files (jpg, jpeg, png, gif, webp, svg) — use describe_image instead. Do NOT use this for video files (mp4, mov, avi, webm, mkv) — use describe_video instead.',
+    description: 'Read and extract text content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, Excel/XLSX spreadsheets, and other common formats. Do NOT use this for image files (jpg, jpeg, png, gif, webp, svg) — use describe_image instead. Do NOT use this for video files (mp4, mov, avi, webm, mkv) — use describe_video instead.',
     inputSchema: {
       type: "object",
       properties: {
@@ -5782,6 +5875,7 @@ const bridgedToolNames = [
   // 'list_landing_page_files' — removed: coding_agent handles file listing internally
   'get_landing_page_preview_url',
   'publish_landing_page_changes',
+  'update_landing_page_context',
 ];
 
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
@@ -6168,7 +6262,9 @@ emmaToolRegistry.register({
     const { settingsService } = await import('../services/settingsService');
     const productIssueEmails = await settingsService.getJsonArraySetting('product_issue_emails', ['founders@agentweb.pro']);
 
-    for (const issue of args.issues) {
+    for (const rawIssue of args.issues) {
+      // Gemini may serialize array items as JSON strings instead of objects — normalize
+      const issue = typeof rawIssue === 'string' ? JSON.parse(rawIssue) : rawIssue;
       try {
         const issueContext: Record<string, any> = {
           'User Name': user.displayName || user.email,

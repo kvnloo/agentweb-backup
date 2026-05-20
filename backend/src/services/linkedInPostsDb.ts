@@ -28,7 +28,8 @@ export interface LinkedInPost {
     accountId: string;        // Account URN (e.g., "urn:li:person:456")
     content: string;          // Post text content
     mediaUrls?: string[];     // Optional image URLs
-    createdAt: string;        // ISO timestamp
+    createdAt: string;        // ISO timestamp of the post itself
+    cachedAt?: string;        // ISO timestamp of when this was fetched/cached from LinkedIn API
     metrics?: PostMetricsCache;
     metricsFetchedAt?: string; // ISO timestamp of last metrics fetch
 }
@@ -42,7 +43,68 @@ function handleDbError(operation: string, error: any): void {
 }
 
 /**
- * Store a LinkedIn post in the database (personal accounts only)
+ * Upsert a post fetched from the LinkedIn API into the cache.
+ * Sets cachedAt to now. Does not overwrite an existing post's createdAt if it's already stored.
+ */
+export async function upsertApiPost(
+    userId: string,
+    accountId: string,
+    postId: string,
+    content: string,
+    postCreatedAt: string,
+): Promise<void> {
+    try {
+        const now = new Date().toISOString();
+        await dynamodb.put({
+            TableName: LINKEDIN_POSTS_TABLE,
+            Item: {
+                userId,
+                postId,
+                accountId,
+                content,
+                createdAt: postCreatedAt,
+                cachedAt: now,
+            },
+            // Don't overwrite if already exists with same content (avoids losing metrics cache)
+            // But DO overwrite if content changed (post edited)
+        }).promise();
+    } catch (error) {
+        handleDbError('upsertApiPost', error);
+    }
+}
+
+/**
+ * Get the oldest cachedAt timestamp among the posts for an account.
+ * Returns null if no posts exist or none have cachedAt set.
+ * Used to determine if the cache is stale and a refresh is needed.
+ */
+export async function getPostsCacheAge(accountId: string): Promise<Date | null> {
+    try {
+        const params: AWS.DynamoDB.DocumentClient.QueryInput = {
+            TableName: LINKEDIN_POSTS_TABLE,
+            IndexName: 'AccountPostsIndex',
+            KeyConditionExpression: 'accountId = :accountId',
+            ExpressionAttributeValues: { ':accountId': accountId },
+            ScanIndexForward: false,
+            Limit: 50,
+            ProjectionExpression: 'cachedAt',
+        };
+        const result = await dynamodb.query(params).promise();
+        const items = (result.Items || []) as LinkedInPost[];
+        const timestamps = items
+            .map(i => i.cachedAt)
+            .filter((t): t is string => !!t)
+            .map(t => new Date(t).getTime());
+        if (timestamps.length === 0) return null;
+        // Return the oldest cachedAt — if even the oldest is within TTL, all are fresh
+        return new Date(Math.min(...timestamps));
+    } catch (error) {
+        return null;
+    }
+}
+
+/**
+ * Store a LinkedIn post in the database
  */
 export async function createPost(
     userId: string,

@@ -36,6 +36,7 @@ function makeDeps(overrides: Partial<ConfigServiceDeps> = {}): ConfigServiceDeps
     loadListFieldNames: jest.fn().mockResolvedValue([]),
     llmSuggestTypes: jest.fn().mockResolvedValue([]),
     llmInferAliases: jest.fn().mockResolvedValue({}),
+    llmClassifySmartFields: jest.fn().mockResolvedValue({}),
     ...overrides,
   };
 }
@@ -618,6 +619,23 @@ describe('setEnrichmentConfig — validation', () => {
     expect(saved.config.fields[0].aliasFor).toBe('funding_stage');
   });
 
+  it('never assigns aliasFor to emailDomain even when client sends one', async () => {
+    // emailDomain is computed server-side from the email field. If it were aliased
+    // to a canonical enrichment field, the waterfall would overwrite the computed
+    // value with fetched data — incorrect behavior. This is the regression guard.
+    const deps = makeDeps({
+      llmInferAliases: jest.fn().mockResolvedValue({ emailDomain: 'email_domain' }),
+    });
+    const config = validConfig({
+      fields: [
+        { name: 'emailDomain', type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty', aliasFor: 'email_domain' as any },
+      ],
+    });
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+    expect(saved.config.fields.find(f => f.name === 'emailDomain')?.aliasFor).toBeUndefined();
+  });
+
   it("accepts a valid aliasFor pointing at a real FIELD_GROUPS field", async () => {
     const deps = makeDeps();
     const config = validConfig({
@@ -794,5 +812,502 @@ describe('suggestFieldTypes', () => {
 
     expect(result).toEqual([]);
     expect(deps.llmSuggestTypes).not.toHaveBeenCalled();
+  });
+});
+
+// ─── Smart field classification ───────────────────────────────────────────────
+
+describe('setEnrichmentConfig — smart field classification', () => {
+  it('calls llmClassifySmartFields for fields that have instructions', async () => {
+    const deps = makeDeps({
+      writeListConfig: jest.fn().mockResolvedValue(undefined),
+      llmClassifySmartFields: jest.fn().mockResolvedValue({}),
+    });
+    const config = validConfig({
+      fields: [
+        { name: 'industry', type: 'string', instruction: 'company industry', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    expect(deps.llmClassifySmartFields).toHaveBeenCalledWith(
+      expect.arrayContaining([expect.objectContaining({ name: 'industry' })]),
+    );
+  });
+
+  it('stores smartCondition and smartDependencies when LLM classifies a field as smart', async () => {
+    const deps = makeDeps({
+      writeListConfig: jest.fn().mockResolvedValue(undefined),
+      llmClassifySmartFields: jest.fn().mockResolvedValue({
+        isQualified: { isSmartField: true, dependencies: ['funding_stage', 'total_funding'] },
+      }),
+    });
+    const config = validConfig({
+      fields: [
+        {
+          name: 'isQualified',
+          type: 'boolean',
+          instruction: 'true when series A or later and total funding > $1M',
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+        },
+      ],
+    });
+
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    const qualField = saved.config.fields.find(f => f.name === 'isQualified');
+    expect(qualField?.smartCondition).toBe('true when series A or later and total funding > $1M');
+    expect(qualField?.smartDependencies).toEqual(['funding_stage', 'total_funding']);
+  });
+
+  it('does NOT tag a normal field as smart', async () => {
+    const deps = makeDeps({
+      writeListConfig: jest.fn().mockResolvedValue(undefined),
+      llmClassifySmartFields: jest.fn().mockResolvedValue({
+        industry: { isSmartField: false, dependencies: [] },
+      }),
+    });
+    const config = validConfig({
+      fields: [
+        { name: 'industry', type: 'string', instruction: 'company industry', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    const field = saved.config.fields.find(f => f.name === 'industry');
+    expect(field?.smartCondition).toBeUndefined();
+    expect(field?.smartDependencies).toBeUndefined();
+  });
+
+  it('does NOT re-classify a field whose instruction matches existing smartCondition', async () => {
+    // The stored DB config holds the cached smartCondition — client-supplied
+    // classification keys are stripped and re-loaded from DB (concern #1 fix).
+    const storedConfig = validConfig({
+      fields: [
+        {
+          name: 'isQualified',
+          type: 'boolean',
+          instruction: 'true when series A or later',
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          smartCondition: 'true when series A or later',
+          smartDependencies: ['funding_stage'],
+        },
+      ],
+    });
+    const deps = makeDeps({
+      readListConfig: jest.fn().mockResolvedValue(storedConfig),
+      writeListConfig: jest.fn().mockResolvedValue(undefined),
+      llmClassifySmartFields: jest.fn().mockResolvedValue({}),
+    });
+    const config = validConfig({
+      fields: [
+        {
+          name: 'isQualified',
+          type: 'boolean',
+          instruction: 'true when series A or later',  // same as stored smartCondition
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          // client does NOT send smartCondition — server must read it from DB
+        },
+      ],
+    });
+
+    await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    // instruction == stored smartCondition → NOT in classification call
+    const classifyCall = (deps.llmClassifySmartFields as jest.Mock).mock.calls[0]?.[0] ?? [];
+    const names = classifyCall.map((f: any) => f.name);
+    expect(names).not.toContain('isQualified');
+  });
+
+  it('re-classifies a smart field when its instruction changes', async () => {
+    const deps = makeDeps({
+      writeListConfig: jest.fn().mockResolvedValue(undefined),
+      llmClassifySmartFields: jest.fn().mockResolvedValue({
+        isQualified: { isSmartField: true, dependencies: ['employee_count'] },
+      }),
+    });
+    const config = validConfig({
+      fields: [
+        {
+          name: 'isQualified',
+          type: 'boolean',
+          instruction: 'NEW condition: large company with > 500 employees',  // changed
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          smartCondition: 'OLD condition: series A or later',  // stale
+          smartDependencies: ['funding_stage'],
+        },
+      ],
+    });
+
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    // Should be re-classified with new instruction and new deps
+    const field = saved.config.fields.find(f => f.name === 'isQualified');
+    expect(field?.smartCondition).toBe('NEW condition: large company with > 500 employees');
+    expect(field?.smartDependencies).toEqual(['employee_count']);
+  });
+
+  it('clears smartCondition when user changes instruction to a plain fetch field', async () => {
+    const deps = makeDeps({
+      writeListConfig: jest.fn().mockResolvedValue(undefined),
+      llmClassifySmartFields: jest.fn().mockResolvedValue({
+        industry: { isSmartField: false, dependencies: [] },
+      }),
+    });
+    const config = validConfig({
+      fields: [
+        {
+          name: 'industry',
+          type: 'string',
+          instruction: 'company industry sector',  // changed to plain fetch
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          smartCondition: 'old condition that was wrong',  // stale
+          smartDependencies: ['employee_count'],
+        },
+      ],
+    });
+
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    const field = saved.config.fields.find(f => f.name === 'industry');
+    expect(field?.smartCondition).toBeUndefined();
+    expect(field?.smartDependencies).toBeUndefined();
+  });
+
+  it('proceeds with save when llmClassifySmartFields throws (fail-soft)', async () => {
+    const deps = makeDeps({
+      writeListConfig: jest.fn().mockResolvedValue(undefined),
+      llmClassifySmartFields: jest.fn().mockRejectedValue(new Error('LLM down')),
+    });
+    const config = validConfig();
+
+    await expect(
+      setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps),
+    ).resolves.not.toThrow();
+    expect(deps.writeListConfig).toHaveBeenCalled();
+  });
+
+  it('sets inferred fieldType from classification on all classified fields', async () => {
+    const deps = makeDeps({
+      writeListConfig: jest.fn().mockResolvedValue(undefined),
+      llmClassifySmartFields: jest.fn().mockResolvedValue({
+        isQualified: { isSmartField: true, dependencies: ['funding_stage'], fieldType: 'boolean' },
+        companyScore: { isSmartField: true, dependencies: ['employee_count'], fieldType: 'number' },
+        industry: { isSmartField: false, dependencies: [], fieldType: 'string' },
+      }),
+    });
+    const config = validConfig({
+      fields: [
+        { name: 'isQualified', type: 'string', instruction: 'true when series A', include: true, overwritePolicy: 'fill_if_empty' },
+        { name: 'companyScore', type: 'string', instruction: '0-100 score based on size', include: true, overwritePolicy: 'fill_if_empty' },
+        { name: 'industry', type: 'string', instruction: 'industry of the company', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    expect(saved.config.fields.find(f => f.name === 'isQualified')?.type).toBe('boolean');
+    expect(saved.config.fields.find(f => f.name === 'companyScore')?.type).toBe('number');
+    expect(saved.config.fields.find(f => f.name === 'industry')?.type).toBe('string');
+  });
+
+  it('sets date type for date fields', async () => {
+    const deps = makeDeps({
+      writeListConfig: jest.fn().mockResolvedValue(undefined),
+      llmClassifySmartFields: jest.fn().mockResolvedValue({
+        foundedYear: { isSmartField: false, dependencies: [], fieldType: 'date' },
+      }),
+    });
+    const config = validConfig({
+      fields: [
+        { name: 'foundedYear', type: 'string', instruction: 'year the company was founded', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+    expect(saved.config.fields.find(f => f.name === 'foundedYear')?.type).toBe('date');
+  });
+
+  it('sets enum type and enumOptions for categorical fields', async () => {
+    const deps = makeDeps({
+      writeListConfig: jest.fn().mockResolvedValue(undefined),
+      llmClassifySmartFields: jest.fn().mockResolvedValue({
+        companyTier: { isSmartField: true, dependencies: ['employee_count', 'revenue_range'], fieldType: 'enum', enumOptions: ['A', 'B', 'C'] },
+      }),
+    });
+    const config = validConfig({
+      fields: [
+        { name: 'companyTier', type: 'string', instruction: 'tier A/B/C based on size and revenue', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+    const field = saved.config.fields.find(f => f.name === 'companyTier');
+    expect(field?.type).toBe('enum');
+    expect(field?.enumOptions).toEqual(['A', 'B', 'C']);
+  });
+
+  it('skips enum type when LLM returns enum but no enumOptions', async () => {
+    const deps = makeDeps({
+      writeListConfig: jest.fn().mockResolvedValue(undefined),
+      llmClassifySmartFields: jest.fn().mockResolvedValue({
+        companyTier: { isSmartField: false, dependencies: [], fieldType: 'enum', enumOptions: [] },
+      }),
+    });
+    const config = validConfig({
+      fields: [
+        { name: 'companyTier', type: 'string', instruction: 'company tier', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+    // enum with no options is useless — original type preserved
+    expect(saved.config.fields.find(f => f.name === 'companyTier')?.type).toBe('string');
+  });
+
+  it('filters blank strings out of LLM-returned enumOptions', async () => {
+    const deps = makeDeps({
+      writeListConfig: jest.fn().mockResolvedValue(undefined),
+      llmClassifySmartFields: jest.fn().mockResolvedValue({
+        tier: { isSmartField: false, dependencies: [], fieldType: 'enum', enumOptions: ['A', '', 'B', '  '] },
+      }),
+    });
+    const config = validConfig({
+      fields: [{ name: 'tier', type: 'string', instruction: 'tier A or B', include: true, overwritePolicy: 'fill_if_empty' }],
+    });
+
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+    expect(saved.config.fields.find(f => f.name === 'tier')?.enumOptions).toEqual(['A', 'B']);
+  });
+
+  it('clears stale enumOptions when type changes away from enum', async () => {
+    const deps = makeDeps({
+      writeListConfig: jest.fn().mockResolvedValue(undefined),
+      llmClassifySmartFields: jest.fn().mockResolvedValue({
+        tier: { isSmartField: false, dependencies: [], fieldType: 'string' },
+      }),
+    });
+    const config = validConfig({
+      fields: [{ name: 'tier', type: 'enum', enumOptions: ['A', 'B', 'C'], instruction: 'company tier', include: true, overwritePolicy: 'fill_if_empty' }],
+    });
+
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+    const field = saved.config.fields.find(f => f.name === 'tier');
+    expect(field?.type).toBe('string');
+    expect(field?.enumOptions).toBeUndefined();
+  });
+
+  it('ignores invalid fieldType from LLM — keeps user-set type', async () => {
+    const deps = makeDeps({
+      writeListConfig: jest.fn().mockResolvedValue(undefined),
+      llmClassifySmartFields: jest.fn().mockResolvedValue({
+        isQualified: { isSmartField: true, dependencies: [], fieldType: 'invalid_type' },
+      }),
+    });
+    const config = validConfig({
+      fields: [
+        { name: 'isQualified', type: 'string', instruction: 'some condition', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    // Invalid type rejected → original type preserved
+    expect(saved.config.fields.find(f => f.name === 'isQualified')?.type).toBe('string');
+  });
+
+  it('silently drops smartDependencies that are not valid canonical field names', async () => {
+    const deps = makeDeps({
+      writeListConfig: jest.fn().mockResolvedValue(undefined),
+      llmClassifySmartFields: jest.fn().mockResolvedValue({
+        isQualified: {
+          isSmartField: true,
+          dependencies: ['funding_stage', 'made_up_field_xyz'],  // second is invalid
+        },
+      }),
+    });
+    const config = validConfig({
+      fields: [
+        {
+          name: 'isQualified',
+          type: 'boolean',
+          instruction: 'some condition',
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+        },
+      ],
+    });
+
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    const field = saved.config.fields.find(f => f.name === 'isQualified');
+    expect(field?.smartDependencies).toEqual(['funding_stage']);
+    expect(field?.smartDependencies).not.toContain('made_up_field_xyz');
+  });
+
+  it('ignores client-supplied notSmartInstruction — uses DB as source of truth', async () => {
+    // Security: a malicious client could send notSmartInstruction === instruction
+    // to permanently suppress LLM classification. Server must discard client values
+    // and restore only from DB. With no stored config, field should be classified.
+    const classifyMock = jest.fn().mockResolvedValue({
+      industry: { isSmartField: false, dependencies: [] },
+    });
+    const deps = makeDeps({
+      readListConfig: jest.fn().mockResolvedValue(null),  // no stored config
+      llmClassifySmartFields: classifyMock,
+    });
+    const config = validConfig({
+      fields: [
+        {
+          name: 'industry',
+          type: 'string',
+          instruction: 'company industry',
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          notSmartInstruction: 'company industry',  // forged by client — must be ignored
+        },
+      ],
+    });
+
+    await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    // Field must appear in classification call despite client-supplied notSmartInstruction
+    const classifyCall = classifyMock.mock.calls[0]?.[0] ?? [];
+    expect(classifyCall.map((f: any) => f.name)).toContain('industry');
+  });
+
+  it('stores notSmartInstruction when LLM classifies a field as not smart', async () => {
+    const deps = makeDeps({
+      llmClassifySmartFields: jest.fn().mockResolvedValue({
+        industry: { isSmartField: false, dependencies: [] },
+      }),
+    });
+    const config = validConfig({
+      fields: [
+        { name: 'industry', type: 'string', instruction: 'company industry', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    const field = saved.config.fields.find(f => f.name === 'industry');
+    expect(field?.notSmartInstruction).toBe('company industry');
+    expect(field?.smartCondition).toBeUndefined();
+  });
+
+  it('skips re-classification when notSmartInstruction matches current instruction (cached not-smart)', async () => {
+    // DB holds the cached notSmartInstruction — client classification keys are
+    // stripped and restored from DB (concern #1 fix).
+    const storedConfig = validConfig({
+      fields: [
+        {
+          name: 'industry',
+          type: 'string',
+          instruction: 'company industry',
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          notSmartInstruction: 'company industry',
+        },
+      ],
+    });
+    const classifyMock = jest.fn().mockResolvedValue({});
+    const deps = makeDeps({
+      readListConfig: jest.fn().mockResolvedValue(storedConfig),
+      llmClassifySmartFields: classifyMock,
+    });
+    const config = validConfig({
+      fields: [
+        {
+          name: 'industry',
+          type: 'string',
+          instruction: 'company industry',  // same as stored notSmartInstruction
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          // client does NOT send notSmartInstruction — server reads from DB
+        },
+      ],
+    });
+
+    await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    const classifyCall = classifyMock.mock.calls[0]?.[0] ?? [];
+    expect(classifyCall.map((f: any) => f.name)).not.toContain('industry');
+  });
+
+  it('re-classifies a not-smart field when its instruction changes', async () => {
+    const deps = makeDeps({
+      llmClassifySmartFields: jest.fn().mockResolvedValue({
+        industry: { isSmartField: false, dependencies: [], fieldType: 'string' },
+      }),
+    });
+    const config = validConfig({
+      fields: [
+        {
+          name: 'industry',
+          type: 'string',
+          instruction: 'NEW: primary industry sector',  // changed
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          notSmartInstruction: 'OLD: company industry',  // stale
+        },
+      ],
+    });
+
+    await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    expect(deps.llmClassifySmartFields).toHaveBeenCalledWith(
+      expect.arrayContaining([expect.objectContaining({ name: 'industry' })]),
+    );
+  });
+
+  it('clears notSmartInstruction when field flips from not-smart to smart', async () => {
+    const deps = makeDeps({
+      llmClassifySmartFields: jest.fn().mockResolvedValue({
+        score: { isSmartField: true, dependencies: ['employee_count'], fieldType: 'number' },
+      }),
+    });
+    const config = validConfig({
+      fields: [
+        {
+          name: 'score',
+          type: 'number',
+          instruction: '1-100 score based on employee count',
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          notSmartInstruction: 'OLD: plain score field',  // stale from previous not-smart run
+        },
+      ],
+    });
+
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    const field = saved.config.fields.find(f => f.name === 'score');
+    expect(field?.smartCondition).toBe('1-100 score based on employee count');
+    expect(field?.notSmartInstruction).toBeUndefined();
+  });
+
+  it('skips classification for include:false fields', async () => {
+    const classifyMock = jest.fn().mockResolvedValue({});
+    const deps = makeDeps({ llmClassifySmartFields: classifyMock });
+    const config = validConfig({
+      fields: [
+        { name: 'industry', type: 'string', instruction: 'company industry', include: false, overwritePolicy: 'fill_if_empty' },
+        { name: 'company', type: 'string', instruction: 'company name', include: true, overwritePolicy: 'fill_if_empty', aliasFor: 'company_name' },
+      ],
+    });
+
+    await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+
+    const classifyCall = classifyMock.mock.calls[0]?.[0] ?? [];
+    const names = classifyCall.map((f: any) => f.name);
+    expect(names).not.toContain('industry');   // include:false — skipped
+    expect(names).toContain('company');         // include:true — classified
   });
 });

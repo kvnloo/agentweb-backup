@@ -105,8 +105,8 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       // Create post (with or without images)
       const postUrn = await linkedInService.createPost(token, authorUrn, content, imageUrns.length > 0 ? imageUrns : undefined);
 
-      // Store post in database for personal accounts only
-      if (userId && config.account_type === 'personal') {
+      // Store post in database for both personal and company page accounts
+      if (userId && (config.account_type === 'personal' || config.account_type === 'company_page')) {
         try {
           const { createPost: storePost } = await import('../linkedInPostsDb');
           await storePost(userId, authorUrn, postUrn, content, mediaUrls);
@@ -265,9 +265,10 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     }
   }
 
-  async listPosts(account: ConnectedAccount, options?: { limit?: number }, userId?: string): Promise<any[]> {
+  async listPosts(account: ConnectedAccount, options?: { limit?: number; force_reload?: boolean }, userId?: string): Promise<any[]> {
     const config = account.config as LinkedInConfig;
     const limit = options?.limit || 10;
+    const forceReload = options?.force_reload === true;
 
     // Personal profiles: fetch from database
     if (config.account_type === 'personal') {
@@ -290,12 +291,81 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       }
     }
 
-    // Organization accounts: use LinkedIn API
-    const { token } = await this.getValidToken(account, userId);
-    const authorUrn = account.account_id;
+    // Organization accounts: TTL-based cache with optional force reload
+    const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 1 day
+    const { getPostsByAccount, getPostsCacheAge, upsertApiPost } = await import('../linkedInPostsDb');
+    const cachedPosts = await getPostsByAccount(account.account_id, limit);
 
-    const response = await linkedInService.listPosts(token, authorUrn, 0, limit);
-    return response.elements || [];
+    // Check if cache is fresh enough to skip the API call
+    if (!forceReload && cachedPosts.length > 0) {
+      const oldestCache = await getPostsCacheAge(account.account_id);
+      const cacheIsStale = !oldestCache || (Date.now() - oldestCache.getTime() > CACHE_TTL_MS);
+      if (!cacheIsStale) {
+        // Cache is fresh — return without hitting the API
+        return cachedPosts.map(post => ({
+          id: post.postId,
+          author: post.accountId,
+          commentary: post.content,
+          created: { time: new Date(post.createdAt).getTime() },
+          lifecycleState: 'PUBLISHED',
+          visibility: 'PUBLIC',
+          _fromCache: true,
+        }));
+      }
+    }
+
+    // Cache is stale, empty, or force_reload requested — call LinkedIn API
+    try {
+      const { token } = await this.getValidToken(account, userId);
+      const authorUrn = account.account_id;
+      const response = await linkedInService.listPosts(token, authorUrn, 0, limit);
+      const apiPosts = response.elements || [];
+
+      if (apiPosts.length > 0) {
+        // Store API posts into local cache (fire-and-forget, don't block the response)
+        if (userId) {
+          Promise.all(apiPosts.map((p: any) => {
+            const content = p.commentary || p.text || '';
+            const postCreatedAt = p.createdAt
+              ? new Date(p.createdAt).toISOString()
+              : p.created?.time
+                ? new Date(p.created.time).toISOString()
+                : new Date().toISOString();
+            return upsertApiPost(userId, account.account_id, p.id, content, postCreatedAt);
+          })).catch(err => console.warn('[LinkedInAdapter] Failed to cache API posts:', err?.message));
+        }
+        return apiPosts;
+      }
+
+      // API returned empty — fall back to locally cached posts (created via AgentWeb)
+      if (cachedPosts.length > 0) {
+        return cachedPosts.map(post => ({
+          id: post.postId,
+          author: post.accountId,
+          commentary: post.content,
+          created: { time: new Date(post.createdAt).getTime() },
+          lifecycleState: 'PUBLISHED',
+          visibility: 'PUBLIC',
+        }));
+      }
+
+      return [];
+    } catch (error: any) {
+      // If API call fails but we have cached posts, return those
+      if (cachedPosts.length > 0) {
+        console.warn('[LinkedInAdapter] LinkedIn API failed for company page, returning cached posts:', error?.message);
+        return cachedPosts.map(post => ({
+          id: post.postId,
+          author: post.accountId,
+          commentary: post.content,
+          created: { time: new Date(post.createdAt).getTime() },
+          lifecycleState: 'PUBLISHED',
+          visibility: 'PUBLIC',
+        }));
+      }
+      // No cache available — re-throw so caller surfaces the real error
+      throw error;
+    }
   }
 
   /**

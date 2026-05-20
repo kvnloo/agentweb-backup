@@ -1215,6 +1215,7 @@ export async function runScheduledChat(
     console.error(`Error in runScheduledChat for ${schedule.scheduleName}:`, error);
     console.error('Full error details:', {
       message: error instanceof Error ? error.message : String(error),
+      originalMessage: (error as any)?.originalMessage || null,
       stack: error instanceof Error ? error.stack : undefined,
       name: error instanceof Error ? error.name : 'Unknown'
     });
@@ -1272,6 +1273,7 @@ export async function runScheduledChat(
     }
 
     // Send oncall alert and Notion ticket for scheduled chat exception (always, including test runs)
+    const originalMessage = (error as any)?.originalMessage;
     sendAgentModeOncallAlert({
       subject: `Scheduled Chat Error: ${schedule.scheduleName}`,
       message: `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
@@ -1282,6 +1284,7 @@ export async function runScheduledChat(
         'User ID': userId,
         'Is Test Run': isTest ? 'Yes' : 'No',
         'Error Message': errorMessage,
+        ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
         'Error Stack': error instanceof Error ? (error.stack || 'No stack trace') : 'N/A',
         'Execution Time (ms)': errorResult.executionTime,
         'Timestamp': errorResult.createdAt
@@ -1289,7 +1292,7 @@ export async function runScheduledChat(
     }).catch(err => console.error('Failed to send oncall alert for scheduled chat error:', err));
     createOncallItem({
       title: `Scheduled Chat Error: ${schedule.scheduleName}`,
-      description: `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
+      description: `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}${originalMessage ? `\n\nOriginal API error: ${originalMessage}` : ''}`,
       additionalTags: ['Scheduled Chat'],
       context: {
         'Schedule ID': schedule.scheduleId,
@@ -1297,6 +1300,7 @@ export async function runScheduledChat(
         'Session ID': sessionId || 'N/A',
         'Is Test Run': isTest ? 'Yes' : 'No',
         'Error Message': errorMessage,
+        ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
       }
     }).catch(err => console.error('Failed to create Notion item for scheduled chat error:', err));
 
@@ -1465,11 +1469,21 @@ export async function generateSessionResponse(
   if (attachments && attachments.length > 0) {
     const IMAGE_MIMETYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp', 'image/svg+xml']);
     const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg']);
+    const VIDEO_MIMETYPES = new Set(['video/mp4', 'video/quicktime', 'video/webm', 'video/avi', 'video/x-msvideo']);
+    const VIDEO_EXTS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv']);
     const attachmentUrls = attachments.map((attachment: any) => {
       const mimetype = (attachment.mimetype || '').toLowerCase();
       const ext = (attachment.filename || '').split('.').pop()?.toLowerCase() || '';
       const isImage = IMAGE_MIMETYPES.has(mimetype) || IMAGE_EXTS.has(ext);
-      const hint = isImage ? ' (image — use describe_image tool to analyze)' : '';
+      const isVideo = VIDEO_MIMETYPES.has(mimetype) || VIDEO_EXTS.has(ext);
+      let hint: string;
+      if (isImage) {
+        hint = ' (image — use describe_image tool to analyze)';
+      } else if (isVideo) {
+        hint = ' (video — use describe_video tool to analyze)';
+      } else {
+        hint = ' (document — use read_file_content tool to read its contents)';
+      }
       return `[${attachment.filename || 'Attachment'}](${attachment.url})${hint}`;
     }).join('\n');
     messageContent = `${userMessage}\n\n**Attached Files:**\n${attachmentUrls}`;

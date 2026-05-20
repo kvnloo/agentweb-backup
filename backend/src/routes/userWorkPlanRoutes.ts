@@ -1,7 +1,13 @@
 import express from "express";
-import { workPlanService } from "../services/workPlanService";
+import { workPlanService, WorkPlan } from "../services/workPlanService";
 import { emailService } from "../services/emailService";
-import { userDb } from "../services/db";
+import { userDb, orgDb } from "../services/db";
+import {
+  canEditItem,
+  canManageOrgFeature,
+  isFeatureEffectivelyEnabled,
+  listOrgVisibleItems,
+} from "../services/orgShareService";
 
 const router = express.Router();
 
@@ -11,20 +17,36 @@ router.get("/", async (req, res) => {
     const { userId } = (req as any).user;
     const user = await userDb.getUserById(userId);
     const orgId = user?.orgId;
+    const org = orgId ? await orgDb.getOrgById(orgId) : null;
+    const enabled = isFeatureEffectivelyEnabled(
+      { userId, orgId, orgRole: user?.orgRole as "owner" | "member" | undefined },
+      org,
+      "workPlans",
+    );
 
-    const [ownPlans, publicPlans, orgPlans] = await Promise.all([
+    const [ownPlans, publicPlans, fanout] = await Promise.all([
       workPlanService.getWorkPlansByOwner(userId),
       workPlanService.getPublicPlansForAgentMode(),
-      orgId ? workPlanService.getWorkPlansByOrg(orgId) : Promise.resolve([]),
+      orgId
+        ? listOrgVisibleItems({
+            callerUserId: userId,
+            orgId,
+            featureEnabled: enabled,
+            getOwnerItems: async () => [],
+            getMemberIds:  async () => (await orgDb.getOrgMembers(orgId)).map((m: any) => m.userId),
+            getItemsForOwner: (uid: string) => workPlanService.getWorkPlansByOwner(uid),
+            getId: (p: any) => p.planId,
+          })
+        : Promise.resolve({ items: [] as WorkPlan[], truncated: false }),
     ]);
 
     const seen = new Set<string>();
-    const all = [...ownPlans, ...orgPlans, ...publicPlans].filter(p => {
+    const all = [...ownPlans, ...fanout.items, ...publicPlans].filter(p => {
       if (seen.has(p.planId)) return false;
       seen.add(p.planId);
       return true;
     });
-    res.json(all);
+    res.json({ items: all, truncated: fanout.truncated });
   } catch (error) {
     console.error("Error fetching user work plans:", error);
     res.status(500).json({ message: "Failed to fetch work plans" });
@@ -65,6 +87,19 @@ router.post("/", async (req, res) => {
     const user = await userDb.getUserById(userId);
     const orgId = user?.orgId;
 
+    // Org-level create gating: only org owner or listed workPlans editor
+    if (orgId) {
+      const org = await orgDb.getOrgById(orgId);
+      const allowed = canManageOrgFeature(
+        { userId, orgId, orgRole: user?.orgRole as "owner" | "member" | undefined },
+        org,
+        "workPlans",
+      );
+      if (!allowed) {
+        return res.status(403).json({ message: "Work plans are managed by your org admin" });
+      }
+    }
+
     const plan = await workPlanService.createWorkPlan({
       title,
       description,
@@ -88,7 +123,7 @@ router.post("/", async (req, res) => {
   }
 });
 
-// Update own private plan
+// Update own private plan (or org editor updating another member's plan)
 router.put("/:planId", async (req, res) => {
   try {
     const { userId } = (req as any).user;
@@ -96,9 +131,24 @@ router.put("/:planId", async (req, res) => {
     const plan = await workPlanService.getWorkPlan(planId);
 
     if (!plan) return res.status(404).json({ message: "Work plan not found" });
-    if (plan.ownerId !== userId) return res.status(403).json({ message: "Not authorized" });
     if (plan.visibility !== 'private') {
       return res.status(403).json({ message: "Cannot edit plans that are public or pending review" });
+    }
+
+    // Resolve caller's user record and org context for permission check
+    const callerUser = await userDb.getUserById(userId);
+    const callerOrgId = callerUser?.orgId;
+    const ownerUser = plan.ownerId && plan.ownerId !== userId
+      ? await userDb.getUserById(plan.ownerId)
+      : null;
+    const ownerOrgId = plan.ownerId === userId ? callerOrgId : ownerUser?.orgId;
+    const org = callerOrgId ? await orgDb.getOrgById(callerOrgId) : null;
+
+    const callerUserLike = { userId, orgId: callerOrgId, orgRole: callerUser?.orgRole as "owner" | "member" | undefined };
+    const planItemLike = { userId: plan.ownerId };
+
+    if (!canEditItem(planItemLike, callerUserLike, org, ownerOrgId, "workPlans")) {
+      return res.status(403).json({ message: "Not authorized" });
     }
 
     const { title, description, steps, welcomeMessage, autocomplete, requireLogin, showLoginSignup, defaultModel } = req.body;
@@ -121,7 +171,7 @@ router.put("/:planId", async (req, res) => {
   }
 });
 
-// Delete own private plan
+// Delete own private plan (owner or org owner/admin only; editors cannot delete)
 router.delete("/:planId", async (req, res) => {
   try {
     const { userId } = (req as any).user;
@@ -129,10 +179,20 @@ router.delete("/:planId", async (req, res) => {
     const plan = await workPlanService.getWorkPlan(planId);
 
     if (!plan) return res.status(404).json({ message: "Work plan not found" });
-    if (plan.ownerId !== userId) return res.status(403).json({ message: "Not authorized" });
     if (plan.visibility !== 'private') {
       return res.status(403).json({ message: "Cannot delete plans that are public or pending review" });
     }
+
+    // Only the plan owner or an org owner (admin override) may delete
+    let allowed = plan.ownerId === userId;
+    if (!allowed && plan.ownerId) {
+      const callerUser = await userDb.getUserById(userId);
+      if (callerUser?.orgRole === "owner" && callerUser?.orgId) {
+        const owner = await userDb.getUserById(plan.ownerId);
+        if (owner?.orgId === callerUser.orgId) allowed = true;
+      }
+    }
+    if (!allowed) return res.status(403).json({ message: "Not authorized" });
 
     await workPlanService.deleteWorkPlan(planId);
     res.json({ message: "Work plan deleted successfully" });

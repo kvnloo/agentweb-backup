@@ -2972,8 +2972,7 @@ router.get("/chat-sessions", async (req, res) => {
     const timeRange = startTime && endTime ? { startTime, endTime } : undefined;
     const syncMode = req.query.sync === "true" || req.query.sync === "1";
 
-    // Allow higher limit when time-range is specified (matching old chat-history behavior)
-    const maxLimit = timeRange ? 1000 : 100;
+    const maxLimit = 1000;
     const defaultLimit = timeRange ? 100 : 30;
     const rawLimit = Number(req.query.limit);
     const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), maxLimit) : defaultLimit;
@@ -3072,7 +3071,7 @@ router.put("/users/:userId/role", async (req, res) => {
     const { roles } = req.body; // Expect an array of roles
 
     // Validate roles
-    const validRolesSet = new Set(["partner", "customer", "free"]);
+    const validRolesSet = new Set(["partner", "customer", "free", "contractor"]);
 
     if (!Array.isArray(roles) || roles.some((r) => !validRolesSet.has(r))) {
       return res.status(400).json({
