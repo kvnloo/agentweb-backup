@@ -255,7 +255,10 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
     }
 
     const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_id } = req.body;
-    let template_html: string | undefined = rawTemplateHtml;
+    // Condense uploaded HTML to avoid exceeding v0 prompt size limits
+    let template_html: string | undefined = rawTemplateHtml
+      ? extractTemplateOutline(rawTemplateHtml)
+      : undefined;
 
     // If template_id provided (user picked a template), look it up from DynamoDB
     if (template_id && !template_html) {

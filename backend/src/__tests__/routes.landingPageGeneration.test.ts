@@ -392,6 +392,52 @@ describe("POST /api/landing-pages/v0/generate", () => {
     // Verify generation service was called with the lead_list_id
     expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("list-123");
   });
+
+  it("FAIL: template_html provided but extractTemplateOutline returns empty string → generation proceeds with empty template", async () => {
+    mockedExtractOutline.mockReturnValue("");
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", template_html: "<html></html>" });
+
+    expect(res.status).toBe(201);
+    expect(mockedExtractOutline).toHaveBeenCalledWith("<html></html>");
+    // Empty string is falsy so treated as no template
+    expect(mockGenerateLandingPage.mock.calls[0][5]).toBe("");
+  });
+
+  it("SUCCESS: template_html provided → extractTemplateOutline applied before passing to service", async () => {
+    mockedExtractOutline.mockReturnValue("Condensed HTML Outline");
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const largeHtml = "<html><body><section id='hero'>Hello</section></body></html>";
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Deploy this page", template_html: largeHtml });
+
+    expect(res.status).toBe(201);
+    // extractTemplateOutline must be called on the raw uploaded HTML
+    expect(mockedExtractOutline).toHaveBeenCalledWith(largeHtml);
+    // Service receives the condensed outline, not the raw HTML
+    expect(mockGenerateLandingPage.mock.calls[0][5]).toBe("Condensed HTML Outline");
+  });
+
+  it("SUCCESS: template_html takes precedence over template_id when both provided", async () => {
+    mockedExtractOutline.mockReturnValue("Outline From Upload");
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", template_html: "<html>uploaded</html>", template_id: "some-template-id" });
+
+    expect(res.status).toBe(201);
+    // template_html was condensed from uploaded content
+    expect(mockedExtractOutline).toHaveBeenCalledWith("<html>uploaded</html>");
+    // DynamoDB template lookup skipped since template_html already set
+    expect(mockGetSetting).not.toHaveBeenCalled();
+    expect(mockGenerateLandingPage.mock.calls[0][5]).toBe("Outline From Upload");
+  });
 });
 
 // =============================================================================
