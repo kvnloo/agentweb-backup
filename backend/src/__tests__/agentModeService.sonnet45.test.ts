@@ -145,6 +145,21 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['gpt-5.4'].client).not.toBeNull();
     });
 
+    it('should include gpt-5.4-nano in the supported models', async () => {
+      const models = await agentModeService.getSupportedModels();
+      expect(models).toContain('gpt-5.4-nano');
+    });
+
+    it('should have temperature support enabled for gpt-5.4-nano', () => {
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['gpt-5.4-nano'].supportsTemperature).toBe(true);
+    });
+
+    it('should have a non-null client for gpt-5.4-nano (Azure client created eagerly)', () => {
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['gpt-5.4-nano'].client).not.toBeNull();
+    });
+
     it('should include gpt-5.5 in the supported models', async () => {
       const models = await agentModeService.getSupportedModels();
       expect(models).toContain('gpt-5.5');
@@ -165,6 +180,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['gpt-5-chat-2'].maxTools).toBe(128);
       expect(llmModels['gpt-5.2-chat'].maxTools).toBe(128);
       expect(llmModels['gpt-5.4'].maxTools).toBe(128);
+      expect(llmModels['gpt-5.4-nano'].maxTools).toBe(128);
       expect(llmModels['gpt-5.5'].maxTools).toBe(128);
     });
 
