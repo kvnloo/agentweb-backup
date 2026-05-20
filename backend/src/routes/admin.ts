@@ -379,7 +379,9 @@ router.post("/crm-sync/:source/start", async (req, res) => {
         if (forceFullSync) {
           return true;
         }
-        return isAfterLastSync(user.createdAt, previousLastSyncAt);
+        // Use the most recent of createdAt or updatedAt so updated users are included in incremental sync
+        const mostRecentUserTime = [user.updatedAt, user.createdAt].filter(Boolean).sort().pop();
+        return isAfterLastSync(mostRecentUserTime, previousLastSyncAt);
       });
 
       // chatSessionCount is already computed by userDb.getAllUsers() via UserIdIndex GSI
@@ -426,8 +428,9 @@ router.post("/crm-sync/:source/start", async (req, res) => {
         if (forceFullSync) {
           return true;
         }
-        const createdTime = entry.joinedAt || entry.createdAt;
-        return isAfterLastSync(createdTime, previousLastSyncAt);
+        // Use the most recent of any timestamp so updated entries are included in incremental sync
+        const mostRecentEntryTime = [entry.updatedAt, entry.joinedAt, entry.createdAt].filter(Boolean).sort().pop();
+        return isAfterLastSync(mostRecentEntryTime, previousLastSyncAt);
       });
 
       leads = filteredEntries.map((entry: any) => {
