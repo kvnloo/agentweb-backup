@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-20',
     changes: [
+      'New: GPT-5.4 Nano Available as an AI Model for CRM Email Drafting',
+      '- GPT-5.4 Nano is now selectable in the Draft Email dialog in CRM',
+      '- Use it as a faster, lighter alternative to GPT-5.4 for generating personalized email drafts',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
       'Fixed: Scheduled Chat Error — Social Listening Research and Similar Schedules Now Retry on Intermittent Bedrock Errors',
       '- Scheduled chats occasionally failed with "I encountered an issue processing your request" due to a transient Bedrock infrastructure error (HTTP 400 with no error body)',
       '- This error was incorrectly treated as a permanent failure and not retried',
