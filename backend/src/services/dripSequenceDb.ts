@@ -414,6 +414,7 @@ async function getExistingEnrollment(
   sequenceId: string,
   leadEmail: string,
 ): Promise<SequenceEnrollment | null> {
+  if (!leadEmail) return null;
   const result = await dynamodb.query({
     TableName: ENROLLMENTS_TABLE,
     IndexName: 'leadEmail-index',

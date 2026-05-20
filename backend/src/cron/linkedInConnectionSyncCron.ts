@@ -135,7 +135,7 @@ async function enrollNewConnections(newConnections: UnipileConnection[]): Promis
             lastKey = (page as any).lastEvaluatedKey ?? null;
 
             for (const lead of items) {
-              if (!lead.linkedin) continue;
+              if (!lead.linkedin || !lead.email) continue;
               const normalized = normalizeLinkedInUrl(lead.linkedin);
               if (normalized !== conn.publicProfileUrl) continue;
 

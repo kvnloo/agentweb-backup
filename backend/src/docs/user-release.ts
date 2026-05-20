@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-20',
     changes: [
+      'Fixed: LinkedIn Connection Sync No Longer Errors on Leads Without Email Addresses',
+      '- The LinkedIn connection sync cron was throwing a DynamoDB validation error when processing leads that have no email address',
+      '- Leads without an email are now skipped during LinkedIn-triggered sequence enrollment',
+      '- Also added a defensive guard in the enrollment de-dup check to prevent similar errors from any other caller',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
       'Fixed: Scheduled Chats No Longer Send Duplicate Emails When Email Notifications Are Configured',
       '- When a scheduled chat had email notifications configured, the AI sometimes also added a notify_session step inside the prompt, causing two emails per run',
       '- The schedule tool now explicitly instructs the AI to omit any email-sending step from the prompt when email_notifications is already set on the schedule',
