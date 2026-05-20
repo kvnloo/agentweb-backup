@@ -11,14 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-20',
     changes: [
+      'Fixed: CRM "Last Contact" No Longer Shows Sync Time as a Contact Event',
+      '- The Last Contact column in CRM was showing the time of the most recent sync run for leads with no actual contact history',
+      '- This caused many leads to appear freshly contacted (e.g., "9h ago") after a users or waitlist sync, making it hard to identify who truly hasn\'t been reached',
+      '- Last Contact now shows "Never" for leads with no engagement history, so the column accurately reflects real outreach activity',
+      'Fixed: CRM Users/Waitlist Sync — Incremental Sync Now Picks Up Updated Records',
+      '- The incremental sync for AgentWeb Users and Waitlist was only checking creation time, so records updated after the last sync (e.g., subscription changes, invited status) were silently skipped',
+      '- The filter now uses the most recent of createdAt/updatedAt/joinedAt, ensuring changed records are included in the next sync run',
       'Fixed: iShare Messages Now Correctly Attributed as Anonymous',
       '- Messages submitted by visitors via interactive share (iShare) links were previously stored identically to messages from the session owner, with no way to distinguish the source',
       '- Each message sent through an iShare link now records the sender as anonymous in the message metadata, along with the visitor\'s IP address and browser info when available',
-    ],
-  },
-  {
-    date: '2026-05-20',
-    changes: [
       'Fixed: LinkedIn Connection Sync No Longer Errors on Leads Without Email Addresses',
       '- The LinkedIn connection sync cron was throwing a DynamoDB validation error when processing leads that have no email address',
       '- Leads without an email are now skipped during LinkedIn-triggered sequence enrollment',
