@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-20',
     changes: [
+      'Fixed: Org Knowledge Base Integrations Now Respect the "Knowledge Bases" Sharing Setting',
+      '- When an org admin set Knowledge Bases sharing to "Private", org members could still see the org\'s connected ClickUp workspaces, Foreplay ad library, and Google Drive shared folders — on the Knowledge Base page and through Emma',
+      '- These integrations now honor the org-wide Knowledge Bases sharing toggle: when sharing is off, only the org owner and designated KB editors can access them',
+      '- Knowledge base files already respected this setting; ClickUp, Foreplay, and Google Drive folders are now consistent with it',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
       'New: Native Account Owner and Additional POC Emails on CRM Lead Records',
       '- Each CRM lead now has a native "Account Owner" field that maps to an org team member (e.g. Harsha, Matt, Fangfang)',
       '- Select an account owner from the dropdown in the lead detail panel — options are pulled from your org\'s members',
