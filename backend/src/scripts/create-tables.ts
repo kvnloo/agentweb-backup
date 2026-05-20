@@ -1728,6 +1728,46 @@ const createAccountMemoryTable = async () => {
   }
 };
 
+// Create Org Memory table
+const createOrgMemoryTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-OrgMemory`,
+    AttributeDefinitions: [
+      { AttributeName: 'orgId', AttributeType: 'S' },
+      { AttributeName: 'memoryId', AttributeType: 'S' },
+      { AttributeName: 'category', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'orgId', KeyType: 'HASH' },
+      { AttributeName: 'memoryId', KeyType: 'RANGE' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'OrgIdCategoryIndex',
+        KeySchema: [
+          { AttributeName: 'orgId', KeyType: 'HASH' },
+          { AttributeName: 'category', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 // Create Social Engagement Tracking table
 const createSocialEngagementTrackingTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
@@ -1989,6 +2029,7 @@ const main = async () => {
     await createMcpOAuthTokensTable();
     await createLandingPagesTable();
     await createAccountMemoryTable();
+    await createOrgMemoryTable();
     await createSocialEngagementTrackingTable();
     await createBrowserCookiesTable();
     await createOrganizationsTable();
