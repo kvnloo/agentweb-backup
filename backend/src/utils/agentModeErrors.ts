@@ -68,6 +68,10 @@ const TRANSIENT_MESSAGE_PATTERNS = [
   /502/,
   /503/,
   /internal.?server.?error/i,
+  // AWS SDK emits "X status code (no body)" when Bedrock returns an HTTP error with
+  // no parseable response body — this indicates a transient infrastructure error
+  // (e.g. API Gateway timeout or Bedrock cold-start) rather than a client mistake.
+  /status code \(no body\)/i,
 ];
 
 export function isTransientLLMError(error: unknown): boolean {
