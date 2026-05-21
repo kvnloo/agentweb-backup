@@ -174,6 +174,7 @@ async function fetchItemsForFeature(userId: string, f: ToggleableFeature): Promi
     case "landingPages":   return getLandingPagesByOwner(userId);
     case "workPlans":      return workPlanService.getWorkPlansByOwner(userId);
     case "skills":         return skillService.getSkillsByOwner(userId);
+    case "funnels":        throw new Error("funnels member-removal handling not yet implemented");
   }
 }
 
@@ -184,6 +185,7 @@ function getItemId(item: any, f: ToggleableFeature): string {
     case "landingPages":   return item.id;
     case "workPlans":      return item.planId;
     case "skills":         return item.skillId;
+    case "funnels":        throw new Error("funnels member-removal handling not yet implemented");
   }
 }
 
@@ -204,6 +206,8 @@ async function transferItemOwner(item: any, f: ToggleableFeature, newOwnerId: st
     case "skills":
       await skillService.transferOwner(item.skillId, newOwnerId);
       return;
+    case "funnels":
+      throw new Error("funnels member-removal handling not yet implemented");
   }
 }
 
@@ -224,6 +228,8 @@ async function deleteItem(item: any, f: ToggleableFeature): Promise<void> {
     case "skills":
       await skillService.deleteSkill(item.skillId);
       return;
+    case "funnels":
+      throw new Error("funnels member-removal handling not yet implemented");
   }
 }
 

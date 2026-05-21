@@ -137,6 +137,7 @@ const allDelete = {
   landingPages: "delete",
   workPlans: "delete",
   skills: "delete",
+  funnels: "leave",
 };
 
 /** All-transfer decisions */
@@ -146,6 +147,7 @@ const allTransfer = {
   landingPages: "transfer",
   workPlans: "transfer",
   skills: "transfer",
+  funnels: "leave",
 };
 
 /** All-leave decisions */
@@ -155,6 +157,7 @@ const allLeave = {
   landingPages: "leave",
   workPlans: "leave",
   skills: "leave",
+  funnels: "leave",
 };
 
 /** Setup normal user mocks (items empty by default) */
@@ -532,6 +535,7 @@ describe("POST /api/orgs/me/members/:userId/remove", () => {
           landingPages: "leave",
           workPlans: "delete",
           skills: "transfer",
+          funnels: "leave",
         },
       });
 

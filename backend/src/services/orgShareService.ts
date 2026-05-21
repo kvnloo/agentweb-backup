@@ -1,7 +1,7 @@
 import type { Organization } from "./db";
 
 export type ToggleableFeature =
-  | "knowledgeBase" | "htmlTemplates" | "landingPages" | "workPlans" | "skills";
+  | "knowledgeBase" | "htmlTemplates" | "landingPages" | "workPlans" | "skills" | "funnels";
 export type AlwaysOnFeature = "brandGuidelines" | "marketingStrategy";
 export type Feature = ToggleableFeature | AlwaysOnFeature;
 
@@ -84,7 +84,7 @@ export const ORG_ITEMS_CAP     = 2000;
 export const RESPONSE_CAP      = 1000;
 
 export const TOGGLEABLE_FEATURES: ReadonlyArray<ToggleableFeature> = [
-  "knowledgeBase", "htmlTemplates", "landingPages", "workPlans", "skills",
+  "knowledgeBase", "htmlTemplates", "landingPages", "workPlans", "skills", "funnels",
 ];
 export const ALWAYS_ON_FEATURES: ReadonlyArray<AlwaysOnFeature> = [
   "brandGuidelines", "marketingStrategy",
