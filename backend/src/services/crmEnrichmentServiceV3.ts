@@ -335,7 +335,6 @@ function bucketByOverwritePolicy(
 type LeadFailureCategory =
   | 'identityResolution'
   | 'llmOrParse'
-  | 'searchWeb'
   | 'update';
 
 interface PerLeadOutcome {
@@ -812,7 +811,6 @@ export async function runEnrichment(
   let identityResolutionFailed = 0;
   let apolloFailed = 0;
   let llmOrParseFailed = 0;
-  let searchWebFailed = 0;
   let updateFailed = 0;
 
   emitToRooms(progressEvent, {
@@ -881,9 +879,6 @@ export async function runEnrichment(
         case 'llmOrParse':
           llmOrParseFailed += 1;
           continue;
-        case 'searchWeb':
-          searchWebFailed += 1;
-          continue;
         case 'update':
           updateFailed += 1;
           continue;
@@ -916,7 +911,7 @@ export async function runEnrichment(
 
     const completedSoFar = Math.min(i + CONCURRENCY, leads.length);
     const failedSoFar =
-      identityResolutionFailed + llmOrParseFailed + searchWebFailed + updateFailed;
+      identityResolutionFailed + llmOrParseFailed + updateFailed;
     emitToRooms(progressEvent, {
       runId,
       listId: input.listId,
@@ -942,7 +937,11 @@ export async function runEnrichment(
       apolloFailed,
       llmOrParseFailed,
       updateFailed,
-      searchWebFailed,
+      // v3 treats web-fetch failures as soft degradations — affected fields
+      // fall through to 'missing' rather than failing the lead — so there is
+      // no hard web-failure count. Kept at 0 for result-shape parity with the
+      // v2 path and the customer-portal failure-breakdown UI.
+      searchWebFailed: 0,
     },
     tierFillBreakdown: { total, ...tierBreakdown },
     durationMs: Date.now() - startedAt,
@@ -953,7 +952,7 @@ export async function runEnrichment(
   }
 
   const totalFailed =
-    identityResolutionFailed + llmOrParseFailed + searchWebFailed + updateFailed;
+    identityResolutionFailed + llmOrParseFailed + updateFailed;
   console.log(`[v3] runEnrichment DONE runId=${runId} processed=${processed} failed=${totalFailed} durationMs=${result.durationMs}`);
   emitToRooms(completeEvent, {
     runId,
