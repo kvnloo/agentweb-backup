@@ -173,6 +173,17 @@ test("legacy-only owner (googleAnalyticsPropertyId) normalises into properties",
   expect(r.properties).toEqual([{ propertyId: "555", label: "Main Property" }]);
   expect(r.primaryPropertyId).toBe("555");
 });
+
+test("org owner with flag ON → own bundle, source 'self' (no indicator for the owner)", async () => {
+  const owner = { ...ownerUser, orgId: "org-1" }; // ownerUser.userId === "owner-1"
+  mockOrgDb.getOrgById.mockResolvedValue({ orgId: "org-1", ownerUserId: "owner-1", shareAnalyticsWithOrg: true } as any);
+
+  const r = await resolveAnalyticsConfig(owner);
+
+  expect(r.source).toBe("self"); // the owner's own data — drives "no indicator" in the UI
+  expect(r.properties).toEqual([{ propertyId: "111", label: "Owner GA" }]);
+  expect(mockUserDb.getUserById).not.toHaveBeenCalled();
+});
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -241,7 +252,10 @@ export async function resolveAnalyticsConfig(user: any): Promise<ResolvedAnalyti
       const owner =
         org.ownerUserId === user.userId ? user : await userDb.getUserById(org.ownerUserId);
       if (owner && normaliseProperties(owner).length > 0) {
-        return buildBundle(owner, "org");
+        // The org owner viewing their own shared config is still "self" — the
+        // "Showing organization analytics" indicator is for members only.
+        const src = org.ownerUserId === user.userId ? "self" : "org";
+        return buildBundle(owner, src);
       }
     }
   }
@@ -252,7 +266,7 @@ export async function resolveAnalyticsConfig(user: any): Promise<ResolvedAnalyti
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `cd backend && npm test -- analyticsConfigResolver`
-Expected: PASS — 5 tests.
+Expected: PASS — 6 tests.
 
 - [ ] **Step 5: Verify compilation**
 
@@ -371,13 +385,13 @@ git commit -m "feat(crm): add admin route to toggle org analytics sharing"
 
 ---
 
-## Task 4: Add `isOrgOwner` to the admin user-list payload
+## Task 4: Add `isOrgOwner` and `orgShareAnalyticsWithOrg` to the admin user-list payload
 
 **Files:**
 - Modify: `backend/src/routes/admin.ts` (the user-list handler, lines ~521-535)
 - Test: `backend/src/__tests__/admin.analyticsSharing.test.ts` (add to the existing file)
 
-The user-list handler currently builds an `orgMap` of `orgId → name` and stamps `user.orgName`. It must also stamp `user.isOrgOwner`.
+The user-list handler currently builds an `orgMap` of `orgId → name` and stamps `user.orgName`. It must also stamp `user.isOrgOwner` **and** `user.orgShareAnalyticsWithOrg`. The latter is required so the partner-portal checkbox (Task 9) is initialised from persisted state — without it, saving the SEO dialog would silently disable analytics sharing.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -390,7 +404,7 @@ test("user-list payload stamps isOrgOwner", async () => {
     { userId: "u-owner", email: "o@x.com", orgId: "org-1" },
     { userId: "u-member", email: "m@x.com", orgId: "org-1" },
   ] as any);
-  mockOrgDb.getOrgById.mockResolvedValue({ orgId: "org-1", name: "Acme", ownerUserId: "u-owner" } as any);
+  mockOrgDb.getOrgById.mockResolvedValue({ orgId: "org-1", name: "Acme", ownerUserId: "u-owner", shareAnalyticsWithOrg: true } as any);
 
   const res = await request(app)
     .get("/api/admin/users")
@@ -400,6 +414,8 @@ test("user-list payload stamps isOrgOwner", async () => {
   const member = res.body.find((u: any) => u.userId === "u-member");
   expect(owner.isOrgOwner).toBe(true);
   expect(member.isOrgOwner).toBe(false);
+  expect(owner.orgShareAnalyticsWithOrg).toBe(true);
+  expect(member.orgShareAnalyticsWithOrg).toBe(true);
 });
 ```
 
@@ -431,16 +447,20 @@ In `backend/src/routes/admin.ts`, the batch-org-fetch block currently reads (lin
     }
 ```
 
-Replace it with (carry `ownerUserId` and stamp `isOrgOwner`):
+Replace it with (carry `ownerUserId` + `shareAnalyticsWithOrg`, and stamp `isOrgOwner` + `orgShareAnalyticsWithOrg`):
 
 ```typescript
-    // Batch-fetch org name + owner for users who belong to an org
+    // Batch-fetch org name + owner + analytics-sharing flag for users in an org
     const orgIds = [...new Set(sanitized.filter((u: any) => u.orgId).map((u: any) => u.orgId as string))];
-    const orgMap: Record<string, { name: string; ownerUserId: string }> = {};
+    const orgMap: Record<string, { name: string; ownerUserId: string; shareAnalyticsWithOrg: boolean }> = {};
     await Promise.all(
       orgIds.map(async (orgId) => {
         const org = await orgDb.getOrgById(orgId).catch(() => null);
-        if (org) orgMap[orgId] = { name: org.name, ownerUserId: org.ownerUserId };
+        if (org) orgMap[orgId] = {
+          name: org.name,
+          ownerUserId: org.ownerUserId,
+          shareAnalyticsWithOrg: !!org.shareAnalyticsWithOrg,
+        };
       })
     );
     for (const user of sanitized) {
@@ -448,6 +468,7 @@ Replace it with (carry `ownerUserId` and stamp `isOrgOwner`):
       if (orgInfo) {
         user.orgName = orgInfo.name;
         user.isOrgOwner = orgInfo.ownerUserId === user.userId;
+        user.orgShareAnalyticsWithOrg = orgInfo.shareAnalyticsWithOrg;
       }
     }
 ```
@@ -466,7 +487,7 @@ Expected: no errors.
 
 ```bash
 git add backend/src/routes/admin.ts backend/src/__tests__/admin.analyticsSharing.test.ts
-git commit -m "feat(crm): expose isOrgOwner on admin user-list payload"
+git commit -m "feat(crm): expose isOrgOwner and org analytics-sharing flag on admin user-list"
 ```
 
 ---
@@ -926,12 +947,10 @@ In the edit-button `onClick` at line 4398, append to the existing setters:
 ```typescript
 setEditingUserIsOrgOwner(!!user.isOrgOwner);
 setEditingUserOrgId(user.orgId || null);
-setShareAnalyticsWithOrg(false); // re-fetched below
+setShareAnalyticsWithOrg(!!user.orgShareAnalyticsWithOrg);
 ```
 
-Also fetch the org's current flag when opening the dialog. After the dialog opens, fetch the org so the checkbox reflects persisted state. The simplest approach: read it from the org via a small GET. If a convenient org GET is not available to the partner-portal, instead derive it from the user list (have the backend user-list payload also include `org.shareAnalyticsWithOrg` alongside `isOrgOwner` — extend Task 4's `orgMap` to carry it and stamp `user.orgShareAnalyticsWithOrg`). Use whichever is already cheapest; if extending the payload, set `setShareAnalyticsWithOrg(!!user.orgShareAnalyticsWithOrg)` here instead of `false`.
-
-> Implementation note: extending the Task 4 payload is the cleaner option — add `shareAnalyticsWithOrg: org.shareAnalyticsWithOrg` to the `orgMap` value and stamp `user.orgShareAnalyticsWithOrg = orgInfo.shareAnalyticsWithOrg` in the loop. Do that, and the dialog needs no extra fetch.
+`user.orgShareAnalyticsWithOrg` is supplied by the admin user-list payload (Task 4). **Seeding the checkbox from persisted state is required, not optional:** the save handler (Step 4) PATCHes the flag on every save of an org owner's dialog, so a checkbox left at a stale `false` would silently turn analytics sharing **off** the next time an admin edits that owner's SEO settings for any reason.
 
 - [ ] **Step 3: Render the checkbox in the dialog**
 
@@ -982,11 +1001,9 @@ Expected: no errors.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add partner-portal/src/pages/AdminDashboard.tsx backend/src/routes/admin.ts
+git add partner-portal/src/pages/AdminDashboard.tsx
 git commit -m "feat(crm): add Share-analytics-with-organization checkbox to admin SEO dialog"
 ```
-
-(If you extended the Task 4 payload in Step 2, `admin.ts` is included here.)
 
 ---
 
@@ -1173,7 +1190,7 @@ In `backend/src/services/db.ts`, the `pruneEditorListsForUser` `next` object —
 
 (The `?? { enabled: false, editors: [] }` guards orgs whose stored `shareSettings` predate this field.)
 
-- [ ] **Step 5: Add `funnels` to the feature registry**
+- [ ] **Step 5: Add `funnels` to the feature registry and the migration defaults**
 
 In `backend/src/services/orgShareService.ts`, extend the `ToggleableFeature` union (line 3-4):
 
@@ -1190,6 +1207,21 @@ export const TOGGLEABLE_FEATURES: ReadonlyArray<ToggleableFeature> = [
 ];
 ```
 
+`migrate-org-share-settings.ts` is the **only** other place a full `OrgShareSettings` is constructed (confirmed by grep — `pruneEditorListsForUser` is the other and is handled in Step 4). Its `defaults: OrgShareSettings` literal must gain `funnels`, or `npx tsc` will fail on a missing required field. Update `backend/src/scripts/migrate-org-share-settings.ts`:
+
+```typescript
+const defaults: OrgShareSettings = {
+  knowledgeBase:     { enabled: false, editors: [] },
+  htmlTemplates:     { enabled: false, editors: [] },
+  landingPages:      { enabled: false, editors: [] },
+  workPlans:         { enabled: true,  editors: [] },
+  skills:            { enabled: true,  editors: [] },
+  funnels:           { enabled: false, editors: [] },
+  brandGuidelines:   { editors: [] },
+  marketingStrategy: { editors: [] },
+};
+```
+
 - [ ] **Step 6: Run the test to verify it passes**
 
 Run: `cd backend && npm test -- pruneEditorLists.funnels`
@@ -1203,7 +1235,7 @@ Expected: tsc clean. **Note:** `orgShareSettings.ts` `validateSettings` iterates
 - [ ] **Step 8: Commit**
 
 ```bash
-git add backend/src/services/db.ts backend/src/services/orgShareService.ts backend/src/__tests__/pruneEditorLists.funnels.test.ts
+git add backend/src/services/db.ts backend/src/services/orgShareService.ts backend/src/scripts/migrate-org-share-settings.ts backend/src/__tests__/pruneEditorLists.funnels.test.ts
 git commit -m "feat(crm): register funnels as a toggleable org-shared resource"
 ```
 
@@ -1235,10 +1267,20 @@ test("GET /api/funnels: sharing ON → caller's funnels + org members' funnels, 
 });
 
 test("GET /api/funnels: sharing OFF, plain member → only own funnels", async () => {
-  // org shareSettings.funnels.enabled = false; m-1 is a plain member
+  // org shareSettings.funnels.enabled = false; caller m-1 is a plain member
   const res = await request(app).get("/api/funnels").set("Authorization", `Bearer ${m1Token}`);
   const ids = res.body.funnels.map((f: any) => f.configId);
   expect(ids).toEqual(["funnel:f-a"]);
+});
+
+test("GET /api/funnels: each funnel carries a server-computed canEdit", async () => {
+  // Arrange: org-1 shareSettings.funnels = { enabled: true, editors: ["m-1"] };
+  // f-a owned by m-1, f-b owned by m-2.
+  const res = await request(app).get("/api/funnels").set("Authorization", `Bearer ${m1Token}`);
+  const own = res.body.funnels.find((f: any) => f.configId === "funnel:f-a");
+  const shared = res.body.funnels.find((f: any) => f.configId === "funnel:f-b");
+  expect(own.canEdit).toBe(true);
+  expect(shared.canEdit).toBe(true); // m-1 is a funnels editor → may edit a shared funnel (B3 fix)
 });
 ```
 
@@ -1247,61 +1289,93 @@ test("GET /api/funnels: sharing OFF, plain member → only own funnels", async (
 Run: `cd backend && npm test -- funnel.orgSharing`
 Expected: FAIL — funnels have no `ownerUserId`; sharing produces no fan-out.
 
-- [ ] **Step 3: Rewrite `GET /` in `funnel.ts`**
+- [ ] **Step 3: Rewrite `GET /` in `funnel.ts` using `listOrgVisibleItems`**
+
+Spec §3.3 requires reusing the existing `listOrgVisibleItems` helper — it supplies the established member-fanout and response caps (`MEMBER_FANOUT_CAP` / `PER_SOURCE_CAP` / `ORG_ITEMS_CAP` / `RESPONSE_CAP`) and dedups by id. Do **not** hand-roll the fan-out.
 
 In `backend/src/routes/funnel.ts`, add imports at the top:
 
 ```typescript
 import { userDb, orgDb } from "../services/db";
-import { isFeatureEffectivelyEnabled, MEMBER_FANOUT_CAP } from "../services/orgShareService";
+import { isFeatureEffectivelyEnabled, canEditItem, listOrgVisibleItems } from "../services/orgShareService";
+```
+
+Add this item type near the top of the file (after the existing `FunnelConfig` / `FunnelsSettings` interfaces):
+
+```typescript
+interface FunnelListItem {
+  configId: string;
+  name: string;
+  stages: FunnelStage[];
+  createdAt: string;
+  updatedAt: string;
+  ownerUserId: string;
+  ownerName: string;
+  canEdit: boolean;
+}
 ```
 
 Replace the `GET /` handler (lines 50-73) with:
 
 ```typescript
-// Get all funnels visible to the caller (own + org-shared)
+// Get all funnels visible to the caller (own + org-shared), each tagged with
+// its owner and a server-computed canEdit flag.
 router.get("/", async (req, res) => {
   try {
     const userId = (req as any).user.userId;
     const user = await userDb.getUserById(userId);
+    const ownName = user?.name || user?.email || "You";
 
-    const toArray = (funnels: FunnelsSettings, ownerUserId: string, ownerName: string) =>
-      Object.values(funnels).map((funnel) => ({
-        configId: `funnel:${funnel.id}`,
-        name: funnel.name,
-        stages: funnel.stages,
-        createdAt: funnel.createdAt,
-        updatedAt: funnel.updatedAt,
+    const toItems = (
+      funnels: FunnelsSettings,
+      ownerUserId: string,
+      ownerName: string,
+      canEdit: boolean,
+    ): FunnelListItem[] =>
+      Object.values(funnels).map((f) => ({
+        configId: `funnel:${f.id}`,
+        name: f.name,
+        stages: f.stages,
+        createdAt: f.createdAt,
+        updatedAt: f.updatedAt,
         ownerUserId,
         ownerName,
+        canEdit,
       }));
 
-    const ownName = user?.name || user?.email || "You";
-    const result = toArray(await getUserFunnels(userId), userId, ownName);
-
-    if (user?.orgId) {
-      const org = await orgDb.getOrgById(user.orgId);
-      const orgLike = org
-        ? { orgId: org.orgId, ownerUserId: org.ownerUserId, shareSettings: org.shareSettings }
-        : null;
-      const userLike = { userId, orgId: user.orgId, orgRole: user.orgRole };
-      if (org && isFeatureEffectivelyEnabled(userLike, orgLike, "funnels")) {
-        const members = await orgDb.getOrgMembers(user.orgId);
-        const others = members
-          .filter((m: { userId: string }) => m.userId !== userId)
-          .slice(0, MEMBER_FANOUT_CAP);
-        const memberFunnels = await Promise.all(
-          others.map(async (m: { userId: string }) => {
-            const memberUser = await userDb.getUserById(m.userId);
-            const name = memberUser?.name || memberUser?.email || "Org member";
-            return toArray(await getUserFunnels(m.userId), m.userId, name);
-          })
-        );
-        for (const arr of memberFunnels) result.push(...arr);
-      }
+    // No org → only the caller's own funnels.
+    if (!user?.orgId) {
+      const own = toItems(await getUserFunnels(userId), userId, ownName, true);
+      return res.json({ success: true, funnels: own, truncated: false });
     }
 
-    res.json({ success: true, funnels: result });
+    const org = await orgDb.getOrgById(user.orgId);
+    const orgLike = org
+      ? { orgId: org.orgId, ownerUserId: org.ownerUserId, shareSettings: org.shareSettings }
+      : null;
+    const userLike = { userId, orgId: user.orgId, orgRole: user.orgRole };
+    // Editors / org owner may edit every org funnel; plain members may not.
+    // canEditItem on a non-self item reduces to the caller's editor/admin
+    // status, so it is identical for every other member — compute it once.
+    const canEditOthers = canEditItem(
+      { userId: "__other__" }, userLike, orgLike, user.orgId, "funnels",
+    );
+
+    const result = await listOrgVisibleItems<FunnelListItem>({
+      callerUserId: userId,
+      orgId: user.orgId,
+      featureEnabled: isFeatureEffectivelyEnabled(userLike, orgLike, "funnels"),
+      getOwnerItems: async () => toItems(await getUserFunnels(userId), userId, ownName, true),
+      getMemberIds: async () => (await orgDb.getOrgMembers(user.orgId!)).map((m) => m.userId),
+      getItemsForOwner: async (ownerUserId) => {
+        const ownerUser = await userDb.getUserById(ownerUserId);
+        const name = ownerUser?.name || ownerUser?.email || "Org member";
+        return toItems(await getUserFunnels(ownerUserId), ownerUserId, name, canEditOthers);
+      },
+      getId: (f) => f.configId,
+    });
+
+    res.json({ success: true, funnels: result.items, truncated: result.truncated });
   } catch (error: any) {
     console.error("Error fetching funnels:", error);
     res.status(500).json({ success: false, message: "Error fetching funnels", error: error.message });
@@ -1309,7 +1383,7 @@ router.get("/", async (req, res) => {
 });
 ```
 
-(`name`/`email` field access uses `any`-typed users — matches the rest of `funnel.ts`. If `user.name` is not a real field, use `user?.email` only.)
+(`name`/`email` field access uses `any`-typed users — matches the rest of `funnel.ts`. If `user.name` is not a real field, `email` is the fallback. `listOrgVisibleItems` excludes the caller from `getMemberIds` itself, so `getItemsForOwner` is only ever called for other members — hence `canEditOthers`.)
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -1325,7 +1399,7 @@ Expected: no errors.
 
 ```bash
 git add backend/src/routes/funnel.ts backend/src/__tests__/funnel.orgSharing.test.ts
-git commit -m "feat(crm): fan out GET /api/funnels across org members"
+git commit -m "feat(crm): fan out GET /api/funnels via listOrgVisibleItems with canEdit"
 ```
 
 ---
@@ -1383,10 +1457,10 @@ Expected: FAIL — the item routes ignore `ownerUserId` and never gate.
 
 - [ ] **Step 3: Add a shared resolver helper in `funnel.ts`**
 
-Add imports (extend the Task 13 import line):
+Add `canViewItem` to the `orgShareService` import introduced in Task 13, so the line reads:
 
 ```typescript
-import { isFeatureEffectivelyEnabled, MEMBER_FANOUT_CAP, canViewItem, canEditItem } from "../services/orgShareService";
+import { isFeatureEffectivelyEnabled, canEditItem, canViewItem, listOrgVisibleItems } from "../services/orgShareService";
 ```
 
 Add this helper near the top of `funnel.ts` (after `saveUserFunnels`):
@@ -1580,6 +1654,8 @@ git commit -m "feat(crm): org-aware access gating on funnel item routes"
 **Files:**
 - Modify: `backend/src/routes/seo.ts` (funnel-metrics block, lines 678-742)
 - Test: `backend/src/__tests__/seo.orgAnalytics.test.ts` (extend)
+
+**Depends on Phase 1 Task 6** — this task edits the seo.ts funnel block that Task 6 rewrote (its "before" code below already reads `resolved.primaryPropertyId`). Run Phase 1 before this task.
 
 The funnel block currently reads `funnels_${req.user.userId}` — the viewer's own map. It must resolve a shared funnel for its owner via a `funnelOwnerId` query param.
 
@@ -1816,6 +1892,7 @@ In `SEO.tsx`, the `FunnelConfig` interface (line ~175) — add:
 ```typescript
   ownerUserId?: string;
   ownerName?: string;
+  canEdit?: boolean;
 ```
 
 - [ ] **Step 2: Show the "Shared by" badge in the funnel selector**
@@ -1826,9 +1903,11 @@ In the funnel selector rendering, for each funnel whose `ownerUserId` is set and
 
 Where `SEO.tsx` requests `/api/seo/metrics` with a `funnelId` param (`fetchMetrics` / `fetchFunnelMetricsOnly`, lines ~378-532), also pass `funnelOwnerId` — look up the selected funnel in the `funnels` array and append `params.funnelOwnerId = selectedFunnel.ownerUserId` when it is set.
 
-- [ ] **Step 4: Make shared funnels read-only for non-editors**
+- [ ] **Step 4: Drive funnel read-only state off the server's `canEdit`**
 
-When opening a funnel for editing (the `FunnelConfig` editor / edit dialog), a funnel owned by another member must be read-only unless the caller may edit it. The simplest reliable signal: attempt is gated server-side already (Task 14 `PUT` returns 403), but the UI should not offer a broken Save. Determine editability client-side: a funnel is editable if `!funnel.ownerUserId || funnel.ownerUserId === user?.userId` **or** the user is an org editor/owner for funnels. Since the customer-portal already loads `shareSettings` in `OrgSharingTab`, the lightest approach for `SEO.tsx` is: treat a funnel owned by another member as **read-only by default**, and rely on the 403 toast for the editor case — OR fetch `shareSettings` and compute edit rights. Implement read-only-by-default for other-owned funnels: pass a `readOnly` prop into the funnel editor that disables inputs and hides Save when `funnel.ownerUserId && funnel.ownerUserId !== user?.userId`.
+`GET /api/funnels` returns a server-computed `canEdit` per funnel (Task 13): `true` for the caller's own funnels and for shared funnels the caller may edit (a funnels editor or the org owner), `false` otherwise. The UI must **not** recompute permissions itself.
+
+When opening a funnel in the editor (the `FunnelConfig` editor / edit dialog), pass `readOnly={funnel.canEdit === false}`. This keeps a shared funnel **editable for editors and the org owner** (so E2E FS-13 passes) and read-only only for plain members.
 
 - [ ] **Step 5: Thread `readOnly` into `FunnelConfig.tsx`**
 
