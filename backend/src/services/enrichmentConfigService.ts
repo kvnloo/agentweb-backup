@@ -187,6 +187,14 @@ export interface ConfigServiceDeps {
   ): Promise<Record<string, SmartFieldClassification>>;
 }
 
+/** Subset of ConfigServiceDeps needed to PROCESS a config (resolve aliases,
+ *  classify smart fields, validate) without persisting it. Used by callers
+ *  that build a config in memory and run enrichment directly — e.g. Emma. */
+export type ConfigProcessingDeps = Pick<
+  ConfigServiceDeps,
+  'readListConfig' | 'llmInferAliases' | 'llmClassifySmartFields'
+>;
+
 // ─── Validation ───────────────────────────────────────────────────────────────
 
 class ConfigValidationError extends Error {
@@ -408,9 +416,14 @@ export async function getEnrichmentConfig(
   };
 }
 
-export async function setEnrichmentConfig(
+/**
+ * Process a raw enrichment config: resolve aliasFor (heuristic + LLM),
+ * restore + classify smart fields, validate, and stamp audit fields.
+ * Does NOT persist. setEnrichmentConfig = processEnrichmentConfig + write.
+ */
+export async function processEnrichmentConfig(
   input: { listId: string; userId: string; config: EnrichmentConfig },
-  deps: ConfigServiceDeps,
+  deps: ConfigProcessingDeps,
 ): Promise<{ config: EnrichmentConfig; warnings: string[] }> {
   // Step 1: heuristic alias inference (camelCase, synonym map, standard
   // columns). Cheap, no API call. Catches the easy 80% of cases.
@@ -559,8 +572,16 @@ export async function setEnrichmentConfig(
     updatedBy: input.userId,
   };
 
-  await deps.writeListConfig(input.listId, stamped);
   return { config: stamped, warnings };
+}
+
+export async function setEnrichmentConfig(
+  input: { listId: string; userId: string; config: EnrichmentConfig },
+  deps: ConfigServiceDeps,
+): Promise<{ config: EnrichmentConfig; warnings: string[] }> {
+  const { config, warnings } = await processEnrichmentConfig(input, deps);
+  await deps.writeListConfig(input.listId, config);
+  return { config, warnings };
 }
 
 export async function suggestFieldTypes(
