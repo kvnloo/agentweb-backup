@@ -87,6 +87,8 @@ interface User {
   orgId?: string;
   orgRole?: "owner" | "member";
   orgName?: string;
+  isOrgOwner?: boolean;
+  orgShareAnalyticsWithOrg?: boolean;
 }
 
 interface AdminContextType {
