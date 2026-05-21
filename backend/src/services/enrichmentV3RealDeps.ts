@@ -669,10 +669,18 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
         const items = await crmDb.batchGetLeads(listId, leadIds);
         return items as LeadRecord[];
       }
-      // Whole-list run → single Query page. No explicit limit: DDB returns
-      // up to ~1MB worth of items in one round-trip.
-      const result = await crmDb.getLeadsByListId(listId);
-      return (result?.items ?? []) as LeadRecord[];
+      // Whole-list run → page through the Query fully. A single
+      // getLeadsByListId call returns at most one ~1MB DDB page; without this
+      // loop, lists larger than that page are silently truncated and the
+      // remaining leads are never enriched.
+      const all: LeadRecord[] = [];
+      let startKey: any = undefined;
+      do {
+        const page = await crmDb.getLeadsByListId(listId, undefined, startKey);
+        all.push(...((page?.items ?? []) as LeadRecord[]));
+        startKey = page?.lastEvaluatedKey ?? null;
+      } while (startKey);
+      return all;
     },
 
     resolveIdentity: (input) => pureResolveIdentity(input, identityDeps),
