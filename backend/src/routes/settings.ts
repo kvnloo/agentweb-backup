@@ -1045,12 +1045,15 @@ router.get('/google-drive/folders/:folderId/files', authenticateToken, async (re
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Org branch: check folder is in the org's list and caller can view
+    // Org branch: check folder is in the org's list OR the user's own list (legacy), and caller can view
     if (user.orgId) {
       const org = await orgDb.getOrgById(user.orgId);
       if (!org) return res.status(404).json({ error: 'Org not found' });
       const orgFolders = org.googleDriveFolders || [];
-      if (!orgFolders.some((f: { folderId: string }) => f.folderId === folderId)) {
+      const userFolders = user.googleDriveFolders || [];
+      const folderInOrg = orgFolders.some((f: { folderId: string }) => f.folderId === folderId);
+      const folderOnUser = userFolders.some((f: { folderId: string }) => f.folderId === folderId);
+      if (!folderInOrg && !folderOnUser) {
         return res.status(403).json({ error: 'Folder not found in your org' });
       }
       const allowed = canViewItem(
