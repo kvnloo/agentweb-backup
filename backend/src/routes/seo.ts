@@ -7,8 +7,8 @@ import {
   getGoogleSearchConsoleAccessToken,
   getGoogleAnalyticsDataClient,
   getTechnicalSeoScore,
-  getGoogleAnalyticsProperties,
 } from "../services/seoService";
+import { resolveAnalyticsConfig } from "../services/analyticsConfigResolver";
 
 const router = express.Router();
 
@@ -26,11 +26,14 @@ router.get("/metrics", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Check if user has SEO domains or GA Property ID configured.
+    // Resolve the effective analytics config (org owner's when org sharing is on).
+    const resolved = await resolveAnalyticsConfig(user);
+
+    // Check if effective config has SEO domains or a GA property configured.
     // When ?domain= is passed (e.g. from a landing page link) we still proceed so the
     // frontend can show the "not configured yet" callout with setup instructions.
     const domainFilterParam = (req.query.domain as string) || null;
-    if ((!user.seoDomains || user.seoDomains.length === 0) && !user.googleAnalyticsPropertyId && !domainFilterParam) {
+    if (resolved.properties.length === 0 && resolved.seoDomains.length === 0 && !domainFilterParam) {
       return res.status(400).json({
         message: "No SEO domains or Google Analytics Property ID configured. Please configure SEO/AEO settings in the admin panel."
       });
@@ -336,7 +339,7 @@ router.get("/metrics", async (req, res) => {
     // For *.agentwebforms.com subdomains, also inject the platform-owned GA4 property from Secrets Manager
     // so traffic shows up without requiring per-user config.
     let gaMetricsArray: any[] = [];
-    let gaProperties = getGoogleAnalyticsProperties(user);
+    let gaProperties = resolved.properties;
 
     if (domainFilter) {
       const lpConfig = await getLandingPagesConfig();
@@ -385,9 +388,9 @@ router.get("/metrics", async (req, res) => {
             let dimensionFilter: any = undefined;
             const filterExpressions: any[] = [];
 
-            if (user.gaFilteredDomains && user.gaFilteredDomains.length > 0) {
+            if (resolved.gaFilteredDomains && resolved.gaFilteredDomains.length > 0) {
               filterExpressions.push(
-                ...user.gaFilteredDomains.map((domain: string) => ({
+                ...resolved.gaFilteredDomains.map((domain: string) => ({
                   notExpression: {
                     filter: {
                       fieldName: "hostName",
@@ -679,7 +682,7 @@ router.get("/metrics", async (req, res) => {
     let funnelMetrics: any = null;
     const funnelId = req.query.funnelId as string;
 
-    if (user.googleAnalyticsPropertyId && funnelId) {
+    if (resolved.primaryPropertyId && funnelId) {
       try {
         // Fetch funnel config from AW-Settings
         const AWS = require("aws-sdk");
@@ -722,7 +725,7 @@ router.get("/metrics", async (req, res) => {
 
             funnelMetrics = await calculateFunnelMetrics(
               gaClient,
-              user.googleAnalyticsPropertyId,
+              resolved.primaryPropertyId,
               { startDate: startDateStr, endDate: endDateStr },
               funnel.stages
             );
@@ -933,8 +936,11 @@ router.get("/product-metrics", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Check if user has product domain and GA Property ID configured
-    if (!user.productDomain || !user.googleAnalyticsPropertyId) {
+    // Resolve the effective analytics config (org owner's when org sharing is on).
+    const resolved = await resolveAnalyticsConfig(user);
+
+    // Check if effective config has a product domain and GA property configured
+    if (!resolved.productDomain || !resolved.primaryPropertyId) {
       return res.status(400).json({
         message: "Product domain or Google Analytics Property ID not configured. Please configure in the admin panel."
       });
@@ -973,7 +979,7 @@ router.get("/product-metrics", async (req, res) => {
     const startDateStr = startDate.toISOString().split("T")[0];
     const endDateStr = endDate.toISOString().split("T")[0];
 
-    const propertyId = user.googleAnalyticsPropertyId;
+    const propertyId = resolved.primaryPropertyId;
 
     // Fetch overall product metrics
     const [overallResponse] = await gaClient.runReport({
@@ -992,7 +998,7 @@ router.get("/product-metrics", async (req, res) => {
                 fieldName: "hostName",
                 stringFilter: {
                   matchType: "CONTAINS" as const,
-                  value: user.productDomain,
+                  value: resolved.productDomain,
                 },
               },
             },
@@ -1045,7 +1051,7 @@ router.get("/product-metrics", async (req, res) => {
                 fieldName: "hostName",
                 stringFilter: {
                   matchType: "CONTAINS" as const,
-                  value: user.productDomain,
+                  value: resolved.productDomain,
                 },
               },
             },
@@ -1109,7 +1115,7 @@ router.get("/product-metrics", async (req, res) => {
                 fieldName: "hostName",
                 stringFilter: {
                   matchType: "CONTAINS" as const,
-                  value: user.productDomain,
+                  value: resolved.productDomain,
                 },
               },
             },
@@ -1229,7 +1235,7 @@ router.get("/product-metrics", async (req, res) => {
       .sort((a, b) => b.totalDuration - a.totalDuration);
 
     res.json({
-      productDomain: user.productDomain,
+      productDomain: resolved.productDomain,
       metrics: {
         activeUsers,
         sessions,
