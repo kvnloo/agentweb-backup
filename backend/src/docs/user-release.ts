@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-20
+// Last updated: 2026-05-21
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,15 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-05-21',
+    changes: [
+      'Fixed: Lead Enrichment via Emma Now Fills Every Requested Field',
+      '- Asking Emma to enrich CRM leads now uses the same enrichment engine as the CRM page\'s Enrichment Config',
+      '- Previously some requested fields (such as LinkedIn summary, skills, headline, and location) could come back empty even though the job reported success',
+      '- Emma enrichment now also benefits from Apollo and LinkedIn structured-data lookups and the same accuracy safeguards used by the CRM page',
+    ],
+  },
   {
     date: '2026-05-20',
     changes: [
