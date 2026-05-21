@@ -13,6 +13,8 @@ jest.mock('../services/metaService', () => ({
     updateAdSet: jest.fn(),
     deleteAdSet: jest.fn(),
     getCampaign: jest.fn(),
+    updateCampaign: jest.fn(),
+    deleteCampaign: jest.fn(),
     listAdCreatives: jest.fn(),
     createAdCreative: jest.fn(),
     listAds: jest.fn(),
@@ -122,7 +124,7 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
 
     describe('updateMetaAdsAdSet', () => {
       it('should successfully update an ad set', async () => {
-        const params = { daily_budget: 2000 };
+        const params = { status: 'PAUSED' };
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
         (metaService.updateAdSet as jest.Mock).mockResolvedValue({ success: true });
@@ -131,6 +133,66 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
 
         expect(result.success).toBe(true);
         expect(result.message).toBe('Ad set updated successfully');
+      });
+
+      it('should convert daily_budget from dollars to cents before calling metaService', async () => {
+        const params = { daily_budget: 150 };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.updateAdSet as jest.Mock).mockResolvedValue({ success: true });
+
+        await agentModeService.updateMetaAdsAdSet('user123', 'adset_123', params);
+
+        expect(metaService.updateAdSet).toHaveBeenCalledWith(
+          'mock-access-token',
+          'adset_123',
+          expect.objectContaining({ daily_budget: 15000 })
+        );
+      });
+
+      it('should convert lifetime_budget from dollars to cents before calling metaService', async () => {
+        const params = { lifetime_budget: 500 };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.updateAdSet as jest.Mock).mockResolvedValue({ success: true });
+
+        await agentModeService.updateMetaAdsAdSet('user123', 'adset_123', params);
+
+        expect(metaService.updateAdSet).toHaveBeenCalledWith(
+          'mock-access-token',
+          'adset_123',
+          expect.objectContaining({ lifetime_budget: 50000 })
+        );
+      });
+
+      it('should convert bid_amount from dollars to cents before calling metaService', async () => {
+        const params = { bid_amount: 2.5 };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.updateAdSet as jest.Mock).mockResolvedValue({ success: true });
+
+        await agentModeService.updateMetaAdsAdSet('user123', 'adset_123', params);
+
+        expect(metaService.updateAdSet).toHaveBeenCalledWith(
+          'mock-access-token',
+          'adset_123',
+          expect.objectContaining({ bid_amount: 250 })
+        );
+      });
+
+      it('should not modify params without budget fields', async () => {
+        const params = { name: 'Renamed Ad Set', status: 'ACTIVE' };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.updateAdSet as jest.Mock).mockResolvedValue({ success: true });
+
+        await agentModeService.updateMetaAdsAdSet('user123', 'adset_123', params);
+
+        expect(metaService.updateAdSet).toHaveBeenCalledWith(
+          'mock-access-token',
+          'adset_123',
+          expect.objectContaining({ name: 'Renamed Ad Set', status: 'ACTIVE' })
+        );
       });
     });
 
@@ -476,6 +538,59 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
 
         expect(result.success).toBe(false);
         expect(result.message).toBe('Ad not found');
+      });
+    });
+  });
+
+  // ==================== CAMPAIGN UPDATE BUDGET CONVERSION ====================
+  describe('Campaign Update Budget Conversion', () => {
+    describe('updateMetaAdsCampaign', () => {
+      it('should convert budget_amount from dollars to cents when updating a campaign', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
+
+        await agentModeService.updateMetaAdsCampaign('user123', 'camp_123', { budget_amount: 150 });
+
+        expect(metaService.updateCampaign).toHaveBeenCalledWith(
+          'mock-access-token',
+          'camp_123',
+          expect.objectContaining({ daily_budget: 15000 })
+        );
+        const call = (metaService.updateCampaign as jest.Mock).mock.calls[0][2];
+        expect(call.budget_amount).toBeUndefined();
+      });
+
+      it('should not modify params without budget_amount', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
+
+        await agentModeService.updateMetaAdsCampaign('user123', 'camp_123', { name: 'New Name', status: 'PAUSED' });
+
+        expect(metaService.updateCampaign).toHaveBeenCalledWith(
+          'mock-access-token',
+          'camp_123',
+          expect.objectContaining({ name: 'New Name', status: 'PAUSED' })
+        );
+      });
+
+      it('should return success after updating campaign', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.updateMetaAdsCampaign('user123', 'camp_123', { status: 'PAUSED' });
+
+        expect(result.success).toBe(true);
+        expect(result.message).toBe('Campaign updated successfully');
+      });
+
+      it('should handle errors gracefully', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.updateCampaign as jest.Mock).mockRejectedValue(new Error('Campaign not found'));
+
+        const result = await agentModeService.updateMetaAdsCampaign('user123', 'camp_123', { status: 'PAUSED' });
+
+        expect(result.success).toBe(false);
+        expect(result.message).toBe('Campaign not found');
       });
     });
   });
