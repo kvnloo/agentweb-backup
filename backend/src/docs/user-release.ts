@@ -18,6 +18,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-21',
+    changes: [
+      'Fixed: CRM Enrichment Now Processes Every Lead in Large Lists',
+      '- Enriching a large lead list could silently stop after the first batch of leads, leaving the rest of the list un-enriched with no error',
+      '- Enrichment now pages through the entire list, so every lead is processed regardless of list size',
+    ],
+  },
+  {
     date: '2026-05-20',
     changes: [
       'Fixed: Emma Can Now Read Word Documents (.docx)',

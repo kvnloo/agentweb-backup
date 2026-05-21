@@ -26,6 +26,7 @@ import {
   type SiblingFieldMappingTable,
 } from './enrichmentSiblingConfigFields';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
+import { STANDARD_ENRICHABLE_FIELDS } from './enrichmentConfigService';
 
 // ─── Socket progress options ─────────────────────────────────────────────────
 //
@@ -212,11 +213,10 @@ export interface OrchestratorDeps {
 }
 
 /** Standard CRM lead columns — values for these field names go to top-level
- *  AW-Leads attributes via setLeadFields.topLevel (not customFields). Mirrors
- *  STANDARD_ENRICHABLE_FIELDS in enrichmentConfigService. */
-const STANDARD_LEAD_COLUMNS = new Set<string>([
-  'firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'notes', 'website',
-]);
+ *  AW-Leads attributes via setLeadFields.topLevel (not customFields). Derived
+ *  from STANDARD_ENRICHABLE_FIELDS plus `website` — a genuine top-level
+ *  AW-Leads column that is not part of the enrichable-fields list. */
+const STANDARD_LEAD_COLUMNS = new Set<string>([...STANDARD_ENRICHABLE_FIELDS, 'website']);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -337,7 +337,6 @@ function bucketByOverwritePolicy(
 type LeadFailureCategory =
   | 'identityResolution'
   | 'llmOrParse'
-  | 'searchWeb'
   | 'update';
 
 interface PerLeadOutcome {
@@ -795,8 +794,11 @@ export async function runEnrichment(
   const refreshSet = buildRefreshFieldsSet(input.refreshFields);
 
   // Build sibling field mapping table once per run (one LLM call for unaliased
-  // fields, canonical match is free). Passed to every processLead call.
-  const siblingMappingTable = await buildSiblingFieldMappingTable(workingConfig.fields);
+  // fields, canonical match is free). Passed to every processLead call. Skipped
+  // entirely when there are no leads — no processLead would consume it.
+  const siblingMappingTable: SiblingFieldMappingTable = leads.length > 0
+    ? await buildSiblingFieldMappingTable(workingConfig.fields)
+    : { canonical: new Map(), llm: new Map() };
   const configFieldsByName: Record<string, EnrichmentFieldConfig> = {};
   const fieldAliasMap: Record<string, string> = {};
   for (const f of workingConfig.fields) {
@@ -814,7 +816,6 @@ export async function runEnrichment(
   let identityResolutionFailed = 0;
   let apolloFailed = 0;
   let llmOrParseFailed = 0;
-  let searchWebFailed = 0;
   let updateFailed = 0;
 
   emitToRooms(progressEvent, {
@@ -864,12 +865,15 @@ export async function runEnrichment(
       ),
     );
 
+    // Pass 1 — tally counters and collect the leads that need a DB write.
+    // Counting is cheap and order-independent; the writes are the expensive
+    // part and are issued concurrently in pass 2.
+    const pendingWrites: Array<{ lead: LeadRecord; outcome: PerLeadOutcome }> = [];
     for (const { lead, outcome } of outcomes) {
       // Apollo failures are independent of pass/fail — count them regardless of outcome.
       if (outcome.apolloOrgFailed || outcome.apolloPersonFailed) apolloFailed += 1;
 
-      // Aggregate tier counts only on success or partial success — failed leads
-      // (identity / waterfall errors) contribute nothing useful to the breakdown.
+      // Aggregate tier counts only on success — failed leads contribute nothing.
       if (outcome.failureCategory === null) {
         for (const [groupName, counts] of outcome.perGroupTierFills.entries()) {
           tierBreakdown[groupName] = addTierCounts(tierBreakdown[groupName] ?? emptyTierCount(), counts);
@@ -882,9 +886,6 @@ export async function runEnrichment(
           continue;
         case 'llmOrParse':
           llmOrParseFailed += 1;
-          continue;
-        case 'searchWeb':
-          searchWebFailed += 1;
           continue;
         case 'update':
           updateFailed += 1;
@@ -905,9 +906,22 @@ export async function runEnrichment(
         previewSamples.push({ leadId: lead.leadId, extractedFields, meta });
         processed += 1;
       } else {
-        const wStart = Date.now();
-        const writeResult = await writeLeadOutcome(lead, outcome, input, deps);
-        console.log(`[v3][lead ${lead.leadId}] write in ${Date.now() - wStart}ms (ok=${writeResult.ok})`);
+        pendingWrites.push({ lead, outcome });
+      }
+    }
+
+    // Pass 2 — issue all writes for this chunk concurrently. Each write is an
+    // independent per-leadId DynamoDB update, so there is no ordering hazard.
+    if (pendingWrites.length > 0) {
+      const writeResults = await Promise.all(
+        pendingWrites.map(async ({ lead, outcome }) => {
+          const wStart = Date.now();
+          const writeResult = await writeLeadOutcome(lead, outcome, input, deps);
+          console.log(`[v3][lead ${lead.leadId}] write in ${Date.now() - wStart}ms (ok=${writeResult.ok})`);
+          return writeResult;
+        }),
+      );
+      for (const writeResult of writeResults) {
         if (writeResult.ok) {
           processed += 1;
         } else {
@@ -918,7 +932,7 @@ export async function runEnrichment(
 
     const completedSoFar = Math.min(i + CONCURRENCY, leads.length);
     const failedSoFar =
-      identityResolutionFailed + llmOrParseFailed + searchWebFailed + updateFailed;
+      identityResolutionFailed + llmOrParseFailed + updateFailed;
     emitToRooms(progressEvent, {
       runId,
       listId: input.listId,
@@ -944,7 +958,11 @@ export async function runEnrichment(
       apolloFailed,
       llmOrParseFailed,
       updateFailed,
-      searchWebFailed,
+      // v3 treats web-fetch failures as soft degradations — affected fields
+      // fall through to 'missing' rather than failing the lead — so there is
+      // no hard web-failure count. Kept at 0 for result-shape parity with the
+      // v2 path and the customer-portal failure-breakdown UI.
+      searchWebFailed: 0,
     },
     tierFillBreakdown: { total, ...tierBreakdown },
     durationMs: Date.now() - startedAt,
@@ -955,7 +973,7 @@ export async function runEnrichment(
   }
 
   const totalFailed =
-    identityResolutionFailed + llmOrParseFailed + searchWebFailed + updateFailed;
+    identityResolutionFailed + llmOrParseFailed + updateFailed;
   console.log(`[v3] runEnrichment DONE runId=${runId} processed=${processed} failed=${totalFailed} durationMs=${result.durationMs}`);
   emitToRooms(completeEvent, {
     runId,

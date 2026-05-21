@@ -10,6 +10,7 @@ import {
   suggestFieldTypes,
   processEnrichmentConfig,
   RESERVED_FIELD_NAMES,
+  STANDARD_ENRICHABLE_FIELDS,
   type ConfigServiceDeps,
 } from '../services/enrichmentConfigService';
 import type { EnrichmentConfig } from '../services/crmEnrichmentServiceV3';
@@ -1404,5 +1405,13 @@ describe('processEnrichmentConfig', () => {
       deps,
     );
     expect(config.fields[0].smartCondition).toBeUndefined();
+  });
+});
+
+describe('STANDARD_ENRICHABLE_FIELDS export', () => {
+  it('exports the 8 canonical standard lead columns', () => {
+    expect([...STANDARD_ENRICHABLE_FIELDS]).toEqual([
+      'firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'notes',
+    ]);
   });
 });
