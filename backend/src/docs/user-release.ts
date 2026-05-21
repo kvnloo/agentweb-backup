@@ -9,6 +9,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-21',
+    changes: [
+      'New: Organization-Wide Analytics Sharing',
+      '- Admins can now share an organization\'s analytics (Google Analytics, Search Console, Microsoft Clarity) with every member from the owner\'s configuration',
+      '- The whole team sees the same numbers and can monitor shared analytics dashboards together',
+    ],
+  },
+  {
     date: '2026-05-20',
     changes: [
       'Fixed: Emma Can Now Read Word Documents (.docx)',
