@@ -164,6 +164,24 @@ describe('pickPreviewLeadIds', () => {
     (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({ items: [] });
     await expect(pickPreviewLeadIds('list-1', undefined)).rejects.toThrow(/no leads/i);
   });
+
+  it('treats a non-array items response as an empty pool and throws', async () => {
+    // Exercises the `Array.isArray(result?.items) ? ... : []` false branch (line 98)
+    (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({ items: null });
+    await expect(pickPreviewLeadIds('list-1', undefined)).rejects.toThrow(/no leads/i);
+  });
+
+  it('treats a missing items field as an empty pool and throws', async () => {
+    // Exercises the `Array.isArray(result?.items) ? ... : []` false branch (line 98) via undefined
+    (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({});
+    await expect(pickPreviewLeadIds('list-1', undefined)).rejects.toThrow(/no leads/i);
+  });
+
+  it('treats a null DB result as an empty pool (optional-chaining null path, line 98)', async () => {
+    // Exercises the `result?.items` optional-chaining false branch when result itself is null
+    (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue(null);
+    await expect(pickPreviewLeadIds('list-1', undefined)).rejects.toThrow(/no leads/i);
+  });
 });
 
 describe('resolveExecuteLeadIds', () => {
@@ -179,5 +197,19 @@ describe('resolveExecuteLeadIds', () => {
     });
     const r = await resolveExecuteLeadIds('list-1', undefined);
     expect(r).toEqual({ leadIds: undefined, count: 2 });
+  });
+
+  it('treats a non-array items response as zero leads', async () => {
+    // Exercises the `Array.isArray(result?.items) ? ... : []` false branch (line 125)
+    (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({ items: null });
+    const r = await resolveExecuteLeadIds('list-1', undefined);
+    expect(r).toEqual({ leadIds: undefined, count: 0 });
+  });
+
+  it('treats a null DB result as zero leads (optional-chaining null path, line 125)', async () => {
+    // Exercises the `result?.items` optional-chaining false branch when result itself is null
+    (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue(null);
+    const r = await resolveExecuteLeadIds('list-1', undefined);
+    expect(r).toEqual({ leadIds: undefined, count: 0 });
   });
 });

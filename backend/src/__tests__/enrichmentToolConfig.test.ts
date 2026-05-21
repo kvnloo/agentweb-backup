@@ -58,6 +58,27 @@ describe('buildRawEnrichmentConfig', () => {
     expect(cfg.fields[0].name).toBe('industry');
     expect(cfg.fields[0].instruction).toBe('find it');
   });
+
+  it('throws when field name is not a string (non-string type coerced to empty)', () => {
+    // Exercises the `typeof f?.name === 'string' ? ... : ''` false branch (line 32)
+    expect(() =>
+      buildRawEnrichmentConfig([{ name: 123 as any, instruction: 'find it' }], 'user-1'),
+    ).toThrow(/name is required/);
+  });
+
+  it('throws when field instruction is not a string (non-string type coerced to empty)', () => {
+    // Exercises the `typeof f?.instruction === 'string' ? ... : ''` false branch (line 33)
+    expect(() =>
+      buildRawEnrichmentConfig([{ name: 'industry', instruction: null as any }], 'user-1'),
+    ).toThrow(/instruction is required/);
+  });
+
+  it('throws when a field item itself is null (optional-chaining null path)', () => {
+    // Exercises the `f?.name` optional-chaining null branch (line 32-33)
+    expect(() =>
+      buildRawEnrichmentConfig([null as any], 'user-1'),
+    ).toThrow(/name is required/);
+  });
 });
 
 describe('getEmmaEnrichMaxLeads', () => {
