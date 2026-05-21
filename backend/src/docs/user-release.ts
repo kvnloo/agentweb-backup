@@ -279,6 +279,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-21',
+    changes: [
+      'Fixed: Google Drive Folders Now Load Correctly in Knowledge Base for Org Members',
+      '- Users who added Google Drive folders before joining an organization were seeing the folders listed but getting errors when trying to load files',
+      '- Emma also could not access those Drive folders, making them invisible to AI tools',
+      '- Drive folders are now merged across the org and user records, so all previously configured folders work without any manual re-configuration',
+    ],
+  },
+  {
     date: '2026-05-17',
     changes: [
       'Fixed: Knowledge Bases with Content Were Not Appearing in the Knowledge Base Page',
