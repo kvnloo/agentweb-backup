@@ -1804,6 +1804,11 @@ export class AgentModeService {
       let lastToolSignature = '';
       let consecutiveRepeats = 0;
       const MAX_CONSECUTIVE_REPEATS = 3;
+      // Sliding-window loop detection: catches alternating/cycling patterns like
+      // navigate→screenshot→navigate→screenshot that evade the consecutive check
+      const toolSignatureHistory: string[] = [];
+      const SIGNATURE_HISTORY_WINDOW = 10;
+      const SIGNATURE_REPEAT_THRESHOLD = 3;
 
       // Track max_tokens continuations to prevent infinite continuation loops
       let maxTokensContinuations = 0;
@@ -2445,6 +2450,30 @@ export class AgentModeService {
           consecutiveRepeats = 0;
         }
         lastToolSignature = currentToolSignature;
+
+        // Sliding-window loop detection: catches alternating/cycling patterns like
+        // A→B→A→B→A that evade the consecutive-only check above
+        if (currentToolSignature) {
+          toolSignatureHistory.push(currentToolSignature);
+          if (toolSignatureHistory.length > SIGNATURE_HISTORY_WINDOW) {
+            toolSignatureHistory.shift();
+          }
+          if (toolSignatureHistory.length >= SIGNATURE_HISTORY_WINDOW) {
+            const sigCounts = new Map<string, number>();
+            for (const sig of toolSignatureHistory) {
+              sigCounts.set(sig, (sigCounts.get(sig) || 0) + 1);
+            }
+            const maxCount = Math.max(...sigCounts.values());
+            if (maxCount >= SIGNATURE_REPEAT_THRESHOLD) {
+              console.warn(`AgentMode: Detected cycling tool call pattern (${maxCount}x in last ${SIGNATURE_HISTORY_WINDOW} steps) in session ${sessionId}, injecting anti-loop warning`);
+              toolSignatureHistory.length = 0; // reset to avoid spamming
+              (messages as any[]).push({
+                role: 'user',
+                content: '[SYSTEM] You are stuck in a loop — you have been calling the same tools repeatedly without making meaningful progress. STOP. Do not navigate or take screenshots again. Provide your final response now based on what you have already observed.'
+              });
+            }
+          }
+        }
 
         // Do not append an assistant message; tool messages above are sufficient for model continuation
       }
