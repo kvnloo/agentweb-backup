@@ -22,6 +22,7 @@ import {
   pickPreviewLeadIds,
   resolveExecuteLeadIds,
 } from '../emma/enrichmentToolRunner';
+import { crmDb } from '../services/db';
 
 const SUMMARY = {
   runId: 'run-1',
@@ -131,5 +132,65 @@ describe('enrich_leads_execute', () => {
       ),
     ).rejects.toThrow(/no leads/i);
     expect(runEmmaEnrichment).not.toHaveBeenCalled();
+  });
+});
+
+describe('enrich_lead_custom', () => {
+  beforeEach(() => {
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+      leadId: 'lead-7',
+      customFields: { company_size: '200' },
+      title: 'CTO',
+    });
+  });
+
+  it('registers and requires list_id + lead_id + output_fields', () => {
+    const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+    expect(tool).toBeDefined();
+    expect(tool.definition.inputSchema.required).toEqual(
+      expect.arrayContaining(['list_id', 'lead_id', 'output_fields']),
+    );
+  });
+
+  it('runs V3 enrich mode on a single-lead batch and returns enriched values', async () => {
+    (runEmmaEnrichment as jest.Mock).mockResolvedValue({ ...SUMMARY, processedCount: 1 });
+    const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+    const result = await tool.execute(
+      {
+        list_id: 'list-abc',
+        lead_id: 'lead-7',
+        output_fields: [
+          { name: 'company_size', instruction: 'find headcount' },
+          { name: 'title', instruction: 'find their job title' },
+        ],
+      },
+      { userId: 'user1' },
+    );
+    expect(runEmmaEnrichment).toHaveBeenCalledWith(expect.objectContaining({
+      listId: 'list-abc',
+      userId: 'user1',
+      mode: 'enrich',
+      leadIds: ['lead-7'],
+    }));
+    expect(result.leadId).toBe('lead-7');
+    expect(result.enrichedValues).toEqual({ company_size: '200', title: 'CTO' });
+  });
+
+  it('rejects when output_fields is empty (via buildRawEnrichmentConfig)', async () => {
+    (runEmmaEnrichment as jest.Mock).mockRejectedValue(new Error('output_fields must be a non-empty array'));
+    const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+    await expect(
+      tool.execute({ list_id: 'l', lead_id: 'x', output_fields: [] }, { userId: 'user1' }),
+    ).rejects.toThrow(/non-empty/);
+  });
+
+  it('rejects when there is no user context', async () => {
+    const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+    await expect(
+      tool.execute(
+        { list_id: 'l', lead_id: 'x', output_fields: [{ name: 'f', instruction: 'i' }] },
+        {},
+      ),
+    ).rejects.toThrow(/Authentication required/);
   });
 });

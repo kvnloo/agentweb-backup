@@ -5751,117 +5751,80 @@ emmaToolRegistry.register({
   name: 'enrich_lead_custom',
   definition: {
     name: 'enrich_lead_custom',
-    description: `Enrich a single CRM lead with custom fields on demand, without needing to kick off a whole-list enrichment job.
+    description: `Enrich a single CRM lead with custom fields on demand, without running a whole-list job.
 
-Use this when the user wants to fill in specific missing information on one lead (e.g. "find this person's LinkedIn headline and company size") rather than a bulk batch. It wraps the existing CRM enrichment pipeline with a batch of 1, sourcing from web_search and linkedin by default.
+Use this when the user wants specific missing information filled on one lead (e.g. "find this person's LinkedIn headline and company size"). It runs the V3 enrichment engine on a batch of one. The response includes enrichedValues — a map of field name to the found value (null if nothing was found). Values are also persisted to the lead. Always show enrichedValues to the user; if a value is null, say nothing was found for that field.
 
-Pass one entry in custom_field_prompts per field you want populated. Each prompt is a natural-language description of what to find. The response includes enrichedValues — a map of field name to the found value (or null if nothing was found). Values are also persisted to the lead's customFields in DynamoDB. Always show enrichedValues to the user; if a value is null, tell them nothing was found for that field. Check warnings for skip reasons (e.g. personal email with no company).`,
+output_fields: one entry per field to populate, each with a snake_case "name", an "instruction" describing what to find, and an optional "overwrite_policy" (defaults to fill_if_empty; use always_overwrite to refresh a field that already has a value).`,
     inputSchema: {
       type: 'object',
       properties: {
-        list_id: {
-          type: 'string',
-          description: 'The CRM lead list ID containing the lead.'
-        },
-        lead_id: {
-          type: 'string',
-          description: 'The specific lead to enrich.'
-        },
-        custom_field_prompts: {
+        list_id: { type: 'string', description: 'The CRM lead list ID containing the lead.' },
+        lead_id: { type: 'string', description: 'The specific lead to enrich.' },
+        output_fields: {
           type: 'array',
-          description: 'One entry per custom field to populate. Each entry has a field_name (snake_case) and a prompt describing what to find.',
+          minItems: 1,
+          description: 'Fields to populate on this lead.',
           items: {
             type: 'object',
             properties: {
-              field_name: { type: 'string', description: 'Snake_case custom field name to populate, e.g. "company_size".' },
-              prompt: { type: 'string', description: 'Natural language description of what to find for this field.' },
-              data_type: { type: 'string', enum: ['text', 'number', 'date'], description: 'Expected data type. Defaults to text.' }
+              name: { type: 'string', description: 'Custom field name in snake_case.' },
+              instruction: { type: 'string', description: 'Natural-language description of what to find for this field.' },
+              overwrite_policy: {
+                type: 'string',
+                enum: ['fill_if_empty', 'always_overwrite'],
+                description: 'fill_if_empty (default): only set the field when empty. always_overwrite: refresh even when a value exists.',
+              },
             },
-            required: ['field_name', 'prompt']
+            required: ['name', 'instruction'],
           },
-          minItems: 1
         },
-        sources: {
-          type: 'array',
-          items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] },
-          description: 'Data sources to use. Defaults to ["web_search", "linkedin"] if omitted.'
-        },
-        force_overwrite: {
-          type: 'boolean',
-          description: 'If true, re-enrich fields that are already populated. Default true (custom enrichment is intentional).'
-        }
       },
-      required: ['list_id', 'lead_id', 'custom_field_prompts']
-    }
+      required: ['list_id', 'lead_id', 'output_fields'],
+    },
   },
   execute: async (args: any, context: any) => {
     if (!context?.userId) {
       throw new Error('Authentication required: no user context');
     }
-    const prompts: Array<{ field_name: string; prompt: string; data_type?: string }> = args.custom_field_prompts || [];
-    if (!Array.isArray(prompts) || prompts.length === 0) {
-      throw new Error('custom_field_prompts must be a non-empty array');
-    }
-
-    const outputFields = prompts.map(p => p.field_name);
-    const instruction = prompts
-      .map(p => {
-        const type = p.data_type && p.data_type !== 'text' ? ` (${p.data_type})` : '';
-        return `- ${p.field_name}${type}: ${p.prompt}`;
-      })
-      .join('\n');
-    // Pass per-field prompts to the cluster service as field descriptions so
-    // any ungrouped fields get a search query tuned to what we're looking for.
-    const fieldDescriptions: Record<string, string> = {};
-    for (const p of prompts) {
-      if (p.field_name && p.prompt) fieldDescriptions[p.field_name] = p.prompt;
-    }
-    const sources = Array.isArray(args.sources) && args.sources.length > 0
-      ? args.sources
-      : ['web_search', 'linkedin'];
-
-    const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
-    const { crmDb } = await import('../services/db');
-    const service = new CrmEnrichmentService();
-    const result = await service.execute({
+    const { runEmmaEnrichment } = await import('./enrichmentToolRunner');
+    const summary = await runEmmaEnrichment({
       listId: args.list_id,
       userId: context.userId,
-      instruction,
-      outputFields,
-      sources,
+      outputFields: args.output_fields,
+      mode: 'enrich',
       leadIds: [args.lead_id],
-      fieldDescriptions,
-      forceOverwrite: args.force_overwrite !== false,
-    }, context.socketId, context.socketEmit ? { socketEmit: context.socketEmit } : undefined);
+      socketId: context.socketId,
+      socketEmit: context.socketEmit,
+    });
 
-    // Fetch the lead after enrichment so we can return the actual enriched values
-    let enrichedValues: Record<string, string | null> = {};
-    if (result.processedCount > 0) {
+    // Read the lead back so we can return the actual enriched values.
+    // V3 writes standard columns top-level and custom names into customFields.
+    const enrichedValues: Record<string, string | null> = {};
+    if (summary.processedCount > 0) {
       try {
-        const lead = await crmDb.getLeadById(args.list_id, args.lead_id);
-        if (lead?.customFields) {
-          for (const field of outputFields) {
-            enrichedValues[field] = lead.customFields[field] ?? null;
-          }
+        const { crmDb } = await import('../services/db');
+        const lead: any = await crmDb.getLeadById(args.list_id, args.lead_id);
+        const customFields = (lead?.customFields ?? {}) as Record<string, string>;
+        for (const f of (args.output_fields as Array<{ name: string }>)) {
+          enrichedValues[f.name] = customFields[f.name] ?? lead?.[f.name] ?? null;
         }
       } catch {
-        // Non-fatal — enrichment succeeded, values are in DB
+        // Non-fatal — enrichment succeeded, values are in the DB.
       }
     }
 
     return {
       leadId: args.lead_id,
       listId: args.list_id,
-      outputFields,
       enrichedValues,
-      processedCount: result.processedCount,
-      failedCount: result.failedCount,
-      skippedCount: result.skippedCount,
-      failureBreakdown: result.failureBreakdown,
-      warnings: result.warnings,
-      jobId: result.jobId,
+      runId: summary.runId,
+      processedCount: summary.processedCount,
+      failedCount: summary.failedCount,
+      failureBreakdown: summary.failureBreakdown,
+      warnings: summary.warnings,
     };
-  }
+  },
 });
 
 // ─── Scheduled Chat tools (bridged from mcpToolRegistry / apiTools.ts) ───────
