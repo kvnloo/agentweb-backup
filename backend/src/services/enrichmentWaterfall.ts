@@ -65,7 +65,7 @@ function resolveApolloWaitMs(ctx: WaterfallContext): number {
  * is present. All other terminal states (no_email, rejected, timeout)
  * resolve to null so the caller falls through to Tier 4.
  */
-async function waitForApolloAsyncResult(
+export async function waitForApolloAsyncResult(
   requestId: string,
   budgetMs: number,
 ): Promise<{ email: string; emailStatus?: string } | null> {

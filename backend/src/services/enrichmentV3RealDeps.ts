@@ -18,6 +18,7 @@ import { resolveIdentity as pureResolveIdentity } from './enrichmentIdentityReso
 import { runWaterfall as pureRunWaterfall } from './enrichmentGroupWaterfall';
 import { apolloAsyncRequestCacheKey, APOLLO_SCHEMA_VERSION } from './apolloCacheKeys';
 import { FIELD_GROUPS } from './enrichmentGroups';
+import { waitForApolloAsyncResult } from './enrichmentWaterfall';
 import { STANDARD_ENRICHABLE_FIELDS } from './enrichmentConfigService';
 import {
   getRawDataFromCache,
@@ -226,32 +227,12 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
               cacheType: 'apollo',
             });
           }
-          // Inline polling logic: up to 30s with backoff schedule.
-          const budgetMs = 30_000;
-          if (key) {
-            const intervals = [2000, 5000, 10000, 15000];
-            let attempt = 0;
-            const start = Date.now();
-            while (true) {
-              const remaining = budgetMs - (Date.now() - start);
-              if (remaining <= 0) return null;
-              const row: any = await crmDb.getEnrichmentCacheItem(key.canonicalId, key.sk).catch(() => null);
-              const status = row?.rawData?.status;
-              if (status === 'completed') {
-                const result = row.rawData.result || {};
-                if (typeof result.email === 'string' && result.email.length > 0) {
-                  return { email: result.email, emailStatus: result.emailStatus };
-                }
-                return null;
-              }
-              if (status === 'no_email' || status === 'rejected') return null;
-              const remainingAfterRead = budgetMs - (Date.now() - start);
-              if (remainingAfterRead <= 0) return null;
-              const baseDelay = intervals[Math.min(attempt, intervals.length - 1)];
-              const delay = Math.min(baseDelay, remainingAfterRead);
-              await new Promise((r) => setTimeout(r, delay));
-              attempt++;
-            }
+          // Poll the placeholder row for the webhook result — shared logic
+          // with the Tier 3 waterfall path. 30s budget: the identity path
+          // waits less than the waterfall's configurable 90s default.
+          const polled = await waitForApolloAsyncResult(f.asyncRequestId, 30_000);
+          if (polled?.email) {
+            return { email: polled.email, emailStatus: polled.emailStatus };
           }
         }
         return null;
