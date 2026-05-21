@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-21',
     changes: [
+      'Fixed: Sequence Auto-Enroll Section No Longer Shows Unrelated Lists',
+      '- The AUTO-ENROLL section in a sequence detail view was showing every list that ever had a lead manually enrolled — even lists the user never configured for auto-enrollment',
+      '- Now only lists explicitly enabled for auto-enrollment are shown',
+    ],
+  },
+  {
+    date: '2026-05-21',
+    changes: [
       'Fixed: Lead Enrichment via Emma Now Fills Every Requested Field',
       '- Asking Emma to enrich CRM leads now uses the same enrichment engine as the CRM page\'s Enrichment Config',
       '- Previously some requested fields (such as LinkedIn summary, skills, headline, and location) could come back empty even though the job reported success',
