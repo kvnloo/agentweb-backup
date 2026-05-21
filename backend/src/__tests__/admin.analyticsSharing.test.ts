@@ -22,7 +22,9 @@ jest.mock("../middleware/auth", () => ({
 }));
 
 jest.mock("../services/db", () => ({
-  userDb: {},
+  userDb: {
+    getAllUsers: jest.fn(),
+  },
   taskDb: {},
   subscriberDb: {},
   crmDb: {},
@@ -32,8 +34,18 @@ jest.mock("../services/db", () => ({
   },
 }));
 
-import { orgDb } from "../services/db";
+// Stub settingsService so the user-list handler's Clarity replay-URL batch
+// fetch resolves cleanly and the endpoint returns 200.
+jest.mock("../services/settingsService", () => ({
+  settingsService: {
+    getSetting: jest.fn().mockResolvedValue(null),
+    setSetting: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
+import { orgDb, userDb } from "../services/db";
 const mockOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 
 const adminToken = jwt.sign(
   { userId: "admin-1", email: "admin@example.com", isAdmin: true },
@@ -88,5 +100,31 @@ describe("PATCH /api/admin/orgs/:orgId/analytics-sharing", () => {
       .set("Authorization", `Bearer ${adminToken}`)
       .send({});
     expect(res.status).toBe(400);
+  });
+});
+
+describe("GET /api/admin/users", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test("user-list payload stamps isOrgOwner and orgShareAnalyticsWithOrg", async () => {
+    // two users in org-1: owner u-owner, member u-member
+    mockUserDb.getAllUsers.mockResolvedValue([
+      { userId: "u-owner", email: "o@x.com", orgId: "org-1" },
+      { userId: "u-member", email: "m@x.com", orgId: "org-1" },
+    ] as any);
+    mockOrgDb.getOrgById.mockResolvedValue({ orgId: "org-1", name: "Acme", ownerUserId: "u-owner", shareAnalyticsWithOrg: true } as any);
+
+    const res = await request(app)
+      .get("/api/admin/users")
+      .set("Authorization", `Bearer ${adminToken}`);
+
+    const owner = res.body.find((u: any) => u.userId === "u-owner");
+    const member = res.body.find((u: any) => u.userId === "u-member");
+    expect(owner.isOrgOwner).toBe(true);
+    expect(member.isOrgOwner).toBe(false);
+    expect(owner.orgShareAnalyticsWithOrg).toBe(true);
+    expect(member.orgShareAnalyticsWithOrg).toBe(true);
   });
 });

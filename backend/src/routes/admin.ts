@@ -539,18 +539,25 @@ router.get("/users", async (req, res) => {
       };
     });
 
-    // Batch-fetch org names for users who belong to an org
+    // Batch-fetch org name + owner + analytics-sharing flag for users in an org
     const orgIds = [...new Set(sanitized.filter((u: any) => u.orgId).map((u: any) => u.orgId as string))];
-    const orgMap: Record<string, string> = {};
+    const orgMap: Record<string, { name: string; ownerUserId: string; shareAnalyticsWithOrg: boolean }> = {};
     await Promise.all(
       orgIds.map(async (orgId) => {
         const org = await orgDb.getOrgById(orgId).catch(() => null);
-        if (org) orgMap[orgId] = org.name;
+        if (org) orgMap[orgId] = {
+          name: org.name,
+          ownerUserId: org.ownerUserId,
+          shareAnalyticsWithOrg: !!org.shareAnalyticsWithOrg,
+        };
       })
     );
     for (const user of sanitized) {
-      if (user.orgId && orgMap[user.orgId]) {
-        user.orgName = orgMap[user.orgId];
+      const orgInfo = user.orgId ? orgMap[user.orgId] : undefined;
+      if (orgInfo) {
+        user.orgName = orgInfo.name;
+        user.isOrgOwner = orgInfo.ownerUserId === user.userId;
+        user.orgShareAnalyticsWithOrg = orgInfo.shareAnalyticsWithOrg;
       }
     }
 
