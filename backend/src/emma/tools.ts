@@ -5624,315 +5624,208 @@ emmaToolRegistry.register({
   name: 'enrich_leads_preview',
   definition: {
     name: 'enrich_leads_preview',
-    description: `Preview a CRM lead enrichment job. Processes 2 sample leads to show what the enrichment will produce before committing to the full batch.
+    description: `Preview a CRM lead enrichment job before running the full batch. Runs the V3 enrichment engine in preview mode on 2 sample leads and returns what it would produce.
 
-Returns: totalLeads (total in list), leadsToProcess (would be enriched), alreadyEnriched (already have all fields), and samples (up to 2 leads with their enrichedFields). In enrichedFields, a null value means nothing was found for that field — tell the user "not found" rather than showing null. Show the sample results to the user and ask them to confirm quality before proceeding.
+Returns: runId, processedCount (the 2 sampled leads), and samples — each with leadId and enrichedFields. In enrichedFields a missing value means nothing was found; tell the user "not found" rather than showing null. Show the samples and ask the user to confirm before calling enrich_leads_execute.
 
-After showing the preview, ask the user to confirm before calling enrich_leads_execute.
-
-Field and source guidance:
-- output_fields: one snake_case field per distinct data point. Numeric values (dates, counts, amounts), categorical values (industry, funding stage), URLs (linkedin_url), and prose summaries (company_profile) each get their own field. When a prose request names sub-items ("profile describing industry, employee count, products"), create the prose field PLUS a separate field for each named item.
-- sources_per_field: map each field to its source. Use "web_search" for company info, funding, tech stack, company LinkedIn URL. Use "linkedin" ONLY for the lead's personal LinkedIn profile (field name: linkedin_url). Use "existing_data" for fields derivable from existing lead data.
-- field_descriptions: short natural-language description of each output field (what to find / where it lives). Required for any field that isn't a well-known canonical field — these descriptions guide the per-field web search. Common fields like industry, funding_stage, employee_count are auto-grouped and don't need a description; uncommon or domain-specific fields do (e.g. {"product_certifications": "ISO/SOC2/HIPAA certifications the company holds"}).
-- linkedin_search_template: set to "{{firstName}} {{lastName}} {{company}}" when any field uses the "linkedin" source; omit otherwise.
-
-Search queries are now built automatically per field group — do not pass a single global query template.`,
+output_fields guidance: one entry per distinct data point. Each entry has a snake_case "name", an "instruction" (what to find / where it lives), and an optional "overwrite_policy". Numeric values, categorical values, URLs, and prose summaries each get their own field. The engine routes data sources (Apollo, LinkedIn, web search) automatically — you do not specify sources. If the result includes fieldRemaps, tell the user which requested fields were mapped onto existing CRM columns to avoid duplicates.`,
     inputSchema: {
       type: 'object',
       properties: {
-        list_id: {
-          type: 'string',
-          description: 'The CRM lead list ID to enrich.'
-        },
-        instruction: {
-          type: 'string',
-          description: 'Natural language instruction for what to enrich (e.g. "Determine company size and industry").'
-        },
+        list_id: { type: 'string', description: 'The CRM lead list ID to enrich.' },
         output_fields: {
           type: 'array',
-          items: { type: 'string' },
-          description: 'Array of custom field names to populate in snake_case. One field per distinct data point — numeric values, categorical values, URLs, and prose summaries each get their own field.'
-        },
-        sources: {
-          type: 'array',
-          items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] },
-          description: 'Union of all data sources used across all fields. web_search: searches the web. linkedin: looks up personal LinkedIn profiles. existing_data: infers from existing lead fields.'
-        },
-        sources_per_field: {
-          type: 'object',
-          additionalProperties: {
-            type: 'array',
-            items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] }
-          },
-          description: 'Per-field source mapping. Key: field name, Value: array of sources for that field. "linkedin" source is ONLY for the lead\'s personal LinkedIn profile (linkedin_url). All other fields use "web_search". Falls back to job-level sources when absent for a field.'
-        },
-        field_descriptions: {
-          type: 'object',
-          additionalProperties: { type: 'string' },
-          description: 'Short natural-language description of each output field. Key: field name (snake_case), Value: 1-line description of what to find. Required for fields that are not well-known canonical fields. Used by the clustering service to build per-field web searches. Example: {"product_certifications": "ISO/SOC2/HIPAA certifications the company holds", "ideal_customer_profile": "type of customer the company sells to"}'
-        },
-        linkedin_search_template: {
-          type: 'string',
-          description: 'LinkedIn person search query. Set to "{{firstName}} {{lastName}} {{company}}" when any field uses the "linkedin" source. Omit if no LinkedIn fields.'
-        },
-        filters: {
-          type: 'array',
+          minItems: 1,
+          description: 'Fields to populate. One entry per distinct data point.',
           items: {
             type: 'object',
             properties: {
-              field: { type: 'string' },
-              operator: { type: 'string', enum: ['equals', 'not_equals', 'contains', 'is_empty', 'is_not_empty'] },
-              value: {}
+              name: { type: 'string', description: 'Custom field name in snake_case, e.g. "funding_stage".' },
+              instruction: { type: 'string', description: 'Natural-language description of what to find for this field.' },
+              overwrite_policy: {
+                type: 'string',
+                enum: ['fill_if_empty', 'always_overwrite'],
+                description: 'fill_if_empty (default): only set the field when it is currently empty. always_overwrite: refresh even when a value already exists.',
+              },
             },
-            required: ['field', 'operator']
+            required: ['name', 'instruction'],
           },
-          description: 'Optional filters to narrow which leads to enrich.'
         },
-        force_overwrite: {
-          type: 'boolean',
-          description: 'If true, re-enrich leads that already have these fields populated. Default false.'
+        lead_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional. When provided, the 2 preview samples are drawn from this subset.',
         },
-        force_refresh_cache: {
-          type: 'boolean',
-          description: 'If true, bypass the raw data cache and re-fetch from web search / LinkedIn APIs. Use when cached data is known to be stale. Default false.'
-        }
       },
-      required: ['list_id', 'instruction', 'output_fields', 'sources']
-    }
+      required: ['list_id', 'output_fields'],
+    },
   },
   execute: async (args: any, context: any) => {
     if (!context?.userId) {
       throw new Error('Authentication required: no user context');
     }
-    const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
-    const service = new CrmEnrichmentService();
-    return await service.preview({
+    const { runEmmaEnrichment, pickPreviewLeadIds } = await import('./enrichmentToolRunner');
+    const leadIds = await pickPreviewLeadIds(args.list_id, args.lead_ids);
+    return await runEmmaEnrichment({
       listId: args.list_id,
       userId: context.userId,
-      instruction: args.instruction,
       outputFields: args.output_fields,
-      sources: args.sources,
-      sourcesPerField: args.sources_per_field,
-      linkedinSearchTemplate: args.linkedin_search_template,
-      fieldDescriptions: args.field_descriptions,
-      filters: args.filters,
-      forceOverwrite: args.force_overwrite,
-      forceRefreshCache: args.force_refresh_cache,
+      mode: 'preview',
+      leadIds,
+      socketId: context.socketId,
+      socketEmit: context.socketEmit,
     });
-  }
+  },
 });
 
 emmaToolRegistry.register({
   name: 'enrich_leads_execute',
   definition: {
     name: 'enrich_leads_execute',
-    description: `Execute a CRM lead enrichment job. Processes all matching leads in parallel, enriching custom fields using AI and the specified data sources.
+    description: `Execute a CRM lead enrichment job on the V3 engine. Processes the list's leads in parallel, enriching the requested fields from Apollo, LinkedIn, and web search automatically.
 
-Progress updates are sent via Socket.IO in real-time. This call blocks until the full job completes, then returns final counts: processedCount, failedCount, skippedCount, and failureBreakdown. A lead is skipped when it has only a personal email (gmail, etc.) and no company name — check warnings for details.
+Progress updates stream via Socket.IO. This call blocks until the job completes, then returns runId, processedCount, failedCount, and failureBreakdown.
 
-Call enrich_leads_preview first to show the user what will happen before executing.
-
-Pass the same output_fields, sources_per_field, field_descriptions, and linkedin_search_template used in the preview call.`,
+Call enrich_leads_preview first and let the user confirm. Pass the same output_fields used in the preview. Large lists are capped — if the list is over the limit, narrow it with lead_ids or tell the user to run a full enrichment from the CRM page. If the result includes fieldRemaps, tell the user which requested fields were mapped onto existing CRM columns to avoid duplicates.`,
     inputSchema: {
       type: 'object',
       properties: {
-        list_id: {
-          type: 'string',
-          description: 'The CRM lead list ID to enrich.'
-        },
-        instruction: {
-          type: 'string',
-          description: 'Natural language instruction for what to enrich.'
-        },
+        list_id: { type: 'string', description: 'The CRM lead list ID to enrich.' },
         output_fields: {
           type: 'array',
-          items: { type: 'string' },
-          description: 'Array of custom field names to populate in snake_case. One field per distinct data point — numeric values, categorical values, URLs, and prose summaries each get their own field.'
-        },
-        sources: {
-          type: 'array',
-          items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] },
-          description: 'Union of all data sources used across all fields.'
-        },
-        sources_per_field: {
-          type: 'object',
-          additionalProperties: {
-            type: 'array',
-            items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] }
-          },
-          description: 'Per-field source mapping. Key: field name, Value: array of sources for that field. "linkedin" source is ONLY for the lead\'s personal LinkedIn profile (linkedin_url). All other fields use "web_search".'
-        },
-        field_descriptions: {
-          type: 'object',
-          additionalProperties: { type: 'string' },
-          description: 'Short natural-language description of each output field. Key: field name (snake_case), Value: 1-line description of what to find. Required for non-canonical fields. Used by the clustering service to build per-field web searches.'
-        },
-        linkedin_search_template: {
-          type: 'string',
-          description: 'LinkedIn person search query. Set to "{{firstName}} {{lastName}} {{company}}" when any field uses the "linkedin" source. Omit if no LinkedIn fields.'
-        },
-        filters: {
-          type: 'array',
+          minItems: 1,
+          description: 'Fields to populate. One entry per distinct data point.',
           items: {
             type: 'object',
             properties: {
-              field: { type: 'string' },
-              operator: { type: 'string', enum: ['equals', 'not_equals', 'contains', 'is_empty', 'is_not_empty'] },
-              value: {}
+              name: { type: 'string', description: 'Custom field name in snake_case.' },
+              instruction: { type: 'string', description: 'Natural-language description of what to find for this field.' },
+              overwrite_policy: {
+                type: 'string',
+                enum: ['fill_if_empty', 'always_overwrite'],
+                description: 'fill_if_empty (default): only set the field when empty. always_overwrite: refresh even when a value exists.',
+              },
             },
-            required: ['field', 'operator']
+            required: ['name', 'instruction'],
           },
-          description: 'Optional filters to narrow which leads to enrich.'
         },
-        force_overwrite: {
-          type: 'boolean',
-          description: 'If true, re-enrich leads that already have these fields populated. Default false.'
+        lead_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional subset of lead IDs to enrich. Omit to enrich the whole list.',
         },
-        force_refresh_cache: {
-          type: 'boolean',
-          description: 'If true, bypass the raw data cache and re-fetch from web search / LinkedIn APIs. Use when cached data is known to be stale. Default false.'
-        }
       },
-      required: ['list_id', 'instruction', 'output_fields', 'sources']
-    }
+      required: ['list_id', 'output_fields'],
+    },
   },
   execute: async (args: any, context: any) => {
     if (!context?.userId) {
       throw new Error('Authentication required: no user context');
     }
-    const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
-    const service = new CrmEnrichmentService();
-    return await service.execute({
+    const { runEmmaEnrichment, resolveExecuteLeadIds } = await import('./enrichmentToolRunner');
+    const { getEmmaEnrichMaxLeads } = await import('./enrichmentToolConfig');
+    const { leadIds, count } = await resolveExecuteLeadIds(args.list_id, args.lead_ids);
+    if (count === 0) {
+      throw new Error('This list has no leads to enrich.');
+    }
+    const max = getEmmaEnrichMaxLeads();
+    if (count > max) {
+      throw new Error(
+        `This run targets ${count} leads, over the ${max}-lead limit for enrichment through chat. ` +
+        `Narrow it with lead_ids, or run a full enrichment from the CRM page's Enrichment Config.`,
+      );
+    }
+    return await runEmmaEnrichment({
       listId: args.list_id,
       userId: context.userId,
-      instruction: args.instruction,
       outputFields: args.output_fields,
-      sources: args.sources,
-      sourcesPerField: args.sources_per_field,
-      linkedinSearchTemplate: args.linkedin_search_template,
-      fieldDescriptions: args.field_descriptions,
-      filters: args.filters,
-      forceOverwrite: args.force_overwrite,
-      forceRefreshCache: args.force_refresh_cache,
-    }, context.socketId, context.socketEmit ? { socketEmit: context.socketEmit } : undefined);
-  }
+      mode: 'enrich',
+      leadIds,
+      socketId: context.socketId,
+      socketEmit: context.socketEmit,
+    });
+  },
 });
 
 emmaToolRegistry.register({
   name: 'enrich_lead_custom',
   definition: {
     name: 'enrich_lead_custom',
-    description: `Enrich a single CRM lead with custom fields on demand, without needing to kick off a whole-list enrichment job.
+    description: `Enrich a single CRM lead with custom fields on demand, without running a whole-list job.
 
-Use this when the user wants to fill in specific missing information on one lead (e.g. "find this person's LinkedIn headline and company size") rather than a bulk batch. It wraps the existing CRM enrichment pipeline with a batch of 1, sourcing from web_search and linkedin by default.
+Use this when the user wants specific missing information filled on one lead (e.g. "find this person's LinkedIn headline and company size"). It runs the V3 enrichment engine on a batch of one. The response includes enrichedValues — a map of field name to the found value (null if nothing was found). Values are also persisted to the lead. Always show enrichedValues to the user; if a value is null, say nothing was found for that field.
 
-Pass one entry in custom_field_prompts per field you want populated. Each prompt is a natural-language description of what to find. The response includes enrichedValues — a map of field name to the found value (or null if nothing was found). Values are also persisted to the lead's customFields in DynamoDB. Always show enrichedValues to the user; if a value is null, tell them nothing was found for that field. Check warnings for skip reasons (e.g. personal email with no company).`,
+output_fields: one entry per field to populate, each with a snake_case "name", an "instruction" describing what to find, and an optional "overwrite_policy" (defaults to fill_if_empty; use always_overwrite to refresh a field that already has a value). If the result includes fieldRemaps, tell the user which requested fields were mapped onto existing CRM columns to avoid duplicates.`,
     inputSchema: {
       type: 'object',
       properties: {
-        list_id: {
-          type: 'string',
-          description: 'The CRM lead list ID containing the lead.'
-        },
-        lead_id: {
-          type: 'string',
-          description: 'The specific lead to enrich.'
-        },
-        custom_field_prompts: {
+        list_id: { type: 'string', description: 'The CRM lead list ID containing the lead.' },
+        lead_id: { type: 'string', description: 'The specific lead to enrich.' },
+        output_fields: {
           type: 'array',
-          description: 'One entry per custom field to populate. Each entry has a field_name (snake_case) and a prompt describing what to find.',
+          minItems: 1,
+          description: 'Fields to populate on this lead.',
           items: {
             type: 'object',
             properties: {
-              field_name: { type: 'string', description: 'Snake_case custom field name to populate, e.g. "company_size".' },
-              prompt: { type: 'string', description: 'Natural language description of what to find for this field.' },
-              data_type: { type: 'string', enum: ['text', 'number', 'date'], description: 'Expected data type. Defaults to text.' }
+              name: { type: 'string', description: 'Custom field name in snake_case.' },
+              instruction: { type: 'string', description: 'Natural-language description of what to find for this field.' },
+              overwrite_policy: {
+                type: 'string',
+                enum: ['fill_if_empty', 'always_overwrite'],
+                description: 'fill_if_empty (default): only set the field when empty. always_overwrite: refresh even when a value exists.',
+              },
             },
-            required: ['field_name', 'prompt']
+            required: ['name', 'instruction'],
           },
-          minItems: 1
         },
-        sources: {
-          type: 'array',
-          items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] },
-          description: 'Data sources to use. Defaults to ["web_search", "linkedin"] if omitted.'
-        },
-        force_overwrite: {
-          type: 'boolean',
-          description: 'If true, re-enrich fields that are already populated. Default true (custom enrichment is intentional).'
-        }
       },
-      required: ['list_id', 'lead_id', 'custom_field_prompts']
-    }
+      required: ['list_id', 'lead_id', 'output_fields'],
+    },
   },
   execute: async (args: any, context: any) => {
     if (!context?.userId) {
       throw new Error('Authentication required: no user context');
     }
-    const prompts: Array<{ field_name: string; prompt: string; data_type?: string }> = args.custom_field_prompts || [];
-    if (!Array.isArray(prompts) || prompts.length === 0) {
-      throw new Error('custom_field_prompts must be a non-empty array');
-    }
-
-    const outputFields = prompts.map(p => p.field_name);
-    const instruction = prompts
-      .map(p => {
-        const type = p.data_type && p.data_type !== 'text' ? ` (${p.data_type})` : '';
-        return `- ${p.field_name}${type}: ${p.prompt}`;
-      })
-      .join('\n');
-    // Pass per-field prompts to the cluster service as field descriptions so
-    // any ungrouped fields get a search query tuned to what we're looking for.
-    const fieldDescriptions: Record<string, string> = {};
-    for (const p of prompts) {
-      if (p.field_name && p.prompt) fieldDescriptions[p.field_name] = p.prompt;
-    }
-    const sources = Array.isArray(args.sources) && args.sources.length > 0
-      ? args.sources
-      : ['web_search', 'linkedin'];
-
-    const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
-    const { crmDb } = await import('../services/db');
-    const service = new CrmEnrichmentService();
-    const result = await service.execute({
+    const { runEmmaEnrichment } = await import('./enrichmentToolRunner');
+    const summary = await runEmmaEnrichment({
       listId: args.list_id,
       userId: context.userId,
-      instruction,
-      outputFields,
-      sources,
+      outputFields: args.output_fields,
+      mode: 'enrich',
       leadIds: [args.lead_id],
-      fieldDescriptions,
-      forceOverwrite: args.force_overwrite !== false,
-    }, context.socketId, context.socketEmit ? { socketEmit: context.socketEmit } : undefined);
+      socketId: context.socketId,
+      socketEmit: context.socketEmit,
+    });
 
-    // Fetch the lead after enrichment so we can return the actual enriched values
-    let enrichedValues: Record<string, string | null> = {};
-    if (result.processedCount > 0) {
+    // Read the lead back so we can return the actual enriched values.
+    // V3 writes standard columns top-level and custom names into customFields.
+    const enrichedValues: Record<string, string | null> = {};
+    if (summary.processedCount > 0) {
       try {
-        const lead = await crmDb.getLeadById(args.list_id, args.lead_id);
-        if (lead?.customFields) {
-          for (const field of outputFields) {
-            enrichedValues[field] = lead.customFields[field] ?? null;
-          }
+        const { crmDb } = await import('../services/db');
+        const lead: any = await crmDb.getLeadById(args.list_id, args.lead_id);
+        const customFields = (lead?.customFields ?? {}) as Record<string, string>;
+        for (const f of (args.output_fields as Array<{ name: string }>)) {
+          enrichedValues[f.name] = customFields[f.name] ?? lead?.[f.name] ?? null;
         }
       } catch {
-        // Non-fatal — enrichment succeeded, values are in DB
+        // Non-fatal — enrichment succeeded, values are in the DB.
       }
     }
 
     return {
       leadId: args.lead_id,
       listId: args.list_id,
-      outputFields,
       enrichedValues,
-      processedCount: result.processedCount,
-      failedCount: result.failedCount,
-      skippedCount: result.skippedCount,
-      failureBreakdown: result.failureBreakdown,
-      warnings: result.warnings,
-      jobId: result.jobId,
+      runId: summary.runId,
+      processedCount: summary.processedCount,
+      failedCount: summary.failedCount,
+      failureBreakdown: summary.failureBreakdown,
+      warnings: summary.warnings,
+      fieldRemaps: summary.fieldRemaps,
     };
-  }
+  },
 });
 
 // ─── Scheduled Chat tools (bridged from mcpToolRegistry / apiTools.ts) ───────

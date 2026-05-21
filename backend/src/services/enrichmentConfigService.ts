@@ -60,6 +60,14 @@ const CANONICAL_SYNONYMS: Record<string, string> = {
   full_name: 'first_name',         // imperfect — won't split, but routes to person_identity
 };
 
+/** Resolve a field name to its canonical FIELD_GROUPS name. Returns the name
+ *  itself when it is already canonical, the inferred canonical when a
+ *  heuristic match exists, or undefined when there is no canonical analog. */
+export function canonicalFieldName(name: string): string | undefined {
+  if (CANONICAL_FIELD_NAMES.has(name)) return name;
+  return inferAliasFor(name);
+}
+
 /** Infer `aliasFor` for a single field. Returns the canonical name, or
  *  undefined if no high-confidence match. */
 function inferAliasFor(fieldName: string): string | undefined {
@@ -124,7 +132,7 @@ export const STANDARD_DATA_ALIASES: Record<string, string> = {
  *  regardless of whether the list's fieldNames contains them. Mirrors the
  *  "Standard Fields" section of the Configure Display Fields dialog, minus
  *  non-enrichable system fields (createdAt, updatedAt, status, dealValue). */
-const STANDARD_ENRICHABLE_FIELDS = [
+export const STANDARD_ENRICHABLE_FIELDS = [
   'firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'notes',
 ] as const;
 
@@ -186,6 +194,14 @@ export interface ConfigServiceDeps {
     input: Array<{ name: string; instruction: string }>,
   ): Promise<Record<string, SmartFieldClassification>>;
 }
+
+/** Subset of ConfigServiceDeps needed to PROCESS a config (resolve aliases,
+ *  classify smart fields, validate) without persisting it. Used by callers
+ *  that build a config in memory and run enrichment directly — e.g. Emma. */
+export type ConfigProcessingDeps = Pick<
+  ConfigServiceDeps,
+  'readListConfig' | 'llmInferAliases' | 'llmClassifySmartFields'
+>;
 
 // ─── Validation ───────────────────────────────────────────────────────────────
 
@@ -408,9 +424,14 @@ export async function getEnrichmentConfig(
   };
 }
 
-export async function setEnrichmentConfig(
+/**
+ * Process a raw enrichment config: resolve aliasFor (heuristic + LLM),
+ * restore + classify smart fields, validate, and stamp audit fields.
+ * Does NOT persist. setEnrichmentConfig = processEnrichmentConfig + write.
+ */
+export async function processEnrichmentConfig(
   input: { listId: string; userId: string; config: EnrichmentConfig },
-  deps: ConfigServiceDeps,
+  deps: ConfigProcessingDeps,
 ): Promise<{ config: EnrichmentConfig; warnings: string[] }> {
   // Step 1: heuristic alias inference (camelCase, synonym map, standard
   // columns). Cheap, no API call. Catches the easy 80% of cases.
@@ -559,8 +580,16 @@ export async function setEnrichmentConfig(
     updatedBy: input.userId,
   };
 
-  await deps.writeListConfig(input.listId, stamped);
   return { config: stamped, warnings };
+}
+
+export async function setEnrichmentConfig(
+  input: { listId: string; userId: string; config: EnrichmentConfig },
+  deps: ConfigServiceDeps,
+): Promise<{ config: EnrichmentConfig; warnings: string[] }> {
+  const { config, warnings } = await processEnrichmentConfig(input, deps);
+  await deps.writeListConfig(input.listId, config);
+  return { config, warnings };
 }
 
 export async function suggestFieldTypes(

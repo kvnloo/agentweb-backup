@@ -8,7 +8,9 @@ import {
   getEnrichmentConfig,
   setEnrichmentConfig,
   suggestFieldTypes,
+  processEnrichmentConfig,
   RESERVED_FIELD_NAMES,
+  STANDARD_ENRICHABLE_FIELDS,
   type ConfigServiceDeps,
 } from '../services/enrichmentConfigService';
 import type { EnrichmentConfig } from '../services/crmEnrichmentServiceV3';
@@ -1309,5 +1311,107 @@ describe('setEnrichmentConfig — smart field classification', () => {
     const names = classifyCall.map((f: any) => f.name);
     expect(names).not.toContain('industry');   // include:false — skipped
     expect(names).toContain('company');         // include:true — classified
+  });
+});
+
+// ─── processEnrichmentConfig ──────────────────────────────────────────────────
+
+describe('processEnrichmentConfig', () => {
+  it('resolves heuristic aliases without writing to the DB', async () => {
+    const deps = makeDeps();
+    const { config } = await processEnrichmentConfig(
+      {
+        listId: 'list-1',
+        userId: 'user-1',
+        config: {
+          fields: [
+            { name: 'fundingRound', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+          ],
+          globalOverwriteDefault: 'fill_if_empty',
+          schemaVersion: 1,
+          updatedAt: '2020-01-01T00:00:00.000Z',
+          updatedBy: 'old',
+        },
+      },
+      deps,
+    );
+    expect(config.fields[0].aliasFor).toBe('funding_stage');
+    expect(config.updatedBy).toBe('user-1');
+    expect(deps.writeListConfig).not.toHaveBeenCalled();
+  });
+
+  it('throws ConfigValidationError on a duplicate field name', async () => {
+    const deps = makeDeps();
+    await expect(
+      processEnrichmentConfig(
+        {
+          listId: 'list-1',
+          userId: 'user-1',
+          config: {
+            fields: [
+              { name: 'industry', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+              { name: 'industry', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+            ],
+            globalOverwriteDefault: 'fill_if_empty',
+            schemaVersion: 1,
+            updatedAt: '2020-01-01T00:00:00.000Z',
+            updatedBy: 'old',
+          },
+        },
+        deps,
+      ),
+    ).rejects.toThrow(/already in the list/);
+  });
+
+  it('survives an llmInferAliases failure (soft-fail branch)', async () => {
+    const deps = makeDeps();
+    deps.llmInferAliases = jest.fn().mockRejectedValue(new Error('llm down'));
+    const { config } = await processEnrichmentConfig(
+      {
+        listId: 'list-1',
+        userId: 'user-1',
+        config: {
+          fields: [
+            { name: 'opaque_xyz', type: 'string', instruction: 'something custom', include: true, overwritePolicy: 'fill_if_empty' },
+          ],
+          globalOverwriteDefault: 'fill_if_empty',
+          schemaVersion: 1,
+          updatedAt: '2020-01-01T00:00:00.000Z',
+          updatedBy: 'old',
+        },
+      },
+      deps,
+    );
+    expect(config.fields[0].aliasFor).toBeUndefined();
+  });
+
+  it('survives an llmClassifySmartFields failure (soft-fail branch)', async () => {
+    const deps = makeDeps();
+    deps.llmClassifySmartFields = jest.fn().mockRejectedValue(new Error('llm down'));
+    const { config } = await processEnrichmentConfig(
+      {
+        listId: 'list-1',
+        userId: 'user-1',
+        config: {
+          fields: [
+            { name: 'is_hiring', type: 'string', instruction: 'are they hiring engineers', include: true, overwritePolicy: 'fill_if_empty' },
+          ],
+          globalOverwriteDefault: 'fill_if_empty',
+          schemaVersion: 1,
+          updatedAt: '2020-01-01T00:00:00.000Z',
+          updatedBy: 'old',
+        },
+      },
+      deps,
+    );
+    expect(config.fields[0].smartCondition).toBeUndefined();
+  });
+});
+
+describe('STANDARD_ENRICHABLE_FIELDS export', () => {
+  it('exports the 8 canonical standard lead columns', () => {
+    expect([...STANDARD_ENRICHABLE_FIELDS]).toEqual([
+      'firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'notes',
+    ]);
   });
 });

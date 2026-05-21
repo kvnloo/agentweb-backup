@@ -88,6 +88,18 @@ function makeInput(overrides: Partial<RunEnrichmentInput> = {}): RunEnrichmentIn
 
 // ─── Empty list ───────────────────────────────────────────────────────────────
 
+describe('runEnrichment — empty list skips sibling mapping table', () => {
+  it('does not call buildSiblingFieldMappingTable when there are no leads', async () => {
+    const { buildSiblingFieldMappingTable } = require('../services/enrichmentSiblingConfigFields');
+    (buildSiblingFieldMappingTable as jest.Mock).mockClear();
+
+    const deps = makeDeps({ loadLeads: jest.fn().mockResolvedValue([]) });
+    await runEnrichment(makeInput(), deps);
+
+    expect(buildSiblingFieldMappingTable as jest.Mock).not.toHaveBeenCalled();
+  });
+});
+
 describe('runEnrichment — empty list', () => {
   it('returns 0-processed run when list has no leads', async () => {
     const deps = makeDeps({ loadLeads: jest.fn().mockResolvedValue([]) });
@@ -1206,5 +1218,44 @@ describe('runEnrichment — smart fields', () => {
     // But funding_stage must NOT be stored on the lead
     const setCallArgs = (deps.setLeadFields as jest.Mock).mock.calls[0][0];
     expect(setCallArgs.customFields).not.toHaveProperty('funding_stage');
+  });
+});
+
+// ─── Concurrent chunk writes ──────────────────────────────────────────────────
+
+describe('runEnrichment — concurrent chunk writes', () => {
+  it('writes all leads in a chunk concurrently, not one-at-a-time', async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const setLeadFields = jest.fn().mockImplementation(async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise(resolve => setTimeout(resolve, 10));
+      inFlight -= 1;
+    });
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([
+        makeLead({ leadId: 'l1' }),
+        makeLead({ leadId: 'l2' }),
+        makeLead({ leadId: 'l3' }),
+      ]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [{
+          field: 'company_name',
+          value: 'Acme',
+          meta: { source: 'apollo', enrichedAt: '2026-01-01T00:00:00Z' },
+        }],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+      }),
+      setLeadFields,
+    });
+
+    const result = await runEnrichment(makeInput(), deps);
+
+    expect(result.processed).toBe(3);
+    expect(setLeadFields).toHaveBeenCalledTimes(3);
+    // Sequential writes would never have more than one call in flight at once.
+    expect(maxInFlight).toBe(3);
   });
 });
