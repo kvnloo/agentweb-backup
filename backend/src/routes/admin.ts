@@ -107,6 +107,27 @@ const isAfterLastSync = (recordTime: string | undefined, lastSyncAt: string | un
 router.use(authenticateToken);
 router.use(isAdmin);
 
+// ─── Org analytics sharing (admin-controlled) ────────────────────────────
+// PATCH /api/admin/orgs/:orgId/analytics-sharing  { enabled: boolean }
+router.patch("/orgs/:orgId/analytics-sharing", async (req, res) => {
+  try {
+    const { orgId } = req.params;
+    const { enabled } = req.body;
+    if (typeof enabled !== "boolean") {
+      return res.status(400).json({ message: "Body field 'enabled' must be a boolean" });
+    }
+    const org = await orgDb.getOrgById(orgId);
+    if (!org) {
+      return res.status(404).json({ message: "Organization not found" });
+    }
+    await orgDb.updateOrg(orgId, { shareAnalyticsWithOrg: enabled });
+    return res.json({ orgId, shareAnalyticsWithOrg: enabled });
+  } catch (error: any) {
+    console.error("Error updating org analytics-sharing:", error.message);
+    return res.status(500).json({ message: "Failed to update analytics sharing" });
+  }
+});
+
 // Get all Unipile (LinkedIn outreach) accounts across all users (with live status + orphan detection)
 router.get("/unipile-accounts", async (req, res) => {
   try {
