@@ -1,4 +1,5 @@
 import { userDb } from "./db";
+import { resolveAnalyticsConfig, ResolvedAnalyticsConfig } from "./analyticsConfigResolver";
 import { getSecret } from "../utils/secretsManager";
 import { JWT } from "google-auth-library";
 import { BetaAnalyticsDataClient } from "@google-analytics/data";
@@ -181,13 +182,14 @@ function calculateGaDateRange(timeframe: string): { startDateStr: string; endDat
   };
 }
 
-export async function fetchSearchConsoleMetrics(userId: string, timeframe: string = "30d", filterDomain?: string): Promise<any> {
+export async function fetchSearchConsoleMetrics(userId: string, timeframe: string = "30d", filterDomain?: string, resolvedConfig?: ResolvedAnalyticsConfig): Promise<any> {
   const user = await userDb.getUserById(userId);
   if (!user) {
     return { error: "User not found" };
   }
 
-  if (!user.seoDomains || user.seoDomains.length === 0) {
+  const resolved = resolvedConfig ?? (await resolveAnalyticsConfig(user));
+  if (!resolved.seoDomains || resolved.seoDomains.length === 0) {
     return { message: "Google Search Console is not configured. Use the search_user_guide tool to find setup instructions and share them with the user." };
   }
 
@@ -199,11 +201,11 @@ export async function fetchSearchConsoleMetrics(userId: string, timeframe: strin
   const { startDateStr, endDateStr } = calculateDateRange(timeframe);
 
   // Filter to a specific domain if requested
-  let domainsToFetch = user.seoDomains as string[];
+  let domainsToFetch = resolved.seoDomains as string[];
   if (filterDomain) {
     domainsToFetch = domainsToFetch.filter((d: string) => d.toLowerCase().includes(filterDomain.toLowerCase()));
     if (domainsToFetch.length === 0) {
-      return { error: `Domain "${filterDomain}" not found in configured domains: ${(user.seoDomains as string[]).join(', ')}` };
+      return { error: `Domain "${filterDomain}" not found in configured domains: ${(resolved.seoDomains as string[]).join(', ')}` };
     }
   }
 
@@ -396,20 +398,21 @@ export async function fetchSearchConsoleMetrics(userId: string, timeframe: strin
   const metrics = await Promise.all(metricsPromises);
   return {
     search_console_integration_status: "Google Search Console is configured and connected. If a domain shows 0 clicks/impressions, the site may not be indexed yet or had no search traffic in this period. Do NOT tell the user Search Console is not set up.",
-    configured_domains: user.seoDomains,
+    configured_domains: resolved.seoDomains,
     metrics,
     timeframe,
     timestamp: new Date().toISOString(),
   };
 }
 
-export async function fetchClarityProjectInfo(userId: string, filterProjectId?: string): Promise<any> {
+export async function fetchClarityProjectInfo(userId: string, filterProjectId?: string, resolvedConfig?: ResolvedAnalyticsConfig): Promise<any> {
   const user = await userDb.getUserById(userId);
   if (!user) {
     return { error: "User not found" };
   }
 
-  const clarityProjects = getClarityProjects(user);
+  const resolved = resolvedConfig ?? (await resolveAnalyticsConfig(user));
+  const clarityProjects = resolved.clarityProjects;
   if (clarityProjects.length === 0) {
     return { message: "Microsoft Clarity is not configured. Use the search_user_guide tool to find setup instructions and share them with the user." };
   }
@@ -466,13 +469,14 @@ export function getClarityProjects(user: any): Array<{ projectId: string; label:
   return [];
 }
 
-export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: string = "30d", filterPropertyId?: string): Promise<any> {
+export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: string = "30d", filterPropertyId?: string, resolvedConfig?: ResolvedAnalyticsConfig): Promise<any> {
   const user = await userDb.getUserById(userId);
   if (!user) {
     return { error: "User not found" };
   }
 
-  const gaProperties = getGoogleAnalyticsProperties(user);
+  const resolved = resolvedConfig ?? (await resolveAnalyticsConfig(user));
+  const gaProperties = resolved.properties;
   if (gaProperties.length === 0) {
     return { message: "Google Analytics (GA4) is not configured. Use the search_user_guide tool to find setup instructions and share them with the user." };
   }
@@ -495,8 +499,8 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
 
   // Build dimension filter to exclude filtered domains
   let dimensionFilter: any = undefined;
-  if (user.gaFilteredDomains && user.gaFilteredDomains.length > 0) {
-    const notExpressions = user.gaFilteredDomains.map((domain: string) => ({
+  if (resolved.gaFilteredDomains && resolved.gaFilteredDomains.length > 0) {
+    const notExpressions = resolved.gaFilteredDomains.map((domain: string) => ({
       notExpression: {
         filter: {
           fieldName: "hostName",
