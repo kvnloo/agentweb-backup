@@ -285,6 +285,8 @@ interface User {
   orgId?: string;
   orgRole?: "owner" | "member";
   orgName?: string;
+  isOrgOwner?: boolean;
+  orgShareAnalyticsWithOrg?: boolean;
 }
 
 // Define an interface for the task data shown in the admin tasks tab
@@ -840,6 +842,9 @@ export default function AdminDashboard() {
   const [seoDomainsText, setSeoDomainsText] = useState("");
   const [googleAnalyticsPropertyId, setGoogleAnalyticsPropertyId] = useState("");
   const [googleAnalyticsProperties, setGoogleAnalyticsProperties] = useState<Array<{ propertyId: string; label: string }>>([]);
+  const [shareAnalyticsWithOrg, setShareAnalyticsWithOrg] = useState(false);
+  const [editingUserIsOrgOwner, setEditingUserIsOrgOwner] = useState(false);
+  const [editingUserOrgId, setEditingUserOrgId] = useState<string | null>(null);
   const [gaFilteredDomainsText, setGaFilteredDomainsText] = useState("");
   const [clarityProjectId, setClarityProjectId] = useState("");
   const [clarityProjects, setClarityProjects] = useState<Array<{ projectId: string; label: string }>>([]);
@@ -2693,6 +2698,13 @@ export default function AdminDashboard() {
               : user
           )
         );
+        if (editingUserIsOrgOwner && editingUserOrgId) {
+          await axios.patch(
+            buildApiUrl(`/api/admin/orgs/${editingUserOrgId}/analytics-sharing`),
+            { enabled: shareAnalyticsWithOrg },
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+        }
         setSuccess("SEO/AEO configuration updated successfully!");
         setSeoDomainsDialogOpen(false);
         setEditingSeoDomainsUserId(null);
@@ -4395,7 +4407,7 @@ export default function AdminDashboard() {
                                   <Typography variant="caption" color="text.secondary">SEO / GA / Clarity</Typography>
                                   <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
                                     <Typography variant="body2">{user.seoDomains?.join(", ") || "—"}</Typography>
-                                    <IconButton size="small" onClick={() => { setEditingSeoDomainsUserId(user.userId); setSeoDomainsText((user.seoDomains || []).join("\n")); setGoogleAnalyticsPropertyId(user.googleAnalyticsPropertyId || ""); setGaFilteredDomainsText((user.gaFilteredDomains || []).join("\n")); setClarityProjectId(user.clarityProjectId || ""); setProductDomain(user.productDomain || ""); setSeoDomainsDialogOpen(true); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                    <IconButton size="small" onClick={() => { setEditingSeoDomainsUserId(user.userId); setSeoDomainsText((user.seoDomains || []).join("\n")); setGoogleAnalyticsPropertyId(user.googleAnalyticsPropertyId || ""); setGaFilteredDomainsText((user.gaFilteredDomains || []).join("\n")); setClarityProjectId(user.clarityProjectId || ""); setProductDomain(user.productDomain || ""); setEditingUserIsOrgOwner(!!user.isOrgOwner); setEditingUserOrgId(user.orgId || null); setShareAnalyticsWithOrg(!!user.orgShareAnalyticsWithOrg); setSeoDomainsDialogOpen(true); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
                                   </Box>
                                 </Grid>
                                 <Grid item xs={3}>
@@ -6944,6 +6956,24 @@ export default function AdminDashboard() {
                 disabled={seoDomainsEditLoading}
               />
             </Grid>
+            {editingUserIsOrgOwner && (
+              <Grid item xs={12}>
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={shareAnalyticsWithOrg}
+                      onChange={(e) => setShareAnalyticsWithOrg(e.target.checked)}
+                      disabled={seoDomainsEditLoading}
+                    />
+                  }
+                  label="Share analytics with organization"
+                />
+                <Typography variant="caption" display="block" sx={{ color: 'text.secondary' }}>
+                  When on, every member of this org sees this owner's analytics
+                  (GA4, Search Console, Clarity, funnels run against this property).
+                </Typography>
+              </Grid>
+            )}
             <Grid item xs={12}>
               <Box>
                 <Typography variant="subtitle2" sx={{ mb: 1 }}>
