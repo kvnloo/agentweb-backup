@@ -1,6 +1,7 @@
 import express from "express";
 import { authenticateToken } from "../middleware/auth";
-import { userDb } from "../services/db";
+import { userDb, orgDb } from "../services/db";
+import { canViewItem } from "../services/orgShareService";
 import { getSecret, getLandingPagesConfig } from "../utils/secretsManager";
 import { calculateFunnelMetrics, DEFAULT_FUNNEL_STAGES, validateFunnelStages } from "../services/funnelService";
 import {
@@ -681,17 +682,32 @@ router.get("/metrics", async (req, res) => {
     // Calculate funnel metrics if GA4 is configured and funnelId provided
     let funnelMetrics: any = null;
     const funnelId = req.query.funnelId as string;
+    const funnelOwnerId = (req.query.funnelOwnerId as string) || (req as any).user.userId;
 
     if (resolved.primaryPropertyId && funnelId) {
       try {
-        // Fetch funnel config from AW-Settings
+        // A shared funnel may belong to another org member — gate the cross-member case.
+        if (funnelOwnerId !== (req as any).user.userId) {
+          const org = user.orgId ? await orgDb.getOrgById(user.orgId) : null;
+          const owner = await userDb.getUserById(funnelOwnerId);
+          const orgLike = org
+            ? { orgId: org.orgId, ownerUserId: org.ownerUserId, shareSettings: org.shareSettings }
+            : null;
+          const userLike = { userId: user.userId, orgId: user.orgId, orgRole: user.orgRole };
+          if (!owner || owner.orgId !== user.orgId ||
+              !canViewItem({ userId: funnelOwnerId }, userLike, orgLike, owner.orgId, "funnels")) {
+            throw new Error("Funnel not accessible");
+          }
+        }
+
+        // Fetch funnel config from AW-Settings (keyed to the funnel's owner)
         const AWS = require("aws-sdk");
         const dynamodb = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || "us-west-2" });
         const TABLE_PREFIX = process.env.NODE_ENV === "production" ? "" : "Dev-";
 
         const funnelResult = await dynamodb.get({
           TableName: `${TABLE_PREFIX}AW-Settings`,
-          Key: { settingName: `funnels_${(req as any).user.userId}` },
+          Key: { settingName: `funnels_${funnelOwnerId}` },
         }).promise();
 
         const funnel = funnelResult.Item?.funnels?.[funnelId];

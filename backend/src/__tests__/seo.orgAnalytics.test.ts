@@ -23,6 +23,37 @@ jest.mock("../services/db", () => ({
   userDb: {
     getUserById: jest.fn(),
   },
+  orgDb: {
+    getOrgById: jest.fn(),
+  },
+}));
+
+// Records the `settingName` of every AW-Settings get so tests can assert which
+// owner's funnel map was looked up.
+const awSettingsGetKeys: string[] = [];
+jest.mock("aws-sdk", () => ({
+  DynamoDB: {
+    DocumentClient: jest.fn().mockImplementation(() => ({
+      get: (params: any) => {
+        const settingName = params?.Key?.settingName;
+        if (typeof settingName === "string") awSettingsGetKeys.push(settingName);
+        return {
+          promise: () =>
+            Promise.resolve({
+              Item: {
+                settingName,
+                funnels: {
+                  "f-b": {
+                    name: "Funnel B",
+                    stages: [{ name: "Visit", type: "pageview" }],
+                  },
+                },
+              },
+            }),
+        };
+      },
+    })),
+  },
 }));
 
 // Stub seoService so the handlers don't reach real Google APIs.
@@ -51,17 +82,23 @@ jest.mock("../services/analyticsConfigResolver", () => ({
   resolveAnalyticsConfig: jest.fn(),
 }));
 
-import { userDb } from "../services/db";
+import { userDb, orgDb } from "../services/db";
 import { resolveAnalyticsConfig } from "../services/analyticsConfigResolver";
 import seoRoutes from "../routes/seo";
 
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
+const mockOrgDb = orgDb as jest.Mocked<typeof orgDb>;
 const mockResolve = resolveAnalyticsConfig as jest.MockedFunction<
   typeof resolveAnalyticsConfig
 >;
 
 const memberToken = jwt.sign(
   { userId: "member-1", email: "member@example.com", isAdmin: false },
+  JWT_SECRET
+);
+
+const m1Token = jwt.sign(
+  { userId: "m-1", email: "m1@example.com", isAdmin: false },
   JWT_SECRET
 );
 
@@ -72,6 +109,7 @@ app.use("/api/seo", seoRoutes);
 describe("seo routes — org analytics inheritance", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    awSettingsGetKeys.length = 0;
     // A member with no analytics config of their own.
     mockUserDb.getUserById.mockResolvedValue({
       userId: "member-1",
@@ -109,5 +147,43 @@ describe("seo routes — org analytics inheritance", () => {
       .get("/api/seo/product-metrics")
       .set("Authorization", `Bearer ${memberToken}`);
     expect(res.status).not.toBe(400);
+  });
+
+  test("GET /metrics looks the funnel up under funnelOwnerId, not the caller", async () => {
+    // funnel f-b lives in funnels_m-2; caller is m-1 with view access
+    mockResolve.mockResolvedValue({
+      properties: [{ propertyId: "OWNER-PROP", label: "Owner" }],
+      primaryPropertyId: "OWNER-PROP",
+      gaFilteredDomains: [],
+      seoDomains: ["acme.com"],
+      clarityProjects: [],
+      source: "org",
+    });
+    // m-1 (caller) and m-2 (funnel owner) are in the same org.
+    mockUserDb.getUserById.mockImplementation((id: string) =>
+      Promise.resolve(
+        id === "m-2"
+          ? ({ userId: "m-2", email: "m2@example.com", orgId: "org-1" } as any)
+          : ({
+              userId: "m-1",
+              email: "m1@example.com",
+              orgId: "org-1",
+              orgRole: "member",
+            } as any)
+      )
+    );
+    // Org has funnel sharing enabled so m-1 can view m-2's funnel.
+    mockOrgDb.getOrgById.mockResolvedValue({
+      orgId: "org-1",
+      ownerUserId: "m-owner",
+      shareSettings: { funnels: { enabled: true, editors: [] } },
+    } as any);
+
+    const res = await request(app)
+      .get("/api/seo/metrics?funnelId=f-b&funnelOwnerId=m-2")
+      .set("Authorization", `Bearer ${m1Token}`);
+    expect(res.status).toBe(200);
+    // The AW-Settings get must have been keyed funnels_m-2
+    expect(awSettingsGetKeys).toContain("funnels_m-2");
   });
 });
