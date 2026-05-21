@@ -1,15 +1,11 @@
-// Real-service adapters that satisfy v3.1 orchestrator deps.
+// Real-service adapters that satisfy the v3.1 orchestrator deps
+// (OrchestratorDeps + IdentityResolverDeps).
 //
-// Phase 1a status (matches what users see today):
-//   ✓ Apollo people + org enrichment via existing apolloService
-//   ✓ enrich.so reverse lookup via existing enrichSoService
-//   ✓ DDB read/write via crmDb
-//   ✗ Web fetch + LLM extraction + critic — stubbed (return empty / null)
-//     until Phase 1b wires the existing v2 extraction pipeline.
-//
-// Apollo direct-map fields WILL populate on a real run. Web-only groups
-// (intent_signals, company_social) will show 'missing' fields in the report,
-// which is expected behavior pre-Phase-1b.
+// Wires the orchestrator and waterfall to production services: Apollo
+// (people / org), enrich.so, Unipile, Google CSE web search + LLM extraction,
+// the critic pass, and DynamoDB read/write via crmDb. All external dependency
+// construction lives here so the orchestrator and waterfall stay pure and
+// unit-testable.
 
 import { crmDb } from './db';
 import { getApolloService, isApolloServiceReady } from './apolloService';
