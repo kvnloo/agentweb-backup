@@ -14,6 +14,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'New: Organization-Wide Analytics Sharing',
       '- Admins can now share an organization\'s analytics (Google Analytics, Search Console, Microsoft Clarity) with every member from the owner\'s configuration',
       '- The whole team sees the same numbers and can monitor shared analytics dashboards together',
+      'New: Share Funnels Across Your Team',
+      '- User-journey funnels can now be shared organization-wide',
+      '- Turn on Funnels sharing in Settings → Organization → Sharing; editors and the org owner can edit shared funnels',
     ],
   },
   {
