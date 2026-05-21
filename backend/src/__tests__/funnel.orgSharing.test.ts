@@ -83,6 +83,7 @@ app.use(express.json());
 app.use("/api/funnels", funnelRouter);
 
 const m1Token = jwt.sign({ userId: "m-1", email: "m1@example.com" }, JWT_SECRET);
+const m3Token = jwt.sign({ userId: "m-3", email: "m3@example.com" }, JWT_SECRET);
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -160,5 +161,83 @@ describe("GET /api/funnels — org-wide sharing", () => {
     const shared = res.body.funnels.find((f: any) => f.configId === "funnel:f-b");
     expect(own.canEdit).toBe(true);
     expect(shared.canEdit).toBe(true); // m-1 is a funnels editor → may edit a shared funnel
+  });
+});
+
+describe("GET/PUT/DELETE /api/funnels/:configId — org-aware gating", () => {
+  test("PUT /api/funnels/:id?ownerUserId=other — editor allowed", async () => {
+    // m-1 is in shareSettings.funnels.editors; funnel f-b owned by m-2
+    funnelsByUser["m-2"] = { "f-b": funnel("f-b") };
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === "m-1") return Promise.resolve({ userId: "m-1", name: "Member One", orgId: "org-1", orgRole: "member" });
+      if (uid === "m-2") return Promise.resolve({ userId: "m-2", name: "Member Two", orgId: "org-1", orgRole: "member" });
+      return Promise.resolve(null);
+    });
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1", ownerUserId: "owner-x",
+      shareSettings: { funnels: { enabled: false, editors: ["m-1"] } },
+    });
+
+    const res = await request(app)
+      .put("/api/funnels/funnel:f-b?ownerUserId=m-2")
+      .set("Authorization", `Bearer ${m1Token}`)
+      .send({ name: "Edited" });
+    expect(res.status).toBe(200);
+  });
+
+  test("PUT /api/funnels/:id?ownerUserId=other — plain member denied 403", async () => {
+    // m-3 is a plain member (not editor); funnel f-b owned by m-2
+    funnelsByUser["m-2"] = { "f-b": funnel("f-b") };
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === "m-3") return Promise.resolve({ userId: "m-3", name: "Member Three", orgId: "org-1", orgRole: "member" });
+      if (uid === "m-2") return Promise.resolve({ userId: "m-2", name: "Member Two", orgId: "org-1", orgRole: "member" });
+      return Promise.resolve(null);
+    });
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1", ownerUserId: "owner-x",
+      shareSettings: { funnels: { enabled: true, editors: ["m-1"] } },
+    });
+
+    const res = await request(app)
+      .put("/api/funnels/funnel:f-b?ownerUserId=m-2")
+      .set("Authorization", `Bearer ${m3Token}`)
+      .send({ name: "Edited" });
+    expect(res.status).toBe(403);
+  });
+
+  test("DELETE /api/funnels/:id?ownerUserId=other — editor denied 403 (delete is owner/org-owner only)", async () => {
+    funnelsByUser["m-2"] = { "f-b": funnel("f-b") };
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === "m-1") return Promise.resolve({ userId: "m-1", name: "Member One", orgId: "org-1", orgRole: "member" });
+      if (uid === "m-2") return Promise.resolve({ userId: "m-2", name: "Member Two", orgId: "org-1", orgRole: "member" });
+      return Promise.resolve(null);
+    });
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1", ownerUserId: "owner-x",
+      shareSettings: { funnels: { enabled: false, editors: ["m-1"] } },
+    });
+
+    const res = await request(app)
+      .delete("/api/funnels/funnel:f-b?ownerUserId=m-2")
+      .set("Authorization", `Bearer ${m1Token}`); // m-1 is editor, not org owner
+    expect(res.status).toBe(403);
+  });
+
+  test("GET /api/funnels/:id?ownerUserId=other — plain member with sharing OFF denied 403", async () => {
+    funnelsByUser["m-2"] = { "f-b": funnel("f-b") };
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === "m-3") return Promise.resolve({ userId: "m-3", name: "Member Three", orgId: "org-1", orgRole: "member" });
+      if (uid === "m-2") return Promise.resolve({ userId: "m-2", name: "Member Two", orgId: "org-1", orgRole: "member" });
+      return Promise.resolve(null);
+    });
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1", ownerUserId: "owner-x",
+      shareSettings: { funnels: { enabled: false, editors: ["m-1"] } },
+    });
+
+    const res = await request(app)
+      .get("/api/funnels/funnel:f-b?ownerUserId=m-2")
+      .set("Authorization", `Bearer ${m3Token}`);
+    expect(res.status).toBe(403);
   });
 });

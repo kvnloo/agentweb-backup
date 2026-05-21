@@ -4,7 +4,7 @@ import { validateFunnelStages, FunnelStage } from "../services/funnelService";
 import AWS from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
 import { userDb, orgDb } from "../services/db";
-import { isFeatureEffectivelyEnabled, canEditItem, listOrgVisibleItems } from "../services/orgShareService";
+import { isFeatureEffectivelyEnabled, canEditItem, canViewItem, listOrgVisibleItems } from "../services/orgShareService";
 
 const router = express.Router();
 const dynamodb = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || "us-west-2" });
@@ -57,6 +57,31 @@ async function saveUserFunnels(userId: string, funnels: FunnelsSettings): Promis
       updatedAt: new Date().toISOString(),
     },
   }).promise();
+}
+
+/**
+ * Resolve the funnel-owning user for an item route. Returns the owner userId and
+ * the org context, or an HTTP error to send. When `ownerUserId` is absent or
+ * equals the caller, the caller owns it.
+ */
+async function resolveFunnelOwner(
+  callerId: string,
+  ownerUserIdParam: string | undefined,
+): Promise<
+  | { error: { status: number; message: string } }
+  | { ownerUserId: string; caller: any; org: any; ownerOrgId: string | undefined }
+> {
+  const caller = await userDb.getUserById(callerId);
+  const ownerUserId = ownerUserIdParam && ownerUserIdParam !== callerId ? ownerUserIdParam : callerId;
+  if (ownerUserId === callerId) {
+    return { ownerUserId, caller, org: null, ownerOrgId: caller?.orgId };
+  }
+  const owner = await userDb.getUserById(ownerUserId);
+  if (!owner || !caller?.orgId || owner.orgId !== caller.orgId) {
+    return { error: { status: 403, message: "Funnel not accessible" } };
+  }
+  const org = await orgDb.getOrgById(caller.orgId);
+  return { ownerUserId, caller, org, ownerOrgId: owner.orgId };
 }
 
 // Get all funnels visible to the caller (own + org-shared), each tagged with
@@ -127,25 +152,31 @@ router.get("/", async (req, res) => {
   }
 });
 
-// Get a specific funnel
+// Get a specific funnel (own or org-shared)
 router.get("/:configId", async (req, res) => {
   try {
-    const userId = (req as any).user.userId;
-    const { configId } = req.params;
-
-    // Remove "funnel:" prefix if present
-    const funnelId = configId.replace(/^funnel:/, "");
-
-    const funnels = await getUserFunnels(userId);
-    const funnel = funnels[funnelId];
-
-    if (!funnel) {
-      return res.status(404).json({
-        success: false,
-        message: "Funnel not found",
-      });
+    const callerId = (req as any).user.userId;
+    const funnelId = req.params.configId.replace(/^funnel:/, "");
+    const resolved = await resolveFunnelOwner(callerId, req.query.ownerUserId as string | undefined);
+    if ("error" in resolved) {
+      return res.status(resolved.error.status).json({ success: false, message: resolved.error.message });
     }
 
+    if (resolved.ownerUserId !== callerId) {
+      const orgLike = resolved.org
+        ? { orgId: resolved.org.orgId, ownerUserId: resolved.org.ownerUserId, shareSettings: resolved.org.shareSettings }
+        : null;
+      const userLike = { userId: callerId, orgId: resolved.caller?.orgId, orgRole: resolved.caller?.orgRole };
+      if (!canViewItem({ userId: resolved.ownerUserId }, userLike, orgLike, resolved.ownerOrgId, "funnels")) {
+        return res.status(403).json({ success: false, message: "Funnel not accessible" });
+      }
+    }
+
+    const funnels = await getUserFunnels(resolved.ownerUserId);
+    const funnel = funnels[funnelId];
+    if (!funnel) {
+      return res.status(404).json({ success: false, message: "Funnel not found" });
+    }
     res.json({
       success: true,
       funnel: {
@@ -154,15 +185,12 @@ router.get("/:configId", async (req, res) => {
         stages: funnel.stages,
         createdAt: funnel.createdAt,
         updatedAt: funnel.updatedAt,
+        ownerUserId: resolved.ownerUserId,
       },
     });
   } catch (error: any) {
     console.error("Error fetching funnel:", error);
-    res.status(500).json({
-      success: false,
-      message: "Error fetching funnel",
-      error: error.message,
-    });
+    res.status(500).json({ success: false, message: "Error fetching funnel", error: error.message });
   }
 });
 
@@ -231,107 +259,81 @@ router.post("/", async (req, res) => {
   }
 });
 
-// Update an existing funnel
+// Update an existing funnel (own or org-shared, if the caller may edit)
 router.put("/:configId", async (req, res) => {
   try {
-    const userId = (req as any).user.userId;
-    const { configId } = req.params;
+    const callerId = (req as any).user.userId;
+    const funnelId = req.params.configId.replace(/^funnel:/, "");
     const { name, stages } = req.body;
 
-    // Remove "funnel:" prefix if present
-    const funnelId = configId.replace(/^funnel:/, "");
-
-    if (name && !name.trim()) {
-      return res.status(400).json({
-        success: false,
-        message: "Funnel name cannot be empty",
-      });
+    if (name !== undefined && (typeof name !== "string" || !name.trim())) {
+      return res.status(400).json({ success: false, message: "Funnel name cannot be empty" });
     }
-
-    if (stages) {
+    if (stages !== undefined) {
       if (!Array.isArray(stages)) {
-        return res.status(400).json({
-          success: false,
-          message: "Stages must be an array",
-        });
+        return res.status(400).json({ success: false, message: "Stages must be an array" });
       }
-
       const errors = validateFunnelStages(stages);
       if (errors.length > 0) {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid funnel configuration",
-          errors,
-        });
+        return res.status(400).json({ success: false, message: "Invalid funnel configuration", errors });
       }
     }
 
-    const funnels = await getUserFunnels(userId);
+    const resolved = await resolveFunnelOwner(callerId, req.query.ownerUserId as string | undefined);
+    if ("error" in resolved) {
+      return res.status(resolved.error.status).json({ success: false, message: resolved.error.message });
+    }
+    if (resolved.ownerUserId !== callerId) {
+      const orgLike = resolved.org
+        ? { orgId: resolved.org.orgId, ownerUserId: resolved.org.ownerUserId, shareSettings: resolved.org.shareSettings }
+        : null;
+      const userLike = { userId: callerId, orgId: resolved.caller?.orgId, orgRole: resolved.caller?.orgRole };
+      if (!canEditItem({ userId: resolved.ownerUserId }, userLike, orgLike, resolved.ownerOrgId, "funnels")) {
+        return res.status(403).json({ success: false, message: "Not allowed to edit this funnel" });
+      }
+    }
 
+    const funnels = await getUserFunnels(resolved.ownerUserId);
     if (!funnels[funnelId]) {
-      return res.status(404).json({
-        success: false,
-        message: "Funnel not found",
-      });
+      return res.status(404).json({ success: false, message: "Funnel not found" });
     }
-
-    // Update the funnel
-    if (name) {
-      funnels[funnelId].name = name.trim();
-    }
-    if (stages) {
-      funnels[funnelId].stages = stages;
-    }
+    if (name) funnels[funnelId].name = name.trim();
+    if (stages) funnels[funnelId].stages = stages;
     funnels[funnelId].updatedAt = new Date().toISOString();
+    await saveUserFunnels(resolved.ownerUserId, funnels);
 
-    await saveUserFunnels(userId, funnels);
-
-    res.json({
-      success: true,
-      message: "Funnel updated successfully",
-    });
+    res.json({ success: true, message: "Funnel updated successfully" });
   } catch (error: any) {
     console.error("Error updating funnel:", error);
-    res.status(500).json({
-      success: false,
-      message: "Error updating funnel",
-      error: error.message,
-    });
+    res.status(500).json({ success: false, message: "Error updating funnel", error: error.message });
   }
 });
 
-// Delete a funnel
+// Delete a funnel (own, or any org funnel if the caller is the org owner)
 router.delete("/:configId", async (req, res) => {
   try {
-    const userId = (req as any).user.userId;
-    const { configId } = req.params;
+    const callerId = (req as any).user.userId;
+    const funnelId = req.params.configId.replace(/^funnel:/, "");
 
-    // Remove "funnel:" prefix if present
-    const funnelId = configId.replace(/^funnel:/, "");
-
-    const funnels = await getUserFunnels(userId);
-
-    if (!funnels[funnelId]) {
-      return res.status(404).json({
-        success: false,
-        message: "Funnel not found",
-      });
+    const resolved = await resolveFunnelOwner(callerId, req.query.ownerUserId as string | undefined);
+    if ("error" in resolved) {
+      return res.status(resolved.error.status).json({ success: false, message: resolved.error.message });
+    }
+    if (resolved.ownerUserId !== callerId && resolved.caller?.orgRole !== "owner") {
+      return res.status(403).json({ success: false, message: "Only the funnel owner or org owner can delete this funnel" });
     }
 
+    const funnels = await getUserFunnels(resolved.ownerUserId);
+    if (!funnels[funnelId]) {
+      return res.status(404).json({ success: false, message: "Funnel not found" });
+    }
     delete funnels[funnelId];
-    await saveUserFunnels(userId, funnels);
+    await saveUserFunnels(resolved.ownerUserId, funnels);
 
-    res.json({
-      success: true,
-      message: "Funnel deleted successfully",
-    });
+    res.json({ success: true, message: "Funnel deleted successfully" });
   } catch (error: any) {
     console.error("Error deleting funnel:", error);
-    res.status(500).json({
-      success: false,
-      message: "Error deleting funnel",
-      error: error.message,
-    });
+    res.status(500).json({ success: false, message: "Error deleting funnel", error: error.message });
   }
 });
 
