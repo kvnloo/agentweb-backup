@@ -1,5 +1,6 @@
 jest.mock('../services/enrichmentConfigService', () => ({
   processEnrichmentConfig: jest.fn(),
+  canonicalFieldName: jest.fn(), // returns undefined by default → "no canonical match"
 }));
 jest.mock('../services/enrichmentConfigDeps', () => ({
   buildConfigProcessingDeps: jest.fn().mockReturnValue({}),
@@ -11,7 +12,7 @@ jest.mock('../services/enrichmentV3RealDeps', () => ({
   buildOrchestratorDeps: jest.fn().mockReturnValue({}),
 }));
 jest.mock('../services/db', () => ({
-  crmDb: { getLeadsByListId: jest.fn() },
+  crmDb: { getLeadsByListId: jest.fn(), getLeadListById: jest.fn() },
 }));
 
 import { processEnrichmentConfig } from '../services/enrichmentConfigService';
@@ -22,6 +23,7 @@ import {
   pickPreviewLeadIds,
   resolveExecuteLeadIds,
 } from '../emma/enrichmentToolRunner';
+import { buildRawEnrichmentConfig } from '../emma/enrichmentToolConfig';
 
 const PROCESSED_CONFIG = {
   fields: [{ name: 'industry', type: 'string', instruction: 'x', include: true, overwritePolicy: 'fill_if_empty' }],
@@ -34,6 +36,8 @@ const PROCESSED_CONFIG = {
 beforeEach(() => {
   jest.clearAllMocks();
   (processEnrichmentConfig as jest.Mock).mockResolvedValue({ config: PROCESSED_CONFIG, warnings: [] });
+  // Default: list has no existing custom fields (normalization is a no-op for existing tests)
+  (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ fieldNames: [] });
 });
 
 describe('runEmmaEnrichment', () => {
@@ -123,6 +127,59 @@ describe('runEmmaEnrichment', () => {
       }),
     ).rejects.toThrow(/already in the list/);
     expect(runEnrichment).not.toHaveBeenCalled();
+  });
+
+  it('normalizes a standard synonym (company_name → company) and includes fieldRemaps in summary', async () => {
+    (runEnrichment as jest.Mock).mockResolvedValue({
+      runId: 'run-norm',
+      processed: 3,
+      failed: { identityResolutionFailed: 0, apolloFailed: 0, llmOrParseFailed: 0, updateFailed: 0, searchWebFailed: 0 },
+      tierFillBreakdown: {},
+      durationMs: 100,
+    });
+    // List has no existing custom fields — normalization applies standard synonym only
+    (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ fieldNames: [] });
+
+    const summary = await runEmmaEnrichment({
+      listId: 'list-1',
+      userId: 'user-1',
+      outputFields: [{ name: 'company_name', instruction: 'find the company' }],
+      mode: 'enrich',
+    });
+
+    // processEnrichmentConfig should have been called with a config whose first field is 'company'
+    const calledConfig = (processEnrichmentConfig as jest.Mock).mock.calls[0][0].config;
+    expect(calledConfig.fields[0].name).toBe('company');
+
+    // Summary should carry the remap
+    expect(summary.fieldRemaps).toEqual([
+      { from: 'company_name', to: 'company', reason: 'standard_column' },
+    ]);
+  });
+
+  it('proceeds with original output_fields when getLeadListById throws (fail-soft)', async () => {
+    (crmDb.getLeadListById as jest.Mock).mockRejectedValue(new Error('DynamoDB timeout'));
+    (runEnrichment as jest.Mock).mockResolvedValue({
+      runId: 'run-fallback',
+      processed: 1,
+      failed: { identityResolutionFailed: 0, apolloFailed: 0, llmOrParseFailed: 0, updateFailed: 0, searchWebFailed: 0 },
+      tierFillBreakdown: {},
+      durationMs: 50,
+    });
+
+    const summary = await runEmmaEnrichment({
+      listId: 'list-1',
+      userId: 'user-1',
+      outputFields: [{ name: 'company_name', instruction: 'find the company' }],
+      mode: 'enrich',
+    });
+
+    // Should have called processEnrichmentConfig with the original (unnormalized) field
+    const calledConfig = (processEnrichmentConfig as jest.Mock).mock.calls[0][0].config;
+    expect(calledConfig.fields[0].name).toBe('company_name');
+
+    // No remaps — normalization was skipped
+    expect(summary.fieldRemaps).toBeUndefined();
   });
 });
 

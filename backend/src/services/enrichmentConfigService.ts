@@ -60,6 +60,14 @@ const CANONICAL_SYNONYMS: Record<string, string> = {
   full_name: 'first_name',         // imperfect — won't split, but routes to person_identity
 };
 
+/** Resolve a field name to its canonical FIELD_GROUPS name. Returns the name
+ *  itself when it is already canonical, the inferred canonical when a
+ *  heuristic match exists, or undefined when there is no canonical analog. */
+export function canonicalFieldName(name: string): string | undefined {
+  if (CANONICAL_FIELD_NAMES.has(name)) return name;
+  return inferAliasFor(name);
+}
+
 /** Infer `aliasFor` for a single field. Returns the canonical name, or
  *  undefined if no high-confidence match. */
 function inferAliasFor(fieldName: string): string | undefined {

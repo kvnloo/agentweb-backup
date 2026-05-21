@@ -8,6 +8,7 @@ import { runEnrichment, type RunEnrichmentResult } from '../services/crmEnrichme
 import { buildOrchestratorDeps } from '../services/enrichmentV3RealDeps';
 import type { SocketEmitFn } from '../services/crmEnrichmentService';
 import { buildRawEnrichmentConfig, type EmmaEnrichmentOutputField } from './enrichmentToolConfig';
+import { normalizeOutputFields, type FieldRemap } from './enrichmentFieldNormalizer';
 
 /** Emma-facing summary of a V3 enrichment run. */
 export interface EmmaEnrichmentSummary {
@@ -19,6 +20,8 @@ export interface EmmaEnrichmentSummary {
   durationMs: number;
   warnings: string[];
   samples?: Array<{ leadId: string; enrichedFields: Record<string, string> }>;
+  /** Field renames applied before building the config (synonym/alias normalization). */
+  fieldRemaps?: FieldRemap[];
 }
 
 export interface RunEmmaEnrichmentParams {
@@ -40,7 +43,26 @@ export interface RunEmmaEnrichmentParams {
 export async function runEmmaEnrichment(
   params: RunEmmaEnrichmentParams,
 ): Promise<EmmaEnrichmentSummary> {
-  const rawConfig = buildRawEnrichmentConfig(params.outputFields, params.userId);
+  // Normalize field names: map synonyms onto existing standard/custom columns to
+  // avoid creating duplicates. Fail soft — if the list lookup throws, proceed
+  // with the original output_fields unchanged (enrichment must never be blocked).
+  let effectiveOutputFields = params.outputFields;
+  let remaps: FieldRemap[] = [];
+  try {
+    const { crmDb } = await import('../services/db');
+    const list = await crmDb.getLeadListById(params.listId);
+    const existingFieldNames: string[] = Array.isArray(list?.fieldNames) ? list.fieldNames : [];
+    const normalized = normalizeOutputFields(params.outputFields, existingFieldNames);
+    effectiveOutputFields = normalized.fields;
+    remaps = normalized.remaps;
+  } catch (err) {
+    console.warn(
+      `[emma-enrich] Failed to fetch list fieldNames for normalization (listId=${params.listId}); ` +
+      `proceeding with original output_fields. Error: ${err}`,
+    );
+  }
+
+  const rawConfig = buildRawEnrichmentConfig(effectiveOutputFields, params.userId);
   const { config, warnings } = await processEnrichmentConfig(
     { listId: params.listId, userId: params.userId, config: rawConfig },
     buildConfigProcessingDeps(),
@@ -65,7 +87,7 @@ export async function runEmmaEnrichment(
   console.log(
     `[emma-enrich] engine=v3 runId=${result.runId} listId=${params.listId} ` +
     `userId=${params.userId} mode=${params.mode} leads=${result.processed} ` +
-    `fields=${params.outputFields.length} failed=${failedCount} durationMs=${result.durationMs}`,
+    `fields=${effectiveOutputFields.length} failed=${failedCount} durationMs=${result.durationMs}`,
   );
 
   const summary: EmmaEnrichmentSummary = {
@@ -82,6 +104,9 @@ export async function runEmmaEnrichment(
       leadId: p.leadId,
       enrichedFields: p.extractedFields,
     }));
+  }
+  if (remaps.length > 0) {
+    summary.fieldRemaps = remaps;
   }
   return summary;
 }

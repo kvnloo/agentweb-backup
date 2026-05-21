@@ -215,7 +215,7 @@ export interface OrchestratorDeps {
  *  AW-Leads attributes via setLeadFields.topLevel (not customFields). Mirrors
  *  STANDARD_ENRICHABLE_FIELDS in enrichmentConfigService. */
 const STANDARD_LEAD_COLUMNS = new Set<string>([
-  'firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'notes',
+  'firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'notes', 'website',
 ]);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

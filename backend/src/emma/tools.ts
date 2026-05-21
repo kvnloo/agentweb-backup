@@ -5628,7 +5628,7 @@ emmaToolRegistry.register({
 
 Returns: runId, processedCount (the 2 sampled leads), and samples — each with leadId and enrichedFields. In enrichedFields a missing value means nothing was found; tell the user "not found" rather than showing null. Show the samples and ask the user to confirm before calling enrich_leads_execute.
 
-output_fields guidance: one entry per distinct data point. Each entry has a snake_case "name", an "instruction" (what to find / where it lives), and an optional "overwrite_policy". Numeric values, categorical values, URLs, and prose summaries each get their own field. The engine routes data sources (Apollo, LinkedIn, web search) automatically — you do not specify sources.`,
+output_fields guidance: one entry per distinct data point. Each entry has a snake_case "name", an "instruction" (what to find / where it lives), and an optional "overwrite_policy". Numeric values, categorical values, URLs, and prose summaries each get their own field. The engine routes data sources (Apollo, LinkedIn, web search) automatically — you do not specify sources. If the result includes fieldRemaps, tell the user which requested fields were mapped onto existing CRM columns to avoid duplicates.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -5686,7 +5686,7 @@ emmaToolRegistry.register({
 
 Progress updates stream via Socket.IO. This call blocks until the job completes, then returns runId, processedCount, failedCount, and failureBreakdown.
 
-Call enrich_leads_preview first and let the user confirm. Pass the same output_fields used in the preview. Large lists are capped — if the list is over the limit, narrow it with lead_ids or tell the user to run a full enrichment from the CRM page.`,
+Call enrich_leads_preview first and let the user confirm. Pass the same output_fields used in the preview. Large lists are capped — if the list is over the limit, narrow it with lead_ids or tell the user to run a full enrichment from the CRM page. If the result includes fieldRemaps, tell the user which requested fields were mapped onto existing CRM columns to avoid duplicates.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -5755,7 +5755,7 @@ emmaToolRegistry.register({
 
 Use this when the user wants specific missing information filled on one lead (e.g. "find this person's LinkedIn headline and company size"). It runs the V3 enrichment engine on a batch of one. The response includes enrichedValues — a map of field name to the found value (null if nothing was found). Values are also persisted to the lead. Always show enrichedValues to the user; if a value is null, say nothing was found for that field.
 
-output_fields: one entry per field to populate, each with a snake_case "name", an "instruction" describing what to find, and an optional "overwrite_policy" (defaults to fill_if_empty; use always_overwrite to refresh a field that already has a value).`,
+output_fields: one entry per field to populate, each with a snake_case "name", an "instruction" describing what to find, and an optional "overwrite_policy" (defaults to fill_if_empty; use always_overwrite to refresh a field that already has a value). If the result includes fieldRemaps, tell the user which requested fields were mapped onto existing CRM columns to avoid duplicates.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -5823,6 +5823,7 @@ output_fields: one entry per field to populate, each with a snake_case "name", a
       failedCount: summary.failedCount,
       failureBreakdown: summary.failureBreakdown,
       warnings: summary.warnings,
+      fieldRemaps: summary.fieldRemaps,
     };
   },
 });
