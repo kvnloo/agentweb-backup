@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-21',
     changes: [
+      'Fixed: Meta Ads Budget Updates Now Apply the Correct Dollar Amount',
+      '- Updating an ad set\'s daily or lifetime budget via Emma was setting the wrong amount — passing $150 resulted in a $1.50 budget because the value was sent to Meta in dollars instead of the required cents',
+      '- Budget values are now correctly converted (multiplied by 100) before being sent to the Meta Ads API for both ad set and campaign updates',
+      '- Creating ad sets was not affected; only update operations had the missing conversion',
+    ],
+  },
+  {
+    date: '2026-05-21',
+    changes: [
       'Fixed: Sequence Auto-Enroll Section No Longer Shows Unrelated Lists',
       '- The AUTO-ENROLL section in a sequence detail view was showing every list that ever had a lead manually enrolled — even lists the user never configured for auto-enrollment',
       '- Now only lists explicitly enabled for auto-enrollment are shown',
