@@ -1,5 +1,12 @@
 /**
- * Tests for Funnel routes
+ * Tests for Funnel routes.
+ *
+ * The funnel router was rewritten to be org-aware: it imports userDb/orgDb from
+ * ../services/db and orgShareService. These tests exercise the simple
+ * own-funnels path by mocking userDb.getUserById to return a user with NO
+ * orgId — so GET /api/funnels returns only the caller's funnels and the
+ * item routes (GET/PUT/DELETE /:configId) operate on the caller's own funnel
+ * map exactly as before.
  */
 
 // Mock the auth middleware
@@ -9,19 +16,36 @@ jest.mock('../middleware/auth', () => ({
 import { authenticateToken } from '../middleware/auth';
 const mockedAuthenticateToken = authenticateToken as jest.MockedFunction<typeof authenticateToken>;
 
-// Mock AWS SDK
+// Mock AWS SDK — DocumentClient with get/put (and config.update so the
+// transitively-imported src/config/aws.ts does not crash on suite load).
 const mockGet = jest.fn();
 const mockPut = jest.fn();
 jest.mock('aws-sdk', () => {
+  const DocumentClient = jest.fn().mockImplementation(() => ({
+    get: mockGet,
+    put: mockPut
+  }));
   return {
-    DynamoDB: {
-      DocumentClient: jest.fn().mockImplementation(() => ({
-        get: mockGet,
-        put: mockPut
-      }))
-    }
+    __esModule: true,
+    default: { DynamoDB: { DocumentClient }, config: { update: jest.fn() } },
+    DynamoDB: { DocumentClient },
+    config: { update: jest.fn() }
   };
 });
+
+// Mock ../services/db — userDb.getUserById returns a user with NO orgId so the
+// routes take the simple own-funnels path. orgDb stubbed (unused on that path).
+const mockGetUserById = jest.fn();
+jest.mock('../services/db', () => ({
+  userDb: { getUserById: mockGetUserById },
+  orgDb: {
+    getOrgById: jest.fn(),
+    getOrgMembers: jest.fn()
+  }
+}));
+
+// orgShareService runs for real (not reached on the no-org path).
+jest.unmock('../services/orgShareService');
 
 import express from 'express';
 import request from 'supertest';
@@ -32,6 +56,12 @@ describe('Funnel Routes', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+
+    // Caller has no orgId → routes use the caller's own funnel map only.
+    mockGetUserById.mockResolvedValue({
+      userId: 'test-user-123',
+      email: 'test@example.com'
+    });
 
     app = express();
     app.use(express.json());
@@ -76,9 +106,16 @@ describe('Funnel Routes', () => {
         .expect(200);
 
       expect(response.body.success).toBe(true);
+      // No-org caller → truncated is always false.
+      expect(response.body.truncated).toBe(false);
       expect(response.body.funnels).toHaveLength(1);
-      expect(response.body.funnels[0].configId).toBe('funnel:funnel-1');
-      expect(response.body.funnels[0].name).toBe('Main Conversion Funnel');
+      // Each funnel is now also tagged with owner info and a canEdit flag.
+      expect(response.body.funnels[0]).toEqual(expect.objectContaining({
+        configId: 'funnel:funnel-1',
+        name: 'Main Conversion Funnel',
+        ownerUserId: 'test-user-123',
+        canEdit: true
+      }));
     });
 
     it('should return empty list when no funnels exist', async () => {
@@ -92,6 +129,7 @@ describe('Funnel Routes', () => {
 
       expect(response.body.success).toBe(true);
       expect(response.body.funnels).toEqual([]);
+      expect(response.body.truncated).toBe(false);
       expect(mockPut).not.toHaveBeenCalled();
     });
   });
