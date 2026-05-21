@@ -1,4 +1,5 @@
 import express from "express";
+import AWS from "aws-sdk";
 import { userDb, orgDb, taskDb } from "../services/db";
 import { workPlanService } from "../services/workPlanService";
 import { skillService } from "../services/skillService";
@@ -11,6 +12,41 @@ import {
 import { TOGGLEABLE_FEATURES, ToggleableFeature } from "../services/orgShareService";
 
 const router = express.Router();
+
+const dynamodb = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || "us-west-2" });
+const TABLE_PREFIX = process.env.NODE_ENV === "production" ? "" : "Dev-";
+
+// ── Funnel helpers (funnels are stored one item per user in AW-Settings) ─────
+
+/** Read a user's funnels map from AW-Settings (keyed `funnels_<userId>`). */
+async function getUserFunnelsMap(userId: string): Promise<Record<string, any>> {
+  const result = await dynamodb
+    .get({
+      TableName: `${TABLE_PREFIX}AW-Settings`,
+      Key: { settingName: `funnels_${userId}` },
+    })
+    .promise();
+  return (result.Item?.funnels as Record<string, any>) || {};
+}
+
+/** Write a user's funnels map back to AW-Settings. */
+async function saveUserFunnelsMap(userId: string, funnels: Record<string, any>): Promise<void> {
+  await dynamodb
+    .put({
+      TableName: `${TABLE_PREFIX}AW-Settings`,
+      Item: {
+        settingName: `funnels_${userId}`,
+        funnels,
+        updatedAt: new Date().toISOString(),
+      },
+    })
+    .promise();
+}
+
+/** Count the funnels owned by a user. */
+async function getUserFunnelCount(userId: string): Promise<number> {
+  return Object.keys(await getUserFunnelsMap(userId)).length;
+}
 
 // ── GET /:userId/removal-preview ───────────────────────────────────────────
 
@@ -30,12 +66,13 @@ router.get("/:userId/removal-preview", async (req, res) => {
       return res.status(404).json({ message: "Member not found in your org" });
     }
 
-    const [taskList, templates, landingPages, workPlans, skills] = await Promise.all([
+    const [taskList, templates, landingPages, workPlans, skills, funnelsCount] = await Promise.all([
       taskDb.getTasksByUserId(target.userId).then((a) => (a ?? []).length),
       htmlTemplateService.getTemplatesByOwner(target.userId).then((a) => a.length),
       getLandingPagesByOwner(target.userId).then((a) => a.length),
       workPlanService.getWorkPlansByOwner(target.userId).then((a) => a.length),
       skillService.getSkillsByOwner(target.userId).then((a) => a.length),
+      getUserFunnelCount(target.userId),
     ]);
 
     res.json({
@@ -46,6 +83,7 @@ router.get("/:userId/removal-preview", async (req, res) => {
         landingPages,
         workPlans,
         skills,
+        funnels: funnelsCount,
       },
     });
   } catch (e) {
@@ -138,10 +176,10 @@ router.post("/:userId/remove", async (req, res) => {
             if (!item) break;
             try {
               if (d === "transfer") {
-                await transferItemOwner(item, f, callerId);
+                await transferItemOwner(item, f, target.userId, callerId);
                 summary[f].updated++;
               } else if (d === "delete") {
-                await deleteItem(item, f);
+                await deleteItem(item, f, target.userId);
                 summary[f].deleted++;
               }
             } catch (e: any) {
@@ -174,7 +212,7 @@ async function fetchItemsForFeature(userId: string, f: ToggleableFeature): Promi
     case "landingPages":   return getLandingPagesByOwner(userId);
     case "workPlans":      return workPlanService.getWorkPlansByOwner(userId);
     case "skills":         return skillService.getSkillsByOwner(userId);
-    case "funnels":        throw new Error("funnels member-removal handling not yet implemented");
+    case "funnels":        return Object.values(await getUserFunnelsMap(userId));
   }
 }
 
@@ -185,11 +223,16 @@ function getItemId(item: any, f: ToggleableFeature): string {
     case "landingPages":   return item.id;
     case "workPlans":      return item.planId;
     case "skills":         return item.skillId;
-    case "funnels":        throw new Error("funnels member-removal handling not yet implemented");
+    case "funnels":        return item.id;
   }
 }
 
-async function transferItemOwner(item: any, f: ToggleableFeature, newOwnerId: string): Promise<void> {
+async function transferItemOwner(
+  item: any,
+  f: ToggleableFeature,
+  ownerId: string,
+  newOwnerId: string,
+): Promise<void> {
   switch (f) {
     case "knowledgeBase":
       await taskDb.updateTaskOwner(item.taskId, newOwnerId);
@@ -206,12 +249,23 @@ async function transferItemOwner(item: any, f: ToggleableFeature, newOwnerId: st
     case "skills":
       await skillService.transferOwner(item.skillId, newOwnerId);
       return;
-    case "funnels":
-      throw new Error("funnels member-removal handling not yet implemented");
+    case "funnels": {
+      const [ownerFunnels, recipientFunnels] = await Promise.all([
+        getUserFunnelsMap(ownerId),
+        getUserFunnelsMap(newOwnerId),
+      ]);
+      const funnel = ownerFunnels[item.id];
+      if (!funnel) return;
+      recipientFunnels[item.id] = funnel;
+      delete ownerFunnels[item.id];
+      await saveUserFunnelsMap(newOwnerId, recipientFunnels);
+      await saveUserFunnelsMap(ownerId, ownerFunnels);
+      return;
+    }
   }
 }
 
-async function deleteItem(item: any, f: ToggleableFeature): Promise<void> {
+async function deleteItem(item: any, f: ToggleableFeature, ownerId: string): Promise<void> {
   switch (f) {
     case "knowledgeBase":
       await taskDb.deleteTask(item.taskId);
@@ -228,8 +282,13 @@ async function deleteItem(item: any, f: ToggleableFeature): Promise<void> {
     case "skills":
       await skillService.deleteSkill(item.skillId);
       return;
-    case "funnels":
-      throw new Error("funnels member-removal handling not yet implemented");
+    case "funnels": {
+      const ownerFunnels = await getUserFunnelsMap(ownerId);
+      if (!(item.id in ownerFunnels)) return;
+      delete ownerFunnels[item.id];
+      await saveUserFunnelsMap(ownerId, ownerFunnels);
+      return;
+    }
   }
 }
 
