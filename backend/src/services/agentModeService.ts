@@ -13791,15 +13791,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   // Helper: get Google Drive shared folders for a caller.
-  // If the caller belongs to an org, returns the org's folder list; otherwise the user's own list.
+  // Returns the union of org-level and user-level folders so that folders added before the
+  // org feature existed (stored on the user record) continue to work without data migration.
   private async getUserGoogleDriveFolders(userId: string): Promise<Array<{ folderId: string; name: string }>> {
     const { userDb, orgDb } = await import('./db');
     const user = await userDb.getUserById(userId);
+    const userFolders: Array<{ folderId: string; name: string }> =
+      Array.isArray(user?.googleDriveFolders) ? user!.googleDriveFolders : [];
     if (user?.orgId) {
       const org = await orgDb.getOrgById(user.orgId);
-      return Array.isArray(org?.googleDriveFolders) ? org!.googleDriveFolders : [];
+      const orgFolders: Array<{ folderId: string; name: string }> =
+        Array.isArray(org?.googleDriveFolders) ? org!.googleDriveFolders : [];
+      // Merge: org folders first, then user folders not already in org list
+      const orgFolderIds = new Set(orgFolders.map(f => f.folderId));
+      return [...orgFolders, ...userFolders.filter(f => !orgFolderIds.has(f.folderId))];
     }
-    return Array.isArray(user?.googleDriveFolders) ? user!.googleDriveFolders : [];
+    return userFolders;
   }
 
   public async searchKnowledgeBase(query: string, maxResults: number = 5, userId?: string): Promise<any> {
