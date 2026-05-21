@@ -237,6 +237,17 @@ export function checkEmailFormat(html: string): EmailFormatWarning[] {
   return warnings;
 }
 
+// Map spaced/alternate variable names that users commonly type to their camelCase keys.
+// e.g. "first name" → "firstName"
+const VARIABLE_ALIASES: Record<string, string> = {
+  'first name': 'firstName',
+  'last name': 'lastName',
+  'First Name': 'firstName',
+  'Last Name': 'lastName',
+  'First name': 'firstName',
+  'Last name': 'lastName',
+};
+
 export function substituteVariables(template: string, lead: Record<string, any>): string {
   if (!template) return template;
 
@@ -246,6 +257,13 @@ export function substituteVariables(template: string, lead: Record<string, any>)
   for (const field of STANDARD_FIELDS) {
     const regex = new RegExp(`\\{\\{${field}\\}\\}`, 'g');
     result = result.replace(regex, lead[field] != null ? String(lead[field]) : '');
+  }
+
+  // Replace aliased field names: {{first name}}, {{last name}}, etc.
+  for (const [alias, canonical] of Object.entries(VARIABLE_ALIASES)) {
+    const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`\\{\\{${escaped}\\}\\}`, 'g');
+    result = result.replace(regex, lead[canonical] != null ? String(lead[canonical]) : '');
   }
 
   // Replace custom fields: {{customFields.xxx}}

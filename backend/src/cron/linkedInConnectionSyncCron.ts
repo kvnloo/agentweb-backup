@@ -112,7 +112,7 @@ export async function syncConnectionsForAccount(
  * enrollmentTrigger.type='linkedin_connection_accepted', then find leads in
  * that sequence owner's lists whose linkedin URL matches, and enroll them.
  */
-async function enrollNewConnections(newConnections: UnipileConnection[]): Promise<number> {
+export async function enrollNewConnections(newConnections: UnipileConnection[]): Promise<number> {
   if (newConnections.length === 0) return 0;
 
   const sequences = await dripSequenceDb.getAllSequencesByTriggerType('linkedin_connection_accepted');
@@ -127,6 +127,8 @@ async function enrollNewConnections(newConnections: UnipileConnection[]): Promis
         const lists = await crmDb.getLeadListsByUserId(seq.userId);
 
         for (const list of lists as any[]) {
+          // Only search lists that are configured for auto-enroll on this sequence
+          if (seq.autoEnrollListIds?.length && !seq.autoEnrollListIds.includes(list.listId)) continue;
           // Scan leads in this list for a matching LinkedIn URL
           let lastKey: any = null;
           do {

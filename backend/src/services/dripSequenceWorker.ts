@@ -40,9 +40,17 @@ export async function processDueEnrollments(): Promise<{
     stats.processed++;
     try {
       await processEnrollment(enrollment, stats);
-    } catch (err) {
+    } catch (err: any) {
       stats.errors++;
       console.error(`[dripWorker] Error processing enrollment ${enrollment.enrollmentId}:`, err);
+      // Not-connected: snooze 6 hours so we stop hammering every 5 minutes.
+      // The LinkedIn connection sync will re-enroll via auto-enroll once the
+      // connection is accepted, but for manually enrolled leads we use backoff.
+      if (err?.message?.includes('not a 1st-degree connection')) {
+        const retryAt = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
+        await dripSequenceDb.snoozeEnrollment(enrollment.enrollmentId, retryAt).catch(() => {});
+        console.log(`[dripWorker] Snoozed enrollment ${enrollment.enrollmentId} until ${retryAt} (not yet connected)`);
+      }
     }
   }
 

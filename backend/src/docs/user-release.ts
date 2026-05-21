@@ -71,6 +71,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-20',
     changes: [
+      'Fixed: LinkedIn Drip Campaign — Three Reliability Improvements',
+      '- Messages in campaign templates that used {{first name}} or {{last name}} (with a space) were being sent as literal placeholder text instead of the lead\'s name — now resolved',
+      '- Enrollments that failed because the lead was not yet a 1st-degree connection were retrying every 5 minutes, causing a retry storm — they now snooze for 6 hours and retry once the connection is accepted',
+      '- Campaign auto-enrollment was pulling leads from all of a user\'s lists instead of only the lists configured for the campaign — now correctly scoped to the configured lists only',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
       'New: Organization-Wide Emma Memory',
       '- Organizations can now maintain a shared memory that Emma uses across all member conversations',
       '- Go to Settings → Organization → Organization Memory to add, edit, or delete org-wide facts',
