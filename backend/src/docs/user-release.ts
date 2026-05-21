@@ -26,6 +26,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-21',
+    changes: [
+      'Fixed: Emma No Longer Gets Stuck in a Repeated Navigate/Screenshot Loop',
+      '- In some sessions, Emma would navigate to the same file URL and take a screenshot repeatedly — sometimes 20+ times — before completing the task',
+      '- A new sliding-window loop detector now catches this alternating pattern and stops it within 10 iterations',
+      '- Emma now provides a final response based on what she has already observed instead of looping indefinitely',
+    ],
+  },
+  {
     date: '2026-05-20',
     changes: [
       'Fixed: Emma Can Now Read Word Documents (.docx)',
