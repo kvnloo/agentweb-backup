@@ -22,6 +22,7 @@ import { resolveIdentity as pureResolveIdentity } from './enrichmentIdentityReso
 import { runWaterfall as pureRunWaterfall } from './enrichmentGroupWaterfall';
 import { apolloAsyncRequestCacheKey, APOLLO_SCHEMA_VERSION } from './apolloCacheKeys';
 import { FIELD_GROUPS } from './enrichmentGroups';
+import { STANDARD_ENRICHABLE_FIELDS } from './enrichmentConfigService';
 import {
   getRawDataFromCache,
   writeRawDataToCache,
@@ -281,7 +282,7 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
       // Split by destination: standard lead columns go to top-level (where
       // the lead table reads them); custom names go to customFields.
       // Matches STANDARD_LEAD_COLUMNS in crmEnrichmentServiceV3.ts.
-      const STANDARD = new Set(['firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'notes']);
+      const STANDARD = new Set<string>(STANDARD_ENRICHABLE_FIELDS);
       const topLevel: Record<string, string> = {};
       const customFields: Record<string, string> = {};
       const removeCustomFieldKeys: string[] = [];

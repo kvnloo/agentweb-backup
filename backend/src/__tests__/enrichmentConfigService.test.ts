@@ -9,6 +9,7 @@ import {
   setEnrichmentConfig,
   suggestFieldTypes,
   RESERVED_FIELD_NAMES,
+  STANDARD_ENRICHABLE_FIELDS,
   type ConfigServiceDeps,
 } from '../services/enrichmentConfigService';
 import type { EnrichmentConfig } from '../services/crmEnrichmentServiceV3';
@@ -1309,5 +1310,13 @@ describe('setEnrichmentConfig — smart field classification', () => {
     const names = classifyCall.map((f: any) => f.name);
     expect(names).not.toContain('industry');   // include:false — skipped
     expect(names).toContain('company');         // include:true — classified
+  });
+});
+
+describe('STANDARD_ENRICHABLE_FIELDS export', () => {
+  it('exports the 8 canonical standard lead columns', () => {
+    expect([...STANDARD_ENRICHABLE_FIELDS]).toEqual([
+      'firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'notes',
+    ]);
   });
 });

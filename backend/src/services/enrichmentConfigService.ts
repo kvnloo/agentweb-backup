@@ -124,7 +124,7 @@ export const STANDARD_DATA_ALIASES: Record<string, string> = {
  *  regardless of whether the list's fieldNames contains them. Mirrors the
  *  "Standard Fields" section of the Configure Display Fields dialog, minus
  *  non-enrichable system fields (createdAt, updatedAt, status, dealValue). */
-const STANDARD_ENRICHABLE_FIELDS = [
+export const STANDARD_ENRICHABLE_FIELDS = [
   'firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'notes',
 ] as const;
 

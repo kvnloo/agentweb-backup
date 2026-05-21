@@ -26,6 +26,7 @@ import {
   type SiblingFieldMappingTable,
 } from './enrichmentSiblingConfigFields';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
+import { STANDARD_ENRICHABLE_FIELDS } from './enrichmentConfigService';
 
 // ─── Socket progress options ─────────────────────────────────────────────────
 //
@@ -212,11 +213,8 @@ export interface OrchestratorDeps {
 }
 
 /** Standard CRM lead columns — values for these field names go to top-level
- *  AW-Leads attributes via setLeadFields.topLevel (not customFields). Mirrors
- *  STANDARD_ENRICHABLE_FIELDS in enrichmentConfigService. */
-const STANDARD_LEAD_COLUMNS = new Set<string>([
-  'firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'notes',
-]);
+ *  AW-Leads attributes via setLeadFields.topLevel (not customFields). */
+const STANDARD_LEAD_COLUMNS = new Set<string>(STANDARD_ENRICHABLE_FIELDS);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
