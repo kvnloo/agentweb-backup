@@ -11899,7 +11899,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async updateMetaAdsCampaign(userId: string, campaignId: string, params: any, account_id?: string): Promise<any> {
     try {
       const { accessToken } = await this.getMetaCredentials(userId, account_id);
-      await metaService.updateCampaign(accessToken, campaignId, params);
+      const normalizedParams = { ...params };
+      if (normalizedParams.budget_amount !== undefined) {
+        normalizedParams.daily_budget = Math.round(normalizedParams.budget_amount * 100);
+        delete normalizedParams.budget_amount;
+      }
+      await metaService.updateCampaign(accessToken, campaignId, normalizedParams);
       return {
         success: true,
         message: `Campaign updated successfully`
@@ -11937,7 +11942,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async updateMetaAdsAdSet(userId: string, adSetId: string, params: any, account_id?: string): Promise<any> {
     try {
       const { accessToken } = await this.getMetaCredentials(userId, account_id);
-      await metaService.updateAdSet(accessToken, adSetId, params);
+      const toCents = (val?: number) => val !== undefined ? Math.round(val * 100) : undefined;
+      const normalizedParams = {
+        ...params,
+        ...(params.daily_budget !== undefined && { daily_budget: toCents(params.daily_budget) }),
+        ...(params.lifetime_budget !== undefined && { lifetime_budget: toCents(params.lifetime_budget) }),
+        ...(params.bid_amount !== undefined && { bid_amount: toCents(params.bid_amount) }),
+      };
+      await metaService.updateAdSet(accessToken, adSetId, normalizedParams);
       return {
         success: true,
         message: `Ad set updated successfully`
