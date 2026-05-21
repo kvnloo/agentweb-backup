@@ -792,8 +792,11 @@ export async function runEnrichment(
   const refreshSet = buildRefreshFieldsSet(input.refreshFields);
 
   // Build sibling field mapping table once per run (one LLM call for unaliased
-  // fields, canonical match is free). Passed to every processLead call.
-  const siblingMappingTable = await buildSiblingFieldMappingTable(workingConfig.fields);
+  // fields, canonical match is free). Passed to every processLead call. Skipped
+  // entirely when there are no leads — no processLead would consume it.
+  const siblingMappingTable: SiblingFieldMappingTable = leads.length > 0
+    ? await buildSiblingFieldMappingTable(workingConfig.fields)
+    : { canonical: new Map(), llm: new Map() };
   const configFieldsByName: Record<string, EnrichmentFieldConfig> = {};
   const fieldAliasMap: Record<string, string> = {};
   for (const f of workingConfig.fields) {

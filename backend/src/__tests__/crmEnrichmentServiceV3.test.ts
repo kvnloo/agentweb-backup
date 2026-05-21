@@ -88,6 +88,18 @@ function makeInput(overrides: Partial<RunEnrichmentInput> = {}): RunEnrichmentIn
 
 // ─── Empty list ───────────────────────────────────────────────────────────────
 
+describe('runEnrichment — empty list skips sibling mapping table', () => {
+  it('does not call buildSiblingFieldMappingTable when there are no leads', async () => {
+    const { buildSiblingFieldMappingTable } = require('../services/enrichmentSiblingConfigFields');
+    (buildSiblingFieldMappingTable as jest.Mock).mockClear();
+
+    const deps = makeDeps({ loadLeads: jest.fn().mockResolvedValue([]) });
+    await runEnrichment(makeInput(), deps);
+
+    expect(buildSiblingFieldMappingTable as jest.Mock).not.toHaveBeenCalled();
+  });
+});
+
 describe('runEnrichment — empty list', () => {
   it('returns 0-processed run when list has no leads', async () => {
     const deps = makeDeps({ loadLeads: jest.fn().mockResolvedValue([]) });
