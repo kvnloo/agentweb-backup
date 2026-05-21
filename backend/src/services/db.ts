@@ -558,6 +558,13 @@ export interface Organization {
   createdAt: string;
   updatedAt: string;
   shareSettings?: OrgShareSettings;
+  /**
+   * Admin-controlled: when true, org members inherit the org owner's analytics
+   * configuration (GA4 properties, gaFilteredDomains, productDomain, seoDomains,
+   * clarityProjects). Set only by the platform admin via
+   * PATCH /api/admin/orgs/:orgId/analytics-sharing. Default: undefined/false.
+   */
+  shareAnalyticsWithOrg?: boolean;
   secrets?: Record<string, string>; // Encrypted per-org secrets (key → encrypted value)
   orgMemoryEnabled?: boolean; // Whether org-wide Emma memory is enabled (default: true)
 }
