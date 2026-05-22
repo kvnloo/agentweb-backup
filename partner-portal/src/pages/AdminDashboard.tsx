@@ -247,6 +247,9 @@ interface User {
   secretNames?: string[]; // Names of configured secrets (values not exposed)
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
+  googleAnalyticsProperties?: Array<{ propertyId: string; label: string }>;
+  primaryAnalyticsPropertyId?: string;
+  clarityProjects?: Array<{ projectId: string; label: string }>;
   gaFilteredDomains?: string[]; // Domains to exclude from Google Analytics
   clarityProjectId?: string; // Microsoft Clarity Project ID
   productDomain?: string; // Product site domain for feature usage tracking
@@ -849,6 +852,8 @@ export default function AdminDashboard() {
   const [clarityProjectId, setClarityProjectId] = useState("");
   const [clarityProjects, setClarityProjects] = useState<Array<{ projectId: string; label: string }>>([]);
   const [productDomain, setProductDomain] = useState("");
+  const [primaryAnalyticsPropertyId, setPrimaryAnalyticsPropertyId] = useState("");
+  const [seoAeoDialogLoading, setSeoAeoDialogLoading] = useState(false);
   const [seoDomainsEditLoading, setSeoDomainsEditLoading] = useState(false);
   const [editingCmsTypeUserId, setEditingCmsTypeUserId] = useState<string | null>(null);
   const [currentCmsType, setCurrentCmsType] = useState<"Basehub" | "Webflow" | "">("");
@@ -2524,6 +2529,36 @@ export default function AdminDashboard() {
     }
   };
 
+  const openSeoAeoDialog = async (user: User) => {
+    setEditingSeoDomainsUserId(user.userId);
+    setEditingUserIsOrgOwner(!!user.isOrgOwner);
+    setEditingUserOrgId(user.orgId || null);
+    setShareAnalyticsWithOrg(!!user.orgShareAnalyticsWithOrg);
+    // Reset fields, then load the resolved config (Org record if the user is in an org).
+    setSeoDomainsText(""); setGoogleAnalyticsProperties([]); setPrimaryAnalyticsPropertyId("");
+    setGaFilteredDomainsText(""); setClarityProjects([]); setProductDomain("");
+    setGoogleAnalyticsPropertyId(""); setClarityProjectId("");
+    setSeoDomainsDialogOpen(true);
+    setSeoAeoDialogLoading(true);
+    try {
+      const { data } = await axios.get(
+        buildApiUrl(`/api/admin/users/${user.userId}/seo-aeo`),
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      const c = data.config || {};
+      setSeoDomainsText((c.seoDomains || []).join("\n"));
+      setGoogleAnalyticsProperties(c.googleAnalyticsProperties || []);
+      setPrimaryAnalyticsPropertyId(c.primaryAnalyticsPropertyId || "");
+      setGaFilteredDomainsText((c.gaFilteredDomains || []).join("\n"));
+      setClarityProjects(c.clarityProjects || []);
+      setProductDomain(c.productDomain || "");
+    } catch (e: any) {
+      setError(e.response?.data?.message || "Failed to load SEO/AEO config");
+    } finally {
+      setSeoAeoDialogLoading(false);
+    }
+  };
+
   const handleSaveSeoDomains = async () => {
     if (!editingSeoDomainsUserId) return;
 
@@ -2668,12 +2703,14 @@ export default function AdminDashboard() {
         buildApiUrl(`/api/admin/users/${editingSeoDomainsUserId}/seo-aeo`),
         {
           seoDomains: domains,
-          googleAnalyticsPropertyId: gaId || null,
-          googleAnalyticsProperties: validatedGaProperties.length > 0 ? validatedGaProperties : undefined,
+          googleAnalyticsProperties: validatedGaProperties,
+          primaryAnalyticsPropertyId:
+            validatedGaProperties.some(p => p.propertyId === primaryAnalyticsPropertyId)
+              ? primaryAnalyticsPropertyId
+              : null,
           gaFilteredDomains: filteredDomains,
-          clarityProjectId: clarityId || null,
-          clarityProjects: validatedClarityProjects.length > 0 ? validatedClarityProjects : undefined,
-          productDomain: prodDomain || null
+          clarityProjects: validatedClarityProjects,
+          productDomain: prodDomain || null,
         },
         {
           headers: { Authorization: `Bearer ${token}` }
@@ -2681,19 +2718,19 @@ export default function AdminDashboard() {
       );
 
       if (response.status === 200) {
+        const savedConfig = response.data.config || {};
         // Update the user in the local state without reloading
         setUsers((prevUsers: User[]) =>
           prevUsers.map((user: User) =>
             user.userId === editingSeoDomainsUserId
               ? {
                   ...user,
-                  seoDomains: response.data.seoDomains || [],
-                  googleAnalyticsPropertyId: response.data.googleAnalyticsPropertyId || undefined,
-                  googleAnalyticsProperties: response.data.googleAnalyticsProperties || undefined,
-                  gaFilteredDomains: response.data.gaFilteredDomains || [],
-                  clarityProjectId: response.data.clarityProjectId || undefined,
-                  clarityProjects: response.data.clarityProjects || undefined,
-                  productDomain: response.data.productDomain || undefined
+                  seoDomains: savedConfig.seoDomains || [],
+                  googleAnalyticsProperties: savedConfig.googleAnalyticsProperties || undefined,
+                  primaryAnalyticsPropertyId: savedConfig.primaryAnalyticsPropertyId || undefined,
+                  gaFilteredDomains: savedConfig.gaFilteredDomains || [],
+                  clarityProjects: savedConfig.clarityProjects || undefined,
+                  productDomain: savedConfig.productDomain || undefined
                 }
               : user
           )
@@ -2711,6 +2748,7 @@ export default function AdminDashboard() {
         setSeoDomainsText("");
         setGoogleAnalyticsPropertyId("");
         setGoogleAnalyticsProperties([]);
+        setPrimaryAnalyticsPropertyId("");
         setGaFilteredDomainsText("");
         setClarityProjectId("");
         setClarityProjects([]);
@@ -4407,7 +4445,7 @@ export default function AdminDashboard() {
                                   <Typography variant="caption" color="text.secondary">SEO / GA / Clarity</Typography>
                                   <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
                                     <Typography variant="body2">{user.seoDomains?.join(", ") || "—"}</Typography>
-                                    <IconButton size="small" onClick={() => { setEditingSeoDomainsUserId(user.userId); setSeoDomainsText((user.seoDomains || []).join("\n")); setGoogleAnalyticsPropertyId(user.googleAnalyticsPropertyId || ""); setGaFilteredDomainsText((user.gaFilteredDomains || []).join("\n")); setClarityProjectId(user.clarityProjectId || ""); setProductDomain(user.productDomain || ""); setEditingUserIsOrgOwner(!!user.isOrgOwner); setEditingUserOrgId(user.orgId || null); setShareAnalyticsWithOrg(!!user.orgShareAnalyticsWithOrg); setSeoDomainsDialogOpen(true); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                    <IconButton size="small" onClick={() => openSeoAeoDialog(user)}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
                                   </Box>
                                 </Grid>
                                 <Grid item xs={3}>
@@ -6908,6 +6946,7 @@ export default function AdminDashboard() {
           setSeoDomainsText("");
           setGoogleAnalyticsPropertyId("");
           setGoogleAnalyticsProperties([]);
+          setPrimaryAnalyticsPropertyId("");
           setGaFilteredDomainsText("");
           setClarityProjectId("");
           setClarityProjects([]);
@@ -6926,6 +6965,7 @@ export default function AdminDashboard() {
               setSeoDomainsText("");
               setGoogleAnalyticsPropertyId("");
               setGoogleAnalyticsProperties([]);
+              setPrimaryAnalyticsPropertyId("");
               setGaFilteredDomainsText("");
               setClarityProjectId("");
               setClarityProjects([]);
@@ -6940,6 +6980,11 @@ export default function AdminDashboard() {
             <CloseIcon />
           </IconButton>
         </DialogTitle>
+        {editingUserOrgId && (
+          <Typography variant="caption" display="block" sx={{ px: 3, color: 'text.secondary' }}>
+            This is the organization-wide analytics config — shared by all members.
+          </Typography>
+        )}
         <DialogContent dividers>
           <Grid container spacing={2}>
             <Grid item xs={12}>
@@ -7130,12 +7175,13 @@ export default function AdminDashboard() {
               setSeoDomainsText("");
               setGoogleAnalyticsPropertyId("");
               setGoogleAnalyticsProperties([]);
+              setPrimaryAnalyticsPropertyId("");
               setGaFilteredDomainsText("");
               setClarityProjectId("");
               setClarityProjects([]);
               setProductDomain("");
             }}
-            disabled={seoDomainsEditLoading}
+            disabled={seoDomainsEditLoading || seoAeoDialogLoading}
           >
             Cancel
           </Button>
@@ -7143,7 +7189,7 @@ export default function AdminDashboard() {
             onClick={handleSaveSeoDomains}
             color="primary"
             variant="contained"
-            disabled={seoDomainsEditLoading}
+            disabled={seoDomainsEditLoading || seoAeoDialogLoading}
           >
             {seoDomainsEditLoading ? "Saving..." : "Save"}
           </Button>
