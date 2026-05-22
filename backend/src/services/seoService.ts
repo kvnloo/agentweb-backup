@@ -593,9 +593,9 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
             if (hostName) {
               const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
               fullUrl = `https://${hostName}${path}`;
-            } else if (user.seoDomains && user.seoDomains.length > 0) {
+            } else if (resolved.seoDomains && resolved.seoDomains.length > 0) {
               const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
-              fullUrl = `https://${user.seoDomains[0]}${path}`;
+              fullUrl = `https://${resolved.seoDomains[0]}${path}`;
             }
 
             topPagesByEngagement.push({
