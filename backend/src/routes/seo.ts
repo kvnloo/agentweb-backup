@@ -39,6 +39,65 @@ router.get("/config", async (req, res) => {
   }
 });
 
+// Shared guard: load the caller, resolve the write target, enforce canEdit.
+async function loadEditableTarget(req: any, res: any) {
+  const user = await userDb.getUserById(req.user.userId);
+  if (!user) { res.status(404).json({ message: "User not found" }); return null; }
+  const target = await resolveConfigTarget(user);
+  if (!target.canEdit) { res.status(403).json({ message: "Not allowed to edit analytics config" }); return null; }
+  return target;
+}
+
+// Save GA4 properties, primary, filtered domains, product domain.
+router.put("/config/ga", async (req, res) => {
+  try {
+    const target = await loadEditableTarget(req, res);
+    if (!target) return;
+    const v = validateAnalyticsConfig({
+      googleAnalyticsProperties: req.body.googleAnalyticsProperties,
+      primaryAnalyticsPropertyId: req.body.primaryAnalyticsPropertyId,
+      gaFilteredDomains: req.body.gaFilteredDomains,
+      productDomain: req.body.productDomain,
+    });
+    if (!v.ok) return res.status(400).json({ message: v.error });
+    await writeAnalyticsConfig(target, v.value);
+    res.json({ ok: true, config: await readAnalyticsConfig(target) });
+  } catch (error: any) {
+    console.error("Error saving GA config:", error.message);
+    res.status(500).json({ message: "Failed to save GA config" });
+  }
+});
+
+// Save SEO domains.
+router.put("/config/seo-domains", async (req, res) => {
+  try {
+    const target = await loadEditableTarget(req, res);
+    if (!target) return;
+    const v = validateAnalyticsConfig({ seoDomains: req.body.seoDomains });
+    if (!v.ok) return res.status(400).json({ message: v.error });
+    await writeAnalyticsConfig(target, v.value);
+    res.json({ ok: true, config: await readAnalyticsConfig(target) });
+  } catch (error: any) {
+    console.error("Error saving SEO domains:", error.message);
+    res.status(500).json({ message: "Failed to save SEO domains" });
+  }
+});
+
+// Save Clarity projects.
+router.put("/config/clarity", async (req, res) => {
+  try {
+    const target = await loadEditableTarget(req, res);
+    if (!target) return;
+    const v = validateAnalyticsConfig({ clarityProjects: req.body.clarityProjects });
+    if (!v.ok) return res.status(400).json({ message: v.error });
+    await writeAnalyticsConfig(target, v.value);
+    res.json({ ok: true, config: await readAnalyticsConfig(target) });
+  } catch (error: any) {
+    console.error("Error saving Clarity config:", error.message);
+    res.status(500).json({ message: "Failed to save Clarity config" });
+  }
+});
+
 // Get SEO metrics for user's configured domains
 router.get("/metrics", async (req, res) => {
   try {

@@ -80,3 +80,62 @@ test("GET /config unknown user → 404", async () => {
   const res = await request(app).get("/api/seo/config").set("x-uid", "ghost");
   expect(res.status).toBe(404);
 });
+
+import { writeAnalyticsConfig } from "../services/analyticsConfigStore";
+const mockWrite = writeAnalyticsConfig as jest.Mock;
+
+describe("PUT /api/seo/config sections", () => {
+  beforeEach(() => {
+    mockResolveTarget.mockResolvedValue({ kind: "org", id: "org-1", canEdit: true });
+  });
+
+  test("PUT /config/ga saves GA properties + primary", async () => {
+    const res = await request(app).put("/api/seo/config/ga").set("x-uid", "u-1").send({
+      googleAnalyticsProperties: [{ propertyId: "1", label: "A" }],
+      primaryAnalyticsPropertyId: "1",
+      gaFilteredDomains: [], productDomain: null,
+    });
+    expect(res.status).toBe(200);
+    expect(mockWrite).toHaveBeenCalledWith(
+      { kind: "org", id: "org-1", canEdit: true },
+      expect.objectContaining({ googleAnalyticsProperties: [{ propertyId: "1", label: "A" }], primaryAnalyticsPropertyId: "1" }),
+    );
+  });
+
+  test("PUT /config/ga with primary not in properties → 400", async () => {
+    const res = await request(app).put("/api/seo/config/ga").set("x-uid", "u-1").send({
+      googleAnalyticsProperties: [{ propertyId: "1", label: "A" }],
+      primaryAnalyticsPropertyId: "999",
+    });
+    expect(res.status).toBe(400);
+  });
+
+  test("PUT /config/ga when caller cannot edit → 403", async () => {
+    mockResolveTarget.mockResolvedValue({ kind: "org", id: "org-1", canEdit: false });
+    const res = await request(app).put("/api/seo/config/ga").set("x-uid", "u-1")
+      .send({ googleAnalyticsProperties: [] });
+    expect(res.status).toBe(403);
+    expect(mockWrite).not.toHaveBeenCalled();
+  });
+
+  test("PUT /config/seo-domains saves domains", async () => {
+    const res = await request(app).put("/api/seo/config/seo-domains").set("x-uid", "u-1")
+      .send({ seoDomains: ["acme.com"] });
+    expect(res.status).toBe(200);
+    expect(mockWrite).toHaveBeenCalledWith(expect.anything(), { seoDomains: ["acme.com"] });
+  });
+
+  test("PUT /config/seo-domains rejects bad domain → 400", async () => {
+    const res = await request(app).put("/api/seo/config/seo-domains").set("x-uid", "u-1")
+      .send({ seoDomains: ["not a domain"] });
+    expect(res.status).toBe(400);
+  });
+
+  test("PUT /config/clarity saves projects", async () => {
+    const res = await request(app).put("/api/seo/config/clarity").set("x-uid", "u-1")
+      .send({ clarityProjects: [{ projectId: "ul13e4f7fe", label: "Site" }] });
+    expect(res.status).toBe(200);
+    expect(mockWrite).toHaveBeenCalledWith(expect.anything(),
+      { clarityProjects: [{ projectId: "ul13e4f7fe", label: "Site" }] });
+  });
+});
