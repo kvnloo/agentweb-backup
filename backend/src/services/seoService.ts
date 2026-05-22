@@ -34,6 +34,20 @@ export async function getGoogleSearchConsoleAccessToken(): Promise<string | null
   }
 }
 
+/** Returns the shared Google service-account email users must grant access to. */
+export async function getServiceAccountEmail(): Promise<string | null> {
+  try {
+    const secretName = process.env.NODE_ENV === "production"
+      ? "prod/AgentWeb/Google/SearchConsole"
+      : "dev/AgentWeb/Google/SearchConsole";
+    const serviceAccount = JSON.parse(await getSecret(secretName));
+    return serviceAccount.client_email || null;
+  } catch (error: any) {
+    console.error("Error fetching service account email:", error.message);
+    return null;
+  }
+}
+
 export async function getGoogleAnalyticsDataClient(): Promise<BetaAnalyticsDataClient | null> {
   try {
     const secretName = process.env.NODE_ENV === "production"

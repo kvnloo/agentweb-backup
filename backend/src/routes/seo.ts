@@ -8,13 +8,36 @@ import {
   getGoogleSearchConsoleAccessToken,
   getGoogleAnalyticsDataClient,
   getTechnicalSeoScore,
+  getServiceAccountEmail,
 } from "../services/seoService";
-import { resolveAnalyticsConfig } from "../services/analyticsConfigResolver";
+import { resolveAnalyticsConfig, resolveConfigTarget } from "../services/analyticsConfigResolver";
+import { readAnalyticsConfig, writeAnalyticsConfig } from "../services/analyticsConfigStore";
+import { validateAnalyticsConfig } from "../services/analyticsConfigValidator";
 
 const router = express.Router();
 
 // Apply authentication middleware to all routes
 router.use(authenticateToken);
+
+// Get the caller's editable analytics config (self-service Settings tab).
+router.get("/config", async (req, res) => {
+  try {
+    const user = await userDb.getUserById((req as any).user.userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
+    const target = await resolveConfigTarget(user);
+    const config = await readAnalyticsConfig(target);
+    const serviceAccountEmail = await getServiceAccountEmail();
+    res.json({
+      config,
+      canEdit: target.canEdit,
+      scope: target.kind === "org" ? "org" : "self",
+      serviceAccountEmail,
+    });
+  } catch (error: any) {
+    console.error("Error fetching analytics config:", error.message);
+    res.status(500).json({ message: "Failed to fetch analytics config" });
+  }
+});
 
 // Get SEO metrics for user's configured domains
 router.get("/metrics", async (req, res) => {
