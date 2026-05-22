@@ -1,5 +1,9 @@
 /**
  * Tests for Admin SEO/AEO configuration endpoint
+ * Updated to the new contract: PUT /api/admin/users/:userId/seo-aeo accepts
+ * array fields (googleAnalyticsProperties, clarityProjects) and returns
+ * { config, scope }. The route delegates to resolveConfigTarget /
+ * writeAnalyticsConfig / readAnalyticsConfig.
  */
 
 // Mock the auth middleware
@@ -19,24 +23,55 @@ const mockedIsAdmin = isAdmin as jest.MockedFunction<typeof isAdmin>;
 jest.mock('../services/db', () => ({
   userDb: {
     getUserById: jest.fn(),
-    updateUser: jest.fn()
-  }
+    updateUser: jest.fn(),
+    getAllUsers: jest.fn(),
+  },
+  taskDb: {},
+  subscriberDb: {},
+  crmDb: {},
+  orgDb: {
+    getOrgById: jest.fn(),
+    updateOrg: jest.fn(),
+    updateShareSettings: jest.fn(),
+  },
+}));
+
+jest.mock('../services/settingsService', () => ({
+  settingsService: {
+    getSetting: jest.fn().mockResolvedValue(null),
+    setSetting: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
+jest.mock('../services/analyticsConfigResolver', () => ({
+  resolveConfigTarget: jest.fn(),
+}));
+
+jest.mock('../services/analyticsConfigStore', () => ({
+  readAnalyticsConfig: jest.fn(),
+  writeAnalyticsConfig: jest.fn(),
 }));
 
 import express from 'express';
 import request from 'supertest';
 import adminRoutes from '../routes/admin';
 import { userDb } from '../services/db';
+import { resolveConfigTarget } from '../services/analyticsConfigResolver';
+import { readAnalyticsConfig, writeAnalyticsConfig } from '../services/analyticsConfigStore';
+
+const mockResolveTarget = resolveConfigTarget as jest.Mock;
+const mockRead = readAnalyticsConfig as jest.Mock;
+const mockWrite = writeAnalyticsConfig as jest.Mock;
 
 describe('Admin SEO/AEO Configuration', () => {
   let app: express.Application;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    
+
     app = express();
     app.use(express.json());
-    
+
     // Mock authenticateToken to pass through
     mockedAuthenticateToken.mockImplementation(async (req: any, res: any, next: any) => {
       (req as any).user = {
@@ -46,13 +81,22 @@ describe('Admin SEO/AEO Configuration', () => {
       next();
       return undefined;
     });
-    
+
     // Mock isAdmin to pass through
     mockedIsAdmin.mockImplementation(async (req: any, res: any, next: any) => {
       next();
       return undefined;
     });
-    
+
+    // Default: user found, resolves to self, stored config is empty
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: 'test-user-123',
+      email: 'test@example.com',
+    });
+    mockResolveTarget.mockResolvedValue({ kind: 'user', id: 'test-user-123', canEdit: true });
+    mockRead.mockResolvedValue({ seoDomains: [], googleAnalyticsProperties: [], clarityProjects: [] });
+    mockWrite.mockResolvedValue(undefined);
+
     app.use('/api/admin', adminRoutes);
   });
 
@@ -64,7 +108,6 @@ describe('Admin SEO/AEO Configuration', () => {
         .put('/api/admin/users/test-user-123/seo-aeo')
         .send({
           seoDomains: ['example.com'],
-          googleAnalyticsPropertyId: '123456789'
         })
         .expect(404);
 
@@ -72,15 +115,7 @@ describe('Admin SEO/AEO Configuration', () => {
     });
 
     it('should update SEO domains', async () => {
-      (userDb.getUserById as jest.Mock).mockResolvedValue({
-        userId: 'test-user-123',
-        email: 'test@example.com'
-      });
-      (userDb.updateUser as jest.Mock).mockResolvedValue({
-        userId: 'test-user-123',
-        email: 'test@example.com',
-        seoDomains: ['example.com', 'another.com']
-      });
+      mockRead.mockResolvedValue({ seoDomains: ['example.com', 'another.com'], googleAnalyticsProperties: [], clarityProjects: [] });
 
       const response = await request(app)
         .put('/api/admin/users/test-user-123/seo-aeo')
@@ -89,74 +124,54 @@ describe('Admin SEO/AEO Configuration', () => {
         })
         .expect(200);
 
-      expect(userDb.updateUser).toHaveBeenCalledWith('test-user-123', {
-        seoDomains: ['example.com', 'another.com']
-      });
-      expect(response.body.seoDomains).toEqual(['example.com', 'another.com']);
+      expect(mockWrite).toHaveBeenCalled();
+      expect(response.body.config.seoDomains).toEqual(['example.com', 'another.com']);
+      expect(response.body.scope).toBe('self');
     });
 
-    it('should update Google Analytics Property ID', async () => {
-      (userDb.getUserById as jest.Mock).mockResolvedValue({
-        userId: 'test-user-123',
-        email: 'test@example.com'
-      });
-      (userDb.updateUser as jest.Mock).mockResolvedValue({
-        userId: 'test-user-123',
-        email: 'test@example.com',
-        googleAnalyticsPropertyId: '123456789'
+    it('should update Google Analytics Properties (array format)', async () => {
+      mockRead.mockResolvedValue({
+        seoDomains: [],
+        googleAnalyticsProperties: [{ propertyId: '123456789', label: 'Main' }],
+        clarityProjects: [],
       });
 
       const response = await request(app)
         .put('/api/admin/users/test-user-123/seo-aeo')
         .send({
-          googleAnalyticsPropertyId: '123456789'
+          googleAnalyticsProperties: [{ propertyId: '123456789', label: 'Main' }],
         })
         .expect(200);
 
-      expect(userDb.updateUser).toHaveBeenCalledWith('test-user-123', {
-        googleAnalyticsPropertyId: '123456789'
-      });
-      expect(response.body.googleAnalyticsPropertyId).toBe('123456789');
+      expect(mockWrite).toHaveBeenCalled();
+      const writtenFields = mockWrite.mock.calls[0][1];
+      expect(writtenFields.googleAnalyticsProperties[0].propertyId).toBe('123456789');
+      expect(response.body.config.googleAnalyticsProperties[0].propertyId).toBe('123456789');
     });
 
-    it('should update both SEO domains and GA Property ID', async () => {
-      (userDb.getUserById as jest.Mock).mockResolvedValue({
-        userId: 'test-user-123',
-        email: 'test@example.com'
-      });
-      (userDb.updateUser as jest.Mock).mockResolvedValue({
-        userId: 'test-user-123',
-        email: 'test@example.com',
+    it('should update both SEO domains and GA Properties', async () => {
+      mockRead.mockResolvedValue({
         seoDomains: ['example.com'],
-        googleAnalyticsPropertyId: '123456789',
-        clarityProjectId: 'ul13e4f7fe'
+        googleAnalyticsProperties: [{ propertyId: '123456789', label: 'Main' }],
+        clarityProjects: [{ projectId: 'ul13e4f7fe', label: 'Main' }],
       });
 
       const response = await request(app)
         .put('/api/admin/users/test-user-123/seo-aeo')
         .send({
           seoDomains: ['example.com'],
-          googleAnalyticsPropertyId: '123456789',
-          clarityProjectId: 'ul13e4f7fe'
+          googleAnalyticsProperties: [{ propertyId: '123456789', label: 'Main' }],
+          clarityProjects: [{ projectId: 'ul13e4f7fe', label: 'Main' }],
         })
         .expect(200);
 
-      expect(userDb.updateUser).toHaveBeenCalledWith('test-user-123', {
-        seoDomains: ['example.com'],
-        googleAnalyticsPropertyId: '123456789',
-        clarityProjectId: 'ul13e4f7fe'
-      });
-      expect(response.body.seoDomains).toEqual(['example.com']);
-      expect(response.body.googleAnalyticsPropertyId).toBe('123456789');
-      expect(response.body.clarityProjectId).toBe('ul13e4f7fe');
+      expect(mockWrite).toHaveBeenCalled();
+      expect(response.body.config.seoDomains).toEqual(['example.com']);
+      expect(response.body.config.googleAnalyticsProperties[0].propertyId).toBe('123456789');
+      expect(response.body.config.clarityProjects[0].projectId).toBe('ul13e4f7fe');
     });
 
     it('should validate SEO domains format', async () => {
-      (userDb.getUserById as jest.Mock).mockResolvedValue({
-        userId: 'test-user-123',
-        email: 'test@example.com'
-      });
-
       const response = await request(app)
         .put('/api/admin/users/test-user-123/seo-aeo')
         .send({
@@ -168,11 +183,6 @@ describe('Admin SEO/AEO Configuration', () => {
     });
 
     it('should validate SEO domains is an array', async () => {
-      (userDb.getUserById as jest.Mock).mockResolvedValue({
-        userId: 'test-user-123',
-        email: 'test@example.com'
-      });
-
       const response = await request(app)
         .put('/api/admin/users/test-user-123/seo-aeo')
         .send({
@@ -183,115 +193,89 @@ describe('Admin SEO/AEO Configuration', () => {
       expect(response.body.message).toBe('seoDomains must be an array');
     });
 
-    it('should validate Google Analytics Property ID is numeric', async () => {
-      (userDb.getUserById as jest.Mock).mockResolvedValue({
-        userId: 'test-user-123',
-        email: 'test@example.com'
-      });
-
+    it('should validate Google Analytics Property ID is numeric (via array format)', async () => {
       const response = await request(app)
         .put('/api/admin/users/test-user-123/seo-aeo')
         .send({
-          googleAnalyticsPropertyId: 'G-XXXXXXXXXX'
+          googleAnalyticsProperties: [{ propertyId: 'G-XXXXXXXXXX', label: 'Bad' }],
         })
         .expect(400);
 
-      expect(response.body.message).toContain('Invalid Google Analytics Property ID format');
+      expect(response.body.message).toContain('Invalid GA4 Property ID');
     });
 
-    it('should update Microsoft Clarity Project ID', async () => {
-      (userDb.getUserById as jest.Mock).mockResolvedValue({
-        userId: 'test-user-123',
-        email: 'test@example.com'
-      });
-      (userDb.updateUser as jest.Mock).mockResolvedValue({
-        userId: 'test-user-123',
-        email: 'test@example.com',
-        clarityProjectId: 'ul13e4f7fe'
+    it('should update Microsoft Clarity Projects (array format)', async () => {
+      mockRead.mockResolvedValue({
+        seoDomains: [],
+        googleAnalyticsProperties: [],
+        clarityProjects: [{ projectId: 'ul13e4f7fe', label: 'Main' }],
       });
 
       const response = await request(app)
         .put('/api/admin/users/test-user-123/seo-aeo')
         .send({
-          clarityProjectId: 'ul13e4f7fe'
+          clarityProjects: [{ projectId: 'ul13e4f7fe', label: 'Main' }],
         })
         .expect(200);
 
-      expect(userDb.updateUser).toHaveBeenCalledWith('test-user-123', {
-        clarityProjectId: 'ul13e4f7fe'
-      });
-      expect(response.body.clarityProjectId).toBe('ul13e4f7fe');
+      expect(mockWrite).toHaveBeenCalled();
+      const writtenFields = mockWrite.mock.calls[0][1];
+      expect(writtenFields.clarityProjects[0].projectId).toBe('ul13e4f7fe');
+      expect(response.body.config.clarityProjects[0].projectId).toBe('ul13e4f7fe');
     });
 
-    it('should validate Microsoft Clarity Project ID format', async () => {
-      (userDb.getUserById as jest.Mock).mockResolvedValue({
-        userId: 'test-user-123',
-        email: 'test@example.com'
-      });
-
+    it('should validate Microsoft Clarity Project ID format (via array format)', async () => {
       const response = await request(app)
         .put('/api/admin/users/test-user-123/seo-aeo')
         .send({
-          clarityProjectId: 'bad id!'
+          clarityProjects: [{ projectId: 'bad id!', label: 'Bad' }],
         })
         .expect(400);
 
-      expect(response.body.message).toContain('Invalid Microsoft Clarity Project ID format');
+      expect(response.body.message).toContain('Invalid Clarity Project ID');
     });
 
-    it('should accept empty string for GA Property ID to clear it', async () => {
-      (userDb.getUserById as jest.Mock).mockResolvedValue({
-        userId: 'test-user-123',
-        email: 'test@example.com',
-        googleAnalyticsPropertyId: '123456789'
-      });
-      (userDb.updateUser as jest.Mock).mockResolvedValue({
-        userId: 'test-user-123',
-        email: 'test@example.com',
-        googleAnalyticsPropertyId: null
+    it('should handle empty googleAnalyticsProperties array (clears config)', async () => {
+      mockRead.mockResolvedValue({
+        seoDomains: [],
+        googleAnalyticsProperties: [],
+        clarityProjects: [],
+        primaryAnalyticsPropertyId: null,
       });
 
       const response = await request(app)
         .put('/api/admin/users/test-user-123/seo-aeo')
         .send({
-          googleAnalyticsPropertyId: ''
+          googleAnalyticsProperties: [],
         })
         .expect(200);
 
-      expect(userDb.updateUser).toHaveBeenCalledWith('test-user-123', {
-        googleAnalyticsPropertyId: null
-      });
+      expect(mockWrite).toHaveBeenCalled();
+      const writtenFields = mockWrite.mock.calls[0][1];
+      expect(writtenFields.googleAnalyticsProperties).toEqual([]);
     });
 
-    it('should trim whitespace from GA Property ID', async () => {
-      (userDb.getUserById as jest.Mock).mockResolvedValue({
-        userId: 'test-user-123',
-        email: 'test@example.com'
-      });
-      (userDb.updateUser as jest.Mock).mockResolvedValue({
-        userId: 'test-user-123',
-        email: 'test@example.com',
-        googleAnalyticsPropertyId: '123456789'
+    it('should trim whitespace from GA Property IDs in array format', async () => {
+      mockRead.mockResolvedValue({
+        seoDomains: [],
+        googleAnalyticsProperties: [{ propertyId: '123456789', label: 'Main' }],
+        clarityProjects: [],
       });
 
       const response = await request(app)
         .put('/api/admin/users/test-user-123/seo-aeo')
         .send({
-          googleAnalyticsPropertyId: '  123456789  '
+          googleAnalyticsProperties: [{ propertyId: '  123456789  ', label: 'Main' }],
         })
         .expect(200);
 
-      expect(userDb.updateUser).toHaveBeenCalledWith('test-user-123', {
-        googleAnalyticsPropertyId: '123456789'
-      });
+      expect(mockWrite).toHaveBeenCalled();
+      const writtenFields = mockWrite.mock.calls[0][1];
+      expect(writtenFields.googleAnalyticsProperties[0].propertyId).toBe('123456789');
     });
 
     it('should handle errors gracefully', async () => {
-      (userDb.getUserById as jest.Mock).mockResolvedValue({
-        userId: 'test-user-123',
-        email: 'test@example.com'
-      });
-      (userDb.updateUser as jest.Mock).mockRejectedValue(new Error('Database error'));
+      mockWrite.mockRejectedValue(new Error('Database error'));
 
       const response = await request(app)
         .put('/api/admin/users/test-user-123/seo-aeo')

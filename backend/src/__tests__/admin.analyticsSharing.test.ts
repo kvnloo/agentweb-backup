@@ -31,6 +31,7 @@ jest.mock("../services/db", () => ({
   orgDb: {
     getOrgById: jest.fn(),
     updateOrg: jest.fn(),
+    updateShareSettings: jest.fn(),
   },
 }));
 
@@ -82,15 +83,21 @@ describe("PATCH /api/admin/orgs/:orgId/analytics-sharing", () => {
     expect(res.status).toBe(404);
   });
 
-  test("admin enables → 200 and persists the flag", async () => {
-    mockOrgDb.getOrgById.mockResolvedValue({ orgId: "org-1", ownerUserId: "o-1" } as any);
-    mockOrgDb.updateOrg.mockResolvedValue({ orgId: "org-1", shareAnalyticsWithOrg: true } as any);
+  test("admin enables → 200 and persists the flag via shareSettings.analytics.enabled", async () => {
+    mockOrgDb.getOrgById.mockResolvedValue({
+      orgId: "org-1", ownerUserId: "o-1",
+      shareSettings: { analytics: { enabled: false, editors: [] } },
+    } as any);
+    mockOrgDb.updateShareSettings.mockResolvedValue(undefined);
     const res = await request(app)
       .patch("/api/admin/orgs/org-1/analytics-sharing")
       .set("Authorization", `Bearer ${adminToken}`)
       .send({ enabled: true });
     expect(res.status).toBe(200);
-    expect(mockOrgDb.updateOrg).toHaveBeenCalledWith("org-1", { shareAnalyticsWithOrg: true });
+    expect(res.body.analyticsSharingEnabled).toBe(true);
+    const call = (mockOrgDb.updateShareSettings as jest.Mock).mock.calls[0];
+    expect(call[0]).toBe("org-1");
+    expect(call[1].analytics.enabled).toBe(true);
   });
 
   test("missing/invalid body.enabled → 400", async () => {
