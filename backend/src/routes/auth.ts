@@ -10,7 +10,7 @@ import { AuthenticatedRequest } from '../middleware/auth';
 import { ChatbotDB } from '../services/chatbotService';
 import * as authController from '../controllers/auth';
 import rateLimit from 'express-rate-limit';
-import { resolveAnalyticsConfig } from '../services/analyticsConfigResolver';
+import { resolveAnalyticsConfig, resolveConfigTarget } from '../services/analyticsConfigResolver';
 
 const router = express.Router();
 
@@ -152,11 +152,14 @@ router.get('/me', authenticateToken, async (req, res) => {
       response.hasBrandGuidelines = !!(org.brandGuidelines?.brandData?.brandName);
     }
 
-    // Effective analytics config — drives customer-portal SEO/Product gating.
+    // Effective analytics config + whether the caller may edit it (drives the
+    // customer-portal SEO dashboard gating and the Analytics & SEO Settings tab).
     try {
       response.effectiveAnalyticsConfig = await resolveAnalyticsConfig(user);
+      response.canEditAnalyticsConfig = (await resolveConfigTarget(user)).canEdit;
     } catch (e: any) {
       console.error('Error resolving analytics config for /me:', e.message);
+      response.canEditAnalyticsConfig = false;
     }
 
     res.json(response);
