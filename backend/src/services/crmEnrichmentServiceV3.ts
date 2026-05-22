@@ -535,7 +535,13 @@ async function processLead(
       for (const fill of webFills) {
         const verdict = criticResult.verdicts[fill.field];
         if (verdict) {
-          fill.meta = { ...fill.meta, criticVerdict: verdict };
+          // Derive an actionable per-field quality view from the verdict.
+          // Advisory only — `drop` recommends removal but nothing is auto-deleted.
+          const criticView: EnrichedFieldMeta['criticView'] =
+            verdict === 'contradicted' ? 'drop' :
+            verdict === 'supported' ? 'high' :
+            'low';   // unsupported / partially-supported
+          fill.meta = { ...fill.meta, criticVerdict: verdict, criticView };
         }
       }
       console.log(`[v3][lead ${lead.leadId}] critic done in ${Date.now() - cStart}ms`);

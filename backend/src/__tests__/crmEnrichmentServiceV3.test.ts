@@ -1410,3 +1410,64 @@ describe('runEnrichment — enrichedJobId stamping (Fix 7)', () => {
     expect(setLeadFields).not.toHaveBeenCalled();
   });
 });
+
+describe('runEnrichment — critic view derivation (Fix 5)', () => {
+  function webFillDeps(verdicts: Record<string, string>) {
+    return makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [{
+          field: 'company_description',
+          value: 'A SaaS company',
+          meta: { source: 'web_search', provider: 'llm_web_search', enrichedAt: '2026-01-01T00:00:00Z' },
+        }],
+        missing: [],
+        tierFills: { crm: 0, apollo: 0, web: 1, missing: 0 },
+      }),
+      runCriticOverWebFills: jest.fn().mockResolvedValue({ verdicts }),
+      setLeadFields: jest.fn().mockResolvedValue(undefined),
+    });
+  }
+
+  const cfg = makeConfig({
+    fields: [{ name: 'company_description', type: 'string', instruction: 'desc', include: true, overwritePolicy: 'always_overwrite' }],
+  });
+
+  it('FAIL CASE: a contradicted verdict derives criticView "drop"', async () => {
+    const deps = webFillDeps({ company_description: 'contradicted' });
+    await runEnrichment(makeInput({ config: cfg }), deps);
+    const meta = (deps.setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.company_description;
+    expect(meta.criticVerdict).toBe('contradicted');
+    expect(meta.criticView).toBe('drop');
+  });
+
+  it('FAIL CASE: an unsupported verdict derives criticView "low"', async () => {
+    const deps = webFillDeps({ company_description: 'unsupported' });
+    await runEnrichment(makeInput({ config: cfg }), deps);
+    const meta = (deps.setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.company_description;
+    expect(meta.criticView).toBe('low');
+  });
+
+  it('FAIL CASE: a partially-supported verdict derives criticView "low"', async () => {
+    const deps = webFillDeps({ company_description: 'partially-supported' });
+    await runEnrichment(makeInput({ config: cfg }), deps);
+    const meta = (deps.setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.company_description;
+    expect(meta.criticView).toBe('low');
+  });
+
+  it('SUCCESS CASE: a supported verdict derives criticView "high" and the fill is still persisted', async () => {
+    const deps = webFillDeps({ company_description: 'supported' });
+    await runEnrichment(makeInput({ config: cfg }), deps);
+    const call = (deps.setLeadFields as jest.Mock).mock.calls[0][0];
+    expect(call.topLevel?.company_description ?? call.customFields?.company_description).toBe('A SaaS company');
+    expect(call.enrichmentMetadata.company_description.criticView).toBe('high');
+  });
+
+  it('SUCCESS CASE: a fill with no critic verdict has no criticView', async () => {
+    const deps = webFillDeps({});  // critic returns no verdict for the field
+    await runEnrichment(makeInput({ config: cfg }), deps);
+    const meta = (deps.setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.company_description;
+    expect(meta.criticVerdict).toBeUndefined();
+    expect(meta.criticView).toBeUndefined();
+  });
+});
