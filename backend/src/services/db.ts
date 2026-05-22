@@ -7479,6 +7479,7 @@ export const orgDb = {
       workPlans:         { ...ss.workPlans,         editors: strip(ss.workPlans.editors) },
       skills:            { ...ss.skills,            editors: strip(ss.skills.editors) },
       funnels:           { ...(ss.funnels ?? { enabled: false, editors: [] }), editors: strip((ss.funnels?.editors) ?? []) },
+      analytics:         { ...(ss.analytics ?? { enabled: false, editors: [] }), editors: strip((ss.analytics?.editors) ?? []) },
       brandGuidelines:   { editors: strip(ss.brandGuidelines.editors) },
       marketingStrategy: { editors: strip(ss.marketingStrategy.editors) },
     };

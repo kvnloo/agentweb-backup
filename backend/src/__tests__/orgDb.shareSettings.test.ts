@@ -39,6 +39,7 @@ describe("updateShareSettings", () => {
       workPlans:         { enabled: true,  editors: [] },
       skills:            { enabled: false, editors: [] },
       funnels:           { enabled: false, editors: [] },
+      analytics:         { enabled: false, editors: [] },
       brandGuidelines:   { editors: [] },
       marketingStrategy: { editors: [] },
     };
@@ -63,6 +64,7 @@ describe("pruneEditorListsForUser", () => {
         workPlans:         { enabled: true,  editors: [] },
         skills:            { enabled: false, editors: [] },
         funnels:           { enabled: false, editors: [] },
+        analytics:         { enabled: false, editors: [] },
         brandGuidelines:   { editors: ["u-1", "u-2"] },
         marketingStrategy: { editors: [] },
       },

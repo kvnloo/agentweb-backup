@@ -213,6 +213,7 @@ async function fetchItemsForFeature(userId: string, f: ToggleableFeature): Promi
     case "workPlans":      return workPlanService.getWorkPlansByOwner(userId);
     case "skills":         return skillService.getSkillsByOwner(userId);
     case "funnels":        return Object.values(await getUserFunnelsMap(userId));
+    case "analytics":      return [];
   }
 }
 
@@ -224,6 +225,7 @@ function getItemId(item: any, f: ToggleableFeature): string {
     case "workPlans":      return item.planId;
     case "skills":         return item.skillId;
     case "funnels":        return item.id;
+    case "analytics":      return item.id ?? "";
   }
 }
 
@@ -262,6 +264,9 @@ async function transferItemOwner(
       await saveUserFunnelsMap(ownerId, ownerFunnels);
       return;
     }
+    case "analytics":
+      // analytics has no per-user items to transfer
+      return;
   }
 }
 
@@ -289,6 +294,9 @@ async function deleteItem(item: any, f: ToggleableFeature, ownerId: string): Pro
       await saveUserFunnelsMap(ownerId, ownerFunnels);
       return;
     }
+    case "analytics":
+      // analytics has no per-user items to delete
+      return;
   }
 }
 
