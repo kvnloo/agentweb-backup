@@ -852,6 +852,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
         return {
           value: result?.value != null ? String(result.value) : null,
           reasoning: result?.reasoning ?? '',
+          model: EXTRACT_MODEL,
         };
       } catch (err) {
         console.warn('[v3 deps] evaluateSmartField failed:', (err as Error).message);

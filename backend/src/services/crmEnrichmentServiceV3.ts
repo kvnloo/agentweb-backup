@@ -209,7 +209,7 @@ export interface OrchestratorDeps {
     /** Canonical dep name → enriched value, gathered from waterfall fills
      *  and the lead's existing field data. */
     depValues: Record<string, string>;
-  }): Promise<{ value: string | null; reasoning: string }>;
+  }): Promise<{ value: string | null; reasoning: string; model?: string }>;
 }
 
 /** Standard CRM lead columns — values for these field names go to top-level
@@ -623,6 +623,7 @@ async function processLead(
               source: 'llm',
               enrichedAt: new Date().toISOString(),
               confidence: 'medium',
+              ...(evalResult.model ? { provider: evalResult.model } : {}),
               ...(evalResult.reasoning ? { sourceQuote: evalResult.reasoning } : {}),
             },
           });

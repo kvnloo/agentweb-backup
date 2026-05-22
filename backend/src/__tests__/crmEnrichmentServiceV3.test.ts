@@ -1259,3 +1259,69 @@ describe('runEnrichment — concurrent chunk writes', () => {
     expect(maxInFlight).toBe(3);
   });
 });
+
+describe('runEnrichment — smart-field meta records the producing model', () => {
+  function smartConfig(): EnrichmentConfig {
+    return makeConfig({
+      fields: [
+        {
+          name: 'isQualified',
+          type: 'string',
+          instruction: 'qualified?',
+          include: true,
+          overwritePolicy: 'always_overwrite',
+          smartCondition: 'company has > 100 employees',
+        },
+      ],
+    });
+  }
+
+  it('FAIL CASE: smart-field fill meta has provider set to the model from evaluateSmartField', async () => {
+    const setLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      evaluateSmartField: jest.fn().mockResolvedValue({ value: 'yes', reasoning: 'big company', model: 'gpt-5-chat-2' }),
+      setLeadFields,
+    });
+    await runEnrichment(makeInput({ config: smartConfig() }), deps);
+    const meta = (setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.isQualified;
+    expect(meta.source).toBe('llm');
+    expect(meta.provider).toBe('gpt-5-chat-2');
+  });
+
+  it('FAIL CASE: smart-field meta omits provider when evaluateSmartField returns no model', async () => {
+    const setLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      evaluateSmartField: jest.fn().mockResolvedValue({ value: 'yes', reasoning: 'r' }),
+      setLeadFields,
+    });
+    await runEnrichment(makeInput({ config: smartConfig() }), deps);
+    const meta = (setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.isQualified;
+    expect(meta.source).toBe('llm');
+    expect(meta.provider).toBeUndefined();
+  });
+
+  it('FAIL CASE: smart-field meta provider reflects an overridden model name', async () => {
+    const setLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      evaluateSmartField: jest.fn().mockResolvedValue({ value: 'no', reasoning: 'r', model: 'gpt-4.1' }),
+      setLeadFields,
+    });
+    await runEnrichment(makeInput({ config: smartConfig() }), deps);
+    const meta = (setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.isQualified;
+    expect(meta.provider).toBe('gpt-4.1');
+  });
+
+  it('SUCCESS CASE: a null smart-field value produces no fill at all', async () => {
+    const setLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      evaluateSmartField: jest.fn().mockResolvedValue({ value: null, reasoning: '', model: 'gpt-5-chat-2' }),
+      setLeadFields,
+    });
+    await runEnrichment(makeInput({ config: smartConfig() }), deps);
+    expect(setLeadFields).not.toHaveBeenCalled();
+  });
+});
