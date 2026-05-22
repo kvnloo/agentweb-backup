@@ -59,6 +59,7 @@ experience.
 | 8 | Migration strategy | **One-time batch script + resolver fallback.** |
 | 9 | Primary GA property | **Explicit "Primary" radio** on one GA4 property row. |
 | 10 | Rollback handling | **Single-write** to the Org record; accept that a backend revert temporarily hides post-deploy edits (no data loss). |
+| 11 | Editor view when sharing off | Analytics editors keep `/seo` dashboard access regardless of the sharing toggle; the toggle gates ordinary members only. |
 
 ## 4. Data Model
 
@@ -83,8 +84,9 @@ automatically.
 
 The legacy standalone `Organization.shareAnalyticsWithOrg` boolean is migrated
 into `shareSettings.analytics.enabled` (Section 8) and then deprecated. The
-resolver and admin routes read the new location, with a read-fallback to the
-old boolean for one release.
+resolver and admin routes read `shareSettings.analytics.enabled` for a migrated
+org and fall back to the old `shareAnalyticsWithOrg` boolean for an un-migrated
+org (one-release fallback).
 
 ### 4.2 Organization record becomes the config source of truth
 
@@ -110,9 +112,12 @@ exist there).
 - **User has `orgId`** → read config from the `Organization` record.
   - `source: "self"` when the caller is the org owner.
   - `source: "org"` for everyone else in the org.
-  - **Member gate:** if `shareSettings.analytics.enabled` is `false`, members
-    receive an *empty* resolved config (`source: "self"`, empty arrays) — they
-    cannot view. The owner and analytics editors always receive the config.
+  - **Member gate:** if sharing is `false`, ordinary members receive an *empty*
+    resolved config (`source: "self"`, empty arrays) — they cannot view. The
+    owner and analytics editors **always** receive the config, regardless of the
+    toggle (Decision 11). The gate reads `shareSettings.analytics.enabled` for a
+    migrated org, and the legacy `Organization.shareAnalyticsWithOrg` boolean for
+    an un-migrated org.
 - **User has no `orgId`** → read from the user's own record. `source: "self"`.
 - **Fallback:** if the `Organization` record has not been migrated
   (see 4.4), fall back to reading the org owner's user record. Log when the
@@ -137,13 +142,22 @@ Rule: the fallback fires only when `Organization.analyticsConfigSource` is
 touches the Org record, it sets `analyticsConfigSource` — and the resolver then
 trusts the Org record verbatim, including empty arrays.
 
-### 4.5 Legacy field audit (required task)
+### 4.5 Direct config-reader audit (required task)
 
-Bug B (7.2) exists because code read the singular `user.googleAnalyticsPropertyId`
-directly. Before implementation is considered complete, **grep every reader of
-the singular `googleAnalyticsPropertyId` and `clarityProjectId`** across the
-backend and both portals, and route each through `resolveAnalyticsConfig()` /
-`effectiveAnalyticsConfig`. This prevents the bug class from recurring.
+Bug B (7.2) exists because code read `user.googleAnalyticsPropertyId` directly.
+Two classes of direct reader must be found and rerouted before implementation is
+considered complete:
+
+1. **Singular legacy fields** — `googleAnalyticsPropertyId`, `clarityProjectId`.
+2. **Array config fields** — `googleAnalyticsProperties`, `clarityProjects`,
+   `seoDomains`, `gaFilteredDomains`, `productDomain` read directly off the
+   *user* object. Once config moves to the Org record, a direct
+   `user.clarityProjects` read returns empty for an org member — e.g.
+   `getClarityProjects(user)` in `seoService.ts`.
+
+Grep every reader of both classes across the backend and both portals and route
+each through `resolveAnalyticsConfig()` / `effectiveAnalyticsConfig`. This
+prevents the Bug B class from recurring.
 
 ## 5. Backend API
 
@@ -175,13 +189,19 @@ conscious trade-off for a low-frequency config page.
 
 Every write also sets `analyticsConfigSource` (4.4).
 
+`GET /api/seo/config` is readable by any authenticated user — a member receives
+`canEdit: false` with a read-only copy of the resolved config. The customer
+portal simply never surfaces the tab to members (§6.1); the flag is the
+authoritative gate.
+
 ### 5.3 Shared validation
 
 Extract the existing validation in `PUT /api/admin/users/:id/seo-aeo`
 (`admin.ts:1160-1398`) into a shared module `validateAnalyticsConfig` — GA ID
 `^\d+$`, Clarity ID `^[a-zA-Z0-9_-]{6,32}$`, label ≤100 chars, SEO-domain regex,
-duplicate-GA-ID check. The admin route and the new self-service routes both use
-it so validation cannot drift.
+duplicate-GA-ID check. It also enforces that `primaryAnalyticsPropertyId`, when
+present, is one of the submitted `googleAnalyticsProperties`. The admin route and
+the new self-service routes both use it so validation cannot drift.
 
 ### 5.4 Org-sharing wiring
 
@@ -236,7 +256,8 @@ Built as small, focused components under
 Wiring in `customer-portal/src/pages/Settings.tsx`: add `"analytics-seo"` to
 `VALID_TABS` (line 87) and add a `TabsTrigger` + `TabsContent`. The trigger
 renders **only when `canEditAnalyticsConfig` is true** — members never see the
-tab.
+tab. Add `canEditAnalyticsConfig` to the customer-portal `AuthContext` type
+(`AuthContext.tsx`), alongside `effectiveAnalyticsConfig`.
 
 ### 6.2 Customer Portal — Organization Sharing tab
 
@@ -279,13 +300,16 @@ section.
 ### 7.3 Bug C — Shared-funnel metrics return `PERMISSION_DENIED`
 **Re-framed for the new model.** Commit `0ab05b44` ("resolve shared-funnel
 metrics under the funnel owner") was built for the old per-user-config world.
-With one org-level config, a same-org funnel's owner and viewer resolve to the
-**same** org GA property — the "wrong property" bug class largely dissolves.
-**Fix:** ensure `seo.ts` funnel-metrics (around `seo.ts:744`) uses the resolved
-**org** config consistently; verify whether the `0ab05b44` funnel-owner
-resolution is now redundant and keep it only for genuine owner≠viewer-org edge
-cases. The remaining `PERMISSION_DENIED` cause is operational (service account
-not granted on the property) — surfaced to users by the Test-connection control.
+Funnel sharing is **intra-org only** (via `OrgShareSettings.funnels`), so a
+funnel's owner and any viewer are always in the same org and resolve to the
+**same** org GA property. The per-funnel-owner resolution is therefore
+redundant.
+**Fix:** `seo.ts` funnel-metrics (around `seo.ts:744`) resolves the org config
+**once** and uses its `primaryPropertyId`; remove the now-redundant funnel-owner
+resolution added in `0ab05b44`. Implementation must confirm funnel sharing is
+intra-org only before removing it. The remaining `PERMISSION_DENIED` cause is
+purely operational (service account not granted on the property) — surfaced to
+users by the Test-connection control.
 
 ### 7.4 Bug D — "SEO/AEO Not Configured" screen wrongly shown to members
 **Cause:** members received an empty `effectiveAnalyticsConfig`, so
@@ -303,11 +327,14 @@ HEAD and add a regression test.
 ### 8.1 One-time batch script
 A script in `backend/src/scripts/` (run via `npx ts-node`, like
 `create-tables.ts`):
-- For each `Organization`: copy the org owner's user-record analytics fields
-  onto the `Organization` record **only where the Org field is absent**; set
-  `analyticsConfigSource = "migrated"`; set `shareSettings.analytics.enabled`
-  from the legacy `shareAnalyticsWithOrg`; seed `shareSettings.analytics.editors`
-  to `[]`.
+- For each `Organization` (owner identified by `Organization.ownerUserId`): copy
+  the owner's user-record analytics fields onto the `Organization` record **only
+  where the Org field is absent**, and set `analyticsConfigSource = "migrated"`.
+- **Sharing settings — also "only if absent".** Seed `shareSettings.analytics`
+  only when it does not already exist: `enabled` from the legacy
+  `shareAnalyticsWithOrg`, `editors` to `[]`. If `shareSettings.analytics`
+  already exists (e.g. an admin toggled sharing between deploy and migration),
+  leave it untouched — never clobber it with the stale legacy boolean.
 - **Idempotent** — safe to re-run; never overwrites an already-set Org field.
 - **Dry-run mode** — prints intended changes without writing.
 - **Per-org logging** and resumability — scans paginate; a re-run after
@@ -332,7 +359,7 @@ functions, and lines.
   (`/api/seo/metrics`, `/api/seo/product-metrics`, `/api/auth/me`, emma tools,
   `chatbotService`, `seoAgentModeTools`).
 - **`validateAnalyticsConfig`** — invalid GA/Clarity IDs, oversize labels, bad
-  domains, duplicate GA, happy path.
+  domains, duplicate GA, primary-not-in-properties, happy path.
 - **New endpoints** — `GET /api/seo/config` per caller type; the three `PUT`s
   (403 when `!canEdit`, attribute-level writes, `analyticsConfigSource` set);
   `POST /api/seo/config/ga/test` (ok / permission_denied / not_found, 403 when
@@ -343,7 +370,8 @@ functions, and lines.
 - **Member removal** clears the departing member from `analytics.editors`
   (hook into the existing member-removal flow — cf. commit `512e6ee7`).
 - **Migration script** — idempotency, dry-run, absent-vs-empty handling,
-  `shareAnalyticsWithOrg` → `analytics.enabled`.
+  `shareAnalyticsWithOrg` → `analytics.enabled`, and that it does **not** clobber
+  a pre-existing `shareSettings.analytics`.
 - **Delegation** — a delegated admin session edits the target customer's org
   config.
 - **Bug regression tests** — B, C, D.
