@@ -478,38 +478,6 @@ export async function fetchClarityProjectInfo(userId: string, filterProjectId?: 
   };
 }
 
-/**
- * Migration helper: Get Google Analytics properties from user, with fallback to legacy field.
- * Returns array of { propertyId, label } objects.
- */
-export function getGoogleAnalyticsProperties(user: any): Array<{ propertyId: string; label: string }> {
-  // New format: multiple properties with labels
-  if (user.googleAnalyticsProperties && user.googleAnalyticsProperties.length > 0) {
-    return user.googleAnalyticsProperties;
-  }
-  // Legacy format: single property ID
-  if (user.googleAnalyticsPropertyId) {
-    return [{ propertyId: user.googleAnalyticsPropertyId, label: "Main Property" }];
-  }
-  return [];
-}
-
-/**
- * Migration helper: Get Clarity projects from user, with fallback to legacy field.
- * Returns array of { projectId, label } objects.
- */
-export function getClarityProjects(user: any): Array<{ projectId: string; label: string }> {
-  // New format: multiple projects with labels
-  if (user.clarityProjects && user.clarityProjects.length > 0) {
-    return user.clarityProjects;
-  }
-  // Legacy format: single project ID
-  if (user.clarityProjectId) {
-    return [{ projectId: user.clarityProjectId, label: "Main Project" }];
-  }
-  return [];
-}
-
 export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: string = "30d", filterPropertyId?: string, resolvedConfig?: ResolvedAnalyticsConfig): Promise<any> {
   const user = await userDb.getUserById(userId);
   if (!user) {

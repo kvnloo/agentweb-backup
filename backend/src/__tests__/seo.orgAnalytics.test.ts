@@ -61,7 +61,6 @@ jest.mock("../services/seoService", () => ({
   getGoogleSearchConsoleAccessToken: jest.fn().mockResolvedValue("test-token"),
   getGoogleAnalyticsDataClient: jest.fn().mockResolvedValue(null),
   getTechnicalSeoScore: jest.fn().mockResolvedValue(null),
-  getGoogleAnalyticsProperties: jest.fn().mockReturnValue([]),
 }));
 
 // Stub funnelService — not exercised by these tests.

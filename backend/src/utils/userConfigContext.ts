@@ -32,20 +32,20 @@ export async function buildUserAnalyticsContext(user: {
     }
   }
 
-  if (user.seoDomains && user.seoDomains.length > 0) {
+  if (resolved.seoDomains && resolved.seoDomains.length > 0) {
     if (lines.length === 0) lines.push("## Your Analytics Configuration\n");
     lines.push("");
     lines.push("**Google Search Console — already configured:**");
-    for (const domain of user.seoDomains) {
+    for (const domain of resolved.seoDomains) {
       lines.push(`- ${domain}`);
     }
   }
 
-  if (user.clarityProjects && user.clarityProjects.length > 0) {
+  if (resolved.clarityProjects && resolved.clarityProjects.length > 0) {
     if (lines.length === 0) lines.push("## Your Analytics Configuration\n");
     lines.push("");
     lines.push("**Microsoft Clarity — already configured:**");
-    for (const proj of user.clarityProjects) {
+    for (const proj of resolved.clarityProjects) {
       lines.push(`- ${proj.label}: Project ID \`${proj.projectId}\``);
     }
   }

@@ -173,11 +173,11 @@ router.get("/metrics", async (req, res) => {
     // a GSC page filter to scope results to the specific subdomain.
     let gscPageFilter: string | null = null; // hostname to use as GSC page dimensionFilter
     const domainsToFetch: string[] = (() => {
-      if (!domainFilter) return (user.seoDomains || []);
-      const filtered = (user.seoDomains || []).filter((d: string) => bareHost(d) === bareHost(domainFilter));
+      if (!domainFilter) return (resolved.seoDomains || []);
+      const filtered = (resolved.seoDomains || []).filter((d: string) => bareHost(d) === bareHost(domainFilter));
       if (filtered.length > 0) return filtered;
       // No exact match — check if any configured domain is the parent of domainFilter
-      const parent = (user.seoDomains || []).find((d: string) => {
+      const parent = (resolved.seoDomains || []).find((d: string) => {
         const h = bareHost(d);
         return domainFilter.endsWith(`.${h}`);
       });
@@ -601,10 +601,10 @@ router.get("/metrics", async (req, res) => {
                     // Ensure path starts with /
                     const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
                     fullUrl = `https://${hostName}${path}`;
-                  } else if (user.seoDomains && user.seoDomains.length > 0) {
+                  } else if (resolved.seoDomains && resolved.seoDomains.length > 0) {
                     // Fallback to first SEO domain if hostname not available
                     const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
-                    fullUrl = `https://${user.seoDomains[0]}${path}`;
+                    fullUrl = `https://${resolved.seoDomains[0]}${path}`;
                   }
 
                   // Use the path as the title since we're grouping by path
@@ -996,7 +996,11 @@ router.get("/debug", async (req, res) => {
   try {
     const userId = (req as any).user.userId;
     const user = await userDb.getUserById(userId);
-    if (!user || !user.seoDomains || user.seoDomains.length === 0) {
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+    const resolvedDebug = await resolveAnalyticsConfig(user);
+    if (!resolvedDebug.seoDomains || resolvedDebug.seoDomains.length === 0) {
       return res.status(400).json({ message: "No SEO domains configured" });
     }
 
@@ -1005,7 +1009,7 @@ router.get("/debug", async (req, res) => {
       return res.status(500).json({ message: "Google Search Console API not configured" });
     }
 
-    const domain = user.seoDomains[0];
+    const domain = resolvedDebug.seoDomains[0];
     const siteUrl = domain.startsWith("http") ? domain : `sc-domain:${domain}`;
     
     // Test with a specific date range around November 10
