@@ -21627,6 +21627,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!message) throw new Error('message is required for send-message action');
 
           // Gate: if list_id + lead_id provided, enforce that conversation history was synced within 24h
+          // and check for duplicate sends to prevent spam.
           const { list_id: sendListId, lead_id: sendLeadId } = args;
           let sendLead: any = null;
           if (sendListId && sendLeadId) {
@@ -21641,6 +21642,34 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                   error: `LinkedIn conversation history is stale (last synced: ${syncAt ?? 'never'}). Call update-conversation-history with list_id="${sendListId}" and lead_id="${sendLeadId}" before sending to ensure you have up-to-date context.`,
                   requiresSync: true,
                 };
+              }
+
+              // Anti-spam: check if this exact message was already sent to this lead.
+              // Compares the final rendered message (variables already substituted by the agent).
+              // Blocks on check failure — a delayed send is safer than a duplicate spam.
+              const leadLinkedInForCheck = (sendLead.linkedin as string | undefined)?.toLowerCase();
+              if (leadLinkedInForCheck) {
+                const { emailEventsDb: checkEventsDb } = await import('./emailEventsDb');
+                const priorEvents = await checkEventsDb.getEventsByEmailDomainAndLeadEmail(
+                  `linkedin-${sendListId}`,
+                  leadLinkedInForCheck
+                );
+                const priorSentMessages = priorEvents.filter(
+                  (e: any) => e.eventType === 'linkedin.message.sent'
+                );
+                const normalizedMessage = message.trim().toLowerCase();
+                const duplicateEvent = priorSentMessages.find(
+                  (e: any) => (e.data?.text ?? '').trim().toLowerCase() === normalizedMessage
+                );
+                if (duplicateEvent) {
+                  console.warn(`[AgentMode] send-message: duplicate message blocked for lead ${sendLeadId} — identical text was already sent`);
+                  return {
+                    success: false,
+                    error: `This exact message was already sent to this lead (duplicate detected). Choose a different follow-up message or skip this lead.`,
+                    duplicate: true,
+                    alreadySentAt: duplicateEvent.createdAt,
+                  };
+                }
               }
             }
           }

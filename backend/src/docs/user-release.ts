@@ -18,6 +18,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-22',
+    changes: [
+      'Fixed: LinkedIn DM Campaigns No Longer Send the Same Message Twice to the Same Lead',
+      '- Scheduled LinkedIn outreach campaigns could send an identical follow-up message to a lead multiple times across different daily runs, risking spam flags',
+      '- The agent now checks engagement history before sending and blocks any message whose exact text was already delivered to that lead',
+      '- Different follow-up messages (e.g. Touch 3 after Touch 2) are still allowed through normally',
+    ],
+  },
+  {
     date: '2026-05-21',
     changes: [
       'Fixed: Meta Ads Budget Updates Now Apply the Correct Dollar Amount',
