@@ -9,6 +9,7 @@ import {
   getGoogleAnalyticsDataClient,
   getTechnicalSeoScore,
   getServiceAccountEmail,
+  testGaProperty,
 } from "../services/seoService";
 import { resolveAnalyticsConfig, resolveConfigTarget } from "../services/analyticsConfigResolver";
 import { readAnalyticsConfig, writeAnalyticsConfig } from "../services/analyticsConfigStore";
@@ -95,6 +96,31 @@ router.put("/config/clarity", async (req, res) => {
   } catch (error: any) {
     console.error("Error saving Clarity config:", error.message);
     res.status(500).json({ message: "Failed to save Clarity config" });
+  }
+});
+
+// Per-user cooldown for the GA test probe (2s) — prevents property-ID enumeration.
+export const gaTestCooldown = new Map<string, number>();
+
+// Live-test a GA4 property with the shared service account.
+router.post("/config/ga/test", async (req, res) => {
+  try {
+    const target = await loadEditableTarget(req, res);
+    if (!target) return;
+    const propertyId = String(req.body.propertyId || "").trim();
+    if (!/^\d+$/.test(propertyId)) {
+      return res.status(400).json({ ok: false, reason: "invalid", message: "Property ID must be numeric" });
+    }
+    const uid = (req as any).user.userId;
+    const now = Date.now();
+    if (now - (gaTestCooldown.get(uid) ?? 0) < 2000) {
+      return res.status(429).json({ ok: false, reason: "rate_limited", message: "Please wait before testing again" });
+    }
+    gaTestCooldown.set(uid, now);
+    res.json(await testGaProperty(propertyId));
+  } catch (error: any) {
+    console.error("Error testing GA property:", error.message);
+    res.status(500).json({ ok: false, reason: "error", message: "Failed to test GA property" });
   }
 });
 

@@ -139,3 +139,50 @@ describe("PUT /api/seo/config sections", () => {
       { clarityProjects: [{ projectId: "ul13e4f7fe", label: "Site" }] });
   });
 });
+
+import { testGaProperty } from "../services/seoService";
+import { gaTestCooldown } from "../routes/seo";
+const mockTestGa = testGaProperty as jest.Mock;
+
+describe("POST /api/seo/config/ga/test", () => {
+  beforeEach(() => {
+    mockResolveTarget.mockResolvedValue({ kind: "org", id: "org-1", canEdit: true });
+    gaTestCooldown.clear();
+  });
+
+  test("valid property, connected → ok true", async () => {
+    mockTestGa.mockResolvedValue({ ok: true });
+    const res = await request(app).post("/api/seo/config/ga/test").set("x-uid", "u-1")
+      .send({ propertyId: "123" });
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+  });
+
+  test("permission denied → ok false reason permission_denied", async () => {
+    mockTestGa.mockResolvedValue({ ok: false, reason: "permission_denied" });
+    const res = await request(app).post("/api/seo/config/ga/test").set("x-uid", "u-1")
+      .send({ propertyId: "123" });
+    expect(res.body).toMatchObject({ ok: false, reason: "permission_denied" });
+  });
+
+  test("non-numeric propertyId → 400 reason invalid", async () => {
+    const res = await request(app).post("/api/seo/config/ga/test").set("x-uid", "u-1")
+      .send({ propertyId: "G-ABC" });
+    expect(res.status).toBe(400);
+    expect(res.body.reason).toBe("invalid");
+  });
+
+  test("caller cannot edit → 403", async () => {
+    mockResolveTarget.mockResolvedValue({ kind: "org", id: "org-1", canEdit: false });
+    const res = await request(app).post("/api/seo/config/ga/test").set("x-uid", "u-1")
+      .send({ propertyId: "123" });
+    expect(res.status).toBe(403);
+  });
+
+  test("rapid repeat from same user → 429", async () => {
+    mockTestGa.mockResolvedValue({ ok: true });
+    await request(app).post("/api/seo/config/ga/test").set("x-uid", "rate-u").send({ propertyId: "1" });
+    const res = await request(app).post("/api/seo/config/ga/test").set("x-uid", "rate-u").send({ propertyId: "1" });
+    expect(res.status).toBe(429);
+  });
+});

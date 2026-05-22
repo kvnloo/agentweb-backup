@@ -48,6 +48,33 @@ export async function getServiceAccountEmail(): Promise<string | null> {
   }
 }
 
+/**
+ * Probe a GA4 property with the shared service account. Used by the
+ * "Test connection" button so users see permission problems immediately.
+ */
+export async function testGaProperty(
+  propertyId: string,
+): Promise<{ ok: boolean; reason?: string; message?: string }> {
+  const client = await getGoogleAnalyticsDataClient();
+  if (!client) return { ok: false, reason: "error", message: "GA client unavailable" };
+  try {
+    await client.runReport({
+      property: `properties/${propertyId}`,
+      dateRanges: [{ startDate: "yesterday", endDate: "today" }],
+      metrics: [{ name: "sessions" }],
+      limit: 1,
+    });
+    return { ok: true };
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    if (e?.code === 7 || /PERMISSION_DENIED/i.test(msg)) return { ok: false, reason: "permission_denied", message: msg };
+    if (e?.code === 5 || e?.code === 3 || /NOT_FOUND|INVALID_ARGUMENT/i.test(msg)) {
+      return { ok: false, reason: "not_found", message: msg };
+    }
+    return { ok: false, reason: "error", message: msg };
+  }
+}
+
 export async function getGoogleAnalyticsDataClient(): Promise<BetaAnalyticsDataClient | null> {
   try {
     const secretName = process.env.NODE_ENV === "production"
