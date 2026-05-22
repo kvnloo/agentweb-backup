@@ -547,6 +547,18 @@ export interface Organization {
   fromName?: string;
   slackChannel?: string;
   googleAnalyticsProperties?: Array<{ propertyId: string; label: string }>;
+  primaryAnalyticsPropertyId?: string; // Explicit primary GA4 property (must be one of googleAnalyticsProperties)
+  gaFilteredDomains?: string[]; // Domains to exclude from Google Analytics
+  clarityProjects?: Array<{ projectId: string; label: string }>; // Microsoft Clarity projects
+  productDomain?: string; // Product site domain for feature usage tracking
+  /**
+   * Migration marker. Absent → analytics config has never been written to this
+   * Organization record; resolveAnalyticsConfig() falls back to the owner's user
+   * record. "migrated" → set by the migration script. "self" → set by a
+   * self-service or admin save. When present, the Org record is authoritative
+   * (including empty arrays).
+   */
+  analyticsConfigSource?: "migrated" | "self";
   googleDriveFolders?: Array<{ folderId: string; name: string }>;
   pendingInvites?: Array<{
     email: string;
@@ -576,6 +588,7 @@ export interface OrgShareSettings {
   workPlans: { enabled: boolean; editors: string[] };
   skills: { enabled: boolean; editors: string[] };
   funnels: { enabled: boolean; editors: string[] };
+  analytics: { enabled: boolean; editors: string[] };
   // Always shared with org—only editors are configurable, enabled is implicit
   brandGuidelines: { editors: string[] };
   marketingStrategy: { editors: string[] };
