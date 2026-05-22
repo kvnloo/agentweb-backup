@@ -847,6 +847,9 @@ router.get("/metrics", async (req, res) => {
             const startDateStr = startDate.toISOString().split("T")[0];
             const endDateStr = endDate.toISOString().split("T")[0];
 
+            // Funnel metrics run against the caller's resolved analytics config.
+            // For org users this is the shared org-level GA4 property, so a
+            // shared funnel's owner and viewer always use the same property.
             funnelMetrics = await calculateFunnelMetrics(
               gaClient,
               resolved.primaryPropertyId,
