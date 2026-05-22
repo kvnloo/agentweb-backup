@@ -44,9 +44,11 @@ jest.mock('../services/linkedInOutreachService', () => ({
 
 // Mock emailEventsDb
 const mockAddLinkedInMessageEvent = jest.fn().mockResolvedValue(undefined);
+const mockGetEventsByEmailDomainAndLeadEmail = jest.fn().mockResolvedValue([]);
 jest.mock('../services/emailEventsDb', () => ({
   emailEventsDb: {
     addLinkedInMessageEvent: (...args: any[]) => mockAddLinkedInMessageEvent(...args),
+    getEventsByEmailDomainAndLeadEmail: (...args: any[]) => mockGetEventsByEmailDomainAndLeadEmail(...args),
   },
 }));
 
@@ -190,6 +192,69 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(result.success).toBe(false);
       expect(result.requiresSync).toBe(true);
       expect(mockSendMessage).not.toHaveBeenCalled();
+    });
+
+    it('blocks duplicate send when identical message text was already sent to this lead', async () => {
+      mockGetLeadById.mockResolvedValue(freshLead);
+      mockGetEventsByEmailDomainAndLeadEmail.mockResolvedValue([
+        {
+          eventType: 'linkedin.message.sent',
+          createdAt: '2026-05-15T09:03:05.000Z',
+          data: { text: 'Hello, let us connect!' }, // exact same text as validArgs.message
+        },
+      ]);
+
+      const result = await service.linkedinOutreach('user-1', validArgs);
+
+      expect(result.success).toBe(false);
+      expect(result.duplicate).toBe(true);
+      expect(result.error).toContain('already sent');
+      expect(mockSendMessage).not.toHaveBeenCalled();
+    });
+
+    it('allows send when prior message exists but with different text (new follow-up)', async () => {
+      mockGetLeadById.mockResolvedValue(freshLead);
+      mockGetEventsByEmailDomainAndLeadEmail.mockResolvedValue([
+        {
+          eventType: 'linkedin.message.sent',
+          createdAt: '2026-05-14T14:44:00.000Z',
+          data: { text: 'Hey Steve — scaling consumer brands is serious work. Would love to connect.' },
+        },
+      ]);
+      mockSendMessage.mockResolvedValue({ id: 'msg-followup-id' });
+
+      const result = await service.linkedinOutreach('user-1', validArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockSendMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('allows send when prior events exist but are only received messages (not sent)', async () => {
+      mockGetLeadById.mockResolvedValue(freshLead);
+      mockGetEventsByEmailDomainAndLeadEmail.mockResolvedValue([
+        {
+          eventType: 'linkedin.message.received',
+          createdAt: '2026-05-14T14:44:00.000Z',
+          data: { text: 'Hello, let us connect!' }, // same text but received, not sent
+        },
+      ]);
+      mockSendMessage.mockResolvedValue({ id: 'msg-id' });
+
+      const result = await service.linkedinOutreach('user-1', validArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockSendMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('proceeds with send when dedup check throws (fail-safe behavior)', async () => {
+      mockGetLeadById.mockResolvedValue(freshLead);
+      mockGetEventsByEmailDomainAndLeadEmail.mockRejectedValue(new Error('DynamoDB timeout'));
+      mockSendMessage.mockResolvedValue({ id: 'msg-id' });
+
+      const result = await service.linkedinOutreach('user-1', validArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockSendMessage).toHaveBeenCalledTimes(1);
     });
 
     it('returns error when account is not owned or org-shared', async () => {
