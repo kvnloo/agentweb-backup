@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-22',
+    changes: [
+      'Fixed: Admin Delegate Access No Longer Switches to the Wrong Account',
+      '- When an admin opened a delegate session in a new tab while another customer portal tab was open, the delegate tab could sometimes show the wrong customer\'s account',
+      '- The issue was caused by a few places reading the auth token directly from localStorage instead of going through the secure token resolution in useAuth()',
+      '- Token reads now always go through useAuth(), which correctly returns the tab-isolated sessionStorage token for delegate sessions',
+    ],
+  },
+  {
     date: '2026-05-21',
     changes: [
       'Fixed: Meta Ads Budget Updates Now Apply the Correct Dollar Amount',
