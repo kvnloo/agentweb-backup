@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-22',
     changes: [
+      'New: Emma Now Knows Whether a CRM Lead Has Accepted Your LinkedIn Connection',
+      '- When Emma looks up a lead\'s details, she now checks the LinkedIn connection cache and reports whether you are a 1st-degree connection, and if so, when you connected',
+      '- This lets Emma automatically choose the right LinkedIn action: sending a direct message to connected leads instead of a new connection invite',
+      '- No manual steps required — the status is derived from the same connection data already synced every 10 minutes in the background',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
       'Fixed: All Landing Pages Can Now Be Deleted',
       '- Previously, the first (root) landing page could not be deleted — the trash icon was hidden and the API blocked deletion',
       '- All landing pages, including the root page, can now be deleted from the Landing Pages view',

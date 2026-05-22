@@ -7833,6 +7833,24 @@ export class AgentModeService {
         return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
       }
 
+      // Check LinkedIn connection status from cache (non-blocking, swallows errors)
+      let linkedInConnectionStatus: {
+        isConnected: boolean;
+        connectedAt?: string;
+        connectedAtTimestamp?: number;
+      } | null = null;
+      if (lead.linkedin) {
+        const { getConnectionByProfileUrl } = await import('./unipileConnectionsDb');
+        const conn = await getConnectionByProfileUrl(lead.linkedin as string).catch(() => null);
+        linkedInConnectionStatus = conn
+          ? {
+              isConnected: true,
+              connectedAt: new Date(conn.connectedAt * 1000).toISOString(),
+              connectedAtTimestamp: conn.connectedAt,
+            }
+          : { isConnected: false };
+      }
+
       // Get engagement count and recent engagements
       const [engagementCount, engagementsResult] = await Promise.all([
         crmDb.getLeadEngagementCount(listId, leadId, userId),
@@ -7868,6 +7886,7 @@ export class AgentModeService {
           phone: lead.phone || '',
           notes: lead.notes || '',
           linkedin: lead.linkedin || '',
+          linkedInConnectionStatus,
           customFields: lead.customFields || {},
           icpMatch: lead.icpMatch || null,
           isEngaged: lead.isEngaged || false,
