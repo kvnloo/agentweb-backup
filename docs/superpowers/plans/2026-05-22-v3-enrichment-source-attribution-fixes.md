@@ -98,7 +98,9 @@ PR A bundles Fixes 4, 3, 2, 7, 1 (Tasks 1-5). Every change is additive metadata 
 
 ---
 
-### Task 1 — Fix 4: Remove the dead `existing_data` branch
+### Task 1 — Fix 4: Remove the dead `existing_data` branch — ⚠️ DROPPED
+
+> ⚠️ **DROPPED on revalidation (2026-05-22) — do NOT execute this task.** During execution the `existing_data` branch was found to be **not dead code**: V3 Tier 1 (`enrichmentGroupWaterfall.ts:246-248`) copies a lead's stored `enrichmentMetadata` verbatim, and the v2 service writes `source:'existing_data'` (`crmEnrichmentService.ts:1569`) — so a lead enriched by v2 and re-run through V3 produces a genuine `existing_data` Tier-1 fill. The branch (commented `// value already in DB`) is an intentional guard, not dead code. Removing it is not behaviour-preserving and has no upside. Fix 4 is removed from scope; the steps below are retained for the record only.
 
 `bucketByOverwritePolicy` in `crmEnrichmentServiceV3.ts` has a filter `if (fill.meta.source === 'existing_data') continue;`. No V3 code path ever produces an `existing_data` fill — V3 Tier 1 CRM hits copy the lead's *existing* `enrichmentMetadata[f]` verbatim (whatever source it had), and no waterfall tier emits `source:'existing_data'`. The branch is unreachable dead code. This is a single-line removal; the `'existing_data'` enum value in `EnrichedFieldMeta.source` **stays** (in active use elsewhere).
 

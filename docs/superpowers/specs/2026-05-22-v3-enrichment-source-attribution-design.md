@@ -125,7 +125,9 @@ smart-field meta builder (`crmEnrichmentServiceV3.ts:622-628`) sets
 `provider: result.model` on the `source:'llm'` meta. Model knowledge stays in
 `enrichmentV3RealDeps.ts`.
 
-### Fix 4 — Remove dead `existing_data` branch (GAP 5b)
+### Fix 4 — Remove dead `existing_data` branch (GAP 5b) — ⚠️ DROPPED
+
+> ⚠️ **Dropped on revalidation (2026-05-22).** The branch is **not dead code**: V3 Tier 1 copies a lead's stored `enrichmentMetadata` verbatim (`enrichmentGroupWaterfall.ts:246-248`), and the v2 service writes `source:'existing_data'` (`crmEnrichmentService.ts:1569`) — so a v2-enriched lead re-run through V3 yields a real `existing_data` Tier-1 fill. The branch is an intentional `// value already in DB` guard. Removing it is not behaviour-preserving and has no upside, so Fix 4 is out of scope. Both audits and the earlier revalidation missed that V3 Tier 1 inherits v2-era stored meta.
 
 Delete the unreachable filter `if (fill.meta.source === 'existing_data') continue;`
 at `crmEnrichmentServiceV3.ts:319` — no V3 code path produces an
