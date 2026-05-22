@@ -104,6 +104,16 @@ describe("resolveAnalyticsConfig", () => {
     const r = await resolveAnalyticsConfig({ userId: "owner-1", orgId: "org-1" });
     expect(r.primaryPropertyId).toBe("aaa");
   });
+
+  test("migrated org with a deliberately empty GA4 array → empty, no owner-record fallback (spec 4.4)", async () => {
+    mockOrgDb.getOrgById.mockResolvedValue(
+      migratedOrg({ googleAnalyticsProperties: [], primaryAnalyticsPropertyId: undefined }) as any
+    );
+    const r = await resolveAnalyticsConfig({ userId: "owner-1", orgId: "org-1" });
+    expect(r.properties).toEqual([]);
+    expect(r.primaryPropertyId).toBeNull();
+    expect(mockUserDb.getUserById).not.toHaveBeenCalled();
+  });
 });
 
 describe("resolveConfigTarget", () => {
