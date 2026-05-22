@@ -872,3 +872,91 @@ describe('runWaterfall — web-tier per-field provenance (Fix 1)', () => {
     expect(fill?.meta.sourceQuote).toBeUndefined();
   });
 });
+
+describe('runWaterfall — confidence on meta (Fix 6)', () => {
+  it('FAIL CASE: a Tier 2 Apollo deterministic fill uses the raw registry confidence', async () => {
+    // funding_stage is now registered as 'high' in APOLLO_FIELD_CONFIDENCE (snake_case
+    // waterfall block). A Tier-2 direct Apollo fill for funding_stage must return
+    // confidence: 'high' — proving the snake_case lookup wiring actually works.
+    // (Before Fix 1, APOLLO_FIELD_CONFIDENCE had no snake_case keys so every
+    //  waterfall lookup silently returned the 'medium' default.)
+    const deps = makeDeps({
+      fetchApolloOrg: jest.fn().mockResolvedValue(apolloResult({ funding_stage: 'Series B' })),
+    });
+    const result = await runWaterfall(
+      makeInput({ groupName: 'company_financial', requestedFields: ['funding_stage'] }),
+      deps,
+    );
+    const fill = result.fields.find(f => f.field === 'funding_stage');
+    // funding_stage is registered as 'high' in the snake_case waterfall block.
+    expect(fill?.meta.confidence).toBe('high');
+  });
+
+  it('FAIL CASE: a Tier 3 LLM-over-Apollo fill is downgraded one notch from the registry value (high→medium)', async () => {
+    // funding_stage → registry: 'high'; Tier-3 llmExtracted downgrade: high → medium.
+    const deps = makeDeps({
+      fetchApolloOrg: jest.fn().mockResolvedValue(apolloResult(
+        { unrelated: 'x' },
+        { name: 'Acme', latest_funding_stage: 'Series B' },
+      )),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({
+        filled: { funding_stage: fv('Series B') }, missing: [],
+      }),
+    });
+    const result = await runWaterfall(
+      makeInput({ groupName: 'company_financial', requestedFields: ['funding_stage'] }),
+      deps,
+    );
+    const fill = result.fields.find(f => f.field === 'funding_stage');
+    // high → medium (one-notch downgrade for LLM extraction over Apollo context)
+    expect(fill?.meta.confidence).toBe('medium');
+  });
+
+  it('Tier 3 LLM-over-Apollo fill for a low registry field stays low (low→low branch)', async () => {
+    // revenue_range → registry: 'low'; Tier-3 llmExtracted downgrade: low → low.
+    const deps = makeDeps({
+      fetchApolloOrg: jest.fn().mockResolvedValue(apolloResult(
+        { unrelated: 'x' },
+        { name: 'Acme', annual_revenue_printed: '$1M–$10M' },
+      )),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({
+        filled: { revenue_range: fv('$1M–$10M') }, missing: [],
+      }),
+    });
+    const result = await runWaterfall(
+      makeInput({ groupName: 'company_financial', requestedFields: ['revenue_range'] }),
+      deps,
+    );
+    const fill = result.fields.find(f => f.field === 'revenue_range');
+    // low → low (floor — can't go lower than 'low')
+    expect(fill?.meta.confidence).toBe('low');
+  });
+
+  it('FAIL CASE: a Unipile fill carries medium confidence', async () => {
+    const deps = makeDeps({
+      findLinkedInUrl: jest.fn().mockResolvedValue('https://www.linkedin.com/in/jane-doe'),
+    });
+    const result = await runWaterfall(
+      makeInput({ groupName: 'person_identity', requestedFields: ['linkedin_url'] }),
+      deps,
+    );
+    const fill = result.fields.find(f => f.field === 'linkedin_url');
+    expect(fill?.meta.provider).toBe('unipile');
+    expect(fill?.meta.confidence).toBe('medium');
+  });
+
+  it('SUCCESS CASE: a web-tier fill carries medium confidence', async () => {
+    const deps = makeDeps({
+      fetchWebForGroup: jest.fn().mockResolvedValue({ webContext: 'ctx' }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({
+        filled: { company_description: fv('A SaaS company') }, missing: [],
+      }),
+    });
+    const result = await runWaterfall(
+      makeInput({ groupName: 'company_firmographic', requestedFields: ['company_description'] }),
+      deps,
+    );
+    const fill = result.fields.find(f => f.field === 'company_description');
+    expect(fill?.meta.confidence).toBe('medium');
+  });
+});

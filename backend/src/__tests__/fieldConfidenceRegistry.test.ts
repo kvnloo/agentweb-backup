@@ -152,3 +152,23 @@ describe('fieldConfidenceRegistry — getFieldConfidence', () => {
     });
   });
 });
+
+describe('APOLLO_FIELD_CONFIDENCE — identity fields (Fix 6)', () => {
+  it('FAIL CASE: rates apollo firstName as high', () => {
+    expect(getFieldConfidence('apollo', 'firstName')).toBe('high');
+  });
+  it('FAIL CASE: rates apollo email as high', () => {
+    expect(getFieldConfidence('apollo', 'email')).toBe('high');
+  });
+  it('FAIL CASE: rates apollo company as medium', () => {
+    expect(getFieldConfidence('apollo', 'company')).toBe('medium');
+  });
+  it('FAIL CASE: rates apollo title as medium', () => {
+    expect(getFieldConfidence('apollo', 'title')).toBe('medium');
+  });
+  it('SUCCESS CASE: rates apollo lastName and linkedin high, phone medium', () => {
+    expect(getFieldConfidence('apollo', 'lastName')).toBe('high');
+    expect(getFieldConfidence('apollo', 'linkedin')).toBe('high');
+    expect(getFieldConfidence('apollo', 'phone')).toBe('medium');
+  });
+});

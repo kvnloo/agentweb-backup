@@ -1241,3 +1241,71 @@ describe('resolveIdentity — Tier 7 pattern-email attribution (Fix 2)', () => {
     expect(meta.provider).toBe('pattern');
   });
 });
+
+describe('resolveIdentity — makeApiMeta per-field confidence (Fix 6)', () => {
+  it('FAIL CASE: an Apollo-resolved firstName carries high confidence', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        firstName: 'Jane', lastName: 'Doe', company: 'Acme', email: 'jane@acme.com', emailStatus: 'verified',
+      }),
+      writeLeadFields,
+    });
+    await resolveIdentity(makeInput({
+      lead: { leadId: LEAD_ID, email: 'jane@acme.com' },
+      needsPersonFields: true,
+    }), deps);
+    const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta;
+    expect(meta.firstName.confidence).toBe('high');
+  });
+
+  it('FAIL CASE: an Apollo-resolved company carries medium confidence (per-field, not high)', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        firstName: 'Jane', lastName: 'Doe', company: 'Acme', email: 'jane@acme.com', emailStatus: 'verified',
+      }),
+      writeLeadFields,
+    });
+    await resolveIdentity(makeInput({
+      lead: { leadId: LEAD_ID, email: 'jane@acme.com' },
+      needsPersonFields: true,
+      needsCompanyFields: true,
+    }), deps);
+    const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta;
+    expect(meta.company.confidence).toBe('medium');
+    // The same Apollo result fills firstName at 'high' — proves per-field lookup.
+    expect(meta.firstName.confidence).toBe('high');
+  });
+
+  it('FAIL CASE: an enrich.so reverse-lookup company carries medium confidence', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      enrichSoReverseLookup: jest.fn().mockResolvedValue({ company: 'Acme', firstName: 'Jane', lastName: 'Doe' }),
+      writeLeadFields,
+    });
+    await resolveIdentity(makeInput({
+      lead: { leadId: LEAD_ID, email: 'jane@personal.com' },
+      needsCompanyFields: true,
+    }), deps);
+    const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta;
+    expect(meta.company.confidence).toBe('medium');
+    // enrich.so rates firstName 'high' in the registry — per-field lookup proof.
+    expect(meta.firstName).toBeDefined();
+    expect(meta.firstName.confidence).toBe('high');
+  });
+
+  it('SUCCESS CASE: a Unipile-resolved linkedin carries medium confidence', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      findLinkedInUrl: jest.fn().mockResolvedValue('https://www.linkedin.com/in/jane-doe'),
+      writeLeadFields,
+    });
+    await resolveIdentity(makeInput({
+      lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', company: 'Acme' },
+      needsPersonFields: true,
+    }), deps);
+    const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta;
+    expect(meta.linkedin.confidence).toBe('medium');
+  });
+});

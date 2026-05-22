@@ -8,6 +8,7 @@ import type { LeadRecord } from './crmEnrichmentService';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
 import { extractDomainFromEmail } from '../utils/leadSchema';
 import { apolloEmailStatusToConfidence } from './apolloFieldMapper';
+import { getFieldConfidence } from './fieldConfidenceRegistry';
 
 const IDENTITY_FIELD_TTL_MS = 90 * 86400 * 1000; // 90 days — no FIELD_GROUP for identity fields
 
@@ -139,10 +140,19 @@ export type ResolveIdentityResult =
   | { ok: true; resolved: Partial<LeadRecord> & { emailDomain?: string }; siblings: SiblingLeadResult[]; emailPattern?: string }
   | { ok: false; reason: 'no_identity_signal' | 'identity_unresolvable' };
 
-function makeApiMeta(provider: IdentityProvider): EnrichedFieldMeta {
+function makeApiMeta(provider: IdentityProvider, field?: string): EnrichedFieldMeta {
+  // Per-field confidence: apollo / enrich.so use the registry (so e.g.
+  // enrich.so firstName='high' but company='medium'); unipile and pattern have
+  // no registry entry and default to 'medium'. A missing field name also
+  // defaults to 'medium'.
+  let confidence: EnrichedFieldMeta['confidence'] = 'medium';
+  if (field && (provider === 'apollo' || provider === 'enrich.so')) {
+    confidence = getFieldConfidence(provider, field);
+  }
   return {
     source: 'api',
     provider,
+    confidence,
     enrichedAt: new Date().toISOString(),
   };
 }
@@ -297,7 +307,7 @@ export async function resolveIdentity(
       const foundLinkedin = await deps.findLinkedInUrl({ firstName, lastName, company });
       if (foundLinkedin) {
         resolved.linkedin = foundLinkedin;
-        meta.linkedin = makeApiMeta('unipile');
+        meta.linkedin = makeApiMeta('unipile', 'linkedin');
       }
     } catch (err) {
       console.warn(`${logTag} step 2 findLinkedInUrl failed:`, (err as Error).message);
@@ -340,14 +350,12 @@ export async function resolveIdentity(
 
       const apolloResult = await deps.apolloPeopleMatch(apolloInput);
       if (apolloResult) {
-        const apolloMeta = makeApiMeta('apollo');
-
         let emailTrusted = false;
         if (apolloResult.email && !email && !resolved.email) {
           email = apolloResult.email;
           resolved.email = apolloResult.email;
           meta.email = {
-            ...apolloMeta,
+            ...makeApiMeta('apollo', 'email'),
             confidence: apolloEmailStatusToConfidence(apolloResult.emailStatus ?? ''),
           };
           emailTrusted = true;
@@ -361,27 +369,27 @@ export async function resolveIdentity(
         if (matchConfident) {
           if (apolloResult.firstName && !lead.firstName && !resolved.firstName) {
             resolved.firstName = apolloResult.firstName;
-            meta.firstName = apolloMeta;
+            meta.firstName = makeApiMeta('apollo', 'firstName');
           }
           if (apolloResult.lastName && !lead.lastName && !resolved.lastName) {
             resolved.lastName = apolloResult.lastName;
-            meta.lastName = apolloMeta;
+            meta.lastName = makeApiMeta('apollo', 'lastName');
           }
           if (apolloResult.title && !lead.title && !resolved.title) {
             resolved.title = apolloResult.title;
-            meta.title = apolloMeta;
+            meta.title = makeApiMeta('apollo', 'title');
           }
           if (apolloResult.linkedin && !lead.linkedin && !resolved.linkedin) {
             resolved.linkedin = apolloResult.linkedin;
-            meta.linkedin = apolloMeta;
+            meta.linkedin = makeApiMeta('apollo', 'linkedin');
           }
           if (apolloResult.company && !lead.company && !resolved.company) {
             resolved.company = apolloResult.company;
-            meta.company = apolloMeta;
+            meta.company = makeApiMeta('apollo', 'company');
           }
           if (apolloResult.website && !lead.website && !resolved.website) {
             resolved.website = apolloResult.website;
-            meta.website = apolloMeta;
+            meta.website = makeApiMeta('apollo', 'website');
           }
         }
       }
@@ -410,14 +418,14 @@ export async function resolveIdentity(
       if (found?.email) {
         email = found.email;
         resolved.email = found.email;
-        meta.email = makeApiMeta('enrich.so');
+        meta.email = makeApiMeta('enrich.so', 'email');
         // Chain: reverse-lookup on the resolved email fills company.
         // Names are already known (gate ensures firstName+lastName present).
         try {
           const enrichSo = await deps.enrichSoReverseLookup({ email });
           if (enrichSo?.company && !lead.company && !resolved.company) {
             resolved.company = enrichSo.company;
-            meta.company = makeApiMeta('enrich.so');
+            meta.company = makeApiMeta('enrich.so', 'company');
           }
         } catch (err) {
           console.warn(`${logTag} step 5.5 enrichSoReverseLookup chain failed:`, (err as Error).message);
@@ -459,7 +467,7 @@ export async function resolveIdentity(
         email = brokerResult.email;
         resolved.email = brokerResult.email;
         meta.email = {
-          ...makeApiMeta('apollo'),
+          ...makeApiMeta('apollo', 'email'),
           confidence: apolloEmailStatusToConfidence(brokerResult.emailStatus ?? ''),
         };
       }
@@ -517,18 +525,17 @@ export async function resolveIdentity(
       try {
         const enrichSo = await deps.enrichSoReverseLookup({ email });
         if (enrichSo) {
-          const enrichSoMeta = makeApiMeta('enrich.so');
           if (enrichSo.company) {
             resolved.company = enrichSo.company;
-            meta.company = enrichSoMeta;
+            meta.company = makeApiMeta('enrich.so', 'company');
           }
           if (enrichSo.firstName && !lead.firstName && !resolved.firstName) {
             resolved.firstName = enrichSo.firstName;
-            meta.firstName = enrichSoMeta;
+            meta.firstName = makeApiMeta('enrich.so', 'firstName');
           }
           if (enrichSo.lastName && !lead.lastName && !resolved.lastName) {
             resolved.lastName = enrichSo.lastName;
-            meta.lastName = enrichSoMeta;
+            meta.lastName = makeApiMeta('enrich.so', 'lastName');
           }
         }
       } catch (err) {

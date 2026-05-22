@@ -17,6 +17,7 @@
 import { isFresh } from './enrichmentTtl';
 import { FIELD_GROUPS } from './enrichmentGroups';
 import { apolloEmailStatusToConfidence } from './apolloFieldMapper';
+import { getFieldConfidence } from './fieldConfidenceRegistry';
 import type { LeadRecord } from './crmEnrichmentService';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
 
@@ -199,10 +200,18 @@ function getLeadFieldValue(lead: LeadRecord, field: string): string | undefined 
   return undefined;
 }
 
-function metaApollo(): EnrichedFieldMeta {
+function metaApollo(field: string, opts?: { llmExtracted?: boolean }): EnrichedFieldMeta {
+  // Tier 2 (deterministic direct-map) uses the raw registry confidence; Tier 3
+  // (LLM extraction over Apollo raw JSON) passes { llmExtracted: true }, which
+  // downgrades one notch — LLM extraction is less reliable than a direct map.
+  let confidence = getFieldConfidence('apollo', field);
+  if (opts?.llmExtracted) {
+    confidence = confidence === 'high' ? 'medium' : confidence === 'medium' ? 'low' : 'low';
+  }
   return {
     source: 'api',
     provider: 'apollo',
+    confidence,
     enrichedAt: new Date().toISOString(),
   };
 }
@@ -222,6 +231,7 @@ function metaUnipile(): EnrichedFieldMeta {
   return {
     source: 'api',
     provider: 'unipile',
+    confidence: 'medium',
     enrichedAt: new Date().toISOString(),
   };
 }
@@ -292,7 +302,7 @@ export async function runWaterfall(
     for (const f of remaining) {
       const value = apolloRaw[f];
       if (typeof value === 'string' && value.length > 0) {
-        apolloHits.push({ field: f, value, meta: metaApollo() });
+        apolloHits.push({ field: f, value, meta: metaApollo(f) });
       }
     }
   }
@@ -328,7 +338,7 @@ export async function runWaterfall(
     for (const f of tier3Targets) {
       const entry = llmResult.filled[f];
       if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
-        filled.push({ field: f, value: entry.value, meta: metaApollo() });
+        filled.push({ field: f, value: entry.value, meta: metaApollo(f, { llmExtracted: true }) });
         tier3Fills += 1;
       }
     }
@@ -374,7 +384,7 @@ export async function runWaterfall(
           filled.push({
             field: 'email',
             value: brokerResult.email,
-            meta: { ...metaApollo(), confidence: apolloEmailStatusToConfidence(brokerResult.emailStatus ?? '') },
+            meta: { ...metaApollo('email'), confidence: apolloEmailStatusToConfidence(brokerResult.emailStatus ?? '') },
           });
           remaining = remaining.filter(f => f !== 'email');
         }
