@@ -2294,8 +2294,8 @@ async function removePageFromGitHub(githubRepoUrl: string, slug: string): Promis
 }
 
 /**
- * Delete a landing page. Root page cannot be deleted.
- * Sub-pages are soft-deleted (archived) and their route file is removed from GitHub.
+ * Delete a landing page. All pages are deletable (including the root).
+ * Pages are soft-deleted (archived) and their route file is removed from GitHub.
  */
 export async function deleteLandingPage(
   id: string,
@@ -2304,15 +2304,6 @@ export async function deleteLandingPage(
   const record = await getLandingPage(id, userId);
   if (!record) {
     throw new Error("Landing page not found");
-  }
-
-  // Allow deleting a failed root page that was never deployed (no GitHub repo created).
-  // A deployed root page still cannot be deleted — it would orphan the repo and Vercel project.
-  if (record.isRootPage && record.githubRepoUrl) {
-    throw new Error("Cannot delete the root landing page. Use Emma to edit it instead.");
-  }
-  if (record.isRootPage && record.status !== "failed") {
-    throw new Error("Cannot delete the root landing page. Use Emma to edit it instead.");
   }
 
   // Remove route file from GitHub
@@ -2446,16 +2437,9 @@ export async function transferLandingPageOwner(id: string, newOwnerId: string): 
 
 /**
  * Delete a landing page given an already-fetched record (for org-share flows where
- * the caller may not be the owner). Enforces root-page guard.
+ * the caller may not be the owner). All pages are deletable.
  */
 export async function deleteLandingPageByRecord(record: GeneratedLandingPage): Promise<void> {
-  if (record.isRootPage && record.githubRepoUrl) {
-    throw new Error("Cannot delete the root landing page. Use Emma to edit it instead.");
-  }
-  if (record.isRootPage && record.status !== "failed") {
-    throw new Error("Cannot delete the root landing page. Use Emma to edit it instead.");
-  }
-
   if (record.githubRepoUrl && record.slug) {
     try {
       await removePageFromGitHub(record.githubRepoUrl, record.slug);
