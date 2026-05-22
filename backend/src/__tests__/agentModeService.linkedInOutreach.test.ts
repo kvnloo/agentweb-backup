@@ -246,15 +246,14 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(mockSendMessage).toHaveBeenCalledTimes(1);
     });
 
-    it('proceeds with send when dedup check throws (fail-safe behavior)', async () => {
+    it('blocks send when dedup check throws (spam-safe: error is surfaced, not swallowed)', async () => {
       mockGetLeadById.mockResolvedValue(freshLead);
       mockGetEventsByEmailDomainAndLeadEmail.mockRejectedValue(new Error('DynamoDB timeout'));
-      mockSendMessage.mockResolvedValue({ id: 'msg-id' });
 
       const result = await service.linkedinOutreach('user-1', validArgs);
 
-      expect(result.success).toBe(true);
-      expect(mockSendMessage).toHaveBeenCalledTimes(1);
+      expect(result.success).toBe(false);
+      expect(mockSendMessage).not.toHaveBeenCalled();
     });
 
     it('returns error when account is not owned or org-shared', async () => {

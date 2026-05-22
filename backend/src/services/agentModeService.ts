@@ -21645,34 +21645,30 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               }
 
               // Anti-spam: check if this exact message was already sent to this lead.
-              // Prevents duplicate sends across campaign runs (e.g. same Touch 2 message sent multiple times).
+              // Compares the final rendered message (variables already substituted by the agent).
+              // Blocks on check failure — a delayed send is safer than a duplicate spam.
               const leadLinkedInForCheck = (sendLead.linkedin as string | undefined)?.toLowerCase();
               if (leadLinkedInForCheck) {
-                try {
-                  const { emailEventsDb: checkEventsDb } = await import('./emailEventsDb');
-                  const priorEvents = await checkEventsDb.getEventsByEmailDomainAndLeadEmail(
-                    `linkedin-${sendListId}`,
-                    leadLinkedInForCheck
-                  );
-                  const priorSentMessages = priorEvents.filter(
-                    (e: any) => e.eventType === 'linkedin.message.sent'
-                  );
-                  const normalizedMessage = message.trim().toLowerCase();
-                  const duplicateEvent = priorSentMessages.find(
-                    (e: any) => (e.data?.text ?? '').trim().toLowerCase() === normalizedMessage
-                  );
-                  if (duplicateEvent) {
-                    console.warn(`[AgentMode] send-message: duplicate message blocked for lead ${sendLeadId} — identical text was already sent`);
-                    return {
-                      success: false,
-                      error: `This exact message was already sent to this lead (duplicate detected). Choose a different follow-up message or skip this lead.`,
-                      duplicate: true,
-                      alreadySentAt: duplicateEvent.createdAt,
-                    };
-                  }
-                } catch (dupCheckError: any) {
-                  // Log but don't block — better to risk a duplicate than fail silently
-                  console.warn('[AgentMode] send-message: duplicate check failed, proceeding anyway:', dupCheckError.message);
+                const { emailEventsDb: checkEventsDb } = await import('./emailEventsDb');
+                const priorEvents = await checkEventsDb.getEventsByEmailDomainAndLeadEmail(
+                  `linkedin-${sendListId}`,
+                  leadLinkedInForCheck
+                );
+                const priorSentMessages = priorEvents.filter(
+                  (e: any) => e.eventType === 'linkedin.message.sent'
+                );
+                const normalizedMessage = message.trim().toLowerCase();
+                const duplicateEvent = priorSentMessages.find(
+                  (e: any) => (e.data?.text ?? '').trim().toLowerCase() === normalizedMessage
+                );
+                if (duplicateEvent) {
+                  console.warn(`[AgentMode] send-message: duplicate message blocked for lead ${sendLeadId} — identical text was already sent`);
+                  return {
+                    success: false,
+                    error: `This exact message was already sent to this lead (duplicate detected). Choose a different follow-up message or skip this lead.`,
+                    duplicate: true,
+                    alreadySentAt: duplicateEvent.createdAt,
+                  };
                 }
               }
             }
