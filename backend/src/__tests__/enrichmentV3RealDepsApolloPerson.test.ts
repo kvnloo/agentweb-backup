@@ -393,40 +393,43 @@ describe('buildFieldGuidanceV3 — LinkedIn field-specific guidance', () => {
 });
 
 describe('rejectHallucinatedLinkedInUrls', () => {
+  // Fix 1: rejectHallucinatedLinkedInUrls operates on per-field objects.
+  const fv = (value: string) => ({ value });
+
   it('keeps a linkedin_url whose slug appears in source', () => {
     const source = 'Profile: https://www.linkedin.com/in/jane-doe-acme';
-    const result = rejectHallucinatedLinkedInUrls({ linkedin_url: 'https://www.linkedin.com/in/jane-doe-acme' }, source);
-    expect(result.linkedin_url).toBe('https://www.linkedin.com/in/jane-doe-acme');
+    const result = rejectHallucinatedLinkedInUrls({ linkedin_url: fv('https://www.linkedin.com/in/jane-doe-acme') }, source);
+    expect(result.linkedin_url?.value).toBe('https://www.linkedin.com/in/jane-doe-acme');
   });
 
   it('rejects a linkedin_url whose slug does NOT appear in source', () => {
     const source = 'Jane Doe works at Acme Corp. No LinkedIn URL present.';
-    const result = rejectHallucinatedLinkedInUrls({ linkedin_url: 'https://www.linkedin.com/in/jane-doe-acme' }, source);
+    const result = rejectHallucinatedLinkedInUrls({ linkedin_url: fv('https://www.linkedin.com/in/jane-doe-acme') }, source);
     expect(result.linkedin_url).toBeUndefined();
   });
 
   it('rejects a company_linkedin_url whose slug is not in source', () => {
     const source = 'Acme Corp is a software company.';
-    const result = rejectHallucinatedLinkedInUrls({ company_linkedin_url: 'https://www.linkedin.com/company/acme-corp' }, source);
+    const result = rejectHallucinatedLinkedInUrls({ company_linkedin_url: fv('https://www.linkedin.com/company/acme-corp') }, source);
     expect(result.company_linkedin_url).toBeUndefined();
   });
 
   it('keeps a company_linkedin_url whose slug appears in source', () => {
     const source = 'Visit our page: https://www.linkedin.com/company/acme-corp';
-    const result = rejectHallucinatedLinkedInUrls({ company_linkedin_url: 'https://www.linkedin.com/company/acme-corp' }, source);
-    expect(result.company_linkedin_url).toBe('https://www.linkedin.com/company/acme-corp');
+    const result = rejectHallucinatedLinkedInUrls({ company_linkedin_url: fv('https://www.linkedin.com/company/acme-corp') }, source);
+    expect(result.company_linkedin_url?.value).toBe('https://www.linkedin.com/company/acme-corp');
   });
 
   it('does not reject non-LinkedIn fields', () => {
     const source = 'Contact: john@acme.com';
-    const result = rejectHallucinatedLinkedInUrls({ email: 'john@acme.com', title: 'Engineer' }, source);
-    expect(result.email).toBe('john@acme.com');
-    expect(result.title).toBe('Engineer');
+    const result = rejectHallucinatedLinkedInUrls({ email: fv('john@acme.com'), title: fv('Engineer') }, source);
+    expect(result.email?.value).toBe('john@acme.com');
+    expect(result.title?.value).toBe('Engineer');
   });
 
   it('rejects a URL with a non-/in/ path for a linkedin field', () => {
     const source = 'Shared linkedin.com/pub/dir/jane-doe link';
-    const result = rejectHallucinatedLinkedInUrls({ linkedin_url: 'https://www.linkedin.com/pub/dir/jane-doe' }, source);
+    const result = rejectHallucinatedLinkedInUrls({ linkedin_url: fv('https://www.linkedin.com/pub/dir/jane-doe') }, source);
     expect(result.linkedin_url).toBeUndefined();
   });
 });

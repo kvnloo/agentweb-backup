@@ -15,9 +15,10 @@ import type { OrchestratorDeps } from './crmEnrichmentServiceV3';
 import { CrmEnrichmentService, type LeadRecord } from './crmEnrichmentService';
 import type { IdentityResolverDeps } from './enrichmentIdentityResolver';
 import { resolveIdentity as pureResolveIdentity } from './enrichmentIdentityResolver';
-import { runWaterfall as pureRunWaterfall } from './enrichmentGroupWaterfall';
+import { runWaterfall as pureRunWaterfall, type LLMFilledValue } from './enrichmentGroupWaterfall';
 import { apolloAsyncRequestCacheKey, APOLLO_SCHEMA_VERSION } from './apolloCacheKeys';
 import { FIELD_GROUPS } from './enrichmentGroups';
+import { trimQuote } from '../utils/enrichedFieldValue';
 import { waitForApolloAsyncResult } from './enrichmentWaterfall';
 import { STANDARD_ENRICHABLE_FIELDS } from './enrichmentConfigService';
 import {
@@ -438,23 +439,26 @@ export function buildFieldGuidanceV3(fields: string[], configFieldsByName: Recor
   }).join('\n');
 }
 
-export function rejectHallucinatedLinkedInUrls(filled: Record<string, string>, sourceContext: string): Record<string, string> {
+export function rejectHallucinatedLinkedInUrls(
+  filled: Record<string, LLMFilledValue>,
+  sourceContext: string,
+): Record<string, LLMFilledValue> {
   const normalizedSource = sourceContext.toLowerCase().replace(/\s+/g, ' ').trim();
-  const result: Record<string, string> = {};
-  for (const [field, value] of Object.entries(filled)) {
+  const result: Record<string, LLMFilledValue> = {};
+  for (const [field, entry] of Object.entries(filled)) {
     if (/linkedin/i.test(field)) {
-      const slugMatch = value.match(/linkedin\.com\/(in|company)\/([^/?#\s]+)/i);
+      const slugMatch = entry.value.match(/linkedin\.com\/(in|company)\/([^/?#\s]+)/i);
       if (!slugMatch) {
-        console.warn(`[v3 deps] Rejected LinkedIn URL "${value}" for field "${field}" — no valid /in/ or /company/ path`);
+        console.warn(`[v3 deps] Rejected LinkedIn URL "${entry.value}" for field "${field}" — no valid /in/ or /company/ path`);
         continue;
       }
       const slug = slugMatch[2].toLowerCase();
       if (!normalizedSource.includes(slug)) {
-        console.warn(`[v3 deps] Rejected hallucinated LinkedIn URL "${value}" for field "${field}" — slug "${slug}" not in source data`);
+        console.warn(`[v3 deps] Rejected hallucinated LinkedIn URL "${entry.value}" for field "${field}" — slug "${slug}" not in source data`);
         continue;
       }
     }
-    result[field] = value;
+    result[field] = entry;
   }
   return result;
 }
@@ -466,7 +470,7 @@ async function extractFieldsViaLLMReal(input: {
   groupName: string;
   lead: LeadRecord;
   configFieldsByName: Record<string, { instruction?: string } | undefined>;
-}): Promise<{ filled: Record<string, string>; missing: string[] }> {
+}): Promise<{ filled: Record<string, LLMFilledValue>; missing: string[] }> {
   if (input.fields.length === 0) return { filled: {}, missing: [] };
 
   const fieldGuide = buildFieldGuidanceV3(input.fields, input.configFieldsByName);
@@ -481,22 +485,33 @@ async function extractFieldsViaLLMReal(input: {
 
   const isWebTier = input.tier === 'web';
 
+  // Web tier asks for per-field provenance objects so the value carries the
+  // sourceUrl / sourceQuote the critic and provenance UI need. Apollo tier
+  // keeps the bare-string prompt (Apollo JSON has no URLs) and the bare result
+  // is normalized into the unified {value} shape below.
   const systemPrompt = isWebTier
     ? `You extract structured CRM data for a given lead. Follow this priority order:\n` +
       `1. Extract from the provided web context if the information is clearly present.\n` +
       `2. If information is missing or insufficient, use your web search capability to look it up.\n` +
       `3. If web search yields no result, use your own training knowledge if you are FULLY confident.\n` +
       `4. If you do not know a value with confidence, return null for that field.\n` +
-      `NEVER guess, infer, or fabricate. Return strict JSON only, strings only, no markdown.`
+      `NEVER guess, infer, or fabricate. For each field return an object ` +
+      `{"value": <string>, "sourceUrl": <url or null>, "sourceQuote": <short verbatim snippet or null>}. ` +
+      `Return strict JSON only, no markdown.`
     : `You extract structured CRM data from the provided context. Return strict JSON: ` +
       `an object with one key per requested field. Use null when the value isn't ` +
       `explicitly present. Do NOT infer or fabricate. Strings only, no markdown.`;
 
-  const userPrompt =
-    `Lead: ${leadContext}\n\n` +
-    `Source (${input.tier}):\n${input.sourceContext.slice(0, 16000)}\n\n` +
-    `Extract these fields (return one JSON object with these exact keys):\n${fieldGuide}\n\n` +
-    `Return ONLY a JSON object like {"field_name": "value", "other_field": null}. No prose.`;
+  const userPrompt = isWebTier
+    ? `Lead: ${leadContext}\n\n` +
+      `Source (${input.tier}):\n${input.sourceContext.slice(0, 16000)}\n\n` +
+      `Extract these fields (return one JSON object with these exact keys):\n${fieldGuide}\n\n` +
+      `Return ONLY a JSON object like ` +
+      `{"field_name": {"value": "...", "sourceUrl": "...", "sourceQuote": "..."}, "other_field": null}. No prose.`
+    : `Lead: ${leadContext}\n\n` +
+      `Source (${input.tier}):\n${input.sourceContext.slice(0, 16000)}\n\n` +
+      `Extract these fields (return one JSON object with these exact keys):\n${fieldGuide}\n\n` +
+      `Return ONLY a JSON object like {"field_name": "value", "other_field": null}. No prose.`;
 
   try {
     let parsed: Record<string, any>;
@@ -507,12 +522,36 @@ async function extractFieldsViaLLMReal(input: {
       const llm = createLLMService(EXTRACT_MODEL, 0.0);
       parsed = await llm.generateJSONContent<Record<string, any>>(systemPrompt, userPrompt);
     }
-    const filled: Record<string, string> = {};
+    const filled: Record<string, LLMFilledValue> = {};
     const missing: string[] = [];
     for (const field of input.fields) {
-      const value = parsed?.[field];
-      if (value != null && String(value).trim().length > 0 && String(value).toLowerCase() !== 'null') {
-        filled[field] = String(value).trim();
+      const raw = parsed?.[field];
+      // Web tier returns objects; Apollo tier returns bare strings. Normalize
+      // both into LLMFilledValue. A web-tier null/empty value → missing.
+      let entry: LLMFilledValue | null = null;
+      if (raw != null) {
+        if (isWebTier && typeof raw === 'object' && !Array.isArray(raw)) {
+          const v = raw.value;
+          if (v != null && String(v).trim().length > 0 && String(v).toLowerCase() !== 'null') {
+            entry = { value: String(v).trim() };
+            if (typeof raw.sourceUrl === 'string' && raw.sourceUrl.trim() && raw.sourceUrl.toLowerCase() !== 'null') {
+              entry.sourceUrl = raw.sourceUrl.trim();
+            }
+            if (typeof raw.sourceQuote === 'string' && raw.sourceQuote.trim() && raw.sourceQuote.toLowerCase() !== 'null') {
+              entry.sourceQuote = trimQuote(raw.sourceQuote) ?? undefined;
+            }
+          }
+        } else if (!isWebTier && String(raw).trim().length > 0 && String(raw).toLowerCase() !== 'null') {
+          entry = { value: String(raw).trim() };
+        } else if (isWebTier && String(raw).trim().length > 0 && String(raw).toLowerCase() !== 'null') {
+          // LLM returned a bare string for the web tier despite the object-shape
+          // instruction — accept the value but flag the lost provenance.
+          console.warn(`[v3 deps] web-tier LLM returned bare string for field "${field}" — provenance unavailable`);
+          entry = { value: String(raw).trim() };
+        }
+      }
+      if (entry) {
+        filled[field] = entry;
       } else {
         missing.push(field);
       }
@@ -823,11 +862,19 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       });
       const filled: any[] = [];
       for (const field of fields) {
-        const value = llmResult.filled[field];
-        if (typeof value === 'string' && value.length > 0) {
+        const entry = llmResult.filled[field];
+        if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
           filled.push({
-            field, value,
-            meta: { source: 'web_search', enrichedAt: new Date().toISOString() },
+            field,
+            value: entry.value,
+            meta: {
+              source: 'web_search',
+              provider: 'llm_web_search',
+              confidence: 'medium',
+              ...(entry.sourceUrl ? { sourceUrl: entry.sourceUrl } : {}),
+              ...(entry.sourceQuote ? { sourceQuote: entry.sourceQuote } : {}),
+              enrichedAt: new Date().toISOString(),
+            },
           });
         }
       }

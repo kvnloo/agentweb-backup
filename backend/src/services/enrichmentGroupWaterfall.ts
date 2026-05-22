@@ -101,8 +101,16 @@ export interface LLMExtractInput {
   configFieldsByName: Record<string, { instruction?: string } | undefined>;
 }
 
+/** One LLM-extracted field value plus its web provenance (web tier only —
+ *  Apollo-tier values are normalized into this shape with no URL/quote). */
+export interface LLMFilledValue {
+  value: string;
+  sourceUrl?: string;
+  sourceQuote?: string;
+}
+
 export interface LLMExtractResult {
-  filled: Record<string, string>;
+  filled: Record<string, LLMFilledValue>;
   missing: string[];
 }
 
@@ -199,9 +207,13 @@ function metaApollo(): EnrichedFieldMeta {
   };
 }
 
-function metaWeb(): EnrichedFieldMeta {
+function metaWeb(sourceUrl?: string, sourceQuote?: string): EnrichedFieldMeta {
   return {
     source: 'web_search',
+    provider: 'llm_web_search',
+    confidence: 'medium',
+    ...(sourceUrl ? { sourceUrl } : {}),
+    ...(sourceQuote ? { sourceQuote } : {}),
     enrichedAt: new Date().toISOString(),
   };
 }
@@ -212,6 +224,14 @@ function metaUnipile(): EnrichedFieldMeta {
     provider: 'unipile',
     enrichedAt: new Date().toISOString(),
   };
+}
+
+/** True when an LLM-extracted entry carries a non-empty value — i.e. it
+ *  actually produced a fill. A present-but-empty entry counts as NOT filled
+ *  (matching the bare-string era where `''` was falsy), so the field stays
+ *  in `remaining` and is reported missing. */
+function llmFilledHasValue(entry: LLMFilledValue | undefined): boolean {
+  return !!entry && typeof entry.value === 'string' && entry.value.length > 0;
 }
 
 // ─── Main entry ───────────────────────────────────────────────────────────────
@@ -306,13 +326,13 @@ export async function runWaterfall(
       configFieldsByName: input.configFieldsByName,
     });
     for (const f of tier3Targets) {
-      const value = llmResult.filled[f];
-      if (typeof value === 'string' && value.length > 0) {
-        filled.push({ field: f, value, meta: metaApollo() });
+      const entry = llmResult.filled[f];
+      if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
+        filled.push({ field: f, value: entry.value, meta: metaApollo() });
         tier3Fills += 1;
       }
     }
-    remaining = remaining.filter(f => !llmResult.filled[f]);
+    remaining = remaining.filter(f => !llmFilledHasValue(llmResult.filled[f]));
   }
 
   if (remaining.length === 0) {
@@ -409,13 +429,13 @@ export async function runWaterfall(
         configFieldsByName: input.configFieldsByName,
       });
       for (const f of remaining) {
-        const value = llmResult.filled[f];
-        if (typeof value === 'string' && value.length > 0) {
-          filled.push({ field: f, value, meta: metaUnipile() });
+        const entry = llmResult.filled[f];
+        if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
+          filled.push({ field: f, value: entry.value, meta: metaUnipile() });
           unipileCompanyFills += 1;
         }
       }
-      remaining = remaining.filter(f => !llmResult.filled[f]);
+      remaining = remaining.filter(f => !llmFilledHasValue(llmResult.filled[f]));
     }
   }
 
@@ -445,13 +465,13 @@ export async function runWaterfall(
       configFieldsByName: input.configFieldsByName,
     });
     for (const f of remaining) {
-      const value = llmResult.filled[f];
-      if (typeof value === 'string' && value.length > 0) {
-        filled.push({ field: f, value, meta: metaWeb() });
+      const entry = llmResult.filled[f];
+      if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
+        filled.push({ field: f, value: entry.value, meta: metaWeb(entry.sourceUrl, entry.sourceQuote) });
         webFills += 1;
       }
     }
-    remaining = remaining.filter(f => !llmResult.filled[f]);
+    remaining = remaining.filter(f => !llmFilledHasValue(llmResult.filled[f]));
   }
 
   return {

@@ -70,6 +70,14 @@ function makeInput(overrides: Partial<RunWaterfallInput> = {}): RunWaterfallInpu
   };
 }
 
+// Fix 1: extractFieldsViaLLM now returns per-field objects; `fv` builds one.
+function fv(value: string, sourceUrl?: string, sourceQuote?: string) {
+  const obj: { value: string; sourceUrl?: string; sourceQuote?: string } = { value };
+  if (sourceUrl) obj.sourceUrl = sourceUrl;
+  if (sourceQuote) obj.sourceQuote = sourceQuote;
+  return obj;
+}
+
 beforeEach(() => {
   jest.useFakeTimers();
   jest.setSystemTime(FROZEN_NOW);
@@ -244,7 +252,7 @@ describe('runWaterfall — Tier 2 (Apollo)', () => {
     const deps = makeDeps({
       fetchWebForGroup: jest.fn().mockResolvedValue({ webContext: 'news...' }),
       extractFieldsViaLLM: jest.fn().mockResolvedValue({
-        filled: { recent_news: 'launched product Y' }, missing: [],
+        filled: { recent_news: fv('launched product Y') }, missing: [],
       }),
     });
     const result = await runWaterfall(
@@ -273,7 +281,7 @@ describe('runWaterfall — Tier 3 (LLM over Apollo)', () => {
     const deps = makeDeps({
       fetchApolloOrg: jest.fn().mockResolvedValue(apolloResult(apolloMapped, apolloRaw)),
       extractFieldsViaLLM: jest.fn().mockResolvedValue({
-        filled: { tech_stack: 'AWS, HubSpot, Stripe' },
+        filled: { tech_stack: fv('AWS, HubSpot, Stripe') },
         missing: [],
       }),
     });
@@ -298,7 +306,7 @@ describe('runWaterfall — Tier 3 (LLM over Apollo)', () => {
       fetchApolloOrg: jest.fn().mockResolvedValue(null),
       fetchWebForGroup: jest.fn().mockResolvedValue({ webContext: 'serp...' }),
       extractFieldsViaLLM: jest.fn().mockResolvedValue({
-        filled: { tech_stack: 'AWS' }, missing: [],
+        filled: { tech_stack: fv('AWS') }, missing: [],
       }),
     });
     await runWaterfall(
@@ -324,7 +332,7 @@ describe('runWaterfall — Tier 3 (LLM over Apollo)', () => {
       fetchApolloOrg: jest.fn().mockResolvedValue(apolloResult({ tech_stack: 'AWS' })),
       fetchWebForGroup: jest.fn().mockResolvedValue({ webContext: 'serp...' }),
       extractFieldsViaLLM: jest.fn().mockResolvedValue({
-        filled: { crm_used: 'HubSpot' }, missing: [],
+        filled: { crm_used: fv('HubSpot') }, missing: [],
       }),
     });
     await runWaterfall(
@@ -351,7 +359,7 @@ describe('runWaterfall — Tier 4 (Web)', () => {
       fetchApolloOrg: jest.fn().mockResolvedValue(null),
       fetchWebForGroup: jest.fn().mockResolvedValue({ webContext: 'serp content' }),
       extractFieldsViaLLM: jest.fn().mockResolvedValue({
-        filled: { company_name: 'Acme', industry: 'SaaS', employee_count: '500' },
+        filled: { company_name: fv('Acme'), industry: fv('SaaS'), employee_count: fv('500') },
         missing: [],
       }),
     });
@@ -373,7 +381,7 @@ describe('runWaterfall — Tier 4 (Web)', () => {
       fetchApolloOrg: jest.fn().mockResolvedValue(null),
       fetchWebForGroup: jest.fn().mockResolvedValue({ webContext: 'serp content' }),
       extractFieldsViaLLM: jest.fn().mockResolvedValue({
-        filled: { company_name: 'Acme' },
+        filled: { company_name: fv('Acme') },
         missing: ['industry'],
       }),
     });
@@ -545,7 +553,7 @@ describe('runWaterfall — Apollo memoization (per-lead-per-entity)', () => {
       fetchApolloOrg: apolloMock,
       fetchWebForGroup: jest.fn().mockResolvedValue({ webContext: 'serp' }),
       extractFieldsViaLLM: jest.fn().mockResolvedValue({
-        filled: { company_name: 'Acme' }, missing: [],
+        filled: { company_name: fv('Acme') }, missing: [],
       }),
     });
     const ctx = createApolloFetchContext();
@@ -631,7 +639,7 @@ describe('runWaterfall — Tier 3.5c (Unipile company enrichment)', () => {
     const deps = makeDeps({
       findUnipileCompany: jest.fn().mockResolvedValue(companyRaw),
       extractFieldsViaLLM: jest.fn().mockResolvedValue({
-        filled: { company_description: 'A SaaS company', employee_count: '42' },
+        filled: { company_description: fv('A SaaS company'), employee_count: fv('42') },
         missing: [],
       }),
     });
@@ -694,7 +702,7 @@ describe('runWaterfall — Tier 3.5c (Unipile company enrichment)', () => {
     const deps = makeDeps({
       findUnipileCompany: jest.fn().mockResolvedValue(null),
       fetchWebForGroup: jest.fn().mockResolvedValue({ webContext: 'serp content' }),
-      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: { company_description: 'from web' }, missing: [] }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: { company_description: fv('from web') }, missing: [] }),
     });
     const result = await runWaterfall(
       makeInput({ groupName: 'company_firmographic', requestedFields: ['company_description'] }),
@@ -747,7 +755,7 @@ describe('runWaterfall — Tier 3.5c (Unipile company enrichment)', () => {
   it('does not fill field when LLM returns empty string for it', async () => {
     const deps = makeDeps({
       findUnipileCompany: jest.fn().mockResolvedValue({ name: 'Acme' }),
-      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: { company_description: '' }, missing: [] }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: { company_description: fv('') }, missing: [] }),
       fetchWebForGroup: jest.fn().mockResolvedValue(null),
     });
     const result = await runWaterfall(
@@ -781,7 +789,7 @@ describe('runWaterfall — Tier 3.5c (Unipile company enrichment)', () => {
     const deps = makeDeps({
       findUnipileCompany: jest.fn().mockResolvedValue({ name: 'Acme' }),
       extractFieldsViaLLM: jest.fn().mockResolvedValue({
-        filled: { company_description: 'A company' },
+        filled: { company_description: fv('A company') },
         missing: [],
       }),
     });
@@ -792,5 +800,75 @@ describe('runWaterfall — Tier 3.5c (Unipile company enrichment)', () => {
 
     expect(result.tierFills).toEqual({ crm: 0, apollo: 1, web: 0, missing: 0 });
     expect(result.missing).toEqual([]);
+  });
+});
+
+describe('runWaterfall — web-tier per-field provenance (Fix 1)', () => {
+  it('FAIL CASE: a web-tier fill carries provider llm_web_search', async () => {
+    const deps = makeDeps({
+      fetchWebForGroup: jest.fn().mockResolvedValue({ webContext: 'Acme is a SaaS company.' }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({
+        filled: { company_description: fv('A SaaS company') },
+        missing: [],
+      }),
+    });
+    const result = await runWaterfall(
+      makeInput({ groupName: 'company_firmographic', requestedFields: ['company_description'] }),
+      deps,
+    );
+    const fill = result.fields.find(f => f.field === 'company_description');
+    expect(fill?.meta.source).toBe('web_search');
+    expect(fill?.meta.provider).toBe('llm_web_search');
+    expect(fill?.meta.confidence).toBe('medium');
+  });
+
+  it('FAIL CASE: a web-tier fill carries the sourceUrl returned by the LLM', async () => {
+    const deps = makeDeps({
+      fetchWebForGroup: jest.fn().mockResolvedValue({ webContext: 'ctx' }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({
+        filled: { company_description: fv('A SaaS company', 'https://acme.com/about') },
+        missing: [],
+      }),
+    });
+    const result = await runWaterfall(
+      makeInput({ groupName: 'company_firmographic', requestedFields: ['company_description'] }),
+      deps,
+    );
+    const fill = result.fields.find(f => f.field === 'company_description');
+    expect(fill?.meta.sourceUrl).toBe('https://acme.com/about');
+  });
+
+  it('FAIL CASE: a web-tier fill carries the sourceQuote returned by the LLM', async () => {
+    const deps = makeDeps({
+      fetchWebForGroup: jest.fn().mockResolvedValue({ webContext: 'ctx' }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({
+        filled: { company_description: fv('A SaaS company', undefined, 'Acme builds SaaS for teams') },
+        missing: [],
+      }),
+    });
+    const result = await runWaterfall(
+      makeInput({ groupName: 'company_firmographic', requestedFields: ['company_description'] }),
+      deps,
+    );
+    const fill = result.fields.find(f => f.field === 'company_description');
+    expect(fill?.meta.sourceQuote).toBe('Acme builds SaaS for teams');
+  });
+
+  it('SUCCESS CASE: a web-tier fill with no URL/quote still produces a valued fill', async () => {
+    const deps = makeDeps({
+      fetchWebForGroup: jest.fn().mockResolvedValue({ webContext: 'ctx' }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({
+        filled: { company_description: fv('A SaaS company') },
+        missing: [],
+      }),
+    });
+    const result = await runWaterfall(
+      makeInput({ groupName: 'company_firmographic', requestedFields: ['company_description'] }),
+      deps,
+    );
+    const fill = result.fields.find(f => f.field === 'company_description');
+    expect(fill?.value).toBe('A SaaS company');
+    expect(fill?.meta.sourceUrl).toBeUndefined();
+    expect(fill?.meta.sourceQuote).toBeUndefined();
   });
 });
