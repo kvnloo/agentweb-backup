@@ -2176,12 +2176,13 @@ export const taskDb = {
 
         return {
           taskId: task.taskId,
+          userId: task.userId,
           name: task.name,
           knowledgeBaseSize: size,
           knowledgeBaseType: task.knowledgeBaseType || 'private',
           knowledgeBaseFiles: task.knowledgeBaseFiles || [],
           knowledgeBaseUpdatedAt: task.knowledgeBaseUpdatedAt || task.updatedAt || task.createdAt,
-          // Include additional fields that might be useful
+          knowledgeBase: task.knowledgeBase || null,
           updatedAt: task.updatedAt || task.createdAt,
           createdAt: task.createdAt
         };
