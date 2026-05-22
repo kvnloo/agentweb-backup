@@ -141,18 +141,16 @@ describe("PUT /api/seo/config sections", () => {
 });
 
 import { testGaProperty } from "../services/seoService";
-import { gaTestCooldown } from "../routes/seo";
 const mockTestGa = testGaProperty as jest.Mock;
 
 describe("POST /api/seo/config/ga/test", () => {
   beforeEach(() => {
     mockResolveTarget.mockResolvedValue({ kind: "org", id: "org-1", canEdit: true });
-    gaTestCooldown.clear();
   });
 
   test("valid property, connected → ok true", async () => {
     mockTestGa.mockResolvedValue({ ok: true });
-    const res = await request(app).post("/api/seo/config/ga/test").set("x-uid", "u-1")
+    const res = await request(app).post("/api/seo/config/ga/test").set("x-uid", "u-ga-ok")
       .send({ propertyId: "123" });
     expect(res.status).toBe(200);
     expect(res.body.ok).toBe(true);
@@ -160,7 +158,7 @@ describe("POST /api/seo/config/ga/test", () => {
 
   test("permission denied → ok false reason permission_denied", async () => {
     mockTestGa.mockResolvedValue({ ok: false, reason: "permission_denied" });
-    const res = await request(app).post("/api/seo/config/ga/test").set("x-uid", "u-1")
+    const res = await request(app).post("/api/seo/config/ga/test").set("x-uid", "u-ga-denied")
       .send({ propertyId: "123" });
     expect(res.body).toMatchObject({ ok: false, reason: "permission_denied" });
   });

@@ -100,7 +100,7 @@ router.put("/config/clarity", async (req, res) => {
 });
 
 // Per-user cooldown for the GA test probe (2s) — prevents property-ID enumeration.
-export const gaTestCooldown = new Map<string, number>();
+const gaTestCooldown = new Map<string, number>();
 
 // Live-test a GA4 property with the shared service account.
 router.post("/config/ga/test", async (req, res) => {
