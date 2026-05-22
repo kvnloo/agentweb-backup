@@ -1325,3 +1325,88 @@ describe('runEnrichment — smart-field meta records the producing model', () =>
     expect(setLeadFields).not.toHaveBeenCalled();
   });
 });
+
+describe('runEnrichment — enrichedJobId stamping (Fix 7)', () => {
+  it('FAIL CASE: every persisted fill carries meta.enrichedJobId equal to the run id', async () => {
+    const setLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [
+          { field: 'company_name', value: 'Acme', meta: { source: 'api', provider: 'apollo', enrichedAt: '2026-01-01T00:00:00Z' } },
+        ],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+      }),
+      setLeadFields,
+    });
+    const result = await runEnrichment(makeInput({ config: makeConfig({
+      fields: [{ name: 'company_name', type: 'string', instruction: 'co', include: true, overwritePolicy: 'always_overwrite' }],
+    }) }), deps);
+    const meta = (setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.company_name;
+    expect(meta.enrichedJobId).toBe(result.runId);
+  });
+
+  it('FAIL CASE: enrichedJobId is identical across multiple fields written for one lead', async () => {
+    const setLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [
+          { field: 'company_name', value: 'Acme', meta: { source: 'api', provider: 'apollo', enrichedAt: '2026-01-01T00:00:00Z' } },
+          { field: 'industry', value: 'SaaS', meta: { source: 'api', provider: 'apollo', enrichedAt: '2026-01-01T00:00:00Z' } },
+        ],
+        missing: [],
+        tierFills: { crm: 0, apollo: 2, web: 0, missing: 0 },
+      }),
+      setLeadFields,
+    });
+    const result = await runEnrichment(makeInput({ config: makeConfig({
+      fields: [
+        { name: 'company_name', type: 'string', instruction: 'co', include: true, overwritePolicy: 'always_overwrite' },
+        { name: 'industry', type: 'string', instruction: 'ind', include: true, overwritePolicy: 'always_overwrite' },
+      ],
+    }) }), deps);
+    const md = (setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata;
+    expect(md.company_name.enrichedJobId).toBe(result.runId);
+    expect(md.industry.enrichedJobId).toBe(result.runId);
+  });
+
+  it('FAIL CASE: stamping enrichedJobId does not erase other meta keys', async () => {
+    const setLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [
+          { field: 'company_name', value: 'Acme', meta: { source: 'api', provider: 'apollo', confidence: 'high', enrichedAt: '2026-01-01T00:00:00Z' } },
+        ],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+      }),
+      setLeadFields,
+    });
+    await runEnrichment(makeInput({ config: makeConfig({
+      fields: [{ name: 'company_name', type: 'string', instruction: 'co', include: true, overwritePolicy: 'always_overwrite' }],
+    }) }), deps);
+    const meta = (setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.company_name;
+    expect(meta.provider).toBe('apollo');
+    expect(meta.confidence).toBe('high');
+  });
+
+  it('SUCCESS CASE: preview mode does not call setLeadFields (no stamping path)', async () => {
+    const setLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [{ field: 'company_name', value: 'Acme', meta: { source: 'api', provider: 'apollo', enrichedAt: '2026-01-01T00:00:00Z' } }],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+      }),
+      setLeadFields,
+    });
+    await runEnrichment(makeInput({ mode: 'preview', config: makeConfig({
+      fields: [{ name: 'company_name', type: 'string', instruction: 'co', include: true, overwritePolicy: 'always_overwrite' }],
+    }) }), deps);
+    expect(setLeadFields).not.toHaveBeenCalled();
+  });
+});

@@ -658,13 +658,16 @@ async function writeLeadOutcome(
   outcome: PerLeadOutcome,
   input: RunEnrichmentInput,
   deps: OrchestratorDeps,
+  runId: string,
 ): Promise<{ ok: true } | { ok: false; reason: 'update' }> {
   if (input.mode === 'preview') return { ok: true };
   const { fillIfEmpty, alwaysOverwrite } = bucketByOverwritePolicy(lead, outcome.fills, input.config);
 
   // Split each fill by destination — standard CRM columns write to the lead's
   // top-level attributes (so values appear in the same column shown in the
-  // lead table); custom fields write to the customFields map.
+  // lead table); custom fields write to the customFields map. Every persisted
+  // fill is stamped with this run's id so the field is traceable to the job
+  // that produced it (V2-parity — see crmEnrichmentService.ts).
   const splitBucket = (fills: FieldFill[]) => {
     const topLevel: Record<string, string> = {};
     const customFields: Record<string, string> = {};
@@ -675,7 +678,7 @@ async function writeLeadOutcome(
       } else {
         customFields[f.field] = f.value;
       }
-      enrichmentMetadata[f.field] = f.meta;
+      enrichmentMetadata[f.field] = { ...f.meta, enrichedJobId: runId };
     }
     return { topLevel, customFields, enrichmentMetadata };
   };
@@ -917,7 +920,7 @@ export async function runEnrichment(
       const writeResults = await Promise.all(
         pendingWrites.map(async ({ lead, outcome }) => {
           const wStart = Date.now();
-          const writeResult = await writeLeadOutcome(lead, outcome, input, deps);
+          const writeResult = await writeLeadOutcome(lead, outcome, input, deps, runId);
           console.log(`[v3][lead ${lead.leadId}] write in ${Date.now() - wStart}ms (ok=${writeResult.ok})`);
           return writeResult;
         }),
