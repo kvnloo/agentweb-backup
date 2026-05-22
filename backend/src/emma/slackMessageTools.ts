@@ -7,7 +7,7 @@ import {
   getThreadReplies,
   postSlackMessage,
 } from '../services/slackService';
-import { userDb } from '../services/db';
+import { userDb, orgDb } from '../services/db';
 
 const NO_SLACK_CHANNEL_ERROR = 'No Slack channel is configured for your account. Ask your admin to set one up.';
 const NO_CHANNEL_SPECIFIED_ERROR = 'You have multiple Slack channels configured. Specify which channel to use via channel_id or channel_name.';
@@ -16,6 +16,17 @@ const NO_CHANNEL_SPECIFIED_ERROR = 'You have multiple Slack channels configured.
 function getUserAllowedChannels(user: { slackChannels?: string[]; slackChannel?: string }): string[] {
   if (user.slackChannels && user.slackChannels.length > 0) return user.slackChannels;
   if (user.slackChannel) return [user.slackChannel];
+  return [];
+}
+
+// Returns allowed channels for a user, falling back to the org owner's channel for org members.
+async function getEffectiveAllowedChannels(user: { slackChannels?: string[]; slackChannel?: string; orgId?: string } | null | undefined): Promise<string[]> {
+  const personal = getUserAllowedChannels(user ?? {});
+  if (personal.length > 0) return personal;
+  if (user?.orgId) {
+    const org = await orgDb.getOrgById(user.orgId);
+    if (org?.slackChannel) return [org.slackChannel];
+  }
   return [];
 }
 
@@ -28,7 +39,7 @@ async function resolveChannelForUser(
   if (context.userId) {
     const user = await userDb.getUserById(context.userId);
     if (!user?.isAdmin) {
-      const allowed = getUserAllowedChannels(user ?? {});
+      const allowed = await getEffectiveAllowedChannels(user);
       if (allowed.length === 0) {
         return { error: NO_SLACK_CHANNEL_ERROR };
       }
@@ -88,7 +99,7 @@ emmaToolRegistry.register({
     if (context.userId) {
       const user = await userDb.getUserById(context.userId);
       if (!user?.isAdmin) {
-        const allowed = getUserAllowedChannels(user ?? {});
+        const allowed = await getEffectiveAllowedChannels(user);
         if (allowed.length === 0) {
           return { success: false, error: NO_SLACK_CHANNEL_ERROR };
         }

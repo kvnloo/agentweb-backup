@@ -19,6 +19,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-22',
     changes: [
+      'Fixed: Org Members Can Now Send and Read Slack Messages Using the Org Owner\'s Connected Workspace',
+      '- Org team members were blocked from using any Slack features (list channels, fetch messages, send messages) even when the org owner had a Slack workspace and channel configured',
+      '- The error "No Slack channel is configured for your account" appeared for all org members regardless of the org owner\'s setup',
+      '- Slack tools now fall back to the org\'s configured channel when an org member has no personal Slack channel set up, consistent with how other org-wide resources like brand guidelines are shared',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
       'Fixed: Admin Delegate Access No Longer Switches to the Wrong Account',
       '- When an admin opened a delegate session in a new tab while another customer portal tab was open, the delegate tab could sometimes show the wrong customer\'s account',
       '- The issue was caused by a few places reading the auth token directly from localStorage instead of going through the secure token resolution in useAuth()',
