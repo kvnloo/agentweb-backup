@@ -85,7 +85,8 @@ describe('Agent Mode Controller - Session Loading', () => {
     });
 
     it('should mark session as active when progress exists', async () => {
-      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      const recentSession = { ...mockSession, updatedAt: new Date().toISOString() };
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(recentSession);
       progressStore.set('session-123', { iteration: 1, status: 'thinking' });
 
       const req = mockRequest(mockUser, 'session-123');

@@ -29,6 +29,9 @@ import { DynamoDB } from 'aws-sdk';
 
 /** Default expiration for legacy interactive shares that don't have an expiresAt field (7 days from sharedAt). */
 const LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS = 7;
+// In-memory progress is stale if the session hasn't been updated in this window.
+// Prevents the UI from showing a stuck loading spinner after a server restart or crash.
+const PROGRESS_STALE_MS = 10 * 60 * 1000;
 
 /**
  * In-memory set of session IDs that are currently generating a response.
@@ -1925,7 +1928,12 @@ export const agentModeController = {
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
       }
-      const progressActive = hasActiveProgress(session.sessionId);
+      // Treat in-memory progress as stale if the session hasn't been updated in 10 minutes.
+      // Prevents the UI from showing a stuck loading spinner after a server restart or crash.
+      const sessionAge = session.updatedAt
+        ? Date.now() - new Date(session.updatedAt).getTime()
+        : Infinity;
+      const progressActive = sessionAge < PROGRESS_STALE_MS && hasActiveProgress(session.sessionId);
 
       // For non-admin users, check if they own the session
       if (!user?.isAdmin && session.userId !== user?.userId) {
