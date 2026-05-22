@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-22',
     changes: [
+      'Fixed: All Landing Pages Can Now Be Deleted',
+      '- Previously, the first (root) landing page could not be deleted — the trash icon was hidden and the API blocked deletion',
+      '- All landing pages, including the root page, can now be deleted from the Landing Pages view',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
       'Fixed: Admin Delegate Access No Longer Switches to the Wrong Account',
       '- When an admin opened a delegate session in a new tab while another customer portal tab was open, the delegate tab could sometimes show the wrong customer\'s account',
       '- The issue was caused by a few places reading the auth token directly from localStorage instead of going through the secure token resolution in useAuth()',
