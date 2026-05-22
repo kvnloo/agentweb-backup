@@ -11,7 +11,7 @@ import { apolloEmailStatusToConfidence } from './apolloFieldMapper';
 
 const IDENTITY_FIELD_TTL_MS = 90 * 86400 * 1000; // 90 days — no FIELD_GROUP for identity fields
 
-export type IdentityProvider = 'apollo' | 'enrich.so' | 'unipile';
+export type IdentityProvider = 'apollo' | 'enrich.so' | 'unipile' | 'pattern';
 
 export interface ApolloPersonResult {
   firstName?: string;
@@ -485,7 +485,13 @@ export async function resolveIdentity(
       if (patternResult?.email) {
         email = patternResult.email;
         resolved.email = patternResult.email;
-        meta.email = makeApiMeta('enrich.so');
+        meta.email = {
+          source: 'api',
+          provider: 'pattern',
+          confidence: 'medium',
+          ...(patternResult.pattern ? { sourceQuote: `pattern: ${patternResult.pattern}` } : {}),
+          enrichedAt: new Date().toISOString(),
+        };
         emailPattern = patternResult.pattern;
       }
     } catch (err) {

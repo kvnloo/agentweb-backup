@@ -1153,7 +1153,7 @@ describe('resolveIdentity — pattern matching (Tier 7)', () => {
     expect(result.emailPattern).toBe('f.last@domain');
   });
 
-  it('meta.email provider is enrich.so when pattern finds email', async () => {
+  it('meta.email provider is "pattern" when pattern matching finds email', async () => {
     const writeLeadFields = jest.fn().mockResolvedValue(undefined);
     const deps = makeDeps({
       findEmailViaPatterns: jest.fn().mockResolvedValue({ email: 'j.doe@acme.com', pattern: 'f.last@domain' }),
@@ -1169,6 +1169,75 @@ describe('resolveIdentity — pattern matching (Tier 7)', () => {
     );
     expect(writeLeadFields).toHaveBeenCalled();
     const call = writeLeadFields.mock.calls[0][0];
-    expect(call.meta.email.provider).toBe('enrich.so');
+    expect(call.meta.email.provider).toBe('pattern');
+  });
+});
+
+// ─── Tier 7 — Pattern-email attribution (Fix 2) ───────────────────────────────
+
+describe('resolveIdentity — Tier 7 pattern-email attribution (Fix 2)', () => {
+  function tier7Input() {
+    return makeInput({
+      lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+      needsPersonFields: false,
+      needsCompanyFields: false,
+    });
+  }
+
+  it('FAIL CASE: pattern-email meta has provider "pattern", not "enrich.so"', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      findEmailViaPatterns: jest.fn().mockResolvedValue({ email: 'jane.doe@acme.com', pattern: 'first.last' }),
+      writeLeadFields,
+    });
+    await resolveIdentity(tier7Input(), deps);
+    const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta.email;
+    expect(meta.source).toBe('api');
+    expect(meta.provider).toBe('pattern');
+  });
+
+  it('FAIL CASE: pattern-email meta carries the pattern in sourceQuote', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      findEmailViaPatterns: jest.fn().mockResolvedValue({ email: 'jane.doe@acme.com', pattern: 'first.last' }),
+      writeLeadFields,
+    });
+    await resolveIdentity(tier7Input(), deps);
+    const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta.email;
+    expect(meta.sourceQuote).toBe('pattern: first.last');
+  });
+
+  it('FAIL CASE: pattern-email meta confidence is "medium"', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      findEmailViaPatterns: jest.fn().mockResolvedValue({ email: 'jane.doe@acme.com', pattern: 'flast' }),
+      writeLeadFields,
+    });
+    await resolveIdentity(tier7Input(), deps);
+    const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta.email;
+    expect(meta.confidence).toBe('medium');
+  });
+
+  it('SUCCESS CASE: the resolved email value is still persisted', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      findEmailViaPatterns: jest.fn().mockResolvedValue({ email: 'jane.doe@acme.com', pattern: 'first.last' }),
+      writeLeadFields,
+    });
+    const result = await resolveIdentity(tier7Input(), deps);
+    expect(result.ok).toBe(true);
+    expect((writeLeadFields as jest.Mock).mock.calls[0][0].fields.email).toBe('jane.doe@acme.com');
+  });
+
+  it('pattern-email meta has no sourceQuote when pattern is absent', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      findEmailViaPatterns: jest.fn().mockResolvedValue({ email: 'jane.doe@acme.com' }), // no pattern
+      writeLeadFields,
+    });
+    await resolveIdentity(tier7Input(), deps);
+    const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta.email;
+    expect(meta.sourceQuote).toBeUndefined();
+    expect(meta.provider).toBe('pattern');
   });
 });
