@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-15
+// Last updated: 2026-05-22
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,432 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-05-23',
+    changes: [
+      'Fixed: CRM Inbox "Last Contact" No Longer Shows Enrichment Time',
+      '- Enriching a lead record (company info, industry, etc.) was updating the record\'s modified timestamp, which the CRM inbox was incorrectly showing as the "Last contact" time',
+      '- Leads with no real contact history now show their creation date instead of the last enrichment time, so "Last contact" only reflects actual engagement events',
+    ],
+  },
+  {
+    date: '2026-05-23',
+    changes: [
+      'Fixed: Knowledge Base Files Can Now Be Read Back Immediately After Writing',
+      '- Creating or updating a knowledge base file would succeed (returning a valid size and timestamp) but reading it back immediately returned "Knowledge base file not found in storage"',
+      '- The root cause was a mismatch in storage bucket environment variables: write operations used KNOWLEDGE_BASE_BUCKET / PRIVATE_KNOWLEDGE_BASE_BUCKET while read operations used GCS_BUCKET_NAME / GCS_BUCKET_NAME_PRIVATE, which in production resolved to the wrong (dev) bucket',
+      '- Read operations now use the same bucket environment variables as writes, so files are immediately readable after being created or updated',
+    ],
+  },
+  {
+    date: '2026-05-23',
+    changes: [
+      'Fixed: Group Email Unsubscribe Links Now Work Correctly',
+      '- Group emails sent to CRM leads now include a properly formatted unsubscribe link that leads to the correct unsubscribe page',
+      '- Templates using either {{unsubscribeUrl}} or {{unsubscribe_url}} are now both recognized and substituted — previously the snake_case variant caused all leads to be skipped as "missing variables"',
+      '- The email preview in the composer no longer appends a duplicate unsubscribe footer when the template already contains an unsubscribe link',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
+      'Improved: Browser Automation Skill Now Falls Back to Local Agent When Headless Browser Fails',
+      '- When a website blocks the headless cloud browser (bot protection, Cloudflare, React crash, blank page), the Browser Automation skill now automatically uses the Local Agent as a fallback',
+      '- The Local Agent tool is now bundled directly into the Browser Automation skill so it is always available without a separate install',
+      '- Previously, the agent would report the site as broken or inaccessible; now it retries via the Local Agent which uses a real (non-headless) browser',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
+      'New: Emma Now Knows Whether a CRM Lead Has Accepted Your LinkedIn Connection',
+      '- When Emma looks up a lead\'s details, she now checks the LinkedIn connection cache and reports whether you are a 1st-degree connection, and if so, when you connected',
+      '- This lets Emma automatically choose the right LinkedIn action: sending a direct message to connected leads instead of a new connection invite',
+      '- No manual steps required — the status is derived from the same connection data already synced every 10 minutes in the background',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
+      'Fixed: All Landing Pages Can Now Be Deleted',
+      '- Previously, the first (root) landing page could not be deleted — the trash icon was hidden and the API blocked deletion',
+      '- All landing pages, including the root page, can now be deleted from the Landing Pages view',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
+      'Fixed: Org Members Can Now Send and Read Slack Messages Using the Org Owner\'s Connected Workspace',
+      '- Org team members were blocked from using any Slack features (list channels, fetch messages, send messages) even when the org owner had a Slack workspace and channel configured',
+      '- The error "No Slack channel is configured for your account" appeared for all org members regardless of the org owner\'s setup',
+      '- Slack tools now fall back to the org\'s configured channel when an org member has no personal Slack channel set up, consistent with how other org-wide resources like brand guidelines are shared',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
+      'Fixed: Admin Delegate Access No Longer Switches to the Wrong Account',
+      '- When an admin opened a delegate session in a new tab while another customer portal tab was open, the delegate tab could sometimes show the wrong customer\'s account',
+      '- The issue was caused by a few places reading the auth token directly from localStorage instead of going through the secure token resolution in useAuth()',
+      '- Token reads now always go through useAuth(), which correctly returns the tab-isolated sessionStorage token for delegate sessions',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
+      'Fixed: LinkedIn DM Campaigns No Longer Send the Same Message Twice to the Same Lead',
+      '- Scheduled LinkedIn outreach campaigns could send an identical follow-up message to a lead multiple times across different daily runs, risking spam flags',
+      '- The agent now checks engagement history before sending and blocks any message whose exact text was already delivered to that lead',
+      '- Different follow-up messages (e.g. Touch 3 after Touch 2) are still allowed through normally',
+    ],
+  },
+  {
+    date: '2026-05-21',
+    changes: [
+      'Fixed: Meta Ads Budget Updates Now Apply the Correct Dollar Amount',
+      '- Updating an ad set\'s daily or lifetime budget via Emma was setting the wrong amount — passing $150 resulted in a $1.50 budget because the value was sent to Meta in dollars instead of the required cents',
+      '- Budget values are now correctly converted (multiplied by 100) before being sent to the Meta Ads API for both ad set and campaign updates',
+      '- Creating ad sets was not affected; only update operations had the missing conversion',
+    ],
+  },
+  {
+    date: '2026-05-21',
+    changes: [
+      'Fixed: Sequence Auto-Enroll Section No Longer Shows Unrelated Lists',
+      '- The AUTO-ENROLL section in a sequence detail view was showing every list that ever had a lead manually enrolled — even lists the user never configured for auto-enrollment',
+      '- Now only lists explicitly enabled for auto-enrollment are shown',
+    ],
+  },
+  {
+    date: '2026-05-21',
+    changes: [
+      'Fixed: Lead Enrichment via Emma Now Fills Every Requested Field',
+      '- Asking Emma to enrich CRM leads now uses the same enrichment engine as the CRM page\'s Enrichment Config',
+      '- Previously some requested fields (such as LinkedIn summary, skills, headline, and location) could come back empty even though the job reported success',
+      '- Emma enrichment now also benefits from Apollo and LinkedIn structured-data lookups and the same accuracy safeguards used by the CRM page',
+    ],
+  },
+  {
+    date: '2026-05-21',
+    changes: [
+      'Fixed: CRM Enrichment Now Processes Every Lead in Large Lists',
+      '- Enriching a large lead list could silently stop after the first batch of leads, leaving the rest of the list un-enriched with no error',
+      '- Enrichment now pages through the entire list, so every lead is processed regardless of list size',
+    ],
+  },
+  {
+    date: '2026-05-21',
+    changes: [
+      'Fixed: Emma No Longer Gets Stuck in a Repeated Navigate/Screenshot Loop',
+      '- In some sessions, Emma would navigate to the same file URL and take a screenshot repeatedly — sometimes 20+ times — before completing the task',
+      '- A new sliding-window loop detector now catches this alternating pattern and stops it within 10 iterations',
+      '- Emma now provides a final response based on what she has already observed instead of looping indefinitely',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
+      'Fixed: Emma Can Now Read Word Documents (.docx)',
+      '- Emma was unable to process Word documents uploaded as attachments — the file content came through as garbled binary data',
+      '- Emma can now read and understand the full text content of .docx and .doc files',
+      '- Use Emma to summarize, reformat, or build on any Word document you attach to a conversation',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
+      'Fixed: CRM Enrichment No Longer Produces Fake LinkedIn URLs',
+      '- The v3 enrichment pipeline could occasionally fabricate a plausible-looking LinkedIn URL for a lead even when no LinkedIn URL was present in any data source',
+      '- The LLM extraction step now receives explicit per-field instructions for LinkedIn fields: it must only copy a URL that appears verbatim in the provided data and must return null if none is found',
+      '- A post-extraction guard additionally checks that the URL\'s slug literally appears in the source text, rejecting any hallucinated URL before it reaches the lead record',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
+      'Fixed: Subscription End Date Now Correctly Reflects Latest Payment',
+      '- The admin Users tab was showing a stale subscription end date even after a payment was processed',
+      '- Payments now sync the subscription period end date from Stripe immediately',
+      '- The manual admin re-sync also now correctly overwrites stale end dates',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
+      'Fixed: CRM "Last Contact" No Longer Shows Sync Time as a Contact Event',
+      '- The Last Contact column in CRM was showing the time of the most recent sync run for leads with no actual contact history',
+      '- This caused many leads to appear freshly contacted (e.g., "9h ago") after a users or waitlist sync, making it hard to identify who truly hasn\'t been reached',
+      '- Last Contact now shows "Never" for leads with no engagement history, so the column accurately reflects real outreach activity',
+      'Fixed: CRM Users/Waitlist Sync — Incremental Sync Now Picks Up Updated Records',
+      '- The incremental sync for AgentWeb Users and Waitlist was only checking creation time, so records updated after the last sync (e.g., subscription changes, invited status) were silently skipped',
+      '- The filter now uses the most recent of createdAt/updatedAt/joinedAt, ensuring changed records are included in the next sync run',
+      'Fixed: iShare Messages Now Correctly Attributed as Anonymous',
+      '- Messages submitted by visitors via interactive share (iShare) links were previously stored identically to messages from the session owner, with no way to distinguish the source',
+      '- Each message sent through an iShare link now records the sender as anonymous in the message metadata, along with the visitor\'s IP address and browser info when available',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
+      'Fixed: LinkedIn Connection Sync No Longer Errors on Leads Without Email Addresses',
+      '- The LinkedIn connection sync cron was throwing a DynamoDB validation error when processing leads that have no email address',
+      '- Leads without an email are now skipped during LinkedIn-triggered sequence enrollment',
+      '- Also added a defensive guard in the enrollment de-dup check to prevent similar errors from any other caller',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
+      'Fixed: Scheduled Chats No Longer Send Duplicate Emails When Email Notifications Are Configured',
+      '- When a scheduled chat had email notifications configured, the AI sometimes also added a notify_session step inside the prompt, causing two emails per run',
+      '- The schedule tool now explicitly instructs the AI to omit any email-sending step from the prompt when email_notifications is already set on the schedule',
+      '- Users will receive exactly one email per scheduled run going forward',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
+      'Fixed: LinkedIn Drip Campaign — Three Reliability Improvements',
+      '- Messages in campaign templates that used {{first name}} or {{last name}} (with a space) were being sent as literal placeholder text instead of the lead\'s name — now resolved',
+      '- Enrollments that failed because the lead was not yet a 1st-degree connection were retrying every 5 minutes, causing a retry storm — they now snooze for 6 hours and retry once the connection is accepted',
+      '- Campaign auto-enrollment was pulling leads from all of a user\'s lists instead of only the lists configured for the campaign — now correctly scoped to the configured lists only',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
+      'New: Organization-Wide Emma Memory',
+      '- Organizations can now maintain a shared memory that Emma uses across all member conversations',
+      '- Go to Settings → Organization → Organization Memory to add, edit, or delete org-wide facts',
+      '- All org members can view and add memories; only the org owner can edit, delete, or disable',
+      '- Emma will automatically save org-relevant facts during conversations using her new save_org_memory tool',
+      '- Org memories appear alongside personal memories in every chat session for all members',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
+      'New: GPT-5.4 Nano Available as an AI Model for CRM Email Drafting',
+      '- GPT-5.4 Nano is now selectable in the Draft Email dialog in CRM',
+      '- Use it as a faster, lighter alternative to GPT-5.4 for generating personalized email drafts',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
+      'Fixed: Scheduled Chat Error — Social Listening Research and Similar Schedules Now Retry on Intermittent Bedrock Errors',
+      '- Scheduled chats occasionally failed with "I encountered an issue processing your request" due to a transient Bedrock infrastructure error (HTTP 400 with no error body)',
+      '- This error was incorrectly treated as a permanent failure and not retried',
+      '- The fix adds "400 status code (no body)" to the list of transient Bedrock errors that trigger automatic retry, preventing spurious failures on intermittent AWS infrastructure issues',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
+      'New: Native Account Owner and Additional POC Emails on CRM Lead Records',
+      '- Each CRM lead now has a native "Account Owner" field that maps to an org team member (e.g. Harsha, Matt, Fangfang)',
+      '- Select an account owner from the dropdown in the lead detail panel — options are pulled from your org\'s members',
+      '- Add extra Point of Contact (POC) emails per lead using the new tag-input field: type an email and press Enter or comma to add, click × to remove',
+      '- Filter leads by account owner in the Filters popover; active filter shows as a pill in the list header',
+      '- Toggle the "Account Owner" column on in Configure Display Fields to show and sort by owner in the lead table',
+      '- Fixes: the previous Account Owner field was stored as a custom field and not properly recognized by the system — it now uses a native field consistent with the data model',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
+      'Fixed: Landing Page Sub-Pages Now Show the Correct Custom Domain URL',
+      '- Sub-pages (additional pages added to a landing page site) were displaying the Vercel URL instead of the custom domain URL',
+      '- Sub-page URLs now correctly use the custom domain as the base (e.g. mycustomdomain.com/pricing instead of lp-xyz.vercel.app/pricing)',
+      '- When assigning a custom subdomain, sub-pages now store the full URL including their page path',
+      'Fixed: Failed Landing Pages Can Now Be Deleted',
+      '- Landing pages that failed during generation (before any GitHub repo was created) could not be deleted from the UI, forcing users to regenerate without being able to clean up the failed record',
+      '- The delete button now appears for failed landing pages that were never deployed, matching existing backend support',
+    ],
+  },
+  {
+    date: '2026-05-19',
+    changes: [
+      'Fixed: Fathom No Longer Shows "Disconnected" Due to Temporary API Errors',
+      '- Fathom accounts were incorrectly shown as "Disconnected" when the Fathom API was temporarily unavailable or slow',
+      '- The connection status check now only marks an account as disconnected on definitive auth failures (invalid/revoked token), not on network errors or server issues',
+      '- A 5-second timeout prevents the Connected Accounts page from hanging when Fathom is slow to respond',
+    ],
+  },
+  {
+    date: '2026-05-19',
+    changes: [
+      'New: Gemini 3.5 Flash Available in Agent Mode',
+      '- Google\'s latest Gemini 3.5 Flash model is now available in the Agent Mode model selector',
+    ],
+  },
+  {
+    date: '2026-05-19',
+    changes: [
+      'New: Contractor Account Type',
+      '- Admins can now grant users the Contractor role from the Users tab in the Admin page',
+      '- A new Contractors tab in the Admin page lets admins assign specific customer accounts to each contractor',
+      '- Contractors can log in to the partner portal and access their assigned customer portals via the Contractor Accesses page',
+      '- Contractor portal sessions show a "Contractor View" indicator in the header (distinct from admin delegated access)',
+    ],
+  },
+  {
+    date: '2026-05-19',
+    changes: [
+      'Fixed: Stop Button Now Fully Cancels Generation — No Ghost Responses on Reload',
+      '- Clicking Stop while Emma was generating a response would stop the UI, but the backend kept running and the response reappeared after a page reload',
+      '- The backend now cancels the in-flight LLM call immediately when the client disconnects, and discards any completed response so it is never saved to the session',
+      '- Page reload after stopping now shows a clean state — no ghost response, no stuck "Thinking…" indicator',
+    ],
+  },
+  {
+    date: '2026-05-19',
+    changes: [
+      'Fixed: Social Media Posts and Bug Reports Now Work Correctly with Gemini Models',
+      '- Social media posts created by Gemini-powered sessions were rendering as blank (undefined content and platform labels) in the generated HTML',
+      '- Bug reports submitted via Gemini sessions were failing with a Notion API error because issue fields were undefined',
+      '- Both tools now correctly handle Gemini\'s behavior of serializing array items as JSON strings instead of objects',
+    ],
+  },
+  {
+    date: '2026-05-19',
+    changes: [
+      'CRM: Company Accounts — Group Contacts by Organization',
+      '- Added a new "Companies" tab in CRM for account-based marketing (ABM) workflows',
+      '- Create a Company account with name, domain, industry, deal stage (Prospect → Closed Won/Lost), deal value, website, and notes',
+      '- Assign multiple contacts from any list to a Company — each contact\'s detail panel now has a "Company Account" section for one-click assignment or removal',
+      '- The Company detail view shows all assigned contacts grouped together, enabling true multi-contact account management (e.g. all Warp contacts in one place)',
+      '- Deal stage and deal value are tracked at the account level, separate from individual contact deals',
+    ],
+  },
+  {
+    date: '2026-05-19',
+    changes: [
+      'Fixed: Uploading an HTML File to Create a Landing Page Now Works',
+      '- Using the "Upload HTML" template option and clicking Generate previously failed with "Generation failed"',
+      '- Large HTML files were being sent verbatim to the AI generator, exceeding its prompt size limits',
+      '- Uploaded HTML is now condensed automatically (extracting design tokens, section structure, and layout patterns) before generation — matching how saved templates are handled',
+    ],
+  },
+  {
+    date: '2026-05-19',
+    changes: [
+      'CRM: LinkedIn Connection Indicator on Leads',
+      '- The LinkedIn icon on each lead now shows a green dot when that lead is a 1st-degree LinkedIn connection with your connected outreach account',
+      '- Connection status is checked automatically after loading each lead list — no manual refresh needed',
+      '- Hover the icon to see "LinkedIn — 1st-degree connection" tooltip',
+      'Drip Sequences: LinkedIn Auto-Enroll and Exit Conditions',
+      '- New sequence setting: "Auto-enroll when lead accepts LinkedIn invite" — leads are automatically enrolled into the sequence when they accept your LinkedIn connection request (checked every 10 minutes)',
+      '- New exit condition: "Exit when lead replies on LinkedIn" — the sequence stops sending to a lead as soon as they reply to any LinkedIn message',
+      '- LinkedIn connection data is cached in a dedicated store, enabling fast lookups and supporting future features without touching lead records',
+      'Improved: Research Reports Page Loads Faster for Large Accounts',
+      '- The Reports page previously froze or timed out for accounts with hundreds of reports and sessions',
+      '- Reports now load progressively — the first 30 appear immediately, with more loading automatically as you scroll',
+      '- Search and filters still work across all reports at once, bypassing the scroll limit',
+    ],
+  },
+  {
+    date: '2026-05-18',
+    changes: [
+      'Improved: Emma Can Now Return Timestamped Transcripts and Scene Breakdowns from Videos',
+      '- When asking Emma to analyze a video for scripting or content repurposing, you can now request a timestamped spoken-word transcript (every line with start/end time in seconds)',
+      '- Emma can also return a scene-by-scene breakdown with titles, descriptions, and timestamps — useful for identifying B-roll opportunities, cut points, or content segments',
+      '- You can focus analysis on a specific time range (e.g. "analyze the segment from 0:30 to 1:15") without re-processing the full video',
+      '- Works on direct video file URLs (mp4, mov, webm, etc.) and YouTube links',
+      '- Duration is now returned as part of the structured analysis',
+    ],
+  },
+  {
+    date: '2026-05-18',
+    changes: [
+      'Fixed: Org-Shared LinkedIn Outreach Accounts Now Visible to All Team Members',
+      '- When a team member connected a LinkedIn Outreach (Unipile) account and shared it with the organization, other team members could not see or use the account',
+      '- The connected accounts list was only returning the calling user\'s personal accounts, ignoring org-shared accounts from teammates',
+      '- Org-shared accounts are now included for all members of the same organization',
+    ],
+  },
+  {
+    date: '2026-05-18',
+    changes: [
+      'CRM Group Email: Format Verification Before Sending',
+      '- The "Prepare for Sending" step now checks your email HTML for common issues before you send',
+      '- Warns if dark mode handling is missing (add <meta name="color-scheme" content="light"> to opt iOS Mail out of color inversion)',
+      '- Warns if dark text on a light background has no dark mode protection — the cause of unreadable text seen in Apple Mail / iOS dark mode',
+      '- Warns if CSS class rules outside @media blocks are present (Gmail strips these, breaking layout)',
+      'CRM Group Email: "Load from URL" Now Instant',
+      '- Loading an email HTML file from a URL in the Group Email composer no longer hangs',
+      '- Previously took up to 80+ seconds due to an unnecessary LLM call on every load; now returns in under 1 second',
+    ],
+  },
+  {
+    date: '2026-05-18',
+    changes: [
+      'Fixed: CRM Lead Enrichment and Field Edits Now Work for All Leads',
+      '- A subset of leads imported before a data-quality fix had empty strings stored for email, LinkedIn URL, or name+company key fields',
+      '- DynamoDB rejected any write to these leads — silently blocking enrichment updates and CRM field edits',
+      '- All affected leads (~158k) have been repaired; enrichment and manual edits now work correctly across the entire CRM',
+    ],
+  },
+  {
+    date: '2026-05-21',
+    changes: [
+      'Fixed: Google Drive Folders Now Load Correctly in Knowledge Base for Org Members',
+      '- Users who added Google Drive folders before joining an organization were seeing the folders listed but getting errors when trying to load files',
+      '- Emma also could not access those Drive folders, making them invisible to AI tools',
+      '- Drive folders are now merged across the org and user records, so all previously configured folders work without any manual re-configuration',
+    ],
+  },
+  {
+    date: '2026-05-17',
+    changes: [
+      'Fixed: Knowledge Bases with Content Were Not Appearing in the Knowledge Base Page',
+      '- Knowledge bases whose content was saved correctly but had a size of 0 recorded in the database were not showing up in the Knowledge Base page',
+      '- This affected knowledge bases that were created or updated in sessions where the size metadata was not written — the content existed in storage but the listing logic filtered them out',
+      '- Affected knowledge bases are now visible and fully accessible again',
+      '- New saves now always record a size of at least 1, preventing this from recurring',
+    ],
+  },
+  {
+    date: '2026-05-16',
+    changes: [
+      'Landing Pages: Context Field for "When to Use" Notes',
+      '- Each landing page now has a Context field where you can describe when the page is best used, its tone, and target audience (e.g. "cold outreach to SaaS founders, conversational, focuses on pain points")',
+      '- The field is collapsed by default on the landing page card — click the summary line (or "+ Add context" if empty) to expand and edit',
+      '- Character counter shows usage up to the 500-character limit',
+      '- Emma can now read and update context when you describe a page in conversation — she will save your notes automatically via the update_landing_page_context tool',
+      'Fixed: Agent Mode No Longer Incorrectly Offers Visual Context Tool',
+      '- In Agent Mode, Emma was occasionally calling get_visual_context (a page-screenshot tool) when asked about images, returning a useless "screenshot will be captured" response',
+      '- This tool is only meaningful when Emma is embedded in a specific portal page with a live browser context; it has no effect in standalone Agent Mode chat',
+      '- The tool is now fully excluded from Agent Mode sessions and cannot be called even if the model hallucinates the call from prior conversation history',
+      'Fixed: LinkedIn Outreach No Longer Falsely Reports Invites as Sent When the Message Is Too Long',
+      '- LinkedIn rejects connection-request notes longer than 300 characters with a "Too many characters" error',
+      '- The assistant now validates message length before calling the API — messages over 300 chars are rejected immediately with a clear error',
+      '- When a message is too long, the assistant is explicitly instructed to shorten it and retry rather than proceeding to falsely claim success',
+      '- The 300-character limit is now documented in the tool description so the assistant avoids generating oversized notes in the first place',
+    ],
+  },
+  {
+    date: '2026-05-16',
+    changes: [
+      'Fixed: Emma Can Now Read Excel/XLSX Files',
+      '- When a user attached an Excel file and asked Emma to analyze it, Emma would acknowledge the file but not actually read it',
+      '- XLSX files are binary archives and could not be read as plain text; Emma now parses them correctly using the xlsx library, converting each sheet to CSV',
+      '- Multi-sheet workbooks are fully supported; each sheet is labeled separately in the output',
+      '- Emma now also explicitly recognizes other attached document types (PDF, CSV, etc.) and knows to call read_file_content to process them',
+      'Fixed: Admin Chat History — get_chat_history No Longer Undercounts Sessions',
+      '- Calling the chat-sessions API with limit=1000 but without a time range previously returned only ~91 sessions due to a hard cap of 100 items per DynamoDB page',
+      '- The API now paginates through multiple DynamoDB pages to honour the full requested limit, matching the behaviour of the time-range path',
+      '- Emma\'s get_chat_history tool and the Admin Chat History tab now return consistent, accurate session counts for any requested limit',
+    ],
+  },
+  {
+    date: '2026-05-16',
+    changes: [
+      'Fixed: Drag-and-Drop File Attachment Now Works on Windows 11 / Chrome',
+      '- Dragging a file onto the Agent Mode chat window on Windows 11 with Chrome would open the file in a new browser tab instead of attaching it',
+      '- The fix suppresses Chrome\'s built-in file-open behavior by registering document-level dragover and drop event listeners that call preventDefault(), which take effect whenever the Agent Mode page is active',
+    ],
+  },
   {
     date: '2026-05-15',
     changes: [
@@ -6300,12 +6726,33 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-16',
+    changes: [
+      'Improved: Foreplay Ad Search Now Searches the Full Discovery Database',
+      '- Emma can now search Foreplay\'s global discovery database of millions of ads — not just your own saved swipefile',
+      '- Use the "search_ads_knowledge_base" tool with source=\'discovery\' to find ads by any company, brand, niche, format, or keyword',
+      '- Supports filtering by company name, ad format (video/image/carousel), platform (Facebook/Instagram), niche, live status, and sort order',
+      '- Discovery searches cost 1 Foreplay credit per result — Emma will always note this and keep results small by default',
+      '- Default behavior (source=\'swipefile\') is unchanged: searching your own saved ads remains free',
+      '- Fixed: When the platform-wide Foreplay API key was missing, Emma showed a misleading "No Foreplay account connected" error instead of a clear admin action message',
+    ],
+  },
+  {
     date: '2026-05-15',
     changes: [
       'Fixed: Landing Page Generation Now Recovers from Transient GitHub Errors',
       '- Some landing page generation sessions were failing with "Request failed with status code 422" when GitHub transiently rejected the repo creation request',
       '- The service now automatically retries GitHub repo creation up to 3 times, preventing failures caused by momentary GitHub API glitches',
       '- Orphaned failed landing page records that were never deployed can now be deleted and regenerated cleanly',
+    ],
+  },
+  {
+    date: '2026-05-20',
+    changes: [
+      'Improved: LinkedIn Steps in Sequences Now Require a Connected Outreach Account',
+      '- When adding a LinkedIn step to a Sequence, you now see a "Send from" dropdown showing your connected LinkedIn Outreach accounts',
+      '- If no account is connected, a clear warning appears on the step and saving is blocked until you connect one in Settings → Connected Accounts',
+      '- If an account is connected but expired or disconnected, the pre-save check tells you to reconnect before the sequence can go active',
     ],
   },
   {

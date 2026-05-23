@@ -89,6 +89,8 @@ import { getAccountsByUserId } from '../services/connectedAccountsDb';
 import { settingsService } from '../services/settingsService';
 import { io } from '../server';
 import { CrmEnrichmentService, EnrichmentJobSpec } from '../services/crmEnrichmentService';
+import * as apolloServiceModule from '../services/apolloService';
+import type { ApolloService } from '../services/apolloService';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -2868,5 +2870,263 @@ describe('CrmEnrichmentService.getEnrichmentConfig', () => {
     const config = await CrmEnrichmentService.getEnrichmentConfig();
     expect(config.enrichmentModel).toBe('gemini-3-pro-preview');
     expect(config.dataExtractionModel).toBe('gpt-5-chat-2');
+  });
+});
+
+// ─── apolloTechStack waterfall ────────────────────────────────────────────────
+
+function mockApolloOrg(techStack: string[] | null) {
+  const matchOrg = jest.fn().mockResolvedValue(
+    techStack && techStack.length > 0
+      ? { found: true, organization: { techStack }, fromCache: false, checkedAt: new Date().toISOString() }
+      : { found: false, fromCache: false, checkedAt: new Date().toISOString() },
+  );
+  const svc = { matchOrg, matchPerson: jest.fn(), findEmail: jest.fn() } as unknown as ApolloService;
+  jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(true);
+  jest.spyOn(apolloServiceModule, 'getApolloService').mockReturnValue(svc);
+  return { matchOrg, svc };
+}
+
+function baseSpec(overrides: Partial<EnrichmentJobSpec> = {}): EnrichmentJobSpec {
+  return {
+    listId: 'list-1',
+    userId: 'user-1',
+    instruction: 'Find tech stack',
+    outputFields: ['tech_stack_analytics', 'tech_stack_cms'],
+    sources: ['web_search'],
+    apolloTechStack: true,
+    ...overrides,
+  } as EnrichmentJobSpec;
+}
+
+describe('enrichLead — apolloTechStack waterfall', () => {
+  let service: CrmEnrichmentService;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new CrmEnrichmentService();
+    mockCrmDb.setLeadFields.mockImplementation(async (listId: string, leadId: string, options: any) => {
+      const payload: Record<string, any> = { ...(options?.topLevel || {}) };
+      if (options?.customFields) payload.customFields = options.customFields;
+      if (options?.enrichmentMetadata) payload.enrichmentMetadata = options.enrichmentMetadata;
+      await mockCrmDb.updateLead(listId, leadId, payload as any);
+    });
+    mockCrmDb.mergeFieldNames.mockImplementation(async (listId: string, newFields: Set<string> | string[]) => {
+      await mockCrmDb.updateFieldNames(listId, Array.from(newFields as any));
+    });
+    mockCrmDb.createEnrichmentSnapshotItem.mockResolvedValue(undefined);
+    mockCrmDb.createEnrichmentJobMeta.mockResolvedValue(undefined);
+    mockCrmDb.updateEnrichmentJobStatus.mockResolvedValue(undefined);
+    mockCrmDb.updateLead.mockResolvedValue({} as any);
+    mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('uses Apollo context and skips web search when Apollo returns techStack', async () => {
+    const { matchOrg } = mockApolloOrg(['Google Analytics', 'WordPress']);
+    mockGeminiCreate.mockResolvedValue(
+      geminiResponse({ tech_stack_analytics: 'Google Analytics', tech_stack_cms: 'WordPress' }),
+    );
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead-1', emailDomain: 'acme.com' })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    await service.execute(baseSpec());
+
+    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+    expect(mockAgentModeService.searchWeb).not.toHaveBeenCalled();
+    expect(mockGeminiCreate).toHaveBeenCalled();
+    // First call is field-alias resolution; Apollo context appears in a later extraction call.
+    const allPrompts = mockGeminiCreate.mock.calls.map(c => JSON.stringify(c[0])).join('\n');
+    expect(allPrompts).toContain('Google Analytics');
+    expect(allPrompts).toContain('WordPress');
+  });
+
+  it('falls back to web search when Apollo returns no techStack', async () => {
+    const { matchOrg } = mockApolloOrg(null);
+    mockAgentModeService.searchWeb.mockResolvedValue({
+      success: true,
+      results: [{ title: 'Acme tech', snippet: 'Uses Mixpanel and Shopify' }],
+    });
+    mockGeminiCreate.mockResolvedValue(
+      geminiResponse({ tech_stack_analytics: 'Mixpanel', tech_stack_cms: 'Shopify' }),
+    );
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead-1', emailDomain: 'acme.com' })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    await service.execute(baseSpec());
+
+    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+    expect(mockAgentModeService.searchWeb).toHaveBeenCalled();
+  });
+
+  it('skips Apollo and runs web search when lead has no domain', async () => {
+    const { matchOrg } = mockApolloOrg(['React']);
+    mockAgentModeService.searchWeb.mockResolvedValue({
+      success: true,
+      results: [{ title: 'Acme', snippet: 'Uses Hubspot' }],
+    });
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ tech_stack_analytics: 'Unknown' }));
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead-1', email: undefined, emailDomain: undefined, website: undefined, company: 'Acme' })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    await service.execute(baseSpec());
+
+    expect(matchOrg).not.toHaveBeenCalled();
+    expect(mockAgentModeService.searchWeb).toHaveBeenCalled();
+  });
+
+  it('falls back to web search when Apollo service is not ready', async () => {
+    jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(false);
+    mockAgentModeService.searchWeb.mockResolvedValue({
+      success: true,
+      results: [{ title: 'Acme', snippet: 'Uses AWS' }],
+    });
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ tech_stack_analytics: 'Unknown' }));
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead-1', emailDomain: 'acme.com' })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    await service.execute(baseSpec());
+
+    expect(mockAgentModeService.searchWeb).toHaveBeenCalled();
+  });
+
+  it('does not call Apollo when apolloTechStack flag is absent', async () => {
+    jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(true);
+    const matchOrg = jest.fn();
+    jest.spyOn(apolloServiceModule, 'getApolloService').mockReturnValue(
+      { matchOrg, matchPerson: jest.fn(), findEmail: jest.fn() } as unknown as ApolloService,
+    );
+    mockAgentModeService.searchWeb.mockResolvedValue({
+      success: true,
+      results: [{ title: 'Acme', snippet: 'Uses AWS' }],
+    });
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ tech_stack_analytics: 'Unknown' }));
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead-1', emailDomain: 'acme.com' })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    // No apolloTechStack flag
+    await service.execute(baseSpec({ apolloTechStack: undefined } as any));
+
+    expect(matchOrg).not.toHaveBeenCalled();
+  });
+
+  it('does not call Apollo during preview (no credits burned on preview)', async () => {
+    const { matchOrg } = mockApolloOrg(['React', 'AWS']);
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ tech_stack_analytics: 'Unknown' }));
+    mockAgentModeService.searchWeb.mockResolvedValue({
+      success: true,
+      results: [{ title: 'Acme', snippet: 'Uses AWS' }],
+    });
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead-1', emailDomain: 'acme.com' })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    await service.preview(baseSpec());
+
+    expect(matchOrg).not.toHaveBeenCalled();
+  });
+
+  it('does not call Apollo when domain is a personal email domain', async () => {
+    const { matchOrg } = mockApolloOrg(['React']);
+    mockAgentModeService.searchWeb.mockResolvedValue({
+      success: true,
+      results: [{ title: 'Gmail', snippet: 'Email service' }],
+    });
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ tech_stack_analytics: 'Unknown' }));
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead-1', emailDomain: 'gmail.com' })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    await service.execute(baseSpec());
+
+    expect(matchOrg).not.toHaveBeenCalled();
+    expect(mockAgentModeService.searchWeb).toHaveBeenCalled();
+  });
+
+  it('extracts domain from website when emailDomain absent', async () => {
+    const { matchOrg } = mockApolloOrg(['Segment']);
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ tech_stack_analytics: 'Segment' }));
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead-1', emailDomain: undefined, website: 'https://www.beta.com' })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    await service.execute(baseSpec());
+
+    expect(matchOrg).toHaveBeenCalledWith('beta.com');
+  });
+
+  it('falls back to web search when Apollo matchOrg rejects', async () => {
+    const matchOrg = jest.fn().mockRejectedValue(new Error('Apollo timeout'));
+    const svc = { matchOrg, matchPerson: jest.fn(), findEmail: jest.fn() } as unknown as ApolloService;
+    jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(true);
+    jest.spyOn(apolloServiceModule, 'getApolloService').mockReturnValue(svc);
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ tech_stack_analytics: 'Mixpanel' }));
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead-1', emailDomain: 'acme.com' })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    await service.execute(baseSpec());
+
+    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+    expect(mockAgentModeService.searchWeb).toHaveBeenCalled();
+  });
+
+  it('falls back to web search when Apollo returns found:true with empty techStack', async () => {
+    const matchOrg = jest.fn().mockResolvedValue({
+      found: true,
+      organization: { techStack: [] },
+      fromCache: false,
+      checkedAt: new Date().toISOString(),
+    });
+    const svc = { matchOrg, matchPerson: jest.fn(), findEmail: jest.fn() } as unknown as ApolloService;
+    jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(true);
+    jest.spyOn(apolloServiceModule, 'getApolloService').mockReturnValue(svc);
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ tech_stack_analytics: 'Mixpanel' }));
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead-1', emailDomain: 'acme.com' })],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    await service.execute(baseSpec());
+
+    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+    expect(mockAgentModeService.searchWeb).toHaveBeenCalled();
   });
 });

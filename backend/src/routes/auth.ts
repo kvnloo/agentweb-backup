@@ -61,7 +61,8 @@ router.get('/me', authenticateToken, async (req, res) => {
       response.delegateInfo = {
         isDelegated: true,
         adminEmail: authenticatedReq.delegateInfo.adminEmail,
-        adminUserId: authenticatedReq.delegateInfo.adminUserId
+        adminUserId: authenticatedReq.delegateInfo.adminUserId,
+        isContractor: authenticatedReq.delegateInfo.isContractor,
       };
     }
 
@@ -148,6 +149,14 @@ router.get('/me', authenticateToken, async (req, res) => {
       response.orgName = org.name;
       response.orgRole = user.orgRole;
       response.hasBrandGuidelines = !!(org.brandGuidelines?.brandData?.brandName);
+      // Merge org-level and user-level Drive folders so legacy user-record folders
+      // (added before the org feature) continue to appear in the UI without migration.
+      const orgFolders: Array<{ folderId: string; name: string }> =
+        Array.isArray(org.googleDriveFolders) ? org.googleDriveFolders : [];
+      const userFolders: Array<{ folderId: string; name: string }> =
+        Array.isArray(user.googleDriveFolders) ? user.googleDriveFolders : [];
+      const orgFolderIds = new Set(orgFolders.map((f: { folderId: string }) => f.folderId));
+      response.googleDriveFolders = [...orgFolders, ...userFolders.filter((f: { folderId: string }) => !orgFolderIds.has(f.folderId))];
     }
 
     res.json(response);

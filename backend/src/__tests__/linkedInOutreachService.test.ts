@@ -184,6 +184,42 @@ describe('LinkedInOutreachService', () => {
       expect(thrown.message).not.toBe('UnsuccessfulRequestError');
       expect((thrown as any).structuredError).toBeDefined();
     });
+
+    it('should reject with a character-limit error when message exceeds 300 chars', async () => {
+      const longMessage = 'a'.repeat(301);
+      await expect(
+        linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, longMessage)
+      ).rejects.toThrow('too long');
+
+      // The Unipile API must never be called for an oversized message
+      expect(mockUnipileClient.users.sendInvitation).not.toHaveBeenCalled();
+    });
+
+    it('should reject for a message of exactly 301 chars', async () => {
+      const longMessage = 'a'.repeat(301);
+      await expect(
+        linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, longMessage)
+      ).rejects.toThrow('300 characters');
+    });
+
+    it('should accept a message of exactly 300 chars', async () => {
+      const maxMessage = 'a'.repeat(300);
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, maxMessage);
+      expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledWith(
+        expect.objectContaining({ message: maxMessage })
+      );
+    });
+
+    it('should accept a message of 299 chars', async () => {
+      const shortMessage = 'a'.repeat(299);
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, shortMessage);
+      expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalled();
+    });
+
+    it('should accept invitation with no message (undefined)', async () => {
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, undefined);
+      expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalled();
+    });
   });
 
   describe('sendMessage', () => {

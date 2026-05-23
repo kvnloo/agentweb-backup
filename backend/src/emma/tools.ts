@@ -1,6 +1,6 @@
 import { agentModeService } from '../services/agentModeService';
 import { emmaToolRegistry } from './registry';
-import { accountMemoryDb, userDb } from '../services/db';
+import { accountMemoryDb, orgMemoryDb, userDb } from '../services/db';
 import { crmDb } from '../services/db';
 import { askCrm, AskCrmLead } from '../services/askCrmService';
 import { getAccountSummary } from '../services/accountSummaryService';
@@ -114,8 +114,35 @@ emmaToolRegistry.register({
     const { skillService } = await import('../services/skillService');
     const { getAllowedSkills } = await import('../services/subscriptionService');
 
+    // Best-effort user + org lookup. Powers two things:
+    //  (1) Org-shared skill fanout — only when `shareSettings.skills` is
+    //      effectively enabled for this caller (plain members need
+    //      enabled=true; editors and the org owner always get fanout).
+    //  (2) The admin virtual-skill check below.
+    // If any lookup fails, fall back to non-org behavior — published + own
+    // skills still list.
+    let currentUser: any = null;
+    let userOrgId: string | undefined;
+    try {
+      const { userDb, orgDb } = await import('../services/db');
+      const { isFeatureEffectivelyEnabled } = await import('../services/orgShareService');
+      currentUser = await userDb.getUserById(userId);
+      const candidateOrgId = currentUser?.orgId;
+      if (candidateOrgId) {
+        const org = await orgDb.getOrgById(candidateOrgId);
+        const effectivelyEnabled = isFeatureEffectivelyEnabled(
+          { userId, orgId: candidateOrgId, orgRole: currentUser?.orgRole },
+          org,
+          'skills',
+        );
+        if (effectivelyEnabled) userOrgId = candidateOrgId;
+      }
+    } catch {
+      // best-effort: degrade to non-org behavior
+    }
+
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-      skillService.getSkillsAvailableToUser(userId),
+      skillService.getSkillsAvailableToUser(userId, userOrgId),
       getAllowedSkills(userId)
     ]);
 
@@ -147,24 +174,20 @@ emmaToolRegistry.register({
       });
     }
 
-    // Add __admin_tools__ virtual skill for admin users or admin delegated access
-    try {
-      const { userDb } = await import('../services/db');
-      const currentUser = await userDb.getUserById(userId);
-      const hasAdminAccess = currentUser?.isAdmin === true || context?.isDelegatedAdmin === true;
-      if (hasAdminAccess) {
-        const { agentModeService } = await import('../services/agentModeService');
-        const adminToolNamesList = agentModeService.getAdminToolNames();
-        availableSkills.push({
-          skillId: '__admin_tools__',
-          name: 'Admin Tools',
-          description: 'Admin-only tools: manage predefined work plans, skill definitions, chat history, and client health assessment. WARNING: These tools modify production configuration — use with extra care.',
-          toolNames: adminToolNamesList,
-          toolCount: adminToolNamesList.length
-        });
-      }
-    } catch {
-      // Skip admin tools if user lookup fails
+    // Add __admin_tools__ virtual skill for admin users or admin delegated access.
+    // Reuses currentUser from the lookup above; if that lookup failed, currentUser
+    // is null and admin tools are skipped (unless delegated-admin context says otherwise).
+    const hasAdminAccess = currentUser?.isAdmin === true || context?.isDelegatedAdmin === true;
+    if (hasAdminAccess) {
+      const { agentModeService } = await import('../services/agentModeService');
+      const adminToolNamesList = agentModeService.getAdminToolNames();
+      availableSkills.push({
+        skillId: '__admin_tools__',
+        name: 'Admin Tools',
+        description: 'Admin-only tools: manage predefined work plans, skill definitions, chat history, and client health assessment. WARNING: These tools modify production configuration — use with extra care.',
+        toolNames: adminToolNamesList,
+        toolCount: adminToolNamesList.length
+      });
     }
 
     return {
@@ -187,7 +210,7 @@ Actions:
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
 - list-received-invitations: (exact action string: "list-received-invitations") List pending connection requests received from others. Returns paginated results with sender info.
-- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended.
+- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended. IMPORTANT: message must be 300 characters or fewer — LinkedIn rejects longer notes. Always count characters before sending; if over limit, trim the message first.
 - send-message: Send a direct message. Requires profile_url or provider_id. message required. Only works for 1st-degree connections or open profiles. When sending to a CRM lead, always provide list_id and lead_id — the system enforces that update-conversation-history was called within the last 24 hours before allowing a send.
 - send-inmail: Send a LinkedIn InMail to any profile regardless of connection degree (2nd/3rd-degree connections). Requires profile_url or provider_id, message (body), and subject. Requires a LinkedIn Premium account with available InMail credits. Use this when send-message is not possible due to connection degree restrictions. list_id and lead_id are optional but recommended for CRM persistence.
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
@@ -221,7 +244,7 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         message: {
           type: 'string',
-          description: 'Message content. Required for send-message and send-inmail; recommended for send-invite.'
+          description: 'Message content. Required for send-message and send-inmail; recommended for send-invite. For send-invite: must be 300 characters or fewer (LinkedIn hard limit).'
         },
         subject: {
           type: 'string',
@@ -2899,7 +2922,7 @@ emmaToolRegistry.register({
   name: 'get_lead_details',
   definition: {
     name: 'get_lead_details',
-    description: 'Get full details for a single lead including all fields, ICP match info, email drafts, and recent engagement history.',
+    description: 'Get full details for a single lead including all fields, ICP match info, email drafts, and recent engagement history. Also returns `lead.linkedInConnectionStatus`: if the lead has a LinkedIn URL, this field indicates whether they are a 1st-degree connection (`isConnected: true/false`), and if connected, when they connected (`connectedAt` ISO string, `connectedAtTimestamp` UNIX seconds). Returns `null` if the lead has no LinkedIn URL. Use this to decide whether to send a connection invite vs. a direct message.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3806,7 +3829,7 @@ emmaToolRegistry.register({
   name: "describe_video",
   definition: {
     name: "describe_video",
-    description: 'Analyze and describe a video from a URL using Gemini. Use this when the user mentions a video, asks to "read" a video, or when you need to understand video content (mp4, mov, avi, webm, mkv, etc.). Always prefer this over read_file_content for video files.',
+    description: 'Analyze and describe a video from a URL using Gemini. Accepts direct video file URLs (mp4, mov, avi, webm, mkv, etc.) AND YouTube URLs (youtube.com or youtu.be). Always prefer this over read_file_content for video files. For scripting and content repurposing, set return_transcript=true to get a timestamped spoken-word transcript, and/or return_scenes=true to get a structured scene-by-scene breakdown. Use start_time/end_time to focus on a specific segment.',
     inputSchema: {
       type: "object",
       properties: {
@@ -3818,13 +3841,34 @@ emmaToolRegistry.register({
           type: 'string',
           description: 'Custom prompt/instructions for analyzing the video. Specify what aspects to focus on (e.g., key events, narration, visual details, or timing).',
           default: 'Please describe this video in detail. Focus on key events, visual elements, and any spoken content.'
+        },
+        return_transcript: {
+          type: 'boolean',
+          description: 'When true, returns a timestamped transcript of all spoken content as an array of {start, end, text} objects. Use for scripting, captioning, or content repurposing workflows.'
+        },
+        return_scenes: {
+          type: 'boolean',
+          description: 'When true, returns scene segmentation as an array of {start, end, title, description} objects identifying distinct video segments. Use for scene planning or B-roll identification.'
+        },
+        start_time: {
+          type: 'string',
+          description: 'Focus analysis on a time range starting at this timestamp (e.g. "0:30", "1:15"). Use together with end_time for targeted segment analysis.'
+        },
+        end_time: {
+          type: 'string',
+          description: 'Focus analysis on a time range ending at this timestamp (e.g. "2:00", "3:45"). Use together with start_time for targeted segment analysis.'
         }
       },
       required: ["video_file_url"]
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.describeVideo(args.video_file_url, args.prompt);
+    return await agentModeService.describeVideo(args.video_file_url, args.prompt, {
+      return_transcript: args.return_transcript,
+      return_scenes: args.return_scenes,
+      start_time: args.start_time,
+      end_time: args.end_time
+    });
   }
 });
 
@@ -4358,24 +4402,71 @@ emmaToolRegistry.register({
   name: "search_ads_knowledge_base",
   definition: {
     name: "search_ads_knowledge_base",
-    description: "Search the user's Foreplay ad library (swipefile + boards) for ads the user has SAVED/bookmarked. Use this for ad creative inspiration or finding specific saved ads by brand, headline, or description. IMPORTANT: This only searches the user's own saved collection — it does NOT search the public Meta/Facebook Ads Library for ads currently running by any company. For finding a specific company's currently-running Meta ads, use Playwright to browse https://www.facebook.com/ads/library/ with the company's Facebook Page ID (view_all_page_id=PAGE_ID) — do NOT use keyword search (q=) as that returns false positives. Do NOT use search_knowledge_base for Foreplay ad searches.",
+    description: "Search Foreplay ad library. Defaults to the user's saved swipefile + boards (free). Set source='discovery' to search Foreplay's global database of millions of ads — use this for competitive intelligence or finding ads from a specific company. IMPORTANT: discovery mode costs 1 Foreplay credit per result — keep max_results small (5–10). For finding a specific company's currently-running Meta ads, use source='discovery' with company_name. Do NOT use search_knowledge_base for Foreplay ad searches. IMPORTANT: This does NOT search the public Meta/Facebook Ads Library — for that, use Playwright to browse https://www.facebook.com/ads/library/.",
     inputSchema: {
       type: "object",
       properties: {
         query: {
           type: "string",
-          description: "Search query (e.g. brand name, headline keyword, ad type)"
+          description: "Search query — keyword, headline, ad copy, or niche (e.g. 'checkout', 'SaaS onboarding', 'skincare'). Optional when company_name is provided."
+        },
+        source: {
+          type: "string",
+          enum: ["swipefile", "discovery"],
+          description: "Where to search. 'swipefile' (default) = user's own saved ads, free. 'discovery' = Foreplay's global database of millions of ads, costs 1 credit per result."
+        },
+        company_name: {
+          type: "string",
+          description: "Company or brand name to search ads for (e.g. 'Nike', 'Shopify'). Only used when source='discovery'. Can be combined with query."
         },
         max_results: {
           type: "number",
-          description: "Max results to return (default 5)",
+          description: "Max results to return. Default 5 for swipefile, 10 for discovery (max 20).",
           default: 5
+        },
+        format: {
+          type: "array",
+          items: { type: "string", enum: ["image", "video", "carousel", "dco"] },
+          description: "Filter by ad format. Only applies to source='discovery'."
+        },
+        platform: {
+          type: "array",
+          items: { type: "string", enum: ["facebook", "instagram"] },
+          description: "Filter by publisher platform. Only applies to source='discovery'."
+        },
+        niche: {
+          type: "array",
+          items: { type: "string" },
+          description: "Filter by niche tags (e.g. ['ecommerce', 'saas']). Only applies to source='discovery'."
+        },
+        live: {
+          type: "boolean",
+          description: "If true, return only currently-running ads. If false, return only stopped ads. Only applies to source='discovery'."
+        },
+        sort: {
+          type: "string",
+          enum: ["newest", "oldest", "longest_running"],
+          description: "Sort order. Only applies to source='discovery'."
         }
-      },
-      required: ["query"]
+      }
     }
   },
   execute: async (args: any, context?: any) => {
+    if (args.source === 'discovery') {
+      return await agentModeService.searchForeplayDiscovery(
+        args.query,
+        {
+          maxResults: args.max_results || 10,
+          companyName: args.company_name,
+          format: args.format,
+          platform: args.platform,
+          niche: args.niche,
+          live: args.live,
+          sort: args.sort,
+        },
+        context?.userId
+      );
+    }
     return await agentModeService.searchForeplayAds(args.query, args.max_results || 5, context?.userId);
   }
 });
@@ -4635,7 +4726,7 @@ emmaToolRegistry.register({
   name: "read_file_content",
   definition: {
     name: "read_file_content",
-    description: 'Read and extract text content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, and other common formats. Do NOT use this for image files (jpg, jpeg, png, gif, webp, svg) — use describe_image instead. Do NOT use this for video files (mp4, mov, avi, webm, mkv) — use describe_video instead.',
+    description: 'Read and extract text content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, Excel/XLSX spreadsheets, Word documents (docx, doc), and other common formats. Do NOT use this for image files (jpg, jpeg, png, gif, webp, svg) — use describe_image instead. Do NOT use this for video files (mp4, mov, avi, webm, mkv) — use describe_video instead.',
     inputSchema: {
       type: "object",
       properties: {
@@ -5321,6 +5412,100 @@ emmaToolRegistry.register({
   }
 });
 
+// ─── Org Memory Tools ────────────────────────────────────────
+
+emmaToolRegistry.register({
+  name: 'save_org_memory',
+  definition: {
+    name: 'save_org_memory',
+    description: 'Save a fact about this organization for all org members to share in future sessions. Use this when you learn something important about the company, its strategy, shared workflows, or team preferences that every member should know. Categories: preference (team likes/dislikes), history (past decisions), insight (business learnings), workflow (shared process patterns).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        content: {
+          type: 'string',
+          description: 'The org-wide fact to remember (max 2000 chars). Be specific and actionable.'
+        },
+        category: {
+          type: 'string',
+          enum: ['preference', 'history', 'insight', 'workflow'],
+          description: 'Category for the memory fact.'
+        }
+      },
+      required: ['content', 'category']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const { userDb, orgDb } = await import('../services/db');
+    const user = await userDb.getUserById(userId);
+    if (!user?.orgId) {
+      return { success: false, message: 'User is not a member of any organization.' };
+    }
+
+    const org = await orgDb.getOrgById(user.orgId);
+    if (!org) {
+      return { success: false, message: 'Organization not found.' };
+    }
+    if (org.orgMemoryEnabled === false) {
+      return { success: false, message: 'Organization memory is disabled.' };
+    }
+
+    const memory = await orgMemoryDb.addMemory(
+      user.orgId,
+      args.category,
+      args.content,
+      userId
+    );
+    return {
+      success: true,
+      memoryId: memory.memoryId,
+      message: `Saved org memory: "${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`
+    };
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'delete_org_memory',
+  definition: {
+    name: 'delete_org_memory',
+    description: 'Delete a specific org memory by its ID. Use this when an org-wide fact is no longer accurate or relevant. Only org owners can delete org memories.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        memoryId: {
+          type: 'string',
+          description: 'The ID of the org memory to delete.'
+        }
+      },
+      required: ['memoryId']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const { userDb, orgDb } = await import('../services/db');
+    const user = await userDb.getUserById(userId);
+    if (!user?.orgId) {
+      return { success: false, message: 'User is not a member of any organization.' };
+    }
+
+    const org = await orgDb.getOrgById(user.orgId);
+    if (!org) {
+      return { success: false, message: 'Organization not found.' };
+    }
+    if (org.ownerUserId !== userId) {
+      return { success: false, message: 'Only the org owner can delete org memories.' };
+    }
+
+    await orgMemoryDb.deleteMemory(user.orgId, args.memoryId);
+    return { success: true, message: `Org memory ${args.memoryId} deleted.` };
+  }
+});
+
 emmaToolRegistry.register({
   name: 'account_summary',
   definition: {
@@ -5439,315 +5624,208 @@ emmaToolRegistry.register({
   name: 'enrich_leads_preview',
   definition: {
     name: 'enrich_leads_preview',
-    description: `Preview a CRM lead enrichment job. Processes 2 sample leads to show what the enrichment will produce before committing to the full batch.
+    description: `Preview a CRM lead enrichment job before running the full batch. Runs the V3 enrichment engine in preview mode on 2 sample leads and returns what it would produce.
 
-Returns: totalLeads (total in list), leadsToProcess (would be enriched), alreadyEnriched (already have all fields), and samples (up to 2 leads with their enrichedFields). In enrichedFields, a null value means nothing was found for that field — tell the user "not found" rather than showing null. Show the sample results to the user and ask them to confirm quality before proceeding.
+Returns: runId, processedCount (the 2 sampled leads), and samples — each with leadId and enrichedFields. In enrichedFields a missing value means nothing was found; tell the user "not found" rather than showing null. Show the samples and ask the user to confirm before calling enrich_leads_execute.
 
-After showing the preview, ask the user to confirm before calling enrich_leads_execute.
-
-Field and source guidance:
-- output_fields: one snake_case field per distinct data point. Numeric values (dates, counts, amounts), categorical values (industry, funding stage), URLs (linkedin_url), and prose summaries (company_profile) each get their own field. When a prose request names sub-items ("profile describing industry, employee count, products"), create the prose field PLUS a separate field for each named item.
-- sources_per_field: map each field to its source. Use "web_search" for company info, funding, tech stack, company LinkedIn URL. Use "linkedin" ONLY for the lead's personal LinkedIn profile (field name: linkedin_url). Use "existing_data" for fields derivable from existing lead data.
-- field_descriptions: short natural-language description of each output field (what to find / where it lives). Required for any field that isn't a well-known canonical field — these descriptions guide the per-field web search. Common fields like industry, funding_stage, employee_count are auto-grouped and don't need a description; uncommon or domain-specific fields do (e.g. {"product_certifications": "ISO/SOC2/HIPAA certifications the company holds"}).
-- linkedin_search_template: set to "{{firstName}} {{lastName}} {{company}}" when any field uses the "linkedin" source; omit otherwise.
-
-Search queries are now built automatically per field group — do not pass a single global query template.`,
+output_fields guidance: one entry per distinct data point. Each entry has a snake_case "name", an "instruction" (what to find / where it lives), and an optional "overwrite_policy". Numeric values, categorical values, URLs, and prose summaries each get their own field. The engine routes data sources (Apollo, LinkedIn, web search) automatically — you do not specify sources. If the result includes fieldRemaps, tell the user which requested fields were mapped onto existing CRM columns to avoid duplicates.`,
     inputSchema: {
       type: 'object',
       properties: {
-        list_id: {
-          type: 'string',
-          description: 'The CRM lead list ID to enrich.'
-        },
-        instruction: {
-          type: 'string',
-          description: 'Natural language instruction for what to enrich (e.g. "Determine company size and industry").'
-        },
+        list_id: { type: 'string', description: 'The CRM lead list ID to enrich.' },
         output_fields: {
           type: 'array',
-          items: { type: 'string' },
-          description: 'Array of custom field names to populate in snake_case. One field per distinct data point — numeric values, categorical values, URLs, and prose summaries each get their own field.'
-        },
-        sources: {
-          type: 'array',
-          items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] },
-          description: 'Union of all data sources used across all fields. web_search: searches the web. linkedin: looks up personal LinkedIn profiles. existing_data: infers from existing lead fields.'
-        },
-        sources_per_field: {
-          type: 'object',
-          additionalProperties: {
-            type: 'array',
-            items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] }
-          },
-          description: 'Per-field source mapping. Key: field name, Value: array of sources for that field. "linkedin" source is ONLY for the lead\'s personal LinkedIn profile (linkedin_url). All other fields use "web_search". Falls back to job-level sources when absent for a field.'
-        },
-        field_descriptions: {
-          type: 'object',
-          additionalProperties: { type: 'string' },
-          description: 'Short natural-language description of each output field. Key: field name (snake_case), Value: 1-line description of what to find. Required for fields that are not well-known canonical fields. Used by the clustering service to build per-field web searches. Example: {"product_certifications": "ISO/SOC2/HIPAA certifications the company holds", "ideal_customer_profile": "type of customer the company sells to"}'
-        },
-        linkedin_search_template: {
-          type: 'string',
-          description: 'LinkedIn person search query. Set to "{{firstName}} {{lastName}} {{company}}" when any field uses the "linkedin" source. Omit if no LinkedIn fields.'
-        },
-        filters: {
-          type: 'array',
+          minItems: 1,
+          description: 'Fields to populate. One entry per distinct data point.',
           items: {
             type: 'object',
             properties: {
-              field: { type: 'string' },
-              operator: { type: 'string', enum: ['equals', 'not_equals', 'contains', 'is_empty', 'is_not_empty'] },
-              value: {}
+              name: { type: 'string', description: 'Custom field name in snake_case, e.g. "funding_stage".' },
+              instruction: { type: 'string', description: 'Natural-language description of what to find for this field.' },
+              overwrite_policy: {
+                type: 'string',
+                enum: ['fill_if_empty', 'always_overwrite'],
+                description: 'fill_if_empty (default): only set the field when it is currently empty. always_overwrite: refresh even when a value already exists.',
+              },
             },
-            required: ['field', 'operator']
+            required: ['name', 'instruction'],
           },
-          description: 'Optional filters to narrow which leads to enrich.'
         },
-        force_overwrite: {
-          type: 'boolean',
-          description: 'If true, re-enrich leads that already have these fields populated. Default false.'
+        lead_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional. When provided, the 2 preview samples are drawn from this subset.',
         },
-        force_refresh_cache: {
-          type: 'boolean',
-          description: 'If true, bypass the raw data cache and re-fetch from web search / LinkedIn APIs. Use when cached data is known to be stale. Default false.'
-        }
       },
-      required: ['list_id', 'instruction', 'output_fields', 'sources']
-    }
+      required: ['list_id', 'output_fields'],
+    },
   },
   execute: async (args: any, context: any) => {
     if (!context?.userId) {
       throw new Error('Authentication required: no user context');
     }
-    const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
-    const service = new CrmEnrichmentService();
-    return await service.preview({
+    const { runEmmaEnrichment, pickPreviewLeadIds } = await import('./enrichmentToolRunner');
+    const leadIds = await pickPreviewLeadIds(args.list_id, args.lead_ids);
+    return await runEmmaEnrichment({
       listId: args.list_id,
       userId: context.userId,
-      instruction: args.instruction,
       outputFields: args.output_fields,
-      sources: args.sources,
-      sourcesPerField: args.sources_per_field,
-      linkedinSearchTemplate: args.linkedin_search_template,
-      fieldDescriptions: args.field_descriptions,
-      filters: args.filters,
-      forceOverwrite: args.force_overwrite,
-      forceRefreshCache: args.force_refresh_cache,
+      mode: 'preview',
+      leadIds,
+      socketId: context.socketId,
+      socketEmit: context.socketEmit,
     });
-  }
+  },
 });
 
 emmaToolRegistry.register({
   name: 'enrich_leads_execute',
   definition: {
     name: 'enrich_leads_execute',
-    description: `Execute a CRM lead enrichment job. Processes all matching leads in parallel, enriching custom fields using AI and the specified data sources.
+    description: `Execute a CRM lead enrichment job on the V3 engine. Processes the list's leads in parallel, enriching the requested fields from Apollo, LinkedIn, and web search automatically.
 
-Progress updates are sent via Socket.IO in real-time. This call blocks until the full job completes, then returns final counts: processedCount, failedCount, skippedCount, and failureBreakdown. A lead is skipped when it has only a personal email (gmail, etc.) and no company name — check warnings for details.
+Progress updates stream via Socket.IO. This call blocks until the job completes, then returns runId, processedCount, failedCount, and failureBreakdown.
 
-Call enrich_leads_preview first to show the user what will happen before executing.
-
-Pass the same output_fields, sources_per_field, field_descriptions, and linkedin_search_template used in the preview call.`,
+Call enrich_leads_preview first and let the user confirm. Pass the same output_fields used in the preview. Large lists are capped — if the list is over the limit, narrow it with lead_ids or tell the user to run a full enrichment from the CRM page. If the result includes fieldRemaps, tell the user which requested fields were mapped onto existing CRM columns to avoid duplicates.`,
     inputSchema: {
       type: 'object',
       properties: {
-        list_id: {
-          type: 'string',
-          description: 'The CRM lead list ID to enrich.'
-        },
-        instruction: {
-          type: 'string',
-          description: 'Natural language instruction for what to enrich.'
-        },
+        list_id: { type: 'string', description: 'The CRM lead list ID to enrich.' },
         output_fields: {
           type: 'array',
-          items: { type: 'string' },
-          description: 'Array of custom field names to populate in snake_case. One field per distinct data point — numeric values, categorical values, URLs, and prose summaries each get their own field.'
-        },
-        sources: {
-          type: 'array',
-          items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] },
-          description: 'Union of all data sources used across all fields.'
-        },
-        sources_per_field: {
-          type: 'object',
-          additionalProperties: {
-            type: 'array',
-            items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] }
-          },
-          description: 'Per-field source mapping. Key: field name, Value: array of sources for that field. "linkedin" source is ONLY for the lead\'s personal LinkedIn profile (linkedin_url). All other fields use "web_search".'
-        },
-        field_descriptions: {
-          type: 'object',
-          additionalProperties: { type: 'string' },
-          description: 'Short natural-language description of each output field. Key: field name (snake_case), Value: 1-line description of what to find. Required for non-canonical fields. Used by the clustering service to build per-field web searches.'
-        },
-        linkedin_search_template: {
-          type: 'string',
-          description: 'LinkedIn person search query. Set to "{{firstName}} {{lastName}} {{company}}" when any field uses the "linkedin" source. Omit if no LinkedIn fields.'
-        },
-        filters: {
-          type: 'array',
+          minItems: 1,
+          description: 'Fields to populate. One entry per distinct data point.',
           items: {
             type: 'object',
             properties: {
-              field: { type: 'string' },
-              operator: { type: 'string', enum: ['equals', 'not_equals', 'contains', 'is_empty', 'is_not_empty'] },
-              value: {}
+              name: { type: 'string', description: 'Custom field name in snake_case.' },
+              instruction: { type: 'string', description: 'Natural-language description of what to find for this field.' },
+              overwrite_policy: {
+                type: 'string',
+                enum: ['fill_if_empty', 'always_overwrite'],
+                description: 'fill_if_empty (default): only set the field when empty. always_overwrite: refresh even when a value exists.',
+              },
             },
-            required: ['field', 'operator']
+            required: ['name', 'instruction'],
           },
-          description: 'Optional filters to narrow which leads to enrich.'
         },
-        force_overwrite: {
-          type: 'boolean',
-          description: 'If true, re-enrich leads that already have these fields populated. Default false.'
+        lead_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional subset of lead IDs to enrich. Omit to enrich the whole list.',
         },
-        force_refresh_cache: {
-          type: 'boolean',
-          description: 'If true, bypass the raw data cache and re-fetch from web search / LinkedIn APIs. Use when cached data is known to be stale. Default false.'
-        }
       },
-      required: ['list_id', 'instruction', 'output_fields', 'sources']
-    }
+      required: ['list_id', 'output_fields'],
+    },
   },
   execute: async (args: any, context: any) => {
     if (!context?.userId) {
       throw new Error('Authentication required: no user context');
     }
-    const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
-    const service = new CrmEnrichmentService();
-    return await service.execute({
+    const { runEmmaEnrichment, resolveExecuteLeadIds } = await import('./enrichmentToolRunner');
+    const { getEmmaEnrichMaxLeads } = await import('./enrichmentToolConfig');
+    const { leadIds, count } = await resolveExecuteLeadIds(args.list_id, args.lead_ids);
+    if (count === 0) {
+      throw new Error('This list has no leads to enrich.');
+    }
+    const max = getEmmaEnrichMaxLeads();
+    if (count > max) {
+      throw new Error(
+        `This run targets ${count} leads, over the ${max}-lead limit for enrichment through chat. ` +
+        `Narrow it with lead_ids, or run a full enrichment from the CRM page's Enrichment Config.`,
+      );
+    }
+    return await runEmmaEnrichment({
       listId: args.list_id,
       userId: context.userId,
-      instruction: args.instruction,
       outputFields: args.output_fields,
-      sources: args.sources,
-      sourcesPerField: args.sources_per_field,
-      linkedinSearchTemplate: args.linkedin_search_template,
-      fieldDescriptions: args.field_descriptions,
-      filters: args.filters,
-      forceOverwrite: args.force_overwrite,
-      forceRefreshCache: args.force_refresh_cache,
-    }, context.socketId, context.socketEmit ? { socketEmit: context.socketEmit } : undefined);
-  }
+      mode: 'enrich',
+      leadIds,
+      socketId: context.socketId,
+      socketEmit: context.socketEmit,
+    });
+  },
 });
 
 emmaToolRegistry.register({
   name: 'enrich_lead_custom',
   definition: {
     name: 'enrich_lead_custom',
-    description: `Enrich a single CRM lead with custom fields on demand, without needing to kick off a whole-list enrichment job.
+    description: `Enrich a single CRM lead with custom fields on demand, without running a whole-list job.
 
-Use this when the user wants to fill in specific missing information on one lead (e.g. "find this person's LinkedIn headline and company size") rather than a bulk batch. It wraps the existing CRM enrichment pipeline with a batch of 1, sourcing from web_search and linkedin by default.
+Use this when the user wants specific missing information filled on one lead (e.g. "find this person's LinkedIn headline and company size"). It runs the V3 enrichment engine on a batch of one. The response includes enrichedValues — a map of field name to the found value (null if nothing was found). Values are also persisted to the lead. Always show enrichedValues to the user; if a value is null, say nothing was found for that field.
 
-Pass one entry in custom_field_prompts per field you want populated. Each prompt is a natural-language description of what to find. The response includes enrichedValues — a map of field name to the found value (or null if nothing was found). Values are also persisted to the lead's customFields in DynamoDB. Always show enrichedValues to the user; if a value is null, tell them nothing was found for that field. Check warnings for skip reasons (e.g. personal email with no company).`,
+output_fields: one entry per field to populate, each with a snake_case "name", an "instruction" describing what to find, and an optional "overwrite_policy" (defaults to fill_if_empty; use always_overwrite to refresh a field that already has a value). If the result includes fieldRemaps, tell the user which requested fields were mapped onto existing CRM columns to avoid duplicates.`,
     inputSchema: {
       type: 'object',
       properties: {
-        list_id: {
-          type: 'string',
-          description: 'The CRM lead list ID containing the lead.'
-        },
-        lead_id: {
-          type: 'string',
-          description: 'The specific lead to enrich.'
-        },
-        custom_field_prompts: {
+        list_id: { type: 'string', description: 'The CRM lead list ID containing the lead.' },
+        lead_id: { type: 'string', description: 'The specific lead to enrich.' },
+        output_fields: {
           type: 'array',
-          description: 'One entry per custom field to populate. Each entry has a field_name (snake_case) and a prompt describing what to find.',
+          minItems: 1,
+          description: 'Fields to populate on this lead.',
           items: {
             type: 'object',
             properties: {
-              field_name: { type: 'string', description: 'Snake_case custom field name to populate, e.g. "company_size".' },
-              prompt: { type: 'string', description: 'Natural language description of what to find for this field.' },
-              data_type: { type: 'string', enum: ['text', 'number', 'date'], description: 'Expected data type. Defaults to text.' }
+              name: { type: 'string', description: 'Custom field name in snake_case.' },
+              instruction: { type: 'string', description: 'Natural-language description of what to find for this field.' },
+              overwrite_policy: {
+                type: 'string',
+                enum: ['fill_if_empty', 'always_overwrite'],
+                description: 'fill_if_empty (default): only set the field when empty. always_overwrite: refresh even when a value exists.',
+              },
             },
-            required: ['field_name', 'prompt']
+            required: ['name', 'instruction'],
           },
-          minItems: 1
         },
-        sources: {
-          type: 'array',
-          items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] },
-          description: 'Data sources to use. Defaults to ["web_search", "linkedin"] if omitted.'
-        },
-        force_overwrite: {
-          type: 'boolean',
-          description: 'If true, re-enrich fields that are already populated. Default true (custom enrichment is intentional).'
-        }
       },
-      required: ['list_id', 'lead_id', 'custom_field_prompts']
-    }
+      required: ['list_id', 'lead_id', 'output_fields'],
+    },
   },
   execute: async (args: any, context: any) => {
     if (!context?.userId) {
       throw new Error('Authentication required: no user context');
     }
-    const prompts: Array<{ field_name: string; prompt: string; data_type?: string }> = args.custom_field_prompts || [];
-    if (!Array.isArray(prompts) || prompts.length === 0) {
-      throw new Error('custom_field_prompts must be a non-empty array');
-    }
-
-    const outputFields = prompts.map(p => p.field_name);
-    const instruction = prompts
-      .map(p => {
-        const type = p.data_type && p.data_type !== 'text' ? ` (${p.data_type})` : '';
-        return `- ${p.field_name}${type}: ${p.prompt}`;
-      })
-      .join('\n');
-    // Pass per-field prompts to the cluster service as field descriptions so
-    // any ungrouped fields get a search query tuned to what we're looking for.
-    const fieldDescriptions: Record<string, string> = {};
-    for (const p of prompts) {
-      if (p.field_name && p.prompt) fieldDescriptions[p.field_name] = p.prompt;
-    }
-    const sources = Array.isArray(args.sources) && args.sources.length > 0
-      ? args.sources
-      : ['web_search', 'linkedin'];
-
-    const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
-    const { crmDb } = await import('../services/db');
-    const service = new CrmEnrichmentService();
-    const result = await service.execute({
+    const { runEmmaEnrichment } = await import('./enrichmentToolRunner');
+    const summary = await runEmmaEnrichment({
       listId: args.list_id,
       userId: context.userId,
-      instruction,
-      outputFields,
-      sources,
+      outputFields: args.output_fields,
+      mode: 'enrich',
       leadIds: [args.lead_id],
-      fieldDescriptions,
-      forceOverwrite: args.force_overwrite !== false,
-    }, context.socketId, context.socketEmit ? { socketEmit: context.socketEmit } : undefined);
+      socketId: context.socketId,
+      socketEmit: context.socketEmit,
+    });
 
-    // Fetch the lead after enrichment so we can return the actual enriched values
-    let enrichedValues: Record<string, string | null> = {};
-    if (result.processedCount > 0) {
+    // Read the lead back so we can return the actual enriched values.
+    // V3 writes standard columns top-level and custom names into customFields.
+    const enrichedValues: Record<string, string | null> = {};
+    if (summary.processedCount > 0) {
       try {
-        const lead = await crmDb.getLeadById(args.list_id, args.lead_id);
-        if (lead?.customFields) {
-          for (const field of outputFields) {
-            enrichedValues[field] = lead.customFields[field] ?? null;
-          }
+        const { crmDb } = await import('../services/db');
+        const lead: any = await crmDb.getLeadById(args.list_id, args.lead_id);
+        const customFields = (lead?.customFields ?? {}) as Record<string, string>;
+        for (const f of (args.output_fields as Array<{ name: string }>)) {
+          enrichedValues[f.name] = customFields[f.name] ?? lead?.[f.name] ?? null;
         }
       } catch {
-        // Non-fatal — enrichment succeeded, values are in DB
+        // Non-fatal — enrichment succeeded, values are in the DB.
       }
     }
 
     return {
       leadId: args.lead_id,
       listId: args.list_id,
-      outputFields,
       enrichedValues,
-      processedCount: result.processedCount,
-      failedCount: result.failedCount,
-      skippedCount: result.skippedCount,
-      failureBreakdown: result.failureBreakdown,
-      warnings: result.warnings,
-      jobId: result.jobId,
+      runId: summary.runId,
+      processedCount: summary.processedCount,
+      failedCount: summary.failedCount,
+      failureBreakdown: summary.failureBreakdown,
+      warnings: summary.warnings,
+      fieldRemaps: summary.fieldRemaps,
     };
-  }
+  },
 });
 
 // ─── Scheduled Chat tools (bridged from mcpToolRegistry / apiTools.ts) ───────
@@ -5784,6 +5862,7 @@ const bridgedToolNames = [
   // 'list_landing_page_files' — removed: coding_agent handles file listing internally
   'get_landing_page_preview_url',
   'publish_landing_page_changes',
+  'update_landing_page_context',
 ];
 
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
@@ -6170,7 +6249,9 @@ emmaToolRegistry.register({
     const { settingsService } = await import('../services/settingsService');
     const productIssueEmails = await settingsService.getJsonArraySetting('product_issue_emails', ['founders@agentweb.pro']);
 
-    for (const issue of args.issues) {
+    for (const rawIssue of args.issues) {
+      // Gemini may serialize array items as JSON strings instead of objects — normalize
+      const issue = typeof rawIssue === 'string' ? JSON.parse(rawIssue) : rawIssue;
       try {
         const issueContext: Record<string, any> = {
           'User Name': user.displayName || user.email,

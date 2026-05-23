@@ -4,7 +4,7 @@ import axios from "axios";
 import fs from "fs";
 import path from "path";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken, getLandingPagesConfig } from "../utils/secretsManager";
-import { userDb } from "./db";
+import { userDb, orgDb } from "./db";
 import { addSubdomain, generateSubdomain } from "./customDomainService";
 import { settingsService } from "./settingsService";
 import { paginatedQuery } from "../utils/dynamoPagination";
@@ -93,6 +93,15 @@ const TABLE_PREFIX =
   process.env.NODE_ENV === "development" ? "Dev-" : "";
 const TABLE_NAME = `${TABLE_PREFIX}AW-LandingPages`;
 
+/** Convert a page name to a URL-safe slug, max 30 chars, no leading/trailing hyphens. */
+export function buildPageSlug(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .slice(0, 30)
+    .replace(/^-|-$/g, "");
+}
+
 export interface GeneratedLandingPage {
   id: string;
   userId: string;
@@ -115,6 +124,7 @@ export interface GeneratedLandingPage {
   archived?: boolean;
   archivedAt?: string;
   gtmContainerId?: string;
+  context?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -496,11 +506,7 @@ async function addPageToExistingRepo(
   const now = new Date().toISOString();
 
   // Create a slug for the new page route
-  const slug = name
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "")
-    .slice(0, 30);
+  const slug = buildPageSlug(name);
 
   const repoMatch = existingPage.githubRepoUrl!.match(/github\.com\/([^\/]+)\/([^\/]+)/);
   if (!repoMatch) throw new Error("Invalid GitHub repo URL on existing page");
@@ -510,11 +516,13 @@ async function addPageToExistingRepo(
 
   console.log(`[V0 SERVICE] Adding new page /${slug} to existing repo ${repoFullName} via v0 generation`);
 
-  // Use the existing page's deployed URL as the base
+  // Use the custom domain if available, otherwise the vercel deployed URL origin.
+  // customDomainUrl takes priority because it's the public-facing address.
   let baseUrl = `https://${repoName}.vercel.app`;
-  if (existingPage.deployedUrl) {
+  const urlForBase = existingPage.customDomainUrl || existingPage.deployedUrl;
+  if (urlForBase) {
     try {
-      const parsed = new URL(existingPage.deployedUrl);
+      const parsed = new URL(urlForBase);
       baseUrl = parsed.origin;
     } catch {
       // URL parse failed — fall back to repo-name-based URL
@@ -1090,11 +1098,7 @@ export async function deployLandingPage(
 
     // Step 3: Create GitHub repo and push files (validation already passed)
     console.log("[V0 SERVICE] Step 3: Creating GitHub repo and pushing files");
-    const slug = record.name
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-|-$/g, "")
-      .slice(0, 30);
+    const slug = buildPageSlug(record.name);
     const repoName = `lp-${slug}-${id.slice(0, 8)}`;
     const { githubRepoUrl, repoFullName } = await createGitHubRepoAndPush(repoName, zipBuffer, record.name);
 
@@ -1168,6 +1172,18 @@ export async function deployLandingPage(
       const domainRecord = await addSubdomain(userId, vercelProjectId, subdomain);
       customDomain = domainRecord.domain;
       console.log(`[V0 SERVICE] Auto-assigned subdomain: ${customDomain}`);
+      // Persist customDomainUrl so it's available on subsequent fetches without relying on enrichment
+      await dynamodb
+        .update({
+          TableName: TABLE_NAME,
+          Key: { id },
+          UpdateExpression: "SET customDomainUrl = :customUrl, updatedAt = :updatedAt",
+          ExpressionAttributeValues: {
+            ":customUrl": `https://${customDomain}`,
+            ":updatedAt": new Date().toISOString(),
+          },
+        })
+        .promise();
     } catch (subdomainErr: any) {
       // Non-fatal — the Vercel URL still works
       console.warn(`[V0 SERVICE] Could not auto-assign subdomain: ${subdomainErr.message}`);
@@ -2278,8 +2294,8 @@ async function removePageFromGitHub(githubRepoUrl: string, slug: string): Promis
 }
 
 /**
- * Delete a landing page. Root page cannot be deleted.
- * Sub-pages are soft-deleted (archived) and their route file is removed from GitHub.
+ * Delete a landing page. All pages are deletable (including the root).
+ * Pages are soft-deleted (archived) and their route file is removed from GitHub.
  */
 export async function deleteLandingPage(
   id: string,
@@ -2288,15 +2304,6 @@ export async function deleteLandingPage(
   const record = await getLandingPage(id, userId);
   if (!record) {
     throw new Error("Landing page not found");
-  }
-
-  // Allow deleting a failed root page that was never deployed (no GitHub repo created).
-  // A deployed root page still cannot be deleted — it would orphan the repo and Vercel project.
-  if (record.isRootPage && record.githubRepoUrl) {
-    throw new Error("Cannot delete the root landing page. Use Emma to edit it instead.");
-  }
-  if (record.isRootPage && record.status !== "failed") {
-    throw new Error("Cannot delete the root landing page. Use Emma to edit it instead.");
   }
 
   // Remove route file from GitHub
@@ -2340,6 +2347,116 @@ export async function updateLandingPageGtm(
       ExpressionAttributeValues: {
         ":gtm": gtmContainerId,
         ":now": new Date().toISOString(),
+      },
+    })
+    .promise();
+}
+
+export async function updateLandingPageContext(
+  id: string,
+  userId: string,
+  context: string
+): Promise<void> {
+  const record = await getLandingPage(id, userId);
+  if (!record) throw new Error("Landing page not found");
+
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      UpdateExpression: "SET #ctx = :ctx, updatedAt = :now",
+      ExpressionAttributeNames: { "#ctx": "context" },
+      ExpressionAttributeValues: {
+        ":ctx": context,
+        ":now": new Date().toISOString(),
+      },
+    })
+    .promise();
+}
+
+/**
+ * Get all (non-archived) landing pages for a specific owner.
+ * Uses UserIdIndex GSI on AW-LandingPages.
+ */
+export async function getLandingPagesByOwner(userId: string): Promise<GeneratedLandingPage[]> {
+  return await paginatedQuery<GeneratedLandingPage>(dynamodb, {
+    TableName: TABLE_NAME,
+    IndexName: "UserIdIndex",
+    KeyConditionExpression: "userId = :u",
+    FilterExpression: "attribute_not_exists(archived) OR archived = :archivedFalse",
+    ExpressionAttributeValues: {
+      ":u": userId,
+      ":archivedFalse": false,
+    },
+    ScanIndexForward: false,
+  });
+}
+
+/**
+ * Get all landing pages visible to org members (fanout).
+ * Returns pages owned by all other org members (caller excluded).
+ */
+export async function getLandingPagesByOrg(orgId: string, callerUserId: string): Promise<GeneratedLandingPage[]> {
+  const members = await orgDb.getOrgMembers(orgId);
+  const others = members.map((m) => m.userId).filter((uid) => uid !== callerUserId);
+  const perMember = await Promise.all(others.map((uid) => getLandingPagesByOwner(uid)));
+  return perMember.flat();
+}
+
+/**
+ * Get a landing page by ID without scoping to a specific user (for org-share permission checks).
+ */
+export async function getLandingPageById(id: string): Promise<GeneratedLandingPage | null> {
+  const result = await dynamodb
+    .get({
+      TableName: TABLE_NAME,
+      Key: { id },
+    })
+    .promise();
+  const item = result.Item as GeneratedLandingPage | undefined;
+  if (!item || item.archived) return null;
+  return item;
+}
+
+/**
+ * Transfer ownership of a landing page to a new user (used when removing a member from an org).
+ */
+export async function transferLandingPageOwner(id: string, newOwnerId: string): Promise<void> {
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      UpdateExpression: "SET userId = :newOwner, updatedAt = :now",
+      ExpressionAttributeValues: {
+        ":newOwner": newOwnerId,
+        ":now": new Date().toISOString(),
+      },
+    })
+    .promise();
+}
+
+/**
+ * Delete a landing page given an already-fetched record (for org-share flows where
+ * the caller may not be the owner). All pages are deletable.
+ */
+export async function deleteLandingPageByRecord(record: GeneratedLandingPage): Promise<void> {
+  if (record.githubRepoUrl && record.slug) {
+    try {
+      await removePageFromGitHub(record.githubRepoUrl, record.slug);
+    } catch (err: any) {
+      console.error("[V0 SERVICE] Failed to remove route from GitHub:", err.message);
+    }
+  }
+
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id: record.id },
+      UpdateExpression: "SET archived = :archived, archivedAt = :archivedAt, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":archived": true,
+        ":archivedAt": new Date().toISOString(),
+        ":updatedAt": new Date().toISOString(),
       },
     })
     .promise();

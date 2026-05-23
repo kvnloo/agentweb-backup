@@ -20,6 +20,7 @@ import { crmDb } from '../services/db';
 import { externalCrmSyncService, ExternalCrmSyncConfig } from '../services/externalCrmSyncService';
 import { HubSpotService } from '../services/hubspotService';
 import { AttioService } from '../services/attioService';
+import { mergeCustomFields } from '../utils/customFieldsGuard';
 
 const router = express.Router();
 
@@ -187,7 +188,11 @@ async function handleHubSpotEvent(
     } else {
       // Merge custom fields with existing ones
       const mergedCustomFields = Object.keys(customFieldUpdates).length > 0
-        ? { ...(lead.customFields || {}), ...customFieldUpdates }
+        ? mergeCustomFields(
+            lead.customFields,
+            customFieldUpdates,
+            { source: 'crmWebhook.hubspot', listId, leadId: lead.leadId },
+          )
         : undefined;
 
       const updates: Record<string, any> = { ...leadFields };

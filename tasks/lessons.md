@@ -108,6 +108,23 @@ This file captures patterns and mistakes to avoid. Updated after corrections fro
   - **Monitoring service:** `test-env-access` is the one that polls Notion for new comments and re-triggers Claude. If it's not running, new comments won't be processed.
   - **Date:** 2026-04-02
 
+### Don't Add a Polling Loop — Restart test-env-access Instead
+- **Lesson:** When Notion comments aren't being picked up (status stuck on "In Review" after user replies), the fix is to restart the `test-env-access` tmux session — NOT to add a polling loop to `.claude-run.sh`
+  - **Why:** The comment relay already works via webhook: Notion → backend `/webhooks/notion-dev-env` → `relayPromptToEC2()` → port 5175 on EC2 → `test-env-access/server.js` → spawns Claude with `--resume`. Adding a polling loop to `.claude-run.sh` creates a **duplicate trigger** — both the webhook and the loop pick up the same comment and fire two Claude runs.
+  - **Root cause of missing comments:** `test-env-access` not running (it's stopped/crash after instance restart)
+  - **Fix:** `tmux new-session -d -s test-env-access -c /home/ec2-user/agentweb/test-env-access "node server.js 2>&1 | tee -a /var/log/test-env/test-env-access.log; exec bash"`
+  - **How to diagnose:** `ss -tlnp | grep 5175` — if nothing listening, `test-env-access` is down
+  - **Date:** 2026-05-20
+
+## Data Safety
+
+### Never Delete Test Accounts or Any User Account
+- **Lesson:** Never delete user accounts from DynamoDB — especially `test@example.com` and `test1@example.com`
+  - **Why:** Deleting a user row wipes the account entirely. The `createUser` condition (`attribute_not_exists(email)`) only protects against overwrite if the row exists — once deleted, anyone can re-register with the same email and create a blank account, losing all historical data (tasks, sessions, org membership, configs).
+  - **What happened:** `test@example.com` was deleted (mechanism unknown — no CloudTrail trail was configured), then someone signed up fresh with the same email, replacing the original admin account that owned the AgentWeb org with 283 tasks and 2409 chat sessions.
+  - **Fix:** If an account needs to be "reset", deactivate it (`isActive: false`) or clear specific fields — never delete the row. If you must delete a test account for a specific reason, recreate it immediately via `npm run create-admin` and restore the userId.
+  - **Date:** 2026-05-20
+
 ## Domain Terminology
 
 ### "Tasks" = Web Automation Subagent Activities (NOT User Activities)
@@ -119,6 +136,31 @@ This file captures patterns and mistakes to avoid. Updated after corrections fro
     - `AW-TaskSchedules` = recurring automation schedules
   - **Fix:** When showing "user activities" for an admin, use `AW-ChatSessions` (user chatting with AI), NOT task executions (subagent automation). Task counts in the admin UI labeled "Tasks / Workflows" represent automation setups, not user engagement sessions.
   - **Date:** 2026-04-09
+
+## CRM / Outreach Safety
+
+### CRITICAL: Always scope outreach operations to the configured list — never fan out to all user lists
+- **Lesson:** When implementing any feature that sends messages, emails, or takes actions on leads, ALWAYS filter to the exact list(s) explicitly configured for that operation. Never iterate over all lists a user owns as a "convenience" fallback.
+- **Why:** `enrollNewConnections` fetched ALL of a user's lead lists via `getLeadListsByUserId()` instead of only the lists in `seq.autoEnrollListIds`. This caused 6 people from unrelated lists to receive unsolicited LinkedIn outreach messages. Real messages were sent to real people who were not in the intended campaign list. This is damaging — it erodes trust with contacts, can be flagged as spam, and is impossible to fully undo once sent.
+- **The error pattern to avoid:**
+  ```typescript
+  // WRONG — iterates every list the user owns
+  const lists = await crmDb.getLeadListsByUserId(seq.userId);
+  for (const list of lists) { /* search and act */ }
+
+  // RIGHT — filter to only the explicitly configured lists
+  const lists = await crmDb.getLeadListsByUserId(seq.userId);
+  for (const list of lists) {
+    if (seq.targetListIds?.length && !seq.targetListIds.includes(list.listId)) continue;
+    /* search and act */
+  }
+  ```
+- **Rule:** Any function that dispatches outreach (LinkedIn messages, emails, enrollments, invitations) MUST:
+  1. Have a clearly named scope parameter (`listId`, `targetListIds`, `autoEnrollListIds`, etc.)
+  2. Enforce that scope before touching any lead record
+  3. Never default to "all lists" as a fallback — if the scope is unset, fail loudly or require explicit opt-in
+- **Test requirement:** Every outreach-dispatching function must have a test that asserts leads outside the configured list are NOT contacted.
+- **Date:** 2026-05-20
 
 ## Code Patterns
 

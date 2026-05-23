@@ -88,6 +88,10 @@ describe('validateLeadCrmExtensions', () => {
     expect(() => validateLeadCrmExtensions({ healthScore: 101 })).toThrow(/healthScore/);
   });
 
+  it('rejects healthScore NaN', () => {
+    expect(() => validateLeadCrmExtensions({ healthScore: NaN })).toThrow(/healthScore/);
+  });
+
   it('rejects non-array dealIds', () => {
     expect(() => validateLeadCrmExtensions({ dealIds: 'deal_1' as any })).toThrow(/dealIds/);
   });
@@ -168,6 +172,16 @@ describe('buildLeadCrmFields', () => {
     expect('dealIds' in fields).toBe(false);
   });
 
+  it('persists pocEmails when provided', () => {
+    const fields = buildLeadCrmFields('jane@acme.com', { pocEmails: ['a@b.com', 'c@d.com'] });
+    expect(fields.pocEmails).toEqual(['a@b.com', 'c@d.com']);
+  });
+
+  it('does not write empty pocEmails arrays', () => {
+    const fields = buildLeadCrmFields('jane@acme.com', { pocEmails: [] });
+    expect('pocEmails' in fields).toBe(false);
+  });
+
   it('throws on invalid extension values', () => {
     expect(() => buildLeadCrmFields('jane@acme.com', { lifecycle: 'zombie' as any })).toThrow();
   });
@@ -209,6 +223,24 @@ describe('buildLeadCrmUpdateFragments', () => {
     const { setFields, removeFields } = buildLeadCrmUpdateFragments({ dealIds: [] });
     expect(removeFields).toContain('dealIds');
     expect(setFields).toEqual([]);
+  });
+
+  it('sets dealIds when a non-empty array is supplied', () => {
+    const { setFields, removeFields } = buildLeadCrmUpdateFragments({ dealIds: ['deal_1'] });
+    expect(setFields.find(f => f.attr === 'dealIds')?.value).toEqual(['deal_1']);
+    expect(removeFields).not.toContain('dealIds');
+  });
+
+  it('sets pocEmails when a non-empty array is supplied', () => {
+    const { setFields, removeFields } = buildLeadCrmUpdateFragments({ pocEmails: ['a@b.com'] });
+    expect(setFields.find(f => f.attr === 'pocEmails')?.value).toEqual(['a@b.com']);
+    expect(removeFields).not.toContain('pocEmails');
+  });
+
+  it('removes pocEmails when an empty array is supplied', () => {
+    const { setFields, removeFields } = buildLeadCrmUpdateFragments({ pocEmails: [] });
+    expect(removeFields).toContain('pocEmails');
+    expect(setFields.find(f => f.attr === 'pocEmails')).toBeUndefined();
   });
 
   it('sets isPrimary=false correctly (boolean, not treated as empty)', () => {

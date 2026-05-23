@@ -61,6 +61,7 @@ import FunnelTab from "../components/admin/FunnelTab";
 import AlertEmailsTab from "../components/admin/AlertEmailsTab";
 import OnboardingTab from "../components/admin/OnboardingTab";
 import ConnectedAccountsTab from "../components/admin/ConnectedAccountsTab";
+import ContractorsTab from "../components/admin/ContractorsTab";
 import {
   UserGrowthChart,
   TaskGrowthChart,
@@ -226,8 +227,8 @@ interface User {
   lastActiveAt?: string;
   displayName?: string;
   supportNote?: string;
-  role?: "partner" | "customer" | "free"; // For single role from API
-  roles?: ("partner" | "customer" | "free")[];
+  role?: "partner" | "customer" | "free" | "contractor"; // For single role from API
+  roles?: ("partner" | "customer" | "free" | "contractor")[];
   taskCount?: number;
   workflowCount?: number;
   chatSessionCount?: number;
@@ -720,6 +721,7 @@ export default function AdminDashboard() {
     'alert-emails': 19,
     'onboarding': 20,
     'connected-accounts': 21,
+    'contractors': 22,
   };
   
   // Get initial tab value from URL or default to Users
@@ -785,7 +787,7 @@ export default function AdminDashboard() {
   const [scoreOverrideReason, setScoreOverrideReason] = useState("");
   const [roleDialogOpen, setRoleDialogOpen] = useState(false);
   const [selectedUserRoles, setSelectedUserRoles] = useState<
-    ("partner" | "customer" | "free")[]
+    ("partner" | "customer" | "free" | "contractor")[]
   >([]);
   const [editingNoteEmail, setEditingNoteEmail] = useState<string | null>(null);
   const [currentNoteText, setCurrentNoteText] = useState("");
@@ -1946,7 +1948,7 @@ export default function AdminDashboard() {
     setChatDialogOpen(true);
   };
 
-  const handleRoleCheckboxChange = (role: "partner" | "customer" | "free") => {
+  const handleRoleCheckboxChange = (role: "partner" | "customer" | "free" | "contractor") => {
     setSelectedUserRoles((prevRoles) =>
       prevRoles.includes(role)
         ? prevRoles.filter((r) => r !== role)
@@ -3050,6 +3052,7 @@ export default function AdminDashboard() {
             <Tab label="Alert Emails" {...a11yProps(18)} />
             <Tab label="Onboarding" {...a11yProps(20)} />
             <Tab label="Connected Accounts" {...a11yProps(21)} />
+            <Tab label="Contractors" {...a11yProps(22)} />
           </Tabs>
         </Box>
 
@@ -3774,7 +3777,13 @@ export default function AdminDashboard() {
               if (u.subscription_status !== "trialing" || !u.current_period_end) return false;
               return new Date(u.current_period_end).getTime() < now.getTime();
             });
-            const hasAttention = pastDue.length > 0 || trialEnding.length > 0 || trialExpired.length > 0;
+            const subscriptionExpired = contextUsers.filter(u => {
+              if (u.subscriptionType === "Free") return false;
+              if (u.subscription_status !== "canceled" && u.subscription_status !== "canceling") return false;
+              if (!u.current_period_end) return false;
+              return new Date(u.current_period_end).getTime() < now.getTime();
+            });
+            const hasAttention = pastDue.length > 0 || trialEnding.length > 0 || trialExpired.length > 0 || subscriptionExpired.length > 0;
             if (!hasAttention) return null;
             return (
               <Paper variant="outlined" sx={{ mb: 3, p: 2, borderColor: "error.light", bgcolor: "error.50" }}>
@@ -3813,6 +3822,18 @@ export default function AdminDashboard() {
                         <Chip label={u._daysLeft === 0 ? "Today!" : `${u._daysLeft}d left`} size="small" color={u._daysLeft <= 2 ? "error" : "warning"} variant="outlined" />
                         <Typography variant="body2" sx={{ fontWeight: 500 }}>{u.email}</Typography>
                         <Typography variant="caption" color="text.secondary">{u.supportNote || u.subscriptionType || ""} · ends {format(new Date(u.current_period_end!), "MMM d")}</Typography>
+                      </Box>
+                    ))}
+                  </Box>
+                )}
+                {subscriptionExpired.length > 0 && (
+                  <Box sx={{ mt: trialEnding.length > 0 ? 1.5 : 0 }}>
+                    <Typography variant="caption" sx={{ fontWeight: 600, color: "warning.main" }}>SUBSCRIPTION ENDED — MOVE TO FREE TIER</Typography>
+                    {subscriptionExpired.sort((a, b) => new Date(a.current_period_end!).getTime() - new Date(b.current_period_end!).getTime()).map(u => (
+                      <Box key={u.userId} sx={{ display: "flex", alignItems: "center", gap: 1, py: 0.5 }}>
+                        <Chip label="Ended" size="small" color="warning" variant="outlined" />
+                        <Typography variant="body2" sx={{ fontWeight: 500 }}>{u.email}</Typography>
+                        <Typography variant="caption" color="text.secondary">{u.subscriptionType || ""} · ended {format(new Date(u.current_period_end!), "MMM d")}</Typography>
                       </Box>
                     ))}
                   </Box>
@@ -6154,6 +6175,10 @@ export default function AdminDashboard() {
         <TabPanel value={tabValue} index={21}>
           <ConnectedAccountsTab />
         </TabPanel>
+
+        <TabPanel value={tabValue} index={22}>
+          <ContractorsTab />
+        </TabPanel>
       </Paper>
 
       {/* Satisfaction Score Override Popover */}
@@ -6314,6 +6339,16 @@ export default function AdminDashboard() {
               />
             }
             label="Free Access"
+          />
+          <FormControlLabel
+            control={
+              <Checkbox
+                checked={selectedUserRoles.includes("contractor")}
+                onChange={() => handleRoleCheckboxChange("contractor")}
+                name="contractorRole"
+              />
+            }
+            label="Contractor Access"
           />
         </DialogContent>
         <DialogActions>

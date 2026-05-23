@@ -14,7 +14,10 @@ export interface EnrichedFieldMeta {
    *    cross-tenant origin is never surfaced to end users.
    *  - 'agentweb': the public-facing source value the UI sees for those fills.
    */
-  source: 'web_search' | 'linkedin' | 'existing_data' | 'manual' | 'api' | 'crm-history' | 'agentweb';
+  /**
+   *  - 'llm': value computed by the smart-field LLM evaluator (POST enrichment phase).
+   */
+  source: 'web_search' | 'linkedin' | 'existing_data' | 'manual' | 'api' | 'crm-history' | 'agentweb' | 'llm';
   /**
    * For 'crm-history' fills: the leadId of the sibling we copied from.
    * Stripped before responses reach the customer-portal.

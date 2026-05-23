@@ -144,6 +144,53 @@ describe('DynamoDB pagination in chatbotService', () => {
     });
   });
 
+  describe('getRecentSessionsPage without time range', () => {
+    const makeSession = (i: number) => ({
+      sessionId: `s-${i}`,
+      adminListPartition: 'all',
+      updatedAt: `2026-05-15T00:${String(i).padStart(2, '0')}:00.000Z`,
+    });
+
+    it('should paginate through multiple DynamoDB pages when limit exceeds first page', async () => {
+      // DynamoDB returns 30 items per page (simulates internal page size)
+      // With limit=60, the function must issue 2 queries.
+      const page1 = Array.from({ length: 30 }, (_, i) => makeSession(i));
+      const page2 = Array.from({ length: 30 }, (_, i) => makeSession(30 + i));
+
+      queryPromiseMock
+        .mockResolvedValueOnce({
+          Items: page1,
+          LastEvaluatedKey: { sessionId: 's-29', adminListPartition: 'all', updatedAt: '2026-05-15T00:29:00.000Z' },
+        })
+        .mockResolvedValueOnce({
+          Items: page2,
+        });
+
+      const result = await chatbotDb.getRecentSessionsPage(60, undefined, undefined);
+
+      expect(queryPromiseMock).toHaveBeenCalledTimes(2);
+      expect(result.sessions).toHaveLength(60);
+    });
+
+    it('should return the correct nextCursor when more sessions remain beyond limit', async () => {
+      // DynamoDB returns 30 sessions with a cursor indicating there are more.
+      // The caller requested limit=30, so we stop here but must return the cursor.
+      const page1 = Array.from({ length: 30 }, (_, i) => makeSession(i));
+      const nextKey = { sessionId: 's-29', adminListPartition: 'all', updatedAt: '2026-05-15T00:29:00.000Z' };
+
+      queryPromiseMock.mockResolvedValueOnce({
+        Items: page1,
+        LastEvaluatedKey: nextKey,
+      });
+
+      const result = await chatbotDb.getRecentSessionsPage(30, undefined, undefined);
+
+      expect(queryPromiseMock).toHaveBeenCalledTimes(1);
+      expect(result.sessions).toHaveLength(30);
+      expect(result.lastEvaluatedKey).toEqual(nextKey);
+    });
+  });
+
   describe('getRecentSessionsPage with time range', () => {
     it('should include sessions created before the window if they had messages within it', async () => {
       // updatedAt only changes when real messages are written, so any session returned by

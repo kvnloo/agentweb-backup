@@ -1433,7 +1433,8 @@ export async function generateSessionResponse(
   attachments?: any[],
   isInteractiveShare?: boolean,
   pageContext?: { currentUrl?: string; structuredContext?: string; screenshot?: string },
-  isDelegatedAccess?: boolean
+  isDelegatedAccess?: boolean,
+  ishareSenderInfo?: { ip?: string; userAgent?: string }
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -1469,11 +1470,21 @@ export async function generateSessionResponse(
   if (attachments && attachments.length > 0) {
     const IMAGE_MIMETYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp', 'image/svg+xml']);
     const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg']);
+    const VIDEO_MIMETYPES = new Set(['video/mp4', 'video/quicktime', 'video/webm', 'video/avi', 'video/x-msvideo']);
+    const VIDEO_EXTS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv']);
     const attachmentUrls = attachments.map((attachment: any) => {
       const mimetype = (attachment.mimetype || '').toLowerCase();
       const ext = (attachment.filename || '').split('.').pop()?.toLowerCase() || '';
       const isImage = IMAGE_MIMETYPES.has(mimetype) || IMAGE_EXTS.has(ext);
-      const hint = isImage ? ' (image — use describe_image tool to analyze)' : '';
+      const isVideo = VIDEO_MIMETYPES.has(mimetype) || VIDEO_EXTS.has(ext);
+      let hint: string;
+      if (isImage) {
+        hint = ' (image — use describe_image tool to analyze)';
+      } else if (isVideo) {
+        hint = ' (video — use describe_video tool to analyze)';
+      } else {
+        hint = ' (document — use read_file_content tool to read its contents)';
+      }
       return `[${attachment.filename || 'Attachment'}](${attachment.url})${hint}`;
     }).join('\n');
     messageContent = `${userMessage}\n\n**Attached Files:**\n${attachmentUrls}`;
@@ -1493,7 +1504,14 @@ export async function generateSessionResponse(
       portalType: (session.portalType || 'agent') as 'agent',
       timestamp: new Date().toISOString(),
       attachments: attachments || [],
-      ...(pageContext?.currentUrl ? { currentUrl: pageContext.currentUrl } : {})
+      ...(pageContext?.currentUrl ? { currentUrl: pageContext.currentUrl } : {}),
+      ...(isInteractiveShare ? {
+        ishareSender: {
+          isAnonymous: true as const,
+          ...(ishareSenderInfo?.ip ? { ip: ishareSenderInfo.ip } : {}),
+          ...(ishareSenderInfo?.userAgent ? { userAgent: ishareSenderInfo.userAgent } : {}),
+        }
+      } : {})
     }
   };
 
@@ -1653,54 +1671,43 @@ export async function generateSessionResponse(
     }
   );
 
-  // Add all response messages to session (includes assistant responses and tool calls).
-  // Strip base64 image data URIs from tool result content before persisting — they are
-  // ~300KB each and would exceed the DynamoDB 400KB item limit.
-  if (response.responseMessages.length > 0) {
-    const persistableMessages = response.responseMessages.map((msg: any) => {
-      if (msg.role === 'tool' && Array.isArray(msg.content)) {
-        const strippedContent = msg.content
-          .filter((item: any) => item.type !== 'image_url')
-          .map((item: any) => item.text ?? item)
-          .join('\n') || '[screenshot captured]';
-        return { ...msg, content: strippedContent };
-      }
-      return msg;
-    });
-    // Wrap in try/catch so a DynamoDB save failure does not discard the generated response.
-    // The caller (e.g. Slack handler) still receives response.content and can deliver it to the user.
-    try {
-      await chatbotDb.addMessagesToSession(sessionId, persistableMessages);
-    } catch (saveError) {
-      console.error('AgentMode: Failed to persist response messages to session — response will still be returned to caller:', saveError);
-    }
-  }
-
-  // If this session is linked to a GTM work item, update status to pending_review after AI responds
-  if (updatedSession.gtmWorkItem) {
-    try {
-      await updateGtmWorkItemStatus(updatedSession.gtmWorkItem, 'pending_review');
-    } catch (error) {
-      console.error('GTM status sync: Failed to set pending_review:', error);
-    }
-  }
-
-  // If cancelled, add a stopped indicator message
+  // If the user clicked Stop, discard the response entirely — don't persist anything.
+  // The user message was already saved before the LLM call; the assistant response is dropped
+  // so a page reload shows the user message with no ghost response from a cancelled turn.
   if (response.cancelled) {
-    const stoppedMessage: ChatMessage = {
-      role: 'assistant',
-      content: response.content || 'Generation was stopped.',
-      timestamp: new Date().toISOString(),
-      metadata: {
-        timestamp: new Date().toISOString(),
-        stopped: true,
-      },
-    };
-    // Only add if we didn't already have response messages (avoid duplicate content)
-    if (response.responseMessages.length === 0) {
-      await chatbotDb.addMessageToSession(sessionId, stoppedMessage);
-    }
     clearCancel(sessionId);
+  } else {
+    // Add all response messages to session (includes assistant responses and tool calls).
+    // Strip base64 image data URIs from tool result content before persisting — they are
+    // ~300KB each and would exceed the DynamoDB 400KB item limit.
+    if (response.responseMessages.length > 0) {
+      const persistableMessages = response.responseMessages.map((msg: any) => {
+        if (msg.role === 'tool' && Array.isArray(msg.content)) {
+          const strippedContent = msg.content
+            .filter((item: any) => item.type !== 'image_url')
+            .map((item: any) => item.text ?? item)
+            .join('\n') || '[screenshot captured]';
+          return { ...msg, content: strippedContent };
+        }
+        return msg;
+      });
+      // Wrap in try/catch so a DynamoDB save failure does not discard the generated response.
+      // The caller (e.g. Slack handler) still receives response.content and can deliver it to the user.
+      try {
+        await chatbotDb.addMessagesToSession(sessionId, persistableMessages);
+      } catch (saveError) {
+        console.error('AgentMode: Failed to persist response messages to session — response will still be returned to caller:', saveError);
+      }
+    }
+
+    // If this session is linked to a GTM work item, update status to pending_review after AI responds
+    if (updatedSession.gtmWorkItem) {
+      try {
+        await updateGtmWorkItemStatus(updatedSession.gtmWorkItem, 'pending_review');
+      } catch (error) {
+        console.error('GTM status sync: Failed to set pending_review:', error);
+      }
+    }
   }
 
   // Get the updated session to include workPlan if it was modified
@@ -2040,6 +2047,20 @@ export const agentModeController = {
       // Clear old progress store (but keep active connections)
       // Don't call cleanupProgress here as it removes active SSE connections
       progressStore.delete(sessionId);
+
+      // Cancel generation immediately when the client disconnects (e.g. Stop button aborts the fetch).
+      // This fires before /stop reaches the backend and ensures the worker receives the cancel signal
+      // while it still has a live sessionToRequestId mapping. Also emit SSE 'complete' so the frontend
+      // SSE stream clears the "Thinking..." state on reload instead of showing it indefinitely.
+      req.on('close', () => {
+        if (!res.headersSent) {
+          console.log(`AgentMode: Client disconnected for session ${sessionId} — signalling cancellation`);
+          requestCancel(sessionId);
+          generateMarketingResponseWorkerService.cancelSession(sessionId);
+          emitProgress(sessionId, { iteration: 0, status: 'complete' });
+          progressStore.delete(sessionId);
+        }
+      });
 
       // Use llmModel from request, session, or default
       const modelToUse = llmModel || session.llmModel || agentModeService.default_model;
@@ -2712,13 +2733,20 @@ export const agentModeController = {
       const modelToUse = session.llmModel || defaultModel;
 
       // Use the same generateSessionResponse logic as the regular generateResponse
+      const ishareSenderInfo = {
+        ip: req.ip || (req.headers?.['x-forwarded-for'] as string | undefined)?.split(',')[0].trim(),
+        userAgent: req.headers?.['user-agent'] as string | undefined,
+      };
       const response = await generateSessionResponse(
         session.sessionId,
         userMessage,
         session.userId,
         modelToUse,
         attachments,
-        true // isInteractiveShare - block admin tools for security
+        true, // isInteractiveShare - block admin tools for security
+        undefined, // pageContext
+        undefined, // isDelegatedAccess
+        ishareSenderInfo
       );
 
       // Clear progress store after completion (keep connections open for future messages)
@@ -4926,6 +4954,15 @@ export const agentModeController = {
       // Use session's llmModel if available, otherwise use default
       const defaultModel = await agentModeService.getDefaultModel();
       const modelToUse = session.llmModel || defaultModel;
+
+      // Cancel generation immediately when the client disconnects
+      req.on('close', () => {
+        if (!res.headersSent) {
+          console.log(`AgentMode: Client disconnected for conversable session ${session.sessionId} — signalling cancellation`);
+          requestCancel(session.sessionId);
+          generateMarketingResponseWorkerService.cancelSession(session.sessionId);
+        }
+      });
 
       // Generate AI response using the same function as regular users
       const response = await generateSessionResponse(

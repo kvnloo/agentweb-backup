@@ -1,9 +1,10 @@
 import express from 'express';
 import { settingsService } from '../services/settingsService';
 import { authenticateToken, requireAdmin } from '../middleware/auth';
-import { userDb } from '../services/db';
+import { userDb, orgDb } from '../services/db';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { agentModeService } from '../services/agentModeService';
+import { canEditItem, canViewItem } from '../services/orgShareService';
 
 const router = express.Router();
 
@@ -956,6 +957,25 @@ router.post('/google-drive/folders', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
+    // Org branch: write to org's folder list
+    if (user.orgId) {
+      const org = await orgDb.getOrgById(user.orgId);
+      if (!org) return res.status(404).json({ error: 'Org not found' });
+      const allowed = canEditItem(
+        { userId: org.ownerUserId },
+        { userId, orgId: user.orgId, orgRole: user.orgRole },
+        org, user.orgId, 'knowledgeBase',
+      );
+      if (!allowed) return res.status(403).json({ error: 'Not authorized to manage org Drive folders' });
+      const existingOrgFolders = org.googleDriveFolders || [];
+      if (existingOrgFolders.some((f: { folderId: string }) => f.folderId === trimmedFolderId)) {
+        return res.status(400).json({ error: 'This folder has already been added' });
+      }
+      const updatedOrgFolders = [...existingOrgFolders, { folderId: trimmedFolderId, name: folderName }];
+      await orgDb.updateOrg(user.orgId, { googleDriveFolders: updatedOrgFolders });
+      return res.json({ folder: { folderId: trimmedFolderId, name: folderName }, googleDriveFolders: updatedOrgFolders });
+    }
+
     const existingFolders = user.googleDriveFolders || [];
 
     // Check if folder already exists
@@ -984,6 +1004,22 @@ router.delete('/google-drive/folders/:folderId', authenticateToken, async (req, 
       return res.status(404).json({ error: 'User not found' });
     }
 
+    // Org branch: remove from org's folder list
+    if (user.orgId) {
+      const org = await orgDb.getOrgById(user.orgId);
+      if (!org) return res.status(404).json({ error: 'Org not found' });
+      const allowed = canEditItem(
+        { userId: org.ownerUserId },
+        { userId, orgId: user.orgId, orgRole: user.orgRole },
+        org, user.orgId, 'knowledgeBase',
+      );
+      if (!allowed) return res.status(403).json({ error: 'Not authorized to manage org Drive folders' });
+      const existingOrgFolders = org.googleDriveFolders || [];
+      const updatedOrgFolders = existingOrgFolders.filter((f: { folderId: string }) => f.folderId !== folderId);
+      await orgDb.updateOrg(user.orgId, { googleDriveFolders: updatedOrgFolders });
+      return res.json({ googleDriveFolders: updatedOrgFolders });
+    }
+
     const existingFolders = user.googleDriveFolders || [];
     const updatedFolders = existingFolders.filter((f: { folderId: string }) => f.folderId !== folderId);
 
@@ -997,21 +1033,40 @@ router.delete('/google-drive/folders/:folderId', authenticateToken, async (req, 
 });
 
 // List files inside a Google Drive folder
-// Verifies the folder belongs to the user and is accessible via the service account
+// Verifies the folder belongs to the user (or their org) and is accessible via the service account
 router.get('/google-drive/folders/:folderId/files', authenticateToken, async (req, res) => {
   try {
     const { folderId } = req.params;
     const userId = (req as any).user?.userId;
 
-    // Verify folder belongs to this user
+    // Verify folder belongs to this user or their org
     const user = await userDb.getUserById(userId);
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    const userFolders = user.googleDriveFolders || [];
-    if (!userFolders.some((f: { folderId: string }) => f.folderId === folderId)) {
-      return res.status(403).json({ error: 'Folder not found on your account' });
+    // Org branch: check folder is in the org's list OR the user's own list (legacy), and caller can view
+    if (user.orgId) {
+      const org = await orgDb.getOrgById(user.orgId);
+      if (!org) return res.status(404).json({ error: 'Org not found' });
+      const orgFolders = org.googleDriveFolders || [];
+      const userFolders = user.googleDriveFolders || [];
+      const folderInOrg = orgFolders.some((f: { folderId: string }) => f.folderId === folderId);
+      const folderOnUser = userFolders.some((f: { folderId: string }) => f.folderId === folderId);
+      if (!folderInOrg && !folderOnUser) {
+        return res.status(403).json({ error: 'Folder not found in your org' });
+      }
+      const allowed = canViewItem(
+        { userId: org.ownerUserId },
+        { userId, orgId: user.orgId, orgRole: user.orgRole },
+        org, user.orgId, 'knowledgeBase',
+      );
+      if (!allowed) return res.status(403).json({ error: 'Not authorized to view org Drive folders' });
+    } else {
+      const userFolders = user.googleDriveFolders || [];
+      if (!userFolders.some((f: { folderId: string }) => f.folderId === folderId)) {
+        return res.status(403).json({ error: 'Folder not found on your account' });
+      }
     }
 
     const { getSecret } = await import('../utils/secretsManager');

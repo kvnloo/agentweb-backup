@@ -133,6 +133,7 @@ import {
   BrandContext,
   remapFilesForSubPage,
   ensurePageMetadataTitle,
+  buildPageSlug,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig } from "../services/v0Service";
@@ -624,6 +625,69 @@ describe("v0Service - deleteLandingPage", () => {
       deleteLandingPage("page-1", "user-1")
     ).resolves.toBeUndefined();
     // deleteLandingPage now does a soft-delete (archive) via update, not a hard delete
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("SUCCESS: failed root page with no githubRepoUrl can be deleted", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "root-fail",
+            userId: "user-1",
+            name: "Failed Page",
+            status: "failed",
+            isRootPage: true,
+            // no githubRepoUrl — never deployed
+          },
+        }),
+    });
+
+    await expect(
+      deleteLandingPage("root-fail", "user-1")
+    ).resolves.toBeUndefined();
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("SUCCESS: failed root page WITH githubRepoUrl can be deleted", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "root-fail-deployed",
+            userId: "user-1",
+            name: "Failed But Deployed",
+            status: "failed",
+            isRootPage: true,
+            githubRepoUrl: "https://github.com/AgentWebPro/lp-test",
+          },
+        }),
+    });
+
+    await expect(
+      deleteLandingPage("root-fail-deployed", "user-1")
+    ).resolves.toBeUndefined();
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("SUCCESS: deployed root page can be deleted", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "root-deployed",
+            userId: "user-1",
+            name: "Deployed Page",
+            status: "deployed",
+            isRootPage: true,
+            githubRepoUrl: "https://github.com/AgentWebPro/lp-test",
+          },
+        }),
+    });
+
+    await expect(
+      deleteLandingPage("root-deployed", "user-1")
+    ).resolves.toBeUndefined();
     expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
 });
@@ -1145,6 +1209,31 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     // At least 2 Vercel polling calls after the GitHub GET ref call
     expect(mockAxiosGet).toHaveBeenCalledTimes(3); // 1 GitHub ref + 2 Vercel polls
   });
+
+  it("SUCCESS: sub-page deployedUrl uses customDomainUrl as base when existingPage has one", async () => {
+    // Site record has a custom domain — sub-page URL should use that as origin
+    const siteWithCustomDomain = {
+      ...existingSiteRecord,
+      customDomainUrl: "https://my-brand.agentwebforms.com",
+    };
+    mockQuery.mockReturnValueOnce({
+      promise: () => Promise.resolve({ Items: [siteWithCustomDomain] }),
+    });
+    await setupV0Mocks();
+    setupGitHubMocks();
+    setupVercelDeploySuccessMock();
+
+    const result = await generateLandingPage(
+      "user-1",
+      "Create pricing page",
+      "Pricing Page",
+      {}
+    );
+
+    expect(result.status).toBe("deployed");
+    expect(result.deployedUrl).toContain("https://my-brand.agentwebforms.com/");
+    expect(result.deployedUrl).not.toContain("vercel.app");
+  });
 });
 
 // =============================================================================
@@ -1248,5 +1337,45 @@ describe("v0Service - loadDefaultTemplateOutline fallback", () => {
     const prompt = mockChatsCreate.mock.calls[0][0].message;
     expect(prompt).toContain("DESIGN INSPIRATION");
     expect(mockGetSetting).not.toHaveBeenCalled();
+  });
+});
+
+// =============================================================================
+// buildPageSlug
+// =============================================================================
+describe("v0Service - buildPageSlug", () => {
+  it("FAIL: name that truncates at exactly 30 chars on a hyphen produces no trailing hyphen", () => {
+    // "Premium dark landing page for Open Future Forum" → after replace → "premium-dark-landing-page-for-"
+    // slice(0,30) = "premium-dark-landing-page-for-" — the fix strips the trailing hyphen
+    const result = buildPageSlug('Premium dark landing page for Open Future Forum — "Forum Select"');
+    expect(result).not.toMatch(/-$/);
+    expect(result).toBe("premium-dark-landing-page-for");
+  });
+
+  it("FAIL: name that would produce leading hyphen after truncation has it stripped", () => {
+    // Contrived: if first char after truncation is a hyphen
+    const result = buildPageSlug("---abc");
+    expect(result).not.toMatch(/^-/);
+  });
+
+  it("FAIL: name with consecutive special chars produces single hyphens", () => {
+    const result = buildPageSlug("hello   world---page");
+    expect(result).toBe("hello-world-page");
+  });
+
+  it("SUCCESS: normal name is lowercased and slugified", () => {
+    const result = buildPageSlug("My Landing Page");
+    expect(result).toBe("my-landing-page");
+  });
+
+  it("SUCCESS: name within 30 chars is not truncated", () => {
+    const result = buildPageSlug("Short Name");
+    expect(result).toBe("short-name");
+  });
+
+  it("SUCCESS: name longer than 30 chars is truncated cleanly", () => {
+    const result = buildPageSlug("a".repeat(40));
+    expect(result.length).toBeLessThanOrEqual(30);
+    expect(result).not.toMatch(/^-|-$/);
   });
 });

@@ -10,7 +10,14 @@ export function hasUnsafeEmailStyles(html: string): boolean {
   if (!html) return false;
   const styleBlocks = html.match(/<style[^>]*>([\s\S]*?)<\/style>/gi);
   if (!styleBlocks) return false;
-  return styleBlocks.some(block => /\.[a-zA-Z][\w-]*\s*\{/.test(block));
+  return styleBlocks.some(block => {
+    // Strip the opening/closing <style> tags to get just the CSS
+    const css = block.replace(/<style[^>]*>/i, '').replace(/<\/style>/i, '');
+    // Remove all @media blocks — class rules inside @media are acceptable
+    // (they handle responsive layout and dark mode; Gmail ignores them gracefully)
+    const outsideMedia = css.replace(/@media[^{]*\{[\s\S]*?\}\s*\}/g, '');
+    return /\.[a-zA-Z][\w-]*\s*\{/.test(outsideMedia);
+  });
 }
 
 /**
@@ -66,8 +73,8 @@ export function extractVariables(template: string): string[] {
   let match;
   while ((match = regex.exec(template)) !== null) {
     const varName = match[1].trim();
-    // Skip special non-lead variables
-    if (varName === 'unsubscribeUrl') continue;
+    // Skip special non-lead variables (both naming conventions)
+    if (varName === 'unsubscribeUrl' || varName === 'unsubscribe_url') continue;
     vars.add(varName);
   }
   return Array.from(vars);
@@ -100,9 +107,9 @@ export function leadHasVariable(lead: Record<string, any>, varName: string): boo
 export function injectUnsubscribeUrl(html: string, unsubscribeUrl: string, fallbackFooterHtml?: string): string {
   if (!html) return html;
 
-  // Step 1: replace {{unsubscribeUrl}} variable
-  if (/\{\{unsubscribeUrl\}\}/i.test(html)) {
-    return html.replace(/\{\{unsubscribeUrl\}\}/gi, unsubscribeUrl);
+  // Step 1: replace {{unsubscribeUrl}} or {{unsubscribe_url}} variable
+  if (/\{\{unsubscribe(?:Url|_url)\}\}/i.test(html)) {
+    return html.replace(/\{\{unsubscribe(?:Url|_url)\}\}/gi, unsubscribeUrl);
   }
 
   // Step 2: update existing unsubscribe anchor href
@@ -172,6 +179,75 @@ export function rewriteS3ImageUrls(html: string, baseUrl: string): string {
   );
 }
 
+export interface EmailFormatWarning {
+  code: string;
+  message: string;
+  severity: 'error' | 'warning';
+}
+
+/**
+ * Check an HTML email for common format issues that cause rendering problems.
+ * Returns a list of warnings to surface to the user before sending.
+ */
+export function checkEmailFormat(html: string): EmailFormatWarning[] {
+  if (!html) return [];
+  const warnings: EmailFormatWarning[] = [];
+
+  // Check for class-based CSS (stripped by Gmail)
+  if (hasUnsafeEmailStyles(html)) {
+    warnings.push({
+      code: 'class-based-css',
+      message: 'Email contains <style> blocks with CSS classes. Gmail strips these — use inline styles instead.',
+      severity: 'error',
+    });
+  }
+
+  // Check for dark mode handling. Two valid approaches:
+  // 1. Opt-out: <meta name="color-scheme" content="light"> tells Apple Mail / iOS Mail
+  //    to never invert the email — simplest and most reliable fix.
+  // 2. Opt-in: @media (prefers-color-scheme: dark) with explicit overrides for every
+  //    dark text color and light background.
+  const hasColorSchemeOptOut = /color-scheme[^"]*"[^"]*light/i.test(html) ||
+    /<meta[^>]*name=["']color-scheme["'][^>]*content=["'][^"']*light[^"']*["']/i.test(html) ||
+    /<meta[^>]*content=["'][^"']*light[^"']*["'][^>]*name=["']color-scheme["']/i.test(html);
+  const hasDarkModeQuery = /@media[^{]*prefers-color-scheme\s*:\s*dark/i.test(html);
+  const darkModeHandled = hasColorSchemeOptOut || hasDarkModeQuery;
+
+  if (!darkModeHandled) {
+    warnings.push({
+      code: 'no-dark-mode',
+      message: 'No dark mode handling detected. In Apple Mail and iOS dark mode, light backgrounds may invert making dark text unreadable. Fix: add <meta name="color-scheme" content="light"> in the <head> to opt out of dark mode inversion.',
+      severity: 'warning',
+    });
+  }
+
+  // Check for hardcoded light text colors on potentially dark-mode-inverted backgrounds
+  // Detect dark hex/named text colors inline (e.g. color:#111, color:#333, color:black)
+  // without a nearby dark-mode override — a common source of "black text on dark bg" bugs
+  const hasDarkTextColors = /color\s*:\s*(#[0-2][0-9a-fA-F]{5}|#[0-2][0-9a-fA-F]{2}|black|#000)/i.test(html);
+  const hasLightBgColors = /background(-color)?\s*:\s*(#[e-f][0-9a-fA-F]{5}|#[e-f][0-9a-fA-F]{2}|white|#fff\b)/i.test(html);
+  if (hasDarkTextColors && hasLightBgColors && !darkModeHandled) {
+    warnings.push({
+      code: 'dark-mode-contrast',
+      message: 'Email uses dark text on a light background without dark mode handling. In dark mode (e.g. iOS Mail), the background may invert while text stays dark, making it unreadable. Fix: add <meta name="color-scheme" content="light"> in the <head>.',
+      severity: 'warning',
+    });
+  }
+
+  return warnings;
+}
+
+// Map spaced/alternate variable names that users commonly type to their camelCase keys.
+// e.g. "first name" → "firstName"
+const VARIABLE_ALIASES: Record<string, string> = {
+  'first name': 'firstName',
+  'last name': 'lastName',
+  'First Name': 'firstName',
+  'Last Name': 'lastName',
+  'First name': 'firstName',
+  'Last name': 'lastName',
+};
+
 export function substituteVariables(template: string, lead: Record<string, any>): string {
   if (!template) return template;
 
@@ -181,6 +257,13 @@ export function substituteVariables(template: string, lead: Record<string, any>)
   for (const field of STANDARD_FIELDS) {
     const regex = new RegExp(`\\{\\{${field}\\}\\}`, 'g');
     result = result.replace(regex, lead[field] != null ? String(lead[field]) : '');
+  }
+
+  // Replace aliased field names: {{first name}}, {{last name}}, etc.
+  for (const [alias, canonical] of Object.entries(VARIABLE_ALIASES)) {
+    const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`\\{\\{${escaped}\\}\\}`, 'g');
+    result = result.replace(regex, lead[canonical] != null ? String(lead[canonical]) : '');
   }
 
   // Replace custom fields: {{customFields.xxx}}

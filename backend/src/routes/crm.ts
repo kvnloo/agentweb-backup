@@ -4,7 +4,7 @@ import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
-import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles } from '../utils/emailVariables';
+import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles, checkEmailFormat } from '../utils/emailVariables';
 import axios from 'axios';
 import { assertPublicHostname, SsrfBlockedError } from '../utils/ssrfGuard';
 import { signUnsubscribeUrl } from '../utils/unsubscribeUrl';
@@ -54,95 +54,15 @@ import {
   getEnrichmentConfig as svcGetEnrichmentConfig,
   setEnrichmentConfig as svcSetEnrichmentConfig,
   suggestFieldTypes as svcSuggestFieldTypes,
-  type ConfigServiceDeps,
-  type FieldTypeSuggestion,
 } from '../services/enrichmentConfigService';
+import { buildConfigServiceDeps } from '../services/enrichmentConfigDeps';
 import { runEnrichment as svcRunEnrichmentV3 } from '../services/crmEnrichmentServiceV3';
 import { buildOrchestratorDeps as buildV3OrchestratorDeps } from '../services/enrichmentV3RealDeps';
 import { sanitizeLeadForResponse } from '../utils/enrichmentMetadataPresentation';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
 
-// ─── v3.1 enrichment-config service-deps adapter ────────────────────────────
-// Wires the pure-logic config service to real DDB + a Phase-1 heuristic type
-// suggester. The LLM suggester slot is intentionally heuristic-only for now —
-// users can edit types in the UI; we revisit with a real LLM call in Phase 1.5.
-
-function heuristicTypeSuggestion(
-  fields: Array<{ name: string; instruction: string }>,
-): FieldTypeSuggestion[] {
-  return fields.map(({ name }) => {
-    const lc = name.toLowerCase();
-    if (/(_count|_at$|count$|number_of)/.test(lc) || lc === 'employees' || lc === 'revenue') {
-      return { name, type: 'number' as const };
-    }
-    if (/^is_|^has_|verified$/.test(lc)) {
-      return { name, type: 'boolean' as const };
-    }
-    if (lc.endsWith('_date') || lc.endsWith('date') || lc.endsWith('_at')) {
-      return { name, type: 'date' as const };
-    }
-    return { name, type: 'string' as const };
-  });
-}
-
-const enrichmentConfigDeps: ConfigServiceDeps = {
-  readListConfig: (listId) => crmDb.getEnrichmentConfig(listId),
-  writeListConfig: (listId, config) => crmDb.setEnrichmentConfig(listId, config),
-  loadListFieldNames: async (listId) => {
-    const list = await crmDb.getLeadListById(listId);
-    return Array.isArray(list?.fieldNames) ? (list!.fieldNames as string[]) : [];
-  },
-  llmSuggestTypes: async (fields) => heuristicTypeSuggestion(fields),
-  llmInferAliases: async (fields) => {
-    if (fields.length === 0) return {};
-    // Lazy import — avoids circular deps + keeps the LLM service out of the
-    // hot path for callers that never hit alias inference.
-    const { FIELD_GROUPS } = await import('../services/enrichmentGroups');
-    const { createLLMService } = await import('../utils/llmService');
-
-    // Build the canonical-field cheat sheet for the system prompt. Grouping
-    // by FIELD_GROUPS gives the LLM more context (it understands "Series A"
-    // → funding_stage instead of guessing across groups).
-    const canonicalCheatsheet = Object.entries(FIELD_GROUPS)
-      .map(([group, cfg]) => `  ${group}: ${cfg.fields.join(', ')}`)
-      .join('\n');
-
-    const systemPrompt =
-      `You map user-named CRM enrichment fields to canonical field names ` +
-      `based on semantic intent (not just name similarity). ` +
-      `Return strict JSON keyed by user field name.\n\n` +
-      `Available canonical fields, grouped:\n${canonicalCheatsheet}\n\n` +
-      `Rules:\n` +
-      `- Match by MEANING, not string similarity. "stag" with instruction ` +
-      `"funding stage" → "funding_stage".\n` +
-      `- Return null when the user's field is a unique custom concept (no ` +
-      `confident canonical match).\n` +
-      `- Use the field's instruction text to disambiguate. If instruction is ` +
-      `empty, fall back to name alone.\n` +
-      `- Pick at most ONE canonical name per user field.`;
-
-    const userPrompt =
-      `Map each user field to a canonical name (or null):\n` +
-      fields.map(f => `- ${f.name}${f.instruction ? ` — "${f.instruction}"` : ''}`).join('\n') +
-      `\n\nReturn JSON: {"<userFieldName>": "<canonical_name>" | null} for each input.`;
-
-    try {
-      const llm = createLLMService(
-        process.env.CRM_ENRICH_V3_ALIAS_MODEL || 'gpt-5-chat-2',
-        0.0,
-      );
-      const result = await llm.generateJSONContent<Record<string, string | null>>(
-        systemPrompt,
-        userPrompt,
-      );
-      return result ?? {};
-    } catch (err) {
-      console.warn('[crm] llmInferAliases failed:', (err as Error).message);
-      return {};
-    }
-  },
-};
+const enrichmentConfigDeps = buildConfigServiceDeps();
 const d1StripeClient = d1StripeSecretKey
   ? new Stripe(d1StripeSecretKey, { apiVersion: '2025-05-28.basil' as any })
   : null;
@@ -917,6 +837,41 @@ router.get('/leads/:leadId/enrichment', async (req: Request, res: Response) => {
 });
 
 /**
+ * @route GET /api/crm/org-members
+ * @desc Return org members for the current user's org (for account owner dropdown)
+ * @access Private
+ */
+router.get('/org-members', async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(401).json({ message: 'Unauthorized' });
+
+    if (!user.orgId) {
+      // No org — return just the current user as the only member
+      return res.json({
+        success: true,
+        members: [{ userId: user.userId, email: user.email, displayName: user.displayName ?? null }],
+      });
+    }
+
+    const members = await orgDb.getOrgMembers(user.orgId);
+    const safeMembers = members.map((m) => ({
+      userId: m.userId,
+      email: m.email,
+      displayName: m.displayName ?? null,
+    }));
+
+    return res.json({ success: true, members: safeMembers });
+  } catch (err) {
+    console.error('[CRM] GET /org-members error:', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+/**
  * @route GET /api/crm/lists
  * @desc Get all lead lists for the authenticated user
  * @access Private
@@ -1572,11 +1527,11 @@ router.put('/lists/:listId/enrichment-config', async (req: Request, res: Respons
 
     const config = req.body;
     try {
-      const saved = await svcSetEnrichmentConfig(
+      const { config: saved, warnings } = await svcSetEnrichmentConfig(
         { listId, userId, config },
         enrichmentConfigDeps,
       );
-      return res.json({ config: saved, isDefault: false });
+      return res.json({ config: saved, isDefault: false, warnings });
     } catch (validationError: any) {
       if (validationError?.name === 'ConfigValidationError') {
         return res.status(400).json({ message: validationError.message });
@@ -3921,6 +3876,7 @@ router.post('/lists/:listId/leads/enrich-tech-stack', async (req: Request, res: 
       sources: ['web_search' as const],
       forceOverwrite: forceEnrich,
       leadIds,
+      apolloTechStack: true,
     };
 
     if (mode === 'preview') {
@@ -4062,6 +4018,131 @@ router.post('/lists/:listId/leads/:leadId/sync-linkedin-messages', async (req: R
   } catch (error: any) {
     console.error('Error syncing LinkedIn messages:', error);
     return res.status(500).json({ message: error.message || 'Failed to sync LinkedIn messages' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/:leadId/sync-linkedin-connection
+ * @desc Check whether this lead has accepted our LinkedIn connection request and activate
+ *       any awaiting_connection enrollment for this lead.
+ * @access Private
+ */
+router.post('/lists/:listId/leads/:leadId/sync-linkedin-connection', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId, leadId } = req.params;
+
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list || (list as any).userId !== userId) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    const lead = await crmDb.getLeadById(listId, leadId);
+    if (!lead) return res.status(404).json({ message: 'Lead not found' });
+
+    const leadLinkedIn = (lead.linkedin as string | undefined)?.trim().toLowerCase();
+    if (!leadLinkedIn) {
+      return res.status(400).json({ message: 'Lead has no LinkedIn URL' });
+    }
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const accountId = await linkedInOutreachService.resolveAccountId(userId);
+    if (!accountId) {
+      return res.status(400).json({ message: 'No LinkedIn account connected' });
+    }
+
+    const { syncConnectionsForAccount } = await import('../cron/linkedInConnectionSyncCron');
+    const { getConnectionByProfileUrl } = await import('../services/unipileConnectionsDb');
+
+    // Refresh the cache for this account (quick, not full sync)
+    await syncConnectionsForAccount(accountId);
+
+    // Check if this specific lead is now connected
+    const connection = await getConnectionByProfileUrl(leadLinkedIn);
+    const isConnected = !!connection;
+
+    return res.json({ isConnected, syncedAt: new Date().toISOString() });
+  } catch (error: any) {
+    console.error('Error syncing LinkedIn connection:', error);
+    return res.status(500).json({ message: error.message || 'Failed to sync LinkedIn connection' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/check-linkedin-connections
+ * @desc Given a list of LinkedIn profile URLs, returns which ones are already 1st-degree
+ *       connections in the AW-UnipileConnections cache. Used to render connection status
+ *       indicators on leads in the CRM table.
+ * @body { urls: string[] }
+ * @access Private
+ */
+router.post('/lists/:listId/check-linkedin-connections', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    const { urls } = req.body;
+
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+    if (!Array.isArray(urls) || urls.length === 0) return res.json({ connected: [] });
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list || (list as any).userId !== userId) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    const { getConnectionByProfileUrl } = await import('../services/unipileConnectionsDb');
+
+    const connected: string[] = [];
+    await Promise.all(urls.map(async (url: string) => {
+      const conn = await getConnectionByProfileUrl(url).catch(() => null);
+      if (conn) connected.push(url.trim().toLowerCase().replace(/\/?$/, '/'));
+    }));
+
+    return res.json({ connected });
+  } catch (error: any) {
+    console.error('Error checking LinkedIn connections:', error);
+    return res.status(500).json({ message: error.message || 'Failed to check LinkedIn connections' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/sync-linkedin-connections
+ * @desc Full resync of LinkedIn connections for this list — checks all awaiting_connection
+ *       enrollments in the list and activates any whose lead has connected.
+ * @access Private
+ */
+router.post('/lists/:listId/sync-linkedin-connections', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list || (list as any).userId !== userId) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const accountId = await linkedInOutreachService.resolveAccountId(userId);
+    if (!accountId) {
+      return res.status(400).json({ message: 'No LinkedIn account connected' });
+    }
+
+    const { syncConnectionsForAccount } = await import('../cron/linkedInConnectionSyncCron');
+
+    // Full sync — paginate through all connections for this account
+    const synced = await syncConnectionsForAccount(accountId, { fullSync: true });
+
+    return res.json({ synced: synced.length, syncedAt: new Date().toISOString() });
+  } catch (error: any) {
+    console.error('Error syncing LinkedIn connections for list:', error);
+    return res.status(500).json({ message: error.message || 'Failed to sync LinkedIn connections' });
   }
 });
 
@@ -5083,6 +5164,9 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
     const eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
     const eligibleCount = eligibleLeads.length;
 
+    // Run format verification on the HTML content
+    const formatWarnings = checkEmailFormat(htmlContent || '');
+
     if (variables.length === 0) {
       // No variables used — all eligible leads are ready
       return res.json({
@@ -5091,6 +5175,7 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
         notReadyCount: 0,
         variables: [],
         variableCoverage: {},
+        formatWarnings,
       });
     }
 
@@ -5120,6 +5205,7 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
       notReadyCount: eligibleCount - readyCount,
       variables,
       variableCoverage,
+      formatWarnings,
     });
   } catch (error) {
     console.error('Error preparing group email:', error);
@@ -5219,7 +5305,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
         // routes/crmPublic.ts accepts the legacy unsigned form as a fallback
         // for emails sent before this change.
         const unsubscribeUrl = signUnsubscribeUrl({
-          baseUrl: `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe`,
+          baseUrl: CUSTOMER_FRONTEND_URL,
           listId,
           leadId: lead.leadId,
           email: lead.email,
@@ -5308,7 +5394,7 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
 
     const CUSTOMER_FRONTEND_URL_TEST = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
     const testUnsubscribeUrl = signUnsubscribeUrl({
-      baseUrl: `${CUSTOMER_FRONTEND_URL_TEST}/crm-unsubscribe`,
+      baseUrl: CUSTOMER_FRONTEND_URL_TEST,
       listId,
       leadId: 'TEST',
       email: recipients[0]?.trim() || 'test@example.com',
@@ -5481,14 +5567,10 @@ router.post('/lists/:listId/group-email/load-from-url', async (req: Request, res
       bodyContent = bodyContent.substring(0, 200000);
     }
 
-    // Convert class-based CSS to inline styles now so the stored HTML is email-client-safe.
-    // Doing this at import time avoids the LLM call at every test-send or real send.
-    const { html: inlinedContent } = await inlineEmailStyles(bodyContent);
-
     return res.json({
       success: true,
       title: extractedTitle,
-      message: inlinedContent,
+      message: bodyContent,
     });
   } catch (error: any) {
     console.error('Error loading HTML from URL:', error.message || error);

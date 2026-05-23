@@ -423,6 +423,19 @@ VITE_DEBUG=true' > /home/ec2-user/agentweb/customer-portal/.env.local"
         "$SCRIPT_DIR/cloud-dev-claude.md" "$SSH_USER@$PUBLIC_IP:/home/ec2-user/.claude/CLAUDE.md"
     remote "sed -i 's|PUBLIC_IP|$PUBLIC_IP|g' /home/ec2-user/.claude/CLAUDE.md"
 
+    # Restore persisted Claude memory into user-level memory directory.
+    # The repo was already synced to ~/agentweb by _do_sync_dev above, so
+    # copy from the instance-local repo path — no additional scp needed.
+    remote "
+      MEMORY_SRC='/home/ec2-user/agentweb/.claude/memory'
+      MEMORY_DEST='/home/ec2-user/.claude/projects/-home-ec2-user-agentweb/memory'
+      if [[ -d \"\$MEMORY_SRC\" ]]; then
+        mkdir -p \"\$MEMORY_DEST\"
+        cp -r \"\$MEMORY_SRC/\"* \"\$MEMORY_DEST/\"
+        echo '[test-env] Claude memory restored from repo'
+      fi
+    "
+
     # Authenticate gh CLI with GitHub PAT from Secrets Manager
     log "Authenticating gh CLI..."
     remote "aws secretsmanager get-secret-value \

@@ -145,6 +145,21 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['gpt-5.4'].client).not.toBeNull();
     });
 
+    it('should include gpt-5.4-nano in the supported models', async () => {
+      const models = await agentModeService.getSupportedModels();
+      expect(models).toContain('gpt-5.4-nano');
+    });
+
+    it('should have temperature support enabled for gpt-5.4-nano', () => {
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['gpt-5.4-nano'].supportsTemperature).toBe(true);
+    });
+
+    it('should have a non-null client for gpt-5.4-nano (Azure client created eagerly)', () => {
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['gpt-5.4-nano'].client).not.toBeNull();
+    });
+
     it('should include gpt-5.5 in the supported models', async () => {
       const models = await agentModeService.getSupportedModels();
       expect(models).toContain('gpt-5.5');
@@ -165,6 +180,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['gpt-5-chat-2'].maxTools).toBe(128);
       expect(llmModels['gpt-5.2-chat'].maxTools).toBe(128);
       expect(llmModels['gpt-5.4'].maxTools).toBe(128);
+      expect(llmModels['gpt-5.4-nano'].maxTools).toBe(128);
       expect(llmModels['gpt-5.5'].maxTools).toBe(128);
     });
 
@@ -202,6 +218,26 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     it('should have null client initially for Gemini 3.1 Flash Lite Preview (lazy-loaded)', () => {
       const llmModels = (agentModeService as any).llmModels;
       expect(llmModels['gemini-3.1-flash-lite'].client).toBeNull();
+    });
+
+    it('should include Gemini 3.5 Flash in the supported models', async () => {
+      const models = await agentModeService.getSupportedModels();
+      expect(models).toContain('gemini-3.5-flash');
+    });
+
+    it('should have temperature support enabled for Gemini 3.5 Flash', () => {
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['gemini-3.5-flash'].supportsTemperature).toBe(true);
+    });
+
+    it('should have null client initially for Gemini 3.5 Flash (lazy-loaded)', () => {
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['gemini-3.5-flash'].client).toBeNull();
+    });
+
+    it('should NOT set maxTools on Gemini 3.5 Flash', () => {
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['gemini-3.5-flash'].maxTools).toBeUndefined();
     });
 
     it('should return only anthropic non-opus models from getReportsModelOptions for non-admins', async () => {
@@ -419,6 +455,28 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       const llmModels = (agentModeService as any).llmModels;
       expect(llmModels['gemini-3.1-flash-lite'].client).toBe(mockGeminiClient);
+    });
+
+    it('should lazy-load Gemini client for gemini-3.5-flash on first callLLM', async () => {
+      const mockCreate = jest.fn().mockResolvedValue({
+        choices: [{ message: { content: 'test response' } }],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+      });
+      const mockGeminiClient = { chat: { completions: { create: mockCreate } } };
+
+      jest.spyOn(agentModeService as any, 'getGeminiClient').mockResolvedValue(mockGeminiClient);
+
+      const messages = [
+        { role: 'system', content: 'You are a helpful assistant.' },
+        { role: 'user', content: 'Hello' },
+      ];
+
+      await (agentModeService as any).callLLM('gemini-3.5-flash', messages);
+
+      expect((agentModeService as any).getGeminiClient).toHaveBeenCalled();
+
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['gemini-3.5-flash'].client).toBe(mockGeminiClient);
     });
   });
 

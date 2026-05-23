@@ -2,14 +2,16 @@
  * Tests for org-shared skills.
  *
  * When a user belongs to an org, GET /api/user-skills should include
- * private skills from all org members (not just their own). Skills remain
- * private; only the owner can edit or delete their skill.
+ * private skills from other org members (not just their own). Skills remain
+ * private; only the owner (or org admin) can delete a skill, and only the
+ * owner or an approved editor can edit a skill.
  */
 import request from "supertest";
 import express from "express";
 
 const mockUserId = "user-1";
 const mockOrgMemberId = "user-2";
+const mockEditorId = "user-3";
 const mockOrgId = "org-abc";
 
 const mySkill = {
@@ -40,6 +42,24 @@ const memberSkill = {
   updatedAt: "2026-01-02T00:00:00.000Z",
 };
 
+// Org with skills sharing enabled; user-3 is an editor
+const mockOrgEnabled = {
+  orgId: mockOrgId,
+  ownerUserId: "org-owner",
+  shareSettings: {
+    skills: { enabled: true, editors: [mockEditorId] },
+  },
+};
+
+// Org with skills sharing disabled
+const mockOrgDisabled = {
+  orgId: mockOrgId,
+  ownerUserId: "org-owner",
+  shareSettings: {
+    skills: { enabled: false, editors: [] },
+  },
+};
+
 const mockGetSkillsByOwner = jest.fn();
 const mockGetSkillsByOrg = jest.fn();
 const mockGetSkillsByVisibility = jest.fn();
@@ -65,8 +85,10 @@ jest.mock("../services/emailService", () => ({
 }));
 
 const mockGetUserById = jest.fn();
+const mockGetOrgById = jest.fn();
 jest.mock("../services/db", () => ({
   userDb: { getUserById: mockGetUserById },
+  orgDb: { getOrgById: mockGetOrgById },
 }));
 
 jest.mock("../middleware/auth", () => ({
@@ -89,14 +111,16 @@ describe("GET /api/user-skills — org sharing", () => {
     mockGetSkillsByVisibility.mockResolvedValue([]);
   });
 
-  it("includes org members' private skills when user is in an org", async () => {
+  it("includes org members' private skills when user is in an org (skills enabled)", async () => {
     mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId });
+    mockGetOrgById.mockResolvedValue(mockOrgEnabled);
     mockGetSkillsByOwner.mockResolvedValue([mySkill]);
-    mockGetSkillsByOrg.mockResolvedValue([mySkill, memberSkill]);
+    // getSkillsByOrg returns only OTHER members' skills (not caller's)
+    mockGetSkillsByOrg.mockResolvedValue([memberSkill]);
 
     const res = await request(app).get("/api/user-skills");
     expect(res.status).toBe(200);
-    const ids = res.body.map((s: any) => s.skillId);
+    const ids = res.body.items.map((s: any) => s.skillId);
     expect(ids).toContain("skill-1");
     expect(ids).toContain("skill-2");
   });
@@ -107,27 +131,130 @@ describe("GET /api/user-skills — org sharing", () => {
 
     const res = await request(app).get("/api/user-skills");
     expect(res.status).toBe(200);
-    const ids = res.body.map((s: any) => s.skillId);
+    const ids = res.body.items.map((s: any) => s.skillId);
     expect(ids).toContain("skill-1");
     expect(ids).not.toContain("skill-2");
   });
 
   it("deduplicates skills appearing in both own and org results", async () => {
     mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId });
+    mockGetOrgById.mockResolvedValue(mockOrgEnabled);
     mockGetSkillsByOwner.mockResolvedValue([mySkill]);
+    // Suppose org fanout also returned mySkill somehow (shouldn't in practice, but dedup guard)
     mockGetSkillsByOrg.mockResolvedValue([mySkill, memberSkill]);
 
     const res = await request(app).get("/api/user-skills");
     expect(res.status).toBe(200);
-    const ids = res.body.map((s: any) => s.skillId);
+    const ids = res.body.items.map((s: any) => s.skillId);
     const skill1Occurrences = ids.filter((id: string) => id === "skill-1").length;
     expect(skill1Occurrences).toBe(1);
+  });
+
+  it("list excludes other-member skills when shareSettings.skills.enabled is false", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId });
+    mockGetOrgById.mockResolvedValue(mockOrgDisabled);
+    mockGetSkillsByOwner.mockResolvedValue([mySkill]);
+    // getSkillsByOrg should NOT be called when feature is disabled
+    mockGetSkillsByOrg.mockResolvedValue([memberSkill]);
+
+    const res = await request(app).get("/api/user-skills");
+    expect(res.status).toBe(200);
+    const ids = res.body.items.map((s: any) => s.skillId);
+    expect(ids).toContain("skill-1");
+    expect(ids).not.toContain("skill-2");
+    // Confirm org fanout was not invoked
+    expect(mockGetSkillsByOrg).not.toHaveBeenCalled();
+  });
+
+  it("response is wrapped in { items, truncated } envelope", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId });
+    mockGetOrgById.mockResolvedValue(mockOrgEnabled);
+    mockGetSkillsByOwner.mockResolvedValue([mySkill]);
+    mockGetSkillsByOrg.mockResolvedValue([memberSkill]);
+
+    const res = await request(app).get("/api/user-skills");
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty("items");
+    expect(res.body).toHaveProperty("truncated");
+    expect(Array.isArray(res.body.items)).toBe(true);
   });
 });
 
 describe("PUT /api/user-skills/:skillId — org member cannot edit another member's skill", () => {
-  it("returns 403 when trying to edit a skill owned by another org member", async () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("returns 403 when trying to edit a skill owned by another org member (non-editor)", async () => {
     mockGetSkill.mockResolvedValue(memberSkill);
+    // Caller is user-1, a plain member (not in editors list)
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "member" });
+    mockGetOrgById.mockResolvedValue(mockOrgEnabled);
+
+    const res = await request(app)
+      .put("/api/user-skills/skill-2")
+      .send({ name: "Hijacked" });
+
+    expect(res.status).toBe(403);
+    expect(mockUpdateSkill).not.toHaveBeenCalled();
+  });
+
+  it("owner can edit their own skill", async () => {
+    mockGetSkill.mockResolvedValue(mySkill);
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "member" });
+    mockGetOrgById.mockResolvedValue(mockOrgEnabled);
+    mockUpdateSkill.mockResolvedValue(undefined);
+
+    const res = await request(app)
+      .put("/api/user-skills/skill-1")
+      .send({ name: "Updated" });
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateSkill).toHaveBeenCalled();
+  });
+});
+
+describe("PUT /api/user-skills/:skillId — editor in shareSettings can edit another member's skill", () => {
+  // Use a separate app where the authenticated user is user-3 (an editor)
+  const editorApp = express();
+  editorApp.use(express.json());
+  editorApp.use("/api/user-skills", (req: any, _res: any, next: any) => {
+    req.user = { userId: mockEditorId, email: "editor@example.com", isAdmin: false };
+    next();
+  }, userSkillRoutes);
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("editor in shareSettings.skills.editors can PATCH another member's skill", async () => {
+    mockGetSkill.mockResolvedValue(memberSkill);
+    // When getUserById is called for editorId (caller) or ownerId (user-2), return appropriate objects
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === mockEditorId) return Promise.resolve({ userId: mockEditorId, orgId: mockOrgId, orgRole: "member" });
+      if (uid === mockOrgMemberId) return Promise.resolve({ userId: mockOrgMemberId, orgId: mockOrgId, orgRole: "member" });
+      return Promise.resolve(null);
+    });
+    mockGetOrgById.mockResolvedValue(mockOrgEnabled);
+    mockUpdateSkill.mockResolvedValue(undefined);
+
+    const res = await request(editorApp)
+      .put("/api/user-skills/skill-2")
+      .send({ name: "Editor Update" });
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateSkill).toHaveBeenCalled();
+  });
+
+  it("non-editor org member is rejected with 403 on PATCH", async () => {
+    // user-1 is not in editors list for skill-2 (owned by user-2)
+    mockGetSkill.mockResolvedValue(memberSkill);
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === mockUserId) return Promise.resolve({ userId: mockUserId, orgId: mockOrgId, orgRole: "member" });
+      if (uid === mockOrgMemberId) return Promise.resolve({ userId: mockOrgMemberId, orgId: mockOrgId, orgRole: "member" });
+      return Promise.resolve(null);
+    });
+    mockGetOrgById.mockResolvedValue(mockOrgEnabled);
 
     const res = await request(app)
       .put("/api/user-skills/skill-2")
@@ -139,8 +266,13 @@ describe("PUT /api/user-skills/:skillId — org member cannot edit another membe
 });
 
 describe("DELETE /api/user-skills/:skillId — org member cannot delete another member's skill", () => {
-  it("returns 403 when trying to delete a skill owned by another org member", async () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("returns 403 when trying to delete a skill owned by another org member (non-admin)", async () => {
     mockGetSkill.mockResolvedValue(memberSkill);
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "member" });
 
     const res = await request(app).delete("/api/user-skills/skill-2");
 
@@ -149,9 +281,72 @@ describe("DELETE /api/user-skills/:skillId — org member cannot delete another 
   });
 });
 
+describe("DELETE /api/user-skills/:skillId — DELETE remains owner-only or admin; editor cannot delete", () => {
+  // Editor app (user-3 is an editor but not org owner)
+  const editorApp = express();
+  editorApp.use(express.json());
+  editorApp.use("/api/user-skills", (req: any, _res: any, next: any) => {
+    req.user = { userId: mockEditorId, email: "editor@example.com", isAdmin: false };
+    next();
+  }, userSkillRoutes);
+
+  // Org owner app
+  const orgOwnerUserId = "user-org-owner";
+  const orgOwnerApp = express();
+  orgOwnerApp.use(express.json());
+  orgOwnerApp.use("/api/user-skills", (req: any, _res: any, next: any) => {
+    req.user = { userId: orgOwnerUserId, email: "orgowner@example.com", isAdmin: false };
+    next();
+  }, userSkillRoutes);
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("editor cannot delete another member's skill even when in editors list", async () => {
+    mockGetSkill.mockResolvedValue(memberSkill);
+    mockGetUserById.mockResolvedValue({ userId: mockEditorId, orgId: mockOrgId, orgRole: "member" });
+
+    const res = await request(editorApp).delete("/api/user-skills/skill-2");
+
+    expect(res.status).toBe(403);
+    expect(mockDeleteSkill).not.toHaveBeenCalled();
+  });
+
+  it("org owner (orgRole=owner) can delete another member's skill", async () => {
+    const privateSkillByMember = { ...memberSkill, visibility: "private" };
+    mockGetSkill.mockResolvedValue(privateSkillByMember);
+    mockGetUserById.mockResolvedValue({ userId: orgOwnerUserId, orgId: mockOrgId, orgRole: "owner" });
+    mockDeleteSkill.mockResolvedValue(undefined);
+
+    const res = await request(orgOwnerApp).delete("/api/user-skills/skill-2");
+
+    expect(res.status).toBe(200);
+    expect(mockDeleteSkill).toHaveBeenCalledWith("skill-2");
+  });
+
+  it("skill owner can delete their own skill", async () => {
+    mockGetSkill.mockResolvedValue(mySkill);
+    mockDeleteSkill.mockResolvedValue(undefined);
+
+    const res = await request(app).delete("/api/user-skills/skill-1");
+
+    expect(res.status).toBe(200);
+    expect(mockDeleteSkill).toHaveBeenCalledWith("skill-1");
+  });
+});
+
 describe("POST /api/user-skills — new skill gets orgId stamped", () => {
-  it("stamps the orgId from the user's record onto the new skill", async () => {
-    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId });
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("stamps the orgId from the user's record onto the new skill (editor allowed)", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "member" });
+    mockGetOrgById.mockResolvedValue({
+      orgId: mockOrgId,
+      shareSettings: { skills: { enabled: false, editors: [mockUserId] } },
+    });
     mockCreateSkill.mockResolvedValue({ ...mySkill, skillId: "skill-new" });
     mockUpdateSkill.mockResolvedValue(undefined);
 
@@ -177,5 +372,58 @@ describe("POST /api/user-skills — new skill gets orgId stamped", () => {
     expect(res.status).toBe(201);
     const call = mockUpdateSkill.mock.calls[0][0];
     expect(call.orgId).toBeUndefined();
+  });
+});
+
+describe("POST /api/user-skills — org-level create gating", () => {
+  beforeEach(() => { jest.clearAllMocks(); });
+
+  it("org owner can create regardless of toggle", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "owner" });
+    mockGetOrgById.mockResolvedValue({
+      orgId: mockOrgId,
+      shareSettings: { skills: { enabled: false, editors: [] } },
+    });
+    mockCreateSkill.mockResolvedValue({ ...mySkill, skillId: "owner-skill" });
+    mockUpdateSkill.mockResolvedValue(undefined);
+
+    const res = await request(app)
+      .post("/api/user-skills")
+      .send({ name: "Owner Skill", description: "d" });
+
+    expect(res.status).toBe(201);
+    expect(mockCreateSkill).toHaveBeenCalledTimes(1);
+  });
+
+  it("listed editor can create even when enabled=false", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "member" });
+    mockGetOrgById.mockResolvedValue({
+      orgId: mockOrgId,
+      shareSettings: { skills: { enabled: false, editors: [mockUserId] } },
+    });
+    mockCreateSkill.mockResolvedValue({ ...mySkill, skillId: "editor-skill" });
+    mockUpdateSkill.mockResolvedValue(undefined);
+
+    const res = await request(app)
+      .post("/api/user-skills")
+      .send({ name: "Editor Skill", description: "d" });
+
+    expect(res.status).toBe(201);
+    expect(mockCreateSkill).toHaveBeenCalledTimes(1);
+  });
+
+  it("non-editor org member gets 403 on create", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "member" });
+    mockGetOrgById.mockResolvedValue({
+      orgId: mockOrgId,
+      shareSettings: { skills: { enabled: true, editors: [] } },
+    });
+
+    const res = await request(app)
+      .post("/api/user-skills")
+      .send({ name: "Member Attempt", description: "d" });
+
+    expect(res.status).toBe(403);
+    expect(mockCreateSkill).not.toHaveBeenCalled();
   });
 });

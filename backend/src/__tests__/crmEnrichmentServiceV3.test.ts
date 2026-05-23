@@ -14,6 +14,11 @@ import {
 } from '../services/crmEnrichmentServiceV3';
 import type { LeadRecord } from '../services/crmEnrichmentService';
 
+jest.mock('../services/enrichmentSiblingConfigFields', () => ({
+  ...jest.requireActual('../services/enrichmentSiblingConfigFields'),
+  buildSiblingFieldMappingTable: jest.fn().mockResolvedValue({ canonical: new Map(), llm: new Map() }),
+}));
+
 const LIST_ID = 'list-1';
 const USER_ID = 'user-1';
 
@@ -66,6 +71,7 @@ function makeDeps(overrides: Partial<OrchestratorDeps> = {}): OrchestratorDeps {
     }),
     runCriticOverWebFills: jest.fn().mockResolvedValue({ verdicts: {} }),
     setLeadFields: jest.fn().mockResolvedValue(undefined),
+    evaluateSmartField: jest.fn().mockResolvedValue({ value: null, reasoning: '' }),
     ...overrides,
   };
 }
@@ -81,6 +87,18 @@ function makeInput(overrides: Partial<RunEnrichmentInput> = {}): RunEnrichmentIn
 }
 
 // ─── Empty list ───────────────────────────────────────────────────────────────
+
+describe('runEnrichment — empty list skips sibling mapping table', () => {
+  it('does not call buildSiblingFieldMappingTable when there are no leads', async () => {
+    const { buildSiblingFieldMappingTable } = require('../services/enrichmentSiblingConfigFields');
+    (buildSiblingFieldMappingTable as jest.Mock).mockClear();
+
+    const deps = makeDeps({ loadLeads: jest.fn().mockResolvedValue([]) });
+    await runEnrichment(makeInput(), deps);
+
+    expect(buildSiblingFieldMappingTable as jest.Mock).not.toHaveBeenCalled();
+  });
+});
 
 describe('runEnrichment — empty list', () => {
   it('returns 0-processed run when list has no leads', async () => {
@@ -299,6 +317,80 @@ describe('runEnrichment — aliasFor routing', () => {
     const writeCall = (deps.setLeadFields as jest.Mock).mock.calls[0][0];
     expect(writeCall.customFields).toEqual({ stag: 'Series E' });
     expect(writeCall.customFields.funding_stage).toBeUndefined();
+  });
+
+  it('fans out a single canonical fill to every user-facing field that maps to it', async () => {
+    // Real CRM lists frequently have data in BOTH `company` and `company_name`.
+    // Both config fields route to canonical `company_name`; the waterfall fills
+    // it once and the orchestrator must write the same value under BOTH user
+    // names so neither column silently misses its enriched value.
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead()]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [
+          { field: 'company_name', value: 'Acme Corp', meta: { source: 'api', provider: 'apollo', enrichedAt: '2026-05-11T00:00:00Z' } as any },
+        ],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+      }),
+    });
+    const config = makeConfig({
+      fields: [
+        { name: 'company',      type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty', aliasFor: 'company_name' },
+        { name: 'company_name', type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    await runEnrichment(makeInput({ config }), deps);
+
+    // Waterfall is called exactly once for the canonical (no duplicate work).
+    expect(deps.runWaterfall).toHaveBeenCalledTimes(1);
+    const wfCall = (deps.runWaterfall as jest.Mock).mock.calls[0][0];
+    expect(wfCall.requestedFields).toEqual(['company_name']);
+
+    // setLeadFields was given both user-facing columns with the same value.
+    // `company` is a STANDARD_LEAD_COLUMN → topLevel; `company_name` is not → customFields.
+    expect(deps.setLeadFields).toHaveBeenCalledTimes(1);
+    const writeCall = (deps.setLeadFields as jest.Mock).mock.calls[0][0];
+    expect(writeCall.topLevel).toEqual({ company: 'Acme Corp' });
+    expect(writeCall.customFields).toEqual({ company_name: 'Acme Corp' });
+  });
+
+  it('fans out to all three user fields when three configs alias the same canonical', async () => {
+    // Lead has empty email so the fill_if_empty policy lets the canonical
+    // `email` value through to the top-level column.
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ email: '' })]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [
+          { field: 'email', value: 'jane@acme.com', meta: { source: 'api', provider: 'apollo', enrichedAt: '2026-05-11T00:00:00Z' } as any },
+        ],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+      }),
+    });
+    const config = makeConfig({
+      fields: [
+        { name: 'email',  type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+        { name: 'Email',  type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty', aliasFor: 'email' },
+        { name: 'e_mail', type: 'string', instruction: '', include: true,
+          overwritePolicy: 'fill_if_empty', aliasFor: 'email' },
+      ],
+    });
+
+    await runEnrichment(makeInput({ config }), deps);
+
+    expect(deps.runWaterfall).toHaveBeenCalledTimes(1);
+    const writeCall = (deps.setLeadFields as jest.Mock).mock.calls[0][0];
+    // `email` is a STANDARD_LEAD_COLUMN → topLevel; the two aliases land in customFields.
+    expect(writeCall.topLevel).toEqual({ email: 'jane@acme.com' });
+    expect(writeCall.customFields).toEqual({
+      Email: 'jane@acme.com',
+      e_mail: 'jane@acme.com',
+    });
   });
 
   it('leaves ungrouped fields alone when aliasFor is not set', async () => {
@@ -830,5 +922,340 @@ describe('runEnrichment — socket progress events', () => {
     const finalProgress = progressCalls[progressCalls.length - 1][2];
     expect(finalProgress.processedCount).toBe(2);
     expect(finalProgress.progress).toBe(100);
+  });
+});
+
+// ─── Smart fields ─────────────────────────────────────────────────────────────
+
+describe('runEnrichment — smart fields', () => {
+  function makeSmartConfig(overrides: Partial<EnrichmentConfig> = {}): EnrichmentConfig {
+    return makeConfig({
+      fields: [
+        {
+          name: 'isQualified',
+          type: 'boolean',
+          instruction: 'true when series A or later and total funding > $1M',
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          smartCondition: 'true when series A or later and total funding > $1M',
+          smartDependencies: ['funding_stage', 'total_funding'],
+        },
+      ],
+      ...overrides,
+    });
+  }
+
+  it('excludes smart field from waterfall routing — runWaterfall not called for smart field', async () => {
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead()]),
+    });
+    await runEnrichment(makeInput({ config: makeSmartConfig() }), deps);
+    // runWaterfall should not have been called with isQualified as a requested field
+    const waterfallCalls = (deps.runWaterfall as jest.Mock).mock.calls;
+    const allRequestedFields = waterfallCalls.flatMap((call: any[]) => call[0].requestedFields ?? []);
+    expect(allRequestedFields).not.toContain('isQualified');
+  });
+
+  it('injects missing smart-field deps as synthetic enrichment fields', async () => {
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead()]),
+    });
+    await runEnrichment(makeInput({ config: makeSmartConfig() }), deps);
+    // funding_stage and total_funding are deps — they should have been routed
+    // through runWaterfall (both are in company_financial group)
+    const waterfallCalls = (deps.runWaterfall as jest.Mock).mock.calls;
+    const allRequestedFields = waterfallCalls.flatMap((call: any[]) => call[0].requestedFields ?? []);
+    expect(allRequestedFields).toContain('funding_stage');
+    expect(allRequestedFields).toContain('total_funding');
+  });
+
+  it('does NOT inject dep already present in user config', async () => {
+    const configWithDep = makeConfig({
+      fields: [
+        {
+          name: 'funding_stage',
+          type: 'string',
+          instruction: 'company funding stage',
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+        },
+        {
+          name: 'isQualified',
+          type: 'boolean',
+          instruction: 'true when series A or later',
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          smartCondition: 'true when series A or later',
+          smartDependencies: ['funding_stage'],
+        },
+      ],
+    });
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead()]),
+    });
+    await runEnrichment(makeInput({ config: configWithDep }), deps);
+    // funding_stage appears exactly once in requested fields (from user config),
+    // not duplicated via injection
+    const waterfallCalls = (deps.runWaterfall as jest.Mock).mock.calls;
+    const allRequestedFields = waterfallCalls.flatMap((call: any[]) => call[0].requestedFields ?? []);
+    const count = allRequestedFields.filter((f: string) => f === 'funding_stage').length;
+    expect(count).toBe(1);
+  });
+
+  it('calls evaluateSmartField with enriched dep values after waterfall', async () => {
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead()]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [
+          { field: 'funding_stage', value: 'Series B', meta: { source: 'api', enrichedAt: '2026-05-11T00:00:00Z' } },
+          { field: 'total_funding', value: '5000000', meta: { source: 'api', enrichedAt: '2026-05-11T00:00:00Z' } },
+        ],
+        missing: [],
+        tierFills: { crm: 0, apollo: 2, web: 0, missing: 0 },
+      }),
+      evaluateSmartField: jest.fn().mockResolvedValue({ value: 'true', reasoning: 'Series B > Series A' }),
+    });
+
+    await runEnrichment(makeInput({ config: makeSmartConfig() }), deps);
+
+    expect(deps.evaluateSmartField).toHaveBeenCalledWith(
+      expect.objectContaining({
+        fieldName: 'isQualified',
+        condition: 'true when series A or later and total funding > $1M',
+        depValues: expect.objectContaining({
+          funding_stage: 'Series B',
+          total_funding: '5000000',
+        }),
+      }),
+    );
+  });
+
+  it('writes smart field value to lead after evaluation', async () => {
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead()]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [
+          { field: 'funding_stage', value: 'Series B', meta: { source: 'api', enrichedAt: '2026-05-11T00:00:00Z' } },
+          { field: 'total_funding', value: '5000000', meta: { source: 'api', enrichedAt: '2026-05-11T00:00:00Z' } },
+        ],
+        missing: [],
+        tierFills: { crm: 0, apollo: 2, web: 0, missing: 0 },
+      }),
+      evaluateSmartField: jest.fn().mockResolvedValue({ value: 'true', reasoning: 'Series B > Series A' }),
+    });
+
+    await runEnrichment(makeInput({ config: makeSmartConfig() }), deps);
+
+    const setCallArgs = (deps.setLeadFields as jest.Mock).mock.calls[0][0];
+    expect(setCallArgs.customFields).toMatchObject({ isQualified: 'true' });
+    expect(setCallArgs.enrichmentMetadata?.isQualified?.source).toBe('llm');
+  });
+
+  it('skips evaluateSmartField when all deps could not be enriched', async () => {
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead()]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [],  // nothing enriched
+        missing: ['funding_stage', 'total_funding'],
+        tierFills: { crm: 0, apollo: 0, web: 0, missing: 2 },
+      }),
+      evaluateSmartField: jest.fn().mockResolvedValue({ value: 'true', reasoning: '' }),
+    });
+
+    await runEnrichment(makeInput({ config: makeSmartConfig() }), deps);
+
+    // No dep data available → evaluateSmartField must NOT be called (save LLM tokens)
+    expect(deps.evaluateSmartField).not.toHaveBeenCalled();
+  });
+
+  it('succeeds overall when evaluateSmartField throws — smart field just missing', async () => {
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead()]),
+      evaluateSmartField: jest.fn().mockRejectedValue(new Error('LLM timeout')),
+    });
+
+    const result = await runEnrichment(makeInput({ config: makeSmartConfig() }), deps);
+
+    expect(result.processed).toBe(1);
+    expect(result.failed.llmOrParseFailed).toBe(0);
+  });
+
+  it('fallback finds dep value stored under user-facing field name (reverse-alias lookup)', async () => {
+    // Lead already has funding_stage stored under the user-facing name 'Funding Stage'
+    // from a prior enrichment run. Waterfall skips it (fill_if_empty). Fallback must
+    // find it via reverse-alias so smart eval receives the dep value.
+    const configWithAlias = makeConfig({
+      fields: [
+        {
+          name: 'Funding Stage',
+          type: 'string',
+          instruction: 'company funding stage',
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          aliasFor: 'funding_stage',
+        },
+        {
+          name: 'isQualified',
+          type: 'boolean',
+          instruction: 'true when series A or later',
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          smartCondition: 'true when series A or later',
+          smartDependencies: ['funding_stage'],
+        },
+      ],
+    });
+    const leadWithExistingDep = makeLead({
+      customFields: { 'Funding Stage': 'Series B' },
+    });
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([leadWithExistingDep]),
+      // Waterfall returns nothing — fill_if_empty, value already exists
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [],
+        missing: ['Funding Stage'],
+        tierFills: { crm: 0, apollo: 0, web: 0, missing: 1 },
+      }),
+      evaluateSmartField: jest.fn().mockResolvedValue({ value: 'true', reasoning: 'Series B > Series A' }),
+    });
+
+    await runEnrichment(makeInput({ config: configWithAlias }), deps);
+
+    // Fallback must have found 'funding_stage' via reverse-alias of 'Funding Stage'
+    expect(deps.evaluateSmartField).toHaveBeenCalledWith(
+      expect.objectContaining({
+        depValues: expect.objectContaining({ funding_stage: 'Series B' }),
+      }),
+    );
+  });
+
+  it('does NOT write injected dep fields to lead after enrichment', async () => {
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead()]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [
+          { field: 'funding_stage', value: 'Series B', meta: { source: 'api', enrichedAt: '2026-05-11T00:00:00Z' } },
+          { field: 'total_funding', value: '5000000', meta: { source: 'api', enrichedAt: '2026-05-11T00:00:00Z' } },
+        ],
+        missing: [],
+        tierFills: { crm: 0, apollo: 2, web: 0, missing: 0 },
+      }),
+      evaluateSmartField: jest.fn().mockResolvedValue({ value: 'true', reasoning: 'Series B > Series A' }),
+    });
+
+    await runEnrichment(makeInput({ config: makeSmartConfig() }), deps);
+
+    const setCallArgs = (deps.setLeadFields as jest.Mock).mock.calls[0][0];
+    // Injected deps must NOT appear on the lead
+    expect(setCallArgs.customFields).not.toHaveProperty('funding_stage');
+    expect(setCallArgs.customFields).not.toHaveProperty('total_funding');
+    // Smart field itself MUST be written
+    expect(setCallArgs.customFields).toMatchObject({ isQualified: 'true' });
+  });
+
+  it('writes dep field normally when it is part of user config (not injected)', async () => {
+    const configWithDep = makeConfig({
+      fields: [
+        {
+          name: 'funding_stage',
+          type: 'string',
+          instruction: 'company funding stage',
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+        },
+        {
+          name: 'isQualified',
+          type: 'boolean',
+          instruction: 'true when series A or later',
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+          smartCondition: 'true when series A or later',
+          smartDependencies: ['funding_stage'],
+        },
+      ],
+    });
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead()]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [
+          { field: 'funding_stage', value: 'Series A', meta: { source: 'api', enrichedAt: '2026-05-11T00:00:00Z' } },
+        ],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+      }),
+      evaluateSmartField: jest.fn().mockResolvedValue({ value: 'true', reasoning: 'Series A' }),
+    });
+
+    await runEnrichment(makeInput({ config: configWithDep }), deps);
+
+    const setCallArgs = (deps.setLeadFields as jest.Mock).mock.calls[0][0];
+    // funding_stage is in user config → must be written
+    expect(setCallArgs.customFields).toHaveProperty('funding_stage', 'Series A');
+    expect(setCallArgs.customFields).toMatchObject({ isQualified: 'true' });
+  });
+
+  it('smart eval still uses injected dep value even though dep is not written to lead', async () => {
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead()]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [
+          { field: 'funding_stage', value: 'Series C', meta: { source: 'api', enrichedAt: '2026-05-11T00:00:00Z' } },
+        ],
+        missing: ['total_funding'],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 1 },
+      }),
+      evaluateSmartField: jest.fn().mockResolvedValue({ value: 'true', reasoning: 'Series C' }),
+    });
+
+    await runEnrichment(makeInput({ config: makeSmartConfig() }), deps);
+
+    // Eval must have been called with the dep value
+    expect(deps.evaluateSmartField).toHaveBeenCalledWith(
+      expect.objectContaining({
+        depValues: expect.objectContaining({ funding_stage: 'Series C' }),
+      }),
+    );
+    // But funding_stage must NOT be stored on the lead
+    const setCallArgs = (deps.setLeadFields as jest.Mock).mock.calls[0][0];
+    expect(setCallArgs.customFields).not.toHaveProperty('funding_stage');
+  });
+});
+
+// ─── Concurrent chunk writes ──────────────────────────────────────────────────
+
+describe('runEnrichment — concurrent chunk writes', () => {
+  it('writes all leads in a chunk concurrently, not one-at-a-time', async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const setLeadFields = jest.fn().mockImplementation(async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise(resolve => setTimeout(resolve, 10));
+      inFlight -= 1;
+    });
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([
+        makeLead({ leadId: 'l1' }),
+        makeLead({ leadId: 'l2' }),
+        makeLead({ leadId: 'l3' }),
+      ]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [{
+          field: 'company_name',
+          value: 'Acme',
+          meta: { source: 'apollo', enrichedAt: '2026-01-01T00:00:00Z' },
+        }],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+      }),
+      setLeadFields,
+    });
+
+    const result = await runEnrichment(makeInput(), deps);
+
+    expect(result.processed).toBe(3);
+    expect(setLeadFields).toHaveBeenCalledTimes(3);
+    // Sequential writes would never have more than one call in flight at once.
+    expect(maxInFlight).toBe(3);
   });
 });

@@ -353,15 +353,16 @@ export async function syncSubscriptionFromStripe(
       }
     }
 
-    // 5. Additive-only merge: only fill fields that are null/undefined in DynamoDB
+    // 5. Additive-only merge for most fields, but always overwrite current_period_end
+    // (it must reflect Stripe's truth — stale dates are why this sync exists)
     const SYNC_FIELDS = ['subscription_status', 'stripe_subscription_id', 'subscriptionType', 'has_payment_method', 'current_period_end'] as const;
+    const ALWAYS_OVERWRITE: ReadonlyArray<string> = ['current_period_end'];
     const updates: Record<string, any> = {};
 
     for (const field of SYNC_FIELDS) {
       const dbValue = user[field];
       const stripeValue = stripeValues[field];
-      // Only write if DB value is null/undefined AND Stripe has a value
-      if ((dbValue === null || dbValue === undefined) && stripeValue !== undefined) {
+      if (stripeValue !== undefined && (ALWAYS_OVERWRITE.includes(field) || dbValue === null || dbValue === undefined)) {
         updates[field] = stripeValue;
       }
     }
@@ -658,11 +659,25 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
     updateData.subscription_amount = invoice.amount_paid;
   }
 
+  // Sync current_period_end from the live subscription so the admin Users tab shows the correct end date
+  const subIdToFetch = subscriptionId || user.stripe_subscription_id;
+  if (subIdToFetch) {
+    try {
+      const s = getStripeOrThrow();
+      const subscription = await s.subscriptions.retrieve(subIdToFetch) as any;
+      if (subscription.current_period_end) {
+        updateData.current_period_end = new Date(subscription.current_period_end * 1000).toISOString();
+      }
+    } catch (err) {
+      console.warn(`[STRIPE] Failed to fetch subscription ${subIdToFetch} for period_end sync: ${err}`);
+    }
+  }
+
   await userDb.updateUser(user.userId, updateData);
   syncUserUpdateToLeadList(user.email, { subscription_status: 'active' });
 
   console.log(
-    `[STRIPE] Invoice payment succeeded: user ${user.userId} → status=active, has_payment_method=true${updateData.stripe_subscription_id ? `, backfilled sub=${subscriptionId}` : ''}${updateData.subscription_amount ? `, amount=${updateData.subscription_amount}` : ''}`
+    `[STRIPE] Invoice payment succeeded: user ${user.userId} → status=active, has_payment_method=true${updateData.stripe_subscription_id ? `, backfilled sub=${subscriptionId}` : ''}${updateData.subscription_amount ? `, amount=${updateData.subscription_amount}` : ''}${updateData.current_period_end ? `, periodEnd=${updateData.current_period_end}` : ''}`
   );
 }
 

@@ -62,21 +62,34 @@ export class FathomApiService {
   /**
    * Validate the API key by hitting the teams endpoint.
    *
-   * @returns true if the key is valid (200), false otherwise
+   * Returns false only on definitive auth failures (401/403).
+   * Network errors, timeouts, and 5xx responses return null (uncertain)
+   * so the caller can fall back to stored token status rather than
+   * falsely showing the account as disconnected.
+   *
+   * @returns true if connected, false if credentials rejected, null if uncertain
    */
-  async validateApiKey(): Promise<boolean> {
+  async validateApiKey(): Promise<boolean | null> {
     try {
-      const response = await fetch(`${FATHOM_API_BASE}/teams`, {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/json',
-        },
-      });
-
-      return response.ok;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      try {
+        const response = await fetch(`${FATHOM_API_BASE}/teams`, {
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          signal: controller.signal,
+        });
+        if (response.ok) return true;
+        if (response.status === 401 || response.status === 403) return false;
+        return null; // 5xx or other — uncertain, don't penalise
+      } finally {
+        clearTimeout(timeout);
+      }
     } catch {
-      return false;
+      return null; // network error or timeout — uncertain
     }
   }
 }

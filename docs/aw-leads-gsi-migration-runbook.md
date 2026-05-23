@@ -235,6 +235,54 @@ You should not need this — the GSIs are additive and the backfill is `if_not_e
 | `skippedOrphaned > 0` in backfill output | Leads exist whose parent `AW-LeadLists` row is missing | Flag to engineering — these rows won't get a `userId` |
 | `errored > 0` in backfill output | Individual `UpdateItem` calls failed | Inspect the warn lines; re-run is safe |
 | Script appears stuck mid-build | Populated table can take hours per index | Check `IndexStatus` / `Backfilling` via the verify command above |
+| Large `errored` count with message "empty string value … secondary index key" | Pre-existing leads have `email=""` or `linkedin=""` stored from before the sparse-index guards were added | **Run the empty-GSI-key repair script below** |
+
+---
+
+## Repair: empty-string GSI key attributes
+
+**When to run this:** If `backfillLeadsUserId` reports a large `errored` count with the message "The AttributeValue for a key attribute cannot contain an empty string value", legacy leads are storing `""` for `email`, `linkedin`, or `nameCompanyKey`. DynamoDB rejects any `UpdateItem` on these rows — including live CRM enrichment writes and field edits — until the empty attributes are removed.
+
+**Root cause:** Old import paths and early enrichment code stored `""` for optional fields. The write-path guards (`createLead`, `updateLead`, CSV import) were added later and prevent new occurrences. `updateLead` also self-heals these rows on the fly — but leads that are never touched again stay broken indefinitely, and code paths that bypass `updateLead` (e.g. `setLeadFields`) continue to fail on them.
+
+**The fix:** `REMOVE` the empty-string attribute so the GSI index skips the lead entirely (sparse index behaviour). The script also re-attempts the `userId` + `nameCompanyKey` backfill for repaired leads that were skipped by the original run.
+
+### Dry-run first
+
+```bash
+cd <repo>
+NODE_ENV=production npx ts-node backend/src/scripts/repairEmptyGsiKeys.ts --dry-run
+```
+
+This prints `[repairEmptyGsiKeys] DONE { scanned, repaired, skippedClean, errored, dryRun: true }` with no writes. Verify `repaired` matches the `errored` count from the original backfill run. The first 5 affected leads are logged so you can spot-check.
+
+### Real run
+
+```bash
+NODE_ENV=production npx ts-node backend/src/scripts/repairEmptyGsiKeys.ts
+```
+
+Expected output:
+
+```
+[repairEmptyGsiKeys] starting { dryRun: false, env: 'production', leadsTable: 'AW-Leads' }
+[repairEmptyGsiKeys] loaded N lists
+[repairEmptyGsiKeys] DONE { scanned: 206000, repaired: 158000, skippedClean: 48000, errored: 0, dryRun: false }
+```
+
+`errored: 0` is the success signal. `repaired` should equal the `errored` count from the original `backfillLeadsUserId` run.
+
+### Verify after repair
+
+```bash
+# Re-run the backfill dry-run — should now report errored: 0 and touched: 0
+SKIP_GSI=1 DRY_RUN=1 AWS_REGION=us-west-2 \
+  ./backend/src/scripts/repair-leads-add-lookup-indexes.sh
+```
+
+### Required IAM permissions
+
+Same as the main migration — `dynamodb:Scan` and `dynamodb:UpdateItem` on `AW-Leads`, plus `dynamodb:Scan` on `AW-LeadLists`. No additional permissions needed beyond those granted for the original backfill.
 
 ---
 
@@ -242,16 +290,18 @@ You should not need this — the GSIs are additive and the backfill is `if_not_e
 
 | Field | Dev | Staging | Prod |
 |---|---|---|---|
-| Operator | | | |
-| Run start (UTC) | | | |
-| Run end (UTC) | | | |
-| Pre-flight item count | | | |
-| Billing mode | | | |
-| PITR enabled? | | | |
-| Dry-run `touched` / `skippedNoop` / `skippedOrphaned` | | | |
-| Real-run `touched` / `errored` | | | |
-| Anomalies / notes | | | |
-| Sign-off (engineering) | | | |
+| Operator | — | — | rui |
+| Run start (UTC) | — | — | 2026-05-15 ~19:08 UTC |
+| Run end (UTC) | — | — | 2026-05-18 |
+| Pre-flight item count | — | — | 206,028 |
+| Billing mode | — | — | PAY_PER_REQUEST |
+| PITR enabled? | — | — | Unknown (IAM lacked DescribeContinuousBackups) |
+| Dry-run `touched` / `skippedNoop` / `skippedOrphaned` | — | — | 204,842 / 4 / 1,187 |
+| Real-run `touched` / `errored` | — | — | 46,777 / 158,092 (empty GSI keys — repaired separately) |
+| Repair run `repaired` / `errored` | — | — | 158,091 / 0 |
+| Post-repair verification `touched` / `errored` | — | — | 28 (live writes) / 0 ✅ |
+| Anomalies / notes | — | — | 1,187 orphaned leads from 2 deleted lists (list_1772000220985 + list_1772000519919, created 2026-02-25, lists since deleted). 158k leads had `linkedin=""` from pre-GSI import paths — repaired via repairEmptyGsiKeys.ts (PR #1560). |
+| Sign-off (engineering) | — | — | rui 2026-05-18 |
 
 ---
 

@@ -4473,3 +4473,27 @@ Decoding the raw email HTML revealed the logo `<img>` (converted from SVG) had `
 **Superhuman:** We contacted Superhuman support to report the SVG sanitization behavior. **Awaiting their response.** No fix has been applied at our end for this issue. If Superhuman confirms this is by design (i.e., SVGs will always have styles stripped), the mitigation would be to convert SVGs to PNGs server-side before sending (already prototyped: `convertEmailSvgsToPng` in `emailVariables.ts` using `sharp` + content-addressed S3 keys — `email-svgs/<sha256>.png`).
 
 **Slashy:** A server-side fix was applied: `removeInvertedImgFilters()` in `emailVariables.ts` strips `filter:brightness(0) invert(1)` from `<img>` style attributes before send. This ensures the logo renders in its original colors on all clients. Trade-off: on clients that correctly render the purple header (Gmail, Apple Mail), the logo now appears dark against the purple background rather than white — acceptable since it remains legible. The proper long-term fix is a white-variant logo asset that does not rely on CSS filters.
+
+## Session Judge Scoring — Bug-Reported Sessions (2026-05-16)
+
+### Background
+
+Session satisfaction scores were being computed too low for sessions where the assistant hit a known platform bug. The judge LLM was seeing friction and failures without understanding that the issue had been formally escalated — so it scored the session as if the user's problem was simply unresolved.
+
+### Signal: `report_product_issues` Tool Call
+
+The reliable signal that a bug was reported is the presence of `report_product_issues` in the serialized transcript's `[called tools: ...]` line. This is more deterministic than trying to parse natural-language acknowledgments ("I've filed a bug", etc.).
+
+### Fix
+
+The scoring judge prompt was updated (both the hardcoded `DEFAULT_SCORING_SYSTEM_PROMPT` in `sessionScoringService.ts` and the live prompt managed via the admin Settings → Scoring Judges page) to include:
+
+> **IMPORTANT: Bug reported during session:**
+> - If the transcript contains `[called tools: report_product_issues]`, a bug was formally reported
+> - Treat the problematic behavior as a known platform limitation, not an assistant failure
+> - Score the overall session as satisfied (score ≥ 4) unless the user expressed strong dissatisfaction **after** the tool was called
+> - Dimension scores (e.g. `outputQuality`) may still reflect pre-report friction
+
+### Live Prompt State
+
+The prompt was manually updated in both dev and prod via the admin Scoring Judges page. No migration or deploy is needed — the page writes directly to the `default-scoring-prompt` DynamoDB setting at runtime. Custom judges were also updated to match.

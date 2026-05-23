@@ -293,14 +293,14 @@ mcpToolRegistry.register({
   name: 'manage_scheduled_chat',
   definition: {
     name: 'manage_scheduled_chat',
-    description: 'Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: "create", "update", "toggle", or "delete". For "create": schedule_name, starting_message, schedule_frequency, and at least one email_notifications address are REQUIRED — do not call with action "create" unless you have all four. For "update": schedule_id is required; omit any field to keep its existing value — if you provide email_notifications it must be non-empty.',
+    description: 'Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: "create", "update", "toggle", or "delete". For "create": schedule_name, starting_message, schedule_frequency, and at least one email_notifications address are REQUIRED — do not call with action "create" unless you have all four. For "update": schedule_id is required; omit any field to keep its existing value — if you provide email_notifications it must be non-empty. IMPORTANT: When email_notifications is configured on the schedule, the system automatically emails results after every run — do NOT include notify_session or any email-sending instruction in starting_message, as that would cause duplicate emails (one from the system, one from the AI executing the tool).',
     inputSchema: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['create', 'update', 'toggle', 'delete'], description: 'CRUD action' },
         schedule_id: { type: 'string', description: 'Schedule ID (required for update/toggle/delete)' },
         schedule_name: { type: 'string', description: 'Schedule name (REQUIRED for create, optional for update)' },
-        starting_message: { type: 'string', description: 'The prompt/message to run on each execution (REQUIRED for create, optional for update)' },
+        starting_message: { type: 'string', description: 'The prompt/message to run on each execution (REQUIRED for create, optional for update). IMPORTANT: Do NOT include notify_session or any instruction to send an email in this prompt when email_notifications is set — the system already sends emails automatically, and adding notify_session here will cause duplicate emails.' },
         schedule_frequency: { type: 'string', description: 'Frequency: hourly, daily, weekly, monthly, every_n_days (REQUIRED for create, optional for update)' },
         frequency_interval_days: { type: 'number', description: 'Number of days between runs when schedule_frequency is every_n_days (create/update)' },
         next_run_time: { type: 'string', description: 'ISO 8601 datetime for the first/next run (create/update)' },
@@ -1303,6 +1303,29 @@ mcpToolRegistry.register({
     const data = await mcpFetch({
       method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/duplicate`, context: ctx(context),
       body: { name: args.name }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'update_landing_page_context',
+  definition: {
+    name: 'update_landing_page_context',
+    description: 'Save or update the context field on a landing page — a plain-text description of when to use it, its tone, and target audience. Use this whenever the user provides notes about a landing page (e.g. "this is for cold outreach targeting SaaS founders"). Keep it concise (max 500 characters). The context is shown in the UI and used by the agent to pick the best matching page for CTAs.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID' },
+        context: { type: 'string', description: 'Free-text notes: when to use this page, tone, audience, offer, etc.' }
+      },
+      required: ['page_id', 'context']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'PATCH', path: `/api/landing-pages/v0/generated/${args.page_id}/context`, context: ctx(context),
+      body: { context: args.context }
     });
     return jsonResult(data);
   }

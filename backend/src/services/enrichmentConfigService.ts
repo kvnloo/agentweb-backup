@@ -60,6 +60,14 @@ const CANONICAL_SYNONYMS: Record<string, string> = {
   full_name: 'first_name',         // imperfect — won't split, but routes to person_identity
 };
 
+/** Resolve a field name to its canonical FIELD_GROUPS name. Returns the name
+ *  itself when it is already canonical, the inferred canonical when a
+ *  heuristic match exists, or undefined when there is no canonical analog. */
+export function canonicalFieldName(name: string): string | undefined {
+  if (CANONICAL_FIELD_NAMES.has(name)) return name;
+  return inferAliasFor(name);
+}
+
 /** Infer `aliasFor` for a single field. Returns the canonical name, or
  *  undefined if no high-confidence match. */
 function inferAliasFor(fieldName: string): string | undefined {
@@ -103,6 +111,10 @@ export const TRULY_RESERVED_NAMES = [
 
 const TRULY_RESERVED_SET = new Set<string>(TRULY_RESERVED_NAMES);
 
+/** Fields that are auto-derived from other lead data and should never receive
+ *  an aliasFor assignment — they have no external enrichment source. */
+const ALIAS_INFERENCE_BLOCKLIST = new Set(['emailDomain', 'email_domain']);
+
 /** Maps the lead's standard column name → canonical FIELD_GROUPS field
  *  it enriches against. Used by `buildDefaultConfig` to auto-set aliasFor.  */
 export const STANDARD_DATA_ALIASES: Record<string, string> = {
@@ -120,7 +132,7 @@ export const STANDARD_DATA_ALIASES: Record<string, string> = {
  *  regardless of whether the list's fieldNames contains them. Mirrors the
  *  "Standard Fields" section of the Configure Display Fields dialog, minus
  *  non-enrichable system fields (createdAt, updatedAt, status, dealValue). */
-const STANDARD_ENRICHABLE_FIELDS = [
+export const STANDARD_ENRICHABLE_FIELDS = [
   'firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'notes',
 ] as const;
 
@@ -137,6 +149,8 @@ const EXCLUDED_LIST_FIELD_NAMES = new Set<string>([
   'contactStatusUpdatedAt', 'contactStatusUpdatedBy',
   // System timestamps
   'createdAt', 'updatedAt',
+  // Identity-derived fields — auto-computed from other lead data, not enrichable
+  'emailDomain',
 ]);
 
 // Back-compat re-export — callers still importing the old name get the strict set.
@@ -147,6 +161,13 @@ export const RESERVED_FIELD_NAMES = TRULY_RESERVED_NAMES;
 export interface FieldTypeSuggestion {
   name: string;
   type: 'string' | 'number' | 'boolean' | 'enum' | 'date';
+  enumOptions?: string[];
+}
+
+export interface SmartFieldClassification {
+  isSmartField: boolean;
+  dependencies: string[];
+  fieldType?: 'string' | 'number' | 'boolean' | 'date' | 'enum';
   enumOptions?: string[];
 }
 
@@ -165,7 +186,22 @@ export interface ConfigServiceDeps {
   llmInferAliases(
     input: Array<{ name: string; instruction: string }>,
   ): Promise<Record<string, string | null>>;
+  /** Called once per save to classify fields as smart (computed/derived) or
+   *  normal (directly fetchable). For smart fields also extracts canonical
+   *  dependency field names. Implementations should fail soft (return {} on
+   *  error) so the rest of the save still proceeds. */
+  llmClassifySmartFields(
+    input: Array<{ name: string; instruction: string }>,
+  ): Promise<Record<string, SmartFieldClassification>>;
 }
+
+/** Subset of ConfigServiceDeps needed to PROCESS a config (resolve aliases,
+ *  classify smart fields, validate) without persisting it. Used by callers
+ *  that build a config in memory and run enrichment directly — e.g. Emma. */
+export type ConfigProcessingDeps = Pick<
+  ConfigServiceDeps,
+  'readListConfig' | 'llmInferAliases' | 'llmClassifySmartFields'
+>;
 
 // ─── Validation ───────────────────────────────────────────────────────────────
 
@@ -176,31 +212,40 @@ class ConfigValidationError extends Error {
   }
 }
 
-function validateConfig(config: EnrichmentConfig): void {
+function validateConfig(config: EnrichmentConfig): { warnings: string[] } {
   if (config.schemaVersion !== 1) {
     throw new ConfigValidationError(
       `schemaVersion must be 1; received ${config.schemaVersion}`,
     );
   }
 
-  // Two fields routing to the same canonical name → routing conflict.
+  // Two fields routing to the same canonical name → routing collision.
   // Covers both: explicit aliasFor collisions AND a self-canonical name
   // (e.g. `email`) clashing with an inferred alias (e.g. `Email`→`email`).
-  // The waterfall fills the canonical once and the rename can only land on
-  // one user-facing field — the other silently misses its value.
-  const canonicalOwners = new Map<string, string>();   // canonical → user field name
+  // Real CRM lists commonly have data in both `company` and `company_name`
+  // (or `email` + `Email`), so we ALLOW the collision and fan out fills to
+  // every user-facing field at enrichment time. We surface a warning so the
+  // user understands both columns will receive the same enriched value.
+  const canonicalToUserFields = new Map<string, string[]>();
   for (const field of config.fields) {
     const canonical = field.aliasFor
       ?? (CANONICAL_FIELD_NAMES.has(field.name) ? field.name : null);
     if (!canonical) continue;
-    const existing = canonicalOwners.get(canonical);
-    if (existing && existing !== field.name) {
-      throw new ConfigValidationError(
-        `Fields '${existing}' and '${field.name}' both map to '${canonical}'. ` +
-        `Each canonical field can have only one config field — remove one.`,
-      );
-    }
-    canonicalOwners.set(canonical, field.name);
+    const names = canonicalToUserFields.get(canonical) ?? [];
+    if (!names.includes(field.name)) names.push(field.name);
+    canonicalToUserFields.set(canonical, names);
+  }
+  // Each warning is just the duplicate group descriptor (e.g. `'company' and
+  // 'company_name'`). The frontend wraps the list with a single shared header
+  // + explainer, so the message reads cleanly when several groups collide.
+  const warnings: string[] = [];
+  for (const [, names] of canonicalToUserFields.entries()) {
+    if (names.length < 2) continue;
+    const quoted = names.map(n => `'${n}'`);
+    const list = names.length === 2
+      ? `${quoted[0]} and ${quoted[1]}`
+      : `${quoted.slice(0, -1).join(', ')}, and ${quoted[quoted.length - 1]}`;
+    warnings.push(list);
   }
 
   const seen = new Set<string>();
@@ -233,7 +278,19 @@ function validateConfig(config: EnrichmentConfig): void {
         );
       }
     }
+
+    if (field.smartDependencies != null) {
+      for (const dep of field.smartDependencies) {
+        if (!CANONICAL_FIELD_NAMES.has(dep)) {
+          throw new ConfigValidationError(
+            `smart field '${field.name}' dependency '${dep}' is not a known canonical field`,
+          );
+        }
+      }
+    }
   }
+
+  return { warnings };
 }
 
 // ─── Default-config generator ─────────────────────────────────────────────────
@@ -340,41 +397,65 @@ function mergeSavedWithCandidates(
 export async function getEnrichmentConfig(
   input: { listId: string; userId: string },
   deps: ConfigServiceDeps,
-): Promise<{ config: EnrichmentConfig; isDefault: boolean }> {
+): Promise<{ config: EnrichmentConfig; isDefault: boolean; knownColumns: string[] }> {
   // Always read list field names — we surface the full candidate set in the
   // dialog (standard lead columns + custom fields), regardless of whether a
   // saved config exists. Saved settings are merged in on top.
   const fieldNames = await deps.loadListFieldNames(input.listId);
   const stored = await deps.readListConfig(input.listId);
 
+  // knownColumns = the rows that will auto-resurface on next dialog open
+  // (standard CRM cols ∪ list schema cols, minus excluded/reserved). Frontend
+  // hides the trash icon for these — delete is destructive only for fields
+  // outside this set (manually-added saved-only rows).
+  const knownColumns = candidateFieldNames(fieldNames);
+
   if (stored) {
-    return { config: mergeSavedWithCandidates(stored, fieldNames), isDefault: false };
+    return {
+      config: mergeSavedWithCandidates(stored, fieldNames),
+      isDefault: false,
+      knownColumns,
+    };
   }
   return {
     config: buildDefaultConfig(fieldNames, input.userId),
     isDefault: true,
+    knownColumns,
   };
 }
 
-export async function setEnrichmentConfig(
+/**
+ * Process a raw enrichment config: resolve aliasFor (heuristic + LLM),
+ * restore + classify smart fields, validate, and stamp audit fields.
+ * Does NOT persist. setEnrichmentConfig = processEnrichmentConfig + write.
+ */
+export async function processEnrichmentConfig(
   input: { listId: string; userId: string; config: EnrichmentConfig },
-  deps: ConfigServiceDeps,
-): Promise<EnrichmentConfig> {
+  deps: ConfigProcessingDeps,
+): Promise<{ config: EnrichmentConfig; warnings: string[] }> {
   // Step 1: heuristic alias inference (camelCase, synonym map, standard
   // columns). Cheap, no API call. Catches the easy 80% of cases.
   // Explicit client-supplied aliasFor is preserved.
   let enriched: EnrichmentConfig = {
     ...input.config,
-    fields: input.config.fields.map(f => ({
-      ...f,
-      aliasFor: f.aliasFor ?? inferAliasFor(f.name),
-    })),
+    fields: input.config.fields.map(
+      // Strip server-managed classification keys from the client payload.
+      // These are computed server-side and must not be client-injectable:
+      // - smartCondition / smartDependencies: trust these → skip POST eval
+      // - notSmartInstruction: set this === instruction → suppress classification
+      ({ smartCondition: _sc, smartDependencies: _sd, notSmartInstruction: _nsi, ...f }) => ({
+        ...f,
+        // Blocklisted fields (e.g. emailDomain) must never get an aliasFor —
+        // strip even if the stored config has a stale one from old inference.
+        aliasFor: ALIAS_INFERENCE_BLOCKLIST.has(f.name) ? undefined : (f.aliasFor ?? inferAliasFor(f.name)),
+      }),
+    ),
   };
 
   // Step 2: LLM fallback for fields the heuristic couldn't resolve. One LLM
   // call total per save (not per enrichment run) — cheap. LLM matches opaque
   // names like `stag` → `funding_stage` based on the user's instruction text.
-  const llmCandidates = enriched.fields.filter(f => !f.aliasFor);
+  const llmCandidates = enriched.fields.filter(f => !f.aliasFor && !ALIAS_INFERENCE_BLOCKLIST.has(f.name));
   if (llmCandidates.length > 0) {
     try {
       const llmAliases = await deps.llmInferAliases(
@@ -398,7 +479,98 @@ export async function setEnrichmentConfig(
     }
   }
 
-  validateConfig(enriched);
+  // Step 3a: Restore server-persisted classification keys from DB.
+  // Client-supplied values were stripped in Step 1 — client must not control
+  // these. Load from DB (authoritative) and re-attach for fields that match by
+  // name. If no stored config exists (new list), nothing to restore.
+  {
+    const storedConfig = await deps.readListConfig(input.listId).catch(() => null);
+    const storedByName = new Map(
+      (storedConfig?.fields ?? []).map(f => [f.name, f]),
+    );
+    enriched = {
+      ...enriched,
+      fields: enriched.fields.map(f => {
+        const sf = storedByName.get(f.name);
+        if (!sf) return f;
+        const restored: Partial<EnrichmentFieldConfig> = {};
+        if (sf.smartCondition !== undefined) restored.smartCondition = sf.smartCondition;
+        if (sf.smartDependencies !== undefined) restored.smartDependencies = sf.smartDependencies;
+        if (sf.notSmartInstruction !== undefined) restored.notSmartInstruction = sf.notSmartInstruction;
+        return { ...f, ...restored };
+      }),
+    };
+  }
+
+  // Step 3b: Classify smart fields via LLM. Only classify fields that have an
+  // instruction, are enabled, and haven't been classified with the current
+  // instruction yet (either as smart or not-smart).
+  // smartCondition holds the instruction used when LLM said "smart".
+  // notSmartInstruction holds the instruction used when LLM said "not smart".
+  // If either matches the current instruction, skip — result is already cached.
+  const classificationCandidates = enriched.fields.filter(
+    f => f.instruction && f.include && (
+      f.smartCondition?.trim() !== f.instruction.trim() &&
+      f.notSmartInstruction?.trim() !== f.instruction.trim()
+    ),
+  );
+  if (classificationCandidates.length > 0) {
+    try {
+      const classifications = await deps.llmClassifySmartFields(
+        classificationCandidates.map(f => ({ name: f.name, instruction: f.instruction })),
+      );
+      enriched = {
+        ...enriched,
+        fields: enriched.fields.map(f => {
+          const cls = classifications[f.name];
+          if (!cls) return f;  // not in classification batch — leave unchanged
+
+          const VALID_INFERRED_TYPES = new Set(['string', 'number', 'boolean', 'date', 'enum']);
+          const inferredType = cls.fieldType && VALID_INFERRED_TYPES.has(cls.fieldType)
+            ? cls.fieldType as 'string' | 'number' | 'boolean' | 'date' | 'enum'
+            : undefined;
+          const validEnumOptions = (cls.enumOptions ?? []).filter(o => typeof o === 'string' && o.trim());
+          let typeOverride: Partial<EnrichmentFieldConfig> = {};
+          if (inferredType) {
+            if (inferredType === 'enum' && validEnumOptions.length > 0) {
+              typeOverride = { type: 'enum', enumOptions: validEnumOptions };
+            } else if (inferredType !== 'enum') {
+              typeOverride = { type: inferredType, enumOptions: undefined };  // clear stale enumOptions
+            }
+            // else: enum with no valid options — skip type change
+          }
+
+          if (cls.isSmartField) {
+            // Only canonical FIELD_GROUPS names are kept as dependencies.
+            // This means smart fields cannot depend on other smart fields —
+            // a user-field name like `isQualified` would be filtered here.
+            // See the POST eval loop in crmEnrichmentServiceV3 for full context.
+            const validDeps = (cls.dependencies ?? []).filter(d => CANONICAL_FIELD_NAMES.has(d));
+            const droppedDeps = (cls.dependencies ?? []).filter(d => !CANONICAL_FIELD_NAMES.has(d));
+            if (droppedDeps.length > 0) {
+              // eslint-disable-next-line no-console
+              console.warn(`[enrichmentConfigService] smart field '${f.name}' had non-canonical deps filtered: ${droppedDeps.join(', ')} — these may be other smart field names (chaining not supported)`);
+            }
+            const out = { ...f, ...typeOverride, smartCondition: f.instruction, smartDependencies: validDeps };
+            delete (out as any).notSmartInstruction;
+            return out;
+          }
+          // LLM says not smart — strip stale smart tags, cache this instruction
+          // in notSmartInstruction so we don't re-classify on the next save.
+          const out = { ...f, ...typeOverride, notSmartInstruction: f.instruction };
+          delete (out as any).smartCondition;
+          delete (out as any).smartDependencies;
+          return out;
+        }),
+      };
+    } catch (err) {
+      // Fail soft — alias results still stand, save proceeds without smart tags.
+      // eslint-disable-next-line no-console
+      console.warn('[enrichmentConfigService] smart field classification failed:', err);
+    }
+  }
+
+  const { warnings } = validateConfig(enriched);
 
   // Stamp server-side audit fields, overwriting whatever the client sent.
   // Trusting client-provided timestamps would let bad clients backdate writes.
@@ -408,8 +580,16 @@ export async function setEnrichmentConfig(
     updatedBy: input.userId,
   };
 
-  await deps.writeListConfig(input.listId, stamped);
-  return stamped;
+  return { config: stamped, warnings };
+}
+
+export async function setEnrichmentConfig(
+  input: { listId: string; userId: string; config: EnrichmentConfig },
+  deps: ConfigServiceDeps,
+): Promise<{ config: EnrichmentConfig; warnings: string[] }> {
+  const { config, warnings } = await processEnrichmentConfig(input, deps);
+  await deps.writeListConfig(input.listId, config);
+  return { config, warnings };
 }
 
 export async function suggestFieldTypes(

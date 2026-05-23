@@ -1,15 +1,11 @@
-// Real-service adapters that satisfy v3.1 orchestrator deps.
+// Real-service adapters that satisfy the v3.1 orchestrator deps
+// (OrchestratorDeps + IdentityResolverDeps).
 //
-// Phase 1a status (matches what users see today):
-//   ✓ Apollo people + org enrichment via existing apolloService
-//   ✓ enrich.so reverse lookup via existing enrichSoService
-//   ✓ DDB read/write via crmDb
-//   ✗ Web fetch + LLM extraction + critic — stubbed (return empty / null)
-//     until Phase 1b wires the existing v2 extraction pipeline.
-//
-// Apollo direct-map fields WILL populate on a real run. Web-only groups
-// (intent_signals, company_social) will show 'missing' fields in the report,
-// which is expected behavior pre-Phase-1b.
+// Wires the orchestrator and waterfall to production services: Apollo
+// (people / org), enrich.so, Unipile, Google CSE web search + LLM extraction,
+// the critic pass, and DynamoDB read/write via crmDb. All external dependency
+// construction lives here so the orchestrator and waterfall stay pure and
+// unit-testable.
 
 import { crmDb } from './db';
 import { getApolloService, isApolloServiceReady } from './apolloService';
@@ -22,6 +18,8 @@ import { resolveIdentity as pureResolveIdentity } from './enrichmentIdentityReso
 import { runWaterfall as pureRunWaterfall } from './enrichmentGroupWaterfall';
 import { apolloAsyncRequestCacheKey, APOLLO_SCHEMA_VERSION } from './apolloCacheKeys';
 import { FIELD_GROUPS } from './enrichmentGroups';
+import { waitForApolloAsyncResult } from './enrichmentWaterfall';
+import { STANDARD_ENRICHABLE_FIELDS } from './enrichmentConfigService';
 import {
   getRawDataFromCache,
   writeRawDataToCache,
@@ -229,32 +227,12 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
               cacheType: 'apollo',
             });
           }
-          // Inline polling logic: up to 30s with backoff schedule.
-          const budgetMs = 30_000;
-          if (key) {
-            const intervals = [2000, 5000, 10000, 15000];
-            let attempt = 0;
-            const start = Date.now();
-            while (true) {
-              const remaining = budgetMs - (Date.now() - start);
-              if (remaining <= 0) return null;
-              const row: any = await crmDb.getEnrichmentCacheItem(key.canonicalId, key.sk).catch(() => null);
-              const status = row?.rawData?.status;
-              if (status === 'completed') {
-                const result = row.rawData.result || {};
-                if (typeof result.email === 'string' && result.email.length > 0) {
-                  return { email: result.email, emailStatus: result.emailStatus };
-                }
-                return null;
-              }
-              if (status === 'no_email' || status === 'rejected') return null;
-              const remainingAfterRead = budgetMs - (Date.now() - start);
-              if (remainingAfterRead <= 0) return null;
-              const baseDelay = intervals[Math.min(attempt, intervals.length - 1)];
-              const delay = Math.min(baseDelay, remainingAfterRead);
-              await new Promise((r) => setTimeout(r, delay));
-              attempt++;
-            }
+          // Poll the placeholder row for the webhook result — shared logic
+          // with the Tier 3 waterfall path. 30s budget: the identity path
+          // waits less than the waterfall's configurable 90s default.
+          const polled = await waitForApolloAsyncResult(f.asyncRequestId, 30_000);
+          if (polled?.email) {
+            return { email: polled.email, emailStatus: polled.emailStatus };
           }
         }
         return null;
@@ -281,7 +259,7 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
       // Split by destination: standard lead columns go to top-level (where
       // the lead table reads them); custom names go to customFields.
       // Matches STANDARD_LEAD_COLUMNS in crmEnrichmentServiceV3.ts.
-      const STANDARD = new Set(['firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'notes']);
+      const STANDARD = new Set<string>(STANDARD_ENRICHABLE_FIELDS);
       const topLevel: Record<string, string> = {};
       const customFields: Record<string, string> = {};
       const removeCustomFieldKeys: string[] = [];
@@ -442,6 +420,45 @@ async function fetchWebForGroupReal(
 
 // ─── LLM extraction (Tier 3 over Apollo / Tier 4 over web) ────────────────────
 
+export function buildFieldGuidanceV3(fields: string[], configFieldsByName: Record<string, { instruction?: string } | undefined>): string {
+  return fields.map(name => {
+    const fl = name.toLowerCase();
+    const instr = configFieldsByName[name]?.instruction || '';
+    let guidance: string;
+    if (/company_linkedin|company.*linkedin|linkedin.*company/.test(fl)) {
+      guidance = `ONLY copy a LinkedIn company page URL that appears verbatim in the source data above. The URL must start with "https://www.linkedin.com/company/". Do NOT construct, guess, or complete a URL. Return null if no exact /company/ URL is present in the data.`;
+    } else if (/linkedin/.test(fl)) {
+      guidance = `ONLY copy a linkedin.com/in/ URL that appears verbatim in the provided data. Do NOT construct, guess, or complete a URL — even if you think you know the person's LinkedIn handle. Do NOT use /pub/dir/ or /search/ URLs. Return null if no exact /in/ URL is present in the data.`;
+    } else if (instr) {
+      guidance = instr;
+    } else {
+      guidance = `Return only what is explicitly stated in the provided data. Return null if not present.`;
+    }
+    return `- ${name}: ${guidance}`;
+  }).join('\n');
+}
+
+export function rejectHallucinatedLinkedInUrls(filled: Record<string, string>, sourceContext: string): Record<string, string> {
+  const normalizedSource = sourceContext.toLowerCase().replace(/\s+/g, ' ').trim();
+  const result: Record<string, string> = {};
+  for (const [field, value] of Object.entries(filled)) {
+    if (/linkedin/i.test(field)) {
+      const slugMatch = value.match(/linkedin\.com\/(in|company)\/([^/?#\s]+)/i);
+      if (!slugMatch) {
+        console.warn(`[v3 deps] Rejected LinkedIn URL "${value}" for field "${field}" — no valid /in/ or /company/ path`);
+        continue;
+      }
+      const slug = slugMatch[2].toLowerCase();
+      if (!normalizedSource.includes(slug)) {
+        console.warn(`[v3 deps] Rejected hallucinated LinkedIn URL "${value}" for field "${field}" — slug "${slug}" not in source data`);
+        continue;
+      }
+    }
+    result[field] = value;
+  }
+  return result;
+}
+
 async function extractFieldsViaLLMReal(input: {
   tier: 'apollo' | 'web';
   sourceContext: string;
@@ -452,10 +469,7 @@ async function extractFieldsViaLLMReal(input: {
 }): Promise<{ filled: Record<string, string>; missing: string[] }> {
   if (input.fields.length === 0) return { filled: {}, missing: [] };
 
-  const fieldGuide = input.fields.map(name => {
-    const instr = input.configFieldsByName[name]?.instruction || '';
-    return `- ${name}${instr ? `: ${instr}` : ''}`;
-  }).join('\n');
+  const fieldGuide = buildFieldGuidanceV3(input.fields, input.configFieldsByName);
 
   const leadContext = JSON.stringify({
     email: input.lead.email,
@@ -503,7 +517,9 @@ async function extractFieldsViaLLMReal(input: {
         missing.push(field);
       }
     }
-    return { filled, missing };
+    const verified = rejectHallucinatedLinkedInUrls(filled, input.sourceContext);
+    const verifiedMissing = input.fields.filter(f => !(f in verified));
+    return { filled: verified, missing: [...new Set([...missing, ...verifiedMissing])] };
   } catch (err) {
     console.warn('[v3 deps] extractFieldsViaLLM failed:', (err as Error).message);
     return { filled: {}, missing: input.fields };
@@ -634,10 +650,18 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
         const items = await crmDb.batchGetLeads(listId, leadIds);
         return items as LeadRecord[];
       }
-      // Whole-list run → single Query page. No explicit limit: DDB returns
-      // up to ~1MB worth of items in one round-trip.
-      const result = await crmDb.getLeadsByListId(listId);
-      return (result?.items ?? []) as LeadRecord[];
+      // Whole-list run → page through the Query fully. A single
+      // getLeadsByListId call returns at most one ~1MB DDB page; without this
+      // loop, lists larger than that page are silently truncated and the
+      // remaining leads are never enriched.
+      const all: LeadRecord[] = [];
+      let startKey: any = undefined;
+      do {
+        const page = await crmDb.getLeadsByListId(listId, undefined, startKey);
+        all.push(...((page?.items ?? []) as LeadRecord[]));
+        startKey = page?.lastEvaluatedKey ?? null;
+      } while (startKey);
+      return all;
     },
 
     resolveIdentity: (input) => pureResolveIdentity(input, identityDeps),
@@ -812,6 +836,27 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
         missing: llmResult.missing,
         tierFills: { crm: 0, apollo: 0, web: filled.length, missing: llmResult.missing.length },
       };
+    },
+
+    evaluateSmartField: async ({ fieldName, condition, depValues }) => {
+      const {
+        buildSmartFieldEvalSystemPrompt,
+        buildSmartFieldEvalUserPrompt,
+      } = await import('./enrichmentPrompts');
+      try {
+        const llm = createLLMService(EXTRACT_MODEL, 0.0);
+        const result = await llm.generateJSONContent<{ value: string | null; reasoning: string }>(
+          buildSmartFieldEvalSystemPrompt(),
+          buildSmartFieldEvalUserPrompt(fieldName, condition, depValues),
+        );
+        return {
+          value: result?.value != null ? String(result.value) : null,
+          reasoning: result?.reasoning ?? '',
+        };
+      } catch (err) {
+        console.warn('[v3 deps] evaluateSmartField failed:', (err as Error).message);
+        return { value: null, reasoning: '' };
+      }
     },
 
     runCriticOverWebFills: runCriticReal,

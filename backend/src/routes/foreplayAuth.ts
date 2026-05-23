@@ -1,7 +1,8 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
-import { userDb } from '../services/db';
+import { userDb, orgDb } from '../services/db';
 import { encryptPassword } from '../utils/crypto';
+import { canEditItem } from '../services/orgShareService';
 import { getAccessToken, getUsage, listBoards, getBoardAds, getSwipefileAds, getAd, clearForeplayCacheForToken } from '../services/foreplayService';
 
 const router = express.Router();
@@ -32,9 +33,28 @@ router.post('/save-token', authenticateToken, async (req: any, res) => {
       throw apiError;
     }
 
-    // Encrypt and save token to user secrets
-    const encryptedToken = encryptPassword(foreplayToken.trim(), userId);
     const user = await userDb.getUserById(userId);
+    const orgId = user?.orgId;
+
+    if (orgId) {
+      // Org user: gate on KB-editor or owner permission
+      const org = await orgDb.getOrgById(orgId);
+      const userLike = { userId, orgId, orgRole: user?.orgRole as 'owner' | 'member' | undefined };
+      const itemLike = { userId: org?.ownerUserId };
+      if (!canEditItem(itemLike, userLike, org, orgId, 'knowledgeBase')) {
+        return res.status(403).json({ error: 'Only org admins or KB editors can connect Foreplay for the org' });
+      }
+
+      // Encrypt and save token to org secrets
+      const encryptedToken = encryptPassword(foreplayToken.trim(), orgId);
+      await orgDb.setOrgSecret(orgId, 'foreplay_api_token', encryptedToken);
+
+      console.log(`[Foreplay] Token saved for org ${orgId} by user ${userId}`);
+      return res.json({ success: true, boards });
+    }
+
+    // Solo user: store per-user (original behaviour)
+    const encryptedToken = encryptPassword(foreplayToken.trim(), userId);
     const existingSecrets = (user?.secrets as Record<string, string>) || {};
     const updatedSecrets = { ...existingSecrets, foreplay_api_token: encryptedToken };
     await userDb.updateUser(userId, { secrets: updatedSecrets });
@@ -173,11 +193,27 @@ router.post('/disconnect', authenticateToken, async (req: any, res) => {
     const tokenToClear = await getAccessToken(userId);
 
     const user = await userDb.getUserById(userId);
+    const orgId = user?.orgId;
+
+    if (orgId) {
+      // Org user: gate on KB-editor or owner permission
+      const org = await orgDb.getOrgById(orgId);
+      const userLike = { userId, orgId, orgRole: user?.orgRole as 'owner' | 'member' | undefined };
+      const itemLike = { userId: org?.ownerUserId };
+      if (!canEditItem(itemLike, userLike, org, orgId, 'knowledgeBase')) {
+        return res.status(403).json({ error: 'Only org admins or KB editors can disconnect Foreplay for the org' });
+      }
+
+      await orgDb.removeOrgSecret(orgId, 'foreplay_api_token');
+      if (tokenToClear) clearForeplayCacheForToken(tokenToClear);
+
+      console.log(`[Foreplay Disconnect] Token removed for org ${orgId} by user ${userId}`);
+      return res.json({ success: true });
+    }
+
+    // Solo user: remove per-user token (original behaviour)
     const existingSecrets = (user?.secrets as Record<string, string>) || {};
-
-    // Remove foreplay_api_token
     const { foreplay_api_token, ...remainingSecrets } = existingSecrets;
-
     await userDb.updateUser(userId, { secrets: remainingSecrets });
 
     if (tokenToClear) clearForeplayCacheForToken(tokenToClear);
