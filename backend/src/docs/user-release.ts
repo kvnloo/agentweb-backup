@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-23',
     changes: [
+      'Fixed: CRM Inbox "Last Contact" No Longer Shows Enrichment Time',
+      '- Enriching a lead record (company info, industry, etc.) was updating the record\'s modified timestamp, which the CRM inbox was incorrectly showing as the "Last contact" time',
+      '- Leads with no real contact history now show their creation date instead of the last enrichment time, so "Last contact" only reflects actual engagement events',
+    ],
+  },
+  {
+    date: '2026-05-23',
+    changes: [
       'Fixed: Knowledge Base Files Can Now Be Read Back Immediately After Writing',
       '- Creating or updating a knowledge base file would succeed (returning a valid size and timestamp) but reading it back immediately returned "Knowledge base file not found in storage"',
       '- The root cause was a mismatch in storage bucket environment variables: write operations used KNOWLEDGE_BASE_BUCKET / PRIVATE_KNOWLEDGE_BASE_BUCKET while read operations used GCS_BUCKET_NAME / GCS_BUCKET_NAME_PRIVATE, which in production resolved to the wrong (dev) bucket',
