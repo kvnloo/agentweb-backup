@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-21
+// Last updated: 2026-05-22
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,15 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-05-22',
+    changes: [
+      'Improved: Browser Automation Skill Now Falls Back to Local Agent When Headless Browser Fails',
+      '- When a website blocks the headless cloud browser (bot protection, Cloudflare, React crash, blank page), the Browser Automation skill now automatically uses the Local Agent as a fallback',
+      '- The Local Agent tool is now bundled directly into the Browser Automation skill so it is always available without a separate install',
+      '- Previously, the agent would report the site as broken or inaccessible; now it retries via the Local Agent which uses a real (non-headless) browser',
+    ],
+  },
   {
     date: '2026-05-22',
     changes: [
