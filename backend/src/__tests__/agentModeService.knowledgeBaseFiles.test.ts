@@ -42,8 +42,8 @@ describe('AgentModeService - Knowledge Base Files', () => {
 
     process.env.GCS_PROJECT_ID = 'test-project';
     process.env.GCS_CLIENT_EMAIL = 'test@example.com';
-    process.env.GCS_BUCKET_NAME = 'test-bucket';
-    process.env.GCS_BUCKET_NAME_PRIVATE = 'test-bucket-private';
+    process.env.KNOWLEDGE_BASE_BUCKET = 'test-bucket';
+    process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET = 'test-bucket-private';
   });
 
   describe('list_knowledge_base_files', () => {
@@ -362,7 +362,26 @@ describe('AgentModeService - Knowledge Base Files', () => {
         );
 
         const storageInstance = mockedStorage.mock.results[0].value;
+        // Read must use KNOWLEDGE_BASE_BUCKET (same var as write) to avoid write/read bucket mismatch
         expect(storageInstance.bucket).toHaveBeenCalledWith('test-bucket');
+      });
+
+      it('should use private bucket when knowledgeBaseType is private', async () => {
+        const mockTask = { taskId: 'task-1', userId: 'user-123', name: 'Task 1', knowledgeBaseSize: 1024, knowledgeBaseType: 'private' };
+        const mockContent = Buffer.from('Test content');
+        mockedTaskDb.getTaskById.mockResolvedValue(mockTask as any);
+        mockFile.exists.mockResolvedValue([true]);
+        mockFile.download.mockResolvedValue([mockContent]);
+        mockFile.getMetadata = jest.fn().mockResolvedValue([{ contentType: 'text/plain' }]);
+
+        await (agentModeService as any).readKnowledgeBaseFiles(
+          [{ kb_identifier: 'task-1', file_name: 'knowledge-base.txt' }],
+          'user-123'
+        );
+
+        const storageInstance = mockedStorage.mock.results[0].value;
+        // Read must use PRIVATE_KNOWLEDGE_BASE_BUCKET (same var as write) to avoid write/read bucket mismatch
+        expect(storageInstance.bucket).toHaveBeenCalledWith('test-bucket-private');
       });
 
       it('should truncate content when it exceeds 1MB limit', async () => {
