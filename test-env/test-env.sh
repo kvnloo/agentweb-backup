@@ -423,6 +423,16 @@ VITE_DEBUG=true' > /home/ec2-user/agentweb/customer-portal/.env.local"
         "$SCRIPT_DIR/cloud-dev-claude.md" "$SSH_USER@$PUBLIC_IP:/home/ec2-user/.claude/CLAUDE.md"
     remote "sed -i 's|PUBLIC_IP|$PUBLIC_IP|g' /home/ec2-user/.claude/CLAUDE.md"
 
+    # Restore persisted Claude memory into user-level memory directory
+    if [[ -d "$REPO_ROOT/.claude/memory" ]]; then
+      log "Restoring Claude memory..."
+      MEMORY_DEST="/home/ec2-user/.claude/projects/-home-ec2-user-agentweb/memory"
+      remote "mkdir -p '$MEMORY_DEST'"
+      rsync -az \
+        -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i $KEY_FILE" \
+        "$REPO_ROOT/.claude/memory/" "$SSH_USER@$PUBLIC_IP:$MEMORY_DEST/"
+    fi
+
     # Authenticate gh CLI with GitHub PAT from Secrets Manager
     log "Authenticating gh CLI..."
     remote "aws secretsmanager get-secret-value \
