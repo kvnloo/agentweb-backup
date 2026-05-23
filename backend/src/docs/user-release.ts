@@ -18,14 +18,21 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-23',
+    changes: [
+      'Fixed: Group Email Unsubscribe Links Now Work Correctly',
+      '- Group emails sent to CRM leads now include a properly formatted unsubscribe link that leads to the correct unsubscribe page',
+      '- Templates using either {{unsubscribeUrl}} or {{unsubscribe_url}} are now both recognized and substituted — previously the snake_case variant caused all leads to be skipped as "missing variables"',
+      '- The email preview in the composer no longer appends a duplicate unsubscribe footer when the template already contains an unsubscribe link',
+    ],
+  },
+  {
     date: '2026-05-22',
     changes: [
       'Improved: Browser Automation Skill Now Falls Back to Local Agent When Headless Browser Fails',
       '- When a website blocks the headless cloud browser (bot protection, Cloudflare, React crash, blank page), the Browser Automation skill now automatically uses the Local Agent as a fallback',
       '- The Local Agent tool is now bundled directly into the Browser Automation skill so it is always available without a separate install',
       '- Previously, the agent would report the site as broken or inaccessible; now it retries via the Local Agent which uses a real (non-headless) browser',
-    ],
-  },
   {
     date: '2026-05-22',
     changes: [
