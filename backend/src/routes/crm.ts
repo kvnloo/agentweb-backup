@@ -5305,7 +5305,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
         // routes/crmPublic.ts accepts the legacy unsigned form as a fallback
         // for emails sent before this change.
         const unsubscribeUrl = signUnsubscribeUrl({
-          baseUrl: `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe`,
+          baseUrl: CUSTOMER_FRONTEND_URL,
           listId,
           leadId: lead.leadId,
           email: lead.email,
@@ -5394,7 +5394,7 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
 
     const CUSTOMER_FRONTEND_URL_TEST = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
     const testUnsubscribeUrl = signUnsubscribeUrl({
-      baseUrl: `${CUSTOMER_FRONTEND_URL_TEST}/crm-unsubscribe`,
+      baseUrl: CUSTOMER_FRONTEND_URL_TEST,
       listId,
       leadId: 'TEST',
       email: recipients[0]?.trim() || 'test@example.com',

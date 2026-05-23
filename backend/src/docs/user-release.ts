@@ -18,6 +18,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-23',
+    changes: [
+      'Fixed: Group Email Unsubscribe Links Now Work Correctly',
+      '- Group emails sent to CRM leads now include a properly formatted unsubscribe link that leads to the correct unsubscribe page',
+      '- Templates using either {{unsubscribeUrl}} or {{unsubscribe_url}} are now both recognized and substituted — previously the snake_case variant caused all leads to be skipped as "missing variables"',
+      '- The email preview in the composer no longer appends a duplicate unsubscribe footer when the template already contains an unsubscribe link',
+    ],
+  },
+  {
     date: '2026-05-22',
     changes: [
       'Improved: Browser Automation Skill Now Falls Back to Local Agent When Headless Browser Fails',
