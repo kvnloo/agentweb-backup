@@ -42,8 +42,8 @@ describe('AgentModeService - Knowledge Base Files', () => {
 
     process.env.GCS_PROJECT_ID = 'test-project';
     process.env.GCS_CLIENT_EMAIL = 'test@example.com';
-    process.env.KNOWLEDGE_BASE_BUCKET = 'test-bucket';
-    process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET = 'test-bucket-private';
+    process.env.GCS_BUCKET_NAME = 'test-bucket';
+    process.env.GCS_BUCKET_NAME_PRIVATE = 'test-bucket-private';
   });
 
   describe('list_knowledge_base_files', () => {

@@ -9732,8 +9732,8 @@ Format the response as JSON with this structure:
       });
 
       const bucketName = knowledgeBaseType === 'public'
-        ? (process.env.KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-dev')
-        : (process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-private-dev');
+        ? (process.env.GCS_BUCKET_NAME || 'agentweb-knowledge-base-dev')
+        : (process.env.GCS_BUCKET_NAME_PRIVATE || 'agentweb-knowledge-base-private-dev');
 
       const bucket = storage.bucket(bucketName);
       const filePath = `tasks/${taskId}/knowledge-base.txt`;
@@ -9863,8 +9863,8 @@ Format the response as JSON with this structure:
       // 4. Determine bucket based on knowledgeBaseType
       const knowledgeBaseType = task.knowledgeBaseType || 'private';
       const bucketName = knowledgeBaseType === 'public'
-        ? (process.env.KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-dev')
-        : (process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-private-dev');
+        ? (process.env.GCS_BUCKET_NAME || 'agentweb-knowledge-base-dev')
+        : (process.env.GCS_BUCKET_NAME_PRIVATE || 'agentweb-knowledge-base-private-dev');
 
       const bucket = storage.bucket(bucketName);
 
@@ -10055,8 +10055,8 @@ Format the response as JSON with this structure:
 
       const knowledgeBaseType = task.knowledgeBaseType || 'private';
       const bucketName = knowledgeBaseType === 'public'
-        ? (process.env.KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-dev')
-        : (process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-private-dev');
+        ? (process.env.GCS_BUCKET_NAME || 'agentweb-knowledge-base-dev')
+        : (process.env.GCS_BUCKET_NAME_PRIVATE || 'agentweb-knowledge-base-private-dev');
 
       const bucket = storage.bucket(bucketName);
       const kbFiles = task.knowledgeBaseFiles || [];
@@ -14748,8 +14748,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       projectId: process.env.GCS_PROJECT_ID,
       credentials: { client_email: process.env.GCS_CLIENT_EMAIL, private_key: privateKey }
     });
-    const BUCKET_NAME = process.env.KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-dev';
-    const PRIVATE_BUCKET_NAME = process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-private-dev';
+    const BUCKET_NAME = process.env.GCS_BUCKET_NAME || 'agentweb-knowledge-base-dev';
+    const PRIVATE_BUCKET_NAME = process.env.GCS_BUCKET_NAME_PRIVATE || 'agentweb-knowledge-base-private-dev';
     const bucketType = task.knowledgeBaseType || 'private';
     const bucket = storage.bucket(bucketType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
 
