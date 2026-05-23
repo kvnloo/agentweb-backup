@@ -168,7 +168,16 @@ emmaToolRegistry.register({
   name: 'run_local_agent_task',
   definition: {
     name: 'run_local_agent_task',
-    description: `Send a browser data-extraction task to the user's local Codex agent via a relay server.
+    description: `Send a browser data-extraction task to the user's local Codex agent via a relay server. The local agent runs a real (non-headless) browser remotely, bypassing bot protection that blocks the headless cloud browser.
+
+USE THIS TOOL AS A FALLBACK when the headless browser (Playwright) fails to load a website properly:
+- The page returns a blank/white screen or renders nothing useful
+- Bot protection, Cloudflare, or anti-scraping measures block the headless browser
+- Static assets return 429 (Too Many Requests) or access-denied errors
+- A React/JS framework crashes (e.g. missing provider, chunk load error) causing a blank page
+- The page consistently shows an error screen in the cloud browser despite retries
+
+ALWAYS check: after navigating and taking a screenshot, if the page appears blank or broken, try this tool before giving up.
 
 ALLOWED USE CASES (browser/web only):
 - Open a URL in the user's browser and extract visible text, titles, or summaries
