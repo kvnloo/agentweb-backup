@@ -33,9 +33,20 @@ export interface Variant {
   variantId: string;
   /** 'control' | 'treatment' */
   type: 'control' | 'treatment';
-  /** Weight 0–1 (must sum to 1 across all active variants for a step). */
+  /** Weight 0–1 (must sum to 1 across active, non-pending variants for a step). */
   weight: number;
   copy: VariantCopy;
+  /**
+   * When true this variant was proposed by the loop cron but not yet approved
+   * by Harsha. The variant route will not serve it to users until the watchdog
+   * activates it (clears the flag) after ✅ reaction or 6pm PT auto-ship.
+   */
+  pending?: boolean;
+  /** ISO timestamp when the variant was staged pending approval. */
+  pendingApprovalTs?: string;
+  /** Slack DM channel + ts that carries the approval request for this variant. */
+  pendingSlackChannel?: string;
+  pendingSlackTs?: string;
   /** Bucket-level stats — updated by the loop cron. */
   stats?: {
     n: number;
@@ -138,7 +149,10 @@ export function resolveVariant(
   const stepConfig = config.steps[step];
   if (!stepConfig?.active_variants?.length) return null;
 
-  const variants = stepConfig.active_variants;
+  // Exclude variants that are staged pending approval — not yet active for users.
+  const variants = stepConfig.active_variants.filter((v) => !v.pending);
+  if (!variants.length) return null;
+
   // Stable bucket: deterministic float 0..1 from hash of userId+step.
   const bucket = stableHashBucket(userId + step);
 

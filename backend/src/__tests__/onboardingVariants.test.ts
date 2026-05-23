@@ -185,6 +185,42 @@ describe('resolveVariant', () => {
     const result = resolveVariant(config, 'test', 'user-1');
     expect(result).not.toBeNull();
   });
+
+  test('pending variant is never served to users', () => {
+    const pendingVariant: Variant = {
+      variantId: 'pending-treat',
+      type: 'treatment',
+      weight: 0.3,
+      copy: { heading: 'Pending heading' },
+      pending: true,
+      pendingApprovalTs: new Date().toISOString(),
+    };
+    const config = makeConfig({
+      steps: {
+        brand: { active_variants: [controlVariant, pendingVariant] },
+      },
+    });
+    // All 500 users should get 'control' since 'pending-treat' is pending
+    const N = 500;
+    for (let i = 0; i < N; i++) {
+      const v = resolveVariant(config, 'brand', `user-${i}`);
+      expect(v?.variantId).toBe('control');
+    }
+  });
+
+  test('returns null when all variants are pending', () => {
+    const pendingVariant: Variant = {
+      variantId: 'all-pending',
+      type: 'treatment',
+      weight: 1.0,
+      copy: { heading: 'Pending' },
+      pending: true,
+    };
+    const config = makeConfig({
+      steps: { brand: { active_variants: [pendingVariant] } },
+    });
+    expect(resolveVariant(config, 'brand', 'user-1')).toBeNull();
+  });
 });
 
 // -----------------------------------------------------------------------

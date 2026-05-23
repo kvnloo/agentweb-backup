@@ -12,7 +12,7 @@
 
 import AWS from 'aws-sdk';
 import { WebClient } from '@slack/web-api';
-import { readConfig } from '../services/onboardingLoopConfig';
+import { readConfig, writeConfig, invalidateConfigCache } from '../services/onboardingLoopConfig';
 import { LLMService } from '../utils/llmService';
 import { LLMServiceInterface, StepStats, sensorScan, diagnoseUnderperforming, generateMutations, validateBusinessRules, critiqueMutations } from '../services/onboardingLoopAgents';
 import { postDailySlackDM } from '../services/onboardingLoopApproval';
@@ -179,36 +179,72 @@ export async function runOnboardingLoop(): Promise<void> {
       return;
     }
 
-    // Post Slack DM — approval is async (pollApprovalDecision called separately)
-    const slackUserId = process.env.ONBOARDING_LOOP_APPROVER_SLACK_USER_ID;
-    if (!slackUserId) {
-      console.warn('[OnboardingLoop] ONBOARDING_LOOP_APPROVER_SLACK_USER_ID not set — skipping Slack DM');
-    } else if (!process.env.SLACK_BOT_TOKEN) {
-      console.warn('[OnboardingLoop] SLACK_BOT_TOKEN not set — skipping Slack DM');
-    } else {
-      const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-      const { channel, ts } = await postDailySlackDM(
-        proposedMutations,
-        stats,
-        slackUserId,
-        slackClient,
-      );
-      console.log(`[OnboardingLoop] Slack DM posted — channel=${channel} ts=${ts}`);
+    // -----------------------------------------------------------------------
+    // Stage proposed variants in config with pending=true.
+    // The variant route skips pending variants until the watchdog activates
+    // them after ✅ approval or 6pm PT auto-ship.
+    // -----------------------------------------------------------------------
+    const pendingTs = new Date().toISOString();
+    const updatedConfig = JSON.parse(JSON.stringify(config)) as typeof config;
+    let latestVersionId = versionId;
 
-      await logRun(docClient, runId, 'completed', {
-        proposedSteps: proposedMutations.map((m) => m.step),
-        mutationCount: proposedMutations.reduce((sum, m) => sum + m.variants.length, 0),
-        slackChannel: channel,
-        slackTs: ts,
-        versionId,
-      });
-      return;
+    let slackChannel = '';
+    let slackTs = '';
+
+    // Post Slack DM first so we have the channel+ts to stamp on each variant.
+    const slackUserId = process.env.ONBOARDING_LOOP_APPROVER_SLACK_USER_ID;
+    if (slackUserId && process.env.SLACK_BOT_TOKEN) {
+      try {
+        const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+        const dm = await postDailySlackDM(proposedMutations, stats, slackUserId, slackClient);
+        slackChannel = dm.channel;
+        slackTs = dm.ts;
+        console.log(`[OnboardingLoop] Slack DM posted — channel=${slackChannel} ts=${slackTs}`);
+      } catch (err) {
+        console.warn('[OnboardingLoop] Slack DM failed (non-fatal):', err);
+      }
+    } else {
+      console.warn('[OnboardingLoop] Slack env vars missing — staging proposals without DM notification');
+    }
+
+    for (const { step, variants } of proposedMutations) {
+      if (!updatedConfig.steps[step]) {
+        updatedConfig.steps[step] = { active_variants: [] };
+      }
+      const stepCfg = updatedConfig.steps[step];
+
+      // Enforce max_active_arms_per_step — don't stage if already at cap.
+      const activeCount = stepCfg.active_variants.filter((v) => !v.pending).length;
+      const pendingCount = stepCfg.active_variants.filter((v) => v.pending).length;
+      const availableSlots = Math.max(0, config.thresholds.max_active_arms_per_step - activeCount - pendingCount);
+
+      const toStage = variants.slice(0, availableSlots);
+      for (const { variant } of toStage) {
+        stepCfg.active_variants.push({
+          ...variant,
+          pending: true,
+          pendingApprovalTs: pendingTs,
+          ...(slackChannel ? { pendingSlackChannel: slackChannel, pendingSlackTs: slackTs } : {}),
+        });
+      }
+      console.log(`[OnboardingLoop] Staged ${toStage.length} pending variants for step "${step}"`);
+    }
+
+    // Write updated config to S3.
+    try {
+      latestVersionId = await writeConfig(updatedConfig, latestVersionId);
+      invalidateConfigCache();
+      console.log(`[OnboardingLoop] Config written — new versionId=${latestVersionId}`);
+    } catch (err) {
+      console.error('[OnboardingLoop] Config write failed:', err);
+      // Don't abort — log and continue. Variants weren't staged but DM was sent.
     }
 
     await logRun(docClient, runId, 'completed', {
       proposedSteps: proposedMutations.map((m) => m.step),
       mutationCount: proposedMutations.reduce((sum, m) => sum + m.variants.length, 0),
-      versionId,
+      ...(slackChannel ? { slackChannel, slackTs } : {}),
+      versionId: latestVersionId,
     });
   } catch (error) {
     console.error('[OnboardingLoop] CRITICAL ERROR:', error);

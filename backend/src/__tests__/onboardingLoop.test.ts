@@ -1078,4 +1078,85 @@ describe('runOnboardingLoopWatchdog', () => {
     await runOnboardingLoopWatchdog();
     expect(mockChatPostMessage).not.toHaveBeenCalled();
   });
+
+  test('activates pending variant when ✅ reaction received', async () => {
+    process.env.ONBOARDING_LOOP_ENABLED = 'true';
+    process.env.SLACK_BOT_TOKEN = 'xoxb-test';
+
+    const config = makeConfig({
+      steps: {
+        brand: {
+          active_variants: [
+            makeVariant('ctrl', 1.0, 'control'),
+            {
+              variantId: 'pending-treat',
+              type: 'treatment',
+              weight: 0.1,
+              copy: { heading: 'New heading' },
+              pending: true,
+              pendingApprovalTs: new Date().toISOString(),
+              pendingSlackChannel: 'C-test',
+              pendingSlackTs: '123.456',
+            },
+          ],
+        },
+      },
+    });
+    mockS3Config(config);
+    mockGetAllUsers.mockResolvedValue([]);
+    mockReactionsGet.mockResolvedValue({
+      ok: true,
+      message: { reactions: [{ name: 'white_check_mark' }] },
+    });
+    mockConversationsReplies.mockResolvedValue({ ok: true, messages: [] });
+    mockPutObject.mockReturnValue({ promise: () => Promise.resolve({ VersionId: 'v2' }) });
+
+    await runOnboardingLoopWatchdog();
+
+    expect(mockPutObject).toHaveBeenCalled();
+    const written = JSON.parse(mockPutObject.mock.calls[0][0].Body);
+    const activatedVariant = written.steps.brand.active_variants.find((v: any) => v.variantId === 'pending-treat');
+    expect(activatedVariant).toBeDefined();
+    expect(activatedVariant.pending).toBeUndefined();
+  });
+
+  test('removes pending variant when ❌ reaction received', async () => {
+    process.env.ONBOARDING_LOOP_ENABLED = 'true';
+    process.env.SLACK_BOT_TOKEN = 'xoxb-test';
+
+    const config = makeConfig({
+      steps: {
+        brand: {
+          active_variants: [
+            makeVariant('ctrl', 1.0, 'control'),
+            {
+              variantId: 'denied-treat',
+              type: 'treatment',
+              weight: 0.1,
+              copy: { heading: 'Denied heading' },
+              pending: true,
+              pendingApprovalTs: new Date().toISOString(),
+              pendingSlackChannel: 'C-test',
+              pendingSlackTs: '123.456',
+            },
+          ],
+        },
+      },
+    });
+    mockS3Config(config);
+    mockGetAllUsers.mockResolvedValue([]);
+    mockReactionsGet.mockResolvedValue({
+      ok: true,
+      message: { reactions: [{ name: 'x' }] },
+    });
+    mockConversationsReplies.mockResolvedValue({ ok: true, messages: [] });
+    mockPutObject.mockReturnValue({ promise: () => Promise.resolve({ VersionId: 'v2' }) });
+
+    await runOnboardingLoopWatchdog();
+
+    expect(mockPutObject).toHaveBeenCalled();
+    const written = JSON.parse(mockPutObject.mock.calls[0][0].Body);
+    const deniedVariant = written.steps.brand.active_variants.find((v: any) => v.variantId === 'denied-treat');
+    expect(deniedVariant).toBeUndefined();
+  });
 });

@@ -18,9 +18,11 @@ import { WebClient } from '@slack/web-api';
 import {
   readConfig,
   writeConfig,
+  invalidateConfigCache,
   OnboardingLoopConfig,
   Variant,
 } from '../services/onboardingLoopConfig';
+import { pollApprovalDecision, checkAutoShipConditions } from '../services/onboardingLoopApproval';
 import { sensorScan, StepStats } from '../services/onboardingLoopAgents';
 import { userDb } from '../services/db';
 
@@ -72,6 +74,65 @@ export async function runOnboardingLoopWatchdog(): Promise<void> {
           console.log(
             `[OnboardingWatchdog] Retiring variant "${stat.variantId}" on step "${stat.step}": ${retiredVariants[retiredVariants.length - 1].reason}`,
           );
+        }
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pending variant activation: poll Slack reactions for staged proposals.
+    // If ✅ approved (or 6pm PT auto-ship) → activate variant (clear pending).
+    // If ❌ denied or 🛑 hold → remove variant from config.
+    // -----------------------------------------------------------------------
+    const hasWatchdogWarnings = retiredVariants.length > 0;
+    const slackToken = process.env.SLACK_BOT_TOKEN;
+    const slackClient = slackToken ? new WebClient(slackToken) : null;
+
+    for (const [stepName, stepCfg] of Object.entries(updatedConfig.steps)) {
+      const pendingVariants = stepCfg.active_variants.filter((v) => v.pending);
+      if (pendingVariants.length === 0) continue;
+
+      for (const variant of pendingVariants) {
+        if (!variant.pendingSlackChannel || !variant.pendingSlackTs || !slackClient) {
+          // No Slack DM to poll — auto-activate after 24h staging window.
+          const stagedAt = variant.pendingApprovalTs ? new Date(variant.pendingApprovalTs).getTime() : 0;
+          if (Date.now() - stagedAt > 24 * 60 * 60 * 1000) {
+            if (checkAutoShipConditions(stats, hasWatchdogWarnings)) {
+              delete variant.pending;
+              delete variant.pendingApprovalTs;
+              dirty = true;
+              console.log(`[OnboardingWatchdog] Auto-activated pending variant "${variant.variantId}" on step "${stepName}" (no Slack, 24h elapsed)`);
+            }
+          }
+          continue;
+        }
+
+        try {
+          const decision = await pollApprovalDecision(
+            variant.pendingSlackChannel,
+            variant.pendingSlackTs,
+            slackClient,
+            config.approval.auto_ship_cutoff_hour_pt,
+          );
+
+          if (decision.decision === 'approved' || decision.decision === 'auto_ship') {
+            if (decision.decision === 'auto_ship' && !checkAutoShipConditions(stats, hasWatchdogWarnings)) {
+              console.log(`[OnboardingWatchdog] auto_ship blocked by conditions for variant "${variant.variantId}" — holding`);
+              continue;
+            }
+            delete variant.pending;
+            delete variant.pendingApprovalTs;
+            delete variant.pendingSlackChannel;
+            delete variant.pendingSlackTs;
+            dirty = true;
+            console.log(`[OnboardingWatchdog] Activated variant "${variant.variantId}" on step "${stepName}" (${decision.decision})`);
+          } else if (decision.decision === 'denied') {
+            stepCfg.active_variants = stepCfg.active_variants.filter((v) => v.variantId !== variant.variantId);
+            dirty = true;
+            console.log(`[OnboardingWatchdog] Removed denied variant "${variant.variantId}" on step "${stepName}"`);
+          }
+          // 'hold' → leave pending, check again next hour
+        } catch (err) {
+          console.warn(`[OnboardingWatchdog] Slack poll failed for variant "${variant.variantId}":`, err);
         }
       }
     }
@@ -129,6 +190,7 @@ export async function runOnboardingLoopWatchdog(): Promise<void> {
     // -----------------------------------------------------------------------
     if (dirty) {
       const newVersionId = await writeConfig(updatedConfig, versionId);
+      invalidateConfigCache();
       console.log(
         `[OnboardingWatchdog] Config updated — new versionId=${newVersionId}, ` +
           `retired=${retiredVariants.length}, paused=${updatedConfig.paused}`,
