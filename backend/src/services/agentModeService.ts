@@ -14748,8 +14748,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       projectId: process.env.GCS_PROJECT_ID,
       credentials: { client_email: process.env.GCS_CLIENT_EMAIL, private_key: privateKey }
     });
-    const BUCKET_NAME = process.env.GCS_BUCKET_NAME || 'agentweb-knowledge-base-dev';
-    const PRIVATE_BUCKET_NAME = process.env.GCS_BUCKET_NAME_PRIVATE || 'agentweb-knowledge-base-private-dev';
+    const BUCKET_NAME = process.env.KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-dev';
+    const PRIVATE_BUCKET_NAME = process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-private-dev';
     const bucketType = task.knowledgeBaseType || 'private';
     const bucket = storage.bucket(bucketType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
 

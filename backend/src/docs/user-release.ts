@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-23',
+    changes: [
+      'Fixed: Knowledge Base Files Can Now Be Read Back Immediately After Writing',
+      '- Creating or updating a knowledge base file would succeed (returning a valid size and timestamp) but reading it back immediately returned "Knowledge base file not found in storage"',
+      '- The root cause was a mismatch in storage bucket environment variables: write operations used KNOWLEDGE_BASE_BUCKET / PRIVATE_KNOWLEDGE_BASE_BUCKET while read operations used GCS_BUCKET_NAME / GCS_BUCKET_NAME_PRIVATE, which in production resolved to the wrong (dev) bucket',
+      '- Read operations now use the same bucket environment variables as writes, so files are immediately readable after being created or updated',
+    ],
+  },
+  {
     date: '2026-05-22',
     changes: [
       'Improved: Browser Automation Skill Now Falls Back to Local Agent When Headless Browser Fails',
