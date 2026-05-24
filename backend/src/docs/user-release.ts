@@ -9,6 +9,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-24',
+    changes: [
+      'Fixed: Admin Notes on Client Health Page Now Save Correctly',
+      '- Notes written in the Client Health dashboard were accepted by the server but silently discarded — they would vanish after refreshing the page',
+      '- Notes are now persisted to the client record and pre-populated when you reopen a client\'s health detail panel',
+    ],
+  },
+  {
     date: '2026-05-23',
     changes: [
       'Fixed: CRM Inbox "Last Contact" No Longer Shows Enrichment Time',
