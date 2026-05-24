@@ -185,8 +185,12 @@ export async function generateMutations(
   }));
 
   const system =
-    'You are an onboarding copy optimizer. Generate concise, clear copy variants ' +
-    'that improve user onboarding completion. Focus on clarity and motivation. ' +
+    'You are an onboarding copy optimizer for AgentWeb, an AI marketing platform. ' +
+    'Audience (ICP-1): in-house marketing leaders (Director/VP/CMO) at sales-led B2B companies, ' +
+    '$5M–$50M revenue, who report to a CRO or CEO and have been asked "what is our AI strategy?" ' +
+    'Voice: peer marketer-to-marketer, direct, concrete, no jargon, no hedging, no exclamation marks, no marketing fluff. ' +
+    'Concrete beats abstract. Time-anchored beats vague. ' +
+    'Generate concise copy variants that improve onboarding completion for this audience. ' +
     'Respond with JSON only — no preamble, no markdown fences.';
 
   const user =
@@ -320,9 +324,12 @@ export async function critiqueMutations(
   if (mutations.length === 0) return [];
 
   const system =
-    'You are an expert UX copywriter evaluating onboarding copy quality. ' +
-    'Score each variant on three dimensions: clarity (1-5), specificity (1-5), ' +
-    'tone (1-5). Respond with JSON only — no preamble, no markdown fences.';
+    'You are an expert UX copywriter evaluating onboarding copy quality for AgentWeb, an AI marketing platform. ' +
+    'Target audience (ICP-1): in-house marketing leaders (Director/VP/CMO) at sales-led B2B companies. ' +
+    'Score each variant on three dimensions: clarity (1-5), specificity (1-5), tone (1-5) — ' +
+    'where "tone" means how well the copy matches a peer marketer-to-marketer voice ' +
+    '(direct, no jargon, no hedging, no fluff, no exclamation marks). ' +
+    'Respond with JSON only — no preamble, no markdown fences.';
 
   const variantSummaries = mutations.map((v) => ({
     variantId: v.variantId,
