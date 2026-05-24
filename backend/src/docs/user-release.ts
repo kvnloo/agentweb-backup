@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-25',
+    changes: [
+      'Fixed: Scheduled Chats No Longer Fail When Using Brave Search MCP for Web Search',
+      '- Scheduled chats that required a web search step were failing validation with "Missing function calls: search_web" even though the agent was successfully searching the web',
+      '- The agent was using the Brave Search MCP tool (bravesearch_brave_web_search) which produces equivalent results to the built-in search_web, but the validation logic did not recognize them as the same',
+      '- The validator now treats bravesearch_brave_web_search and bravesearch_brave_news_search as aliases for search_web, so scheduled chats pass validation regardless of which search tool the agent chooses',
+    ],
+  },
+  {
     date: '2026-05-24',
     changes: [
       'Fixed: Admin Notes on Client Health Page Now Save Correctly',
