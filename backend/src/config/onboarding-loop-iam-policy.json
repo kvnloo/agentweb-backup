@@ -1,0 +1,74 @@
+{
+  "_note": "Manual step: Create this policy in AWS IAM as 'onboarding-loop-cron-policy' and attach to the EB backend instance role (aws-elasticbeanstalk-ec2-role). The aw_backend_user IAM credentials lack iam:CreatePolicy — requires console or admin CLI.",
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "S3OnboardingLoop",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:GetObjectVersion",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::agentweb-onboarding-loop",
+        "arn:aws:s3:::agentweb-onboarding-loop/*"
+      ]
+    },
+    {
+      "Sid": "DynamoOnboardingLoopRuns",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem",
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+        "dynamodb:UpdateItem",
+        "dynamodb:Scan"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:us-west-2:992382574572:table/AW-OnboardingLoopRuns",
+        "arn:aws:dynamodb:us-west-2:992382574572:table/AW-OnboardingLoopRuns/index/*",
+        "arn:aws:dynamodb:us-west-2:992382574572:table/Dev-AW-OnboardingLoopRuns",
+        "arn:aws:dynamodb:us-west-2:992382574572:table/Dev-AW-OnboardingLoopRuns/index/*"
+      ]
+    },
+    {
+      "Sid": "DynamoUsersRead",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:Query",
+        "dynamodb:Scan"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:us-west-2:992382574572:table/AW-Users",
+        "arn:aws:dynamodb:us-west-2:992382574572:table/AW-Users/index/*"
+      ]
+    },
+    {
+      "Sid": "BedrockInvoke",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-opus-4*",
+        "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-sonnet-4*",
+        "arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4*",
+        "arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4*"
+      ]
+    },
+    {
+      "Sid": "SecretsManagerSlack",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue"
+      ],
+      "Resource": [
+        "arn:aws:secretsmanager:us-west-2:992382574572:secret:dev/AgentWeb/Slack*",
+        "arn:aws:secretsmanager:us-west-2:992382574572:secret:prod/AgentWeb/Slack*"
+      ]
+    }
+  ]
+}
