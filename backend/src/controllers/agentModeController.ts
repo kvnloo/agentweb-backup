@@ -782,11 +782,21 @@ export async function runVerifiedChat(
       allToolCalls.push(...toolCalls);
       const actualFunctionCalls = toolCalls.map((call: any) => call.name).filter(Boolean);
 
+      // Normalize tool call names so MCP-prefixed equivalents satisfy built-in requirements.
+      // e.g. bravesearch_brave_web_search is equivalent to search_web for validation purposes.
+      const FUNCTION_CALL_ALIASES: Record<string, string> = {
+        'bravesearch_brave_web_search': 'search_web',
+        'bravesearch_brave_news_search': 'search_web',
+      };
+      const normalizedFunctionCalls = actualFunctionCalls.map(
+        (name: string) => FUNCTION_CALL_ALIASES[name] ?? name
+      );
+
       // Add to reporting array
-      allActualFunctionCallsForReporting.push(...actualFunctionCalls);
+      allActualFunctionCallsForReporting.push(...normalizedFunctionCalls);
 
       // Add to key-value format for easy updates
-      actualFunctionCalls.forEach((callName: string) => {
+      normalizedFunctionCalls.forEach((callName: string) => {
         allActualFunctionCalls[callName] = (allActualFunctionCalls[callName] || 0) + 1;
       });
 
