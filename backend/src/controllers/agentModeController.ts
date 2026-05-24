@@ -38,6 +38,45 @@ const LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS = 7;
 export const activeSessionGenerations = new Set<string>();
 
 /**
+ * Wall-clock timeout for a single agent-mode generation. Without this, a hung
+ * LLM call (stuck await, runaway tool loop, never-resolving upstream) keeps
+ * the activeSessionGenerations lock held indefinitely — every subsequent
+ * /generate request then returns 409 "Session is busy" forever. The lock
+ * release lives in a try/finally that only runs when the inner promise
+ * settles; Promise.race against this timeout forces a rejection so the
+ * finally runs and the lock releases.
+ *
+ * Note: this does NOT cancel the underlying generation (would require an
+ * AbortController plumbed through every layer). The orphaned generation
+ * continues in the background until it settles. That's acceptable — the
+ * critical thing is that the user-facing lock releases.
+ */
+const GENERATION_TIMEOUT_MS = parseInt(
+  process.env.AGENT_MODE_GENERATION_TIMEOUT_MS || '300000',
+  10
+); // 5 minutes default
+
+async function withGenerationTimeout<T>(
+  promise: Promise<T>,
+  sessionId: string
+): Promise<T> {
+  let timeoutHandle: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<T>((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      reject(new Error(
+        `Generation timed out after ${GENERATION_TIMEOUT_MS}ms for session ${sessionId}. ` +
+        `The lock has been released; the orphaned generation may still complete in the background.`
+      ));
+    }, GENERATION_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+}
+
+/**
  * Returns the effective expiration date for an interactive share.
  * If expiresAt is set, use it. Otherwise, default to sharedAt + 7 days.
  * If neither is set, returns a date in the past (treat as expired).
@@ -2074,16 +2113,20 @@ export const agentModeController = {
       const authReqForGenerate = req as any;
       const isDelegatedAccessForMessage = authReqForGenerate.delegateInfo?.isDelegated === true;
 
-      // Generate AI response using common function
-      const response = await generateSessionResponse(
-        sessionId,
-        userMessage,
-        user.userId,
-        modelToUse,
-        attachments,
-        undefined, // isInteractiveShare
-        pageContext,
-        isDelegatedAccessForMessage
+      // Generate AI response using common function (wrapped in wall-clock timeout
+      // so the activeSessionGenerations lock always releases even if generation hangs).
+      const response = await withGenerationTimeout(
+        generateSessionResponse(
+          sessionId,
+          userMessage,
+          user.userId,
+          modelToUse,
+          attachments,
+          undefined, // isInteractiveShare
+          pageContext,
+          isDelegatedAccessForMessage
+        ),
+        sessionId
       );
 
       // Clear progress store after completion (keep connections open for future messages)
@@ -2732,21 +2775,25 @@ export const agentModeController = {
       const defaultModel = await agentModeService.getDefaultModel();
       const modelToUse = session.llmModel || defaultModel;
 
-      // Use the same generateSessionResponse logic as the regular generateResponse
+      // Use the same generateSessionResponse logic as the regular generateResponse,
+      // wrapped in wall-clock timeout to guarantee lock release on hung generation.
       const ishareSenderInfo = {
         ip: req.ip || (req.headers?.['x-forwarded-for'] as string | undefined)?.split(',')[0].trim(),
         userAgent: req.headers?.['user-agent'] as string | undefined,
       };
-      const response = await generateSessionResponse(
-        session.sessionId,
-        userMessage,
-        session.userId,
-        modelToUse,
-        attachments,
-        true, // isInteractiveShare - block admin tools for security
-        undefined, // pageContext
-        undefined, // isDelegatedAccess
-        ishareSenderInfo
+      const response = await withGenerationTimeout(
+        generateSessionResponse(
+          session.sessionId,
+          userMessage,
+          session.userId,
+          modelToUse,
+          attachments,
+          true, // isInteractiveShare - block admin tools for security
+          undefined, // pageContext
+          undefined, // isDelegatedAccess
+          ishareSenderInfo
+        ),
+        session.sessionId
       );
 
       // Clear progress store after completion (keep connections open for future messages)
