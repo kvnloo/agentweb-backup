@@ -124,13 +124,13 @@ router.get("/", async (req, res) => {
     // canEditItem on a non-self item reduces to the caller's editor/admin
     // status, so it is identical for every other member — compute it once.
     const canEditOthers = canEditItem(
-      { userId: "__other__" }, userLike, orgLike, user.orgId, "funnels",
+      { userId: "__other__" }, userLike, orgLike, user.orgId, "analytics",
     );
 
     const result = await listOrgVisibleItems<FunnelListItem>({
       callerUserId: userId,
       orgId: user.orgId,
-      featureEnabled: isFeatureEffectivelyEnabled(userLike, orgLike, "funnels"),
+      featureEnabled: isFeatureEffectivelyEnabled(userLike, orgLike, "analytics"),
       getOwnerItems: async () => toItems(await getUserFunnels(userId), userId, ownName, true),
       getMemberIds: async () => (await orgDb.getOrgMembers(user.orgId!)).map((m) => m.userId),
       getItemsForOwner: async (ownerUserId) => {
@@ -167,7 +167,7 @@ router.get("/:configId", async (req, res) => {
         ? { orgId: resolved.org.orgId, ownerUserId: resolved.org.ownerUserId, shareSettings: resolved.org.shareSettings }
         : null;
       const userLike = { userId: callerId, orgId: resolved.caller?.orgId, orgRole: resolved.caller?.orgRole };
-      if (!canViewItem({ userId: resolved.ownerUserId }, userLike, orgLike, resolved.ownerOrgId, "funnels")) {
+      if (!canViewItem({ userId: resolved.ownerUserId }, userLike, orgLike, resolved.ownerOrgId, "analytics")) {
         return res.status(403).json({ success: false, message: "Funnel not accessible" });
       }
     }
@@ -288,7 +288,7 @@ router.put("/:configId", async (req, res) => {
         ? { orgId: resolved.org.orgId, ownerUserId: resolved.org.ownerUserId, shareSettings: resolved.org.shareSettings }
         : null;
       const userLike = { userId: callerId, orgId: resolved.caller?.orgId, orgRole: resolved.caller?.orgRole };
-      if (!canEditItem({ userId: resolved.ownerUserId }, userLike, orgLike, resolved.ownerOrgId, "funnels")) {
+      if (!canEditItem({ userId: resolved.ownerUserId }, userLike, orgLike, resolved.ownerOrgId, "analytics")) {
         return res.status(403).json({ success: false, message: "Not allowed to edit this funnel" });
       }
     }

@@ -9,7 +9,7 @@ import {
   deleteLandingPageByRecord,
   transferLandingPageOwner,
 } from "../services/v0Service";
-import { TOGGLEABLE_FEATURES, ToggleableFeature } from "../services/orgShareService";
+import { OWNED_FEATURES, OwnedFeature } from "../services/orgShareService";
 
 const router = express.Router();
 
@@ -117,8 +117,8 @@ router.post("/:userId/remove", async (req, res) => {
       return res.status(404).json({ message: "Member not found in your org" });
     }
 
-    const decisions: Partial<Record<ToggleableFeature, Decision>> = req.body?.decisions || {};
-    for (const f of TOGGLEABLE_FEATURES) {
+    const decisions: Partial<Record<OwnedFeature, Decision>> = req.body?.decisions || {};
+    for (const f of OWNED_FEATURES) {
       const d = decisions[f];
       if (!d || !["transfer", "delete", "leave"].includes(d)) {
         return res.status(400).json({ message: `Invalid decision for ${f}: ${d}` });
@@ -127,7 +127,7 @@ router.post("/:userId/remove", async (req, res) => {
 
     // Cap pre-check — fetch counts before making any writes
     // htmlTemplates uses bulk helpers so no per-item pre-check needed, but we still count
-    for (const f of TOGGLEABLE_FEATURES) {
+    for (const f of OWNED_FEATURES) {
       if (decisions[f] === "leave") continue;
       const items = await fetchItemsForFeature(target.userId, f);
       if (items.length > PER_FEATURE_CAP) {
@@ -137,7 +137,7 @@ router.post("/:userId/remove", async (req, res) => {
 
     const summary: Record<string, { updated: number; deleted: number; errors: string[] }> = {};
 
-    for (const f of TOGGLEABLE_FEATURES) {
+    for (const f of OWNED_FEATURES) {
       const d = decisions[f]!;
       summary[f] = { updated: 0, deleted: 0, errors: [] };
       if (d === "leave") continue;
@@ -205,7 +205,7 @@ router.post("/:userId/remove", async (req, res) => {
 
 // ── Per-feature helpers (used for all features except htmlTemplates) ────────
 
-async function fetchItemsForFeature(userId: string, f: ToggleableFeature): Promise<any[]> {
+async function fetchItemsForFeature(userId: string, f: OwnedFeature): Promise<any[]> {
   switch (f) {
     case "knowledgeBase":  return (await taskDb.getTasksByUserId(userId)) ?? [];
     case "htmlTemplates":  return htmlTemplateService.getTemplatesByOwner(userId);
@@ -217,7 +217,7 @@ async function fetchItemsForFeature(userId: string, f: ToggleableFeature): Promi
   }
 }
 
-function getItemId(item: any, f: ToggleableFeature): string {
+function getItemId(item: any, f: OwnedFeature): string {
   switch (f) {
     case "knowledgeBase":  return item.taskId;
     case "htmlTemplates":  return item.template_id;
@@ -231,7 +231,7 @@ function getItemId(item: any, f: ToggleableFeature): string {
 
 async function transferItemOwner(
   item: any,
-  f: ToggleableFeature,
+  f: OwnedFeature,
   ownerId: string,
   newOwnerId: string,
 ): Promise<void> {
@@ -270,7 +270,7 @@ async function transferItemOwner(
   }
 }
 
-async function deleteItem(item: any, f: ToggleableFeature, ownerId: string): Promise<void> {
+async function deleteItem(item: any, f: OwnedFeature, ownerId: string): Promise<void> {
   switch (f) {
     case "knowledgeBase":
       await taskDb.deleteTask(item.taskId);

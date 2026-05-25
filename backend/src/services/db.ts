@@ -589,7 +589,6 @@ export interface OrgShareSettings {
   landingPages: { enabled: boolean; editors: string[] };
   workPlans: { enabled: boolean; editors: string[] };
   skills: { enabled: boolean; editors: string[] };
-  funnels: { enabled: boolean; editors: string[] };
   analytics: { enabled: boolean; editors: string[] };
   // Always shared with org—only editors are configurable, enabled is implicit
   brandGuidelines: { editors: string[] };
@@ -7480,7 +7479,6 @@ export const orgDb = {
       landingPages:      { ...ss.landingPages,      editors: strip(ss.landingPages.editors) },
       workPlans:         { ...ss.workPlans,         editors: strip(ss.workPlans.editors) },
       skills:            { ...ss.skills,            editors: strip(ss.skills.editors) },
-      funnels:           { ...(ss.funnels ?? { enabled: false, editors: [] }), editors: strip((ss.funnels?.editors) ?? []) },
       analytics:         { ...(ss.analytics ?? { enabled: false, editors: [] }), editors: strip((ss.analytics?.editors) ?? []) },
       brandGuidelines:   { editors: strip(ss.brandGuidelines.editors) },
       marketingStrategy: { editors: strip(ss.marketingStrategy.editors) },

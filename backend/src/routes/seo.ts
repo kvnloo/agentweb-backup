@@ -815,7 +815,7 @@ router.get("/metrics", async (req, res) => {
             : null;
           const userLike = { userId: user.userId, orgId: user.orgId, orgRole: user.orgRole };
           if (!owner || owner.orgId !== user.orgId ||
-              !canViewItem({ userId: funnelOwnerId }, userLike, orgLike, owner.orgId, "funnels")) {
+              !canViewItem({ userId: funnelOwnerId }, userLike, orgLike, owner.orgId, "analytics")) {
             throw new Error("Funnel not accessible");
           }
         }
