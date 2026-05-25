@@ -48,6 +48,9 @@ interface User {
   secretNames?: string[]; // Names of configured secrets (values not exposed)
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
+  googleAnalyticsProperties?: Array<{ propertyId: string; label: string }>;
+  primaryAnalyticsPropertyId?: string;
+  clarityProjects?: Array<{ projectId: string; label: string }>;
   gaFilteredDomains?: string[]; // Domains to exclude from Google Analytics
   clarityProjectId?: string; // Microsoft Clarity Project ID
   productDomain?: string; // Product site domain for feature usage tracking
@@ -87,6 +90,8 @@ interface User {
   orgId?: string;
   orgRole?: "owner" | "member";
   orgName?: string;
+  isOrgOwner?: boolean;
+  orgShareAnalyticsWithOrg?: boolean;
 }
 
 interface AdminContextType {

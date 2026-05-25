@@ -10,6 +10,7 @@ const defaults: OrgShareSettings = {
   landingPages:      { enabled: false, editors: [] },
   workPlans:         { enabled: true,  editors: [] },
   skills:            { enabled: true,  editors: [] },
+  analytics:         { enabled: false, editors: [] },
   brandGuidelines:   { editors: [] },
   marketingStrategy: { editors: [] },
 };

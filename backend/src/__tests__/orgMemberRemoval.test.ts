@@ -37,6 +37,8 @@ const mockWorkPlanTransferOwner = jest.fn();
 const mockGetSkillsByOwner = jest.fn();
 const mockDeleteSkill = jest.fn();
 const mockSkillTransferOwner = jest.fn();
+const mockDynamoGet = jest.fn();
+const mockDynamoPut = jest.fn();
 
 // ── Jest mocks ──────────────────────────────────────────────────────────────
 jest.mock("../services/db", () => ({
@@ -82,6 +84,15 @@ jest.mock("../services/skillService", () => ({
     getSkillsByOwner: mockGetSkillsByOwner,
     deleteSkill: mockDeleteSkill,
     transferOwner: mockSkillTransferOwner,
+  },
+}));
+
+jest.mock("aws-sdk", () => ({
+  DynamoDB: {
+    DocumentClient: jest.fn(() => ({
+      get: (...args: any[]) => ({ promise: () => mockDynamoGet(...args) }),
+      put: (...args: any[]) => ({ promise: () => mockDynamoPut(...args) }),
+    })),
   },
 }));
 
@@ -137,6 +148,8 @@ const allDelete = {
   landingPages: "delete",
   workPlans: "delete",
   skills: "delete",
+  funnels: "leave",
+  analytics: "leave",
 };
 
 /** All-transfer decisions */
@@ -146,6 +159,8 @@ const allTransfer = {
   landingPages: "transfer",
   workPlans: "transfer",
   skills: "transfer",
+  funnels: "leave",
+  analytics: "leave",
 };
 
 /** All-leave decisions */
@@ -155,6 +170,8 @@ const allLeave = {
   landingPages: "leave",
   workPlans: "leave",
   skills: "leave",
+  funnels: "leave",
+  analytics: "leave",
 };
 
 /** Setup normal user mocks (items empty by default) */
@@ -181,6 +198,8 @@ function setupNormalUsers() {
   mockWorkPlanTransferOwner.mockResolvedValue(undefined);
   mockDeleteSkill.mockResolvedValue(undefined);
   mockSkillTransferOwner.mockResolvedValue(undefined);
+  mockDynamoGet.mockResolvedValue({ Item: undefined });
+  mockDynamoPut.mockResolvedValue({});
 }
 
 // ── GET removal-preview tests ────────────────────────────────────────────────
@@ -200,6 +219,7 @@ describe("GET /api/orgs/me/members/:userId/removal-preview", () => {
     mockGetLandingPagesByOwner.mockResolvedValue(makeItems(5));
     mockGetWorkPlansByOwner.mockResolvedValue(makeItems(1));
     mockGetSkillsByOwner.mockResolvedValue(makeItems(4));
+    mockDynamoGet.mockResolvedValue({ Item: undefined });
 
     const res = await request(app).get(
       `/api/orgs/me/members/${targetUserId}/removal-preview`
@@ -213,7 +233,43 @@ describe("GET /api/orgs/me/members/:userId/removal-preview", () => {
       landingPages: 5,
       workPlans: 1,
       skills: 4,
+      funnels: 0,
     });
+  });
+
+  it("includes funnels count reflecting the member's funnels", async () => {
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === callerUserId) return Promise.resolve(callerOwner);
+      if (uid === targetUserId) return Promise.resolve(targetMember);
+      return Promise.resolve(null);
+    });
+    mockGetTasksByUserId.mockResolvedValue([]);
+    mockGetTemplatesByOwner.mockResolvedValue([]);
+    mockGetLandingPagesByOwner.mockResolvedValue([]);
+    mockGetWorkPlansByOwner.mockResolvedValue([]);
+    mockGetSkillsByOwner.mockResolvedValue([]);
+    // AW-Settings item keyed funnels_<targetUserId> with two funnels
+    mockDynamoGet.mockImplementation((params: any) => {
+      if (params?.Key?.settingName === `funnels_${targetUserId}`) {
+        return Promise.resolve({
+          Item: {
+            settingName: `funnels_${targetUserId}`,
+            funnels: {
+              "f-1": { id: "f-1", name: "Funnel One", stages: [], createdAt: "", updatedAt: "" },
+              "f-2": { id: "f-2", name: "Funnel Two", stages: [], createdAt: "", updatedAt: "" },
+            },
+          },
+        });
+      }
+      return Promise.resolve({ Item: undefined });
+    });
+
+    const res = await request(app).get(
+      `/api/orgs/me/members/${targetUserId}/removal-preview`
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.itemCounts.funnels).toBe(2);
   });
 
   it("returns 404 if target user is not in caller's org", async () => {
@@ -532,6 +588,8 @@ describe("POST /api/orgs/me/members/:userId/remove", () => {
           landingPages: "leave",
           workPlans: "delete",
           skills: "transfer",
+          funnels: "leave",
+          analytics: "leave",
         },
       });
 

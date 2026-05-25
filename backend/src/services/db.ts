@@ -549,6 +549,18 @@ export interface Organization {
   fromName?: string;
   slackChannel?: string;
   googleAnalyticsProperties?: Array<{ propertyId: string; label: string }>;
+  primaryAnalyticsPropertyId?: string; // Explicit primary GA4 property (must be one of googleAnalyticsProperties)
+  gaFilteredDomains?: string[]; // Domains to exclude from Google Analytics
+  clarityProjects?: Array<{ projectId: string; label: string }>; // Microsoft Clarity projects
+  productDomain?: string; // Product site domain for feature usage tracking
+  /**
+   * Migration marker. Absent → analytics config has never been written to this
+   * Organization record; resolveAnalyticsConfig() falls back to the owner's user
+   * record. "migrated" → set by the migration script. "self" → set by a
+   * self-service or admin save. When present, the Org record is authoritative
+   * (including empty arrays).
+   */
+  analyticsConfigSource?: "migrated" | "self";
   googleDriveFolders?: Array<{ folderId: string; name: string }>;
   pendingInvites?: Array<{
     email: string;
@@ -560,6 +572,13 @@ export interface Organization {
   createdAt: string;
   updatedAt: string;
   shareSettings?: OrgShareSettings;
+  /**
+   * Admin-controlled: when true, org members inherit the org owner's analytics
+   * configuration (GA4 properties, gaFilteredDomains, productDomain, seoDomains,
+   * clarityProjects). Set only by the platform admin via
+   * PATCH /api/admin/orgs/:orgId/analytics-sharing. Default: undefined/false.
+   */
+  shareAnalyticsWithOrg?: boolean;
   secrets?: Record<string, string>; // Encrypted per-org secrets (key → encrypted value)
   orgMemoryEnabled?: boolean; // Whether org-wide Emma memory is enabled (default: true)
 }
@@ -570,6 +589,7 @@ export interface OrgShareSettings {
   landingPages: { enabled: boolean; editors: string[] };
   workPlans: { enabled: boolean; editors: string[] };
   skills: { enabled: boolean; editors: string[] };
+  analytics: { enabled: boolean; editors: string[] };
   // Always shared with org—only editors are configurable, enabled is implicit
   brandGuidelines: { editors: string[] };
   marketingStrategy: { editors: string[] };
@@ -7459,6 +7479,7 @@ export const orgDb = {
       landingPages:      { ...ss.landingPages,      editors: strip(ss.landingPages.editors) },
       workPlans:         { ...ss.workPlans,         editors: strip(ss.workPlans.editors) },
       skills:            { ...ss.skills,            editors: strip(ss.skills.editors) },
+      analytics:         { ...(ss.analytics ?? { enabled: false, editors: [] }), editors: strip((ss.analytics?.editors) ?? []) },
       brandGuidelines:   { editors: strip(ss.brandGuidelines.editors) },
       marketingStrategy: { editors: strip(ss.marketingStrategy.editors) },
     };

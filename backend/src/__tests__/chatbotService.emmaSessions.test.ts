@@ -202,16 +202,16 @@ describe('getEmmaSystemContext', () => {
 });
 
 describe('buildUserAnalyticsContext', () => {
-  it('returns empty string for null user', () => {
-    expect(buildUserAnalyticsContext(null)).toBe('');
+  it('returns empty string for null user', async () => {
+    expect(await buildUserAnalyticsContext(null)).toBe('');
   });
 
-  it('returns empty string for user with no analytics config', () => {
-    expect(buildUserAnalyticsContext({})).toBe('');
+  it('returns empty string for user with no analytics config', async () => {
+    expect(await buildUserAnalyticsContext({})).toBe('');
   });
 
-  it('includes GA4 properties when configured', () => {
-    const result = buildUserAnalyticsContext({
+  it('includes GA4 properties when configured', async () => {
+    const result = await buildUserAnalyticsContext({
       googleAnalyticsProperties: [
         { propertyId: '123456789', label: 'Main Site' },
         { propertyId: '987654321', label: 'Audit Site' },
@@ -225,8 +225,8 @@ describe('buildUserAnalyticsContext', () => {
     expect(result).toContain('do NOT ask them to provide IDs');
   });
 
-  it('includes Search Console domains when configured', () => {
-    const result = buildUserAnalyticsContext({
+  it('includes Search Console domains when configured', async () => {
+    const result = await buildUserAnalyticsContext({
       seoDomains: ['audit.agentweb.pro', 'agentweb.pro'],
     });
     expect(result).toContain('Google Search Console');
@@ -235,8 +235,8 @@ describe('buildUserAnalyticsContext', () => {
     expect(result).toContain('do NOT ask them to provide IDs');
   });
 
-  it('includes Clarity projects when configured', () => {
-    const result = buildUserAnalyticsContext({
+  it('includes Clarity projects when configured', async () => {
+    const result = await buildUserAnalyticsContext({
       clarityProjects: [{ projectId: 'ul13e4f7fe', label: 'Main App' }],
     });
     expect(result).toContain('Microsoft Clarity');
@@ -244,8 +244,8 @@ describe('buildUserAnalyticsContext', () => {
     expect(result).toContain('Main App');
   });
 
-  it('includes gaFilteredDomains when present alongside GA4', () => {
-    const result = buildUserAnalyticsContext({
+  it('includes gaFilteredDomains when present alongside GA4', async () => {
+    const result = await buildUserAnalyticsContext({
       googleAnalyticsProperties: [{ propertyId: 'P-1', label: 'Site' }],
       gaFilteredDomains: ['app.agentweb.pro', 'partner.agentweb.pro'],
     });
@@ -253,8 +253,8 @@ describe('buildUserAnalyticsContext', () => {
     expect(result).toContain('partner.agentweb.pro');
   });
 
-  it('includes all sections when all analytics are configured', () => {
-    const result = buildUserAnalyticsContext({
+  it('includes all sections when all analytics are configured', async () => {
+    const result = await buildUserAnalyticsContext({
       googleAnalyticsProperties: [{ propertyId: 'P-1', label: 'Main' }],
       seoDomains: ['agentweb.pro'],
       clarityProjects: [{ projectId: 'c1', label: 'Clarity Main' }],
@@ -264,8 +264,8 @@ describe('buildUserAnalyticsContext', () => {
     expect(result).toContain('Microsoft Clarity');
   });
 
-  it('returns empty string for user with empty arrays', () => {
-    const result = buildUserAnalyticsContext({
+  it('returns empty string for user with empty arrays', async () => {
+    const result = await buildUserAnalyticsContext({
       googleAnalyticsProperties: [],
       seoDomains: [],
       clarityProjects: [],
