@@ -26,7 +26,6 @@ const FULL = {
   landingPages: { enabled: false, editors: [] },
   workPlans: { enabled: false, editors: [] },
   skills: { enabled: false, editors: [] },
-  funnels: { enabled: false, editors: [] },
   analytics: { enabled: true, editors: [] },
   brandGuidelines: { editors: [] },
   marketingStrategy: { editors: [] },

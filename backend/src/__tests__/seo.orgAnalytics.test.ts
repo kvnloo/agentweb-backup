@@ -175,7 +175,7 @@ describe("seo routes — org analytics inheritance", () => {
     mockOrgDb.getOrgById.mockResolvedValue({
       orgId: "org-1",
       ownerUserId: "m-owner",
-      shareSettings: { funnels: { enabled: true, editors: [] } },
+      shareSettings: { analytics: { enabled: true, editors: [] } },
     } as any);
 
     const res = await request(app)

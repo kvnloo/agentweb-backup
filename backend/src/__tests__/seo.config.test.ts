@@ -43,7 +43,7 @@ beforeEach(() => {
 });
 
 test("GET /config returns config, canEdit, scope, serviceAccountEmail", async () => {
-  mockResolveTarget.mockResolvedValue({ kind: "org", id: "org-1", canEdit: true });
+  mockResolveTarget.mockResolvedValue({ kind: "org", id: "org-1", canEdit: true, canView: true });
   const res = await request(app).get("/api/seo/config").set("x-uid", "u-1");
   expect(res.status).toBe(200);
   expect(res.body.canEdit).toBe(true);

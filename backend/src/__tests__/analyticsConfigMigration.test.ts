@@ -36,7 +36,7 @@ test("seeds shareSettings.analytics from legacy boolean when absent", () => {
   const existing = {
     knowledgeBase: { enabled: false, editors: [] }, htmlTemplates: { enabled: false, editors: [] },
     landingPages: { enabled: false, editors: [] }, workPlans: { enabled: false, editors: [] },
-    skills: { enabled: false, editors: [] }, funnels: { enabled: false, editors: [] },
+    skills: { enabled: false, editors: [] },
     brandGuidelines: { editors: [] }, marketingStrategy: { editors: [] },
   };
   const u = migrateOrg(

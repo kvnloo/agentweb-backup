@@ -31,7 +31,7 @@ const sampleSettings = {
   landingPages:      { enabled: false, editors: [] },
   workPlans:         { enabled: true,  editors: [] },
   skills:            { enabled: false, editors: [] },
-  funnels:           { enabled: false, editors: [] },
+  analytics:         { enabled: false, editors: [] },
   brandGuidelines:   { editors: [] },
   marketingStrategy: { editors: [] },
 };

@@ -92,7 +92,7 @@ beforeEach(() => {
 
 describe("GET /api/funnels — org-wide sharing", () => {
   test("sharing ON → caller's funnels + org members' funnels, tagged", async () => {
-    // caller m-1 in org-1; org has shareSettings.funnels.enabled = true
+    // caller m-1 in org-1; org has shareSettings.analytics.enabled = true
     // m-1 has funnel f-a; member m-2 has funnel f-b
     funnelsByUser["m-1"] = { "f-a": funnel("f-a") };
     funnelsByUser["m-2"] = { "f-b": funnel("f-b") };
@@ -103,7 +103,7 @@ describe("GET /api/funnels — org-wide sharing", () => {
     });
     mockGetOrgById.mockResolvedValue({
       orgId: "org-1", ownerUserId: "owner-x",
-      shareSettings: { funnels: { enabled: true, editors: [] } },
+      shareSettings: { analytics: { enabled: true, editors: [] } },
     });
     mockGetOrgMembers.mockResolvedValue([{ userId: "m-1" }, { userId: "m-2" }]);
 
@@ -119,7 +119,7 @@ describe("GET /api/funnels — org-wide sharing", () => {
   });
 
   test("sharing OFF, plain member → only own funnels", async () => {
-    // org shareSettings.funnels.enabled = false; caller m-1 is a plain member
+    // org shareSettings.analytics.enabled = false; caller m-1 is a plain member
     funnelsByUser["m-1"] = { "f-a": funnel("f-a") };
     funnelsByUser["m-2"] = { "f-b": funnel("f-b") };
     mockGetUserById.mockImplementation((uid: string) => {
@@ -129,7 +129,7 @@ describe("GET /api/funnels — org-wide sharing", () => {
     });
     mockGetOrgById.mockResolvedValue({
       orgId: "org-1", ownerUserId: "owner-x",
-      shareSettings: { funnels: { enabled: false, editors: [] } },
+      shareSettings: { analytics: { enabled: false, editors: [] } },
     });
     mockGetOrgMembers.mockResolvedValue([{ userId: "m-1" }, { userId: "m-2" }]);
 
@@ -140,7 +140,7 @@ describe("GET /api/funnels — org-wide sharing", () => {
   });
 
   test("each funnel carries a server-computed canEdit", async () => {
-    // org-1 shareSettings.funnels = { enabled: true, editors: ["m-1"] };
+    // org-1 shareSettings.analytics = { enabled: true, editors: ["m-1"] };
     // f-a owned by m-1, f-b owned by m-2.
     funnelsByUser["m-1"] = { "f-a": funnel("f-a") };
     funnelsByUser["m-2"] = { "f-b": funnel("f-b") };
@@ -151,7 +151,7 @@ describe("GET /api/funnels — org-wide sharing", () => {
     });
     mockGetOrgById.mockResolvedValue({
       orgId: "org-1", ownerUserId: "owner-x",
-      shareSettings: { funnels: { enabled: true, editors: ["m-1"] } },
+      shareSettings: { analytics: { enabled: true, editors: ["m-1"] } },
     });
     mockGetOrgMembers.mockResolvedValue([{ userId: "m-1" }, { userId: "m-2" }]);
 
@@ -160,13 +160,13 @@ describe("GET /api/funnels — org-wide sharing", () => {
     const own = res.body.funnels.find((f: any) => f.configId === "funnel:f-a");
     const shared = res.body.funnels.find((f: any) => f.configId === "funnel:f-b");
     expect(own.canEdit).toBe(true);
-    expect(shared.canEdit).toBe(true); // m-1 is a funnels editor → may edit a shared funnel
+    expect(shared.canEdit).toBe(true); // m-1 is an analytics editor (funnels gate on analytics) → may edit a shared funnel
   });
 });
 
 describe("GET/PUT/DELETE /api/funnels/:configId — org-aware gating", () => {
   test("PUT /api/funnels/:id?ownerUserId=other — editor allowed", async () => {
-    // m-1 is in shareSettings.funnels.editors; funnel f-b owned by m-2
+    // m-1 is in shareSettings.analytics.editors; funnel f-b owned by m-2
     funnelsByUser["m-2"] = { "f-b": funnel("f-b") };
     mockGetUserById.mockImplementation((uid: string) => {
       if (uid === "m-1") return Promise.resolve({ userId: "m-1", name: "Member One", orgId: "org-1", orgRole: "member" });
@@ -175,7 +175,7 @@ describe("GET/PUT/DELETE /api/funnels/:configId — org-aware gating", () => {
     });
     mockGetOrgById.mockResolvedValue({
       orgId: "org-1", ownerUserId: "owner-x",
-      shareSettings: { funnels: { enabled: false, editors: ["m-1"] } },
+      shareSettings: { analytics: { enabled: false, editors: ["m-1"] } },
     });
 
     const res = await request(app)
@@ -195,7 +195,7 @@ describe("GET/PUT/DELETE /api/funnels/:configId — org-aware gating", () => {
     });
     mockGetOrgById.mockResolvedValue({
       orgId: "org-1", ownerUserId: "owner-x",
-      shareSettings: { funnels: { enabled: true, editors: ["m-1"] } },
+      shareSettings: { analytics: { enabled: true, editors: ["m-1"] } },
     });
 
     const res = await request(app)
@@ -214,7 +214,7 @@ describe("GET/PUT/DELETE /api/funnels/:configId — org-aware gating", () => {
     });
     mockGetOrgById.mockResolvedValue({
       orgId: "org-1", ownerUserId: "owner-x",
-      shareSettings: { funnels: { enabled: false, editors: ["m-1"] } },
+      shareSettings: { analytics: { enabled: false, editors: ["m-1"] } },
     });
 
     const res = await request(app)
@@ -232,7 +232,7 @@ describe("GET/PUT/DELETE /api/funnels/:configId — org-aware gating", () => {
     });
     mockGetOrgById.mockResolvedValue({
       orgId: "org-1", ownerUserId: "owner-x",
-      shareSettings: { funnels: { enabled: false, editors: ["m-1"] } },
+      shareSettings: { analytics: { enabled: false, editors: ["m-1"] } },
     });
 
     const res = await request(app)
