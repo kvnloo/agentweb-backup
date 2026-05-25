@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-25',
     changes: [
+      'Fixed: Admin Delegate Access to Customer Portal No Longer Resets to Wrong Account on Reload',
+      '- When an admin accessed a customer\'s portal and then reloaded the page, the portal would switch to a different customer\'s account',
+      '- Multiple delegate session tokens were accumulating in the browser\'s session storage, and the wrong one would be picked on reload due to non-deterministic key ordering',
+      '- The fix ensures only one delegate token is ever active at a time: switching to a new customer now clears any previous delegate tokens before storing the new one',
+    ],
+  },
+  {
+    date: '2026-05-25',
+    changes: [
       'Fixed: Scheduled Chats No Longer Fail When Using Brave Search MCP for Web Search',
       '- Scheduled chats that required a web search step were failing validation with "Missing function calls: search_web" even though the agent was successfully searching the web',
       '- The agent was using the Brave Search MCP tool (bravesearch_brave_web_search) which produces equivalent results to the built-in search_web, but the validation logic did not recognize them as the same',
