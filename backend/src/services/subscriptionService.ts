@@ -10,6 +10,7 @@ export interface SubscriptionType {
   allowedSkills: string[]; // Array of skill IDs (e.g., ["skill-uuid-1", "skill-uuid-2"]) or ["*"] for all
   allowedConnectedAccounts?: string[]; // Array of platform types (e.g., ["linkedin", "gmail"]) or ["*"] for all; undefined = all
   allowedFunctionCalls?: string[]; // Deprecated — kept for on-read migration from old configs
+  allowedFeatures?: string[]; // e.g., ["custom-domain"] or ["*"] for all
   monthlyTokenAllowance?: number | null; // Monthly token limit; null/undefined = unlimited
   monthlyExtraCostAllowance?: number | null; // Monthly extra API cost limit in USD (enrichment, etc.); null/undefined = unlimited
 }
@@ -386,4 +387,29 @@ export function filterFunctionCalls(
     if (!functionName) return true;
     return allowedFunctionCalls.includes(functionName);
   });
+}
+
+/**
+ * Get allowed feature flags for a user based on their subscription tier.
+ * Returns the raw array from tier config; ["*"] means "all features."
+ * Defaults to [] when no tier or no allowedFeatures (default-deny).
+ */
+export async function getAllowedFeatures(userId: string): Promise<string[]> {
+  try {
+    const tierName = await getUserSubscriptionType(userId);
+    const tier = await getSubscriptionTypeConfig(tierName);
+    return tier?.allowedFeatures || [];
+  } catch (error) {
+    console.error("Error getting allowed features:", error);
+    return [];
+  }
+}
+
+/**
+ * Check whether a user's subscription tier grants a specific feature flag.
+ * Honors the "*" wildcard.
+ */
+export async function userHasFeature(userId: string, feature: string): Promise<boolean> {
+  const features = await getAllowedFeatures(userId);
+  return features.includes("*") || features.includes(feature);
 }

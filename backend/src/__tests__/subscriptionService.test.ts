@@ -13,6 +13,8 @@ import {
   getAllowedSkills,
   getPublicAllowedSkills,
   resolveSkillsToToolNames,
+  getAllowedFeatures,
+  userHasFeature,
 } from '../services/subscriptionService';
 
 jest.mock('../services/settingsService', () => ({
@@ -346,5 +348,80 @@ describe('subscriptionService', () => {
       { type: 'plain', other: true },
       { type: 'function', function: { name: undefined as any } },
     ]);
+  });
+
+  describe('getAllowedFeatures', () => {
+    it('returns empty array when tier has no allowedFeatures field', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ subscriptionType: 'Legacy' });
+      (settingsService.getSetting as jest.Mock).mockResolvedValueOnce({
+        settingValue: JSON.stringify([
+          { name: 'Legacy', allowedPages: ['*'], allowedSkills: ['*'] },
+        ]),
+      });
+      const result = await getAllowedFeatures('user-1');
+      expect(result).toEqual([]);
+    });
+
+    it('returns the configured allowedFeatures array', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ subscriptionType: 'Pro' });
+      (settingsService.getSetting as jest.Mock).mockResolvedValueOnce({
+        settingValue: JSON.stringify([
+          { name: 'Pro', allowedPages: ['*'], allowedSkills: ['*'], allowedFeatures: ['custom-domain'] },
+        ]),
+      });
+      const result = await getAllowedFeatures('user-1');
+      expect(result).toEqual(['custom-domain']);
+    });
+
+    it('returns empty array when tier config is missing', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ subscriptionType: 'Ghost' });
+      (settingsService.getSetting as jest.Mock).mockResolvedValueOnce({
+        settingValue: JSON.stringify([{ name: 'Pro', allowedPages: ['*'], allowedSkills: ['*'] }]),
+      });
+      const result = await getAllowedFeatures('user-1');
+      expect(result).toEqual([]);
+    });
+  });
+
+  describe('userHasFeature', () => {
+    it('returns true when feature is listed', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ subscriptionType: 'Pro' });
+      (settingsService.getSetting as jest.Mock).mockResolvedValueOnce({
+        settingValue: JSON.stringify([
+          { name: 'Pro', allowedPages: ['*'], allowedSkills: ['*'], allowedFeatures: ['custom-domain'] },
+        ]),
+      });
+      expect(await userHasFeature('user-1', 'custom-domain')).toBe(true);
+    });
+
+    it('returns true when allowedFeatures includes wildcard', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ subscriptionType: 'Admin' });
+      (settingsService.getSetting as jest.Mock).mockResolvedValueOnce({
+        settingValue: JSON.stringify([
+          { name: 'Admin', allowedPages: ['*'], allowedSkills: ['*'], allowedFeatures: ['*'] },
+        ]),
+      });
+      expect(await userHasFeature('user-1', 'anything')).toBe(true);
+    });
+
+    it('returns false when feature is not listed', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ subscriptionType: 'Basic' });
+      (settingsService.getSetting as jest.Mock).mockResolvedValueOnce({
+        settingValue: JSON.stringify([
+          { name: 'Basic', allowedPages: ['*'], allowedSkills: ['*'], allowedFeatures: [] },
+        ]),
+      });
+      expect(await userHasFeature('user-1', 'custom-domain')).toBe(false);
+    });
+
+    it('returns false when tier has no allowedFeatures field (default-deny)', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ subscriptionType: 'Legacy' });
+      (settingsService.getSetting as jest.Mock).mockResolvedValueOnce({
+        settingValue: JSON.stringify([
+          { name: 'Legacy', allowedPages: ['*'], allowedSkills: ['*'] },
+        ]),
+      });
+      expect(await userHasFeature('user-1', 'custom-domain')).toBe(false);
+    });
   });
 });
