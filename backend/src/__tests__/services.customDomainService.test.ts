@@ -378,4 +378,94 @@ describe("customDomainService", () => {
       expect(result.status).toBe("pending_verification");
     });
   });
+
+  describe('addCustomDomain with landingPageId', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it('stores landingPageId on the record when provided', async () => {
+      mockAxiosPost.mockResolvedValueOnce({
+        data: { verified: false, verification: [{ type: 'TXT', domain: '_vercel.example.com', value: 'vc-domain-verify=abc' }] },
+      });
+
+      const result = await addCustomDomain('user-1', 'prj_123', 'landing.example.com', 'lp-42');
+
+      expect(result.landingPageId).toBe('lp-42');
+      expect(mockPut).toHaveBeenCalledWith(
+        expect.objectContaining({
+          Item: expect.objectContaining({ landingPageId: 'lp-42' }),
+        })
+      );
+    });
+
+    it('omits landingPageId when not provided', async () => {
+      mockAxiosPost.mockResolvedValueOnce({
+        data: { verified: false, verification: [] },
+      });
+
+      const result = await addCustomDomain('user-1', 'prj_123', 'landing.example.com');
+
+      expect(result.landingPageId).toBeUndefined();
+    });
+  });
+
+  describe('verifyDomain returns updated record', () => {
+    it('returns the updated record with landingPageId on successful verification', async () => {
+      mockGet.mockReturnValueOnce({
+        promise: () => Promise.resolve({
+          Item: {
+            id: 'dom-1',
+            userId: 'user-1',
+            domain: 'landing.example.com',
+            type: 'custom',
+            status: 'pending_verification',
+            vercelProjectId: 'prj_123',
+            landingPageId: 'lp-42',
+            verificationRecords: [{ type: 'TXT', domain: '_vercel.landing.example.com', value: 'vc-domain-verify=abc' }],
+            createdAt: '2026-05-25T00:00:00Z',
+            updatedAt: '2026-05-25T00:00:00Z',
+          },
+        }),
+      });
+
+      mockAxiosGet.mockResolvedValueOnce({ data: { verified: true } });
+
+      const result = await verifyDomain('dom-1', 'user-1');
+
+      expect(result.verified).toBe(true);
+      expect(result.record).toMatchObject({
+        id: 'dom-1',
+        landingPageId: 'lp-42',
+        domain: 'landing.example.com',
+        status: 'active',
+      });
+    });
+
+    it('returns the record even when domain was already active (idempotent rerun)', async () => {
+      mockGet.mockReturnValueOnce({
+        promise: () => Promise.resolve({
+          Item: {
+            id: 'dom-1',
+            userId: 'user-1',
+            domain: 'landing.example.com',
+            type: 'custom',
+            status: 'active',
+            vercelProjectId: 'prj_123',
+            landingPageId: 'lp-42',
+            createdAt: '2026-05-25T00:00:00Z',
+            updatedAt: '2026-05-25T00:00:00Z',
+          },
+        }),
+      });
+
+      mockAxiosGet.mockResolvedValueOnce({ data: { verified: true } });
+
+      const result = await verifyDomain('dom-1', 'user-1');
+
+      expect(result.verified).toBe(true);
+      expect(result.record.status).toBe('active');
+      expect(result.record.verificationRecords).toBeUndefined();
+    });
+  });
 });

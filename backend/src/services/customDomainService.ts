@@ -30,6 +30,7 @@ export interface CustomDomainRecord {
   type: "subdomain" | "custom";
   status: "active" | "pending_verification" | "error";
   vercelProjectId: string;
+  landingPageId?: string;
   verificationRecords?: VerificationRecord[];
   errorMessage?: string;
   createdAt: string;
@@ -181,7 +182,8 @@ export async function addSubdomain(
 export async function addCustomDomain(
   userId: string,
   vercelProjectId: string,
-  domain: string
+  domain: string,
+  landingPageId?: string
 ): Promise<CustomDomainRecord> {
   const cleanDomain = domain.toLowerCase().trim();
   validateDomain(cleanDomain);
@@ -206,6 +208,7 @@ export async function addCustomDomain(
     type: "custom",
     status: isVerified ? "active" : "pending_verification",
     vercelProjectId,
+    ...(landingPageId ? { landingPageId } : {}),
     verificationRecords: isVerified
       ? undefined
       : vercelData.verification?.map((v: any) => ({
@@ -321,7 +324,12 @@ export async function getDomain(
 export async function verifyDomain(
   domainId: string,
   userId: string
-): Promise<{ verified: boolean; status: string; verificationRecords?: VerificationRecord[] }> {
+): Promise<{
+  verified: boolean;
+  status: string;
+  verificationRecords?: VerificationRecord[];
+  record: CustomDomainRecord;
+}> {
   const result = await dynamodb
     .get({ TableName: TABLE_NAME, Key: { id: domainId } })
     .promise();
@@ -341,6 +349,7 @@ export async function verifyDomain(
 
   const vercelData = response.data as any;
   const isVerified = vercelData.verified === true;
+  const now = new Date().toISOString();
 
   if (isVerified && record.status !== "active") {
     // Update DynamoDB to active
@@ -353,10 +362,16 @@ export async function verifyDomain(
         ExpressionAttributeNames: { "#status": "status" },
         ExpressionAttributeValues: {
           ":status": "active",
-          ":updatedAt": new Date().toISOString(),
+          ":updatedAt": now,
         },
       })
       .promise();
+    record.status = "active";
+    record.updatedAt = now;
+    delete record.verificationRecords;
+  } else if (isVerified) {
+    // Already active on prior verify; mirror in-memory invariants without rewriting DB.
+    delete record.verificationRecords;
   }
 
   return {
@@ -369,5 +384,6 @@ export async function verifyDomain(
           domain: v.domain,
           value: v.value,
         })),
+    record,
   };
 }
