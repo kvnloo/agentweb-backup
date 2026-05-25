@@ -13,6 +13,7 @@ import { getEnrichSoService } from './enrichSoService';
 import type { MappedPerson, MappedOrganization } from './apolloFieldMapper';
 import type { OrchestratorDeps } from './crmEnrichmentServiceV3';
 import { CrmEnrichmentService, type LeadRecord } from './crmEnrichmentService';
+import { sanitizePhone } from '../utils/phoneValidation';
 import type { IdentityResolverDeps } from './enrichmentIdentityResolver';
 import { resolveIdentity as pureResolveIdentity } from './enrichmentIdentityResolver';
 import { runWaterfall as pureRunWaterfall, type LLMFilledValue } from './enrichmentGroupWaterfall';
@@ -295,7 +296,7 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
 
 // Note: `org` is ALREADY a MappedOrganization from `apolloService.matchOrg`,
 // no need to re-map. Function name kept for clarity at call site.
-function mapApolloOrgToCrmFields(m: MappedOrganization): Record<string, string> {
+export function mapApolloOrgToCrmFields(m: MappedOrganization): Record<string, string> {
   const out: Record<string, string> = {};
   if (m.name) out.company_name = m.name;
   if (m.websiteUrl) out.website = m.websiteUrl;
@@ -316,7 +317,7 @@ function mapApolloOrgToCrmFields(m: MappedOrganization): Record<string, string> 
     if (loc) out.hq_location = loc;
   }
   if (m.hqRawAddress) out.hq_address = m.hqRawAddress;
-  if (m.phone) out.company_phone = m.phone;
+  if (m.phone) { const p = sanitizePhone(m.phone); if (p) out.company_phone = p; }
   if (m.twitterUrl) {
     const handle = m.twitterUrl.replace(/\/$/, '').split('/').pop();
     if (handle) out.twitter_handle = handle;
@@ -324,14 +325,14 @@ function mapApolloOrgToCrmFields(m: MappedOrganization): Record<string, string> 
   return out;
 }
 
-function mapApolloPersonToCrmFields(p: MappedPerson): Record<string, string> {
+export function mapApolloPersonToCrmFields(p: MappedPerson): Record<string, string> {
   const out: Record<string, string> = {};
   if (p.firstName) out.first_name = p.firstName;
   if (p.lastName) out.last_name = p.lastName;
   if (p.title) out.title = p.title;
   if (p.linkedin) out.linkedin_url = p.linkedin;
   if (p.email) out.email = p.email;
-  if (p.phone) out.phone = p.phone;
+  if (p.phone) { const ph = sanitizePhone(p.phone); if (ph) out.phone = ph; }
   if (p.seniority) out.seniority = p.seniority;
   if (p.departments && p.departments.length) out.department = p.departments[0];
   // Compose location from city / state / country — Apollo returns these
