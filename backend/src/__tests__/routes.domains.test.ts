@@ -546,4 +546,96 @@ describe("Domain API Routes", () => {
       expect(landingPageUpdateSpy).not.toHaveBeenCalled();
     });
   });
+
+  describe("DELETE /api/domains/:id — landing page cleanup", () => {
+    let landingPageUpdateSpy: jest.Mock;
+    let landingPageGetSpy: jest.Mock;
+    let originalUpdate: any;
+    let originalGet: any;
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      originalUpdate = mockDynamoInstance.update;
+      originalGet = mockDynamoInstance.get;
+      landingPageUpdateSpy = jest.fn().mockReturnValue({ promise: () => Promise.resolve() });
+      landingPageGetSpy = jest.fn().mockReturnValue({
+        promise: () => Promise.resolve({
+          Item: {
+            id: "lp-42",
+            userId: "test-user-123",
+            customDomainUrl: "https://landing.example.com",
+          },
+        }),
+      });
+      mockDynamoInstance.update = landingPageUpdateSpy;
+      mockDynamoInstance.get = landingPageGetSpy;
+    });
+
+    afterEach(() => {
+      mockDynamoInstance.update = originalUpdate;
+      mockDynamoInstance.get = originalGet;
+    });
+
+    it("clears customDomainUrl when deleted domain matched and record has landingPageId", async () => {
+      mockGetDomain.mockResolvedValueOnce({
+        id: "dom-1",
+        userId: "test-user-123",
+        domain: "landing.example.com",
+        landingPageId: "lp-42",
+        type: "custom",
+      });
+      mockRemoveDomain.mockResolvedValueOnce(undefined);
+
+      const res = await request(app).delete("/api/domains/dom-1");
+
+      expect(res.status).toBe(200);
+      expect(landingPageUpdateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          Key: { id: "lp-42" },
+          UpdateExpression: expect.stringContaining("REMOVE customDomainUrl"),
+        })
+      );
+    });
+
+    it("does not clear when the landing page customDomainUrl does not match the deleted domain", async () => {
+      landingPageGetSpy.mockReturnValueOnce({
+        promise: () => Promise.resolve({
+          Item: {
+            id: "lp-42",
+            userId: "test-user-123",
+            customDomainUrl: "https://other-site.agentwebforms.com",
+          },
+        }),
+      });
+      mockGetDomain.mockResolvedValueOnce({
+        id: "dom-1",
+        userId: "test-user-123",
+        domain: "landing.example.com",
+        landingPageId: "lp-42",
+        type: "custom",
+      });
+      mockRemoveDomain.mockResolvedValueOnce(undefined);
+
+      const res = await request(app).delete("/api/domains/dom-1");
+
+      expect(res.status).toBe(200);
+      expect(landingPageUpdateSpy).not.toHaveBeenCalled();
+    });
+
+    it("skips cleanup when domain record has no landingPageId", async () => {
+      mockGetDomain.mockResolvedValueOnce({
+        id: "dom-1",
+        userId: "test-user-123",
+        domain: "landing.example.com",
+        type: "custom",
+      });
+      mockRemoveDomain.mockResolvedValueOnce(undefined);
+
+      const res = await request(app).delete("/api/domains/dom-1");
+
+      expect(res.status).toBe(200);
+      expect(landingPageGetSpy).not.toHaveBeenCalled();
+      expect(landingPageUpdateSpy).not.toHaveBeenCalled();
+    });
+  });
 });

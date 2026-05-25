@@ -174,7 +174,37 @@ router.delete("/:id", async (req, res: Response) => {
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
+    // Capture the domain record before removal so we can clean up the landing page link.
+    const record = await getDomain(req.params.id, userId);
+
     await removeDomain(req.params.id, userId);
+
+    // If the domain was linked to a landing page and that page's customDomainUrl
+    // points at this domain, clear it. Non-fatal on failure.
+    if (record?.landingPageId) {
+      try {
+        const pageResult = await dynamodb.get({
+          TableName: LANDING_PAGES_TABLE,
+          Key: { id: record.landingPageId },
+        }).promise();
+        const currentUrl = pageResult.Item?.customDomainUrl as string | undefined;
+        if (currentUrl && currentUrl.startsWith(`https://${record.domain}`)) {
+          await dynamodb.update({
+            TableName: LANDING_PAGES_TABLE,
+            Key: { id: record.landingPageId },
+            ConditionExpression: "userId = :uid",
+            UpdateExpression: "REMOVE customDomainUrl SET updatedAt = :now",
+            ExpressionAttributeValues: {
+              ":uid": userId,
+              ":now": new Date().toISOString(),
+            },
+          }).promise();
+        }
+      } catch (cleanupErr: any) {
+        console.error("[DOMAINS] Failed to clear customDomainUrl on delete:", cleanupErr?.message);
+      }
+    }
+
     res.json({ message: "Domain removed successfully" });
   } catch (error: any) {
     console.error("[DOMAINS] Error removing domain:", error);
