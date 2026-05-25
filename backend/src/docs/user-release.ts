@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-25',
     changes: [
+      'Fixed: Adding a New Landing Page Subpage No Longer Creates an Orphaned Vercel Project',
+      '- Asking Emma to create a new landing page on an existing domain (e.g. hireemma.ai) was incorrectly spinning up a brand-new Vercel project and GitHub repo instead of adding a route to the existing one',
+      '- Root cause: v0-generated subpages included an app/api/capture route that conflicted with the root repo\'s existing API route, causing a Turbopack build failure; Emma then called deploy_landing_page on the failed subpage record, which created the orphaned project',
+      '- New subpages now skip the conflicting API route during file remapping, and deploy_landing_page now refuses to process subpage records to prevent this class of error entirely',
+    ],
+  },
+  {
+    date: '2026-05-25',
+    changes: [
       'Fixed: Admin Delegate Access to Customer Portal No Longer Resets to Wrong Account on Reload',
       '- When an admin accessed a customer\'s portal and then reloaded the page, the portal would switch to a different customer\'s account',
       '- Multiple delegate session tokens were accumulating in the browser\'s session storage, and the wrong one would be picked on reload due to non-deterministic key ordering',
