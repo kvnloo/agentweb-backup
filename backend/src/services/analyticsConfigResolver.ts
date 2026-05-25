@@ -14,6 +14,12 @@ export interface ConfigTarget {
   kind: "org" | "user";
   id: string;
   canEdit: boolean;
+  /**
+   * True when this caller is permitted to read the underlying analytics
+   * config. Owners and analytics editors always can; plain members only when
+   * org-wide analytics sharing is enabled. Solo users always can.
+   */
+  canView: boolean;
 }
 
 /** Normalise GA4 properties (new array form, falling back to legacy single field). */
@@ -100,15 +106,20 @@ export async function resolveAnalyticsConfig(user: any): Promise<ResolvedAnalyti
  * editors may edit. Solo users target their own user record.
  */
 export async function resolveConfigTarget(user: any): Promise<ConfigTarget> {
-  if (!user?.orgId) return { kind: "user", id: user.userId, canEdit: true };
+  if (!user?.orgId) return { kind: "user", id: user.userId, canEdit: true, canView: true };
 
   const org = await orgDb.getOrgById(user.orgId);
-  if (!org) return { kind: "user", id: user.userId, canEdit: true };
+  if (!org) return { kind: "user", id: user.userId, canEdit: true, canView: true };
 
   const isOwner = org.ownerUserId === user.userId;
   const isEditor =
     Array.isArray(org.shareSettings?.analytics?.editors) &&
     org.shareSettings!.analytics!.editors.includes(user.userId);
 
-  return { kind: "org", id: org.orgId, canEdit: isOwner || isEditor };
+  return {
+    kind: "org",
+    id: org.orgId,
+    canEdit: isOwner || isEditor,
+    canView: isOwner || isEditor || isSharingEnabled(org),
+  };
 }

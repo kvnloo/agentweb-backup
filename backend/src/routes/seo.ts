@@ -21,12 +21,24 @@ const router = express.Router();
 router.use(authenticateToken);
 
 // Get the caller's editable analytics config (self-service Settings tab).
+// When the caller is a plain member of an org with analytics sharing OFF, the
+// response carries an empty config so the API never leaks org data to a user
+// who has no UI access — mirroring `resolveAnalyticsConfig`'s gate.
 router.get("/config", async (req, res) => {
   try {
     const user = await userDb.getUserById((req as any).user.userId);
     if (!user) return res.status(404).json({ message: "User not found" });
     const target = await resolveConfigTarget(user);
-    const config = await readAnalyticsConfig(target);
+    const config = target.canView
+      ? await readAnalyticsConfig(target)
+      : {
+          seoDomains: [],
+          googleAnalyticsProperties: [],
+          primaryAnalyticsPropertyId: null,
+          gaFilteredDomains: [],
+          clarityProjects: [],
+          productDomain: null,
+        };
     const serviceAccountEmail = await getServiceAccountEmail();
     res.json({
       config,
