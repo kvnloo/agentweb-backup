@@ -7833,6 +7833,24 @@ export class AgentModeService {
         return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
       }
 
+      // Check LinkedIn connection status from cache (non-blocking, swallows errors)
+      let linkedInConnectionStatus: {
+        isConnected: boolean;
+        connectedAt?: string;
+        connectedAtTimestamp?: number;
+      } | null = null;
+      if (lead.linkedin) {
+        const { getConnectionByProfileUrl } = await import('./unipileConnectionsDb');
+        const conn = await getConnectionByProfileUrl(lead.linkedin as string).catch(() => null);
+        linkedInConnectionStatus = conn
+          ? {
+              isConnected: true,
+              connectedAt: new Date(conn.connectedAt * 1000).toISOString(),
+              connectedAtTimestamp: conn.connectedAt,
+            }
+          : { isConnected: false };
+      }
+
       // Get engagement count and recent engagements
       const [engagementCount, engagementsResult] = await Promise.all([
         crmDb.getLeadEngagementCount(listId, leadId, userId),
@@ -7868,6 +7886,7 @@ export class AgentModeService {
           phone: lead.phone || '',
           notes: lead.notes || '',
           linkedin: lead.linkedin || '',
+          linkedInConnectionStatus,
           customFields: lead.customFields || {},
           icpMatch: lead.icpMatch || null,
           isEngaged: lead.isEngaged || false,
@@ -9713,8 +9732,8 @@ Format the response as JSON with this structure:
       });
 
       const bucketName = knowledgeBaseType === 'public'
-        ? (process.env.KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-dev')
-        : (process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-private-dev');
+        ? (process.env.GCS_BUCKET_NAME || 'agentweb-knowledge-base-dev')
+        : (process.env.GCS_BUCKET_NAME_PRIVATE || 'agentweb-knowledge-base-private-dev');
 
       const bucket = storage.bucket(bucketName);
       const filePath = `tasks/${taskId}/knowledge-base.txt`;
@@ -9844,8 +9863,8 @@ Format the response as JSON with this structure:
       // 4. Determine bucket based on knowledgeBaseType
       const knowledgeBaseType = task.knowledgeBaseType || 'private';
       const bucketName = knowledgeBaseType === 'public'
-        ? (process.env.KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-dev')
-        : (process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-private-dev');
+        ? (process.env.GCS_BUCKET_NAME || 'agentweb-knowledge-base-dev')
+        : (process.env.GCS_BUCKET_NAME_PRIVATE || 'agentweb-knowledge-base-private-dev');
 
       const bucket = storage.bucket(bucketName);
 
@@ -10036,8 +10055,8 @@ Format the response as JSON with this structure:
 
       const knowledgeBaseType = task.knowledgeBaseType || 'private';
       const bucketName = knowledgeBaseType === 'public'
-        ? (process.env.KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-dev')
-        : (process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-private-dev');
+        ? (process.env.GCS_BUCKET_NAME || 'agentweb-knowledge-base-dev')
+        : (process.env.GCS_BUCKET_NAME_PRIVATE || 'agentweb-knowledge-base-private-dev');
 
       const bucket = storage.bucket(bucketName);
       const kbFiles = task.knowledgeBaseFiles || [];
@@ -21627,6 +21646,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!message) throw new Error('message is required for send-message action');
 
           // Gate: if list_id + lead_id provided, enforce that conversation history was synced within 24h
+          // and check for duplicate sends to prevent spam.
           const { list_id: sendListId, lead_id: sendLeadId } = args;
           let sendLead: any = null;
           if (sendListId && sendLeadId) {
@@ -21641,6 +21661,34 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                   error: `LinkedIn conversation history is stale (last synced: ${syncAt ?? 'never'}). Call update-conversation-history with list_id="${sendListId}" and lead_id="${sendLeadId}" before sending to ensure you have up-to-date context.`,
                   requiresSync: true,
                 };
+              }
+
+              // Anti-spam: check if this exact message was already sent to this lead.
+              // Compares the final rendered message (variables already substituted by the agent).
+              // Blocks on check failure — a delayed send is safer than a duplicate spam.
+              const leadLinkedInForCheck = (sendLead.linkedin as string | undefined)?.toLowerCase();
+              if (leadLinkedInForCheck) {
+                const { emailEventsDb: checkEventsDb } = await import('./emailEventsDb');
+                const priorEvents = await checkEventsDb.getEventsByEmailDomainAndLeadEmail(
+                  `linkedin-${sendListId}`,
+                  leadLinkedInForCheck
+                );
+                const priorSentMessages = priorEvents.filter(
+                  (e: any) => e.eventType === 'linkedin.message.sent'
+                );
+                const normalizedMessage = message.trim().toLowerCase();
+                const duplicateEvent = priorSentMessages.find(
+                  (e: any) => (e.data?.text ?? '').trim().toLowerCase() === normalizedMessage
+                );
+                if (duplicateEvent) {
+                  console.warn(`[AgentMode] send-message: duplicate message blocked for lead ${sendLeadId} — identical text was already sent`);
+                  return {
+                    success: false,
+                    error: `This exact message was already sent to this lead (duplicate detected). Choose a different follow-up message or skip this lead.`,
+                    duplicate: true,
+                    alreadySentAt: duplicateEvent.createdAt,
+                  };
+                }
               }
             }
           }

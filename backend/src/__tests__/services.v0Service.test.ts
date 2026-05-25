@@ -649,7 +649,7 @@ describe("v0Service - deleteLandingPage", () => {
     expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
 
-  it("FAIL: failed root page WITH githubRepoUrl cannot be deleted", async () => {
+  it("SUCCESS: failed root page WITH githubRepoUrl can be deleted", async () => {
     mockGet.mockReturnValueOnce({
       promise: () =>
         Promise.resolve({
@@ -666,10 +666,11 @@ describe("v0Service - deleteLandingPage", () => {
 
     await expect(
       deleteLandingPage("root-fail-deployed", "user-1")
-    ).rejects.toThrow("Cannot delete the root landing page");
+    ).resolves.toBeUndefined();
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
 
-  it("FAIL: deployed root page cannot be deleted", async () => {
+  it("SUCCESS: deployed root page can be deleted", async () => {
     mockGet.mockReturnValueOnce({
       promise: () =>
         Promise.resolve({
@@ -686,7 +687,8 @@ describe("v0Service - deleteLandingPage", () => {
 
     await expect(
       deleteLandingPage("root-deployed", "user-1")
-    ).rejects.toThrow("Cannot delete the root landing page");
+    ).resolves.toBeUndefined();
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
 });
 

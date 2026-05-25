@@ -220,7 +220,13 @@ describe('MCP Server', () => {
       expect(response.body.error.message).toContain('No valid session ID');
     });
 
-    it('should return 400 for invalid session ID', async () => {
+    it('should return 404 for stale/unknown session ID (so MCP client auto-reinitializes)', async () => {
+      // When a sessionId is provided but unknown to this server instance (e.g. after
+      // a server restart wiped the in-memory sessions Map), we return 404. The MCP
+      // TypeScript SDK's StreamableHTTPClientTransport treats 404 as "session expired"
+      // and automatically re-initializes a new session — eliminating the manual
+      // /mcp reconnect that was previously required. Returning 400 (the prior
+      // behavior) was treated as terminal by the SDK and forced manual recovery.
       (isInitializeRequest as unknown as jest.Mock).mockReturnValueOnce(false);
 
       const response = await request(app)
@@ -229,7 +235,9 @@ describe('MCP Server', () => {
         .set('mcp-session-id', 'nonexistent-session')
         .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
 
-      expect(response.status).toBe(400);
+      expect(response.status).toBe(404);
+      expect(response.body.error.code).toBe(-32001);
+      expect(response.body.error.message).toContain('Session not found');
     });
   });
 
@@ -247,16 +255,17 @@ describe('MCP Server', () => {
         .set('Authorization', `Bearer ${TEST_TOKEN}`);
 
       expect(response.status).toBe(400);
-      expect(response.text).toContain('Invalid or missing session ID');
+      expect(response.text).toContain('Missing session ID');
     });
 
-    it('should return 400 for invalid session ID', async () => {
+    it('should return 404 for stale/unknown session ID (so MCP client auto-reinitializes)', async () => {
       const response = await request(app)
         .get('/mcp')
         .set('Authorization', `Bearer ${TEST_TOKEN}`)
         .set('mcp-session-id', 'invalid-session');
 
-      expect(response.status).toBe(400);
+      expect(response.status).toBe(404);
+      expect(response.text).toContain('Session not found');
     });
   });
 
@@ -268,14 +277,16 @@ describe('MCP Server', () => {
       setupMcpServer(app);
     });
 
-    it('should return 400 for invalid session ID', async () => {
+    it('should return 204 for unknown session ID (idempotent termination — already gone is success)', async () => {
+      // DELETE on a missing session used to return 400. That's wrong semantically:
+      // the caller asked to terminate a session, the session doesn't exist (likely
+      // already terminated), so we should succeed idempotently.
       const response = await request(app)
         .delete('/mcp')
         .set('Authorization', `Bearer ${TEST_TOKEN}`)
         .set('mcp-session-id', 'invalid-session');
 
-      expect(response.status).toBe(400);
-      expect(response.text).toContain('Invalid or missing session ID');
+      expect(response.status).toBe(204);
     });
 
     it('should return 400 for missing session ID', async () => {

@@ -1,6 +1,7 @@
 import express, { Request, Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { assessClientHealth, listAllClients } from "../services/clientHealthService";
+import { userDb } from "../services/db";
 
 const router = express.Router();
 
@@ -64,16 +65,21 @@ router.get("/:clientEmail", async (req: Request, res: Response) => {
  */
 router.post("/:clientId/notes", async (req: Request, res: Response) => {
   try {
-    const userId = req.user?.userId;
-    if (!userId) {
+    const authReq = req as AuthenticatedRequest;
+    const callerUserId = authReq.user?.userId;
+    if (!callerUserId) {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
+    if (!authReq.user?.isAdmin) {
+      return res.status(403).json({ success: false, message: "Admin access required" });
+    }
 
-    // Notes storage is a Phase 3 feature — for now acknowledge the save
-    return res.json({
-      success: true,
-      message: "Note saved",
-    });
+    const clientId = req.params.clientId;
+    const note: string = typeof req.body?.note === "string" ? req.body.note : "";
+
+    await userDb.updateUser(clientId, { clientHealthNote: note });
+
+    return res.json({ success: true, message: "Note saved" });
   } catch (error) {
     console.error("POST /api/client-health/:clientId/notes error:", error);
     return res.status(500).json({
