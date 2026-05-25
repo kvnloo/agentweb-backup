@@ -48,6 +48,18 @@ jest.mock("../services/customDomainService", () => ({
   generateSubdomain: (...args: any[]) => mockGenerateSubdomain(...args),
 }));
 
+// Mock subscriptionService for tier-gate tests
+const mockUserHasFeature = jest.fn();
+jest.mock("../services/subscriptionService", () => ({
+  userHasFeature: (...args: any[]) => mockUserHasFeature(...args),
+}));
+
+// Mock authorizeLandingPageAccess for landing-page ownership checks
+const mockAuthorizeLandingPageAccess = jest.fn();
+jest.mock("../routes/landingPageGeneration", () => ({
+  authorizeLandingPageAccess: (...args: any[]) => mockAuthorizeLandingPageAccess(...args),
+}));
+
 // Mock auth middleware
 jest.mock("../middleware/auth", () => ({
   authenticateToken: (req: any, _res: any, next: any) => {
@@ -68,6 +80,7 @@ app.use("/api/domains", domainRoutes);
 describe("Domain API Routes", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockUserHasFeature.mockResolvedValue(true); // default allow — per-test can override
   });
 
   describe("GET /api/domains", () => {
@@ -288,6 +301,93 @@ describe("Domain API Routes", () => {
 
       const res = await request(app).get("/api/domains/dom-999");
       expect(res.status).toBe(404);
+    });
+  });
+
+  describe("POST /api/domains/custom — tier gate", () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it("returns 403 when user lacks custom-domain feature", async () => {
+      mockUserHasFeature.mockResolvedValueOnce(false);
+
+      const res = await request(app)
+        .post("/api/domains/custom")
+        .send({ vercelProjectId: "prj_123", domain: "landing.example.com" });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toMatch(/higher-tier/i);
+      expect(mockAddCustomDomain).not.toHaveBeenCalled();
+    });
+
+    it("proceeds when user has custom-domain feature", async () => {
+      mockUserHasFeature.mockResolvedValueOnce(true);
+      mockAddCustomDomain.mockResolvedValueOnce({
+        id: "dom-1",
+        userId: "test-user-123",
+        domain: "landing.example.com",
+        type: "custom",
+        status: "pending_verification",
+        vercelProjectId: "prj_123",
+        verificationRecords: [],
+        createdAt: "now",
+        updatedAt: "now",
+      });
+
+      const res = await request(app)
+        .post("/api/domains/custom")
+        .send({ vercelProjectId: "prj_123", domain: "landing.example.com" });
+
+      expect(res.status).toBe(201);
+      expect(mockAddCustomDomain).toHaveBeenCalledWith("test-user-123", "prj_123", "landing.example.com", undefined);
+    });
+  });
+
+  describe("POST /api/domains/custom — landingPageId ownership", () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+      mockUserHasFeature.mockResolvedValue(true);
+    });
+
+    it("returns 403 when caller does not own the landing page", async () => {
+      mockAuthorizeLandingPageAccess.mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        error: "Not authorized to edit this landing page",
+      });
+
+      const res = await request(app)
+        .post("/api/domains/custom")
+        .send({ vercelProjectId: "prj_123", domain: "landing.example.com", landingPageId: "lp-other" });
+
+      expect(res.status).toBe(403);
+      expect(mockAddCustomDomain).not.toHaveBeenCalled();
+    });
+
+    it("passes landingPageId to addCustomDomain when ownership check passes", async () => {
+      mockAuthorizeLandingPageAccess.mockResolvedValueOnce({
+        ok: true,
+        page: { id: "lp-42", userId: "test-user-123", slug: null },
+      });
+      mockAddCustomDomain.mockResolvedValueOnce({
+        id: "dom-1",
+        userId: "test-user-123",
+        domain: "landing.example.com",
+        type: "custom",
+        status: "pending_verification",
+        vercelProjectId: "prj_123",
+        landingPageId: "lp-42",
+        createdAt: "now",
+        updatedAt: "now",
+      });
+
+      const res = await request(app)
+        .post("/api/domains/custom")
+        .send({ vercelProjectId: "prj_123", domain: "landing.example.com", landingPageId: "lp-42" });
+
+      expect(res.status).toBe(201);
+      expect(mockAddCustomDomain).toHaveBeenCalledWith("test-user-123", "prj_123", "landing.example.com", "lp-42");
     });
   });
 });

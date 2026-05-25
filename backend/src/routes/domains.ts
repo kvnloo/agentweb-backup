@@ -9,6 +9,8 @@ import {
   getDomain,
   verifyDomain,
 } from "../services/customDomainService";
+import { userHasFeature } from "../services/subscriptionService";
+import { authorizeLandingPageAccess } from "./landingPageGeneration";
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || "us-west-2",
@@ -126,7 +128,8 @@ router.post("/custom", async (req, res: Response) => {
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const { vercelProjectId, domain } = req.body;
+    // Payload validation FIRST — keeps 400 errors as 400 (not 403) for malformed requests
+    const { vercelProjectId, domain, landingPageId } = req.body;
     if (!vercelProjectId || typeof vercelProjectId !== "string") {
       return res.status(400).json({ error: "vercelProjectId is required" });
     }
@@ -134,7 +137,26 @@ router.post("/custom", async (req, res: Response) => {
       return res.status(400).json({ error: "domain is required" });
     }
 
-    const result = await addCustomDomain(userId, vercelProjectId, domain);
+    // Tier gate
+    const ok = await userHasFeature(userId, "custom-domain");
+    if (!ok) {
+      return res.status(403).json({ error: "Custom domains require a higher-tier subscription" });
+    }
+
+    // Landing page ownership
+    if (landingPageId && typeof landingPageId === "string") {
+      const auth = await authorizeLandingPageAccess(landingPageId, userId, "edit");
+      if (!auth.ok) {
+        return res.status(auth.status).json({ error: auth.error });
+      }
+    }
+
+    const result = await addCustomDomain(
+      userId,
+      vercelProjectId,
+      domain,
+      landingPageId && typeof landingPageId === "string" ? landingPageId : undefined
+    );
     res.status(201).json(result);
   } catch (error: any) {
     console.error("[DOMAINS] Error adding custom domain:", error);
