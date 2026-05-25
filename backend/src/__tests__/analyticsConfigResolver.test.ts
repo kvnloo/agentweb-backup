@@ -117,34 +117,77 @@ describe("resolveAnalyticsConfig", () => {
 });
 
 describe("resolveConfigTarget", () => {
-  test("solo user → kind 'user', canEdit true", async () => {
+  test("solo user → kind 'user', canEdit true, canView true", async () => {
     const t = await resolveConfigTarget({ userId: "solo-1" });
-    expect(t).toEqual({ kind: "user", id: "solo-1", canEdit: true });
+    expect(t).toEqual({ kind: "user", id: "solo-1", canEdit: true, canView: true });
   });
 
-  test("org owner → kind 'org', canEdit true", async () => {
+  test("org owner → kind 'org', canEdit + canView true", async () => {
     mockOrgDb.getOrgById.mockResolvedValue(migratedOrg() as any);
     const t = await resolveConfigTarget({ userId: "owner-1", orgId: "org-1" });
-    expect(t).toEqual({ kind: "org", id: "org-1", canEdit: true });
+    expect(t).toEqual({ kind: "org", id: "org-1", canEdit: true, canView: true });
   });
 
-  test("org editor → kind 'org', canEdit true", async () => {
+  test("org editor → kind 'org', canEdit + canView true", async () => {
     mockOrgDb.getOrgById.mockResolvedValue(
       migratedOrg({ shareSettings: { analytics: { enabled: true, editors: ["m-1"] } } }) as any
     );
     const t = await resolveConfigTarget({ userId: "m-1", orgId: "org-1" });
-    expect(t).toEqual({ kind: "org", id: "org-1", canEdit: true });
+    expect(t).toEqual({ kind: "org", id: "org-1", canEdit: true, canView: true });
   });
 
-  test("plain member → kind 'org', canEdit false", async () => {
+  test("plain member, sharing ON → canEdit false, canView true", async () => {
     mockOrgDb.getOrgById.mockResolvedValue(migratedOrg() as any);
     const t = await resolveConfigTarget({ userId: "m-1", orgId: "org-1" });
-    expect(t).toEqual({ kind: "org", id: "org-1", canEdit: false });
+    expect(t).toEqual({ kind: "org", id: "org-1", canEdit: false, canView: true });
   });
 
-  test("orgId set but org missing → kind 'user', canEdit true", async () => {
+  test("plain member, sharing OFF → canEdit + canView both false", async () => {
+    mockOrgDb.getOrgById.mockResolvedValue(
+      migratedOrg({ shareSettings: { analytics: { enabled: false, editors: [] } } }) as any
+    );
+    const t = await resolveConfigTarget({ userId: "m-1", orgId: "org-1" });
+    expect(t).toEqual({ kind: "org", id: "org-1", canEdit: false, canView: false });
+  });
+
+  test("owner, sharing OFF → canView still true (owners always see their own org data)", async () => {
+    mockOrgDb.getOrgById.mockResolvedValue(
+      migratedOrg({ shareSettings: { analytics: { enabled: false, editors: [] } } }) as any
+    );
+    const t = await resolveConfigTarget({ userId: "owner-1", orgId: "org-1" });
+    expect(t.canEdit).toBe(true);
+    expect(t.canView).toBe(true);
+  });
+
+  test("editor, sharing OFF → canView still true (Decision 11)", async () => {
+    mockOrgDb.getOrgById.mockResolvedValue(
+      migratedOrg({ shareSettings: { analytics: { enabled: false, editors: ["m-1"] } } }) as any
+    );
+    const t = await resolveConfigTarget({ userId: "m-1", orgId: "org-1" });
+    expect(t.canEdit).toBe(true);
+    expect(t.canView).toBe(true);
+  });
+
+  test("plain member, un-migrated org with legacy shareAnalyticsWithOrg=true → canView true", async () => {
+    mockOrgDb.getOrgById.mockResolvedValue({
+      orgId: "org-1", ownerUserId: "owner-1", shareAnalyticsWithOrg: true,
+    } as any);
+    const t = await resolveConfigTarget({ userId: "m-1", orgId: "org-1" });
+    expect(t.canView).toBe(true);
+    expect(t.canEdit).toBe(false);
+  });
+
+  test("plain member, un-migrated org with legacy shareAnalyticsWithOrg=false → canView false", async () => {
+    mockOrgDb.getOrgById.mockResolvedValue({
+      orgId: "org-1", ownerUserId: "owner-1", shareAnalyticsWithOrg: false,
+    } as any);
+    const t = await resolveConfigTarget({ userId: "m-1", orgId: "org-1" });
+    expect(t.canView).toBe(false);
+  });
+
+  test("orgId set but org missing → kind 'user', canEdit + canView true (treat as solo)", async () => {
     mockOrgDb.getOrgById.mockResolvedValue(null);
     const t = await resolveConfigTarget({ userId: "m-1", orgId: "org-1" });
-    expect(t).toEqual({ kind: "user", id: "m-1", canEdit: true });
+    expect(t).toEqual({ kind: "user", id: "m-1", canEdit: true, canView: true });
   });
 });
