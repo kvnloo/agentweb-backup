@@ -10,6 +10,10 @@
 
 **Spec:** `docs/superpowers/specs/2026-05-25-landing-page-custom-domain-design.md`
 
+**Revision history:**
+- v1 — initial plan
+- v2 — fixes from two independent CTO reviews + validator pass: corrected axios mock pattern in Task 3, ordered payload-validation-before-tier-gate in Task 4, optional-chained `result.record` in Task 5, preserved existing mock shapes + seeded `userDb.getUserById` + catch-block fallback in Task 7, imported `STRIPE_SIGNUP_URL` from `@/config` + added `landingPageId` to frontend type + `it.todo` markers in Task 9, restructured polling effect to avoid side-effects-in-updater anti-pattern + `shouldAdvanceTime` in Task 11, switched to `getByTestId` for disconnect confirm in Task 12, added `slug` to `GeneratedPage` + dropped `as any` in Task 13.
+
 ---
 
 ## File Structure
@@ -262,7 +266,7 @@ git commit -m "refactor(domains): export authorizeLandingPageAccess for cross-ro
 
 - [ ] **Step 1: Write failing tests**
 
-Append to `backend/src/__tests__/services.customDomainService.test.ts` (inside the existing `describe('customDomainService', ...)` block — adjust to match the actual block name in the file):
+Append to `backend/src/__tests__/services.customDomainService.test.ts` (inside the existing `describe('customDomainService', ...)` block — adjust to match the actual block name in the file). **Important:** the file already mocks axios via `jest.mock("axios", ...)` with module-scope handles `mockAxiosPost` and `mockAxiosGet` that are wrapped in arrow closures (`post: (...args) => mockAxiosPost(...args)`). Use those existing handles — DO NOT re-assign `require('axios').default.post`; the reassignment doesn't replace the closures the service actually calls.
 
 ```ts
 describe('addCustomDomain with landingPageId', () => {
@@ -271,10 +275,9 @@ describe('addCustomDomain with landingPageId', () => {
   });
 
   it('stores landingPageId on the record when provided', async () => {
-    const mockAxiosPost = jest.fn().mockResolvedValueOnce({
+    mockAxiosPost.mockResolvedValueOnce({
       data: { verified: false, verification: [{ type: 'TXT', domain: '_vercel.example.com', value: 'vc-domain-verify=abc' }] },
     });
-    require('axios').default.post = mockAxiosPost;
 
     const result = await addCustomDomain('user-1', 'prj_123', 'landing.example.com', 'lp-42');
 
@@ -287,10 +290,9 @@ describe('addCustomDomain with landingPageId', () => {
   });
 
   it('omits landingPageId when not provided', async () => {
-    const mockAxiosPost = jest.fn().mockResolvedValueOnce({
+    mockAxiosPost.mockResolvedValueOnce({
       data: { verified: false, verification: [] },
     });
-    require('axios').default.post = mockAxiosPost;
 
     const result = await addCustomDomain('user-1', 'prj_123', 'landing.example.com');
 
@@ -317,8 +319,7 @@ describe('verifyDomain returns updated record', () => {
       }),
     });
 
-    const mockAxiosGet = jest.fn().mockResolvedValueOnce({ data: { verified: true } });
-    require('axios').default.get = mockAxiosGet;
+    mockAxiosGet.mockResolvedValueOnce({ data: { verified: true } });
 
     const result = await verifyDomain('dom-1', 'user-1');
 
@@ -329,6 +330,32 @@ describe('verifyDomain returns updated record', () => {
       domain: 'landing.example.com',
       status: 'active',
     });
+  });
+
+  it('returns the record even when domain was already active (idempotent rerun)', async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () => Promise.resolve({
+        Item: {
+          id: 'dom-1',
+          userId: 'user-1',
+          domain: 'landing.example.com',
+          type: 'custom',
+          status: 'active',
+          vercelProjectId: 'prj_123',
+          landingPageId: 'lp-42',
+          createdAt: '2026-05-25T00:00:00Z',
+          updatedAt: '2026-05-25T00:00:00Z',
+        },
+      }),
+    });
+
+    mockAxiosGet.mockResolvedValueOnce({ data: { verified: true } });
+
+    const result = await verifyDomain('dom-1', 'user-1');
+
+    expect(result.verified).toBe(true);
+    expect(result.record.status).toBe('active');
+    expect(result.record.verificationRecords).toBeUndefined();
   });
 });
 ```
@@ -456,6 +483,9 @@ export async function verifyDomain(
     record.status = "active";
     record.updatedAt = now;
     delete record.verificationRecords;
+  } else if (isVerified) {
+    // Already active on prior verify; mirror in-memory invariants without rewriting DB.
+    delete record.verificationRecords;
   }
 
   return {
@@ -500,7 +530,7 @@ git commit -m "feat(customDomain): add landingPageId field; verifyDomain returns
 
 - [ ] **Step 1: Write failing tests**
 
-Append a new `describe` block to `backend/src/__tests__/routes.domains.test.ts`. First add the new mocks at the top of the file (alongside the existing `mockAddCustomDomain` etc.):
+Append a new `describe` block to `backend/src/__tests__/routes.domains.test.ts`. First add the new mocks at the top of the file, **in the same style as the existing `mockAddCustomDomain` / customDomainService mock block (around lines 33-49)** — declare the `const` arrow handles ABOVE the `jest.mock` factory, and place `jest.mock(...)` immediately after, before `import domainRoutes from "../routes/domains"` at line 60. Jest hoists the `jest.mock` calls; the factory bodies are evaluated lazily on first import, so the `const` declarations resolve in time.
 
 ```ts
 const mockUserHasFeature = jest.fn();
@@ -512,6 +542,15 @@ const mockAuthorizeLandingPageAccess = jest.fn();
 jest.mock("../routes/landingPageGeneration", () => ({
   authorizeLandingPageAccess: (...args: any[]) => mockAuthorizeLandingPageAccess(...args),
 }));
+```
+
+**Crucially**, extend the outermost `beforeEach` (currently at `routes.domains.test.ts:68-71`) so existing `POST /api/domains/custom` tests don't start hitting the new 403 gate:
+
+```ts
+beforeEach(() => {
+  jest.clearAllMocks();
+  mockUserHasFeature.mockResolvedValue(true); // default allow — per-test can override
+});
 ```
 
 Then add tests:
@@ -627,18 +666,19 @@ router.post("/custom", async (req, res: Response) => {
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    // Tier gate
-    const ok = await userHasFeature(userId, "custom-domain");
-    if (!ok) {
-      return res.status(403).json({ error: "Custom domains require a higher-tier subscription" });
-    }
-
+    // Payload validation first — keeps 400 errors as 400 (not 403) for malformed requests
     const { vercelProjectId, domain, landingPageId } = req.body;
     if (!vercelProjectId || typeof vercelProjectId !== "string") {
       return res.status(400).json({ error: "vercelProjectId is required" });
     }
     if (!domain || typeof domain !== "string") {
       return res.status(400).json({ error: "domain is required" });
+    }
+
+    // Tier gate
+    const ok = await userHasFeature(userId, "custom-domain");
+    if (!ok) {
+      return res.status(403).json({ error: "Custom domains require a higher-tier subscription" });
     }
 
     // Landing page ownership
@@ -861,7 +901,10 @@ router.post("/:id/verify", async (req, res: Response) => {
 
     // If domain just transitioned to active and is linked to a landing page,
     // persist customDomainUrl on that page. Non-fatal on failure.
-    if (result.verified && result.record.landingPageId) {
+    // No ConditionExpression on userId here: org editors (allowed by
+    // authorizeLandingPageAccess at add time) may not be the page owner.
+    // Ownership was already validated when the domain was added.
+    if (result.verified && result.record?.landingPageId) {
       try {
         const pageResult = await dynamodb.get({
           TableName: LANDING_PAGES_TABLE,
@@ -875,11 +918,9 @@ router.post("/:id/verify", async (req, res: Response) => {
         await dynamodb.update({
           TableName: LANDING_PAGES_TABLE,
           Key: { id: result.record.landingPageId },
-          ConditionExpression: "userId = :uid",
           UpdateExpression: "SET customDomainUrl = :url, updatedAt = :now",
           ExpressionAttributeValues: {
             ":url": customDomainUrl,
-            ":uid": userId,
             ":now": new Date().toISOString(),
           },
         }).promise();
@@ -1093,27 +1134,35 @@ git commit -m "feat(domains): clear customDomainUrl on delete when domains match
 
 - [ ] **Step 1: Write failing test**
 
-Open `backend/src/__tests__/auth.subscription.test.ts`. Add an import for `getAllowedFeatures` to the existing mock block, and add a test asserting the field is on the response. Locate the existing `jest.mock('../services/subscriptionService', ...)` block and extend it:
+Open `backend/src/__tests__/auth.subscription.test.ts`. The existing `jest.mock('../services/subscriptionService', ...)` factory must be extended WITHOUT changing the shape of existing exports — `getAllowedSkills` currently returns string IDs like `['skill-1', 'skill-2']` (see `auth.ts:106-113` which filters `publishedSkills` by `allowedSet.has(s.skillId)` and maps to `{skillId, name}`). Existing tests assert `[{skillId:'skill-1', ...}, {skillId:'skill-2', ...}]`. Replacing the mock with a different shape breaks them.
+
+Only ADD `getAllowedFeatures` to the existing factory — do not change other entries:
 
 ```ts
 jest.mock('../services/subscriptionService', () => ({
   getUserSubscriptionType: jest.fn(async () => 'Pro'),
   getAllowedPages: jest.fn(async () => ['/tasks', '/seo']),
-  getAllowedSkills: jest.fn(async () => [{ skillId: 'sk-1', name: 'Skill 1' }]),
+  getAllowedSkills: jest.fn(async () => ['skill-1', 'skill-2']),
   getHiddenPages: jest.fn(async () => []),
   getAllowedFeatures: jest.fn(async () => ['custom-domain']),
 }));
 ```
 
-Then add the import line and a new test (place it after an existing `/me` test):
+Add the import and a new test inside the existing `describe('GET /api/auth/me', ...)` block. The new test MUST seed `userDb.getUserById` with a customer-role user — without it, the route returns 404 at `auth.ts:51-54`, and the `getAllowedFeatures` code path is also gated on `user.roles.includes('customer')` (`auth.ts:88`):
 
 ```ts
 import { getAllowedFeatures } from '../services/subscriptionService';
 
-// ...inside the existing describe('GET /api/auth/me', ...) block:
+// ...inside the existing describe('GET /api/auth/me', ...) block, alongside other /me tests:
 
 it('returns allowedFeatures in the response', async () => {
-  // Configure auth mock to return a valid user — follow the pattern used by neighboring tests
+  mockedUserDb.getUserById.mockResolvedValueOnce({
+    userId: 'user-1',
+    email: 'c@e.com',
+    roles: ['customer'],
+    password: 'x',
+  } as any);
+
   const res = await request(app)
     .get('/api/auth/me')
     .set('Authorization', 'Bearer valid-token');
@@ -1124,7 +1173,7 @@ it('returns allowedFeatures in the response', async () => {
 });
 ```
 
-If `auth.subscription.test.ts` mocks the auth middleware and module differently, follow the patterns already there — the goal is `expect(res.body.allowedFeatures).toEqual(['custom-domain'])`.
+If neighboring tests use a different mock name (e.g. `userDbMock` instead of `mockedUserDb`), follow the local convention — the substance is: seed the user lookup with `roles: ['customer']`.
 
 - [ ] **Step 2: Run failing test**
 
@@ -1133,21 +1182,27 @@ Expected: test fails because `allowedFeatures` is undefined in the response.
 
 - [ ] **Step 3: Implement**
 
-In `backend/src/routes/auth.ts`, update the dynamic import (line 90) and response shape. Find the two places that set `response.allowedPages` (around lines 100 and 139):
+In `backend/src/routes/auth.ts`, there are two code paths that build `/me` response:
 
-At line 90, extend the import:
+1. **Try-block (line ~90 onward)** — the normal customer-role path. Extend the dynamic import:
 
 ```ts
 const { getUserSubscriptionType, getAllowedPages, getAllowedSkills, getHiddenPages, getAllowedFeatures } = await import('../services/subscriptionService');
 ```
 
-After each `response.allowedPages = ...` line, add:
+After the existing `response.allowedPages = await getAllowedPages(subscriptionUserId);` line (~line 100), add:
 
 ```ts
-response.allowedFeatures = await getAllowedFeatures(subscriptionUserId); // or userId in the second branch
+response.allowedFeatures = await getAllowedFeatures(subscriptionUserId);
 ```
 
-Also update the response type if there's an explicit `AuthMeResponse` interface in the same file — add `allowedFeatures?: string[]` to it. If the response is loosely typed, no type change is needed.
+2. **Catch-block fallback (line ~134-141)** — runs when the subscription lookup throws. This block re-imports `getAllowedPages` only. Do NOT call `getAllowedFeatures` here (the error path should fail safe). After the existing `response.allowedPages = await getAllowedPages(userId);`, add:
+
+```ts
+response.allowedFeatures = []; // safe fallback when subscription lookup failed
+```
+
+Also update the response type if there's an explicit `AuthMeResponse` interface in the same file — add `allowedFeatures?: string[]` to it. If the response is loosely typed (e.g. `response: any`), no type change is needed.
 
 - [ ] **Step 4: Run test**
 
@@ -1273,45 +1328,12 @@ describe('CustomDomainPanel — gate', () => {
 describe('CustomDomainPanel — rehydration on mount', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('starts in State 2 when a pending domain exists', async () => {
-    mockGet.mockResolvedValueOnce({
-      data: {
-        domains: [
-          {
-            id: 'dom-1',
-            type: 'custom',
-            status: 'pending_verification',
-            domain: 'landing.example.com',
-            verificationRecords: [{ type: 'TXT', domain: '_vercel.landing.example.com', value: 'vc=abc' }],
-          },
-        ],
-      },
-    });
-
-    render(
-      <CustomDomainPanel page={defaultPage} isPaidForCustomDomain={true} onUpdate={vi.fn()} />
-    );
-
-    expect(await screen.findByText(/pending dns/i)).toBeInTheDocument();
-    expect(screen.getByText('vc=abc')).toBeInTheDocument();
-  });
-
-  it('starts in State 3 when an active domain exists', async () => {
-    mockGet.mockResolvedValueOnce({
-      data: {
-        domains: [
-          { id: 'dom-1', type: 'custom', status: 'active', domain: 'landing.example.com' },
-        ],
-      },
-    });
-
-    render(
-      <CustomDomainPanel page={defaultPage} isPaidForCustomDomain={true} onUpdate={vi.fn()} />
-    );
-
-    expect(await screen.findByText(/your domain is live/i)).toBeInTheDocument();
-    expect(screen.getByText('https://landing.example.com')).toBeInTheDocument();
-  });
+  // Pending/verified rehydration tests are marked it.todo here because Task 9
+  // only implements State 1 (idle) rendering. Tasks 10 and 11 will convert
+  // these to `it(...)` once the corresponding renders exist. This keeps
+  // Task 9's commit green per CLAUDE.md Rule 2 (no failing tests at task boundary).
+  it.todo('starts in State 2 when a pending domain exists');
+  it.todo('starts in State 3 when an active domain exists');
 
   it('starts in State 1 when no custom domain exists', async () => {
     mockGet.mockResolvedValueOnce({ data: { domains: [] } });
@@ -1338,7 +1360,7 @@ Create `customer-portal/src/components/landing-pages/CustomDomainPanel.tsx`:
 import React, { useEffect, useRef, useState } from "react";
 import axios from "axios";
 import { useAuth } from "@/contexts/AuthContext";
-import { buildApiUrl } from "@/config";
+import { buildApiUrl, STRIPE_SIGNUP_URL } from "@/config";
 import { useToast } from "@/hooks/use-toast";
 import { copyToClipboard } from "@/utils/clipboard";
 import { Button } from "@/components/ui/button";
@@ -1355,8 +1377,6 @@ import {
 } from "@/components/ui/alert-dialog";
 import { CheckCircle, Copy, ExternalLink, Globe, Loader2 } from "lucide-react";
 
-const STRIPE_SIGNUP_URL = "https://buy.stripe.com/8wM5o0aXC2vP58k3cc"; // mirrors handleUpgrade in LandingPages.tsx
-
 interface DnsRecord {
   type: string;
   name: string;
@@ -1368,11 +1388,12 @@ interface CustomDomainRecord {
   domain: string;
   type: "subdomain" | "custom";
   status: "active" | "pending_verification" | "error";
+  landingPageId?: string;
   verificationRecords?: { type: string; domain: string; value: string }[];
 }
 
 interface CustomDomainPanelProps {
-  page: { id: string; vercelProjectId: string; slug: string | null; name: string };
+  page: { id: string; vercelProjectId: string; slug?: string | null; name: string };
   isPaidForCustomDomain: boolean;
   onUpdate: () => void;
 }
@@ -1514,9 +1535,9 @@ export default CustomDomainPanel;
 Run: `cd customer-portal && npm test -- CustomDomainPanel`
 Expected: the gate + rehydration tests pass. Pending/verified tests still fail (those will pass in Tasks 10–12).
 
-Mark only the gate + rehydration tests as expected-pass for now. The pending/verified tests can be skipped in this task or left as known-failing until subsequent tasks (preferred: leave failing so the next task immediately picks them up). If skipping, wrap in `it.todo`.
+All tests in the file at this point should either pass or be `it.todo` placeholders — no failing tests at the task boundary (CLAUDE.md Rule 2). The State 2 / State 3 rehydration tests are `it.todo` per Step 1 above; they will be converted to `it(...)` in Tasks 10 and 11 once the corresponding renders exist.
 
-For this task, the goal is: **gate tests pass**, **State 1 idle rehydration test passes**. Pending/verified-state tests will require subsequent tasks.
+For this task, the goal is: **gate tests pass**, **State 1 idle rehydration test passes**, **State 2 / State 3 tests are `it.todo`** (visible but not executed).
 
 - [ ] **Step 5: TypeScript check**
 
@@ -1540,7 +1561,38 @@ git commit -m "feat(landing-pages): CustomDomainPanel scaffold + gate + rehydrat
 
 - [ ] **Step 1: Write failing tests**
 
-Append to the test file:
+First, convert the State 2 rehydration `it.todo` set in Task 9 into a real `it(...)`, now that the pending render exists. Locate:
+
+```tsx
+it.todo('starts in State 2 when a pending domain exists');
+```
+
+and replace with:
+
+```tsx
+it('starts in State 2 when a pending domain exists', async () => {
+  mockGet.mockResolvedValueOnce({
+    data: {
+      domains: [
+        {
+          id: 'dom-1',
+          type: 'custom',
+          status: 'pending_verification',
+          domain: 'landing.example.com',
+          verificationRecords: [{ type: 'TXT', domain: '_vercel.landing.example.com', value: 'vc=abc' }],
+        },
+      ],
+    },
+  });
+
+  render(<CustomDomainPanel page={defaultPage} isPaidForCustomDomain={true} onUpdate={vi.fn()} />);
+
+  expect(await screen.findByText(/pending dns/i)).toBeInTheDocument();
+  expect(screen.getByText('vc=abc')).toBeInTheDocument();
+});
+```
+
+Then append:
 
 ```tsx
 describe('CustomDomainPanel — submit and State 2', () => {
@@ -1785,13 +1837,40 @@ git commit -m "feat(landing-pages): CustomDomainPanel submit + pending state wit
 
 - [ ] **Step 1: Write failing tests**
 
-Append:
+First, convert the State 3 rehydration `it.todo` set in Task 9 into a real `it(...)`, now that the verified render exists. Locate:
+
+```tsx
+it.todo('starts in State 3 when an active domain exists');
+```
+
+and replace with:
+
+```tsx
+it('starts in State 3 when an active domain exists', async () => {
+  mockGet.mockResolvedValueOnce({
+    data: {
+      domains: [
+        { id: 'dom-1', type: 'custom', status: 'active', domain: 'landing.example.com' },
+      ],
+    },
+  });
+
+  render(<CustomDomainPanel page={defaultPage} isPaidForCustomDomain={true} onUpdate={vi.fn()} />);
+
+  expect(await screen.findByText(/your domain is live/i)).toBeInTheDocument();
+  expect(screen.getByText('https://landing.example.com')).toBeInTheDocument();
+});
+```
+
+Then append:
 
 ```tsx
 describe('CustomDomainPanel — verify polling', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.useFakeTimers();
+    // shouldAdvanceTime is required so React Testing Library's findBy* helpers
+    // (which use real setTimeout internally) don't hang while timers are faked.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     mockGet.mockResolvedValue({
       data: {
         domains: [
@@ -1920,28 +1999,32 @@ const verify = async (record: CustomDomainRecord): Promise<boolean> => {
   }
 };
 
+// Polling effect — restructured to keep the setState updater pure (no side
+// effects inside setPollCount). In React 18 StrictMode the updater can be
+// invoked twice per tick to detect impurity, which would double-fire verify().
+// Instead, this effect only increments pollCount; a separate effect reacts to
+// pollCount changes and either fires verify() or sets the cap.
+useEffect(() => {
+  if (state.kind !== "pending" || pollCapped) return;
+  const id = window.setInterval(() => {
+    setPollCount((p) => p + 1);
+  }, POLL_INTERVAL_MS);
+  return () => window.clearInterval(id);
+}, [state.kind, pollCapped]);
+
 useEffect(() => {
   if (state.kind !== "pending") return;
-  if (pollCapped) return;
-
-  const id = window.setInterval(() => {
-    setPollCount((prev) => {
-      const next = prev + 1;
-      if (next > MAX_POLL_CYCLES) {
-        setPollCapped(true);
-        window.clearInterval(id);
-        return prev;
-      }
-      // Fire-and-forget verify; failure is silent per spec
-      void verify(state.record);
-      return next;
-    });
-  }, POLL_INTERVAL_MS);
-
-  return () => window.clearInterval(id);
-  // verify uses state.record by value; including state.record in deps recreates the interval unnecessarily
+  if (pollCount === 0) return;
+  if (pollCount > MAX_POLL_CYCLES) {
+    setPollCapped(true);
+    return;
+  }
+  void verify(state.record);
+  // verify and state.record intentionally omitted: this effect should only
+  // re-run on pollCount tick. state.record is captured at tick time and
+  // remains accurate because verify only touches record.id and record.domain.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-}, [state.kind, pollCapped]);
+}, [pollCount]);
 ```
 
 Wire the "Check Again" button:
@@ -2084,8 +2167,12 @@ describe('CustomDomainPanel — disconnect', () => {
     );
 
     await screen.findByText(/your domain is live/i);
+    // Open the confirm dialog
     await user.click(screen.getByRole('button', { name: /disconnect/i }));
-    await user.click(screen.getByRole('button', { name: /^disconnect$/i, hidden: false })); // confirm button in dialog
+    // Click the confirm button inside the dialog — selected by data-testid
+    // because both the trigger and the dialog action share the label "Disconnect"
+    // and getByRole would throw on multiple matches.
+    await user.click(screen.getByTestId('btn-confirm-disconnect'));
 
     await waitFor(() => expect(mockDelete).toHaveBeenCalledWith(
       'http://localhost:3001/api/domains/dom-1',
@@ -2097,7 +2184,7 @@ describe('CustomDomainPanel — disconnect', () => {
 });
 ```
 
-Note: if both buttons match `/disconnect/i`, refine selectors using a `data-testid` (add `data-testid="btn-confirm-disconnect"` to the AlertDialogAction below).
+Note: `data-testid="btn-confirm-disconnect"` is added in Step 3's AlertDialogAction below — that's why the failing test runs and fails on "element not found by testid" rather than the misleading "multiple matches" RTL error.
 
 - [ ] **Step 2: Run failing tests**
 
@@ -2151,7 +2238,7 @@ Inside the verified-state render block, replace the `{/* AlertDialog wired in Ta
 </AlertDialog>
 ```
 
-Update the test in Step 1 to use `screen.getByTestId('btn-confirm-disconnect')` for the confirm click (replace the second `getByRole('button', { name: /^disconnect$/i, hidden: false })` line). This is more reliable than role matching when two buttons share the label.
+(Test in Step 1 already uses `screen.getByTestId('btn-confirm-disconnect')`; no rewrite needed here.)
 
 - [ ] **Step 4: Run tests**
 
@@ -2177,9 +2264,20 @@ git commit -m "feat(landing-pages): CustomDomainPanel disconnect flow with confi
 **Files:**
 - Modify: `customer-portal/src/pages/LandingPages.tsx`
 
-- [ ] **Step 1: Add helper function**
+- [ ] **Step 1: Add `slug` to the `GeneratedPage` interface**
 
-In `customer-portal/src/pages/LandingPages.tsx`, below the existing `hasLandingPagesAccess` function (around line 113), add:
+The `GeneratedPage` interface at `customer-portal/src/pages/LandingPages.tsx:66-83` doesn't currently include `slug`, even though the backend `v0Service.ts:123` exposes `slug?: string`. The custom-domain panel needs it for sub-page URL composition (`https://<domain>/<slug>`). Add the field:
+
+```tsx
+// inside the GeneratedPage interface, alongside other optional string fields:
+slug?: string;
+```
+
+Verify the backend `/api/landing-pages/v0/generated` response actually carries `slug` (it does — see `backend/src/routes/landingPageGeneration.ts:445-490`, which returns the raw page record). If a field-filter exists upstream that drops `slug`, surface it during this task.
+
+- [ ] **Step 2: Add helper function**
+
+Below the existing `hasLandingPagesAccess` function (around line 113), add:
 
 ```tsx
 function hasCustomDomainAccess(
@@ -2192,7 +2290,7 @@ function hasCustomDomainAccess(
 }
 ```
 
-- [ ] **Step 2: Compute the gate value**
+- [ ] **Step 3: Compute the gate value**
 
 Just below `const isSuperPremium = user?.isAdmin || hasLandingPagesAccess(user);` (around line 176), add:
 
@@ -2200,7 +2298,7 @@ Just below `const isSuperPremium = user?.isAdmin || hasLandingPagesAccess(user);
 const isPaidForCustomDomain = hasCustomDomainAccess(user);
 ```
 
-- [ ] **Step 3: Import the new component**
+- [ ] **Step 4: Import the new component**
 
 Add to the imports at the top of the file (near `import SubdomainChooserModal from ...`):
 
@@ -2208,26 +2306,31 @@ Add to the imports at the top of the file (near `import SubdomainChooserModal fr
 import CustomDomainPanel from "@/components/landing-pages/CustomDomainPanel";
 ```
 
-- [ ] **Step 4: Replace the "Coming Soon" placeholder**
+- [ ] **Step 5: Replace the "Coming Soon" placeholder**
 
-Locate the block in `LandingPages.tsx` at lines 939–949 (the "Custom Domains — Coming Soon" card) and replace it with:
+The surrounding code at `LandingPages.tsx:913` already early-returns if `!selectedPage?.vercelProjectId`, so by the time we render the panel, `vercelProjectId` is guaranteed defined. We still need to satisfy TypeScript without `as any`. Locate the block at lines 939–949 (the "Custom Domains — Coming Soon" card) and replace it with:
 
 ```tsx
 <CustomDomainPanel
-  page={selectedPage as any}
+  page={{
+    id: selectedPage.id,
+    vercelProjectId: selectedPage.vercelProjectId!, // safe — guarded above
+    slug: selectedPage.slug,
+    name: selectedPage.name,
+  }}
   isPaidForCustomDomain={isPaidForCustomDomain}
   onUpdate={fetchGeneratedPages}
 />
 ```
 
-(The `as any` is acceptable here only if `GeneratedPage` doesn't structurally satisfy the new prop type. If it does, drop the cast.)
+No `as any` — every field is explicitly mapped. The `!` on `vercelProjectId` reflects the existing guard at line 913.
 
-- [ ] **Step 5: Verify existing tests pass and TypeScript clean**
+- [ ] **Step 6: Verify existing tests pass and TypeScript clean**
 
 Run: `cd customer-portal && npx tsc && npm test -- LandingPages`
 Expected: no TypeScript errors; existing `LandingPages.tsx` tests still pass.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add customer-portal/src/pages/LandingPages.tsx
