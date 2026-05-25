@@ -22,12 +22,20 @@ function shape(rec: any): StoredAnalyticsConfig {
   };
 }
 
-/** Read the editable analytics config from the target record (Org or user). */
+/**
+ * Read the editable analytics config from the target record. For un-migrated
+ * Orgs (no `analyticsConfigSource`), falls back to the owner's user record so
+ * the Settings tab and admin SEO/AEO dialog don't render an empty form
+ * pre-migration — mirroring the resolver behaviour used by `/seo`.
+ */
 export async function readAnalyticsConfig(target: ConfigTarget): Promise<StoredAnalyticsConfig> {
-  const rec = target.kind === "org"
-    ? await orgDb.getOrgById(target.id)
-    : await userDb.getUserById(target.id);
-  return shape(rec);
+  if (target.kind === "user") {
+    return shape(await userDb.getUserById(target.id));
+  }
+  const org = await orgDb.getOrgById(target.id);
+  if (org?.analyticsConfigSource) return shape(org);
+  const owner = org?.ownerUserId ? await userDb.getUserById(org.ownerUserId) : null;
+  return shape(owner ?? org);
 }
 
 /**
