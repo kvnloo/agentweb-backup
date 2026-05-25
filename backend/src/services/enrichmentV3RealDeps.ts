@@ -154,28 +154,35 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
     findLinkedInUrl: ({ firstName, lastName, company }) =>
       findLinkedInUrlImpl(userId, firstName, lastName, company),
 
-    resolveCompanyDomainViaWebSearch: async ({ company, linkedin, title, firstName, lastName }) => {
+    resolveCompanyDomainViaWebSearch: async ({ company, domain, linkedin, title, firstName, lastName }) => {
       try {
         const llm = createLLMService(WEB_SEARCH_MODEL, 0.2);
         const systemPrompt =
-          'You are a company researcher. Given company information, search the web to find the official company website. ' +
-          'STRICT RULES: Only return a website if you find it confirmed via web search. ' +
-          'Do NOT guess, infer, or construct a URL. Do NOT use your training knowledge alone. ' +
-          'If the web search does not return a clear, confirmed result, return null. ' +
-          'Return JSON with a single key "website" containing the full URL (e.g. "https://acme.com"), or null. ' +
-          'Return ONLY valid JSON, no explanation.';
-        const parts: string[] = [`Company name: ${company}`];
+          'You are a company researcher. Given whatever information is available about a person or company, ' +
+          'search the web to find the official company website and company name. ' +
+          'STRICT RULES: Only return results confirmed via web search. Do NOT guess, infer, or construct answers. ' +
+          'Return JSON with keys: ' +
+          '"website" (full URL confirmed via web search, e.g. "https://acme.com"), ' +
+          '"company" (company name string confirmed via web search), ' +
+          '"searchedDomain" (the exact domain you searched/confirmed, e.g. "acme.com" — include only when an email domain was provided as input). ' +
+          'Set a key to null if not confidently found. Return ONLY valid JSON, no explanation.';
+        const parts: string[] = [];
+        if (company) parts.push(`Company name: ${company}`);
+        if (domain) parts.push(`Email domain: ${domain}`);
         if (firstName || lastName) parts.push(`Contact name: ${[firstName, lastName].filter(Boolean).join(' ')}`);
         if (title) parts.push(`Contact title: ${title}`);
         if (linkedin) parts.push(`Contact LinkedIn: ${linkedin}`);
-        parts.push('Find the official website for this company.');
+        parts.push('Find the official company website and company name.');
         const userPrompt = parts.join('\n');
-        const result = await llm.generateJSONContentWithWebSearch<{ website: string | null }>(
+        const result = await llm.generateJSONContentWithWebSearch<{ website: string | null; company?: string | null; searchedDomain?: string | null }>(
           systemPrompt,
           userPrompt,
         );
-        if (!result?.website || typeof result.website !== 'string') return null;
-        return { website: result.website.trim() };
+        const website = typeof result?.website === 'string' ? result.website.trim() : undefined;
+        const companyName = typeof result?.company === 'string' ? result.company.trim() : undefined;
+        const searchedDomain = typeof result?.searchedDomain === 'string' ? result.searchedDomain.trim() : undefined;
+        if (!website && !companyName) return null;
+        return { website, company: companyName, searchedDomain };
       } catch (err) {
         console.warn('[v3 deps] resolveCompanyDomainViaWebSearch failed:', (err as Error).message);
         return null;

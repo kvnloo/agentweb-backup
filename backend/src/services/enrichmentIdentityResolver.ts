@@ -107,12 +107,13 @@ export interface IdentityResolverDeps {
    * Returns null on failure or when no confident match is found.
    */
   resolveCompanyDomainViaWebSearch(input: {
-    company: string;
+    company?: string;
+    domain?: string;
     linkedin?: string;
     title?: string;
     firstName?: string;
     lastName?: string;
-  }): Promise<{ website: string } | null>;
+  }): Promise<{ website?: string; company?: string; searchedDomain?: string } | null>;
   writeLeadFields(input: {
     listId: string;
     leadId: string;
@@ -262,33 +263,62 @@ export async function resolveIdentity(
   // Resolves the official website via a web-search-capable LLM (Gemini), then
   // derives emailDomain from it in-memory so step 6's Apollo org-match can run
   // even when there is no email address to extract a domain from.
+  // rawEmailDomain computed once here — reused by Tier 0.5 Branch B gate and
+  // by domainForApollo at Tier 3 so extractDomainFromEmail is only called once.
+  const rawEmailDomain = extractDomainFromEmail(email);
+  const hasBusinessEmailDomain = !!rawEmailDomain && !CrmEnrichmentService.isPersonalDomain(rawEmailDomain);
+
   const websiteAfterTier0 = lead.website || resolved.website;
   const emailDomainAfterTier0 = lead.emailDomain || resolved.emailDomain;
   const companyForDomainLookup = lead.company || resolved.company;
-  if (!websiteAfterTier0 && !emailDomainAfterTier0 && !extractDomainFromEmail(email) && companyForDomainLookup) {
+
+  // Tier 0.5 fires when website is still missing and we have at least one
+  // searchable signal (company name OR business email domain). Passes all
+  // available signals to the LLM so it can find website + company name.
+  // Must run before Tier 3 Apollo so resolved domain/company improves the
+  // Apollo org-match signal.
+  const tier05HasSignal = !!companyForDomainLookup || hasBusinessEmailDomain;
+  if (!websiteAfterTier0 && tier05HasSignal && needsCompanyFields) {
     try {
       const domainResult = await deps.resolveCompanyDomainViaWebSearch({
-        company: companyForDomainLookup,
+        company: companyForDomainLookup || undefined,
+        domain: hasBusinessEmailDomain ? rawEmailDomain : undefined,
         linkedin: lead.linkedin || resolved.linkedin || undefined,
         title: lead.title || resolved.title || undefined,
         firstName: lead.firstName || resolved.firstName || undefined,
         lastName: lead.lastName || resolved.lastName || undefined,
       });
       if (domainResult?.website) {
-        resolved.website = domainResult.website;
-        meta.website = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
-        // Derive emailDomain from the resolved website so downstream
-        // emailDomain-gated steps (step 6 Apollo org-match, enrich.so
-        // find-email) can fire when the lead arrived with only a company
-        // name. Without this the Tier 0.5 fix is cosmetic — the website
-        // populates but no email is ever found.
-        const derivedDomain = deriveDomainFromWebsite(domainResult.website);
-        if (derivedDomain && !lead.emailDomain && !resolved.emailDomain) {
-          resolved.emailDomain = derivedDomain;
-          meta.emailDomain = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
+        // Branch B validation (options 2 + 4): when we passed an email domain,
+        // the returned website must resolve to that same domain. Guards against
+        // LLM returning a plausible-but-wrong site (wrong TLD, similar name).
+        let websiteAccepted = true;
+        if (hasBusinessEmailDomain) {
+          const derivedFromWebsite = deriveDomainFromWebsite(domainResult.website);
+          const domainOrSubdomain = (d: string | null) =>
+            !!d && (d === rawEmailDomain || d.endsWith(`.${rawEmailDomain}`));
+          const derivedMatches = domainOrSubdomain(derivedFromWebsite);                        // option 4
+          const echoedDomain = domainResult.searchedDomain;
+          const echoMatches = !echoedDomain || domainOrSubdomain(echoedDomain);               // option 2
+          if (!derivedMatches || !echoMatches) {
+            console.warn(`${logTag} tier 0.5 domain mismatch — expected=${rawEmailDomain} derived=${derivedFromWebsite} echoed=${echoedDomain ?? '∅'} — rejecting`);
+            websiteAccepted = false;
+          }
         }
-        console.log(`${logTag} tier 0.5 website=${domainResult.website} emailDomain=${derivedDomain || '∅'} for company="${companyForDomainLookup}"`);
+        if (websiteAccepted) {
+          resolved.website = domainResult.website;
+          meta.website = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
+          const derivedDomain = deriveDomainFromWebsite(domainResult.website);
+          if (derivedDomain && !lead.emailDomain && !resolved.emailDomain) {
+            resolved.emailDomain = derivedDomain;
+            meta.emailDomain = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
+          }
+          console.log(`${logTag} tier 0.5 website=${domainResult.website} emailDomain=${derivedDomain || '∅'}`);
+        }
       }
+      // Company name NOT written from Tier 0.5 — LLM output is unvalidated.
+      // The resolved website/emailDomain above feeds Apollo Tier 3 which has
+      // its own critic; Apollo fills company with validated data.
     } catch (err) {
       console.warn(`${logTag} tier 0.5 resolveCompanyDomainViaWebSearch failed:`, (err as Error).message);
     }
@@ -322,7 +352,6 @@ export async function resolveIdentity(
   const linkedinForApollo = linkedinUrl || resolved.linkedin;
   const firstNameEff = lead.firstName || resolved.firstName;
   const lastNameEff = lead.lastName || resolved.lastName;
-  const rawEmailDomain = extractDomainFromEmail(email);
   const domainForApollo =
     lead.emailDomain || resolved.emailDomain ||
     (rawEmailDomain && !CrmEnrichmentService.isPersonalDomain(rawEmailDomain) ? rawEmailDomain : undefined) ||
