@@ -193,6 +193,37 @@ router.post("/:id/verify", async (req, res: Response) => {
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
     const result = await verifyDomain(req.params.id, userId);
+
+    // If domain just transitioned to active and is linked to a landing page,
+    // persist customDomainUrl on that page. Non-fatal on failure.
+    // No ConditionExpression on userId here: org editors (allowed by
+    // authorizeLandingPageAccess at add time) may not be the page owner.
+    // Ownership was already validated when the domain was added.
+    if (result.verified && result.record?.landingPageId) {
+      try {
+        const pageResult = await dynamodb.get({
+          TableName: LANDING_PAGES_TABLE,
+          Key: { id: result.record.landingPageId },
+        }).promise();
+        const slug = pageResult.Item?.slug;
+        const customDomainUrl = slug
+          ? `https://${result.record.domain}/${slug}`
+          : `https://${result.record.domain}`;
+
+        await dynamodb.update({
+          TableName: LANDING_PAGES_TABLE,
+          Key: { id: result.record.landingPageId },
+          UpdateExpression: "SET customDomainUrl = :url, updatedAt = :now",
+          ExpressionAttributeValues: {
+            ":url": customDomainUrl,
+            ":now": new Date().toISOString(),
+          },
+        }).promise();
+      } catch (updateErr: any) {
+        console.error("[DOMAINS] Failed to persist customDomainUrl on verify:", updateErr?.message);
+      }
+    }
+
     res.json(result);
   } catch (error: any) {
     console.error("[DOMAINS] Error verifying domain:", error);

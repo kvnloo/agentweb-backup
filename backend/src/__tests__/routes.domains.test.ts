@@ -390,4 +390,160 @@ describe("Domain API Routes", () => {
       expect(mockAddCustomDomain).toHaveBeenCalledWith("test-user-123", "prj_123", "landing.example.com", "lp-42");
     });
   });
+
+  describe("POST /api/domains/:id/verify — landing page persistence", () => {
+    let landingPageUpdateSpy: jest.Mock;
+    let originalUpdate: any;
+    let originalGet: any;
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      // Save originals so we can restore after this describe block to avoid leaking into later tests
+      originalUpdate = mockDynamoInstance.update;
+      originalGet = mockDynamoInstance.get;
+      landingPageUpdateSpy = jest.fn().mockReturnValue({ promise: () => Promise.resolve() });
+      mockDynamoInstance.update = landingPageUpdateSpy;
+      mockDynamoInstance.get = jest.fn().mockReturnValue({
+        promise: () => Promise.resolve({ Item: { id: "lp-42", slug: null, userId: "test-user-123" } }),
+      });
+    });
+
+    afterEach(() => {
+      mockDynamoInstance.update = originalUpdate;
+      mockDynamoInstance.get = originalGet;
+    });
+
+    it("updates customDomainUrl on landing page when verified + landingPageId present (root page)", async () => {
+      mockVerifyDomain.mockResolvedValueOnce({
+        verified: true,
+        status: "active",
+        record: {
+          id: "dom-1",
+          userId: "test-user-123",
+          domain: "landing.example.com",
+          type: "custom",
+          status: "active",
+          vercelProjectId: "prj_123",
+          landingPageId: "lp-42",
+          createdAt: "now",
+          updatedAt: "now",
+        },
+      });
+
+      const res = await request(app).post("/api/domains/dom-1/verify");
+
+      expect(res.status).toBe(200);
+      expect(landingPageUpdateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          Key: { id: "lp-42" },
+          ExpressionAttributeValues: expect.objectContaining({
+            ":url": "https://landing.example.com",
+          }),
+        })
+      );
+    });
+
+    it("appends slug to customDomainUrl for sub-pages", async () => {
+      mockDynamoInstance.get = jest.fn().mockReturnValue({
+        promise: () => Promise.resolve({ Item: { id: "lp-42", slug: "pricing", userId: "test-user-123" } }),
+      });
+      mockVerifyDomain.mockResolvedValueOnce({
+        verified: true,
+        status: "active",
+        record: {
+          id: "dom-1",
+          userId: "test-user-123",
+          domain: "landing.example.com",
+          type: "custom",
+          status: "active",
+          vercelProjectId: "prj_123",
+          landingPageId: "lp-42",
+          createdAt: "now",
+          updatedAt: "now",
+        },
+      });
+
+      const res = await request(app).post("/api/domains/dom-1/verify");
+
+      expect(res.status).toBe(200);
+      expect(landingPageUpdateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ExpressionAttributeValues: expect.objectContaining({
+            ":url": "https://landing.example.com/pricing",
+          }),
+        })
+      );
+    });
+
+    it("does not update landing page when record has no landingPageId", async () => {
+      mockVerifyDomain.mockResolvedValueOnce({
+        verified: true,
+        status: "active",
+        record: {
+          id: "dom-1",
+          userId: "test-user-123",
+          domain: "landing.example.com",
+          type: "custom",
+          status: "active",
+          vercelProjectId: "prj_123",
+          createdAt: "now",
+          updatedAt: "now",
+        },
+      });
+
+      const res = await request(app).post("/api/domains/dom-1/verify");
+
+      expect(res.status).toBe(200);
+      expect(landingPageUpdateSpy).not.toHaveBeenCalled();
+    });
+
+    it("still returns 200 if landing page DB write fails (non-fatal)", async () => {
+      landingPageUpdateSpy.mockReturnValueOnce({
+        promise: () => Promise.reject(new Error("ConditionalCheckFailed")),
+      });
+      mockVerifyDomain.mockResolvedValueOnce({
+        verified: true,
+        status: "active",
+        record: {
+          id: "dom-1",
+          userId: "test-user-123",
+          domain: "landing.example.com",
+          type: "custom",
+          status: "active",
+          vercelProjectId: "prj_123",
+          landingPageId: "lp-42",
+          createdAt: "now",
+          updatedAt: "now",
+        },
+      });
+
+      const res = await request(app).post("/api/domains/dom-1/verify");
+
+      expect(res.status).toBe(200);
+    });
+
+    it("does not update landing page when verification is still pending", async () => {
+      mockVerifyDomain.mockResolvedValueOnce({
+        verified: false,
+        status: "pending_verification",
+        verificationRecords: [{ type: "TXT", domain: "_vercel.x", value: "abc" }],
+        record: {
+          id: "dom-1",
+          userId: "test-user-123",
+          domain: "landing.example.com",
+          type: "custom",
+          status: "pending_verification",
+          vercelProjectId: "prj_123",
+          landingPageId: "lp-42",
+          createdAt: "now",
+          updatedAt: "now",
+        },
+      });
+
+      const res = await request(app).post("/api/domains/dom-1/verify");
+
+      expect(res.status).toBe(200);
+      expect(landingPageUpdateSpy).not.toHaveBeenCalled();
+    });
+  });
 });
