@@ -23,6 +23,7 @@ jest.mock('../services/subscriptionService', () => ({
   getAllowedPages: jest.fn(async () => ['/tasks', '/seo']),
   getAllowedSkills: jest.fn(async () => ['skill-1', 'skill-2']),
   getHiddenPages: jest.fn(async () => []),
+  getAllowedFeatures: jest.fn(async () => ['custom-domain']),
 }));
 
 jest.mock('../services/skillService', () => ({
@@ -35,13 +36,14 @@ jest.mock('../services/skillService', () => ({
   },
 }));
 
-import { getUserSubscriptionType, getAllowedPages, getAllowedSkills } from '../services/subscriptionService';
+import { getUserSubscriptionType, getAllowedPages, getAllowedSkills, getAllowedFeatures } from '../services/subscriptionService';
 
 const mockedUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
 const mockedGetUserSubscriptionType = getUserSubscriptionType as jest.MockedFunction<typeof getUserSubscriptionType>;
 const mockedGetAllowedPages = getAllowedPages as jest.MockedFunction<typeof getAllowedPages>;
 const mockedGetAllowedSkills = getAllowedSkills as jest.MockedFunction<typeof getAllowedSkills>;
+const mockedGetAllowedFeatures = getAllowedFeatures as jest.MockedFunction<typeof getAllowedFeatures>;
 
 let app: express.Application;
 
@@ -193,6 +195,23 @@ describe('GET /api/auth/me subscription fields', () => {
 
     expect(res.body.orgManagedSubscription).toBeUndefined();
     expect(mockedGetUserSubscriptionType).toHaveBeenCalledWith('owner-1');
+  });
+
+  it('returns allowedFeatures in the response', async () => {
+    mockedUserDb.getUserById.mockResolvedValueOnce({
+      userId: 'user-1',
+      email: 'c@e.com',
+      roles: ['customer'],
+      password: 'x',
+    } as any);
+
+    const res = await request(app)
+      .get('/api/auth/me')
+      .set('Authorization', 'Bearer test-token')
+      .expect(200);
+
+    expect(res.body.allowedFeatures).toEqual(['custom-domain']);
+    expect(mockedGetAllowedFeatures).toHaveBeenCalledWith('user-1');
   });
 
   it('falls back to member userId when org lookup returns null', async () => {
