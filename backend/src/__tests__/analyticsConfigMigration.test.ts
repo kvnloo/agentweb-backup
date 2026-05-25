@@ -63,3 +63,43 @@ test("legacy singular owner fields normalise into arrays", () => {
   expect(u!.googleAnalyticsProperties).toEqual([{ propertyId: "999", label: "Main Property" }]);
   expect(u!.clarityProjects).toEqual([{ projectId: "ul99x99x", label: "Main Project" }]);
 });
+
+test("legacy clarityProjectId is carried even when owner has an empty clarityProjects array", () => {
+  const u = migrateOrg(
+    { orgId: "o", ownerUserId: "owner-1" } as any,
+    { userId: "owner-1", clarityProjects: [], clarityProjectId: "ownerclar01" } as any,
+  );
+  expect(u!.clarityProjects).toEqual([{ projectId: "ownerclar01", label: "Main Project" }]);
+});
+
+test("legacy googleAnalyticsPropertyId is carried even when owner has an empty googleAnalyticsProperties array", () => {
+  const u = migrateOrg(
+    { orgId: "o", ownerUserId: "owner-1" } as any,
+    { userId: "owner-1", googleAnalyticsProperties: [], googleAnalyticsPropertyId: "999" } as any,
+  );
+  expect(u!.googleAnalyticsProperties).toEqual([{ propertyId: "999", label: "Main Property" }]);
+});
+
+test("a non-empty owner array wins over the legacy singular field", () => {
+  const u = migrateOrg(
+    { orgId: "o", ownerUserId: "owner-1" } as any,
+    {
+      userId: "owner-1",
+      clarityProjects: [{ projectId: "real-1", label: "Real" }],
+      clarityProjectId: "stale-legacy",
+      googleAnalyticsProperties: [{ propertyId: "real-ga", label: "Real GA" }],
+      googleAnalyticsPropertyId: "stale-ga",
+    } as any,
+  );
+  expect(u!.clarityProjects).toEqual([{ projectId: "real-1", label: "Real" }]);
+  expect(u!.googleAnalyticsProperties).toEqual([{ propertyId: "real-ga", label: "Real GA" }]);
+});
+
+test("an empty owner array with no legacy field stays empty (genuinely empty)", () => {
+  const u = migrateOrg(
+    { orgId: "o", ownerUserId: "owner-1" } as any,
+    { userId: "owner-1", clarityProjects: [], googleAnalyticsProperties: [] } as any,
+  );
+  expect(u!.clarityProjects).toEqual([]);
+  expect(u!.googleAnalyticsProperties).toEqual([]);
+});
