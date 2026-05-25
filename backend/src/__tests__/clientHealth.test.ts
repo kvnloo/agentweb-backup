@@ -190,6 +190,51 @@ describe('Client Health - assessClientHealth', () => {
     expect(result.success).toBe(true);
     expect(result.health.client.displayName).toBe('John Smith');
   });
+
+  // Notes: returns persisted note when client has one
+  it('should include clientHealthNote in health assessment', async () => {
+    const adminUserId = 'admin-user';
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: adminUserId,
+      email: 'admin@example.com',
+      isAdmin: true,
+    });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-1',
+      email: 'client@example.com',
+      displayName: 'Test Client',
+      isAdmin: false,
+      clientHealthNote: 'Follow up on renewal next quarter',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.success).toBe(true);
+    expect(result.health.notes).toBe('Follow up on renewal next quarter');
+  });
+
+  // Notes: returns empty string when no note stored
+  it('should return empty string for notes when none stored', async () => {
+    const adminUserId = 'admin-user';
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: adminUserId,
+      email: 'admin@example.com',
+      isAdmin: true,
+    });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-2',
+      email: 'client2@example.com',
+      displayName: 'Client Two',
+      isAdmin: false,
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+
+    const result = await assessClientHealth(adminUserId, 'client2@example.com');
+
+    expect(result.success).toBe(true);
+    expect(result.health.notes).toBe('');
+  });
 });
 
 describe('Client Health - listAllClients', () => {

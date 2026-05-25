@@ -699,6 +699,17 @@ export async function runVerifiedChat(
     }
   }
 
+  // When the agent calls a bravesearch MCP tool, it satisfies the equivalent built-in
+  // search_web requirement (but not vice-versa: explicit bravesearch_* requirements stay specific).
+  const FUNCTION_CALL_SATISFIES: Record<string, string[]> = {
+    'search_web': ['bravesearch_brave_web_search', 'bravesearch_brave_news_search'],
+  };
+  // Count how many times a required function was called, including via accepted aliases.
+  const countCallsForRequirement = (functionName: string, calls: string[]): number => {
+    const aliases = FUNCTION_CALL_SATISFIES[functionName] ?? [];
+    return calls.filter(c => c === functionName || aliases.includes(c)).length;
+  };
+
   // Track remaining keywords and function calls
   let remainingKeywords = [...keywords];
   const remainingFunctionCallCounts: Record<string, number> = {};
@@ -706,10 +717,8 @@ export async function runVerifiedChat(
     remainingFunctionCallCounts[reqFunc.functionName] = reqFunc.minCount;
   });
 
-  // Track all function calls for reporting (array format)
+  // Track all function calls across attempts (raw names, used for alias-aware evaluation)
   const allActualFunctionCallsForReporting: string[] = [];
-  // Track function calls for evaluation (key-value format, modified during evaluation)
-  const allActualFunctionCalls: Record<string, number> = {};
 
   while (attempt < maxAttempts) {
     attempt++;
@@ -736,18 +745,13 @@ export async function runVerifiedChat(
           const keywordText = remainingKeywords.length > 0
             ? `include these keywords: ${remainingKeywords.join(', ')}`
             : '';
-          // Use allActualFunctionCallsForReporting (never decremented) to avoid
-          // asking the LLM to re-call tools that already ran. The evaluation at
-          // lines 558-563 decrements allActualFunctionCalls when a function is
-          // matched, which zeroes out counts of already-called functions when the
-          // overall check fails due to a single missing function.
           const functionCallText = requiredFunctions
             .filter(reqFunc => {
-              const currentCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
+              const currentCount = countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting);
               return currentCount < reqFunc.minCount;
             })
             .map(reqFunc => {
-              const currentCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
+              const currentCount = countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting);
               const remaining = reqFunc.minCount - currentCount;
               return `${reqFunc.functionName} (${remaining} more time${remaining > 1 ? 's' : ''} needed)`;
             })
@@ -782,13 +786,8 @@ export async function runVerifiedChat(
       allToolCalls.push(...toolCalls);
       const actualFunctionCalls = toolCalls.map((call: any) => call.name).filter(Boolean);
 
-      // Add to reporting array
+      // Keep original names so bravesearch_* requirements remain trackable
       allActualFunctionCallsForReporting.push(...actualFunctionCalls);
-
-      // Add to key-value format for easy updates
-      actualFunctionCalls.forEach((callName: string) => {
-        allActualFunctionCalls[callName] = (allActualFunctionCalls[callName] || 0) + 1;
-      });
 
       // Check work plan status
       const workPlan = response.workPlan;
@@ -817,24 +816,9 @@ export async function runVerifiedChat(
 
         // Evaluate function calls
         requiredFunctions.forEach((reqFunc) => {
-          const actualCount = allActualFunctionCalls[reqFunc.functionName] || 0;
+          const actualCount = countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting);
           if (actualCount >= reqFunc.minCount) {
             functionCallMatches.push(reqFunc.functionName);
-            // Update remaining counts and remove matched calls from allActualFunctionCalls
-            // This prevents double-counting in future evaluations
-            if (remainingFunctionCallCounts.hasOwnProperty(reqFunc.functionName)) {
-              remainingFunctionCallCounts[reqFunc.functionName] -= reqFunc.minCount;
-              if (remainingFunctionCallCounts[reqFunc.functionName] < 0) {
-                remainingFunctionCallCounts[reqFunc.functionName] = 0;
-              }
-            }
-            // Decrement the count of matched calls from allActualFunctionCalls
-            if (allActualFunctionCalls.hasOwnProperty(reqFunc.functionName)) {
-              allActualFunctionCalls[reqFunc.functionName] -= reqFunc.minCount;
-              if (allActualFunctionCalls[reqFunc.functionName] <= 0) {
-                delete allActualFunctionCalls[reqFunc.functionName];
-              }
-            }
           } else {
             functionCallMisses.push(reqFunc.functionName);
           }
@@ -844,15 +828,14 @@ export async function runVerifiedChat(
       // Check if all requirements are met
       const allKeywordsMet = remainingKeywords.length === 0;
       const allFunctionCallsMet = requiredFunctions.every(reqFunc => {
-        const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
-        return actualCount >= reqFunc.minCount;
+        return countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) >= reqFunc.minCount;
       });
       const allRequirementsMet = (!workPlan || workPlanCompleted) && allKeywordsMet && allFunctionCallsMet;
 
       if (allRequirementsMet) {
         // Build final function status
         const functionStatus = requiredFunctions.map((reqFunc) => {
-          const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
+          const actualCount = countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting);
           return {
             functionName: reqFunc.functionName,
             requiredCount: reqFunc.minCount,
@@ -868,12 +851,10 @@ export async function runVerifiedChat(
           keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
           keywordMisses: remainingKeywords,
           functionCallMatches: requiredFunctions.filter(reqFunc => {
-            const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
-            return actualCount >= reqFunc.minCount;
+            return countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) >= reqFunc.minCount;
           }).map(reqFunc => reqFunc.functionName),
           functionCallMisses: requiredFunctions.filter(reqFunc => {
-            const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
-            return actualCount < reqFunc.minCount;
+            return countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) < reqFunc.minCount;
           }).map(reqFunc => reqFunc.functionName),
           functionStatus,
           attempts: attempt,
@@ -897,7 +878,7 @@ export async function runVerifiedChat(
 
   // If we get here, we've exhausted all attempts
   const functionStatus = requiredFunctions.map((reqFunc) => {
-    const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
+    const actualCount = countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting);
     return {
       functionName: reqFunc.functionName,
       requiredCount: reqFunc.minCount,
@@ -913,12 +894,10 @@ export async function runVerifiedChat(
     keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
     keywordMisses: remainingKeywords,
     functionCallMatches: requiredFunctions.filter(reqFunc => {
-      const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
-      return actualCount >= reqFunc.minCount;
+      return countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) >= reqFunc.minCount;
     }).map(reqFunc => reqFunc.functionName),
     functionCallMisses: requiredFunctions.filter(reqFunc => {
-      const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
-      return actualCount < reqFunc.minCount;
+      return countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) < reqFunc.minCount;
     }).map(reqFunc => reqFunc.functionName),
     functionStatus,
     attempts: attempt,

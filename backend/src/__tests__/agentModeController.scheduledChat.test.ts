@@ -223,6 +223,69 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       );
     });
 
+    it('should count bravesearch_brave_web_search as satisfying a search_web requirement', async () => {
+      const scheduleWithSearchWeb = {
+        ...baseSchedule,
+        keywords: [],
+        requiredFunctionCalls: ['search_web'],
+      };
+
+      // Agent calls bravesearch MCP tool instead of the built-in search_web
+      const braveResponse = {
+        ...mockResponse,
+        content: 'Found some results.',
+        toolCalls: [
+          { name: 'bravesearch_brave_web_search', arguments: { query: 'test' } },
+        ],
+      };
+
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(braveResponse);
+
+      const result = await runScheduledChat(scheduleWithSearchWeb, mockUserId, true);
+
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect(result).toEqual(
+        expect.objectContaining({
+          status: 'success',
+          passed: true,
+          attempt: 1,
+          functionCallMatches: ['search_web'],
+          functionCallMisses: [],
+        })
+      );
+    });
+
+    it('should count bravesearch_brave_news_search as satisfying a search_web requirement', async () => {
+      const scheduleWithSearchWeb = {
+        ...baseSchedule,
+        keywords: [],
+        requiredFunctionCalls: ['search_web'],
+      };
+
+      const braveNewsResponse = {
+        ...mockResponse,
+        content: 'Found some news.',
+        toolCalls: [
+          { name: 'bravesearch_brave_news_search', arguments: { query: 'test' } },
+        ],
+      };
+
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(braveNewsResponse);
+
+      const result = await runScheduledChat(scheduleWithSearchWeb, mockUserId, true);
+
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect(result).toEqual(
+        expect.objectContaining({
+          status: 'success',
+          passed: true,
+          attempt: 1,
+          functionCallMatches: ['search_web'],
+          functionCallMisses: [],
+        })
+      );
+    });
+
     it('should retry up to 6 times when criteria are not met', async () => {
       // Mock responses that don't meet criteria
       const incompleteResponse = {
