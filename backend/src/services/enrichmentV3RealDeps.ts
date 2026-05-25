@@ -278,7 +278,10 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
       // Split by destination: standard lead columns go to top-level (where
       // the lead table reads them); custom names go to customFields.
       // Matches STANDARD_LEAD_COLUMNS in crmEnrichmentServiceV3.ts.
-      const STANDARD = new Set<string>(STANDARD_ENRICHABLE_FIELDS);
+      // `website` is a top-level AW-Leads attribute but not in STANDARD_ENRICHABLE_FIELDS
+      // (which is the user-configurable enrichment set). Include it here so the
+      // resolver's Tier 0.5 website write lands at item.website, not customFields.website.
+      const STANDARD = new Set<string>([...STANDARD_ENRICHABLE_FIELDS, 'website']);
       const topLevel: Record<string, string> = {};
       const customFields: Record<string, string> = {};
       const removeCustomFieldKeys: string[] = [];
