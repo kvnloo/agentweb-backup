@@ -65,14 +65,18 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
         const p = result?.match?.person;
         if (!p) return null;
         const org = result?.match?.organization;
+        // Fall back to current employment entry when top-level org is absent.
+        // Apollo sometimes omits the organization object for personal-email matches
+        // but still populates employment_history with the current employer.
+        const currentJob = p.employmentHistory?.find(e => e.current);
         return {
           firstName: p.firstName,
           lastName: p.lastName,
-          title: p.title,
+          title: p.title ?? currentJob?.title,
           linkedin: p.linkedin,
           email: p.email,
           emailStatus: p.emailStatus,
-          company: org?.name ?? undefined,
+          company: org?.name ?? currentJob?.organizationName ?? undefined,
           website: org?.websiteUrl ?? undefined,
           city: p.city,
           state: p.state,
@@ -158,14 +162,20 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
       try {
         const llm = createLLMService(WEB_SEARCH_MODEL, 0.2);
         const systemPrompt =
-          'You are a company researcher. Given whatever information is available about a person or company, ' +
-          'search the web to find the official company website and company name. ' +
-          'STRICT RULES: Only return results confirmed via web search. Do NOT guess, infer, or construct answers. ' +
-          'Return JSON with keys: ' +
-          '"website" (full URL confirmed via web search, e.g. "https://acme.com"), ' +
-          '"company" (company name string confirmed via web search), ' +
-          '"searchedDomain" (the exact domain you searched/confirmed, e.g. "acme.com" — include only when an email domain was provided as input). ' +
-          'Set a key to null if not confidently found. Return ONLY valid JSON, no explanation.';
+          'You are a company researcher. Given information about a person or company, find the official company website and company name.\n\n' +
+          'LOOKUP PRIORITY (follow in order):\n' +
+          '1. Search the web — prefer confirmed, live results.\n' +
+          '2. Use your own knowledge only if web search returns nothing useful.\n' +
+          '3. If neither source gives a confident answer, return null for that field.\n\n' +
+          'STRICT RULES:\n' +
+          '- Do NOT fabricate, guess, or construct any answer.\n' +
+          '- Do NOT infer a website from a company name pattern (e.g. acme.com from "Acme Inc") without confirmation.\n' +
+          '- If uncertain, set the field to null — empty is better than wrong.\n\n' +
+          'Return JSON with keys:\n' +
+          '"website" (full URL, e.g. "https://acme.com" — null if not confirmed),\n' +
+          '"company" (official company name — null if not confirmed),\n' +
+          '"searchedDomain" (exact domain you confirmed, e.g. "acme.com" — include ONLY when an email domain was provided as input, otherwise omit).\n' +
+          'Return ONLY valid JSON, no explanation.';
         const parts: string[] = [];
         if (company) parts.push(`Company name: ${company}`);
         if (domain) parts.push(`Email domain: ${domain}`);

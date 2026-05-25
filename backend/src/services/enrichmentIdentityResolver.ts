@@ -313,12 +313,16 @@ export async function resolveIdentity(
             resolved.emailDomain = derivedDomain;
             meta.emailDomain = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
           }
-          console.log(`${logTag} tier 0.5 website=${domainResult.website} emailDomain=${derivedDomain || '∅'}`);
+          // Company name accepted when website validation passed — the confirmed
+          // domain corroborates the LLM's company attribution. Only fills when
+          // lead has no company yet; never overwrites an existing company name.
+          if (domainResult.company && !lead.company && !resolved.company) {
+            resolved.company = domainResult.company;
+            meta.company = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
+          }
+          console.log(`${logTag} tier 0.5 website=${domainResult.website} emailDomain=${derivedDomain || '∅'} company=${domainResult.company || '∅'}`);
         }
       }
-      // Company name NOT written from Tier 0.5 — LLM output is unvalidated.
-      // The resolved website/emailDomain above feeds Apollo Tier 3 which has
-      // its own critic; Apollo fills company with validated data.
     } catch (err) {
       console.warn(`${logTag} tier 0.5 resolveCompanyDomainViaWebSearch failed:`, (err as Error).message);
     }
@@ -414,7 +418,9 @@ export async function resolveIdentity(
             resolved.linkedin = apolloResult.linkedin;
             meta.linkedin = makeApiMeta('apollo', 'linkedin');
           }
-          if (apolloResult.company && !lead.company && !resolved.company) {
+          if (apolloResult.company && !lead.company) {
+            // Apollo wins over Tier 0.5 LLM company — only guard against
+            // overwriting what the user explicitly imported on the lead.
             resolved.company = apolloResult.company;
             meta.company = makeApiMeta('apollo', 'company');
           }
@@ -575,21 +581,10 @@ export async function resolveIdentity(
     }
   }
 
-  // 7. Completeness gate.
-  if (needsPersonFields) {
-    const personOk = (lead.firstName || resolved.firstName) &&
-                     (lead.lastName  || resolved.lastName);
-    if (!personOk) return { ok: false, reason: 'identity_unresolvable' };
-  }
-  if (needsCompanyFields) {
-    const companyOk = lead.company || resolved.company;
-    if (!companyOk) return { ok: false, reason: 'identity_unresolvable' };
-  }
-
-
-  // 8. Persist newly-resolved attributes ONLY in enrich mode. We also project
-  // `meta` down to only the fields that made it into writableFields so the
-  // write never carries audit entries for absent attributes.
+  // 7. Persist newly-resolved attributes ONLY in enrich mode. Runs BEFORE the
+  // completeness gate so that partial signals (linkedin, title, website from
+  // Tier 0.5) are written to the lead even when we can't resolve company —
+  // preventing data loss for skipped leads.
   const writableFields: Record<string, string> = {};
   for (const [key, value] of Object.entries(resolved)) {
     // emailDomain is normally derived locally from email and not worth
@@ -612,6 +607,18 @@ export async function resolveIdentity(
       fields: writableFields,
       meta: writableMeta,
     });
+  }
+
+  // 8. Completeness gate — checked after partial writes so resolved fields
+  // (linkedin, title, website) are never discarded even when gate fires.
+  if (needsPersonFields) {
+    const personOk = (lead.firstName || resolved.firstName) &&
+                     (lead.lastName  || resolved.lastName);
+    if (!personOk) return { ok: false, reason: 'identity_unresolvable' };
+  }
+  if (needsCompanyFields) {
+    const companyOk = lead.company || resolved.company;
+    if (!companyOk) return { ok: false, reason: 'identity_unresolvable' };
   }
 
   return { ok: true, resolved, siblings: validSiblings, emailPattern };

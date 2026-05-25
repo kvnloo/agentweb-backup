@@ -402,6 +402,36 @@ describe('resolveIdentity — write semantics', () => {
     expect(call.fields).toEqual({ firstName: 'Jane' });
     expect(call.fields.lastName).toBeUndefined();
   });
+  it('writes person fields (linkedin, title) before completeness gate fires — no data loss on skip', async () => {
+    // Apollo returns person+linkedin+title but no org (personal email).
+    // Completeness gate fires (needsCompanyFields=true, no company).
+    // Write must still happen so linkedin/title land in the DB.
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        firstName: 'Nels',
+        lastName: 'Anderson',
+        linkedin: 'http://www.linkedin.com/in/kullahanderson',
+        title: 'Startup and Strategic Advisor',
+      }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'kanderso66@gmail.com', firstName: 'Nels', lastName: 'Anderson' },
+        needsCompanyFields: true,
+        mode: 'enrich',
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(false); // company missing → gate fires
+    // But write must have happened with the person fields Apollo returned
+    expect(deps.writeLeadFields).toHaveBeenCalledTimes(1);
+    const call = (deps.writeLeadFields as jest.Mock).mock.calls[0][0];
+    expect(call.fields).toMatchObject({
+      linkedin: 'http://www.linkedin.com/in/kullahanderson',
+      title: 'Startup and Strategic Advisor',
+    });
+  });
 });
 
 // ─── Combined flow ────────────────────────────────────────────────────────────
@@ -592,7 +622,7 @@ describe('resolveIdentity — Tier 0.5 Branch B (business email → company+webs
     );
   });
 
-  it('fills resolved.website but NOT resolved.company from LLM result (company left for Apollo/enrich.so)', async () => {
+  it('fills resolved.website AND resolved.company from LLM result when website validation passes', async () => {
     const deps = makeDeps({
       resolveCompanyDomainViaWebSearch: jest
         .fn()
@@ -605,11 +635,28 @@ describe('resolveIdentity — Tier 0.5 Branch B (business email → company+webs
       }),
       deps,
     );
-    expect(result.ok).toBe(false); // still fails completeness gate — company not filled by Tier 0.5
-    if (result.ok) {
-      expect(result.resolved.website).toBe('https://geniecore.net');
-      expect(result.resolved.company).toBeUndefined();
-    }
+    // Website domain matches email domain → validation passes → company written → gate passes
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.website).toBe('https://geniecore.net');
+    expect(result.resolved.company).toBe('GenieCore');
+  });
+
+  it('does NOT fill company when lead already has a company name', async () => {
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest
+        .fn()
+        .mockResolvedValue({ website: 'https://geniecore.net', company: 'GenieCore LLM Name' }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'eric@geniecore.net', firstName: 'Eric', lastName: 'Smith', company: 'GenieCore Existing' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    if (!result.ok) return;
+    expect(result.resolved.company).toBeUndefined(); // existing company not overwritten
   });
 
   it('does not fire for personal/freemail email domain', async () => {
