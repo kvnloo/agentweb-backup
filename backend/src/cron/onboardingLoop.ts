@@ -53,7 +53,7 @@ async function logRun(
         TableName: RUNS_TABLE,
         Item: {
           runId,
-          runAt: new Date().toISOString(),
+          ts: new Date().toISOString(),
           status,
           ...details,
         },
