@@ -21,10 +21,12 @@ export function migrateOrg(org: Organization, ownerUser: any): Record<string, an
     }
   }
 
-  // Legacy singular owner fields → array form.
+  // Legacy singular owner fields → array form. An empty owner array (e.g. the
+  // owner only ever used the legacy single-field UI) counts as "no data" here,
+  // so the legacy value is still carried — matching the resolver's normaliser.
   if (
     org.googleAnalyticsProperties === undefined &&
-    updates.googleAnalyticsProperties === undefined &&
+    !updates.googleAnalyticsProperties?.length &&
     ownerUser?.googleAnalyticsPropertyId
   ) {
     updates.googleAnalyticsProperties = [
@@ -33,7 +35,7 @@ export function migrateOrg(org: Organization, ownerUser: any): Record<string, an
   }
   if (
     org.clarityProjects === undefined &&
-    updates.clarityProjects === undefined &&
+    !updates.clarityProjects?.length &&
     ownerUser?.clarityProjectId
   ) {
     updates.clarityProjects = [{ projectId: ownerUser.clarityProjectId, label: "Main Project" }];
