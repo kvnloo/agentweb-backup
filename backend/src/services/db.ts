@@ -66,6 +66,7 @@ export interface User {
   createdAt: string;
   lastLoginTime?: string;
   lastActiveAt?: string; // Updated when user creates a chat session (non-delegated); more accurate than lastLoginTime for DAU/WAU/MAU
+  signupSource?: "password" | "oauth" | "waitlist" | "admin" | string; // How the account was created. Set at signup; do not mutate.
   supportNote?: string;
   roles?: ("partner" | "customer" | "free" | "contractor")[];
   displayName?: string;
