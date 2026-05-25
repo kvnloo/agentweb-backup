@@ -327,6 +327,7 @@ export const googleCallback = async (
           subscriptionType: "Free",
           allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
           allowedSkills: freeTierConfig?.allowedSkills ?? [],
+          signupSource: "oauth",
         });
 
         // Auto-sync new user to CRM lead list (fire-and-forget)
@@ -392,6 +393,7 @@ export const googleCallback = async (
           subscriptionType: "Free",
           allowedPages: freeTierConfigOAuth?.allowedPages ?? [...DEFAULT_PAGES],
           allowedSkills: freeTierConfigOAuth?.allowedSkills ?? [],
+          signupSource: "oauth",
         });
 
         // Auto-sync new user to CRM lead list (fire-and-forget)

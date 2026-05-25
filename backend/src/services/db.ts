@@ -66,6 +66,7 @@ export interface User {
   createdAt: string;
   lastLoginTime?: string;
   lastActiveAt?: string; // Updated when user creates a chat session (non-delegated); more accurate than lastLoginTime for DAU/WAU/MAU
+  signupSource?: "password" | "oauth" | "waitlist" | "admin" | string; // How the account was created. Set at signup; do not mutate.
   supportNote?: string;
   roles?: ("partner" | "customer" | "free" | "contractor")[];
   displayName?: string;
@@ -626,7 +627,7 @@ interface UserWithCounts extends User {
   chatSessionCount?: number;
 }
 
-class UserDB {
+export class UserDB {
   private docClient: AWS.DynamoDB.DocumentClient;
   private tableName: string;
 
@@ -946,18 +947,55 @@ class UserDB {
     }
   }
 
+  // Throwaway / disposable email provider domains. Bot signups use these
+  // because they don't require real inbox access. List sourced from the
+  // common disposable-domain blocklists (mailinator, guerrillamail, etc.).
+  // Keep alphabetised. Add to the list as new providers surface in the data.
+  private static THROWAWAY_DOMAINS = new Set([
+    "10minutemail.com",
+    "dispostable.com",
+    "fakeinbox.com",
+    "guerrillamail.com",
+    "guerrillamail.info",
+    "guerrillamail.net",
+    "guerrillamail.org",
+    "mailinator.com",
+    "mailnesia.com",
+    "maildrop.cc",
+    "mintemail.com",
+    "mohmal.com",
+    "sharklasers.com",
+    "spambox.us",
+    "tempmail.com",
+    "temp-mail.org",
+    "throwawaymail.com",
+    "trashmail.com",
+    "yopmail.com",
+  ]);
+
   static isBotLikeEmail(email: string): boolean {
     if (!email) return false;
     const [local, domain] = email.split("@");
     if (!domain) return false;
+    const lcLocal = local.toLowerCase();
+    const lcDomain = domain.toLowerCase();
+    // Disposable / throwaway provider domains
+    if (UserDB.THROWAWAY_DOMAINS.has(lcDomain)) return true;
     // Gmail dot-trick bots: 3+ dots in the local part
-    if (domain === "gmail.com" && (local.match(/\./g) || []).length >= 3) return true;
+    if (lcDomain === "gmail.com" && (lcLocal.match(/\./g) || []).length >= 3) return true;
+    // Gmail plus-addressing bots: typical pattern is 2+ plus segments,
+    // e.g., real.name+spam+bot@gmail.com. Single plus tags are legit
+    // (Gmail filtering), so only flag when there's more than one.
+    if (lcDomain === "gmail.com" && (lcLocal.match(/\+/g) || []).length >= 2) return true;
     // Internal test/smoke accounts
-    const testDomains = ["test.com", "onb.com"];
-    if (testDomains.includes(domain)) return true;
+    const testDomains = ["test.com", "onb.com", "example.com", "example.org"];
+    if (testDomains.includes(lcDomain)) return true;
     const ownDomain = "agentweb.pro";
-    if (domain === ownDomain && /^(test|smoketest|attrtest)/.test(local)) return true;
-    if (domain === `updates.${ownDomain}`) return true;
+    if (lcDomain === ownDomain && /^(test|smoketest|attrtest|qa|bot)/.test(lcLocal)) return true;
+    if (lcDomain === `updates.${ownDomain}`) return true;
+    // Heuristic: random-looking local part. ≥16 chars AND no vowel = almost
+    // certainly script-generated. Real people pick pronounceable handles.
+    if (lcLocal.length >= 16 && !/[aeiouy]/.test(lcLocal)) return true;
     return false;
   }
 
