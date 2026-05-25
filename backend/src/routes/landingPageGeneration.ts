@@ -63,7 +63,7 @@ function validateBranchName(branch: string): boolean {
  * On non-owner view denial we return 404 (not 403) to avoid leaking
  * existence of pages outside the caller's scope.
  */
-async function authorizeLandingPageAccess(
+export async function authorizeLandingPageAccess(
   pageId: string,
   callerUserId: string,
   mode: "view" | "edit",
