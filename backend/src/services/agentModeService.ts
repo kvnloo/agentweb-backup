@@ -1804,6 +1804,11 @@ export class AgentModeService {
       let lastToolSignature = '';
       let consecutiveRepeats = 0;
       const MAX_CONSECUTIVE_REPEATS = 3;
+      // Sliding-window loop detection: catches alternating/cycling patterns like
+      // navigate→screenshot→navigate→screenshot that evade the consecutive check
+      const toolSignatureHistory: string[] = [];
+      const SIGNATURE_HISTORY_WINDOW = 10;
+      const SIGNATURE_REPEAT_THRESHOLD = 3;
 
       // Track max_tokens continuations to prevent infinite continuation loops
       let maxTokensContinuations = 0;
@@ -2445,6 +2450,30 @@ export class AgentModeService {
           consecutiveRepeats = 0;
         }
         lastToolSignature = currentToolSignature;
+
+        // Sliding-window loop detection: catches alternating/cycling patterns like
+        // A→B→A→B→A that evade the consecutive-only check above
+        if (currentToolSignature) {
+          toolSignatureHistory.push(currentToolSignature);
+          if (toolSignatureHistory.length > SIGNATURE_HISTORY_WINDOW) {
+            toolSignatureHistory.shift();
+          }
+          if (toolSignatureHistory.length >= SIGNATURE_HISTORY_WINDOW) {
+            const sigCounts = new Map<string, number>();
+            for (const sig of toolSignatureHistory) {
+              sigCounts.set(sig, (sigCounts.get(sig) || 0) + 1);
+            }
+            const maxCount = Math.max(...sigCounts.values());
+            if (maxCount >= SIGNATURE_REPEAT_THRESHOLD) {
+              console.warn(`AgentMode: Detected cycling tool call pattern (${maxCount}x in last ${SIGNATURE_HISTORY_WINDOW} steps) in session ${sessionId}, injecting anti-loop warning`);
+              toolSignatureHistory.length = 0; // reset to avoid spamming
+              (messages as any[]).push({
+                role: 'user',
+                content: '[SYSTEM] You are stuck in a loop — you have been calling the same tools repeatedly without making meaningful progress. STOP. Do not navigate or take screenshots again. Provide your final response now based on what you have already observed.'
+              });
+            }
+          }
+        }
 
         // Do not append an assistant message; tool messages above are sufficient for model continuation
       }
@@ -7804,6 +7833,24 @@ export class AgentModeService {
         return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
       }
 
+      // Check LinkedIn connection status from cache (non-blocking, swallows errors)
+      let linkedInConnectionStatus: {
+        isConnected: boolean;
+        connectedAt?: string;
+        connectedAtTimestamp?: number;
+      } | null = null;
+      if (lead.linkedin) {
+        const { getConnectionByProfileUrl } = await import('./unipileConnectionsDb');
+        const conn = await getConnectionByProfileUrl(lead.linkedin as string).catch(() => null);
+        linkedInConnectionStatus = conn
+          ? {
+              isConnected: true,
+              connectedAt: new Date(conn.connectedAt * 1000).toISOString(),
+              connectedAtTimestamp: conn.connectedAt,
+            }
+          : { isConnected: false };
+      }
+
       // Get engagement count and recent engagements
       const [engagementCount, engagementsResult] = await Promise.all([
         crmDb.getLeadEngagementCount(listId, leadId, userId),
@@ -7839,6 +7886,7 @@ export class AgentModeService {
           phone: lead.phone || '',
           notes: lead.notes || '',
           linkedin: lead.linkedin || '',
+          linkedInConnectionStatus,
           customFields: lead.customFields || {},
           icpMatch: lead.icpMatch || null,
           isEngaged: lead.isEngaged || false,
@@ -9684,8 +9732,8 @@ Format the response as JSON with this structure:
       });
 
       const bucketName = knowledgeBaseType === 'public'
-        ? (process.env.KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-dev')
-        : (process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-private-dev');
+        ? (process.env.GCS_BUCKET_NAME || 'agentweb-knowledge-base-dev')
+        : (process.env.GCS_BUCKET_NAME_PRIVATE || 'agentweb-knowledge-base-private-dev');
 
       const bucket = storage.bucket(bucketName);
       const filePath = `tasks/${taskId}/knowledge-base.txt`;
@@ -9815,8 +9863,8 @@ Format the response as JSON with this structure:
       // 4. Determine bucket based on knowledgeBaseType
       const knowledgeBaseType = task.knowledgeBaseType || 'private';
       const bucketName = knowledgeBaseType === 'public'
-        ? (process.env.KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-dev')
-        : (process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-private-dev');
+        ? (process.env.GCS_BUCKET_NAME || 'agentweb-knowledge-base-dev')
+        : (process.env.GCS_BUCKET_NAME_PRIVATE || 'agentweb-knowledge-base-private-dev');
 
       const bucket = storage.bucket(bucketName);
 
@@ -10007,8 +10055,8 @@ Format the response as JSON with this structure:
 
       const knowledgeBaseType = task.knowledgeBaseType || 'private';
       const bucketName = knowledgeBaseType === 'public'
-        ? (process.env.KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-dev')
-        : (process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-private-dev');
+        ? (process.env.GCS_BUCKET_NAME || 'agentweb-knowledge-base-dev')
+        : (process.env.GCS_BUCKET_NAME_PRIVATE || 'agentweb-knowledge-base-private-dev');
 
       const bucket = storage.bucket(bucketName);
       const kbFiles = task.knowledgeBaseFiles || [];
@@ -11870,7 +11918,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async updateMetaAdsCampaign(userId: string, campaignId: string, params: any, account_id?: string): Promise<any> {
     try {
       const { accessToken } = await this.getMetaCredentials(userId, account_id);
-      await metaService.updateCampaign(accessToken, campaignId, params);
+      const normalizedParams = { ...params };
+      if (normalizedParams.budget_amount !== undefined) {
+        normalizedParams.daily_budget = Math.round(normalizedParams.budget_amount * 100);
+        delete normalizedParams.budget_amount;
+      }
+      await metaService.updateCampaign(accessToken, campaignId, normalizedParams);
       return {
         success: true,
         message: `Campaign updated successfully`
@@ -11908,7 +11961,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async updateMetaAdsAdSet(userId: string, adSetId: string, params: any, account_id?: string): Promise<any> {
     try {
       const { accessToken } = await this.getMetaCredentials(userId, account_id);
-      await metaService.updateAdSet(accessToken, adSetId, params);
+      const toCents = (val?: number) => val !== undefined ? Math.round(val * 100) : undefined;
+      const normalizedParams = {
+        ...params,
+        ...(params.daily_budget !== undefined && { daily_budget: toCents(params.daily_budget) }),
+        ...(params.lifetime_budget !== undefined && { lifetime_budget: toCents(params.lifetime_budget) }),
+        ...(params.bid_amount !== undefined && { bid_amount: toCents(params.bid_amount) }),
+      };
+      await metaService.updateAdSet(accessToken, adSetId, normalizedParams);
       return {
         success: true,
         message: `Ad set updated successfully`
@@ -13762,15 +13822,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   // Helper: get Google Drive shared folders for a caller.
-  // If the caller belongs to an org, returns the org's folder list; otherwise the user's own list.
+  // Returns the union of org-level and user-level folders so that folders added before the
+  // org feature existed (stored on the user record) continue to work without data migration.
   private async getUserGoogleDriveFolders(userId: string): Promise<Array<{ folderId: string; name: string }>> {
     const { userDb, orgDb } = await import('./db');
     const user = await userDb.getUserById(userId);
+    const userFolders: Array<{ folderId: string; name: string }> =
+      Array.isArray(user?.googleDriveFolders) ? user!.googleDriveFolders : [];
     if (user?.orgId) {
       const org = await orgDb.getOrgById(user.orgId);
-      return Array.isArray(org?.googleDriveFolders) ? org!.googleDriveFolders : [];
+      const orgFolders: Array<{ folderId: string; name: string }> =
+        Array.isArray(org?.googleDriveFolders) ? org!.googleDriveFolders : [];
+      // Merge: org folders first, then user folders not already in org list
+      const orgFolderIds = new Set(orgFolders.map(f => f.folderId));
+      return [...orgFolders, ...userFolders.filter(f => !orgFolderIds.has(f.folderId))];
     }
-    return Array.isArray(user?.googleDriveFolders) ? user!.googleDriveFolders : [];
+    return userFolders;
   }
 
   public async searchKnowledgeBase(query: string, maxResults: number = 5, userId?: string): Promise<any> {
@@ -21579,6 +21646,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!message) throw new Error('message is required for send-message action');
 
           // Gate: if list_id + lead_id provided, enforce that conversation history was synced within 24h
+          // and check for duplicate sends to prevent spam.
           const { list_id: sendListId, lead_id: sendLeadId } = args;
           let sendLead: any = null;
           if (sendListId && sendLeadId) {
@@ -21593,6 +21661,34 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                   error: `LinkedIn conversation history is stale (last synced: ${syncAt ?? 'never'}). Call update-conversation-history with list_id="${sendListId}" and lead_id="${sendLeadId}" before sending to ensure you have up-to-date context.`,
                   requiresSync: true,
                 };
+              }
+
+              // Anti-spam: check if this exact message was already sent to this lead.
+              // Compares the final rendered message (variables already substituted by the agent).
+              // Blocks on check failure — a delayed send is safer than a duplicate spam.
+              const leadLinkedInForCheck = (sendLead.linkedin as string | undefined)?.toLowerCase();
+              if (leadLinkedInForCheck) {
+                const { emailEventsDb: checkEventsDb } = await import('./emailEventsDb');
+                const priorEvents = await checkEventsDb.getEventsByEmailDomainAndLeadEmail(
+                  `linkedin-${sendListId}`,
+                  leadLinkedInForCheck
+                );
+                const priorSentMessages = priorEvents.filter(
+                  (e: any) => e.eventType === 'linkedin.message.sent'
+                );
+                const normalizedMessage = message.trim().toLowerCase();
+                const duplicateEvent = priorSentMessages.find(
+                  (e: any) => (e.data?.text ?? '').trim().toLowerCase() === normalizedMessage
+                );
+                if (duplicateEvent) {
+                  console.warn(`[AgentMode] send-message: duplicate message blocked for lead ${sendLeadId} — identical text was already sent`);
+                  return {
+                    success: false,
+                    error: `This exact message was already sent to this lead (duplicate detected). Choose a different follow-up message or skip this lead.`,
+                    duplicate: true,
+                    alreadySentAt: duplicateEvent.createdAt,
+                  };
+                }
               }
             }
           }

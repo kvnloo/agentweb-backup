@@ -19,7 +19,7 @@ import {
   isApolloServiceReady,
   type MatchResult as ApolloMatchResult,
 } from './apolloService';
-import type { MappedPerson, MappedMatch } from './apolloFieldMapper';
+import { apolloEmailStatusToConfidence, type MappedPerson, type MappedMatch } from './apolloFieldMapper';
 import { getEnrichSoService, type ReverseResult, type EnrichSoConfidence } from './enrichSoService';
 import { findEmailViaPatterns } from './emailPatternFinder';
 import { apolloAsyncRequestCacheKey, APOLLO_SCHEMA_VERSION } from './apolloCacheKeys';
@@ -65,7 +65,7 @@ function resolveApolloWaitMs(ctx: WaterfallContext): number {
  * is present. All other terminal states (no_email, rejected, timeout)
  * resolve to null so the caller falls through to Tier 4.
  */
-async function waitForApolloAsyncResult(
+export async function waitForApolloAsyncResult(
   requestId: string,
   budgetMs: number,
 ): Promise<{ email: string; emailStatus?: string } | null> {
@@ -530,11 +530,7 @@ export async function waterfallFindEmail(
             { userId: ctx.userId },
           );
           if (f.found && f.email) {
-            const status = (f.emailStatus ?? '').toLowerCase();
-            const confidence: EnrichSoConfidence =
-              status === 'verified' ? 'high' :
-              status === 'guessed' ? 'low' :
-              'medium';
+            const confidence: EnrichSoConfidence = apolloEmailStatusToConfidence(f.emailStatus ?? '');
             return {
               found: true,
               email: f.email,
@@ -570,11 +566,7 @@ export async function waterfallFindEmail(
       );
       if (f.found && f.email) {
         // Sync hit (Apollo first-party).
-        const status = (f.emailStatus ?? '').toLowerCase();
-        const confidence: EnrichSoConfidence =
-          status === 'verified' ? 'high' :
-          status === 'guessed' ? 'low' :
-          'medium';
+        const confidence: EnrichSoConfidence = apolloEmailStatusToConfidence(f.emailStatus ?? '');
         return {
           found: true,
           email: f.email,
@@ -629,11 +621,7 @@ export async function waterfallFindEmail(
         // direct-lead-write safety net for results that arrive after we give up.
         const polled = await waitForApolloAsyncResult(f.asyncRequestId, resolveApolloWaitMs(ctx));
         if (polled?.email) {
-          const status = (polled.emailStatus ?? '').toLowerCase();
-          const confidence: EnrichSoConfidence =
-            status === 'verified' ? 'high' :
-            status === 'guessed' ? 'low' :
-            'medium';
+          const confidence: EnrichSoConfidence = apolloEmailStatusToConfidence(polled.emailStatus ?? '');
           return {
             found: true,
             email: polled.email,

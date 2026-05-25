@@ -97,7 +97,7 @@ function pickLastContact(lead: any): string | undefined {
       latest = e.createdAt;
     }
   }
-  return latest ?? lead?.updatedAt ?? lead?.createdAt;
+  return latest ?? lead?.createdAt;
 }
 
 /**
@@ -189,7 +189,7 @@ export async function dedupContactsForUser(query: DedupQuery): Promise<DedupResu
           name: displayName,
           company: lead.company ?? '',
           heatScore: computeHeatScore(lead),
-          lastContactAt: pickLastContact(lead) ?? lead.updatedAt ?? lead.createdAt ?? '',
+          lastContactAt: pickLastContact(lead) ?? '',
           lists: [membership],
           primaryLead: lead,
         });

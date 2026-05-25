@@ -55,6 +55,7 @@ interface ClientHealthAssessment {
   status: HealthStatus;
   status_reasons: string[];
   payment: PaymentInfo;
+  notes: string;
 }
 
 interface ClientSummary {
@@ -333,6 +334,7 @@ export async function assessClientHealth(
       status,
       status_reasons: reasons,
       payment: buildPaymentInfo(client),
+      notes: client.clientHealthNote || '',
     };
 
     return {

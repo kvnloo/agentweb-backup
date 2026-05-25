@@ -265,8 +265,28 @@ export function setupMcpServer(app: express.Express) {
         // Handle the initialization request
         await transport.handleRequest(req, res, req.body);
         return;
+      } else if (sessionId) {
+        // Session ID provided but unknown to this server instance.
+        // This happens when the server restarts (in-memory sessions Map is wiped)
+        // or when a session is cleaned up by cleanupStaleSessions while the client
+        // still has the old ID cached.
+        //
+        // Return 404 (not 400) so the StreamableHTTPClientTransport in the MCP SDK
+        // treats this as "session expired" and automatically re-initializes a new
+        // session on the next request. Returning 400 caused the SDK to treat the
+        // error as terminal — forcing every caller to manually reconnect.
+        console.log(`[MCP-SERVER-DEBUG] Unknown session ID ${sessionId} — returning 404 so client auto-reinitializes`);
+        res.status(404).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32001,
+            message: 'Session not found. Please reinitialize.'
+          },
+          id: null
+        });
+        return;
       } else {
-        // Invalid request - no session ID or not initialization request
+        // No session ID AND not an initialization request — actually a bad request.
         res.status(400).json({
           jsonrpc: '2.0',
           error: {
@@ -299,8 +319,13 @@ export function setupMcpServer(app: express.Express) {
   app.get("/mcp", validateMcpAccessToken, async (req: Request, res: Response) => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
-    if (!sessionId || !sessions.has(sessionId)) {
-      res.status(400).send('Invalid or missing session ID');
+    if (!sessionId) {
+      res.status(400).send('Missing session ID');
+      return;
+    }
+    if (!sessions.has(sessionId)) {
+      // Session expired/unknown — return 404 so MCP SDK client auto-reinitializes.
+      res.status(404).send('Session not found. Please reinitialize.');
       return;
     }
 
@@ -320,8 +345,13 @@ export function setupMcpServer(app: express.Express) {
   app.delete("/mcp", validateMcpAccessToken, async (req: Request, res: Response) => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
-    if (!sessionId || !sessions.has(sessionId)) {
-      res.status(400).send('Invalid or missing session ID');
+    if (!sessionId) {
+      res.status(400).send('Missing session ID');
+      return;
+    }
+    if (!sessions.has(sessionId)) {
+      // Already gone — idempotent success rather than error.
+      res.status(204).send();
       return;
     }
 

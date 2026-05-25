@@ -54,123 +54,15 @@ import {
   getEnrichmentConfig as svcGetEnrichmentConfig,
   setEnrichmentConfig as svcSetEnrichmentConfig,
   suggestFieldTypes as svcSuggestFieldTypes,
-  type ConfigServiceDeps,
-  type FieldTypeSuggestion,
 } from '../services/enrichmentConfigService';
+import { buildConfigServiceDeps } from '../services/enrichmentConfigDeps';
 import { runEnrichment as svcRunEnrichmentV3 } from '../services/crmEnrichmentServiceV3';
 import { buildOrchestratorDeps as buildV3OrchestratorDeps } from '../services/enrichmentV3RealDeps';
 import { sanitizeLeadForResponse } from '../utils/enrichmentMetadataPresentation';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
 
-// ─── v3.1 enrichment-config service-deps adapter ────────────────────────────
-// Wires the pure-logic config service to real DDB + a Phase-1 heuristic type
-// suggester. The LLM suggester slot is intentionally heuristic-only for now —
-// users can edit types in the UI; we revisit with a real LLM call in Phase 1.5.
-
-function heuristicTypeSuggestion(
-  fields: Array<{ name: string; instruction: string }>,
-): FieldTypeSuggestion[] {
-  return fields.map(({ name }) => {
-    const lc = name.toLowerCase();
-    if (/(_count|_at$|count$|number_of)/.test(lc) || lc === 'employees' || lc === 'revenue') {
-      return { name, type: 'number' as const };
-    }
-    if (/^is_|^has_|verified$/.test(lc)) {
-      return { name, type: 'boolean' as const };
-    }
-    if (lc.endsWith('_date') || lc.endsWith('date') || lc.endsWith('_at')) {
-      return { name, type: 'date' as const };
-    }
-    return { name, type: 'string' as const };
-  });
-}
-
-const enrichmentConfigDeps: ConfigServiceDeps = {
-  readListConfig: (listId) => crmDb.getEnrichmentConfig(listId),
-  writeListConfig: (listId, config) => crmDb.setEnrichmentConfig(listId, config),
-  loadListFieldNames: async (listId) => {
-    const list = await crmDb.getLeadListById(listId);
-    return Array.isArray(list?.fieldNames) ? (list!.fieldNames as string[]) : [];
-  },
-  llmSuggestTypes: async (fields) => heuristicTypeSuggestion(fields),
-  llmInferAliases: async (fields) => {
-    if (fields.length === 0) return {};
-    // Lazy import — avoids circular deps + keeps the LLM service out of the
-    // hot path for callers that never hit alias inference.
-    const { FIELD_GROUPS } = await import('../services/enrichmentGroups');
-    const { createLLMService } = await import('../utils/llmService');
-
-    // Build the canonical-field cheat sheet for the system prompt. Grouping
-    // by FIELD_GROUPS gives the LLM more context (it understands "Series A"
-    // → funding_stage instead of guessing across groups).
-    const canonicalCheatsheet = Object.entries(FIELD_GROUPS)
-      .map(([group, cfg]) => `  ${group}: ${cfg.fields.join(', ')}`)
-      .join('\n');
-
-    const systemPrompt =
-      `You map user-named CRM enrichment fields to canonical field names ` +
-      `based on semantic intent (not just name similarity). ` +
-      `Return strict JSON keyed by user field name.\n\n` +
-      `Available canonical fields, grouped:\n${canonicalCheatsheet}\n\n` +
-      `Rules:\n` +
-      `- Match by MEANING, not string similarity. "stag" with instruction ` +
-      `"funding stage" → "funding_stage".\n` +
-      `- Return null when the user's field is a unique custom concept (no ` +
-      `confident canonical match).\n` +
-      `- Use the field's instruction text to disambiguate. If instruction is ` +
-      `empty, fall back to name alone.\n` +
-      `- Pick at most ONE canonical name per user field.`;
-
-    const userPrompt =
-      `Map each user field to a canonical name (or null):\n` +
-      fields.map(f => `- ${f.name}${f.instruction ? ` — "${f.instruction}"` : ''}`).join('\n') +
-      `\n\nReturn JSON: {"<userFieldName>": "<canonical_name>" | null} for each input.`;
-
-    try {
-      const llm = createLLMService(
-        process.env.CRM_ENRICH_V3_ALIAS_MODEL || 'gpt-5-chat-2',
-        0.0,
-      );
-      const result = await llm.generateJSONContent<Record<string, string | null>>(
-        systemPrompt,
-        userPrompt,
-      );
-      return result ?? {};
-    } catch (err) {
-      console.warn('[crm] llmInferAliases failed:', (err as Error).message);
-      return {};
-    }
-  },
-
-  llmClassifySmartFields: async (fields) => {
-    if (fields.length === 0) return {};
-    const { FIELD_GROUPS } = await import('../services/enrichmentGroups');
-    const { createLLMService: mkLLM } = await import('../utils/llmService');
-    const {
-      buildSmartFieldClassificationSystemPrompt,
-      buildSmartFieldClassificationUserPrompt,
-    } = await import('../services/enrichmentPrompts');
-
-    const canonicalFieldList = Object.entries(FIELD_GROUPS)
-      .map(([group, cfg]) => `  ${group}: ${cfg.fields.join(', ')}`)
-      .join('\n');
-
-    try {
-      const llm = mkLLM(process.env.CRM_ENRICH_V3_CLASSIFY_MODEL || process.env.CRM_ENRICH_V3_ALIAS_MODEL || 'gpt-5-chat-2', 0.0);
-      const result = await llm.generateJSONContent<
-        Record<string, { isSmartField: boolean; dependencies: string[]; fieldType?: 'string' | 'number' | 'boolean' | 'date' | 'enum'; enumOptions?: string[] }>
-      >(
-        buildSmartFieldClassificationSystemPrompt(canonicalFieldList),
-        buildSmartFieldClassificationUserPrompt(fields),
-      );
-      return result ?? {};
-    } catch (err) {
-      console.warn('[crm] llmClassifySmartFields failed:', (err as Error).message);
-      return {};
-    }
-  },
-};
+const enrichmentConfigDeps = buildConfigServiceDeps();
 const d1StripeClient = d1StripeSecretKey
   ? new Stripe(d1StripeSecretKey, { apiVersion: '2025-05-28.basil' as any })
   : null;
@@ -5413,7 +5305,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
         // routes/crmPublic.ts accepts the legacy unsigned form as a fallback
         // for emails sent before this change.
         const unsubscribeUrl = signUnsubscribeUrl({
-          baseUrl: `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe`,
+          baseUrl: CUSTOMER_FRONTEND_URL,
           listId,
           leadId: lead.leadId,
           email: lead.email,
@@ -5502,7 +5394,7 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
 
     const CUSTOMER_FRONTEND_URL_TEST = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
     const testUnsubscribeUrl = signUnsubscribeUrl({
-      baseUrl: `${CUSTOMER_FRONTEND_URL_TEST}/crm-unsubscribe`,
+      baseUrl: CUSTOMER_FRONTEND_URL_TEST,
       listId,
       leadId: 'TEST',
       email: recipients[0]?.trim() || 'test@example.com',

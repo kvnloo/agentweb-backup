@@ -531,6 +531,8 @@ export interface User {
    * Default `undefined` / falsy = legacy per-axis status flow.
    */
   useEagerPipeline?: boolean;
+  /** Admin-written retention note for this client. Written via POST /api/client-health/:clientId/notes. */
+  clientHealthNote?: string;
 }
 
 export interface Organization {

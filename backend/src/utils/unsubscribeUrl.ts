@@ -49,6 +49,7 @@ function computeSignature(listId: string, leadId: string, email: string): string
 /**
  * Build a signed unsubscribe URL.
  *
+ * baseUrl should be the frontend origin, e.g. `https://app.agentweb.pro`.
  * Returns: `${baseUrl}/crm-unsubscribe?listId=...&leadId=...&email=...&sig=<hex>`
  */
 export function signUnsubscribeUrl({ baseUrl, listId, leadId, email }: SignParams): string {

@@ -1,215 +1,196 @@
-// Tests for Emma CRM enrichment tool registration and execution
+// Tests for Emma CRM enrichment tool registration and execution (V3 engine)
 
 jest.mock('../server', () => ({
-  io: {
-    to: jest.fn().mockReturnValue({ emit: jest.fn() }),
-    emit: jest.fn(),
-  },
+  io: { to: jest.fn().mockReturnValue({ emit: jest.fn() }), emit: jest.fn() },
   app: {},
 }));
 
+jest.mock('../emma/enrichmentToolRunner', () => ({
+  runEmmaEnrichment: jest.fn(),
+  pickPreviewLeadIds: jest.fn(),
+  resolveExecuteLeadIds: jest.fn(),
+}));
+
 jest.mock('../services/db', () => ({
-  crmDb: {
-    getLeadListById: jest.fn(),
-    getLeadsByListId: jest.fn(),
-    updateLead: jest.fn(),
-    updateFieldNames: jest.fn(),
-  },
+  crmDb: { getLeadById: jest.fn() },
 }));
 
-jest.mock('../services/agentModeService', () => ({
-  agentModeService: {
-    searchWeb: jest.fn(),
-    linkedinOutreach: jest.fn(),
-  },
-}));
-
-jest.mock('../utils/llmService', () => ({
-  createLLMService: jest.fn(),
-}));
-
-jest.mock('../services/connectedAccountsDb', () => ({
-  getAccountsByUserId: jest.fn(),
-}));
-
-// Import tools to trigger registration (side effect)
 import '../emma/tools';
 import { emmaToolRegistry } from '../emma/registry';
-import { CrmEnrichmentService } from '../services/crmEnrichmentService';
+import {
+  runEmmaEnrichment,
+  pickPreviewLeadIds,
+  resolveExecuteLeadIds,
+} from '../emma/enrichmentToolRunner';
+import { crmDb } from '../services/db';
 
-// Spy on CrmEnrichmentService methods
-jest.spyOn(CrmEnrichmentService.prototype, 'preview').mockResolvedValue({
-  totalLeads: 100,
-  leadsToProcess: 80,
-  alreadyEnriched: 20,
-  samples: [
-    { leadId: 'lead1', lead: { leadId: 'lead1', company: 'Acme' }, enrichedFields: { industry: 'Tech' } },
-    { leadId: 'lead2', lead: { leadId: 'lead2', company: 'Beta' }, enrichedFields: { industry: 'Finance' } },
-  ],
-});
-
-jest.spyOn(CrmEnrichmentService.prototype, 'execute').mockResolvedValue({
-  jobId: 'job-123',
-  processedCount: 80,
+const SUMMARY = {
+  runId: 'run-1',
+  mode: 'enrich' as const,
+  processedCount: 5,
   failedCount: 0,
-  skippedCount: 0,
-  totalToProcess: 80,
-  outputFields: ['industry'],
-  failureBreakdown: { searchWebFailed: 0, linkedinFailed: 0, llmOrParseFailed: 0, updateFailed: 0 },
+  failureBreakdown: { identityResolutionFailed: 0, apolloFailed: 0, llmOrParseFailed: 0, updateFailed: 0, searchWebFailed: 0 },
+  durationMs: 100,
+  warnings: [],
+};
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  (runEmmaEnrichment as jest.Mock).mockResolvedValue(SUMMARY);
+  (pickPreviewLeadIds as jest.Mock).mockResolvedValue(['l1', 'l2']);
+  (resolveExecuteLeadIds as jest.Mock).mockResolvedValue({ leadIds: undefined, count: 5 });
 });
 
-describe('Emma CRM Enrichment Tools', () => {
-  it('should register enrich_leads_preview tool', () => {
-    const tool = emmaToolRegistry.getTool('enrich_leads_preview');
-    expect(tool).toBeDefined();
-    expect(tool!.definition.name).toBe('enrich_leads_preview');
-    expect(tool!.definition.inputSchema.required).toContain('list_id');
-    expect(tool!.definition.inputSchema.required).toContain('instruction');
-    expect(tool!.definition.inputSchema.required).toContain('output_fields');
-    expect(tool!.definition.inputSchema.required).toContain('sources');
-  });
-
-  it('should register enrich_leads_execute tool', () => {
-    const tool = emmaToolRegistry.getTool('enrich_leads_execute');
-    expect(tool).toBeDefined();
-    expect(tool!.definition.name).toBe('enrich_leads_execute');
-    expect(tool!.definition.inputSchema.required).toContain('list_id');
-  });
-
-  it('should call service.preview() with correct args from preview tool', async () => {
+describe('enrich_leads_preview', () => {
+  it('registers with the new object-array output_fields schema', () => {
     const tool = emmaToolRegistry.getTool('enrich_leads_preview')!;
-    const result = await tool.execute({
-      list_id: 'list-abc',
-      instruction: 'Determine industry',
-      output_fields: ['industry'],
-      sources: ['web_search'],
-    }, { userId: 'user1' });
+    expect(tool).toBeDefined();
+    expect(tool.definition.inputSchema.required).toEqual(
+      expect.arrayContaining(['list_id', 'output_fields']),
+    );
+    expect(tool.definition.inputSchema.required).not.toContain('instruction');
+    expect(tool.definition.inputSchema.required).not.toContain('sources');
+  });
 
-    expect(result.totalLeads).toBe(100);
-    expect(result.samples).toHaveLength(2);
-    expect(CrmEnrichmentService.prototype.preview).toHaveBeenCalledWith(expect.objectContaining({
+  it('runs V3 in preview mode on the sampled lead ids', async () => {
+    const tool = emmaToolRegistry.getTool('enrich_leads_preview')!;
+    const result = await tool.execute(
+      { list_id: 'list-abc', output_fields: [{ name: 'industry', instruction: 'classify' }] },
+      { userId: 'user1', socketId: 'sock-1' },
+    );
+    expect(pickPreviewLeadIds).toHaveBeenCalledWith('list-abc', undefined);
+    expect(runEmmaEnrichment).toHaveBeenCalledWith(expect.objectContaining({
       listId: 'list-abc',
       userId: 'user1',
-      instruction: 'Determine industry',
-      outputFields: ['industry'],
-      sources: ['web_search'],
+      mode: 'preview',
+      leadIds: ['l1', 'l2'],
+      socketId: 'sock-1',
+    }));
+    expect(result).toBe(SUMMARY);
+  });
+
+  it('rejects when there is no user context', async () => {
+    const tool = emmaToolRegistry.getTool('enrich_leads_preview')!;
+    await expect(
+      tool.execute({ list_id: 'l', output_fields: [{ name: 'f', instruction: 'i' }] }, {}),
+    ).rejects.toThrow(/Authentication required/);
+  });
+});
+
+describe('enrich_leads_execute', () => {
+  it('registers and requires list_id + output_fields', () => {
+    const tool = emmaToolRegistry.getTool('enrich_leads_execute')!;
+    expect(tool).toBeDefined();
+    expect(tool.definition.inputSchema.required).toEqual(
+      expect.arrayContaining(['list_id', 'output_fields']),
+    );
+  });
+
+  it('runs V3 in enrich mode for a list under the cap', async () => {
+    (resolveExecuteLeadIds as jest.Mock).mockResolvedValue({ leadIds: undefined, count: 5 });
+    const tool = emmaToolRegistry.getTool('enrich_leads_execute')!;
+    await tool.execute(
+      { list_id: 'list-abc', output_fields: [{ name: 'industry', instruction: 'classify' }] },
+      { userId: 'user1', socketId: 'sock-1' },
+    );
+    expect(runEmmaEnrichment).toHaveBeenCalledWith(expect.objectContaining({
+      listId: 'list-abc', userId: 'user1', mode: 'enrich', leadIds: undefined,
     }));
   });
 
-  it('should call service.execute() with correct args from execute tool', async () => {
+  it('passes an explicit lead_ids subset through', async () => {
+    (resolveExecuteLeadIds as jest.Mock).mockResolvedValue({ leadIds: ['a', 'b'], count: 2 });
     const tool = emmaToolRegistry.getTool('enrich_leads_execute')!;
-    const result = await tool.execute({
-      list_id: 'list-abc',
-      instruction: 'Determine industry',
-      output_fields: ['industry'],
-      sources: ['web_search'],
-    }, { userId: 'user1', socketId: 'sock-123' });
+    await tool.execute(
+      { list_id: 'list-abc', output_fields: [{ name: 'industry', instruction: 'classify' }], lead_ids: ['a', 'b'] },
+      { userId: 'user1' },
+    );
+    expect(runEmmaEnrichment).toHaveBeenCalledWith(expect.objectContaining({ leadIds: ['a', 'b'] }));
+  });
 
-    expect(result.jobId).toBe('job-123');
-    expect(CrmEnrichmentService.prototype.execute).toHaveBeenCalledWith(
-      expect.objectContaining({
-        listId: 'list-abc',
-        userId: 'user1',
-      }),
-      'sock-123',
-      undefined
+  it('rejects and does not run when the list exceeds the cap', async () => {
+    process.env.EMMA_ENRICH_MAX_LEADS = '10';
+    (resolveExecuteLeadIds as jest.Mock).mockResolvedValue({ leadIds: undefined, count: 11 });
+    const tool = emmaToolRegistry.getTool('enrich_leads_execute')!;
+    await expect(
+      tool.execute(
+        { list_id: 'big', output_fields: [{ name: 'industry', instruction: 'classify' }] },
+        { userId: 'user1' },
+      ),
+    ).rejects.toThrow(/limit/i);
+    expect(runEmmaEnrichment).not.toHaveBeenCalled();
+    delete process.env.EMMA_ENRICH_MAX_LEADS;
+  });
+
+  it('rejects when the list is empty', async () => {
+    (resolveExecuteLeadIds as jest.Mock).mockResolvedValue({ leadIds: undefined, count: 0 });
+    const tool = emmaToolRegistry.getTool('enrich_leads_execute')!;
+    await expect(
+      tool.execute(
+        { list_id: 'empty', output_fields: [{ name: 'industry', instruction: 'classify' }] },
+        { userId: 'user1' },
+      ),
+    ).rejects.toThrow(/no leads/i);
+    expect(runEmmaEnrichment).not.toHaveBeenCalled();
+  });
+});
+
+describe('enrich_lead_custom', () => {
+  beforeEach(() => {
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+      leadId: 'lead-7',
+      customFields: { company_size: '200' },
+      title: 'CTO',
+    });
+  });
+
+  it('registers and requires list_id + lead_id + output_fields', () => {
+    const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+    expect(tool).toBeDefined();
+    expect(tool.definition.inputSchema.required).toEqual(
+      expect.arrayContaining(['list_id', 'lead_id', 'output_fields']),
     );
   });
 
-  it('should pass userId from context', async () => {
-    const tool = emmaToolRegistry.getTool('enrich_leads_preview')!;
-    await tool.execute({
-      list_id: 'list-xyz',
-      instruction: 'test',
-      output_fields: ['field1'],
-      sources: ['existing_data'],
-    }, { userId: 'user-42' });
-
-    expect(CrmEnrichmentService.prototype.preview).toHaveBeenCalledWith(
-      expect.objectContaining({ userId: 'user-42' })
-    );
-  });
-
-  describe('enrich_lead_custom tool', () => {
-    beforeEach(() => {
-      (CrmEnrichmentService.prototype.execute as jest.Mock).mockClear();
-    });
-
-    it('should register enrich_lead_custom tool', () => {
-      const tool = emmaToolRegistry.getTool('enrich_lead_custom');
-      expect(tool).toBeDefined();
-      expect(tool!.definition.name).toBe('enrich_lead_custom');
-      expect(tool!.definition.inputSchema.required).toEqual(
-        expect.arrayContaining(['list_id', 'lead_id', 'custom_field_prompts'])
-      );
-    });
-
-    it('should wrap service.execute() with a single-lead batch and derived outputFields/instruction', async () => {
-      const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
-      const result = await tool.execute({
+  it('runs V3 enrich mode on a single-lead batch and returns enriched values', async () => {
+    (runEmmaEnrichment as jest.Mock).mockResolvedValue({ ...SUMMARY, processedCount: 1 });
+    const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+    const result = await tool.execute(
+      {
         list_id: 'list-abc',
         lead_id: 'lead-7',
-        custom_field_prompts: [
-          { field_name: 'company_size', prompt: 'Find headcount on LinkedIn' },
-          { field_name: 'industry', prompt: 'Classify their industry', data_type: 'text' },
+        output_fields: [
+          { name: 'company_size', instruction: 'find headcount' },
+          { name: 'title', instruction: 'find their job title' },
         ],
-      }, { userId: 'user1' });
+      },
+      { userId: 'user1' },
+    );
+    expect(runEmmaEnrichment).toHaveBeenCalledWith(expect.objectContaining({
+      listId: 'list-abc',
+      userId: 'user1',
+      mode: 'enrich',
+      leadIds: ['lead-7'],
+    }));
+    expect(result.leadId).toBe('lead-7');
+    expect(result.enrichedValues).toEqual({ company_size: '200', title: 'CTO' });
+  });
 
-      expect(result.leadId).toBe('lead-7');
-      expect(result.listId).toBe('list-abc');
-      expect(result.outputFields).toEqual(['company_size', 'industry']);
-      expect(result.processedCount).toBe(80);
-      expect(CrmEnrichmentService.prototype.execute).toHaveBeenCalledWith(
-        expect.objectContaining({
-          listId: 'list-abc',
-          userId: 'user1',
-          outputFields: ['company_size', 'industry'],
-          leadIds: ['lead-7'],
-          forceOverwrite: true,
-          sources: ['web_search', 'linkedin'],
-          instruction: expect.stringContaining('company_size'),
-        }),
-        undefined,
-        undefined
-      );
-    });
+  it('rejects when output_fields is empty (via buildRawEnrichmentConfig)', async () => {
+    (runEmmaEnrichment as jest.Mock).mockRejectedValue(new Error('output_fields must be a non-empty array'));
+    const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+    await expect(
+      tool.execute({ list_id: 'l', lead_id: 'x', output_fields: [] }, { userId: 'user1' }),
+    ).rejects.toThrow(/non-empty/);
+  });
 
-    it('should respect custom sources when provided', async () => {
-      const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
-      await tool.execute({
-        list_id: 'list-abc',
-        lead_id: 'lead-7',
-        custom_field_prompts: [{ field_name: 'notes', prompt: 'Anything interesting' }],
-        sources: ['existing_data'],
-        force_overwrite: false,
-      }, { userId: 'user1' });
-
-      expect(CrmEnrichmentService.prototype.execute).toHaveBeenCalledWith(
-        expect.objectContaining({
-          sources: ['existing_data'],
-          forceOverwrite: false,
-        }),
-        undefined,
-        undefined
-      );
-    });
-
-    it('should throw when custom_field_prompts is empty', async () => {
-      const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
-      await expect(
-        tool.execute({ list_id: 'l', lead_id: 'x', custom_field_prompts: [] }, { userId: 'user1' })
-      ).rejects.toThrow(/non-empty/);
-    });
-
-    it('should throw when no userId in context', async () => {
-      const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
-      await expect(
-        tool.execute({
-          list_id: 'l',
-          lead_id: 'x',
-          custom_field_prompts: [{ field_name: 'f', prompt: 'p' }],
-        }, {})
-      ).rejects.toThrow(/Authentication required/);
-    });
+  it('rejects when there is no user context', async () => {
+    const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+    await expect(
+      tool.execute(
+        { list_id: 'l', lead_id: 'x', output_fields: [{ name: 'f', instruction: 'i' }] },
+        {},
+      ),
+    ).rejects.toThrow(/Authentication required/);
   });
 });

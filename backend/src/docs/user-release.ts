@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-22
+// Last updated: 2026-05-25
 
 export interface UserReleaseNote {
   date: string;
@@ -9,7 +9,7 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
-    date: '2026-05-22',
+    date: '2026-05-25',
     changes: [
       'New: Self-Service Analytics Setup',
       '- Configure your SEO domains, Google Analytics 4 properties, and Microsoft Clarity projects yourself under Settings → Analytics & SEO',
@@ -17,17 +17,148 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- A Test button shows immediately whether the analytics service account has access to each property',
       'New: Organization-Wide Analytics Sharing',
       '- Org admins can share analytics with their whole team and appoint analytics editors from Settings → Organization Sharing',
+      'New: Share Funnels Across Your Team',
+      '- User-journey funnels can now be shared organization-wide',
+      '- Turn on Funnels sharing in Settings → Organization → Sharing; editors and the org owner can edit shared funnels',
+    ],
+  },
+  {
+    date: '2026-05-25',
+    changes: [
+      'Fixed: Scheduled Chats No Longer Fail When Using Brave Search MCP for Web Search',
+      '- Scheduled chats that required a web search step were failing validation with "Missing function calls: search_web" even though the agent was successfully searching the web',
+      '- The agent was using the Brave Search MCP tool (bravesearch_brave_web_search) which produces equivalent results to the built-in search_web, but the validation logic did not recognize them as the same',
+      '- The validator now treats bravesearch_brave_web_search and bravesearch_brave_news_search as aliases for search_web, so scheduled chats pass validation regardless of which search tool the agent chooses',
+    ],
+  },
+  {
+    date: '2026-05-24',
+    changes: [
+      'Fixed: Admin Notes on Client Health Page Now Save Correctly',
+      '- Notes written in the Client Health dashboard were accepted by the server but silently discarded — they would vanish after refreshing the page',
+      '- Notes are now persisted to the client record and pre-populated when you reopen a client\'s health detail panel',
+    ],
+  },
+  {
+    date: '2026-05-23',
+    changes: [
+      'Fixed: CRM Inbox "Last Contact" No Longer Shows Enrichment Time',
+      '- Enriching a lead record (company info, industry, etc.) was updating the record\'s modified timestamp, which the CRM inbox was incorrectly showing as the "Last contact" time',
+      '- Leads with no real contact history now show their creation date instead of the last enrichment time, so "Last contact" only reflects actual engagement events',
+    ],
+  },
+  {
+    date: '2026-05-23',
+    changes: [
+      'Fixed: Knowledge Base Files Can Now Be Read Back Immediately After Writing',
+      '- Creating or updating a knowledge base file would succeed (returning a valid size and timestamp) but reading it back immediately returned "Knowledge base file not found in storage"',
+      '- The root cause was a mismatch in storage bucket environment variables: write operations used KNOWLEDGE_BASE_BUCKET / PRIVATE_KNOWLEDGE_BASE_BUCKET while read operations used GCS_BUCKET_NAME / GCS_BUCKET_NAME_PRIVATE, which in production resolved to the wrong (dev) bucket',
+      '- Read operations now use the same bucket environment variables as writes, so files are immediately readable after being created or updated',
+    ],
+  },
+  {
+    date: '2026-05-23',
+    changes: [
+      'Fixed: Group Email Unsubscribe Links Now Work Correctly',
+      '- Group emails sent to CRM leads now include a properly formatted unsubscribe link that leads to the correct unsubscribe page',
+      '- Templates using either {{unsubscribeUrl}} or {{unsubscribe_url}} are now both recognized and substituted — previously the snake_case variant caused all leads to be skipped as "missing variables"',
+      '- The email preview in the composer no longer appends a duplicate unsubscribe footer when the template already contains an unsubscribe link',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
+      'Improved: Browser Automation Skill Now Falls Back to Local Agent When Headless Browser Fails',
+      '- When a website blocks the headless cloud browser (bot protection, Cloudflare, React crash, blank page), the Browser Automation skill now automatically uses the Local Agent as a fallback',
+      '- The Local Agent tool is now bundled directly into the Browser Automation skill so it is always available without a separate install',
+      '- Previously, the agent would report the site as broken or inaccessible; now it retries via the Local Agent which uses a real (non-headless) browser',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
+      'New: Emma Now Knows Whether a CRM Lead Has Accepted Your LinkedIn Connection',
+      '- When Emma looks up a lead\'s details, she now checks the LinkedIn connection cache and reports whether you are a 1st-degree connection, and if so, when you connected',
+      '- This lets Emma automatically choose the right LinkedIn action: sending a direct message to connected leads instead of a new connection invite',
+      '- No manual steps required — the status is derived from the same connection data already synced every 10 minutes in the background',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
+      'Fixed: All Landing Pages Can Now Be Deleted',
+      '- Previously, the first (root) landing page could not be deleted — the trash icon was hidden and the API blocked deletion',
+      '- All landing pages, including the root page, can now be deleted from the Landing Pages view',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
+      'Fixed: Org Members Can Now Send and Read Slack Messages Using the Org Owner\'s Connected Workspace',
+      '- Org team members were blocked from using any Slack features (list channels, fetch messages, send messages) even when the org owner had a Slack workspace and channel configured',
+      '- The error "No Slack channel is configured for your account" appeared for all org members regardless of the org owner\'s setup',
+      '- Slack tools now fall back to the org\'s configured channel when an org member has no personal Slack channel set up, consistent with how other org-wide resources like brand guidelines are shared',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
+      'Fixed: Admin Delegate Access No Longer Switches to the Wrong Account',
+      '- When an admin opened a delegate session in a new tab while another customer portal tab was open, the delegate tab could sometimes show the wrong customer\'s account',
+      '- The issue was caused by a few places reading the auth token directly from localStorage instead of going through the secure token resolution in useAuth()',
+      '- Token reads now always go through useAuth(), which correctly returns the tab-isolated sessionStorage token for delegate sessions',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
+      'Fixed: LinkedIn DM Campaigns No Longer Send the Same Message Twice to the Same Lead',
+      '- Scheduled LinkedIn outreach campaigns could send an identical follow-up message to a lead multiple times across different daily runs, risking spam flags',
+      '- The agent now checks engagement history before sending and blocks any message whose exact text was already delivered to that lead',
+      '- Different follow-up messages (e.g. Touch 3 after Touch 2) are still allowed through normally',
     ],
   },
   {
     date: '2026-05-21',
     changes: [
-      'New: Organization-Wide Analytics Sharing',
-      '- Admins can now share an organization\'s analytics (Google Analytics, Search Console, Microsoft Clarity) with every member from the owner\'s configuration',
-      '- The whole team sees the same numbers and can monitor shared analytics dashboards together',
-      'New: Share Funnels Across Your Team',
-      '- User-journey funnels can now be shared organization-wide',
-      '- Turn on Funnels sharing in Settings → Organization → Sharing; editors and the org owner can edit shared funnels',
+      'Fixed: Meta Ads Budget Updates Now Apply the Correct Dollar Amount',
+      '- Updating an ad set\'s daily or lifetime budget via Emma was setting the wrong amount — passing $150 resulted in a $1.50 budget because the value was sent to Meta in dollars instead of the required cents',
+      '- Budget values are now correctly converted (multiplied by 100) before being sent to the Meta Ads API for both ad set and campaign updates',
+      '- Creating ad sets was not affected; only update operations had the missing conversion',
+    ],
+  },
+  {
+    date: '2026-05-21',
+    changes: [
+      'Fixed: Sequence Auto-Enroll Section No Longer Shows Unrelated Lists',
+      '- The AUTO-ENROLL section in a sequence detail view was showing every list that ever had a lead manually enrolled — even lists the user never configured for auto-enrollment',
+      '- Now only lists explicitly enabled for auto-enrollment are shown',
+    ],
+  },
+  {
+    date: '2026-05-21',
+    changes: [
+      'Fixed: Lead Enrichment via Emma Now Fills Every Requested Field',
+      '- Asking Emma to enrich CRM leads now uses the same enrichment engine as the CRM page\'s Enrichment Config',
+      '- Previously some requested fields (such as LinkedIn summary, skills, headline, and location) could come back empty even though the job reported success',
+      '- Emma enrichment now also benefits from Apollo and LinkedIn structured-data lookups and the same accuracy safeguards used by the CRM page',
+    ],
+  },
+  {
+    date: '2026-05-21',
+    changes: [
+      'Fixed: CRM Enrichment Now Processes Every Lead in Large Lists',
+      '- Enriching a large lead list could silently stop after the first batch of leads, leaving the rest of the list un-enriched with no error',
+      '- Enrichment now pages through the entire list, so every lead is processed regardless of list size',
+    ],
+  },
+  {
+    date: '2026-05-21',
+    changes: [
+      'Fixed: Emma No Longer Gets Stuck in a Repeated Navigate/Screenshot Loop',
+      '- In some sessions, Emma would navigate to the same file URL and take a screenshot repeatedly — sometimes 20+ times — before completing the task',
+      '- A new sliding-window loop detector now catches this alternating pattern and stops it within 10 iterations',
+      '- Emma now provides a final response based on what she has already observed instead of looping indefinitely',
     ],
   },
   {
@@ -272,6 +403,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- A subset of leads imported before a data-quality fix had empty strings stored for email, LinkedIn URL, or name+company key fields',
       '- DynamoDB rejected any write to these leads — silently blocking enrichment updates and CRM field edits',
       '- All affected leads (~158k) have been repaired; enrichment and manual edits now work correctly across the entire CRM',
+    ],
+  },
+  {
+    date: '2026-05-21',
+    changes: [
+      'Fixed: Google Drive Folders Now Load Correctly in Knowledge Base for Org Members',
+      '- Users who added Google Drive folders before joining an organization were seeing the folders listed but getting errors when trying to load files',
+      '- Emma also could not access those Drive folders, making them invisible to AI tools',
+      '- Drive folders are now merged across the org and user records, so all previously configured folders work without any manual re-configuration',
     ],
   },
   {

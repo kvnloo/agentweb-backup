@@ -1,15 +1,11 @@
-// Real-service adapters that satisfy v3.1 orchestrator deps.
+// Real-service adapters that satisfy the v3.1 orchestrator deps
+// (OrchestratorDeps + IdentityResolverDeps).
 //
-// Phase 1a status (matches what users see today):
-//   ✓ Apollo people + org enrichment via existing apolloService
-//   ✓ enrich.so reverse lookup via existing enrichSoService
-//   ✓ DDB read/write via crmDb
-//   ✗ Web fetch + LLM extraction + critic — stubbed (return empty / null)
-//     until Phase 1b wires the existing v2 extraction pipeline.
-//
-// Apollo direct-map fields WILL populate on a real run. Web-only groups
-// (intent_signals, company_social) will show 'missing' fields in the report,
-// which is expected behavior pre-Phase-1b.
+// Wires the orchestrator and waterfall to production services: Apollo
+// (people / org), enrich.so, Unipile, Google CSE web search + LLM extraction,
+// the critic pass, and DynamoDB read/write via crmDb. All external dependency
+// construction lives here so the orchestrator and waterfall stay pure and
+// unit-testable.
 
 import { crmDb } from './db';
 import { getApolloService, isApolloServiceReady } from './apolloService';
@@ -22,6 +18,8 @@ import { resolveIdentity as pureResolveIdentity } from './enrichmentIdentityReso
 import { runWaterfall as pureRunWaterfall } from './enrichmentGroupWaterfall';
 import { apolloAsyncRequestCacheKey, APOLLO_SCHEMA_VERSION } from './apolloCacheKeys';
 import { FIELD_GROUPS } from './enrichmentGroups';
+import { waitForApolloAsyncResult } from './enrichmentWaterfall';
+import { STANDARD_ENRICHABLE_FIELDS } from './enrichmentConfigService';
 import {
   getRawDataFromCache,
   writeRawDataToCache,
@@ -229,32 +227,12 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
               cacheType: 'apollo',
             });
           }
-          // Inline polling logic: up to 30s with backoff schedule.
-          const budgetMs = 30_000;
-          if (key) {
-            const intervals = [2000, 5000, 10000, 15000];
-            let attempt = 0;
-            const start = Date.now();
-            while (true) {
-              const remaining = budgetMs - (Date.now() - start);
-              if (remaining <= 0) return null;
-              const row: any = await crmDb.getEnrichmentCacheItem(key.canonicalId, key.sk).catch(() => null);
-              const status = row?.rawData?.status;
-              if (status === 'completed') {
-                const result = row.rawData.result || {};
-                if (typeof result.email === 'string' && result.email.length > 0) {
-                  return { email: result.email, emailStatus: result.emailStatus };
-                }
-                return null;
-              }
-              if (status === 'no_email' || status === 'rejected') return null;
-              const remainingAfterRead = budgetMs - (Date.now() - start);
-              if (remainingAfterRead <= 0) return null;
-              const baseDelay = intervals[Math.min(attempt, intervals.length - 1)];
-              const delay = Math.min(baseDelay, remainingAfterRead);
-              await new Promise((r) => setTimeout(r, delay));
-              attempt++;
-            }
+          // Poll the placeholder row for the webhook result — shared logic
+          // with the Tier 3 waterfall path. 30s budget: the identity path
+          // waits less than the waterfall's configurable 90s default.
+          const polled = await waitForApolloAsyncResult(f.asyncRequestId, 30_000);
+          if (polled?.email) {
+            return { email: polled.email, emailStatus: polled.emailStatus };
           }
         }
         return null;
@@ -281,7 +259,7 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
       // Split by destination: standard lead columns go to top-level (where
       // the lead table reads them); custom names go to customFields.
       // Matches STANDARD_LEAD_COLUMNS in crmEnrichmentServiceV3.ts.
-      const STANDARD = new Set(['firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'notes']);
+      const STANDARD = new Set<string>(STANDARD_ENRICHABLE_FIELDS);
       const topLevel: Record<string, string> = {};
       const customFields: Record<string, string> = {};
       const removeCustomFieldKeys: string[] = [];
@@ -672,10 +650,18 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
         const items = await crmDb.batchGetLeads(listId, leadIds);
         return items as LeadRecord[];
       }
-      // Whole-list run → single Query page. No explicit limit: DDB returns
-      // up to ~1MB worth of items in one round-trip.
-      const result = await crmDb.getLeadsByListId(listId);
-      return (result?.items ?? []) as LeadRecord[];
+      // Whole-list run → page through the Query fully. A single
+      // getLeadsByListId call returns at most one ~1MB DDB page; without this
+      // loop, lists larger than that page are silently truncated and the
+      // remaining leads are never enriched.
+      const all: LeadRecord[] = [];
+      let startKey: any = undefined;
+      do {
+        const page = await crmDb.getLeadsByListId(listId, undefined, startKey);
+        all.push(...((page?.items ?? []) as LeadRecord[]));
+        startKey = page?.lastEvaluatedKey ?? null;
+      } while (startKey);
+      return all;
     },
 
     resolveIdentity: (input) => pureResolveIdentity(input, identityDeps),
