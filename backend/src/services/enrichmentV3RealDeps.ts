@@ -50,8 +50,8 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
     apolloPeopleMatch: async ({ email, linkedinUrl, firstName, lastName, domain, company }) => {
       if (!isApolloServiceReady()) return null;
       if (!email && !linkedinUrl && !firstName && !lastName) return null;
-      // Adapter-level guard: personal emails give poor Apollo results.
-      if (email && CrmEnrichmentService.isPersonalEmailDomain(email)) return null;
+      // Personal emails are allowed — Apollo can still return person+org data.
+      // Domain filtering is handled upstream (domainForApollo strips freemail domains).
       try {
         const apollo = getApolloService();
         const input: Parameters<typeof apollo.matchPerson>[0] = {};

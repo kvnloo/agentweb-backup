@@ -5,6 +5,7 @@
 // Design ref: tasks/crm-enrichment-v3.1-design.md §5.1.
 
 import type { LeadRecord } from './crmEnrichmentService';
+import { CrmEnrichmentService } from './crmEnrichmentService';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
 import { extractDomainFromEmail } from '../utils/leadSchema';
 import { apolloEmailStatusToConfidence } from './apolloFieldMapper';
@@ -321,9 +322,10 @@ export async function resolveIdentity(
   const linkedinForApollo = linkedinUrl || resolved.linkedin;
   const firstNameEff = lead.firstName || resolved.firstName;
   const lastNameEff = lead.lastName || resolved.lastName;
+  const rawEmailDomain = extractDomainFromEmail(email);
   const domainForApollo =
     lead.emailDomain || resolved.emailDomain ||
-    extractDomainFromEmail(email) ||
+    (rawEmailDomain && !CrmEnrichmentService.isPersonalDomain(rawEmailDomain) ? rawEmailDomain : undefined) ||
     deriveDomainFromWebsite(lead.website || resolved.website || '') ||
     undefined;
   const companyForApollo = lead.company || resolved.company;

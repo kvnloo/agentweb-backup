@@ -897,6 +897,62 @@ describe('resolveIdentity — unified Apollo call with expanded signals', () => 
     );
   });
 
+  it('calls Apollo for personal email leads (no early bail-out)', async () => {
+    const deps = makeDeps();
+    await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          email: 'bfactor@yahoo.com',
+          firstName: 'Bob',
+          lastName: 'Factor',
+        },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    expect(deps.apolloPeopleMatch).toHaveBeenCalledWith(
+      expect.objectContaining({ email: 'bfactor@yahoo.com' }),
+    );
+  });
+
+  it('strips freemail domain from Apollo input so personal email does not mislead org lookup', async () => {
+    const deps = makeDeps();
+    await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          email: 'bfactor@yahoo.com',
+          firstName: 'Bob',
+          lastName: 'Factor',
+        },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    const call = (deps.apolloPeopleMatch as jest.Mock).mock.calls[0][0];
+    expect(call.domain).toBeUndefined();
+  });
+
+  it('preserves business domain in Apollo input for non-freemail leads', async () => {
+    const deps = makeDeps();
+    await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          email: 'alice@acme.com',
+          firstName: 'Alice',
+          lastName: 'Smith',
+        },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    expect(deps.apolloPeopleMatch).toHaveBeenCalledWith(
+      expect.objectContaining({ domain: 'acme.com' }),
+    );
+  });
+
   it('skips Apollo when no signals at all (no email, linkedin, or name)', async () => {
     const deps = makeDeps();
     await resolveIdentity(
