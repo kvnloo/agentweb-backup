@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-21
+// Last updated: 2026-05-25
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,16 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-05-25',
+    changes: [
+      'Landing Pages: Connect Your Own Custom Domain',
+      '- Paid users can now point a custom domain (e.g. landing.mycompany.com or mycompany.com) at any landing page from the Domain Settings panel',
+      '- The panel walks you through the DNS records you need to add at your registrar (TXT for verification, plus CNAME for subdomains or A 76.76.21.21 for apex domains)',
+      '- The page auto-polls every 10 seconds for up to 30 minutes; once verification succeeds, the live URL shown on the landing page card updates to your custom domain',
+      '- Disconnect at any time from the same panel — the domain is removed and the landing page reverts to its default URL',
+    ],
+  },
   {
     date: '2026-05-21',
     changes: [
