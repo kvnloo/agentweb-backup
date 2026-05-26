@@ -15,7 +15,7 @@ import { WebClient } from '@slack/web-api';
 import { readConfig, writeConfig, invalidateConfigCache } from '../services/onboardingLoopConfig';
 import { LLMService } from '../utils/llmService';
 import { LLMServiceInterface, StepStats, sensorScan, diagnoseUnderperforming, generateMutations, validateBusinessRules, critiqueMutations } from '../services/onboardingLoopAgents';
-import { postDailySlackDM } from '../services/onboardingLoopApproval';
+import { postDailySlackDM, postHeartbeatSlackDM, HeartbeatMetrics } from '../services/onboardingLoopApproval';
 import { userDb } from '../services/db';
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
@@ -53,7 +53,7 @@ async function logRun(
         TableName: RUNS_TABLE,
         Item: {
           runId,
-          runAt: new Date().toISOString(),
+          ts: new Date().toISOString(),
           status,
           ...details,
         },
@@ -171,6 +171,24 @@ export async function runOnboardingLoop(): Promise<void> {
 
     if (proposedMutations.length === 0) {
       console.log('[OnboardingLoop] No mutations needed today — all steps healthy or no proposals passed critique');
+
+      // Even with nothing to ship, send a heartbeat so the approver sees the
+      // loop is alive + the funnel state. Silence-by-design masked a real bug
+      // for 2 days; the heartbeat removes that ambiguity.
+      const slackUserId = process.env.ONBOARDING_LOOP_APPROVER_SLACK_USER_ID;
+      if (slackUserId && process.env.SLACK_BOT_TOKEN) {
+        try {
+          const metrics = computeHeartbeatMetrics(users, config);
+          const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+          const dm = await postHeartbeatSlackDM(metrics, slackUserId, slackClient);
+          console.log(`[OnboardingLoop] Heartbeat DM posted — channel=${dm.channel} ts=${dm.ts}`);
+        } catch (err) {
+          // Non-fatal — log and continue. The runs-table log is the source of
+          // truth for "did the cron fire."
+          console.warn('[OnboardingLoop] Heartbeat DM failed (non-fatal):', err);
+        }
+      }
+
       await logRun(docClient, runId, 'completed', {
         reason: 'no_mutations',
         underperformingSteps,
@@ -253,4 +271,105 @@ export async function runOnboardingLoop(): Promise<void> {
     });
     // Don't rethrow — cron errors should not crash the server
   }
+}
+
+
+// ---------------------------------------------------------------------------
+// computeHeartbeatMetrics
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute the metrics surfaced in the daily heartbeat DM. Pure function over
+ * the same users + config the loop already has in hand, so this adds no extra
+ * I/O on the cron path.
+ *
+ * "Self-active" uses lastActiveAt (per db.ts:68, only ticks on non-delegated
+ * sessions). Delegated admin activity on a customer account does NOT count —
+ * this is what makes the metric trustworthy when we pilot accounts.
+ *
+ * Exported so tests can hit it directly with synthetic user fixtures.
+ */
+export interface HeartbeatUser {
+  userId?: string;
+  createdAt?: string;
+  onboardingStage?: string;
+  onboardingEvents?: unknown;
+  lastLoginTime?: string;
+  lastActiveAt?: string;
+}
+
+export function computeHeartbeatMetrics(
+  users: ReadonlyArray<HeartbeatUser>,
+  config: { steps: Record<string, { active_variants?: unknown[] }> },
+  now: Date = new Date(),
+): HeartbeatMetrics {
+  const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+  const nowMs = now.getTime();
+  const todayStr = now.toISOString().slice(0, 10);
+
+  const stepNames = Object.keys(config.steps);
+  const variantCount = stepNames.reduce(
+    (sum, s) => sum + (config.steps[s]?.active_variants?.length || 0),
+    0,
+  );
+  const reason =
+    variantCount <= stepNames.length
+      ? `Only ${variantCount} variant(s) across ${stepNames.length} step(s). Need a challenger variant per step to detect lift.`
+      : 'All non-control variants are within healthy bounds vs control.';
+
+  const inWindow = (iso: unknown, windowMs: number): boolean => {
+    if (typeof iso !== 'string') return false;
+    const t = Date.parse(iso);
+    return Number.isFinite(t) && t >= nowMs - windowMs && t <= nowMs;
+  };
+
+  const stageDistribution: Record<string, number> = {};
+  let pilotEligible = 0;
+  let pilotOnly = 0;
+  let last24Signups = 0;
+  let last7dSignups = 0;
+  let last24Completions = 0;
+  let last7dCompletions = 0;
+  const selfActive24 = new Set<string>();
+  const selfActive7d = new Set<string>();
+  const selfActive30d = new Set<string>();
+
+  for (const u of users) {
+    const stage = u.onboardingStage || '(unset)';
+    stageDistribution[stage] = (stageDistribution[stage] || 0) + 1;
+
+    if (inWindow(u.createdAt, ONE_DAY_MS)) last24Signups++;
+    if (inWindow(u.createdAt, 7 * ONE_DAY_MS)) last7dSignups++;
+
+    const events = Array.isArray(u.onboardingEvents) ? u.onboardingEvents : [];
+    for (const e of events as Array<{ event?: string; ts?: string }>) {
+      if (e?.event !== 'onboarding_completed') continue;
+      if (inWindow(e.ts, ONE_DAY_MS)) last24Completions++;
+      if (inWindow(e.ts, 7 * ONE_DAY_MS)) last7dCompletions++;
+    }
+
+    if (u.userId) {
+      if (inWindow(u.lastActiveAt, ONE_DAY_MS)) selfActive24.add(u.userId);
+      if (inWindow(u.lastActiveAt, 7 * ONE_DAY_MS)) selfActive7d.add(u.userId);
+      if (inWindow(u.lastActiveAt, 30 * ONE_DAY_MS)) selfActive30d.add(u.userId);
+    }
+
+    // Pilot ratio: of users who logged in recently (30d), how many never
+    // performed an action under their own (non-delegated) session?
+    if (inWindow(u.lastLoginTime, 30 * ONE_DAY_MS)) {
+      pilotEligible++;
+      if (!inWindow(u.lastActiveAt, 30 * ONE_DAY_MS)) pilotOnly++;
+    }
+  }
+
+  return {
+    todayStr,
+    reason,
+    totalUsers: users.length,
+    stageDistribution,
+    signups: { last24h: last24Signups, last7d: last7dSignups },
+    completions: { last24h: last24Completions, last7d: last7dCompletions },
+    selfActive: { last24h: selfActive24.size, last7d: selfActive7d.size, last30d: selfActive30d.size },
+    pilotRatio: pilotEligible > 0 ? pilotOnly / pilotEligible : null,
+  };
 }
