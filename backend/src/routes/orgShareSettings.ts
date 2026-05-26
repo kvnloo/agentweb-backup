@@ -41,7 +41,15 @@ router.patch("/", async (req, res) => {
     if (!user?.orgId) return res.status(404).json({ message: "No org" });
     if (user.orgRole !== "owner") return res.status(403).json({ message: "Org owner only" });
 
-    const validated = validateSettings(req.body?.shareSettings);
+    const org = await orgDb.getOrgById(user.orgId);
+
+    // Back-fill `analytics` from the org's existing settings when an older client
+    // omits it, so the not-yet-deployed customer portal keeps working.
+    const incoming = req.body?.shareSettings;
+    if (incoming && typeof incoming === "object" && incoming.analytics === undefined) {
+      incoming.analytics = org?.shareSettings?.analytics ?? { enabled: false, editors: [] };
+    }
+    const validated = validateSettings(incoming);
     if ("error" in validated) return res.status(400).json({ message: validated.error });
 
     const members = await orgDb.getOrgMembers(user.orgId);

@@ -64,6 +64,7 @@ import agentApiRoutes from "./routes/agentApi";
 import emmaApiRoutes from "./routes/emmaApi";
 import memoryRoutes from "./routes/memory";
 import leadMagnetAdminRoutes from "./routes/leadMagnetAdmin";
+import onboardingLoopAdminRoutes from "./routes/onboardingLoopAdmin";
 import socialPostsRoutes from "./routes/socialPosts";
 import landingPagesRoutes from "./routes/landingPages";
 import htmlTemplatesRoutes from "./routes/htmlTemplates";
@@ -80,6 +81,9 @@ import orgShareSettingsRoutes from "./routes/orgShareSettings";
 import orgMemberRemovalRoutes from "./routes/orgMemberRemoval";
 import testAccountsRoutes from "./routes/testAccounts";
 import onboardingEventsRoutes from "./routes/onboardingEvents";
+import onboardingVariantsRoutes from "./routes/onboardingVariants";
+import loopEventsRoutes from "./routes/loopEvents";
+import { registerAiEvalFunnelForProduction } from "./loops/instances/ai-eval-funnel/cron";
 import brandBuildRoutes from "./routes/brandBuild";
 import adGenRoutes from "./routes/adGen";
 import onboardingStepsRoutes from "./routes/onboardingSteps";
@@ -284,6 +288,7 @@ app.use("/api/oauth/foreplay", foreplayAuthRoutes);
 app.use("/api/oauth", connectedAccountsRoutes);
 app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
 app.use("/api/admin/lead-magnets", authenticateToken, isAdmin, leadMagnetAdminRoutes);
+app.use("/api/admin/onboarding-loop", authenticateToken, isAdmin, onboardingLoopAdminRoutes);
 app.use("/api/client-health", authenticateToken, isAdmin, clientHealthRoutes);
 app.use("/api/skills", authenticateToken, isAdmin, skillRoutes);
 app.use("/api/user-skills", authenticateToken, userSkillRoutes);
@@ -298,6 +303,20 @@ app.use("/api/emma", emmaApiRoutes);
 app.use("/api/memory", memoryRoutes);
 app.use("/api/test-accounts", testAccountsRoutes);
 app.use("/api/onboarding", onboardingEventsRoutes);
+app.use("/api/onboarding", onboardingVariantsRoutes);
+app.use("/api/loop-events", loopEventsRoutes);
+
+// Register closed-loop instances with production impls (real DDB sensor +
+// NotionDigestTool + Slack DM gate via the cron wrapper). The route handlers
+// look up the loop manifest from LOOP_REGISTRY; the cron in server.ts
+// invokes runAiEvalLoopOnce() on a daily schedule.
+try {
+  registerAiEvalFunnelForProduction();
+} catch (err) {
+  // Idempotent registration may throw on hot-reload; safe to swallow during
+  // dev-server restarts. Production should never hit this path twice.
+  console.warn("[loops] registerAiEvalFunnelForProduction skipped:", String(err));
+}
 app.use("/api/onboarding", brandBuildRoutes);
 app.use("/api/onboarding", adGenRoutes);
 app.use("/api/onboarding", onboardingStepsRoutes);

@@ -14,10 +14,13 @@ jest.mock('../services/slackService', () => ({
   postSlackMessage: jest.fn(),
 }));
 
-// Mock userDb before any imports
+// Mock userDb and orgDb before any imports
 jest.mock('../services/db', () => ({
   userDb: {
     getUserById: jest.fn(),
+  },
+  orgDb: {
+    getOrgById: jest.fn(),
   },
 }));
 
@@ -30,7 +33,7 @@ import {
   getThreadReplies,
   postSlackMessage,
 } from '../services/slackService';
-import { userDb } from '../services/db';
+import { userDb, orgDb } from '../services/db';
 
 const mockedGetChannels = getSlackChannels as jest.MockedFunction<typeof getSlackChannels>;
 const mockedGetChannelInfo = getSlackChannelInfo as jest.MockedFunction<typeof getSlackChannelInfo>;
@@ -38,6 +41,7 @@ const mockedGetMessages = getRecentChannelMessages as jest.MockedFunction<typeof
 const mockedGetReplies = getThreadReplies as jest.MockedFunction<typeof getThreadReplies>;
 const mockedPostMessage = postSlackMessage as jest.MockedFunction<typeof postSlackMessage>;
 const mockedGetUserById = (userDb.getUserById as jest.MockedFunction<typeof userDb.getUserById>);
+const mockedGetOrgById = (orgDb.getOrgById as jest.MockedFunction<typeof orgDb.getOrgById>);
 
 const executeTool = async (name: string, args: any, context: any = {}) => {
   const tool = emmaToolRegistry.getTool(name);
@@ -68,6 +72,11 @@ const REGULAR_USER = { userId: 'user-1', isAdmin: false, slackChannel: 'C_USER' 
 const REGULAR_USER_NO_CHANNEL = { userId: 'user-2', isAdmin: false, slackChannel: undefined };
 const MULTI_CHANNEL_USER = { userId: 'user-3', isAdmin: false, slackChannels: ['C001', 'C002'] };
 const MULTI_CHANNEL_USER_WITH_LEGACY = { userId: 'user-4', isAdmin: false, slackChannel: 'C_OLD', slackChannels: ['C001', 'C002'] };
+// Org member with no personal Slack config — should inherit from org
+const ORG_MEMBER_NO_CHANNEL = { userId: 'user-5', isAdmin: false, slackChannel: undefined, orgId: 'org-1' };
+// Org member with own Slack config — personal config takes priority over org
+const ORG_MEMBER_WITH_CHANNEL = { userId: 'user-6', isAdmin: false, slackChannel: 'C_PERSONAL', orgId: 'org-1' };
+const ORG_WITH_SLACK = { orgId: 'org-1', name: 'Test Org', ownerUserId: 'owner-1', slackChannel: 'C_ORG', maxMembers: 5, createdAt: '', updatedAt: '' };
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -136,6 +145,40 @@ describe('slack_list_channels', () => {
     mockedGetUserById.mockResolvedValue(REGULAR_USER_NO_CHANNEL as any);
 
     const result = await executeTool('slack_list_channels', {}, { userId: 'user-2' });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/No Slack channel/);
+  });
+
+  it('org member with no personal channel: uses org channel', async () => {
+    mockedGetUserById.mockResolvedValue(ORG_MEMBER_NO_CHANNEL as any);
+    mockedGetOrgById.mockResolvedValue(ORG_WITH_SLACK as any);
+    mockedGetChannels.mockResolvedValue([{ id: 'C_ORG', name: 'org-channel', displayName: '#org-channel', isPrivate: false }] as any);
+
+    const result = await executeTool('slack_list_channels', {}, { userId: 'user-5' });
+
+    expect(result.success).toBe(true);
+    expect(result.count).toBe(1);
+    expect(result.channels[0].id).toBe('C_ORG');
+    expect(mockedGetOrgById).toHaveBeenCalledWith('org-1');
+  });
+
+  it('org member with personal channel: personal channel takes priority over org', async () => {
+    mockedGetUserById.mockResolvedValue(ORG_MEMBER_WITH_CHANNEL as any);
+    mockedGetChannels.mockResolvedValue([{ id: 'C_PERSONAL', name: 'personal', displayName: '#personal', isPrivate: false }] as any);
+
+    const result = await executeTool('slack_list_channels', {}, { userId: 'user-6' });
+
+    expect(result.success).toBe(true);
+    expect(result.channels[0].id).toBe('C_PERSONAL');
+    expect(mockedGetOrgById).not.toHaveBeenCalled();
+  });
+
+  it('org member with no personal channel and org has no Slack: returns error', async () => {
+    mockedGetUserById.mockResolvedValue(ORG_MEMBER_NO_CHANNEL as any);
+    mockedGetOrgById.mockResolvedValue({ ...ORG_WITH_SLACK, slackChannel: undefined } as any);
+
+    const result = await executeTool('slack_list_channels', {}, { userId: 'user-5' });
 
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/No Slack channel/);
@@ -313,6 +356,19 @@ describe('slack_get_recent_messages', () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/No Slack channel/);
+  });
+
+  it('org member with no personal channel: fetches messages from org channel', async () => {
+    mockedGetUserById.mockResolvedValue(ORG_MEMBER_NO_CHANNEL as any);
+    mockedGetOrgById.mockResolvedValue(ORG_WITH_SLACK as any);
+    mockedGetMessages.mockResolvedValue(MESSAGES as any);
+    mockedGetReplies.mockResolvedValue(THREAD_REPLIES as any);
+
+    const result = await executeTool('slack_get_recent_messages', {}, { userId: 'user-5' });
+
+    expect(result.success).toBe(true);
+    expect(result.channel_id).toBe('C_ORG');
+    expect(mockedGetMessages).toHaveBeenCalledWith('C_ORG', undefined, undefined);
   });
 
   it('multi-channel user: returns error when no channel specified', async () => {
@@ -626,6 +682,18 @@ describe('slack_send_message', () => {
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/No Slack channel/);
     expect(mockedPostMessage).not.toHaveBeenCalled();
+  });
+
+  it('org member with no personal channel: sends to org channel', async () => {
+    mockedGetUserById.mockResolvedValue(ORG_MEMBER_NO_CHANNEL as any);
+    mockedGetOrgById.mockResolvedValue(ORG_WITH_SLACK as any);
+    mockedPostMessage.mockResolvedValue({ ts: '1711235020.000100', channel: 'C_ORG' });
+
+    const result = await executeTool('slack_send_message', { text: 'Hello org!' }, { userId: 'user-5' });
+
+    expect(result.success).toBe(true);
+    expect(result.channel_id).toBe('C_ORG');
+    expect(mockedPostMessage).toHaveBeenCalledWith('C_ORG', 'Hello org!', undefined);
   });
 
   it('returns error when text is undefined', async () => {

@@ -66,6 +66,7 @@ export interface User {
   createdAt: string;
   lastLoginTime?: string;
   lastActiveAt?: string; // Updated when user creates a chat session (non-delegated); more accurate than lastLoginTime for DAU/WAU/MAU
+  signupSource?: "password" | "oauth" | "waitlist" | "admin" | string; // How the account was created. Set at signup; do not mutate.
   supportNote?: string;
   roles?: ("partner" | "customer" | "free" | "contractor")[];
   displayName?: string;
@@ -531,6 +532,8 @@ export interface User {
    * Default `undefined` / falsy = legacy per-axis status flow.
    */
   useEagerPipeline?: boolean;
+  /** Admin-written retention note for this client. Written via POST /api/client-health/:clientId/notes. */
+  clientHealthNote?: string;
 }
 
 export interface Organization {
@@ -547,6 +550,18 @@ export interface Organization {
   fromName?: string;
   slackChannel?: string;
   googleAnalyticsProperties?: Array<{ propertyId: string; label: string }>;
+  primaryAnalyticsPropertyId?: string; // Explicit primary GA4 property (must be one of googleAnalyticsProperties)
+  gaFilteredDomains?: string[]; // Domains to exclude from Google Analytics
+  clarityProjects?: Array<{ projectId: string; label: string }>; // Microsoft Clarity projects
+  productDomain?: string; // Product site domain for feature usage tracking
+  /**
+   * Migration marker. Absent → analytics config has never been written to this
+   * Organization record; resolveAnalyticsConfig() falls back to the owner's user
+   * record. "migrated" → set by the migration script. "self" → set by a
+   * self-service or admin save. When present, the Org record is authoritative
+   * (including empty arrays).
+   */
+  analyticsConfigSource?: "migrated" | "self";
   googleDriveFolders?: Array<{ folderId: string; name: string }>;
   pendingInvites?: Array<{
     email: string;
@@ -558,6 +573,13 @@ export interface Organization {
   createdAt: string;
   updatedAt: string;
   shareSettings?: OrgShareSettings;
+  /**
+   * Admin-controlled: when true, org members inherit the org owner's analytics
+   * configuration (GA4 properties, gaFilteredDomains, productDomain, seoDomains,
+   * clarityProjects). Set only by the platform admin via
+   * PATCH /api/admin/orgs/:orgId/analytics-sharing. Default: undefined/false.
+   */
+  shareAnalyticsWithOrg?: boolean;
   secrets?: Record<string, string>; // Encrypted per-org secrets (key → encrypted value)
   orgMemoryEnabled?: boolean; // Whether org-wide Emma memory is enabled (default: true)
 }
@@ -568,6 +590,7 @@ export interface OrgShareSettings {
   landingPages: { enabled: boolean; editors: string[] };
   workPlans: { enabled: boolean; editors: string[] };
   skills: { enabled: boolean; editors: string[] };
+  analytics: { enabled: boolean; editors: string[] };
   // Always shared with org—only editors are configurable, enabled is implicit
   brandGuidelines: { editors: string[] };
   marketingStrategy: { editors: string[] };
@@ -626,7 +649,7 @@ interface UserWithCounts extends User {
   chatSessionCount?: number;
 }
 
-class UserDB {
+export class UserDB {
   private docClient: AWS.DynamoDB.DocumentClient;
   private tableName: string;
 
@@ -946,18 +969,55 @@ class UserDB {
     }
   }
 
+  // Throwaway / disposable email provider domains. Bot signups use these
+  // because they don't require real inbox access. List sourced from the
+  // common disposable-domain blocklists (mailinator, guerrillamail, etc.).
+  // Keep alphabetised. Add to the list as new providers surface in the data.
+  private static THROWAWAY_DOMAINS = new Set([
+    "10minutemail.com",
+    "dispostable.com",
+    "fakeinbox.com",
+    "guerrillamail.com",
+    "guerrillamail.info",
+    "guerrillamail.net",
+    "guerrillamail.org",
+    "mailinator.com",
+    "mailnesia.com",
+    "maildrop.cc",
+    "mintemail.com",
+    "mohmal.com",
+    "sharklasers.com",
+    "spambox.us",
+    "tempmail.com",
+    "temp-mail.org",
+    "throwawaymail.com",
+    "trashmail.com",
+    "yopmail.com",
+  ]);
+
   static isBotLikeEmail(email: string): boolean {
     if (!email) return false;
     const [local, domain] = email.split("@");
     if (!domain) return false;
+    const lcLocal = local.toLowerCase();
+    const lcDomain = domain.toLowerCase();
+    // Disposable / throwaway provider domains
+    if (UserDB.THROWAWAY_DOMAINS.has(lcDomain)) return true;
     // Gmail dot-trick bots: 3+ dots in the local part
-    if (domain === "gmail.com" && (local.match(/\./g) || []).length >= 3) return true;
+    if (lcDomain === "gmail.com" && (lcLocal.match(/\./g) || []).length >= 3) return true;
+    // Gmail plus-addressing bots: typical pattern is 2+ plus segments,
+    // e.g., real.name+spam+bot@gmail.com. Single plus tags are legit
+    // (Gmail filtering), so only flag when there's more than one.
+    if (lcDomain === "gmail.com" && (lcLocal.match(/\+/g) || []).length >= 2) return true;
     // Internal test/smoke accounts
-    const testDomains = ["test.com", "onb.com"];
-    if (testDomains.includes(domain)) return true;
+    const testDomains = ["test.com", "onb.com", "example.com", "example.org"];
+    if (testDomains.includes(lcDomain)) return true;
     const ownDomain = "agentweb.pro";
-    if (domain === ownDomain && /^(test|smoketest|attrtest)/.test(local)) return true;
-    if (domain === `updates.${ownDomain}`) return true;
+    if (lcDomain === ownDomain && /^(test|smoketest|attrtest|qa|bot)/.test(lcLocal)) return true;
+    if (lcDomain === `updates.${ownDomain}`) return true;
+    // Heuristic: random-looking local part. ≥16 chars AND no vowel = almost
+    // certainly script-generated. Real people pick pronounceable handles.
+    if (lcLocal.length >= 16 && !/[aeiouy]/.test(lcLocal)) return true;
     return false;
   }
 
@@ -7457,6 +7517,7 @@ export const orgDb = {
       landingPages:      { ...ss.landingPages,      editors: strip(ss.landingPages.editors) },
       workPlans:         { ...ss.workPlans,         editors: strip(ss.workPlans.editors) },
       skills:            { ...ss.skills,            editors: strip(ss.skills.editors) },
+      analytics:         { ...(ss.analytics ?? { enabled: false, editors: [] }), editors: strip((ss.analytics?.editors) ?? []) },
       brandGuidelines:   { editors: strip(ss.brandGuidelines.editors) },
       marketingStrategy: { editors: strip(ss.marketingStrategy.editors) },
     };

@@ -18,6 +18,7 @@ import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { createOncallItem } from '../services/notionService';
 import { skillService } from '../services/skillService';
 import { normalizeEmailList } from '../utils/validation';
@@ -36,6 +37,45 @@ const LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS = 7;
  * Exported so tests can inspect and reset it.
  */
 export const activeSessionGenerations = new Set<string>();
+
+/**
+ * Wall-clock timeout for a single agent-mode generation. Without this, a hung
+ * LLM call (stuck await, runaway tool loop, never-resolving upstream) keeps
+ * the activeSessionGenerations lock held indefinitely — every subsequent
+ * /generate request then returns 409 "Session is busy" forever. The lock
+ * release lives in a try/finally that only runs when the inner promise
+ * settles; Promise.race against this timeout forces a rejection so the
+ * finally runs and the lock releases.
+ *
+ * Note: this does NOT cancel the underlying generation (would require an
+ * AbortController plumbed through every layer). The orphaned generation
+ * continues in the background until it settles. That's acceptable — the
+ * critical thing is that the user-facing lock releases.
+ */
+const GENERATION_TIMEOUT_MS = parseInt(
+  process.env.AGENT_MODE_GENERATION_TIMEOUT_MS || '300000',
+  10
+); // 5 minutes default
+
+async function withGenerationTimeout<T>(
+  promise: Promise<T>,
+  sessionId: string
+): Promise<T> {
+  let timeoutHandle: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<T>((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      reject(new Error(
+        `Generation timed out after ${GENERATION_TIMEOUT_MS}ms for session ${sessionId}. ` +
+        `The lock has been released; the orphaned generation may still complete in the background.`
+      ));
+    }, GENERATION_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+}
 
 /**
  * Returns the effective expiration date for an interactive share.
@@ -660,6 +700,17 @@ export async function runVerifiedChat(
     }
   }
 
+  // When the agent calls a bravesearch MCP tool, it satisfies the equivalent built-in
+  // search_web requirement (but not vice-versa: explicit bravesearch_* requirements stay specific).
+  const FUNCTION_CALL_SATISFIES: Record<string, string[]> = {
+    'search_web': ['bravesearch_brave_web_search', 'bravesearch_brave_news_search'],
+  };
+  // Count how many times a required function was called, including via accepted aliases.
+  const countCallsForRequirement = (functionName: string, calls: string[]): number => {
+    const aliases = FUNCTION_CALL_SATISFIES[functionName] ?? [];
+    return calls.filter(c => c === functionName || aliases.includes(c)).length;
+  };
+
   // Track remaining keywords and function calls
   let remainingKeywords = [...keywords];
   const remainingFunctionCallCounts: Record<string, number> = {};
@@ -667,10 +718,8 @@ export async function runVerifiedChat(
     remainingFunctionCallCounts[reqFunc.functionName] = reqFunc.minCount;
   });
 
-  // Track all function calls for reporting (array format)
+  // Track all function calls across attempts (raw names, used for alias-aware evaluation)
   const allActualFunctionCallsForReporting: string[] = [];
-  // Track function calls for evaluation (key-value format, modified during evaluation)
-  const allActualFunctionCalls: Record<string, number> = {};
 
   while (attempt < maxAttempts) {
     attempt++;
@@ -697,18 +746,13 @@ export async function runVerifiedChat(
           const keywordText = remainingKeywords.length > 0
             ? `include these keywords: ${remainingKeywords.join(', ')}`
             : '';
-          // Use allActualFunctionCallsForReporting (never decremented) to avoid
-          // asking the LLM to re-call tools that already ran. The evaluation at
-          // lines 558-563 decrements allActualFunctionCalls when a function is
-          // matched, which zeroes out counts of already-called functions when the
-          // overall check fails due to a single missing function.
           const functionCallText = requiredFunctions
             .filter(reqFunc => {
-              const currentCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
+              const currentCount = countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting);
               return currentCount < reqFunc.minCount;
             })
             .map(reqFunc => {
-              const currentCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
+              const currentCount = countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting);
               const remaining = reqFunc.minCount - currentCount;
               return `${reqFunc.functionName} (${remaining} more time${remaining > 1 ? 's' : ''} needed)`;
             })
@@ -743,13 +787,8 @@ export async function runVerifiedChat(
       allToolCalls.push(...toolCalls);
       const actualFunctionCalls = toolCalls.map((call: any) => call.name).filter(Boolean);
 
-      // Add to reporting array
+      // Keep original names so bravesearch_* requirements remain trackable
       allActualFunctionCallsForReporting.push(...actualFunctionCalls);
-
-      // Add to key-value format for easy updates
-      actualFunctionCalls.forEach((callName: string) => {
-        allActualFunctionCalls[callName] = (allActualFunctionCalls[callName] || 0) + 1;
-      });
 
       // Check work plan status
       const workPlan = response.workPlan;
@@ -778,24 +817,9 @@ export async function runVerifiedChat(
 
         // Evaluate function calls
         requiredFunctions.forEach((reqFunc) => {
-          const actualCount = allActualFunctionCalls[reqFunc.functionName] || 0;
+          const actualCount = countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting);
           if (actualCount >= reqFunc.minCount) {
             functionCallMatches.push(reqFunc.functionName);
-            // Update remaining counts and remove matched calls from allActualFunctionCalls
-            // This prevents double-counting in future evaluations
-            if (remainingFunctionCallCounts.hasOwnProperty(reqFunc.functionName)) {
-              remainingFunctionCallCounts[reqFunc.functionName] -= reqFunc.minCount;
-              if (remainingFunctionCallCounts[reqFunc.functionName] < 0) {
-                remainingFunctionCallCounts[reqFunc.functionName] = 0;
-              }
-            }
-            // Decrement the count of matched calls from allActualFunctionCalls
-            if (allActualFunctionCalls.hasOwnProperty(reqFunc.functionName)) {
-              allActualFunctionCalls[reqFunc.functionName] -= reqFunc.minCount;
-              if (allActualFunctionCalls[reqFunc.functionName] <= 0) {
-                delete allActualFunctionCalls[reqFunc.functionName];
-              }
-            }
           } else {
             functionCallMisses.push(reqFunc.functionName);
           }
@@ -805,15 +829,14 @@ export async function runVerifiedChat(
       // Check if all requirements are met
       const allKeywordsMet = remainingKeywords.length === 0;
       const allFunctionCallsMet = requiredFunctions.every(reqFunc => {
-        const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
-        return actualCount >= reqFunc.minCount;
+        return countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) >= reqFunc.minCount;
       });
       const allRequirementsMet = (!workPlan || workPlanCompleted) && allKeywordsMet && allFunctionCallsMet;
 
       if (allRequirementsMet) {
         // Build final function status
         const functionStatus = requiredFunctions.map((reqFunc) => {
-          const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
+          const actualCount = countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting);
           return {
             functionName: reqFunc.functionName,
             requiredCount: reqFunc.minCount,
@@ -829,12 +852,10 @@ export async function runVerifiedChat(
           keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
           keywordMisses: remainingKeywords,
           functionCallMatches: requiredFunctions.filter(reqFunc => {
-            const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
-            return actualCount >= reqFunc.minCount;
+            return countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) >= reqFunc.minCount;
           }).map(reqFunc => reqFunc.functionName),
           functionCallMisses: requiredFunctions.filter(reqFunc => {
-            const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
-            return actualCount < reqFunc.minCount;
+            return countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) < reqFunc.minCount;
           }).map(reqFunc => reqFunc.functionName),
           functionStatus,
           attempts: attempt,
@@ -858,7 +879,7 @@ export async function runVerifiedChat(
 
   // If we get here, we've exhausted all attempts
   const functionStatus = requiredFunctions.map((reqFunc) => {
-    const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
+    const actualCount = countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting);
     return {
       functionName: reqFunc.functionName,
       requiredCount: reqFunc.minCount,
@@ -874,12 +895,10 @@ export async function runVerifiedChat(
     keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
     keywordMisses: remainingKeywords,
     functionCallMatches: requiredFunctions.filter(reqFunc => {
-      const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
-      return actualCount >= reqFunc.minCount;
+      return countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) >= reqFunc.minCount;
     }).map(reqFunc => reqFunc.functionName),
     functionCallMisses: requiredFunctions.filter(reqFunc => {
-      const actualCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
-      return actualCount < reqFunc.minCount;
+      return countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) < reqFunc.minCount;
     }).map(reqFunc => reqFunc.functionName),
     functionStatus,
     attempts: attempt,
@@ -2074,16 +2093,20 @@ export const agentModeController = {
       const authReqForGenerate = req as any;
       const isDelegatedAccessForMessage = authReqForGenerate.delegateInfo?.isDelegated === true;
 
-      // Generate AI response using common function
-      const response = await generateSessionResponse(
-        sessionId,
-        userMessage,
-        user.userId,
-        modelToUse,
-        attachments,
-        undefined, // isInteractiveShare
-        pageContext,
-        isDelegatedAccessForMessage
+      // Generate AI response using common function (wrapped in wall-clock timeout
+      // so the activeSessionGenerations lock always releases even if generation hangs).
+      const response = await withGenerationTimeout(
+        generateSessionResponse(
+          sessionId,
+          userMessage,
+          user.userId,
+          modelToUse,
+          attachments,
+          undefined, // isInteractiveShare
+          pageContext,
+          isDelegatedAccessForMessage
+        ),
+        sessionId
       );
 
       // Clear progress store after completion (keep connections open for future messages)
@@ -2669,6 +2692,34 @@ export const agentModeController = {
           slackThread: session.slackThread
         }
       });
+
+      // ai-eval-funnel loop telemetry — fire-once eval_completed / eval_failed
+      // events server-side so the lander's loop sensor can see them
+      // reliably. Idempotent via ConditionExpression in fireLoopEventOnce —
+      // safe to call on every poll. Only fires for AI_GTM_Position_Eval
+      // sessions; other plan sessions are no-ops.
+      if (session.pageIdentifier === 'plan-AI_GTM_Position_Eval') {
+        const messages = session.messages || [];
+        let reportUrl: string | undefined;
+        let firstErrorText: string | undefined;
+        for (const msg of messages) {
+          const m = msg as { content?: string; text?: string; role?: string; metadata?: { isErrorMessage?: boolean } };
+          const content = (m.content || m.text || '');
+          if (m.role !== 'system' && !reportUrl) {
+            const s3Match = content.match(/https:\/\/[^\s"']+\.html/);
+            if (s3Match) reportUrl = s3Match[0];
+          }
+          if (m.metadata?.isErrorMessage === true && !firstErrorText) {
+            firstErrorText = content.slice(0, 1000);
+          }
+        }
+        if (reportUrl) {
+          loopEventsEmitter.fireEvalCompleted(session.sessionId, reportUrl).catch(() => {});
+        }
+        if (firstErrorText) {
+          loopEventsEmitter.fireEvalFailed(session.sessionId, firstErrorText).catch(() => {});
+        }
+      }
     } catch (error) {
       console.error('AgentMode: Get shared conversation error:', error);
       res.status(500).json({ error: 'Failed to get shared conversation' });
@@ -2732,21 +2783,25 @@ export const agentModeController = {
       const defaultModel = await agentModeService.getDefaultModel();
       const modelToUse = session.llmModel || defaultModel;
 
-      // Use the same generateSessionResponse logic as the regular generateResponse
+      // Use the same generateSessionResponse logic as the regular generateResponse,
+      // wrapped in wall-clock timeout to guarantee lock release on hung generation.
       const ishareSenderInfo = {
         ip: req.ip || (req.headers?.['x-forwarded-for'] as string | undefined)?.split(',')[0].trim(),
         userAgent: req.headers?.['user-agent'] as string | undefined,
       };
-      const response = await generateSessionResponse(
-        session.sessionId,
-        userMessage,
-        session.userId,
-        modelToUse,
-        attachments,
-        true, // isInteractiveShare - block admin tools for security
-        undefined, // pageContext
-        undefined, // isDelegatedAccess
-        ishareSenderInfo
+      const response = await withGenerationTimeout(
+        generateSessionResponse(
+          session.sessionId,
+          userMessage,
+          session.userId,
+          modelToUse,
+          attachments,
+          true, // isInteractiveShare - block admin tools for security
+          undefined, // pageContext
+          undefined, // isDelegatedAccess
+          ishareSenderInfo
+        ),
+        session.sessionId
       );
 
       // Clear progress store after completion (keep connections open for future messages)
@@ -5334,6 +5389,13 @@ export const agentModeController = {
         conversableToken,
         userId: session.userId
       });
+
+      // ai-eval-funnel loop telemetry — fire eval_started server-side so the
+      // loop's sensor sees the start regardless of frontend telemetry state.
+      // Idempotent via ConditionExpression — safe on retries.
+      if (planTitle === 'AI_GTM_Position_Eval') {
+        loopEventsEmitter.fireEvalStarted(session.sessionId).catch(() => {});
+      }
 
       // Fire-and-forget: send starting message after response is returned
       if (startingMessage && typeof startingMessage === 'string' && startingMessage.trim()) {

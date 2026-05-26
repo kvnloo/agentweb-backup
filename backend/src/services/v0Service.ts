@@ -923,8 +923,9 @@ export function remapFilesForSubPage(
       const newImport = `./_components/${relativeName.replace(/\.tsx$/, "")}`;
       componentRenames.set(oldImport, newImport);
     } else if (file.path.startsWith("app/api/")) {
-      // API routes (e.g. lead capture) — keep in place, shared across pages
-      result.push({ path: file.path, content: file.content });
+      // Skip app/api/ routes — the existing root repo already has its own API routes
+      // (possibly in a route group like (frontend)/api/capture/route.ts), and adding a
+      // duplicate would cause a Turbopack "conflicting routes" build error.
     } else if (file.path.startsWith("app/") && file.path !== "app/page.tsx") {
       // Other app files (e.g. app/loading.tsx) → namespace under slug
       const relativeName = file.path.replace("app/", "");
@@ -1005,6 +1006,16 @@ export async function deployLandingPage(
 
   if (!["draft", "failed", "deploying"].includes(record.status)) {
     throw new Error(`Cannot deploy a landing page with status: ${record.status}`);
+  }
+
+  // Sub-pages (those with a slug) are always added to the existing repo — they must
+  // never go through the first-page deploy path which creates a brand-new GitHub repo
+  // and Vercel project, orphaning the existing site.
+  if (record.slug) {
+    throw new Error(
+      "Cannot re-deploy a sub-page via deploy_landing_page — sub-pages are added to the existing repo. " +
+      "Use generate_landing_page with the same prompt to retry."
+    );
   }
 
   try {
@@ -2294,8 +2305,8 @@ async function removePageFromGitHub(githubRepoUrl: string, slug: string): Promis
 }
 
 /**
- * Delete a landing page. Root page cannot be deleted.
- * Sub-pages are soft-deleted (archived) and their route file is removed from GitHub.
+ * Delete a landing page. All pages are deletable (including the root).
+ * Pages are soft-deleted (archived) and their route file is removed from GitHub.
  */
 export async function deleteLandingPage(
   id: string,
@@ -2304,15 +2315,6 @@ export async function deleteLandingPage(
   const record = await getLandingPage(id, userId);
   if (!record) {
     throw new Error("Landing page not found");
-  }
-
-  // Allow deleting a failed root page that was never deployed (no GitHub repo created).
-  // A deployed root page still cannot be deleted — it would orphan the repo and Vercel project.
-  if (record.isRootPage && record.githubRepoUrl) {
-    throw new Error("Cannot delete the root landing page. Use Emma to edit it instead.");
-  }
-  if (record.isRootPage && record.status !== "failed") {
-    throw new Error("Cannot delete the root landing page. Use Emma to edit it instead.");
   }
 
   // Remove route file from GitHub
@@ -2446,16 +2448,9 @@ export async function transferLandingPageOwner(id: string, newOwnerId: string): 
 
 /**
  * Delete a landing page given an already-fetched record (for org-share flows where
- * the caller may not be the owner). Enforces root-page guard.
+ * the caller may not be the owner). All pages are deletable.
  */
 export async function deleteLandingPageByRecord(record: GeneratedLandingPage): Promise<void> {
-  if (record.isRootPage && record.githubRepoUrl) {
-    throw new Error("Cannot delete the root landing page. Use Emma to edit it instead.");
-  }
-  if (record.isRootPage && record.status !== "failed") {
-    throw new Error("Cannot delete the root landing page. Use Emma to edit it instead.");
-  }
-
   if (record.githubRepoUrl && record.slug) {
     try {
       await removePageFromGitHub(record.githubRepoUrl, record.slug);

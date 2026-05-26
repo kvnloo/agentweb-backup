@@ -530,6 +530,77 @@ createTestAccount().then(async () => {
       // backend/src/cron/onboardingStuckDetector.ts is preserved and unit-
       // tested; re-enable here if we want the daily summary back.
 
+      // Onboarding Loop — daily at 15:00 UTC (7am PT), gated by ONBOARDING_LOOP_ENABLED=true
+      try {
+        const LOOP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        const { runOnboardingLoop } = await import('./cron/onboardingLoop');
+
+        const nowForLoop = new Date();
+        const nextLoopRun = new Date(nowForLoop);
+        nextLoopRun.setUTCHours(15, 0, 0, 0);
+        if (nextLoopRun <= nowForLoop) {
+          nextLoopRun.setUTCDate(nextLoopRun.getUTCDate() + 1);
+        }
+        const msUntilLoop = nextLoopRun.getTime() - nowForLoop.getTime();
+
+        console.log(`[OnboardingLoop] Initialized — first run at 15:00 UTC (in ${Math.round(msUntilLoop / 60000)} min)`);
+        setTimeout(() => {
+          runOnboardingLoop().catch(e => console.error('[OnboardingLoop] Error:', e));
+          setInterval(() => {
+            runOnboardingLoop().catch(e => console.error('[OnboardingLoop] Error:', e));
+          }, LOOP_INTERVAL_MS);
+        }, msUntilLoop);
+      } catch (error) {
+        console.error('[OnboardingLoop] Failed to initialize:', error);
+      }
+
+      // Onboarding Loop Watchdog — hourly, gated by ONBOARDING_LOOP_ENABLED=true
+      try {
+        const WATCHDOG_INTERVAL_MS = 60 * 60 * 1000;
+        const { runOnboardingLoopWatchdog } = await import('./cron/onboardingLoopWatchdog');
+
+        console.log('[OnboardingWatchdog] Initialized — running hourly');
+        runOnboardingLoopWatchdog().catch(e => console.error('[OnboardingWatchdog] Error on first run:', e));
+        setInterval(() => {
+          runOnboardingLoopWatchdog().catch(e => console.error('[OnboardingWatchdog] Error:', e));
+        }, WATCHDOG_INTERVAL_MS);
+      } catch (error) {
+        console.error('[OnboardingWatchdog] Failed to initialize:', error);
+      }
+
+      // AI Eval Funnel closed-loop — daily at 16:00 UTC (8am PT), one hour
+      // offset from the onboarding loop so the two don't race for shared
+      // resources (Slack rate limits, Bedrock, etc.). Gated by
+      // AI_EVAL_LOOP_ENABLED=true.
+      if (process.env.AI_EVAL_LOOP_ENABLED === 'true') {
+        try {
+          const AI_EVAL_LOOP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+          const { runAiEvalLoopOnce } = await import('./loops/instances/ai-eval-funnel/cron');
+
+          const nowForAiEval = new Date();
+          const nextAiEvalRun = new Date(nowForAiEval);
+          nextAiEvalRun.setUTCHours(16, 0, 0, 0);
+          if (nextAiEvalRun <= nowForAiEval) {
+            nextAiEvalRun.setUTCDate(nextAiEvalRun.getUTCDate() + 1);
+          }
+          const msUntilAiEval = nextAiEvalRun.getTime() - nowForAiEval.getTime();
+
+          console.log(
+            `[AiEvalLoop] Initialized — first run at 16:00 UTC (in ${Math.round(msUntilAiEval / 60000)} min)`,
+          );
+          setTimeout(() => {
+            runAiEvalLoopOnce().catch(e => console.error('[AiEvalLoop] Error:', e));
+            setInterval(() => {
+              runAiEvalLoopOnce().catch(e => console.error('[AiEvalLoop] Error:', e));
+            }, AI_EVAL_LOOP_INTERVAL_MS);
+          }, msUntilAiEval);
+        } catch (error) {
+          console.error('[AiEvalLoop] Failed to initialize:', error);
+        }
+      } else {
+        console.log('[AiEvalLoop] Disabled (set AI_EVAL_LOOP_ENABLED=true to enable)');
+      }
+
     }, 30000); // Delay 30s after startup to allow Agent Mode to boot first
   });
 }); 

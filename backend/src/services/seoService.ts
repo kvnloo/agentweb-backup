@@ -1,4 +1,5 @@
 import { userDb } from "./db";
+import { resolveAnalyticsConfig, ResolvedAnalyticsConfig } from "./analyticsConfigResolver";
 import { getSecret } from "../utils/secretsManager";
 import { JWT } from "google-auth-library";
 import { BetaAnalyticsDataClient } from "@google-analytics/data";
@@ -30,6 +31,47 @@ export async function getGoogleSearchConsoleAccessToken(): Promise<string | null
   } catch (error: any) {
     console.error("Error fetching Google Search Console access token:", error);
     return null;
+  }
+}
+
+/** Returns the shared Google service-account email users must grant access to. */
+export async function getServiceAccountEmail(): Promise<string | null> {
+  try {
+    const secretName = process.env.NODE_ENV === "production"
+      ? "prod/AgentWeb/Google/SearchConsole"
+      : "dev/AgentWeb/Google/SearchConsole";
+    const serviceAccount = JSON.parse(await getSecret(secretName));
+    return serviceAccount.client_email || null;
+  } catch (error: any) {
+    console.error("Error fetching service account email:", error.message);
+    return null;
+  }
+}
+
+/**
+ * Probe a GA4 property with the shared service account. Used by the
+ * "Test connection" button so users see permission problems immediately.
+ */
+export async function testGaProperty(
+  propertyId: string,
+): Promise<{ ok: boolean; reason?: string; message?: string }> {
+  const client = await getGoogleAnalyticsDataClient();
+  if (!client) return { ok: false, reason: "error", message: "GA client unavailable" };
+  try {
+    await client.runReport({
+      property: `properties/${propertyId}`,
+      dateRanges: [{ startDate: "yesterday", endDate: "today" }],
+      metrics: [{ name: "sessions" }],
+      limit: 1,
+    });
+    return { ok: true };
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    if (e?.code === 7 || /PERMISSION_DENIED/i.test(msg)) return { ok: false, reason: "permission_denied", message: msg };
+    if (e?.code === 5 || e?.code === 3 || /NOT_FOUND|INVALID_ARGUMENT/i.test(msg)) {
+      return { ok: false, reason: "not_found", message: msg };
+    }
+    return { ok: false, reason: "error", message: msg };
   }
 }
 
@@ -181,13 +223,14 @@ function calculateGaDateRange(timeframe: string): { startDateStr: string; endDat
   };
 }
 
-export async function fetchSearchConsoleMetrics(userId: string, timeframe: string = "30d", filterDomain?: string): Promise<any> {
+export async function fetchSearchConsoleMetrics(userId: string, timeframe: string = "30d", filterDomain?: string, resolvedConfig?: ResolvedAnalyticsConfig): Promise<any> {
   const user = await userDb.getUserById(userId);
   if (!user) {
     return { error: "User not found" };
   }
 
-  if (!user.seoDomains || user.seoDomains.length === 0) {
+  const resolved = resolvedConfig ?? (await resolveAnalyticsConfig(user));
+  if (!resolved.seoDomains || resolved.seoDomains.length === 0) {
     return { message: "Google Search Console is not configured. Use the search_user_guide tool to find setup instructions and share them with the user." };
   }
 
@@ -199,11 +242,11 @@ export async function fetchSearchConsoleMetrics(userId: string, timeframe: strin
   const { startDateStr, endDateStr } = calculateDateRange(timeframe);
 
   // Filter to a specific domain if requested
-  let domainsToFetch = user.seoDomains as string[];
+  let domainsToFetch = resolved.seoDomains as string[];
   if (filterDomain) {
     domainsToFetch = domainsToFetch.filter((d: string) => d.toLowerCase().includes(filterDomain.toLowerCase()));
     if (domainsToFetch.length === 0) {
-      return { error: `Domain "${filterDomain}" not found in configured domains: ${(user.seoDomains as string[]).join(', ')}` };
+      return { error: `Domain "${filterDomain}" not found in configured domains: ${(resolved.seoDomains as string[]).join(', ')}` };
     }
   }
 
@@ -396,20 +439,21 @@ export async function fetchSearchConsoleMetrics(userId: string, timeframe: strin
   const metrics = await Promise.all(metricsPromises);
   return {
     search_console_integration_status: "Google Search Console is configured and connected. If a domain shows 0 clicks/impressions, the site may not be indexed yet or had no search traffic in this period. Do NOT tell the user Search Console is not set up.",
-    configured_domains: user.seoDomains,
+    configured_domains: resolved.seoDomains,
     metrics,
     timeframe,
     timestamp: new Date().toISOString(),
   };
 }
 
-export async function fetchClarityProjectInfo(userId: string, filterProjectId?: string): Promise<any> {
+export async function fetchClarityProjectInfo(userId: string, filterProjectId?: string, resolvedConfig?: ResolvedAnalyticsConfig): Promise<any> {
   const user = await userDb.getUserById(userId);
   if (!user) {
     return { error: "User not found" };
   }
 
-  const clarityProjects = getClarityProjects(user);
+  const resolved = resolvedConfig ?? (await resolveAnalyticsConfig(user));
+  const clarityProjects = resolved.clarityProjects;
   if (clarityProjects.length === 0) {
     return { message: "Microsoft Clarity is not configured. Use the search_user_guide tool to find setup instructions and share them with the user." };
   }
@@ -434,45 +478,14 @@ export async function fetchClarityProjectInfo(userId: string, filterProjectId?: 
   };
 }
 
-/**
- * Migration helper: Get Google Analytics properties from user, with fallback to legacy field.
- * Returns array of { propertyId, label } objects.
- */
-export function getGoogleAnalyticsProperties(user: any): Array<{ propertyId: string; label: string }> {
-  // New format: multiple properties with labels
-  if (user.googleAnalyticsProperties && user.googleAnalyticsProperties.length > 0) {
-    return user.googleAnalyticsProperties;
-  }
-  // Legacy format: single property ID
-  if (user.googleAnalyticsPropertyId) {
-    return [{ propertyId: user.googleAnalyticsPropertyId, label: "Main Property" }];
-  }
-  return [];
-}
-
-/**
- * Migration helper: Get Clarity projects from user, with fallback to legacy field.
- * Returns array of { projectId, label } objects.
- */
-export function getClarityProjects(user: any): Array<{ projectId: string; label: string }> {
-  // New format: multiple projects with labels
-  if (user.clarityProjects && user.clarityProjects.length > 0) {
-    return user.clarityProjects;
-  }
-  // Legacy format: single project ID
-  if (user.clarityProjectId) {
-    return [{ projectId: user.clarityProjectId, label: "Main Project" }];
-  }
-  return [];
-}
-
-export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: string = "30d", filterPropertyId?: string): Promise<any> {
+export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: string = "30d", filterPropertyId?: string, resolvedConfig?: ResolvedAnalyticsConfig): Promise<any> {
   const user = await userDb.getUserById(userId);
   if (!user) {
     return { error: "User not found" };
   }
 
-  const gaProperties = getGoogleAnalyticsProperties(user);
+  const resolved = resolvedConfig ?? (await resolveAnalyticsConfig(user));
+  const gaProperties = resolved.properties;
   if (gaProperties.length === 0) {
     return { message: "Google Analytics (GA4) is not configured. Use the search_user_guide tool to find setup instructions and share them with the user." };
   }
@@ -495,8 +508,8 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
 
   // Build dimension filter to exclude filtered domains
   let dimensionFilter: any = undefined;
-  if (user.gaFilteredDomains && user.gaFilteredDomains.length > 0) {
-    const notExpressions = user.gaFilteredDomains.map((domain: string) => ({
+  if (resolved.gaFilteredDomains && resolved.gaFilteredDomains.length > 0) {
+    const notExpressions = resolved.gaFilteredDomains.map((domain: string) => ({
       notExpression: {
         filter: {
           fieldName: "hostName",
@@ -580,9 +593,9 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
             if (hostName) {
               const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
               fullUrl = `https://${hostName}${path}`;
-            } else if (user.seoDomains && user.seoDomains.length > 0) {
+            } else if (resolved.seoDomains && resolved.seoDomains.length > 0) {
               const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
-              fullUrl = `https://${user.seoDomains[0]}${path}`;
+              fullUrl = `https://${resolved.seoDomains[0]}${path}`;
             }
 
             topPagesByEngagement.push({

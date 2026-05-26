@@ -8,6 +8,18 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2026-05-22",
+    changes: [
+      "Self-Service Analytics & SEO Configuration",
+      "- Customers can configure their own SEO domains, Google Analytics 4 properties, and Microsoft Clarity projects via Settings → Analytics & SEO in the customer portal",
+      "- A GA4 \"Test connection\" button reports immediately whether the shared analytics service account has access to a property",
+      "- Org admins can share analytics org-wide and appoint analytics editors from Settings → Organization Sharing; org analytics config now lives on the Organization record",
+      "- Partner Portal: the Configure SEO/AEO dialog now loads the resolved, org-aware config — fixing empty GA4/Clarity lists",
+      "- Fixed: shared-funnel metrics, the User Journey Funnel section, and the SEO dashboard now resolve org-shared analytics correctly for members",
+      "- New backend endpoints: GET /api/seo/config and PUT /api/seo/config/{ga,seo-domains,clarity}",
+    ],
+  },
+  {
     date: "2026-05-19",
     changes: [
       "Org-wide Sharing Controls (Customer Portal)",

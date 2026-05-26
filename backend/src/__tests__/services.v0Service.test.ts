@@ -445,6 +445,30 @@ describe("v0Service - deployLandingPage", () => {
       "Deployment failed"
     );
   });
+
+  it("FAIL: sub-page record with slug → throws to prevent creating orphaned repo", async () => {
+    // Sub-pages (slug is set) must not go through deployLandingPage because that
+    // function creates a brand-new GitHub repo and Vercel project, orphaning the
+    // existing site (hireemma.ai bug: generated prj_7H2ecLCyExN8dKICzHEUrmsYv6eI).
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "sub-page-1",
+            userId: "user-1",
+            status: "failed",
+            v0ChatId: "chat_sub",
+            slug: "state-of-ai-marketing",
+            githubRepoUrl: "https://github.com/AgentWebPro/agentweb-landing-page",
+            vercelProjectId: "prj_lH8z68FO47QtpLrLa45FnFRc2xwV",
+          },
+        }),
+    });
+
+    await expect(deployLandingPage("sub-page-1", "user-1")).rejects.toThrow(
+      "sub-page"
+    );
+  });
 });
 
 // =============================================================================
@@ -649,7 +673,7 @@ describe("v0Service - deleteLandingPage", () => {
     expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
 
-  it("FAIL: failed root page WITH githubRepoUrl cannot be deleted", async () => {
+  it("SUCCESS: failed root page WITH githubRepoUrl can be deleted", async () => {
     mockGet.mockReturnValueOnce({
       promise: () =>
         Promise.resolve({
@@ -666,10 +690,11 @@ describe("v0Service - deleteLandingPage", () => {
 
     await expect(
       deleteLandingPage("root-fail-deployed", "user-1")
-    ).rejects.toThrow("Cannot delete the root landing page");
+    ).resolves.toBeUndefined();
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
 
-  it("FAIL: deployed root page cannot be deleted", async () => {
+  it("SUCCESS: deployed root page can be deleted", async () => {
     mockGet.mockReturnValueOnce({
       promise: () =>
         Promise.resolve({
@@ -686,7 +711,8 @@ describe("v0Service - deleteLandingPage", () => {
 
     await expect(
       deleteLandingPage("root-deployed", "user-1")
-    ).rejects.toThrow("Cannot delete the root landing page");
+    ).resolves.toBeUndefined();
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -880,15 +906,18 @@ describe("v0Service - remapFilesForSubPage", () => {
     expect(result.find(f => f.path === "app/abm-startups/_components/footer.tsx")).toBeDefined();
   });
 
-  it("keeps app/api/ routes in place (shared across pages)", () => {
+  it("skips app/api/ routes to avoid Turbopack route conflicts with existing root routes", () => {
+    // The root repo may already have e.g. app/(frontend)/api/capture/route.ts.
+    // Adding app/api/capture/route.ts from a sub-page generation would create
+    // conflicting routes at /api/capture, causing a Turbopack build failure.
     const files = [
       { path: "app/page.tsx", content: buf('export default function Page() { return <div/>; }') },
       { path: "app/api/capture/route.ts", content: buf('export async function POST() {}') },
     ];
     const result = remapFilesForSubPage(files, "pricing");
 
-    expect(result).toHaveLength(2);
-    expect(result.find(f => f.path === "app/api/capture/route.ts")).toBeDefined();
+    expect(result).toHaveLength(1);
+    expect(result.find(f => f.path === "app/api/capture/route.ts")).toBeUndefined();
     expect(result.find(f => f.path === "app/pricing/page.tsx")).toBeDefined();
   });
 

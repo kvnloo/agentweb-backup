@@ -73,8 +73,8 @@ export function extractVariables(template: string): string[] {
   let match;
   while ((match = regex.exec(template)) !== null) {
     const varName = match[1].trim();
-    // Skip special non-lead variables
-    if (varName === 'unsubscribeUrl') continue;
+    // Skip special non-lead variables (both naming conventions)
+    if (varName === 'unsubscribeUrl' || varName === 'unsubscribe_url') continue;
     vars.add(varName);
   }
   return Array.from(vars);
@@ -107,9 +107,9 @@ export function leadHasVariable(lead: Record<string, any>, varName: string): boo
 export function injectUnsubscribeUrl(html: string, unsubscribeUrl: string, fallbackFooterHtml?: string): string {
   if (!html) return html;
 
-  // Step 1: replace {{unsubscribeUrl}} variable
-  if (/\{\{unsubscribeUrl\}\}/i.test(html)) {
-    return html.replace(/\{\{unsubscribeUrl\}\}/gi, unsubscribeUrl);
+  // Step 1: replace {{unsubscribeUrl}} or {{unsubscribe_url}} variable
+  if (/\{\{unsubscribe(?:Url|_url)\}\}/i.test(html)) {
+    return html.replace(/\{\{unsubscribe(?:Url|_url)\}\}/gi, unsubscribeUrl);
   }
 
   // Step 2: update existing unsubscribe anchor href

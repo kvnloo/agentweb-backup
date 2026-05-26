@@ -11,11 +11,137 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-25',
     changes: [
+<<<<<<< harshit/landing-page-custom-domain-ui
       'Landing Pages: Connect Your Own Custom Domain',
       '- Paid users can now point a custom domain (e.g. landing.mycompany.com or mycompany.com) at any landing page from the Domain Settings panel',
       '- The panel walks you through the DNS records you need to add at your registrar (TXT for verification, plus CNAME for subdomains or A 76.76.21.21 for apex domains)',
       '- The page auto-polls every 10 seconds for up to 30 minutes; once verification succeeds, the live URL shown on the landing page card updates to your custom domain',
       '- Disconnect at any time from the same panel — the domain is removed and the landing page reverts to its default URL',
+=======
+      'New: Self-Service Analytics Setup',
+      '- Configure your SEO domains, Google Analytics 4 properties, and Microsoft Clarity projects yourself under Settings → Analytics & SEO',
+      'New: Test GA4 Connections',
+      '- A Test button shows immediately whether the analytics service account has access to each property',
+      'New: Organization-Wide Analytics Sharing',
+      '- Org admins can share analytics with their whole team and appoint analytics editors from Settings → Organization Sharing',
+      'New: Share Funnels Across Your Team',
+      '- User-journey funnels can now be shared organization-wide',
+      '- Turn on Funnels sharing in Settings → Organization → Sharing; editors and the org owner can edit shared funnels',
+    ],
+  },
+  {
+    date: '2026-05-25',
+    changes: [
+      'Fixed: Adding a New Landing Page Subpage No Longer Creates an Orphaned Vercel Project',
+      '- Asking Emma to create a new landing page on an existing domain (e.g. hireemma.ai) was incorrectly spinning up a brand-new Vercel project and GitHub repo instead of adding a route to the existing one',
+      '- Root cause: v0-generated subpages included an app/api/capture route that conflicted with the root repo\'s existing API route, causing a Turbopack build failure; Emma then called deploy_landing_page on the failed subpage record, which created the orphaned project',
+      '- New subpages now skip the conflicting API route during file remapping, and deploy_landing_page now refuses to process subpage records to prevent this class of error entirely',
+    ],
+  },
+  {
+    date: '2026-05-25',
+    changes: [
+      'Fixed: Admin Delegate Access to Customer Portal No Longer Resets to Wrong Account on Reload',
+      '- When an admin accessed a customer\'s portal and then reloaded the page, the portal would switch to a different customer\'s account',
+      '- Multiple delegate session tokens were accumulating in the browser\'s session storage, and the wrong one would be picked on reload due to non-deterministic key ordering',
+      '- The fix ensures only one delegate token is ever active at a time: switching to a new customer now clears any previous delegate tokens before storing the new one',
+    ],
+  },
+  {
+    date: '2026-05-25',
+    changes: [
+      'Fixed: Scheduled Chats No Longer Fail When Using Brave Search MCP for Web Search',
+      '- Scheduled chats that required a web search step were failing validation with "Missing function calls: search_web" even though the agent was successfully searching the web',
+      '- The agent was using the Brave Search MCP tool (bravesearch_brave_web_search) which produces equivalent results to the built-in search_web, but the validation logic did not recognize them as the same',
+      '- The validator now treats bravesearch_brave_web_search and bravesearch_brave_news_search as aliases for search_web, so scheduled chats pass validation regardless of which search tool the agent chooses',
+    ],
+  },
+  {
+    date: '2026-05-24',
+    changes: [
+      'Fixed: Admin Notes on Client Health Page Now Save Correctly',
+      '- Notes written in the Client Health dashboard were accepted by the server but silently discarded — they would vanish after refreshing the page',
+      '- Notes are now persisted to the client record and pre-populated when you reopen a client\'s health detail panel',
+    ],
+  },
+  {
+    date: '2026-05-23',
+    changes: [
+      'Fixed: CRM Inbox "Last Contact" No Longer Shows Enrichment Time',
+      '- Enriching a lead record (company info, industry, etc.) was updating the record\'s modified timestamp, which the CRM inbox was incorrectly showing as the "Last contact" time',
+      '- Leads with no real contact history now show their creation date instead of the last enrichment time, so "Last contact" only reflects actual engagement events',
+    ],
+  },
+  {
+    date: '2026-05-23',
+    changes: [
+      'Fixed: Knowledge Base Files Can Now Be Read Back Immediately After Writing',
+      '- Creating or updating a knowledge base file would succeed (returning a valid size and timestamp) but reading it back immediately returned "Knowledge base file not found in storage"',
+      '- The root cause was a mismatch in storage bucket environment variables: write operations used KNOWLEDGE_BASE_BUCKET / PRIVATE_KNOWLEDGE_BASE_BUCKET while read operations used GCS_BUCKET_NAME / GCS_BUCKET_NAME_PRIVATE, which in production resolved to the wrong (dev) bucket',
+      '- Read operations now use the same bucket environment variables as writes, so files are immediately readable after being created or updated',
+    ],
+  },
+  {
+    date: '2026-05-23',
+    changes: [
+      'Fixed: Group Email Unsubscribe Links Now Work Correctly',
+      '- Group emails sent to CRM leads now include a properly formatted unsubscribe link that leads to the correct unsubscribe page',
+      '- Templates using either {{unsubscribeUrl}} or {{unsubscribe_url}} are now both recognized and substituted — previously the snake_case variant caused all leads to be skipped as "missing variables"',
+      '- The email preview in the composer no longer appends a duplicate unsubscribe footer when the template already contains an unsubscribe link',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
+      'Improved: Browser Automation Skill Now Falls Back to Local Agent When Headless Browser Fails',
+      '- When a website blocks the headless cloud browser (bot protection, Cloudflare, React crash, blank page), the Browser Automation skill now automatically uses the Local Agent as a fallback',
+      '- The Local Agent tool is now bundled directly into the Browser Automation skill so it is always available without a separate install',
+      '- Previously, the agent would report the site as broken or inaccessible; now it retries via the Local Agent which uses a real (non-headless) browser',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
+      'New: Emma Now Knows Whether a CRM Lead Has Accepted Your LinkedIn Connection',
+      '- When Emma looks up a lead\'s details, she now checks the LinkedIn connection cache and reports whether you are a 1st-degree connection, and if so, when you connected',
+      '- This lets Emma automatically choose the right LinkedIn action: sending a direct message to connected leads instead of a new connection invite',
+      '- No manual steps required — the status is derived from the same connection data already synced every 10 minutes in the background',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
+      'Fixed: All Landing Pages Can Now Be Deleted',
+      '- Previously, the first (root) landing page could not be deleted — the trash icon was hidden and the API blocked deletion',
+      '- All landing pages, including the root page, can now be deleted from the Landing Pages view',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
+      'Fixed: Org Members Can Now Send and Read Slack Messages Using the Org Owner\'s Connected Workspace',
+      '- Org team members were blocked from using any Slack features (list channels, fetch messages, send messages) even when the org owner had a Slack workspace and channel configured',
+      '- The error "No Slack channel is configured for your account" appeared for all org members regardless of the org owner\'s setup',
+      '- Slack tools now fall back to the org\'s configured channel when an org member has no personal Slack channel set up, consistent with how other org-wide resources like brand guidelines are shared',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
+      'Fixed: Admin Delegate Access No Longer Switches to the Wrong Account',
+      '- When an admin opened a delegate session in a new tab while another customer portal tab was open, the delegate tab could sometimes show the wrong customer\'s account',
+      '- The issue was caused by a few places reading the auth token directly from localStorage instead of going through the secure token resolution in useAuth()',
+      '- Token reads now always go through useAuth(), which correctly returns the tab-isolated sessionStorage token for delegate sessions',
+    ],
+  },
+  {
+    date: '2026-05-22',
+    changes: [
+      'Fixed: LinkedIn DM Campaigns No Longer Send the Same Message Twice to the Same Lead',
+      '- Scheduled LinkedIn outreach campaigns could send an identical follow-up message to a lead multiple times across different daily runs, risking spam flags',
+      '- The agent now checks engagement history before sending and blocks any message whose exact text was already delivered to that lead',
+      '- Different follow-up messages (e.g. Touch 3 after Touch 2) are still allowed through normally',
+>>>>>>> main
     ],
   },
   {

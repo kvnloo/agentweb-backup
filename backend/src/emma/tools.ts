@@ -2922,7 +2922,7 @@ emmaToolRegistry.register({
   name: 'get_lead_details',
   definition: {
     name: 'get_lead_details',
-    description: 'Get full details for a single lead including all fields, ICP match info, email drafts, and recent engagement history.',
+    description: 'Get full details for a single lead including all fields, ICP match info, email drafts, and recent engagement history. Also returns `lead.linkedInConnectionStatus`: if the lead has a LinkedIn URL, this field indicates whether they are a 1st-degree connection (`isConnected: true/false`), and if connected, when they connected (`connectedAt` ISO string, `connectedAtTimestamp` UNIX seconds). Returns `null` if the lead has no LinkedIn URL. Use this to decide whether to send a connection invite vs. a direct message.',
     inputSchema: {
       type: 'object',
       properties: {
