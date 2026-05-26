@@ -6,6 +6,7 @@ const mockDynamoInstance = {
   update: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
   delete: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
   query: jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) }),
+  scan: jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) }),
 };
 
 const mockS3Instance = {
@@ -50,6 +51,7 @@ jest.mock("axios", () => ({
 
 import {
   getProjectDomain,
+  removeDomain,
   setPageSubdomain,
   removePageSubdomainFromVercel,
 } from "../services/customDomainService";
@@ -245,5 +247,100 @@ describe("updateSubdomainMiddleware", () => {
     expect(content).toContain('"pricing.mysite.com"');
     expect(content).toContain('"/pricing"');
     expect(content).toContain('"contact.mysite.com"');
+  });
+});
+
+describe("removeDomain cascade", () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it("clears subdomainPrefix and customDomainUrl from landing pages under the removed domain", async () => {
+    // 1. Domain record fetch
+    mockDynamoInstance.get.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "dom-1",
+            userId: "user-1",
+            domain: "mysite.com",
+            vercelProjectId: "proj-1",
+            type: "custom",
+            status: "active",
+          },
+        }),
+    });
+
+    // 2. Vercel domain delete — success
+    mockAxiosDelete.mockResolvedValueOnce({});
+
+    // 3. DynamoDB domain record delete
+    // (already mocked by default)
+
+    // 4. Scan landing pages for the project
+    mockDynamoInstance.scan.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Items: [
+            {
+              id: "page-1",
+              subdomainPrefix: "pricing",
+              customDomainUrl: "https://pricing.mysite.com/pricing",
+              vercelProjectId: "proj-1",
+            },
+            {
+              id: "page-2",
+              subdomainPrefix: "contact",
+              customDomainUrl: "https://contact.otherdomain.com/contact",
+              // different domain — should NOT be cleaned up
+              vercelProjectId: "proj-1",
+            },
+          ],
+        }),
+    });
+
+    // 5. Vercel delete for the page subdomain — success
+    mockAxiosDelete.mockResolvedValueOnce({});
+
+    await removeDomain("dom-1", "user-1");
+
+    // The page-1 subdomain was removed from Vercel
+    expect(mockAxiosDelete).toHaveBeenCalledWith(
+      expect.stringContaining("pricing.mysite.com"),
+      expect.anything()
+    );
+
+    // The page-1 landing page record had its fields cleared
+    expect(mockDynamoInstance.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        Key: { id: "page-1" },
+        UpdateExpression: "REMOVE subdomainPrefix, customDomainUrl",
+      })
+    );
+
+    // page-2 (different domain) was NOT touched
+    expect(mockDynamoInstance.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({ Key: { id: "page-2" } })
+    );
+  });
+
+  it("does not fail when no landing pages have subdomains configured", async () => {
+    mockDynamoInstance.get.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "dom-2",
+            userId: "user-1",
+            domain: "mysite.com",
+            vercelProjectId: "proj-1",
+            type: "custom",
+            status: "active",
+          },
+        }),
+    });
+    mockAxiosDelete.mockResolvedValueOnce({});
+    mockDynamoInstance.scan.mockReturnValueOnce({
+      promise: () => Promise.resolve({ Items: [] }),
+    });
+
+    await expect(removeDomain("dom-2", "user-1")).resolves.toBeUndefined();
   });
 });

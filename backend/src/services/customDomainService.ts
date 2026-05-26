@@ -9,6 +9,7 @@ const dynamodb = new AWS.DynamoDB.DocumentClient({
 
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 const TABLE_NAME = `${TABLE_PREFIX}AW-CustomDomains`;
+const LANDING_PAGES_TABLE = `${TABLE_PREFIX}AW-LandingPages`;
 
 const SUBDOMAIN_BASE = "agentwebforms.com";
 const VERCEL_API_BASE = "https://api.vercel.com";
@@ -258,6 +259,47 @@ export async function removeDomain(
 
   // Delete from DynamoDB
   await dynamodb.delete({ TableName: TABLE_NAME, Key: { id: domainId } }).promise();
+
+  // Cascade: clear per-page subdomains that were under this domain
+  try {
+    const scanResult = await dynamodb.scan({
+      TableName: LANDING_PAGES_TABLE,
+      FilterExpression: "vercelProjectId = :pid AND attribute_exists(subdomainPrefix)",
+      ExpressionAttributeValues: { ":pid": record.vercelProjectId },
+    }).promise();
+
+    const pages = (scanResult.Items || []) as Array<{
+      id: string;
+      subdomainPrefix?: string;
+      customDomainUrl?: string;
+    }>;
+
+    await Promise.all(
+      pages
+        .filter((p) => p.customDomainUrl?.includes(record.domain))
+        .map(async (p) => {
+          // Remove the subdomain from Vercel (best-effort)
+          if (p.subdomainPrefix) {
+            try {
+              await axios.delete(
+                `${VERCEL_API_BASE}/v9/projects/${record.vercelProjectId}/domains/${p.subdomainPrefix}.${record.domain}`,
+                { headers }
+              );
+            } catch {
+              // Ignore 404 — already removed
+            }
+          }
+          // Clear the fields from DynamoDB
+          await dynamodb.update({
+            TableName: LANDING_PAGES_TABLE,
+            Key: { id: p.id },
+            UpdateExpression: "REMOVE subdomainPrefix, customDomainUrl",
+          }).promise();
+        })
+    );
+  } catch (err: any) {
+    console.error("[CUSTOM DOMAINS] Failed to cascade page-subdomain cleanup:", err?.message);
+  }
 }
 
 /**
