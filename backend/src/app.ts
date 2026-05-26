@@ -83,7 +83,7 @@ import testAccountsRoutes from "./routes/testAccounts";
 import onboardingEventsRoutes from "./routes/onboardingEvents";
 import onboardingVariantsRoutes from "./routes/onboardingVariants";
 import loopEventsRoutes from "./routes/loopEvents";
-import { registerAiEvalFunnel } from "./loops/instances/ai-eval-funnel";
+import { registerAiEvalFunnelForProduction } from "./loops/instances/ai-eval-funnel/cron";
 import brandBuildRoutes from "./routes/brandBuild";
 import adGenRoutes from "./routes/adGen";
 import onboardingStepsRoutes from "./routes/onboardingSteps";
@@ -306,14 +306,16 @@ app.use("/api/onboarding", onboardingEventsRoutes);
 app.use("/api/onboarding", onboardingVariantsRoutes);
 app.use("/api/loop-events", loopEventsRoutes);
 
-// Register closed-loop instances. The route handlers + cron read from the
-// LOOP_REGISTRY; this is the one-time wire-up at process startup.
+// Register closed-loop instances with production impls (real DDB sensor +
+// NotionDigestTool + Slack DM gate via the cron wrapper). The route handlers
+// look up the loop manifest from LOOP_REGISTRY; the cron in server.ts
+// invokes runAiEvalLoopOnce() on a daily schedule.
 try {
-  registerAiEvalFunnel();
+  registerAiEvalFunnelForProduction();
 } catch (err) {
   // Idempotent registration may throw on hot-reload; safe to swallow during
   // dev-server restarts. Production should never hit this path twice.
-  console.warn("[loops] registerAiEvalFunnel skipped:", String(err));
+  console.warn("[loops] registerAiEvalFunnelForProduction skipped:", String(err));
 }
 app.use("/api/onboarding", brandBuildRoutes);
 app.use("/api/onboarding", adGenRoutes);

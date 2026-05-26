@@ -568,6 +568,39 @@ createTestAccount().then(async () => {
         console.error('[OnboardingWatchdog] Failed to initialize:', error);
       }
 
+      // AI Eval Funnel closed-loop — daily at 16:00 UTC (8am PT), one hour
+      // offset from the onboarding loop so the two don't race for shared
+      // resources (Slack rate limits, Bedrock, etc.). Gated by
+      // AI_EVAL_LOOP_ENABLED=true.
+      if (process.env.AI_EVAL_LOOP_ENABLED === 'true') {
+        try {
+          const AI_EVAL_LOOP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+          const { runAiEvalLoopOnce } = await import('./loops/instances/ai-eval-funnel/cron');
+
+          const nowForAiEval = new Date();
+          const nextAiEvalRun = new Date(nowForAiEval);
+          nextAiEvalRun.setUTCHours(16, 0, 0, 0);
+          if (nextAiEvalRun <= nowForAiEval) {
+            nextAiEvalRun.setUTCDate(nextAiEvalRun.getUTCDate() + 1);
+          }
+          const msUntilAiEval = nextAiEvalRun.getTime() - nowForAiEval.getTime();
+
+          console.log(
+            `[AiEvalLoop] Initialized — first run at 16:00 UTC (in ${Math.round(msUntilAiEval / 60000)} min)`,
+          );
+          setTimeout(() => {
+            runAiEvalLoopOnce().catch(e => console.error('[AiEvalLoop] Error:', e));
+            setInterval(() => {
+              runAiEvalLoopOnce().catch(e => console.error('[AiEvalLoop] Error:', e));
+            }, AI_EVAL_LOOP_INTERVAL_MS);
+          }, msUntilAiEval);
+        } catch (error) {
+          console.error('[AiEvalLoop] Failed to initialize:', error);
+        }
+      } else {
+        console.log('[AiEvalLoop] Disabled (set AI_EVAL_LOOP_ENABLED=true to enable)');
+      }
+
     }, 30000); // Delay 30s after startup to allow Agent Mode to boot first
   });
 }); 
