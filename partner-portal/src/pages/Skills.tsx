@@ -625,7 +625,14 @@ export default function Skills() {
                 ) : (
                   filteredSkills.map((skill: Skill) => (
                     <TableRow key={skill.skillId}>
-                      <TableCell sx={{ fontWeight: "bold" }}>{skill.name}</TableCell>
+                      <TableCell sx={{ fontWeight: "bold" }}>
+                        {skill.name}
+                        {skill.ownerEmail && (
+                          <Typography variant="caption" color="text.secondary" display="block">
+                            {skill.ownerEmail}
+                          </Typography>
+                        )}
+                      </TableCell>
                       <TableCell sx={{ maxWidth: 200 }}>
                         <Tooltip
                           title={skill.description}
@@ -647,51 +654,68 @@ export default function Skills() {
                         </Tooltip>
                       </TableCell>
                       <TableCell>
-                        <Chip 
-                          label={skill.isPublished ? "Published" : "Draft"} 
-                          color={skill.isPublished ? "success" : "default"}
-                          size="small"
-                        />
+                        <Stack direction="row" spacing={0.5} flexWrap="wrap">
+                          <Chip
+                            label={skill.isPublished ? "Published" : "Draft"}
+                            color={skill.isPublished ? "success" : "default"}
+                            size="small"
+                          />
+                          {skill.visibility === "private" && (
+                            <Chip label="Private" color="default" size="small" variant="outlined" />
+                          )}
+                          {skill.visibility === "pending_review" && (
+                            <Chip label="Pending Review" color="warning" size="small" variant="outlined" />
+                          )}
+                        </Stack>
                       </TableCell>
                       <TableCell>
                         <Stack direction="column" spacing={0}>
                           {subscriptionTypes.map((sub) => {
                             const isIncluded = sub.allowedSkills.includes(skill.skillId) || sub.allowedSkills.includes("*");
                             const isSaving = savingSubscriptionKey === `${skill.skillId}:${sub.name}`;
+                            const isUserPrivate = skill.visibility === "private" || skill.visibility === "pending_review";
                             return (
-                              <Tooltip key={sub.name} title={isIncluded ? `Remove from ${sub.name}` : `Add to ${sub.name}`}>
-                                <FormControlLabel
-                                  control={
-                                    <Checkbox
-                                      size="small"
-                                      checked={isIncluded}
-                                      disabled={isSaving || !skill.isPublished}
-                                      onChange={() => handleToggleSubscription(skill.skillId, sub.name)}
-                                    />
-                                  }
-                                  label={<Typography variant="caption">{sub.name}</Typography>}
-                                  sx={{ m: 0 }}
-                                />
+                              <Tooltip key={sub.name} title={isUserPrivate ? "Cannot assign — user-created private skill must be approved first" : isIncluded ? `Remove from ${sub.name}` : `Add to ${sub.name}`}>
+                                <span>
+                                  <FormControlLabel
+                                    control={
+                                      <Checkbox
+                                        size="small"
+                                        checked={isIncluded}
+                                        disabled={isSaving || !skill.isPublished || isUserPrivate}
+                                        onChange={() => handleToggleSubscription(skill.skillId, sub.name)}
+                                      />
+                                    }
+                                    label={<Typography variant="caption">{sub.name}</Typography>}
+                                    sx={{ m: 0 }}
+                                  />
+                                </span>
                               </Tooltip>
                             );
                           })}
                           {(() => {
                             const isPublicIncluded = publicAllowedSkills.includes(skill.skillId) || publicAllowedSkills.includes("*");
                             const isPublicSaving = savingSubscriptionKey === `${skill.skillId}:Public`;
+                            const isUserPrivate = skill.visibility === "private" || skill.visibility === "pending_review";
+                            const tooltipText = isUserPrivate
+                              ? "Cannot make public — this is a user-created private skill. It must be approved via the review queue first."
+                              : isPublicIncluded ? "Remove from Public" : "Add to Public";
                             return (
-                              <Tooltip title={isPublicIncluded ? "Remove from Public" : "Add to Public"}>
-                                <FormControlLabel
-                                  control={
-                                    <Checkbox
-                                      size="small"
-                                      checked={isPublicIncluded}
-                                      disabled={isPublicSaving || !skill.isPublished}
-                                      onChange={() => handleTogglePublicSkill(skill.skillId)}
-                                    />
-                                  }
-                                  label={<Typography variant="caption" sx={{ fontStyle: "italic" }}>Public</Typography>}
-                                  sx={{ m: 0 }}
-                                />
+                              <Tooltip title={tooltipText}>
+                                <span>
+                                  <FormControlLabel
+                                    control={
+                                      <Checkbox
+                                        size="small"
+                                        checked={isPublicIncluded}
+                                        disabled={isPublicSaving || !skill.isPublished || isUserPrivate}
+                                        onChange={() => handleTogglePublicSkill(skill.skillId)}
+                                      />
+                                    }
+                                    label={<Typography variant="caption" sx={{ fontStyle: "italic" }}>Public</Typography>}
+                                    sx={{ m: 0 }}
+                                  />
+                                </span>
                               </Tooltip>
                             );
                           })()}
@@ -704,10 +728,19 @@ export default function Skills() {
                       </TableCell>
                       <TableCell>
                         <Stack direction="row" spacing={1}>
-                          <Tooltip title="Edit Skill">
-                            <IconButton onClick={() => handleOpenEditDialog(skill)}>
-                              <EditIcon />
-                            </IconButton>
+                          <Tooltip title={
+                            (skill.visibility === "private" || skill.visibility === "pending_review")
+                              ? "Cannot edit — this is a user-created private skill"
+                              : "Edit Skill"
+                          }>
+                            <span>
+                              <IconButton
+                                onClick={() => handleOpenEditDialog(skill)}
+                                disabled={skill.visibility === "private" || skill.visibility === "pending_review"}
+                              >
+                                <EditIcon />
+                              </IconButton>
+                            </span>
                           </Tooltip>
                           <Tooltip title={
                             syncStatus[skill.skillId]?.inSync
