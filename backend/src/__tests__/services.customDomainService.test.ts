@@ -129,6 +129,27 @@ describe("customDomainService", () => {
       const longSubdomain = "a".repeat(64);
       await expect(addSubdomain("user-123", "proj-id", longSubdomain)).rejects.toThrow();
     });
+
+    it("stores landingPageId on the domain record when provided", async () => {
+      mockAxiosPost.mockResolvedValueOnce({ data: { domain: "mysite.agentwebforms.com" } });
+
+      const result = await addSubdomain("user-123", "vercel-proj-id", "mysite", "lp-42");
+
+      expect(result.landingPageId).toBe("lp-42");
+      expect(mockPut).toHaveBeenCalledWith(
+        expect.objectContaining({
+          Item: expect.objectContaining({ landingPageId: "lp-42" }),
+        })
+      );
+    });
+
+    it("does not set landingPageId when not provided", async () => {
+      mockAxiosPost.mockResolvedValueOnce({ data: { domain: "mysite.agentwebforms.com" } });
+
+      const result = await addSubdomain("user-123", "vercel-proj-id", "mysite");
+
+      expect(result.landingPageId).toBeUndefined();
+    });
   });
 
   describe("addCustomDomain", () => {
@@ -166,6 +187,16 @@ describe("customDomainService", () => {
     it("should reject invalid domain formats", async () => {
       await expect(addCustomDomain("user-123", "proj-id", "not a domain")).rejects.toThrow(
         /invalid domain/i
+      );
+    });
+
+    it("throws with 'already in use' message when Vercel returns 409", async () => {
+      const conflictError = new Error("Request failed with status code 409");
+      (conflictError as any).response = { status: 409 };
+      mockAxiosPost.mockRejectedValueOnce(conflictError);
+
+      await expect(addCustomDomain("user-123", "proj-id", "taken.example.com")).rejects.toThrow(
+        /already in use/i
       );
     });
   });
@@ -228,6 +259,53 @@ describe("customDomainService", () => {
       });
 
       await expect(removeDomain("dom-123", "user-123")).rejects.toThrow(/not found|unauthorized/i);
+    });
+
+    it("throws and does not delete DynamoDB record when Vercel returns a non-404 error", async () => {
+      mockGet.mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Item: {
+              id: "dom-123",
+              userId: "user-123",
+              domain: "mysite.agentwebforms.com",
+              vercelProjectId: "proj-id",
+              type: "subdomain",
+              status: "active",
+            },
+          }),
+      });
+      const vercelError = new Error("Request failed with status code 403");
+      (vercelError as any).response = { status: 403 };
+      mockAxiosDelete.mockRejectedValueOnce(vercelError);
+
+      await expect(removeDomain("dom-123", "user-123")).rejects.toThrow(/vercel/i);
+      expect(mockDelete).not.toHaveBeenCalled();
+    });
+
+    it("still removes DynamoDB record when Vercel returns 404 (already gone)", async () => {
+      mockGet.mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Item: {
+              id: "dom-123",
+              userId: "user-123",
+              domain: "mysite.agentwebforms.com",
+              vercelProjectId: "proj-id",
+              type: "subdomain",
+              status: "active",
+            },
+          }),
+      });
+      const notFound = new Error("Not Found");
+      (notFound as any).response = { status: 404 };
+      mockAxiosDelete.mockRejectedValueOnce(notFound);
+
+      await removeDomain("dom-123", "user-123");
+
+      expect(mockDelete).toHaveBeenCalledWith(
+        expect.objectContaining({ Key: { id: "dom-123" } })
+      );
     });
   });
 

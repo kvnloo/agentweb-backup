@@ -111,6 +111,14 @@ describe("Domain API Routes", () => {
   });
 
   describe("POST /api/domains/subdomain", () => {
+    beforeEach(() => {
+      // Default: authorization passes; tests that need to override will do so per-test
+      mockAuthorizeLandingPageAccess.mockResolvedValue({
+        ok: true,
+        page: { id: "any-page", userId: "test-user-123", vercelProjectId: "proj-1", slug: null },
+      });
+    });
+
     it("should add a subdomain", async () => {
       mockAddSubdomain.mockResolvedValueOnce({
         id: "dom-new",
@@ -126,6 +134,35 @@ describe("Domain API Routes", () => {
       expect(res.status).toBe(201);
       expect(res.body.domain).toBe("coolsite.agentwebforms.com");
       expect(mockAddSubdomain).toHaveBeenCalledWith("test-user-123", "proj-1", "coolsite");
+    });
+
+    it("returns 403 when caller does not own the landing page", async () => {
+      mockAuthorizeLandingPageAccess.mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        error: "Not authorized to edit this landing page",
+      });
+
+      const res = await request(app)
+        .post("/api/domains/subdomain")
+        .send({ vercelProjectId: "proj-1", subdomain: "mysite", landingPageId: "lp-other" });
+
+      expect(res.status).toBe(403);
+      expect(mockAddSubdomain).not.toHaveBeenCalled();
+    });
+
+    it("returns 400 when vercelProjectId does not match the landing page", async () => {
+      mockAuthorizeLandingPageAccess.mockResolvedValueOnce({
+        ok: true,
+        page: { id: "lp-42", userId: "test-user-123", vercelProjectId: "prj_correct", slug: null },
+      });
+
+      const res = await request(app)
+        .post("/api/domains/subdomain")
+        .send({ vercelProjectId: "prj_WRONG", subdomain: "mysite", landingPageId: "lp-42" });
+
+      expect(res.status).toBe(400);
+      expect(mockAddSubdomain).not.toHaveBeenCalled();
     });
 
     it("should return 400 if vercelProjectId missing", async () => {
@@ -343,6 +380,33 @@ describe("Domain API Routes", () => {
 
       expect(res.status).toBe(403);
       expect(mockAddCustomDomain).not.toHaveBeenCalled();
+    });
+
+    it("returns 400 when vercelProjectId does not match the landing page", async () => {
+      mockAuthorizeLandingPageAccess.mockResolvedValueOnce({
+        ok: true,
+        page: { id: "lp-42", userId: "test-user-123", vercelProjectId: "prj_correct", slug: null },
+      });
+
+      const res = await request(app)
+        .post("/api/domains/custom")
+        .send({ vercelProjectId: "prj_WRONG", domain: "landing.example.com", landingPageId: "lp-42" });
+
+      expect(res.status).toBe(400);
+      expect(mockAddCustomDomain).not.toHaveBeenCalled();
+    });
+
+    it("returns 409 when domain is already in use on another Vercel project", async () => {
+      mockAddCustomDomain.mockRejectedValueOnce(
+        new Error("Domain already in use on another project")
+      );
+
+      const res = await request(app)
+        .post("/api/domains/custom")
+        .send({ vercelProjectId: "prj_123", domain: "taken.example.com" });
+
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/already in use/i);
     });
 
     it("passes landingPageId to addCustomDomain when ownership check passes", async () => {

@@ -78,15 +78,30 @@ router.post("/subdomain", async (req, res: Response) => {
       return res.status(400).json({ error: "subdomain is required" });
     }
 
-    const result = await addSubdomain(userId, vercelProjectId, subdomain);
+    // N5: landing page ownership check — mirrors POST /custom (supports org editors)
+    // N6: validate caller-supplied vercelProjectId matches the trusted landing page record
+    if (landingPageId && typeof landingPageId === "string") {
+      const auth = await authorizeLandingPageAccess(landingPageId, userId, "edit");
+      if (!auth.ok) {
+        return res.status(auth.status).json({ error: auth.error });
+      }
+      if (auth.page.vercelProjectId && auth.page.vercelProjectId !== vercelProjectId) {
+        return res.status(400).json({ error: "vercelProjectId does not match the landing page" });
+      }
+    }
 
-    // If a landing page ID was provided, persist customDomainUrl on the record.
+    // Pass landingPageId to service so the domain record stores the association.
+    // This lets the DELETE route clean up customDomainUrl when the subdomain is removed.
+    const result = landingPageId && typeof landingPageId === "string"
+      ? await addSubdomain(userId, vercelProjectId, subdomain, landingPageId)
+      : await addSubdomain(userId, vercelProjectId, subdomain);
+
+    // Persist customDomainUrl on the landing page record.
     // For sub-pages (those with a slug), the URL must include the slug path.
     // This is non-fatal: if it fails (e.g. ConditionalCheckFailed), the subdomain
     // was still successfully added to Vercel, so we return 201 regardless.
     if (landingPageId && typeof landingPageId === "string") {
       try {
-        // Fetch the page to check for a slug (sub-pages need /{slug} appended)
         const pageResult = await dynamodb.get({
           TableName: LANDING_PAGES_TABLE,
           Key: { id: landingPageId },
@@ -138,11 +153,15 @@ router.post("/custom", async (req, res: Response) => {
       return res.status(400).json({ error: "domain is required" });
     }
 
-    // Landing page ownership
+    // Landing page ownership + vercelProjectId validation
     if (landingPageId && typeof landingPageId === "string") {
       const auth = await authorizeLandingPageAccess(landingPageId, userId, "edit");
       if (!auth.ok) {
         return res.status(auth.status).json({ error: auth.error });
+      }
+      // N6: validate caller-supplied vercelProjectId against the trusted landing page record
+      if (auth.page.vercelProjectId && auth.page.vercelProjectId !== vercelProjectId) {
+        return res.status(400).json({ error: "vercelProjectId does not match the landing page" });
       }
     }
 
@@ -155,7 +174,9 @@ router.post("/custom", async (req, res: Response) => {
     res.status(201).json(result);
   } catch (error: any) {
     console.error("[DOMAINS] Error adding custom domain:", error);
-    const status = error.message?.includes("Invalid") ? 400 : 500;
+    const status = error.message?.includes("Invalid") ? 400
+      : error.message?.includes("already in use") ? 409
+      : 500;
     res.status(status).json({ error: error.message || "Failed to add custom domain" });
   }
 });
@@ -238,6 +259,7 @@ router.post("/:id/verify", async (req, res: Response) => {
         await dynamodb.update({
           TableName: LANDING_PAGES_TABLE,
           Key: { id: result.record.landingPageId },
+          ConditionExpression: "attribute_exists(id)",
           UpdateExpression: "SET customDomainUrl = :url, updatedAt = :now",
           ExpressionAttributeValues: {
             ":url": customDomainUrl,

@@ -112,7 +112,8 @@ async function getVercelHeaders(): Promise<Record<string, string>> {
 export async function addSubdomain(
   userId: string,
   vercelProjectId: string,
-  subdomain: string
+  subdomain: string,
+  landingPageId?: string
 ): Promise<CustomDomainRecord> {
   // Sanitize input
   const cleanSubdomain = subdomain.toLowerCase().trim();
@@ -166,6 +167,7 @@ export async function addSubdomain(
     type: "subdomain",
     status: "active", // Subdomains are active immediately (DNS is pre-configured)
     vercelProjectId,
+    ...(landingPageId ? { landingPageId } : {}),
     createdAt: now,
     updatedAt: now,
   };
@@ -191,11 +193,19 @@ export async function addCustomDomain(
   const headers = await getVercelHeaders();
 
   // Add domain to Vercel project
-  const response = await axios.post(
-    `${VERCEL_API_BASE}/v10/projects/${vercelProjectId}/domains`,
-    { name: cleanDomain },
-    { headers }
-  );
+  let response;
+  try {
+    response = await axios.post(
+      `${VERCEL_API_BASE}/v10/projects/${vercelProjectId}/domains`,
+      { name: cleanDomain },
+      { headers }
+    );
+  } catch (err: any) {
+    if (err.response?.status === 409) {
+      throw new Error("Domain already in use on another project");
+    }
+    throw err;
+  }
 
   const vercelData = response.data as any;
   const isVerified = vercelData.verified === true;
@@ -251,11 +261,11 @@ export async function removeDomain(
       { headers }
     );
   } catch (err: any) {
-    // If Vercel already removed it (404), that's fine
-    if (err.response?.status !== 404) {
-      console.error(
-        `[CUSTOM DOMAINS] Failed to remove domain from Vercel: ${err.message}`
-      );
+    if (err.response?.status === 404) {
+      // Already gone from Vercel — proceed with DynamoDB cleanup
+    } else {
+      // Non-404 error: domain is still live in Vercel; abort to avoid inconsistency
+      throw new Error(`Failed to remove domain from Vercel: ${err.message}`);
     }
   }
 
