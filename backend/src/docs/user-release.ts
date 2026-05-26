@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-26',
     changes: [
+      'Fixed: New Users No Longer Incorrectly Assigned Basic Subscription Tier',
+      '- Users who signed up but whose subscription tier was not saved correctly were appearing as "Basic" (full-access) instead of "Free"',
+      '- The fallback tier used when no subscription is set now correctly defaults to Free rather than Basic',
+    ],
+  },
+  {
+    date: '2026-05-26',
+    changes: [
       'Fixed: Landing Pages No Longer Get Stuck in "Deploying" Status Due to Route Conflicts',
       '- New landing pages added to a shared site could fail to build because the generated code included an API route that conflicted with an existing shared route, causing a Turbopack build error',
       '- The duplicate API route is now skipped during deployment; sub-pages correctly use the shared lead capture endpoint instead of creating a conflicting one',
