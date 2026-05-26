@@ -110,12 +110,15 @@ router.post("/subdomain", async (req, res: Response) => {
     // was still successfully added to Vercel, so we return 201 regardless.
     if (landingPageId && typeof landingPageId === "string") {
       try {
-        // Fetch the page to check for a slug (sub-pages need /{slug} appended)
+        // Fetch the page to get slug and githubRepoUrl
         const pageResult = await dynamodb.get({
           TableName: LANDING_PAGES_TABLE,
           Key: { id: landingPageId },
         }).promise();
-        const slug = pageResult.Item?.slug;
+        const page = pageResult.Item as any;
+        const slug = page?.slug as string | undefined;
+        const githubRepoUrl = page?.githubRepoUrl as string | undefined;
+
         const customDomainUrl = slug
           ? `https://${result.domain}/${slug}`
           : `https://${result.domain}`;
@@ -131,6 +134,36 @@ router.post("/subdomain", async (req, res: Response) => {
             ":now": new Date().toISOString(),
           },
         }).promise();
+
+        // Update GitHub middleware so the subdomain routes to the correct page path
+        if (slug && githubRepoUrl) {
+          const repoMatch = githubRepoUrl.match(/github\.com\/([^/]+\/[^/]+?)(?:\.git)?(?:\s|$)/);
+          if (repoMatch) {
+            // Build full domain map: existing agentwebforms subdomains + this new one
+            const siblingPages = await dynamodb.query({
+              TableName: LANDING_PAGES_TABLE,
+              IndexName: "UserIdIndex",
+              KeyConditionExpression: "userId = :uid",
+              FilterExpression: "vercelProjectId = :pid AND attribute_exists(customDomainUrl) AND id <> :self",
+              ExpressionAttributeValues: { ":uid": userId, ":pid": vercelProjectId, ":self": landingPageId },
+            }).promise();
+
+            const domainMap: Record<string, string> = {};
+            for (const p of (siblingPages.Items || []) as any[]) {
+              if (p.customDomainUrl && p.slug) {
+                try {
+                  const host = new URL(p.customDomainUrl).host;
+                  domainMap[host] = `/${p.slug}`;
+                } catch { /* skip malformed */ }
+              }
+            }
+            domainMap[result.domain] = `/${slug}`;
+
+            await updateSubdomainMiddleware(repoMatch[1], domainMap).catch((e: any) =>
+              console.error("[DOMAINS] Failed to update middleware:", e?.message)
+            );
+          }
+        }
       } catch (updateErr: any) {
         console.error("[DOMAINS] Failed to persist customDomainUrl on landing page:", updateErr?.message);
       }
