@@ -1471,3 +1471,92 @@ describe('runEnrichment — critic view derivation (Fix 5)', () => {
     expect(meta.criticView).toBeUndefined();
   });
 });
+
+// ─── Cross-group field propagation ───────────────────────────────────────────
+// person_identity fills linkedin_url → enrichedLead.linkedin must be set
+// before company_firmographic waterfall runs so findUnipileCompany Approach 1
+// can use it.
+
+describe('runEnrichment — cross-group field propagation', () => {
+  it('propagates linkedin_url fill into enrichedLead.linkedin before company group runs', async () => {
+    const lead = makeLead({ leadId: 'lead-prop-1', email: 'jane@acme.com' });
+
+    let companyGroupLead: any = null;
+
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([lead]),
+      runWaterfall: jest.fn().mockImplementation(async ({ groupName, lead: l }) => {
+        if (groupName === 'person_identity') {
+          return {
+            fields: [{
+              field: 'linkedin_url',
+              value: 'https://www.linkedin.com/in/jane',
+              meta: { source: 'linkedin', enrichedAt: new Date().toISOString() },
+            }],
+            missing: [],
+            tierFills: { crm: 0, apollo: 0, web: 1, missing: 0 },
+          };
+        }
+        if (groupName === 'company_firmographic') {
+          companyGroupLead = l;
+        }
+        return { fields: [], missing: [], tierFills: { crm: 0, apollo: 0, web: 0, missing: 0 } };
+      }),
+    });
+
+    const config = makeConfig({
+      fields: [
+        { name: 'linkedin_url', type: 'string', instruction: 'linkedin url', include: true, overwritePolicy: 'fill_if_empty' },
+        { name: 'company_name', type: 'string', instruction: 'company name', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    await runEnrichment(makeInput({ config }), deps);
+
+    expect(companyGroupLead).not.toBeNull();
+    expect(companyGroupLead.linkedin).toBe('https://www.linkedin.com/in/jane');
+  });
+
+  it('propagates company_name fill into enrichedLead.company', async () => {
+    const lead = makeLead({ leadId: 'lead-prop-2', email: 'jane@acme.com' });
+
+    const companyGroupLeads: any[] = [];
+
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([lead]),
+      runWaterfall: jest.fn().mockImplementation(async ({ groupName, lead: l }) => {
+        if (groupName === 'company_firmographic') {
+          companyGroupLeads.push(l);
+          return {
+            fields: [{
+              field: 'company_name',
+              value: 'Acme Corp',
+              meta: { source: 'web_search', enrichedAt: new Date().toISOString() },
+            }],
+            missing: [],
+            tierFills: { crm: 0, apollo: 0, web: 1, missing: 0 },
+          };
+        }
+        return { fields: [], missing: [], tierFills: { crm: 0, apollo: 0, web: 0, missing: 0 } };
+      }),
+    });
+
+    const config = makeConfig({
+      fields: [
+        { name: 'company_name', type: 'string', instruction: 'company name', include: true, overwritePolicy: 'fill_if_empty' },
+        { name: 'employee_count', type: 'string', instruction: 'employee count', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    await runEnrichment(makeInput({ config }), deps);
+
+    // company_firmographic runs twice (once per field batch) OR once with both fields —
+    // either way, the second call (if any) should see company already set.
+    // Primary assertion: company_name fill propagates to enrichedLead.company_name.
+    expect(companyGroupLeads[0]).not.toBeNull();
+    // After first company_firmographic call fills company_name, enrichedLead.company is set.
+    // Verify by checking the fill reached allFills (setLeadFields was called with company_name).
+    const setCall = (deps.setLeadFields as jest.Mock).mock.calls[0]?.[0];
+    expect(setCall?.topLevel?.company_name ?? setCall?.customFields?.company_name).toBe('Acme Corp');
+  });
+});

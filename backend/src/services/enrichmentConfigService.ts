@@ -118,14 +118,15 @@ const ALIAS_INFERENCE_BLOCKLIST = new Set(['emailDomain', 'email_domain']);
 /** Maps the lead's standard column name → canonical FIELD_GROUPS field
  *  it enriches against. Used by `buildDefaultConfig` to auto-set aliasFor.  */
 export const STANDARD_DATA_ALIASES: Record<string, string> = {
-  firstName: 'first_name',
-  lastName:  'last_name',
-  email:     'email',
-  phone:     'phone',
-  title:     'title',
-  linkedin:  'linkedin_url',
-  company:   'company_name',
-  website:   'website',
+  firstName:       'first_name',
+  lastName:        'last_name',
+  email:           'email',
+  phone:           'phone',
+  title:           'title',
+  linkedin:        'linkedin_url',
+  company:         'company_name',
+  website:         'website',
+  companyLinkedin: 'company_linkedin_url',
 };
 
 /** Standard lead columns that ARE enrichable — always surfaced in the config
@@ -133,7 +134,7 @@ export const STANDARD_DATA_ALIASES: Record<string, string> = {
  *  "Standard Fields" section of the Configure Display Fields dialog, minus
  *  non-enrichable system fields (createdAt, updatedAt, status, dealValue). */
 export const STANDARD_ENRICHABLE_FIELDS = [
-  'firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'notes',
+  'firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'companyLinkedin', 'notes',
 ] as const;
 
 /** Custom-field names from list.fieldNames that should NOT appear in

@@ -518,21 +518,23 @@ async function extractFieldsViaLLMReal(input: {
       `4. If you do not know a value with confidence, return null for that field.\n` +
       `NEVER guess, infer, or fabricate. For each field return an object ` +
       `{"value": <string>, "sourceUrl": <url or null>, "sourceQuote": <short verbatim snippet or null>}. ` +
-      `Return strict JSON only, no markdown.`
+      `Return strict JSON only, no markdown. If you have no data for any field, return {} — never return explanations or apologies.`
     : `You extract structured CRM data from the provided context. Return strict JSON: ` +
       `an object with one key per requested field. Use null when the value isn't ` +
-      `explicitly present. Do NOT infer or fabricate. Strings only, no markdown.`;
+      `explicitly present. Do NOT infer or fabricate. Strings only, no markdown. ` +
+      `If you have no data for any field, return {} — never return explanations or apologies.`;
 
   const userPrompt = isWebTier
     ? `Lead: ${leadContext}\n\n` +
       `Source (${input.tier}):\n${input.sourceContext.slice(0, 16000)}\n\n` +
       `Extract these fields (return one JSON object with these exact keys):\n${fieldGuide}\n\n` +
       `Return ONLY a JSON object like ` +
-      `{"field_name": {"value": "...", "sourceUrl": "...", "sourceQuote": "..."}, "other_field": null}. No prose.`
+      `{"field_name": {"value": "...", "sourceUrl": "...", "sourceQuote": "..."}, "other_field": null}. ` +
+      `No prose. If nothing is found, return {}.`
     : `Lead: ${leadContext}\n\n` +
       `Source (${input.tier}):\n${input.sourceContext.slice(0, 16000)}\n\n` +
       `Extract these fields (return one JSON object with these exact keys):\n${fieldGuide}\n\n` +
-      `Return ONLY a JSON object like {"field_name": "value", "other_field": null}. No prose.`;
+      `Return ONLY a JSON object like {"field_name": "value", "other_field": null}. No prose. If nothing is found, return {}.`;
 
   try {
     let parsed: Record<string, any>;
@@ -631,15 +633,16 @@ async function runCriticReal(input: {
 
 // ─── Shared Unipile LinkedIn lookup ──────────────────────────────────────────
 
-async function findLinkedInUrlImpl(
+export async function findLinkedInUrlImpl(
   userId: string,
   firstName: string | undefined,
   lastName: string | undefined,
   company: string | undefined,
 ): Promise<string | null> {
+  const { linkedInOutreachService } = await import('./linkedInOutreachService');
+  let accountId: string | null = null;
   try {
-    const { linkedInOutreachService } = await import('./linkedInOutreachService');
-    const accountId = await linkedInOutreachService.resolveAccountId(userId);
+    accountId = await linkedInOutreachService.resolveAccountIdForEnrichment(userId);
     if (!accountId) return null;
     const keywords = [firstName, lastName].filter(Boolean).join(' ');
     if (!keywords) return null;
@@ -652,6 +655,10 @@ async function findLinkedInUrlImpl(
     if (!unipileNameMatches(first, firstName, lastName)) return null;
     return `https://www.linkedin.com/in/${first.public_identifier}`;
   } catch (err) {
+    // Any failure after accountId was resolved — purge both caches so next call
+    // re-resolves to a live account (covers NOT_FOUND + newly-connected replacements).
+    linkedInOutreachService.invalidateResolvedAccount(userId);
+    if (accountId) linkedInOutreachService.clearStatusCache(accountId);
     console.warn('[v3 deps] findLinkedInUrl failed:', (err as Error).message);
     return null;
   }
@@ -775,7 +782,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       findUnipileCompany: async (lead: LeadRecord, companyLinkedInUrl?: string): Promise<any | null> => {
         try {
           const { linkedInOutreachService } = await import('./linkedInOutreachService');
-          const accountId = await linkedInOutreachService.resolveAccountId(userId);
+          const accountId = await linkedInOutreachService.resolveAccountIdForEnrichment(userId);
           if (!accountId) return null;
 
           let companyIdentifier: string | null = null;

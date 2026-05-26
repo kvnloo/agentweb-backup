@@ -279,7 +279,16 @@ function routeFields(
     if (ent === 'company') needsCompany = true;
   }
 
-  return { routing: { groupedByGroup, ungrouped, userNamesByCanonical }, needsPerson, needsCompany };
+  // Re-sort groupedByGroup to match FIELD_GROUPS definition order so person_identity
+  // always runs before company groups, regardless of user field config order.
+  const sortedGroupedByGroup = new Map<string, string[]>();
+  for (const groupName of Object.keys(FIELD_GROUPS)) {
+    if (groupedByGroup.has(groupName)) {
+      sortedGroupedByGroup.set(groupName, groupedByGroup.get(groupName)!);
+    }
+  }
+
+  return { routing: { groupedByGroup: sortedGroupedByGroup, ungrouped, userNamesByCanonical }, needsPerson, needsCompany };
 }
 
 function buildRefreshFieldsSet(
@@ -497,6 +506,15 @@ async function processLead(
         }
       }
       allFills.push(...renamedFills);
+      // Propagate canonical fills into enrichedLead so subsequent groups see them.
+      // linkedin_url → lead.linkedin so findUnipileCompany Approach 1 can use it.
+      // company_name → lead.company for Approach 3 name search.
+      // All canonical names set directly (Tier 3.5c reads lead.company_linkedin_url etc.).
+      for (const fill of groupResult.fields) {
+        if (fill.field === 'linkedin_url') (enrichedLead as any).linkedin = fill.value;
+        else if (fill.field === 'company_name') (enrichedLead as any).company = fill.value;
+        (enrichedLead as any)[fill.field] = fill.value;
+      }
       perGroupTierFills.set(
         groupName,
         addTierCounts(perGroupTierFills.get(groupName) ?? emptyTierCount(), groupResult.tierFills),

@@ -13,6 +13,9 @@ export class LinkedInOutreachService {
   // Short-lived cache for connectivity checks — avoids a Unipile API call on every page load
   private connectedStatusCache: Map<string, { connected: boolean; timestamp: number }> = new Map();
   private static readonly CONNECTED_STATUS_TTL_MS = 10 * 60 * 1000; // 10 minutes
+  // Per-user resolved account cache — avoids re-running the full account resolution chain on every call
+  private resolvedAccountCache: Map<string, { accountId: string; timestamp: number }> = new Map();
+  private static readonly RESOLVED_ACCOUNT_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
   // ─── Logging helpers ────────────────────────────────────────────────────────
 
@@ -154,6 +157,10 @@ export class LinkedInOutreachService {
    */
   clearStatusCache(accountId: string): void {
     this.connectedStatusCache.delete(accountId);
+  }
+
+  invalidateResolvedAccount(userId: string): void {
+    this.resolvedAccountCache.delete(userId);
   }
 
   async isAccountConnected(accountId: string): Promise<boolean> {
@@ -912,7 +919,7 @@ export class LinkedInOutreachService {
 
   /**
    * Resolve a Unipile account_id for a given user.
-   * 1. Uses the user's own connected Unipile account if available.
+   * 1. Uses the user's own connected Unipile account if available (no connectivity check).
    * 2. Falls back to a randomly-selected site-wide Unipile account configured in settings.
    * Returns null if no account can be found.
    */
@@ -921,7 +928,7 @@ export class LinkedInOutreachService {
     try {
       const { getAccountsByUserId } = await import('./connectedAccountsDb');
       const accounts = await getAccountsByUserId(userId);
-      const userAccount = accounts.find((a: any) => a.platform === 'unipile');
+      const userAccount = (accounts as any[]).find((a) => a.platform === 'unipile');
       if (userAccount?.account_id) return userAccount.account_id;
     } catch { /* ignore */ }
 
@@ -942,6 +949,55 @@ export class LinkedInOutreachService {
         }
       }
     } catch { /* ignore parse errors or settings fetch failures */ }
+
+    return null;
+  }
+
+  /**
+   * Enrichment-specific account resolution. Differs from resolveAccountId in three ways:
+   * 1. Tries ALL user accounts (not just the first), skipping dead ones with a connectivity check.
+   * 2. Site-wide accounts are the last resort, never the first choice.
+   * 3. Result cached per user for 1 hour; invalidated on NOT_FOUND errors via invalidateResolvedAccount().
+   */
+  async resolveAccountIdForEnrichment(userId: string): Promise<string | null> {
+    const cached = this.resolvedAccountCache.get(userId);
+    if (cached && Date.now() - cached.timestamp < LinkedInOutreachService.RESOLVED_ACCOUNT_TTL_MS) {
+      return cached.accountId;
+    }
+
+    const setCache = (accountId: string) => {
+      this.resolvedAccountCache.set(userId, { accountId, timestamp: Date.now() });
+      return accountId;
+    };
+
+    // 1. User's own accounts — try all, first live one wins
+    try {
+      const { getAccountsByUserId } = await import('./connectedAccountsDb');
+      const accounts = await getAccountsByUserId(userId);
+      const userAccounts = (accounts as any[]).filter((a) => a.platform === 'unipile');
+      for (const account of userAccounts) {
+        if (account.account_id && await this.isAccountConnected(account.account_id)) {
+          return setCache(account.account_id);
+        }
+      }
+    } catch { /* ignore */ }
+
+    // 2. Site-wide accounts (last resort) — verify connectivity before returning
+    try {
+      const { settingsService } = await import('./settingsService');
+      const setting = await settingsService.getSetting('site-wide-unipile-accounts');
+      if (setting?.settingValue) {
+        const siteAccounts = JSON.parse(setting.settingValue);
+        const enabled = (siteAccounts as any[]).filter((a) => a.enabled !== false);
+        const shuffled = enabled.sort(() => Math.random() - 0.5);
+        for (const account of shuffled) {
+          if (await this.isAccountConnected(account.account_id)) {
+            return setCache(account.account_id);
+          }
+          this.log(`Site-wide account ${account.account_id} (${account.account_name}) is disconnected — skipping`);
+        }
+      }
+    } catch { /* ignore */ }
 
     return null;
   }
