@@ -48,12 +48,6 @@ jest.mock("../services/customDomainService", () => ({
   generateSubdomain: (...args: any[]) => mockGenerateSubdomain(...args),
 }));
 
-// Mock subscriptionService for tier-gate tests
-const mockUserHasFeature = jest.fn();
-jest.mock("../services/subscriptionService", () => ({
-  userHasFeature: (...args: any[]) => mockUserHasFeature(...args),
-}));
-
 // Mock authorizeLandingPageAccess for landing-page ownership checks
 const mockAuthorizeLandingPageAccess = jest.fn();
 jest.mock("../routes/landingPageGeneration", () => ({
@@ -80,7 +74,6 @@ app.use("/api/domains", domainRoutes);
 describe("Domain API Routes", () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockUserHasFeature.mockResolvedValue(true); // default allow — per-test can override
   });
 
   describe("GET /api/domains", () => {
@@ -304,25 +297,12 @@ describe("Domain API Routes", () => {
     });
   });
 
-  describe("POST /api/domains/custom — tier gate", () => {
+  describe("POST /api/domains/custom — landingPageId ownership", () => {
     beforeEach(() => {
       jest.clearAllMocks();
     });
 
-    it("returns 403 when user lacks custom-domain feature", async () => {
-      mockUserHasFeature.mockResolvedValueOnce(false);
-
-      const res = await request(app)
-        .post("/api/domains/custom")
-        .send({ vercelProjectId: "prj_123", domain: "landing.example.com" });
-
-      expect(res.status).toBe(403);
-      expect(res.body.error).toMatch(/higher-tier/i);
-      expect(mockAddCustomDomain).not.toHaveBeenCalled();
-    });
-
-    it("proceeds when user has custom-domain feature", async () => {
-      mockUserHasFeature.mockResolvedValueOnce(true);
+    it("adds domain without landingPageId", async () => {
       mockAddCustomDomain.mockResolvedValueOnce({
         id: "dom-1",
         userId: "test-user-123",
@@ -341,13 +321,6 @@ describe("Domain API Routes", () => {
 
       expect(res.status).toBe(201);
       expect(mockAddCustomDomain).toHaveBeenCalledWith("test-user-123", "prj_123", "landing.example.com", undefined);
-    });
-  });
-
-  describe("POST /api/domains/custom — landingPageId ownership", () => {
-    beforeEach(() => {
-      jest.clearAllMocks();
-      mockUserHasFeature.mockResolvedValue(true);
     });
 
     it("returns 403 when caller does not own the landing page", async () => {

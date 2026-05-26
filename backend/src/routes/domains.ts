@@ -9,7 +9,6 @@ import {
   getDomain,
   verifyDomain,
 } from "../services/customDomainService";
-import { userHasFeature } from "../services/subscriptionService";
 import { authorizeLandingPageAccess } from "./landingPageGeneration";
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({
@@ -135,12 +134,6 @@ router.post("/custom", async (req, res: Response) => {
     }
     if (!domain || typeof domain !== "string") {
       return res.status(400).json({ error: "domain is required" });
-    }
-
-    // Tier gate
-    const ok = await userHasFeature(userId, "custom-domain");
-    if (!ok) {
-      return res.status(403).json({ error: "Custom domains require a higher-tier subscription" });
     }
 
     // Landing page ownership
