@@ -10,6 +10,7 @@ import { AuthenticatedRequest } from '../middleware/auth';
 import { ChatbotDB } from '../services/chatbotService';
 import * as authController from '../controllers/auth';
 import rateLimit from 'express-rate-limit';
+import { resolveAnalyticsConfig, resolveConfigTarget } from '../services/analyticsConfigResolver';
 
 const router = express.Router();
 
@@ -157,6 +158,16 @@ router.get('/me', authenticateToken, async (req, res) => {
         Array.isArray(user.googleDriveFolders) ? user.googleDriveFolders : [];
       const orgFolderIds = new Set(orgFolders.map((f: { folderId: string }) => f.folderId));
       response.googleDriveFolders = [...orgFolders, ...userFolders.filter((f: { folderId: string }) => !orgFolderIds.has(f.folderId))];
+    }
+
+    // Effective analytics config + whether the caller may edit it (drives the
+    // customer-portal SEO dashboard gating and the Analytics & SEO Settings tab).
+    try {
+      response.effectiveAnalyticsConfig = await resolveAnalyticsConfig(user);
+      response.canEditAnalyticsConfig = (await resolveConfigTarget(user)).canEdit;
+    } catch (e: any) {
+      console.error('Error resolving analytics config for /me:', e.message);
+      response.canEditAnalyticsConfig = false;
     }
 
     res.json(response);

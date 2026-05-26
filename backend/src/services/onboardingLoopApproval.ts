@@ -28,6 +28,98 @@ export interface ApprovalResult {
 }
 
 // ---------------------------------------------------------------------------
+// postHeartbeatSlackDM
+// ---------------------------------------------------------------------------
+
+/**
+ * Posts the daily heartbeat DM when the loop has no mutations to propose.
+ * Confirms the loop is alive and reports onboarding funnel + self-driven
+ * activity, so silence-by-design doesn't look like silence-from-bug.
+ *
+ * Why: with one variant per step, the proposal path never fires and the
+ * approver gets no DM. Without this, "no message" is indistinguishable from
+ * "the cron is broken" — the bug that masked the runs-table issue for 2 days.
+ *
+ * Uses chat.postMessage with the user ID directly as channel. The bot lacks
+ * im:write scope, but chat:write works on existing DM channels. If the user
+ * has never DM'd the bot, Slack returns channel_not_found and the caller
+ * should escalate to scope expansion.
+ */
+export async function postHeartbeatSlackDM(
+  metrics: HeartbeatMetrics,
+  slackUserId: string,
+  slackClient: WebClient,
+): Promise<{ channel: string; ts: string }> {
+  const text = formatHeartbeat(metrics);
+  const posted = await slackClient.chat.postMessage({
+    channel: slackUserId,
+    text,
+    mrkdwn: true,
+  });
+  if (!posted.ok || !posted.ts) {
+    throw new Error(`Slack postMessage failed: ${posted.error ?? 'unknown'}`);
+  }
+  return { channel: slackUserId, ts: posted.ts };
+}
+
+export interface HeartbeatMetrics {
+  todayStr: string; // YYYY-MM-DD
+  reason: string; // why no mutations (e.g. "only 1 variant per step")
+  totalUsers: number; // real users (post bot filter)
+  stageDistribution: Record<string, number>; // onboardingStage → count
+  signups: { last24h: number; last7d: number };
+  completions: { last24h: number; last7d: number };
+  selfActive: { last24h: number; last7d: number; last30d: number }; // distinct users with non-delegated activity in window
+  pilotRatio: number | null; // fraction of users where lastLoginTime exists but lastActiveAt doesn't (0..1), null if no data
+}
+
+export function formatHeartbeat(m: HeartbeatMetrics): string {
+  const lines: string[] = [];
+  lines.push(`🟢 *Onboarding Loop — Heartbeat (${m.todayStr})*`);
+  lines.push('');
+  lines.push(`*Status:* Healthy. No mutations to propose today.`);
+  lines.push(`_Why:_ ${m.reason}`);
+  lines.push('');
+  lines.push(`*Last 24h*`);
+  lines.push(`  • New signups: ${m.signups.last24h}`);
+  lines.push(`  • Completed onboarding: ${m.completions.last24h}`);
+  lines.push(`  • Self-active users: ${m.selfActive.last24h}`);
+  lines.push('');
+  lines.push(`*Last 7d*`);
+  lines.push(`  • New signups: ${m.signups.last7d}`);
+  lines.push(`  • Completed onboarding: ${m.completions.last7d}`);
+  lines.push(`  • Self-active users: ${m.selfActive.last7d}`);
+  lines.push('');
+  lines.push(`*Funnel (all real users, n=${m.totalUsers})*`);
+  const stageOrder = [
+    '(unset)',
+    'signed_up_no_start',
+    'goal_selected',
+    'brand_submitted',
+    'brand_skipped',
+    'data_connected',
+    'channel_connected',
+    'onboarding_completed',
+    'active',
+    'stale',
+  ];
+  for (const stage of stageOrder) {
+    const n = m.stageDistribution[stage] ?? 0;
+    if (n === 0) continue;
+    const pct = m.totalUsers > 0 ? ((n / m.totalUsers) * 100).toFixed(1) : '—';
+    lines.push(`  • ${stage.padEnd(22)} ${String(n).padStart(4)}  (${pct}%)`);
+  }
+  lines.push('');
+  if (m.pilotRatio !== null) {
+    const pct = (m.pilotRatio * 100).toFixed(0);
+    lines.push(`*Pilot ratio:* ${pct}% of recently-logged-in users never acted under their own session (likely we drove the account).`);
+    lines.push('');
+  }
+  lines.push(`_Loop is alive. You'll get a proposal DM when underperformance is detected._`);
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
 // postDailySlackDM
 // ---------------------------------------------------------------------------
 

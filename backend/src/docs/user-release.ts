@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-22
+// Last updated: 2026-05-25
 
 export interface UserReleaseNote {
   date: string;
@@ -15,6 +15,33 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Web-sourced enriched fields now display a critic quality view (high, low, or drop) so you can see at a glance which web-found values the system considers well-supported',
       '- A "drop" view means the critic could not verify the value against its source — the value is kept and never deleted automatically, but is flagged for your review',
       '- Confidence labels (high / medium / low) are now shown for every enriched field, including Apollo, LinkedIn, web, and pattern-matched results — previously some fields had no confidence label at all',
+      'New: Self-Service Analytics Setup',
+      '- Configure your SEO domains, Google Analytics 4 properties, and Microsoft Clarity projects yourself under Settings → Analytics & SEO',
+      'New: Test GA4 Connections',
+      '- A Test button shows immediately whether the analytics service account has access to each property',
+      'New: Organization-Wide Analytics Sharing',
+      '- Org admins can share analytics with their whole team and appoint analytics editors from Settings → Organization Sharing',
+      'New: Share Funnels Across Your Team',
+      '- User-journey funnels can now be shared organization-wide',
+      '- Turn on Funnels sharing in Settings → Organization → Sharing; editors and the org owner can edit shared funnels',
+    ],
+  },
+  {
+    date: '2026-05-25',
+    changes: [
+      'Fixed: Adding a New Landing Page Subpage No Longer Creates an Orphaned Vercel Project',
+      '- Asking Emma to create a new landing page on an existing domain (e.g. hireemma.ai) was incorrectly spinning up a brand-new Vercel project and GitHub repo instead of adding a route to the existing one',
+      '- Root cause: v0-generated subpages included an app/api/capture route that conflicted with the root repo\'s existing API route, causing a Turbopack build failure; Emma then called deploy_landing_page on the failed subpage record, which created the orphaned project',
+      '- New subpages now skip the conflicting API route during file remapping, and deploy_landing_page now refuses to process subpage records to prevent this class of error entirely',
+    ],
+  },
+  {
+    date: '2026-05-25',
+    changes: [
+      'Fixed: Admin Delegate Access to Customer Portal No Longer Resets to Wrong Account on Reload',
+      '- When an admin accessed a customer\'s portal and then reloaded the page, the portal would switch to a different customer\'s account',
+      '- Multiple delegate session tokens were accumulating in the browser\'s session storage, and the wrong one would be picked on reload due to non-deterministic key ordering',
+      '- The fix ensures only one delegate token is ever active at a time: switching to a new customer now clears any previous delegate tokens before storing the new one',
     ],
   },
   {
