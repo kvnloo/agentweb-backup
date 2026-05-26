@@ -53,9 +53,9 @@ export const activeSessionGenerations = new Set<string>();
  * critical thing is that the user-facing lock releases.
  */
 const GENERATION_TIMEOUT_MS = parseInt(
-  process.env.AGENT_MODE_GENERATION_TIMEOUT_MS || '300000',
+  process.env.AGENT_MODE_GENERATION_TIMEOUT_MS || '600000',
   10
-); // 5 minutes default
+); // 10 minutes default — local agent browser tasks need > 5 min
 
 async function withGenerationTimeout<T>(
   promise: Promise<T>,
