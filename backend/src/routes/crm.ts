@@ -4096,10 +4096,13 @@ router.post('/lists/:listId/check-linkedin-connections', async (req: Request, re
 
     const { getConnectionByProfileUrl } = await import('../services/unipileConnectionsDb');
 
-    const connected: string[] = [];
+    const connected: Array<{ url: string; connectedAt: number | null }> = [];
     await Promise.all(urls.map(async (url: string) => {
       const conn = await getConnectionByProfileUrl(url).catch(() => null);
-      if (conn) connected.push(url.trim().toLowerCase().replace(/\/?$/, '/'));
+      if (conn) connected.push({
+        url: url.trim().toLowerCase().replace(/\/?$/, '/'),
+        connectedAt: conn.connectedAt ?? null,
+      });
     }));
 
     return res.json({ connected });
