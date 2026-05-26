@@ -14,6 +14,7 @@ import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { settingsService } from '../services/settingsService';
 import { dripSequenceDb } from '../services/dripSequenceDb';
 import { crmDb } from '../services/db';
+import { leadListAlertService } from '../services/leadListAlertService';
 import {
   upsertConnections,
   getLatestConnectedAt,
@@ -166,6 +167,32 @@ export async function enrollNewConnections(newConnections: UnipileConnection[]):
   return enrolled;
 }
 
+/**
+ * For each newly detected connection, look up matching CRM leads via the
+ * LinkedinLookupIndex GSI and send an email notification to the list owner.
+ * Fires independently of sequence enrollment.
+ */
+export async function notifyNewConnections(newConnections: UnipileConnection[]): Promise<void> {
+  for (const conn of newConnections) {
+    try {
+      const leads = await crmDb.findLeadsByLinkedin(conn.publicProfileUrl);
+      for (const lead of leads as any[]) {
+        if (!lead.listId) continue;
+        try {
+          const list = await crmDb.getLeadListById(lead.listId);
+          if (!list) continue;
+          await leadListAlertService.notifyLinkedInConnectionAccepted(list, lead);
+          console.log(`${TAG} Notified list owner for lead ${lead.leadId} (LinkedIn connection accepted)`);
+        } catch (err) {
+          console.error(`${TAG} Failed to notify for lead ${lead.leadId}:`, err);
+        }
+      }
+    } catch (err) {
+      console.error(`${TAG} Failed to look up leads for connection ${conn.publicProfileUrl}:`, err);
+    }
+  }
+}
+
 // ─── Main cron entry point ────────────────────────────────────────────────────
 
 let isRunning = false;
@@ -197,9 +224,12 @@ export async function runLinkedInConnectionSync(): Promise<void> {
       }
     }
 
-    // Auto-enroll leads whose LinkedIn connection was just detected
+    // Auto-enroll leads and send email notifications for newly accepted connections
     if (allNewConnections.length > 0) {
-      const enrolled = await enrollNewConnections(allNewConnections);
+      const [enrolled] = await Promise.all([
+        enrollNewConnections(allNewConnections),
+        notifyNewConnections(allNewConnections),
+      ]);
       if (enrolled > 0) {
         console.log(`${TAG} Auto-enrolled ${enrolled} lead(s) from new connections`);
       }
