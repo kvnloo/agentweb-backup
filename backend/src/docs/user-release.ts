@@ -11,6 +11,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-26',
     changes: [
+      'Improved: Agent Mode Timeout Extended to 10 Minutes',
+      '- Long-running browser automation tasks (such as scraping LinkedIn profiles with a local agent) now have a 10-minute window before timing out, up from 5 minutes',
+    ],
+  },
+  {
+    date: '2026-05-26',
+    changes: [
       'Fixed: New Users No Longer Incorrectly Assigned Basic Subscription Tier',
       '- Users who signed up but whose subscription tier was not saved correctly were appearing as "Basic" (full-access) instead of "Free"',
       '- The fallback tier used when no subscription is set now correctly defaults to Free rather than Basic',
