@@ -37,6 +37,9 @@ const mockListDomains = jest.fn();
 const mockGetDomain = jest.fn();
 const mockVerifyDomain = jest.fn();
 const mockGenerateSubdomain = jest.fn();
+const mockGetProjectDomain = jest.fn();
+const mockSetPageSubdomain = jest.fn();
+const mockRemovePageSubdomainFromVercel = jest.fn();
 
 jest.mock("../services/customDomainService", () => ({
   addSubdomain: (...args: any[]) => mockAddSubdomain(...args),
@@ -46,6 +49,15 @@ jest.mock("../services/customDomainService", () => ({
   getDomain: (...args: any[]) => mockGetDomain(...args),
   verifyDomain: (...args: any[]) => mockVerifyDomain(...args),
   generateSubdomain: (...args: any[]) => mockGenerateSubdomain(...args),
+  getProjectDomain: (...args: any[]) => mockGetProjectDomain(...args),
+  setPageSubdomain: (...args: any[]) => mockSetPageSubdomain(...args),
+  removePageSubdomainFromVercel: (...args: any[]) => mockRemovePageSubdomainFromVercel(...args),
+}));
+
+// Mock v0Service for updateSubdomainMiddleware
+const mockUpdateSubdomainMiddleware = jest.fn();
+jest.mock("../services/v0Service", () => ({
+  updateSubdomainMiddleware: (...args: any[]) => mockUpdateSubdomainMiddleware(...args),
 }));
 
 // Mock auth middleware
@@ -288,6 +300,206 @@ describe("Domain API Routes", () => {
 
       const res = await request(app).get("/api/domains/dom-999");
       expect(res.status).toBe(404);
+    });
+  });
+
+  describe("GET /api/domains/project-domain", () => {
+    it("returns the active project domain", async () => {
+      mockGetProjectDomain.mockResolvedValueOnce({
+        domain: "mysite.com",
+        status: "active",
+      });
+
+      const res = await request(app).get("/api/domains/project-domain?vercelProjectId=proj-1");
+      expect(res.status).toBe(200);
+      expect(res.body.domain).toBe("mysite.com");
+      expect(mockGetProjectDomain).toHaveBeenCalledWith("test-user-123", "proj-1");
+    });
+
+    it("returns null when no active project domain", async () => {
+      mockGetProjectDomain.mockResolvedValueOnce(null);
+
+      const res = await request(app).get("/api/domains/project-domain?vercelProjectId=proj-1");
+      expect(res.status).toBe(200);
+      expect(res.body.domain).toBeNull();
+    });
+
+    it("returns 400 if vercelProjectId is missing", async () => {
+      const res = await request(app).get("/api/domains/project-domain");
+      expect(res.status).toBe(400);
+    });
+  });
+
+  describe("POST /api/domains/page-subdomain", () => {
+    const VALID_BODY = {
+      vercelProjectId: "proj-1",
+      landingPageId: "lp-1",
+      subdomainPrefix: "pricing",
+      mainDomain: "mysite.com",
+    };
+
+    beforeEach(() => {
+      mockSetPageSubdomain.mockResolvedValue({ fullDomain: "pricing.mysite.com" });
+      mockUpdateSubdomainMiddleware.mockResolvedValue(undefined);
+      mockDynamoInstance.query.mockReturnValue({
+        promise: () => Promise.resolve({ Items: [] }),
+      });
+      mockDynamoInstance.get.mockReturnValue({
+        promise: () =>
+          Promise.resolve({
+            Item: {
+              id: "lp-1",
+              userId: "test-user-123",
+              slug: "pricing",
+              githubRepoUrl: "https://github.com/AgentWebPro/lp-test-abc",
+              vercelProjectId: "proj-1",
+            },
+          }),
+      });
+      mockDynamoInstance.update.mockReturnValue({ promise: () => Promise.resolve() });
+    });
+
+    it("returns 201 with fullDomain and customDomainUrl on success", async () => {
+      const res = await request(app)
+        .post("/api/domains/page-subdomain")
+        .send(VALID_BODY);
+
+      expect(res.status).toBe(201);
+      expect(res.body.fullDomain).toBe("pricing.mysite.com");
+      expect(res.body.customDomainUrl).toBe("https://pricing.mysite.com/pricing");
+    });
+
+    it("calls setPageSubdomain with correct args", async () => {
+      await request(app).post("/api/domains/page-subdomain").send(VALID_BODY);
+      expect(mockSetPageSubdomain).toHaveBeenCalledWith(
+        "test-user-123",
+        "proj-1",
+        "pricing",
+        "mysite.com"
+      );
+    });
+
+    it("calls updateSubdomainMiddleware with built domain map", async () => {
+      await request(app).post("/api/domains/page-subdomain").send(VALID_BODY);
+      expect(mockUpdateSubdomainMiddleware).toHaveBeenCalledWith(
+        "AgentWebPro/lp-test-abc",
+        { "pricing.mysite.com": "/pricing" }
+      );
+    });
+
+    it("returns 400 if subdomainPrefix missing", async () => {
+      const res = await request(app)
+        .post("/api/domains/page-subdomain")
+        .send({ ...VALID_BODY, subdomainPrefix: undefined });
+      expect(res.status).toBe(400);
+    });
+
+    it("returns 400 if mainDomain missing", async () => {
+      const res = await request(app)
+        .post("/api/domains/page-subdomain")
+        .send({ ...VALID_BODY, mainDomain: undefined });
+      expect(res.status).toBe(400);
+    });
+
+    it("returns 404 if landing page not found", async () => {
+      mockDynamoInstance.get.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Item: undefined }),
+      });
+      const res = await request(app)
+        .post("/api/domains/page-subdomain")
+        .send(VALID_BODY);
+      expect(res.status).toBe(404);
+    });
+
+    it("root page (no slug) gets customDomainUrl without path suffix", async () => {
+      mockDynamoInstance.get.mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Item: {
+              id: "lp-1",
+              userId: "test-user-123",
+              githubRepoUrl: "https://github.com/AgentWebPro/lp-test-abc",
+              vercelProjectId: "proj-1",
+              // no slug
+            },
+          }),
+      });
+      const res = await request(app)
+        .post("/api/domains/page-subdomain")
+        .send(VALID_BODY);
+      expect(res.status).toBe(201);
+      expect(res.body.customDomainUrl).toBe("https://pricing.mysite.com");
+    });
+  });
+
+  describe("DELETE /api/domains/page-subdomain/:landingPageId", () => {
+    beforeEach(() => {
+      mockRemovePageSubdomainFromVercel.mockResolvedValue(undefined);
+      mockUpdateSubdomainMiddleware.mockResolvedValue(undefined);
+      mockDynamoInstance.get.mockReturnValue({
+        promise: () =>
+          Promise.resolve({
+            Item: {
+              id: "lp-1",
+              userId: "test-user-123",
+              slug: "pricing",
+              subdomainPrefix: "pricing",
+              githubRepoUrl: "https://github.com/AgentWebPro/lp-test-abc",
+              vercelProjectId: "proj-1",
+            },
+          }),
+      });
+      mockDynamoInstance.query.mockReturnValue({
+        promise: () => Promise.resolve({ Items: [] }),
+      });
+      mockDynamoInstance.update.mockReturnValue({ promise: () => Promise.resolve() });
+    });
+
+    it("removes the subdomain and returns 200", async () => {
+      const res = await request(app)
+        .delete("/api/domains/page-subdomain/lp-1")
+        .send({ mainDomain: "mysite.com" });
+
+      expect(res.status).toBe(200);
+      expect(mockRemovePageSubdomainFromVercel).toHaveBeenCalledWith(
+        "proj-1",
+        "pricing.mysite.com"
+      );
+    });
+
+    it("returns 400 if mainDomain is missing", async () => {
+      const res = await request(app)
+        .delete("/api/domains/page-subdomain/lp-1")
+        .send({});
+      expect(res.status).toBe(400);
+    });
+
+    it("returns 404 if landing page not found", async () => {
+      mockDynamoInstance.get.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Item: undefined }),
+      });
+      const res = await request(app)
+        .delete("/api/domains/page-subdomain/lp-99")
+        .send({ mainDomain: "mysite.com" });
+      expect(res.status).toBe(404);
+    });
+
+    it("returns 400 if page has no subdomainPrefix set", async () => {
+      mockDynamoInstance.get.mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Item: {
+              id: "lp-1",
+              userId: "test-user-123",
+              vercelProjectId: "proj-1",
+              // no subdomainPrefix
+            },
+          }),
+      });
+      const res = await request(app)
+        .delete("/api/domains/page-subdomain/lp-1")
+        .send({ mainDomain: "mysite.com" });
+      expect(res.status).toBe(400);
     });
   });
 });

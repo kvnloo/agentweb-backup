@@ -8,7 +8,11 @@ import {
   listDomains,
   getDomain,
   verifyDomain,
+  getProjectDomain,
+  setPageSubdomain,
+  removePageSubdomainFromVercel,
 } from "../services/customDomainService";
+import { updateSubdomainMiddleware } from "../services/v0Service";
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || "us-west-2",
@@ -36,6 +40,29 @@ router.get("/", async (req, res: Response) => {
   } catch (error: any) {
     console.error("[DOMAINS] Error listing domains:", error);
     res.status(500).json({ error: "Failed to list domains" });
+  }
+});
+
+/**
+ * GET /api/domains/project-domain?vercelProjectId=xxx
+ * Returns the active custom domain for a Vercel project, or null if none.
+ * Must be registered before GET /:id to avoid param capture.
+ */
+router.get("/project-domain", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const vercelProjectId = req.query.vercelProjectId as string | undefined;
+    if (!vercelProjectId) {
+      return res.status(400).json({ error: "vercelProjectId query param is required" });
+    }
+
+    const record = await getProjectDomain(userId, vercelProjectId);
+    res.json({ domain: record?.domain ?? null, status: record?.status ?? null });
+  } catch (error: any) {
+    console.error("[DOMAINS] Error getting project domain:", error);
+    res.status(500).json({ error: "Failed to get project domain" });
   }
 });
 
@@ -176,6 +203,185 @@ router.post("/:id/verify", async (req, res: Response) => {
     console.error("[DOMAINS] Error verifying domain:", error);
     const status = error.message?.includes("not found") ? 404 : 500;
     res.status(status).json({ error: error.message || "Failed to verify domain" });
+  }
+});
+
+/**
+ * POST /api/domains/page-subdomain
+ * Set a subdomain prefix for a landing page.
+ * Body: { vercelProjectId, landingPageId, subdomainPrefix, mainDomain }
+ */
+router.post("/page-subdomain", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const { vercelProjectId, landingPageId, subdomainPrefix, mainDomain } = req.body;
+    if (!vercelProjectId || typeof vercelProjectId !== "string")
+      return res.status(400).json({ error: "vercelProjectId is required" });
+    if (!landingPageId || typeof landingPageId !== "string")
+      return res.status(400).json({ error: "landingPageId is required" });
+    if (!subdomainPrefix || typeof subdomainPrefix !== "string")
+      return res.status(400).json({ error: "subdomainPrefix is required" });
+    if (!mainDomain || typeof mainDomain !== "string")
+      return res.status(400).json({ error: "mainDomain is required" });
+
+    // 1. Add the subdomain to Vercel
+    const { fullDomain } = await setPageSubdomain(userId, vercelProjectId, subdomainPrefix, mainDomain);
+
+    // 2. Fetch other pages that already have a subdomainPrefix for domain map rebuild
+    const pagesResult = await dynamodb
+      .query({
+        TableName: LANDING_PAGES_TABLE,
+        IndexName: "UserIdIndex",
+        KeyConditionExpression: "userId = :uid",
+        FilterExpression: "vercelProjectId = :pid AND attribute_exists(subdomainPrefix)",
+        ExpressionAttributeValues: { ":uid": userId, ":pid": vercelProjectId },
+      })
+      .promise();
+    const existingPages = (pagesResult.Items || []) as Array<{
+      id: string;
+      slug?: string;
+      subdomainPrefix?: string;
+    }>;
+
+    // 3. Fetch current page for slug + githubRepoUrl
+    const pageResult = await dynamodb
+      .get({ TableName: LANDING_PAGES_TABLE, Key: { id: landingPageId } })
+      .promise();
+    const currentPage = pageResult.Item as any;
+    if (!currentPage || currentPage.userId !== userId) {
+      return res.status(404).json({ error: "Landing page not found" });
+    }
+
+    // 4. Build the complete domain map (other pages + current page with new prefix)
+    const domainMap: Record<string, string> = {};
+    for (const p of existingPages) {
+      if (p.id === landingPageId) continue;
+      if (p.subdomainPrefix) {
+        domainMap[`${p.subdomainPrefix}.${mainDomain}`] = p.slug ? `/${p.slug}` : "/";
+      }
+    }
+    domainMap[`${subdomainPrefix}.${mainDomain}`] = currentPage.slug
+      ? `/${currentPage.slug}`
+      : "/";
+
+    // 5. Update GitHub repo middleware
+    if (currentPage.githubRepoUrl) {
+      const repoMatch = currentPage.githubRepoUrl.match(
+        /github\.com\/([^/]+\/[^/]+?)(?:\.git)?(?:\s|$)/
+      );
+      if (repoMatch) {
+        await updateSubdomainMiddleware(repoMatch[1], domainMap);
+      }
+    }
+
+    // 6. Persist subdomainPrefix and customDomainUrl to the landing page record
+    const customDomainUrl = currentPage.slug
+      ? `https://${fullDomain}/${currentPage.slug}`
+      : `https://${fullDomain}`;
+
+    await dynamodb
+      .update({
+        TableName: LANDING_PAGES_TABLE,
+        Key: { id: landingPageId },
+        ConditionExpression: "userId = :uid",
+        UpdateExpression:
+          "SET subdomainPrefix = :prefix, customDomainUrl = :url, updatedAt = :now",
+        ExpressionAttributeValues: {
+          ":prefix": subdomainPrefix,
+          ":url": customDomainUrl,
+          ":uid": userId,
+          ":now": new Date().toISOString(),
+        },
+      })
+      .promise();
+
+    res.status(201).json({ fullDomain, customDomainUrl });
+  } catch (error: any) {
+    console.error("[DOMAINS] Error setting page subdomain:", error);
+    const status = error.message?.includes("Invalid") ? 400 : 500;
+    res.status(status).json({ error: error.message || "Failed to set page subdomain" });
+  }
+});
+
+/**
+ * DELETE /api/domains/page-subdomain/:landingPageId
+ * Remove the per-page subdomain prefix.
+ * Body: { mainDomain }
+ */
+router.delete("/page-subdomain/:landingPageId", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const { landingPageId } = req.params;
+    const { mainDomain } = req.body;
+    if (!mainDomain || typeof mainDomain !== "string") {
+      return res.status(400).json({ error: "mainDomain is required" });
+    }
+
+    // Fetch the landing page
+    const pageResult = await dynamodb
+      .get({ TableName: LANDING_PAGES_TABLE, Key: { id: landingPageId } })
+      .promise();
+    const page = pageResult.Item as any;
+    if (!page || page.userId !== userId) {
+      return res.status(404).json({ error: "Landing page not found" });
+    }
+    if (!page.subdomainPrefix) {
+      return res.status(400).json({ error: "No subdomain prefix set for this page" });
+    }
+
+    const fullDomain = `${page.subdomainPrefix}.${mainDomain}`;
+
+    // Remove from Vercel
+    await removePageSubdomainFromVercel(page.vercelProjectId, fullDomain);
+
+    // Fetch remaining pages for domain map rebuild
+    const pagesResult = await dynamodb
+      .query({
+        TableName: LANDING_PAGES_TABLE,
+        IndexName: "UserIdIndex",
+        KeyConditionExpression: "userId = :uid",
+        FilterExpression: "vercelProjectId = :pid AND attribute_exists(subdomainPrefix)",
+        ExpressionAttributeValues: { ":uid": userId, ":pid": page.vercelProjectId },
+      })
+      .promise();
+    const remainingPages = ((pagesResult.Items || []) as any[]).filter(
+      (p: any) => p.id !== landingPageId
+    );
+
+    const domainMap: Record<string, string> = {};
+    for (const p of remainingPages) {
+      domainMap[`${p.subdomainPrefix}.${mainDomain}`] = p.slug ? `/${p.slug}` : "/";
+    }
+
+    // Update GitHub middleware
+    if (page.githubRepoUrl) {
+      const repoMatch = page.githubRepoUrl.match(
+        /github\.com\/([^/]+\/[^/]+?)(?:\.git)?(?:\s|$)/
+      );
+      if (repoMatch) {
+        await updateSubdomainMiddleware(repoMatch[1], domainMap);
+      }
+    }
+
+    // Clear subdomainPrefix from the landing page record
+    await dynamodb
+      .update({
+        TableName: LANDING_PAGES_TABLE,
+        Key: { id: landingPageId },
+        UpdateExpression: "REMOVE subdomainPrefix SET updatedAt = :now",
+        ExpressionAttributeValues: { ":now": new Date().toISOString() },
+      })
+      .promise();
+
+    res.json({ message: "Subdomain removed" });
+  } catch (error: any) {
+    console.error("[DOMAINS] Error removing page subdomain:", error);
+    const status = error.message?.includes("not found") ? 404 : 500;
+    res.status(status).json({ error: error.message || "Failed to remove page subdomain" });
   }
 });
 
