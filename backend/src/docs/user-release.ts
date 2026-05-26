@@ -11,13 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-25',
     changes: [
-<<<<<<< harshit/landing-page-custom-domain-ui
       'Landing Pages: Connect Your Own Custom Domain',
       '- Paid users can now point a custom domain (e.g. landing.mycompany.com or mycompany.com) at any landing page from the Domain Settings panel',
       '- The panel walks you through the DNS records you need to add at your registrar (TXT for verification, plus CNAME for subdomains or A 76.76.21.21 for apex domains)',
       '- The page auto-polls every 10 seconds for up to 30 minutes; once verification succeeds, the live URL shown on the landing page card updates to your custom domain',
       '- Disconnect at any time from the same panel — the domain is removed and the landing page reverts to its default URL',
-=======
+    ],
+  },
+  {
+    date: '2026-05-25',
+    changes: [
       'New: Self-Service Analytics Setup',
       '- Configure your SEO domains, Google Analytics 4 properties, and Microsoft Clarity projects yourself under Settings → Analytics & SEO',
       'New: Test GA4 Connections',
@@ -141,7 +144,6 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Scheduled LinkedIn outreach campaigns could send an identical follow-up message to a lead multiple times across different daily runs, risking spam flags',
       '- The agent now checks engagement history before sending and blocks any message whose exact text was already delivered to that lead',
       '- Different follow-up messages (e.g. Touch 3 after Touch 2) are still allowed through normally',
->>>>>>> main
     ],
   },
   {
