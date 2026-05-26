@@ -9,6 +9,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-26',
+    changes: [
+      'Fixed: Landing Pages No Longer Get Stuck in "Deploying" Status Due to Route Conflicts',
+      '- New landing pages added to a shared site could fail to build because the generated code included an API route that conflicted with an existing shared route, causing a Turbopack build error',
+      '- The duplicate API route is now skipped during deployment; sub-pages correctly use the shared lead capture endpoint instead of creating a conflicting one',
+    ],
+  },
+  {
     date: '2026-05-25',
     changes: [
       'New: Self-Service Analytics Setup',
