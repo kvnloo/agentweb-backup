@@ -99,7 +99,14 @@ describe("Domain API Routes", () => {
       mockListDomains.mockResolvedValueOnce([]);
 
       await request(app).get("/api/domains?projectId=proj-1");
-      expect(mockListDomains).toHaveBeenCalledWith("test-user-123", "proj-1");
+      expect(mockListDomains).toHaveBeenCalledWith("test-user-123", "proj-1", undefined);
+    });
+
+    it("should filter by landingPageId query param", async () => {
+      mockListDomains.mockResolvedValueOnce([]);
+
+      await request(app).get("/api/domains?landingPageId=lp-42");
+      expect(mockListDomains).toHaveBeenCalledWith("test-user-123", undefined, "lp-42");
     });
   });
 

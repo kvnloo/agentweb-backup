@@ -24,15 +24,17 @@ router.use(authenticateToken);
 /**
  * GET /api/domains
  * List all custom domains for the current user.
- * Optional query param: ?projectId=xxx to filter by Vercel project.
+ * Optional query param: ?landingPageId=xxx to filter by landing page.
+ * Optional query param: ?projectId=xxx to filter by Vercel project (fallback).
  */
 router.get("/", async (req, res: Response) => {
   try {
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
+    const landingPageId = req.query.landingPageId as string | undefined;
     const projectId = req.query.projectId as string | undefined;
-    const domains = await listDomains(userId, projectId);
+    const domains = await listDomains(userId, projectId, landingPageId);
     res.json({ domains });
   } catch (error: any) {
     console.error("[DOMAINS] Error listing domains:", error);

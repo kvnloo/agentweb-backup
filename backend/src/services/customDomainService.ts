@@ -268,12 +268,23 @@ export async function removeDomain(
  */
 export async function listDomains(
   userId: string,
-  vercelProjectId?: string
+  vercelProjectId?: string,
+  landingPageId?: string
 ): Promise<CustomDomainRecord[]> {
   let params: AWS.DynamoDB.DocumentClient.QueryInput;
 
-  if (vercelProjectId) {
-    // Use a filter expression on both userId and vercelProjectId
+  if (landingPageId) {
+    params = {
+      TableName: TABLE_NAME,
+      IndexName: "userId-index",
+      KeyConditionExpression: "userId = :userId",
+      FilterExpression: "landingPageId = :lpId",
+      ExpressionAttributeValues: {
+        ":userId": userId,
+        ":lpId": landingPageId,
+      },
+    };
+  } else if (vercelProjectId) {
     params = {
       TableName: TABLE_NAME,
       IndexName: "userId-index",
