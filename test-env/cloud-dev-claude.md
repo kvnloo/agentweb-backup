@@ -40,6 +40,10 @@ You are running inside an EC2 cloud dev environment. These instructions OVERRIDE
     - `gh workflow run deploy.yml -R AgentWebPro/agentweb --ref main`
     - `gh workflow run deploy.yml -R AgentWebPro/agentweb-customer-portal --ref main`
 
+12. **Orphan Cleanup:** When your change makes an import, variable, or function unused, remove it. Do NOT remove pre-existing dead code that already existed — leave it alone unless asked.
+
+13. **Verifiable Targets:** Convert vague tasks to test-defined outcomes before coding: "fix this bug" → "write a failing test that reproduces it, then make it pass". For multi-step tasks, state an upfront plan with explicit validation checkpoints per step.
+
 ## Debugging Tips
 
 - Check service logs: `cat ~/agentweb/logs/backend.log | tail -100`
