@@ -125,6 +125,7 @@ export default function ConnectedAccountsTab() {
   const statusColor = (status: string): 'success' | 'error' | 'warning' | 'default' => {
     if (status === 'OK') return 'success';
     if (status === 'ORPHAN') return 'error';
+    if (status === 'LINKED_IN_PROD') return 'default';
     if (status === 'UNKNOWN') return 'warning';
     return 'error';
   };
@@ -143,7 +144,8 @@ export default function ConnectedAccountsTab() {
           <Typography variant="h6">Connected Accounts — Unipile (LinkedIn Outreach)</Typography>
           <Typography variant="body2" color="text.secondary">
             Shows all LinkedIn accounts in Unipile matched against our DB.
-            <strong> ORPHAN</strong> = exists in Unipile but not in AgentWeb DB (user was deleted or disconnect failed).
+            <strong> ORPHAN</strong> = exists in Unipile but not in AgentWeb DB — needs action.
+            <strong> LINKED_IN_PROD</strong> = linked in production DB but not in this dev DB — safe to ignore.
             Use <strong>Assign</strong> to link an orphan to a user, or force-delete to clean up stale records.
           </Typography>
         </Box>
@@ -188,7 +190,7 @@ export default function ConnectedAccountsTab() {
                   hover
                   sx={acc.is_orphan ? { bgcolor: 'error.50' } : undefined}
                 >
-                  <TableCell>{acc.user_email ?? <em style={{ opacity: 0.5 }}>no user (orphan)</em>}</TableCell>
+                  <TableCell>{acc.user_email ?? <em style={{ opacity: 0.5 }}>{acc.unipile_status === 'LINKED_IN_PROD' ? 'linked in prod' : 'no user (orphan)'}</em>}</TableCell>
                   <TableCell>{acc.account_name}</TableCell>
                   <TableCell sx={{ fontFamily: 'monospace', fontSize: 12 }}>{acc.account_id}</TableCell>
                   <TableCell>
