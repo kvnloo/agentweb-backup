@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-26',
     changes: [
+      'Improved: Admin Skills Page Now Enforces Review Gate for User-Created Private Skills',
+      '- Private and pending-review skills submitted by users are clearly labeled in the admin Skills table',
+      '- Owner email is shown beneath the skill name so admins know who submitted it',
+      '- Edit, subscription assignment, and public visibility controls are disabled for private/pending skills until they are approved through the review queue',
+    ],
+  },
+  {
+    date: '2026-05-26',
+    changes: [
       'Fixed: Agent Mode Now Shows a Clear Message When a Response Times Out',
       '- Previously, if a response took too long to generate, Agent Mode showed a generic "unknown error" message',
       '- It now shows: "The response took too long to generate. Please try again — your session is still active."',
