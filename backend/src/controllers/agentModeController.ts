@@ -18,6 +18,7 @@ import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { createOncallItem } from '../services/notionService';
 import { skillService } from '../services/skillService';
 import { normalizeEmailList } from '../utils/validation';
@@ -2691,6 +2692,34 @@ export const agentModeController = {
           slackThread: session.slackThread
         }
       });
+
+      // ai-eval-funnel loop telemetry — fire-once eval_completed / eval_failed
+      // events server-side so the lander's loop sensor can see them
+      // reliably. Idempotent via ConditionExpression in fireLoopEventOnce —
+      // safe to call on every poll. Only fires for AI_GTM_Position_Eval
+      // sessions; other plan sessions are no-ops.
+      if (session.pageIdentifier === 'plan-AI_GTM_Position_Eval') {
+        const messages = session.messages || [];
+        let reportUrl: string | undefined;
+        let firstErrorText: string | undefined;
+        for (const msg of messages) {
+          const m = msg as { content?: string; text?: string; role?: string; metadata?: { isErrorMessage?: boolean } };
+          const content = (m.content || m.text || '');
+          if (m.role !== 'system' && !reportUrl) {
+            const s3Match = content.match(/https:\/\/[^\s"']+\.html/);
+            if (s3Match) reportUrl = s3Match[0];
+          }
+          if (m.metadata?.isErrorMessage === true && !firstErrorText) {
+            firstErrorText = content.slice(0, 1000);
+          }
+        }
+        if (reportUrl) {
+          loopEventsEmitter.fireEvalCompleted(session.sessionId, reportUrl).catch(() => {});
+        }
+        if (firstErrorText) {
+          loopEventsEmitter.fireEvalFailed(session.sessionId, firstErrorText).catch(() => {});
+        }
+      }
     } catch (error) {
       console.error('AgentMode: Get shared conversation error:', error);
       res.status(500).json({ error: 'Failed to get shared conversation' });
@@ -5360,6 +5389,13 @@ export const agentModeController = {
         conversableToken,
         userId: session.userId
       });
+
+      // ai-eval-funnel loop telemetry — fire eval_started server-side so the
+      // loop's sensor sees the start regardless of frontend telemetry state.
+      // Idempotent via ConditionExpression — safe on retries.
+      if (planTitle === 'AI_GTM_Position_Eval') {
+        loopEventsEmitter.fireEvalStarted(session.sessionId).catch(() => {});
+      }
 
       // Fire-and-forget: send starting message after response is returned
       if (startingMessage && typeof startingMessage === 'string' && startingMessage.trim()) {
