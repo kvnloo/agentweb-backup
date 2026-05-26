@@ -26,6 +26,9 @@ export interface Skill {
   systemPrompt?: string;
   isPublished: boolean;
   ownerId?: string;
+  ownerEmail?: string;
+  visibility?: 'system' | 'private' | 'public' | 'pending_review';
+  reviewFeedback?: string;
   category?: SkillCategory;
   triggerMode?: SkillTriggerMode;
   schedule?: SkillSchedule;
