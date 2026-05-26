@@ -134,9 +134,9 @@ router.get('/me', authenticateToken, async (req, res) => {
         }
       } catch (error) {
         console.error('Error fetching subscription info:', error);
-        // Default to Basic subscription with all pages and all skills on error
+        // Default to Free subscription on error
         const { getAllowedPages } = await import('../services/subscriptionService');
-        response.subscriptionType = 'Basic';
+        response.subscriptionType = 'Free';
         response.allowedPages = await getAllowedPages(userId);
         response.allowedSkills = [];
       }
