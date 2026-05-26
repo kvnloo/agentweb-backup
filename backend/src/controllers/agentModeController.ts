@@ -5411,6 +5411,41 @@ export const agentModeController = {
           .catch(async (firstErr: any) => {
             console.warn(`AgentMode: First attempt failed for session ${sessionId}: ${firstErr?.message}`);
 
+            // Persist a tagged "first attempt failed" record IMMEDIATELY so the
+            // closed-loop sensor (which queries for metadata.isErrorMessage = true)
+            // sees the failure even when the retry rescues the session.
+            // Without this, retries silently mask LLM/Bedrock/Playwright failures —
+            // the lander loop reported 0 logged failures over 30 days despite
+            // known agent crashes, because the retry path here always overwrote
+            // the first-attempt failure with a successful response.
+            //
+            // Uses role='system' so the user doesn't see this in their chat UI
+            // (filterMessagesForClient strips system messages on read). The sensor
+            // path queries the raw messages array, so it still sees the tag.
+            try {
+              // Pack debug info (errorName/code/httpStatus) into the content
+              // since the ChatMessage metadata type is strict — we don't want
+              // to widen the type just to thread these fields through.
+              const debugCtx = JSON.stringify({
+                firstAttemptOnly: true,
+                errorName: firstErr?.name,
+                errorCode: firstErr?.code,
+                httpStatus: firstErr?.status ?? firstErr?.$metadata?.httpStatusCode,
+              });
+              const firstAttemptErrorMessage: ChatMessage = {
+                role: 'system',
+                content: `[telemetry] First-attempt agent failure (retry will follow): ${(firstErr?.message ?? String(firstErr)).slice(0, 500)} | ctx: ${debugCtx}`,
+                timestamp: new Date().toISOString(),
+                metadata: {
+                  timestamp: new Date().toISOString(),
+                  isErrorMessage: true,
+                },
+              };
+              await chatbotDb.addMessageToSession(sessionId, firstAttemptErrorMessage);
+            } catch (saveErr) {
+              console.error('AgentMode: Failed to save first-attempt-failure telemetry record', sessionId, saveErr);
+            }
+
             // Restart the worker before retrying — the current worker may be unresponsive
             try {
               await generateMarketingResponseWorkerService.restartWorker();
@@ -5420,17 +5455,35 @@ export const agentModeController = {
 
             await new Promise(resolve => setTimeout(resolve, 3000));
 
+            let retryErrCaught: any = null;
             try {
               console.log(`AgentMode: Retrying fire-and-forget for session ${sessionId}`);
               await generateSessionResponse(sessionId, trimmedMessage, userId, selectedModel);
               progressStore.delete(sessionId);
               console.log(`AgentMode: Retry succeeded for session ${sessionId}`);
-              return; // Retry succeeded — done
+              return; // Retry succeeded — done. The first-attempt-failure telemetry record
+                      // we wrote above stays in the session as a "rescued by retry" marker.
             } catch (retryErr: any) {
+              retryErrCaught = retryErr;
               console.error(`AgentMode: Retry also failed for session ${sessionId}: ${retryErr?.message}`);
             }
 
-            // Both attempts failed — persist error message and alert
+            // Both attempts failed — persist user-visible error message and alert.
+            // The earlier telemetry record (firstAttemptOnly: true) plus this user-
+            // visible message together give the sensor two markers for terminal
+            // failures and one marker for retry-rescued failures.
+
+            // Also fire eval_failed to the lander loop's anon-event table, so the
+            // loop's policy DSL can see this terminal failure regardless of
+            // the chat-session message-scan path.
+            if (planTitle === 'AI_GTM_Position_Eval') {
+              loopEventsEmitter
+                .fireEvalFailed(
+                  sessionId,
+                  `first: ${(firstErr?.message ?? 'unknown').slice(0, 200)} | retry: ${(retryErrCaught?.message ?? 'unknown').slice(0, 200)}`,
+                )
+                .catch(() => {});
+            }
 
             // Persist error message to session so the user sees something went wrong
             try {
