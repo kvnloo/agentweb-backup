@@ -2324,6 +2324,16 @@ export const agentModeController = {
           return;
         }
 
+        if (error.message.includes('Generation timed out')) {
+          res.status(504).json({
+            error: 'Generation timed out',
+            message: 'The response took too long to generate. Please try again — your session is still active.',
+            code: 'GENERATION_TIMEOUT',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
         // Unknown error - send oncall alert
         const user = req.user as User;
         const sessionId = req.body?.sessionId;
@@ -2966,6 +2976,16 @@ export const agentModeController = {
             error: 'Server is restarting',
             message: 'The server is restarting. Please try again in a moment.',
             code: 'SERVER_RESTARTING',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
+        if (error.message.includes('Generation timed out')) {
+          res.status(504).json({
+            error: 'Generation timed out',
+            message: 'The response took too long to generate. Please try again — your session is still active.',
+            code: 'GENERATION_TIMEOUT',
             suggestion: 'wait_and_retry'
           });
           return;
@@ -5096,6 +5116,16 @@ export const agentModeController = {
             error: 'Server is restarting',
             message: 'The server is restarting. Please try again in a moment.',
             code: 'SERVER_RESTARTING',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
+        if (error.message.includes('Generation timed out')) {
+          res.status(504).json({
+            error: 'Generation timed out',
+            message: 'The response took too long to generate. Please try again — your session is still active.',
+            code: 'GENERATION_TIMEOUT',
             suggestion: 'wait_and_retry'
           });
           return;

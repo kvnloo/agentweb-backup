@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-26',
     changes: [
+      'Fixed: Agent Mode Now Shows a Clear Message When a Response Times Out',
+      '- Previously, if a response took too long to generate, Agent Mode showed a generic "unknown error" message',
+      '- It now shows: "The response took too long to generate. Please try again — your session is still active."',
+      '- Your session and conversation history are preserved; just send your message again to continue',
+    ],
+  },
+  {
+    date: '2026-05-26',
+    changes: [
       'Improved: Agent Mode Timeout Extended to 10 Minutes',
       '- Long-running browser automation tasks (such as scraping LinkedIn profiles with a local agent) now have a 10-minute window before timing out, up from 5 minutes',
     ],
