@@ -1,9 +1,14 @@
 import type { Organization } from "./db";
 
 export type ToggleableFeature =
-  | "knowledgeBase" | "htmlTemplates" | "landingPages" | "workPlans" | "skills";
+  | "knowledgeBase" | "htmlTemplates" | "landingPages" | "workPlans" | "skills" | "analytics";
 export type AlwaysOnFeature = "brandGuidelines" | "marketingStrategy";
 export type Feature = ToggleableFeature | AlwaysOnFeature;
+
+// Features that have user-owned data items needing transfer/delete on member
+// removal. Funnels are no longer a separate share-setting (gated by analytics),
+// but their items still need ownership cleanup.
+export type OwnedFeature = ToggleableFeature | "funnels";
 
 const ALWAYS_ON: ReadonlySet<Feature> = new Set<Feature>(["brandGuidelines", "marketingStrategy"]);
 
@@ -84,10 +89,13 @@ export const ORG_ITEMS_CAP     = 2000;
 export const RESPONSE_CAP      = 1000;
 
 export const TOGGLEABLE_FEATURES: ReadonlyArray<ToggleableFeature> = [
-  "knowledgeBase", "htmlTemplates", "landingPages", "workPlans", "skills",
+  "knowledgeBase", "htmlTemplates", "landingPages", "workPlans", "skills", "analytics",
 ];
 export const ALWAYS_ON_FEATURES: ReadonlyArray<AlwaysOnFeature> = [
   "brandGuidelines", "marketingStrategy",
+];
+export const OWNED_FEATURES: ReadonlyArray<OwnedFeature> = [
+  ...TOGGLEABLE_FEATURES, "funnels",
 ];
 
 export interface ListOrgVisibleArgs<T> {

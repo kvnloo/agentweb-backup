@@ -28,6 +28,9 @@ import { getActivationFields } from "../cron/activationAnalysisCron";
 import multer from "multer";
 import { MAX_FILE_SIZE } from "../config";
 import { validateEmail } from "../utils/validation";
+import { resolveConfigTarget } from "../services/analyticsConfigResolver";
+import { readAnalyticsConfig, writeAnalyticsConfig } from "../services/analyticsConfigStore";
+import { validateAnalyticsConfig } from "../services/analyticsConfigValidator";
 
 const router = express.Router();
 
@@ -106,6 +109,32 @@ const isAfterLastSync = (recordTime: string | undefined, lastSyncAt: string | un
 // Apply authentication and admin middleware to all routes
 router.use(authenticateToken);
 router.use(isAdmin);
+
+// ─── Org analytics sharing (admin-controlled) ────────────────────────────
+// PATCH /api/admin/orgs/:orgId/analytics-sharing  { enabled: boolean }
+router.patch("/orgs/:orgId/analytics-sharing", async (req, res) => {
+  try {
+    const { orgId } = req.params;
+    const { enabled } = req.body;
+    if (typeof enabled !== "boolean") {
+      return res.status(400).json({ message: "Body field 'enabled' must be a boolean" });
+    }
+    const org = await orgDb.getOrgById(orgId);
+    if (!org) {
+      return res.status(404).json({ message: "Organization not found" });
+    }
+    const existing = org.shareSettings?.analytics ?? { enabled: false, editors: [] };
+    const shareSettings = {
+      ...(org.shareSettings ?? {}),
+      analytics: { enabled, editors: existing.editors },
+    };
+    await orgDb.updateShareSettings(orgId, shareSettings as any);
+    return res.json({ orgId, analyticsSharingEnabled: enabled });
+  } catch (error: any) {
+    console.error("Error updating org analytics-sharing:", error.message);
+    return res.status(500).json({ message: "Failed to update analytics sharing" });
+  }
+});
 
 // Get all Unipile (LinkedIn outreach) accounts across all users (with live status + orphan detection)
 router.get("/unipile-accounts", async (req, res) => {
@@ -518,18 +547,25 @@ router.get("/users", async (req, res) => {
       };
     });
 
-    // Batch-fetch org names for users who belong to an org
+    // Batch-fetch org name + owner + analytics-sharing flag for users in an org
     const orgIds = [...new Set(sanitized.filter((u: any) => u.orgId).map((u: any) => u.orgId as string))];
-    const orgMap: Record<string, string> = {};
+    const orgMap: Record<string, { name: string; ownerUserId: string; shareAnalyticsWithOrg: boolean }> = {};
     await Promise.all(
       orgIds.map(async (orgId) => {
         const org = await orgDb.getOrgById(orgId).catch(() => null);
-        if (org) orgMap[orgId] = org.name;
+        if (org) orgMap[orgId] = {
+          name: org.name,
+          ownerUserId: org.ownerUserId,
+          shareAnalyticsWithOrg: !!(org.shareSettings?.analytics?.enabled ?? org.shareAnalyticsWithOrg),
+        };
       })
     );
     for (const user of sanitized) {
-      if (user.orgId && orgMap[user.orgId]) {
-        user.orgName = orgMap[user.orgId];
+      const orgInfo = user.orgId ? orgMap[user.orgId] : undefined;
+      if (orgInfo) {
+        user.orgName = orgInfo.name;
+        user.isOrgOwner = orgInfo.ownerUserId === user.userId;
+        user.orgShareAnalyticsWithOrg = orgInfo.shareAnalyticsWithOrg;
       }
     }
 
@@ -1128,241 +1164,42 @@ router.put("/users/:userId/seo-domains", async (req, res) => {
   }
 });
 
-// Update user SEO/AEO configuration (SEO domains, Google Analytics, and Clarity)
+// Read a user's resolved analytics config (Org record if in an org, else user record).
+router.get("/users/:userId/seo-aeo", async (req, res) => {
+  try {
+    const user = await userDb.getUserById(req.params.userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
+    const target = await resolveConfigTarget(user);
+    const config = await readAnalyticsConfig(target);
+    res.json({ config, scope: target.kind === "org" ? "org" : "self" });
+  } catch (error: any) {
+    console.error("Error reading user SEO/AEO config:", error.message);
+    res.status(500).json({ message: "Error reading SEO/AEO configuration" });
+  }
+});
+
+// Update user SEO/AEO configuration (SEO domains, Google Analytics, and Clarity).
+// Writes to the resolved target: the Organization record for org users, the user
+// record for solo users.
 router.put("/users/:userId/seo-aeo", async (req, res) => {
   try {
     const { userId } = req.params;
-    const {
-      seoDomains,
-      googleAnalyticsPropertyId,  // Legacy single value (kept for backward compatibility)
-      googleAnalyticsProperties,  // New array format
-      gaFilteredDomains,
-      clarityProjectId,  // Legacy single value (kept for backward compatibility)
-      clarityProjects,  // New array format
-      productDomain
-    } = req.body;
-
-    // Check if user exists
     const user = await userDb.getUserById(userId);
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
+    if (!user) return res.status(404).json({ message: "User not found" });
 
-    // Validate seoDomains is an array if provided
-    if (seoDomains !== undefined) {
-      if (!Array.isArray(seoDomains)) {
-        return res.status(400).json({ message: "seoDomains must be an array" });
-      }
+    const v = validateAnalyticsConfig({
+      seoDomains: req.body.seoDomains,
+      googleAnalyticsProperties: req.body.googleAnalyticsProperties,
+      primaryAnalyticsPropertyId: req.body.primaryAnalyticsPropertyId,
+      gaFilteredDomains: req.body.gaFilteredDomains,
+      clarityProjects: req.body.clarityProjects,
+      productDomain: req.body.productDomain,
+    });
+    if (!v.ok) return res.status(400).json({ message: v.error });
 
-      // Validate each domain format (allow both domain and URL-prefix formats)
-      // Domain property: example.com
-      // URL-prefix property: https://example.com or https://example.com/
-      const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
-      const urlPrefixRegex = /^https?:\/\/[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}\/?$/;
-
-      for (const domain of seoDomains) {
-        const trimmedDomain = domain.trim();
-        if (typeof domain !== 'string' || (!domainRegex.test(trimmedDomain) && !urlPrefixRegex.test(trimmedDomain))) {
-          return res.status(400).json({
-            message: `Invalid domain format: ${domain}. Use 'example.com' for domain properties or 'https://example.com' or 'https://example.com/' for URL-prefix properties`
-          });
-        }
-      }
-    }
-
-    // Validate gaFilteredDomains is an array if provided
-    if (gaFilteredDomains !== undefined) {
-      if (!Array.isArray(gaFilteredDomains)) {
-        return res.status(400).json({ message: "gaFilteredDomains must be an array" });
-      }
-
-      // Validate each domain format (allow localhost and standard domains)
-      const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
-      for (const domain of gaFilteredDomains) {
-        if (typeof domain !== 'string') {
-          return res.status(400).json({
-            message: `Invalid filtered domain format: ${domain}. Must be a string`
-          });
-        }
-
-        const trimmedDomain = domain.trim();
-
-        // Allow localhost and IP addresses (common for filtering local/dev traffic)
-        const isLocalhost = trimmedDomain === 'localhost' || trimmedDomain.startsWith('localhost:');
-        const isIpAddress = /^(\d{1,3}\.){3}\d{1,3}(:\d+)?$/.test(trimmedDomain);
-
-        if (!isLocalhost && !isIpAddress && !domainRegex.test(trimmedDomain)) {
-          return res.status(400).json({
-            message: `Invalid filtered domain format: ${domain}. Please use format like app.example.com, localhost, or an IP address`
-          });
-        }
-      }
-    }
-
-    // Validate Google Analytics Property ID format if provided (legacy single value)
-    // Note: The API uses Property ID (numeric), not Measurement ID (G-XXXXXXXXXX)
-    if (googleAnalyticsPropertyId !== undefined && googleAnalyticsPropertyId !== null && googleAnalyticsPropertyId !== "") {
-      // GA4 Property ID is numeric (e.g., 123456789)
-      const gaIdRegex = /^\d+$/;
-      const trimmedId = googleAnalyticsPropertyId.trim();
-      if (typeof googleAnalyticsPropertyId !== 'string' || !gaIdRegex.test(trimmedId)) {
-        return res.status(400).json({
-          message: `Invalid Google Analytics Property ID format: ${googleAnalyticsPropertyId}. Please enter the numeric Property ID (e.g., 123456789). You can find this in GA4 Admin > Property Settings.`
-        });
-      }
-    }
-
-    // Validate Google Analytics Properties array (new format)
-    if (googleAnalyticsProperties !== undefined) {
-      if (!Array.isArray(googleAnalyticsProperties)) {
-        return res.status(400).json({ message: "googleAnalyticsProperties must be an array" });
-      }
-
-      const gaIdRegex = /^\d+$/;
-      const seenPropertyIds = new Set<string>();
-
-      for (const property of googleAnalyticsProperties) {
-        // Validate structure
-        if (!property || typeof property !== 'object' || !property.propertyId || !property.label) {
-          return res.status(400).json({
-            message: "Each GA4 property must have 'propertyId' and 'label' fields"
-          });
-        }
-
-        // Validate property ID format
-        const trimmedId = property.propertyId.trim();
-        if (typeof property.propertyId !== 'string' || !gaIdRegex.test(trimmedId)) {
-          return res.status(400).json({
-            message: `Invalid Google Analytics Property ID format: ${property.propertyId}. Please enter the numeric Property ID (e.g., 123456789).`
-          });
-        }
-
-        // Validate label
-        if (typeof property.label !== 'string' || property.label.trim().length === 0) {
-          return res.status(400).json({
-            message: "Each GA4 property must have a non-empty label"
-          });
-        }
-
-        if (property.label.trim().length > 100) {
-          return res.status(400).json({
-            message: `GA4 property label too long: ${property.label}. Maximum 100 characters.`
-          });
-        }
-
-        // Check for duplicate property IDs
-        if (seenPropertyIds.has(trimmedId)) {
-          return res.status(400).json({
-            message: `Duplicate Google Analytics Property ID: ${trimmedId}`
-          });
-        }
-        seenPropertyIds.add(trimmedId);
-      }
-    }
-
-    if (clarityProjectId !== undefined && clarityProjectId !== null && clarityProjectId !== "") {
-      const clarityIdRegex = /^[a-zA-Z0-9_-]{6,32}$/;
-      const trimmedId = clarityProjectId.trim();
-      if (typeof clarityProjectId !== 'string' || !clarityIdRegex.test(trimmedId)) {
-        return res.status(400).json({
-          message: `Invalid Microsoft Clarity Project ID format: ${clarityProjectId}. Please enter the project ID (e.g., ul13e4f7fe). You can find this in Clarity project settings.`
-        });
-      }
-    }
-
-    // Validate Clarity Projects array (new format)
-    if (clarityProjects !== undefined) {
-      if (!Array.isArray(clarityProjects)) {
-        return res.status(400).json({ message: "clarityProjects must be an array" });
-      }
-
-      const clarityIdRegex = /^[a-zA-Z0-9_-]{6,32}$/;
-      const seenProjectIds = new Set<string>();
-
-      for (const project of clarityProjects) {
-        // Validate structure
-        if (!project || typeof project !== 'object' || !project.projectId || !project.label) {
-          return res.status(400).json({
-            message: "Each Clarity project must have 'projectId' and 'label' fields"
-          });
-        }
-
-        // Validate project ID format
-        const trimmedId = project.projectId.trim();
-        if (typeof project.projectId !== 'string' || !clarityIdRegex.test(trimmedId)) {
-          return res.status(400).json({
-            message: `Invalid Microsoft Clarity Project ID format: ${project.projectId}. Please enter the project ID (e.g., ul13e4f7fe).`
-          });
-        }
-
-        // Validate label
-        if (typeof project.label !== 'string' || project.label.trim().length === 0) {
-          return res.status(400).json({
-            message: "Each Clarity project must have a non-empty label"
-          });
-        }
-
-        if (project.label.trim().length > 100) {
-          return res.status(400).json({
-            message: `Clarity project label too long: ${project.label}. Maximum 100 characters.`
-          });
-        }
-
-        // Check for duplicate project IDs
-        if (seenProjectIds.has(trimmedId)) {
-          return res.status(400).json({
-            message: `Duplicate Microsoft Clarity Project ID: ${trimmedId}`
-          });
-        }
-        seenProjectIds.add(trimmedId);
-      }
-    }
-
-    // Validate productDomain format if provided
-    if (productDomain !== undefined && productDomain !== null && productDomain !== "") {
-      const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
-      const trimmedDomain = productDomain.trim();
-      if (typeof productDomain !== 'string' || !domainRegex.test(trimmedDomain)) {
-        return res.status(400).json({
-          message: `Invalid product domain format: ${productDomain}. Please use format like app.example.com`
-        });
-      }
-    }
-
-    // Build update object with only provided fields
-    const updateData: any = {};
-    if (seoDomains !== undefined) {
-      console.log('[SEO/AEO Update] Saving seoDomains:', JSON.stringify(seoDomains));
-      updateData.seoDomains = seoDomains;
-    }
-    if (googleAnalyticsPropertyId !== undefined) {
-      updateData.googleAnalyticsPropertyId = googleAnalyticsPropertyId?.trim() || null;
-    }
-    if (googleAnalyticsProperties !== undefined) {
-      updateData.googleAnalyticsProperties = googleAnalyticsProperties.map((p: any) => ({
-        propertyId: p.propertyId.trim(),
-        label: p.label.trim()
-      }));
-    }
-    if (gaFilteredDomains !== undefined) {
-      updateData.gaFilteredDomains = gaFilteredDomains;
-    }
-    if (clarityProjectId !== undefined) {
-      updateData.clarityProjectId = clarityProjectId?.trim() || null;
-    }
-    if (clarityProjects !== undefined) {
-      updateData.clarityProjects = clarityProjects.map((p: any) => ({
-        projectId: p.projectId.trim(),
-        label: p.label.trim()
-      }));
-    }
-    if (productDomain !== undefined) {
-      updateData.productDomain = productDomain?.trim() || null;
-    }
-
-    // Update the user's SEO/AEO configuration
-    const updatedUser = await userDb.updateUser(userId, updateData);
-    res.json(updatedUser);
+    const target = await resolveConfigTarget(user);
+    await writeAnalyticsConfig(target, v.value);
+    res.json({ config: await readAnalyticsConfig(target), scope: target.kind === "org" ? "org" : "self" });
   } catch (error) {
     console.error("Error updating user SEO/AEO configuration:", error);
     res.status(500).json({ message: "Error updating SEO/AEO configuration" });

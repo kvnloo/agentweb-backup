@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-22
+// Last updated: 2026-05-25
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,20 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-05-25',
+    changes: [
+      'New: Self-Service Analytics Setup',
+      '- Configure your SEO domains, Google Analytics 4 properties, and Microsoft Clarity projects yourself under Settings → Analytics & SEO',
+      'New: Test GA4 Connections',
+      '- A Test button shows immediately whether the analytics service account has access to each property',
+      'New: Organization-Wide Analytics Sharing',
+      '- Org admins can share analytics with their whole team and appoint analytics editors from Settings → Organization Sharing',
+      'New: Share Funnels Across Your Team',
+      '- User-journey funnels can now be shared organization-wide',
+      '- Turn on Funnels sharing in Settings → Organization → Sharing; editors and the org owner can edit shared funnels',
+    ],
+  },
   {
     date: '2026-05-25',
     changes: [
