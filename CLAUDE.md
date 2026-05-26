@@ -69,6 +69,11 @@ For frontend and other changes, follow the existing testing strategy section bel
 - Zero context switching required from the user
 - Go fix failing CI tests without being told how
 
+**Verifiable Targets:**
+- Convert vague tasks to test-defined outcomes before coding: "fix this bug" → "write a failing test that reproduces it, then make it pass"
+- "add validation" → "write tests for invalid inputs, then implement until they pass"
+- For multi-step tasks, state the plan upfront with explicit validation checkpoints per step
+
 ### Rule 4: Task Management
 
 **Note:** Use the TodoWrite tool (from system prompt) for session-level task tracking. Use `tasks/todo.md` for project-level task planning that persists across sessions.
@@ -92,6 +97,7 @@ For frontend and other changes, follow the existing testing strategy section bel
 - **Simplicity First**: Make every change as simple as possible. Impact minimal code.
 - **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
 - **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
+- **Orphan Cleanup**: When your change makes an import, variable, or function unused, remove it. Do NOT remove pre-existing dead code that already existed — leave it alone unless asked.
 
 ## CRITICAL: Working Directory Rule
 
