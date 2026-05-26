@@ -86,7 +86,7 @@ describe("getProjectDomain", () => {
     expect(result).toBeNull();
   });
 
-  it("ignores pending_verification domains", async () => {
+  it("returns pending_verification domain when no active domain exists", async () => {
     mockDynamoInstance.query.mockReturnValueOnce({
       promise: () =>
         Promise.resolve({
@@ -103,7 +103,36 @@ describe("getProjectDomain", () => {
         }),
     });
     const result = await getProjectDomain("user-1", "proj-1");
-    expect(result).toBeNull();
+    expect(result?.domain).toBe("mysite.com");
+    expect(result?.status).toBe("pending_verification");
+  });
+
+  it("prefers active over pending_verification domain", async () => {
+    mockDynamoInstance.query.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Items: [
+            {
+              id: "d2",
+              type: "custom",
+              status: "pending_verification",
+              domain: "pending.com",
+              vercelProjectId: "proj-1",
+              userId: "user-1",
+            },
+            {
+              id: "d1",
+              type: "custom",
+              status: "active",
+              domain: "active.com",
+              vercelProjectId: "proj-1",
+              userId: "user-1",
+            },
+          ],
+        }),
+    });
+    const result = await getProjectDomain("user-1", "proj-1");
+    expect(result?.domain).toBe("active.com");
   });
 });
 

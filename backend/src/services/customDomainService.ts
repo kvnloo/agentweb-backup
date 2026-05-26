@@ -382,7 +382,9 @@ export async function getProjectDomain(
 ): Promise<CustomDomainRecord | null> {
   const domains = await listDomains(userId, vercelProjectId);
   return (
-    domains.find((d) => d.type === "custom" && d.status === "active") ?? null
+    domains.find((d) => d.type === "custom" && d.status === "active") ??
+    domains.find((d) => d.type === "custom" && d.status === "pending_verification") ??
+    null
   );
 }
 
