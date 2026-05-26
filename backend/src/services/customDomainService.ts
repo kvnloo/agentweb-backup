@@ -371,3 +371,67 @@ export async function verifyDomain(
         })),
   };
 }
+
+/**
+ * Get the active custom domain (type="custom", status="active") for a Vercel project.
+ * Returns null if the project has no verified custom domain yet.
+ */
+export async function getProjectDomain(
+  userId: string,
+  vercelProjectId: string
+): Promise<CustomDomainRecord | null> {
+  const domains = await listDomains(userId, vercelProjectId);
+  return (
+    domains.find((d) => d.type === "custom" && d.status === "active") ?? null
+  );
+}
+
+/**
+ * Add `{subdomainPrefix}.{mainDomain}` to the Vercel project.
+ * Returns the full domain string (e.g., "pricing.mysite.com").
+ * Treats a 409 conflict as success (domain already on this project).
+ */
+export async function setPageSubdomain(
+  userId: string,
+  vercelProjectId: string,
+  subdomainPrefix: string,
+  mainDomain: string
+): Promise<{ fullDomain: string }> {
+  const cleanPrefix = subdomainPrefix.toLowerCase().trim();
+  validateSubdomain(cleanPrefix);
+
+  const fullDomain = `${cleanPrefix}.${mainDomain}`;
+  const headers = await getVercelHeaders();
+
+  try {
+    await axios.post(
+      `${VERCEL_API_BASE}/v10/projects/${vercelProjectId}/domains`,
+      { name: fullDomain },
+      { headers }
+    );
+  } catch (err: any) {
+    if (err.response?.status !== 409) throw err;
+    // Already on this project — treat as success
+  }
+
+  return { fullDomain };
+}
+
+/**
+ * Remove `{fullDomain}` from the Vercel project.
+ * Silently ignores 404 (already removed).
+ */
+export async function removePageSubdomainFromVercel(
+  vercelProjectId: string,
+  fullDomain: string
+): Promise<void> {
+  const headers = await getVercelHeaders();
+  try {
+    await axios.delete(
+      `${VERCEL_API_BASE}/v9/projects/${vercelProjectId}/domains/${fullDomain}`,
+      { headers }
+    );
+  } catch (err: any) {
+    if (err.response?.status !== 404) throw err;
+  }
+}
