@@ -165,7 +165,7 @@ end run
     )
 
 
-def read_existing_chrome(*, max_chars: int = 12000) -> BrowserPage:
+def read_existing_chrome(*, max_chars: int = 40000) -> BrowserPage:
     script = _chrome_read_script()
     proc = _run_osascript(script)
     if proc.returncode != 0:
@@ -177,6 +177,89 @@ def read_existing_chrome(*, max_chars: int = 12000) -> BrowserPage:
         title=title,
         text=_clean_text(text)[:max_chars],
     )
+
+
+def scroll_existing_chrome(*, count: int = 3, max_chars: int = 40000) -> BrowserPage:
+    """Scroll the active Chrome tab N times then read text.
+
+    Prefers Playwright CDP (port 9222) when available — it waits for the DOM
+    to settle after each scroll, which is necessary for SPAs that lazy-load
+    content on scroll (feeds, search results, infinite lists, etc.).
+    Falls back to AppleScript otherwise.
+    """
+    cdp_page = _scroll_via_cdp(count=count, max_chars=max_chars)
+    if cdp_page is not None:
+        return cdp_page
+
+    script = r'''
+on run argv
+  set scrollTimes to (item 1 of argv) as integer
+  set separatorUrl to "---CODEX_RELAY_URL---"
+  set separatorText to "---CODEX_RELAY_TEXT---"
+  tell application "Google Chrome"
+    activate
+    if (count of windows) = 0 then error "Google Chrome has no open windows"
+    set targetTab to active tab of front window
+  end tell
+  set i to 0
+  repeat while i < scrollTimes
+    tell application "Google Chrome"
+      execute targetTab javascript "window.scrollBy(0, window.innerHeight * 3)"
+    end tell
+    delay 3
+    set i to i + 1
+  end repeat
+  delay 1
+  tell application "Google Chrome"
+    set pageTitle to title of targetTab
+    set finalUrl to URL of targetTab
+    set pageText to execute targetTab javascript "document.body ? document.body.innerText : ''"
+  end tell
+  return pageTitle & linefeed & separatorUrl & linefeed & finalUrl & linefeed & separatorText & linefeed & pageText
+end run
+'''
+    proc = _run_osascript(script, str(count), timeout_seconds=count * 4 + 15)
+    if proc.returncode != 0:
+        raise RuntimeError(_chrome_error_message(proc.stderr.strip()))
+    title, final_url, text = _parse_chrome_output(proc.stdout)
+    return BrowserPage(
+        requested_url=final_url,
+        final_url=final_url,
+        title=title,
+        text=_clean_text(text)[:max_chars],
+    )
+
+
+def _scroll_via_cdp(*, count: int, max_chars: int) -> "BrowserPage | None":
+    """Scroll via Playwright CDP if Chrome is running with remote debugging on port 9222."""
+    try:
+        import urllib.request
+        urllib.request.urlopen("http://localhost:9222/json/version", timeout=1).close()
+    except Exception:
+        return None
+    try:
+        from playwright.sync_api import sync_playwright
+        import time as _time
+        with sync_playwright() as pw:
+            browser = pw.chromium.connect_over_cdp("http://localhost:9222")
+            ctx = browser.contexts[0] if browser.contexts else None
+            if not ctx or not ctx.pages:
+                return None
+            page = ctx.pages[-1]
+            final_url = page.url
+            for _ in range(count):
+                page.evaluate("window.scrollBy(0, window.innerHeight * 3)")
+                _time.sleep(2.5)
+            text = page.evaluate("document.body ? document.body.innerText : ''")
+            title = page.title()
+            return BrowserPage(
+                requested_url=final_url,
+                final_url=final_url,
+                title=title,
+                text=_clean_text(text)[:max_chars],
+            )
+    except Exception:
+        return None
 
 
 def click_existing_chrome(
@@ -426,7 +509,11 @@ def main() -> None:
     _add_load_args(open_parser)
 
     read_parser = subparsers.add_parser("read", help="Read visible text from the active Chrome tab.")
-    read_parser.add_argument("--max-chars", type=int, default=12000)
+    read_parser.add_argument("--max-chars", type=int, default=40000)
+
+    scroll_parser = subparsers.add_parser("scroll", help="Scroll down N times then read visible text.")
+    scroll_parser.add_argument("--count", type=int, default=3, help="Number of scroll steps (default: 3).")
+    scroll_parser.add_argument("--max-chars", type=int, default=40000)
 
     click_parser = subparsers.add_parser("click", help="Click a visible element in existing Chrome.")
     click_parser.add_argument("--text", default="", help="Click element containing this visible text or label.")
@@ -446,6 +533,9 @@ def main() -> None:
 
     if args.command == "read":
         print(format_browser_context([read_existing_chrome(max_chars=args.max_chars)]))
+        return
+    if args.command == "scroll":
+        print(format_browser_context([scroll_existing_chrome(count=args.count, max_chars=args.max_chars)]))
         return
     if args.command == "click":
         result = click_existing_chrome(

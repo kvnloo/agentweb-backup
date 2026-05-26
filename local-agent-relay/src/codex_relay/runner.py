@@ -215,11 +215,16 @@ def _augment_task_with_browser_context(task: str, config: CodexConfig) -> str:
             "For browser actions against the user's existing logged-in Google Chrome, use terminal commands only. "
             "Do not use Computer Use for Chrome. Use this exact helper path:\n\n"
             f"{_quote(tool)}\n\n"
-            "Examples:\n"
-            f"{_quote(tool)} read\n"
+            "Commands:\n"
+            f"{_quote(tool)} read                          # read visible text from the active tab\n"
+            f"{_quote(tool)} scroll                        # scroll down 3 times then read (for pages that load content on scroll)\n"
+            f"{_quote(tool)} scroll --count N              # scroll down N times then read\n"
             f"{_quote(tool)} click --text \"Like\" --index 1\n"
             f"{_quote(tool)} click --role button --name \"Like\" --index 1\n"
             f"{_quote(tool)} type \"hello\" --selector \"textarea\"\n"
+            "\nIMPORTANT: If the initial browser context below looks incomplete or truncated "
+            "(e.g. a feed showing only a few items, a list missing entries, or a page that loads content dynamically), "
+            "use `scroll` to load more content before answering. Repeat scrolling as needed until you have enough data.\n"
             "</browser_tools>"
         )
     if context:
