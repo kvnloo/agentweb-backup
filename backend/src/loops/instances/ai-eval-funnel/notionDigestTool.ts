@@ -17,6 +17,7 @@
 import axios from 'axios';
 import type { Mutation, MutationProposal, MutationTools } from '../../core/types';
 import { asMutationId } from '../../core/types';
+import { getNotionCredentials } from '../../../services/notionService';
 import type { AiEvalProposalPayload } from './rules';
 
 const NOTION_API_URL = 'https://api.notion.com/v1';
@@ -27,30 +28,44 @@ const NOTION_VERSION = '2022-06-28';
 const SPRINT_TASKS_DATA_SOURCE = '2bf09247-c951-812a-bd0a-000bd4c05bbf';
 
 interface NotionDigestToolOptions {
-  /** Override the Notion API token. Defaults to NOTION_API_KEY env var. */
+  /** Override the Notion API token. Defaults to loading from
+   * `prod/AgentWeb/Notion` / `dev/AgentWeb/Notion` via Secrets Manager —
+   * same pattern as `services/notionService.ts`. */
   token?: string;
   /** Override the data-source ID. */
   dataSourceId?: string;
 }
 
 export class NotionDigestTool implements MutationTools<AiEvalProposalPayload> {
-  private readonly token: string | undefined;
+  private readonly tokenOverride: string | undefined;
   private readonly dataSourceId: string;
 
   constructor(options: NotionDigestToolOptions = {}) {
-    this.token = options.token ?? process.env.NOTION_API_KEY;
+    this.tokenOverride = options.token;
     this.dataSourceId = options.dataSourceId ?? SPRINT_TASKS_DATA_SOURCE;
+  }
+
+  private async getToken(): Promise<string | null> {
+    if (this.tokenOverride) return this.tokenOverride;
+    try {
+      const { apiToken } = await getNotionCredentials();
+      return apiToken;
+    } catch (err) {
+      console.error('[NotionDigestTool] Failed to load Notion credentials:', String(err));
+      return null;
+    }
   }
 
   async apply(proposal: MutationProposal<AiEvalProposalPayload>): Promise<Mutation> {
     const mutationId = asMutationId(`${proposal.proposalId}:mutation`);
-    if (!this.token) {
+    const token = await this.getToken();
+    if (!token) {
       return {
         mutationId,
         proposalId: proposal.proposalId,
         kind: proposal.kind,
         artifact: {},
-        error: 'NOTION_API_KEY env var missing — Notion task not created',
+        error: 'Notion credentials not available (prod/AgentWeb/Notion or dev/AgentWeb/Notion secret missing/empty)',
       };
     }
 
@@ -75,7 +90,7 @@ export class NotionDigestTool implements MutationTools<AiEvalProposalPayload> {
         },
         {
           headers: {
-            Authorization: `Bearer ${this.token}`,
+            Authorization: `Bearer ${token}`,
             'Notion-Version': NOTION_VERSION,
             'Content-Type': 'application/json',
           },
