@@ -26,7 +26,9 @@ import {
   upsertEnvVar,
   deleteEnvVar,
   updateLandingPageContext,
+  updateLandingPageLeadList,
   INTEGRATIONS,
+  resolveSiteForCaller,
 } from "../services/v0Service";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { listDomains, CustomDomainRecord } from "../services/customDomainService";
@@ -227,6 +229,37 @@ const editRateLimiter = createRateLimiter(
 );
 
 router.use(authenticateToken);
+
+/**
+ * GET /api/landing-pages/v0/site
+ * Returns the caller's root landing site and its deploy status.
+ */
+router.get("/site", async (req: Request, res: Response) => {
+  try {
+    const callerUserId = (req as unknown as AuthenticatedRequest).user!.userId;
+    const site = await resolveSiteForCaller(callerUserId);
+    if (!site) {
+      return res.status(404).json({
+        deployStatus: "no_site",
+        error: "No landing site found. Create a page first.",
+      });
+    }
+    let deployStatus: "deploying" | "ready" | "failed";
+    if (site.status === "failed") deployStatus = "failed";
+    else if (site.vercelProjectId && site.githubRepoUrl) deployStatus = "ready";
+    else deployStatus = "deploying";
+    return res.json({
+      rootPageId: site.id,
+      vercelProjectId: site.vercelProjectId,
+      githubRepoUrl: site.githubRepoUrl,
+      gtmContainerId: site.gtmContainerId,
+      deployStatus,
+    });
+  } catch (err) {
+    console.error("GET /site failed:", err);
+    return res.status(500).json({ error: "Failed to load site" });
+  }
+});
 
 /**
  * POST /api/landing-pages/v0/generate
@@ -1232,99 +1265,14 @@ router.post("/generated/:id/gtm", editRateLimiter, async (req, res: Response) =>
 
     const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
     if (!repoMatch) return res.status(400).json({ error: "Invalid GitHub repo URL" });
-    const [, owner, repoRaw] = repoMatch;
-    const repo = repoRaw.replace(".git", "");
 
-    const { getGitHubOrgToken } = await import("../utils/secretsManager");
-    const { token } = await getGitHubOrgToken();
-    const ghHeaders = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" };
-    const GITHUB_TIMEOUT_MS = 30_000;
-    const repoBase = `https://api.github.com/repos/${owner}/${repo}`;
-
-    // 1. Fetch current layout.tsx
-    const layoutPath = "app/layout.tsx";
-    let currentContent = "";
-    let fileSha: string | undefined;
-    try {
-      const fileRes = await axios.get<any>(`${repoBase}/contents/${layoutPath}`, {
-        headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS,
-      });
-      currentContent = Buffer.from(fileRes.data.content, "base64").toString("utf-8");
-      fileSha = fileRes.data.sha;
-    } catch (err: any) {
-      if (err.response?.status === 404) {
-        return res.status(400).json({ error: "app/layout.tsx not found in the repository" });
-      }
-      throw err;
-    }
-
-    // 2. Build GTM snippets
-    const gtmHeadSnippet =
-      `        {/* Google Tag Manager */}\n` +
-      `        <script dangerouslySetInnerHTML={{ __html: \`(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src='https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);})(window,document,'script','dataLayer','${containerId}');\` }} />\n` +
-      `        {/* End Google Tag Manager */}`;
-
-    const gtmBodySnippet =
-      `        {/* Google Tag Manager (noscript) */}\n` +
-      `        <noscript dangerouslySetInnerHTML={{ __html: \`<iframe src="https://www.googletagmanager.com/ns.html?id=${containerId}" height="0" width="0" style="display:none;visibility:hidden"></iframe>\` }} />\n` +
-      `        {/* End Google Tag Manager (noscript) */}`;
-
-    // 3. Idempotent injection — strip any existing GTM block first
-    let updatedContent = currentContent
-      .replace(/[ \t]*\{\/\* Google Tag Manager \*\/\}[\s\S]*?\{\/\* End Google Tag Manager \*\/\}\n?/g, "")
-      .replace(/[ \t]*\{\/\* Google Tag Manager \(noscript\) \*\/\}[\s\S]*?\{\/\* End Google Tag Manager \(noscript\) \*\/\}\n?/g, "");
-
-    // Insert head snippet inside <head> (before </head> or before first child after <head>)
-    if (/<head[^>]*>/.test(updatedContent)) {
-      updatedContent = updatedContent.replace(
-        /(<head[^>]*>)/,
-        `$1\n${gtmHeadSnippet}`
-      );
-    } else {
-      // Fallback: insert before <body
-      updatedContent = updatedContent.replace(
-        /(<body[^>]*>)/,
-        `${gtmHeadSnippet}\n      $1`
-      );
-    }
-
-    // Insert noscript snippet immediately after <body ...>
-    if (/<body[^>]*>/.test(updatedContent)) {
-      updatedContent = updatedContent.replace(
-        /(<body[^>]*>)/,
-        `$1\n${gtmBodySnippet}`
-      );
-    }
-
-    // 4. Commit updated layout.tsx to GitHub
-    const base64New = Buffer.from(updatedContent, "utf-8").toString("base64");
-    await axios.put<any>(
-      `${repoBase}/contents/${layoutPath}`,
-      {
-        message: `chore: inject GTM container ${containerId}`,
-        content: base64New,
-        sha: fileSha,
-      },
-      { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
-    );
-
-    // 5. Persist gtmContainerId in DynamoDB
-    await updateLandingPageGtm(page.id, page.userId, containerId);
-
-    // Trigger Vercel re-deploy if we have a project ID
-    const vercelProjectId = await resolveVercelProjectId(page);
-    if (vercelProjectId) {
-      try {
-        await triggerVercelDeployment(vercelProjectId, `${owner}/${repo}`);
-      } catch (deployErr: any) {
-        console.warn(`[LP GENERATION] Could not trigger Vercel re-deploy after GTM inject: ${deployErr.message}`);
-      }
-    }
+    await saveGtmForPage(page, containerId);
 
     res.json({ success: true, gtmContainerId: containerId, message: `GTM container ${containerId} injected. Your site will redeploy shortly.` });
   } catch (error: any) {
     console.error("[LP GENERATION] Error injecting GTM:", error);
-    res.status(500).json({ error: error.response?.data?.message || error.message || "Failed to inject GTM" });
+    const httpStatus = error?.httpStatus ?? 500;
+    res.status(httpStatus).json({ error: error.response?.data?.message || error.message || "Failed to inject GTM" });
   }
 });
 
@@ -1361,6 +1309,119 @@ router.get("/generated/:id/preview-url", async (req, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
+// Helper: load integrations payload for a given page (no auth check).
+// Returns the same shape as GET /generated/:id/integrations.
+// ---------------------------------------------------------------------------
+async function loadIntegrationsForPage(page: GeneratedLandingPage): Promise<{
+  recaptcha: { siteKey: string; secretKeyIsSet: boolean };
+  custom: Array<{ key: string; value: string; id?: string; secret?: boolean }>;
+}> {
+  const vercelProjectId = await resolveVercelProjectId(page);
+  if (!vercelProjectId) {
+    return { recaptcha: { siteKey: "", secretKeyIsSet: false }, custom: [] };
+  }
+
+  const envMap = await getProjectEnvVars(vercelProjectId);
+  const cfg = INTEGRATIONS.recaptcha;
+  const siteKeyEntry = envMap[cfg.siteKey.envKey];
+  const secretKeyEntry = envMap[cfg.secretKey.envKey];
+
+  // All known integration env var keys
+  const knownKeys = new Set<string>([cfg.siteKey.envKey, cfg.secretKey.envKey]);
+
+  // Custom env vars: anything not in a known integration
+  const custom = Object.entries(envMap)
+    .filter(([key]) => !knownKeys.has(key))
+    .map(([key, entry]) => ({ key, value: entry.value, id: entry.id, secret: entry.type === "encrypted" }));
+
+  return {
+    recaptcha: {
+      siteKey: siteKeyEntry?.value ?? "",
+      secretKeyIsSet: !!secretKeyEntry?.id,
+    },
+    custom,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Helper: save integrations for a given page (no auth check).
+// Upserts/deletes env vars on the Vercel project and triggers a redeployment.
+// Returns the list of env var keys that were touched.
+// Throws if the page has no Vercel project.
+// ---------------------------------------------------------------------------
+async function saveIntegrationsForPage(
+  page: GeneratedLandingPage,
+  body: {
+    recaptcha?: { siteKey?: string; secretKey?: string };
+    custom?: Array<{ key: string; value: string; secret?: boolean; id?: string; _delete?: boolean }>;
+  },
+): Promise<{ updated: string[] }> {
+  const vercelProjectId = await resolveVercelProjectId(page);
+  if (!vercelProjectId) {
+    throw new Error("Landing page has no Vercel project — deploy it first");
+  }
+
+  const { recaptcha, custom } = body;
+
+  const envMap = await getProjectEnvVars(vercelProjectId);
+  const updated: string[] = [];
+  const allTargets = ["production", "preview", "development"];
+
+  if (recaptcha) {
+    const cfg = INTEGRATIONS.recaptcha;
+
+    if (recaptcha.siteKey !== undefined) {
+      const existing = envMap[cfg.siteKey.envKey];
+      if (recaptcha.siteKey === "") {
+        if (existing?.ids) await Promise.all(existing.ids.map(id => deleteEnvVar(vercelProjectId, id)));
+      } else {
+        await upsertEnvVar(vercelProjectId, cfg.siteKey.envKey, recaptcha.siteKey, cfg.siteKey.target as string[], existing?.ids, cfg.siteKey.type);
+      }
+      updated.push(cfg.siteKey.envKey);
+    }
+
+    if (recaptcha.secretKey !== undefined) {
+      const existing = envMap[cfg.secretKey.envKey];
+      if (recaptcha.secretKey === "") {
+        if (existing?.ids) await Promise.all(existing.ids.map(id => deleteEnvVar(vercelProjectId, id)));
+      } else {
+        await upsertEnvVar(vercelProjectId, cfg.secretKey.envKey, recaptcha.secretKey, cfg.secretKey.target as string[], existing?.ids, cfg.secretKey.type);
+      }
+      updated.push(cfg.secretKey.envKey);
+    }
+  }
+
+  if (Array.isArray(custom)) {
+    for (const entry of custom) {
+      if (!entry.key) continue;
+      if (entry._delete) {
+        const existing = entry.id ? { ids: [entry.id] } : envMap[entry.key];
+        if (existing?.ids) await Promise.all(existing.ids.map(id => deleteEnvVar(vercelProjectId, id)));
+      } else {
+        const existing = envMap[entry.key];
+        await upsertEnvVar(vercelProjectId, entry.key, entry.value, allTargets, existing?.ids, entry.secret ? "encrypted" : "plain");
+      }
+      updated.push(entry.key);
+    }
+  }
+
+  // Trigger a redeployment so the new env vars take effect
+  if (updated.length > 0 && page.githubRepoUrl) {
+    try {
+      const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+      if (repoMatch) {
+        const [, owner, repo] = repoMatch;
+        await triggerVercelDeployment(vercelProjectId, `${owner}/${repo.replace(".git", "")}`);
+      }
+    } catch (deployErr: any) {
+      console.warn(`[LP GENERATION] Could not trigger redeployment after env var update: ${deployErr.message}`);
+    }
+  }
+
+  return { updated };
+}
+
+// ---------------------------------------------------------------------------
 // GET /generated/:id/integrations
 // Returns current integration values for the page's Vercel project.
 // Secret key values are never returned — only a boolean "isSet" flag.
@@ -1374,31 +1435,8 @@ router.get("/generated/:id/integrations", editRateLimiter, async (req: Request, 
     if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
     const page = auth.page;
 
-    const vercelProjectId = await resolveVercelProjectId(page);
-    if (!vercelProjectId) {
-      return res.json({ recaptcha: { siteKey: "", secretKeyIsSet: false } });
-    }
-
-    const envMap = await getProjectEnvVars(vercelProjectId);
-    const cfg = INTEGRATIONS.recaptcha;
-    const siteKeyEntry = envMap[cfg.siteKey.envKey];
-    const secretKeyEntry = envMap[cfg.secretKey.envKey];
-
-    // All known integration env var keys
-    const knownKeys = new Set<string>([cfg.siteKey.envKey, cfg.secretKey.envKey]);
-
-    // Custom env vars: anything not in a known integration
-    const custom = Object.entries(envMap)
-      .filter(([key]) => !knownKeys.has(key))
-      .map(([key, entry]) => ({ key, value: entry.value, id: entry.id, secret: entry.type === "encrypted" }));
-
-    res.json({
-      recaptcha: {
-        siteKey: siteKeyEntry?.value ?? "",
-        secretKeyIsSet: !!secretKeyEntry?.id,
-      },
-      custom,
-    });
+    const payload = await loadIntegrationsForPage(page);
+    res.json(payload);
   } catch (error: any) {
     console.error("[LP GENERATION] Error getting integrations:", error);
     res.status(500).json({ error: error.message || "Failed to get integrations" });
@@ -1419,75 +1457,192 @@ router.put("/generated/:id/integrations", editRateLimiter, async (req: Request, 
     if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
     const page = auth.page;
 
-    const vercelProjectId = await resolveVercelProjectId(page);
-    if (!vercelProjectId) {
-      return res.status(400).json({ error: "Landing page has no Vercel project — deploy it first" });
+    if (typeof req.body !== "object" || req.body == null) {
+      return res.status(400).json({ error: "Invalid body" });
     }
 
-    const { recaptcha, custom } = req.body as {
-      recaptcha?: { siteKey?: string; secretKey?: string };
-      custom?: { key: string; value: string; secret?: boolean; id?: string; _delete?: boolean }[];
-    };
-
-    const envMap = await getProjectEnvVars(vercelProjectId);
-    const updated: string[] = [];
-    const allTargets = ["production", "preview", "development"];
-
-    if (recaptcha) {
-      const cfg = INTEGRATIONS.recaptcha;
-
-      if (recaptcha.siteKey !== undefined) {
-        const existing = envMap[cfg.siteKey.envKey];
-        if (recaptcha.siteKey === "") {
-          if (existing?.ids) await Promise.all(existing.ids.map(id => deleteEnvVar(vercelProjectId, id)));
-        } else {
-          await upsertEnvVar(vercelProjectId, cfg.siteKey.envKey, recaptcha.siteKey, cfg.siteKey.target as string[], existing?.ids, cfg.siteKey.type);
-        }
-        updated.push(cfg.siteKey.envKey);
+    try {
+      const { updated } = await saveIntegrationsForPage(page, req.body);
+      res.json({ success: true, updated });
+    } catch (saveErr: any) {
+      if (saveErr.message?.includes("no Vercel project")) {
+        return res.status(400).json({ error: saveErr.message });
       }
-
-      if (recaptcha.secretKey !== undefined) {
-        const existing = envMap[cfg.secretKey.envKey];
-        if (recaptcha.secretKey === "") {
-          if (existing?.ids) await Promise.all(existing.ids.map(id => deleteEnvVar(vercelProjectId, id)));
-        } else {
-          await upsertEnvVar(vercelProjectId, cfg.secretKey.envKey, recaptcha.secretKey, cfg.secretKey.target as string[], existing?.ids, cfg.secretKey.type);
-        }
-        updated.push(cfg.secretKey.envKey);
-      }
+      throw saveErr;
     }
-
-    if (Array.isArray(custom)) {
-      for (const entry of custom) {
-        if (!entry.key) continue;
-        if (entry._delete) {
-          const existing = entry.id ? { ids: [entry.id] } : envMap[entry.key];
-          if (existing?.ids) await Promise.all(existing.ids.map(id => deleteEnvVar(vercelProjectId, id)));
-        } else {
-          const existing = envMap[entry.key];
-          await upsertEnvVar(vercelProjectId, entry.key, entry.value, allTargets, existing?.ids, entry.secret ? "encrypted" : "plain");
-        }
-        updated.push(entry.key);
-      }
-    }
-
-    // Trigger a redeployment so the new env vars take effect
-    if (updated.length > 0 && page.githubRepoUrl) {
-      try {
-        const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
-        if (repoMatch) {
-          const [, owner, repo] = repoMatch;
-          await triggerVercelDeployment(vercelProjectId, `${owner}/${repo.replace(".git", "")}`);
-        }
-      } catch (deployErr: any) {
-        console.warn(`[LP GENERATION] Could not trigger redeployment after env var update: ${deployErr.message}`);
-      }
-    }
-
-    res.json({ success: true, updated });
   } catch (error: any) {
     console.error("[LP GENERATION] Error updating integrations:", error);
     res.status(500).json({ error: error.message || "Failed to update integrations" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Helper: inject GTM into a page's layout.tsx and persist the container ID.
+// Does NOT do auth checks — callers must authorize before calling.
+// ---------------------------------------------------------------------------
+async function saveGtmForPage(
+  page: GeneratedLandingPage,
+  containerId: string,
+): Promise<void> {
+  if (!page.githubRepoUrl) throw new Error("Landing page has no GitHub repository");
+
+  const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+  if (!repoMatch) throw new Error("Invalid GitHub repo URL");
+  const [, owner, repoRaw] = repoMatch;
+  const repo = repoRaw.replace(".git", "");
+
+  const { getGitHubOrgToken } = await import("../utils/secretsManager");
+  const { token } = await getGitHubOrgToken();
+  const ghHeaders = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" };
+  const GITHUB_TIMEOUT_MS = 30_000;
+  const repoBase = `https://api.github.com/repos/${owner}/${repo}`;
+
+  // 1–4. Fetch layout.tsx, derive updated content, and commit — with up to 3 attempts
+  //       to handle GitHub SHA race conditions (409 Conflict).
+  const layoutPath = "app/layout.tsx";
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      // 1. Fetch current layout.tsx (inside loop so each retry gets a fresh SHA)
+      let currentContent = "";
+      let fileSha: string | undefined;
+      const fileRes = await axios.get<any>(`${repoBase}/contents/${layoutPath}`, {
+        headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS,
+      });
+      currentContent = Buffer.from(fileRes.data.content, "base64").toString("utf-8");
+      fileSha = fileRes.data.sha;
+
+      // 2. Build GTM snippets
+      const gtmHeadSnippet =
+        `        {/* Google Tag Manager */}\n` +
+        `        <script dangerouslySetInnerHTML={{ __html: \`(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src='https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);})(window,document,'script','dataLayer','${containerId}');\` }} />\n` +
+        `        {/* End Google Tag Manager */}`;
+
+      const gtmBodySnippet =
+        `        {/* Google Tag Manager (noscript) */}\n` +
+        `        <noscript dangerouslySetInnerHTML={{ __html: \`<iframe src="https://www.googletagmanager.com/ns.html?id=${containerId}" height="0" width="0" style="display:none;visibility:hidden"></iframe>\` }} />\n` +
+        `        {/* End Google Tag Manager (noscript) */}`;
+
+      // 3. Idempotent injection — strip any existing GTM block first
+      let updatedContent = currentContent
+        .replace(/[ \t]*\{\/\* Google Tag Manager \*\/\}[\s\S]*?\{\/\* End Google Tag Manager \*\/\}\n?/g, "")
+        .replace(/[ \t]*\{\/\* Google Tag Manager \(noscript\) \*\/\}[\s\S]*?\{\/\* End Google Tag Manager \(noscript\) \*\/\}\n?/g, "");
+
+      // Insert head snippet inside <head> (before </head> or before first child after <head>)
+      if (/<head[^>]*>/.test(updatedContent)) {
+        updatedContent = updatedContent.replace(
+          /(<head[^>]*>)/,
+          `$1\n${gtmHeadSnippet}`
+        );
+      } else {
+        // Fallback: insert before <body
+        updatedContent = updatedContent.replace(
+          /(<body[^>]*>)/,
+          `${gtmHeadSnippet}\n      $1`
+        );
+      }
+
+      // Insert noscript snippet immediately after <body ...>
+      if (/<body[^>]*>/.test(updatedContent)) {
+        updatedContent = updatedContent.replace(
+          /(<body[^>]*>)/,
+          `$1\n${gtmBodySnippet}`
+        );
+      }
+
+      // 4. Commit updated layout.tsx to GitHub
+      const base64New = Buffer.from(updatedContent, "utf-8").toString("base64");
+      await axios.put<any>(
+        `${repoBase}/contents/${layoutPath}`,
+        {
+          message: `chore: inject GTM container ${containerId}`,
+          content: base64New,
+          sha: fileSha,
+        },
+        { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+      );
+      break; // success — exit retry loop
+    } catch (err: any) {
+      const status = err?.response?.status;
+      if (status === 404) {
+        throw Object.assign(new Error("app/layout.tsx not found in the repository"), { httpStatus: 400 });
+      }
+      if (status === 409 && attempt < MAX_ATTEMPTS) continue;
+      throw err;
+    }
+  }
+
+  // 5. Persist gtmContainerId in DynamoDB
+  await updateLandingPageGtm(page.id, page.userId, containerId);
+
+  // Trigger Vercel re-deploy if we have a project ID
+  const vercelProjectId = await resolveVercelProjectId(page);
+  if (vercelProjectId) {
+    try {
+      await triggerVercelDeployment(vercelProjectId, `${owner}/${repo}`);
+    } catch (deployErr: any) {
+      console.warn(`[LP GENERATION] Could not trigger Vercel re-deploy after GTM inject: ${deployErr.message}`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /site/gtm
+// Injects GTM into the caller's root landing site.
+// ---------------------------------------------------------------------------
+router.post("/site/gtm", async (req, res: Response) => {
+  const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
+  try {
+    const { gtmContainerId } = req.body ?? {};
+    if (!gtmContainerId || typeof gtmContainerId !== "string" || !/^GTM-[A-Z0-9]{4,10}$/.test(gtmContainerId)) {
+      return res.status(400).json({ error: "Invalid GTM container ID" });
+    }
+    const site = await resolveSiteForCaller(userId);
+    if (!site) return res.status(404).json({ error: "No landing site found" });
+    await saveGtmForPage(site, gtmContainerId);
+    return res.json({ ok: true, gtmContainerId });
+  } catch (err: any) {
+    console.error("POST /site/gtm failed:", err);
+    const httpStatus = err?.httpStatus ?? 500;
+    return res.status(httpStatus).json({ error: err?.message ?? "Failed to save GTM" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /site/integrations
+// Returns integration values for the caller's root landing site.
+// ---------------------------------------------------------------------------
+router.get("/site/integrations", async (req: Request, res: Response) => {
+  try {
+    const site = await resolveSiteForCaller((req as unknown as AuthenticatedRequest).user!.userId);
+    if (!site) return res.status(404).json({ error: "No landing site found" });
+    const payload = await loadIntegrationsForPage(site);
+    return res.json(payload);
+  } catch (err) {
+    console.error("GET /site/integrations failed:", err);
+    return res.status(500).json({ error: "Failed to load integrations" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PUT /site/integrations
+// Saves integration env vars for the caller's root landing site.
+// Returns the fresh integrations payload (same shape as GET /site/integrations).
+// ---------------------------------------------------------------------------
+router.put("/site/integrations", async (req: Request, res: Response) => {
+  try {
+    const site = await resolveSiteForCaller((req as unknown as AuthenticatedRequest).user!.userId);
+    if (!site) return res.status(404).json({ error: "No landing site found" });
+    if (typeof req.body !== "object" || req.body == null) {
+      return res.status(400).json({ error: "Invalid body" });
+    }
+    await saveIntegrationsForPage(site, req.body);
+    const payload = await loadIntegrationsForPage(site);
+    return res.json(payload);
+  } catch (err) {
+    console.error("PUT /site/integrations failed:", err);
+    return res.status(500).json({ error: "Failed to save integrations" });
   }
 });
 
@@ -1536,6 +1691,62 @@ router.patch("/generated/:id/context", authenticateToken, async (req, res: Respo
   } catch (error: any) {
     console.error("[LP GENERATION] Error updating context:", error);
     res.status(500).json({ error: error.message || "Failed to update context" });
+  }
+});
+
+/**
+ * PATCH /api/landing-pages/v0/generated/:id/lead-list
+ * Set or clear the CRM lead list associated with this landing page.
+ * Body: { leadListId: string | null }
+ */
+router.patch("/generated/:id/lead-list", async (req, res: Response) => {
+  try {
+    const callerUserId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!callerUserId) return res.status(401).json({ error: "Unauthorized" });
+    const { id } = req.params;
+    if (!("leadListId" in (req.body ?? {}))) {
+      return res.status(400).json({ error: "leadListId is required (string or null)" });
+    }
+    const { leadListId } = req.body as { leadListId: string | null };
+    if (leadListId !== null && typeof leadListId !== "string") {
+      return res.status(400).json({ error: "leadListId must be a string or null" });
+    }
+
+    const authz = await authorizeLandingPageAccess(id, callerUserId, "edit");
+    if (!authz.ok) return res.status(authz.status).json({ error: authz.error });
+
+    if (leadListId !== null) {
+      const list = await crmDb.getLeadListById(leadListId);
+      if (!list) return res.status(404).json({ error: "Lead list not found" });
+      const sameOwner = list.userId === authz.page.userId;
+      if (!sameOwner) {
+        const callerUser = await userDb.getUserById(callerUserId);
+        const listOwner = await userDb.getUserById(list.userId);
+        const org = callerUser?.orgId ? await orgDb.getOrgById(callerUser.orgId) : null;
+        const allowed = canEditItem(
+          { userId: list.userId },
+          { userId: callerUserId, orgId: callerUser?.orgId, orgRole: callerUser?.orgRole as any },
+          org,
+          listOwner?.orgId,
+          "landingPages",
+        );
+        if (!allowed) return res.status(403).json({ error: "Lead list not accessible" });
+      }
+    }
+
+    try {
+      await updateLandingPageLeadList(id, authz.page.userId, leadListId);
+    } catch (err: any) {
+      if (err?.code === "ConditionalCheckFailedException" || err?.name === "ConditionalCheckFailedException") {
+        return res.status(409).json({ error: "Page was modified concurrently" });
+      }
+      throw err;
+    }
+    const updated = await getLandingPageById(id);
+    return res.json(updated);
+  } catch (err) {
+    console.error("PATCH /lead-list failed:", err);
+    return res.status(500).json({ error: "Failed to update lead list" });
   }
 });
 
