@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-27',
     changes: [
+      'Fixed: Clearer Error When Coding Agent Lacks Permission to Edit a Landing Page',
+      '- When a team member without edit access tried to use the coding agent to edit a landing page, the agent would silently loop and fail with a cryptic error',
+      '- The agent now immediately returns a clear message explaining the permission issue and directing the org owner to Settings → Organization → Org-wide Sharing → Landing Pages to grant access',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
       'Fixed: CRM Lead Panel Notes and Fields Now Show the Correct Lead\'s Data',
       '- Opening a lead panel, then clicking a different lead was displaying notes, stage, sentiment, next step, and other editable fields from the previously viewed lead',
       '- All editable fields in the lead detail panel now reset correctly whenever you switch to a different lead',
