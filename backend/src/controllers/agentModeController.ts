@@ -2189,12 +2189,16 @@ export const agentModeController = {
       // Skip for session-limit errors (user message wasn't saved either).
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
+      const isGenerationTimeout = error instanceof Error && error.message.includes('Generation timed out');
       if (sessionId && !(error instanceof Error && isSessionLimitError(error))) {
         // Skip diagnosis for context-limit errors (they have specific handling below).
+        // Skip diagnosis for generation timeouts — give a direct message without an LLM call.
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
             diagnosticContent = 'The server restarted while processing your request. Please send your message again.';
+          } else if (isGenerationTimeout) {
+            diagnosticContent = 'This request took too long to process. Please try again — your session is still active. For large data tasks, try breaking them into smaller steps (e.g. filter first, then export).';
           } else {
             const userMessage = req.body?.userMessage || '';
             diagnosticContent = await getDiagnosticErrorMessage(error, sessionId, userMessage);
@@ -2218,6 +2222,16 @@ export const agentModeController = {
 
       // Handle specific error types
       if (error instanceof Error) {
+        if (isGenerationTimeout) {
+          res.status(504).json({
+            error: 'Generation timed out',
+            message: 'The response took too long to generate. Please try again — your session is still active.',
+            code: 'GENERATION_TIMEOUT',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
         if (error.message.includes('SESSION_MESSAGE_LIMIT_EXCEEDED')) {
           // Extract the actual error message from the error
           const errorMessage = error.message.includes(':')
@@ -2326,16 +2340,6 @@ export const agentModeController = {
           return;
         }
 
-        if (error.message.includes('Generation timed out')) {
-          res.status(504).json({
-            error: 'Generation timed out',
-            message: 'The response took too long to generate. Please try again — your session is still active.',
-            code: 'GENERATION_TIMEOUT',
-            suggestion: 'wait_and_retry'
-          });
-          return;
-        }
-
         // Unknown error - send oncall alert
         const user = req.user as User;
         const sessionId = req.body?.sessionId;
@@ -2343,7 +2347,7 @@ export const agentModeController = {
         const llmModel = req.body?.llmModel;
         const attachments = req.body?.attachments;
         const session = sessionId ? await chatbotDb.getChatSession(sessionId).catch(() => null) : null;
-        
+
         // Send oncall alert asynchronously (don't await to avoid blocking response)
         const originalMessageForAlert = (error as any)?.originalMessage;
         sendAgentModeOncallAlert({
@@ -2845,12 +2849,16 @@ export const agentModeController = {
       // Skip for session-limit errors (user message wasn't saved either).
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
+      const isGenerationTimeoutShared = error instanceof Error && error.message.includes('Generation timed out');
       if (shareId && !(error instanceof Error && isSessionLimitError(error))) {
         // Skip diagnosis for context-limit errors (they have specific handling below).
+        // Skip diagnosis for generation timeouts — give a direct message without an LLM call.
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
             diagnosticContent = 'The server restarted while processing your request. Please send your message again.';
+          } else if (isGenerationTimeoutShared) {
+            diagnosticContent = 'This request took too long to process. Please try again — your session is still active. For large data tasks, try breaking them into smaller steps.';
           } else {
             const userMessage = req.body?.userMessage || '';
             diagnosticContent = await getDiagnosticErrorMessage(error, shareId, userMessage);
@@ -2874,6 +2882,16 @@ export const agentModeController = {
 
       // Handle specific error types (same as generateResponse)
       if (error instanceof Error) {
+        if (isGenerationTimeoutShared) {
+          res.status(504).json({
+            error: 'Generation timed out',
+            message: 'The response took too long to generate. Please try again — your session is still active.',
+            code: 'GENERATION_TIMEOUT',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
         if (error.message.includes('SESSION_MESSAGE_LIMIT_EXCEEDED')) {
           // Extract the actual error message from the error
           const errorMessage = error.message.includes(':')
@@ -2978,16 +2996,6 @@ export const agentModeController = {
             error: 'Server is restarting',
             message: 'The server is restarting. Please try again in a moment.',
             code: 'SERVER_RESTARTING',
-            suggestion: 'wait_and_retry'
-          });
-          return;
-        }
-
-        if (error.message.includes('Generation timed out')) {
-          res.status(504).json({
-            error: 'Generation timed out',
-            message: 'The response took too long to generate. Please try again — your session is still active.',
-            code: 'GENERATION_TIMEOUT',
             suggestion: 'wait_and_retry'
           });
           return;
