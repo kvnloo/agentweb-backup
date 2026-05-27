@@ -9,6 +9,96 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-27',
+    changes: [
+      'Improved: CRM Lead Panel Now Auto-Syncs LinkedIn Messages and Uses Activity History for Drafts',
+      '- Opening a lead detail panel now automatically syncs the lead\'s LinkedIn message history (if a LinkedIn URL is set) — no more manual "Sync LinkedIn" click needed',
+      '- The sync runs silently on panel open if the last sync was more than 10 minutes ago, so the activity timeline is always fresh',
+      '- AI-generated LinkedIn message drafts now consider the full engagement history — past emails, LinkedIn messages, and interactions are included in the prompt so drafts feel relevant and reference prior touchpoints',
+      '- This applies both to on-demand drafts (Draft Message button) and auto-generated drafts triggered when a LinkedIn connection is accepted',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: Emma No Longer Tells Users to Connect Slack via Connected Accounts',
+      '- When no Slack channel was configured, Emma was incorrectly directing users to Settings → Connected Accounts to connect Slack',
+      '- Slack channels are configured by an admin, not through individual user settings — Emma now correctly tells users to contact their admin to set up Slack access',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: LinkedIn Connection Status Now Scoped Strictly to the List\'s Assigned Account',
+      '- Previously, LinkedIn connection status checks could match connections from site-wide scraping accounts or other users\' accounts, producing false "connected" results in the CRM overview',
+      '- Connection status is now checked exclusively against the LinkedIn account explicitly assigned to each lead list — no fallbacks, no cross-account leakage',
+      '- If no LinkedIn account is assigned to a list, the status check is skipped and shows as not connected (no ambiguous results)',
+      '- The "Set for List" button in CRM → Senders is now accessible even when no email domain is configured, fixing a UI bug that prevented LinkedIn account assignment',
+      '- The LinkedIn connection sync cron now includes per-user connected accounts (not just site-wide accounts), so personal connections are synced correctly',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: Clearer Error When Coding Agent Lacks Permission to Edit a Landing Page',
+      '- When a team member without edit access tried to use the coding agent to edit a landing page, the agent would silently loop and fail with a cryptic error',
+      '- The agent now immediately returns a clear message explaining the permission issue and directing the org owner to Settings → Organization → Org-wide Sharing → Landing Pages to grant access',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: CRM Lead Panel Notes and Fields Now Show the Correct Lead\'s Data',
+      '- Opening a lead panel, then clicking a different lead was displaying notes, stage, sentiment, next step, and other editable fields from the previously viewed lead',
+      '- All editable fields in the lead detail panel now reset correctly whenever you switch to a different lead',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: CRM Inbox Now Explains When Leads Are Missing Emails',
+      '- The CRM Inbox groups contacts by email address, so leads imported from LinkedIn without an email (name, company, LinkedIn URL only) were silently excluded',
+      '- Users with many LinkedIn-imported leads were seeing far fewer contacts in the Inbox than their list actually contained, with no indication of why',
+      '- The Inbox now shows an amber notice: "X leads in your lists don\'t have an email address and won\'t appear here. Open a list and use Enrich to find their emails."',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: create_html_file and save_file Tools Now Return Clear Parameter Errors',
+      '- Both tools were throwing cryptic errors ("Cannot read properties of undefined" or "fileName is required") when the LLM called them with missing or misspelled parameters',
+      '- Added input validation with descriptive error messages that tell the LLM exactly which parameter name to use and retry with',
+      '- Added descriptions to create_html_file schema properties so the LLM understands what values to provide for title and content_draft',
+      '- The LLM can now self-correct on the first retry instead of looping through multiple wrong parameter names',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: CRM Lead Lists Now Accessible in Admin Delegated Chat Sessions',
+      '- When an admin accessed a user\'s account via delegated access and called get_lead_lists (or other CRM tools) in a chat session, 0 lists were returned even though the user had lists configured',
+      '- Root cause: the session was passing the admin\'s user ID to the worker instead of the account owner\'s user ID, so queries hit the wrong data partition',
+      '- Fix: chat sessions now always use the session owner\'s user ID for tool execution, regardless of who initiated the request',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: Org Members Can Now Sync LinkedIn Messages in CRM',
+      '- Clicking "Sync LinkedIn" on a lead in a list owned by your org owner was returning an "Access denied" error for org members',
+      '- Both the LinkedIn message sync and LinkedIn connection sync endpoints now correctly allow access for members of the same organization',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: LinkedIn Connection Accepted Notification Now Fires Only Once',
+      '- The email notification sent when a lead accepts your LinkedIn invitation was being sent repeatedly every 10 minutes',
+      '- Fixed a broken watermark that caused the sync cron to treat already-seen connections as new on every run',
+      '- Added a dedup guard on the lead record so the notification is guaranteed to fire at most once per connection, even if the cron runs overlap',
+    ],
+  },
+  {
     date: '2026-05-26',
     changes: [
       'Improved: Admin Skills Page Now Enforces Review Gate for User-Created Private Skills',
@@ -52,6 +142,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-25',
     changes: [
+      'Improved: CRM Enrichment Now Shows Source Quality for Every Field',
+      '- Web-sourced enriched fields now display a critic quality view (high, low, or drop) so you can see at a glance which web-found values the system considers well-supported',
+      '- A "drop" view means the critic could not verify the value against its source — the value is kept and never deleted automatically, but is flagged for your review',
+      '- Confidence labels (high / medium / low) are now shown for every enriched field, including Apollo, LinkedIn, web, and pattern-matched results — previously some fields had no confidence label at all',
       'New: Self-Service Analytics Setup',
       '- Configure your SEO domains, Google Analytics 4 properties, and Microsoft Clarity projects yourself under Settings → Analytics & SEO',
       'New: Test GA4 Connections',
@@ -471,6 +565,20 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Users who added Google Drive folders before joining an organization were seeing the folders listed but getting errors when trying to load files',
       '- Emma also could not access those Drive folders, making them invisible to AI tools',
       '- Drive folders are now merged across the org and user records, so all previously configured folders work without any manual re-configuration',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'New: LinkedIn Connection Notifications — Get Notified and Reply Instantly',
+      '- When a lead accepts your LinkedIn invitation, you now receive an email notification: "{Lead Name} accepted your LinkedIn invitation"',
+      '- Clicking the link opens the CRM directly to that lead\'s record with the LinkedIn compose area active',
+      '- A personalized AI-drafted follow-up message is pre-filled so you can reply with one click',
+      'Improved: CRM "Latest Signal" Column — See What\'s Actually Happening',
+      '- The "Last Contact" column is now "Latest Signal" across all CRM views (Inbox, list view, lead table)',
+      '- Shows actionable context: "LinkedIn connected 2d ago", "Email reply 5d ago", "Email opened 3d ago", etc.',
+      'Improved: LinkedIn Connected Filter in CRM',
+      '- New filter to show only 1st-degree LinkedIn connections — useful for finding leads ready for warm follow-up',
     ],
   },
   {
@@ -6843,6 +6951,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When adding a LinkedIn step to a Sequence, you now see a "Send from" dropdown showing your connected LinkedIn Outreach accounts',
       '- If no account is connected, a clear warning appears on the step and saving is blocked until you connect one in Settings → Connected Accounts',
       '- If an account is connected but expired or disconnected, the pre-save check tells you to reconnect before the sequence can go active',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: Org Members Can Now Use Slack Features',
+      '- Organization members were seeing "No Slack channel is configured" when using Slack tools, even when the org owner had Slack set up',
+      '- Org members now automatically inherit the org owner\'s configured Slack channels',
+      '- All Slack tools (list channels, read messages, send messages) work correctly for org members',
     ],
   },
   {

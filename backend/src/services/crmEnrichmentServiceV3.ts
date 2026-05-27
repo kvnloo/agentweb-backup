@@ -209,7 +209,7 @@ export interface OrchestratorDeps {
     /** Canonical dep name → enriched value, gathered from waterfall fills
      *  and the lead's existing field data. */
     depValues: Record<string, string>;
-  }): Promise<{ value: string | null; reasoning: string }>;
+  }): Promise<{ value: string | null; reasoning: string; model?: string }>;
 }
 
 /** Standard CRM lead columns — values for these field names go to top-level
@@ -279,7 +279,16 @@ function routeFields(
     if (ent === 'company') needsCompany = true;
   }
 
-  return { routing: { groupedByGroup, ungrouped, userNamesByCanonical }, needsPerson, needsCompany };
+  // Re-sort groupedByGroup to match FIELD_GROUPS definition order so person_identity
+  // always runs before company groups, regardless of user field config order.
+  const sortedGroupedByGroup = new Map<string, string[]>();
+  for (const groupName of Object.keys(FIELD_GROUPS)) {
+    if (groupedByGroup.has(groupName)) {
+      sortedGroupedByGroup.set(groupName, groupedByGroup.get(groupName)!);
+    }
+  }
+
+  return { routing: { groupedByGroup: sortedGroupedByGroup, ungrouped, userNamesByCanonical }, needsPerson, needsCompany };
 }
 
 function buildRefreshFieldsSet(
@@ -391,7 +400,7 @@ async function processLead(
   const allFills: FieldFill[] = [];
   const apolloCtx = createApolloFetchContext();
   const leadStart = Date.now();
-  console.log(`[v3][lead ${lead.leadId}] start (email=${lead.email ?? '∅'}, company=${lead.company ?? '∅'})`);
+  console.log(`[v3:${input.listId}:${lead.leadId}] start (email=${lead.email ?? '∅'}, company=${lead.company ?? '∅'})`);
 
   // Step 0: identity resolution
   let identity: ResolveIdentityResult;
@@ -405,9 +414,9 @@ async function processLead(
       mode: input.mode,
       refreshFields: refreshSet,
     });
-    console.log(`[v3][lead ${lead.leadId}] identity resolved in ${Date.now() - idStart}ms (ok=${identity.ok})`);
+    console.log(`[v3:${input.listId}:${lead.leadId}] identity resolved in ${Date.now() - idStart}ms (ok=${identity.ok})`);
   } catch (err) {
-    console.log(`[v3][lead ${lead.leadId}] identity threw after ${Date.now() - idStart}ms: ${(err as Error).message}`);
+    console.log(`[v3:${input.listId}:${lead.leadId}] identity threw after ${Date.now() - idStart}ms: ${(err as Error).message}`);
     // Resolver makes external API calls (Apollo / enrich.so) — classify as
     // llm-or-parse since these are LLM-adjacent providers.
     return {
@@ -419,7 +428,7 @@ async function processLead(
     };
   }
   if (!identity.ok) {
-    console.log(`[v3][lead ${lead.leadId}] identity unresolved → skipping`);
+    console.log(`[v3:${input.listId}:${lead.leadId}] identity unresolved → skipping`);
     return {
       fills: [],
       perGroupTierFills,
@@ -432,6 +441,10 @@ async function processLead(
   // (Tier 1) can see them — the DB write was already done by the resolver
   // in mode=enrich; in preview it wasn't, but the waterfall benefits regardless.
   const enrichedLead = { ...lead, ...identity.resolved };
+  const resolvedFields = Object.entries(identity.resolved ?? {})
+    .filter(([, v]) => typeof v === 'string' && (v as string).length > 0)
+    .map(([k]) => k);
+  console.log(`[v3:${input.listId}:${lead.leadId}] identity resolved fields=[${resolvedFields.join(',') || 'none'}] (email=${enrichedLead.email ?? '∅'} firstName=${enrichedLead.firstName ?? '∅'} linkedin=${enrichedLead.linkedin ?? '∅'} company=${enrichedLead.company ?? '∅'})`);
 
   // Tier 0b — sibling config-field copy. Uses siblings already fetched by
   // resolveIdentity (zero extra DDB queries). Fills config-requested custom
@@ -462,7 +475,7 @@ async function processLead(
         );
       }
     }
-    console.log(`[v3][lead ${lead.leadId}] tier0b filled ${tier0bResult.fills.length} config field(s) from siblings`);
+    console.log(`[v3:${input.listId}:${lead.leadId}] tier0b filled ${tier0bResult.fills.length} config field(s) from siblings`);
   }
 
   // Steps 1–3: waterfall + ungrouped + critic, wrapped together so any
@@ -472,7 +485,7 @@ async function processLead(
     // without promise-caching; design §6)
     for (const [groupName, fields] of routing.groupedByGroup.entries()) {
       const gStart = Date.now();
-      console.log(`[v3][lead ${lead.leadId}] waterfall group=${groupName} fields=${fields.join(',')} START`);
+      console.log(`[v3:${input.listId}:${lead.leadId}] waterfall group=${groupName} fields=${fields.join(',')} START`);
       const groupResult = await deps.runWaterfall({
         listId: input.listId,
         lead: enrichedLead,
@@ -497,18 +510,32 @@ async function processLead(
         }
       }
       allFills.push(...renamedFills);
+      // Propagate canonical fills into enrichedLead so subsequent groups see them.
+      // linkedin_url → lead.linkedin so findUnipileCompany Approach 1 can use it.
+      // company_name → lead.company for Approach 3 name search.
+      // first_name/last_name → camelCase so findUnipileCompany Approach 3 can use them.
+      // All canonical names set directly (Tier 3.5c reads lead.company_linkedin_url etc.).
+      const crossGroupAliases: string[] = [];
+      for (const fill of groupResult.fields) {
+        if (fill.field === 'linkedin_url') { (enrichedLead as any).linkedin = fill.value; crossGroupAliases.push('linkedin_url→linkedin'); }
+        else if (fill.field === 'company_name') { (enrichedLead as any).company = fill.value; crossGroupAliases.push('company_name→company'); }
+        else if (fill.field === 'first_name') { (enrichedLead as any).firstName = fill.value; crossGroupAliases.push('first_name→firstName'); }
+        else if (fill.field === 'last_name') { (enrichedLead as any).lastName = fill.value; crossGroupAliases.push('last_name→lastName'); }
+        (enrichedLead as any)[fill.field] = fill.value;
+      }
+      console.log(`[v3:${input.listId}:${lead.leadId}] merge group=${groupName} fills=[${groupResult.fields.map(f => f.field).join(',') || 'none'}]${crossGroupAliases.length ? ` aliases=[${crossGroupAliases.join(',')}]` : ''} missing=[${groupResult.missing.join(',') || 'none'}]`);
       perGroupTierFills.set(
         groupName,
         addTierCounts(perGroupTierFills.get(groupName) ?? emptyTierCount(), groupResult.tierFills),
       );
-      console.log(`[v3][lead ${lead.leadId}] waterfall group=${groupName} done in ${Date.now() - gStart}ms (fills=${groupResult.fields.length}, tier=${JSON.stringify(groupResult.tierFills)})`);
+      console.log(`[v3:${input.listId}:${lead.leadId}] waterfall group=${groupName} done in ${Date.now() - gStart}ms (fills=${groupResult.fields.length}, tier=${JSON.stringify(groupResult.tierFills)})`);
     }
 
     // Step 2: ungrouped fields (web only — no canonical group means no Apollo
     // direct-map; LLM extracts using the field's instruction)
     if (routing.ungrouped.length > 0) {
       const ugStart = Date.now();
-      console.log(`[v3][lead ${lead.leadId}] ungrouped-web START fields=${routing.ungrouped.join(',')}`);
+      console.log(`[v3:${input.listId}:${lead.leadId}] ungrouped-web START fields=${routing.ungrouped.join(',')}`);
       const ungroupedResult = await deps.extractUngroupedFieldsViaWeb({
         listId: input.listId,
         lead: enrichedLead,
@@ -520,7 +547,7 @@ async function processLead(
         '__ungrouped__',
         addTierCounts(perGroupTierFills.get('__ungrouped__') ?? emptyTierCount(), ungroupedResult.tierFills),
       );
-      console.log(`[v3][lead ${lead.leadId}] ungrouped-web done in ${Date.now() - ugStart}ms (fills=${ungroupedResult.fields.length})`);
+      console.log(`[v3:${input.listId}:${lead.leadId}] ungrouped-web done in ${Date.now() - ugStart}ms (fills=${ungroupedResult.fields.length})`);
     }
 
     // Step 3: critic pass — only over web-tier fills.
@@ -530,18 +557,24 @@ async function processLead(
     const webFills = allFills.filter(f => f.meta.source === 'web_search');
     if (webFills.length > 0) {
       const cStart = Date.now();
-      console.log(`[v3][lead ${lead.leadId}] critic START over ${webFills.length} web-fill(s)`);
+      console.log(`[v3:${input.listId}:${lead.leadId}] critic START over ${webFills.length} web-fill(s)`);
       const criticResult = await deps.runCriticOverWebFills({ lead: enrichedLead, fills: webFills });
       for (const fill of webFills) {
         const verdict = criticResult.verdicts[fill.field];
         if (verdict) {
-          fill.meta = { ...fill.meta, criticVerdict: verdict };
+          // Derive an actionable per-field quality view from the verdict.
+          // Advisory only — `drop` recommends removal but nothing is auto-deleted.
+          const criticView: EnrichedFieldMeta['criticView'] =
+            verdict === 'contradicted' ? 'drop' :
+            verdict === 'supported' ? 'high' :
+            'low';   // unsupported / partially-supported
+          fill.meta = { ...fill.meta, criticVerdict: verdict, criticView };
         }
       }
-      console.log(`[v3][lead ${lead.leadId}] critic done in ${Date.now() - cStart}ms`);
+      console.log(`[v3:${input.listId}:${lead.leadId}] critic done in ${Date.now() - cStart}ms`);
     }
   } catch (err) {
-    console.log(`[v3][lead ${lead.leadId}] processing threw after ${Date.now() - leadStart}ms: ${(err as Error).message}`);
+    console.log(`[v3:${input.listId}:${lead.leadId}] processing threw after ${Date.now() - leadStart}ms: ${(err as Error).message}`);
     return {
       fills: [],
       perGroupTierFills,
@@ -601,11 +634,11 @@ async function processLead(
       // Skip eval when no dep data is available — LLM would return null anyway.
       const hasDeps = (sf.smartDependencies ?? []).length > 0;
       if (hasDeps && Object.keys(depValues).length === 0) {
-        console.log(`[v3][lead ${lead.leadId}] smart-eval SKIP field=${sf.name} (no dep data)`);
+        console.log(`[v3:${input.listId}:${lead.leadId}] smart-eval SKIP field=${sf.name} (no dep data)`);
         continue;
       }
       const smartStart = Date.now();
-      console.log(`[v3][lead ${lead.leadId}] smart-eval START field=${sf.name} deps=${JSON.stringify(Object.keys(depValues))}`);
+      console.log(`[v3:${input.listId}:${lead.leadId}] smart-eval START field=${sf.name} deps=${JSON.stringify(Object.keys(depValues))}`);
       await smartEvalSemaphore.acquire();
       try {
         const evalResult = await deps.evaluateSmartField({
@@ -614,7 +647,7 @@ async function processLead(
           condition: sf.smartCondition!,
           depValues,
         });
-        console.log(`[v3][lead ${lead.leadId}] smart-eval DONE field=${sf.name} value=${evalResult.value} in ${Date.now() - smartStart}ms`);
+        console.log(`[v3:${input.listId}:${lead.leadId}] smart-eval DONE field=${sf.name} value=${evalResult.value} in ${Date.now() - smartStart}ms`);
         if (evalResult.value !== null) {
           allFills.push({
             field: sf.name,
@@ -623,13 +656,14 @@ async function processLead(
               source: 'llm',
               enrichedAt: new Date().toISOString(),
               confidence: 'medium',
+              ...(evalResult.model ? { provider: evalResult.model } : {}),
               ...(evalResult.reasoning ? { sourceQuote: evalResult.reasoning } : {}),
             },
           });
         }
       } catch (err) {
         // Fail soft — smart field miss never fails the whole lead.
-        console.warn(`[v3][lead ${lead.leadId}] smart-eval failed for ${sf.name}: ${(err as Error).message}`);
+        console.warn(`[v3:${input.listId}:${lead.leadId}] smart-eval failed for ${sf.name}: ${(err as Error).message}`);
       } finally {
         smartEvalSemaphore.release();
       }
@@ -642,7 +676,7 @@ async function processLead(
     ? allFills.filter(f => !injectedDepNames.has(f.field))
     : allFills;
 
-  console.log(`[v3][lead ${lead.leadId}] done in ${Date.now() - leadStart}ms (fills=${writableFills.length})`);
+  console.log(`[v3:${input.listId}:${lead.leadId}] done in ${Date.now() - leadStart}ms (fills=${writableFills.length})`);
   return {
     fills: writableFills,
     perGroupTierFills,
@@ -657,13 +691,16 @@ async function writeLeadOutcome(
   outcome: PerLeadOutcome,
   input: RunEnrichmentInput,
   deps: OrchestratorDeps,
+  runId: string,
 ): Promise<{ ok: true } | { ok: false; reason: 'update' }> {
   if (input.mode === 'preview') return { ok: true };
   const { fillIfEmpty, alwaysOverwrite } = bucketByOverwritePolicy(lead, outcome.fills, input.config);
 
   // Split each fill by destination — standard CRM columns write to the lead's
   // top-level attributes (so values appear in the same column shown in the
-  // lead table); custom fields write to the customFields map.
+  // lead table); custom fields write to the customFields map. Every persisted
+  // fill is stamped with this run's id so the field is traceable to the job
+  // that produced it (V2-parity — see crmEnrichmentService.ts).
   const splitBucket = (fills: FieldFill[]) => {
     const topLevel: Record<string, string> = {};
     const customFields: Record<string, string> = {};
@@ -674,7 +711,7 @@ async function writeLeadOutcome(
       } else {
         customFields[f.field] = f.value;
       }
-      enrichmentMetadata[f.field] = f.meta;
+      enrichmentMetadata[f.field] = { ...f.meta, enrichedJobId: runId };
     }
     return { topLevel, customFields, enrichmentMetadata };
   };
@@ -916,8 +953,8 @@ export async function runEnrichment(
       const writeResults = await Promise.all(
         pendingWrites.map(async ({ lead, outcome }) => {
           const wStart = Date.now();
-          const writeResult = await writeLeadOutcome(lead, outcome, input, deps);
-          console.log(`[v3][lead ${lead.leadId}] write in ${Date.now() - wStart}ms (ok=${writeResult.ok})`);
+          const writeResult = await writeLeadOutcome(lead, outcome, input, deps, runId);
+          console.log(`[v3:${input.listId}:${lead.leadId}] write in ${Date.now() - wStart}ms (ok=${writeResult.ok})`);
           return writeResult;
         }),
       );
@@ -931,15 +968,18 @@ export async function runEnrichment(
     }
 
     const completedSoFar = Math.min(i + CONCURRENCY, leads.length);
-    const failedSoFar =
-      identityResolutionFailed + llmOrParseFailed + updateFailed;
+    const skippedSoFar = identityResolutionFailed;
+    const hardFailedSoFar = llmOrParseFailed + updateFailed;
+    const parts = [`${processed} enriched`];
+    if (skippedSoFar > 0) parts.push(`${skippedSoFar} skipped`);
+    if (hardFailedSoFar > 0) parts.push(`${hardFailedSoFar} failed`);
     emitToRooms(progressEvent, {
       runId,
       listId: input.listId,
-      message: `Enriching ${completedSoFar}/${leads.length} (${processed} enriched, ${failedSoFar} failed)`,
+      message: `Enriching ${completedSoFar}/${leads.length} (${parts.join(', ')})`,
       progress: leads.length === 0 ? 100 : Math.round((completedSoFar / leads.length) * 100),
       processedCount: processed,
-      failedCount: failedSoFar,
+      failedCount: hardFailedSoFar,
       totalToProcess: leads.length,
     });
   }

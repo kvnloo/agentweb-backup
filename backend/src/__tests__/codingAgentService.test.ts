@@ -138,6 +138,45 @@ describe('runCodingAgent', () => {
 
   // --- FAIL CASES ---
 
+  test('returns 403 authorization error immediately without running more LLM iterations', async () => {
+    // Pre-flight list_files succeeds (view access works for the member)
+    mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 2000 }] });
+
+    // LLM calls edit_file — which reads first, then writes
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_file', input: {
+          file_path: 'app/page.tsx',
+          edits: [{ search: '<h1>Old</h1>', replace: '<h1>New</h1>' }]
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    // edit_file step 1: read file content (GET /file-content) — succeeds
+    mockedMcpFetch.mockResolvedValueOnce({ content: '<h1>Old</h1>' });
+    // edit_file step 2: write (PUT /github-edit) — throws 403
+    mockedMcpFetch.mockRejectedValueOnce(new Error('API error (403): Not authorized to edit this landing page'));
+
+    const result = await runCodingAgent('Change the heading', mockContext);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toMatch(/not authorized|403|permission/i);
+    // Should fail-fast: no second LLM call after the 403
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+  });
+
+  test('403 on pre-flight list_files returns authorization error without LLM call', async () => {
+    // The initial list_files read also fails with 403 (edge case: read access revoked)
+    mockedMcpFetch.mockRejectedValueOnce(new Error('API error (403): Not authorized to edit this landing page'));
+
+    const result = await runCodingAgent('Change the heading', mockContext);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toMatch(/not authorized|403|permission/i);
+    // Should NOT have called the LLM at all
+    expect(mockCreate).not.toHaveBeenCalled();
+  });
+
   test('returns structured failure info when max iterations reached', async () => {
     // LLM always returns a tool call, never terminates
     mockCreate.mockResolvedValue({

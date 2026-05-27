@@ -4,6 +4,7 @@ const mockGet = jest.fn().mockReturnValue({ promise: () => Promise.resolve({}) }
 const mockUpdate = jest.fn().mockReturnValue({ promise: () => Promise.resolve() });
 const mockDelete = jest.fn().mockReturnValue({ promise: () => Promise.resolve() });
 const mockQuery = jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) });
+const mockScan = jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) });
 
 jest.mock("aws-sdk", () => {
   return {
@@ -16,6 +17,7 @@ jest.mock("aws-sdk", () => {
           update: mockUpdate,
           delete: mockDelete,
           query: mockQuery,
+          scan: mockScan,
         })),
       },
       SecretsManager: jest.fn(() => ({

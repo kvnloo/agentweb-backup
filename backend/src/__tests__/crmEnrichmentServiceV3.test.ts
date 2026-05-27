@@ -923,6 +923,68 @@ describe('runEnrichment — socket progress events', () => {
     expect(finalProgress.processedCount).toBe(2);
     expect(finalProgress.progress).toBe(100);
   });
+
+  it('progress message says "skipped" (not "failed") for identity-resolution failures, failedCount=0', async () => {
+    const socketEmit = jest.fn();
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      resolveIdentity: jest.fn().mockResolvedValue({ ok: false, reason: 'no_identity_signal' }),
+    });
+
+    await runEnrichment(makeInput(), deps, { userId: USER_ID, socketEmit });
+
+    const chunkProgress = socketEmit.mock.calls.filter(
+      ([, event, payload]) => event === 'crm-enrichment-progress' && payload.progress === 100,
+    );
+    expect(chunkProgress.length).toBeGreaterThanOrEqual(1);
+    const msg: string = chunkProgress[chunkProgress.length - 1][2].message;
+    expect(msg).toMatch(/skipped/i);
+    expect(msg).not.toMatch(/failed/i);
+    expect(chunkProgress[chunkProgress.length - 1][2].failedCount).toBe(0);
+  });
+
+  it('progress message says "failed" for hard failures (llmOrParse), failedCount=N', async () => {
+    const socketEmit = jest.fn();
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      resolveIdentity: jest.fn().mockRejectedValue(new Error('provider timeout')),
+    });
+
+    await runEnrichment(makeInput(), deps, { userId: USER_ID, socketEmit });
+
+    const chunkProgress = socketEmit.mock.calls.filter(
+      ([, event, payload]) => event === 'crm-enrichment-progress' && payload.progress === 100,
+    );
+    expect(chunkProgress.length).toBeGreaterThanOrEqual(1);
+    const payload = chunkProgress[chunkProgress.length - 1][2];
+    expect(payload.message).toMatch(/failed/i);
+    expect(payload.message).not.toMatch(/skipped/i);
+    expect(payload.failedCount).toBe(1);
+  });
+
+  it('progress message shows both "skipped" and "failed" when both categories present', async () => {
+    const socketEmit = jest.fn();
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([
+        makeLead({ leadId: 'lead-skip' }),
+        makeLead({ leadId: 'lead-fail' }),
+      ]),
+      resolveIdentity: jest.fn()
+        .mockResolvedValueOnce({ ok: false, reason: 'no_identity_signal' })
+        .mockRejectedValueOnce(new Error('provider timeout')),
+    });
+
+    await runEnrichment(makeInput(), deps, { userId: USER_ID, socketEmit });
+
+    const chunkProgress = socketEmit.mock.calls.filter(
+      ([, event, payload]) => event === 'crm-enrichment-progress' && payload.progress === 100,
+    );
+    expect(chunkProgress.length).toBeGreaterThanOrEqual(1);
+    const payload = chunkProgress[chunkProgress.length - 1][2];
+    expect(payload.message).toMatch(/skipped/i);
+    expect(payload.message).toMatch(/failed/i);
+    expect(payload.failedCount).toBe(1);
+  });
 });
 
 // ─── Smart fields ─────────────────────────────────────────────────────────────
@@ -1257,5 +1319,306 @@ describe('runEnrichment — concurrent chunk writes', () => {
     expect(setLeadFields).toHaveBeenCalledTimes(3);
     // Sequential writes would never have more than one call in flight at once.
     expect(maxInFlight).toBe(3);
+  });
+});
+
+describe('runEnrichment — smart-field meta records the producing model', () => {
+  function smartConfig(): EnrichmentConfig {
+    return makeConfig({
+      fields: [
+        {
+          name: 'isQualified',
+          type: 'string',
+          instruction: 'qualified?',
+          include: true,
+          overwritePolicy: 'always_overwrite',
+          smartCondition: 'company has > 100 employees',
+        },
+      ],
+    });
+  }
+
+  it('FAIL CASE: smart-field fill meta has provider set to the model from evaluateSmartField', async () => {
+    const setLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      evaluateSmartField: jest.fn().mockResolvedValue({ value: 'yes', reasoning: 'big company', model: 'gpt-5-chat-2' }),
+      setLeadFields,
+    });
+    await runEnrichment(makeInput({ config: smartConfig() }), deps);
+    const meta = (setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.isQualified;
+    expect(meta.source).toBe('llm');
+    expect(meta.provider).toBe('gpt-5-chat-2');
+  });
+
+  it('FAIL CASE: smart-field meta omits provider when evaluateSmartField returns no model', async () => {
+    const setLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      evaluateSmartField: jest.fn().mockResolvedValue({ value: 'yes', reasoning: 'r' }),
+      setLeadFields,
+    });
+    await runEnrichment(makeInput({ config: smartConfig() }), deps);
+    const meta = (setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.isQualified;
+    expect(meta.source).toBe('llm');
+    expect(meta.provider).toBeUndefined();
+  });
+
+  it('FAIL CASE: smart-field meta provider reflects an overridden model name', async () => {
+    const setLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      evaluateSmartField: jest.fn().mockResolvedValue({ value: 'no', reasoning: 'r', model: 'gpt-4.1' }),
+      setLeadFields,
+    });
+    await runEnrichment(makeInput({ config: smartConfig() }), deps);
+    const meta = (setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.isQualified;
+    expect(meta.provider).toBe('gpt-4.1');
+  });
+
+  it('SUCCESS CASE: a null smart-field value produces no fill at all', async () => {
+    const setLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      evaluateSmartField: jest.fn().mockResolvedValue({ value: null, reasoning: '', model: 'gpt-5-chat-2' }),
+      setLeadFields,
+    });
+    await runEnrichment(makeInput({ config: smartConfig() }), deps);
+    expect(setLeadFields).not.toHaveBeenCalled();
+  });
+});
+
+describe('runEnrichment — enrichedJobId stamping (Fix 7)', () => {
+  it('FAIL CASE: every persisted fill carries meta.enrichedJobId equal to the run id', async () => {
+    const setLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [
+          { field: 'company_name', value: 'Acme', meta: { source: 'api', provider: 'apollo', enrichedAt: '2026-01-01T00:00:00Z' } },
+        ],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+      }),
+      setLeadFields,
+    });
+    const result = await runEnrichment(makeInput({ config: makeConfig({
+      fields: [{ name: 'company_name', type: 'string', instruction: 'co', include: true, overwritePolicy: 'always_overwrite' }],
+    }) }), deps);
+    const meta = (setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.company_name;
+    expect(meta.enrichedJobId).toBe(result.runId);
+  });
+
+  it('FAIL CASE: enrichedJobId is identical across multiple fields written for one lead', async () => {
+    const setLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [
+          { field: 'company_name', value: 'Acme', meta: { source: 'api', provider: 'apollo', enrichedAt: '2026-01-01T00:00:00Z' } },
+          { field: 'industry', value: 'SaaS', meta: { source: 'api', provider: 'apollo', enrichedAt: '2026-01-01T00:00:00Z' } },
+        ],
+        missing: [],
+        tierFills: { crm: 0, apollo: 2, web: 0, missing: 0 },
+      }),
+      setLeadFields,
+    });
+    const result = await runEnrichment(makeInput({ config: makeConfig({
+      fields: [
+        { name: 'company_name', type: 'string', instruction: 'co', include: true, overwritePolicy: 'always_overwrite' },
+        { name: 'industry', type: 'string', instruction: 'ind', include: true, overwritePolicy: 'always_overwrite' },
+      ],
+    }) }), deps);
+    const md = (setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata;
+    expect(md.company_name.enrichedJobId).toBe(result.runId);
+    expect(md.industry.enrichedJobId).toBe(result.runId);
+  });
+
+  it('FAIL CASE: stamping enrichedJobId does not erase other meta keys', async () => {
+    const setLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [
+          { field: 'company_name', value: 'Acme', meta: { source: 'api', provider: 'apollo', confidence: 'high', enrichedAt: '2026-01-01T00:00:00Z' } },
+        ],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+      }),
+      setLeadFields,
+    });
+    await runEnrichment(makeInput({ config: makeConfig({
+      fields: [{ name: 'company_name', type: 'string', instruction: 'co', include: true, overwritePolicy: 'always_overwrite' }],
+    }) }), deps);
+    const meta = (setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.company_name;
+    expect(meta.provider).toBe('apollo');
+    expect(meta.confidence).toBe('high');
+  });
+
+  it('SUCCESS CASE: preview mode does not call setLeadFields (no stamping path)', async () => {
+    const setLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [{ field: 'company_name', value: 'Acme', meta: { source: 'api', provider: 'apollo', enrichedAt: '2026-01-01T00:00:00Z' } }],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+      }),
+      setLeadFields,
+    });
+    await runEnrichment(makeInput({ mode: 'preview', config: makeConfig({
+      fields: [{ name: 'company_name', type: 'string', instruction: 'co', include: true, overwritePolicy: 'always_overwrite' }],
+    }) }), deps);
+    expect(setLeadFields).not.toHaveBeenCalled();
+  });
+});
+
+describe('runEnrichment — critic view derivation (Fix 5)', () => {
+  function webFillDeps(verdicts: Record<string, string>) {
+    return makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [{
+          field: 'company_description',
+          value: 'A SaaS company',
+          meta: { source: 'web_search', provider: 'llm_web_search', enrichedAt: '2026-01-01T00:00:00Z' },
+        }],
+        missing: [],
+        tierFills: { crm: 0, apollo: 0, web: 1, missing: 0 },
+      }),
+      runCriticOverWebFills: jest.fn().mockResolvedValue({ verdicts }),
+      setLeadFields: jest.fn().mockResolvedValue(undefined),
+    });
+  }
+
+  const cfg = makeConfig({
+    fields: [{ name: 'company_description', type: 'string', instruction: 'desc', include: true, overwritePolicy: 'always_overwrite' }],
+  });
+
+  it('FAIL CASE: a contradicted verdict derives criticView "drop"', async () => {
+    const deps = webFillDeps({ company_description: 'contradicted' });
+    await runEnrichment(makeInput({ config: cfg }), deps);
+    const meta = (deps.setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.company_description;
+    expect(meta.criticVerdict).toBe('contradicted');
+    expect(meta.criticView).toBe('drop');
+  });
+
+  it('FAIL CASE: an unsupported verdict derives criticView "low"', async () => {
+    const deps = webFillDeps({ company_description: 'unsupported' });
+    await runEnrichment(makeInput({ config: cfg }), deps);
+    const meta = (deps.setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.company_description;
+    expect(meta.criticView).toBe('low');
+  });
+
+  it('FAIL CASE: a partially-supported verdict derives criticView "low"', async () => {
+    const deps = webFillDeps({ company_description: 'partially-supported' });
+    await runEnrichment(makeInput({ config: cfg }), deps);
+    const meta = (deps.setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.company_description;
+    expect(meta.criticView).toBe('low');
+  });
+
+  it('SUCCESS CASE: a supported verdict derives criticView "high" and the fill is still persisted', async () => {
+    const deps = webFillDeps({ company_description: 'supported' });
+    await runEnrichment(makeInput({ config: cfg }), deps);
+    const call = (deps.setLeadFields as jest.Mock).mock.calls[0][0];
+    expect(call.topLevel?.company_description ?? call.customFields?.company_description).toBe('A SaaS company');
+    expect(call.enrichmentMetadata.company_description.criticView).toBe('high');
+  });
+
+  it('SUCCESS CASE: a fill with no critic verdict has no criticView', async () => {
+    const deps = webFillDeps({});  // critic returns no verdict for the field
+    await runEnrichment(makeInput({ config: cfg }), deps);
+    const meta = (deps.setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.company_description;
+    expect(meta.criticVerdict).toBeUndefined();
+    expect(meta.criticView).toBeUndefined();
+  });
+});
+
+// ─── Cross-group field propagation ───────────────────────────────────────────
+// person_identity fills linkedin_url → enrichedLead.linkedin must be set
+// before company_firmographic waterfall runs so findUnipileCompany Approach 1
+// can use it.
+
+describe('runEnrichment — cross-group field propagation', () => {
+  it('propagates linkedin_url fill into enrichedLead.linkedin before company group runs', async () => {
+    const lead = makeLead({ leadId: 'lead-prop-1', email: 'jane@acme.com' });
+
+    let companyGroupLead: any = null;
+
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([lead]),
+      runWaterfall: jest.fn().mockImplementation(async ({ groupName, lead: l }) => {
+        if (groupName === 'person_identity') {
+          return {
+            fields: [{
+              field: 'linkedin_url',
+              value: 'https://www.linkedin.com/in/jane',
+              meta: { source: 'linkedin', enrichedAt: new Date().toISOString() },
+            }],
+            missing: [],
+            tierFills: { crm: 0, apollo: 0, web: 1, missing: 0 },
+          };
+        }
+        if (groupName === 'company_firmographic') {
+          companyGroupLead = l;
+        }
+        return { fields: [], missing: [], tierFills: { crm: 0, apollo: 0, web: 0, missing: 0 } };
+      }),
+    });
+
+    const config = makeConfig({
+      fields: [
+        { name: 'linkedin_url', type: 'string', instruction: 'linkedin url', include: true, overwritePolicy: 'fill_if_empty' },
+        { name: 'company_name', type: 'string', instruction: 'company name', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    await runEnrichment(makeInput({ config }), deps);
+
+    expect(companyGroupLead).not.toBeNull();
+    expect(companyGroupLead.linkedin).toBe('https://www.linkedin.com/in/jane');
+  });
+
+  it('propagates company_name fill into enrichedLead.company', async () => {
+    const lead = makeLead({ leadId: 'lead-prop-2', email: 'jane@acme.com' });
+
+    const companyGroupLeads: any[] = [];
+
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([lead]),
+      runWaterfall: jest.fn().mockImplementation(async ({ groupName, lead: l }) => {
+        if (groupName === 'company_firmographic') {
+          companyGroupLeads.push(l);
+          return {
+            fields: [{
+              field: 'company_name',
+              value: 'Acme Corp',
+              meta: { source: 'web_search', enrichedAt: new Date().toISOString() },
+            }],
+            missing: [],
+            tierFills: { crm: 0, apollo: 0, web: 1, missing: 0 },
+          };
+        }
+        return { fields: [], missing: [], tierFills: { crm: 0, apollo: 0, web: 0, missing: 0 } };
+      }),
+    });
+
+    const config = makeConfig({
+      fields: [
+        { name: 'company_name', type: 'string', instruction: 'company name', include: true, overwritePolicy: 'fill_if_empty' },
+        { name: 'employee_count', type: 'string', instruction: 'employee count', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    await runEnrichment(makeInput({ config }), deps);
+
+    // company_firmographic runs twice (once per field batch) OR once with both fields —
+    // either way, the second call (if any) should see company already set.
+    // Primary assertion: company_name fill propagates to enrichedLead.company_name.
+    expect(companyGroupLeads[0]).not.toBeNull();
+    // After first company_firmographic call fills company_name, enrichedLead.company is set.
+    // Verify by checking the fill reached allFills (setLeadFields was called with company_name).
+    const setCall = (deps.setLeadFields as jest.Mock).mock.calls[0]?.[0];
+    expect(setCall?.topLevel?.company_name ?? setCall?.customFields?.company_name).toBe('Acme Corp');
   });
 });

@@ -133,6 +133,17 @@ export function extractJson<T = unknown>(raw: string): T {
     try {
       return JSON.parse(block) as T;
     } catch {
+      // fall through to layer 3
+    }
+  }
+
+  // Layer 3 — repair common malformed JSON: trailing commas before } or ]
+  const candidate = block ?? stripped;
+  const repaired = candidate.replace(/,(\s*[}\]])/g, "$1");
+  if (repaired !== candidate) {
+    try {
+      return JSON.parse(repaired) as T;
+    } catch {
       // fall through to error
     }
   }

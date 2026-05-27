@@ -2095,11 +2095,13 @@ export const agentModeController = {
 
       // Generate AI response using common function (wrapped in wall-clock timeout
       // so the activeSessionGenerations lock always releases even if generation hangs).
+      // Use session.userId (the account owner) — not user.userId (the requester) — so that
+      // tool calls (e.g. get_lead_lists) query the correct user's data in delegated sessions.
       const response = await withGenerationTimeout(
         generateSessionResponse(
           sessionId,
           userMessage,
-          user.userId,
+          session.userId,
           modelToUse,
           attachments,
           undefined, // isInteractiveShare

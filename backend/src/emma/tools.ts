@@ -4885,14 +4885,20 @@ emmaToolRegistry.register({
     inputSchema: {
       type: "object",
       properties: {
-        title: { type: "string" },
-        content_draft: { type: "string" },
-        format_requirements: { type: "string" }
+        title: { type: "string", description: "Title of the HTML document (e.g. 'LinkedIn Readiness Report for Jed Ng'). Required." },
+        content_draft: { type: "string", description: "The full content to include in the HTML document. Include all data, scores, analysis, and text sections. Required." },
+        format_requirements: { type: "string", description: "Optional additional formatting instructions (e.g. 'use dark theme', 'include charts', 'add progress bars')." }
       },
       required: ["title", "content_draft"]
     }
   },
   execute: async (args: any, context?: any) => {
+    if (!args.title || typeof args.title !== 'string') {
+      throw new Error('title is required and must be a string');
+    }
+    if (!args.content_draft || typeof args.content_draft !== 'string') {
+      throw new Error('content_draft is required and must be a string');
+    }
     return await agentModeService.createHtmlFile(args.title, args.content_draft, args.format_requirements || '', context?.userId, context?.sessionId);
   }
 });

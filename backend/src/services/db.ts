@@ -3796,6 +3796,7 @@ export const crmDb = {
       alertEvents?: string[];
       alertCcEmails?: string[];
       listSenderId?: string | null;
+      linkedInAccountId?: string | null;
       publicAccessEnabled?: boolean;
       autoDraftEnabled?: boolean;
       autoDraftInstruction?: string;
@@ -3879,6 +3880,12 @@ export const crmDb = {
         expressionAttributeNames['#listSenderId'] = 'listSenderId';
         updateExpressions.push('#listSenderId = :listSenderId');
         expressionAttributeValues[':listSenderId'] = updates.listSenderId;
+      }
+
+      if (updates.linkedInAccountId !== undefined) {
+        expressionAttributeNames['#linkedInAccountId'] = 'linkedInAccountId';
+        updateExpressions.push('#linkedInAccountId = :linkedInAccountId');
+        expressionAttributeValues[':linkedInAccountId'] = updates.linkedInAccountId;
       }
 
       if (updates.publicAccessEnabled !== undefined) {
@@ -5493,6 +5500,10 @@ export const crmDb = {
           }
           if (lead.system && Object.keys(lead.system).length > 0) {
             item.system = lead.system;
+          }
+          const nameCompanyKey = computeNameCompanyKey(lead.firstName, lead.lastName, lead.company);
+          if (nameCompanyKey) {
+            item.nameCompanyKey = nameCompanyKey;
           }
 
           return {

@@ -402,6 +402,36 @@ describe('resolveIdentity — write semantics', () => {
     expect(call.fields).toEqual({ firstName: 'Jane' });
     expect(call.fields.lastName).toBeUndefined();
   });
+  it('writes person fields (linkedin, title) before completeness gate fires — no data loss on skip', async () => {
+    // Apollo returns person+linkedin+title but no org (personal email).
+    // Completeness gate fires (needsCompanyFields=true, no company).
+    // Write must still happen so linkedin/title land in the DB.
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        firstName: 'Nels',
+        lastName: 'Anderson',
+        linkedin: 'http://www.linkedin.com/in/kullahanderson',
+        title: 'Startup and Strategic Advisor',
+      }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'kanderso66@gmail.com', firstName: 'Nels', lastName: 'Anderson' },
+        needsCompanyFields: true,
+        mode: 'enrich',
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(false); // company missing → gate fires
+    // But write must have happened with the person fields Apollo returned
+    expect(deps.writeLeadFields).toHaveBeenCalledTimes(1);
+    const call = (deps.writeLeadFields as jest.Mock).mock.calls[0][0];
+    expect(call.fields).toMatchObject({
+      linkedin: 'http://www.linkedin.com/in/kullahanderson',
+      title: 'Startup and Strategic Advisor',
+    });
+  });
 });
 
 // ─── Combined flow ────────────────────────────────────────────────────────────
@@ -527,9 +557,9 @@ describe('resolveIdentity — Tier 0.5 emailDomain derivation', () => {
     expect(call.meta.emailDomain.provider).toBe('llm_web_search');
   });
 
-  it('does not overwrite an emailDomain already on the lead', async () => {
+  it('does not overwrite an emailDomain already derived from the lead email', async () => {
     const deps = makeDeps({
-      resolveCompanyDomainViaWebSearch: jest.fn(),
+      resolveCompanyDomainViaWebSearch: jest.fn().mockResolvedValue({ website: 'https://other.com' }),
     });
     const result = await resolveIdentity(
       makeInput({
@@ -543,10 +573,9 @@ describe('resolveIdentity — Tier 0.5 emailDomain derivation', () => {
       deps,
     );
 
-    // With an email present, Tier 0.5 must not even fire (guard requires no
-    // email AND no website AND no emailDomain). The local extract from
-    // jane@acme.com remains the source of truth.
-    expect(deps.resolveCompanyDomainViaWebSearch).not.toHaveBeenCalled();
+    // Tier 0.5 now fires (company + business email = searchable signal, website missing).
+    // But emailDomain derived locally from jane@acme.com must NOT be overwritten
+    // by the LLM-returned website domain.
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.resolved.emailDomain ?? 'acme.com').toBe('acme.com');
   });
@@ -571,6 +600,189 @@ describe('resolveIdentity — Tier 0.5 emailDomain derivation', () => {
     // be set to garbage — better to leave it empty than to feed bad data
     // into Apollo org-match.
     expect(result.resolved.emailDomain).toBeUndefined();
+  });
+});
+
+// ─── Tier 0.5 Branch B — domain-search via business email ────────────────────
+
+describe('resolveIdentity — Tier 0.5 Branch B (business email → company+website)', () => {
+  it('fires resolveCompanyDomainViaWebSearch with domain when business email present and company missing', async () => {
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest.fn().mockResolvedValue(null),
+    });
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'eric@geniecore.net', firstName: 'Eric', lastName: 'Smith' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    expect(deps.resolveCompanyDomainViaWebSearch).toHaveBeenCalledWith(
+      expect.objectContaining({ domain: 'geniecore.net' }),
+    );
+  });
+
+  it('fills resolved.website AND resolved.company from LLM result when website validation passes', async () => {
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest
+        .fn()
+        .mockResolvedValue({ website: 'https://geniecore.net', company: 'GenieCore' }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'eric@geniecore.net', firstName: 'Eric', lastName: 'Smith' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    // Website domain matches email domain → validation passes → company written → gate passes
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.website).toBe('https://geniecore.net');
+    expect(result.resolved.company).toBe('GenieCore');
+  });
+
+  it('does NOT fill company when lead already has a company name', async () => {
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest
+        .fn()
+        .mockResolvedValue({ website: 'https://geniecore.net', company: 'GenieCore LLM Name' }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'eric@geniecore.net', firstName: 'Eric', lastName: 'Smith', company: 'GenieCore Existing' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    if (!result.ok) return;
+    expect(result.resolved.company).toBeUndefined(); // existing company not overwritten
+  });
+
+  it('does not fire for personal/freemail email domain', async () => {
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest.fn().mockResolvedValue(null),
+    });
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'bfactor@yahoo.com', firstName: 'Bob', lastName: 'Factor' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    expect(deps.resolveCompanyDomainViaWebSearch).not.toHaveBeenCalled();
+  });
+
+  it('fires even when company already known (website still missing — domain signal improves Apollo)', async () => {
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest.fn().mockResolvedValue({ website: 'https://geniecore.net' }),
+    });
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'eric@geniecore.net', company: 'GenieCore' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    expect(deps.resolveCompanyDomainViaWebSearch).toHaveBeenCalledWith(
+      expect.objectContaining({ company: 'GenieCore', domain: 'geniecore.net' }),
+    );
+  });
+
+  it('rejects website when derived domain does not match email domain (option 4)', async () => {
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest
+        .fn()
+        .mockResolvedValue({ website: 'https://geniecore.com', searchedDomain: 'geniecore.com' }), // .com vs .net
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'eric@geniecore.net', firstName: 'Eric', lastName: 'Smith' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) expect(result.resolved.website).toBeUndefined();
+  });
+
+  it('rejects website when echoed searchedDomain does not match email domain (option 2)', async () => {
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest
+        .fn()
+        .mockResolvedValue({ website: 'https://geniecore.net', searchedDomain: 'geniecore.com' }), // echoed wrong domain
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'eric@geniecore.net', firstName: 'Eric', lastName: 'Smith' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) expect(result.resolved.website).toBeUndefined();
+  });
+
+  it('accepts website when both derived domain and echoed domain match email domain', async () => {
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest
+        .fn()
+        .mockResolvedValue({ website: 'https://geniecore.net', searchedDomain: 'geniecore.net' }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'eric@geniecore.net', firstName: 'Eric', lastName: 'Smith' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    if (result.ok) expect(result.resolved.website).toBe('https://geniecore.net');
+  });
+
+  it('accepts website when derived domain is a subdomain of email domain', async () => {
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest
+        .fn()
+        .mockResolvedValue({ website: 'https://app.geniecore.net', searchedDomain: 'geniecore.net' }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'eric@geniecore.net', firstName: 'Eric', lastName: 'Smith' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    if (result.ok) expect(result.resolved.website).toBe('https://app.geniecore.net');
+  });
+
+  it('accepts website when searchedDomain absent but derived domain matches (option 2 skipped, option 4 passes)', async () => {
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest
+        .fn()
+        .mockResolvedValue({ website: 'https://geniecore.net' }), // no searchedDomain
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'eric@geniecore.net', firstName: 'Eric', lastName: 'Smith' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    if (result.ok) expect(result.resolved.website).toBe('https://geniecore.net');
+  });
+
+  it('does not fire when needsCompanyFields=false', async () => {
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest.fn().mockResolvedValue(null),
+    });
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'eric@geniecore.net', firstName: 'Eric', lastName: 'Smith' },
+        needsCompanyFields: false,
+      }),
+      deps,
+    );
+    expect(deps.resolveCompanyDomainViaWebSearch).not.toHaveBeenCalled();
   });
 });
 
@@ -897,6 +1109,62 @@ describe('resolveIdentity — unified Apollo call with expanded signals', () => 
     );
   });
 
+  it('calls Apollo for personal email leads (no early bail-out)', async () => {
+    const deps = makeDeps();
+    await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          email: 'bfactor@yahoo.com',
+          firstName: 'Bob',
+          lastName: 'Factor',
+        },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    expect(deps.apolloPeopleMatch).toHaveBeenCalledWith(
+      expect.objectContaining({ email: 'bfactor@yahoo.com' }),
+    );
+  });
+
+  it('strips freemail domain from Apollo input so personal email does not mislead org lookup', async () => {
+    const deps = makeDeps();
+    await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          email: 'bfactor@yahoo.com',
+          firstName: 'Bob',
+          lastName: 'Factor',
+        },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    const call = (deps.apolloPeopleMatch as jest.Mock).mock.calls[0][0];
+    expect(call.domain).toBeUndefined();
+  });
+
+  it('preserves business domain in Apollo input for non-freemail leads', async () => {
+    const deps = makeDeps();
+    await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          email: 'alice@acme.com',
+          firstName: 'Alice',
+          lastName: 'Smith',
+        },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    expect(deps.apolloPeopleMatch).toHaveBeenCalledWith(
+      expect.objectContaining({ domain: 'acme.com' }),
+    );
+  });
+
   it('skips Apollo when no signals at all (no email, linkedin, or name)', async () => {
     const deps = makeDeps();
     await resolveIdentity(
@@ -1153,7 +1421,7 @@ describe('resolveIdentity — pattern matching (Tier 7)', () => {
     expect(result.emailPattern).toBe('f.last@domain');
   });
 
-  it('meta.email provider is enrich.so when pattern finds email', async () => {
+  it('meta.email provider is "pattern" when pattern matching finds email', async () => {
     const writeLeadFields = jest.fn().mockResolvedValue(undefined);
     const deps = makeDeps({
       findEmailViaPatterns: jest.fn().mockResolvedValue({ email: 'j.doe@acme.com', pattern: 'f.last@domain' }),
@@ -1169,6 +1437,143 @@ describe('resolveIdentity — pattern matching (Tier 7)', () => {
     );
     expect(writeLeadFields).toHaveBeenCalled();
     const call = writeLeadFields.mock.calls[0][0];
-    expect(call.meta.email.provider).toBe('enrich.so');
+    expect(call.meta.email.provider).toBe('pattern');
+  });
+});
+
+// ─── Tier 7 — Pattern-email attribution (Fix 2) ───────────────────────────────
+
+describe('resolveIdentity — Tier 7 pattern-email attribution (Fix 2)', () => {
+  function tier7Input() {
+    return makeInput({
+      lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', emailDomain: 'acme.com' },
+      needsPersonFields: false,
+      needsCompanyFields: false,
+    });
+  }
+
+  it('FAIL CASE: pattern-email meta has provider "pattern", not "enrich.so"', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      findEmailViaPatterns: jest.fn().mockResolvedValue({ email: 'jane.doe@acme.com', pattern: 'first.last' }),
+      writeLeadFields,
+    });
+    await resolveIdentity(tier7Input(), deps);
+    const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta.email;
+    expect(meta.source).toBe('api');
+    expect(meta.provider).toBe('pattern');
+  });
+
+  it('FAIL CASE: pattern-email meta carries the pattern in sourceQuote', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      findEmailViaPatterns: jest.fn().mockResolvedValue({ email: 'jane.doe@acme.com', pattern: 'first.last' }),
+      writeLeadFields,
+    });
+    await resolveIdentity(tier7Input(), deps);
+    const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta.email;
+    expect(meta.sourceQuote).toBe('pattern: first.last');
+  });
+
+  it('FAIL CASE: pattern-email meta confidence is "medium"', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      findEmailViaPatterns: jest.fn().mockResolvedValue({ email: 'jane.doe@acme.com', pattern: 'flast' }),
+      writeLeadFields,
+    });
+    await resolveIdentity(tier7Input(), deps);
+    const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta.email;
+    expect(meta.confidence).toBe('medium');
+  });
+
+  it('SUCCESS CASE: the resolved email value is still persisted', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      findEmailViaPatterns: jest.fn().mockResolvedValue({ email: 'jane.doe@acme.com', pattern: 'first.last' }),
+      writeLeadFields,
+    });
+    const result = await resolveIdentity(tier7Input(), deps);
+    expect(result.ok).toBe(true);
+    expect((writeLeadFields as jest.Mock).mock.calls[0][0].fields.email).toBe('jane.doe@acme.com');
+  });
+
+  it('pattern-email meta has no sourceQuote when pattern is absent', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      findEmailViaPatterns: jest.fn().mockResolvedValue({ email: 'jane.doe@acme.com' }), // no pattern
+      writeLeadFields,
+    });
+    await resolveIdentity(tier7Input(), deps);
+    const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta.email;
+    expect(meta.sourceQuote).toBeUndefined();
+    expect(meta.provider).toBe('pattern');
+  });
+});
+
+describe('resolveIdentity — makeApiMeta per-field confidence (Fix 6)', () => {
+  it('FAIL CASE: an Apollo-resolved firstName carries high confidence', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        firstName: 'Jane', lastName: 'Doe', company: 'Acme', email: 'jane@acme.com', emailStatus: 'verified',
+      }),
+      writeLeadFields,
+    });
+    await resolveIdentity(makeInput({
+      lead: { leadId: LEAD_ID, email: 'jane@acme.com' },
+      needsPersonFields: true,
+    }), deps);
+    const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta;
+    expect(meta.firstName.confidence).toBe('high');
+  });
+
+  it('FAIL CASE: an Apollo-resolved company carries medium confidence (per-field, not high)', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        firstName: 'Jane', lastName: 'Doe', company: 'Acme', email: 'jane@acme.com', emailStatus: 'verified',
+      }),
+      writeLeadFields,
+    });
+    await resolveIdentity(makeInput({
+      lead: { leadId: LEAD_ID, email: 'jane@acme.com' },
+      needsPersonFields: true,
+      needsCompanyFields: true,
+    }), deps);
+    const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta;
+    expect(meta.company.confidence).toBe('medium');
+    // The same Apollo result fills firstName at 'high' — proves per-field lookup.
+    expect(meta.firstName.confidence).toBe('high');
+  });
+
+  it('FAIL CASE: an enrich.so reverse-lookup company carries medium confidence', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      enrichSoReverseLookup: jest.fn().mockResolvedValue({ company: 'Acme', firstName: 'Jane', lastName: 'Doe' }),
+      writeLeadFields,
+    });
+    await resolveIdentity(makeInput({
+      lead: { leadId: LEAD_ID, email: 'jane@personal.com' },
+      needsCompanyFields: true,
+    }), deps);
+    const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta;
+    expect(meta.company.confidence).toBe('medium');
+    // enrich.so rates firstName 'high' in the registry — per-field lookup proof.
+    expect(meta.firstName).toBeDefined();
+    expect(meta.firstName.confidence).toBe('high');
+  });
+
+  it('SUCCESS CASE: a Unipile-resolved linkedin carries medium confidence', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      findLinkedInUrl: jest.fn().mockResolvedValue('https://www.linkedin.com/in/jane-doe'),
+      writeLeadFields,
+    });
+    await resolveIdentity(makeInput({
+      lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', company: 'Acme' },
+      needsPersonFields: true,
+    }), deps);
+    const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta;
+    expect(meta.linkedin.confidence).toBe('medium');
   });
 });

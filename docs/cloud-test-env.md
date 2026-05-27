@@ -20,6 +20,19 @@ This creates:
 
 Each developer needs the `AgentWebTestEnvDeveloper` inline policy on their IAM user. See `README.md` → "Cloud Test Environment" → "Developer IAM Policy" for the full policy JSON. The policy uses tag-based conditions so developers can only launch/terminate instances tagged `purpose=test-env` (production instances are protected).
 
+### Ngrok (HTTPS tunnel for webhooks)
+
+The test environment runs an ngrok container that exposes the backend over HTTPS. This is required for any feature that needs an HTTPS callback URL (e.g. Unipile webhooks, OAuth redirects).
+
+Two secrets must exist in AWS Secrets Manager under `agentweb/test-env/backend-env`:
+
+| Variable | Description |
+|---|---|
+| `NGROK_AUTHTOKEN` | Your personal ngrok auth token — from [dashboard.ngrok.com/get-started/your-authtoken](https://dashboard.ngrok.com/get-started/your-authtoken) |
+| `NGROK_DOMAIN` | Your reserved ngrok domain — e.g. `my-name.ngrok-free.app` (free tier supports one static domain) |
+
+Once set, the `BACKEND_URL` in Secrets Manager should point to `https://<NGROK_DOMAIN>` so webhooks hit the ngrok tunnel.
+
 ### Developer Setup
 
 On first `launch`, the script interactively creates `.test-env.config` and an EC2 key pair. Or create the config manually in repo root:

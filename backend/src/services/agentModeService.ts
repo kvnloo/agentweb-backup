@@ -7840,15 +7840,20 @@ export class AgentModeService {
         connectedAtTimestamp?: number;
       } | null = null;
       if (lead.linkedin) {
-        const { getConnectionByProfileUrl } = await import('./unipileConnectionsDb');
-        const conn = await getConnectionByProfileUrl(lead.linkedin as string).catch(() => null);
-        linkedInConnectionStatus = conn
-          ? {
-              isConnected: true,
-              connectedAt: new Date(conn.connectedAt * 1000).toISOString(),
-              connectedAtTimestamp: conn.connectedAt,
-            }
-          : { isConnected: false };
+        const accountId: string | null = (list as any).linkedInAccountId ?? null;
+        if (accountId) {
+          const { getConnectionByProfileUrlAndAccount } = await import('./unipileConnectionsDb');
+          const conn = await getConnectionByProfileUrlAndAccount(lead.linkedin as string, accountId).catch(() => null);
+          linkedInConnectionStatus = conn
+            ? {
+                isConnected: true,
+                connectedAt: new Date(conn.connectedAt * 1000).toISOString(),
+                connectedAtTimestamp: conn.connectedAt,
+              }
+            : { isConnected: false };
+        } else {
+          linkedInConnectionStatus = { isConnected: false };
+        }
       }
 
       // Get engagement count and recent engagements
@@ -9143,21 +9148,37 @@ ${emailDraftFormat === 'text'
         emailDraft.htmlContent = emailData.htmlContent;
       }
 
+      // Build activity history section for message prompt (reuse already-fetched engagements)
+      let messageActivityContext = '';
+      if (engagements.length > 0) {
+        messageActivityContext = '\n\n## Activity History (most recent first):';
+        engagements.slice(0, 10).forEach((eng: any, index: number) => {
+          messageActivityContext += `\n${index + 1}. [${eng.eventType}] ${eng.createdAt}`;
+          if (eng.eventData?.subject) messageActivityContext += ` — Subject: ${eng.eventData.subject}`;
+          if (eng.text) messageActivityContext += `\n   "${String(eng.text).slice(0, 300)}"`;
+          else if (eng.emailContent?.text) {
+            messageActivityContext += `\n   "${eng.emailContent.text.substring(0, 300)}"`;
+          }
+        });
+      }
+
       // Create message draft for LinkedIn/Facebook/other platforms
       const messagePrompt = `Based on the email draft you just created, now create a shorter message version suitable for LinkedIn, Facebook, or other messaging platforms.
 
 ## Email Draft Created:
 Subject: ${emailData.subject}
 Content: ${emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent}
+${messageActivityContext}
 
 ## Requirements for Message Draft:
 1. Keep it concise and conversational (150-300 characters ideal, max 500)
 2. Maintain the core message and call-to-action from the email
-3. Make it platform-agnostic (works for LinkedIn, Facebook, Twitter DMs, etc.)
-4. Use a friendly, professional tone
-5. Include personalization (use lead's name if appropriate)
-6. No need for subject line or signature
-7. Focus on the key value proposition and CTA
+3. If there is activity history, acknowledge prior touchpoints naturally (e.g. "following up on my earlier email")
+4. Make it platform-agnostic (works for LinkedIn, Facebook, Twitter DMs, etc.)
+5. Use a friendly, professional tone
+6. Include personalization (use lead's name if appropriate)
+7. No need for subject line or signature
+8. Focus on the key value proposition and CTA
 
 Format the response as JSON with this structure:
 {
@@ -13802,6 +13823,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (toolName === 'linkedin_outreach' && safeMessage.toLowerCase().includes('too long')) {
       return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: The invitation message exceeded LinkedIn's 300-character limit. Do NOT report this as a success. Shorten the message to 300 characters or fewer (trim filler words, remove the sign-off line, keep only the core personalisation) and retry the send-invite call immediately.`;
     }
+    // save_file / create_html_file parameter errors — guide LLM to use correct schema names
+    if ((toolName === 'save_file' || toolName === 'create_html_file') &&
+        (safeMessage.includes('required') || safeMessage.includes('undefined') || safeMessage.includes('must be'))) {
+      if (toolName === 'save_file') {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: Use the exact parameter names from the schema: "file_name" (string, the filename with extension e.g. "report.html") and "file_content" (string, the full file content). Do NOT use "filename", "fileName", "content", "html_content", or other variants. Retry immediately with the correct parameters.`;
+      }
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: Use the exact parameter names from the schema: "title" (string, document title) and "content_draft" (string, the full content). Both are required. Retry immediately with the correct parameters.`;
+    }
     return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
   }
 
@@ -15713,19 +15742,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       // Validate inputs
       if (!fileName || typeof fileName !== 'string') {
-        throw new Error('fileName is required and must be a string');
+        throw new Error('file_name is required and must be a non-empty string (e.g. "report.html")');
       }
 
       if (fileContent === undefined || fileContent === null) {
-        throw new Error('fileContent is required and cannot be undefined or null');
+        throw new Error('file_content is required and cannot be undefined or null');
       }
 
       if (typeof fileContent !== 'string') {
-        throw new Error(`fileContent must be a string, received: ${typeof fileContent}`);
+        throw new Error(`file_content must be a string, received: ${typeof fileContent}`);
       }
 
       if (fileContent.trim().length === 0) {
-        throw new Error('fileContent cannot be empty');
+        throw new Error('file_content cannot be empty');
       }
 
       // Generate content hash for deduplication
@@ -19356,6 +19385,13 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
     sessionId: string
   ): Promise<any> {
     try {
+      if (!title || typeof title !== 'string') {
+        throw new Error('title is required and must be a non-empty string');
+      }
+      if (!contentDraft || typeof contentDraft !== 'string') {
+        throw new Error('content_draft is required and must be a non-empty string');
+      }
+
       // Use Claude model by default (check for Claude in model name)
       const defaultClaudeModel = 'anthropic.claude-sonnet-4-6';
 

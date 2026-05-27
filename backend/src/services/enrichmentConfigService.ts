@@ -118,14 +118,15 @@ const ALIAS_INFERENCE_BLOCKLIST = new Set(['emailDomain', 'email_domain']);
 /** Maps the lead's standard column name → canonical FIELD_GROUPS field
  *  it enriches against. Used by `buildDefaultConfig` to auto-set aliasFor.  */
 export const STANDARD_DATA_ALIASES: Record<string, string> = {
-  firstName: 'first_name',
-  lastName:  'last_name',
-  email:     'email',
-  phone:     'phone',
-  title:     'title',
-  linkedin:  'linkedin_url',
-  company:   'company_name',
-  website:   'website',
+  firstName:       'first_name',
+  lastName:        'last_name',
+  email:           'email',
+  phone:           'phone',
+  title:           'title',
+  linkedin:        'linkedin_url',
+  company:         'company_name',
+  website:         'website',
+  companyLinkedin: 'company_linkedin_url',
 };
 
 /** Standard lead columns that ARE enrichable — always surfaced in the config
@@ -133,7 +134,7 @@ export const STANDARD_DATA_ALIASES: Record<string, string> = {
  *  "Standard Fields" section of the Configure Display Fields dialog, minus
  *  non-enrichable system fields (createdAt, updatedAt, status, dealValue). */
 export const STANDARD_ENRICHABLE_FIELDS = [
-  'firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'notes',
+  'firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'companyLinkedin', 'notes',
 ] as const;
 
 /** Custom-field names from list.fieldNames that should NOT appear in
@@ -452,6 +453,10 @@ export async function processEnrichmentConfig(
     ),
   };
 
+  // Fire the DB read immediately — independent of the LLM steps below.
+  // Awaited in Step 3a; running it here overlaps the read with LLM I/O.
+  const storedConfigPromise = deps.readListConfig(input.listId).catch(() => null);
+
   // Step 2: LLM fallback for fields the heuristic couldn't resolve. One LLM
   // call total per save (not per enrichment run) — cheap. LLM matches opaque
   // names like `stag` → `funding_stage` based on the user's instruction text.
@@ -484,7 +489,7 @@ export async function processEnrichmentConfig(
   // these. Load from DB (authoritative) and re-attach for fields that match by
   // name. If no stored config exists (new list), nothing to restore.
   {
-    const storedConfig = await deps.readListConfig(input.listId).catch(() => null);
+    const storedConfig = await storedConfigPromise;
     const storedByName = new Map(
       (storedConfig?.fields ?? []).map(f => [f.name, f]),
     );

@@ -101,4 +101,32 @@ describe("extractJson", () => {
     const raw = 'Sure: {"oops": "no closing brace';
     expect(() => extractJson(raw)).toThrow(JsonExtractError);
   });
+
+  // ── Layer 3: trailing-comma repair ───────────────────────────────────────────
+  // LLMs sometimes emit trailing commas before } or ] which JSON.parse rejects.
+  // Layer 3 strips them and retries before giving up.
+
+  it("repairs trailing comma before closing brace", () => {
+    const raw = '{"a": 1, "b": 2,}';
+    const out = extractJson<{ a: number; b: number }>(raw);
+    expect(out).toEqual({ a: 1, b: 2 });
+  });
+
+  it("repairs trailing comma before closing bracket", () => {
+    const raw = '[1, 2, 3,]';
+    const out = extractJson<number[]>(raw);
+    expect(out).toEqual([1, 2, 3]);
+  });
+
+  it("repairs multiple trailing commas in nested structure", () => {
+    const raw = '{"outer": {"inner": "val",}, "arr": [1, 2,],}';
+    const out = extractJson<any>(raw);
+    expect(out).toEqual({ outer: { inner: "val" }, arr: [1, 2] });
+  });
+
+  it("repairs trailing comma in prose-wrapped JSON", () => {
+    const raw = 'Here is the result: {"name": "Acme", "size": 50,} done.';
+    const out = extractJson<{ name: string; size: number }>(raw);
+    expect(out).toEqual({ name: "Acme", size: 50 });
+  });
 });

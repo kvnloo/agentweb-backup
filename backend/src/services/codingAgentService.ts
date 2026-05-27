@@ -49,6 +49,10 @@ const AGENT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes max for the entire agent 
 const MAX_TOOL_RESULT_CHARS = 30000; // Truncate tool results to prevent context bloat
 const MAX_RETRIES = 2;
 
+function is403Error(e: unknown): boolean {
+  return e instanceof Error && /API error \(403\)/i.test(e.message);
+}
+
 // ─── System Prompt ──────────────────────────────────────────────────────────
 
 const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent that edits landing page code in a GitHub repository connected to Vercel. Your edits go to a draft branch, creating a Vercel preview deployment for user review.
@@ -947,6 +951,7 @@ async function runCodingAgentInternal(
     const fileList = await executeTool('list_files', {}, context);
     fileListingPreamble = `\n\n## Repository file listing (use this to orient yourself — do not call list_files again)\n\`\`\`\n${fileList}\n\`\`\`\n\n`;
   } catch (e) {
+    if (is403Error(e)) throw e; // Authorization failure — propagate immediately
     // Non-fatal: agent can still call list_files itself
     console.warn('[CODING AGENT] Pre-fetch of file listing failed, agent will list files manually:', e);
   }
@@ -1034,6 +1039,7 @@ async function runCodingAgentInternal(
             });
           }
         } catch (error) {
+          if (is403Error(error)) throw error; // Authorization failure — exit loop immediately
           toolResult = `Error executing ${fnName}: ${error instanceof Error ? error.message : String(error)}`;
         }
 
@@ -1059,6 +1065,13 @@ async function runCodingAgentInternal(
     };
 
   } catch (error) {
+    if (is403Error(error)) {
+      return {
+        success: false,
+        message: `Not authorized to edit this landing page. The org owner needs to add you as an editor under Settings → Organization → Org-wide Sharing → Landing Pages.`,
+        iterations: iteration
+      };
+    }
     return {
       success: false,
       message: `Coding agent encountered an error: ${error instanceof Error ? error.message : String(error)}`,
@@ -1097,7 +1110,16 @@ export async function runCodingAgent(
   });
 
   return Promise.race([
-    runCodingAgentInternal(taskDescription, context, maxIterations, model),
+    runCodingAgentInternal(taskDescription, context, maxIterations, model).catch((error) => {
+      if (is403Error(error)) {
+        return {
+          success: false,
+          message: `Not authorized to edit this landing page. The org owner needs to add you as an editor under Settings → Organization → Org-wide Sharing → Landing Pages.`,
+          iterations: 0
+        };
+      }
+      throw error;
+    }),
     timeoutPromise
   ]);
 }

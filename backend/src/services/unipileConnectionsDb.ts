@@ -50,12 +50,33 @@ export async function upsertConnection(conn: UnipileConnection): Promise<void> {
   }).promise();
 }
 
-/** Upsert many connections in parallel batches. */
+/** Upsert many connections in parallel batches. Also updates the per-account latestConnectedAt watermark. */
 export async function upsertConnections(conns: UnipileConnection[]): Promise<void> {
+  if (conns.length === 0) return;
   const BATCH = 25;
   for (let i = 0; i < conns.length; i += BATCH) {
     await Promise.all(conns.slice(i, i + BATCH).map(upsertConnection));
   }
+
+  // Maintain a per-account watermark row (SK='__latest__') so getLatestConnectedAt
+  // can do a direct GetItem instead of relying on alphabetical SK ordering.
+  const maxByAccount = new Map<string, number>();
+  for (const c of conns) {
+    if (c.connectedAt > (maxByAccount.get(c.accountId) ?? 0)) {
+      maxByAccount.set(c.accountId, c.connectedAt);
+    }
+  }
+  await Promise.all(
+    Array.from(maxByAccount.entries()).map(([accountId, connectedAt]) =>
+      dynamodb.update({
+        TableName: TABLE,
+        Key: { accountId, memberId: '__latest__' },
+        UpdateExpression: 'SET connectedAt = :ts',
+        ConditionExpression: 'attribute_not_exists(connectedAt) OR connectedAt < :ts',
+        ExpressionAttributeValues: { ':ts': connectedAt },
+      }).promise().catch(() => { /* ConditionalCheckFailedException — stored value is already ≥ */ })
+    )
+  );
 }
 
 /**
@@ -95,17 +116,37 @@ export async function getConnectionByProfileUrlAndAccount(
   return (result.Items?.[0] as UnipileConnection) ?? null;
 }
 
+/**
+ * Fetch all connection records for a specific Unipile accountId.
+ * Used by the linkedInConnected server-side filter.
+ */
+export async function getAllConnectionsByAccount(accountId: string): Promise<UnipileConnection[]> {
+  const items: UnipileConnection[] = [];
+  let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+  do {
+    const result = await dynamodb.query({
+      TableName: TABLE,
+      KeyConditionExpression: 'accountId = :aid',
+      FilterExpression: 'memberId <> :wm',
+      ExpressionAttributeValues: { ':aid': accountId, ':wm': '__latest__' },
+      ExclusiveStartKey: lastEvaluatedKey,
+    }).promise();
+    items.push(...((result.Items ?? []) as UnipileConnection[]));
+    lastEvaluatedKey = result.LastEvaluatedKey as AWS.DynamoDB.DocumentClient.Key | undefined;
+  } while (lastEvaluatedKey);
+  return items;
+}
+
 /** Get the timestamp of the most recently synced connection for an account. */
 export async function getLatestConnectedAt(accountId: string): Promise<number | null> {
-  const result = await dynamodb.query({
+  // Read the watermark row written by upsertConnections (SK='__latest__').
+  // Avoids relying on alphabetical SK ordering which does NOT sort by connectedAt.
+  const result = await dynamodb.get({
     TableName: TABLE,
-    KeyConditionExpression: 'accountId = :aid',
-    ExpressionAttributeValues: { ':aid': accountId },
+    Key: { accountId, memberId: '__latest__' },
     ProjectionExpression: 'connectedAt',
-    ScanIndexForward: false,
-    Limit: 1,
   }).promise();
-  const item = result.Items?.[0] as Pick<UnipileConnection, 'connectedAt'> | undefined;
+  const item = result.Item as Pick<UnipileConnection, 'connectedAt'> | undefined;
   return item?.connectedAt ?? null;
 }
 
