@@ -156,6 +156,51 @@ router.get('/lists/:listId/leads/:leadId/group-email-status', async (req: Reques
   }
 });
 
+// POST /api/crm/public/leads/:listId
+// Public unauthenticated endpoint for landing page lead capture.
+// Requires the list to have publicAccessEnabled=true.
+router.post('/leads/:listId', async (req: Request, res: Response) => {
+  try {
+    const { listId } = req.params;
+    const body = req.body ?? {};
+
+    // Validate email
+    const email = typeof body.email === 'string' ? body.email.trim() : '';
+    if (!email) {
+      return res.status(400).json({ message: 'email is required' });
+    }
+    if (email.length > MAX_EMAIL_LENGTH) {
+      return res.status(400).json({ message: 'email exceeds max length' });
+    }
+    if (!EMAIL_REGEX.test(email)) {
+      return res.status(400).json({ message: 'email is malformed' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+    if (!list.publicAccessEnabled) {
+      return res.status(403).json({ message: 'Public access not enabled for this list' });
+    }
+
+    // Only allow known safe fields — block any attempt to inject system fields
+    const allowedFields = ['email', 'firstName', 'lastName', 'company', 'phone', 'title', 'website', 'linkedin', 'notes', 'source', 'customFields'];
+    const leadData: Record<string, unknown> = { email };
+    for (const field of allowedFields) {
+      if (field !== 'email' && body[field] !== undefined) {
+        leadData[field] = body[field];
+      }
+    }
+
+    const lead = await crmDb.createLead(listId, leadData as any);
+    return res.status(201).json({ leadId: (lead as any).leadId, success: true });
+  } catch (error) {
+    console.error('Error creating public lead:', error);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 // POST /api/crm/public/lists/:listId/leads/:leadId/group-email-unsubscribe
 router.post('/lists/:listId/leads/:leadId/group-email-unsubscribe', async (req: Request, res: Response) => {
   try {
