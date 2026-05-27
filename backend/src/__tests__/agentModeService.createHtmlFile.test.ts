@@ -361,49 +361,37 @@ describe('AgentModeService - createHtmlFile', () => {
     });
 
     it('should return error when title is missing', async () => {
-      const result = await (agentModeService as any).executeTool(
-        'gpt-4',
-        'create_html_file',
-        {
-          content_draft: 'Test content'
-        },
-        'user123',
-        'session123',
-        false
-      );
+      await expect(
+        (agentModeService as any).executeTool(
+          'gpt-4',
+          'create_html_file',
+          {
+            content_draft: 'Test content'
+          },
+          'user123',
+          'session123',
+          false
+        )
+      ).rejects.toThrow('title is required and must be a string');
 
-      expect(result.success).toBe(false);
-      expect(result.message).toBe('title is required');
-      expect((singletonAgentService as any).createHtmlFile).toHaveBeenCalledWith(
-        undefined,
-        'Test content',
-        expect.any(String),
-        'user123',
-        'session123'
-      );
+      expect((singletonAgentService as any).createHtmlFile).not.toHaveBeenCalled();
     });
 
     it('should return error when content_draft is missing', async () => {
-      const result = await (agentModeService as any).executeTool(
-        'gpt-4',
-        'create_html_file',
-        {
-          title: 'Test Title'
-        },
-        'user123',
-        'session123',
-        false
-      );
+      await expect(
+        (agentModeService as any).executeTool(
+          'gpt-4',
+          'create_html_file',
+          {
+            title: 'Test Title'
+          },
+          'user123',
+          'session123',
+          false
+        )
+      ).rejects.toThrow('content_draft is required and must be a string');
 
-      expect(result.success).toBe(false);
-      expect(result.message).toBe('content_draft is required');
-      expect((singletonAgentService as any).createHtmlFile).toHaveBeenCalledWith(
-        'Test Title',
-        undefined,
-        expect.any(String),
-        'user123',
-        'session123'
-      );
+      expect((singletonAgentService as any).createHtmlFile).not.toHaveBeenCalled();
     });
 
     it('should handle mock mode for create_html_file', async () => {
