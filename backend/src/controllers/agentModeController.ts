@@ -3411,6 +3411,25 @@ export const agentModeController = {
         console.warn('Failed to propagate ishare message feedback to images:', propagateError);
       }
 
+      // Fire-and-forget: create a Notion item for anonymous ishare votes
+      createOncallItem({
+        title: `Agent Mode ${type === 'like' ? 'Like' : 'Dislike'} Feedback (iShare) – ${session.title || shareId}`,
+        description: [
+          `Anonymous visitor voted ${type} on a message in shared session "${session.title || shareId}".`,
+          comment ? `Comment: "${comment}"` : '',
+          '',
+          `Message preview: ${String(message.content || '').slice(0, 300)}`,
+        ].filter(Boolean).join('\n'),
+        additionalTags: [type === 'like' ? 'Feedback-Like' : 'Feedback-Dislike'],
+        context: {
+          sessionId: shareId,
+          messageIndex: messageIndexNum,
+          source: 'ishare',
+        },
+      }).catch((err: Error) => {
+        console.warn('Failed to create Notion feedback item (ishare):', err.message);
+      });
+
       res.json({
         success: true,
         message: updatedMessage,
