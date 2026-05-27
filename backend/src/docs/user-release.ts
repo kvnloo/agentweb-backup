@@ -20,6 +20,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-27',
     changes: [
+      'Improved: Agent Mode Votes Now Create Notion Items for Team Review',
+      '- Thumbs-up and thumbs-down votes on Agent Mode responses now automatically create a Notion task so the team can review positive feedback to learn from and negative feedback to fix',
+      '- Works for both authenticated users and anonymous visitors on shared (iShare) sessions',
+      '- Items are tagged Feedback-Like or Feedback-Dislike and include the session name, message preview, and any comment left by the user',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
       'Improved: CRM Lead Panel Now Auto-Syncs LinkedIn Messages and Uses Activity History for Drafts',
       '- Opening a lead detail panel now automatically syncs the lead\'s LinkedIn message history (if a LinkedIn URL is set) — no more manual "Sync LinkedIn" click needed',
       '- The sync runs silently on panel open if the last sync was more than 10 minutes ago, so the activity timeline is always fresh',
