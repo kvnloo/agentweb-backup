@@ -7840,8 +7840,18 @@ export class AgentModeService {
         connectedAtTimestamp?: number;
       } | null = null;
       if (lead.linkedin) {
-        const { getConnectionByProfileUrl } = await import('./unipileConnectionsDb');
-        const conn = await getConnectionByProfileUrl(lead.linkedin as string).catch(() => null);
+        const { getAccountsByUserId } = await import('./connectedAccountsDb');
+        const { getConnectionByProfileUrlAndAccount } = await import('./unipileConnectionsDb');
+        const userAccounts = await getAccountsByUserId(userId).catch(() => []);
+        const accountIds = userAccounts
+          .filter((a: any) => a.platform === 'unipile')
+          .map((a: any) => a.config?.unipile_account_id || a.account_id)
+          .filter(Boolean) as string[];
+        let conn = null;
+        for (const accountId of accountIds) {
+          conn = await getConnectionByProfileUrlAndAccount(lead.linkedin as string, accountId).catch(() => null);
+          if (conn) break;
+        }
         linkedInConnectionStatus = conn
           ? {
               isConnected: true,

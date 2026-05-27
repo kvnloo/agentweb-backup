@@ -4055,13 +4055,13 @@ router.post('/lists/:listId/leads/:leadId/sync-linkedin-connection', async (req:
     }
 
     const { syncConnectionsForAccount } = await import('../cron/linkedInConnectionSyncCron');
-    const { getConnectionByProfileUrl } = await import('../services/unipileConnectionsDb');
+    const { getConnectionByProfileUrlAndAccount } = await import('../services/unipileConnectionsDb');
 
     // Refresh the cache for this account (quick, not full sync)
     await syncConnectionsForAccount(accountId);
 
-    // Check if this specific lead is now connected
-    const connection = await getConnectionByProfileUrl(leadLinkedIn);
+    // Check if this specific lead is now connected — scoped to the resolved account only
+    const connection = await getConnectionByProfileUrlAndAccount(leadLinkedIn, accountId);
     const isConnected = !!connection;
 
     return res.json({ isConnected, syncedAt: new Date().toISOString() });
@@ -4087,15 +4087,31 @@ router.post('/check-linkedin-connections', async (req: Request, res: Response) =
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
     if (!Array.isArray(urls) || urls.length === 0) return res.json({ connected: [] });
 
-    const { getConnectionByProfileUrl } = await import('../services/unipileConnectionsDb');
+    // Only check connections belonging to the user's own Unipile account(s).
+    // Site-wide accounts are for LinkedIn search only — never for personal connection status.
+    const { getAccountsByUserId } = await import('../services/connectedAccountsDb');
+    const accounts = await getAccountsByUserId(userId);
+    const accountIds = accounts
+      .filter((a: any) => a.platform === 'unipile')
+      .map((a: any) => a.config?.unipile_account_id || a.account_id)
+      .filter(Boolean) as string[];
+
+    if (accountIds.length === 0) return res.json({ connected: [] });
+
+    const { getConnectionByProfileUrlAndAccount } = await import('../services/unipileConnectionsDb');
 
     const connected: Array<{ url: string; connectedAt: number | null }> = [];
     await Promise.all(urls.map(async (url: string) => {
-      const conn = await getConnectionByProfileUrl(url).catch(() => null);
-      if (conn) connected.push({
-        url: url.trim().toLowerCase().replace(/\/?$/, '/'),
-        connectedAt: conn.connectedAt ?? null,
-      });
+      for (const accountId of accountIds) {
+        const conn = await getConnectionByProfileUrlAndAccount(url, accountId).catch(() => null);
+        if (conn) {
+          connected.push({
+            url: url.trim().toLowerCase().replace(/\/?$/, '/'),
+            connectedAt: conn.connectedAt ?? null,
+          });
+          return;
+        }
+      }
     }));
 
     return res.json({ connected });
@@ -4128,15 +4144,31 @@ router.post('/lists/:listId/check-linkedin-connections', async (req: Request, re
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    const { getConnectionByProfileUrl } = await import('../services/unipileConnectionsDb');
+    // Only check connections belonging to the user's own Unipile account(s).
+    // Site-wide accounts are for LinkedIn search only — never for personal connection status.
+    const { getAccountsByUserId } = await import('../services/connectedAccountsDb');
+    const accounts = await getAccountsByUserId(userId);
+    const accountIds = accounts
+      .filter((a: any) => a.platform === 'unipile')
+      .map((a: any) => a.config?.unipile_account_id || a.account_id)
+      .filter(Boolean) as string[];
+
+    if (accountIds.length === 0) return res.json({ connected: [] });
+
+    const { getConnectionByProfileUrlAndAccount } = await import('../services/unipileConnectionsDb');
 
     const connected: Array<{ url: string; connectedAt: number | null }> = [];
     await Promise.all(urls.map(async (url: string) => {
-      const conn = await getConnectionByProfileUrl(url).catch(() => null);
-      if (conn) connected.push({
-        url: url.trim().toLowerCase().replace(/\/?$/, '/'),
-        connectedAt: conn.connectedAt ?? null,
-      });
+      for (const accountId of accountIds) {
+        const conn = await getConnectionByProfileUrlAndAccount(url, accountId).catch(() => null);
+        if (conn) {
+          connected.push({
+            url: url.trim().toLowerCase().replace(/\/?$/, '/'),
+            connectedAt: conn.connectedAt ?? null,
+          });
+          return;
+        }
+      }
     }));
 
     return res.json({ connected });
