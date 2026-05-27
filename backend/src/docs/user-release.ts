@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-27',
     changes: [
+      'Fixed: CRM Lead Lists Now Accessible in Admin Delegated Chat Sessions',
+      '- When an admin accessed a user\'s account via delegated access and called get_lead_lists (or other CRM tools) in a chat session, 0 lists were returned even though the user had lists configured',
+      '- Root cause: the session was passing the admin\'s user ID to the worker instead of the account owner\'s user ID, so queries hit the wrong data partition',
+      '- Fix: chat sessions now always use the session owner\'s user ID for tool execution, regardless of who initiated the request',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
       'Fixed: LinkedIn Connection Accepted Notification Now Fires Only Once',
       '- The email notification sent when a lead accepts your LinkedIn invitation was being sent repeatedly every 10 minutes',
       '- Fixed a broken watermark that caused the sync cron to treat already-seen connections as new on every run',
