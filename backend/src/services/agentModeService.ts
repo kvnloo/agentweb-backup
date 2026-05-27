@@ -7840,15 +7840,20 @@ export class AgentModeService {
         connectedAtTimestamp?: number;
       } | null = null;
       if (lead.linkedin) {
-        const { getConnectionByProfileUrl } = await import('./unipileConnectionsDb');
-        const conn = await getConnectionByProfileUrl(lead.linkedin as string).catch(() => null);
-        linkedInConnectionStatus = conn
-          ? {
-              isConnected: true,
-              connectedAt: new Date(conn.connectedAt * 1000).toISOString(),
-              connectedAtTimestamp: conn.connectedAt,
-            }
-          : { isConnected: false };
+        const accountId: string | null = (list as any).linkedInAccountId ?? null;
+        if (accountId) {
+          const { getConnectionByProfileUrlAndAccount } = await import('./unipileConnectionsDb');
+          const conn = await getConnectionByProfileUrlAndAccount(lead.linkedin as string, accountId).catch(() => null);
+          linkedInConnectionStatus = conn
+            ? {
+                isConnected: true,
+                connectedAt: new Date(conn.connectedAt * 1000).toISOString(),
+                connectedAtTimestamp: conn.connectedAt,
+              }
+            : { isConnected: false };
+        } else {
+          linkedInConnectionStatus = { isConnected: false };
+        }
       }
 
       // Get engagement count and recent engagements
