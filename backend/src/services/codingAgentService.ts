@@ -68,6 +68,12 @@ This is a **Next.js 15 (App Router)** project — NOT a static HTML site.
 - Config: \`next.config.js\`, \`tailwind.config.js\`
 - The initial user message includes a file listing. Use it to orient yourself before editing.
 
+## Creating New Files
+You CAN create new files using \`edit_file\`. For a file that does not yet exist:
+- Use \`line_edits\` with a single block: \`{ start_line: 1, end_line: 1, new_content: "<full file content>" }\`
+- Or use \`edits\` with a search/replace where \`search\` is an empty string \`""\` and \`replace\` is the full file content.
+The tool will create the file if it doesn't exist. No need to read it first.
+
 ## Principles
 - Make targeted, small edits (1-5 edit blocks per call). Never rewrite entire files.
 - For files over 5KB, use search_in_file to locate code before reading. Use read_file with line ranges, not whole files.
@@ -95,8 +101,20 @@ export function applySearchReplace(content: string, edits: SearchReplaceEdit[]):
   for (let i = 0; i < edits.length; i++) {
     const edit = edits[i];
 
-    if (!edit.search) {
-      errors.push(`Edit ${i + 1}: search string is empty`);
+    if (edit.search === undefined || edit.search === null) {
+      errors.push(`Edit ${i + 1}: search string is missing`);
+      continue;
+    }
+
+    // Empty search on an empty file = create the file with replace content
+    if (edit.search === '' && result === '') {
+      result = edit.replace;
+      appliedCount++;
+      continue;
+    }
+
+    if (edit.search === '') {
+      errors.push(`Edit ${i + 1}: search string is empty (only valid when creating a new empty file)`);
       continue;
     }
 
@@ -540,15 +558,25 @@ async function executeTool(
         return 'Error: either line_edits or edits array is required and must not be empty.';
       }
 
-      // Step 1: Read current file content (from draft branch if applicable)
-      const fileData = await mcpFetch({
-        method: 'GET',
-        path: `${basePath}/file-content`,
-        queryParams: { path: args.file_path, ...branchQuery },
-        context: { userId: context.userId }
-      });
-
-      const currentContent = fileData.content || '';
+      // Step 1: Read current file content (from draft branch if applicable).
+      // A 404 means the file doesn't exist yet — treat as empty content so the agent can create new files.
+      let currentContent = '';
+      try {
+        const fileData = await mcpFetch({
+          method: 'GET',
+          path: `${basePath}/file-content`,
+          queryParams: { path: args.file_path, ...branchQuery },
+          context: { userId: context.userId }
+        });
+        currentContent = fileData.content || '';
+      } catch (readErr: unknown) {
+        if (readErr instanceof Error && /API error \(404\)/i.test(readErr.message)) {
+          // New file — start with empty content
+          currentContent = '';
+        } else {
+          throw readErr;
+        }
+      }
       let newContent: string;
       let appliedCount: number;
       let errors: string[];

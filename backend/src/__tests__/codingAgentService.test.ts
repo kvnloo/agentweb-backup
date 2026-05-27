@@ -1040,4 +1040,33 @@ describe('applyLineNumberEdit', () => {
     expect(result.appliedCount).toBe(0);
     expect(result.result).toBe(content); // unchanged
   });
+
+  test('creates new file — empty content with line 1-1 edit', () => {
+    const result = applyLineNumberEdit('', [
+      { start_line: 1, end_line: 1, new_content: 'export default function Page() {\n  return <div>Hello</div>;\n}' }
+    ]);
+    expect(result.errors).toHaveLength(0);
+    expect(result.appliedCount).toBe(1);
+    expect(result.result).toBe('export default function Page() {\n  return <div>Hello</div>;\n}');
+  });
+});
+
+describe('applySearchReplace — new file creation', () => {
+  test('creates new file — empty search on empty content', () => {
+    const result = applySearchReplace('', [
+      { search: '', replace: 'const x = 1;\nexport default x;' }
+    ]);
+    expect(result.errors).toHaveLength(0);
+    expect(result.appliedCount).toBe(1);
+    expect(result.result).toBe('const x = 1;\nexport default x;');
+  });
+
+  test('rejects empty search on non-empty content', () => {
+    const result = applySearchReplace('existing content', [
+      { search: '', replace: 'new content' }
+    ]);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain('empty');
+    expect(result.appliedCount).toBe(0);
+  });
 });
