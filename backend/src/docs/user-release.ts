@@ -9,6 +9,47 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-26',
+    changes: [
+      'Improved: Admin Skills Page Now Enforces Review Gate for User-Created Private Skills',
+      '- Private and pending-review skills submitted by users are clearly labeled in the admin Skills table',
+      '- Owner email is shown beneath the skill name so admins know who submitted it',
+      '- Edit, subscription assignment, and public visibility controls are disabled for private/pending skills until they are approved through the review queue',
+    ],
+  },
+  {
+    date: '2026-05-26',
+    changes: [
+      'Fixed: Agent Mode Now Shows a Clear Message When a Response Times Out',
+      '- Previously, if a response took too long to generate, Agent Mode showed a generic "unknown error" message',
+      '- It now shows: "The response took too long to generate. Please try again — your session is still active."',
+      '- Your session and conversation history are preserved; just send your message again to continue',
+    ],
+  },
+  {
+    date: '2026-05-26',
+    changes: [
+      'Improved: Agent Mode Timeout Extended to 10 Minutes',
+      '- Long-running browser automation tasks (such as scraping LinkedIn profiles with a local agent) now have a 10-minute window before timing out, up from 5 minutes',
+    ],
+  },
+  {
+    date: '2026-05-26',
+    changes: [
+      'Fixed: New Users No Longer Incorrectly Assigned Basic Subscription Tier',
+      '- Users who signed up but whose subscription tier was not saved correctly were appearing as "Basic" (full-access) instead of "Free"',
+      '- The fallback tier used when no subscription is set now correctly defaults to Free rather than Basic',
+    ],
+  },
+  {
+    date: '2026-05-26',
+    changes: [
+      'Fixed: Landing Pages No Longer Get Stuck in "Deploying" Status Due to Route Conflicts',
+      '- New landing pages added to a shared site could fail to build because the generated code included an API route that conflicted with an existing shared route, causing a Turbopack build error',
+      '- The duplicate API route is now skipped during deployment; sub-pages correctly use the shared lead capture endpoint instead of creating a conflicting one',
+    ],
+  },
+  {
     date: '2026-05-25',
     changes: [
       'New: Self-Service Analytics Setup',

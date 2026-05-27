@@ -54,6 +54,7 @@ export interface Skill {
   maxIterations?: number;
   isBuiltIn?: boolean;
   ownerId?: string;
+  ownerEmail?: string;
   orgId?: string;
   visibility?: SkillVisibility;
   reviewFeedback?: string;

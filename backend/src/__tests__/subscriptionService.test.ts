@@ -76,14 +76,14 @@ describe('subscriptionService', () => {
     jest.clearAllMocks();
   });
 
-  it('getUserSubscriptionType returns user.subscriptionType or Basic by default', async () => {
+  it('getUserSubscriptionType returns user.subscriptionType or Free by default', async () => {
     mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u1', subscriptionType: 'Pro' } as any);
     const t1 = await getUserSubscriptionType('u1');
     expect(t1).toBe('Pro');
 
     mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u2' } as any);
     const t2 = await getUserSubscriptionType('u2');
-    expect(t2).toBe('Basic');
+    expect(t2).toBe('Free');
   });
 
   it('getAllAvailablePages includes default pages and customer portal pages', () => {
@@ -104,6 +104,16 @@ describe('subscriptionService', () => {
     expect(cfg!.name).toBe('Basic');
     expect(cfg!.allowedPages).toEqual(getAllAvailablePages());
     expect(cfg!.allowedSkills).toEqual(['*']);
+  });
+
+  it('getSubscriptionTypeConfig returns Free tier fallback when no types defined', async () => {
+    mockedSettingsService.getSetting.mockResolvedValueOnce(null as any);
+
+    const cfg = await getSubscriptionTypeConfig('Free');
+    expect(cfg).not.toBeNull();
+    expect(cfg!.name).toBe('Free');
+    expect(cfg!.allowedPages).toEqual(['/', '/agent-mode', '/settings', '/guide']);
+    expect(cfg!.allowedSkills).toEqual([]);
   });
 
   it('getSubscriptionTypeConfig normalizes /marketing prefix in allowedPages', async () => {
