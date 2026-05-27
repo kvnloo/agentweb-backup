@@ -26,52 +26,6 @@ import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
 // Fields NOT listed here fall straight from Tier 1 to Tier 4 (web) for the group.
 // Phase 1 keeps this narrow — only fields with a direct Apollo→CRM mapping.
 
-// ─── Unipile person coverage map ─────────────────────────────────────────────
-// Fields directly mappable from a Unipile profile raw response without LLM.
-// Remaining fields after direct map still go through extractFieldsViaLLM.
-
-// Root-level fields directly readable from the Unipile profile without job selection.
-// Job-dependent fields (title, tenure_at_company, prior_companies, education,
-// recent_role_change_date) are intentionally excluded — the LLM step receives the
-// full raw profile + lead.company context and can pick the correct work_experience
-// entry without the false-positive risk of heuristic string matching.
-export const UNIPILE_PERSON_COVERAGE: Record<string, string[]> = {
-  person_identity: ['first_name', 'last_name', 'location', 'linkedin_url', 'email', 'phone'],
-};
-
-/** Direct map from Unipile raw profile JSON → CRM field names (root-level only).
- *  Field names verified against real Unipile /api/v1/users response. */
-function mapUnipilePersonToCrmFields(raw: Record<string, any>): Record<string, string> {
-  const clean = (v: unknown): string | undefined => {
-    if (typeof v !== 'string') return undefined;
-    const s = v.replace(/\s*\n\s*/g, ' ').trim();
-    return s || undefined;
-  };
-
-  const out: Record<string, string> = {};
-  const firstName = clean(raw.first_name);
-  const lastName = clean(raw.last_name);
-  const location = clean(raw.location);
-  if (firstName)  out.first_name  = firstName;
-  if (lastName)   out.last_name   = lastName;
-  if (location)   out.location    = location;
-  if (raw.public_identifier) {
-    out.linkedin_url = `https://www.linkedin.com/in/${raw.public_identifier}`;
-  }
-
-  // contact_info — available on Sales Navigator / Recruiter accounts; empty arrays on normal accounts
-  const ci = raw.contact_info;
-  if (ci) {
-    const emails: any[] = Array.isArray(ci.emails) ? ci.emails : [];
-    const phones: any[] = Array.isArray(ci.phones) ? ci.phones : [];
-    const email = clean(emails[0]?.address ?? emails[0]?.value);
-    const phone = clean(phones[0]?.number ?? phones[0]?.value);
-    if (email) out.email = email;
-    if (phone) out.phone = phone;
-  }
-
-  return out;
-}
 
 export const APOLLO_GROUP_COVERAGE: Record<string, string[]> = {
   company_firmographic: [
@@ -147,6 +101,7 @@ export interface LLMExtractInput {
   groupName: string;
   lead: LeadRecord;
   configFieldsByName: Record<string, { instruction?: string } | undefined>;
+  listId?: string;
 }
 
 /** One LLM-extracted field value plus its web provenance (web tier only —
@@ -174,9 +129,22 @@ export interface WaterfallDeps {
   fetchWebForGroup(
     lead: LeadRecord,
     groupName: string,
+    listId?: string,
   ): Promise<{ webContext: string } | null>;
-  findLinkedInUrl(lead: LeadRecord): Promise<string | null>;
-  findUnipileCompany?(lead: LeadRecord, companyLinkedInUrl?: string, profileOnly?: boolean): Promise<{ companyRaw: any; personProfileRaw?: any } | null>;
+  /** Tier 3.5b: person enrichment via Unipile.
+   *  Case A (has linkedin, missing name/title): getProfile → extract fields.
+   *  Case B (no linkedin, has name, missing title): searchPeople → LLM picks
+   *  best of 5 candidates → extracts title from headline. */
+  findUnipilePerson?(lead: LeadRecord): Promise<{
+    first_name?: string;
+    last_name?: string;
+    title?: string;
+    linkedin_url?: string;
+  } | null>;
+  /** Tier 5: company enrichment via Unipile (runs after Tier 4 web).
+   *  Only fires when lead.linkedin is present. getProfile → company_id → getCompany.
+   *  Returns companyRaw (full company profile) and company_name from work_experience. */
+  findUnipileCompany?(lead: LeadRecord): Promise<{ company_name?: string; companyRaw: any } | null>;
   /** Tier 3.5: Apollo broker chain (run_waterfall_email). Optional — only
    *  wired when the caller has a persisted lead to receive the webhook result. */
   apolloBrokerChain?: (
@@ -210,31 +178,47 @@ async function ensureApolloFetched(
   lead: LeadRecord,
   entityType: 'company' | 'person',
   deps: WaterfallDeps,
+  listId?: string,
 ): Promise<Record<string, string> | null> {
+  const atag = `[v3:${listId ? `${listId}:` : ''}${lead.leadId ?? lead.email ?? '?'}:apollo:${entityType}]`;
   if (entityType === 'company') {
-    if (ctx.orgFetchAttempted) return ctx.orgRaw;
+    if (ctx.orgFetchAttempted) {
+      console.log(`${atag} cache hit (already fetched)`);
+      return ctx.orgRaw;
+    }
     ctx.orgFetchAttempted = true;
     try {
       const result = await deps.fetchApolloOrg(lead);
       ctx.orgRaw = result?.mapped ?? null;
       ctx.orgRawJson = result?.raw ?? null;
+      const mappedCount = ctx.orgRaw ? Object.keys(ctx.orgRaw).length : 0;
+      const rawKeys = ctx.orgRawJson ? Object.keys(ctx.orgRawJson).length : 0;
+      console.log(`${atag} ${ctx.orgRaw ? `HIT mapped_fields=${mappedCount} raw_keys=${rawKeys}` : 'MISS no org data'}`);
       return ctx.orgRaw;
-    } catch {
+    } catch (err) {
       ctx.orgFetchFailed = true;
       ctx.orgRaw = null;
+      console.warn(`${atag} ERROR ${(err as Error).message}`);
       return null;
     }
   }
-  if (ctx.personFetchAttempted) return ctx.personRaw;
+  if (ctx.personFetchAttempted) {
+    console.log(`${atag} cache hit (already fetched)`);
+    return ctx.personRaw;
+  }
   ctx.personFetchAttempted = true;
   try {
     const result = await deps.fetchApolloPerson(lead);
     ctx.personRaw = result?.mapped ?? null;
     ctx.personRawJson = result?.raw ?? null;
+    const mappedCount = ctx.personRaw ? Object.keys(ctx.personRaw).length : 0;
+    const rawKeys = ctx.personRawJson ? Object.keys(ctx.personRawJson).length : 0;
+    console.log(`${atag} ${ctx.personRaw ? `HIT mapped_fields=${mappedCount} raw_keys=${rawKeys}` : 'MISS no person data'}`);
     return ctx.personRaw;
-  } catch {
+  } catch (err) {
     ctx.personFetchFailed = true;
     ctx.personRaw = null;
+    console.warn(`${atag} ERROR ${(err as Error).message}`);
     return null;
   }
 }
@@ -313,21 +297,37 @@ export async function runWaterfall(
 
   const filled: FieldFill[] = [];
   let remaining = [...fields];
+  const lid = lead.leadId ?? lead.email ?? '?';
+  const tag = `[v3:${input.listId}:${lid}:wf:${groupName}]`;
+
+  console.log(`${tag} START fields=[${fields.join(',')}]`);
 
   // ─ Tier 1: CRM ─────────────────────────────────────────────────────────────
   const crmHits: FieldFill[] = [];
   for (const f of fields) {
-    if (refreshFields.has(`${lead.leadId}:${f}`)) continue;
+    if (refreshFields.has(`${lead.leadId}:${f}`)) {
+      console.log(`${tag} T1 MISS field=${f} reason=refresh_forced`);
+      continue;
+    }
     const value = getLeadFieldValue(lead, f);
-    if (!value) continue;
+    if (!value) {
+      console.log(`${tag} T1 MISS field=${f} reason=empty`);
+      continue;
+    }
     const meta = lead.enrichmentMetadata?.[f] as EnrichedFieldMeta | undefined;
-    if (!isFresh(meta, f)) continue;
+    if (!isFresh(meta, f)) {
+      console.log(`${tag} T1 MISS field=${f} reason=stale`);
+      continue;
+    }
+    console.log(`${tag} T1 HIT  field=${f} value="${String(value).slice(0, 60)}"`);
     crmHits.push({ field: f, value, meta: meta! });
   }
   filled.push(...crmHits);
   remaining = remaining.filter(f => !crmHits.find(c => c.field === f));
+  console.log(`${tag} T1 done crm_hits=${crmHits.length} remaining=[${remaining.join(',')}]`);
 
   if (remaining.length === 0) {
+    console.log(`${tag} DONE all filled by T1`);
     return {
       fields: filled,
       missing: [],
@@ -341,7 +341,11 @@ export async function runWaterfall(
   let apolloRaw: Record<string, string> | null = null;
   if (remainingInCoverage.length > 0) {
     const entityType = groupEntityType(groupName);
-    apolloRaw = await ensureApolloFetched(apolloCtx, lead, entityType, deps);
+    console.log(`${tag} T2 fetch entity=${entityType} fields_in_coverage=[${remainingInCoverage.join(',')}]`);
+    apolloRaw = await ensureApolloFetched(apolloCtx, lead, entityType, deps, input.listId);
+    if (!apolloRaw) console.log(`${tag} T2 fetch returned null (no Apollo data)`);
+  } else {
+    console.log(`${tag} T2 SKIP no remaining fields in Apollo coverage`);
   }
 
   const apolloHits: FieldFill[] = [];
@@ -349,12 +353,16 @@ export async function runWaterfall(
     for (const f of remaining) {
       const value = apolloRaw[f];
       if (typeof value === 'string' && value.length > 0) {
+        console.log(`${tag} T2 HIT  field=${f} value="${String(value).slice(0, 60)}"`);
         apolloHits.push({ field: f, value, meta: metaApollo(f) });
+      } else {
+        console.log(`${tag} T2 MISS field=${f} reason=not_in_apollo_mapped`);
       }
     }
   }
   filled.push(...apolloHits);
   remaining = remaining.filter(f => !apolloHits.find(a => a.field === f));
+  console.log(`${tag} T2 done apollo_hits=${apolloHits.length} remaining=[${remaining.join(',')}]`);
 
   // ─ Tier 3: LLM over full Apollo context ────────────────────────────────────
   // Uses the raw Apollo JSON (not the pre-mapped subset) so LLM can extract
@@ -366,6 +374,7 @@ export async function runWaterfall(
   let tier3Fills = 0;
   if (apolloRaw && remaining.some(f => coverage.includes(f))) {
     const tier3Targets = remaining.filter(f => coverage.includes(f));
+    console.log(`${tag} T3 LLM/Apollo targets=[${tier3Targets.join(',')}]`);
     const entityType = groupEntityType(groupName);
     const rawJson = entityType === 'person' ? apolloCtx.personRawJson : apolloCtx.orgRawJson;
     const stripKeys = entityType === 'person' ? STRIP_PERSON_KEYS : STRIP_ORG_KEYS;
@@ -381,18 +390,28 @@ export async function runWaterfall(
       groupName,
       lead,
       configFieldsByName: input.configFieldsByName,
+      listId: input.listId,
     });
     for (const f of tier3Targets) {
       const entry = llmResult.filled[f];
       if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
+        console.log(`${tag} T3 HIT  field=${f} value="${String(entry.value).slice(0, 60)}"`);
         filled.push({ field: f, value: entry.value, meta: metaApollo(f, { llmExtracted: true }) });
         tier3Fills += 1;
+      } else {
+        console.log(`${tag} T3 MISS field=${f} reason=llm_returned_empty`);
       }
     }
     remaining = remaining.filter(f => !llmFilledHasValue(llmResult.filled[f]));
+    console.log(`${tag} T3 done tier3_fills=${tier3Fills} remaining=[${remaining.join(',')}]`);
+  } else if (!apolloRaw) {
+    console.log(`${tag} T3 SKIP no apolloRaw`);
+  } else {
+    console.log(`${tag} T3 SKIP no remaining fields in Apollo coverage`);
   }
 
   if (remaining.length === 0) {
+    console.log(`${tag} DONE all filled by T1-T3`);
     return {
       fields: filled,
       missing: [],
@@ -422,22 +441,28 @@ export async function runWaterfall(
     const company     = lead.company    || undefined;
     const linkedin    = lead.linkedin   || undefined;
     if (firstName && lastName && (emailDomain || company)) {
+      console.log(`${tag} T3.5a attempt name="${firstName} ${lastName}" domain=${emailDomain ?? '∅'} company=${company ?? '∅'}`);
       try {
         const brokerResult = await deps.apolloBrokerChain(
           { firstName, lastName, emailDomain, company, linkedin },
           input.leadHint,
         );
         if (brokerResult?.email) {
+          console.log(`${tag} T3.5a HIT  email=${brokerResult.email} confidence=${apolloEmailStatusToConfidence(brokerResult.emailStatus ?? '')}`);
           filled.push({
             field: 'email',
             value: brokerResult.email,
             meta: { ...metaApollo('email'), confidence: apolloEmailStatusToConfidence(brokerResult.emailStatus ?? '') },
           });
           remaining = remaining.filter(f => f !== 'email');
+        } else {
+          console.log(`${tag} T3.5a MISS broker returned null`);
         }
       } catch (err) {
-        console.warn('[waterfall tier3.5a] apolloBrokerChain failed:', (err as Error).message);
+        console.warn(`${tag} T3.5a ERROR:`, (err as Error).message);
       }
+    } else {
+      console.log(`${tag} T3.5a SKIP missing name/domain/company (firstName=${!!firstName} lastName=${!!lastName} domain=${!!emailDomain} company=${!!company})`);
     }
   }
 
@@ -454,96 +479,45 @@ export async function runWaterfall(
     };
   }
 
-  // ─ Tier 3.5b: Unipile LinkedIn search (person) ─────────────────────────────
-  // Only for person_identity group when linkedin_url still missing after Apollo tiers.
-  // Searches by firstName + lastName + company to find the LinkedIn public_identifier.
+  // ─ Tier 3.5b: Unipile person enrichment ────────────────────────────────────
+  // Person groups only. Two cases:
+  //   Case A: lead.linkedin present, missing first_name/last_name/title
+  //           → getProfile(linkedin) → extract fields directly from profile
+  //   Case B: no lead.linkedin, have firstName+lastName, missing title
+  //           → searchPeople → LLM picks best of 5 candidates from headline
   let unipileFills = 0;
-  if (groupName === 'person_identity' && remaining.includes('linkedin_url')) {
-    const linkedInUrl = await deps.findLinkedInUrl(lead);
-    if (linkedInUrl) {
-      filled.push({ field: 'linkedin_url', value: linkedInUrl, meta: metaUnipile() });
-      remaining = remaining.filter(f => f !== 'linkedin_url');
-      unipileFills = 1;
-    }
-  }
-
-  // ─ Tier 3.5c: Unipile enrichment (company + person) ────────────────────────
-  // For company groups: cascades company LinkedIn URL → lead LinkedIn URL →
-  // name+company search to fetch company data.
-  // For person groups: reuses the profile fetched during company lookup (zero
-  // extra API calls) or fetches directly from lead.linkedin when available.
-  if (deps.findUnipileCompany && remaining.length > 0) {
-    const entityType = groupEntityType(groupName);
-    if (entityType === 'company') {
-      const companyLinkedInUrl: string | undefined =
-        lead.company_linkedin_url ||
-        filled.find(f => f.field === 'company_linkedin_url')?.value;
-      const result = await deps.findUnipileCompany(lead, companyLinkedInUrl);
-      if (result?.companyRaw) {
-        const llmResult = await deps.extractFieldsViaLLM({
-          tier: 'apollo',
-          sourceContext: JSON.stringify(result.companyRaw),
-          fields: remaining,
-          groupName,
-          lead,
-          configFieldsByName: input.configFieldsByName,
-        });
-        for (const f of remaining) {
-          const entry = llmResult.filled[f];
-          if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
-            filled.push({ field: f, value: entry.value, meta: metaUnipile() });
-            unipileFills += 1;
-          }
-        }
-        remaining = remaining.filter(f => !llmFilledHasValue(llmResult.filled[f]));
-      }
-    } else if (entityType === 'person') {
-      // Fetch person profile — reuse profile already fetched by findUnipileCompany
-      // (via Approach 1/3) when company group ran first, or fetch fresh if not.
-      // profileOnly=true skips the company API call since we only need the profile.
-      // Prefer linkedin_url freshly filled by 3.5b over the original lead field.
+  const PERSON_TIER35B_FIELDS = ['first_name', 'last_name', 'title', 'linkedin_url'];
+  if (deps.findUnipilePerson && groupEntityType(groupName) === 'person') {
+    const needsPersonFields = remaining.some(f => PERSON_TIER35B_FIELDS.includes(f));
+    if (needsPersonFields) {
+      console.log(`${tag} T3.5b attempt linkedin=${lead.linkedin ?? '∅'} name="${lead.firstName ?? '∅'} ${lead.lastName ?? '∅'}" company="${lead.company ?? '∅'}"`);
+      // Prefer linkedin_url freshly filled this run (Tier 2/3) over original lead field
       const resolvedLinkedin = lead.linkedin || filled.find(f => f.field === 'linkedin_url')?.value;
-      const leadForProfile = resolvedLinkedin ? { ...lead, linkedin: resolvedLinkedin } : lead;
-      const result = await deps.findUnipileCompany(leadForProfile, undefined, true);
-      const profileRaw = result?.personProfileRaw;
-      if (profileRaw) {
-        // Step 1: direct map known Unipile profile fields (no LLM cost)
-        const directCoverage = UNIPILE_PERSON_COVERAGE[groupName] ?? [];
-        const directMapped = mapUnipilePersonToCrmFields(profileRaw);
+      const leadForUnipile = resolvedLinkedin ? { ...lead, linkedin: resolvedLinkedin } : lead;
+      const result = await deps.findUnipilePerson(leadForUnipile);
+      if (result) {
         for (const f of remaining) {
-          if (!directCoverage.includes(f)) continue;
-          const value = directMapped[f];
+          if (!PERSON_TIER35B_FIELDS.includes(f)) continue;
+          const value = result[f as keyof typeof result];
           if (typeof value === 'string' && value.length > 0) {
+            console.log(`${tag} T3.5b HIT  field=${f} value="${value.slice(0, 60)}"`);
             filled.push({ field: f, value, meta: metaUnipile() });
             unipileFills += 1;
+          } else {
+            console.log(`${tag} T3.5b MISS field=${f} reason=not_in_result`);
           }
         }
         remaining = remaining.filter(f => !filled.find(x => x.field === f));
-
-        // Step 2: LLM over full raw profile for anything direct map missed
-        if (remaining.length > 0) {
-          const llmResult = await deps.extractFieldsViaLLM({
-            tier: 'apollo',
-            sourceContext: JSON.stringify(profileRaw),
-            fields: remaining,
-            groupName,
-            lead,
-            configFieldsByName: input.configFieldsByName,
-          });
-          for (const f of remaining) {
-            const entry = llmResult.filled[f];
-            if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
-              filled.push({ field: f, value: entry.value, meta: metaUnipile() });
-              unipileFills += 1;
-            }
-          }
-          remaining = remaining.filter(f => !llmFilledHasValue(llmResult.filled[f]));
-        }
+      } else {
+        console.log(`${tag} T3.5b MISS findUnipilePerson returned null`);
       }
+    } else {
+      console.log(`${tag} T3.5b SKIP no person fields in remaining`);
     }
   }
 
   if (remaining.length === 0) {
+    console.log(`${tag} DONE all filled by T1-T3.5b`);
     return {
       fields: filled,
       missing: [],
@@ -557,9 +531,11 @@ export async function runWaterfall(
   }
 
   // ─ Tier 4: Web ─────────────────────────────────────────────────────────────
-  const webCache = await deps.fetchWebForGroup(lead, groupName);
+  console.log(`${tag} T4 fetch remaining=[${remaining.join(',')}]`);
+  const webCache = await deps.fetchWebForGroup(lead, groupName, input.listId);
   let webFills = 0;
   if (webCache) {
+    console.log(`${tag} T4 contextLen=${webCache.webContext.length} LLM fields=[${remaining.join(',')}]`);
     const llmResult = await deps.extractFieldsViaLLM({
       tier: 'web',
       sourceContext: webCache.webContext,
@@ -567,17 +543,72 @@ export async function runWaterfall(
       groupName,
       lead,
       configFieldsByName: input.configFieldsByName,
+      listId: input.listId,
     });
     for (const f of remaining) {
       const entry = llmResult.filled[f];
       if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
+        console.log(`${tag} T4 HIT  field=${f} value="${String(entry.value).slice(0, 60)}" src=${entry.sourceUrl ?? '∅'}`);
         filled.push({ field: f, value: entry.value, meta: metaWeb(entry.sourceUrl, entry.sourceQuote) });
         webFills += 1;
+      } else {
+        console.log(`${tag} T4 MISS field=${f} reason=llm_returned_empty`);
       }
     }
     remaining = remaining.filter(f => !llmFilledHasValue(llmResult.filled[f]));
+  } else {
+    console.log(`${tag} T4 MISS no web data returned`);
+    remaining.forEach(f => console.log(`${tag} T4 MISS field=${f} reason=no_web_data`));
   }
 
+  // ─ Tier 5: Unipile company enrichment (after web) ──────────────────────────
+  // Company groups only. Only fires when lead.linkedin is present — getProfile
+  // gives us company_id → getCompany for full firmographic data.
+  // Last resort: more expensive than web but authoritative.
+  if (deps.findUnipileCompany && remaining.length > 0 && groupEntityType(groupName) === 'company') {
+    const resolvedLinkedin = lead.linkedin || filled.find(f => f.field === 'linkedin_url')?.value;
+    if (resolvedLinkedin) {
+      const leadForCompany = resolvedLinkedin !== lead.linkedin ? { ...lead, linkedin: resolvedLinkedin } : lead;
+      console.log(`${tag} T5 attempt linkedin=${resolvedLinkedin} remaining=[${remaining.join(',')}]`);
+      const result = await deps.findUnipileCompany(leadForCompany);
+      if (result?.companyRaw) {
+        const cRaw = result.companyRaw;
+        console.log(`${tag} T5 companyRaw: name="${cRaw.name ?? '∅'}" website="${cRaw.website ?? '∅'}" employees=${cRaw.employee_count ?? '∅'}`);
+        const llmResult = await deps.extractFieldsViaLLM({
+          tier: 'apollo',
+          sourceContext: JSON.stringify(result.companyRaw),
+          fields: remaining,
+          groupName,
+          lead,
+          configFieldsByName: input.configFieldsByName,
+          listId: input.listId,
+        });
+        for (const f of remaining) {
+          const entry = llmResult.filled[f];
+          if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
+            console.log(`${tag} T5 HIT  field=${f} value="${String(entry.value).slice(0, 60)}"`);
+            filled.push({ field: f, value: entry.value, meta: metaUnipile() });
+            unipileFills += 1;
+          } else {
+            console.log(`${tag} T5 MISS field=${f} reason=llm_returned_empty`);
+          }
+        }
+        remaining = remaining.filter(f => !llmFilledHasValue(llmResult.filled[f]));
+      } else if (result?.company_name && remaining.includes('company_name')) {
+        // companyRaw unavailable but company_name from work_experience is enough
+        console.log(`${tag} T5 HIT  field=company_name value="${result.company_name.slice(0, 60)}" (no companyRaw)`);
+        filled.push({ field: 'company_name', value: result.company_name, meta: metaUnipile() });
+        unipileFills += 1;
+        remaining = remaining.filter(f => f !== 'company_name');
+      } else {
+        console.log(`${tag} T5 MISS no companyRaw returned (result=${result == null ? 'null' : 'no companyRaw'})`);
+      }
+    } else {
+      console.log(`${tag} T5 SKIP no lead.linkedin available`);
+    }
+  }
+
+  console.log(`${tag} DONE web_fills=${webFills} unipile_fills=${unipileFills} missing=[${remaining.join(',')}]`);
   return {
     fields: filled,
     missing: remaining,

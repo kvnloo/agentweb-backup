@@ -1,10 +1,11 @@
 /**
- * Tests for the findUnipileCompany adapter in enrichmentV3RealDeps.
+ * Tests for findUnipilePerson (Tier 3.5b) and findUnipileCompany (Tier 5)
+ * in enrichmentV3RealDeps.
  *
  * Covers:
- * - profileOnly=true branch: skips company API, returns personProfileRaw
- * - Approach 1 (lead.linkedin set): fetches profile, captures personProfileRaw
- * - Approach 3 (no linkedin, name+company): searchPeople → profile → personProfileRaw
+ * - findUnipilePerson Case A (has linkedin): getProfile → direct extract
+ * - findUnipilePerson Case B (no linkedin, has name): searchPeople → LLM picks
+ * - findUnipileCompany: getProfile → company_id → getCompany
  * - No accountId: returns null immediately
  */
 
@@ -12,6 +13,7 @@ import { buildOrchestratorDeps } from '../services/enrichmentV3RealDeps';
 import * as profileFactory from '../services/unipileProfileServiceFactory';
 import * as companyFactory from '../services/unipileCompanyServiceFactory';
 import * as apolloServiceModule from '../services/apolloService';
+import * as llmServiceModule from '../utils/llmService';
 import { createApolloFetchContext } from '../services/enrichmentGroupWaterfall';
 import type { LeadRecord } from '../services/crmEnrichmentService';
 
@@ -20,7 +22,7 @@ const PERSON_PROFILE_RAW = {
   last_name: 'Doe',
   location: 'San Francisco, CA',
   public_identifier: 'janedoe',
-  work_experience: [{ company_id: 'acme-co', end: null }],
+  work_experience: [{ company: 'Acme Corp', company_id: 'acme-co', position: 'VP Marketing', end: null }],
 };
 
 const COMPANY_RAW = { name: 'Acme Corp', specialties: 'SaaS' };
@@ -50,12 +52,18 @@ function mockCompanyService(getCompanyResult: { found: boolean; rawData: any } |
   return { getCompany };
 }
 
-// linkedInOutreachService is dynamically imported inside findUnipileCompany,
-// so jest.mock() at module level intercepts that dynamic import.
+function mockLLM(response: string) {
+  const generateRaw = jest.fn().mockResolvedValue(response);
+  jest.spyOn(llmServiceModule, 'createLLMService').mockReturnValue({ generateRaw } as any);
+  return { generateRaw };
+}
+
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
-    resolveAccountId: jest.fn(),
+    resolveAccountIdForEnrichment: jest.fn(),
     searchPeople: jest.fn(),
+    invalidateResolvedAccount: jest.fn(),
+    clearStatusCache: jest.fn(),
   },
 }));
 
@@ -69,11 +77,13 @@ async function getLinkedInOutreachServiceMock() {
   return mod.linkedInOutreachService as jest.Mocked<typeof mod.linkedInOutreachService>;
 }
 
-describe('findUnipileCompany — no accountId', () => {
-  it('returns null immediately when resolveAccountId returns null', async () => {
+// ─── findUnipilePerson — no accountId ────────────────────────────────────────
+
+describe('findUnipilePerson — no accountId', () => {
+  it('returns null and makes no profile call when resolveAccountIdForEnrichment returns null', async () => {
     mockApolloDisabled();
     const li = await getLinkedInOutreachServiceMock();
-    (li.resolveAccountId as jest.Mock).mockResolvedValue(null);
+    (li.resolveAccountIdForEnrichment as jest.Mock).mockResolvedValue(null);
     const { getProfile } = mockProfileService(null);
     mockCompanyService(null);
 
@@ -89,52 +99,96 @@ describe('findUnipileCompany — no accountId', () => {
     });
 
     expect(getProfile).not.toHaveBeenCalled();
-    // No Unipile fills → first_name comes from somewhere else or is missing
     expect(result.fields.find(f => f.field === 'first_name' && f.meta?.provider === 'unipile')).toBeUndefined();
   });
 });
 
-describe('findUnipileCompany — profileOnly=true (person group)', () => {
-  it('skips company API call and returns personProfileRaw from Approach 1 (lead.linkedin)', async () => {
+// ─── findUnipilePerson — Case A (has linkedin) ───────────────────────────────
+
+describe('findUnipilePerson — Case A (has linkedin → getProfile)', () => {
+  it('extracts first_name, last_name, title, linkedin_url directly from profile', async () => {
     mockApolloDisabled();
     const li = await getLinkedInOutreachServiceMock();
-    (li.resolveAccountId as jest.Mock).mockResolvedValue('acc-1');
-
+    (li.resolveAccountIdForEnrichment as jest.Mock).mockResolvedValue('acc-1');
     mockProfileService({ found: true, rawData: PERSON_PROFILE_RAW });
-    const { getCompany } = mockCompanyService({ found: true, rawData: COMPANY_RAW });
+    mockCompanyService(null);
 
     const deps = buildOrchestratorDeps('user-1');
     const result = await deps.runWaterfall({
       listId: 'list-1',
       lead: makeLead({ linkedin: 'https://www.linkedin.com/in/janedoe' }),
       groupName: 'person_identity',
-      requestedFields: ['first_name', 'last_name', 'location'],
+      requestedFields: ['first_name', 'last_name', 'title', 'linkedin_url'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
       refreshFields: new Set(),
     });
 
-    // profileOnly=true → company API should NOT be called
-    expect(getCompany).not.toHaveBeenCalled();
-
-    // Profile fields should be direct-mapped from personProfileRaw
-    const firstNameField = result.fields.find(f => f.field === 'first_name');
-    expect(firstNameField?.value).toBe('Jane');
-    const lastNameField = result.fields.find(f => f.field === 'last_name');
-    expect(lastNameField?.value).toBe('Doe');
+    expect(result.fields.find(f => f.field === 'first_name')?.value).toBe('Jane');
+    expect(result.fields.find(f => f.field === 'last_name')?.value).toBe('Doe');
+    expect(result.fields.find(f => f.field === 'title')?.value).toBe('VP Marketing');
+    expect(result.fields.find(f => f.field === 'linkedin_url')?.value).toBe('https://www.linkedin.com/in/janedoe');
+    expect(li.searchPeople).not.toHaveBeenCalled();
   });
 
-  it('sanitizes values with leading/trailing whitespace from profile', async () => {
+  it('trims whitespace from profile string values', async () => {
     mockApolloDisabled();
     const li = await getLinkedInOutreachServiceMock();
-    (li.resolveAccountId as jest.Mock).mockResolvedValue('acc-1');
+    (li.resolveAccountIdForEnrichment as jest.Mock).mockResolvedValue('acc-1');
+    mockProfileService({
+      found: true,
+      rawData: { ...PERSON_PROFILE_RAW, first_name: '  Jane  ', last_name: '  Doe  ' },
+    });
+    mockCompanyService(null);
 
+    const deps = buildOrchestratorDeps('user-1');
+    const result = await deps.runWaterfall({
+      listId: 'list-1',
+      lead: makeLead({ linkedin: 'https://www.linkedin.com/in/janedoe' }),
+      groupName: 'person_identity',
+      requestedFields: ['first_name', 'last_name'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    expect(result.fields.find(f => f.field === 'first_name')?.value).toBe('Jane');
+    expect(result.fields.find(f => f.field === 'last_name')?.value).toBe('Doe');
+  });
+
+  it('returns null when profile not found', async () => {
+    mockApolloDisabled();
+    const li = await getLinkedInOutreachServiceMock();
+    (li.resolveAccountIdForEnrichment as jest.Mock).mockResolvedValue('acc-1');
+    mockProfileService({ found: false, rawData: null });
+    mockCompanyService(null);
+
+    const deps = buildOrchestratorDeps('user-1');
+    const result = await deps.runWaterfall({
+      listId: 'list-1',
+      lead: makeLead({ linkedin: 'https://www.linkedin.com/in/janedoe' }),
+      groupName: 'person_identity',
+      requestedFields: ['first_name'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    expect(result.fields.find(f => f.field === 'first_name' && f.meta?.provider === 'unipile')).toBeUndefined();
+  });
+
+  it('uses first open-ended work_experience entry for title', async () => {
+    mockApolloDisabled();
+    const li = await getLinkedInOutreachServiceMock();
+    (li.resolveAccountIdForEnrichment as jest.Mock).mockResolvedValue('acc-1');
     mockProfileService({
       found: true,
       rawData: {
         ...PERSON_PROFILE_RAW,
-        first_name: '  Jane  ',
-        location: 'San Francisco\nCA',
+        work_experience: [
+          { company: 'Acme', position: 'VP Marketing', end: null },
+          { company: 'OldCo', position: 'Manager', end: '2022-12-31' },
+        ],
       },
     });
     mockCompanyService(null);
@@ -144,37 +198,36 @@ describe('findUnipileCompany — profileOnly=true (person group)', () => {
       listId: 'list-1',
       lead: makeLead({ linkedin: 'https://www.linkedin.com/in/janedoe' }),
       groupName: 'person_identity',
-      requestedFields: ['first_name', 'location'],
+      requestedFields: ['title'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
       refreshFields: new Set(),
     });
 
-    const firstNameField = result.fields.find(f => f.field === 'first_name');
-    expect(firstNameField?.value).toBe('Jane');
-    const locationField = result.fields.find(f => f.field === 'location');
-    expect(locationField?.value).toBe('San Francisco CA');
+    expect(result.fields.find(f => f.field === 'title')?.value).toBe('VP Marketing');
   });
 });
 
-describe('findUnipileCompany — Approach 3 (no linkedin, name+company search)', () => {
-  it('calls searchPeople and fetches profile when lead has no linkedin URL', async () => {
+// ─── findUnipilePerson — Case B (no linkedin, search + LLM) ──────────────────
+
+describe('findUnipilePerson — Case B (no linkedin → searchPeople + LLM)', () => {
+  it('calls searchPeople with name+company and fills linkedin_url from chosen candidate', async () => {
     mockApolloDisabled();
     const li = await getLinkedInOutreachServiceMock();
-    (li.resolveAccountId as jest.Mock).mockResolvedValue('acc-1');
+    (li.resolveAccountIdForEnrichment as jest.Mock).mockResolvedValue('acc-1');
     (li.searchPeople as jest.Mock).mockResolvedValue({
-      items: [{ public_identifier: 'janedoe', first_name: 'Jane', last_name: 'Doe' }],
+      items: [{ public_identifier: 'janedoe', first_name: 'Jane', last_name: 'Doe', headline: 'VP Marketing at Acme' }],
     });
-
-    const { getProfile } = mockProfileService({ found: true, rawData: PERSON_PROFILE_RAW });
+    mockLLM(JSON.stringify({ chosenIndex: 0, title: 'VP Marketing', company_name: 'Acme', first_name: 'Jane', last_name: 'Doe' }));
+    mockProfileService(null);
     mockCompanyService(null);
 
     const deps = buildOrchestratorDeps('user-1');
-    await deps.runWaterfall({
+    const result = await deps.runWaterfall({
       listId: 'list-1',
       lead: makeLead({ firstName: 'Jane', lastName: 'Doe', company: 'Acme' }),
       groupName: 'person_identity',
-      requestedFields: ['first_name'],
+      requestedFields: ['first_name', 'last_name', 'linkedin_url', 'title'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
       refreshFields: new Set(),
@@ -184,10 +237,326 @@ describe('findUnipileCompany — Approach 3 (no linkedin, name+company search)',
       keywords: 'Jane Doe',
       company: 'Acme',
     }));
-    // Profile fetched for the resolved public_identifier
-    expect(getProfile).toHaveBeenCalledWith(
-      'https://www.linkedin.com/in/janedoe',
-      'acc-1',
-    );
+    expect(result.fields.find(f => f.field === 'linkedin_url')?.value).toBe('https://www.linkedin.com/in/janedoe');
+    expect(result.fields.find(f => f.field === 'title')?.value).toBe('VP Marketing');
+  });
+
+  it('uses title filter instead of company when lead has no company', async () => {
+    mockApolloDisabled();
+    const li = await getLinkedInOutreachServiceMock();
+    (li.resolveAccountIdForEnrichment as jest.Mock).mockResolvedValue('acc-1');
+    (li.searchPeople as jest.Mock).mockResolvedValue({ items: [] });
+    mockProfileService(null);
+    mockCompanyService(null);
+
+    const deps = buildOrchestratorDeps('user-1');
+    await deps.runWaterfall({
+      listId: 'list-1',
+      lead: makeLead({ firstName: 'Jane', lastName: 'Doe', title: 'VP Marketing' }),
+      groupName: 'person_identity',
+      requestedFields: ['linkedin_url'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    expect(li.searchPeople).toHaveBeenCalledWith('acc-1', expect.objectContaining({
+      keywords: 'Jane Doe',
+      title: 'VP Marketing',
+    }));
+    expect(li.searchPeople).toHaveBeenCalledWith('acc-1', expect.not.objectContaining({ company: expect.anything() }));
+  });
+
+  it('returns null when LLM chooses null (no match)', async () => {
+    mockApolloDisabled();
+    const li = await getLinkedInOutreachServiceMock();
+    (li.resolveAccountIdForEnrichment as jest.Mock).mockResolvedValue('acc-1');
+    (li.searchPeople as jest.Mock).mockResolvedValue({
+      items: [{ public_identifier: 'someone', first_name: 'Other', last_name: 'Person', headline: 'CEO' }],
+    });
+    mockLLM(JSON.stringify({ chosenIndex: null, title: null, company_name: null, first_name: null, last_name: null }));
+    mockProfileService(null);
+    mockCompanyService(null);
+
+    const deps = buildOrchestratorDeps('user-1');
+    const result = await deps.runWaterfall({
+      listId: 'list-1',
+      lead: makeLead({ firstName: 'Jane', lastName: 'Doe', company: 'Acme' }),
+      groupName: 'person_identity',
+      requestedFields: ['linkedin_url'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    expect(result.fields.find(f => f.field === 'linkedin_url' && f.meta?.provider === 'unipile')).toBeUndefined();
+  });
+
+  it('returns null when no candidates returned', async () => {
+    mockApolloDisabled();
+    const li = await getLinkedInOutreachServiceMock();
+    (li.resolveAccountIdForEnrichment as jest.Mock).mockResolvedValue('acc-1');
+    (li.searchPeople as jest.Mock).mockResolvedValue({ items: [] });
+    mockProfileService(null);
+    mockCompanyService(null);
+
+    const deps = buildOrchestratorDeps('user-1');
+    const result = await deps.runWaterfall({
+      listId: 'list-1',
+      lead: makeLead({ firstName: 'Jane', lastName: 'Doe', company: 'Acme' }),
+      groupName: 'person_identity',
+      requestedFields: ['linkedin_url'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    expect(result.fields.find(f => f.field === 'linkedin_url' && f.meta?.provider === 'unipile')).toBeUndefined();
+  });
+
+  it('skips when no firstName or lastName', async () => {
+    mockApolloDisabled();
+    const li = await getLinkedInOutreachServiceMock();
+    (li.resolveAccountIdForEnrichment as jest.Mock).mockResolvedValue('acc-1');
+    mockProfileService(null);
+    mockCompanyService(null);
+
+    const deps = buildOrchestratorDeps('user-1');
+    await deps.runWaterfall({
+      listId: 'list-1',
+      lead: makeLead({ email: 'jane@acme.com' }),
+      groupName: 'person_identity',
+      requestedFields: ['linkedin_url'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    expect(li.searchPeople).not.toHaveBeenCalled();
+  });
+});
+
+// ─── findUnipileCompany — Tier 5 ─────────────────────────────────────────────
+
+describe('findUnipileCompany — Tier 5 (company group, after web)', () => {
+  it('fetches profile → company_id → getCompany', async () => {
+    mockApolloDisabled();
+    const li = await getLinkedInOutreachServiceMock();
+    (li.resolveAccountIdForEnrichment as jest.Mock).mockResolvedValue('acc-1');
+    mockProfileService({ found: true, rawData: PERSON_PROFILE_RAW });
+    const { getCompany } = mockCompanyService({ found: true, rawData: COMPANY_RAW });
+
+    const deps = buildOrchestratorDeps('user-1');
+    await deps.runWaterfall({
+      listId: 'list-1',
+      lead: makeLead({ linkedin: 'https://www.linkedin.com/in/janedoe' }),
+      groupName: 'company_firmographic',
+      requestedFields: ['company_name'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    // Verifies the full getProfile → company_id → getCompany chain fires
+    expect(getCompany).toHaveBeenCalledWith('acme-co', 'acc-1');
+  });
+
+  it('returns company_name from work_experience when no company_id', async () => {
+    mockApolloDisabled();
+    const li = await getLinkedInOutreachServiceMock();
+    (li.resolveAccountIdForEnrichment as jest.Mock).mockResolvedValue('acc-1');
+    mockProfileService({
+      found: true,
+      rawData: {
+        ...PERSON_PROFILE_RAW,
+        work_experience: [{ company: 'Acme Corp', end: null }],
+      },
+    });
+    const { getCompany } = mockCompanyService(null);
+
+    const deps = buildOrchestratorDeps('user-1');
+    const result = await deps.runWaterfall({
+      listId: 'list-1',
+      lead: makeLead({ linkedin: 'https://www.linkedin.com/in/janedoe' }),
+      groupName: 'company_firmographic',
+      requestedFields: ['company_name'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    expect(getCompany).not.toHaveBeenCalled();
+    expect(result.fields.find(f => f.field === 'company_name')?.value).toBe('Acme Corp');
+  });
+
+  it('skips when lead has no linkedin', async () => {
+    mockApolloDisabled();
+    const li = await getLinkedInOutreachServiceMock();
+    (li.resolveAccountIdForEnrichment as jest.Mock).mockResolvedValue('acc-1');
+    const { getProfile } = mockProfileService(null);
+    mockCompanyService(null);
+
+    const deps = buildOrchestratorDeps('user-1');
+    await deps.runWaterfall({
+      listId: 'list-1',
+      lead: makeLead({ company: 'Acme' }),
+      groupName: 'company_firmographic',
+      requestedFields: ['company_name'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    expect(getProfile).not.toHaveBeenCalled();
+  });
+});
+
+// ─── 429 account rotation ────────────────────────────────────────────────────
+
+const rateLimitErr = Object.assign(new Error('Rate limited'), {
+  structuredError: { classification: 'RATE_LIMIT_ERROR' },
+});
+
+describe('findUnipilePerson — 429 rotation', () => {
+  it('rotates to next account on 429 and succeeds on second attempt', async () => {
+    mockApolloDisabled();
+    const li = await getLinkedInOutreachServiceMock();
+    (li.resolveAccountIdForEnrichment as jest.Mock)
+      .mockResolvedValueOnce('acc-1')
+      .mockResolvedValueOnce('acc-2');
+    const getProfile = jest.fn()
+      .mockRejectedValueOnce(rateLimitErr)
+      .mockResolvedValueOnce({ found: true, rawData: PERSON_PROFILE_RAW });
+    jest.spyOn(profileFactory, 'getUnipileProfileService').mockReturnValue({ getProfile } as any);
+    mockCompanyService(null);
+
+    const deps = buildOrchestratorDeps('user-1');
+    const result = await deps.runWaterfall({
+      listId: 'list-1',
+      lead: makeLead({ linkedin: 'https://www.linkedin.com/in/janedoe' }),
+      groupName: 'person_identity',
+      requestedFields: ['first_name'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    expect(getProfile).toHaveBeenCalledTimes(2);
+    expect(getProfile).toHaveBeenNthCalledWith(1, expect.anything(), 'acc-1');
+    expect(getProfile).toHaveBeenNthCalledWith(2, expect.anything(), 'acc-2');
+    expect(li.invalidateResolvedAccount).toHaveBeenCalledWith('user-1');
+    expect(result.fields.find(f => f.field === 'first_name')?.value).toBe('Jane');
+  });
+
+  it('passes skipAccountIds on retry so exhausted account is excluded', async () => {
+    mockApolloDisabled();
+    const li = await getLinkedInOutreachServiceMock();
+    (li.resolveAccountIdForEnrichment as jest.Mock)
+      .mockResolvedValueOnce('acc-1')
+      .mockResolvedValueOnce('acc-2');
+    const getProfile = jest.fn()
+      .mockRejectedValueOnce(rateLimitErr)
+      .mockResolvedValueOnce({ found: true, rawData: PERSON_PROFILE_RAW });
+    jest.spyOn(profileFactory, 'getUnipileProfileService').mockReturnValue({ getProfile } as any);
+    mockCompanyService(null);
+
+    const deps = buildOrchestratorDeps('user-1');
+    await deps.runWaterfall({
+      listId: 'list-1',
+      lead: makeLead({ linkedin: 'https://www.linkedin.com/in/janedoe' }),
+      groupName: 'person_identity',
+      requestedFields: ['first_name'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    // Second call must receive skipAccountIds containing the rate-limited acc-1
+    const secondCallArgs = (li.resolveAccountIdForEnrichment as jest.Mock).mock.calls[1];
+    expect(secondCallArgs[1]).toBeInstanceOf(Set);
+    expect(secondCallArgs[1].has('acc-1')).toBe(true);
+  });
+
+  it('returns null after exhausting all 3 rotation attempts', async () => {
+    mockApolloDisabled();
+    const li = await getLinkedInOutreachServiceMock();
+    (li.resolveAccountIdForEnrichment as jest.Mock)
+      .mockResolvedValueOnce('acc-1')
+      .mockResolvedValueOnce('acc-2')
+      .mockResolvedValueOnce('acc-3');
+    const getProfile = jest.fn().mockRejectedValue(rateLimitErr);
+    jest.spyOn(profileFactory, 'getUnipileProfileService').mockReturnValue({ getProfile } as any);
+    mockCompanyService(null);
+
+    const deps = buildOrchestratorDeps('user-1');
+    const result = await deps.runWaterfall({
+      listId: 'list-1',
+      lead: makeLead({ linkedin: 'https://www.linkedin.com/in/janedoe' }),
+      groupName: 'person_identity',
+      requestedFields: ['first_name'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    expect(getProfile).toHaveBeenCalledTimes(3);
+    expect(result.fields.find(f => f.field === 'first_name' && f.meta?.provider === 'unipile')).toBeUndefined();
+  });
+});
+
+describe('findUnipileCompany — 429 rotation', () => {
+  it('rotates to next account on 429 and succeeds on second attempt', async () => {
+    mockApolloDisabled();
+    const li = await getLinkedInOutreachServiceMock();
+    (li.resolveAccountIdForEnrichment as jest.Mock)
+      .mockResolvedValueOnce('acc-1')
+      .mockResolvedValueOnce('acc-2');
+    const getProfile = jest.fn()
+      .mockRejectedValueOnce(rateLimitErr)
+      .mockResolvedValueOnce({ found: true, rawData: PERSON_PROFILE_RAW });
+    jest.spyOn(profileFactory, 'getUnipileProfileService').mockReturnValue({ getProfile } as any);
+    const { getCompany } = mockCompanyService({ found: true, rawData: COMPANY_RAW });
+
+    const deps = buildOrchestratorDeps('user-1');
+    await deps.runWaterfall({
+      listId: 'list-1',
+      lead: makeLead({ linkedin: 'https://www.linkedin.com/in/janedoe' }),
+      groupName: 'company_firmographic',
+      requestedFields: ['company_name'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    expect(getProfile).toHaveBeenCalledTimes(2);
+    expect(getProfile).toHaveBeenNthCalledWith(1, expect.anything(), 'acc-1');
+    expect(getProfile).toHaveBeenNthCalledWith(2, expect.anything(), 'acc-2');
+    expect(getCompany).toHaveBeenCalledWith('acme-co', 'acc-2');
+  });
+
+  it('returns null after exhausting all 3 rotation attempts', async () => {
+    mockApolloDisabled();
+    const li = await getLinkedInOutreachServiceMock();
+    (li.resolveAccountIdForEnrichment as jest.Mock)
+      .mockResolvedValueOnce('acc-1')
+      .mockResolvedValueOnce('acc-2')
+      .mockResolvedValueOnce('acc-3');
+    const getProfile = jest.fn().mockRejectedValue(rateLimitErr);
+    jest.spyOn(profileFactory, 'getUnipileProfileService').mockReturnValue({ getProfile } as any);
+    mockCompanyService(null);
+
+    const deps = buildOrchestratorDeps('user-1');
+    const result = await deps.runWaterfall({
+      listId: 'list-1',
+      lead: makeLead({ linkedin: 'https://www.linkedin.com/in/janedoe' }),
+      groupName: 'company_firmographic',
+      requestedFields: ['company_name'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    expect(getProfile).toHaveBeenCalledTimes(3);
+    expect(result.fields.find(f => f.field === 'company_name' && f.meta?.provider === 'unipile')).toBeUndefined();
   });
 });

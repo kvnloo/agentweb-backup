@@ -958,15 +958,21 @@ export class LinkedInOutreachService {
    * 1. Tries ALL user accounts (not just the first), skipping dead ones with a connectivity check.
    * 2. Site-wide accounts are the last resort, never the first choice.
    * 3. Result cached per user for 1 hour; invalidated on NOT_FOUND errors via invalidateResolvedAccount().
+   *
+   * Pass `skipAccountIds` to exclude specific accounts (e.g. ones that returned 429 this run).
+   * When skipAccountIds is non-empty the result is NOT cached (cache is per-user, not per-exclusion set).
    */
-  async resolveAccountIdForEnrichment(userId: string): Promise<string | null> {
-    const cached = this.resolvedAccountCache.get(userId);
-    if (cached && Date.now() - cached.timestamp < LinkedInOutreachService.RESOLVED_ACCOUNT_TTL_MS) {
-      return cached.accountId;
+  async resolveAccountIdForEnrichment(userId: string, skipAccountIds?: Set<string>): Promise<string | null> {
+    const skip = skipAccountIds && skipAccountIds.size > 0;
+    if (!skip) {
+      const cached = this.resolvedAccountCache.get(userId);
+      if (cached && Date.now() - cached.timestamp < LinkedInOutreachService.RESOLVED_ACCOUNT_TTL_MS) {
+        return cached.accountId;
+      }
     }
 
     const setCache = (accountId: string) => {
-      this.resolvedAccountCache.set(userId, { accountId, timestamp: Date.now() });
+      if (!skip) this.resolvedAccountCache.set(userId, { accountId, timestamp: Date.now() });
       return accountId;
     };
 
@@ -976,7 +982,9 @@ export class LinkedInOutreachService {
       const accounts = await getAccountsByUserId(userId);
       const userAccounts = (accounts as any[]).filter((a) => a.platform === 'unipile');
       for (const account of userAccounts) {
-        if (account.account_id && await this.isAccountConnected(account.account_id)) {
+        if (!account.account_id) continue;
+        if (skip && skipAccountIds!.has(account.account_id)) continue;
+        if (await this.isAccountConnected(account.account_id)) {
           return setCache(account.account_id);
         }
       }
@@ -991,6 +999,7 @@ export class LinkedInOutreachService {
         const enabled = (siteAccounts as any[]).filter((a) => a.enabled !== false);
         const shuffled = enabled.sort(() => Math.random() - 0.5);
         for (const account of shuffled) {
+          if (skip && skipAccountIds!.has(account.account_id)) continue;
           if (await this.isAccountConnected(account.account_id)) {
             return setCache(account.account_id);
           }
