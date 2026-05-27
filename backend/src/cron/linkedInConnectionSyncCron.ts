@@ -32,9 +32,11 @@ const openai = new OpenAI({
 
 const TAG = '[linkedInConnectionSync]';
 
-/** Returns all Unipile account IDs to sync from site-wide settings. */
+/** Returns all Unipile account IDs to sync: site-wide settings + all per-user connected accounts. */
 async function getAllUnipileAccountIds(): Promise<string[]> {
   const ids = new Set<string>();
+
+  // Site-wide accounts
   try {
     const setting = await settingsService.getSetting('site-wide-unipile-accounts');
     if (setting?.settingValue) {
@@ -44,6 +46,22 @@ async function getAllUnipileAccountIds(): Promise<string[]> {
       }
     }
   } catch { /* ignore */ }
+
+  // Per-user connected Unipile accounts
+  try {
+    const { userDb } = await import('../services/db');
+    const users = await userDb.getAllUsers();
+    for (const user of users) {
+      if (!user.connected_accounts) continue;
+      for (const acct of user.connected_accounts as any[]) {
+        if (acct.platform === 'unipile') {
+          const accountId = acct.config?.unipile_account_id || acct.account_id;
+          if (accountId) ids.add(accountId);
+        }
+      }
+    }
+  } catch { /* ignore */ }
+
   return Array.from(ids);
 }
 
