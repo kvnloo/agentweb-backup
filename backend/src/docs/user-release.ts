@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-27',
     changes: [
+      'Internal: Chat History Sessions Now Have Reviewer Links',
+      '- Every session in the admin Chat History tab now automatically gets an ishare link on first load',
+      '- Reviewers can use these links to view and interact with sessions for output quality review',
+      '- Links are generated once and stored with the session; no regeneration on subsequent loads',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
       'Improved: CRM Lead Panel Now Auto-Syncs LinkedIn Messages and Uses Activity History for Drafts',
       '- Opening a lead detail panel now automatically syncs the lead\'s LinkedIn message history (if a LinkedIn URL is set) — no more manual "Sync LinkedIn" click needed',
       '- The sync runs silently on panel open if the last sync was more than 10 minutes ago, so the activity timeline is always fresh',
