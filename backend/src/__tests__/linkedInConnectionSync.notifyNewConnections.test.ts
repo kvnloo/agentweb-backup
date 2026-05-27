@@ -171,4 +171,35 @@ describe('notifyNewConnections', () => {
     expect(mockCrmDb.findLeadsByLinkedin).not.toHaveBeenCalled();
     expect(mockAlertService.notifyLinkedInConnectionAccepted).not.toHaveBeenCalled();
   });
+
+  it('skips notification when lead already has linkedInConnectionNotifiedAt set', async () => {
+    const alreadyNotifiedLead = {
+      ...MATCHING_LEAD,
+      system: { linkedInConnectionNotifiedAt: '2026-05-27T00:00:00.000Z' },
+    };
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([alreadyNotifiedLead] as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    expect(mockCrmDb.getLeadListById).not.toHaveBeenCalled();
+    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    expect(mockAlertService.notifyLinkedInConnectionAccepted).not.toHaveBeenCalled();
+  });
+
+  it('marks lead with linkedInConnectionNotifiedAt before sending notification', async () => {
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([MATCHING_LEAD] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    expect(mockCrmDb.updateLead).toHaveBeenCalledWith(
+      MATCHING_LEAD.listId,
+      MATCHING_LEAD.leadId,
+      expect.objectContaining({
+        system: expect.objectContaining({ linkedInConnectionNotifiedAt: expect.any(String) }),
+        skipFieldNamesUpdate: true,
+      }),
+    );
+    expect(mockAlertService.notifyLinkedInConnectionAccepted).toHaveBeenCalledWith(LIST, MATCHING_LEAD);
+  });
 });
