@@ -474,6 +474,20 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-27',
+    changes: [
+      'New: LinkedIn Connection Notifications — Get Notified and Reply Instantly',
+      '- When a lead accepts your LinkedIn invitation, you now receive an email notification: "{Lead Name} accepted your LinkedIn invitation"',
+      '- Clicking the link opens the CRM directly to that lead\'s record with the LinkedIn compose area active',
+      '- A personalized AI-drafted follow-up message is pre-filled so you can reply with one click',
+      'Improved: CRM "Latest Signal" Column — See What\'s Actually Happening',
+      '- The "Last Contact" column is now "Latest Signal" across all CRM views (Inbox, list view, lead table)',
+      '- Shows actionable context: "LinkedIn connected 2d ago", "Email reply 5d ago", "Email opened 3d ago", etc.',
+      'Improved: LinkedIn Connected Filter in CRM',
+      '- New filter to show only 1st-degree LinkedIn connections — useful for finding leads ready for warm follow-up',
+    ],
+  },
+  {
     date: '2026-05-17',
     changes: [
       'Fixed: Knowledge Bases with Content Were Not Appearing in the Knowledge Base Page',

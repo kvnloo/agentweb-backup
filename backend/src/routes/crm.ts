@@ -4072,6 +4072,40 @@ router.post('/lists/:listId/leads/:leadId/sync-linkedin-connection', async (req:
 });
 
 /**
+ * @route POST /api/crm/check-linkedin-connections
+ * @desc User-level variant — no listId required. Returns which LinkedIn profile URLs
+ *       are 1st-degree connections. Used by the Inbox view which spans all lists.
+ * @body { urls: string[] }
+ * @access Private
+ */
+router.post('/check-linkedin-connections', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { urls } = req.body;
+
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+    if (!Array.isArray(urls) || urls.length === 0) return res.json({ connected: [] });
+
+    const { getConnectionByProfileUrl } = await import('../services/unipileConnectionsDb');
+
+    const connected: Array<{ url: string; connectedAt: number | null }> = [];
+    await Promise.all(urls.map(async (url: string) => {
+      const conn = await getConnectionByProfileUrl(url).catch(() => null);
+      if (conn) connected.push({
+        url: url.trim().toLowerCase().replace(/\/?$/, '/'),
+        connectedAt: conn.connectedAt ?? null,
+      });
+    }));
+
+    return res.json({ connected });
+  } catch (error: any) {
+    console.error('Error checking LinkedIn connections:', error);
+    return res.status(500).json({ message: error.message || 'Failed to check LinkedIn connections' });
+  }
+});
+
+/**
  * @route POST /api/crm/lists/:listId/check-linkedin-connections
  * @desc Given a list of LinkedIn profile URLs, returns which ones are already 1st-degree
  *       connections in the AW-UnipileConnections cache. Used to render connection status
@@ -4096,10 +4130,13 @@ router.post('/lists/:listId/check-linkedin-connections', async (req: Request, re
 
     const { getConnectionByProfileUrl } = await import('../services/unipileConnectionsDb');
 
-    const connected: string[] = [];
+    const connected: Array<{ url: string; connectedAt: number | null }> = [];
     await Promise.all(urls.map(async (url: string) => {
       const conn = await getConnectionByProfileUrl(url).catch(() => null);
-      if (conn) connected.push(url.trim().toLowerCase().replace(/\/?$/, '/'));
+      if (conn) connected.push({
+        url: url.trim().toLowerCase().replace(/\/?$/, '/'),
+        connectedAt: conn.connectedAt ?? null,
+      });
     }));
 
     return res.json({ connected });
