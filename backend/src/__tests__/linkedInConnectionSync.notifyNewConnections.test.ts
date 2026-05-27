@@ -3,6 +3,25 @@
  * when a CRM lead's LinkedIn connection request is accepted.
  */
 
+jest.mock('openai', () => {
+  return jest.fn().mockImplementation(() => ({
+    chat: {
+      completions: {
+        create: jest.fn().mockResolvedValue({
+          choices: [{ message: { content: '{"content":"Hi, thanks for connecting!"}' } }],
+        }),
+      },
+    },
+  }));
+});
+
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: {
+    readBrandGuidelines: jest.fn().mockResolvedValue(null),
+    readMarketStrategy: jest.fn().mockResolvedValue(null),
+  },
+}));
+
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: { listConnections: jest.fn() },
 }));
@@ -27,6 +46,7 @@ jest.mock('../services/db', () => ({
     getLeadListById: jest.fn(),
     getLeadListsByUserId: jest.fn(),
     getLeadsByListId: jest.fn(),
+    updateLead: jest.fn().mockResolvedValue(undefined),
   },
 }));
 
