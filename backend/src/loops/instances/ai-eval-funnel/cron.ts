@@ -140,7 +140,7 @@ async function postDailyDigest(
   }
 
   lines.push('');
-  lines.push(`React: ✅ ship all  |  ❌ skip all  |  🛑 pause loop`);
+  lines.push(`React ✅ to dispatch all to cloud-dev  |  ❌ to skip  |  🛑 to pause loop`);
   lines.push(`Reply in thread to skip a specific item (e.g. "skip 2").`);
 
   try {
