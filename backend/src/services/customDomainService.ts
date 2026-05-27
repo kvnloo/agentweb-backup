@@ -431,6 +431,18 @@ export async function getProjectDomain(
 }
 
 /**
+ * Get the active subdomain (type="subdomain") record for a Vercel project.
+ * Returns null if the project has no subdomain set yet.
+ */
+export async function getProjectSubdomain(
+  userId: string,
+  vercelProjectId: string
+): Promise<CustomDomainRecord | null> {
+  const domains = await listDomains(userId, vercelProjectId);
+  return domains.find((d) => d.type === "subdomain") ?? null;
+}
+
+/**
  * Add `{subdomainPrefix}.{mainDomain}` to the Vercel project.
  * Returns the full domain string (e.g., "pricing.mysite.com").
  * Treats a 409 conflict as success (domain already on this project).

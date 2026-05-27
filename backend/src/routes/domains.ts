@@ -9,6 +9,7 @@ import {
   getDomain,
   verifyDomain,
   getProjectDomain,
+  getProjectSubdomain,
   setPageSubdomain,
   removePageSubdomainFromVercel,
 } from "../services/customDomainService";
@@ -63,6 +64,29 @@ router.get("/project-domain", async (req, res: Response) => {
   } catch (error: any) {
     console.error("[DOMAINS] Error getting project domain:", error);
     res.status(500).json({ error: "Failed to get project domain" });
+  }
+});
+
+/**
+ * GET /api/domains/project-subdomain?vercelProjectId=xxx
+ * Returns the active subdomain record for a Vercel project, or null if none.
+ * Must be registered before GET /:id to avoid param capture.
+ */
+router.get("/project-subdomain", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const vercelProjectId = req.query.vercelProjectId as string | undefined;
+    if (!vercelProjectId) {
+      return res.status(400).json({ error: "vercelProjectId query param is required" });
+    }
+
+    const record = await getProjectSubdomain(userId, vercelProjectId);
+    res.json({ domain: record?.domain ?? null, status: record?.status ?? null, id: record?.id ?? null });
+  } catch (error: any) {
+    console.error("[DOMAINS] Error getting project subdomain:", error);
+    res.status(500).json({ error: "Failed to get project subdomain" });
   }
 });
 
