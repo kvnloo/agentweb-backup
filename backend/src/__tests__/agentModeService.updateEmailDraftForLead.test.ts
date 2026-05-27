@@ -979,4 +979,76 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       expect(updateCall.messageDraft.content.length).toBeLessThanOrEqual(500);
     });
   });
+
+  describe('Message draft activity history', () => {
+    const listId = 'list-1';
+    const leadId = 'lead-1';
+    const sessionId = 'session-1';
+    const userId = 'user-1';
+    const instruction = 'Write a follow-up';
+
+    const mockLead = {
+      leadId,
+      listId,
+      email: 'jane@techcorp.com',
+      firstName: 'Jane',
+      lastName: 'Smith',
+      company: 'Tech Corp',
+      title: 'CTO',
+    };
+    const mockList = { listId, userId, name: 'Test List' };
+    const mockBrandGuidelines = { exists: false };
+    const mockMarketStrategy = { exists: false };
+    const mockSenderInfo = { fromName: 'Test Sender' };
+
+    const emailDraftResponse = {
+      choices: [{ message: { content: JSON.stringify({ subject: 'Follow up', textContent: 'Hi Jane, following up.' }) } }],
+    };
+    const messageDraftResponse = {
+      choices: [{ message: { content: JSON.stringify({ content: 'Hi Jane, quick follow up!' }) } }],
+    };
+
+    it('includes activity history in the message draft prompt', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue({
+        engagements: [
+          { eventType: 'email.sent', createdAt: '2026-05-01T10:00:00.000Z', eventData: { subject: 'Intro email' }, emailContent: null, text: null },
+          { eventType: 'linkedin.message.received', createdAt: '2026-05-03T09:00:00.000Z', eventData: {}, text: 'Thanks, interested!' },
+        ],
+      });
+      mockReadBrandGuidelines.mockResolvedValue(mockBrandGuidelines);
+      mockReadMarketStrategy.mockResolvedValue(mockMarketStrategy);
+      mockGetSenderForLead.mockResolvedValue(mockSenderInfo);
+      (crmDb.updateLead as jest.Mock).mockResolvedValue({});
+      mockCreate.mockResolvedValueOnce(emailDraftResponse).mockResolvedValueOnce(messageDraftResponse);
+
+      await (agentModeService as any).updateEmailDraftForLead(listId, leadId, instruction, sessionId, userId, 'text');
+
+      const messageCall = mockCreate.mock.calls[1][0];
+      const userMsg = messageCall.messages.find((m: any) => m.role === 'user');
+      expect(userMsg.content).toContain('Activity History');
+      expect(userMsg.content).toContain('email.sent');
+      expect(userMsg.content).toContain('Intro email');
+      expect(userMsg.content).toContain('linkedin.message.received');
+      expect(userMsg.content).toContain('prior touchpoints');
+    });
+
+    it('omits activity history section from message prompt when no engagements', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue({ engagements: [] });
+      mockReadBrandGuidelines.mockResolvedValue(mockBrandGuidelines);
+      mockReadMarketStrategy.mockResolvedValue(mockMarketStrategy);
+      mockGetSenderForLead.mockResolvedValue(mockSenderInfo);
+      (crmDb.updateLead as jest.Mock).mockResolvedValue({});
+      mockCreate.mockResolvedValueOnce(emailDraftResponse).mockResolvedValueOnce(messageDraftResponse);
+
+      await (agentModeService as any).updateEmailDraftForLead(listId, leadId, instruction, sessionId, userId, 'text');
+
+      const messageCall = mockCreate.mock.calls[1][0];
+      const userMsg = messageCall.messages.find((m: any) => m.role === 'user');
+      expect(userMsg.content).not.toContain('Activity History');
+    });
+  });
 });
