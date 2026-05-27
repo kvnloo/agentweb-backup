@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-27',
     changes: [
+      'Fixed: CRM Lead Panel Notes and Fields Now Show the Correct Lead\'s Data',
+      '- Opening a lead panel, then clicking a different lead was displaying notes, stage, sentiment, next step, and other editable fields from the previously viewed lead',
+      '- All editable fields in the lead detail panel now reset correctly whenever you switch to a different lead',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
       'Fixed: create_html_file and save_file Tools Now Return Clear Parameter Errors',
       '- Both tools were throwing cryptic errors ("Cannot read properties of undefined" or "fileName is required") when the LLM called them with missing or misspelled parameters',
       '- Added input validation with descriptive error messages that tell the LLM exactly which parameter name to use and retry with',
