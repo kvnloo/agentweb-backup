@@ -175,11 +175,15 @@ export class UnipileProfileService {
 
     if (!opts.forceRefresh) {
       const lruHit = memGet(mk);
-      if (lruHit) return this.rowToResult(lruHit, true);
+      if (lruHit) {
+        if (lruHit.status === 'error') throw new Error(lruHit.errorMessage || 'cached upstream error');
+        return this.rowToResult(lruHit, true);
+      }
 
       const ddbHit = await this.deps.store.get(key.canonicalId, key.sk);
       if (ddbHit) {
         memSet(mk, ddbHit);
+        if (ddbHit.status === 'error') throw new Error(ddbHit.errorMessage || 'cached upstream error');
         return this.rowToResult(ddbHit, true);
       }
     }
@@ -189,13 +193,14 @@ export class UnipileProfileService {
     try {
       apiData = await this.deps.http.fetchProfile(identifierOrUrl, accountId);
     } catch (err: any) {
+      const message = err?.message ?? String(err);
       const errorRow: UnipileCacheRow = {
         canonicalId: key.canonicalId,
         fieldGroup: key.sk,
         cacheType: 'unipile',
         rawData: null,
         status: 'error',
-        errorMessage: err?.message ?? String(err),
+        errorMessage: message,
         expiresAt: Math.floor(Date.now() / 1000) + ERROR_TTL_SECONDS,
         fetchedAt: new Date().toISOString(),
       };
@@ -242,7 +247,7 @@ export class UnipileProfileService {
 
   private rowToResult(row: UnipileCacheRow, fromCache: boolean): GetProfileResult {
     if (row.status === 'error') {
-      throw new Error(row.errorMessage ?? 'Unipile cached error');
+      return { rawData: null, fromCache, found: false, checkedAt: row.fetchedAt };
     }
     return {
       rawData: row.rawData,

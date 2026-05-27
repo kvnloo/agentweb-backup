@@ -1087,4 +1087,128 @@ describe('LinkedInOutreachService', () => {
       expect(result[0].provider_id).toBe('prov-1');
     });
   });
+
+  describe('resolveAccountIdForEnrichment', () => {
+    const mockGetAccountsByUserId = jest.fn();
+    const mockGetSetting = jest.fn();
+
+    beforeEach(() => {
+      jest.resetModules();
+      jest.doMock('../services/connectedAccountsDb', () => ({
+        getAccountsByUserId: mockGetAccountsByUserId,
+      }));
+      jest.doMock('../services/settingsService', () => ({
+        settingsService: { getSetting: mockGetSetting },
+      }));
+      // Clear per-user resolved-account cache between tests
+      // @ts-ignore
+      linkedInOutreachService.resolvedAccountCache.clear();
+      // @ts-ignore
+      linkedInOutreachService.connectedStatusCache.clear();
+    });
+
+    it('skips dead user accounts and returns first live one', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'dead-acct' },
+        { platform: 'unipile', account_id: 'live-acct' },
+      ]);
+      jest.spyOn(linkedInOutreachService, 'isAccountConnected')
+        .mockImplementation(async (id) => id === 'live-acct');
+
+      const result = await linkedInOutreachService.resolveAccountIdForEnrichment('user-1');
+
+      expect(result).toBe('live-acct');
+    });
+
+    it('falls back to site-wide account when all user accounts are dead', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'dead-user-acct' },
+      ]);
+      mockGetSetting.mockResolvedValue({
+        settingValue: JSON.stringify([
+          { account_id: 'site-acct-1', enabled: true },
+        ]),
+      });
+      jest.spyOn(linkedInOutreachService, 'isAccountConnected')
+        .mockImplementation(async (id) => id === 'site-acct-1');
+
+      const result = await linkedInOutreachService.resolveAccountIdForEnrichment('user-2');
+
+      expect(result).toBe('site-acct-1');
+    });
+
+    it('skips disconnected site-wide accounts', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([]);
+      mockGetSetting.mockResolvedValue({
+        settingValue: JSON.stringify([
+          { account_id: 'dead-site', enabled: true },
+          { account_id: 'live-site', enabled: true },
+        ]),
+      });
+      jest.spyOn(linkedInOutreachService, 'isAccountConnected')
+        .mockImplementation(async (id) => id === 'live-site');
+
+      const result = await linkedInOutreachService.resolveAccountIdForEnrichment('user-3');
+
+      expect(result).toBe('live-site');
+    });
+
+    it('returns null when no live accounts exist anywhere', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([]);
+      mockGetSetting.mockResolvedValue(null);
+
+      const result = await linkedInOutreachService.resolveAccountIdForEnrichment('user-4');
+
+      expect(result).toBeNull();
+    });
+
+    it('caches the resolved account and skips db on subsequent calls', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'cached-acct' },
+      ]);
+      jest.spyOn(linkedInOutreachService, 'isAccountConnected').mockResolvedValue(true);
+
+      await linkedInOutreachService.resolveAccountIdForEnrichment('user-5');
+      const second = await linkedInOutreachService.resolveAccountIdForEnrichment('user-5');
+
+      expect(second).toBe('cached-acct');
+      expect(mockGetAccountsByUserId).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not cache null — retries on every call when no account found', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([]);
+      mockGetSetting.mockResolvedValue(null);
+
+      await linkedInOutreachService.resolveAccountIdForEnrichment('user-6');
+      await linkedInOutreachService.resolveAccountIdForEnrichment('user-6');
+
+      expect(mockGetAccountsByUserId).toHaveBeenCalledTimes(2);
+    });
+
+    it('invalidateResolvedAccount clears cache so next call re-resolves', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'acct-7' },
+      ]);
+      jest.spyOn(linkedInOutreachService, 'isAccountConnected').mockResolvedValue(true);
+
+      await linkedInOutreachService.resolveAccountIdForEnrichment('user-7');
+      linkedInOutreachService.invalidateResolvedAccount('user-7');
+      await linkedInOutreachService.resolveAccountIdForEnrichment('user-7');
+
+      expect(mockGetAccountsByUserId).toHaveBeenCalledTimes(2);
+    });
+
+    it('ignores non-unipile connected accounts', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'gmail', account_id: 'gmail-acct' },
+      ]);
+      mockGetSetting.mockResolvedValue(null);
+      jest.spyOn(linkedInOutreachService, 'isAccountConnected').mockResolvedValue(true);
+
+      const result = await linkedInOutreachService.resolveAccountIdForEnrichment('user-8');
+
+      expect(result).toBeNull();
+      expect(linkedInOutreachService.isAccountConnected).not.toHaveBeenCalled();
+    });
+  });
 });

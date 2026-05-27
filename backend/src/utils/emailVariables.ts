@@ -224,8 +224,8 @@ export function checkEmailFormat(html: string): EmailFormatWarning[] {
   // Check for hardcoded light text colors on potentially dark-mode-inverted backgrounds
   // Detect dark hex/named text colors inline (e.g. color:#111, color:#333, color:black)
   // without a nearby dark-mode override — a common source of "black text on dark bg" bugs
-  const hasDarkTextColors = /color\s*:\s*(#[0-2][0-9a-fA-F]{5}|#[0-2][0-9a-fA-F]{2}|black|#000)/i.test(html);
-  const hasLightBgColors = /background(-color)?\s*:\s*(#[e-f][0-9a-fA-F]{5}|#[e-f][0-9a-fA-F]{2}|white|#fff\b)/i.test(html);
+  const hasDarkTextColors = /color\s*:\s*(#[0-7][0-9a-fA-F]{5}|#[0-7][0-9a-fA-F]{2}|black|#000)/i.test(html);
+  const hasLightBgColors = /background(-color)?\s*:\s*(#[ef][0-9a-fA-F]{5}|#[ef][0-9a-fA-F]{2}|white|#fff\b)/i.test(html);
   if (hasDarkTextColors && hasLightBgColors && !darkModeHandled) {
     warnings.push({
       code: 'dark-mode-contrast',
@@ -247,6 +247,26 @@ const VARIABLE_ALIASES: Record<string, string> = {
   'First name': 'firstName',
   'Last name': 'lastName',
 };
+
+/**
+ * Injects <meta name="color-scheme" content="light"> into the <head> if not already present.
+ * Opts the email out of dark-mode inversion in Apple Mail / iOS Mail.
+ * No-op when the tag already exists or there is no <head>.
+ */
+export function injectColorSchemeMeta(html: string): string {
+  if (!html) return html;
+  // Already opted out — nothing to do.
+  const alreadyPresent =
+    /<meta[^>]*name=["']color-scheme["'][^>]*>/i.test(html) ||
+    /<meta[^>]*content=["'][^"']*light[^"']*["'][^>]*name=["']color-scheme["'][^>]*>/i.test(html);
+  if (alreadyPresent) return html;
+  const meta = '<meta name="color-scheme" content="light">';
+  // Inject right after <head> if present, otherwise before the first <meta> or <body>.
+  if (/<head[^>]*>/i.test(html)) {
+    return html.replace(/<head([^>]*)>/i, `<head$1>${meta}`);
+  }
+  return html;
+}
 
 export function substituteVariables(template: string, lead: Record<string, any>): string {
   if (!template) return template;

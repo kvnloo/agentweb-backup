@@ -42,6 +42,20 @@ export type FieldConfidenceSignal = 'linkedin' | 'email' | 'name+org';
  * is comprehensive but the recency cap is variable per person.
  */
 const APOLLO_FIELD_CONFIDENCE: Record<string, Confidence> = {
+  // Identity fields (filled by the identity resolver / person waterfall).
+  // 'high' for stable identifiers; 'medium' for current-state fields that
+  // drift when the subject changes jobs. Listed explicitly so Apollo identity
+  // fields no longer silently default to 'medium' while enrich.so rates the
+  // same fields 'high'.
+  firstName: 'high',
+  lastName: 'high',
+  email: 'high',
+  linkedin: 'high',
+  website: 'medium',   // current-state; can change when company rebrands
+  company: 'medium',
+  title: 'medium',
+  phone: 'medium',
+
   // Person fields (filled by applyApolloMatchToLead from /people/match)
   employmentHistory: 'medium',
 
@@ -55,6 +69,27 @@ const APOLLO_FIELD_CONFIDENCE: Record<string, Confidence> = {
   companyFundingLastRoundDate: 'high',
   companyAnnualRevenue: 'low',          // estimate
   companyDepartmentHeadcount: 'low',    // estimate
+
+  // ── V3 waterfall snake_case FIELD_GROUPS entries ──────────────────────────
+  // The V3 waterfall (enrichmentGroupWaterfall.ts) calls getFieldConfidence with
+  // the snake_case field names from FIELD_GROUPS (e.g. 'funding_stage'), not
+  // the camelCase names used by the identity resolver path above. Without these
+  // entries every waterfall lookup silently falls back to the 'medium' default.
+  //
+  // Rationale mirrors the camelCase block above:
+  //   'high'   for factual public-record fields (funding rounds, dates, founding year)
+  //   'low'    for synthesized estimates (revenue ranges, valuations)
+  //   (fields that legitimately default to 'medium' are omitted — no entry needed)
+
+  // company_financial group (factual public-record fields)
+  funding_stage: 'high',        // mirrors companyFundingStage: 'high'
+  total_funding: 'high',        // mirrors companyFundingTotal: 'high'
+  last_funding_date: 'high',    // mirrors companyFundingLastRoundDate: 'high'
+  founded_year: 'high',         // factual public record (incorporation date)
+
+  // company_financial group (synthesized estimates)
+  revenue_range: 'low',         // estimate / range — mirrors companyAnnualRevenue: 'low'
+  valuation: 'low',             // estimate; rarely publicly disclosed
 };
 
 /**

@@ -13,11 +13,13 @@ import { getEnrichSoService } from './enrichSoService';
 import type { MappedPerson, MappedOrganization } from './apolloFieldMapper';
 import type { OrchestratorDeps } from './crmEnrichmentServiceV3';
 import { CrmEnrichmentService, type LeadRecord } from './crmEnrichmentService';
+import { sanitizePhone } from '../utils/phoneValidation';
 import type { IdentityResolverDeps } from './enrichmentIdentityResolver';
 import { resolveIdentity as pureResolveIdentity } from './enrichmentIdentityResolver';
-import { runWaterfall as pureRunWaterfall } from './enrichmentGroupWaterfall';
+import { runWaterfall as pureRunWaterfall, type LLMFilledValue } from './enrichmentGroupWaterfall';
 import { apolloAsyncRequestCacheKey, APOLLO_SCHEMA_VERSION } from './apolloCacheKeys';
 import { FIELD_GROUPS } from './enrichmentGroups';
+import { trimQuote } from '../utils/enrichedFieldValue';
 import { waitForApolloAsyncResult } from './enrichmentWaterfall';
 import { STANDARD_ENRICHABLE_FIELDS } from './enrichmentConfigService';
 import {
@@ -28,9 +30,9 @@ import {
 import { fetchTopPages } from './webContentFetcher';
 import { agentModeService } from './agentModeService';
 import { createLLMService } from '../utils/llmService';
+import { extractJson } from './util/extractJson';
 import { getUnipileCompanyService } from './unipileCompanyServiceFactory';
 import { getUnipileProfileService } from './unipileProfileServiceFactory';
-import { extractCompanyIdentifierFromInput } from './unipileCompanyCacheKeys';
 
 // Models — match what v2 enrichment uses (gpt-5-chat-2 via Azure OpenAI; see
 // `crmEnrichmentService.ts:260-261`). Overridable via env for cost tuning.
@@ -48,8 +50,8 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
     apolloPeopleMatch: async ({ email, linkedinUrl, firstName, lastName, domain, company }) => {
       if (!isApolloServiceReady()) return null;
       if (!email && !linkedinUrl && !firstName && !lastName) return null;
-      // Adapter-level guard: personal emails give poor Apollo results.
-      if (email && CrmEnrichmentService.isPersonalEmailDomain(email)) return null;
+      // Personal emails are allowed — Apollo can still return person+org data.
+      // Domain filtering is handled upstream (domainForApollo strips freemail domains).
       try {
         const apollo = getApolloService();
         const input: Parameters<typeof apollo.matchPerson>[0] = {};
@@ -63,14 +65,18 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
         const p = result?.match?.person;
         if (!p) return null;
         const org = result?.match?.organization;
+        // Fall back to current employment entry when top-level org is absent.
+        // Apollo sometimes omits the organization object for personal-email matches
+        // but still populates employment_history with the current employer.
+        const currentJob = p.employmentHistory?.find(e => e.current);
         return {
           firstName: p.firstName,
           lastName: p.lastName,
-          title: p.title,
+          title: p.title ?? currentJob?.title,
           linkedin: p.linkedin,
           email: p.email,
           emailStatus: p.emailStatus,
-          company: org?.name ?? undefined,
+          company: org?.name ?? currentJob?.organizationName ?? undefined,
           website: org?.websiteUrl ?? undefined,
           city: p.city,
           state: p.state,
@@ -152,28 +158,41 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
     findLinkedInUrl: ({ firstName, lastName, company }) =>
       findLinkedInUrlImpl(userId, firstName, lastName, company),
 
-    resolveCompanyDomainViaWebSearch: async ({ company, linkedin, title, firstName, lastName }) => {
+    resolveCompanyDomainViaWebSearch: async ({ company, domain, linkedin, title, firstName, lastName }) => {
       try {
         const llm = createLLMService(WEB_SEARCH_MODEL, 0.2);
         const systemPrompt =
-          'You are a company researcher. Given company information, search the web to find the official company website. ' +
-          'STRICT RULES: Only return a website if you find it confirmed via web search. ' +
-          'Do NOT guess, infer, or construct a URL. Do NOT use your training knowledge alone. ' +
-          'If the web search does not return a clear, confirmed result, return null. ' +
-          'Return JSON with a single key "website" containing the full URL (e.g. "https://acme.com"), or null. ' +
+          'You are a company researcher. Given information about a person or company, find the official company website and company name.\n\n' +
+          'LOOKUP PRIORITY (follow in order):\n' +
+          '1. Search the web — prefer confirmed, live results.\n' +
+          '2. Use your own knowledge only if web search returns nothing useful.\n' +
+          '3. If neither source gives a confident answer, return null for that field.\n\n' +
+          'STRICT RULES:\n' +
+          '- Do NOT fabricate, guess, or construct any answer.\n' +
+          '- Do NOT infer a website from a company name pattern (e.g. acme.com from "Acme Inc") without confirmation.\n' +
+          '- If uncertain, set the field to null — empty is better than wrong.\n\n' +
+          'Return JSON with keys:\n' +
+          '"website" (full URL, e.g. "https://acme.com" — null if not confirmed),\n' +
+          '"company" (official company name — null if not confirmed),\n' +
+          '"searchedDomain" (exact domain you confirmed, e.g. "acme.com" — include ONLY when an email domain was provided as input, otherwise omit).\n' +
           'Return ONLY valid JSON, no explanation.';
-        const parts: string[] = [`Company name: ${company}`];
+        const parts: string[] = [];
+        if (company) parts.push(`Company name: ${company}`);
+        if (domain) parts.push(`Email domain: ${domain}`);
         if (firstName || lastName) parts.push(`Contact name: ${[firstName, lastName].filter(Boolean).join(' ')}`);
         if (title) parts.push(`Contact title: ${title}`);
         if (linkedin) parts.push(`Contact LinkedIn: ${linkedin}`);
-        parts.push('Find the official website for this company.');
+        parts.push('Find the official company website and company name.');
         const userPrompt = parts.join('\n');
-        const result = await llm.generateJSONContentWithWebSearch<{ website: string | null }>(
+        const result = await llm.generateJSONContentWithWebSearch<{ website: string | null; company?: string | null; searchedDomain?: string | null }>(
           systemPrompt,
           userPrompt,
         );
-        if (!result?.website || typeof result.website !== 'string') return null;
-        return { website: result.website.trim() };
+        const website = typeof result?.website === 'string' ? result.website.trim() : undefined;
+        const companyName = typeof result?.company === 'string' ? result.company.trim() : undefined;
+        const searchedDomain = typeof result?.searchedDomain === 'string' ? result.searchedDomain.trim() : undefined;
+        if (!website && !companyName) return null;
+        return { website, company: companyName, searchedDomain };
       } catch (err) {
         console.warn('[v3 deps] resolveCompanyDomainViaWebSearch failed:', (err as Error).message);
         return null;
@@ -259,7 +278,10 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
       // Split by destination: standard lead columns go to top-level (where
       // the lead table reads them); custom names go to customFields.
       // Matches STANDARD_LEAD_COLUMNS in crmEnrichmentServiceV3.ts.
-      const STANDARD = new Set<string>(STANDARD_ENRICHABLE_FIELDS);
+      // `website` is a top-level AW-Leads attribute but not in STANDARD_ENRICHABLE_FIELDS
+      // (which is the user-configurable enrichment set). Include it here so the
+      // resolver's Tier 0.5 website write lands at item.website, not customFields.website.
+      const STANDARD = new Set<string>([...STANDARD_ENRICHABLE_FIELDS, 'website']);
       const topLevel: Record<string, string> = {};
       const customFields: Record<string, string> = {};
       const removeCustomFieldKeys: string[] = [];
@@ -294,7 +316,7 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
 
 // Note: `org` is ALREADY a MappedOrganization from `apolloService.matchOrg`,
 // no need to re-map. Function name kept for clarity at call site.
-function mapApolloOrgToCrmFields(m: MappedOrganization): Record<string, string> {
+export function mapApolloOrgToCrmFields(m: MappedOrganization): Record<string, string> {
   const out: Record<string, string> = {};
   if (m.name) out.company_name = m.name;
   if (m.websiteUrl) out.website = m.websiteUrl;
@@ -315,7 +337,7 @@ function mapApolloOrgToCrmFields(m: MappedOrganization): Record<string, string> 
     if (loc) out.hq_location = loc;
   }
   if (m.hqRawAddress) out.hq_address = m.hqRawAddress;
-  if (m.phone) out.company_phone = m.phone;
+  if (m.phone) { const p = sanitizePhone(m.phone); if (p) out.company_phone = p; }
   if (m.twitterUrl) {
     const handle = m.twitterUrl.replace(/\/$/, '').split('/').pop();
     if (handle) out.twitter_handle = handle;
@@ -323,14 +345,14 @@ function mapApolloOrgToCrmFields(m: MappedOrganization): Record<string, string> 
   return out;
 }
 
-function mapApolloPersonToCrmFields(p: MappedPerson): Record<string, string> {
+export function mapApolloPersonToCrmFields(p: MappedPerson): Record<string, string> {
   const out: Record<string, string> = {};
   if (p.firstName) out.first_name = p.firstName;
   if (p.lastName) out.last_name = p.lastName;
   if (p.title) out.title = p.title;
   if (p.linkedin) out.linkedin_url = p.linkedin;
   if (p.email) out.email = p.email;
-  if (p.phone) out.phone = p.phone;
+  if (p.phone) { const ph = sanitizePhone(p.phone); if (ph) out.phone = ph; }
   if (p.seniority) out.seniority = p.seniority;
   if (p.departments && p.departments.length) out.department = p.departments[0];
   // Compose location from city / state / country — Apollo returns these
@@ -345,9 +367,11 @@ function mapApolloPersonToCrmFields(p: MappedPerson): Record<string, string> {
 async function fetchWebForGroupReal(
   lead: LeadRecord,
   groupName: string,
+  listId?: string,
 ): Promise<{ webContext: string } | null> {
   const groupCfg = FIELD_GROUPS[groupName];
   if (!groupCfg) return null;
+  const wtag = `[v3:${listId ? `${listId}:` : ''}${lead.leadId ?? lead.email ?? '?'}:web:${groupName}]`;
 
   // 1. Cache check (shared across leads at the same canonical entity)
   try {
@@ -363,9 +387,10 @@ async function fetchWebForGroupReal(
   // 2. Build query from the group's searchTemplate
   const query = CrmEnrichmentService.applySearchTemplate(groupCfg.searchTemplate, lead);
   if (!query || query === groupCfg.searchTemplate.replace(/\{\{[^}]+\}\}/g, '').trim().replace(/\s+/g, ' ')) {
-    // No lead-specific signal — skip rather than fetch generic top hits
+    console.log(`${wtag} SKIP no lead-specific signal in query`);
     return null;
   }
+  console.log(`${wtag} query="${query.slice(0, 120)}"`);
 
   // 3. Google CSE
   let webResults: any[] = [];
@@ -375,19 +400,24 @@ async function fetchWebForGroupReal(
       webResults = search.results;
     }
   } catch (err) {
-    console.warn('[v3 deps] searchWeb failed:', (err as Error).message);
+    console.warn(`${wtag} searchWeb ERROR ${(err as Error).message}`);
     return null;
   }
-  if (webResults.length === 0) return null;
+  if (webResults.length === 0) {
+    console.log(`${wtag} MISS searchWeb returned 0 results`);
+    return null;
+  }
 
   // 4. Top-2 page fetch for richer context
   const urls = webResults.map((r: any) => r.url || r.link).filter(Boolean);
+  console.log(`${wtag} got ${webResults.length} result(s) top_urls=[${urls.slice(0, 3).map((u: string) => u.slice(0, 80)).join(', ')}]`);
   let pages: Awaited<ReturnType<typeof fetchTopPages>> = [];
   try {
     pages = await fetchTopPages(urls, 2);
   } catch (err) {
-    console.warn('[v3 deps] page fetch failed:', (err as Error).message);
+    console.warn(`${wtag} page fetch ERROR ${(err as Error).message}`);
   }
+  console.log(`${wtag} fetched ${pages.length} page(s)`);
 
   // 5. Cache + return
   const rawData = {
@@ -404,7 +434,7 @@ async function fetchWebForGroupReal(
   try {
     await writeRawDataToCache(lead as any, groupName, rawData, query, ['web_search']);
   } catch (err) {
-    console.warn('[v3 deps] cache write failed:', (err as Error).message);
+    console.warn(`${wtag} cache write ERROR ${(err as Error).message}`);
   }
 
   // Build context = SERP + page bodies (truncated)
@@ -415,6 +445,7 @@ async function fetchWebForGroupReal(
       .join('\n\n');
     webContext += '\n\nPage contents:\n' + pageText;
   }
+  console.log(`${wtag} context built len=${webContext.length}`);
   return { webContext };
 }
 
@@ -438,23 +469,26 @@ export function buildFieldGuidanceV3(fields: string[], configFieldsByName: Recor
   }).join('\n');
 }
 
-export function rejectHallucinatedLinkedInUrls(filled: Record<string, string>, sourceContext: string): Record<string, string> {
+export function rejectHallucinatedLinkedInUrls(
+  filled: Record<string, LLMFilledValue>,
+  sourceContext: string,
+): Record<string, LLMFilledValue> {
   const normalizedSource = sourceContext.toLowerCase().replace(/\s+/g, ' ').trim();
-  const result: Record<string, string> = {};
-  for (const [field, value] of Object.entries(filled)) {
+  const result: Record<string, LLMFilledValue> = {};
+  for (const [field, entry] of Object.entries(filled)) {
     if (/linkedin/i.test(field)) {
-      const slugMatch = value.match(/linkedin\.com\/(in|company)\/([^/?#\s]+)/i);
+      const slugMatch = entry.value.match(/linkedin\.com\/(in|company)\/([^/?#\s]+)/i);
       if (!slugMatch) {
-        console.warn(`[v3 deps] Rejected LinkedIn URL "${value}" for field "${field}" — no valid /in/ or /company/ path`);
+        console.warn(`[v3 deps] Rejected LinkedIn URL "${entry.value}" for field "${field}" — no valid /in/ or /company/ path`);
         continue;
       }
       const slug = slugMatch[2].toLowerCase();
       if (!normalizedSource.includes(slug)) {
-        console.warn(`[v3 deps] Rejected hallucinated LinkedIn URL "${value}" for field "${field}" — slug "${slug}" not in source data`);
+        console.warn(`[v3 deps] Rejected hallucinated LinkedIn URL "${entry.value}" for field "${field}" — slug "${slug}" not in source data`);
         continue;
       }
     }
-    result[field] = value;
+    result[field] = entry;
   }
   return result;
 }
@@ -466,8 +500,11 @@ async function extractFieldsViaLLMReal(input: {
   groupName: string;
   lead: LeadRecord;
   configFieldsByName: Record<string, { instruction?: string } | undefined>;
-}): Promise<{ filled: Record<string, string>; missing: string[] }> {
+  listId?: string;
+}): Promise<{ filled: Record<string, LLMFilledValue>; missing: string[] }> {
   if (input.fields.length === 0) return { filled: {}, missing: [] };
+  const ltag = `[v3:${input.listId ? `${input.listId}:` : ''}${input.lead.leadId ?? input.lead.email ?? '?'}:llm:${input.groupName}:${input.tier}]`;
+  console.log(`${ltag} START fields=[${input.fields.join(',')}] contextLen=${input.sourceContext.length}`);
 
   const fieldGuide = buildFieldGuidanceV3(input.fields, input.configFieldsByName);
 
@@ -481,22 +518,35 @@ async function extractFieldsViaLLMReal(input: {
 
   const isWebTier = input.tier === 'web';
 
+  // Web tier asks for per-field provenance objects so the value carries the
+  // sourceUrl / sourceQuote the critic and provenance UI need. Apollo tier
+  // keeps the bare-string prompt (Apollo JSON has no URLs) and the bare result
+  // is normalized into the unified {value} shape below.
   const systemPrompt = isWebTier
     ? `You extract structured CRM data for a given lead. Follow this priority order:\n` +
       `1. Extract from the provided web context if the information is clearly present.\n` +
       `2. If information is missing or insufficient, use your web search capability to look it up.\n` +
       `3. If web search yields no result, use your own training knowledge if you are FULLY confident.\n` +
       `4. If you do not know a value with confidence, return null for that field.\n` +
-      `NEVER guess, infer, or fabricate. Return strict JSON only, strings only, no markdown.`
+      `NEVER guess, infer, or fabricate. For each field return an object ` +
+      `{"value": <string>, "sourceUrl": <url or null>, "sourceQuote": <short verbatim snippet or null>}. ` +
+      `Return strict JSON only, no markdown. If you have no data for any field, return {} — never return explanations or apologies.`
     : `You extract structured CRM data from the provided context. Return strict JSON: ` +
       `an object with one key per requested field. Use null when the value isn't ` +
-      `explicitly present. Do NOT infer or fabricate. Strings only, no markdown.`;
+      `explicitly present. Do NOT infer or fabricate. Strings only, no markdown. ` +
+      `If you have no data for any field, return {} — never return explanations or apologies.`;
 
-  const userPrompt =
-    `Lead: ${leadContext}\n\n` +
-    `Source (${input.tier}):\n${input.sourceContext.slice(0, 16000)}\n\n` +
-    `Extract these fields (return one JSON object with these exact keys):\n${fieldGuide}\n\n` +
-    `Return ONLY a JSON object like {"field_name": "value", "other_field": null}. No prose.`;
+  const userPrompt = isWebTier
+    ? `Lead: ${leadContext}\n\n` +
+      `Source (${input.tier}):\n${input.sourceContext.slice(0, 16000)}\n\n` +
+      `Extract these fields (return one JSON object with these exact keys):\n${fieldGuide}\n\n` +
+      `Return ONLY a JSON object like ` +
+      `{"field_name": {"value": "...", "sourceUrl": "...", "sourceQuote": "..."}, "other_field": null}. ` +
+      `No prose. If nothing is found, return {}.`
+    : `Lead: ${leadContext}\n\n` +
+      `Source (${input.tier}):\n${input.sourceContext.slice(0, 16000)}\n\n` +
+      `Extract these fields (return one JSON object with these exact keys):\n${fieldGuide}\n\n` +
+      `Return ONLY a JSON object like {"field_name": "value", "other_field": null}. No prose. If nothing is found, return {}.`;
 
   try {
     let parsed: Record<string, any>;
@@ -507,21 +557,46 @@ async function extractFieldsViaLLMReal(input: {
       const llm = createLLMService(EXTRACT_MODEL, 0.0);
       parsed = await llm.generateJSONContent<Record<string, any>>(systemPrompt, userPrompt);
     }
-    const filled: Record<string, string> = {};
+    const filled: Record<string, LLMFilledValue> = {};
     const missing: string[] = [];
     for (const field of input.fields) {
-      const value = parsed?.[field];
-      if (value != null && String(value).trim().length > 0 && String(value).toLowerCase() !== 'null') {
-        filled[field] = String(value).trim();
+      const raw = parsed?.[field];
+      // Web tier returns objects; Apollo tier returns bare strings. Normalize
+      // both into LLMFilledValue. A web-tier null/empty value → missing.
+      let entry: LLMFilledValue | null = null;
+      if (raw != null) {
+        if (isWebTier && typeof raw === 'object' && !Array.isArray(raw)) {
+          const v = raw.value;
+          if (v != null && String(v).trim().length > 0 && String(v).toLowerCase() !== 'null') {
+            entry = { value: String(v).trim() };
+            if (typeof raw.sourceUrl === 'string' && raw.sourceUrl.trim() && raw.sourceUrl.toLowerCase() !== 'null') {
+              entry.sourceUrl = raw.sourceUrl.trim();
+            }
+            if (typeof raw.sourceQuote === 'string' && raw.sourceQuote.trim() && raw.sourceQuote.toLowerCase() !== 'null') {
+              entry.sourceQuote = trimQuote(raw.sourceQuote) ?? undefined;
+            }
+          }
+        } else if (!isWebTier && String(raw).trim().length > 0 && String(raw).toLowerCase() !== 'null') {
+          entry = { value: String(raw).trim() };
+        } else if (isWebTier && String(raw).trim().length > 0 && String(raw).toLowerCase() !== 'null') {
+          // LLM returned a bare string for the web tier despite the object-shape
+          // instruction — accept the value but flag the lost provenance.
+          console.warn(`[v3 deps] web-tier LLM returned bare string for field "${field}" — provenance unavailable`);
+          entry = { value: String(raw).trim() };
+        }
+      }
+      if (entry) {
+        filled[field] = entry;
       } else {
         missing.push(field);
       }
     }
     const verified = rejectHallucinatedLinkedInUrls(filled, input.sourceContext);
     const verifiedMissing = input.fields.filter(f => !(f in verified));
+    console.log(`${ltag} DONE filled=[${Object.keys(verified).join(',')}] missing=[${verifiedMissing.join(',')}]`);
     return { filled: verified, missing: [...new Set([...missing, ...verifiedMissing])] };
   } catch (err) {
-    console.warn('[v3 deps] extractFieldsViaLLM failed:', (err as Error).message);
+    console.warn(`${ltag} ERROR ${(err as Error).message}`);
     return { filled: {}, missing: input.fields };
   }
 }
@@ -571,27 +646,37 @@ async function runCriticReal(input: {
 
 // ─── Shared Unipile LinkedIn lookup ──────────────────────────────────────────
 
-async function findLinkedInUrlImpl(
+export async function findLinkedInUrlImpl(
   userId: string,
   firstName: string | undefined,
   lastName: string | undefined,
   company: string | undefined,
 ): Promise<string | null> {
+  const { linkedInOutreachService } = await import('./linkedInOutreachService');
+  let accountId: string | null = null;
   try {
-    const { linkedInOutreachService } = await import('./linkedInOutreachService');
-    const accountId = await linkedInOutreachService.resolveAccountId(userId);
+    accountId = await linkedInOutreachService.resolveAccountIdForEnrichment(userId);
     if (!accountId) return null;
     const keywords = [firstName, lastName].filter(Boolean).join(' ');
     if (!keywords) return null;
+    console.log(`[v3 linkedin-search] name="${keywords}" company="${company ?? '∅'}"`);
     const result = await linkedInOutreachService.searchPeople(accountId, {
       keywords,
       company: company || undefined,
     });
-    const first = result?.items?.[0];
+    const candidates = result?.items ?? [];
+    const first = candidates[0];
+    console.log(`[v3 linkedin-search] got ${candidates.length} result(s) first=${first?.public_identifier ?? 'none'}`);
     if (!first?.public_identifier) return null;
-    if (!unipileNameMatches(first, firstName, lastName)) return null;
+    const nameOk = unipileNameMatches(first, firstName, lastName);
+    console.log(`[v3 linkedin-search] nameMatch=${nameOk} → ${nameOk ? `HIT url=https://www.linkedin.com/in/${first.public_identifier}` : 'MISS name mismatch'}`);
+    if (!nameOk) return null;
     return `https://www.linkedin.com/in/${first.public_identifier}`;
   } catch (err) {
+    // Any failure after accountId was resolved — purge both caches so next call
+    // re-resolves to a live account (covers NOT_FOUND + newly-connected replacements).
+    linkedInOutreachService.invalidateResolvedAccount(userId);
+    if (accountId) linkedInOutreachService.clearStatusCache(accountId);
     console.warn('[v3 deps] findLinkedInUrl failed:', (err as Error).message);
     return null;
   }
@@ -669,17 +754,25 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
     runWaterfall: (input) => pureRunWaterfall(input, {
       fetchApolloOrg: async (lead) => {
         if (!isApolloServiceReady()) return null;
-        const domain = lead.emailDomain || extractDomain(lead.email) || extractDomain(lead.website);
-        if (!domain) return null;
+        const domain = lead.emailDomain || (lead.email ? lead.email.split('@')[1]?.trim() || null : null) || extractDomain(lead.website);
+        if (!domain) {
+          console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:org] SKIP no domain`);
+          return null;
+        }
+        console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:org] matchOrg domain=${domain}`);
         try {
           const result = await getApolloService().matchOrg(domain);
-          if (!result?.organization) return null;
+          if (!result?.organization) {
+            console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:org] MISS no organization`);
+            return null;
+          }
+          console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:org] HIT name="${result.organization.name}" website="${result.organization.websiteUrl ?? '∅'}"`);
           return {
             mapped: mapApolloOrgToCrmFields(result.organization),
             raw: result.organizationRaw ?? null,
           };
         } catch (err) {
-          console.warn('[v3 deps] fetchApolloOrg failed:', (err as Error).message);
+          console.warn(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:org] ERROR ${(err as Error).message}`);
           throw err;
         }
       },
@@ -689,19 +782,28 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
         const domain = extractDomain(lead.website) || lead.emailDomain || extractDomain(lead.email) || null;
         const personalDomain = !!domain && CrmEnrichmentService.isPersonalEmailDomain(`x@${domain}`);
         const hasNameAndDomain = !!(lead.firstName || lead.lastName) && !!domain && !personalDomain;
-        if (!lead.email && !hasNameAndDomain) return null;
+        if (!lead.email && !hasNameAndDomain) {
+          console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:person] SKIP no email and no name+domain`);
+          return null;
+        }
         try {
-          const input = lead.email
+          const apolloInput = lead.email
             ? { email: lead.email }
             : { firstName: lead.firstName ?? undefined, lastName: lead.lastName ?? undefined, domain: domain! };
-          const result = await getApolloService().matchPerson(input);
-          if (!result?.match?.person) return null;
+          console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:person] matchPerson input=${JSON.stringify(apolloInput)}`);
+          const result = await getApolloService().matchPerson(apolloInput);
+          if (!result?.match?.person) {
+            console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:person] MISS no person`);
+            return null;
+          }
+          const p = result.match.person;
+          console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:person] HIT name="${p.firstName ?? ''} ${p.lastName ?? ''}" title="${(p as any).title ?? '∅'}" company="${(p as any).organizationName ?? '∅'}"`);
           return {
             mapped: mapApolloPersonToCrmFields(result.match.person),
             raw: result.personRaw ?? null,
           };
         } catch (err) {
-          console.warn('[v3 deps] fetchApolloPerson failed:', (err as Error).message);
+          console.warn(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:person] ERROR ${(err as Error).message}`);
           throw err;
         }
       },
@@ -709,65 +811,182 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       extractFieldsViaLLM: extractFieldsViaLLMReal,
       fetchWebForGroup: fetchWebForGroupReal,
 
-      findLinkedInUrl: (lead: LeadRecord) =>
-        findLinkedInUrlImpl(userId, lead.firstName, lead.lastName, lead.company),
+      // Tier 3.5b: person enrichment via Unipile.
+      // Case A: lead.linkedin present → getProfile → extract name/title directly.
+      // Case B: no lead.linkedin, have name → searchPeople (5 candidates) → LLM picks
+      //         best match and extracts title from headline.
+      findUnipilePerson: async (lead: LeadRecord) => {
+        const tag = `[v3:${lead.leadId ?? lead.email ?? '?'}:unipile:person]`;
+        const { linkedInOutreachService } = await import('./linkedInOutreachService');
+        const triedAccounts = new Set<string>();
 
-      findUnipileCompany: async (lead: LeadRecord, companyLinkedInUrl?: string): Promise<any | null> => {
-        try {
-          const { linkedInOutreachService } = await import('./linkedInOutreachService');
-          const accountId = await linkedInOutreachService.resolveAccountId(userId);
-          if (!accountId) return null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          let accountId: string | null = null;
+          try {
+            accountId = await linkedInOutreachService.resolveAccountIdForEnrichment(
+              userId,
+              triedAccounts.size > 0 ? triedAccounts : undefined,
+            );
+            if (!accountId) { console.warn(`${tag} no accountId → skip`); return null; }
 
-          let companyIdentifier: string | null = null;
-
-          // Approach 2: company LinkedIn URL → extract identifier directly (1 API call)
-          if (companyLinkedInUrl) {
-            companyIdentifier = extractCompanyIdentifierFromInput(companyLinkedInUrl);
-          }
-
-          // Approach 1: person LinkedIn URL → profile → current work_experience company_id (2 API calls)
-          if (!companyIdentifier && lead.linkedin) {
-            try {
+            // Case A: have linkedin → getProfile (no search needed)
+            if (lead.linkedin?.includes('/in/')) {
+              console.log(`${tag} Case A getProfile url=${lead.linkedin}`);
               const profileResult = await getUnipileProfileService().getProfile(lead.linkedin, accountId);
-              if (profileResult?.found && profileResult.rawData?.work_experience) {
-                const current = (profileResult.rawData.work_experience as any[]).find((e) => !e.end);
-                if (current?.company_id) companyIdentifier = String(current.company_id);
+              if (!profileResult?.found || !profileResult.rawData) {
+                console.log(`${tag} Case A MISS profile not found`);
+                return null;
               }
-            } catch {
-              // Approach 1 failed — continue to Approach 3
+              const raw = profileResult.rawData;
+              const current = (raw.work_experience as any[] | undefined)?.find((e: any) => !e.end);
+              const trimStr = (v: unknown): string | undefined => {
+                const s = typeof v === 'string' ? v.trim() : '';
+                return s || undefined;
+              };
+              const result = {
+                first_name:   trimStr(raw.first_name),
+                last_name:    trimStr(raw.last_name),
+                linkedin_url: raw.public_identifier ? `https://www.linkedin.com/in/${raw.public_identifier}` : undefined,
+                title:        trimStr(current?.position),
+              };
+              console.log(`${tag} Case A HIT name="${result.first_name ?? '∅'} ${result.last_name ?? '∅'}" title="${result.title ?? '∅'}" company="${current?.company ?? '∅'}"`);
+              return result;
             }
-          }
 
-          // Approach 3: name + company search → profile → company_id (3 API calls)
-          if (!companyIdentifier && lead.firstName && lead.lastName && lead.company) {
+            // Case B: no linkedin — search by name, LLM picks from top 5
+            if (!lead.firstName || !lead.lastName) {
+              console.log(`${tag} Case B SKIP no firstName/lastName`);
+              return null;
+            }
+            const searchParams: Record<string, string> = {
+              keywords: `${lead.firstName} ${lead.lastName}`,
+            };
+            if (lead.company) searchParams.company = lead.company;
+            else if (lead.title) searchParams.title = lead.title;
+            console.log(`${tag} Case B searchPeople params=${JSON.stringify(searchParams)}`);
+            const searchResult = await linkedInOutreachService.searchPeople(accountId, searchParams);
+            const candidates = (searchResult?.items ?? []).slice(0, 5);
+            console.log(`${tag} Case B got ${candidates.length} candidate(s)`);
+            if (candidates.length === 0) return null;
+
+            // LLM picks the best candidate and extracts title + company from headline
+            const llm = createLLMService(EXTRACT_MODEL, 0.1);
+            const systemPrompt =
+              'You are a lead researcher. Given a lead and LinkedIn search candidates, pick the best match and extract their current title and company.\n\n' +
+              'RULES:\n' +
+              '- The correct person is most likely the first candidate, but verify.\n' +
+              '- Match first name and last name carefully.\n' +
+              '- Parse the headline to extract current title and company (e.g. "CMO at Acme Inc" → title=CMO, company=Acme Inc).\n' +
+              '- If no candidate matches the lead, return null for chosenIndex.\n' +
+              '- Return ONLY valid JSON, no explanation.\n\n' +
+              'Return: { "chosenIndex": 0-4 or null, "title": string or null, "company_name": string or null, "first_name": string or null, "last_name": string or null }';
+            const userPrompt =
+              `Lead: firstName="${lead.firstName}" lastName="${lead.lastName}" company="${lead.company ?? ''}" title="${lead.title ?? ''}"\n\n` +
+              `Candidates:\n${candidates.map((c: any, i: number) =>
+                `[${i}] name="${c.name ?? `${c.first_name ?? ''} ${c.last_name ?? ''}`.trim()}" headline="${c.headline ?? ''}" location="${c.location ?? ''}"`,
+              ).join('\n')}`;
+            let picked: { chosenIndex: number | null; title: string | null; company_name: string | null; first_name: string | null; last_name: string | null } | null = null;
             try {
-              const searchResult = await linkedInOutreachService.searchPeople(accountId, {
-                keywords: `${lead.firstName} ${lead.lastName}`,
-                company: lead.company,
-              });
-              const first = searchResult?.items?.[0];
-              if (first?.public_identifier && unipileNameMatches(first, lead.firstName, lead.lastName)) {
-                const profileUrl = `https://www.linkedin.com/in/${first.public_identifier}`;
-                const profileResult = await getUnipileProfileService().getProfile(profileUrl, accountId);
-                if (profileResult?.found && profileResult.rawData?.work_experience) {
-                  const current = (profileResult.rawData.work_experience as any[]).find((e) => !e.end);
-                  if (current?.company_id) companyIdentifier = String(current.company_id);
-                }
-              }
-            } catch {
-              // Approach 3 failed — no identifier resolved
+              const raw = await llm.generateRaw(systemPrompt, userPrompt);
+              picked = extractJson(raw);
+            } catch (err) {
+              console.warn(`${tag} Case B LLM parse failed: ${(err as Error).message}`);
+              return null;
             }
+            if (picked?.chosenIndex == null) {
+              console.log(`${tag} Case B LLM chose null — no match`);
+              return null;
+            }
+            const chosen = candidates[picked.chosenIndex];
+            if (!chosen?.public_identifier) {
+              console.log(`${tag} Case B chosen candidate has no public_identifier`);
+              return null;
+            }
+            const result = {
+              first_name:   picked.first_name   ?? (typeof chosen.first_name === 'string' ? chosen.first_name : undefined),
+              last_name:    picked.last_name    ?? (typeof chosen.last_name  === 'string' ? chosen.last_name  : undefined),
+              linkedin_url: `https://www.linkedin.com/in/${chosen.public_identifier}`,
+              title:        picked.title        ?? undefined,
+            };
+            console.log(`${tag} Case B HIT candidate[${picked.chosenIndex}] linkedin=${result.linkedin_url} title="${result.title ?? '∅'}" company="${picked.company_name ?? '∅'}"`);
+            return result;
+          } catch (err) {
+            if ((err as any)?.structuredError?.classification === 'RATE_LIMIT_ERROR') {
+              console.warn(`${tag} 429 on account ${accountId} — rotating (attempt ${attempt + 1}/3)`);
+              if (accountId) triedAccounts.add(accountId);
+              linkedInOutreachService.invalidateResolvedAccount(userId);
+              continue;
+            }
+            linkedInOutreachService.invalidateResolvedAccount(userId);
+            if (accountId) linkedInOutreachService.clearStatusCache(accountId);
+            console.warn(`${tag} ERROR ${(err as Error).message}`);
+            return null;
           }
+        }
+        console.warn(`${tag} all accounts rate-limited (tried ${triedAccounts.size})`);
+        return null;
+      },
 
-          if (!companyIdentifier) return null;
-
-          const companyResult = await getUnipileCompanyService().getCompany(companyIdentifier, accountId);
-          if (!companyResult.found || !companyResult.rawData) return null;
-          return companyResult.rawData;
-        } catch (err) {
-          console.warn('[v3 deps] findUnipileCompany failed:', (err as Error).message);
+      // Tier 5: company enrichment via Unipile (runs after Tier 4 web).
+      // Only fires when lead.linkedin is present. getProfile → company_id → getCompany.
+      findUnipileCompany: async (lead: LeadRecord) => {
+        const tag = `[v3:${lead.leadId ?? lead.email ?? '?'}:unipile:company]`;
+        if (!lead.linkedin?.includes('/in/')) {
+          console.log(`${tag} SKIP no lead.linkedin`);
           return null;
         }
+        const { linkedInOutreachService } = await import('./linkedInOutreachService');
+        const triedAccounts = new Set<string>();
+
+        for (let attempt = 0; attempt < 3; attempt++) {
+          let accountId: string | null = null;
+          try {
+            accountId = await linkedInOutreachService.resolveAccountIdForEnrichment(
+              userId,
+              triedAccounts.size > 0 ? triedAccounts : undefined,
+            );
+            if (!accountId) { console.warn(`${tag} no accountId → skip`); return null; }
+
+            console.log(`${tag} getProfile url=${lead.linkedin}`);
+            const profileResult = await getUnipileProfileService().getProfile(lead.linkedin, accountId);
+            if (!profileResult?.found || !profileResult.rawData) {
+              console.log(`${tag} MISS profile not found`);
+              return null;
+            }
+            const current = (profileResult.rawData.work_experience as any[] | undefined)?.find((e: any) => !e.end);
+            const company_name: string | undefined = current?.company ?? undefined;
+            const companyId: string | null = current?.company_id ? String(current.company_id) : null;
+            console.log(`${tag} profile HIT current_role="${current?.position ?? '∅'}" at="${company_name ?? '∅'}" company_id=${companyId ?? 'none'}`);
+
+            if (!companyId) {
+              console.log(`${tag} no company_id in work_experience → return company_name only`);
+              return { company_name, companyRaw: null };
+            }
+
+            console.log(`${tag} getCompany company_id=${companyId}`);
+            const companyResult = await getUnipileCompanyService().getCompany(companyId, accountId);
+            if (!companyResult.found || !companyResult.rawData) {
+              console.warn(`${tag} getCompany MISS found=${companyResult.found} → return company_name only`);
+              return { company_name, companyRaw: null };
+            }
+            const cRaw = companyResult.rawData;
+            console.log(`${tag} companyRaw HIT name="${cRaw.name ?? '∅'}" website="${cRaw.website ?? '∅'}" employees=${cRaw.employee_count ?? '∅'}`);
+            return { company_name: company_name ?? cRaw.name ?? undefined, companyRaw: cRaw };
+          } catch (err) {
+            if ((err as any)?.structuredError?.classification === 'RATE_LIMIT_ERROR') {
+              console.warn(`${tag} 429 on account ${accountId} — rotating (attempt ${attempt + 1}/3)`);
+              if (accountId) triedAccounts.add(accountId);
+              linkedInOutreachService.invalidateResolvedAccount(userId);
+              continue;
+            }
+            linkedInOutreachService.invalidateResolvedAccount(userId);
+            if (accountId) linkedInOutreachService.clearStatusCache(accountId);
+            console.warn(`${tag} ERROR ${(err as Error).message}`);
+            return null;
+          }
+        }
+        console.warn(`${tag} all accounts rate-limited (tried ${triedAccounts.size})`);
+        return null;
       },
 
       apolloBrokerChain: async ({ firstName, lastName, emailDomain, company, linkedin }, leadHint) => {
@@ -783,7 +1002,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
     // Ungrouped fields → synthetic web fetch using a generic "{{emailDomain}}"
     // query, then LLM extraction. No canonical group → no cache key → no
     // AW-EnrichmentRawCache reuse (one fetch per lead per run).
-    extractUngroupedFieldsViaWeb: async ({ lead, fields, configFieldsByName }) => {
+    extractUngroupedFieldsViaWeb: async ({ listId, lead, fields, configFieldsByName }) => {
       if (fields.length === 0) {
         return { fields: [], missing: [], tierFills: { crm: 0, apollo: 0, web: 0, missing: 0 } };
       }
@@ -819,15 +1038,23 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       }
       const llmResult = await extractFieldsViaLLMReal({
         tier: 'web', sourceContext: webContext, fields, groupName: '__ungrouped__',
-        lead, configFieldsByName,
+        lead, configFieldsByName, listId,
       });
       const filled: any[] = [];
       for (const field of fields) {
-        const value = llmResult.filled[field];
-        if (typeof value === 'string' && value.length > 0) {
+        const entry = llmResult.filled[field];
+        if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
           filled.push({
-            field, value,
-            meta: { source: 'web_search', enrichedAt: new Date().toISOString() },
+            field,
+            value: entry.value,
+            meta: {
+              source: 'web_search',
+              provider: 'llm_web_search',
+              confidence: 'medium',
+              ...(entry.sourceUrl ? { sourceUrl: entry.sourceUrl } : {}),
+              ...(entry.sourceQuote ? { sourceQuote: entry.sourceQuote } : {}),
+              enrichedAt: new Date().toISOString(),
+            },
           });
         }
       }
@@ -838,20 +1065,38 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       };
     },
 
-    evaluateSmartField: async ({ fieldName, condition, depValues }) => {
+    evaluateSmartField: async ({ lead, fieldName, condition, depValues }) => {
       const {
         buildSmartFieldEvalSystemPrompt,
         buildSmartFieldEvalUserPrompt,
       } = await import('./enrichmentPrompts');
       try {
+        const sanitize = (s: string) => s.replace(/["\n`]/g, ' ').trim();
+        const raw: Record<string, string> = {
+          name: [lead.firstName, lead.lastName].filter(Boolean).join(' '),
+          firstName: lead.firstName || '',
+          lastName: lead.lastName || '',
+          company: lead.company || '',
+          title: lead.title || '',
+          emailDomain: lead.emailDomain || '',
+          website: lead.website || '',
+          linkedin: lead.linkedin || '',
+        };
+        const nativeValues = Object.fromEntries(
+          Object.entries(raw)
+            .filter(([, v]) => v)
+            .map(([k, v]) => [k, sanitize(v.slice(0, 200))])
+        );
+        const mergedDepValues = { ...nativeValues, ...depValues };
         const llm = createLLMService(EXTRACT_MODEL, 0.0);
         const result = await llm.generateJSONContent<{ value: string | null; reasoning: string }>(
           buildSmartFieldEvalSystemPrompt(),
-          buildSmartFieldEvalUserPrompt(fieldName, condition, depValues),
+          buildSmartFieldEvalUserPrompt(fieldName, condition, mergedDepValues),
         );
         return {
           value: result?.value != null ? String(result.value) : null,
           reasoning: result?.reasoning ?? '',
+          model: EXTRACT_MODEL,
         };
       } catch (err) {
         console.warn('[v3 deps] evaluateSmartField failed:', (err as Error).message);

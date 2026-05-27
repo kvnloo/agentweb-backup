@@ -116,6 +116,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-25',
     changes: [
+      'Improved: CRM Enrichment Now Shows Source Quality for Every Field',
+      '- Web-sourced enriched fields now display a critic quality view (high, low, or drop) so you can see at a glance which web-found values the system considers well-supported',
+      '- A "drop" view means the critic could not verify the value against its source — the value is kept and never deleted automatically, but is flagged for your review',
+      '- Confidence labels (high / medium / low) are now shown for every enriched field, including Apollo, LinkedIn, web, and pattern-matched results — previously some fields had no confidence label at all',
       'New: Self-Service Analytics Setup',
       '- Configure your SEO domains, Google Analytics 4 properties, and Microsoft Clarity projects yourself under Settings → Analytics & SEO',
       'New: Test GA4 Connections',

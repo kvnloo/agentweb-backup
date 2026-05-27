@@ -116,9 +116,9 @@ describe('getEnrichmentConfig', () => {
     const result = await getEnrichmentConfig({ listId: LIST_ID, userId: USER_ID }, deps);
 
     expect(result.isDefault).toBe(true);
-    // 8 standard enrichable fields + 2 custom
+    // 9 standard enrichable fields + 2 custom
     expect(result.config.fields.map(f => f.name).sort()).toEqual([
-      'company', 'email', 'firstName', 'industry', 'lastName', 'linkedin', 'notes', 'phone', 'tech_stack', 'title',
+      'company', 'companyLinkedin', 'email', 'firstName', 'industry', 'lastName', 'linkedin', 'notes', 'phone', 'tech_stack', 'title',
     ]);
     // Default: include=true (opt-out), overwrite=fill_if_empty (safe)
     expect(result.config.fields.every(f => f.include === true)).toBe(true);
@@ -145,7 +145,7 @@ describe('getEnrichmentConfig', () => {
     const fields = result.config.fields;
     const names = fields.map(f => f.name).sort();
 
-    expect(names).toEqual(['company', 'email', 'employee_count', 'firstName', 'industry', 'lastName', 'linkedin', 'notes', 'phone', 'title']);
+    expect(names).toEqual(['company', 'companyLinkedin', 'email', 'employee_count', 'firstName', 'industry', 'lastName', 'linkedin', 'notes', 'phone', 'title']);
 
     // Standard data columns get auto-mapped aliasFor → canonical FIELD_GROUPS name
     const byName = Object.fromEntries(fields.map(f => [f.name, f]));
@@ -337,7 +337,7 @@ describe('getEnrichmentConfig', () => {
     expect(names).toContain('email');
   });
 
-  it('returns the standard 8 fields when the list has no custom field schema', async () => {
+  it('returns the standard 9 fields when the list has no custom field schema', async () => {
     // Previously this test expected an empty fields array. After the merge
     // change, standard enrichable lead columns are always surfaced.
     const deps = makeDeps({
@@ -348,9 +348,9 @@ describe('getEnrichmentConfig', () => {
     const result = await getEnrichmentConfig({ listId: LIST_ID, userId: USER_ID }, deps);
 
     expect(result.isDefault).toBe(true);
-    expect(result.config.fields).toHaveLength(8);
+    expect(result.config.fields).toHaveLength(9);
     expect(result.config.fields.map(f => f.name).sort()).toEqual([
-      'company', 'email', 'firstName', 'lastName', 'linkedin', 'notes', 'phone', 'title',
+      'company', 'companyLinkedin', 'email', 'firstName', 'lastName', 'linkedin', 'notes', 'phone', 'title',
     ]);
   });
 });
@@ -1409,9 +1409,9 @@ describe('processEnrichmentConfig', () => {
 });
 
 describe('STANDARD_ENRICHABLE_FIELDS export', () => {
-  it('exports the 8 canonical standard lead columns', () => {
+  it('exports the 9 canonical standard lead columns', () => {
     expect([...STANDARD_ENRICHABLE_FIELDS]).toEqual([
-      'firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'notes',
+      'firstName', 'lastName', 'email', 'company', 'phone', 'title', 'linkedin', 'companyLinkedin', 'notes',
     ]);
   });
 });

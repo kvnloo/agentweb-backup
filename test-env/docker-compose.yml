@@ -12,7 +12,18 @@ services:
       - NODE_ENV=development
       - FRONTEND_URL=http://${PUBLIC_IP}:5173
       - CUSTOMER_FRONTEND_URL=http://${PUBLIC_IP}:5174
-      - BACKEND_URL=http://${PUBLIC_IP}:3001
+      # BACKEND_URL is intentionally omitted here — read from .env.test-env (contains the ngrok HTTPS URL)
+    restart: unless-stopped
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    command: http backend:3001 --url=${NGROK_DOMAIN}
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
+    ports:
+      - "4040:4040"
+    depends_on:
+      - backend
     restart: unless-stopped
 
   partner-portal:
