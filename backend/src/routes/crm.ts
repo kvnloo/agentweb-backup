@@ -4315,6 +4315,54 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
 });
 
 /**
+ * @route POST /api/crm/lists/:listId/leads/:leadId/generate-linkedin-draft
+ * @desc Generate (or return existing) LinkedIn message draft for a lead.
+ *       Pass { force: true } in body to regenerate even when a draft already exists.
+ *       Requires list.linkedInAccountId to be configured.
+ * @access Private
+ */
+router.post('/lists/:listId/leads/:leadId/generate-linkedin-draft', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId, leadId } = req.params;
+    const force = req.body?.force === true;
+
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list || (list as any).userId !== userId) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    const linkedInAccountId: string | null = (list as any).linkedInAccountId ?? null;
+    if (!linkedInAccountId) {
+      return res.status(400).json({ message: 'linkedInAccountId not configured on this lead list' });
+    }
+
+    const lead = await crmDb.getLeadById(listId, leadId);
+    if (!lead) return res.status(404).json({ message: 'Lead not found' });
+
+    const leadLinkedIn = (lead.linkedin as string | undefined)?.trim();
+    if (!leadLinkedIn) {
+      return res.status(400).json({ message: 'Lead has no LinkedIn URL' });
+    }
+
+    const { agentModeService } = await import('../services/agentModeService');
+    const result = await agentModeService.generateLinkedInDraftForLead(listId, leadId, userId, force);
+
+    if (!result.success) {
+      return res.status(500).json({ message: result.message || 'Failed to generate draft', error: result.error });
+    }
+
+    return res.json({ success: true, draft: result.draft });
+  } catch (error: any) {
+    console.error('Error generating LinkedIn draft:', error);
+    return res.status(500).json({ message: error.message || 'Failed to generate LinkedIn draft' });
+  }
+});
+
+/**
  * @route POST /api/crm/lists/:listId/leads/:leadId/engagements
  * @desc Add a custom engagement event to a lead
  * @access Private
