@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: LinkedIn Connection Accepted Notification Now Fires Only Once',
+      '- The email notification sent when a lead accepts your LinkedIn invitation was being sent repeatedly every 10 minutes',
+      '- Fixed a broken watermark that caused the sync cron to treat already-seen connections as new on every run',
+      '- Added a dedup guard on the lead record so the notification is guaranteed to fire at most once per connection, even if the cron runs overlap',
+    ],
+  },
+  {
     date: '2026-05-26',
     changes: [
       'Improved: Admin Skills Page Now Enforces Review Gate for User-Created Private Skills',

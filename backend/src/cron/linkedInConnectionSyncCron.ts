@@ -251,9 +251,19 @@ export async function notifyNewConnections(newConnections: UnipileConnection[]):
       const leads = await crmDb.findLeadsByLinkedin(conn.publicProfileUrl);
       for (const lead of leads as any[]) {
         if (!lead.listId) continue;
+        // Dedup: skip if we already sent a notification for this lead's connection event.
+        if (lead.system?.linkedInConnectionNotifiedAt) {
+          console.log(`${TAG} Skipping duplicate notification for lead ${lead.leadId} (already notified at ${lead.system.linkedInConnectionNotifiedAt})`);
+          continue;
+        }
         try {
           const list = await crmDb.getLeadListById(lead.listId);
           if (!list) continue;
+          // Mark as notified before sending — prevents duplicate sends if this throws.
+          await crmDb.updateLead(lead.listId, lead.leadId, {
+            system: { ...((lead.system as Record<string, any>) ?? {}), linkedInConnectionNotifiedAt: new Date().toISOString() },
+            skipFieldNamesUpdate: true,
+          });
           // Generate a follow-up draft before notifying so the panel is pre-filled.
           await generateConnectionFollowUpDraft(lead, list).catch(err =>
             console.error(`${TAG} Draft generation failed for lead ${lead.leadId}:`, err)
