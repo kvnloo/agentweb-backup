@@ -429,7 +429,7 @@ router.delete("/page-subdomain/:landingPageId", async (req, res: Response) => {
       .update({
         TableName: LANDING_PAGES_TABLE,
         Key: { id: landingPageId },
-        UpdateExpression: "REMOVE subdomainPrefix SET updatedAt = :now",
+        UpdateExpression: "REMOVE subdomainPrefix, customDomainUrl SET updatedAt = :now",
         ExpressionAttributeValues: { ":now": new Date().toISOString() },
       })
       .promise();
