@@ -127,11 +127,12 @@ export async function getAllConnectionsByAccount(accountId: string): Promise<Uni
     const result = await dynamodb.query({
       TableName: TABLE,
       KeyConditionExpression: 'accountId = :aid',
-      FilterExpression: 'memberId <> :wm',
-      ExpressionAttributeValues: { ':aid': accountId, ':wm': '__latest__' },
+      ExpressionAttributeValues: { ':aid': accountId },
       ExclusiveStartKey: lastEvaluatedKey,
     }).promise();
-    items.push(...((result.Items ?? []) as UnipileConnection[]));
+    // Skip the __latest__ watermark row (sort key is a sentinel, not a real connection)
+    const batch = (result.Items ?? []).filter((item: any) => item.memberId !== '__latest__') as UnipileConnection[];
+    items.push(...batch);
     lastEvaluatedKey = result.LastEvaluatedKey as AWS.DynamoDB.DocumentClient.Key | undefined;
   } while (lastEvaluatedKey);
   return items;
