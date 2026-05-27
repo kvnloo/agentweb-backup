@@ -3247,6 +3247,26 @@ export const agentModeController = {
         console.warn('Failed to propagate message feedback to images:', propagateError);
       }
 
+      // Fire-and-forget: create a Notion item so the team can review positive/negative feedback
+      createOncallItem({
+        title: `Agent Mode ${type === 'like' ? 'Like' : 'Dislike'} Feedback – ${session.title || sessionId}`,
+        description: [
+          `User ${user.email} voted ${type} on a message in session "${session.title || sessionId}".`,
+          comment ? `Comment: "${comment}"` : '',
+          '',
+          `Message preview: ${String(message.content || '').slice(0, 300)}`,
+        ].filter(Boolean).join('\n'),
+        additionalTags: [type === 'like' ? 'Feedback-Like' : 'Feedback-Dislike'],
+        context: {
+          sessionId,
+          messageIndex: messageIndexNum,
+          userId: user.userId,
+          userEmail: user.email,
+        },
+      }).catch((err: Error) => {
+        console.warn('Failed to create Notion feedback item:', err.message);
+      });
+
       res.json({
         success: true,
         message: updatedMessage,
