@@ -9,6 +9,7 @@ const dynamodb = new AWS.DynamoDB.DocumentClient({
 
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 const TABLE_NAME = `${TABLE_PREFIX}AW-CustomDomains`;
+const LANDING_PAGES_TABLE = `${TABLE_PREFIX}AW-LandingPages`;
 
 const SUBDOMAIN_BASE = "agentwebforms.com";
 const VERCEL_API_BASE = "https://api.vercel.com";
@@ -258,6 +259,47 @@ export async function removeDomain(
 
   // Delete from DynamoDB
   await dynamodb.delete({ TableName: TABLE_NAME, Key: { id: domainId } }).promise();
+
+  // Cascade: clear per-page subdomains that were under this domain
+  try {
+    const scanResult = await dynamodb.scan({
+      TableName: LANDING_PAGES_TABLE,
+      FilterExpression: "vercelProjectId = :pid AND attribute_exists(subdomainPrefix)",
+      ExpressionAttributeValues: { ":pid": record.vercelProjectId },
+    }).promise();
+
+    const pages = (scanResult.Items || []) as Array<{
+      id: string;
+      subdomainPrefix?: string;
+      customDomainUrl?: string;
+    }>;
+
+    await Promise.all(
+      pages
+        .filter((p) => p.customDomainUrl?.includes(record.domain))
+        .map(async (p) => {
+          // Remove the subdomain from Vercel (best-effort)
+          if (p.subdomainPrefix) {
+            try {
+              await axios.delete(
+                `${VERCEL_API_BASE}/v9/projects/${record.vercelProjectId}/domains/${p.subdomainPrefix}.${record.domain}`,
+                { headers }
+              );
+            } catch {
+              // Ignore 404 — already removed
+            }
+          }
+          // Clear the fields from DynamoDB
+          await dynamodb.update({
+            TableName: LANDING_PAGES_TABLE,
+            Key: { id: p.id },
+            UpdateExpression: "REMOVE subdomainPrefix, customDomainUrl",
+          }).promise();
+        })
+    );
+  } catch (err: any) {
+    console.error("[CUSTOM DOMAINS] Failed to cascade page-subdomain cleanup:", err?.message);
+  }
 }
 
 /**
@@ -370,4 +412,82 @@ export async function verifyDomain(
           value: v.value,
         })),
   };
+}
+
+/**
+ * Get the active custom domain (type="custom", status="active") for a Vercel project.
+ * Returns null if the project has no verified custom domain yet.
+ */
+export async function getProjectDomain(
+  userId: string,
+  vercelProjectId: string
+): Promise<CustomDomainRecord | null> {
+  const domains = await listDomains(userId, vercelProjectId);
+  return (
+    domains.find((d) => d.type === "custom" && d.status === "active") ??
+    domains.find((d) => d.type === "custom" && d.status === "pending_verification") ??
+    null
+  );
+}
+
+/**
+ * Get the active subdomain (type="subdomain") record for a Vercel project.
+ * Returns null if the project has no subdomain set yet.
+ */
+export async function getProjectSubdomain(
+  userId: string,
+  vercelProjectId: string
+): Promise<CustomDomainRecord | null> {
+  const domains = await listDomains(userId, vercelProjectId);
+  return domains.find((d) => d.type === "subdomain") ?? null;
+}
+
+/**
+ * Add `{subdomainPrefix}.{mainDomain}` to the Vercel project.
+ * Returns the full domain string (e.g., "pricing.mysite.com").
+ * Treats a 409 conflict as success (domain already on this project).
+ */
+export async function setPageSubdomain(
+  userId: string,
+  vercelProjectId: string,
+  subdomainPrefix: string,
+  mainDomain: string
+): Promise<{ fullDomain: string }> {
+  const cleanPrefix = subdomainPrefix.toLowerCase().trim();
+  validateSubdomain(cleanPrefix);
+
+  const fullDomain = `${cleanPrefix}.${mainDomain}`;
+  const headers = await getVercelHeaders();
+
+  try {
+    await axios.post(
+      `${VERCEL_API_BASE}/v10/projects/${vercelProjectId}/domains`,
+      { name: fullDomain },
+      { headers }
+    );
+  } catch (err: any) {
+    if (err.response?.status !== 409) throw err;
+    // Already on this project — treat as success
+  }
+
+  return { fullDomain };
+}
+
+/**
+ * Remove `{fullDomain}` from the Vercel project.
+ * Silently ignores 404 (already removed).
+ */
+export async function removePageSubdomainFromVercel(
+  vercelProjectId: string,
+  fullDomain: string
+): Promise<void> {
+  const headers = await getVercelHeaders();
+  try {
+    await axios.delete(
+      `${VERCEL_API_BASE}/v9/projects/${vercelProjectId}/domains/${fullDomain}`,
+      { headers }
+    );
+  } catch (err: any) {
+    if (err.response?.status !== 404) throw err;
+  }
 }
