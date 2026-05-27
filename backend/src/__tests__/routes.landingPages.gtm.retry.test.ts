@@ -31,6 +31,10 @@ jest.mock('../services/v0Service', () => {
   };
 });
 
+jest.mock('../utils/secretsManager', () => ({
+  getGitHubOrgToken: jest.fn().mockResolvedValue({ token: 'gh-test-token' }),
+}));
+
 jest.mock('../services/db', () => ({
   userDb: { getUserById: jest.fn().mockResolvedValue({ userId: 'u1' }) },
   orgDb: { getOrgById: jest.fn() },

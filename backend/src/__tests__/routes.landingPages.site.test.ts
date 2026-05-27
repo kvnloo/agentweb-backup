@@ -3,11 +3,26 @@ import express, { Application } from 'express';
 
 process.env.JWT_SECRET = 'test-jwt-secret-for-testing';
 
+const mockAxiosGet = jest.fn();
+const mockAxiosPut = jest.fn();
+jest.mock('axios', () => ({
+  __esModule: true,
+  default: {
+    get: (...a: any[]) => mockAxiosGet(...a),
+    put: (...a: any[]) => mockAxiosPut(...a),
+    isAxiosError: (e: any) => !!e?.response,
+  },
+  get: (...a: any[]) => mockAxiosGet(...a),
+  put: (...a: any[]) => mockAxiosPut(...a),
+  isAxiosError: (e: any) => !!e?.response,
+}));
+
 const mockResolveSiteForCaller = jest.fn();
 const mockGetProjectEnvVars = jest.fn();
 const mockUpsertEnvVar = jest.fn();
 const mockDeleteEnvVar = jest.fn();
 const mockTriggerDeploy = jest.fn();
+const mockUpdateLandingPageGtm = jest.fn();
 jest.mock('../services/v0Service', () => {
   const actual = jest.requireActual('../services/v0Service');
   return {
@@ -17,8 +32,13 @@ jest.mock('../services/v0Service', () => {
     upsertEnvVar: (...a: any[]) => mockUpsertEnvVar(...a),
     deleteEnvVar: (...a: any[]) => mockDeleteEnvVar(...a),
     triggerVercelDeployment: (...a: any[]) => mockTriggerDeploy(...a),
+    updateLandingPageGtm: (...a: any[]) => mockUpdateLandingPageGtm(...a),
   };
 });
+
+jest.mock('../utils/secretsManager', () => ({
+  getGitHubOrgToken: jest.fn().mockResolvedValue({ token: 'gh-test-token' }),
+}));
 
 jest.mock('../services/db', () => ({
   userDb: { getUserById: jest.fn().mockResolvedValue({ userId: 'u1' }) },
@@ -166,5 +186,41 @@ describe('PUT /api/landing-pages/v0/site/integrations', () => {
     const res = await request(app).put('/api/landing-pages/v0/site/integrations')
       .send({ recaptcha: {} });
     expect(res.status).toBe(500);
+  });
+});
+
+describe('POST /api/landing-pages/v0/site/gtm', () => {
+  beforeEach(() => { jest.clearAllMocks(); });
+
+  it('returns 404 when no site', async () => {
+    mockResolveSiteForCaller.mockResolvedValue(null);
+    const res = await request(app).post('/api/landing-pages/v0/site/gtm').send({ gtmContainerId: 'GTM-ABCD1' });
+    expect(res.status).toBe(404);
+  });
+
+  it('returns 400 on invalid GTM container ID', async () => {
+    mockResolveSiteForCaller.mockResolvedValue({
+      id: 'p1', userId: 'u1', vercelProjectId: 'vp1',
+      githubRepoUrl: 'https://github.com/o/r', status: 'deployed',
+    });
+    const res = await request(app).post('/api/landing-pages/v0/site/gtm').send({ gtmContainerId: 'not-valid' });
+    expect(res.status).toBe(400);
+  });
+
+  it('happy path → 200', async () => {
+    mockResolveSiteForCaller.mockResolvedValue({
+      id: 'p1', userId: 'u1', vercelProjectId: 'vp1',
+      githubRepoUrl: 'https://github.com/o/r', status: 'deployed',
+    });
+    mockAxiosGet.mockResolvedValue({
+      data: { sha: 'sha1', content: Buffer.from('export default function(){return null}').toString('base64') },
+    });
+    mockAxiosPut.mockResolvedValue({ data: {} });
+    mockUpdateLandingPageGtm.mockResolvedValue(undefined);
+    mockTriggerDeploy.mockResolvedValue(undefined);
+    const res = await request(app).post('/api/landing-pages/v0/site/gtm').send({ gtmContainerId: 'GTM-ABCD1' });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, gtmContainerId: 'GTM-ABCD1' });
+    expect(mockUpdateLandingPageGtm).toHaveBeenCalled();
   });
 });
