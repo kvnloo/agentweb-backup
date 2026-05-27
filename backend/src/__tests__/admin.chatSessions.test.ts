@@ -11,6 +11,7 @@ jest.mock("../services/chatbotService", () => ({
     getChatSession: jest.fn(),
     updateSessionSatisfactionScore: jest.fn(),
     updateSessionJudgeScore: jest.fn(),
+    createOrReuseInteractiveShare: jest.fn(),
   },
 }));
 
@@ -35,7 +36,9 @@ jest.mock("../middleware/admin", () => ({
   isAdmin: (_req: any, _res: any, next: any) => next(),
 }));
 
-const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
+const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb> & {
+  createOrReuseInteractiveShare: jest.MockedFunction<(sessionId: string, days: number) => Promise<string>>;
+};
 const mockSettingsService = settingsService as jest.Mocked<typeof settingsService>;
 const mockScoreSessionIfNeeded = sessionScoringService.scoreSessionIfNeeded as jest.MockedFunction<typeof sessionScoringService.scoreSessionIfNeeded>;
 const mockScoreSessionWithJudgeIfNeeded = sessionScoringService.scoreSessionWithJudgeIfNeeded as jest.MockedFunction<typeof sessionScoringService.scoreSessionWithJudgeIfNeeded>;
@@ -47,6 +50,8 @@ app.use("/api/admin", adminRoutes);
 describe("Admin chat sessions endpoint", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // Default: createOrReuseInteractiveShare resolves (most tests don't assert on it)
+    mockChatbotDb.createOrReuseInteractiveShare.mockResolvedValue("http://localhost:5174/ishare/session-x?conversable=token");
   });
 
   it("hydrates sessions with messages from the messages table", async () => {
@@ -191,6 +196,13 @@ describe("Admin chat sessions endpoint", () => {
         { role: "user", content: "hello" },
         { role: "assistant", content: "hi" },
       ],
+      // Pre-populate a valid non-expired ishare so ensureIshareLinkForReview is a no-op
+      interactiveShareMetadata: {
+        isActive: true,
+        token: "existingtoken",
+        sharedAt: "2024-01-01T00:00:00Z",
+        expiresAt: new Date(Date.now() + 365 * 86400000).toISOString(),
+      },
     });
 
     beforeEach(() => {
@@ -422,6 +434,125 @@ describe("Admin chat sessions endpoint", () => {
 
       expect(mockChatbotDb.getRecentSessionsPage).toHaveBeenCalled();
       expect(mockChatbotDb.getChatSession).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("ishare link creation", () => {
+    const makeSessionWithUserMsg = (id: string, extraFields: Record<string, any> = {}) => ({
+      sessionId: id,
+      userId: "user-1",
+      createdAt: "2024-01-01T00:00:00Z",
+      updatedAt: "2024-01-01T00:00:00Z",
+      messages: [
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "hi" },
+      ],
+      ...extraFields,
+    });
+
+    it("creates a 7-day ishare link for sessions that have no interactiveShareMetadata", async () => {
+      const session = makeSessionWithUserMsg("no-share-session");
+
+      mockChatbotDb.getRecentSessionsPage.mockResolvedValue({
+        sessions: [session] as any,
+        lastEvaluatedKey: undefined,
+      });
+      mockChatbotDb.getChatSession.mockResolvedValue(session as any);
+      mockChatbotDb.createOrReuseInteractiveShare.mockResolvedValue(
+        "http://localhost:5174/ishare/no-share-session?conversable=newtoken123"
+      );
+
+      const res = await request(app).get("/api/admin/chat-sessions").expect(200);
+
+      expect(mockChatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith("no-share-session", 7);
+      expect(res.body.sessions[0].interactiveShareMetadata).toMatchObject({
+        isActive: true,
+        token: "newtoken123",
+      });
+    });
+
+    it("reuses an existing token even if it is expired (token persists indefinitely once stored)", async () => {
+      const expiredSession = makeSessionWithUserMsg("expired-share-session", {
+        interactiveShareMetadata: {
+          isActive: true,
+          token: "oldexpiredtoken",
+          sharedAt: "2024-01-01T00:00:00Z",
+          expiresAt: new Date(Date.now() - 86400000).toISOString(),
+        },
+      });
+
+      mockChatbotDb.getRecentSessionsPage.mockResolvedValue({
+        sessions: [expiredSession] as any,
+        lastEvaluatedKey: undefined,
+      });
+      mockChatbotDb.getChatSession.mockResolvedValue(expiredSession as any);
+
+      const res = await request(app).get("/api/admin/chat-sessions").expect(200);
+
+      expect(mockChatbotDb.createOrReuseInteractiveShare).not.toHaveBeenCalled();
+      expect(res.body.sessions[0].interactiveShareMetadata.token).toBe("oldexpiredtoken");
+    });
+
+    it("does not create a new ishare link when a token already exists", async () => {
+      const activeSession = makeSessionWithUserMsg("active-share-session", {
+        interactiveShareMetadata: {
+          isActive: true,
+          token: "validtoken789",
+          sharedAt: "2024-01-01T00:00:00Z",
+          expiresAt: new Date(Date.now() + 7 * 86400000).toISOString(),
+        },
+      });
+
+      mockChatbotDb.getRecentSessionsPage.mockResolvedValue({
+        sessions: [activeSession] as any,
+        lastEvaluatedKey: undefined,
+      });
+      mockChatbotDb.getChatSession.mockResolvedValue(activeSession as any);
+
+      const res = await request(app).get("/api/admin/chat-sessions").expect(200);
+
+      expect(mockChatbotDb.createOrReuseInteractiveShare).not.toHaveBeenCalled();
+      expect(res.body.sessions[0].interactiveShareMetadata.token).toBe("validtoken789");
+    });
+
+    it("continues returning sessions even if ishare creation fails for one", async () => {
+      const sessions = [
+        makeSessionWithUserMsg("session-ok"),
+        makeSessionWithUserMsg("session-fail"),
+      ];
+
+      mockChatbotDb.getRecentSessionsPage.mockResolvedValue({
+        sessions: sessions as any,
+        lastEvaluatedKey: undefined,
+      });
+      mockChatbotDb.getChatSession.mockImplementation(async (id: string) =>
+        sessions.find((s) => s.sessionId === id) as any
+      );
+      mockChatbotDb.createOrReuseInteractiveShare
+        .mockResolvedValueOnce("http://localhost:5174/ishare/session-ok?conversable=tok1")
+        .mockRejectedValueOnce(new Error("DynamoDB timeout"));
+
+      const res = await request(app).get("/api/admin/chat-sessions").expect(200);
+
+      expect(res.body.sessions).toHaveLength(2);
+      expect(res.body.sessions.find((s: any) => s.sessionId === "session-ok").interactiveShareMetadata.token).toBe("tok1");
+      expect(res.body.sessions.find((s: any) => s.sessionId === "session-fail").interactiveShareMetadata).toBeUndefined();
+    });
+
+    it("creates ishare links for sessions found by sessionId search", async () => {
+      const session = makeSessionWithUserMsg("search-session");
+
+      mockChatbotDb.getChatSession.mockResolvedValue(session as any);
+      mockChatbotDb.createOrReuseInteractiveShare.mockResolvedValue(
+        "http://localhost:5174/ishare/search-session?conversable=searchtok"
+      );
+
+      const res = await request(app)
+        .get("/api/admin/chat-sessions?sessionId=search-session")
+        .expect(200);
+
+      expect(mockChatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith("search-session", 7);
+      expect(res.body.sessions[0].interactiveShareMetadata.token).toBe("searchtok");
     });
   });
 });
