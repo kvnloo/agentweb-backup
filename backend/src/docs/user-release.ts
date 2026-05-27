@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-27',
     changes: [
+      'Improved: CRM Lead Panel Now Auto-Syncs LinkedIn Messages and Uses Activity History for Drafts',
+      '- Opening a lead detail panel now automatically syncs the lead\'s LinkedIn message history (if a LinkedIn URL is set) — no more manual "Sync LinkedIn" click needed',
+      '- The sync runs silently on panel open if the last sync was more than 10 minutes ago, so the activity timeline is always fresh',
+      '- AI-generated LinkedIn message drafts now consider the full engagement history — past emails, LinkedIn messages, and interactions are included in the prompt so drafts feel relevant and reference prior touchpoints',
+      '- This applies both to on-demand drafts (Draft Message button) and auto-generated drafts triggered when a LinkedIn connection is accepted',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
       'Fixed: Emma No Longer Tells Users to Connect Slack via Connected Accounts',
       '- When no Slack channel was configured, Emma was incorrectly directing users to Settings → Connected Accounts to connect Slack',
       '- Slack channels are configured by an admin, not through individual user settings — Emma now correctly tells users to contact their admin to set up Slack access',
