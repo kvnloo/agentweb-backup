@@ -38,6 +38,7 @@ const mockGetDomain = jest.fn();
 const mockVerifyDomain = jest.fn();
 const mockGenerateSubdomain = jest.fn();
 const mockGetProjectDomain = jest.fn();
+const mockGetProjectSubdomain = jest.fn();
 const mockSetPageSubdomain = jest.fn();
 const mockRemovePageSubdomainFromVercel = jest.fn();
 
@@ -50,6 +51,7 @@ jest.mock("../services/customDomainService", () => ({
   verifyDomain: (...args: any[]) => mockVerifyDomain(...args),
   generateSubdomain: (...args: any[]) => mockGenerateSubdomain(...args),
   getProjectDomain: (...args: any[]) => mockGetProjectDomain(...args),
+  getProjectSubdomain: (...args: any[]) => mockGetProjectSubdomain(...args),
   setPageSubdomain: (...args: any[]) => mockSetPageSubdomain(...args),
   removePageSubdomainFromVercel: (...args: any[]) => mockRemovePageSubdomainFromVercel(...args),
 }));
@@ -330,6 +332,51 @@ describe("Domain API Routes", () => {
     });
   });
 
+  describe("GET /api/domains/project-subdomain", () => {
+    it("returns the active project subdomain", async () => {
+      mockGetProjectSubdomain.mockResolvedValueOnce({
+        id: "dom-sub-1",
+        domain: "mysite.agentwebforms.com",
+        status: "active",
+      });
+
+      const res = await request(app).get(
+        "/api/domains/project-subdomain?vercelProjectId=proj-1"
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        domain: "mysite.agentwebforms.com",
+        status: "active",
+        id: "dom-sub-1",
+      });
+      expect(mockGetProjectSubdomain).toHaveBeenCalledWith("test-user-123", "proj-1");
+    });
+
+    it("returns nulls when no project subdomain exists", async () => {
+      mockGetProjectSubdomain.mockResolvedValueOnce(null);
+
+      const res = await request(app).get(
+        "/api/domains/project-subdomain?vercelProjectId=proj-1"
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ domain: null, status: null, id: null });
+    });
+
+    it("returns 400 if vercelProjectId is missing", async () => {
+      const res = await request(app).get("/api/domains/project-subdomain");
+      expect(res.status).toBe(400);
+    });
+
+    it("returns 500 if the service throws", async () => {
+      mockGetProjectSubdomain.mockRejectedValueOnce(new Error("boom"));
+
+      const res = await request(app).get(
+        "/api/domains/project-subdomain?vercelProjectId=proj-1"
+      );
+      expect(res.status).toBe(500);
+    });
+  });
+
   describe("POST /api/domains/page-subdomain", () => {
     const VALID_BODY = {
       vercelProjectId: "proj-1",
@@ -465,6 +512,16 @@ describe("Domain API Routes", () => {
         "proj-1",
         "pricing.mysite.com"
       );
+    });
+
+    it("clears both subdomainPrefix and customDomainUrl from the page record", async () => {
+      await request(app)
+        .delete("/api/domains/page-subdomain/lp-1")
+        .send({ mainDomain: "mysite.com" });
+
+      const updateCall = mockDynamoInstance.update.mock.calls[0][0];
+      expect(updateCall.UpdateExpression).toContain("subdomainPrefix");
+      expect(updateCall.UpdateExpression).toContain("customDomainUrl");
     });
 
     it("returns 400 if mainDomain is missing", async () => {
