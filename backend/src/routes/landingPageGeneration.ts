@@ -1589,13 +1589,15 @@ async function saveGtmForPage(
 // POST /site/gtm
 // Injects GTM into the caller's root landing site.
 // ---------------------------------------------------------------------------
-router.post("/site/gtm", async (req: AuthenticatedRequest, res: Response) => {
+router.post("/site/gtm", async (req, res: Response) => {
+  const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
   try {
     const { gtmContainerId } = req.body ?? {};
     if (!gtmContainerId || typeof gtmContainerId !== "string" || !/^GTM-[A-Z0-9]{4,10}$/.test(gtmContainerId)) {
       return res.status(400).json({ error: "Invalid GTM container ID" });
     }
-    const site = await resolveSiteForCaller(req.user!.userId);
+    const site = await resolveSiteForCaller(userId);
     if (!site) return res.status(404).json({ error: "No landing site found" });
     await saveGtmForPage(site, gtmContainerId);
     return res.json({ ok: true, gtmContainerId });
@@ -1696,9 +1698,10 @@ router.patch("/generated/:id/context", authenticateToken, async (req, res: Respo
  * Set or clear the CRM lead list associated with this landing page.
  * Body: { leadListId: string | null }
  */
-router.patch("/generated/:id/lead-list", async (req: AuthenticatedRequest, res) => {
+router.patch("/generated/:id/lead-list", async (req, res: Response) => {
   try {
-    const callerUserId = req.user!.userId;
+    const callerUserId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!callerUserId) return res.status(401).json({ error: "Unauthorized" });
     const { id } = req.params;
     if (!("leadListId" in (req.body ?? {}))) {
       return res.status(400).json({ error: "leadListId is required (string or null)" });
@@ -1724,7 +1727,7 @@ router.patch("/generated/:id/lead-list", async (req: AuthenticatedRequest, res) 
           { userId: callerUserId, orgId: callerUser?.orgId, orgRole: callerUser?.orgRole as any },
           org,
           listOwner?.orgId,
-          "crm",
+          "landingPages",
         );
         if (!allowed) return res.status(403).json({ error: "Lead list not accessible" });
       }
