@@ -1314,7 +1314,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { name, description, displayFields, sortConfig, alertEvents, alertCcEmails, listSenderId, icpsOnly, engagedOnly, autoDraftEnabled, statusConfig, listType } = req.body;
+    const { name, description, displayFields, sortConfig, alertEvents, alertCcEmails, listSenderId, linkedInAccountId, icpsOnly, engagedOnly, autoDraftEnabled, statusConfig, listType } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -1338,6 +1338,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       alertEvents?: string[];
       alertCcEmails?: string[];
       listSenderId?: string | null;
+      linkedInAccountId?: string | null;
       autoDraftEnabled?: boolean;
       icpsOnly?: boolean;
       engagedOnly?: boolean;
@@ -1417,6 +1418,24 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
         }
       }
       updates.listSenderId = normalizedListSenderId;
+    }
+
+    if (linkedInAccountId !== undefined) {
+      if (linkedInAccountId !== null && typeof linkedInAccountId !== 'string') {
+        return res.status(400).json({ message: 'linkedInAccountId must be a string or null' });
+      }
+      if (linkedInAccountId) {
+        const { getAccountsByUserId } = await import('../services/connectedAccountsDb');
+        const accounts = await getAccountsByUserId(userId);
+        const ownedIds = accounts
+          .filter((a: any) => a.platform === 'unipile')
+          .map((a: any) => a.config?.unipile_account_id || a.account_id)
+          .filter(Boolean);
+        if (!ownedIds.includes(linkedInAccountId)) {
+          return res.status(400).json({ message: 'linkedInAccountId must reference one of your connected LinkedIn accounts' });
+        }
+      }
+      updates.linkedInAccountId = linkedInAccountId;
     }
 
     if (icpsOnly !== undefined) {
@@ -4048,10 +4067,9 @@ router.post('/lists/:listId/leads/:leadId/sync-linkedin-connection', async (req:
       return res.status(400).json({ message: 'Lead has no LinkedIn URL' });
     }
 
-    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
-    const accountId = await linkedInOutreachService.resolveAccountId(userId);
+    const accountId: string | null = (list as any).linkedInAccountId ?? null;
     if (!accountId) {
-      return res.status(400).json({ message: 'No LinkedIn account connected' });
+      return res.status(400).json({ message: 'No LinkedIn account assigned to this list' });
     }
 
     const { syncConnectionsForAccount } = await import('../cron/linkedInConnectionSyncCron');
@@ -4060,7 +4078,7 @@ router.post('/lists/:listId/leads/:leadId/sync-linkedin-connection', async (req:
     // Refresh the cache for this account (quick, not full sync)
     await syncConnectionsForAccount(accountId);
 
-    // Check if this specific lead is now connected — scoped to the resolved account only
+    // Check if this specific lead is now connected — scoped to the list's assigned account only
     const connection = await getConnectionByProfileUrlAndAccount(leadLinkedIn, accountId);
     const isConnected = !!connection;
 
@@ -4082,36 +4100,35 @@ router.post('/check-linkedin-connections', async (req: Request, res: Response) =
   try {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
-    const { urls } = req.body;
+    const { urls, listId: inboxListId } = req.body;
 
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
     if (!Array.isArray(urls) || urls.length === 0) return res.json({ connected: [] });
 
-    // Only check connections belonging to the user's own Unipile account(s).
-    // Site-wide accounts are for LinkedIn search only — never for personal connection status.
-    const { getAccountsByUserId } = await import('../services/connectedAccountsDb');
-    const accounts = await getAccountsByUserId(userId);
-    const accountIds = accounts
-      .filter((a: any) => a.platform === 'unipile')
-      .map((a: any) => a.config?.unipile_account_id || a.account_id)
-      .filter(Boolean) as string[];
-
-    if (accountIds.length === 0) return res.json({ connected: [] });
+    // InboxView spans multiple lists — use the linkedInAccountId from the first list
+    // that has one configured. If none of the user's lists have one, return empty.
+    let accountId: string | null = null;
+    if (inboxListId) {
+      const inboxList = await crmDb.getLeadListById(inboxListId);
+      accountId = (inboxList as any)?.linkedInAccountId ?? null;
+    }
+    if (!accountId) {
+      const userLists = await crmDb.getLeadListsByUserId(userId);
+      for (const l of userLists as any[]) {
+        if (l.linkedInAccountId) { accountId = l.linkedInAccountId; break; }
+      }
+    }
+    if (!accountId) return res.json({ connected: [] });
 
     const { getConnectionByProfileUrlAndAccount } = await import('../services/unipileConnectionsDb');
 
     const connected: Array<{ url: string; connectedAt: number | null }> = [];
     await Promise.all(urls.map(async (url: string) => {
-      for (const accountId of accountIds) {
-        const conn = await getConnectionByProfileUrlAndAccount(url, accountId).catch(() => null);
-        if (conn) {
-          connected.push({
-            url: url.trim().toLowerCase().replace(/\/?$/, '/'),
-            connectedAt: conn.connectedAt ?? null,
-          });
-          return;
-        }
-      }
+      const conn = await getConnectionByProfileUrlAndAccount(url, accountId!).catch(() => null);
+      if (conn) connected.push({
+        url: url.trim().toLowerCase().replace(/\/?$/, '/'),
+        connectedAt: conn.connectedAt ?? null,
+      });
     }));
 
     return res.json({ connected });
@@ -4144,31 +4161,20 @@ router.post('/lists/:listId/check-linkedin-connections', async (req: Request, re
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    // Only check connections belonging to the user's own Unipile account(s).
-    // Site-wide accounts are for LinkedIn search only — never for personal connection status.
-    const { getAccountsByUserId } = await import('../services/connectedAccountsDb');
-    const accounts = await getAccountsByUserId(userId);
-    const accountIds = accounts
-      .filter((a: any) => a.platform === 'unipile')
-      .map((a: any) => a.config?.unipile_account_id || a.account_id)
-      .filter(Boolean) as string[];
-
-    if (accountIds.length === 0) return res.json({ connected: [] });
+    // Only check connections using the LinkedIn account explicitly assigned to this list.
+    // No fallback to user-level or site-wide accounts.
+    const accountId: string | null = (list as any).linkedInAccountId ?? null;
+    if (!accountId) return res.json({ connected: [] });
 
     const { getConnectionByProfileUrlAndAccount } = await import('../services/unipileConnectionsDb');
 
     const connected: Array<{ url: string; connectedAt: number | null }> = [];
     await Promise.all(urls.map(async (url: string) => {
-      for (const accountId of accountIds) {
-        const conn = await getConnectionByProfileUrlAndAccount(url, accountId).catch(() => null);
-        if (conn) {
-          connected.push({
-            url: url.trim().toLowerCase().replace(/\/?$/, '/'),
-            connectedAt: conn.connectedAt ?? null,
-          });
-          return;
-        }
-      }
+      const conn = await getConnectionByProfileUrlAndAccount(url, accountId).catch(() => null);
+      if (conn) connected.push({
+        url: url.trim().toLowerCase().replace(/\/?$/, '/'),
+        connectedAt: conn.connectedAt ?? null,
+      });
     }));
 
     return res.json({ connected });
