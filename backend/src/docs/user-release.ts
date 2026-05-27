@@ -11,6 +11,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-27',
     changes: [
+      'Fixed: LinkedIn Connection Status Now Scoped Strictly to the List\'s Assigned Account',
+      '- Previously, LinkedIn connection status checks could match connections from site-wide scraping accounts or other users\' accounts, producing false "connected" results in the CRM overview',
+      '- Connection status is now checked exclusively against the LinkedIn account explicitly assigned to each lead list — no fallbacks, no cross-account leakage',
+      '- If no LinkedIn account is assigned to a list, the status check is skipped and shows as not connected (no ambiguous results)',
+      '- The "Set for List" button in CRM → Senders is now accessible even when no email domain is configured, fixing a UI bug that prevented LinkedIn account assignment',
+      '- The LinkedIn connection sync cron now includes per-user connected accounts (not just site-wide accounts), so personal connections are synced correctly',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
       'Fixed: Clearer Error When Coding Agent Lacks Permission to Edit a Landing Page',
       '- When a team member without edit access tried to use the coding agent to edit a landing page, the agent would silently loop and fail with a cryptic error',
       '- The agent now immediately returns a clear message explaining the permission issue and directing the org owner to Settings → Organization → Org-wide Sharing → Landing Pages to grant access',
