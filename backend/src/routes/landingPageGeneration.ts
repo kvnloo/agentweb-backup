@@ -1241,72 +1241,84 @@ router.post("/generated/:id/gtm", editRateLimiter, async (req, res: Response) =>
     const GITHUB_TIMEOUT_MS = 30_000;
     const repoBase = `https://api.github.com/repos/${owner}/${repo}`;
 
-    // 1. Fetch current layout.tsx
+    // 1–4. Fetch layout.tsx, derive updated content, and commit — with up to 3 attempts
+    //       to handle GitHub SHA race conditions (409 Conflict).
     const layoutPath = "app/layout.tsx";
-    let currentContent = "";
-    let fileSha: string | undefined;
-    try {
-      const fileRes = await axios.get<any>(`${repoBase}/contents/${layoutPath}`, {
-        headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS,
-      });
-      currentContent = Buffer.from(fileRes.data.content, "base64").toString("utf-8");
-      fileSha = fileRes.data.sha;
-    } catch (err: any) {
-      if (err.response?.status === 404) {
-        return res.status(400).json({ error: "app/layout.tsx not found in the repository" });
+    const MAX_ATTEMPTS = 3;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        // 1. Fetch current layout.tsx (inside loop so each retry gets a fresh SHA)
+        let currentContent = "";
+        let fileSha: string | undefined;
+        try {
+          const fileRes = await axios.get<any>(`${repoBase}/contents/${layoutPath}`, {
+            headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS,
+          });
+          currentContent = Buffer.from(fileRes.data.content, "base64").toString("utf-8");
+          fileSha = fileRes.data.sha;
+        } catch (err: any) {
+          if (err.response?.status === 404) {
+            return res.status(400).json({ error: "app/layout.tsx not found in the repository" });
+          }
+          throw err;
+        }
+
+        // 2. Build GTM snippets
+        const gtmHeadSnippet =
+          `        {/* Google Tag Manager */}\n` +
+          `        <script dangerouslySetInnerHTML={{ __html: \`(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src='https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);})(window,document,'script','dataLayer','${containerId}');\` }} />\n` +
+          `        {/* End Google Tag Manager */}`;
+
+        const gtmBodySnippet =
+          `        {/* Google Tag Manager (noscript) */}\n` +
+          `        <noscript dangerouslySetInnerHTML={{ __html: \`<iframe src="https://www.googletagmanager.com/ns.html?id=${containerId}" height="0" width="0" style="display:none;visibility:hidden"></iframe>\` }} />\n` +
+          `        {/* End Google Tag Manager (noscript) */}`;
+
+        // 3. Idempotent injection — strip any existing GTM block first
+        let updatedContent = currentContent
+          .replace(/[ \t]*\{\/\* Google Tag Manager \*\/\}[\s\S]*?\{\/\* End Google Tag Manager \*\/\}\n?/g, "")
+          .replace(/[ \t]*\{\/\* Google Tag Manager \(noscript\) \*\/\}[\s\S]*?\{\/\* End Google Tag Manager \(noscript\) \*\/\}\n?/g, "");
+
+        // Insert head snippet inside <head> (before </head> or before first child after <head>)
+        if (/<head[^>]*>/.test(updatedContent)) {
+          updatedContent = updatedContent.replace(
+            /(<head[^>]*>)/,
+            `$1\n${gtmHeadSnippet}`
+          );
+        } else {
+          // Fallback: insert before <body
+          updatedContent = updatedContent.replace(
+            /(<body[^>]*>)/,
+            `${gtmHeadSnippet}\n      $1`
+          );
+        }
+
+        // Insert noscript snippet immediately after <body ...>
+        if (/<body[^>]*>/.test(updatedContent)) {
+          updatedContent = updatedContent.replace(
+            /(<body[^>]*>)/,
+            `$1\n${gtmBodySnippet}`
+          );
+        }
+
+        // 4. Commit updated layout.tsx to GitHub
+        const base64New = Buffer.from(updatedContent, "utf-8").toString("base64");
+        await axios.put<any>(
+          `${repoBase}/contents/${layoutPath}`,
+          {
+            message: `chore: inject GTM container ${containerId}`,
+            content: base64New,
+            sha: fileSha,
+          },
+          { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+        );
+        break; // success — exit retry loop
+      } catch (err: any) {
+        const status = err?.response?.status;
+        if (status === 409 && attempt < MAX_ATTEMPTS) continue;
+        throw err;
       }
-      throw err;
     }
-
-    // 2. Build GTM snippets
-    const gtmHeadSnippet =
-      `        {/* Google Tag Manager */}\n` +
-      `        <script dangerouslySetInnerHTML={{ __html: \`(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src='https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);})(window,document,'script','dataLayer','${containerId}');\` }} />\n` +
-      `        {/* End Google Tag Manager */}`;
-
-    const gtmBodySnippet =
-      `        {/* Google Tag Manager (noscript) */}\n` +
-      `        <noscript dangerouslySetInnerHTML={{ __html: \`<iframe src="https://www.googletagmanager.com/ns.html?id=${containerId}" height="0" width="0" style="display:none;visibility:hidden"></iframe>\` }} />\n` +
-      `        {/* End Google Tag Manager (noscript) */}`;
-
-    // 3. Idempotent injection — strip any existing GTM block first
-    let updatedContent = currentContent
-      .replace(/[ \t]*\{\/\* Google Tag Manager \*\/\}[\s\S]*?\{\/\* End Google Tag Manager \*\/\}\n?/g, "")
-      .replace(/[ \t]*\{\/\* Google Tag Manager \(noscript\) \*\/\}[\s\S]*?\{\/\* End Google Tag Manager \(noscript\) \*\/\}\n?/g, "");
-
-    // Insert head snippet inside <head> (before </head> or before first child after <head>)
-    if (/<head[^>]*>/.test(updatedContent)) {
-      updatedContent = updatedContent.replace(
-        /(<head[^>]*>)/,
-        `$1\n${gtmHeadSnippet}`
-      );
-    } else {
-      // Fallback: insert before <body
-      updatedContent = updatedContent.replace(
-        /(<body[^>]*>)/,
-        `${gtmHeadSnippet}\n      $1`
-      );
-    }
-
-    // Insert noscript snippet immediately after <body ...>
-    if (/<body[^>]*>/.test(updatedContent)) {
-      updatedContent = updatedContent.replace(
-        /(<body[^>]*>)/,
-        `$1\n${gtmBodySnippet}`
-      );
-    }
-
-    // 4. Commit updated layout.tsx to GitHub
-    const base64New = Buffer.from(updatedContent, "utf-8").toString("base64");
-    await axios.put<any>(
-      `${repoBase}/contents/${layoutPath}`,
-      {
-        message: `chore: inject GTM container ${containerId}`,
-        content: base64New,
-        sha: fileSha,
-      },
-      { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
-    );
 
     // 5. Persist gtmContainerId in DynamoDB
     await updateLandingPageGtm(page.id, page.userId, containerId);
