@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-27',
     changes: [
+      'Fixed: Emma No Longer Tells Users to Connect Slack via Connected Accounts',
+      '- When no Slack channel was configured, Emma was incorrectly directing users to Settings → Connected Accounts to connect Slack',
+      '- Slack channels are configured by an admin, not through individual user settings — Emma now correctly tells users to contact their admin to set up Slack access',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
       'Fixed: LinkedIn Connection Status Now Scoped Strictly to the List\'s Assigned Account',
       '- Previously, LinkedIn connection status checks could match connections from site-wide scraping accounts or other users\' accounts, producing false "connected" results in the CRM overview',
       '- Connection status is now checked exclusively against the LinkedIn account explicitly assigned to each lead list — no fallbacks, no cross-account leakage',
