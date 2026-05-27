@@ -5,6 +5,7 @@ import fs from "fs";
 import path from "path";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken, getLandingPagesConfig } from "../utils/secretsManager";
 import { userDb, orgDb } from "./db";
+import { canEditItem } from "./orgShareService";
 import { addSubdomain, generateSubdomain } from "./customDomainService";
 import { settingsService } from "./settingsService";
 import { paginatedQuery } from "../utils/dynamoPagination";
@@ -2239,7 +2240,7 @@ export async function listLandingPages(
  * Searches ALL records including archived — the site survives page deletion.
  * Also auto-marks the site record as isRootPage if not already set.
  */
-async function findUserSiteRecord(userId: string): Promise<GeneratedLandingPage | null> {
+export async function findUserSiteRecord(userId: string): Promise<GeneratedLandingPage | null> {
   const pages = await paginatedQuery<GeneratedLandingPage>(dynamodb, {
     TableName: TABLE_NAME,
     IndexName: "UserIdIndex",
@@ -2267,6 +2268,43 @@ async function findUserSiteRecord(userId: string): Promise<GeneratedLandingPage 
   }
 
   return siteRecord || null;
+}
+
+/**
+ * Resolve the landing-page site for a caller, accounting for org membership.
+ * Returns the caller's own site if present; otherwise searches org members for
+ * a site the caller has edit access to.
+ */
+export async function resolveSiteForCaller(
+  callerUserId: string,
+): Promise<GeneratedLandingPage | null> {
+  // Call via module exports so jest.spyOn can intercept in tests.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const self: typeof import("./v0Service") = require("./v0Service");
+  const own = await self.findUserSiteRecord(callerUserId);
+  if (own) return own;
+
+  const user = await userDb.getUserById(callerUserId);
+  if (!user?.orgId) return null;
+
+  const [members, org] = await Promise.all([
+    orgDb.getOrgMembers(user.orgId),
+    orgDb.getOrgById(user.orgId),
+  ]);
+  for (const m of members) {
+    if (m.userId === callerUserId) continue;
+    const site = await self.findUserSiteRecord(m.userId);
+    if (!site) continue;
+    const allowed = canEditItem(
+      { userId: site.userId },
+      { userId: callerUserId, orgId: user.orgId, orgRole: user.orgRole as any },
+      org,
+      user.orgId,
+      "landingPages",
+    );
+    if (allowed) return site;
+  }
+  return null;
 }
 
 /**
