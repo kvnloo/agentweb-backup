@@ -269,6 +269,38 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.success).toBe(true);
       expect(result.leads).toHaveLength(1);
     });
+
+    it('should include customFields in lead response for CSV export use cases', async () => {
+      const leadWithFunding = { ...mockLead, customFields: { fundingAmount: '15000000', fundingRound: 'Series B', industry: 'FinTech' } };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [leadWithFunding],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.getLeads(listId, userId, {});
+
+      expect(result.success).toBe(true);
+      expect(result.leads[0].customFields).toEqual({ fundingAmount: '15000000', fundingRound: 'Series B', industry: 'FinTech' });
+    });
+
+    it('should include phone, notes, linkedin, createdAt, updatedAt in lead response', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [mockLead],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.getLeads(listId, userId, {});
+
+      expect(result.success).toBe(true);
+      const lead = result.leads[0];
+      expect(lead.phone).toBe('555-0100');
+      expect(lead.notes).toBe('Met at conference');
+      expect(lead.linkedin).toBe('https://linkedin.com/in/johndoe');
+      expect(lead.createdAt).toBe('2026-01-15T00:00:00.000Z');
+      expect(lead.updatedAt).toBe('2026-02-01T00:00:00.000Z');
+    });
   });
 
   // ─── searchLeads ───────────────────────────────────────────────────────
