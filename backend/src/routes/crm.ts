@@ -1712,6 +1712,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
     const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
     const engagedOnlyQuery = req.query.engagedOnly;
     const statusQuery = typeof req.query.status === 'string' ? req.query.status.trim() : '';
+    const linkedInConnectedQuery = req.query.linkedInConnected;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -1747,7 +1748,9 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
       }
     }
 
-    if (list.icpsOnly || search || effectiveEngagedOnly || statusQuery) {
+    const linkedInConnectedFilter = linkedInConnectedQuery === 'true';
+
+    if (list.icpsOnly || search || effectiveEngagedOnly || statusQuery || linkedInConnectedFilter) {
       // Filtered mode: use flag indexes when possible, then apply remaining filters in-memory.
       const fetchLimit = Math.max(validLimit, 200);
 
@@ -1770,6 +1773,21 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
         ? await buildEngagedLeadLookup(listId, userId)
         : null;
 
+      // Build a set of connected LinkedIn URLs if the filter is active
+      let connectedLinkedInUrlSet: Set<string> | null = null;
+      if (linkedInConnectedFilter) {
+        const accountId: string | null = (list as any).linkedInAccountId ?? null;
+        if (!accountId) {
+          // No account assigned — filter returns nothing
+          return res.json({ leads: [], page: validPage, limit: validLimit, totalPages: 0, hasMore: false, totalFilteredCount: 0 });
+        }
+        const { getAllConnectionsByAccount } = await import('../services/unipileConnectionsDb');
+        const connections = await getAllConnectionsByAccount(accountId);
+        connectedLinkedInUrlSet = new Set(
+          connections.map((c: any) => (c.publicProfileUrl as string || '').trim().toLowerCase().replace(/\/?$/, '/'))
+        );
+      }
+
       const allMatchingLeads = candidateLeads.filter((lead: any) => {
         if (list.icpsOnly && !leadMatchesICPFlag(lead)) {
           return false;
@@ -1782,6 +1800,11 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
         }
         if (statusQuery && (lead.status || null) !== statusQuery) {
           return false;
+        }
+        if (connectedLinkedInUrlSet !== null) {
+          if (!lead.linkedin) return false;
+          const normalized = (lead.linkedin as string).trim().toLowerCase().replace(/\/?$/, '/');
+          if (!connectedLinkedInUrlSet.has(normalized)) return false;
         }
         return true;
       });
