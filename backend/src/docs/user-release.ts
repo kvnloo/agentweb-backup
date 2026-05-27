@@ -6928,6 +6928,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: Org Members Can Now Use Slack Features',
+      '- Organization members were seeing "No Slack channel is configured" when using Slack tools, even when the org owner had Slack set up',
+      '- Org members now automatically inherit the org owner\'s configured Slack channels',
+      '- All Slack tools (list channels, read messages, send messages) work correctly for org members',
+    ],
+  },
+  {
     date: '2026-05-13',
     changes: [
       'Fixed: Send LinkedIn Message in CRM No Longer Fails with a Validation Error',

@@ -77,6 +77,11 @@ const ORG_MEMBER_NO_CHANNEL = { userId: 'user-5', isAdmin: false, slackChannel: 
 // Org member with own Slack config — personal config takes priority over org
 const ORG_MEMBER_WITH_CHANNEL = { userId: 'user-6', isAdmin: false, slackChannel: 'C_PERSONAL', orgId: 'org-1' };
 const ORG_WITH_SLACK = { orgId: 'org-1', name: 'Test Org', ownerUserId: 'owner-1', slackChannel: 'C_ORG', maxMembers: 5, createdAt: '', updatedAt: '' };
+// Org member with no personal Slack config and org record has no slackChannel — should fall through to owner's user record
+const ORG_MEMBER_NO_CHANNEL_2 = { userId: 'user-7', isAdmin: false, slackChannel: undefined, orgId: 'org-2' };
+const ORG_WITHOUT_SLACK = { orgId: 'org-2', name: 'No-Slack Org', ownerUserId: 'owner-2', slackChannel: undefined, maxMembers: 5, createdAt: '', updatedAt: '' };
+const ORG_OWNER_WITH_CHANNEL = { userId: 'owner-2', isAdmin: false, slackChannels: ['C_OWNER'] };
+const ORG_OWNER_NO_CHANNEL = { userId: 'owner-2', isAdmin: false, slackChannel: undefined, slackChannels: undefined };
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -175,10 +180,45 @@ describe('slack_list_channels', () => {
   });
 
   it('org member with no personal channel and org has no Slack: returns error', async () => {
-    mockedGetUserById.mockResolvedValue(ORG_MEMBER_NO_CHANNEL as any);
+    mockedGetUserById.mockImplementation(async (id) => {
+      if (id === 'user-5') return ORG_MEMBER_NO_CHANNEL as any;
+      if (id === 'owner-1') return null; // org owner has no channels either
+      return null;
+    });
     mockedGetOrgById.mockResolvedValue({ ...ORG_WITH_SLACK, slackChannel: undefined } as any);
 
     const result = await executeTool('slack_list_channels', {}, { userId: 'user-5' });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/No Slack channel/);
+  });
+
+  it('org member with no personal channel and org record has no slackChannel: falls back to owner user channels', async () => {
+    mockedGetUserById.mockImplementation(async (id) => {
+      if (id === 'user-7') return ORG_MEMBER_NO_CHANNEL_2 as any;
+      if (id === 'owner-2') return ORG_OWNER_WITH_CHANNEL as any;
+      return null;
+    });
+    mockedGetOrgById.mockResolvedValue(ORG_WITHOUT_SLACK as any);
+    mockedGetChannels.mockResolvedValue([{ id: 'C_OWNER', name: 'owner-channel', displayName: '#owner-channel', isPrivate: false }] as any);
+
+    const result = await executeTool('slack_list_channels', {}, { userId: 'user-7' });
+
+    expect(result.success).toBe(true);
+    expect(result.count).toBe(1);
+    expect(result.channels[0].id).toBe('C_OWNER');
+    expect(mockedGetOrgById).toHaveBeenCalledWith('org-2');
+  });
+
+  it('org member with no personal channel, org record has no slackChannel, owner has no channels: returns error', async () => {
+    mockedGetUserById.mockImplementation(async (id) => {
+      if (id === 'user-7') return ORG_MEMBER_NO_CHANNEL_2 as any;
+      if (id === 'owner-2') return ORG_OWNER_NO_CHANNEL as any;
+      return null;
+    });
+    mockedGetOrgById.mockResolvedValue(ORG_WITHOUT_SLACK as any);
+
+    const result = await executeTool('slack_list_channels', {}, { userId: 'user-7' });
 
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/No Slack channel/);
@@ -369,6 +409,23 @@ describe('slack_get_recent_messages', () => {
     expect(result.success).toBe(true);
     expect(result.channel_id).toBe('C_ORG');
     expect(mockedGetMessages).toHaveBeenCalledWith('C_ORG', undefined, undefined);
+  });
+
+  it('org member with no personal channel, org record has no slackChannel: fetches messages from org owner channel', async () => {
+    mockedGetUserById.mockImplementation(async (id) => {
+      if (id === 'user-7') return ORG_MEMBER_NO_CHANNEL_2 as any;
+      if (id === 'owner-2') return ORG_OWNER_WITH_CHANNEL as any;
+      return null;
+    });
+    mockedGetOrgById.mockResolvedValue(ORG_WITHOUT_SLACK as any);
+    mockedGetMessages.mockResolvedValue(MESSAGES as any);
+    mockedGetReplies.mockResolvedValue(THREAD_REPLIES as any);
+
+    const result = await executeTool('slack_get_recent_messages', {}, { userId: 'user-7' });
+
+    expect(result.success).toBe(true);
+    expect(result.channel_id).toBe('C_OWNER');
+    expect(mockedGetMessages).toHaveBeenCalledWith('C_OWNER', undefined, undefined);
   });
 
   it('multi-channel user: returns error when no channel specified', async () => {
@@ -694,6 +751,22 @@ describe('slack_send_message', () => {
     expect(result.success).toBe(true);
     expect(result.channel_id).toBe('C_ORG');
     expect(mockedPostMessage).toHaveBeenCalledWith('C_ORG', 'Hello org!', undefined);
+  });
+
+  it('org member with no personal channel, org record has no slackChannel: sends to org owner channel', async () => {
+    mockedGetUserById.mockImplementation(async (id) => {
+      if (id === 'user-7') return ORG_MEMBER_NO_CHANNEL_2 as any;
+      if (id === 'owner-2') return ORG_OWNER_WITH_CHANNEL as any;
+      return null;
+    });
+    mockedGetOrgById.mockResolvedValue(ORG_WITHOUT_SLACK as any);
+    mockedPostMessage.mockResolvedValue({ ts: '1711235021.000100', channel: 'C_OWNER' });
+
+    const result = await executeTool('slack_send_message', { text: 'Hello via owner channel!' }, { userId: 'user-7' });
+
+    expect(result.success).toBe(true);
+    expect(result.channel_id).toBe('C_OWNER');
+    expect(mockedPostMessage).toHaveBeenCalledWith('C_OWNER', 'Hello via owner channel!', undefined);
   });
 
   it('returns error when text is undefined', async () => {
