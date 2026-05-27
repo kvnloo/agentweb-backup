@@ -27,6 +27,7 @@ import {
   deleteEnvVar,
   updateLandingPageContext,
   INTEGRATIONS,
+  resolveSiteForCaller,
 } from "../services/v0Service";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { listDomains, CustomDomainRecord } from "../services/customDomainService";
@@ -227,6 +228,36 @@ const editRateLimiter = createRateLimiter(
 );
 
 router.use(authenticateToken);
+
+/**
+ * GET /api/landing-pages/v0/site
+ * Returns the caller's root landing site and its deploy status.
+ */
+router.get("/site", async (req: Request, res: Response) => {
+  try {
+    const callerUserId = (req as unknown as AuthenticatedRequest).user!.userId;
+    const site = await resolveSiteForCaller(callerUserId);
+    if (!site) {
+      return res.status(404).json({
+        deployStatus: "no_site",
+        error: "No landing site found. Create a page first.",
+      });
+    }
+    let deployStatus: "deploying" | "ready" | "failed";
+    if (site.status === "failed") deployStatus = "failed";
+    else if (site.vercelProjectId && site.githubRepoUrl) deployStatus = "ready";
+    else deployStatus = "deploying";
+    return res.json({
+      rootPageId: site.id,
+      vercelProjectId: site.vercelProjectId,
+      githubRepoUrl: site.githubRepoUrl,
+      deployStatus,
+    });
+  } catch (err) {
+    console.error("GET /site failed:", err);
+    return res.status(500).json({ error: "Failed to load site" });
+  }
+});
 
 /**
  * POST /api/landing-pages/v0/generate
