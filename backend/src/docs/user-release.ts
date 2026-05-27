@@ -27,6 +27,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-27',
     changes: [
+      'Fixed: CRM Inbox Now Explains When Leads Are Missing Emails',
+      '- The CRM Inbox groups contacts by email address, so leads imported from LinkedIn without an email (name, company, LinkedIn URL only) were silently excluded',
+      '- Users with many LinkedIn-imported leads were seeing far fewer contacts in the Inbox than their list actually contained, with no indication of why',
+      '- The Inbox now shows an amber notice: "X leads in your lists don\'t have an email address and won\'t appear here. Open a list and use Enrich to find their emails."',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
       'Fixed: create_html_file and save_file Tools Now Return Clear Parameter Errors',
       '- Both tools were throwing cryptic errors ("Cannot read properties of undefined" or "fileName is required") when the LLM called them with missing or misspelled parameters',
       '- Added input validation with descriptive error messages that tell the LLM exactly which parameter name to use and retry with',
