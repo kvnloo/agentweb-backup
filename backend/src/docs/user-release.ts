@@ -84,6 +84,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-27',
     changes: [
+      'Fixed: Org Members Can Now Sync LinkedIn Messages in CRM',
+      '- Clicking "Sync LinkedIn" on a lead in a list owned by your org owner was returning an "Access denied" error for org members',
+      '- Both the LinkedIn message sync and LinkedIn connection sync endpoints now correctly allow access for members of the same organization',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
       'Fixed: LinkedIn Connection Accepted Notification Now Fires Only Once',
       '- The email notification sent when a lead accepts your LinkedIn invitation was being sent repeatedly every 10 minutes',
       '- Fixed a broken watermark that caused the sync cron to treat already-seen connections as new on every run',
