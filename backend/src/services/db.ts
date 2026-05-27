@@ -343,7 +343,7 @@ export interface User {
   introductionEmailSent?: string; // ISO date when the team introduction email was sent
   resetPasswordToken?: string;
   resetPasswordExpires?: string;
-  subscriptionType?: string | null; // Subscription type for customer-portal users (defaults to "Basic")
+  subscriptionType?: string | null; // Subscription type for customer-portal users (defaults to "Free")
   tokenUsage?: {
     month: string;        // "YYYY-MM" format for current tracking month
     totalTokens: number;  // cumulative tokens used this month
@@ -3796,6 +3796,7 @@ export const crmDb = {
       alertEvents?: string[];
       alertCcEmails?: string[];
       listSenderId?: string | null;
+      linkedInAccountId?: string | null;
       publicAccessEnabled?: boolean;
       autoDraftEnabled?: boolean;
       autoDraftInstruction?: string;
@@ -3879,6 +3880,12 @@ export const crmDb = {
         expressionAttributeNames['#listSenderId'] = 'listSenderId';
         updateExpressions.push('#listSenderId = :listSenderId');
         expressionAttributeValues[':listSenderId'] = updates.listSenderId;
+      }
+
+      if (updates.linkedInAccountId !== undefined) {
+        expressionAttributeNames['#linkedInAccountId'] = 'linkedInAccountId';
+        updateExpressions.push('#linkedInAccountId = :linkedInAccountId');
+        expressionAttributeValues[':linkedInAccountId'] = updates.linkedInAccountId;
       }
 
       if (updates.publicAccessEnabled !== undefined) {

@@ -182,6 +182,75 @@ const sendAlertEmail = async ({
 };
 
 export const leadListAlertService = {
+  async notifyLinkedInConnectionAccepted(list: any, lead: any) {
+    const user = await userDb.getUserById(list.userId);
+    if (!user?.email) return;
+
+    const leadName = formatLeadName(lead);
+    const leadEmail = lead.email || '';
+    const normalizedLeadName = String(leadName).trim().toLowerCase();
+    const normalizedLeadEmail = String(leadEmail).trim().toLowerCase();
+    const showLeadEmail = leadEmail && normalizedLeadName !== normalizedLeadEmail;
+    const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+    const crmUrl = `${customerFrontendUrl}/crm`;
+    const leadEngagementUrl = lead?.leadId
+      ? `${crmUrl}?listId=${encodeURIComponent(list.listId)}&leadId=${encodeURIComponent(lead.leadId)}&openEngagement=1`
+      : crmUrl;
+    const listName = list.name || 'Lead List';
+    const eventTime = new Date().toLocaleString();
+    const subject = `${leadName} accepted your LinkedIn invitation`;
+
+    const text = [
+      `${leadName} has accepted your LinkedIn connection request.`,
+      `Lead list: ${listName} (${list.listId})`,
+      `Lead: ${leadName}${showLeadEmail ? ` (${leadEmail})` : ''}`,
+      `Time: ${eventTime}`,
+      `Review lead engagement: ${leadEngagementUrl}`,
+    ].join('\n');
+
+    const html = `
+      <div style="font-family: Arial, sans-serif; max-width: 640px;">
+        <h2 style="margin-bottom: 12px;">Lead list alert</h2>
+        <p><strong>${emailService.escapeHtml(leadName)}</strong> has accepted your LinkedIn connection request.</p>
+        <div style="margin: 12px 0;">
+          <div><strong>Lead list:</strong> ${emailService.escapeHtml(listName)} (${emailService.escapeHtml(list.listId)})</div>
+          <div><strong>Lead:</strong> ${emailService.escapeHtml(leadName)}${showLeadEmail ? ` (${emailService.escapeHtml(leadEmail)})` : ''}</div>
+          <div><strong>Time:</strong> ${emailService.escapeHtml(eventTime)}</div>
+          <div style="margin-top:12px;">
+            <a href="${emailService.escapeHtml(leadEngagementUrl)}" style="display:inline-block;padding:10px 20px;background:#0077b5;color:#fff;text-decoration:none;border-radius:4px;font-weight:bold;">Send a message on LinkedIn</a>
+          </div>
+        </div>
+      </div>
+    `;
+
+    const ccEmails = Array.isArray(list.alertCcEmails) ? list.alertCcEmails.filter((e: string) => typeof e === 'string' && e.trim()) : undefined;
+    if (Array.isArray(ccEmails) && ccEmails.length > 0) {
+      await emailService.sendEmail(user.email, subject, text, html, ccEmails);
+    } else {
+      await emailService.sendEmail(user.email, subject, text, html);
+    }
+
+    if (user.slackChannel) {
+      try {
+        await sendLeadNotification(user.slackChannel, {
+          firstName: lead.firstName,
+          lastName: lead.lastName,
+          email: lead.email,
+          company: lead.company,
+          phone: lead.phone,
+          linkedin: lead.linkedin,
+          listName,
+          listId: list.listId,
+          crmUrl: leadEngagementUrl,
+          eventType: 'linkedin.connection_accepted',
+          timestamp: new Date().toISOString(),
+        });
+      } catch (slackError) {
+        console.error('Failed to send Slack LinkedIn connection notification:', slackError);
+      }
+    }
+  },
+
   async notifyLeadListOwnerIfConfigured(
     list: any,
     lead: any,

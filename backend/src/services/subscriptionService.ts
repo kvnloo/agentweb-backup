@@ -51,15 +51,15 @@ export async function getTierConfig(tierName: string): Promise<SubscriptionType 
 }
 
 /**
- * Get subscription type for a user (defaults to "Basic" if not set)
+ * Get subscription type for a user (defaults to "Free" if not set)
  */
 export async function getUserSubscriptionType(userId: string): Promise<string> {
   try {
     const user = await userDb.getUserById(userId);
-    return user?.subscriptionType || "Basic";
+    return user?.subscriptionType || "Free";
   } catch (error) {
     console.error("Error getting user subscription type:", error);
-    return "Basic";
+    return "Free";
   }
 }
 
@@ -82,13 +82,17 @@ export async function getSubscriptionTypeConfig(
       }
     }
 
-    // If no subscription types defined, return default Basic type with actual lists
+    // If no subscription types defined, return built-in fallbacks
     if (subscriptionTypes.length === 0) {
+      if (subscriptionTypeName === "Free") {
+        return { ...FREE_TIER_FALLBACK };
+      }
+      // Legacy: users stored as "Basic" before tier system was introduced get full access
       if (subscriptionTypeName === "Basic") {
         return {
           name: "Basic",
-          allowedPages: getAllAvailablePages(), // All available pages (expanded)
-          allowedSkills: ["*"], // All skills allowed by default
+          allowedPages: getAllAvailablePages(),
+          allowedSkills: ["*"],
         };
       }
       return null;

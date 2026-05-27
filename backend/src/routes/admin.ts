@@ -185,18 +185,44 @@ router.get("/unipile-accounts", async (req, res) => {
 
     // 4. Detect orphans: in Unipile but NOT in our DB
     const dbAccountIdSet = new Set(dbAccountIds);
-    const orphans = allUnipileAccounts
-      .filter((u) => !dbAccountIdSet.has(u.id))
-      .map((u) => ({
-        account_id: u.id,
-        account_name: u.name,
-        user_email: null,
-        user_id: null,
-        created_at: u.created_at ?? null,
-        updated_at: null,
-        unipile_status: 'ORPHAN',
-        is_orphan: true,
-      }));
+    const candidateOrphans = allUnipileAccounts.filter((u) => !dbAccountIdSet.has(u.id));
+
+    // In dev, cross-check against the prod table so accounts linked in prod
+    // aren't falsely reported as orphans.
+    let prodLinkedAccountIds = new Set<string>();
+    if (process.env.NODE_ENV === 'development' && candidateOrphans.length > 0) {
+      try {
+        const docClient = new DynamoDB.DocumentClient();
+        let lastKey: DynamoDB.DocumentClient.Key | undefined;
+        do {
+          const result: DynamoDB.DocumentClient.ScanOutput = await docClient.scan({
+            TableName: 'AW-Users',
+            ProjectionExpression: 'connected_accounts',
+            ExclusiveStartKey: lastKey,
+          }).promise();
+          for (const item of result.Items || []) {
+            for (const acc of (item.connected_accounts || [])) {
+              if (acc.platform === 'unipile') prodLinkedAccountIds.add(acc.account_id);
+            }
+          }
+          lastKey = result.LastEvaluatedKey;
+        } while (lastKey);
+      } catch (prodErr) {
+        console.warn('[Admin] Failed to cross-check prod table for orphan detection:', prodErr);
+      }
+    }
+
+    const orphans = candidateOrphans.map((u) => ({
+      account_id: u.id,
+      account_name: u.name,
+      user_email: null,
+      user_id: null,
+      created_at: u.created_at ?? null,
+      updated_at: null,
+      // Distinguish accounts that are linked in prod but not in dev
+      unipile_status: prodLinkedAccountIds.has(u.id) ? 'LINKED_IN_PROD' : 'ORPHAN',
+      is_orphan: !prodLinkedAccountIds.has(u.id),
+    }));
 
     res.json({ accounts: [...accountsWithStatus, ...orphans] });
   } catch (error) {

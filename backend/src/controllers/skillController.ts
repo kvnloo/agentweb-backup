@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import { skillService } from "../services/skillService";
+import { userDb } from "../services/db";
 
 export const createSkill = async (req: Request, res: Response) => {
   try {
@@ -27,7 +28,24 @@ export const createSkill = async (req: Request, res: Response) => {
 export const getAllSkills = async (req: Request, res: Response) => {
   try {
     const allSkills = await skillService.getAllSkills();
-    res.status(200).json(allSkills);
+
+    // Enrich private/pending skills with owner email
+    const ownerIds = [...new Set(
+      allSkills
+        .filter(s => (s.visibility === 'private' || s.visibility === 'pending_review') && s.ownerId)
+        .map(s => s.ownerId!)
+    )];
+    const ownerMap = new Map<string, string>();
+    await Promise.all(ownerIds.map(async (id) => {
+      const user = await userDb.getUserById(id);
+      if (user?.email) ownerMap.set(id, user.email);
+    }));
+
+    const enriched = allSkills.map(s =>
+      s.ownerId && ownerMap.has(s.ownerId) ? { ...s, ownerEmail: ownerMap.get(s.ownerId) } : s
+    );
+
+    res.status(200).json(enriched);
   } catch (error) {
     console.error("Error fetching skills:", error);
     res.status(500).json({ message: "Failed to fetch skills" });

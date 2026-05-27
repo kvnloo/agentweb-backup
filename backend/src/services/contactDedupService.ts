@@ -26,6 +26,8 @@ export interface DedupedContact {
   heatScore: number;
   /** ISO timestamp of the last engagement / updatedAt. */
   lastContactAt: string;
+  /** eventType of the most recent engagement (e.g. "email.received", "linkedin.message.received"). */
+  latestEventType?: string;
   /** List memberships this email appears in. */
   lists: Array<{ listId: string; name: string }>;
   /** Concrete lead row used for click-through / promote actions. */
@@ -75,9 +77,9 @@ export function computeHeatScore(lead: any): number {
     lead?.engagementCount ?? (Array.isArray(lead?.engagements) ? lead.engagements.length : 0) ?? 0;
   let score = Math.min(engagementCount, 5);
 
-  const lastContactRaw = pickLastContact(lead);
-  if (lastContactRaw) {
-    const age = Date.now() - new Date(lastContactRaw).getTime();
+  const lastContact = pickLastContact(lead);
+  if (lastContact) {
+    const age = Date.now() - new Date(lastContact.at).getTime();
     const days = age / (1000 * 60 * 60 * 24);
     if (days < 1) score += 5;
     else if (days < 3) score += 4;
@@ -88,16 +90,20 @@ export function computeHeatScore(lead: any): number {
   return Math.min(10, Math.max(0, score));
 }
 
-function pickLastContact(lead: any): string | undefined {
+function pickLastContact(lead: any): { at: string; eventType?: string } | undefined {
   const engs = Array.isArray(lead?.engagements) ? lead.engagements : [];
-  let latest: string | undefined;
+  let latestAt: string | undefined;
+  let latestEventType: string | undefined;
   for (const e of engs) {
     if (!e?.createdAt) continue;
-    if (!latest || new Date(e.createdAt).getTime() > new Date(latest).getTime()) {
-      latest = e.createdAt;
+    if (!latestAt || new Date(e.createdAt).getTime() > new Date(latestAt).getTime()) {
+      latestAt = e.createdAt;
+      latestEventType = e.eventType;
     }
   }
-  return latest ?? lead?.createdAt;
+  if (latestAt) return { at: latestAt, eventType: latestEventType };
+  if (lead?.createdAt) return { at: lead.createdAt };
+  return undefined;
 }
 
 /**
@@ -182,6 +188,7 @@ export async function dedupContactsForUser(query: DedupQuery): Promise<DedupResu
       const displayName =
         [lead.firstName, lead.lastName].filter(Boolean).join(' ').trim() || email;
 
+      const lastContact = pickLastContact(lead);
       const existing = map.get(email);
       if (!existing) {
         map.set(email, {
@@ -189,7 +196,8 @@ export async function dedupContactsForUser(query: DedupQuery): Promise<DedupResu
           name: displayName,
           company: lead.company ?? '',
           heatScore: computeHeatScore(lead),
-          lastContactAt: pickLastContact(lead) ?? '',
+          lastContactAt: lastContact?.at ?? '',
+          latestEventType: lastContact?.eventType,
           lists: [membership],
           primaryLead: lead,
         });
@@ -206,7 +214,8 @@ export async function dedupContactsForUser(query: DedupQuery): Promise<DedupResu
         existing.primaryLead = lead;
         existing.name = displayName || existing.name;
         existing.company = lead.company || existing.company;
-        existing.lastContactAt = pickLastContact(lead) ?? existing.lastContactAt;
+        existing.lastContactAt = lastContact?.at ?? existing.lastContactAt;
+        existing.latestEventType = lastContact?.eventType ?? existing.latestEventType;
       }
     }
   }

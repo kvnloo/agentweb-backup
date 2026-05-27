@@ -1,7 +1,7 @@
 /**
  * Tests for linkedInConnectionStatus field in AgentModeService.getLeadDetails().
  * Verifies that the AW-UnipileConnections cache is consulted when a lead has a
- * LinkedIn URL, and that the result is surfaced as `lead.linkedInConnectionStatus`.
+ * LinkedIn URL, scoped to the account assigned to the list (list.linkedInAccountId).
  */
 
 jest.mock('../services/db', () => ({
@@ -15,7 +15,7 @@ jest.mock('../services/db', () => ({
 }));
 
 jest.mock('../services/unipileConnectionsDb', () => ({
-  getConnectionByProfileUrl: jest.fn(),
+  getConnectionByProfileUrlAndAccount: jest.fn(),
 }));
 
 // Minimal stubs for transitive dependencies pulled in by agentModeService
@@ -27,15 +27,17 @@ import { crmDb } from '../services/db';
 import * as unipileConnectionsDb from '../services/unipileConnectionsDb';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
-const mockGetConnection = unipileConnectionsDb.getConnectionByProfileUrl as jest.Mock;
+const mockGetConnection = unipileConnectionsDb.getConnectionByProfileUrlAndAccount as jest.Mock;
 
 describe('AgentModeService.getLeadDetails – linkedInConnectionStatus', () => {
   let service: AgentModeService;
   const userId  = 'user-111';
   const listId  = 'list-aaa';
   const leadId  = 'lead-zzz';
+  const linkedInAccountId = 'unipile-acc-1';
 
-  const mockList = { listId, userId, name: 'Outreach List' };
+  const mockList = { listId, userId, name: 'Outreach List', linkedInAccountId };
+  const mockListNoAccount = { listId, userId, name: 'Outreach List', linkedInAccountId: null };
 
   const baseLead = {
     leadId,
@@ -70,7 +72,7 @@ describe('AgentModeService.getLeadDetails – linkedInConnectionStatus', () => {
   it('returns isConnected:true with connectedAt when lead LinkedIn URL is in the cache', async () => {
     mockCrmDb.getLeadById.mockResolvedValue(baseLead as any);
     mockGetConnection.mockResolvedValue({
-      accountId:        'acc-1',
+      accountId:        linkedInAccountId,
       memberId:         'jerry123',
       publicProfileUrl: 'https://www.linkedin.com/in/jerryshan/',
       memberUrn:        'urn:li:member:jerry123',
@@ -91,7 +93,7 @@ describe('AgentModeService.getLeadDetails – linkedInConnectionStatus', () => {
       new Date(1746057600 * 1000).toISOString()
     );
     expect(result.lead.linkedInConnectionStatus.connectedAtTimestamp).toBe(1746057600);
-    expect(mockGetConnection).toHaveBeenCalledWith(baseLead.linkedin);
+    expect(mockGetConnection).toHaveBeenCalledWith(baseLead.linkedin, linkedInAccountId);
   });
 
   it('returns isConnected:false when lead LinkedIn URL is NOT in the cache', async () => {
@@ -102,7 +104,7 @@ describe('AgentModeService.getLeadDetails – linkedInConnectionStatus', () => {
 
     expect(result.success).toBe(true);
     expect(result.lead.linkedInConnectionStatus).toEqual({ isConnected: false });
-    expect(mockGetConnection).toHaveBeenCalledWith(baseLead.linkedin);
+    expect(mockGetConnection).toHaveBeenCalledWith(baseLead.linkedin, linkedInAccountId);
   });
 
   it('returns null linkedInConnectionStatus when lead has no LinkedIn URL', async () => {
@@ -124,5 +126,16 @@ describe('AgentModeService.getLeadDetails – linkedInConnectionStatus', () => {
 
     expect(result.success).toBe(true);
     expect(result.lead.linkedInConnectionStatus).toEqual({ isConnected: false });
+  });
+
+  it('returns isConnected:false and skips cache when list has no linkedInAccountId', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue(mockListNoAccount as any);
+    mockCrmDb.getLeadById.mockResolvedValue(baseLead as any);
+
+    const result = await service.getLeadDetails(listId, leadId, userId);
+
+    expect(result.success).toBe(true);
+    expect(result.lead.linkedInConnectionStatus).toEqual({ isConnected: false });
+    expect(mockGetConnection).not.toHaveBeenCalled();
   });
 });

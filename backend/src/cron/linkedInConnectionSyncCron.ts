@@ -10,10 +10,12 @@
  * Manual resync (per-lead or per-list) calls syncConnectionsForAccount() directly.
  */
 
+import OpenAI from 'openai';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { settingsService } from '../services/settingsService';
 import { dripSequenceDb } from '../services/dripSequenceDb';
 import { crmDb } from '../services/db';
+import { leadListAlertService } from '../services/leadListAlertService';
 import {
   upsertConnections,
   getLatestConnectedAt,
@@ -21,11 +23,20 @@ import {
   UnipileConnection,
 } from '../services/unipileConnectionsDb';
 
+const openai = new OpenAI({
+  apiKey: process.env.AZURE_OPENAI_API_KEY,
+  baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT}`,
+  defaultQuery: { 'api-version': process.env.AZURE_OPENAI_API_VERSION },
+  defaultHeaders: { 'api-key': process.env.AZURE_OPENAI_API_KEY },
+});
+
 const TAG = '[linkedInConnectionSync]';
 
-/** Returns all Unipile account IDs to sync from site-wide settings. */
+/** Returns all Unipile account IDs to sync: site-wide settings + all per-user connected accounts. */
 async function getAllUnipileAccountIds(): Promise<string[]> {
   const ids = new Set<string>();
+
+  // Site-wide accounts
   try {
     const setting = await settingsService.getSetting('site-wide-unipile-accounts');
     if (setting?.settingValue) {
@@ -35,6 +46,22 @@ async function getAllUnipileAccountIds(): Promise<string[]> {
       }
     }
   } catch { /* ignore */ }
+
+  // Per-user connected Unipile accounts
+  try {
+    const { userDb } = await import('../services/db');
+    const users = await userDb.getAllUsers();
+    for (const user of users) {
+      if (!user.connected_accounts) continue;
+      for (const acct of user.connected_accounts as any[]) {
+        if (acct.platform === 'unipile') {
+          const accountId = acct.config?.unipile_account_id || acct.account_id;
+          if (accountId) ids.add(accountId);
+        }
+      }
+    }
+  } catch { /* ignore */ }
+
   return Array.from(ids);
 }
 
@@ -166,6 +193,111 @@ export async function enrollNewConnections(newConnections: UnipileConnection[]):
   return enrolled;
 }
 
+/**
+ * For each newly detected connection, look up matching CRM leads via the
+ * LinkedinLookupIndex GSI and send an email notification to the list owner.
+ * Fires independently of sequence enrollment.
+ */
+/**
+ * Generate and save a LinkedIn follow-up message draft on the lead so the
+ * list owner sees a ready-to-send message when they open the deep-link.
+ * Non-fatal — if generation fails the notification still fires.
+ */
+async function generateConnectionFollowUpDraft(lead: any, list: any): Promise<void> {
+  // Skip if a draft already exists — don't overwrite user-authored content.
+  if (lead.messageDraft?.content) return;
+
+  const leadName = [lead.firstName, lead.lastName].filter(Boolean).join(' ') || lead.email || 'there';
+  const company = lead.company ? ` at ${lead.company}` : '';
+  const title = lead.title ? `, ${lead.title}` : '';
+
+  // Try to get brand/strategy context for the list owner.
+  let brandContext = '';
+  const userId = (list as any).userId;
+  if (userId) {
+    try {
+      const { agentModeService } = await import('../services/agentModeService');
+      const [brand, strategy] = await Promise.all([
+        agentModeService.readBrandGuidelines(userId).catch(() => null),
+        agentModeService.readMarketStrategy(userId).catch(() => null),
+      ]);
+      if (brand?.guidelines) brandContext += `\nBrand voice: ${String(brand.guidelines).slice(0, 300)}`;
+      if (strategy?.strategy) brandContext += `\nOffer/market fit: ${String(strategy.strategy).slice(0, 300)}`;
+    } catch { /* non-fatal */ }
+  }
+
+  const prompt = `A LinkedIn lead just accepted your connection request. Write a short, warm follow-up LinkedIn message to start a conversation.
+
+Lead: ${leadName}${company}${title}${brandContext}
+
+Requirements:
+- 1-3 short sentences, max 300 characters
+- Friendly and natural, not salesy
+- Reference that you just connected
+- Open-ended question or soft next step
+- No subject line, no signature
+
+Respond with JSON: {"content": "the message text"}`;
+
+  const completion = await openai.chat.completions.create({
+    model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
+    messages: [
+      { role: 'system', content: 'You write concise, genuine LinkedIn messages. Respond only with valid JSON.' },
+      { role: 'user', content: prompt },
+    ],
+    temperature: 0.7,
+    max_tokens: 200,
+    response_format: { type: 'json_object' },
+  });
+
+  const raw = completion.choices[0]?.message?.content;
+  if (!raw) return;
+
+  let parsed: { content?: string };
+  try { parsed = JSON.parse(raw); } catch { return; }
+  if (!parsed.content?.trim()) return;
+
+  const now = new Date().toISOString();
+  await crmDb.updateLead(lead.listId, lead.leadId, {
+    messageDraft: { content: parsed.content.trim(), createdAt: now, updatedAt: now },
+  });
+}
+
+export async function notifyNewConnections(newConnections: UnipileConnection[]): Promise<void> {
+  for (const conn of newConnections) {
+    try {
+      const leads = await crmDb.findLeadsByLinkedin(conn.publicProfileUrl);
+      for (const lead of leads as any[]) {
+        if (!lead.listId) continue;
+        // Dedup: skip if we already sent a notification for this lead's connection event.
+        if (lead.system?.linkedInConnectionNotifiedAt) {
+          console.log(`${TAG} Skipping duplicate notification for lead ${lead.leadId} (already notified at ${lead.system.linkedInConnectionNotifiedAt})`);
+          continue;
+        }
+        try {
+          const list = await crmDb.getLeadListById(lead.listId);
+          if (!list) continue;
+          // Mark as notified before sending — prevents duplicate sends if this throws.
+          await crmDb.updateLead(lead.listId, lead.leadId, {
+            system: { ...((lead.system as Record<string, any>) ?? {}), linkedInConnectionNotifiedAt: new Date().toISOString() },
+            skipFieldNamesUpdate: true,
+          });
+          // Generate a follow-up draft before notifying so the panel is pre-filled.
+          await generateConnectionFollowUpDraft(lead, list).catch(err =>
+            console.error(`${TAG} Draft generation failed for lead ${lead.leadId}:`, err)
+          );
+          await leadListAlertService.notifyLinkedInConnectionAccepted(list, lead);
+          console.log(`${TAG} Notified list owner for lead ${lead.leadId} (LinkedIn connection accepted)`);
+        } catch (err) {
+          console.error(`${TAG} Failed to notify for lead ${lead.leadId}:`, err);
+        }
+      }
+    } catch (err) {
+      console.error(`${TAG} Failed to look up leads for connection ${conn.publicProfileUrl}:`, err);
+    }
+  }
+}
+
 // ─── Main cron entry point ────────────────────────────────────────────────────
 
 let isRunning = false;
@@ -197,9 +329,12 @@ export async function runLinkedInConnectionSync(): Promise<void> {
       }
     }
 
-    // Auto-enroll leads whose LinkedIn connection was just detected
+    // Auto-enroll leads and send email notifications for newly accepted connections
     if (allNewConnections.length > 0) {
-      const enrolled = await enrollNewConnections(allNewConnections);
+      const [enrolled] = await Promise.all([
+        enrollNewConnections(allNewConnections),
+        notifyNewConnections(allNewConnections),
+      ]);
       if (enrolled > 0) {
         console.log(`${TAG} Auto-enrolled ${enrolled} lead(s) from new connections`);
       }
