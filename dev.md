@@ -1,3 +1,37 @@
+## Gemini Interactions API Sunset — June 8, 2026 Assessment (2026-05-27)
+
+### Background
+
+Google sent a notice that the legacy schema in the **Interactions API v1 beta** will be permanently removed on June 8, 2026. After that date, the `Api-Revision: 2026-05-07` opt-out header stops working, and older SDK versions (Python 1.x, JS 1.x) will fail.
+
+Affected Google Cloud projects: `gen-lang-client-0974358743`, `gen-lang-client-0298423887`.
+
+### Investigation
+
+Audited all Gemini/Google GenAI SDK usage across the codebase (backend TypeScript, agent engine Python, both frontends).
+
+**SDK versions in use:**
+
+| Package | Version | Status |
+|---------|---------|--------|
+| `@google/genai` (JS) | 2.0.0 | ✅ Already on new SDK |
+| `@google/generative-ai` (JS) | 0.24.1 | ⚠️ Legacy package — not sunset-related (see below) |
+| `google-genai` (Python) | `>=1.8.0` pin | ⚠️ Constraint allows 1.x installs |
+
+**The Interactions API is not used anywhere in this codebase.** All Gemini calls use standard content generation APIs (`generateContent`, `generateContentStream`, `generate_content`, `generate_content_stream`, `generate_videos`). The live voice feature (`liveVoiceService.ts`) uses `ai.live.connect()` from `@google/genai` v2, which is the new SDK.
+
+### Conclusion
+
+**No action required for the June 8 deadline.** The sunset only affects the Interactions API schema, which we do not use.
+
+### Optional Future Cleanup
+
+Two files still import the legacy `@google/generative-ai` package (separate from `@google/genai`):
+- `backend/src/services/agentModeService.ts` — data analysis file processing
+- `backend/src/services/imageGeneration.ts` — `gemini-2.5-flash-image` generation
+
+These could be migrated to `@google/genai` v2 to consolidate to a single SDK, but this is non-urgent. The Python `environment.yml` pin (`google-genai>=1.8.0`) could also be tightened to `>=2.0.0`.
+
 ## perform_data_analysis: Unknown Tool Errors and Timeout in Scheduled Reports (2026-05-15)
 
 ### Problem

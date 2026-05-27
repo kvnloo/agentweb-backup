@@ -9,6 +9,100 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: Clearer Error When Coding Agent Lacks Permission to Edit a Landing Page',
+      '- When a team member without edit access tried to use the coding agent to edit a landing page, the agent would silently loop and fail with a cryptic error',
+      '- The agent now immediately returns a clear message explaining the permission issue and directing the org owner to Settings → Organization → Org-wide Sharing → Landing Pages to grant access',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: CRM Lead Panel Notes and Fields Now Show the Correct Lead\'s Data',
+      '- Opening a lead panel, then clicking a different lead was displaying notes, stage, sentiment, next step, and other editable fields from the previously viewed lead',
+      '- All editable fields in the lead detail panel now reset correctly whenever you switch to a different lead',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: CRM Inbox Now Explains When Leads Are Missing Emails',
+      '- The CRM Inbox groups contacts by email address, so leads imported from LinkedIn without an email (name, company, LinkedIn URL only) were silently excluded',
+      '- Users with many LinkedIn-imported leads were seeing far fewer contacts in the Inbox than their list actually contained, with no indication of why',
+      '- The Inbox now shows an amber notice: "X leads in your lists don\'t have an email address and won\'t appear here. Open a list and use Enrich to find their emails."',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: create_html_file and save_file Tools Now Return Clear Parameter Errors',
+      '- Both tools were throwing cryptic errors ("Cannot read properties of undefined" or "fileName is required") when the LLM called them with missing or misspelled parameters',
+      '- Added input validation with descriptive error messages that tell the LLM exactly which parameter name to use and retry with',
+      '- Added descriptions to create_html_file schema properties so the LLM understands what values to provide for title and content_draft',
+      '- The LLM can now self-correct on the first retry instead of looping through multiple wrong parameter names',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: CRM Lead Lists Now Accessible in Admin Delegated Chat Sessions',
+      '- When an admin accessed a user\'s account via delegated access and called get_lead_lists (or other CRM tools) in a chat session, 0 lists were returned even though the user had lists configured',
+      '- Root cause: the session was passing the admin\'s user ID to the worker instead of the account owner\'s user ID, so queries hit the wrong data partition',
+      '- Fix: chat sessions now always use the session owner\'s user ID for tool execution, regardless of who initiated the request',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: LinkedIn Connection Accepted Notification Now Fires Only Once',
+      '- The email notification sent when a lead accepts your LinkedIn invitation was being sent repeatedly every 10 minutes',
+      '- Fixed a broken watermark that caused the sync cron to treat already-seen connections as new on every run',
+      '- Added a dedup guard on the lead record so the notification is guaranteed to fire at most once per connection, even if the cron runs overlap',
+    ],
+  },
+  {
+    date: '2026-05-26',
+    changes: [
+      'Improved: Admin Skills Page Now Enforces Review Gate for User-Created Private Skills',
+      '- Private and pending-review skills submitted by users are clearly labeled in the admin Skills table',
+      '- Owner email is shown beneath the skill name so admins know who submitted it',
+      '- Edit, subscription assignment, and public visibility controls are disabled for private/pending skills until they are approved through the review queue',
+    ],
+  },
+  {
+    date: '2026-05-26',
+    changes: [
+      'Fixed: Agent Mode Now Shows a Clear Message When a Response Times Out',
+      '- Previously, if a response took too long to generate, Agent Mode showed a generic "unknown error" message',
+      '- It now shows: "The response took too long to generate. Please try again — your session is still active."',
+      '- Your session and conversation history are preserved; just send your message again to continue',
+    ],
+  },
+  {
+    date: '2026-05-26',
+    changes: [
+      'Improved: Agent Mode Timeout Extended to 10 Minutes',
+      '- Long-running browser automation tasks (such as scraping LinkedIn profiles with a local agent) now have a 10-minute window before timing out, up from 5 minutes',
+    ],
+  },
+  {
+    date: '2026-05-26',
+    changes: [
+      'Fixed: New Users No Longer Incorrectly Assigned Basic Subscription Tier',
+      '- Users who signed up but whose subscription tier was not saved correctly were appearing as "Basic" (full-access) instead of "Free"',
+      '- The fallback tier used when no subscription is set now correctly defaults to Free rather than Basic',
+    ],
+  },
+  {
+    date: '2026-05-26',
+    changes: [
+      'Fixed: Landing Pages No Longer Get Stuck in "Deploying" Status Due to Route Conflicts',
+      '- New landing pages added to a shared site could fail to build because the generated code included an API route that conflicted with an existing shared route, causing a Turbopack build error',
+      '- The duplicate API route is now skipped during deployment; sub-pages correctly use the shared lead capture endpoint instead of creating a conflicting one',
+    ],
+  },
+  {
     date: '2026-05-25',
     changes: [
       'Improved: CRM Enrichment Now Shows Source Quality for Every Field',
@@ -434,6 +528,20 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Users who added Google Drive folders before joining an organization were seeing the folders listed but getting errors when trying to load files',
       '- Emma also could not access those Drive folders, making them invisible to AI tools',
       '- Drive folders are now merged across the org and user records, so all previously configured folders work without any manual re-configuration',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'New: LinkedIn Connection Notifications — Get Notified and Reply Instantly',
+      '- When a lead accepts your LinkedIn invitation, you now receive an email notification: "{Lead Name} accepted your LinkedIn invitation"',
+      '- Clicking the link opens the CRM directly to that lead\'s record with the LinkedIn compose area active',
+      '- A personalized AI-drafted follow-up message is pre-filled so you can reply with one click',
+      'Improved: CRM "Latest Signal" Column — See What\'s Actually Happening',
+      '- The "Last Contact" column is now "Latest Signal" across all CRM views (Inbox, list view, lead table)',
+      '- Shows actionable context: "LinkedIn connected 2d ago", "Email reply 5d ago", "Email opened 3d ago", etc.',
+      'Improved: LinkedIn Connected Filter in CRM',
+      '- New filter to show only 1st-degree LinkedIn connections — useful for finding leads ready for warm follow-up',
     ],
   },
   {
