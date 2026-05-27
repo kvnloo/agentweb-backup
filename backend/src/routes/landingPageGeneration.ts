@@ -1404,6 +1404,119 @@ router.get("/generated/:id/preview-url", async (req, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
+// Helper: load integrations payload for a given page (no auth check).
+// Returns the same shape as GET /generated/:id/integrations.
+// ---------------------------------------------------------------------------
+async function loadIntegrationsForPage(page: GeneratedLandingPage): Promise<{
+  recaptcha: { siteKey: string; secretKeyIsSet: boolean };
+  custom: Array<{ key: string; value: string; id?: string; secret?: boolean }>;
+}> {
+  const vercelProjectId = await resolveVercelProjectId(page);
+  if (!vercelProjectId) {
+    return { recaptcha: { siteKey: "", secretKeyIsSet: false }, custom: [] };
+  }
+
+  const envMap = await getProjectEnvVars(vercelProjectId);
+  const cfg = INTEGRATIONS.recaptcha;
+  const siteKeyEntry = envMap[cfg.siteKey.envKey];
+  const secretKeyEntry = envMap[cfg.secretKey.envKey];
+
+  // All known integration env var keys
+  const knownKeys = new Set<string>([cfg.siteKey.envKey, cfg.secretKey.envKey]);
+
+  // Custom env vars: anything not in a known integration
+  const custom = Object.entries(envMap)
+    .filter(([key]) => !knownKeys.has(key))
+    .map(([key, entry]) => ({ key, value: entry.value, id: entry.id, secret: entry.type === "encrypted" }));
+
+  return {
+    recaptcha: {
+      siteKey: siteKeyEntry?.value ?? "",
+      secretKeyIsSet: !!secretKeyEntry?.id,
+    },
+    custom,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Helper: save integrations for a given page (no auth check).
+// Upserts/deletes env vars on the Vercel project and triggers a redeployment.
+// Returns the list of env var keys that were touched.
+// Throws if the page has no Vercel project.
+// ---------------------------------------------------------------------------
+async function saveIntegrationsForPage(
+  page: GeneratedLandingPage,
+  body: {
+    recaptcha?: { siteKey?: string; secretKey?: string };
+    custom?: Array<{ key: string; value: string; secret?: boolean; id?: string; _delete?: boolean }>;
+  },
+): Promise<{ updated: string[] }> {
+  const vercelProjectId = await resolveVercelProjectId(page);
+  if (!vercelProjectId) {
+    throw new Error("Landing page has no Vercel project — deploy it first");
+  }
+
+  const { recaptcha, custom } = body;
+
+  const envMap = await getProjectEnvVars(vercelProjectId);
+  const updated: string[] = [];
+  const allTargets = ["production", "preview", "development"];
+
+  if (recaptcha) {
+    const cfg = INTEGRATIONS.recaptcha;
+
+    if (recaptcha.siteKey !== undefined) {
+      const existing = envMap[cfg.siteKey.envKey];
+      if (recaptcha.siteKey === "") {
+        if (existing?.ids) await Promise.all(existing.ids.map(id => deleteEnvVar(vercelProjectId, id)));
+      } else {
+        await upsertEnvVar(vercelProjectId, cfg.siteKey.envKey, recaptcha.siteKey, cfg.siteKey.target as string[], existing?.ids, cfg.siteKey.type);
+      }
+      updated.push(cfg.siteKey.envKey);
+    }
+
+    if (recaptcha.secretKey !== undefined) {
+      const existing = envMap[cfg.secretKey.envKey];
+      if (recaptcha.secretKey === "") {
+        if (existing?.ids) await Promise.all(existing.ids.map(id => deleteEnvVar(vercelProjectId, id)));
+      } else {
+        await upsertEnvVar(vercelProjectId, cfg.secretKey.envKey, recaptcha.secretKey, cfg.secretKey.target as string[], existing?.ids, cfg.secretKey.type);
+      }
+      updated.push(cfg.secretKey.envKey);
+    }
+  }
+
+  if (Array.isArray(custom)) {
+    for (const entry of custom) {
+      if (!entry.key) continue;
+      if (entry._delete) {
+        const existing = entry.id ? { ids: [entry.id] } : envMap[entry.key];
+        if (existing?.ids) await Promise.all(existing.ids.map(id => deleteEnvVar(vercelProjectId, id)));
+      } else {
+        const existing = envMap[entry.key];
+        await upsertEnvVar(vercelProjectId, entry.key, entry.value, allTargets, existing?.ids, entry.secret ? "encrypted" : "plain");
+      }
+      updated.push(entry.key);
+    }
+  }
+
+  // Trigger a redeployment so the new env vars take effect
+  if (updated.length > 0 && page.githubRepoUrl) {
+    try {
+      const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+      if (repoMatch) {
+        const [, owner, repo] = repoMatch;
+        await triggerVercelDeployment(vercelProjectId, `${owner}/${repo.replace(".git", "")}`);
+      }
+    } catch (deployErr: any) {
+      console.warn(`[LP GENERATION] Could not trigger redeployment after env var update: ${deployErr.message}`);
+    }
+  }
+
+  return { updated };
+}
+
+// ---------------------------------------------------------------------------
 // GET /generated/:id/integrations
 // Returns current integration values for the page's Vercel project.
 // Secret key values are never returned — only a boolean "isSet" flag.
@@ -1417,31 +1530,8 @@ router.get("/generated/:id/integrations", editRateLimiter, async (req: Request, 
     if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
     const page = auth.page;
 
-    const vercelProjectId = await resolveVercelProjectId(page);
-    if (!vercelProjectId) {
-      return res.json({ recaptcha: { siteKey: "", secretKeyIsSet: false } });
-    }
-
-    const envMap = await getProjectEnvVars(vercelProjectId);
-    const cfg = INTEGRATIONS.recaptcha;
-    const siteKeyEntry = envMap[cfg.siteKey.envKey];
-    const secretKeyEntry = envMap[cfg.secretKey.envKey];
-
-    // All known integration env var keys
-    const knownKeys = new Set<string>([cfg.siteKey.envKey, cfg.secretKey.envKey]);
-
-    // Custom env vars: anything not in a known integration
-    const custom = Object.entries(envMap)
-      .filter(([key]) => !knownKeys.has(key))
-      .map(([key, entry]) => ({ key, value: entry.value, id: entry.id, secret: entry.type === "encrypted" }));
-
-    res.json({
-      recaptcha: {
-        siteKey: siteKeyEntry?.value ?? "",
-        secretKeyIsSet: !!secretKeyEntry?.id,
-      },
-      custom,
-    });
+    const payload = await loadIntegrationsForPage(page);
+    res.json(payload);
   } catch (error: any) {
     console.error("[LP GENERATION] Error getting integrations:", error);
     res.status(500).json({ error: error.message || "Failed to get integrations" });
@@ -1462,75 +1552,59 @@ router.put("/generated/:id/integrations", editRateLimiter, async (req: Request, 
     if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
     const page = auth.page;
 
-    const vercelProjectId = await resolveVercelProjectId(page);
-    if (!vercelProjectId) {
-      return res.status(400).json({ error: "Landing page has no Vercel project — deploy it first" });
+    if (typeof req.body !== "object" || req.body == null) {
+      return res.status(400).json({ error: "Invalid body" });
     }
 
-    const { recaptcha, custom } = req.body as {
-      recaptcha?: { siteKey?: string; secretKey?: string };
-      custom?: { key: string; value: string; secret?: boolean; id?: string; _delete?: boolean }[];
-    };
-
-    const envMap = await getProjectEnvVars(vercelProjectId);
-    const updated: string[] = [];
-    const allTargets = ["production", "preview", "development"];
-
-    if (recaptcha) {
-      const cfg = INTEGRATIONS.recaptcha;
-
-      if (recaptcha.siteKey !== undefined) {
-        const existing = envMap[cfg.siteKey.envKey];
-        if (recaptcha.siteKey === "") {
-          if (existing?.ids) await Promise.all(existing.ids.map(id => deleteEnvVar(vercelProjectId, id)));
-        } else {
-          await upsertEnvVar(vercelProjectId, cfg.siteKey.envKey, recaptcha.siteKey, cfg.siteKey.target as string[], existing?.ids, cfg.siteKey.type);
-        }
-        updated.push(cfg.siteKey.envKey);
+    try {
+      const { updated } = await saveIntegrationsForPage(page, req.body);
+      res.json({ success: true, updated });
+    } catch (saveErr: any) {
+      if (saveErr.message?.includes("no Vercel project")) {
+        return res.status(400).json({ error: saveErr.message });
       }
-
-      if (recaptcha.secretKey !== undefined) {
-        const existing = envMap[cfg.secretKey.envKey];
-        if (recaptcha.secretKey === "") {
-          if (existing?.ids) await Promise.all(existing.ids.map(id => deleteEnvVar(vercelProjectId, id)));
-        } else {
-          await upsertEnvVar(vercelProjectId, cfg.secretKey.envKey, recaptcha.secretKey, cfg.secretKey.target as string[], existing?.ids, cfg.secretKey.type);
-        }
-        updated.push(cfg.secretKey.envKey);
-      }
+      throw saveErr;
     }
-
-    if (Array.isArray(custom)) {
-      for (const entry of custom) {
-        if (!entry.key) continue;
-        if (entry._delete) {
-          const existing = entry.id ? { ids: [entry.id] } : envMap[entry.key];
-          if (existing?.ids) await Promise.all(existing.ids.map(id => deleteEnvVar(vercelProjectId, id)));
-        } else {
-          const existing = envMap[entry.key];
-          await upsertEnvVar(vercelProjectId, entry.key, entry.value, allTargets, existing?.ids, entry.secret ? "encrypted" : "plain");
-        }
-        updated.push(entry.key);
-      }
-    }
-
-    // Trigger a redeployment so the new env vars take effect
-    if (updated.length > 0 && page.githubRepoUrl) {
-      try {
-        const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
-        if (repoMatch) {
-          const [, owner, repo] = repoMatch;
-          await triggerVercelDeployment(vercelProjectId, `${owner}/${repo.replace(".git", "")}`);
-        }
-      } catch (deployErr: any) {
-        console.warn(`[LP GENERATION] Could not trigger redeployment after env var update: ${deployErr.message}`);
-      }
-    }
-
-    res.json({ success: true, updated });
   } catch (error: any) {
     console.error("[LP GENERATION] Error updating integrations:", error);
     res.status(500).json({ error: error.message || "Failed to update integrations" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /site/integrations
+// Returns integration values for the caller's root landing site.
+// ---------------------------------------------------------------------------
+router.get("/site/integrations", async (req: Request, res: Response) => {
+  try {
+    const site = await resolveSiteForCaller((req as unknown as AuthenticatedRequest).user!.userId);
+    if (!site) return res.status(404).json({ error: "No landing site found" });
+    const payload = await loadIntegrationsForPage(site);
+    return res.json(payload);
+  } catch (err) {
+    console.error("GET /site/integrations failed:", err);
+    return res.status(500).json({ error: "Failed to load integrations" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PUT /site/integrations
+// Saves integration env vars for the caller's root landing site.
+// Returns the fresh integrations payload (same shape as GET /site/integrations).
+// ---------------------------------------------------------------------------
+router.put("/site/integrations", async (req: Request, res: Response) => {
+  try {
+    const site = await resolveSiteForCaller((req as unknown as AuthenticatedRequest).user!.userId);
+    if (!site) return res.status(404).json({ error: "No landing site found" });
+    if (typeof req.body !== "object" || req.body == null) {
+      return res.status(400).json({ error: "Invalid body" });
+    }
+    await saveIntegrationsForPage(site, req.body);
+    const payload = await loadIntegrationsForPage(site);
+    return res.json(payload);
+  } catch (err) {
+    console.error("PUT /site/integrations failed:", err);
+    return res.status(500).json({ error: "Failed to save integrations" });
   }
 });
 
