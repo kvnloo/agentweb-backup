@@ -1068,7 +1068,7 @@ async function runCodingAgentInternal(
     if (is403Error(error)) {
       return {
         success: false,
-        message: `Not authorized to edit this landing page. The page owner needs to add you as an editor in their organization sharing settings (Settings → Org Sharing → Landing Pages).`,
+        message: `Not authorized to edit this landing page. The org owner needs to add you as an editor under Settings → Organization → Org-wide Sharing → Landing Pages.`,
         iterations: iteration
       };
     }
@@ -1114,7 +1114,7 @@ export async function runCodingAgent(
       if (is403Error(error)) {
         return {
           success: false,
-          message: `Not authorized to edit this landing page. The page owner needs to add you as an editor in their organization sharing settings (Settings → Org Sharing → Landing Pages).`,
+          message: `Not authorized to edit this landing page. The org owner needs to add you as an editor under Settings → Organization → Org-wide Sharing → Landing Pages.`,
           iterations: 0
         };
       }
