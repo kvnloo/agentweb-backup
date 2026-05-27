@@ -69,12 +69,15 @@ describe('GET /api/landing-pages/v0/site', () => {
     mockResolveSiteForCaller.mockResolvedValue({
       id: 'p1', userId: 'u1', status: 'deployed',
       vercelProjectId: 'vp1', githubRepoUrl: 'https://github.com/o/r',
+      gtmContainerId: 'GTM-TEST1',
     });
     const res = await request(app).get('/api/landing-pages/v0/site');
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
       rootPageId: 'p1', vercelProjectId: 'vp1',
-      githubRepoUrl: 'https://github.com/o/r', deployStatus: 'ready',
+      githubRepoUrl: 'https://github.com/o/r',
+      gtmContainerId: 'GTM-TEST1',
+      deployStatus: 'ready',
     });
   });
 

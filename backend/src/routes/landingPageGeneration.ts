@@ -252,6 +252,7 @@ router.get("/site", async (req: Request, res: Response) => {
       rootPageId: site.id,
       vercelProjectId: site.vercelProjectId,
       githubRepoUrl: site.githubRepoUrl,
+      gtmContainerId: site.gtmContainerId,
       deployStatus,
     });
   } catch (err) {
