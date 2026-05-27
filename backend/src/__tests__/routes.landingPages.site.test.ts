@@ -207,6 +207,17 @@ describe('POST /api/landing-pages/v0/site/gtm', () => {
     expect(res.status).toBe(400);
   });
 
+  it('returns 400 when GitHub 404s on layout.tsx', async () => {
+    mockResolveSiteForCaller.mockResolvedValue({
+      id: 'p1', userId: 'u1', vercelProjectId: 'vp1',
+      githubRepoUrl: 'https://github.com/o/r', status: 'deployed',
+    });
+    mockAxiosGet.mockRejectedValue({ response: { status: 404 } });
+    const res = await request(app).post('/api/landing-pages/v0/site/gtm').send({ gtmContainerId: 'GTM-ABCD1' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/app\/layout\.tsx not found/);
+  });
+
   it('happy path → 200', async () => {
     mockResolveSiteForCaller.mockResolvedValue({
       id: 'p1', userId: 'u1', vercelProjectId: 'vp1',

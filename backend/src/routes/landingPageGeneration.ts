@@ -1270,7 +1270,8 @@ router.post("/generated/:id/gtm", editRateLimiter, async (req, res: Response) =>
     res.json({ success: true, gtmContainerId: containerId, message: `GTM container ${containerId} injected. Your site will redeploy shortly.` });
   } catch (error: any) {
     console.error("[LP GENERATION] Error injecting GTM:", error);
-    res.status(500).json({ error: error.response?.data?.message || error.message || "Failed to inject GTM" });
+    const httpStatus = error?.httpStatus ?? 500;
+    res.status(httpStatus).json({ error: error.response?.data?.message || error.message || "Failed to inject GTM" });
   }
 });
 
@@ -1562,6 +1563,9 @@ async function saveGtmForPage(
       break; // success — exit retry loop
     } catch (err: any) {
       const status = err?.response?.status;
+      if (status === 404) {
+        throw Object.assign(new Error("app/layout.tsx not found in the repository"), { httpStatus: 400 });
+      }
       if (status === 409 && attempt < MAX_ATTEMPTS) continue;
       throw err;
     }
@@ -1595,9 +1599,10 @@ router.post("/site/gtm", async (req: AuthenticatedRequest, res: Response) => {
     if (!site) return res.status(404).json({ error: "No landing site found" });
     await saveGtmForPage(site, gtmContainerId);
     return res.json({ ok: true, gtmContainerId });
-  } catch (err) {
+  } catch (err: any) {
     console.error("POST /site/gtm failed:", err);
-    return res.status(500).json({ error: "Failed to save GTM" });
+    const httpStatus = err?.httpStatus ?? 500;
+    return res.status(httpStatus).json({ error: err?.message ?? "Failed to save GTM" });
   }
 });
 
