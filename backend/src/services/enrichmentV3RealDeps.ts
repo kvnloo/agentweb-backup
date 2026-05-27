@@ -858,10 +858,11 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
               console.log(`${tag} Case B SKIP no firstName/lastName`);
               return null;
             }
-            const keywordParts = [`${lead.firstName} ${lead.lastName}`];
-            if (lead.company) keywordParts.push(lead.company);
-            else if (lead.title) keywordParts.push(lead.title);
-            const searchParams: Record<string, string> = { keywords: keywordParts.join(' ') };
+            const searchParams: Record<string, string> = {
+              keywords: `${lead.firstName} ${lead.lastName}`,
+            };
+            if (lead.company) searchParams.company = lead.company;
+            else if (lead.title) searchParams.title = lead.title;
             console.log(`${tag} Case B searchPeople params=${JSON.stringify(searchParams)}`);
             const searchResult = await linkedInOutreachService.searchPeople(accountId, searchParams);
             const candidates = (searchResult?.items ?? []).slice(0, 5);
