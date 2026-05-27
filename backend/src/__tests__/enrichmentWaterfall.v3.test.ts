@@ -982,7 +982,7 @@ describe('runWaterfall — Tier 3.5c (Unipile person enrichment)', () => {
   it('fires for person group when Apollo misses fields; direct-maps root-level fields', async () => {
     const deps = makeDeps({
       findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null, personProfileRaw }),
-      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: { title: 'VP Marketing' }, missing: [] }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: { title: fv('VP Marketing') }, missing: [] }),
     });
     const result = await runWaterfall(
       makeInput({
@@ -1039,7 +1039,7 @@ describe('runWaterfall — Tier 3.5c (Unipile person enrichment)', () => {
   it('falls through to LLM for fields not in direct map', async () => {
     const deps = makeDeps({
       findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null, personProfileRaw }),
-      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: { seniority: 'vp' }, missing: [] }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: { seniority: fv('vp') }, missing: [] }),
     });
     const result = await runWaterfall(
       makeInput({ groupName: 'person_identity', requestedFields: ['seniority'] }),
@@ -1071,7 +1071,7 @@ describe('runWaterfall — Tier 3.5c (Unipile person enrichment)', () => {
     const deps = makeDeps({
       findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null, personProfileRaw }),
       extractFieldsViaLLM: jest.fn().mockResolvedValue({
-        filled: { tenure_at_company: '2y 0m', prior_companies: 'OldCo', education: 'MIT, MBA' },
+        filled: { tenure_at_company: fv('2y 0m'), prior_companies: fv('OldCo'), education: fv('MIT, MBA') },
         missing: [],
       }),
     });
@@ -1101,7 +1101,7 @@ describe('runWaterfall — Tier 3.5c (Unipile person enrichment)', () => {
     };
     const deps = makeDeps({
       findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null, personProfileRaw: multiJobProfile }),
-      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: { title: 'VP Marketing' }, missing: [] }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: { title: fv('VP Marketing') }, missing: [] }),
     });
     const result = await runWaterfall(
       makeInput({
@@ -1148,7 +1148,7 @@ describe('runWaterfall — Tier 3.5c (Unipile person enrichment)', () => {
   it('delegates recent_role_change_date to LLM (job-dependent field)', async () => {
     const deps = makeDeps({
       findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: null, personProfileRaw }),
-      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: { recent_role_change_date: '1/1/2023' }, missing: [] }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({ filled: { recent_role_change_date: fv('1/1/2023') }, missing: [] }),
     });
     const result = await runWaterfall(
       makeInput({ groupName: 'person_career', requestedFields: ['recent_role_change_date'] }),
