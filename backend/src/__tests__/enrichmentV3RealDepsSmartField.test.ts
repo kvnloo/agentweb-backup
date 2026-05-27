@@ -262,7 +262,7 @@ describe('evaluateSmartField — LLM response handling', () => {
       lead: makeLead({ company: 'Acme' }),
       fieldName: 'f', condition: 'c', depValues: {},
     });
-    expect(result).toEqual({ value: 'yes', reasoning: 'matched' });
+    expect(result).toEqual({ value: 'yes', reasoning: 'matched', model: 'gpt-5-chat-2' });
   });
 
   it('returns value: null when LLM returns null value', async () => {
@@ -272,7 +272,7 @@ describe('evaluateSmartField — LLM response handling', () => {
       lead: makeLead({}),
       fieldName: 'f', condition: 'c', depValues: {},
     });
-    expect(result).toEqual({ value: null, reasoning: '' });
+    expect(result).toEqual({ value: null, reasoning: '', model: 'gpt-5-chat-2' });
   });
 
   it('coerces non-null LLM value to string', async () => {
@@ -302,6 +302,6 @@ describe('evaluateSmartField — LLM response handling', () => {
       lead: makeLead({}),
       fieldName: 'f', condition: 'c', depValues: {},
     });
-    expect(result).toEqual({ value: null, reasoning: '' });
+    expect(result).toEqual({ value: null, reasoning: '', model: 'gpt-5-chat-2' });
   });
 });
