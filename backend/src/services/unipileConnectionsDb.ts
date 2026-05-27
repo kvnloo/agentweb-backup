@@ -116,6 +116,27 @@ export async function getConnectionByProfileUrlAndAccount(
   return (result.Items?.[0] as UnipileConnection) ?? null;
 }
 
+/**
+ * Fetch all connection records for a specific Unipile accountId.
+ * Used by the linkedInConnected server-side filter.
+ */
+export async function getAllConnectionsByAccount(accountId: string): Promise<UnipileConnection[]> {
+  const items: UnipileConnection[] = [];
+  let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+  do {
+    const result = await dynamodb.query({
+      TableName: TABLE,
+      KeyConditionExpression: 'accountId = :aid',
+      FilterExpression: 'memberId <> :wm',
+      ExpressionAttributeValues: { ':aid': accountId, ':wm': '__latest__' },
+      ExclusiveStartKey: lastEvaluatedKey,
+    }).promise();
+    items.push(...((result.Items ?? []) as UnipileConnection[]));
+    lastEvaluatedKey = result.LastEvaluatedKey as AWS.DynamoDB.DocumentClient.Key | undefined;
+  } while (lastEvaluatedKey);
+  return items;
+}
+
 /** Get the timestamp of the most recently synced connection for an account. */
 export async function getLatestConnectedAt(accountId: string): Promise<number | null> {
   // Read the watermark row written by upsertConnections (SK='__latest__').
