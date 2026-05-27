@@ -26,6 +26,7 @@ import {
   upsertEnvVar,
   deleteEnvVar,
   updateLandingPageContext,
+  updateLandingPageLeadList,
   INTEGRATIONS,
   resolveSiteForCaller,
 } from "../services/v0Service";
@@ -1682,6 +1683,61 @@ router.patch("/generated/:id/context", authenticateToken, async (req, res: Respo
   } catch (error: any) {
     console.error("[LP GENERATION] Error updating context:", error);
     res.status(500).json({ error: error.message || "Failed to update context" });
+  }
+});
+
+/**
+ * PATCH /api/landing-pages/v0/generated/:id/lead-list
+ * Set or clear the CRM lead list associated with this landing page.
+ * Body: { leadListId: string | null }
+ */
+router.patch("/generated/:id/lead-list", async (req: AuthenticatedRequest, res) => {
+  try {
+    const callerUserId = req.user!.userId;
+    const { id } = req.params;
+    if (!("leadListId" in (req.body ?? {}))) {
+      return res.status(400).json({ error: "leadListId is required (string or null)" });
+    }
+    const { leadListId } = req.body as { leadListId: string | null };
+    if (leadListId !== null && typeof leadListId !== "string") {
+      return res.status(400).json({ error: "leadListId must be a string or null" });
+    }
+
+    const authz = await authorizeLandingPageAccess(id, callerUserId, "edit");
+    if (!authz.ok) return res.status(authz.status).json({ error: authz.error });
+
+    if (leadListId !== null) {
+      const list = await crmDb.getLeadListById(leadListId);
+      if (!list) return res.status(404).json({ error: "Lead list not found" });
+      const sameOwner = list.userId === authz.page.userId;
+      if (!sameOwner) {
+        const callerUser = await userDb.getUserById(callerUserId);
+        const listOwner = await userDb.getUserById(list.userId);
+        const org = callerUser?.orgId ? await orgDb.getOrgById(callerUser.orgId) : null;
+        const allowed = canEditItem(
+          { userId: list.userId },
+          { userId: callerUserId, orgId: callerUser?.orgId, orgRole: callerUser?.orgRole as any },
+          org,
+          listOwner?.orgId,
+          "crm",
+        );
+        if (!allowed) return res.status(403).json({ error: "Lead list not accessible" });
+      }
+    }
+
+    try {
+      await updateLandingPageLeadList(id, authz.page.userId, leadListId);
+    } catch (err: any) {
+      if (err?.code === "ConditionalCheckFailedException" || err?.name === "ConditionalCheckFailedException") {
+        return res.status(409).json({ error: "Page was modified concurrently" });
+      }
+      throw err;
+    }
+    const updated = await getLandingPageById(id);
+    return res.json(updated);
+  } catch (err) {
+    console.error("PATCH /lead-list failed:", err);
+    return res.status(500).json({ error: "Failed to update lead list" });
   }
 });
 

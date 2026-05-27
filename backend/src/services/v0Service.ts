@@ -2423,6 +2423,29 @@ export async function updateLandingPageContext(
     .promise();
 }
 
+export async function updateLandingPageLeadList(
+  pageId: string,
+  ownerUserId: string,
+  leadListId: string | null,
+): Promise<void> {
+  const params: any = {
+    TableName: TABLE_NAME,
+    Key: { id: pageId },
+    ConditionExpression: "userId = :ownerId",
+    ExpressionAttributeValues: {
+      ":ownerId": ownerUserId,
+      ":updatedAt": new Date().toISOString(),
+    },
+  };
+  if (leadListId === null) {
+    params.UpdateExpression = "REMOVE leadListId SET updatedAt = :updatedAt";
+  } else {
+    params.UpdateExpression = "SET leadListId = :leadListId, updatedAt = :updatedAt";
+    params.ExpressionAttributeValues[":leadListId"] = leadListId;
+  }
+  await dynamodb.update(params).promise();
+}
+
 /**
  * Get all (non-archived) landing pages for a specific owner.
  * Uses UserIdIndex GSI on AW-LandingPages.
