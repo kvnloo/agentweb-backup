@@ -29,6 +29,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-27',
     changes: [
+      'Fixed: Coding Agent Can Now Create New Files in Landing Pages',
+      '- Previously, asking the coding agent to create a new file (e.g. an API route) would always fail with "Failed to read file"',
+      '- The agent now correctly handles files that don\'t exist yet — it creates them from scratch',
+      '- This unblocks use cases like adding a Next.js API proxy route to bypass CORS on landing page lead forms',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
       'Fixed: LinkedIn Connection Status Now Scoped Strictly to the List\'s Assigned Account',
       '- Previously, LinkedIn connection status checks could match connections from site-wide scraping accounts or other users\' accounts, producing false "connected" results in the CRM overview',
       '- Connection status is now checked exclusively against the LinkedIn account explicitly assigned to each lead list — no fallbacks, no cross-account leakage',
