@@ -4012,7 +4012,7 @@ router.post('/lists/:listId/leads/:leadId/sync-linkedin-messages', async (req: R
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if ((list as any).userId !== userId) {
+    if (!(await canAccessCrmList(userId, list as any))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -4077,7 +4077,7 @@ router.post('/lists/:listId/leads/:leadId/sync-linkedin-connection', async (req:
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
     const list = await crmDb.getLeadListById(listId);
-    if (!list || (list as any).userId !== userId) {
+    if (!list || !(await canAccessCrmList(userId, list as any))) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
