@@ -9047,7 +9047,7 @@ export class AgentModeService {
         if (senderInfo.notes) {
           emailPrompt += `\n- Notes: ${senderInfo.notes}`;
         }
-        emailPrompt += `\n\nUse this sender information to create an appropriate email signature. The signature should match the sender's name.`;
+        emailPrompt += `\n\nIMPORTANT: Use ONLY this sender information for the email signature. The signature MUST match the sender's name above, even if the lead's notes or engagement history mention a different person's name.`;
         if (senderInfo.notes) {
           emailPrompt += ` If the notes contain a meeting schedule link or other relevant information, consider including it in the email where appropriate.`;
         }
