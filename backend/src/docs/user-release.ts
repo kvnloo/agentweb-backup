@@ -11,6 +11,51 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-27',
     changes: [
+      'Internal: Chat History Sessions Now Have Reviewer Links',
+      '- Every session in the admin Chat History tab now automatically gets an ishare link on first load',
+      '- Reviewers can use these links to view and interact with sessions for output quality review',
+      '- Links are generated once and stored with the session; no regeneration on subsequent loads',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Improved: Agent Mode Votes Now Create Notion Items for Team Review',
+      '- Thumbs-up and thumbs-down votes on Agent Mode responses now automatically create a Notion task so the team can review positive feedback to learn from and negative feedback to fix',
+      '- Works for both authenticated users and anonymous visitors on shared (iShare) sessions',
+      '- Items are tagged Feedback-Like or Feedback-Dislike and include the session name, message preview, and any comment left by the user',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Improved: CRM Lead Panel Now Auto-Syncs LinkedIn Messages and Uses Activity History for Drafts',
+      '- Opening a lead detail panel now automatically syncs the lead\'s LinkedIn message history (if a LinkedIn URL is set) — no more manual "Sync LinkedIn" click needed',
+      '- The sync runs silently on panel open if the last sync was more than 10 minutes ago, so the activity timeline is always fresh',
+      '- AI-generated LinkedIn message drafts now consider the full engagement history — past emails, LinkedIn messages, and interactions are included in the prompt so drafts feel relevant and reference prior touchpoints',
+      '- This applies both to on-demand drafts (Draft Message button) and auto-generated drafts triggered when a LinkedIn connection is accepted',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: Emma No Longer Tells Users to Connect Slack via Connected Accounts',
+      '- When no Slack channel was configured, Emma was incorrectly directing users to Settings → Connected Accounts to connect Slack',
+      '- Slack channels are configured by an admin, not through individual user settings — Emma now correctly tells users to contact their admin to set up Slack access',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: Coding Agent Can Now Create New Files in Landing Pages',
+      '- Previously, asking the coding agent to create a new file (e.g. an API route) would always fail with "Failed to read file"',
+      '- The agent now correctly handles files that don\'t exist yet — it creates them from scratch',
+      '- This unblocks use cases like adding a Next.js API proxy route to bypass CORS on landing page lead forms',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
       'Fixed: LinkedIn Connection Status Now Scoped Strictly to the List\'s Assigned Account',
       '- Previously, LinkedIn connection status checks could match connections from site-wide scraping accounts or other users\' accounts, producing false "connected" results in the CRM overview',
       '- Connection status is now checked exclusively against the LinkedIn account explicitly assigned to each lead list — no fallbacks, no cross-account leakage',
@@ -61,6 +106,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When an admin accessed a user\'s account via delegated access and called get_lead_lists (or other CRM tools) in a chat session, 0 lists were returned even though the user had lists configured',
       '- Root cause: the session was passing the admin\'s user ID to the worker instead of the account owner\'s user ID, so queries hit the wrong data partition',
       '- Fix: chat sessions now always use the session owner\'s user ID for tool execution, regardless of who initiated the request',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: Org Members Can Now Sync LinkedIn Messages in CRM',
+      '- Clicking "Sync LinkedIn" on a lead in a list owned by your org owner was returning an "Access denied" error for org members',
+      '- Both the LinkedIn message sync and LinkedIn connection sync endpoints now correctly allow access for members of the same organization',
     ],
   },
   {
@@ -6925,6 +6978,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When adding a LinkedIn step to a Sequence, you now see a "Send from" dropdown showing your connected LinkedIn Outreach accounts',
       '- If no account is connected, a clear warning appears on the step and saving is blocked until you connect one in Settings → Connected Accounts',
       '- If an account is connected but expired or disconnected, the pre-save check tells you to reconnect before the sequence can go active',
+    ],
+  },
+  {
+    date: '2026-05-27',
+    changes: [
+      'Fixed: Org Members Can Now Use Slack Features',
+      '- Organization members were seeing "No Slack channel is configured" when using Slack tools, even when the org owner had Slack set up',
+      '- Org members now automatically inherit the org owner\'s configured Slack channels',
+      '- All Slack tools (list channels, read messages, send messages) work correctly for org members',
     ],
   },
   {

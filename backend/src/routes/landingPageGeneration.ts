@@ -988,12 +988,25 @@ router.get("/generated/:id/file-content", async (req, res: Response) => {
         { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" } }
       );
     } catch (refErr: any) {
-      // If draft branch doesn't exist yet, fall back to main
-      if (branch !== "main" && refErr.response?.status === 404) {
-        fileRes = await axios.get<any>(
-          `https://api.github.com/repos/${owner}/${repoName}/contents/${filePath}`,
-          { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" } }
-        );
+      if (refErr.response?.status === 404) {
+        // Draft branch doesn't exist yet — fall back to main
+        if (branch !== "main") {
+          try {
+            fileRes = await axios.get<any>(
+              `https://api.github.com/repos/${owner}/${repoName}/contents/${filePath}`,
+              { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" } }
+            );
+          } catch (mainErr: any) {
+            // File also doesn't exist on main — new file
+            if (mainErr.response?.status === 404) {
+              return res.status(404).json({ error: "File not found", newFile: true });
+            }
+            throw mainErr;
+          }
+        } else {
+          // File doesn't exist on main either — new file
+          return res.status(404).json({ error: "File not found", newFile: true });
+        }
       } else {
         throw refErr;
       }
@@ -1523,31 +1536,34 @@ async function saveGtmForPage(
         `        <noscript dangerouslySetInnerHTML={{ __html: \`<iframe src="https://www.googletagmanager.com/ns.html?id=${containerId}" height="0" width="0" style="display:none;visibility:hidden"></iframe>\` }} />\n` +
         `        {/* End Google Tag Manager (noscript) */}`;
 
-      // 3. Idempotent injection — strip any existing GTM block first
+      // 3. Strip any existing GTM blocks (always, whether adding or removing)
       let updatedContent = currentContent
         .replace(/[ \t]*\{\/\* Google Tag Manager \*\/\}[\s\S]*?\{\/\* End Google Tag Manager \*\/\}\n?/g, "")
         .replace(/[ \t]*\{\/\* Google Tag Manager \(noscript\) \*\/\}[\s\S]*?\{\/\* End Google Tag Manager \(noscript\) \*\/\}\n?/g, "");
 
-      // Insert head snippet inside <head> (before </head> or before first child after <head>)
-      if (/<head[^>]*>/.test(updatedContent)) {
-        updatedContent = updatedContent.replace(
-          /(<head[^>]*>)/,
-          `$1\n${gtmHeadSnippet}`
-        );
-      } else {
-        // Fallback: insert before <body
-        updatedContent = updatedContent.replace(
-          /(<body[^>]*>)/,
-          `${gtmHeadSnippet}\n      $1`
-        );
-      }
+      // Only re-inject if we have a non-empty containerId
+      if (containerId) {
+        // Insert head snippet inside <head> (before </head> or before first child after <head>)
+        if (/<head[^>]*>/.test(updatedContent)) {
+          updatedContent = updatedContent.replace(
+            /(<head[^>]*>)/,
+            `$1\n${gtmHeadSnippet}`
+          );
+        } else {
+          // Fallback: insert before <body
+          updatedContent = updatedContent.replace(
+            /(<body[^>]*>)/,
+            `${gtmHeadSnippet}\n      $1`
+          );
+        }
 
-      // Insert noscript snippet immediately after <body ...>
-      if (/<body[^>]*>/.test(updatedContent)) {
-        updatedContent = updatedContent.replace(
-          /(<body[^>]*>)/,
-          `$1\n${gtmBodySnippet}`
-        );
+        // Insert noscript snippet immediately after <body ...>
+        if (/<body[^>]*>/.test(updatedContent)) {
+          updatedContent = updatedContent.replace(
+            /(<body[^>]*>)/,
+            `$1\n${gtmBodySnippet}`
+          );
+        }
       }
 
       // 4. Commit updated layout.tsx to GitHub
@@ -1555,7 +1571,7 @@ async function saveGtmForPage(
       await axios.put<any>(
         `${repoBase}/contents/${layoutPath}`,
         {
-          message: `chore: inject GTM container ${containerId}`,
+          message: containerId ? `chore: inject GTM container ${containerId}` : "chore: remove GTM container",
           content: base64New,
           sha: fileSha,
         },
@@ -1595,13 +1611,17 @@ router.post("/site/gtm", async (req, res: Response) => {
   if (!userId) return res.status(401).json({ error: "Unauthorized" });
   try {
     const { gtmContainerId } = req.body ?? {};
-    if (!gtmContainerId || typeof gtmContainerId !== "string" || !/^GTM-[A-Z0-9]{4,10}$/.test(gtmContainerId)) {
+    if (typeof gtmContainerId !== "string") {
+      return res.status(400).json({ error: "Invalid GTM container ID" });
+    }
+    const isRemove = gtmContainerId.trim() === "";
+    if (!isRemove && !/^GTM-[A-Z0-9]{4,10}$/.test(gtmContainerId)) {
       return res.status(400).json({ error: "Invalid GTM container ID" });
     }
     const site = await resolveSiteForCaller(userId);
     if (!site) return res.status(404).json({ error: "No landing site found" });
-    await saveGtmForPage(site, gtmContainerId);
-    return res.json({ ok: true, gtmContainerId });
+    await saveGtmForPage(site, isRemove ? "" : gtmContainerId);
+    return res.json({ ok: true, gtmContainerId: isRemove ? "" : gtmContainerId });
   } catch (err: any) {
     console.error("POST /site/gtm failed:", err);
     const httpStatus = err?.httpStatus ?? 500;

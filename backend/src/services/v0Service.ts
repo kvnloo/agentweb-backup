@@ -1844,6 +1844,29 @@ export async function getDeploymentStatus(
     return { status: record.status, buildStatus: "error", buildError, deployedUrl: record.deployedUrl };
   }
 
+  // Auto-heal: if Vercel shows the project is READY but our record says failed/deploying, sync it.
+  if (state === "READY" && (record.status === "failed" || record.status === "deploying")) {
+    try {
+      await dynamodb.update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "SET #status = :status, updatedAt = :updatedAt REMOVE errorMessage",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: {
+          ":status": "deployed",
+          ":updatedAt": new Date().toISOString(),
+        },
+      }).promise();
+    } catch (_e) {
+      // Best-effort — don't block the status response
+    }
+    return {
+      status: "deployed",
+      buildStatus: "success",
+      deployedUrl: record.deployedUrl,
+    };
+  }
+
   return {
     status: record.status,
     buildStatus: state === "READY" ? "success" : state.toLowerCase(),
@@ -2388,17 +2411,28 @@ export async function updateLandingPageGtm(
   const record = await getLandingPage(id, userId);
   if (!record) throw new Error("Landing page not found");
 
-  await dynamodb
-    .update({
-      TableName: TABLE_NAME,
-      Key: { id },
-      UpdateExpression: "SET gtmContainerId = :gtm, updatedAt = :now",
-      ExpressionAttributeValues: {
-        ":gtm": gtmContainerId,
-        ":now": new Date().toISOString(),
-      },
-    })
-    .promise();
+  if (gtmContainerId) {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "SET gtmContainerId = :gtm, updatedAt = :now",
+        ExpressionAttributeValues: {
+          ":gtm": gtmContainerId,
+          ":now": new Date().toISOString(),
+        },
+      })
+      .promise();
+  } else {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "REMOVE gtmContainerId SET updatedAt = :now",
+        ExpressionAttributeValues: { ":now": new Date().toISOString() },
+      })
+      .promise();
+  }
 }
 
 export async function updateLandingPageContext(

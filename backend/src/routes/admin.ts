@@ -2748,6 +2748,31 @@ router.post("/announcements/load-from-url", async (req, res) => {
   }
 });
 
+// Ensures every session has an ishare link for reviewer access.
+// Creates a 7-day interactive share on first load; once stored, the token is reused indefinitely.
+async function ensureIshareLinkForReview(sessions: any[]): Promise<void> {
+  await Promise.all(
+    sessions.map(async (session) => {
+      const meta = session.interactiveShareMetadata;
+      if (meta?.isActive && meta?.token) return;
+      try {
+        const ishareUrl = await chatbotDb.createOrReuseInteractiveShare(session.sessionId, 7);
+        const token = new URL(ishareUrl).searchParams.get("conversable");
+        if (token) {
+          session.interactiveShareMetadata = {
+            isActive: true,
+            token,
+            sharedAt: new Date().toISOString(),
+            expiresAt: new Date(Date.now() + 7 * 86400000).toISOString(),
+          };
+        }
+      } catch (err) {
+        console.error(`Error ensuring ishare link for session ${session.sessionId}:`, err);
+      }
+    })
+  );
+}
+
 // Add the chat sessions route
 router.get("/chat-sessions", async (req, res) => {
   try {
@@ -2758,11 +2783,12 @@ router.get("/chat-sessions", async (req, res) => {
     // Fast-path: direct lookup by session ID
     if (sessionIdSearch) {
       const session = await chatbotDb.getChatSession(sessionIdSearch);
-      const results = session &&
+      const results: any[] = session &&
         Array.isArray(session.messages) &&
         session.messages.some((msg: any) => msg.role === "user")
         ? [session]
         : [];
+      await ensureIshareLinkForReview(results);
       return res.json({ sessions: results, nextCursor: null });
     }
 
@@ -2830,6 +2856,7 @@ router.get("/chat-sessions", async (req, res) => {
         ? Buffer.from(JSON.stringify({ offset: nextOffset })).toString("base64")
         : null;
 
+      await ensureIshareLinkForReview(nonEmptySessions);
       return res.json({ sessions: nonEmptySessions, nextCursor });
     }
 
@@ -2923,6 +2950,7 @@ router.get("/chat-sessions", async (req, res) => {
       session.messages.some((msg: any) => msg.role === "user")
     );
 
+    await ensureIshareLinkForReview(nonEmptySessions);
     res.json({ sessions: nonEmptySessions, nextCursor });
   } catch (error) {
     console.error("Error fetching chat sessions:", error);

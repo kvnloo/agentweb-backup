@@ -210,6 +210,45 @@ describe('POST /api/landing-pages/v0/site/gtm', () => {
     expect(res.status).toBe(400);
   });
 
+  it('removes GTM when gtmContainerId is empty string', async () => {
+    mockResolveSiteForCaller.mockResolvedValue({
+      id: 'p1', userId: 'u1', vercelProjectId: 'vp1',
+      githubRepoUrl: 'https://github.com/o/r', status: 'deployed',
+    });
+    const layoutWithGtm = [
+      'export default function Layout() {',
+      '  return (',
+      '    <html>',
+      '      <head>',
+      '        {/* Google Tag Manager */}',
+      '        <script dangerouslySetInnerHTML={{ __html: `old-gtm` }} />',
+      '        {/* End Google Tag Manager */}',
+      '      </head>',
+      '      <body>',
+      '        {/* Google Tag Manager (noscript) */}',
+      '        <noscript dangerouslySetInnerHTML={{ __html: `old-noscript` }} />',
+      '        {/* End Google Tag Manager (noscript) */}',
+      '      </body>',
+      '    </html>',
+      '  );',
+      '}',
+    ].join('\n');
+    mockAxiosGet.mockResolvedValue({
+      data: { sha: 'sha1', content: Buffer.from(layoutWithGtm).toString('base64') },
+    });
+    mockAxiosPut.mockResolvedValue({ data: {} });
+    mockUpdateLandingPageGtm.mockResolvedValue(undefined);
+    mockTriggerDeploy.mockResolvedValue(undefined);
+    const res = await request(app).post('/api/landing-pages/v0/site/gtm').send({ gtmContainerId: '' });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true });
+    // Verify DynamoDB was called with empty string (signals removal)
+    expect(mockUpdateLandingPageGtm).toHaveBeenCalledWith('p1', 'u1', '');
+    // Verify the committed content has no GTM blocks
+    const committedContent = Buffer.from(mockAxiosPut.mock.calls[0][1].content, 'base64').toString('utf-8');
+    expect(committedContent).not.toContain('Google Tag Manager');
+  });
+
   it('returns 400 when GitHub 404s on layout.tsx', async () => {
     mockResolveSiteForCaller.mockResolvedValue({
       id: 'p1', userId: 'u1', vercelProjectId: 'vp1',

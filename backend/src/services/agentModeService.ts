@@ -9148,21 +9148,37 @@ ${emailDraftFormat === 'text'
         emailDraft.htmlContent = emailData.htmlContent;
       }
 
+      // Build activity history section for message prompt (reuse already-fetched engagements)
+      let messageActivityContext = '';
+      if (engagements.length > 0) {
+        messageActivityContext = '\n\n## Activity History (most recent first):';
+        engagements.slice(0, 10).forEach((eng: any, index: number) => {
+          messageActivityContext += `\n${index + 1}. [${eng.eventType}] ${eng.createdAt}`;
+          if (eng.eventData?.subject) messageActivityContext += ` — Subject: ${eng.eventData.subject}`;
+          if (eng.text) messageActivityContext += `\n   "${String(eng.text).slice(0, 300)}"`;
+          else if (eng.emailContent?.text) {
+            messageActivityContext += `\n   "${eng.emailContent.text.substring(0, 300)}"`;
+          }
+        });
+      }
+
       // Create message draft for LinkedIn/Facebook/other platforms
       const messagePrompt = `Based on the email draft you just created, now create a shorter message version suitable for LinkedIn, Facebook, or other messaging platforms.
 
 ## Email Draft Created:
 Subject: ${emailData.subject}
 Content: ${emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent}
+${messageActivityContext}
 
 ## Requirements for Message Draft:
 1. Keep it concise and conversational (150-300 characters ideal, max 500)
 2. Maintain the core message and call-to-action from the email
-3. Make it platform-agnostic (works for LinkedIn, Facebook, Twitter DMs, etc.)
-4. Use a friendly, professional tone
-5. Include personalization (use lead's name if appropriate)
-6. No need for subject line or signature
-7. Focus on the key value proposition and CTA
+3. If there is activity history, acknowledge prior touchpoints naturally (e.g. "following up on my earlier email")
+4. Make it platform-agnostic (works for LinkedIn, Facebook, Twitter DMs, etc.)
+5. Use a friendly, professional tone
+6. Include personalization (use lead's name if appropriate)
+7. No need for subject line or signature
+8. Focus on the key value proposition and CTA
 
 Format the response as JSON with this structure:
 {

@@ -35,6 +35,7 @@ import { runLoop } from '../../core/orchestrator';
 import { productionLoopPorts } from '../../adapters/awsAdapters';
 import { NotionDigestTool } from './notionDigestTool';
 import type { LoopRunResult, Mutation, NormalizedEvent } from '../../core/types';
+import type { RcaEnrichment } from './rcaEnricher';
 
 // Hold module-level refs so the cron can drain the gate after orchestrator returns.
 let aiEvalGate: CaptureGate | null = null;
@@ -100,10 +101,17 @@ export async function runAiEvalLoopOnce(): Promise<LoopRunResult> {
   return result;
 }
 
+/** Minimal slice of SlackPort that postDailyDigest actually uses. Exposed
+ * widened in the test seam so unit tests can pass a stub with only the methods
+ * we call. */
+type SlackPosterLike = {
+  postMessage: (channelOrUserId: string, markdown: string) => Promise<unknown>;
+};
+
 async function postDailyDigest(
   result: LoopRunResult,
   mutations: readonly Mutation[],
-  slack: ReturnType<typeof productionLoopPorts>['slack'],
+  slack: SlackPosterLike,
   slackUserId: string | undefined,
 ): Promise<void> {
   if (!slackUserId) {
@@ -128,19 +136,30 @@ async function postDailyDigest(
     for (let i = 0; i < mutations.length; i++) {
       const m = mutations[i];
       const p = result.proposals[i];
-      const artifact = m.artifact as { notionUrl?: string; title?: string };
+      const artifact = m.artifact as {
+        notionUrl?: string;
+        title?: string;
+        rcaEnrichment?: RcaEnrichment;
+      };
       const ruleId = p?.sourceRuleId ?? 'unknown';
       const titleLine = artifact.notionUrl
         ? `${i + 1}. <${artifact.notionUrl}|${artifact.title ?? ruleId}>`
         : `${i + 1}. ${artifact.title ?? ruleId}`;
       lines.push(titleLine);
       lines.push(`   Rule: \`${ruleId}\`  |  Kind: \`${p?.kind ?? 'n/a'}\``);
+      // RCA top-fix line: one indented bullet under each rule. Acceptance #3.
+      const rca = artifact.rcaEnrichment;
+      if (rca?.error) {
+        lines.push(`   ⚠️ RCA unavailable`);
+      } else if (rca && rca.rankedFixes.length > 0) {
+        lines.push(`   ↳ Top fix: ${truncateForSlack(rca.rankedFixes[0].title, 80)}`);
+      }
       if (m.error) lines.push(`   ⚠️ ${m.error}`);
     }
   }
 
   lines.push('');
-  lines.push(`React: ✅ ship all  |  ❌ skip all  |  🛑 pause loop`);
+  lines.push(`React ✅ to dispatch all to cloud-dev  |  ❌ to skip  |  🛑 to pause loop`);
   lines.push(`Reply in thread to skip a specific item (e.g. "skip 2").`);
 
   try {
@@ -150,11 +169,21 @@ async function postDailyDigest(
   }
 }
 
+/** Truncate the top-fix title for the Slack DM. Adds an ellipsis when cut. */
+function truncateForSlack(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1) + '…';
+}
+
 /** Test helper. */
 export function _resetCronModuleForTesting(): void {
   aiEvalGate = null;
   aiEvalLearning = null;
 }
+
+/** Test seam — calls the internal digest builder so unit tests can assert on
+ * the DM format without mocking the AWS adapter stack. */
+export const _postDailyDigestForTesting = postDailyDigest;
 
 // Export internal so tests can assert on it without exposing it broadly.
 export const _internal = {
