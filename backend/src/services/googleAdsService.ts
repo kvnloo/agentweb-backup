@@ -295,7 +295,7 @@ export class GoogleAdsService {
         campaign: params.campaignResourceName,
         status: 'ENABLED',
         type: params.type,
-        ...(params.cpcBidMicros && { cpcBidMicros: String(params.cpcBidMicros) }),
+        ...(params.cpcBidMicros !== undefined && { cpcBidMicros: String(params.cpcBidMicros) }),
       },
     }]);
     return { resourceName: data.results[0].resourceName };
@@ -311,7 +311,7 @@ export class GoogleAdsService {
     const update: any = { resourceName: adGroupResourceName };
     if (params.name) { update.name = params.name; updateMask.push('name'); }
     if (params.status) { update.status = params.status; updateMask.push('status'); }
-    if (params.cpcBidMicros) { update.cpcBidMicros = String(params.cpcBidMicros); updateMask.push('cpc_bid_micros'); }
+    if (params.cpcBidMicros !== undefined) { update.cpcBidMicros = String(params.cpcBidMicros); updateMask.push('cpc_bid_micros'); }
     if (updateMask.length === 0) return;
     await this.mutate(customerId, accessToken, 'adGroups', [{ update, updateMask: updateMask.join(',') }]);
   }
@@ -336,6 +336,9 @@ export class GoogleAdsService {
     campaignResourceName?: string;
     adGroupResourceName?: string;
   }, keywords: { text: string; matchType: 'BROAD' | 'PHRASE' | 'EXACT' }[]): Promise<void> {
+    if (!target.campaignResourceName && !target.adGroupResourceName) {
+      throw new Error('addNegativeKeywords requires either campaignResourceName or adGroupResourceName');
+    }
     const { accessToken } = await this.getAccountCredentials(userId, customerId);
     if (target.campaignResourceName) {
       await this.mutate(customerId, accessToken, 'campaignCriteria', keywords.map(kw => ({
