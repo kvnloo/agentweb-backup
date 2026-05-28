@@ -87,3 +87,69 @@ describe('getAccountCredentials', () => {
       .rejects.toThrow('Google Ads account not found in your connected accounts');
   });
 });
+
+describe('getAccountCredentials — token refresh', () => {
+  it('refreshes expired token and returns new access token', async () => {
+    const { userDb } = require('../services/db');
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: 'user-123',
+      connected_accounts: [{
+        platform: 'google_ads',
+        account_id: 'acc-abc',
+        account_name: 'Test',
+        config: {
+          customer_id: '1234567890',
+          currency: 'USD',
+          access_token: 'old-token',
+          refresh_token: 'refresh-token',
+          token_expires_at: Date.now() - 1000, // expired
+        },
+      }],
+    });
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { access_token: 'new-token', expires_in: 3600 },
+    });
+    const { updateAccountTokens } = require('../services/connectedAccountsDb');
+
+    const creds = await service.getAccountCredentials('user-123', '1234567890');
+
+    expect(creds.accessToken).toBe('new-token');
+    expect(mockAxiosPost).toHaveBeenCalledWith(
+      'https://oauth2.googleapis.com/token',
+      expect.stringContaining('grant_type=refresh_token'),
+      expect.any(Object)
+    );
+    expect(updateAccountTokens).toHaveBeenCalledWith(
+      'user-123', 'google_ads',
+      expect.objectContaining({ access_token: 'new-token' }),
+      'acc-abc'  // account_id, NOT customer_id
+    );
+  });
+
+  it('throws if user not found', async () => {
+    const { userDb } = require('../services/db');
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce(null);
+    await expect(service.getAccountCredentials('user-123', '1234567890'))
+      .rejects.toThrow('User not found');
+  });
+
+  it('throws if no access token after refresh attempt', async () => {
+    const { userDb } = require('../services/db');
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: 'user-123',
+      connected_accounts: [{
+        platform: 'google_ads',
+        account_id: 'acc-abc',
+        config: {
+          customer_id: '1234567890',
+          currency: 'USD',
+          access_token: null,
+          refresh_token: null,
+          token_expires_at: null,
+        },
+      }],
+    });
+    await expect(service.getAccountCredentials('user-123', '1234567890'))
+      .rejects.toThrow('No access token available');
+  });
+});
