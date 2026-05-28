@@ -4315,6 +4315,59 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
 });
 
 /**
+ * @route POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite
+ * @desc Send a LinkedIn connection invitation to a lead via Unipile, with an optional personalised note.
+ *       Records linkedInInviteSentAt on the lead so the UI can show "invite sent" state.
+ * @access Private
+ */
+router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId, leadId } = req.params;
+    const { message, accountId: requestedAccountId } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list || (list as any).userId !== userId) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    const lead = await crmDb.getLeadById(listId, leadId);
+    if (!lead) {
+      return res.status(404).json({ message: 'Lead not found' });
+    }
+
+    const leadLinkedIn = (lead.linkedin as string | undefined)?.trim();
+    if (!leadLinkedIn) {
+      return res.status(400).json({ message: 'Lead has no LinkedIn URL — add a LinkedIn profile URL first' });
+    }
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const accountId = (requestedAccountId && typeof requestedAccountId === 'string')
+      ? requestedAccountId
+      : await linkedInOutreachService.resolveAccountId(userId);
+    if (!accountId) {
+      return res.status(400).json({ message: 'No LinkedIn account connected. Connect LinkedIn outreach in Settings first.' });
+    }
+
+    const note = message && typeof message === 'string' && message.trim() ? message.trim() : undefined;
+    await linkedInOutreachService.sendInvitation(accountId, leadLinkedIn, true, note);
+
+    const sentAt = new Date().toISOString();
+    await crmDb.updateLead(listId, leadId, { linkedInInviteSentAt: sentAt });
+
+    return res.json({ success: true, linkedInInviteSentAt: sentAt });
+  } catch (error: any) {
+    console.error('Error sending LinkedIn invite:', error);
+    return res.status(500).json({ message: error.message || 'Failed to send LinkedIn invite' });
+  }
+});
+
+/**
  * @route POST /api/crm/lists/:listId/leads/:leadId/engagements
  * @desc Add a custom engagement event to a lead
  * @access Private
