@@ -126,7 +126,7 @@ router.patch("/orgs/:orgId/analytics-sharing", async (req, res) => {
     const existing = org.shareSettings?.analytics ?? { enabled: false, editors: [] };
     const shareSettings = {
       ...(org.shareSettings ?? {}),
-      analytics: { enabled, editors: existing.editors },
+      analytics: { enabled, editors: existing.editors ?? [] },
     };
     await orgDb.updateShareSettings(orgId, shareSettings as any);
     return res.json({ orgId, analyticsSharingEnabled: enabled });
