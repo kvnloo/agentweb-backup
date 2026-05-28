@@ -27,7 +27,7 @@ jest.mock('../services/subscriptionService', () => ({
   getAllAvailablePages: jest.fn(() => ['/', '/agent-mode', '/settings', '/guide', '/tasks']),
   getAllAvailableSkills: jest.fn(async () => ['skill-1', 'skill-2', '__other_skills__']),
   getAllAvailableConnectedAccounts: jest.fn(() => [
-    'linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom', 'instagram',
+    'linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom', 'instagram', 'google_ads',
   ]),
   getPublicAllowedSkills: jest.fn(async () => []),
   getAllAvailableFunctionCalls: jest.fn(async () => ['generate_image', 'generate_video', 'search_web']),
@@ -87,7 +87,7 @@ describe('Admin subscription types - allowedConnectedAccounts', () => {
       .expect(200);
 
     expect(res.body[0].allowedConnectedAccounts).toEqual([
-      'linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom', 'instagram',
+      'linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom', 'instagram', 'google_ads',
     ]);
   });
 
@@ -112,7 +112,7 @@ describe('Admin subscription types - allowedConnectedAccounts', () => {
       .expect(200);
 
     expect(res.body[0].allowedConnectedAccounts).toEqual([
-      'linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom', 'instagram',
+      'linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom', 'instagram', 'google_ads',
     ]);
   });
 
@@ -161,7 +161,7 @@ describe('Admin subscription types - allowedConnectedAccounts', () => {
     expect(mockedSettingsService.setSetting).toHaveBeenCalledTimes(1);
     const savedTypes = JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
     expect(savedTypes[0].allowedConnectedAccounts).toEqual([
-      'linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom', 'instagram',
+      'linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom', 'instagram', 'google_ads',
     ]);
   });
 
@@ -207,7 +207,7 @@ describe('Admin subscription types - allowedConnectedAccounts', () => {
 
     const savedTypes = JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
     expect(savedTypes[0].allowedConnectedAccounts).toEqual([
-      'linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom', 'instagram',
+      'linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom', 'instagram', 'google_ads',
     ]);
   });
 });
