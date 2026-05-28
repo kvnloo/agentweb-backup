@@ -107,6 +107,11 @@ function strOrUndef(v: any): string | undefined {
   return typeof v === 'string' && v.trim() ? v.trim() : undefined;
 }
 
+function urlOrUndef(v: any): string | undefined {
+  const s = strOrUndef(v);
+  return s && s.startsWith('http') ? s : undefined;
+}
+
 function numOrUndef(v: any): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
 }
@@ -167,9 +172,9 @@ export function mapApolloPerson(
     title: strOrUndef(p.title),
     seniority: strOrUndef(p.seniority),
     headline: strOrUndef(p.headline),
-    linkedin: strOrUndef(p.linkedin_url),
-    twitter: strOrUndef(p.twitter_url),
-    github: strOrUndef(p.github_url),
+    linkedin: urlOrUndef(p.linkedin_url),
+    twitter: urlOrUndef(p.twitter_url),
+    github: urlOrUndef(p.github_url),
     city: strOrUndef(p.city),
     state: strOrUndef(p.state),
     country: strOrUndef(p.country),
@@ -232,9 +237,9 @@ export function mapApolloOrganization(apolloOrg: any): MappedOrganization {
     hqState: strOrUndef(o.state),
     hqCountry: strOrUndef(o.country),
     hqRawAddress: strOrUndef(o.raw_address),
-    websiteUrl: strOrUndef(o.website_url),
-    linkedinUrl: strOrUndef(o.linkedin_url),
-    twitterUrl: strOrUndef(o.twitter_url),
+    websiteUrl: urlOrUndef(o.website_url),
+    linkedinUrl: urlOrUndef(o.linkedin_url),
+    twitterUrl: urlOrUndef(o.twitter_url),
     phone: strOrUndef(o.sanitized_phone) ?? strOrUndef(o.phone),
     shortDescription: strOrUndef(o.short_description) ?? strOrUndef(o.seo_description),
   };
