@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-28',
     changes: [
+      'Improved: Agent Mode Session Message Limit Increased to 1,000',
+      '- The session message limit has been increased from 500 to 1,000 messages',
+      '- Longer, ongoing sessions can now continue without needing to start a new session',
+    ],
+  },
+  {
+    date: '2026-05-28',
+    changes: [
       'Fixed: Admin-Created Users Now Start on the Free Tier',
       '- Creating a user manually from the admin waitlist now explicitly assigns the Free subscription tier instead of falling back to Basic',
       '- Existing free-only users upgraded through the waitlist flow keep Free-tier page and skill access defaults',
