@@ -153,3 +153,104 @@ describe('getAccountCredentials — token refresh', () => {
       .rejects.toThrow('No access token available');
   });
 });
+
+describe('createBudget', () => {
+  it('sends mutate request and returns resource name', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/campaignBudgets/456' }] },
+    });
+    const budget = await service.createBudget('user-123', '1234567890', {
+      amountMicros: 10_000_000,
+      name: 'Test Budget',
+    });
+    expect(budget.resourceName).toBe('customers/123/campaignBudgets/456');
+    const callBody = mockAxiosPost.mock.calls[0][1];
+    expect(callBody.operations[0].create.amountMicros).toBe('10000000');
+    expect(callBody.operations[0].create.deliveryMethod).toBe('STANDARD');
+  });
+});
+
+describe('listCampaigns', () => {
+  it('returns campaigns from GAQL search', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          campaign: { resourceName: 'customers/123/campaigns/1', id: '1', name: 'Search Campaign', status: 'ENABLED', advertisingChannelType: 'SEARCH' },
+        }],
+      },
+    });
+    const campaigns = await service.listCampaigns('user-123', '1234567890');
+    expect(campaigns).toHaveLength(1);
+    expect(campaigns[0].name).toBe('Search Campaign');
+    expect(campaigns[0].type).toBe('SEARCH');
+  });
+});
+
+describe('createCampaign', () => {
+  it('creates a SEARCH campaign with MAXIMIZE_CONVERSIONS bidding', async () => {
+    // First call = campaign mutate, second call = location targeting mutate
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/campaigns/2' }] } })
+      .mockResolvedValueOnce({ data: { results: [{}] } });
+    const campaign = await service.createCampaign('user-123', '1234567890', {
+      name: 'Test Search',
+      type: 'SEARCH',
+      budgetResourceName: 'customers/123/campaignBudgets/456',
+      biddingStrategy: 'MAXIMIZE_CONVERSIONS',
+      locationTargetIds: [2840],
+      status: 'PAUSED',
+    });
+    expect(campaign.resourceName).toBe('customers/123/campaigns/2');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.advertisingChannelType).toBe('SEARCH');
+    expect(body.operations[0].create.maximizeConversions).toBeDefined();
+    expect(body.operations[0].create.status).toBe('PAUSED');
+  });
+
+  it('creates a PERFORMANCE_MAX campaign', async () => {
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/campaigns/3' }] } })
+      .mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.createCampaign('user-123', '1234567890', {
+      name: 'PMax Campaign',
+      type: 'PERFORMANCE_MAX',
+      budgetResourceName: 'customers/123/campaignBudgets/456',
+      biddingStrategy: 'MAXIMIZE_CONVERSION_VALUE',
+      locationTargetIds: [2840],
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.advertisingChannelType).toBe('PERFORMANCE_MAX');
+  });
+});
+
+describe('pauseCampaign / resumeCampaign', () => {
+  it('pauses a campaign', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.pauseCampaign('user-123', '1234567890', 'customers/123/campaigns/1');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.status).toBe('PAUSED');
+  });
+
+  it('resumes a campaign', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.resumeCampaign('user-123', '1234567890', 'customers/123/campaigns/1');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.status).toBe('ENABLED');
+  });
+});
+
+describe('searchLocations', () => {
+  it('returns location suggestions', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        geoTargetConstantSuggestions: [{
+          geoTargetConstant: { id: '2840', name: 'United States', countryCode: 'US', targetType: 'Country' },
+        }],
+      },
+    });
+    const locations = await service.searchLocations('user-123', '1234567890', 'United States', 'en');
+    expect(locations).toHaveLength(1);
+    expect(locations[0].id).toBe('2840');
+    expect(locations[0].name).toBe('United States');
+  });
+});

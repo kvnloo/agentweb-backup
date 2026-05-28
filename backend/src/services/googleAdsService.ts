@@ -147,6 +147,122 @@ export class GoogleAdsService {
     }
     return accounts;
   }
+
+  // ── Budgets ──────────────────────────────────────────────────────────────
+
+  async createBudget(userId: string, customerId: string, params: {
+    name: string;
+    amountMicros: number;
+  }): Promise<{ resourceName: string }> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const data = await this.mutate(customerId, accessToken, 'campaignBudgets', [{
+      create: {
+        name: params.name,
+        amountMicros: String(params.amountMicros),
+        deliveryMethod: 'STANDARD',
+      },
+    }]);
+    return { resourceName: data.results[0].resourceName };
+  }
+
+  // ── Campaigns ────────────────────────────────────────────────────────────
+
+  async listCampaigns(userId: string, customerId: string): Promise<{ resourceName: string; id: string; name: string; status: string; type: string }[]> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const results = await this.search(customerId, accessToken,
+      'SELECT campaign.resource_name, campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type FROM campaign ORDER BY campaign.id'
+    );
+    return results.map((r: any) => ({
+      resourceName: r.campaign.resourceName,
+      id: String(r.campaign.id),
+      name: r.campaign.name,
+      status: r.campaign.status,
+      type: r.campaign.advertisingChannelType,
+    }));
+  }
+
+  async createCampaign(userId: string, customerId: string, params: {
+    name: string;
+    type: 'SEARCH' | 'DISPLAY' | 'PERFORMANCE_MAX';
+    budgetResourceName: string;
+    biddingStrategy: 'MAXIMIZE_CONVERSIONS' | 'TARGET_CPA' | 'TARGET_ROAS' | 'MAXIMIZE_CONVERSION_VALUE' | 'TARGET_IMPRESSION_SHARE' | 'MANUAL_CPC';
+    biddingStrategyTarget?: number;
+    locationTargetIds: number[];
+    status?: 'ENABLED' | 'PAUSED';
+  }): Promise<{ resourceName: string }> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+
+    const biddingField: Record<string, any> = {};
+    if (params.biddingStrategy === 'MAXIMIZE_CONVERSIONS') biddingField.maximizeConversions = {};
+    else if (params.biddingStrategy === 'MAXIMIZE_CONVERSION_VALUE') biddingField.maximizeConversionValue = {};
+    else if (params.biddingStrategy === 'TARGET_CPA') biddingField.targetCpa = { targetCpaMicros: String(Math.round((params.biddingStrategyTarget || 0) * 1_000_000)) };
+    else if (params.biddingStrategy === 'TARGET_ROAS') biddingField.targetRoas = { targetRoas: params.biddingStrategyTarget || 1 };
+    else if (params.biddingStrategy === 'TARGET_IMPRESSION_SHARE') biddingField.targetImpressionShare = {};
+    else if (params.biddingStrategy === 'MANUAL_CPC') biddingField.manualCpc = {};
+
+    const data = await this.mutate(customerId, accessToken, 'campaigns', [{
+      create: {
+        name: params.name,
+        advertisingChannelType: params.type,
+        campaignBudget: params.budgetResourceName,
+        status: params.status || 'PAUSED',
+        ...biddingField,
+      },
+    }]);
+
+    const campaignResourceName = data.results[0].resourceName;
+
+    if (params.locationTargetIds.length > 0) {
+      await this.mutate(customerId, accessToken, 'campaignCriteria', params.locationTargetIds.map(id => ({
+        create: {
+          campaign: campaignResourceName,
+          location: { geoTargetConstant: `geoTargetConstants/${id}` },
+        },
+      })));
+    }
+
+    return { resourceName: campaignResourceName };
+  }
+
+  async updateCampaign(userId: string, customerId: string, campaignResourceName: string, params: {
+    name?: string;
+    status?: 'ENABLED' | 'PAUSED';
+  }): Promise<void> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const updateMask: string[] = [];
+    const update: any = { resourceName: campaignResourceName };
+    if (params.name) { update.name = params.name; updateMask.push('name'); }
+    if (params.status) { update.status = params.status; updateMask.push('status'); }
+    await this.mutate(customerId, accessToken, 'campaigns', [{ update, updateMask: updateMask.join(',') }]);
+  }
+
+  async pauseCampaign(userId: string, customerId: string, campaignResourceName: string): Promise<void> {
+    return this.updateCampaign(userId, customerId, campaignResourceName, { status: 'PAUSED' });
+  }
+
+  async resumeCampaign(userId: string, customerId: string, campaignResourceName: string): Promise<void> {
+    return this.updateCampaign(userId, customerId, campaignResourceName, { status: 'ENABLED' });
+  }
+
+  // ── Location search ───────────────────────────────────────────────────────
+
+  async searchLocations(userId: string, customerId: string, query: string, locale: string = 'en'): Promise<{ id: string; name: string; countryCode: string; targetType: string }[]> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const secrets = await getGoogleAdsCredentials();
+    const response = await axios.post(`${GOOGLE_ADS_API_BASE}/geoTargetConstants:suggest`, { locale, query }, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'developer-token': secrets.developerToken,
+      },
+    });
+    const responseData = response.data as { geoTargetConstantSuggestions?: any[] };
+    return (responseData.geoTargetConstantSuggestions || []).map((s: any) => ({
+      id: String(s.geoTargetConstant.id),
+      name: s.geoTargetConstant.name,
+      countryCode: s.geoTargetConstant.countryCode,
+      targetType: s.geoTargetConstant.targetType,
+    }));
+  }
 }
 
 export const googleAdsService = new GoogleAdsService();
