@@ -379,7 +379,7 @@ async function lookupProfilesForLeadsInBackground(
         if (!lead.lastName  && r.lastName)   topLevel.lastName  = r.lastName;
         if (!lead.company   && r.companyName) topLevel.company  = r.companyName;
         if (!lead.title     && r.jobTitle)   topLevel.title     = r.jobTitle;
-        if (!lead.linkedin  && r.profileUrl) topLevel.linkedin  = r.profileUrl;
+        if (!lead.linkedin  && r.profileUrl?.startsWith('http')) topLevel.linkedin  = r.profileUrl;
 
         if (Object.keys(topLevel).length === 0) {
           if (jobId) recordResult(jobId, { found: false });
@@ -723,7 +723,7 @@ router.post('/leads/lookup-by-email', async (req: Request, res: Response) => {
         lastName: result.lastName,
         company: result.companyName,
         title: result.jobTitle,
-        linkedin: result.profileUrl,
+        linkedin: result.profileUrl?.startsWith('http') ? result.profileUrl : undefined,
         location: result.location,
         headline: result.headline,
       },

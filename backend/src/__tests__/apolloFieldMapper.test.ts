@@ -160,3 +160,40 @@ describe('apolloEmailStatusToConfidence', () => {
     expect(apolloEmailStatusToConfidence('some_unknown_status')).toBe('medium');
   });
 });
+
+describe('urlOrUndef — placeholder rejection', () => {
+  it('rejects "Unknown" as linkedin_url', () => {
+    const m = mapApolloPerson({ linkedin_url: 'Unknown' });
+    expect(m.linkedin).toBeUndefined();
+  });
+
+  it('rejects "Unknown" as twitter_url', () => {
+    const m = mapApolloPerson({ twitter_url: 'Unknown' });
+    expect(m.twitter).toBeUndefined();
+  });
+
+  it('rejects "Unknown" as github_url', () => {
+    const m = mapApolloPerson({ github_url: 'Unknown' });
+    expect(m.github).toBeUndefined();
+  });
+
+  it('accepts valid linkedin_url', () => {
+    const m = mapApolloPerson({ linkedin_url: 'https://www.linkedin.com/in/janedoe/' });
+    expect(m.linkedin).toBe('https://www.linkedin.com/in/janedoe/');
+  });
+
+  it('rejects org linkedin_url placeholder', () => {
+    const m = mapApolloOrganization({ linkedin_url: 'Unknown' });
+    expect(m.linkedinUrl).toBeUndefined();
+  });
+
+  it('rejects org website_url placeholder', () => {
+    const m = mapApolloOrganization({ website_url: 'Unknown' });
+    expect(m.websiteUrl).toBeUndefined();
+  });
+
+  it('accepts valid org website_url', () => {
+    const m = mapApolloOrganization({ website_url: 'https://acme.com' });
+    expect(m.websiteUrl).toBe('https://acme.com');
+  });
+});
