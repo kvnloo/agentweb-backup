@@ -617,7 +617,10 @@ export async function resolveIdentity(
     if (!personOk) return { ok: false, reason: 'identity_unresolvable' };
   }
   if (needsCompanyFields) {
-    const companyOk = lead.company || resolved.company;
+    // Business email domain is sufficient — T2/T5 waterfall tiers can discover
+    // company from domain alone (Unipile company search, Apollo org match).
+    // Only block when we have neither company name nor a resolvable domain.
+    const companyOk = lead.company || resolved.company || hasBusinessEmailDomain;
     if (!companyOk) return { ok: false, reason: 'identity_unresolvable' };
   }
 

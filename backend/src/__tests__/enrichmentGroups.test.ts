@@ -292,6 +292,14 @@ describe('FIELD_GROUPS', () => {
     expect(FIELD_GROUPS.intent_signals.ttlDays).toBeLessThan(FIELD_GROUPS.company_firmographic.ttlDays);
   });
 
+  it('person_identity.searchTemplate includes {{email}}', () => {
+    expect(FIELD_GROUPS.person_identity.searchTemplate).toContain('{{email}}');
+  });
+
+  it('person_career.searchTemplate includes {{email}}', () => {
+    expect(FIELD_GROUPS.person_career.searchTemplate).toContain('{{email}}');
+  });
+
   it('person groups appear before all company groups in definition order', () => {
     // person_identity must run before company groups so linkedin_url is known
     // when company enrichment (findUnipileCompany Approach 1) needs it.
