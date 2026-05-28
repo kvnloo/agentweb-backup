@@ -12,18 +12,6 @@ export interface GoogleAdAccount {
   currency: string;
 }
 
-export interface GoogleAdsCampaign {
-  resourceName: string;
-  id: string;
-  name: string;
-  status: string;
-  type: string;
-}
-
-export interface GoogleAdsBudget {
-  resourceName: string;
-}
-
 export interface GoogleAdsAccountCredentials {
   accessToken: string;
   customerId: string;
@@ -40,36 +28,28 @@ export class GoogleAdsService {
     method: 'GET' | 'POST',
     path: string,
     accessToken: string,
-    loginCustomerId: string,
     body?: any
   ): Promise<any> {
     const secrets = await getGoogleAdsCredentials();
+    const headers = {
+      Authorization: `Bearer ${accessToken}`,
+      'developer-token': secrets.developerToken,
+      'login-customer-id': secrets.managerCustomerId,
+      'Content-Type': 'application/json',
+    };
     const response = method === 'GET'
-      ? await axios.get(`${GOOGLE_ADS_API_BASE}${path}`, {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            'developer-token': secrets.developerToken,
-            'login-customer-id': loginCustomerId,
-          },
-        })
-      : await axios.post(`${GOOGLE_ADS_API_BASE}${path}`, body, {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            'developer-token': secrets.developerToken,
-            'login-customer-id': loginCustomerId,
-            'Content-Type': 'application/json',
-          },
-        });
+      ? await axios.get(`${GOOGLE_ADS_API_BASE}${path}`, { headers })
+      : await axios.post(`${GOOGLE_ADS_API_BASE}${path}`, body, { headers });
     return response.data;
   }
 
   async search(customerId: string, accessToken: string, query: string): Promise<any[]> {
-    const data = await this.callApi('POST', `/customers/${customerId}/googleAds:search`, accessToken, customerId, { query });
+    const data = await this.callApi('POST', `/customers/${customerId}/googleAds:search`, accessToken, { query });
     return data.results || [];
   }
 
   async mutate(customerId: string, accessToken: string, resource: string, operations: any[]): Promise<any> {
-    return this.callApi('POST', `/customers/${customerId}/${resource}:mutate`, accessToken, customerId, { operations });
+    return this.callApi('POST', `/customers/${customerId}/${resource}:mutate`, accessToken, { operations });
   }
 
   makeAuthError(message: string): Error {
@@ -126,7 +106,11 @@ export class GoogleAdsService {
     let accessToken = account.config.access_token;
     const isExpired = account.config.token_expires_at && Date.now() > account.config.token_expires_at - 60_000;
     if (isExpired && account.config.refresh_token) {
-      accessToken = await this.refreshAccessToken(userId, customerId, account.config.refresh_token);
+      accessToken = await this.refreshAccessToken(userId, account.account_id, account.config.refresh_token);
+    }
+
+    if (!accessToken) {
+      throw this.makeAuthError('No access token available. Please reconnect your Google Ads account in Settings.');
     }
 
     return { accessToken, customerId, currency: account.config.currency || 'USD' };
