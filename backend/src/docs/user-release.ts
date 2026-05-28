@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-28',
     changes: [
+      'Improved: Waitlist Form Typing Is Now Fast',
+      '- Fixed a performance issue on the landing page where typing in the waitlist form was very slow',
+      '- The form fields are now isolated in their own component so keystrokes no longer trigger a full re-render of the entire landing page',
+    ],
+  },
+  {
+    date: '2026-05-28',
+    changes: [
       'Fixed: CRM Enrichment Now Skips Unenrichable Lists and Completes Batch Enrichment',
       '- When a list\'s leads lack email, LinkedIn URL, and full name, Emma now clearly flags it as unenrichable and skips it rather than reporting a confusing error',
       '- When you ask Emma to enrich multiple lists at once, she now previews all lists first and then automatically runs enrichment on all lists that passed the preview — without asking for per-list confirmation',
