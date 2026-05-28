@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-28',
     changes: [
+      'Fixed: CRM Enrichment Now Skips Unenrichable Lists and Completes Batch Enrichment',
+      '- When a list\'s leads lack email, LinkedIn URL, and full name, Emma now clearly flags it as unenrichable and skips it rather than reporting a confusing error',
+      '- When you ask Emma to enrich multiple lists at once, she now previews all lists first and then automatically runs enrichment on all lists that passed the preview — without asking for per-list confirmation',
+    ],
+  },
+  {
+    date: '2026-05-28',
+    changes: [
       'Improved: Agent Mode Session Message Limit Increased to 1,000',
       '- The session message limit has been increased from 500 to 1,000 messages',
       '- Longer, ongoing sessions can now continue without needing to start a new session',

@@ -5634,6 +5634,10 @@ emmaToolRegistry.register({
 
 Returns: runId, processedCount (the 2 sampled leads), and samples — each with leadId and enrichedFields. In enrichedFields a missing value means nothing was found; tell the user "not found" rather than showing null. Show the samples and ask the user to confirm before calling enrich_leads_execute.
 
+IMPORTANT — identity resolution failures: If processedCount is 0 and failureBreakdown.identityResolutionFailed > 0, the sampled leads lack sufficient identifying information (no email address, no LinkedIn URL, and no full name). This list cannot be enriched — tell the user clearly that the list is unenrichable due to missing identity data (email/LinkedIn/name required) and do NOT call enrich_leads_execute for it. Skip it and continue with the other lists.
+
+"Enrich all lists" workflow: When the user asks to enrich multiple or all lists at once, preview each list first (you may run all previews sequentially without waiting for per-list confirmation). After all previews complete, summarize which lists passed (processedCount > 0) and which are unenrichable (processedCount === 0 with identityResolutionFailed > 0). If the user already confirmed they want all lists enriched, proceed to call enrich_leads_execute for each passing list without asking again per list — only pause if a list has an unexpected issue.
+
 output_fields guidance: one entry per distinct data point. Each entry has a snake_case "name", an "instruction" (what to find / where it lives), and an optional "overwrite_policy". Numeric values, categorical values, URLs, and prose summaries each get their own field. The engine routes data sources (Apollo, LinkedIn, web search) automatically — you do not specify sources. If the result includes fieldRemaps, tell the user which requested fields were mapped onto existing CRM columns to avoid duplicates.`,
     inputSchema: {
       type: 'object',
@@ -5692,7 +5696,7 @@ emmaToolRegistry.register({
 
 Progress updates stream via Socket.IO. This call blocks until the job completes, then returns runId, processedCount, failedCount, and failureBreakdown.
 
-Call enrich_leads_preview first and let the user confirm. Pass the same output_fields used in the preview. Large lists are capped — if the list is over the limit, narrow it with lead_ids or tell the user to run a full enrichment from the CRM page. If the result includes fieldRemaps, tell the user which requested fields were mapped onto existing CRM columns to avoid duplicates.`,
+Call enrich_leads_preview first. For a single-list enrichment, ask the user to confirm after the preview before executing. For a multi-list "enrich all" request where the user has already expressed intent to enrich, proceed directly to execute each list that had processedCount > 0 in its preview — no per-list re-confirmation needed. Do NOT call this for any list whose preview returned processedCount === 0 with identityResolutionFailed > 0. Pass the same output_fields used in the preview. Large lists are capped — if the list is over the limit, narrow it with lead_ids or tell the user to run a full enrichment from the CRM page. If the result includes fieldRemaps, tell the user which requested fields were mapped onto existing CRM columns to avoid duplicates.`,
     inputSchema: {
       type: 'object',
       properties: {
