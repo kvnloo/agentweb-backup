@@ -316,3 +316,35 @@ describe('createAd (Responsive Search Ad)', () => {
     expect(body.operations[0].create.ad.finalUrls[0]).toBe('https://example.com');
   });
 });
+
+describe('addNegativeKeywords — adGroup level', () => {
+  it('adds adGroup-level negative keywords', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.addNegativeKeywords('user-123', '1234567890',
+      { adGroupResourceName: 'customers/123/adGroups/789' },
+      [{ text: 'cheap', matchType: 'EXACT' }]
+    );
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.adGroup).toBe('customers/123/adGroups/789');
+    expect(body.operations[0].create.negative).toBe(true);
+  });
+});
+
+describe('createAd — Responsive Display Ad', () => {
+  it('creates RDA with image assets', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/adGroupAds/2' }] },
+    });
+    await service.createAd('user-123', '1234567890', {
+      adGroupResourceName: 'customers/123/adGroups/789',
+      type: 'RESPONSIVE_DISPLAY_AD',
+      headlines: ['Headline 1'],
+      descriptions: ['Description 1'],
+      finalUrl: 'https://example.com',
+      imageAssetResourceNames: ['customers/123/assets/1'],
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.ad.responsiveDisplayAd).toBeDefined();
+    expect(body.operations[0].create.ad.responsiveDisplayAd.marketingImages).toHaveLength(1);
+  });
+});
