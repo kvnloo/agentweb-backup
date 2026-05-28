@@ -49,6 +49,17 @@ beforeEach(() => {
   service = new GoogleAdsService();
 });
 
+describe('API version', () => {
+  it('uses Google Ads API v24 base URL', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: [] } });
+    await service.listAccessibleAccounts('test-access-token');
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      expect.stringContaining('googleads.googleapis.com/v24'),
+      expect.anything()
+    );
+  });
+});
+
 describe('listAccessibleAccounts', () => {
   it('calls listAccessibleCustomers and returns parsed accounts', async () => {
     mockAxiosGet.mockResolvedValueOnce({

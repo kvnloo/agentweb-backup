@@ -3,7 +3,7 @@ import { getGoogleAdsCredentials } from '../utils/secretsManager';
 import { userDb } from './db';                          // sibling in services/
 import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
 
-const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v18';
+const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
 const TOKEN_REFRESH_URL = 'https://oauth2.googleapis.com/token';
 
 export interface GoogleAdAccount {

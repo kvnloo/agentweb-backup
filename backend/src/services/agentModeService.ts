@@ -988,7 +988,7 @@ export class AgentModeService {
 
         this.gemini_client = new OpenAI({
           apiKey: geminiApiKey.trim(),
-          baseURL: 'https://generativelanguage.googleapis.com/v1beta',
+          baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
         });
 
         return this.gemini_client;
