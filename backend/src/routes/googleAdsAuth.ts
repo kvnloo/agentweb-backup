@@ -180,6 +180,7 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
       account_id: customerId,
       account_name: accountName || customerId,
       config: {
+        account_type: 'google_ads',
         customer_id: customerId,
         currency: currency || 'USD',
         access_token: session.tokens.access_token,
