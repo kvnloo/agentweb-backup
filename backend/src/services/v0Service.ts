@@ -2388,17 +2388,28 @@ export async function updateLandingPageGtm(
   const record = await getLandingPage(id, userId);
   if (!record) throw new Error("Landing page not found");
 
-  await dynamodb
-    .update({
-      TableName: TABLE_NAME,
-      Key: { id },
-      UpdateExpression: "SET gtmContainerId = :gtm, updatedAt = :now",
-      ExpressionAttributeValues: {
-        ":gtm": gtmContainerId,
-        ":now": new Date().toISOString(),
-      },
-    })
-    .promise();
+  if (gtmContainerId) {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "SET gtmContainerId = :gtm, updatedAt = :now",
+        ExpressionAttributeValues: {
+          ":gtm": gtmContainerId,
+          ":now": new Date().toISOString(),
+        },
+      })
+      .promise();
+  } else {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "REMOVE gtmContainerId SET updatedAt = :now",
+        ExpressionAttributeValues: { ":now": new Date().toISOString() },
+      })
+      .promise();
+  }
 }
 
 export async function updateLandingPageContext(
