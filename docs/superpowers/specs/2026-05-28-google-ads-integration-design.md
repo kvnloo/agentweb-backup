@@ -23,7 +23,7 @@ Full Google Ads integration for AgentWeb, following the established Meta Ads pat
 
 ### Approach
 
-Direct Google Ads API integration using the `google-ads-api` npm package (Opteo's TypeScript-first client). Mirrors the Meta Ads pattern: `metaAuth.ts` → `metaService.ts` → `meta.ts` routes → `tools.ts` agent tools.
+Direct Google Ads API integration using the `googleapis` npm package (already in `backend/package.json` v144.0.0, REST-based, no gRPC dependency). Mirrors the Meta Ads pattern: `metaAuth.ts` → `metaService.ts` → `meta.ts` routes → `tools.ts` agent tools.
 
 OAuth reuses the existing Google Cloud project (same client ID as Gmail/YouTube) but adds the `https://www.googleapis.com/auth/adwords` scope and its own Secrets Manager entry.
 
@@ -46,7 +46,18 @@ OAuth reuses the existing Google Cloud project (same client ID as Gmail/YouTube)
 | `backend/src/emma/tools.ts` | Add 2 Google Ads agent tools |
 | `backend/src/services/agentModeService.ts` | Add tool handlers + system prompt instruction |
 | `backend/src/docs/agentModeSystemPrompt.ts` | Add Google Ads workflow instructions |
+| `backend/src/services/connectedAccountsDb.ts` | Add `'google_ads'` to `PlatformType` union |
 | `customer-portal/src/pages/Settings.tsx` | Add Google Ads platform card |
+
+---
+
+## Launch Dependencies
+
+**Google Ads developer token approval is a hard launch blocker for production.**
+
+- Test developer tokens work immediately and allow managing test ad accounts (sandbox only — no real ad delivery)
+- Production requires Google's manual review for Basic or Standard access — timeline is days to weeks with no guarantee
+- **Mitigation:** Submit the developer token application on day 1 of development. Build and validate the full integration against test accounts in parallel. Production launch is gated on token approval, not code completion.
 
 ---
 
@@ -94,11 +105,15 @@ OAuth reuses the existing Google Cloud project (same client ID as Gmail/YouTube)
 
 Single-flight guard — if a refresh is already in-flight for a given userId, subsequent requests wait on the same promise rather than triggering a second refresh. Result is written back to `connected_accounts` once.
 
+### Org Sharing
+
+Google Ads accounts support org-level sharing via the existing `sharedWithOrg` flag on `ConnectedAccount` (same as all other platforms). When `sharedWithOrg: true`, org members can use the account via `getAccountsByUserIdIncludingOrgShared()` without reconnecting.
+
 ---
 
 ## Service Layer: `googleAdsService.ts`
 
-**npm package:** `google-ads-api` by Opteo
+**npm package:** `googleapis` v144.0.0 (already in `backend/package.json`) — REST-based, no additional install needed
 
 ### Campaign Types Supported
 
@@ -116,8 +131,8 @@ listAccessibleAccounts(userId): Promise<AdAccount[]>
 
 // Budgets — must be created before campaign
 createBudget(userId, customerId, params: {
-  amountMicros: number,          // e.g. 10_000_000 = $10/day
-  deliveryMethod: 'STANDARD' | 'ACCELERATED'
+  amountMicros: number,          // e.g. 10_000_000 = $10/day (account's native currency)
+  deliveryMethod: 'STANDARD'     // ACCELERATED is deprecated since 2019 — only STANDARD supported
 }): Promise<Budget>
 
 // Campaigns
@@ -184,6 +199,21 @@ queryReporting(userId, customerId, gaqlQuery: string, dateRange: {
 getQuickMetrics(userId, customerId, campaignIds: string[], dateRange): Promise<MetricsSummary>
 ```
 
+### Account Ownership Validation
+
+Every service method that accepts a `customerId` must validate it against the user's `connected_accounts` before making any API call — mirroring `getMetaAccountCredentials()` in `metaV2.ts`. A private `getGoogleAdsCredentials(userId, customerId)` helper will:
+
+1. Load `connected_accounts` for `userId`
+2. Find the account where `config.customer_id === customerId`
+3. Throw `"Google Ads account not found in your connected accounts"` if not found
+4. Return `{ accessToken, customerId, currency }` after refreshing the token if expired
+
+This prevents one user from querying or modifying another user's ad account.
+
+### Currency Handling
+
+All monetary values from the Google Ads API are in **micros of the account's native currency** (not always USD). The service exposes a `currency` field on `AdAccount` and `MetricsSummary`. Callers must divide by 1,000,000 and display with the account's currency code.
+
 ---
 
 ## Agent Tools
@@ -210,7 +240,8 @@ LOCATION      → SEARCH
 - PMax: skip AD_GROUP/KEYWORD/AD — use ASSET_GROUP
 - Display: UPLOAD image assets before creating ads
 - `LOCATION SEARCH` to resolve location names to IDs
-- Budget and cost values are in micros (× 1,000,000)
+- Budget and cost values are in micros (× 1,000,000 of the account's currency — not always USD)
+- For any write action (CREATE, UPDATE, PAUSE, RESUME): present a plan to the user and get confirmation before executing — this integration spends real money
 
 ### Tool 2: `call_google_ads_reporting_api`
 
@@ -294,9 +325,11 @@ FROM keyword_view WHERE segments.date DURING LAST_30_DAYS
 
 ## Testing
 
-- Unit tests for `googleAdsService.ts` — mock `google-ads-api` client
-- Unit tests for `googleAdsAuth.ts` routes — mock Secrets Manager + OAuth token exchange
-- Unit tests for agent tool handlers in `agentModeService.ts`
+**Coverage requirement: ≥95% on statements, branches, functions, and lines** (project CI gate — `npm run test:coverage`).
+
+- Unit tests for `googleAdsService.ts` — mock `googleapis` client; cover all service methods including token refresh and ownership validation
+- Unit tests for `googleAdsAuth.ts` routes — mock Secrets Manager + OAuth token exchange; cover state validation, callback error paths, and session expiry
+- Unit tests for agent tool handlers in `agentModeService.ts` — cover both tools, both reporting modes, and auth error path
 - TypeScript compilation check: `npx tsc` after every file change
 
 ---
