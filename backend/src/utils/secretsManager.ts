@@ -345,6 +345,39 @@ export async function getYouTubeCredentials(): Promise<GmailCredentials> {
   return getGmailCredentials();
 }
 
+export interface GoogleAdsCredentials {
+  clientId: string;
+  clientSecret: string;
+  developerToken: string;
+  managerCustomerId: string;
+}
+
+export async function getGoogleAdsCredentials(): Promise<GoogleAdsCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/GoogleAds'
+      : 'dev/AgentWeb/GoogleAds';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('Google Ads credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as GoogleAdsCredentials;
+
+    if (!credentials.clientId || !credentials.clientSecret || !credentials.developerToken || !credentials.managerCustomerId) {
+      throw new Error('Google Ads credentials missing required fields');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching Google Ads credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch Google Ads credentials from Secrets Manager');
+  }
+}
+
 /**
  * Interface for V0 credentials returned from Secrets Manager
  */
