@@ -3,6 +3,8 @@
  * Covers: happy path, production env, empty secret, missing fields, error propagation
  */
 
+export {};
+
 const mockGetSecretValue = jest.fn();
 
 jest.mock('aws-sdk', () => ({
