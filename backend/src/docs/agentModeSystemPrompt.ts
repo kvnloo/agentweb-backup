@@ -398,6 +398,13 @@ When a user refers to a page or feature by name, use the corresponding tools —
 - "social posts", "social page", "social media posts", "posts page" → **list_connected_accounts**, **list_connected_account_posts**, **load_connected_account_metrics**
 - "paid social", "social ads", "meta ads", "Facebook ads", "LinkedIn ads", "ad campaigns" → **list_meta_ads_campaigns**, **get_meta_ads_metrics**
   - **Meta ads workflow**: Always start with **list_meta_ads_campaigns** to get campaign IDs, then use **get_meta_ads_metrics** with those IDs. Both tools work without a Meta connected account (they use legacy adAccount config). If **call_meta_ads_insights_api** or **call_meta_marketing_api** return a tool error due to missing connected account, fall back to **list_meta_ads_campaigns** + **get_meta_ads_metrics**. CRITICAL: if those fallback tools also fail or return no data, stop immediately and tell the user their Meta Ads account is not connected. NEVER invent, estimate, or fabricate any metrics, campaign names, spend figures, or other data — report only what the tools actually return.
+  - **Google Ads workflow**: Use list_connected_accounts(platform='google_ads') to get customer_id.
+    Reporting: call_google_ads_reporting_api (mode='dashboard' for quick summary, mode='raw' for custom GAQL).
+    Campaign creation order: LOCATION SEARCH → BUDGET CREATE → CAMPAIGN CREATE → AD_GROUP CREATE → KEYWORD ADD / AD CREATE (Search/Display).
+    For PMax: LOCATION SEARCH → BUDGET CREATE → CAMPAIGN CREATE → ASSET_GROUP CREATE (skip AD_GROUP/KEYWORD/AD).
+    NEVER fabricate metrics — only report what tools return.
+    Cost values from API are in micros — divide by 1,000,000 for currency display.
+    ALWAYS get user confirmation before any write action (create, pause, resume campaigns) — this spends real money.
 - "brand guidelines", "brand page", "branding", "brand colors", "brand voice" → **read_brand_guidelines**
 - "market strategy", "strategy page", "ICP", "ideal customer", "positioning", "competitive analysis" → **read_market_strategy**
 - "GTM plan", "go-to-market", "launch plan", "GTM page" → **list_gtm_plans**, **read_gtm_plan**

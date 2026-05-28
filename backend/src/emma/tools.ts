@@ -7132,3 +7132,88 @@ Response keys:
     });
   }
 });
+
+// ── Google Ads Tools ────────────────────────────────────────────────────────
+
+emmaToolRegistry.register({
+  name: 'call_google_ads_api',
+  definition: {
+    name: 'call_google_ads_api',
+    description: `Manage Google Ads entities via the Google Ads API.
+
+WORKFLOW — always follow this order:
+1. LOCATION SEARCH to resolve location names to IDs before creating a campaign
+2. BUDGET CREATE (required before campaign — returns budgetResourceName)
+3. CAMPAIGN CREATE (use budgetResourceName from step 2)
+4. AD_GROUP CREATE (Search + Display only; skip for PMax)
+5. KEYWORD ADD (Search only)
+6. AD CREATE (Search + Display only; for PMax use ASSET_GROUP entity instead)
+
+COST UNITS: All monetary values in MICROS of the account's native currency (1,000,000 micros = 1 currency unit). Display to user by dividing by 1,000,000.
+CONFIRMATION: Always present a plan to the user and get confirmation before executing any write action (CREATE, PAUSE, RESUME) — this spends real money.
+
+ACTION MATRIX:
+  BUDGET   → CREATE (params: name, amount_micros)
+  CAMPAIGN → LIST, CREATE, PAUSE, RESUME
+  AD_GROUP → LIST, CREATE  (Search + Display only)
+  KEYWORD  → ADD  (Search only; params: ad_group_resource_name, keywords[])
+  LOCATION → SEARCH  (params: query; use before CAMPAIGN CREATE to get location_target_ids)`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        customer_id: { type: 'string', description: 'Google Ads customer ID (numeric). Use list_connected_accounts(platform="google_ads") to get this.' },
+        entity_type: { type: 'string', enum: ['BUDGET', 'CAMPAIGN', 'AD_GROUP', 'KEYWORD', 'AD', 'ASSET', 'ASSET_GROUP', 'LOCATION'] },
+        action: { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
+        name: { type: 'string' },
+        type: { type: 'string', description: 'Campaign type (SEARCH|DISPLAY|PERFORMANCE_MAX) or ad group type (SEARCH_STANDARD|DISPLAY_STANDARD).' },
+        budget_resource_name: { type: 'string', description: 'From BUDGET CREATE. Required for CAMPAIGN CREATE.' },
+        amount_micros: { type: 'number', description: 'Budget in micros. $10/day = 10000000.' },
+        bidding_strategy: { type: 'string', enum: ['MAXIMIZE_CONVERSIONS', 'TARGET_CPA', 'TARGET_ROAS', 'MAXIMIZE_CONVERSION_VALUE', 'TARGET_IMPRESSION_SHARE', 'MANUAL_CPC'] },
+        bidding_strategy_target: { type: 'number' },
+        location_target_ids: { type: 'array', items: { type: 'number' }, description: 'From LOCATION SEARCH.' },
+        campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME.' },
+        ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD ADD.' },
+        keywords: { type: 'array', items: { type: 'object', properties: { text: { type: 'string' }, matchType: { type: 'string', enum: ['BROAD', 'PHRASE', 'EXACT'] } }, required: ['text', 'matchType'] } },
+        query: { type: 'string', description: 'Location search query.' },
+        status: { type: 'string', enum: ['ENABLED', 'PAUSED'] },
+      },
+      required: ['customer_id', 'entity_type', 'action'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    return await agentModeService.handleCallGoogleAdsApi(context?.userId, args);
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'call_google_ads_reporting_api',
+  definition: {
+    name: 'call_google_ads_reporting_api',
+    description: `Fetch Google Ads performance data.
+
+TWO MODES:
+- mode="dashboard": Pre-formatted markdown table (spend, impressions, clicks, CTR, conversions, avg CPC). Use for "how are my campaigns doing?" questions.
+- mode="raw": Custom GAQL query, returns structured results. Use for keyword-level data, custom breakdowns, or specific fields.
+
+COST: cost_micros from API ÷ 1,000,000 = spend in account currency. Check the currency field in response.
+NEVER fabricate metrics — only report what tools return.
+
+GAQL EXAMPLES:
+  Campaign: SELECT campaign.id, campaign.name, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions FROM campaign WHERE segments.date DURING LAST_30_DAYS
+  Keywords: SELECT ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, metrics.clicks, metrics.cost_micros, metrics.average_cpc FROM keyword_view WHERE segments.date DURING LAST_30_DAYS`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        customer_id: { type: 'string', description: 'Google Ads customer ID. Use list_connected_accounts(platform="google_ads").' },
+        mode: { type: 'string', enum: ['raw', 'dashboard'], description: '"dashboard" for formatted summary. "raw" for custom GAQL.' },
+        query: { type: 'string', description: 'GAQL query. Required for mode="raw".' },
+        campaign_ids: { type: 'array', items: { type: 'string' }, description: 'Filter to specific campaigns (dashboard mode only). Omit for all.' },
+        date_preset: { type: 'string', enum: ['TODAY', 'YESTERDAY', 'LAST_7_DAYS', 'LAST_30_DAYS', 'LAST_90_DAYS', 'THIS_MONTH', 'LAST_MONTH', 'THIS_YEAR'], description: 'Defaults to LAST_30_DAYS.' },
+      },
+      required: ['customer_id', 'mode'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    return await agentModeService.handleCallGoogleAdsReportingApi(context?.userId, args);
+  },
+});
