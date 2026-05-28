@@ -9,6 +9,13 @@ import { emailService } from '../services/emailService';
 jest.mock('../services/db');
 jest.mock('../services/emailService');
 jest.mock('../services/waitlistDb');
+jest.mock('../services/subscriptionService', () => ({
+  DEFAULT_PAGES: ['/'],
+  getTierConfig: jest.fn().mockResolvedValue({
+    allowedPages: ['/agent-mode'],
+    allowedSkills: ['skill-1'],
+  }),
+}));
 jest.mock('../middleware/auth', () => ({
   authenticateToken: (req: any, res: any, next: any) => {
     req.user = { userId: 'test-admin', isAdmin: true };
@@ -285,8 +292,59 @@ describe('Admin Waitlist Free User Management', () => {
         .send({ roles: ['customer'] });
 
       expect(response.status).toBe(200);
-      expect((mockUserDb as any).updateUser).toHaveBeenCalledWith('user123', { roles: ['free', 'customer'] });
+      expect((mockUserDb as any).updateUser).toHaveBeenCalledWith('user123', {
+        roles: ['free', 'customer'],
+        subscriptionType: 'Free',
+        allowedPages: ['/agent-mode'],
+        allowedSkills: ['skill-1'],
+      });
       expect((mockWaitlistDb as any).updateStatus).toHaveBeenCalledWith(email, 'completed');
+    });
+
+    it('should create new waitlist users with Free tier defaults', async () => {
+      const email = 'newuser@example.com';
+      const waitlistEntry = createWaitlistItem(email, {
+        fullName: 'New User',
+        companyName: 'New Company',
+      });
+      mockUserDb.getUserByEmail.mockResolvedValue(undefined);
+      mockWaitlistDb.getByEmail.mockResolvedValue(waitlistEntry);
+      (mockUserDb as any).createUser.mockImplementation(
+        async (_email: string, userId: string) => ({
+          userId,
+          email,
+          displayName: 'New User',
+          roles: ['customer'],
+        })
+      );
+      (mockUserDb as any).updateUser.mockImplementation(
+        async (userId: string, updates: any) => ({
+          userId,
+          email,
+          displayName: 'New User',
+          roles: ['customer'],
+          ...updates,
+        })
+      );
+      (mockWaitlistDb as any).updateStatus.mockResolvedValue(createWaitlistItem(email, { status: 'completed' }));
+
+      const response = await request(app)
+        .post(`/api/admin/waitlist/${email}/create-user`)
+        .send({ roles: ['customer'] });
+
+      expect(response.status).toBe(200);
+      const createdUserId = (mockUserDb as any).createUser.mock.calls[0][1];
+      expect((mockUserDb as any).updateUser).toHaveBeenCalledWith(createdUserId, {
+        subscriptionType: 'Free',
+        allowedPages: ['/agent-mode'],
+        allowedSkills: ['skill-1'],
+      });
+      expect(response.body.user).toMatchObject({
+        userId: createdUserId,
+        email,
+        displayName: 'New User',
+        roles: ['customer'],
+      });
     });
 
     it('should block registered users from being created', async () => {
