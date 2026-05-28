@@ -19,6 +19,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-28',
     changes: [
+      'Fixed: CRM Outreach Emails Now Always Use the Configured Sender Name',
+      '- Email drafts generated for leads now correctly use the configured sender\'s name in the signature',
+      '- Previously, if the lead\'s notes contained a prior message signed by a different team member, the LLM would use that name instead of the actual sender',
+    ],
+  },
+  {
+    date: '2026-05-28',
+    changes: [
       'Improved: Agent Mode Session Message Limit Increased to 1,000',
       '- The session message limit has been increased from 500 to 1,000 messages',
       '- Longer, ongoing sessions can now continue without needing to start a new session',
