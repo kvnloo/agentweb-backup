@@ -399,3 +399,18 @@ describe('getQuickMetrics', () => {
     expect(summary.currency).toBe('USD');
   });
 });
+
+describe('getQuickMetrics — with campaignIds filter', () => {
+  it('builds WHERE clause with campaign ID filter', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [] },
+    });
+    await service.getQuickMetrics('user-123', '1234567890', {
+      campaignIds: ['1', '2'],
+      datePreset: 'LAST_7_DAYS',
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.query).toContain('campaign.id IN (1,2)');
+    expect(body.query).toContain('DURING LAST_7_DAYS');
+  });
+});

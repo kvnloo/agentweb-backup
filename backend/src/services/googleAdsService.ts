@@ -422,15 +422,19 @@ export class GoogleAdsService {
     data: Buffer | string;
   }): Promise<string> {
     const { accessToken } = await this.getAccountCredentials(userId, customerId);
-    const base64Data = Buffer.isBuffer(asset.data)
-      ? asset.data.toString('base64')
-      : Buffer.from(asset.data as string, 'binary').toString('base64');
 
     const assetContent: any = {};
     if (asset.type === 'IMAGE' || asset.type === 'LOGO') {
-      assetContent.imageAsset = { data: base64Data };
+      if (typeof asset.data === 'string') {
+        throw new Error('IMAGE/LOGO asset data must be a Buffer, not a string');
+      }
+      assetContent.imageAsset = { data: asset.data.toString('base64') };
     } else {
-      assetContent.youtubeVideoAsset = { youtubeVideoId: asset.data as string };
+      // VIDEO: data is a YouTube video ID string
+      if (Buffer.isBuffer(asset.data)) {
+        throw new Error('VIDEO asset data must be a YouTube video ID string, not a Buffer');
+      }
+      assetContent.youtubeVideoAsset = { youtubeVideoId: asset.data };
     }
 
     const data = await this.mutate(customerId, accessToken, 'assets', [{
