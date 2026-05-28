@@ -1214,7 +1214,7 @@ mcpToolRegistry.register({
   name: 'list_landing_pages',
   definition: {
     name: 'list_landing_pages',
-    description: 'List all generated landing pages for the authenticated user.',
+    description: 'List all generated landing pages for the authenticated user. NOTE: Multiple landing pages can share the same Vercel project (vercelProjectId) and therefore share the same subdomain. The subdomain is configured per-project, not per-page — use configure_landing_page_subdomain with the vercelProjectId to set or change it.',
     inputSchema: { type: 'object', properties: {}, required: [] }
   },
   execute: async (_args: any, context: any) => {
@@ -1227,7 +1227,7 @@ mcpToolRegistry.register({
   name: 'get_landing_page',
   definition: {
     name: 'get_landing_page',
-    description: 'Get details of a specific generated landing page.',
+    description: 'Get details of a specific generated landing page. The returned vercelProjectId identifies the Vercel project; all pages in the same project share one subdomain. To read or change the subdomain, use configure_landing_page_subdomain with that vercelProjectId.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1257,6 +1257,52 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({ method: 'DELETE', path: `/api/landing-pages/v0/generated/${args.page_id}`, context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
+// ─── Landing Page Domain Tools ───────────────────────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'configure_landing_page_subdomain',
+  definition: {
+    name: 'configure_landing_page_subdomain',
+    description: 'Set or update the subdomain for a Vercel project that hosts landing pages (e.g. "everyio" → everyio.agentwebforms.com). IMPORTANT: A subdomain is scoped to the entire Vercel project — all landing pages under the same project share it. Changing the subdomain updates the URL for every page in that project simultaneously. To find the vercelProjectId, call list_landing_pages or get_landing_page first. Use get_landing_page_subdomain to read the current subdomain before making changes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        vercel_project_id: { type: 'string', description: 'The Vercel project ID shared by all pages in the project (from list_landing_pages or get_landing_page)' },
+        subdomain: { type: 'string', description: 'The subdomain prefix to assign (e.g. "everyio" → everyio.agentwebforms.com). Must be lowercase alphanumeric and hyphens only.' }
+      },
+      required: ['vercel_project_id', 'subdomain']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST', path: '/api/domains/subdomain', context: ctx(context),
+      body: { vercelProjectId: args.vercel_project_id, subdomain: args.subdomain }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'get_landing_page_subdomain',
+  definition: {
+    name: 'get_landing_page_subdomain',
+    description: 'Read the current subdomain configured for a Vercel project that hosts landing pages. Returns the domain (e.g. everyio.agentwebforms.com), its status, and record ID. Returns null if no subdomain is set.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        vercel_project_id: { type: 'string', description: 'The Vercel project ID (from list_landing_pages or get_landing_page)' }
+      },
+      required: ['vercel_project_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET', path: `/api/domains/project-subdomain?vercelProjectId=${encodeURIComponent(args.vercel_project_id)}`, context: ctx(context)
+    });
     return jsonResult(data);
   }
 });
