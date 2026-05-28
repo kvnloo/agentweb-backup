@@ -988,12 +988,25 @@ router.get("/generated/:id/file-content", async (req, res: Response) => {
         { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" } }
       );
     } catch (refErr: any) {
-      // If draft branch doesn't exist yet, fall back to main
-      if (branch !== "main" && refErr.response?.status === 404) {
-        fileRes = await axios.get<any>(
-          `https://api.github.com/repos/${owner}/${repoName}/contents/${filePath}`,
-          { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" } }
-        );
+      if (refErr.response?.status === 404) {
+        // Draft branch doesn't exist yet — fall back to main
+        if (branch !== "main") {
+          try {
+            fileRes = await axios.get<any>(
+              `https://api.github.com/repos/${owner}/${repoName}/contents/${filePath}`,
+              { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" } }
+            );
+          } catch (mainErr: any) {
+            // File also doesn't exist on main — new file
+            if (mainErr.response?.status === 404) {
+              return res.status(404).json({ error: "File not found", newFile: true });
+            }
+            throw mainErr;
+          }
+        } else {
+          // File doesn't exist on main either — new file
+          return res.status(404).json({ error: "File not found", newFile: true });
+        }
       } else {
         throw refErr;
       }

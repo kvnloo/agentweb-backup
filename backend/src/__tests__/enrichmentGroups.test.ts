@@ -291,4 +291,19 @@ describe('FIELD_GROUPS', () => {
   it('intent_signals has shorter TTL than company_firmographic', () => {
     expect(FIELD_GROUPS.intent_signals.ttlDays).toBeLessThan(FIELD_GROUPS.company_firmographic.ttlDays);
   });
+
+  it('person groups appear before all company groups in definition order', () => {
+    // person_identity must run before company groups so linkedin_url is known
+    // when company enrichment (findUnipileCompany Approach 1) needs it.
+    const keys = Object.keys(FIELD_GROUPS);
+    const personIndexes = ['person_identity', 'person_career'].map((n) => keys.indexOf(n));
+    const companyIndexes = Object.entries(FIELD_GROUPS)
+      .filter(([, cfg]) => cfg.entityType === 'company')
+      .map(([name]) => keys.indexOf(name));
+
+    const lastPersonIdx = Math.max(...personIndexes);
+    const firstCompanyIdx = Math.min(...companyIndexes);
+
+    expect(lastPersonIdx).toBeLessThan(firstCompanyIdx);
+  });
 });

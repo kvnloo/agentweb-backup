@@ -4,7 +4,7 @@ import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
-import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles, checkEmailFormat } from '../utils/emailVariables';
+import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, checkEmailFormat, injectColorSchemeMeta } from '../utils/emailVariables';
 import axios from 'axios';
 import { assertPublicHostname, SsrfBlockedError } from '../utils/ssrfGuard';
 import { signUnsubscribeUrl } from '../utils/unsubscribeUrl';
@@ -156,7 +156,7 @@ function normalizeLinkedInUrl(url: string): string {
 
     // Only accept linkedin.com domains
     if (!urlObj.hostname.endsWith('linkedin.com')) {
-      return normalized; // Return as-is if not a LinkedIn URL
+      return '';
     }
 
     // Extract pathname and clean it
@@ -168,16 +168,15 @@ function normalizeLinkedInUrl(url: string): string {
     // Only accept /in/ profile URLs (not company pages, etc.)
     const match = pathname.match(/^\/in\/([a-zA-Z0-9_-]+)/);
     if (!match) {
-      return normalized; // Return as-is if not a valid /in/ profile URL
+      return '';
     }
 
     const username = match[1];
 
     // Return canonical format
     return `https://www.linkedin.com/in/${username}`;
-  } catch (error) {
-    // If URL parsing fails, return cleaned version
-    return url.trim().toLowerCase().replace(/\/$/, '');
+  } catch {
+    return '';
   }
 }
 
@@ -1713,6 +1712,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
     const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
     const engagedOnlyQuery = req.query.engagedOnly;
     const statusQuery = typeof req.query.status === 'string' ? req.query.status.trim() : '';
+    const linkedInConnectedQuery = req.query.linkedInConnected;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -1748,7 +1748,9 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
       }
     }
 
-    if (list.icpsOnly || search || effectiveEngagedOnly || statusQuery) {
+    const linkedInConnectedFilter = linkedInConnectedQuery === 'true';
+
+    if (list.icpsOnly || search || effectiveEngagedOnly || statusQuery || linkedInConnectedFilter) {
       // Filtered mode: use flag indexes when possible, then apply remaining filters in-memory.
       const fetchLimit = Math.max(validLimit, 200);
 
@@ -1771,6 +1773,21 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
         ? await buildEngagedLeadLookup(listId, userId)
         : null;
 
+      // Build a set of connected LinkedIn URLs if the filter is active
+      let connectedLinkedInUrlSet: Set<string> | null = null;
+      if (linkedInConnectedFilter) {
+        const accountId: string | null = (list as any).linkedInAccountId ?? null;
+        if (!accountId) {
+          // No account assigned — filter returns nothing
+          return res.json({ leads: [], page: validPage, limit: validLimit, totalPages: 0, hasMore: false, totalFilteredCount: 0 });
+        }
+        const { getAllConnectionsByAccount } = await import('../services/unipileConnectionsDb');
+        const connections = await getAllConnectionsByAccount(accountId);
+        connectedLinkedInUrlSet = new Set(
+          connections.map((c: any) => (c.publicProfileUrl as string || '').trim().toLowerCase().replace(/\/?$/, '/'))
+        );
+      }
+
       const allMatchingLeads = candidateLeads.filter((lead: any) => {
         if (list.icpsOnly && !leadMatchesICPFlag(lead)) {
           return false;
@@ -1783,6 +1800,11 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
         }
         if (statusQuery && (lead.status || null) !== statusQuery) {
           return false;
+        }
+        if (connectedLinkedInUrlSet !== null) {
+          if (!lead.linkedin) return false;
+          const normalized = (lead.linkedin as string).trim().toLowerCase().replace(/\/?$/, '/');
+          if (!connectedLinkedInUrlSet.has(normalized)) return false;
         }
         return true;
       });
@@ -3990,7 +4012,7 @@ router.post('/lists/:listId/leads/:leadId/sync-linkedin-messages', async (req: R
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if ((list as any).userId !== userId) {
+    if (!(await canAccessCrmList(userId, list as any))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -4055,7 +4077,7 @@ router.post('/lists/:listId/leads/:leadId/sync-linkedin-connection', async (req:
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
     const list = await crmDb.getLeadListById(listId);
-    if (!list || (list as any).userId !== userId) {
+    if (!list || !(await canAccessCrmList(userId, list as any))) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
@@ -5239,8 +5261,10 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
     const eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
     const eligibleCount = eligibleLeads.length;
 
-    // Run format verification on the HTML content
-    const formatWarnings = checkEmailFormat(htmlContent || '');
+    // Auto-fix dark mode: inject color-scheme opt-out before format check so
+    // the warning doesn't fire for issues we've already resolved.
+    const processedHtml = injectColorSchemeMeta(htmlContent || '');
+    const formatWarnings = checkEmailFormat(processedHtml);
 
     if (variables.length === 0) {
       // No variables used — all eligible leads are ready
@@ -5347,8 +5371,11 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       skippedUndeliverable = beforeCount - eligibleLeads.length;
     }
 
+    // Apply dark-mode fix once before per-lead substitution.
+    const sendHtml = injectColorSchemeMeta(htmlContent || '');
+
     // Filter out leads missing required variable values
-    const allTemplate = (subject || '') + (htmlContent || '');
+    const allTemplate = (subject || '') + (sendHtml || '');
     const variables = extractVariables(allTemplate);
     let skippedMissingVars = 0;
     if (variables.length > 0) {
@@ -5372,7 +5399,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       try {
         // Substitute variables in subject and content
         const personalizedSubject = substituteVariables(subject, lead);
-        let personalizedHtml = substituteVariables(htmlContent, lead);
+        let personalizedHtml = substituteVariables(sendHtml, lead);
         const personalizedText = textContent ? substituteVariables(textContent, lead) : undefined;
 
         // Inject unsubscribe URL — updates existing link or appends footer if none found
@@ -5477,10 +5504,11 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
 
     const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test group email</div>`;
 
+    const testBaseHtml = injectColorSchemeMeta(htmlContent);
     // Inject banner: inside <body> for full HTML documents, or prepend for fragments
-    const withBanner = /<body\b/i.test(htmlContent)
-      ? htmlContent.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`)
-      : testBanner + htmlContent;
+    const withBanner = /<body\b/i.test(testBaseHtml)
+      ? testBaseHtml.replace(/<body([^>]*)>/i, `<body$1>${testBanner}`)
+      : testBanner + testBaseHtml;
     // Wire up unsubscribe URL with the real portal domain
     const testHtml = injectUnsubscribeUrl(withBanner, testUnsubscribeUrl, unsubscribeFooterHtml);
     const from = `${senderName} <${senderEmail}>`;

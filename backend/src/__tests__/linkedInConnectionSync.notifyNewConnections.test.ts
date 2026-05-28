@@ -4,12 +4,14 @@
  */
 
 jest.mock('openai', () => {
+  const createMock = jest.fn().mockResolvedValue({
+    choices: [{ message: { content: '{"content":"Hi, thanks for connecting!"}' } }],
+  });
+  (global as any).__linkedInCronOpenAICreate = createMock;
   return jest.fn().mockImplementation(() => ({
     chat: {
       completions: {
-        create: jest.fn().mockResolvedValue({
-          choices: [{ message: { content: '{"content":"Hi, thanks for connecting!"}' } }],
-        }),
+        create: createMock,
       },
     },
   }));
@@ -47,6 +49,7 @@ jest.mock('../services/db', () => ({
     getLeadListsByUserId: jest.fn(),
     getLeadsByListId: jest.fn(),
     updateLead: jest.fn().mockResolvedValue(undefined),
+    getLeadEngagements: jest.fn().mockResolvedValue({ engagements: [] }),
   },
 }));
 
@@ -66,6 +69,7 @@ import { leadListAlertService } from '../services/leadListAlertService';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 const mockAlertService = leadListAlertService as jest.Mocked<typeof leadListAlertService>;
+const getOpenAICreate = () => (global as any).__linkedInCronOpenAICreate as jest.Mock;
 
 const NEW_CONNECTION = {
   accountId: 'account-1',
@@ -201,5 +205,87 @@ describe('notifyNewConnections', () => {
       }),
     );
     expect(mockAlertService.notifyLinkedInConnectionAccepted).toHaveBeenCalledWith(LIST, MATCHING_LEAD);
+  });
+});
+
+describe('generateConnectionFollowUpDraft — activity history', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockAlertService.notifyLinkedInConnectionAccepted.mockResolvedValue(undefined);
+    // Reset OpenAI mock to default success response
+    getOpenAICreate().mockResolvedValue({
+      choices: [{ message: { content: '{"content":"Hi, thanks for connecting!"}' } }],
+    });
+  });
+
+  it('fetches lead engagements and passes them to the AI prompt when activity exists', async () => {
+    const leadWithLinkedIn = { ...MATCHING_LEAD, linkedin: 'https://www.linkedin.com/in/john-prospect' };
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([leadWithLinkedIn] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+    mockCrmDb.getLeadEngagements.mockResolvedValue({
+      engagements: [
+        { eventType: 'email.sent', createdAt: '2026-05-01T10:00:00.000Z', eventData: { subject: 'Quick intro' }, text: null },
+        { eventType: 'email.opened', createdAt: '2026-05-02T08:00:00.000Z', eventData: {}, text: null },
+      ],
+    } as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    const createMock = getOpenAICreate();
+    expect(createMock).toHaveBeenCalled();
+    const callArgs = createMock.mock.calls[0][0];
+    const userMessage = callArgs.messages.find((m: any) => m.role === 'user');
+    expect(userMessage.content).toContain('email.sent');
+    expect(userMessage.content).toContain('Quick intro');
+    expect(userMessage.content).toContain('prior touchpoints');
+  });
+
+  it('generates draft without activity section when no engagements exist', async () => {
+    const leadWithLinkedIn = { ...MATCHING_LEAD, linkedin: 'https://www.linkedin.com/in/john-prospect' };
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([leadWithLinkedIn] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+    mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    const createMock = getOpenAICreate();
+    expect(createMock).toHaveBeenCalled();
+    const callArgs = createMock.mock.calls[0][0];
+    const userMessage = callArgs.messages.find((m: any) => m.role === 'user');
+    // No activity section should appear
+    expect(userMessage.content).not.toContain('Past activity');
+    // Should still be a valid draft prompt
+    expect(userMessage.content).toContain('LinkedIn lead just accepted');
+  });
+
+  it('saves the generated draft content to the lead record', async () => {
+    const leadWithLinkedIn = { ...MATCHING_LEAD, linkedin: 'https://www.linkedin.com/in/john-prospect' };
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([leadWithLinkedIn] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+    mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    // updateLead should be called twice: once for notifiedAt, once for messageDraft
+    const draftCall = (mockCrmDb.updateLead as jest.Mock).mock.calls.find(
+      (args: any[]) => args[2]?.messageDraft,
+    );
+    expect(draftCall).toBeDefined();
+    expect(draftCall![2].messageDraft.content).toBe('Hi, thanks for connecting!');
+  });
+
+  it('skips draft generation when lead already has a messageDraft', async () => {
+    const leadWithDraft = {
+      ...MATCHING_LEAD,
+      linkedin: 'https://www.linkedin.com/in/john-prospect',
+      messageDraft: { content: 'Existing draft', createdAt: '2026-05-01T00:00:00.000Z', updatedAt: '2026-05-01T00:00:00.000Z' },
+    };
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([leadWithDraft] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    // getLeadEngagements should NOT be called since we short-circuit early
+    expect(mockCrmDb.getLeadEngagements).not.toHaveBeenCalled();
   });
 });

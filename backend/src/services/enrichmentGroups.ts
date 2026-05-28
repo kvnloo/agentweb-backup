@@ -45,6 +45,33 @@ export interface FieldGroupConfig {
 // Phase 2 (person_social, contact_validity) require APIs not yet wired.
 export const FIELD_GROUPS: Record<string, FieldGroupConfig> = {
 
+  // ── PERSON-LEVEL (runs first so linkedin_url is known before company groups) ─
+  // Cached per work email.
+
+  person_identity: {
+    entityType: 'person',
+    version: 1,
+    fields: [
+      'first_name', 'last_name', 'title', 'seniority',
+      'department', 'linkedin_url', 'email', 'phone', 'location',
+    ],
+    sources: ['linkedin', 'web_search'],
+    searchTemplate: '{{firstName}} {{lastName}} {{emailDomain}} linkedin',
+    ttlDays: 90,
+  },
+
+  person_career: {
+    entityType: 'person',
+    version: 1,
+    fields: [
+      'tenure_at_company', 'prior_companies', 'education',
+      'recent_role_change_date', 'years_experience',
+    ],
+    sources: ['linkedin', 'web_search'],
+    searchTemplate: '{{firstName}} {{lastName}} {{emailDomain}} career history',
+    ttlDays: 90,
+  },
+
   // ── COMPANY-LEVEL ────────────────────────────────────────────────────────
   // Cached per company domain. All leads from the same domain share one entry.
 
@@ -133,32 +160,6 @@ export const FIELD_GROUPS: Record<string, FieldGroupConfig> = {
     ttlDays: 90,
   },
 
-  // ── PERSON-LEVEL ─────────────────────────────────────────────────────────
-  // Cached per work email. Leads with the same email get the same person entry.
-
-  person_identity: {
-    entityType: 'person',
-    version: 1,
-    fields: [
-      'first_name', 'last_name', 'title', 'seniority',
-      'department', 'linkedin_url', 'email', 'phone', 'location',
-    ],
-    sources: ['linkedin', 'web_search'],
-    searchTemplate: '{{firstName}} {{lastName}} {{emailDomain}} linkedin',
-    ttlDays: 90,
-  },
-
-  person_career: {
-    entityType: 'person',
-    version: 1,
-    fields: [
-      'tenure_at_company', 'prior_companies', 'education',
-      'recent_role_change_date', 'years_experience',
-    ],
-    sources: ['linkedin', 'web_search'],
-    searchTemplate: '{{firstName}} {{lastName}} {{emailDomain}} career history',
-    ttlDays: 90,
-  },
 };
 
 // ── Canonical key builders ────────────────────────────────────────────────────
@@ -231,11 +232,15 @@ export function normalizeLinkedInUrl(url: string | null | undefined): string {
   if (!url || typeof url !== 'string') return '';
   const trimmed = url.trim().toLowerCase();
   if (!trimmed) return '';
-  return trimmed
+  const normalized = trimmed
     .replace(/^https?:\/\/(?:www\.)?/, 'https://www.')   // canonical scheme + www
     .split('?')[0]                                        // drop query (miniProfileUrn etc.)
     .split('#')[0]                                        // drop fragment
     .replace(/\/+$/, '');                                 // drop any trailing slashes
+  // Only accept personal profile URLs — /in/<username>. Company pages, schools,
+  // showcase pages etc. are not valid personal LinkedIn identifiers.
+  if (normalized.includes('linkedin.com') && !normalized.includes('/in/')) return '';
+  return normalized;
 }
 
 function normalizeName(name: string): string {

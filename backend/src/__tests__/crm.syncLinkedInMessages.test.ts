@@ -31,6 +31,7 @@ jest.mock('../controllers/templates', () => ({
 const mockGetLeadListById = jest.fn();
 const mockGetLeadById = jest.fn();
 const mockUpdateLeadLinkedInSyncAt = jest.fn();
+const mockGetUserById = jest.fn();
 
 jest.mock('../services/db', () => ({
   crmDb: {
@@ -41,7 +42,7 @@ jest.mock('../services/db', () => ({
   },
   taskDb: { getTaskById: jest.fn() },
   subscriberDb: { getAllTaskSubscribers: jest.fn() },
-  userDb: { getUserById: jest.fn() },
+  userDb: { getUserById: (...args: any[]) => mockGetUserById(...args) },
 }));
 
 const mockAddLinkedInMessageEvent = jest.fn();
@@ -97,6 +98,7 @@ const makeRes = () => ({
 });
 
 const OWNED_LIST = { listId: 'list-123', userId: 'test-user-id' };
+const ORG_MEMBER_LIST = { listId: 'list-123', userId: 'org-owner-id' };
 const LEAD_WITH_LINKEDIN = {
   leadId: 'lead-456',
   linkedin: 'https://www.linkedin.com/in/john-doe',
@@ -151,8 +153,9 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/sync-linkedin-messages', () 
     expect(res.status).toHaveBeenCalledWith(404);
   });
 
-  it('returns 403 when user does not own the list', async () => {
+  it('returns 403 when user does not own the list and is not in same org', async () => {
     mockGetLeadListById.mockResolvedValue({ listId: 'list-123', userId: 'other-user' });
+    mockGetUserById.mockResolvedValue(null); // no org membership
     const req: any = {
       user: { userId: 'test-user-id' },
       params: { listId: 'list-123', leadId: 'lead-456' },
@@ -160,6 +163,22 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/sync-linkedin-messages', () 
     const res = makeRes();
     await handler!(req, res);
     expect(res.status).toHaveBeenCalledWith(403);
+  });
+
+  it('allows org member to sync LinkedIn messages on org owner list', async () => {
+    mockGetLeadListById.mockResolvedValue(ORG_MEMBER_LIST);
+    mockGetUserById
+      .mockResolvedValueOnce({ userId: 'test-user-id', orgId: 'org-abc' })   // requesting user
+      .mockResolvedValueOnce({ userId: 'org-owner-id', orgId: 'org-abc' });  // list owner
+    mockGetMessagesWithContact.mockResolvedValue([]);
+    const req: any = {
+      user: { userId: 'test-user-id' },
+      params: { listId: 'list-123', leadId: 'lead-456' },
+    };
+    const res = makeRes();
+    await handler!(req, res);
+    expect(res.status).not.toHaveBeenCalled();
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ synced: 0 }));
   });
 
   it('returns 404 when lead not found', async () => {

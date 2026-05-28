@@ -1844,6 +1844,29 @@ export async function getDeploymentStatus(
     return { status: record.status, buildStatus: "error", buildError, deployedUrl: record.deployedUrl };
   }
 
+  // Auto-heal: if Vercel shows the project is READY but our record says failed/deploying, sync it.
+  if (state === "READY" && (record.status === "failed" || record.status === "deploying")) {
+    try {
+      await dynamodb.update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "SET #status = :status, updatedAt = :updatedAt REMOVE errorMessage",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: {
+          ":status": "deployed",
+          ":updatedAt": new Date().toISOString(),
+        },
+      }).promise();
+    } catch (_e) {
+      // Best-effort — don't block the status response
+    }
+    return {
+      status: "deployed",
+      buildStatus: "success",
+      deployedUrl: record.deployedUrl,
+    };
+  }
+
   return {
     status: record.status,
     buildStatus: state === "READY" ? "success" : state.toLowerCase(),

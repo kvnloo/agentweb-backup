@@ -211,29 +211,42 @@ async function generateConnectionFollowUpDraft(lead: any, list: any): Promise<vo
   const company = lead.company ? ` at ${lead.company}` : '';
   const title = lead.title ? `, ${lead.title}` : '';
 
-  // Try to get brand/strategy context for the list owner.
-  let brandContext = '';
   const userId = (list as any).userId;
-  if (userId) {
-    try {
-      const { agentModeService } = await import('../services/agentModeService');
-      const [brand, strategy] = await Promise.all([
-        agentModeService.readBrandGuidelines(userId).catch(() => null),
-        agentModeService.readMarketStrategy(userId).catch(() => null),
-      ]);
-      if (brand?.guidelines) brandContext += `\nBrand voice: ${String(brand.guidelines).slice(0, 300)}`;
-      if (strategy?.strategy) brandContext += `\nOffer/market fit: ${String(strategy.strategy).slice(0, 300)}`;
-    } catch { /* non-fatal */ }
-  }
+
+  // Fetch activity history and brand/strategy context in parallel.
+  let brandContext = '';
+  let activityContext = '';
+  try {
+    const { agentModeService } = await import('../services/agentModeService');
+    const [brand, strategy, engagementsResult] = await Promise.all([
+      agentModeService.readBrandGuidelines(userId).catch(() => null),
+      agentModeService.readMarketStrategy(userId).catch(() => null),
+      userId ? crmDb.getLeadEngagements(lead.listId, lead.leadId, userId).catch(() => ({ engagements: [] })) : Promise.resolve({ engagements: [] }),
+    ]);
+    if (brand?.guidelines) brandContext += `\nBrand voice: ${String(brand.guidelines).slice(0, 300)}`;
+    if (strategy?.strategy) brandContext += `\nOffer/market fit: ${String(strategy.strategy).slice(0, 300)}`;
+
+    const engagements: any[] = (engagementsResult as any).engagements || [];
+    if (engagements.length > 0) {
+      activityContext = '\n\nPast activity with this lead (most recent first):';
+      engagements.slice(0, 10).forEach((eng: any, i: number) => {
+        activityContext += `\n${i + 1}. [${eng.eventType}] ${eng.createdAt}`;
+        if (eng.eventData?.subject) activityContext += ` — Subject: ${eng.eventData.subject}`;
+        if (eng.text) activityContext += `\n   "${String(eng.text).slice(0, 300)}"`;
+      });
+      activityContext += '\n\nUse this history to craft a relevant follow-up that references prior touchpoints where appropriate.';
+    }
+  } catch { /* non-fatal */ }
 
   const prompt = `A LinkedIn lead just accepted your connection request. Write a short, warm follow-up LinkedIn message to start a conversation.
 
-Lead: ${leadName}${company}${title}${brandContext}
+Lead: ${leadName}${company}${title}${brandContext}${activityContext}
 
 Requirements:
 - 1-3 short sentences, max 300 characters
 - Friendly and natural, not salesy
 - Reference that you just connected
+- If there is past activity, acknowledge it naturally (e.g. "following up on my earlier email")
 - Open-ended question or soft next step
 - No subject line, no signature
 

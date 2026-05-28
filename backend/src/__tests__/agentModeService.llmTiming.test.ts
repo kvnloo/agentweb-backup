@@ -9,41 +9,60 @@
 
 import { AgentModeService } from '../services/agentModeService';
 import { chatbotDb } from '../services/chatbotService';
-import { settingsService } from '../services/settingsService';
 
-// Mock dependencies
-jest.mock('../services/chatbotService');
+jest.mock('openai');
 jest.mock('../services/settingsService');
-jest.mock('../services/db', () => ({
-  ...jest.requireActual('../services/db'),
-  taskTemplateDb: {
-    getAllTemplates: jest.fn().mockResolvedValue([]),
-    getPublishedTemplates: jest.fn().mockResolvedValue([])
-  }
-}));
+jest.mock('../services/db');
 jest.mock('../utils/secretsManager');
+jest.mock('../services/tokenUsageService', () => ({
+  incrementUserTokenUsage: jest.fn().mockResolvedValue(undefined),
+}));
 
-jest.mock('aws-sdk', () => ({
-  DynamoDB: {
-    DocumentClient: jest.fn().mockImplementation(() => ({
-      get: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
-      put: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
-      query: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
-      scan: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
-      update: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
-      delete: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) })
-    }))
+jest.mock('../services/chatbotService', () => ({
+  chatbotDb: {
+    getChatSession: jest.fn(),
+    addMessageToSession: jest.fn().mockResolvedValue({}),
+    addMessagesToSession: jest.fn().mockResolvedValue(undefined),
+    incrementCalledFunctions: jest.fn().mockResolvedValue({}),
+    incrementFailedFunctions: jest.fn().mockResolvedValue({}),
+    updateSessionResultEndpointMetadata: jest.fn().mockResolvedValue({}),
   },
-  SecretsManager: jest.fn().mockImplementation(() => ({
-    getSecretValue: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) })
+  searchPlatformKnowledgeBase: jest.fn().mockResolvedValue([]),
+}));
+
+jest.mock('../services/skillService', () => ({
+  skillService: {
+    getPublishedSkills: jest.fn().mockResolvedValue([]),
+    getSkillsByIds: jest.fn().mockResolvedValue([]),
+    getSkillsAvailableToUser: jest.fn().mockResolvedValue([]),
+    getSkillsByOwner: jest.fn().mockResolvedValue([]),
+  },
+}));
+
+jest.mock('../services/subscriptionService', () => ({
+  getAllowedSkills: jest.fn().mockResolvedValue(['*']),
+  getPublicAllowedSkills: jest.fn().mockResolvedValue([]),
+  resolveSkillsToToolNames: jest.fn().mockResolvedValue(['*']),
+  filterFunctionCalls: jest.fn().mockImplementation((tools: any) => tools),
+}));
+
+jest.mock('../mcp/client/mcpClientService', () => ({
+  McpClientService: jest.fn().mockImplementation(() => ({
+    initialize: jest.fn(),
+    getTools: jest.fn().mockReturnValue([]),
+    listTools: jest.fn().mockResolvedValue([]),
+    callTool: jest.fn().mockResolvedValue({}),
   })),
-  S3: jest.fn().mockImplementation(() => ({
-    upload: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
-    getObject: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) })
+}));
+
+jest.mock('../mcp/client/toolRegistry', () => ({
+  ToolRegistry: jest.fn().mockImplementation(() => ({
+    register: jest.fn(),
+    unregister: jest.fn(),
+    getAllTools: jest.fn().mockReturnValue([]),
+    getTool: jest.fn(),
+    getToolDefinitions: jest.fn().mockReturnValue([]),
   })),
-  config: {
-    update: jest.fn()
-  }
 }));
 
 describe('AgentModeService - LLM Timing Metadata', () => {
@@ -53,18 +72,19 @@ describe('AgentModeService - LLM Timing Metadata', () => {
   beforeEach(() => {
     jest.clearAllMocks();
 
-    // Mock chatbotDb
-    (chatbotDb.getChatSession as jest.Mock) = jest.fn().mockResolvedValue({
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
       sessionId: 'test-session',
       userId: 'test-user',
       messages: [],
-      workPlan: null
+      workPlan: null,
+      associatedSkills: [],
     });
-    (chatbotDb.addMessageToSession as jest.Mock) = jest.fn().mockResolvedValue({});
-    (chatbotDb.incrementCalledFunctions as jest.Mock) = jest.fn().mockResolvedValue({});
 
-    // Mock settingsService.getSetting
-    (settingsService.getSetting as jest.Mock) = jest.fn().mockResolvedValue(null);
+    const mockSettingsService = require('../services/settingsService');
+    mockSettingsService.settingsService = { getSetting: jest.fn().mockResolvedValue(null) };
+
+    const mockDb = require('../services/db');
+    mockDb.userDb = { getUserById: jest.fn().mockResolvedValue(null) };
 
     agentModeService = new AgentModeService();
     llmCallSpy = jest.spyOn(agentModeService as any, 'callLLM');

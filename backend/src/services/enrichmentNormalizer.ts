@@ -6,11 +6,15 @@
  *
  * Money  → $X.XXB / $X.XXM / $X.XXK (human-readable, US format)
  * Dates  → MM/DD/YYYY (American format)
+ * Phone  → E.164 international format, invalid/vanity numbers dropped
  */
 
 import type { FieldFill } from './enrichmentGroupWaterfall';
+import { sanitizePhone } from '../utils/phoneValidation';
 
 // ─── Field sets ───────────────────────────────────────────────────────────────
+
+const PHONE_FIELDS = new Set(['phone', 'company_phone']);
 
 const MONEY_FIELDS = new Set([
   'total_funding', 'valuation', 'total_funding_usd',
@@ -65,6 +69,21 @@ export function normalizeMoney(raw: string): string {
 
 // Handles: ISO full ("2026-03-01T00:00:00.000+00:00"), ISO date ("2025-10-14"),
 // "14-Nov-2025", "Nov 14, 2025", "2025/10/14", already "MM/DD/YYYY"
+
+// Month name → 0-based index. Used to avoid constructing Date from non-ISO strings
+// (which V8 parses as local midnight, causing off-by-one via getUTCDate() in
+// positive-offset timezones such as IST UTC+5:30).
+const MONTH_NAMES: Record<string, number> = {
+  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+  january: 0, february: 1, march: 2, april: 3, june: 5, july: 6,
+  august: 7, september: 8, october: 9, november: 10, december: 11,
+};
+
+function monthNameToIndex(name: string): number | undefined {
+  return MONTH_NAMES[name.toLowerCase().slice(0, 9)];
+}
+
 export function normalizeDate(raw: string): string {
   const s = raw.trim();
   if (!s) return raw;
@@ -72,24 +91,32 @@ export function normalizeDate(raw: string): string {
   // Already MM/DD/YYYY
   if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(s)) return s;
 
-  // Try native Date parsing first (handles ISO and most standard formats)
+  // "14-Nov-2025" or "14 Nov 2025" — parse without Date constructor to stay UTC-safe.
+  const dmy = s.match(/^(\d{1,2})[-\s]([A-Za-z]{3,9})[-\s](\d{4})$/);
+  if (dmy) {
+    const mi = monthNameToIndex(dmy[2]);
+    if (mi !== undefined) {
+      return `${String(mi + 1).padStart(2, '0')}/${dmy[1].padStart(2, '0')}/${dmy[3]}`;
+    }
+  }
+
+  // "Nov 14, 2025" — parse without Date constructor to stay UTC-safe.
+  const mdy = s.match(/^([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})$/);
+  if (mdy) {
+    const mi = monthNameToIndex(mdy[1]);
+    if (mi !== undefined) {
+      return `${String(mi + 1).padStart(2, '0')}/${mdy[2].padStart(2, '0')}/${mdy[3]}`;
+    }
+  }
+
+  // ISO full datetime or date ("2025-10-14", "2026-03-01T00:00:00.000+00:00",
+  // "2025/10/14"). These parse as UTC — safe to use getUTC* methods.
   const d = new Date(s);
   if (!isNaN(d.getTime())) {
     const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
     const dd = String(d.getUTCDate()).padStart(2, '0');
     const yyyy = d.getUTCFullYear();
     return `${mm}/${dd}/${yyyy}`;
-  }
-
-  // "14-Nov-2025" or "14 Nov 2025"
-  const dmy = s.match(/^(\d{1,2})[-\s]([A-Za-z]{3,9})[-\s](\d{4})$/);
-  if (dmy) {
-    const attempt = new Date(`${dmy[2]} ${dmy[1]}, ${dmy[3]}`);
-    if (!isNaN(attempt.getTime())) {
-      const mm = String(attempt.getMonth() + 1).padStart(2, '0');
-      const dd = String(attempt.getDate()).padStart(2, '0');
-      return `${mm}/${dd}/${attempt.getFullYear()}`;
-    }
   }
 
   return raw; // can't parse — return as-is
@@ -108,23 +135,40 @@ export function normalizeFills(
   fills: FieldFill[],
   aliases: Record<string, string> = {},
 ): FieldFill[] {
-  return fills.map(fill => {
+  const out: FieldFill[] = [];
+  for (const fill of fills) {
     const { field, value } = fill;
-    if (!value) return fill;
+    if (!value) {
+      out.push(fill);
+      continue;
+    }
 
     // Resolve to canonical: explicit alias > self
     const canonical = aliases[field] ?? field;
 
+    if (PHONE_FIELDS.has(canonical)) {
+      const normalized = sanitizePhone(value);
+      // Drop the fill entirely when the value is not a valid phone number
+      // (vanity numbers, free-text, garbage from LLM) rather than persisting
+      // something undiallable.
+      if (normalized === null) continue;
+      out.push(normalized !== value ? { ...fill, value: normalized } : fill);
+      continue;
+    }
+
     if (MONEY_FIELDS.has(canonical)) {
       const normalized = normalizeMoney(value);
-      return normalized !== value ? { ...fill, value: normalized } : fill;
+      out.push(normalized !== value ? { ...fill, value: normalized } : fill);
+      continue;
     }
 
     if (isDateField(canonical)) {
       const normalized = normalizeDate(value);
-      return normalized !== value ? { ...fill, value: normalized } : fill;
+      out.push(normalized !== value ? { ...fill, value: normalized } : fill);
+      continue;
     }
 
-    return fill;
-  });
+    out.push(fill);
+  }
+  return out;
 }

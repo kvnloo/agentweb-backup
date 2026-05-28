@@ -5,13 +5,15 @@
 // Design ref: tasks/crm-enrichment-v3.1-design.md §5.1.
 
 import type { LeadRecord } from './crmEnrichmentService';
+import { CrmEnrichmentService } from './crmEnrichmentService';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
 import { extractDomainFromEmail } from '../utils/leadSchema';
 import { apolloEmailStatusToConfidence } from './apolloFieldMapper';
+import { getFieldConfidence } from './fieldConfidenceRegistry';
 
 const IDENTITY_FIELD_TTL_MS = 90 * 86400 * 1000; // 90 days — no FIELD_GROUP for identity fields
 
-export type IdentityProvider = 'apollo' | 'enrich.so' | 'unipile';
+export type IdentityProvider = 'apollo' | 'enrich.so' | 'unipile' | 'pattern';
 
 export interface ApolloPersonResult {
   firstName?: string;
@@ -105,12 +107,13 @@ export interface IdentityResolverDeps {
    * Returns null on failure or when no confident match is found.
    */
   resolveCompanyDomainViaWebSearch(input: {
-    company: string;
+    company?: string;
+    domain?: string;
     linkedin?: string;
     title?: string;
     firstName?: string;
     lastName?: string;
-  }): Promise<{ website: string } | null>;
+  }): Promise<{ website?: string; company?: string; searchedDomain?: string } | null>;
   writeLeadFields(input: {
     listId: string;
     leadId: string;
@@ -139,10 +142,19 @@ export type ResolveIdentityResult =
   | { ok: true; resolved: Partial<LeadRecord> & { emailDomain?: string }; siblings: SiblingLeadResult[]; emailPattern?: string }
   | { ok: false; reason: 'no_identity_signal' | 'identity_unresolvable' };
 
-function makeApiMeta(provider: IdentityProvider): EnrichedFieldMeta {
+function makeApiMeta(provider: IdentityProvider, field?: string): EnrichedFieldMeta {
+  // Per-field confidence: apollo / enrich.so use the registry (so e.g.
+  // enrich.so firstName='high' but company='medium'); unipile and pattern have
+  // no registry entry and default to 'medium'. A missing field name also
+  // defaults to 'medium'.
+  let confidence: EnrichedFieldMeta['confidence'] = 'medium';
+  if (field && (provider === 'apollo' || provider === 'enrich.so')) {
+    confidence = getFieldConfidence(provider, field);
+  }
   return {
     source: 'api',
     provider,
+    confidence,
     enrichedAt: new Date().toISOString(),
   };
 }
@@ -251,32 +263,65 @@ export async function resolveIdentity(
   // Resolves the official website via a web-search-capable LLM (Gemini), then
   // derives emailDomain from it in-memory so step 6's Apollo org-match can run
   // even when there is no email address to extract a domain from.
+  // rawEmailDomain computed once here — reused by Tier 0.5 Branch B gate and
+  // by domainForApollo at Tier 3 so extractDomainFromEmail is only called once.
+  const rawEmailDomain = extractDomainFromEmail(email);
+  const hasBusinessEmailDomain = !!rawEmailDomain && !CrmEnrichmentService.isPersonalDomain(rawEmailDomain);
+
   const websiteAfterTier0 = lead.website || resolved.website;
   const emailDomainAfterTier0 = lead.emailDomain || resolved.emailDomain;
   const companyForDomainLookup = lead.company || resolved.company;
-  if (!websiteAfterTier0 && !emailDomainAfterTier0 && !extractDomainFromEmail(email) && companyForDomainLookup) {
+
+  // Tier 0.5 fires when website is still missing and we have at least one
+  // searchable signal (company name OR business email domain). Passes all
+  // available signals to the LLM so it can find website + company name.
+  // Must run before Tier 3 Apollo so resolved domain/company improves the
+  // Apollo org-match signal.
+  const tier05HasSignal = !!companyForDomainLookup || hasBusinessEmailDomain;
+  if (!websiteAfterTier0 && tier05HasSignal && needsCompanyFields) {
     try {
       const domainResult = await deps.resolveCompanyDomainViaWebSearch({
-        company: companyForDomainLookup,
+        company: companyForDomainLookup || undefined,
+        domain: hasBusinessEmailDomain ? rawEmailDomain : undefined,
         linkedin: lead.linkedin || resolved.linkedin || undefined,
         title: lead.title || resolved.title || undefined,
         firstName: lead.firstName || resolved.firstName || undefined,
         lastName: lead.lastName || resolved.lastName || undefined,
       });
       if (domainResult?.website) {
-        resolved.website = domainResult.website;
-        meta.website = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
-        // Derive emailDomain from the resolved website so downstream
-        // emailDomain-gated steps (step 6 Apollo org-match, enrich.so
-        // find-email) can fire when the lead arrived with only a company
-        // name. Without this the Tier 0.5 fix is cosmetic — the website
-        // populates but no email is ever found.
-        const derivedDomain = deriveDomainFromWebsite(domainResult.website);
-        if (derivedDomain && !lead.emailDomain && !resolved.emailDomain) {
-          resolved.emailDomain = derivedDomain;
-          meta.emailDomain = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
+        // Branch B validation (options 2 + 4): when we passed an email domain,
+        // the returned website must resolve to that same domain. Guards against
+        // LLM returning a plausible-but-wrong site (wrong TLD, similar name).
+        let websiteAccepted = true;
+        if (hasBusinessEmailDomain) {
+          const derivedFromWebsite = deriveDomainFromWebsite(domainResult.website);
+          const domainOrSubdomain = (d: string | null) =>
+            !!d && (d === rawEmailDomain || d.endsWith(`.${rawEmailDomain}`));
+          const derivedMatches = domainOrSubdomain(derivedFromWebsite);                        // option 4
+          const echoedDomain = domainResult.searchedDomain;
+          const echoMatches = !echoedDomain || domainOrSubdomain(echoedDomain);               // option 2
+          if (!derivedMatches || !echoMatches) {
+            console.warn(`${logTag} tier 0.5 domain mismatch — expected=${rawEmailDomain} derived=${derivedFromWebsite} echoed=${echoedDomain ?? '∅'} — rejecting`);
+            websiteAccepted = false;
+          }
         }
-        console.log(`${logTag} tier 0.5 website=${domainResult.website} emailDomain=${derivedDomain || '∅'} for company="${companyForDomainLookup}"`);
+        if (websiteAccepted) {
+          resolved.website = domainResult.website;
+          meta.website = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
+          const derivedDomain = deriveDomainFromWebsite(domainResult.website);
+          if (derivedDomain && !lead.emailDomain && !resolved.emailDomain) {
+            resolved.emailDomain = derivedDomain;
+            meta.emailDomain = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
+          }
+          // Company name accepted when website validation passed — the confirmed
+          // domain corroborates the LLM's company attribution. Only fills when
+          // lead has no company yet; never overwrites an existing company name.
+          if (domainResult.company && !lead.company && !resolved.company) {
+            resolved.company = domainResult.company;
+            meta.company = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
+          }
+          console.log(`${logTag} tier 0.5 website=${domainResult.website} emailDomain=${derivedDomain || '∅'} company=${domainResult.company || '∅'}`);
+        }
       }
     } catch (err) {
       console.warn(`${logTag} tier 0.5 resolveCompanyDomainViaWebSearch failed:`, (err as Error).message);
@@ -297,7 +342,7 @@ export async function resolveIdentity(
       const foundLinkedin = await deps.findLinkedInUrl({ firstName, lastName, company });
       if (foundLinkedin) {
         resolved.linkedin = foundLinkedin;
-        meta.linkedin = makeApiMeta('unipile');
+        meta.linkedin = makeApiMeta('unipile', 'linkedin');
       }
     } catch (err) {
       console.warn(`${logTag} step 2 findLinkedInUrl failed:`, (err as Error).message);
@@ -313,7 +358,7 @@ export async function resolveIdentity(
   const lastNameEff = lead.lastName || resolved.lastName;
   const domainForApollo =
     lead.emailDomain || resolved.emailDomain ||
-    extractDomainFromEmail(email) ||
+    (rawEmailDomain && !CrmEnrichmentService.isPersonalDomain(rawEmailDomain) ? rawEmailDomain : undefined) ||
     deriveDomainFromWebsite(lead.website || resolved.website || '') ||
     undefined;
   const companyForApollo = lead.company || resolved.company;
@@ -340,14 +385,12 @@ export async function resolveIdentity(
 
       const apolloResult = await deps.apolloPeopleMatch(apolloInput);
       if (apolloResult) {
-        const apolloMeta = makeApiMeta('apollo');
-
         let emailTrusted = false;
         if (apolloResult.email && !email && !resolved.email) {
           email = apolloResult.email;
           resolved.email = apolloResult.email;
           meta.email = {
-            ...apolloMeta,
+            ...makeApiMeta('apollo', 'email'),
             confidence: apolloEmailStatusToConfidence(apolloResult.emailStatus ?? ''),
           };
           emailTrusted = true;
@@ -361,27 +404,29 @@ export async function resolveIdentity(
         if (matchConfident) {
           if (apolloResult.firstName && !lead.firstName && !resolved.firstName) {
             resolved.firstName = apolloResult.firstName;
-            meta.firstName = apolloMeta;
+            meta.firstName = makeApiMeta('apollo', 'firstName');
           }
           if (apolloResult.lastName && !lead.lastName && !resolved.lastName) {
             resolved.lastName = apolloResult.lastName;
-            meta.lastName = apolloMeta;
+            meta.lastName = makeApiMeta('apollo', 'lastName');
           }
           if (apolloResult.title && !lead.title && !resolved.title) {
             resolved.title = apolloResult.title;
-            meta.title = apolloMeta;
+            meta.title = makeApiMeta('apollo', 'title');
           }
           if (apolloResult.linkedin && !lead.linkedin && !resolved.linkedin) {
             resolved.linkedin = apolloResult.linkedin;
-            meta.linkedin = apolloMeta;
+            meta.linkedin = makeApiMeta('apollo', 'linkedin');
           }
-          if (apolloResult.company && !lead.company && !resolved.company) {
+          if (apolloResult.company && !lead.company) {
+            // Apollo wins over Tier 0.5 LLM company — only guard against
+            // overwriting what the user explicitly imported on the lead.
             resolved.company = apolloResult.company;
-            meta.company = apolloMeta;
+            meta.company = makeApiMeta('apollo', 'company');
           }
           if (apolloResult.website && !lead.website && !resolved.website) {
             resolved.website = apolloResult.website;
-            meta.website = apolloMeta;
+            meta.website = makeApiMeta('apollo', 'website');
           }
         }
       }
@@ -410,14 +455,14 @@ export async function resolveIdentity(
       if (found?.email) {
         email = found.email;
         resolved.email = found.email;
-        meta.email = makeApiMeta('enrich.so');
+        meta.email = makeApiMeta('enrich.so', 'email');
         // Chain: reverse-lookup on the resolved email fills company.
         // Names are already known (gate ensures firstName+lastName present).
         try {
           const enrichSo = await deps.enrichSoReverseLookup({ email });
           if (enrichSo?.company && !lead.company && !resolved.company) {
             resolved.company = enrichSo.company;
-            meta.company = makeApiMeta('enrich.so');
+            meta.company = makeApiMeta('enrich.so', 'company');
           }
         } catch (err) {
           console.warn(`${logTag} step 5.5 enrichSoReverseLookup chain failed:`, (err as Error).message);
@@ -459,7 +504,7 @@ export async function resolveIdentity(
         email = brokerResult.email;
         resolved.email = brokerResult.email;
         meta.email = {
-          ...makeApiMeta('apollo'),
+          ...makeApiMeta('apollo', 'email'),
           confidence: apolloEmailStatusToConfidence(brokerResult.emailStatus ?? ''),
         };
       }
@@ -485,7 +530,13 @@ export async function resolveIdentity(
       if (patternResult?.email) {
         email = patternResult.email;
         resolved.email = patternResult.email;
-        meta.email = makeApiMeta('enrich.so');
+        meta.email = {
+          source: 'api',
+          provider: 'pattern',
+          confidence: 'medium',
+          ...(patternResult.pattern ? { sourceQuote: `pattern: ${patternResult.pattern}` } : {}),
+          enrichedAt: new Date().toISOString(),
+        };
         emailPattern = patternResult.pattern;
       }
     } catch (err) {
@@ -511,18 +562,17 @@ export async function resolveIdentity(
       try {
         const enrichSo = await deps.enrichSoReverseLookup({ email });
         if (enrichSo) {
-          const enrichSoMeta = makeApiMeta('enrich.so');
           if (enrichSo.company) {
             resolved.company = enrichSo.company;
-            meta.company = enrichSoMeta;
+            meta.company = makeApiMeta('enrich.so', 'company');
           }
           if (enrichSo.firstName && !lead.firstName && !resolved.firstName) {
             resolved.firstName = enrichSo.firstName;
-            meta.firstName = enrichSoMeta;
+            meta.firstName = makeApiMeta('enrich.so', 'firstName');
           }
           if (enrichSo.lastName && !lead.lastName && !resolved.lastName) {
             resolved.lastName = enrichSo.lastName;
-            meta.lastName = enrichSoMeta;
+            meta.lastName = makeApiMeta('enrich.so', 'lastName');
           }
         }
       } catch (err) {
@@ -531,21 +581,10 @@ export async function resolveIdentity(
     }
   }
 
-  // 7. Completeness gate.
-  if (needsPersonFields) {
-    const personOk = (lead.firstName || resolved.firstName) &&
-                     (lead.lastName  || resolved.lastName);
-    if (!personOk) return { ok: false, reason: 'identity_unresolvable' };
-  }
-  if (needsCompanyFields) {
-    const companyOk = lead.company || resolved.company;
-    if (!companyOk) return { ok: false, reason: 'identity_unresolvable' };
-  }
-
-
-  // 8. Persist newly-resolved attributes ONLY in enrich mode. We also project
-  // `meta` down to only the fields that made it into writableFields so the
-  // write never carries audit entries for absent attributes.
+  // 7. Persist newly-resolved attributes ONLY in enrich mode. Runs BEFORE the
+  // completeness gate so that partial signals (linkedin, title, website from
+  // Tier 0.5) are written to the lead even when we can't resolve company —
+  // preventing data loss for skipped leads.
   const writableFields: Record<string, string> = {};
   for (const [key, value] of Object.entries(resolved)) {
     // emailDomain is normally derived locally from email and not worth
@@ -568,6 +607,18 @@ export async function resolveIdentity(
       fields: writableFields,
       meta: writableMeta,
     });
+  }
+
+  // 8. Completeness gate — checked after partial writes so resolved fields
+  // (linkedin, title, website) are never discarded even when gate fires.
+  if (needsPersonFields) {
+    const personOk = (lead.firstName || resolved.firstName) &&
+                     (lead.lastName  || resolved.lastName);
+    if (!personOk) return { ok: false, reason: 'identity_unresolvable' };
+  }
+  if (needsCompanyFields) {
+    const companyOk = lead.company || resolved.company;
+    if (!companyOk) return { ok: false, reason: 'identity_unresolvable' };
   }
 
   return { ok: true, resolved, siblings: validSiblings, emailPattern };

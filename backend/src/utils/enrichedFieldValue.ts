@@ -45,6 +45,15 @@ export interface EnrichedFieldMeta {
   rejectedAt?: string;
   /** Critic verdict from item #6 critic pass, if it ran. */
   criticVerdict?: 'supported' | 'partially-supported' | 'unsupported' | 'contradicted';
+  /**
+   * Actionable per-field quality view derived from `criticVerdict` for
+   * web-sourced fields. Advisory only — a `drop` view recommends removal but
+   * the value is never auto-deleted.
+   *  - 'drop' ← contradicted
+   *  - 'low'  ← unsupported / partially-supported
+   *  - 'high' ← supported
+   */
+  criticView?: 'drop' | 'low' | 'high';
   /** Normalized form of the value (e.g. enum, numeric range) when a type spec recognizes the field. */
   normalized?: string | number | { min: number; max: number } | null;
 }

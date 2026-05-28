@@ -19,13 +19,20 @@ function getUserAllowedChannels(user: { slackChannels?: string[]; slackChannel?:
   return [];
 }
 
-// Returns allowed channels for a user, falling back to the org owner's channel for org members.
+// Returns allowed channels for a user, falling back to the org's channel config for org members.
+// Priority: personal channels → org.slackChannel (if set on org record) → org owner's user channels.
 async function getEffectiveAllowedChannels(user: { slackChannels?: string[]; slackChannel?: string; orgId?: string } | null | undefined): Promise<string[]> {
   const personal = getUserAllowedChannels(user ?? {});
   if (personal.length > 0) return personal;
   if (user?.orgId) {
     const org = await orgDb.getOrgById(user.orgId);
     if (org?.slackChannel) return [org.slackChannel];
+    // Channels are typically stored on the org owner's user record, not the org record itself
+    if (org?.ownerUserId) {
+      const owner = await userDb.getUserById(org.ownerUserId);
+      const ownerChannels = getUserAllowedChannels(owner ?? {});
+      if (ownerChannels.length > 0) return ownerChannels;
+    }
   }
   return [];
 }
