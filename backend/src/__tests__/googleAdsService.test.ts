@@ -254,3 +254,65 @@ describe('searchLocations', () => {
     expect(locations[0].name).toBe('United States');
   });
 });
+
+describe('createAdGroup', () => {
+  it('creates an ad group for Search campaign', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/adGroups/789' }] },
+    });
+    const ag = await service.createAdGroup('user-123', '1234567890', {
+      name: 'Test Ad Group',
+      campaignResourceName: 'customers/123/campaigns/1',
+      type: 'SEARCH_STANDARD',
+    });
+    expect(ag.resourceName).toBe('customers/123/adGroups/789');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.type).toBe('SEARCH_STANDARD');
+  });
+});
+
+describe('addKeywords', () => {
+  it('adds keywords with correct match types', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}, {}] } });
+    await service.addKeywords('user-123', '1234567890', 'customers/123/adGroups/789', [
+      { text: 'buy shoes', matchType: 'BROAD' },
+      { text: 'running shoes', matchType: 'PHRASE' },
+    ]);
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations).toHaveLength(2);
+    expect(body.operations[0].create.keyword.matchType).toBe('BROAD');
+    expect(body.operations[1].create.keyword.matchType).toBe('PHRASE');
+  });
+});
+
+describe('addNegativeKeywords', () => {
+  it('adds campaign-level negative keywords', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.addNegativeKeywords('user-123', '1234567890',
+      { campaignResourceName: 'customers/123/campaigns/1' },
+      [{ text: 'free', matchType: 'BROAD' }]
+    );
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.campaign).toBe('customers/123/campaigns/1');
+    expect(body.operations[0].create.negative).toBe(true);
+    expect(body.operations[0].create.keyword.text).toBe('free');
+  });
+});
+
+describe('createAd (Responsive Search Ad)', () => {
+  it('creates RSA with headlines and descriptions', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/adGroupAds/1' }] },
+    });
+    await service.createAd('user-123', '1234567890', {
+      adGroupResourceName: 'customers/123/adGroups/789',
+      type: 'RESPONSIVE_SEARCH_AD',
+      headlines: ['Headline 1', 'Headline 2', 'Headline 3'],
+      descriptions: ['Description 1', 'Description 2'],
+      finalUrl: 'https://example.com',
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.ad.responsiveSearchAd.headlines).toHaveLength(3);
+    expect(body.operations[0].create.ad.finalUrls[0]).toBe('https://example.com');
+  });
+});
