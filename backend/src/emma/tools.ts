@@ -7174,12 +7174,13 @@ ACTION MATRIX:
         keywords: { type: 'array', items: { type: 'object', properties: { text: { type: 'string' }, matchType: { type: 'string', enum: ['BROAD', 'PHRASE', 'EXACT'] } }, required: ['text', 'matchType'] } },
         query: { type: 'string', description: 'Location search query.' },
         status: { type: 'string', enum: ['ENABLED', 'PAUSED'] },
+        cpc_bid_micros: { type: 'number', description: 'Optional CPC bid in micros for AD_GROUP CREATE.' },
       },
       required: ['customer_id', 'entity_type', 'action'],
     },
   },
   execute: async (args: any, context: any) => {
-    return await agentModeService.handleCallGoogleAdsApi(context?.userId, args);
+    return await agentModeService.handleCallGoogleAdsApi(context?.userId || context?.agentUserId, args);
   },
 });
 
@@ -7212,6 +7213,6 @@ GAQL EXAMPLES:
     },
   },
   execute: async (args: any, context: any) => {
-    return await agentModeService.handleCallGoogleAdsReportingApi(context?.userId, args);
+    return await agentModeService.handleCallGoogleAdsReportingApi(context?.userId || context?.agentUserId, args);
   },
 });

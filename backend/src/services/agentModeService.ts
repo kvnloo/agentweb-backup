@@ -23107,7 +23107,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'CREATE') {
           if (!args.budget_resource_name || !args.name || !args.type || !args.bidding_strategy) {
-            return { success: false, error: 'name, type, budget_resource_name, bidding_strategy, and location_target_ids are required to create a campaign' };
+            return { success: false, error: 'name, type, budget_resource_name, and bidding_strategy are required to create a campaign' };
           }
           const campaign = await googleAdsService.createCampaign(userId, customer_id, {
             name: args.name,
