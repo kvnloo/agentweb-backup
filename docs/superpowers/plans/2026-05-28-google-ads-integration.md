@@ -22,6 +22,7 @@
 - `backend/src/__tests__/googleAdsRoutes.test.ts`
 
 **New frontend files:**
+- `customer-portal/src/pages/GoogleAdsOAuthCallback.tsx` — OAuth popup callback page (calls /finalize, sends postMessage)
 - `customer-portal/src/components/settings/GoogleAdsAccountModal.tsx`
 - `customer-portal/src/__tests__/settings/GoogleAdsAccountModal.test.tsx`
 
@@ -33,7 +34,8 @@
 - `backend/src/emma/tools.ts` — add `call_google_ads_api` + `call_google_ads_reporting_api`
 - `backend/src/services/agentModeService.ts` — add tool handler methods
 - `backend/src/docs/agentModeSystemPrompt.ts` — add Google Ads workflow instructions
-- `customer-portal/src/pages/Settings.tsx` — add Google Ads platform card
+- `customer-portal/src/App.tsx` — register `/oauth/google-ads/callback` route
+- `customer-portal/src/pages/Settings.tsx` — add Google Ads platform card + postMessage handler
 
 ---
 
@@ -567,23 +569,204 @@ git commit -m "feat: add Google Ads OAuth routes (init/callback/finalize/connect
 
 ---
 
-## Task 4: Register Routes
+## Task 4: OAuth Callback Page + App.tsx Route
+
+**Files:**
+- Create: `customer-portal/src/pages/GoogleAdsOAuthCallback.tsx`
+- Modify: `customer-portal/src/App.tsx`
+
+The OAuth popup flow requires a dedicated callback page — the same pattern as `LinkedInAdsOAuthCallback.tsx`. The page receives `/oauth/google-ads/callback?code=...&state=...`, calls `/finalize`, and sends a `postMessage` to the opener window. Settings.tsx then handles the postMessage to show the account selector modal.
+
+- [ ] **Step 1: Create `customer-portal/src/pages/GoogleAdsOAuthCallback.tsx`**
+
+```typescript
+import { useEffect, useState, useRef } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import axios from 'axios';
+import { Loader2, CheckCircle2, XCircle } from 'lucide-react';
+import { buildApiUrl } from '@/config';
+import { useAuth } from '@/contexts/AuthContext';
+
+export default function GoogleAdsOAuthCallback() {
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const { token, loading } = useAuth();
+  const [status, setStatus] = useState<'loading' | 'success' | 'error'>('loading');
+  const [message, setMessage] = useState('Processing Google Ads authentication...');
+  const hasHandled = useRef(false);
+
+  useEffect(() => {
+    if (loading) return;
+    if (hasHandled.current) return;
+
+    const handle = async () => {
+      hasHandled.current = true;
+      const code = searchParams.get('code');
+      const state = searchParams.get('state');
+      const error = searchParams.get('error');
+
+      if (error) {
+        setStatus('error');
+        setMessage(`Authentication failed: ${error}`);
+        window.opener?.postMessage({ type: 'GOOGLE_ADS_OAUTH_ERROR', error }, window.location.origin);
+        setTimeout(() => window.close(), 2000);
+        return;
+      }
+
+      if (!code || !state) {
+        setStatus('error');
+        setMessage('Missing authorization code or state parameter');
+        window.opener?.postMessage({ type: 'GOOGLE_ADS_OAUTH_ERROR', error: 'missing_parameters' }, window.location.origin);
+        setTimeout(() => window.close(), 2000);
+        return;
+      }
+
+      try {
+        if (!token) throw new Error('session_expired');
+
+        const response = await axios.post(
+          buildApiUrl('/api/oauth/google-ads/finalize'),
+          { code, state },
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+
+        if (response.data.success) {
+          setStatus('success');
+          setMessage('Connected! Closing window...');
+          window.opener?.postMessage(
+            {
+              type: 'GOOGLE_ADS_AUTH_SUCCESS',
+              adAccounts: response.data.adAccounts,
+              tokenSessionId: response.data.tokenSessionId,
+            },
+            window.location.origin
+          );
+          window.close();
+        } else {
+          throw new Error('Failed to finalize authentication');
+        }
+      } catch (err: any) {
+        if (err.message === 'session_expired' || err.response?.status === 401) {
+          setStatus('error');
+          setMessage('Your session has expired. Please log in again.');
+          window.opener?.postMessage({ type: 'FORCE_LOGOUT' }, window.location.origin);
+          setTimeout(() => window.close(), 3000);
+          return;
+        }
+        setStatus('error');
+        setMessage(err.response?.data?.error || err.message || 'Authentication failed');
+        window.opener?.postMessage(
+          { type: 'GOOGLE_ADS_OAUTH_ERROR', error: err.response?.data?.error || err.message },
+          window.location.origin
+        );
+        setTimeout(() => window.close(), 2000);
+      }
+    };
+
+    handle();
+  }, [searchParams, navigate, token, loading]);
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-background">
+      <div className="max-w-md w-full p-8 space-y-6 text-center">
+        {status === 'loading' && (
+          <>
+            <Loader2 className="w-16 h-16 mx-auto text-[#4285F4] animate-spin" />
+            <h2 className="text-2xl font-semibold">Connecting Google Ads</h2>
+            <p className="text-muted-foreground">{message}</p>
+          </>
+        )}
+        {status === 'success' && (
+          <>
+            <CheckCircle2 className="w-16 h-16 mx-auto text-green-500" />
+            <h2 className="text-2xl font-semibold text-green-600">Success!</h2>
+            <p className="text-muted-foreground">{message}</p>
+          </>
+        )}
+        {status === 'error' && (
+          <>
+            <XCircle className="w-16 h-16 mx-auto text-red-500" />
+            <h2 className="text-2xl font-semibold text-red-600">Error</h2>
+            <p className="text-muted-foreground">{message}</p>
+            <button onClick={() => window.close()} className="mt-4 px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90">
+              Close Window
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 2: Register route in `customer-portal/src/App.tsx`**
+
+Find where `LinkedInAdsOAuthCallback` is imported and registered, add alongside it:
+
+```typescript
+// import (near LinkedInAdsOAuthCallback import)
+import GoogleAdsOAuthCallback from "@/pages/GoogleAdsOAuthCallback";
+
+// route (near /oauth/linkedin-ads/callback route)
+<Route path="/oauth/google-ads/callback" element={<GoogleAdsOAuthCallback />} />
+```
+
+- [ ] **Step 3: Add postMessage handler in `Settings.tsx`**
+
+In the `handleOAuthMessage` function in Settings.tsx, add these two cases alongside the other platform handlers:
+
+```typescript
+} else if (event.data.type === 'GOOGLE_ADS_AUTH_SUCCESS') {
+  setGoogleAdsAccounts(event.data.adAccounts || []);
+  setGoogleAdsSessionId(event.data.tokenSessionId);
+  setShowGoogleAdsModal(true);
+  setIsConnectingGoogleAds(false);
+} else if (event.data.type === 'GOOGLE_ADS_OAUTH_ERROR') {
+  setIsConnectingGoogleAds(false);
+  toast({
+    title: 'Google Ads Connection Failed',
+    description: event.data.error || 'Failed to connect Google Ads account',
+    variant: 'destructive',
+  });
+}
+```
+
+**Important:** Remove the incorrect `useEffect` URL-param-based callback handler described in Task 11 — the postMessage approach above is the correct pattern for this codebase.
+
+- [ ] **Step 4: Verify TypeScript compilation**
+
+```bash
+cd customer-portal && npx tsc --noEmit
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add customer-portal/src/pages/GoogleAdsOAuthCallback.tsx customer-portal/src/App.tsx customer-portal/src/pages/Settings.tsx
+git commit -m "feat: add Google Ads OAuth callback page and postMessage handler"
+```
+
+---
+
+## Task 5: Register Backend Routes
 
 **Files:**
 - Modify: `backend/src/app.ts`
 
-- [ ] **Step 1: Add import**
+- [ ] **Step 1: Add imports**
 
-In `backend/src/app.ts`, add after the `youtubeAuthRoutes` import (around line 47):
+In `backend/src/app.ts`, add after the `youtubeAuthRoutes` import:
 ```typescript
 import googleAdsAuthRoutes from "./routes/googleAdsAuth";
+import googleAdsRoutes from "./routes/googleAds";
 ```
 
-- [ ] **Step 2: Register route**
+- [ ] **Step 2: Register routes**
 
 After `app.use("/api/oauth/youtube", youtubeAuthRoutes);` add:
 ```typescript
 app.use("/api/oauth/google-ads", googleAdsAuthRoutes);
+app.use("/api/google-ads", googleAdsRoutes);
 ```
 
 - [ ] **Step 3: Verify TypeScript compilation**
@@ -596,12 +779,12 @@ cd backend && npx tsc --noEmit
 
 ```bash
 git add backend/src/app.ts
-git commit -m "feat: register Google Ads OAuth routes in app.ts"
+git commit -m "feat: register Google Ads routes in app.ts"
 ```
 
 ---
 
-## Task 5: Service Foundation — HTTP Helper + Account Listing
+## Task 6: Service Foundation — HTTP Helper + Account Listing
 
 **Files:**
 - Create: `backend/src/services/googleAdsService.ts`
@@ -652,7 +835,7 @@ jest.mock('../services/db', () => ({
 
 jest.mock('../services/connectedAccountsDb', () => ({
   updateAccountTokens: jest.fn().mockResolvedValue(undefined),
-  normalizeAccounts: jest.fn((accs: any) => (Array.isArray(accs) ? accs : accs ? [accs] : [])),
+  // normalizeAccounts is NOT exported — do not mock it here
 }));
 
 import { GoogleAdsService } from '../services/googleAdsService';
@@ -715,8 +898,8 @@ Expected: fails with `Cannot find module '../services/googleAdsService'`
 ```typescript
 import axios from 'axios';
 import { getGoogleAdsCredentials } from '../utils/secretsManager';
-import { userDb } from '../services/db';
-import { updateAccountTokens } from '../services/connectedAccountsDb';
+import { userDb, User } from './db';                          // sibling in services/
+import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
 
 const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v18';
 const TOKEN_REFRESH_URL = 'https://oauth2.googleapis.com/token';
@@ -906,7 +1089,7 @@ git commit -m "feat: add Google Ads service foundation (HTTP helper, auth, accou
 
 ---
 
-## Task 6: Service — Budget + Campaign CRUD
+## Task 7: Service — Budget + Campaign CRUD
 
 **Files:**
 - Modify: `backend/src/services/googleAdsService.ts`
@@ -1009,7 +1192,7 @@ describe('searchLocations', () => {
         }],
       },
     });
-    const locations = await service.searchLocations('United States', 'en');
+    const locations = await service.searchLocations('user-123', '1234567890', 'United States', 'en');
     expect(locations).toHaveLength(1);
     expect(locations[0].id).toBe('2840');
     expect(locations[0].name).toBe('United States');
@@ -1128,10 +1311,14 @@ async resumeCampaign(userId: string, customerId: string, campaignResourceName: s
 
 // ── Location search ───────────────────────────────────────────────────────
 
-async searchLocations(query: string, locale: string = 'en'): Promise<{ id: string; name: string; countryCode: string; targetType: string }[]> {
+async searchLocations(userId: string, customerId: string, query: string, locale: string = 'en'): Promise<{ id: string; name: string; countryCode: string; targetType: string }[]> {
+  const { accessToken } = await this.getAccountCredentials(userId, customerId);
   const secrets = await getGoogleAdsCredentials();
   const response = await axios.post(`${GOOGLE_ADS_API_BASE}/geoTargetConstants:suggest`, { locale, query }, {
-    headers: { 'developer-token': secrets.developerToken },
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'developer-token': secrets.developerToken,
+    },
   });
   return (response.data.geoTargetConstantSuggestions || []).map((s: any) => ({
     id: String(s.geoTargetConstant.id),
@@ -1159,7 +1346,7 @@ git commit -m "feat: add Google Ads budget + campaign CRUD to service"
 
 ---
 
-## Task 7: Service — Ad Groups, Keywords, Ads
+## Task 8: Service — Ad Groups, Keywords, Ads
 
 **Files:**
 - Modify: `backend/src/services/googleAdsService.ts`
@@ -1404,7 +1591,7 @@ git commit -m "feat: add Google Ads ad group, keyword, and ad methods to service
 
 ---
 
-## Task 8: Service — Assets, Asset Groups, Reporting
+## Task 9: Service — Assets, Asset Groups, Reporting
 
 **Files:**
 - Modify: `backend/src/services/googleAdsService.ts`
@@ -1502,6 +1689,16 @@ async uploadAsset(userId: string, customerId: string, asset: {
 
 // ── Asset Groups (PMax) ───────────────────────────────────────────────────
 
+// Text assets (headlines, descriptions) must be created as TEXT asset resources
+// first, then linked to the asset group. Passing raw strings directly to
+// assetGroupAssets:mutate will return a 400 from the API.
+private async createTextAsset(customerId: string, accessToken: string, text: string): Promise<string> {
+  const data = await this.mutate(customerId, accessToken, 'assets', [{
+    create: { name: text.substring(0, 50), type: 'TEXT', textAsset: { text } },
+  }]);
+  return data.results[0].resourceName;
+}
+
 async createAssetGroup(userId: string, customerId: string, params: {
   name: string;
   campaignResourceName: string;
@@ -1513,10 +1710,10 @@ async createAssetGroup(userId: string, customerId: string, params: {
   logoAssets: string[];
   videoAssets?: string[];
   finalUrl: string;
-  audienceSignals?: string[];
 }): Promise<{ resourceName: string }> {
   const { accessToken } = await this.getAccountCredentials(userId, customerId);
 
+  // Step 1: Create asset group container
   const assetGroupData = await this.mutate(customerId, accessToken, 'assetGroups', [{
     create: {
       name: params.name,
@@ -1527,22 +1724,28 @@ async createAssetGroup(userId: string, customerId: string, params: {
   }]);
   const assetGroupResourceName = assetGroupData.results[0].resourceName;
 
-  type AssetFieldType = 'HEADLINE' | 'LONG_HEADLINE' | 'DESCRIPTION' | 'MARKETING_IMAGE' | 'SQUARE_MARKETING_IMAGE' | 'LOGO' | 'YOUTUBE_VIDEO';
+  // Step 2: Create text assets (headlines + descriptions) as TEXT type resources
+  const headlineResourceNames = await Promise.all(params.headlines.map(t => this.createTextAsset(customerId, accessToken, t)));
+  const longHeadlineResourceNames = await Promise.all(params.longHeadlines.map(t => this.createTextAsset(customerId, accessToken, t)));
+  const descriptionResourceNames = await Promise.all(params.descriptions.map(t => this.createTextAsset(customerId, accessToken, t)));
 
+  // Step 3: Link all assets to the asset group
+  type AssetFieldType = 'HEADLINE' | 'LONG_HEADLINE' | 'DESCRIPTION' | 'MARKETING_IMAGE' | 'SQUARE_MARKETING_IMAGE' | 'LOGO' | 'YOUTUBE_VIDEO';
   const assetLinkOps: any[] = [];
-  const addAssets = (assetResourceNames: string[], fieldType: AssetFieldType) => {
-    for (const asset of assetResourceNames) {
+
+  const addLinks = (resourceNames: string[], fieldType: AssetFieldType) => {
+    for (const asset of resourceNames) {
       assetLinkOps.push({ create: { assetGroup: assetGroupResourceName, asset, fieldType } });
     }
   };
 
-  params.headlines.forEach(text => assetLinkOps.push({ create: { assetGroup: assetGroupResourceName, asset: text, fieldType: 'HEADLINE' } }));
-  params.longHeadlines.forEach(text => assetLinkOps.push({ create: { assetGroup: assetGroupResourceName, asset: text, fieldType: 'LONG_HEADLINE' } }));
-  params.descriptions.forEach(text => assetLinkOps.push({ create: { assetGroup: assetGroupResourceName, asset: text, fieldType: 'DESCRIPTION' } }));
-  addAssets(params.squareImageAssets, 'SQUARE_MARKETING_IMAGE');
-  addAssets(params.landscapeImageAssets, 'MARKETING_IMAGE');
-  addAssets(params.logoAssets, 'LOGO');
-  if (params.videoAssets) addAssets(params.videoAssets, 'YOUTUBE_VIDEO');
+  addLinks(headlineResourceNames, 'HEADLINE');
+  addLinks(longHeadlineResourceNames, 'LONG_HEADLINE');
+  addLinks(descriptionResourceNames, 'DESCRIPTION');
+  addLinks(params.squareImageAssets, 'SQUARE_MARKETING_IMAGE');
+  addLinks(params.landscapeImageAssets, 'MARKETING_IMAGE');
+  addLinks(params.logoAssets, 'LOGO');
+  if (params.videoAssets) addLinks(params.videoAssets, 'YOUTUBE_VIDEO');
 
   if (assetLinkOps.length > 0) {
     await this.mutate(customerId, accessToken, 'assetGroupAssets', assetLinkOps);
@@ -1616,7 +1819,7 @@ git commit -m "feat: add Google Ads assets, asset groups, and reporting to servi
 
 ---
 
-## Task 9: REST Routes
+## Task 10: REST Routes
 
 **Files:**
 - Create: `backend/src/routes/googleAds.ts`
@@ -1731,7 +1934,7 @@ git commit -m "feat: add Google Ads REST routes and register in app.ts"
 
 ---
 
-## Task 10: Agent Tools
+## Task 11: Agent Tools
 
 **Files:**
 - Modify: `backend/src/emma/tools.ts`
@@ -1894,7 +2097,7 @@ public async handleCallGoogleAdsApi(userId: string, args: {
 
     if (entity_type === 'LOCATION' && action === 'SEARCH') {
       if (!args.query) return { success: false, error: 'query is required for LOCATION SEARCH' };
-      const locations = await googleAdsService.searchLocations(args.query, args.locale || 'en');
+      const locations = await googleAdsService.searchLocations(userId, customer_id, args.query, args.locale || 'en');
       return { success: true, locations };
     }
 
@@ -2104,7 +2307,7 @@ git commit -m "feat: add Google Ads agent tools (call_google_ads_api + call_goog
 
 ---
 
-## Task 11: Settings UI
+## Task 12: Settings UI
 
 **Files:**
 - Create: `customer-portal/src/components/settings/GoogleAdsAccountModal.tsx`
@@ -2317,30 +2520,6 @@ const handleGoogleAdsClick = async () => {
     toast({ title: 'Error', description: 'Failed to start Google Ads authentication', variant: 'destructive' });
   }
 };
-```
-
-**Add OAuth callback handler** in the `useEffect` that handles OAuth callbacks (find where `youtube` and `meta` callbacks are handled, add alongside them):
-```typescript
-if (platform === 'google-ads' && code && state) {
-  (async () => {
-    try {
-      const resp = await axios.post(
-        buildApiUrl('/api/oauth/google-ads/finalize'),
-        { code, state },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      if (resp.data.success) {
-        setGoogleAdsAccounts(resp.data.adAccounts || []);
-        setGoogleAdsSessionId(resp.data.tokenSessionId);
-        setShowGoogleAdsModal(true);
-      }
-    } catch {
-      toast({ title: 'Error', description: 'Failed to finalize Google Ads connection', variant: 'destructive' });
-    } finally {
-      setIsConnectingGoogleAds(false);
-    }
-  })();
-}
 ```
 
 **Add connect handler**:
