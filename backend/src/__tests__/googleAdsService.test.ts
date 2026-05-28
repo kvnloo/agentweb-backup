@@ -348,3 +348,54 @@ describe('createAd — Responsive Display Ad', () => {
     expect(body.operations[0].create.ad.responsiveDisplayAd.marketingImages).toHaveLength(1);
   });
 });
+
+describe('uploadAsset', () => {
+  it('uploads an image and returns resource name', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/assets/1' }] },
+    });
+    const result = await service.uploadAsset('user-123', '1234567890', {
+      type: 'IMAGE',
+      name: 'hero.jpg',
+      data: Buffer.from('fake-image-data'),
+    });
+    expect(result).toBe('customers/123/assets/1');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.type).toBe('IMAGE');
+    expect(body.operations[0].create.imageAsset.data).toBeDefined();
+  });
+});
+
+describe('queryReporting', () => {
+  it('runs GAQL and returns results', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{ campaign: { id: '1', name: 'Test' }, metrics: { impressions: '1000' } }],
+      },
+    });
+    const results = await service.queryReporting('user-123', '1234567890',
+      'SELECT campaign.id, campaign.name, metrics.impressions FROM campaign WHERE segments.date DURING LAST_30_DAYS',
+    );
+    expect(results).toHaveLength(1);
+    expect(results[0].metrics.impressions).toBe('1000');
+  });
+});
+
+describe('getQuickMetrics', () => {
+  it('returns formatted metrics summary', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          campaign: { id: '1', name: 'Test Campaign', status: 'ENABLED' },
+          metrics: { impressions: '5000', clicks: '200', costMicros: '1000000000', conversions: '10' },
+        }],
+      },
+    });
+    const summary = await service.getQuickMetrics('user-123', '1234567890', { datePreset: 'LAST_30_DAYS' });
+    expect(summary.campaigns).toHaveLength(1);
+    expect(summary.campaigns[0].name).toBe('Test Campaign');
+    expect(summary.campaigns[0].spendFormatted).toBe('1000.00');
+    expect(summary.campaigns[0].ctr).toBeCloseTo(4.0);
+    expect(summary.currency).toBe('USD');
+  });
+});

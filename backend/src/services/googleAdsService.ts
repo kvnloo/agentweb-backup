@@ -413,6 +413,140 @@ export class GoogleAdsService {
     }]);
     return { resourceName: data.results[0].resourceName };
   }
+
+  // ── Assets ───────────────────────────────────────────────────────────────
+
+  async uploadAsset(userId: string, customerId: string, asset: {
+    type: 'IMAGE' | 'LOGO' | 'VIDEO';
+    name: string;
+    data: Buffer | string;
+  }): Promise<string> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const base64Data = Buffer.isBuffer(asset.data)
+      ? asset.data.toString('base64')
+      : Buffer.from(asset.data as string, 'binary').toString('base64');
+
+    const assetContent: any = {};
+    if (asset.type === 'IMAGE' || asset.type === 'LOGO') {
+      assetContent.imageAsset = { data: base64Data };
+    } else {
+      assetContent.youtubeVideoAsset = { youtubeVideoId: asset.data as string };
+    }
+
+    const data = await this.mutate(customerId, accessToken, 'assets', [{
+      create: { name: asset.name, type: asset.type, ...assetContent },
+    }]);
+    return data.results[0].resourceName;
+  }
+
+  // ── Asset Groups (PMax) ───────────────────────────────────────────────────
+
+  private async createTextAsset(customerId: string, accessToken: string, text: string): Promise<string> {
+    const data = await this.mutate(customerId, accessToken, 'assets', [{
+      create: { name: text.substring(0, 50), type: 'TEXT', textAsset: { text } },
+    }]);
+    return data.results[0].resourceName;
+  }
+
+  async createAssetGroup(userId: string, customerId: string, params: {
+    name: string;
+    campaignResourceName: string;
+    headlines: string[];
+    longHeadlines: string[];
+    descriptions: string[];
+    squareImageAssets: string[];
+    landscapeImageAssets: string[];
+    logoAssets: string[];
+    videoAssets?: string[];
+    finalUrl: string;
+  }): Promise<{ resourceName: string }> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+
+    const assetGroupData = await this.mutate(customerId, accessToken, 'assetGroups', [{
+      create: {
+        name: params.name,
+        campaign: params.campaignResourceName,
+        status: 'ENABLED',
+        finalUrls: [params.finalUrl],
+      },
+    }]);
+    const assetGroupResourceName = assetGroupData.results[0].resourceName;
+
+    const headlineResourceNames = await Promise.all(params.headlines.map(t => this.createTextAsset(customerId, accessToken, t)));
+    const longHeadlineResourceNames = await Promise.all(params.longHeadlines.map(t => this.createTextAsset(customerId, accessToken, t)));
+    const descriptionResourceNames = await Promise.all(params.descriptions.map(t => this.createTextAsset(customerId, accessToken, t)));
+
+    type AssetFieldType = 'HEADLINE' | 'LONG_HEADLINE' | 'DESCRIPTION' | 'MARKETING_IMAGE' | 'SQUARE_MARKETING_IMAGE' | 'LOGO' | 'YOUTUBE_VIDEO';
+    const assetLinkOps: any[] = [];
+
+    const addLinks = (resourceNames: string[], fieldType: AssetFieldType) => {
+      for (const asset of resourceNames) {
+        assetLinkOps.push({ create: { assetGroup: assetGroupResourceName, asset, fieldType } });
+      }
+    };
+
+    addLinks(headlineResourceNames, 'HEADLINE');
+    addLinks(longHeadlineResourceNames, 'LONG_HEADLINE');
+    addLinks(descriptionResourceNames, 'DESCRIPTION');
+    addLinks(params.squareImageAssets, 'SQUARE_MARKETING_IMAGE');
+    addLinks(params.landscapeImageAssets, 'MARKETING_IMAGE');
+    addLinks(params.logoAssets, 'LOGO');
+    if (params.videoAssets) addLinks(params.videoAssets, 'YOUTUBE_VIDEO');
+
+    if (assetLinkOps.length > 0) {
+      await this.mutate(customerId, accessToken, 'assetGroupAssets', assetLinkOps);
+    }
+
+    return { resourceName: assetGroupResourceName };
+  }
+
+  // ── Reporting ─────────────────────────────────────────────────────────────
+
+  async queryReporting(userId: string, customerId: string, gaqlQuery: string): Promise<any[]> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    return this.search(customerId, accessToken, gaqlQuery);
+  }
+
+  async getQuickMetrics(userId: string, customerId: string, options: {
+    campaignIds?: string[];
+    datePreset?: string;
+  }): Promise<{ campaigns: any[]; totals: any; currency: string }> {
+    const { accessToken, currency } = await this.getAccountCredentials(userId, customerId);
+    const dateClause = options.datePreset ? `DURING ${options.datePreset}` : 'DURING LAST_30_DAYS';
+    const whereClause = options.campaignIds?.length
+      ? `WHERE campaign.id IN (${options.campaignIds.join(',')}) AND segments.date ${dateClause}`
+      : `WHERE segments.date ${dateClause}`;
+
+    const query = `SELECT campaign.id, campaign.name, campaign.status, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions, metrics.ctr, metrics.average_cpc FROM campaign ${whereClause} ORDER BY metrics.cost_micros DESC`;
+    const results = await this.search(customerId, accessToken, query);
+
+    const campaigns = results.map((r: any) => {
+      const m = r.metrics;
+      const spend = Number(m.costMicros || 0) / 1_000_000;
+      const clicks = Number(m.clicks || 0);
+      const impressions = Number(m.impressions || 0);
+      return {
+        id: String(r.campaign.id),
+        name: r.campaign.name,
+        status: r.campaign.status,
+        impressions,
+        clicks,
+        ctr: impressions > 0 ? (clicks / impressions) * 100 : 0,
+        spendFormatted: spend.toFixed(2),
+        conversions: Number(m.conversions || 0),
+        avgCpc: clicks > 0 ? (spend / clicks).toFixed(2) : '0.00',
+      };
+    });
+
+    const totals = campaigns.reduce((acc, c) => ({
+      impressions: acc.impressions + c.impressions,
+      clicks: acc.clicks + c.clicks,
+      spend: acc.spend + parseFloat(c.spendFormatted),
+      conversions: acc.conversions + c.conversions,
+    }), { impressions: 0, clicks: 0, spend: 0, conversions: 0 });
+
+    return { campaigns, totals, currency };
+  }
 }
 
 export const googleAdsService = new GoogleAdsService();
