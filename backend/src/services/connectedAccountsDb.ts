@@ -175,7 +175,7 @@ export interface AttioConfig extends BaseOAuthConfig {
 }
 
 export interface GoogleAdsConfig extends BaseOAuthConfig {
-  account_type?: 'google_ads';
+  account_type: 'google_ads';
   customer_id: string;
   currency: string;
 }

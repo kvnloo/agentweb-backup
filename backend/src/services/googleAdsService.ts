@@ -233,6 +233,7 @@ export class GoogleAdsService {
     const update: any = { resourceName: campaignResourceName };
     if (params.name) { update.name = params.name; updateMask.push('name'); }
     if (params.status) { update.status = params.status; updateMask.push('status'); }
+    if (updateMask.length === 0) return; // nothing to update — avoid no-op API call
     await this.mutate(customerId, accessToken, 'campaigns', [{ update, updateMask: updateMask.join(',') }]);
   }
 
@@ -253,6 +254,7 @@ export class GoogleAdsService {
       headers: {
         Authorization: `Bearer ${accessToken}`,
         'developer-token': secrets.developerToken,
+        'login-customer-id': secrets.managerCustomerId,
       },
     });
     const responseData = response.data as { geoTargetConstantSuggestions?: any[] };
