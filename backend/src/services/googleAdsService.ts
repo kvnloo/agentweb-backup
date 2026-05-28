@@ -265,6 +265,151 @@ export class GoogleAdsService {
       targetType: s.geoTargetConstant.targetType,
     }));
   }
+
+  // ── Ad Groups ────────────────────────────────────────────────────────────
+
+  async listAdGroups(userId: string, customerId: string, campaignResourceName: string): Promise<any[]> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const results = await this.search(customerId, accessToken,
+      `SELECT ad_group.resource_name, ad_group.id, ad_group.name, ad_group.status, ad_group.type FROM ad_group WHERE ad_group.campaign = '${campaignResourceName}'`
+    );
+    return results.map((r: any) => ({
+      resourceName: r.adGroup.resourceName,
+      id: String(r.adGroup.id),
+      name: r.adGroup.name,
+      status: r.adGroup.status,
+      type: r.adGroup.type,
+    }));
+  }
+
+  async createAdGroup(userId: string, customerId: string, params: {
+    name: string;
+    campaignResourceName: string;
+    type: 'SEARCH_STANDARD' | 'DISPLAY_STANDARD';
+    cpcBidMicros?: number;
+  }): Promise<{ resourceName: string }> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const data = await this.mutate(customerId, accessToken, 'adGroups', [{
+      create: {
+        name: params.name,
+        campaign: params.campaignResourceName,
+        status: 'ENABLED',
+        type: params.type,
+        ...(params.cpcBidMicros && { cpcBidMicros: String(params.cpcBidMicros) }),
+      },
+    }]);
+    return { resourceName: data.results[0].resourceName };
+  }
+
+  async updateAdGroup(userId: string, customerId: string, adGroupResourceName: string, params: {
+    name?: string;
+    status?: 'ENABLED' | 'PAUSED';
+    cpcBidMicros?: number;
+  }): Promise<void> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const updateMask: string[] = [];
+    const update: any = { resourceName: adGroupResourceName };
+    if (params.name) { update.name = params.name; updateMask.push('name'); }
+    if (params.status) { update.status = params.status; updateMask.push('status'); }
+    if (params.cpcBidMicros) { update.cpcBidMicros = String(params.cpcBidMicros); updateMask.push('cpc_bid_micros'); }
+    if (updateMask.length === 0) return;
+    await this.mutate(customerId, accessToken, 'adGroups', [{ update, updateMask: updateMask.join(',') }]);
+  }
+
+  // ── Keywords ─────────────────────────────────────────────────────────────
+
+  async addKeywords(userId: string, customerId: string, adGroupResourceName: string, keywords: {
+    text: string;
+    matchType: 'BROAD' | 'PHRASE' | 'EXACT';
+  }[]): Promise<void> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'adGroupCriteria', keywords.map(kw => ({
+      create: {
+        adGroup: adGroupResourceName,
+        status: 'ENABLED',
+        keyword: { text: kw.text, matchType: kw.matchType },
+      },
+    })));
+  }
+
+  async addNegativeKeywords(userId: string, customerId: string, target: {
+    campaignResourceName?: string;
+    adGroupResourceName?: string;
+  }, keywords: { text: string; matchType: 'BROAD' | 'PHRASE' | 'EXACT' }[]): Promise<void> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    if (target.campaignResourceName) {
+      await this.mutate(customerId, accessToken, 'campaignCriteria', keywords.map(kw => ({
+        create: {
+          campaign: target.campaignResourceName,
+          negative: true,
+          keyword: { text: kw.text, matchType: kw.matchType },
+        },
+      })));
+    } else if (target.adGroupResourceName) {
+      await this.mutate(customerId, accessToken, 'adGroupCriteria', keywords.map(kw => ({
+        create: {
+          adGroup: target.adGroupResourceName,
+          negative: true,
+          keyword: { text: kw.text, matchType: kw.matchType },
+        },
+      })));
+    }
+  }
+
+  // ── Ads ──────────────────────────────────────────────────────────────────
+
+  async listAds(userId: string, customerId: string, adGroupResourceName: string): Promise<any[]> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const results = await this.search(customerId, accessToken,
+      `SELECT ad_group_ad.resource_name, ad_group_ad.status, ad_group_ad.ad.id, ad_group_ad.ad.type FROM ad_group_ad WHERE ad_group_ad.ad_group = '${adGroupResourceName}'`
+    );
+    return results.map((r: any) => ({
+      resourceName: r.adGroupAd.resourceName,
+      adId: String(r.adGroupAd.ad.id),
+      status: r.adGroupAd.status,
+      type: r.adGroupAd.ad.type,
+    }));
+  }
+
+  async createAd(userId: string, customerId: string, params: {
+    adGroupResourceName: string;
+    type: 'RESPONSIVE_SEARCH_AD' | 'RESPONSIVE_DISPLAY_AD';
+    headlines: string[];
+    descriptions: string[];
+    finalUrl: string;
+    imageAssetResourceNames?: string[];
+  }): Promise<{ resourceName: string }> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+
+    let adContent: any;
+    if (params.type === 'RESPONSIVE_SEARCH_AD') {
+      adContent = {
+        responsiveSearchAd: {
+          headlines: params.headlines.map(text => ({ text })),
+          descriptions: params.descriptions.map(text => ({ text })),
+        },
+      };
+    } else {
+      adContent = {
+        responsiveDisplayAd: {
+          headlines: params.headlines.map(text => ({ text })),
+          descriptions: params.descriptions.map(text => ({ text })),
+          ...(params.imageAssetResourceNames && {
+            marketingImages: params.imageAssetResourceNames.map(asset => ({ asset })),
+          }),
+        },
+      };
+    }
+
+    const data = await this.mutate(customerId, accessToken, 'adGroupAds', [{
+      create: {
+        adGroup: params.adGroupResourceName,
+        status: 'ENABLED',
+        ad: { ...adContent, finalUrls: [params.finalUrl] },
+      },
+    }]);
+    return { resourceName: data.results[0].resourceName };
+  }
 }
 
 export const googleAdsService = new GoogleAdsService();
