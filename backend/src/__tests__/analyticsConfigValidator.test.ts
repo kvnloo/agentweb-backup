@@ -80,4 +80,54 @@ describe("validateAnalyticsConfig", () => {
     const r = validateAnalyticsConfig({ productDomain: "bad domain" });
     expect(r.ok).toBe(false);
   });
+
+  // Bug fix #6: GA_ID_RE format validation for primaryAnalyticsPropertyId on partial updates
+
+  test("primaryAnalyticsPropertyId as Measurement ID format alone → error", () => {
+    const r = validateAnalyticsConfig({ primaryAnalyticsPropertyId: "G-XXXXXXXX" });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContain("Invalid GA4 Property ID format");
+    }
+  });
+
+  test("primaryAnalyticsPropertyId as alphanumeric string alone → error", () => {
+    const r = validateAnalyticsConfig({ primaryAnalyticsPropertyId: "abc123" });
+    expect(r.ok).toBe(false);
+  });
+
+  test("primaryAnalyticsPropertyId as valid numeric alone → ok, no membership check", () => {
+    const r = validateAnalyticsConfig({ primaryAnalyticsPropertyId: "123456789" });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.value.primaryAnalyticsPropertyId).toBe("123456789");
+    }
+  });
+
+  test("primaryAnalyticsPropertyId valid numeric + matching properties → ok", () => {
+    const r = validateAnalyticsConfig({
+      primaryAnalyticsPropertyId: "123456789",
+      googleAnalyticsProperties: [{ propertyId: "123456789", label: "Main" }],
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  test("primaryAnalyticsPropertyId valid numeric + non-matching properties → error", () => {
+    const r = validateAnalyticsConfig({
+      primaryAnalyticsPropertyId: "999999999",
+      googleAnalyticsProperties: [{ propertyId: "123456789", label: "Main" }],
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContain("must be one of the submitted");
+    }
+  });
+
+  test("primaryAnalyticsPropertyId null → ok, clears value", () => {
+    const r = validateAnalyticsConfig({ primaryAnalyticsPropertyId: null });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.value.primaryAnalyticsPropertyId).toBeNull();
+    }
+  });
 });

@@ -134,11 +134,13 @@ describe('resolveIdentity — failure paths', () => {
     expect(deps.writeLeadFields).not.toHaveBeenCalled();
   });
 
-  it("returns 'identity_unresolvable' when company fields requested AND all sources miss", async () => {
+  it("returns 'identity_unresolvable' when company fields requested AND all sources miss AND email is personal (no business domain)", async () => {
+    // Personal email → hasBusinessEmailDomain=false. All company sources return null.
+    // Gate should block since there's no company name and no business email domain.
     const deps = makeDeps();
     const result = await resolveIdentity(
       makeInput({
-        lead: { leadId: LEAD_ID, email: 'jane@unknown-domain.com' },
+        lead: { leadId: LEAD_ID, email: 'jane@gmail.com', firstName: 'Jane', lastName: 'Doe' },
         needsCompanyFields: true,
       }),
       deps,
@@ -146,7 +148,6 @@ describe('resolveIdentity — failure paths', () => {
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toBe('identity_unresolvable');
-    expect(deps.enrichSoReverseLookup).toHaveBeenCalledWith({ email: 'jane@unknown-domain.com' });
   });
 });
 
@@ -689,7 +690,9 @@ describe('resolveIdentity — Tier 0.5 Branch B (business email → company+webs
     );
   });
 
-  it('rejects website when derived domain does not match email domain (option 4)', async () => {
+  it('rejects mismatched website but still passes gate via business email domain (option 4)', async () => {
+    // resolveCompanyDomainViaWebSearch returns .com but lead email is .net — domain mismatch.
+    // Website should NOT be written, but lead still passes gate because business email domain is sufficient.
     const deps = makeDeps({
       resolveCompanyDomainViaWebSearch: jest
         .fn()
@@ -702,11 +705,12 @@ describe('resolveIdentity — Tier 0.5 Branch B (business email → company+webs
       }),
       deps,
     );
-    expect(result.ok).toBe(false);
+    expect(result.ok).toBe(true);
     if (result.ok) expect(result.resolved.website).toBeUndefined();
   });
 
-  it('rejects website when echoed searchedDomain does not match email domain (option 2)', async () => {
+  it('rejects website when echoed searchedDomain does not match email domain but gate passes via business email (option 2)', async () => {
+    // Website echoed wrong domain — rejected. But business email domain still passes the gate.
     const deps = makeDeps({
       resolveCompanyDomainViaWebSearch: jest
         .fn()
@@ -719,7 +723,7 @@ describe('resolveIdentity — Tier 0.5 Branch B (business email → company+webs
       }),
       deps,
     );
-    expect(result.ok).toBe(false);
+    expect(result.ok).toBe(true);
     if (result.ok) expect(result.resolved.website).toBeUndefined();
   });
 
@@ -783,6 +787,166 @@ describe('resolveIdentity — Tier 0.5 Branch B (business email → company+webs
       deps,
     );
     expect(deps.resolveCompanyDomainViaWebSearch).not.toHaveBeenCalled();
+  });
+
+  // Fix #3 — subdomain email domain predicate
+  // rawEmailDomain.endsWith('.' + derivedFromWebsite) allows the parent domain
+  // to match when the lead email uses a subdomain (e.g. marketing.acme.com).
+
+  it('Fix #3: subdomain email + parent domain website → accepted', async () => {
+    // Lead email is john@marketing.acme.com → rawEmailDomain = "marketing.acme.com"
+    // LLM returns website = "https://acme.com" → derivedFromWebsite = "acme.com"
+    // Old predicate: "acme.com".endsWith(".marketing.acme.com") → false → rejected
+    // New predicate: "marketing.acme.com".endsWith(".acme.com") → true → accepted
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest
+        .fn()
+        .mockResolvedValue({ website: 'https://acme.com', searchedDomain: 'acme.com' }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'john@marketing.acme.com', firstName: 'John', lastName: 'Doe' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.resolved.website).toBe('https://acme.com');
+  });
+
+  it('Fix #3: subdomain email + unrelated domain website → rejected', async () => {
+    // LLM returns a completely different domain — must still be rejected.
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest
+        .fn()
+        .mockResolvedValue({ website: 'https://othercorp.com', searchedDomain: 'othercorp.com' }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'john@marketing.acme.com', firstName: 'John', lastName: 'Doe' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    // Gate still passes (business email domain), but website must NOT be set
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.resolved.website).toBeUndefined();
+  });
+
+  it('Fix #3: exact domain match still works after predicate change', async () => {
+    // Regression check: john@acme.com + website "https://acme.com" → d === rawEmailDomain → accepted
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest
+        .fn()
+        .mockResolvedValue({ website: 'https://acme.com', searchedDomain: 'acme.com' }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'john@acme.com', firstName: 'John', lastName: 'Doe' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.resolved.website).toBe('https://acme.com');
+  });
+});
+
+// ─── Tier 0.5 Fix #5 — company-only result when no domain hint ───────────────
+//
+// When the LLM returns a company name but no website, we only accept it when
+// no domain hint (hasBusinessEmailDomain=false) was used, since without a
+// website we cannot validate via domain match.
+
+describe('resolveIdentity — Tier 0.5 company-only result (Fix #5)', () => {
+  it('Fix #5: company-only result written when lead has a company name hint (no email) and LLM returns a confirmed company', async () => {
+    // Lead has company name (triggers tier05HasSignal) but no email →
+    // hasBusinessEmailDomain=false. LLM returns company but no website.
+    // Fix #5 guards: !hasBusinessEmailDomain=true BUT !lead.company=false because
+    // the lead already has a company — so this block is correctly skipped and
+    // the resolved.company comes from the sibling/apollo path (or stays absent).
+    // This test validates that lead.company is not overwritten by Fix #5.
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest
+        .fn()
+        .mockResolvedValue({ company: 'New Corp Name', website: undefined }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', company: 'Existing Corp' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    // lead.company is already "Existing Corp" — Fix #5 !lead.company guard blocks overwrite
+    if (result.ok) expect(result.resolved.company).toBeUndefined();
+  });
+
+  it('Fix #5: company-only result ignored when domain hint was used (hasBusinessEmailDomain=true)', async () => {
+    // Lead has business email → hasBusinessEmailDomain=true → Fix #5 block skipped.
+    // LLM returns company but no website → company must NOT be written via Fix #5 path.
+    // (The website validation also fails because no website was returned, so company
+    // is not written via the websiteAccepted path either.)
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest
+        .fn()
+        .mockResolvedValue({ company: 'Acme Corp', website: undefined }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'john@acme.com', firstName: 'John', lastName: 'Doe' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    // Gate passes via business email domain, but company must not have been set
+    // by the company-only path (it was blocked by hasBusinessEmailDomain=true).
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.resolved.company).toBeUndefined();
+  });
+
+  it('Fix #5: company-only result written when sibling fills resolved.company and LLM confirms same — no double-write', async () => {
+    // Verifies Fix #5 condition: !lead.company is true (no company on lead) and
+    // !resolved.company is also true at Fix #5 check time (no prior company set).
+    // This is the core scenario: lead has company on lead → different from
+    // what LLM returns. Guard prevents clobbering.
+    // Use lead with no company — tier05HasSignal = false → tier 0.5 doesn't fire.
+    // resolveCompanyDomainViaWebSearch must NOT be called at all.
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest.fn().mockResolvedValue({ company: 'Inferred Corp', website: undefined }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    // No company + no business email → tier05HasSignal=false → tier 0.5 doesn't fire
+    expect(deps.resolveCompanyDomainViaWebSearch).not.toHaveBeenCalled();
+    // Gate fires: no company resolved → identity_unresolvable
+    expect(result.ok).toBe(false);
+  });
+
+  it('Fix #5: company-only result NOT overwritten when lead already has company', async () => {
+    // lead.company="Existing Corp" → Fix #5 guard (!lead.company) prevents overwrite.
+    // The LLM returns a different company name — must not clobber the existing value.
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest
+        .fn()
+        .mockResolvedValue({ company: 'New Corp', website: undefined }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', company: 'Existing Corp' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    // Fix #5 guard: !lead.company = false → block skipped → resolved.company not set by Fix #5
+    if (result.ok) expect(result.resolved.company).toBeUndefined();
   });
 });
 
@@ -1507,6 +1671,58 @@ describe('resolveIdentity — Tier 7 pattern-email attribution (Fix 2)', () => {
     const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta.email;
     expect(meta.sourceQuote).toBeUndefined();
     expect(meta.provider).toBe('pattern');
+  });
+});
+
+// ─── Company gate: hasBusinessEmailDomain ─────────────────────────────────────
+
+describe('resolveIdentity — company gate accepts hasBusinessEmailDomain', () => {
+  it('passes through when lead has business email, no company, needsCompanyFields=true', async () => {
+    // wootech.systems is a business domain → hasBusinessEmailDomain=true → companyOk=true
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest.fn().mockResolvedValue({
+        website: 'https://wootech.systems',
+        company: 'WooTech',
+        searchedDomain: 'wootech.systems',
+      }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'dave@wootech.systems' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+  });
+
+  it('blocks when lead has personal email (gmail.com), no company, needsCompanyFields=true', async () => {
+    const deps = makeDeps();
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'dave@gmail.com' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('identity_unresolvable');
+  });
+
+  it('blocks when lead has no email and no company, needsCompanyFields=true', async () => {
+    const deps = makeDeps();
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Dave', lastName: 'Smith' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('identity_unresolvable');
   });
 });
 

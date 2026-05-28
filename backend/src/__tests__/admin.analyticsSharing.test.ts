@@ -108,6 +108,53 @@ describe("PATCH /api/admin/orgs/:orgId/analytics-sharing", () => {
       .send({});
     expect(res.status).toBe(400);
   });
+
+  // Bug fix #7: analytics object exists but has no editors key → editors must default to []
+  test("analytics object exists but has no editors key → editors written as []", async () => {
+    mockOrgDb.getOrgById.mockResolvedValue({
+      orgId: "org-1", ownerUserId: "o-1",
+      shareSettings: { analytics: { enabled: false } },
+    } as any);
+    mockOrgDb.updateShareSettings.mockResolvedValue(undefined);
+    const res = await request(app)
+      .patch("/api/admin/orgs/org-1/analytics-sharing")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ enabled: true });
+    expect(res.status).toBe(200);
+    const call = (mockOrgDb.updateShareSettings as jest.Mock).mock.calls[0];
+    expect(call[1].analytics.editors).toEqual([]);
+    expect(call[1].analytics.editors).not.toBeUndefined();
+  });
+
+  test("analytics object fully absent (no analytics key) → editors written as []", async () => {
+    mockOrgDb.getOrgById.mockResolvedValue({
+      orgId: "org-1", ownerUserId: "o-1",
+      shareSettings: {},
+    } as any);
+    mockOrgDb.updateShareSettings.mockResolvedValue(undefined);
+    const res = await request(app)
+      .patch("/api/admin/orgs/org-1/analytics-sharing")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ enabled: true });
+    expect(res.status).toBe(200);
+    const call = (mockOrgDb.updateShareSettings as jest.Mock).mock.calls[0];
+    expect(call[1].analytics.editors).toEqual([]);
+  });
+
+  test("analytics object has editors array → editors array is preserved", async () => {
+    mockOrgDb.getOrgById.mockResolvedValue({
+      orgId: "org-1", ownerUserId: "o-1",
+      shareSettings: { analytics: { enabled: false, editors: ["user-123"] } },
+    } as any);
+    mockOrgDb.updateShareSettings.mockResolvedValue(undefined);
+    const res = await request(app)
+      .patch("/api/admin/orgs/org-1/analytics-sharing")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ enabled: true });
+    expect(res.status).toBe(200);
+    const call = (mockOrgDb.updateShareSettings as jest.Mock).mock.calls[0];
+    expect(call[1].analytics.editors).toEqual(["user-123"]);
+  });
 });
 
 describe("GET /api/admin/users", () => {

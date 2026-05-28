@@ -554,6 +554,10 @@ export class LinkedInOutreachService {
    * empty result) so the caller can fall back to free-text. Never throws —
    * resolver outages must not block the underlying search.
    */
+  async resolveCompanyId(company: string, accountId: string): Promise<string | null> {
+    return this.resolveSearchParamId('COMPANY', company, accountId);
+  }
+
   private async resolveSearchParamId(
     type: 'COMPANY' | 'LOCATION' | 'INDUSTRY' | 'SCHOOL' | 'SERVICE',
     keywords: string,
