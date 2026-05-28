@@ -236,7 +236,7 @@ export class AgentModeService {
   private readonly FILE_CACHE_MAX_SIZE = 1000; // Max 1000 cached files
   private readonly FILE_CACHE_MAX_AGE_MS = 3600000; // 1 hour TTL
   private readonly FILE_CACHE_CLEANUP_INTERVAL_MS = 600000; // Cleanup every 10 minutes
-  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2';
+  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5.5';
   private defaultModelSettingName = 'agent_mode_default_model';
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
@@ -9468,43 +9468,43 @@ ${emailDraftFormat === 'text'
         });
       }
 
-      // Create message draft for LinkedIn/Facebook/other platforms
-      const messagePrompt = `Based on the email draft you just created, now create a shorter message version suitable for LinkedIn, Facebook, or other messaging platforms.
+      // Create message draft optimised for LinkedIn connection invites (max 300 chars)
+      const leadName = [(lead as any).firstName, (lead as any).lastName].filter(Boolean).join(' ');
+      const leadTitle = (lead as any).title || '';
+      const leadCompany = (lead as any).company || '';
+      const messagePrompt = `Write a LinkedIn connection invite note for ${leadName || 'this person'}${leadTitle ? `, ${leadTitle}` : ''}${leadCompany ? ` at ${leadCompany}` : ''}.
 
-## Email Draft Created:
+Context from their email draft:
 Subject: ${emailData.subject}
-Content: ${emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent}
+Summary: ${(emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent || '').slice(0, 400)}
 ${messageActivityContext}
 
-## Requirements for Message Draft:
-1. Keep it concise and conversational (150-300 characters ideal, max 500)
-2. Maintain the core message and call-to-action from the email
-3. If there is activity history, acknowledge prior touchpoints naturally (e.g. "following up on my earlier email")
-4. Make it platform-agnostic (works for LinkedIn, Facebook, Twitter DMs, etc.)
-5. Use a friendly, professional tone
-6. Include personalization (use lead's name if appropriate)
-7. No need for subject line or signature
-8. Focus on the key value proposition and CTA
+Rules:
+- HARD LIMIT: 300 characters total (LinkedIn will reject longer notes)
+- Sound like a genuine person, not a pitch — be curious or give a specific reason to connect
+- No buzzwords, no "I'd love to connect", no "synergies", no empty flattery
+- Mention one concrete, specific reason you're reaching out (their role, a shared interest, a problem you help with)
+- Do not start with "Hi" or "Hello" — jump straight into the value or reason
+- No CTA, no ask, no links, no emojis
+- First-person singular only
 
-Format the response as JSON with this structure:
-{
-  "content": "The complete message content (concise, 150-500 characters)"
-}`;
+Return JSON: {"content": "the note text"}`;
 
-      // Call LLM to generate message draft
-      const messageCompletion = await openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
+      // Use Gemini for message drafting (fast, cost-effective)
+      const geminiClient = await this.getGeminiClient();
+      const messageCompletion = await geminiClient.chat.completions.create({
+        model: 'gemini-3.5-flash',
         messages: [
           {
             role: "system",
-            content: "You are an expert at crafting concise, engaging messages for social platforms like LinkedIn, Facebook, and Twitter. Create personalized, platform-agnostic messages that drive engagement. Always respond with valid JSON containing a content field.",
+            content: "You craft concise, human LinkedIn connection notes. Under 300 characters, no sales language, sounds like a real person. Always respond with valid JSON containing a content field.",
           },
           { role: "user", content: messagePrompt },
         ],
-        temperature: 0.8,
-        max_tokens: 500,
+        temperature: 0.7,
+        max_tokens: 200,
         response_format: { type: 'json_object' }
-      });
+      } as any);
 
       const messageResponseContent = messageCompletion.choices[0].message.content;
       if (!messageResponseContent) {
@@ -9522,12 +9522,12 @@ Format the response as JSON with this structure:
         messageData = null;
       }
 
-      // Create message draft object if we got valid data
+      // Create message draft object if we got valid data — hard-cap at 300 chars (LinkedIn invite limit)
       let messageDraft = null;
       if (messageData && messageData.content) {
         const now = new Date().toISOString();
         messageDraft = {
-          content: messageData.content,
+          content: String(messageData.content).slice(0, 300),
           createdAt: now,
           updatedAt: now,
           sessionId: sessionId

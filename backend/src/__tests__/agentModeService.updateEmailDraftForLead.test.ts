@@ -956,7 +956,7 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
 
       // Verify second call is for message draft
       const secondCall = mockCreate.mock.calls[1][0];
-      expect(secondCall.messages[0].content).toContain('concise, engaging messages');
+      expect(secondCall.messages[0].content).toContain('connection notes');
       expect(secondCall.messages[0].content).toContain('LinkedIn');
 
       // Should update lead with both email and message drafts
@@ -1031,7 +1031,6 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       expect(userMsg.content).toContain('email.sent');
       expect(userMsg.content).toContain('Intro email');
       expect(userMsg.content).toContain('linkedin.message.received');
-      expect(userMsg.content).toContain('prior touchpoints');
     });
 
     it('omits activity history section from message prompt when no engagements', async () => {
