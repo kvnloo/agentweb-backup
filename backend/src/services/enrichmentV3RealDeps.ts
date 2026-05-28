@@ -510,10 +510,12 @@ async function extractFieldsViaLLMReal(input: {
 
   const leadContext = JSON.stringify({
     email: input.lead.email,
-    company: input.lead.company,
-    website: input.lead.website,
     firstName: input.lead.firstName,
     lastName: input.lead.lastName,
+    title: input.lead.title || undefined,
+    company: input.lead.company,
+    website: input.lead.website,
+    location: input.lead.location || undefined,
   });
 
   const isWebTier = input.tier === 'web';
@@ -530,7 +532,11 @@ async function extractFieldsViaLLMReal(input: {
       `4. If you do not know a value with confidence, return null for that field.\n` +
       `NEVER guess, infer, or fabricate. For each field return an object ` +
       `{"value": <string>, "sourceUrl": <url or null>, "sourceQuote": <short verbatim snippet or null>}. ` +
-      `Return strict JSON only, no markdown. If you have no data for any field, return {} — never return explanations or apologies.`
+      `Return strict JSON only, no markdown. If you have no data for any field, return {} — never return explanations or apologies.\n` +
+      `IMPORTANT — for linkedin_url: name alone is never sufficient to confirm a match (e.g. "John Smith" is too common). ` +
+      `Use ALL available lead signals — email address, email domain, company name, job title, location — to verify the profile belongs to this specific person. ` +
+      `The more signals match (domain + title + company), the more confident you can be. ` +
+      `Only return a URL when you are confident the profile is the right person; otherwise return null.`
     : `You extract structured CRM data from the provided context. Return strict JSON: ` +
       `an object with one key per requested field. Use null when the value isn't ` +
       `explicitly present. Do NOT infer or fabricate. Strings only, no markdown. ` +
@@ -858,11 +864,19 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
               console.log(`${tag} Case B SKIP no firstName/lastName`);
               return null;
             }
-            const searchParams: Record<string, string> = {
-              keywords: `${lead.firstName} ${lead.lastName}`,
+            if (!lead.company && !lead.title) {
+              console.log(`${tag} Case B SKIP no company or title — name-only search too ambiguous`);
+              return null;
+            }
+            // searchPeople resolves company → company_id internally (cached LRU → DynamoDB → Unipile).
+            // Pass company and title as separate params; searchPeople handles ID resolution and
+            // advanced_keywords fallback. No pre-resolve needed here.
+            const nameKeywords = `${lead.firstName} ${lead.lastName}`;
+            const searchParams: Parameters<typeof linkedInOutreachService.searchPeople>[1] = {
+              keywords: nameKeywords,
+              ...(lead.company ? { company: lead.company } : {}),
+              ...(!lead.company && lead.title ? { title: lead.title } : {}),
             };
-            if (lead.company) searchParams.company = lead.company;
-            else if (lead.title) searchParams.title = lead.title;
             console.log(`${tag} Case B searchPeople params=${JSON.stringify(searchParams)}`);
             const searchResult = await linkedInOutreachService.searchPeople(accountId, searchParams);
             const candidates = (searchResult?.items ?? []).slice(0, 5);
@@ -874,14 +888,17 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
             const systemPrompt =
               'You are a lead researcher. Given a lead and LinkedIn search candidates, pick the best match and extract their current title and company.\n\n' +
               'RULES:\n' +
+              '- Match primarily on first name and last name.\n' +
+              '- Ignore professional suffixes (MS, MBA, PhD, II, III, Jr, Sr) when comparing names.\n' +
+              '- If the candidate last name is abbreviated to an initial (e.g. "Jason H." for lead lastName="Hurkmans"), treat it as a match if the initial matches.\n' +
               '- The correct person is most likely the first candidate, but verify.\n' +
-              '- Match first name and last name carefully.\n' +
               '- Parse the headline to extract current title and company (e.g. "CMO at Acme Inc" → title=CMO, company=Acme Inc).\n' +
-              '- If no candidate matches the lead, return null for chosenIndex.\n' +
+              '- When multiple candidates match the name, prefer the one whose headline/location aligns with the lead\'s emailDomain, company, title, or location. These fields may be stale (job change, relocation) so treat alignment as a tiebreaker, not a hard requirement.\n' +
+              '- If NO candidate name matches the lead name, return null for chosenIndex.\n' +
               '- Return ONLY valid JSON, no explanation.\n\n' +
               'Return: { "chosenIndex": 0-4 or null, "title": string or null, "company_name": string or null, "first_name": string or null, "last_name": string or null }';
             const userPrompt =
-              `Lead: firstName="${lead.firstName}" lastName="${lead.lastName}" company="${lead.company ?? ''}" title="${lead.title ?? ''}"\n\n` +
+              `Lead: firstName="${lead.firstName}" lastName="${lead.lastName}" company="${lead.company ?? ''}" title="${lead.title ?? ''}" emailDomain="${lead.emailDomain ?? ''}" location="${lead.location ?? ''}"\n\n` +
               `Candidates:\n${candidates.map((c: any, i: number) =>
                 `[${i}] name="${c.name ?? `${c.first_name ?? ''} ${c.last_name ?? ''}`.trim()}" headline="${c.headline ?? ''}" location="${c.location ?? ''}"`,
               ).join('\n')}`;

@@ -354,12 +354,37 @@ describe("Domain API Routes", () => {
 
     it("returns nulls when no project subdomain exists", async () => {
       mockGetProjectSubdomain.mockResolvedValueOnce(null);
+      mockDynamoInstance.query.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
 
       const res = await request(app).get(
         "/api/domains/project-subdomain?vercelProjectId=proj-1"
       );
       expect(res.status).toBe(200);
       expect(res.body).toEqual({ domain: null, status: null, id: null });
+    });
+
+    it("falls back to landing page subdomainPrefix when AW-CustomDomains has no record", async () => {
+      mockGetProjectSubdomain.mockResolvedValueOnce(null);
+      mockDynamoInstance.query.mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Items: [
+              {
+                id: "lp-1",
+                userId: "test-user-123",
+                vercelProjectId: "proj-1",
+                subdomainPrefix: "pricing",
+                customDomainUrl: "https://pricing.mysite.com/pricing",
+              },
+            ],
+          }),
+      });
+
+      const res = await request(app).get(
+        "/api/domains/project-subdomain?vercelProjectId=proj-1"
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ domain: "pricing.mysite.com", status: "active", id: null });
     });
 
     it("returns 400 if vercelProjectId is missing", async () => {

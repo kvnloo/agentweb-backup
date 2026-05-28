@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-25
+// Last updated: 2026-05-28
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,14 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-05-28',
+    changes: [
+      'Fixed: Admin-Created Users Now Start on the Free Tier',
+      '- Creating a user manually from the admin waitlist now explicitly assigns the Free subscription tier instead of falling back to Basic',
+      '- Existing free-only users upgraded through the waitlist flow keep Free-tier page and skill access defaults',
+    ],
+  },
   {
     date: '2026-05-27',
     changes: [
@@ -7016,4 +7024,3 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
 ];
-

@@ -334,6 +334,99 @@ describe('findUnipilePerson — Case B (no linkedin → searchPeople + LLM)', ()
 
     expect(li.searchPeople).not.toHaveBeenCalled();
   });
+
+  it('skips when both company AND title are empty', async () => {
+    mockApolloDisabled();
+    const li = await getLinkedInOutreachServiceMock();
+    (li.resolveAccountIdForEnrichment as jest.Mock).mockResolvedValue('acc-1');
+    mockProfileService(null);
+    mockCompanyService(null);
+
+    const deps = buildOrchestratorDeps('user-1');
+    await deps.runWaterfall({
+      listId: 'list-1',
+      lead: makeLead({ firstName: 'Jane', lastName: 'Doe' }), // no company, no title
+      groupName: 'person_identity',
+      requestedFields: ['linkedin_url'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    expect(li.searchPeople).not.toHaveBeenCalled();
+  });
+
+  it('does NOT skip when company is empty but title is present', async () => {
+    mockApolloDisabled();
+    const li = await getLinkedInOutreachServiceMock();
+    (li.resolveAccountIdForEnrichment as jest.Mock).mockResolvedValue('acc-1');
+    (li.searchPeople as jest.Mock).mockResolvedValue({ items: [] });
+    mockProfileService(null);
+    mockCompanyService(null);
+
+    const deps = buildOrchestratorDeps('user-1');
+    await deps.runWaterfall({
+      listId: 'list-1',
+      lead: makeLead({ firstName: 'Jane', lastName: 'Doe', title: 'VP Marketing' }), // no company, has title
+      groupName: 'person_identity',
+      requestedFields: ['linkedin_url'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    expect(li.searchPeople).toHaveBeenCalled();
+  });
+
+  it('does NOT skip when title is empty but company is present', async () => {
+    mockApolloDisabled();
+    const li = await getLinkedInOutreachServiceMock();
+    (li.resolveAccountIdForEnrichment as jest.Mock).mockResolvedValue('acc-1');
+    (li.searchPeople as jest.Mock).mockResolvedValue({ items: [] });
+    mockProfileService(null);
+    mockCompanyService(null);
+
+    const deps = buildOrchestratorDeps('user-1');
+    await deps.runWaterfall({
+      listId: 'list-1',
+      lead: makeLead({ firstName: 'Jane', lastName: 'Doe', company: 'Acme' }), // has company, no title
+      groupName: 'person_identity',
+      requestedFields: ['linkedin_url'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    expect(li.searchPeople).toHaveBeenCalled();
+  });
+
+  it('passes company as separate param, not embedded in keywords string', async () => {
+    mockApolloDisabled();
+    const li = await getLinkedInOutreachServiceMock();
+    (li.resolveAccountIdForEnrichment as jest.Mock).mockResolvedValue('acc-1');
+    (li.searchPeople as jest.Mock).mockResolvedValue({ items: [] });
+    mockProfileService(null);
+    mockCompanyService(null);
+
+    const deps = buildOrchestratorDeps('user-1');
+    await deps.runWaterfall({
+      listId: 'list-1',
+      lead: makeLead({ firstName: 'Jane', lastName: 'Doe', company: 'Acme' }),
+      groupName: 'person_identity',
+      requestedFields: ['linkedin_url'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    expect(li.searchPeople).toHaveBeenCalledWith('acc-1', expect.objectContaining({
+      keywords: 'Jane Doe', // company NOT embedded in keywords
+      company: 'Acme',      // company passed as separate param
+    }));
+    // keywords must NOT contain company name
+    const callArgs = (li.searchPeople as jest.Mock).mock.calls[0][1];
+    expect(callArgs.keywords).not.toContain('Acme');
+  });
 });
 
 // ─── findUnipileCompany — Tier 5 ─────────────────────────────────────────────

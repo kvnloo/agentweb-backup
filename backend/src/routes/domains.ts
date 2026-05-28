@@ -83,7 +83,34 @@ router.get("/project-subdomain", async (req, res: Response) => {
     }
 
     const record = await getProjectSubdomain(userId, vercelProjectId);
-    res.json({ domain: record?.domain ?? null, status: record?.status ?? null, id: record?.id ?? null });
+    if (record) {
+      return res.json({ domain: record.domain, status: record.status, id: record.id });
+    }
+
+    // Fallback: users who set a per-page subdomain via POST /page-subdomain have
+    // subdomainPrefix stored on the landing page record, not in AW-CustomDomains.
+    const pagesResult = await dynamodb
+      .query({
+        TableName: LANDING_PAGES_TABLE,
+        IndexName: "UserIdIndex",
+        KeyConditionExpression: "userId = :uid",
+        FilterExpression: "vercelProjectId = :pid AND attribute_exists(subdomainPrefix)",
+        ExpressionAttributeValues: { ":uid": userId, ":pid": vercelProjectId },
+      })
+      .promise();
+    const pages = (pagesResult.Items || []) as any[];
+    if (pages.length > 0) {
+      const page = pages[0];
+      let domain: string | null = null;
+      if (page.customDomainUrl) {
+        try {
+          domain = new URL(page.customDomainUrl).host;
+        } catch { /* ignore malformed URL */ }
+      }
+      return res.json({ domain, status: "active", id: null });
+    }
+
+    res.json({ domain: null, status: null, id: null });
   } catch (error: any) {
     console.error("[DOMAINS] Error getting project subdomain:", error);
     res.status(500).json({ error: "Failed to get project subdomain" });
