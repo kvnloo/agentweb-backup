@@ -19,6 +19,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-28',
     changes: [
+      'Improved: Emma Can Now Configure Landing Page Subdomains',
+      '- Emma can now read and set the subdomain for your landing page project (e.g. yourname.agentwebforms.com)',
+      '- Subdomain configuration is project-wide — changing it updates all landing pages in the same project simultaneously, and Emma will inform you of this before making changes',
+    ],
+  },
+  {
+    date: '2026-05-28',
+    changes: [
       'Fixed: CRM Enrichment Now Skips Unenrichable Lists and Completes Batch Enrichment',
       '- When a list\'s leads lack email, LinkedIn URL, and full name, Emma now clearly flags it as unenrichable and skips it rather than reporting a confusing error',
       '- When you ask Emma to enrich multiple lists at once, she now previews all lists first and then automatically runs enrichment on all lists that passed the preview — without asking for per-list confirmation',
