@@ -521,6 +521,26 @@ router.get("/generated", async (req, res: Response) => {
       // Non-fatal — return pages without enrichment if domain lookup fails
     }
 
+    // Auto-heal: for pages stuck in "failed" or "deploying" that have a Vercel project,
+    // check Vercel in parallel and correct their status before responding.
+    const stalePages = pages.filter(
+      (p) => (p.status === "failed" || p.status === "deploying") && p.vercelProjectId
+    );
+    if (stalePages.length > 0) {
+      try {
+        const healResults = await Promise.allSettled(
+          stalePages.map((p) => getDeploymentStatus(p.id, userId))
+        );
+        healResults.forEach((result, idx) => {
+          if (result.status === "fulfilled" && result.value.status === "deployed") {
+            stalePages[idx].status = "deployed";
+          }
+        });
+      } catch {
+        // Non-fatal — return pages with existing status if heal fails
+      }
+    }
+
     res.json({ pages });
   } catch (error) {
     console.error("[LP GENERATION] Error listing pages:", error);
