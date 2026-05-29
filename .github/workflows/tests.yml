@@ -36,8 +36,9 @@ jobs:
             partner:
               - 'partner-portal/**'
 
-  backend-tests:
-    name: Backend tests
+  # Job A: heavy agentMode files (~150 files, ~half the test time)
+  backend-tests-a:
+    name: Backend tests (agentMode)
     needs: detect-changes
     if: needs.detect-changes.outputs.backend == 'true'
     runs-on: ubuntu-latest
@@ -61,12 +62,48 @@ jobs:
         working-directory: backend
         run: NODE_OPTIONS="--max-old-space-size=4096" npm run build --if-present
 
-      - name: Run tests with coverage
+      - name: Run tests (agentMode files)
         working-directory: backend
-        run: npm run test:coverage -- --coverageReporters=text --coverageReporters=json-summary
+        run: >
+          npm test --
+          --testPathPattern="agentMode"
+          --forceExit
+
+  # Job B: everything else + coverage reporting
+  backend-tests-b:
+    name: Backend tests (all other + coverage)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Build
+        working-directory: backend
+        run: NODE_OPTIONS="--max-old-space-size=4096" npm run build --if-present
+
+      - name: Run tests with coverage (non-agentMode files)
+        working-directory: backend
+        run: >
+          npm run test:coverage --
+          --testPathIgnorePatterns="/node_modules/" "/__tests__/e2e/" "/__tests__/agentMode"
+          --coverageReporters=text --coverageReporters=json-summary
 
       - name: Post coverage comment on PR
-        if: always() && steps.filter.outcome != 'skipped'
+        if: always()
         uses: actions/github-script@v7
         with:
           script: |
@@ -118,8 +155,8 @@ jobs:
 
   backend-staging-deploy:
     name: Backend deploy to staging (after tests pass)
-    needs: [detect-changes, backend-tests]
-    if: needs.detect-changes.outputs.backend == 'true' && needs.backend-tests.result == 'success'
+    needs: [detect-changes, backend-tests-a, backend-tests-b]
+    if: needs.detect-changes.outputs.backend == 'true' && needs.backend-tests-a.result == 'success' && needs.backend-tests-b.result == 'success'
     runs-on: ubuntu-latest
     environment: staging
     steps:
@@ -233,5 +270,3 @@ jobs:
             exit 0
           fi
           npm test --silent
-
-
