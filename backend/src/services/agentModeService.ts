@@ -9472,37 +9472,36 @@ ${emailDraftFormat === 'text'
       const leadName = [(lead as any).firstName, (lead as any).lastName].filter(Boolean).join(' ');
       const leadTitle = (lead as any).title || '';
       const leadCompany = (lead as any).company || '';
-      const messagePrompt = `Write a LinkedIn connection invite note for ${leadName || 'this person'}${leadTitle ? `, ${leadTitle}` : ''}${leadCompany ? ` at ${leadCompany}` : ''}.
+      const leadDesc = [leadName || null, leadTitle, leadCompany ? `at ${leadCompany}` : null].filter(Boolean).join(', ');
+      const emailSummary = (emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent || '').slice(0, 300);
+      const messagePrompt = `You are writing a LinkedIn connection request note. The goal is to get the recipient to accept.
 
-Context from their email draft:
-Subject: ${emailData.subject}
-Summary: ${(emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent || '').slice(0, 400)}
+Recipient: ${leadDesc}
+Context from their email (use to understand the outreach angle): Subject: ${emailData.subject} — ${emailSummary}
 ${messageActivityContext}
 
-Rules:
-- HARD LIMIT: 300 characters total (LinkedIn will reject longer notes)
-- Sound like a genuine person, not a pitch — be curious or give a specific reason to connect
-- No buzzwords, no "I'd love to connect", no "synergies", no empty flattery
-- Mention one concrete, specific reason you're reaching out (their role, a shared interest, a problem you help with)
-- Do not start with "Hi" or "Hello" — jump straight into the value or reason
-- No CTA, no ask, no links, no emojis
-- First-person singular only
+Write a note that:
+- Leads with something specific about THEIR work, role, or company — show you looked them up
+- Explains briefly WHY you want to connect, relevant to them
+- Sounds like one human writing to another — warm, direct, no corporate speak
+- Is under 280 characters total
+- Does NOT start with Hi, Hello, or their name
+- Does NOT have a call to action ("would love to chat", "let's connect")
+- Does NOT use: synergy, opportunity, exciting, leverage, passionate, innovative
+- No emojis
 
-Return JSON: {"content": "the note text"}`;
+Bad: "Your work in enterprise security is impressive. Would love to connect and explore synergies."
+Good: "Been following Island's browser-isolation approach — smart way to solve shadow IT without blocking employees."
+
+Reply with ONLY valid JSON: {"content": "the note text"}`;
 
       // Use Gemini for message drafting (fast, cost-effective)
       const geminiClient = await this.getGeminiClient();
       const messageCompletion = await geminiClient.chat.completions.create({
         model: 'gemini-3.5-flash',
-        messages: [
-          {
-            role: "system",
-            content: "You craft concise, human LinkedIn connection notes. Under 300 characters, no sales language, sounds like a real person. Respond with ONLY a JSON object: {\"content\": \"the note text\"}. No explanation, no markdown.",
-          },
-          { role: "user", content: messagePrompt },
-        ],
-        temperature: 0.7,
-        max_tokens: 200,
+        messages: [{ role: "user", content: messagePrompt }],
+        temperature: 0.8,
+        max_tokens: 2048,
       } as any);
 
       const messageResponseContent = messageCompletion.choices[0].message.content;

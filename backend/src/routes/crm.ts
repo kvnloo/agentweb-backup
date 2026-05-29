@@ -4409,14 +4409,27 @@ router.post('/lists/:listId/leads/:leadId/draft-invite-note', async (req: Reques
     const leadName = [firstName, lastName].filter(Boolean).join(' ') || 'this person';
 
     const leadDesc = [leadName !== 'this person' ? leadName : null, title, company ? `at ${company}` : null].filter(Boolean).join(', ');
-    const notesLine = notes ? ` They do: ${notes.slice(0, 200)}.` : '';
-    const brandLine = brandContext ? ` Sender background: ${brandContext.replace('\nSender context: ', '').slice(0, 200)}.` : '';
+    const notesLine = notes ? `\nWhat we know about them: ${notes.slice(0, 300)}` : '';
+    const senderContext = brandContext ? `\nSender context: ${brandContext.replace('\nSender context: ', '').slice(0, 400)}` : '';
 
-    const prompt = `Write a LinkedIn connection invite note for ${leadDesc}.${notesLine}${brandLine}
+    const prompt = `You are writing a LinkedIn connection request note. The goal is to get the recipient to accept.
 
-Write ONE short sentence (under 120 characters). Specific to their work. No Hi/Hello, no their name, no CTA, no emojis.
+Recipient: ${leadDesc}${notesLine}${senderContext}
 
-Reply ONLY: {"content": "your one sentence"}`;
+Write a note that:
+- Leads with something specific and genuine about THEIR work, role, or company — show you actually looked them up
+- Explains briefly WHY you want to connect in a way that's relevant to them (shared space, complementary work, genuine curiosity)
+- Sounds like one human writing to another — warm, direct, no corporate speak
+- Is under 280 characters total (hard LinkedIn limit)
+- Does NOT start with Hi, Hello, or their name
+- Does NOT have a call to action or ask ("would love to chat", "let's connect")
+- Does NOT use: synergy, opportunity, exciting, leverage, passionate, innovative, value-add
+- No emojis
+
+Bad example: "Your work in enterprise security is impressive. Would love to connect and explore potential synergies."
+Good example: "Been following Island's browser-isolation approach — smart way to solve the shadow IT problem without blocking employees."
+
+Reply with ONLY valid JSON, nothing else: {"content": "the note text"}`;
 
     const geminiClient = await agentModeService.getGeminiClient();
     const completion = await (geminiClient as any).chat.completions.create({
