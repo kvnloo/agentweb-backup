@@ -9485,13 +9485,14 @@ Write a note that:
 - Explains briefly WHY you want to connect, relevant to them
 - Sounds like one human writing to another — warm, direct, no corporate speak
 - Is under 280 characters total
-- Does NOT start with Hi, Hello, or their name
+- Opens with their first name naturally (e.g. "John, saw your work on..." or "Sarah —")
+- Does NOT start with Hi or Hello
 - Does NOT have a call to action ("would love to chat", "let's connect")
 - Does NOT use: synergy, opportunity, exciting, leverage, passionate, innovative
 - No emojis
 
 Bad: "Your work in enterprise security is impressive. Would love to connect and explore synergies."
-Good: "Been following Island's browser-isolation approach — smart way to solve shadow IT without blocking employees."
+Good: "Sarah, Island's browser-isolation is one of the smarter takes on shadow IT — solves it without blocking employees."
 
 Reply with ONLY valid JSON: {"content": "the note text"}`;
 

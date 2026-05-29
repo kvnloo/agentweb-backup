@@ -4421,13 +4421,14 @@ Write a note that:
 - Explains briefly WHY you want to connect in a way that's relevant to them (shared space, complementary work, genuine curiosity)
 - Sounds like one human writing to another — warm, direct, no corporate speak
 - Is under 280 characters total (hard LinkedIn limit)
-- Does NOT start with Hi, Hello, or their name
+- Opens with their first name naturally (e.g. "John, saw your work on..." or "Sarah —")
+- Does NOT start with Hi or Hello
 - Does NOT have a call to action or ask ("would love to chat", "let's connect")
 - Does NOT use: synergy, opportunity, exciting, leverage, passionate, innovative, value-add
 - No emojis
 
 Bad example: "Your work in enterprise security is impressive. Would love to connect and explore potential synergies."
-Good example: "Been following Island's browser-isolation approach — smart way to solve the shadow IT problem without blocking employees."
+Good example: "Sarah, Island's browser-isolation approach is one of the smarter takes on shadow IT I've seen — solves the problem without blocking employees."
 
 Reply with ONLY valid JSON, nothing else: {"content": "the note text"}`;
 
