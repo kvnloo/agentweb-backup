@@ -89,6 +89,22 @@ describe('listAccessibleAccounts', () => {
     const accounts = await service.listAccessibleAccounts('test-access-token');
     expect(accounts).toHaveLength(0);
   });
+
+  it('skips manager accounts', async () => {
+    mockAxiosGet.mockResolvedValueOnce({
+      data: { resourceNames: ['customers/9999999999'] },
+    });
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          customer: { id: '9999999999', descriptiveName: 'MCC Account', currencyCode: 'USD', manager: true },
+        }],
+      },
+    });
+
+    const accounts = await service.listAccessibleAccounts('test-access-token');
+    expect(accounts).toHaveLength(0);
+  });
 });
 
 describe('getAccountCredentials', () => {
@@ -527,28 +543,3 @@ describe('createAssetGroup', () => {
   });
 });
 
-describe('managerCustomerId as login-customer-id', () => {
-  it('uses manager_customer_id as login-customer-id when set on the account', async () => {
-    const { userDb } = require('../services/db');
-    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
-      userId: 'user-123',
-      connected_accounts: [{
-        platform: 'google_ads',
-        account_id: '1234567890',
-        account_name: 'Client Account',
-        config: {
-          customer_id: '1234567890',
-          currency: 'USD',
-          access_token: 'valid-token',
-          refresh_token: 'refresh-token',
-          token_expires_at: Date.now() + 3600 * 1000,
-          manager_customer_id: '9999999999',
-        },
-      }],
-    });
-    mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
-    await service.search('1234567890', 'valid-token', 'SELECT campaign.id FROM campaign', '9999999999');
-    const headers = mockAxiosPost.mock.calls[0][2].headers;
-    expect(headers['login-customer-id']).toBe('9999999999');
-  });
-});
