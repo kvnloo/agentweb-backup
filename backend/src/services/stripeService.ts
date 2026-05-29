@@ -285,7 +285,7 @@ export async function changeSubscriptionPrice(
 export async function syncSubscriptionFromStripe(
   userId: string,
   stripeCustomerId: string
-): Promise<{ subscription_status?: string; stripe_subscription_id?: string; subscriptionType?: string; current_period_end?: string; has_payment_method?: boolean } | null> {
+): Promise<{ subscription_status?: string; stripe_subscription_id?: string; subscriptionType?: string; current_period_end?: string; has_payment_method?: boolean; activeOffer?: any } | null> {
   try {
     // 1. Read the current user record to know which fields are already set
     const user = await userDb.getUserById(userId);
