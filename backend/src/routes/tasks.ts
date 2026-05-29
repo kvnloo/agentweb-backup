@@ -2037,7 +2037,7 @@ router.put("/:taskId/lead-list", authenticateToken, async (req: AuthRequest, res
 });
 
 // Common function to get executions with specific asset types
-async function getExecutionsWithAssets(
+export async function getExecutionsWithAssets(
   userId: string,
   assetType: 'images' | 'videos' | 'html-reports',
   errorMessage: string
