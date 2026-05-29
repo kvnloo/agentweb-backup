@@ -110,6 +110,26 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['anthropic.claude-opus-4-7'].client).toBeNull();
     });
 
+    it('should include Claude Opus 4.8 in the supported models for admins', async () => {
+      const models = await agentModeService.getSupportedModels(true);
+      expect(models).toContain('claude-opus-4-8');
+    });
+
+    it('should include Claude Opus 4.8 in the supported models for non-admins', async () => {
+      const models = await agentModeService.getSupportedModels(false);
+      expect(models).toContain('claude-opus-4-8');
+    });
+
+    it('should include Claude Opus 4.8 by default', async () => {
+      const models = await agentModeService.getSupportedModels();
+      expect(models).toContain('claude-opus-4-8');
+    });
+
+    it('should have null client initially for Opus 4.8 (lazy-loaded)', () => {
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['claude-opus-4-8'].client).toBeNull();
+    });
+
     it('should have temperature support enabled for Sonnet 4.5', async () => {
       const llmModels = (agentModeService as any).llmModels;
       expect(llmModels['anthropic.claude-sonnet-4-5-20250929-v1:0'].supportsTemperature).toBe(true);
@@ -278,7 +298,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
   describe('getSupportedModels default model ordering', () => {
     it('should place the configured default model first in the list', async () => {
       const { settingsService } = require('../services/settingsService');
-      const allModels = Object.keys((agentModeService as any).llmModels).filter((m: string) => !m.includes('opus'));
+      const llmModels = (agentModeService as any).llmModels;
+      const allModels = Object.keys(llmModels).filter((m: string) => !llmModels[m].adminOnly);
       // Configure a model that is NOT first in the natural object-key order
       const nonFirstModel = allModels[allModels.length - 1];
       (settingsService.getSetting as jest.Mock).mockResolvedValue({
@@ -310,8 +331,9 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       const { settingsService } = require('../services/settingsService');
       (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
 
+      const llmModels = (agentModeService as any).llmModels;
       const models = await agentModeService.getSupportedModels();
-      const naturalOrder = Object.keys((agentModeService as any).llmModels).filter((m: string) => !m.includes('opus'));
+      const naturalOrder = Object.keys(llmModels).filter((m: string) => !llmModels[m].adminOnly);
       expect(models).toEqual(naturalOrder);
     });
 
@@ -321,8 +343,9 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         settingValue: 'nonexistent-model-xyz',
       });
 
+      const llmModels = (agentModeService as any).llmModels;
       const models = await agentModeService.getSupportedModels();
-      const naturalOrder = Object.keys((agentModeService as any).llmModels).filter((m: string) => !m.includes('opus'));
+      const naturalOrder = Object.keys(llmModels).filter((m: string) => !llmModels[m].adminOnly);
       expect(models).toEqual(naturalOrder);
     });
 
@@ -330,8 +353,9 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       const { settingsService } = require('../services/settingsService');
       (settingsService.getSetting as jest.Mock).mockRejectedValue(new Error('DB error'));
 
+      const llmModels = (agentModeService as any).llmModels;
       const models = await agentModeService.getSupportedModels();
-      const naturalOrder = Object.keys((agentModeService as any).llmModels).filter((m: string) => !m.includes('opus'));
+      const naturalOrder = Object.keys(llmModels).filter((m: string) => !llmModels[m].adminOnly);
       // Falls back to env/hardcoded default which is likely first anyway
       expect(models.length).toBe(naturalOrder.length);
     });
@@ -477,6 +501,30 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       const llmModels = (agentModeService as any).llmModels;
       expect(llmModels['gemini-3.5-flash'].client).toBe(mockGeminiClient);
+    });
+  });
+
+  describe('Vertex AI client lazy-loading', () => {
+    it('should lazy-load Vertex client for claude-opus-4-8 on first callLLM', async () => {
+      const mockCreate = jest.fn().mockResolvedValue({
+        choices: [{ message: { role: 'assistant', content: 'Hi!', tool_calls: undefined }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 9, completion_tokens: 13, total_tokens: 22 },
+      });
+      const mockVertexClient = { chat: { completions: { create: mockCreate } } };
+
+      jest.spyOn(agentModeService as any, 'getVertexClient').mockResolvedValue(mockVertexClient);
+
+      const messages = [
+        { role: 'system', content: 'You are a helpful assistant.' },
+        { role: 'user', content: 'Hello' },
+      ];
+
+      await (agentModeService as any).callLLM('claude-opus-4-8', messages);
+
+      expect((agentModeService as any).getVertexClient).toHaveBeenCalled();
+
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['claude-opus-4-8'].client).toBe(mockVertexClient);
     });
   });
 

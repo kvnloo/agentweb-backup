@@ -19,6 +19,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-28',
     changes: [
+      'New: Claude Opus 4.8 Now Available in Agent Mode',
+      '- Claude Opus 4.8, Anthropic\'s latest and most capable model, is now available to all users in Agent Mode',
+      '- Select "Claude Opus 4.8" from the model dropdown when starting or continuing a session',
+      '- Powered by Google Vertex AI for low-latency access',
+    ],
+  },
+  {
+    date: '2026-05-28',
+    changes: [
       'Improved: Waitlist Form Typing Is Now Fast',
       '- Fixed a performance issue on the landing page where typing in the waitlist form was very slow',
       '- The form fields are now isolated in their own component so keystrokes no longer trigger a full re-render of the entire landing page',
