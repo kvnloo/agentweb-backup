@@ -159,6 +159,8 @@ interface LLMModelConfig {
   isLive?: boolean;
   /** Maximum number of tools this model/deployment accepts (e.g. Azure OpenAI gpt-5.x limits to 128) */
   maxTools?: number;
+  /** True to restrict model to admin users only */
+  adminOnly?: boolean;
 }
 
 // Type for LLM call options
@@ -903,6 +905,8 @@ export class AgentModeService {
 
   private gemini_client: OpenAI | null = null;
   private gemini_client_promise: Promise<OpenAI> | null = null;
+  private vertex_client: any | null = null;
+  private vertex_client_promise: Promise<any> | null = null;
 
   // Helper method to get Gemini client (lazy-loaded from secrets manager)
   public async getGeminiClient(): Promise<OpenAI> {
@@ -947,12 +951,195 @@ export class AgentModeService {
     return this.gemini_client_promise;
   }
 
+  public async getVertexClient(modelId: string): Promise<any> {
+    if (this.vertex_client) return this.vertex_client;
+    if (this.vertex_client_promise) return this.vertex_client_promise;
+
+    this.vertex_client_promise = (async () => {
+      try {
+        const { GoogleAuth } = await import('google-auth-library');
+        const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+        const secretString = await getSecret(`${environment}/AgentWeb/Google/Vertex`);
+        const credentials = JSON.parse(secretString);
+        const auth = new GoogleAuth({
+          credentials,
+          scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+        });
+        const projectId = credentials.project_id;
+        const VERTEX_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
+
+        const client = {
+          _auth: auth,
+          _projectId: projectId,
+          chat: {
+            completions: {
+              create: async (params: any) => {
+                const token = await auth.getAccessToken();
+                const url = `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/global/publishers/anthropic/models/${modelId}:rawPredict`;
+
+                // Convert OpenAI-format messages to Anthropic format
+                const systemParts: string[] = [];
+                const messages: any[] = [];
+                for (const msg of params.messages) {
+                  if (msg.role === 'system') {
+                    systemParts.push(typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content));
+                  } else if (msg.role === 'assistant') {
+                    const content: any[] = [];
+                    if (msg.content) {
+                      const text = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+                      if (text) content.push({ type: 'text', text });
+                    }
+                    // Convert OpenAI tool_calls → Anthropic tool_use blocks
+                    if (Array.isArray(msg.tool_calls)) {
+                      for (const tc of msg.tool_calls) {
+                        content.push({
+                          type: 'tool_use',
+                          id: tc.id,
+                          name: tc.function.name,
+                          input: (() => { try { return JSON.parse(tc.function.arguments); } catch { return {}; } })(),
+                        });
+                      }
+                    }
+                    if (content.length > 0) messages.push({ role: 'assistant', content });
+                  } else if (msg.role === 'user') {
+                    const content = typeof msg.content === 'string'
+                      ? [{ type: 'text', text: msg.content }]
+                      : Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: String(msg.content) }];
+                    messages.push({ role: 'user', content });
+                  } else if (msg.role === 'tool') {
+                    // Append tool result to the last user message or create a new one
+                    const toolResult = {
+                      type: 'tool_result',
+                      tool_use_id: msg.tool_call_id,
+                      content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
+                    };
+                    const lastMsg = messages[messages.length - 1];
+                    if (lastMsg?.role === 'user') {
+                      lastMsg.content.push(toolResult);
+                    } else {
+                      messages.push({ role: 'user', content: [toolResult] });
+                    }
+                  }
+                }
+
+                // Merge consecutive same-role messages (Anthropic requires alternating roles)
+                const merged: any[] = [];
+                for (const msg of messages) {
+                  const prev = merged[merged.length - 1];
+                  if (prev && prev.role === msg.role) {
+                    prev.content = [...prev.content, ...msg.content];
+                  } else {
+                    merged.push({ ...msg, content: [...msg.content] });
+                  }
+                }
+
+                const body: any = {
+                  anthropic_version: 'vertex-2023-10-16',
+                  max_tokens: params.max_completion_tokens || 12384,
+                  messages: merged,
+                };
+                if (systemParts.length > 0) body.system = systemParts.join('\n');
+                if (params.temperature !== undefined) body.temperature = params.temperature;
+                if (params.tools && params.tools.length > 0) {
+                  body.tools = params.tools.map((t: any) => ({
+                    name: t.function.name,
+                    description: t.function.description || t.function.name,
+                    input_schema: t.function.parameters,
+                  }));
+                }
+
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), VERTEX_REQUEST_TIMEOUT_MS);
+                let response: Response;
+                try {
+                  response = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                      'Authorization': `Bearer ${token}`,
+                      'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(body),
+                    signal: controller.signal,
+                  });
+                } finally {
+                  clearTimeout(timeout);
+                }
+
+                if (!response.ok) {
+                  const errText = await response.text();
+                  const err: any = new Error(`Vertex AI error ${response.status}: ${errText}`);
+                  err.status = response.status;
+                  throw err;
+                }
+
+                const data: any = await response.json();
+
+                // Convert Anthropic response format to OpenAI format
+                let messageContent = '';
+                let toolCalls: any[] | null = null;
+                if (data.content) {
+                  const textParts: string[] = [];
+                  const toolUseParts: any[] = [];
+                  for (const block of data.content) {
+                    if (block.type === 'text') {
+                      textParts.push(block.text);
+                    } else if (block.type === 'tool_use') {
+                      toolUseParts.push({
+                        id: block.id,
+                        type: 'function',
+                        function: {
+                          name: block.name,
+                          arguments: JSON.stringify(block.input),
+                        },
+                      });
+                    }
+                  }
+                  messageContent = textParts.join('\n');
+                  if (toolUseParts.length > 0) toolCalls = toolUseParts;
+                }
+
+                const usage = data.usage || {};
+                return {
+                  choices: [{
+                    message: {
+                      role: 'assistant',
+                      content: messageContent || null,
+                      ...(toolCalls && { tool_calls: toolCalls }),
+                    },
+                    finish_reason: data.stop_reason === 'tool_use' ? 'tool_calls' : 'stop',
+                  }],
+                  usage: {
+                    prompt_tokens: usage.input_tokens || 0,
+                    completion_tokens: usage.output_tokens || 0,
+                    total_tokens: (usage.input_tokens || 0) + (usage.output_tokens || 0),
+                  },
+                };
+              },
+            },
+          },
+        };
+
+        this.vertex_client = client;
+        return client;
+      } catch (error) {
+        console.error('Error initializing Vertex AI client:', error);
+        this.vertex_client_promise = null;
+        throw error;
+      }
+    })();
+
+    return this.vertex_client_promise;
+  }
+
   public async getClientForModel(model: string): Promise<any> {
     if (model.startsWith('anthropic.')) {
       return this.getBedrockClient(model);
     }
     if (model.startsWith('gpt-')) {
       return this.getAzureOpenAIClient(model);
+    }
+    if (model.startsWith('claude-')) {
+      return this.getVertexClient(model);
     }
     return this.getGeminiClient();
   }
@@ -1394,13 +1581,16 @@ export class AgentModeService {
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true },
     'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true },
-    'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true },
+    'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true, adminOnly: true },
     // NOTE: not available on this Bedrock account as of 2026-04-21 (admin-only, kept for future availability)
-    'anthropic.claude-opus-4-7': { client: null, supportsTemperature: true },
+    'anthropic.claude-opus-4-7': { client: null, supportsTemperature: true, adminOnly: true },
+    // Claude Opus 4.8 via Google Vertex AI — available to all users
+    // temperature is deprecated for this model on Vertex AI
+    'claude-opus-4-8': { client: null, supportsTemperature: false },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
-    const models = Object.keys(this.llmModels).filter(m => isAdmin || !m.includes('opus'));
+    const models = Object.keys(this.llmModels).filter(m => isAdmin || !this.llmModels[m].adminOnly);
     const defaultModel = await this.getDefaultModel();
     // Put the default model first so frontends that use [0] pick the right one
     if (defaultModel && models.includes(defaultModel)) {
@@ -1410,7 +1600,7 @@ export class AgentModeService {
   }
 
   async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
-    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || !m.includes('opus')));
+    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || !this.llmModels[m].adminOnly));
   }
   /**
    * Make an LLM call with the specified model and parameters
@@ -1475,17 +1665,17 @@ export class AgentModeService {
       throw new Error(`Model '${model}' is a live voice model. Use the Socket.IO live:start event instead of the HTTP generate endpoint.`);
     }
 
-    // Get the client - lazy-load Gemini or Bedrock client if needed
+    // Get the client - lazy-load Gemini, Bedrock, or Vertex client if needed
     let client = this.llmModels[model].client;
     if (!client) {
       if (model.startsWith('gemini-')) {
         client = await this.getGeminiClient();
-        // Update the cached client for future use
         this.llmModels[model].client = client;
       } else if (model.startsWith('anthropic.')) {
-        // Lazy-load Bedrock client for Claude models
         client = await this.getBedrockClient(model);
-        // Update the cached client for future use
+        this.llmModels[model].client = client;
+      } else if (model.startsWith('claude-')) {
+        client = await this.getVertexClient(model);
         this.llmModels[model].client = client;
       } else {
         throw new Error(`Client not initialized for model: ${model}`);
@@ -1555,6 +1745,7 @@ export class AgentModeService {
       'anthropic.claude-sonnet-4-5-20250929-v1:0': [3, 15],
       'anthropic.claude-sonnet-4-6': [3, 15],
       'anthropic.claude-opus-4-6-v1': [15, 75],
+      'claude-opus-4-8': [15, 75],
       'gpt-5-chat-2': [2.5, 10],
       'gpt-5.2-chat': [3, 12],
       'gemini-3-pro-preview': [1.25, 10],
