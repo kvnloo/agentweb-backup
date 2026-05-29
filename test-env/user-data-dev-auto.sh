@@ -397,6 +397,10 @@ echo "$NOTION_PAGE_ID" > "$APP_DIR/.notion-page-id"
 echo "$NOTION_TOKEN" > "$APP_DIR/.notion-token"
 chown ec2-user:ec2-user "$APP_DIR/.claude-run.sh" "$APP_DIR/.notion-page-id" "$APP_DIR/.notion-token"
 
+# Clear any resume pointer carried over from a prior task on a recycled instance,
+# so the follow-up-comment handler can't resume the previous task's Claude session.
+rm -f "$APP_DIR/.claude-session-id"
+
 sudo -u ec2-user tmux new-session -d -s claude "$APP_DIR/.claude-run.sh"
 
 # 13. Signal readiness
