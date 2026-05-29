@@ -352,14 +352,13 @@ export interface GoogleAdsCredentials {
   clientId: string;
   clientSecret: string;
   developerToken: string;
-  managerCustomerId: string;
 }
 
 /**
  * Get Google Ads API credentials from AWS Secrets Manager.
  *
  * Secret location: dev/AgentWeb/Google/Ads (or prod/... for production)
- * Secret format: { "clientId": "...", "clientSecret": "...", "developerToken": "...", "managerCustomerId": "..." }
+ * Secret format: { "clientId": "...", "clientSecret": "...", "developerToken": "..." }
  *
  * @returns Google Ads API credentials
  */
@@ -378,8 +377,8 @@ export async function getGoogleAdsCredentials(): Promise<GoogleAdsCredentials> {
 
     const credentials = JSON.parse(secretString) as GoogleAdsCredentials;
 
-    if (!credentials.clientId || !credentials.clientSecret || !credentials.developerToken || !credentials.managerCustomerId) {
-      throw new Error('Google Ads credentials missing one or more required fields: clientId, clientSecret, developerToken, managerCustomerId');
+    if (!credentials.clientId || !credentials.clientSecret || !credentials.developerToken) {
+      throw new Error('Google Ads credentials missing one or more required fields: clientId, clientSecret, developerToken');
     }
 
     return credentials;
