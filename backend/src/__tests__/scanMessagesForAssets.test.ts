@@ -36,7 +36,7 @@ jest.mock('../services/agentModeService', () => ({
 }));
 jest.mock('../config', () => ({ MAX_MESSAGE_SIZE_PER_SESSION: 1000 }));
 
-import { scanMessagesForAssets } from '../routes/tasks';
+import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
 import { ChatSession } from '../services/chatbotService';
 
 const makeSession = (overrides?: Partial<ChatSession>): ChatSession => ({
