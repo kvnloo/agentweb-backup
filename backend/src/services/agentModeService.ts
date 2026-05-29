@@ -157,6 +157,13 @@ interface LLMModelConfig {
   supportsTemperature: boolean;
   /** True for Gemini Live models — uses persistent WebSocket, not HTTP generate */
   isLive?: boolean;
+  /**
+   * True if the model can be used as the describe_image vision model — i.e. it is
+   * multimodal AND reachable/provisioned in this deployment. Verified empirically
+   * (see getVisionModelOptions). Models that are text/voice-only, return 404 from
+   * their provider, or aren't provisioned on the account are intentionally omitted.
+   */
+  supportsVision?: boolean;
   /** Maximum number of tools this model/deployment accepts (e.g. Azure OpenAI gpt-5.x limits to 128) */
   maxTools?: number;
   /** True to restrict model to admin users only */
@@ -905,13 +912,13 @@ export class AgentModeService {
   }
 
   /**
-   * Vision-ready model options for the describe_image tool. Every chat model in the
-   * registry is multimodal except the Live (voice) model, so we expose all non-live
-   * models (respecting adminOnly).
+   * Vision-ready model options for the describe_image tool — only models flagged
+   * supportsVision (verified multimodal AND reachable in this deployment), respecting
+   * adminOnly. Excludes the Live voice model, unserved model ids, and unprovisioned models.
    */
   async getVisionModelOptions(isAdmin: boolean = false): Promise<string[]> {
     return Object.keys(this.llmModels).filter(
-      m => !this.llmModels[m].isLive && (isAdmin || !this.llmModels[m].adminOnly)
+      m => this.llmModels[m].supportsVision === true && (isAdmin || !this.llmModels[m].adminOnly)
     );
   }
 
@@ -1657,28 +1664,32 @@ export class AgentModeService {
   private llmModels: Record<string, LLMModelConfig> = {
     // List openai models - create client dynamically for each deployment
     // Azure OpenAI enforces a 128-tool limit per request
-    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true, maxTools: 128 },
-    'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128 },
-    'gpt-5.4': { client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128 },
-    'gpt-5.4-nano': { client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128 },
-    'gpt-5.5': { client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128 },
+    // supportsVision flags below were verified empirically against the describe_image
+    // path (probe against a real image). All GPT-5 deployments handle vision.
+    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true, maxTools: 128, supportsVision: true },
+    'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true },
+    'gpt-5.4': { client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true },
+    'gpt-5.4-nano': { client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
+    'gpt-5.5': { client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     // List gemini models - client will be lazy-loaded
+    // gemini-3-pro-preview omitted from vision: the Gemini API returns 404 for this id (not served).
     'gemini-3-pro-preview': { client: null, supportsTemperature: true },
-    'gemini-3-flash-preview': { client: null, supportsTemperature: true },
-    'gemini-3.1-pro-preview': { client: null, supportsTemperature: true },
-    'gemini-3.1-flash-lite': { client: null, supportsTemperature: true },
-    'gemini-3.5-flash': { client: null, supportsTemperature: true },
-    // Gemini Live voice model — uses persistent WebSocket via liveVoiceService
+    'gemini-3-flash-preview': { client: null, supportsTemperature: true, supportsVision: true },
+    'gemini-3.1-pro-preview': { client: null, supportsTemperature: true, supportsVision: true },
+    'gemini-3.1-flash-lite': { client: null, supportsTemperature: true, supportsVision: true },
+    'gemini-3.5-flash': { client: null, supportsTemperature: true, supportsVision: true },
+    // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
-    'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true },
-    'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true },
-    'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true, adminOnly: true },
-    // NOTE: not available on this Bedrock account as of 2026-04-21 (admin-only, kept for future availability)
+    'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
+    'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true, supportsVision: true },
+    'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true, adminOnly: true, supportsVision: true },
+    // NOTE: not available on this Bedrock account as of 2026-04-21 (admin-only, kept for future availability).
+    // Vision capable, but omitted from vision options until provisioned (selecting it returns 403). Add supportsVision: true when enabled.
     'anthropic.claude-opus-4-7': { client: null, supportsTemperature: true, adminOnly: true },
     // Claude Opus 4.8 via Google Vertex AI — available to all users
     // temperature is deprecated for this model on Vertex AI
-    'claude-opus-4-8': { client: null, supportsTemperature: false },
+    'claude-opus-4-8': { client: null, supportsTemperature: false, supportsVision: true },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
