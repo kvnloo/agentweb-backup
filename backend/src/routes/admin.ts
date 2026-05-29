@@ -24,6 +24,7 @@ import { getRevenueMetrics } from "../services/revenueService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
 import { resyncAllSubscriptionAmounts, syncSubscriptionFromStripe } from "../services/stripeService";
 import { syncNewUserToLeadList, syncUserUpdateToLeadList } from "../services/crmAutoSyncService";
+import { DEFAULT_PAGES, getTierConfig } from "../services/subscriptionService";
 import { getActivationFields } from "../cron/activationAnalysisCron";
 import multer from "multer";
 import { MAX_FILE_SIZE } from "../config";
@@ -126,7 +127,7 @@ router.patch("/orgs/:orgId/analytics-sharing", async (req, res) => {
     const existing = org.shareSettings?.analytics ?? { enabled: false, editors: [] };
     const shareSettings = {
       ...(org.shareSettings ?? {}),
-      analytics: { enabled, editors: existing.editors },
+      analytics: { enabled, editors: existing.editors ?? [] },
     };
     await orgDb.updateShareSettings(orgId, shareSettings as any);
     return res.json({ orgId, analyticsSharingEnabled: enabled });
@@ -1423,11 +1424,20 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
 
     let resultUser;
     let temporaryPassword;
+    const freeTierConfig = await getTierConfig("Free");
+    const freeTierDefaults = {
+      subscriptionType: "Free",
+      allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
+      allowedSkills: freeTierConfig?.allowedSkills ?? [],
+    };
 
     if (existingUser) {
       // Update existing free user with new roles and copy stripe_customer_id if missing
       const updatedRoles = [...(existingUser.roles || []), ...roles];
-      const updatePayload: any = { roles: updatedRoles };
+      const updatePayload: any = {
+        roles: updatedRoles,
+        ...freeTierDefaults,
+      };
       if (waitlistEntry.stripe_customer_id && !existingUser.stripe_customer_id) {
         updatePayload.stripe_customer_id = waitlistEntry.stripe_customer_id;
       }
@@ -1474,7 +1484,10 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
         return res.status(500).json({ message: "Failed to create user" });
       }
 
-      resultUser = newUser;
+      resultUser = await userDb.updateUser(userId, freeTierDefaults) || {
+        ...newUser,
+        ...freeTierDefaults,
+      };
 
       // Auto-sync new user to CRM lead list (fire-and-forget)
       syncNewUserToLeadList({

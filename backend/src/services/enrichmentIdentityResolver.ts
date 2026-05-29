@@ -296,7 +296,7 @@ export async function resolveIdentity(
         if (hasBusinessEmailDomain) {
           const derivedFromWebsite = deriveDomainFromWebsite(domainResult.website);
           const domainOrSubdomain = (d: string | null) =>
-            !!d && (d === rawEmailDomain || d.endsWith(`.${rawEmailDomain}`));
+            !!d && (d === rawEmailDomain || d.endsWith(`.${rawEmailDomain}`) || rawEmailDomain!.endsWith(`.${d}`));
           const derivedMatches = domainOrSubdomain(derivedFromWebsite);                        // option 4
           const echoedDomain = domainResult.searchedDomain;
           const echoMatches = !echoedDomain || domainOrSubdomain(echoedDomain);               // option 2
@@ -322,6 +322,16 @@ export async function resolveIdentity(
           }
           console.log(`${logTag} tier 0.5 website=${domainResult.website} emailDomain=${derivedDomain || '∅'} company=${domainResult.company || '∅'}`);
         }
+      }
+      // Company-only result: LLM returned a company name but no website.
+      // Only accept when no domain hint was passed — without a website we
+      // can't validate via domain match, so only trust it when there was
+      // nothing to validate against.
+      if (!domainResult?.website && domainResult?.company && !hasBusinessEmailDomain
+          && !lead.company && !resolved.company) {
+        resolved.company = domainResult.company;
+        meta.company = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
+        console.log(`${logTag} tier 0.5 company-only (no website) company=${domainResult.company}`);
       }
     } catch (err) {
       console.warn(`${logTag} tier 0.5 resolveCompanyDomainViaWebSearch failed:`, (err as Error).message);
@@ -617,7 +627,10 @@ export async function resolveIdentity(
     if (!personOk) return { ok: false, reason: 'identity_unresolvable' };
   }
   if (needsCompanyFields) {
-    const companyOk = lead.company || resolved.company;
+    // Business email domain is sufficient — T2/T5 waterfall tiers can discover
+    // company from domain alone (Unipile company search, Apollo org match).
+    // Only block when we have neither company name nor a resolvable domain.
+    const companyOk = lead.company || resolved.company || hasBusinessEmailDomain;
     if (!companyOk) return { ok: false, reason: 'identity_unresolvable' };
   }
 

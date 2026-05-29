@@ -399,6 +399,7 @@ describe('Stripe Backend Integration', () => {
         subscription_status: 'past_due',
         stripe_subscription_id: 'sub_123',
         has_payment_method: false,
+        activeOffer: null,
       });
     });
   });

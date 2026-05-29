@@ -77,6 +77,9 @@ export function validateAnalyticsConfig(input: AnalyticsConfigInput): Validation
       return { ok: false, error: "primaryAnalyticsPropertyId must be a string" };
     } else {
       const id = raw.trim();
+      if (!GA_ID_RE.test(id)) {
+        return { ok: false, error: `Invalid GA4 Property ID format: ${raw}. Use the numeric Property ID.` };
+      }
       const props = value.googleAnalyticsProperties;
       if (props && !props.some((p) => p.propertyId === id)) {
         return { ok: false, error: "primaryAnalyticsPropertyId must be one of the submitted GA4 properties" };

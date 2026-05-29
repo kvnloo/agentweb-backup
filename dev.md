@@ -4531,3 +4531,29 @@ The scoring judge prompt was updated (both the hardcoded `DEFAULT_SCORING_SYSTEM
 ### Live Prompt State
 
 The prompt was manually updated in both dev and prod via the admin Scoring Judges page. No migration or deploy is needed — the page writes directly to the `default-scoring-prompt` DynamoDB setting at runtime. Custom judges were also updated to match.
+
+## Large Brand Guidelines Files — Google Drive Workaround (2026-05-28)
+
+### Context
+
+Vivian Health provided their brand guidelines as a ~135 MB zip file. Our upload infrastructure has a 100 MB hard cap (`MAX_FILE_SIZE` in `backend/src/config.ts`) and a 50 MB Express body-parser limit, so the file could not be uploaded directly.
+
+### Solution
+
+Rather than increasing upload limits or adding server-side zip extraction (which would significantly increase backend complexity and S3 storage costs for large binary archives), the simpler approach is to use Google Drive as the storage layer:
+
+1. Create a Google Drive folder for the client's brand assets.
+2. Upload the brand guidelines zip (or its extracted contents) to that folder.
+3. Share the folder with the client's AgentWeb account email so the Google Drive knowledge base connector can access it.
+4. The files are then accessible through the existing Knowledge Base interface — the agent can read PDFs, DOCX files, images, etc. directly from Google Drive without any changes to our upload infrastructure.
+
+### Why this is better than increasing upload limits
+
+- No infrastructure changes required — no risk of destabilizing the upload path for all users.
+- Google Drive is already integrated as a knowledge base source; files stored there are indexed and accessible to the agent the same way as any other KB file.
+- Large zip files don't need to be stored redundantly in S3 — Google Drive handles storage and CDN delivery.
+- The client retains direct access to their own files in Drive and can update them without going through our UI.
+
+### Recommendation for the product
+
+If large brand guideline uploads become a common need, consider adding a "Connect Google Drive folder" shortcut in the Brand Guidelines UI that guides users through sharing a folder with the service account — avoiding the upload flow entirely for large asset libraries.

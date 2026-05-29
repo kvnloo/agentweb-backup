@@ -56,7 +56,7 @@ export const FIELD_GROUPS: Record<string, FieldGroupConfig> = {
       'department', 'linkedin_url', 'email', 'phone', 'location',
     ],
     sources: ['linkedin', 'web_search'],
-    searchTemplate: '{{firstName}} {{lastName}} {{emailDomain}} linkedin',
+    searchTemplate: '{{firstName}} {{lastName}} {{email}} {{emailDomain}} linkedin',
     ttlDays: 90,
   },
 
@@ -68,7 +68,7 @@ export const FIELD_GROUPS: Record<string, FieldGroupConfig> = {
       'recent_role_change_date', 'years_experience',
     ],
     sources: ['linkedin', 'web_search'],
-    searchTemplate: '{{firstName}} {{lastName}} {{emailDomain}} career history',
+    searchTemplate: '{{firstName}} {{lastName}} {{email}} {{emailDomain}} career history',
     ttlDays: 90,
   },
 
