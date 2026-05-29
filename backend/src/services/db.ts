@@ -4946,6 +4946,8 @@ export const crmDb = {
     syncMetadata?: Record<string, any>;
     /** Enrichment metadata sidecar — keyed by field name (custom or standard). See utils/enrichedFieldValue.ts. */
     enrichmentMetadata?: Record<string, any>;
+    /** ISO timestamp set when a LinkedIn connection invite is manually sent from the CRM. */
+    linkedInInviteSentAt?: string | null;
     /** CRM-internal bookkeeping (findReason, freshUntil, scheduledRunAt,
      *  icpSource). Sidecar map distinct from customFields so it does NOT
      *  leak into CSV exports, email-template variables, or the
@@ -5074,6 +5076,15 @@ export const crmDb = {
       if (updates.companyLinkedin !== undefined) {
         setExpressions.push('companyLinkedin = :companyLinkedin');
         expressionAttributeValues[':companyLinkedin'] = updates.companyLinkedin.trim();
+      }
+
+      if (updates.linkedInInviteSentAt !== undefined) {
+        if (updates.linkedInInviteSentAt === null) {
+          removeExpressions.push('linkedInInviteSentAt');
+        } else {
+          setExpressions.push('linkedInInviteSentAt = :linkedInInviteSentAt');
+          expressionAttributeValues[':linkedInInviteSentAt'] = updates.linkedInInviteSentAt;
+        }
       }
 
       if (updates.customFields !== undefined) {

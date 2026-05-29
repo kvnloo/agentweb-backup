@@ -236,7 +236,7 @@ export class AgentModeService {
   private readonly FILE_CACHE_MAX_SIZE = 1000; // Max 1000 cached files
   private readonly FILE_CACHE_MAX_AGE_MS = 3600000; // 1 hour TTL
   private readonly FILE_CACHE_CLEANUP_INTERVAL_MS = 600000; // Cleanup every 10 minutes
-  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2';
+  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5.5';
   private defaultModelSettingName = 'agent_mode_default_model';
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
@@ -9468,66 +9468,71 @@ ${emailDraftFormat === 'text'
         });
       }
 
-      // Create message draft for LinkedIn/Facebook/other platforms
-      const messagePrompt = `Based on the email draft you just created, now create a shorter message version suitable for LinkedIn, Facebook, or other messaging platforms.
+      // Create message draft optimised for LinkedIn connection invites (max 300 chars)
+      const leadName = [(lead as any).firstName, (lead as any).lastName].filter(Boolean).join(' ');
+      const leadTitle = (lead as any).title || '';
+      const leadCompany = (lead as any).company || '';
+      const leadDesc = [leadName || null, leadTitle, leadCompany ? `at ${leadCompany}` : null].filter(Boolean).join(', ');
+      const emailSummary = (emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent || '').slice(0, 300);
+      const messagePrompt = `You are writing a LinkedIn connection request note. The goal is to get the recipient to accept.
 
-## Email Draft Created:
-Subject: ${emailData.subject}
-Content: ${emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent}
+Recipient: ${leadDesc}
+Context from their email (use to understand the outreach angle): Subject: ${emailData.subject} — ${emailSummary}
 ${messageActivityContext}
 
-## Requirements for Message Draft:
-1. Keep it concise and conversational (150-300 characters ideal, max 500)
-2. Maintain the core message and call-to-action from the email
-3. If there is activity history, acknowledge prior touchpoints naturally (e.g. "following up on my earlier email")
-4. Make it platform-agnostic (works for LinkedIn, Facebook, Twitter DMs, etc.)
-5. Use a friendly, professional tone
-6. Include personalization (use lead's name if appropriate)
-7. No need for subject line or signature
-8. Focus on the key value proposition and CTA
+Write a note that:
+- Leads with something specific about THEIR work, role, or company — show you looked them up
+- Explains briefly WHY you want to connect, relevant to them
+- Sounds like one human writing to another — warm, direct, no corporate speak
+- Is under 280 characters total
+- Opens with their first name naturally (e.g. "John, saw your work on..." or "Sarah —")
+- Does NOT start with Hi or Hello
+- Does NOT have a call to action ("would love to chat", "let's connect")
+- Does NOT use: synergy, opportunity, exciting, leverage, passionate, innovative
+- No emojis
 
-Format the response as JSON with this structure:
-{
-  "content": "The complete message content (concise, 150-500 characters)"
-}`;
+Bad: "Your work in enterprise security is impressive. Would love to connect and explore synergies."
+Good: "Sarah, Island's browser-isolation is one of the smarter takes on shadow IT — solves it without blocking employees."
 
-      // Call LLM to generate message draft
-      const messageCompletion = await openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
-        messages: [
-          {
-            role: "system",
-            content: "You are an expert at crafting concise, engaging messages for social platforms like LinkedIn, Facebook, and Twitter. Create personalized, platform-agnostic messages that drive engagement. Always respond with valid JSON containing a content field.",
-          },
-          { role: "user", content: messagePrompt },
-        ],
+Reply with ONLY valid JSON: {"content": "the note text"}`;
+
+      // Use Gemini for message drafting (fast, cost-effective)
+      const geminiClient = await this.getGeminiClient();
+      const messageCompletion = await geminiClient.chat.completions.create({
+        model: 'gemini-3.5-flash',
+        messages: [{ role: "user", content: messagePrompt }],
         temperature: 0.8,
-        max_tokens: 500,
-        response_format: { type: 'json_object' }
-      });
+        max_tokens: 2048,
+      } as any);
 
       const messageResponseContent = messageCompletion.choices[0].message.content;
       if (!messageResponseContent) {
         throw new Error('No message content generated from LLM');
       }
 
-      // Parse the JSON response
+      // Parse the JSON response — Gemini may wrap it in markdown or prose
       let messageData;
       try {
-        const cleanedMessageContent = messageResponseContent.replace(/```json\s*|\s*```/g, '').trim();
-        messageData = JSON.parse(cleanedMessageContent);
+        const cleanedMsg = messageResponseContent.replace(/```json\s*/g, '').replace(/\s*```/g, '').trim();
+        const bs = cleanedMsg.indexOf('{');
+        const be = cleanedMsg.lastIndexOf('}');
+        if (bs !== -1 && be > bs) {
+          messageData = JSON.parse(cleanedMsg.slice(bs, be + 1));
+        } else {
+          messageData = { content: cleanedMsg };
+        }
       } catch (parseError) {
         console.error('AgentMode: Error parsing message draft JSON:', parseError);
         // Continue with email draft only if message draft fails
         messageData = null;
       }
 
-      // Create message draft object if we got valid data
+      // Create message draft object if we got valid data — hard-cap at 300 chars (LinkedIn invite limit)
       let messageDraft = null;
       if (messageData && messageData.content) {
         const now = new Date().toISOString();
         messageDraft = {
-          content: messageData.content,
+          content: String(messageData.content).slice(0, 300),
           createdAt: now,
           updatedAt: now,
           sessionId: sessionId
