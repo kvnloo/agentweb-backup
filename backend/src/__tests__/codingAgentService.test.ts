@@ -1,4 +1,5 @@
-import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, _setBedrockClientForTest, _setSleepFnForTest } from '../services/codingAgentService';
+import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, _setBedrockClientForTest, _setVertexClientForTest, _setSleepFnForTest } from '../services/codingAgentService';
+import { agentModeService } from '../services/agentModeService';
 
 // Mock mcpFetch
 jest.mock('../mcp/server/httpClient', () => ({
@@ -1068,5 +1069,91 @@ describe('applySearchReplace — new file creation', () => {
     expect(result.errors).toHaveLength(1);
     expect(result.errors[0]).toContain('empty');
     expect(result.appliedCount).toBe(0);
+  });
+});
+
+// ─── Model → provider routing ─────────────────────────────────────────────────
+// Regression for "400 The provided model identifier is invalid": switching the
+// coding-agent default model to a Vertex model (claude-opus-4-8) must route to
+// the Vertex client, not the Bedrock client (which rejects bare claude-* ids).
+describe('runCodingAgent — model provider routing', () => {
+  const mockContext: CodingAgentContext = {
+    pageId: 'test-page-123',
+    userId: 'user-456',
+    sessionId: 'session-789',
+    llmModel: 'claude-opus-4-8',
+  };
+
+  const bedrockCreate = jest.fn();
+  const vertexCreate = jest.fn();
+  let modelSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedMcpFetch.mockReset();
+    bedrockCreate.mockReset();
+    vertexCreate.mockReset();
+    _setBedrockClientForTest({ messages: { create: bedrockCreate } } as any);
+    _setVertexClientForTest({ messages: { create: vertexCreate } } as any);
+    _setSleepFnForTest(async () => {});
+    // Pre-flight list_files succeeds so the loop reaches the LLM call.
+    mockedMcpFetch.mockResolvedValue({ files: [{ path: 'app/page.tsx', size: 100 }] });
+    modelSpy = jest.spyOn(agentModeService, 'getCodingAgentDefaultModel');
+  });
+
+  afterEach(() => {
+    modelSpy.mockRestore();
+  });
+
+  afterAll(() => {
+    _setBedrockClientForTest(null);
+    _setVertexClientForTest(null);
+  });
+
+  test('routes a Vertex model (claude-opus-4-8) to the Vertex client, not Bedrock', async () => {
+    modelSpy.mockResolvedValue('claude-opus-4-8');
+    vertexCreate.mockResolvedValueOnce({
+      content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Done.', status: 'success' } }],
+      stop_reason: 'tool_use',
+    });
+
+    const result = await runCodingAgent('change the heading', mockContext);
+
+    expect(result.success).toBe(true);
+    expect(vertexCreate).toHaveBeenCalledTimes(1);
+    expect(bedrockCreate).not.toHaveBeenCalled();
+    // The model id must be passed through to the Vertex client unchanged.
+    expect(vertexCreate.mock.calls[0][0].model).toBe('claude-opus-4-8');
+  });
+
+  test('routes a Bedrock model (anthropic.*) to the Bedrock client, not Vertex', async () => {
+    modelSpy.mockResolvedValue('anthropic.claude-sonnet-4-6');
+    bedrockCreate.mockResolvedValueOnce({
+      content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Done.', status: 'success' } }],
+      stop_reason: 'tool_use',
+    });
+
+    const result = await runCodingAgent('change the heading', mockContext);
+
+    expect(result.success).toBe(true);
+    expect(bedrockCreate).toHaveBeenCalledTimes(1);
+    expect(vertexCreate).not.toHaveBeenCalled();
+  });
+
+  test('retries a transient 5xx from the Vertex client, then succeeds', async () => {
+    modelSpy.mockResolvedValue('claude-opus-4-8');
+    const transient: any = new Error('Vertex AI error 503: overloaded');
+    transient.status = 503;
+    vertexCreate
+      .mockRejectedValueOnce(transient)
+      .mockResolvedValueOnce({
+        content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Done.', status: 'success' } }],
+        stop_reason: 'tool_use',
+      });
+
+    const result = await runCodingAgent('change the heading', mockContext);
+
+    expect(result.success).toBe(true);
+    expect(vertexCreate).toHaveBeenCalledTimes(2);
   });
 });
