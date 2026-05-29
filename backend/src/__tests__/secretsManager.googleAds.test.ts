@@ -32,7 +32,6 @@ describe('secretsManager', () => {
           clientId: 'ads-client-id',
           clientSecret: 'ads-client-secret',
           developerToken: 'dev-token-123',
-          managerCustomerId: '123-456-7890',
         }),
       });
 
@@ -43,7 +42,6 @@ describe('secretsManager', () => {
         clientId: 'ads-client-id',
         clientSecret: 'ads-client-secret',
         developerToken: 'dev-token-123',
-        managerCustomerId: '123-456-7890',
       });
     });
 
@@ -54,7 +52,6 @@ describe('secretsManager', () => {
           clientId: 'id',
           clientSecret: 'secret',
           developerToken: 'token',
-          managerCustomerId: 'manager-id',
         }),
       });
 
@@ -71,7 +68,6 @@ describe('secretsManager', () => {
           clientId: 'prod-id',
           clientSecret: 'prod-secret',
           developerToken: 'prod-token',
-          managerCustomerId: 'prod-manager-id',
         }),
       });
 
@@ -95,7 +91,6 @@ describe('secretsManager', () => {
         SecretString: JSON.stringify({
           clientId: 'id',
           clientSecret: 'secret',
-          managerCustomerId: 'manager-id',
           // developerToken intentionally absent
         }),
       });

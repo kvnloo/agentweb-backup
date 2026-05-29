@@ -7139,27 +7139,22 @@ emmaToolRegistry.register({
     name: 'call_google_ads_api',
     description: `Manage Google Ads entities via the Google Ads API.
 
-WORKFLOW — always follow this order:
-1. LOCATION SEARCH to resolve location names to IDs before creating a campaign
-2. BUDGET CREATE (required before campaign — returns budgetResourceName)
-3. CAMPAIGN CREATE (use budgetResourceName from step 2)
-4. AD_GROUP CREATE (Search + Display only; skip for PMax)
-5. KEYWORD ADD (Search only)
-6. AD CREATE (Search + Display only; for PMax use ASSET_GROUP entity instead)
-
-COST UNITS: All monetary values in MICROS of the account's native currency (1,000,000 micros = 1 currency unit). Display to user by dividing by 1,000,000.
-CONFIRMATION: Always present a plan to the user and get confirmation before executing any write action (CREATE, PAUSE, RESUME) — this spends real money.
-
 ACTION MATRIX:
-  BUDGET   → CREATE (params: name, amount_micros)
-  CAMPAIGN → LIST, CREATE, PAUSE, RESUME
-  AD_GROUP → LIST, CREATE  (Search + Display only)
-  KEYWORD  → ADD  (Search only; params: ad_group_resource_name, keywords[])
-  LOCATION → SEARCH  (params: query; use before CAMPAIGN CREATE to get location_target_ids)`,
+  BUDGET      → CREATE (name, amount_micros), REMOVE (budget_resource_name; must not be attached to any campaign)
+  CAMPAIGN    → LIST, CREATE, PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?), REMOVE (campaign_resource_name)
+  AD_GROUP    → LIST (campaign_resource_name)
+               CREATE (name, campaign_resource_name, type [SEARCH_STANDARD|DISPLAY_STANDARD], cpc_bid_micros?)
+               UPDATE (ad_group_resource_name, name?, status?, cpc_bid_micros?)
+               REMOVE (ad_group_resource_name)
+  KEYWORD     → ADD, ADD_NEGATIVE
+  AD          → LIST, CREATE
+  ASSET       → UPLOAD
+  ASSET_GROUP → CREATE
+  LOCATION    → SEARCH`,
     inputSchema: {
       type: 'object',
       properties: {
-        customer_id: { type: 'string', description: 'Google Ads customer ID (numeric). Use list_connected_accounts(platform="google_ads") to get this.' },
+        customer_id: { type: 'string', description: 'Google Ads customer ID (numeric, no dashes). Call list_connected_accounts(platform="google_ads") and use the "customer_id" field from the result (NOT the "id" field).' },
         entity_type: { type: 'string', enum: ['BUDGET', 'CAMPAIGN', 'AD_GROUP', 'KEYWORD', 'AD', 'ASSET', 'ASSET_GROUP', 'LOCATION'] },
         action: { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
         name: { type: 'string' },
@@ -7169,12 +7164,23 @@ ACTION MATRIX:
         bidding_strategy: { type: 'string', enum: ['MAXIMIZE_CONVERSIONS', 'TARGET_CPA', 'TARGET_ROAS', 'MAXIMIZE_CONVERSION_VALUE', 'TARGET_IMPRESSION_SHARE', 'MANUAL_CPC'] },
         bidding_strategy_target: { type: 'number' },
         location_target_ids: { type: 'array', items: { type: 'number' }, description: 'From LOCATION SEARCH.' },
-        campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME.' },
-        ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD ADD.' },
-        keywords: { type: 'array', items: { type: 'object', properties: { text: { type: 'string' }, matchType: { type: 'string', enum: ['BROAD', 'PHRASE', 'EXACT'] } }, required: ['text', 'matchType'] } },
+        campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME/UPDATE/REMOVE and AD_GROUP LIST.' },
+        ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD ADD/ADD_NEGATIVE, AD LIST/CREATE, AD_GROUP UPDATE.' },
+        keywords: { type: 'array', items: { type: 'object', properties: { text: { type: 'string' }, matchType: { type: 'string', enum: ['BROAD', 'PHRASE', 'EXACT'] } }, required: ['text', 'matchType'] }, description: 'Keywords for ADD or ADD_NEGATIVE action.' },
         query: { type: 'string', description: 'Location search query.' },
-        status: { type: 'string', enum: ['ENABLED', 'PAUSED'] },
-        cpc_bid_micros: { type: 'number', description: 'Optional CPC bid in micros for AD_GROUP CREATE.' },
+        status: { type: 'string', enum: ['ENABLED', 'PAUSED'], description: 'Entity status for CREATE or UPDATE.' },
+        cpc_bid_micros: { type: 'number', description: 'CPC bid in micros for AD_GROUP CREATE or UPDATE.' },
+        headlines: { type: 'array', items: { type: 'string' }, description: 'Ad headlines. Required for AD CREATE. Min 3 for RSA.' },
+        descriptions: { type: 'array', items: { type: 'string' }, description: 'Ad descriptions. Required for AD CREATE. Min 2 for RSA.' },
+        final_url: { type: 'string', description: 'Landing page URL. Required for AD CREATE and ASSET_GROUP CREATE.' },
+        image_asset_resource_names: { type: 'array', items: { type: 'string' }, description: 'Image asset resource names. Optional, Display ads only.' },
+        asset_type: { type: 'string', enum: ['IMAGE', 'LOGO', 'VIDEO'], description: 'Asset type for ASSET UPLOAD.' },
+        data: { description: 'Asset data. Buffer for IMAGE/LOGO, YouTube video ID string for VIDEO.' },
+        long_headlines: { type: 'array', items: { type: 'string' }, description: 'Long headlines for ASSET_GROUP CREATE (PMax).' },
+        square_image_assets: { type: 'array', items: { type: 'string' }, description: 'Square image asset resource names for ASSET_GROUP CREATE.' },
+        landscape_image_assets: { type: 'array', items: { type: 'string' }, description: 'Landscape image asset resource names for ASSET_GROUP CREATE.' },
+        logo_assets: { type: 'array', items: { type: 'string' }, description: 'Logo asset resource names for ASSET_GROUP CREATE.' },
+        video_assets: { type: 'array', items: { type: 'string' }, description: 'Video asset resource names for ASSET_GROUP CREATE. Optional.' },
       },
       required: ['customer_id', 'entity_type', 'action'],
     },
@@ -7203,7 +7209,7 @@ GAQL EXAMPLES:
     inputSchema: {
       type: 'object',
       properties: {
-        customer_id: { type: 'string', description: 'Google Ads customer ID. Use list_connected_accounts(platform="google_ads").' },
+        customer_id: { type: 'string', description: 'Google Ads customer ID (numeric, no dashes). Call list_connected_accounts(platform="google_ads") and use the "customer_id" field (NOT the "id" field).' },
         mode: { type: 'string', enum: ['raw', 'dashboard'], description: '"dashboard" for formatted summary. "raw" for custom GAQL.' },
         query: { type: 'string', description: 'GAQL query. Required for mode="raw".' },
         campaign_ids: { type: 'array', items: { type: 'string' }, description: 'Filter to specific campaigns (dashboard mode only). Omit for all.' },

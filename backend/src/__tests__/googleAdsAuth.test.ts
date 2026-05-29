@@ -139,6 +139,32 @@ describe('POST /connect', () => {
       .expect(401);
     expect(res.body.error).toMatch(/invalid or expired/i);
   });
+
+  it('stores manager_customer_id when managerCustomerId provided', async () => {
+    const state = makeState('user-123');
+    const finalizeRes = await request(app)
+      .post('/finalize')
+      .send({ code: 'auth-code', state })
+      .expect(200);
+
+    const res = await request(app)
+      .post('/connect')
+      .send({
+        tokenSessionId: finalizeRes.body.tokenSessionId,
+        customerId: '1234567890',
+        accountName: 'Client Account',
+        currency: 'USD',
+        managerCustomerId: '9999999999',
+      })
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+    expect(createAccount).toHaveBeenCalledWith('user-123', 'google_ads', expect.objectContaining({
+      config: expect.objectContaining({
+        manager_customer_id: '9999999999',
+      }),
+    }));
+  });
 });
 
 describe('DELETE /disconnect', () => {

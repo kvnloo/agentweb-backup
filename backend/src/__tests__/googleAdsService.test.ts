@@ -10,7 +10,6 @@ jest.mock('../utils/secretsManager', () => ({
     clientId: 'test-client-id',
     clientSecret: 'test-secret',
     developerToken: 'test-dev-token',
-    managerCustomerId: '9999999999',
   }),
 }));
 
@@ -57,6 +56,13 @@ describe('API version', () => {
       expect.stringContaining('googleads.googleapis.com/v24'),
       expect.anything()
     );
+  });
+
+  it('uses path customer ID as login-customer-id for direct account access', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
+    await service.search('1234567890', 'test-access-token', 'SELECT campaign.id FROM campaign');
+    const headers = mockAxiosPost.mock.calls[0][2].headers;
+    expect(headers['login-customer-id']).toBe('1234567890');
   });
 });
 
@@ -423,5 +429,126 @@ describe('getQuickMetrics — with campaignIds filter', () => {
     const body = mockAxiosPost.mock.calls[0][1];
     expect(body.query).toContain('campaign.id IN (1,2)');
     expect(body.query).toContain('DURING LAST_7_DAYS');
+  });
+});
+
+describe('updateCampaign', () => {
+  it('sends mutate request with update and updateMask for name change', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', { name: 'New Name' });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.resourceName).toBe('customers/123/campaigns/1');
+    expect(body.operations[0].update.name).toBe('New Name');
+    expect(body.operations[0].updateMask).toContain('name');
+  });
+
+  it('sends mutate request with update and updateMask for status change', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', { status: 'PAUSED' });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.status).toBe('PAUSED');
+    expect(body.operations[0].updateMask).toContain('status');
+  });
+});
+
+describe('updateAdGroup', () => {
+  it('sends mutate request with update and updateMask for name change', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateAdGroup('user-123', '1234567890', 'customers/123/adGroups/789', { name: 'Updated Group' });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.resourceName).toBe('customers/123/adGroups/789');
+    expect(body.operations[0].update.name).toBe('Updated Group');
+    expect(body.operations[0].updateMask).toContain('name');
+  });
+
+  it('sends mutate request with cpcBidMicros update', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateAdGroup('user-123', '1234567890', 'customers/123/adGroups/789', { cpcBidMicros: 500000 });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.cpcBidMicros).toBe('500000');
+    expect(body.operations[0].updateMask).toContain('cpc_bid_micros');
+  });
+});
+
+describe('listAds', () => {
+  it('calls search and returns mapped ad results', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          adGroupAd: {
+            resourceName: 'customers/123/adGroupAds/1',
+            status: 'ENABLED',
+            ad: { id: '1', type: 'RESPONSIVE_SEARCH_AD' },
+          },
+        }],
+      },
+    });
+    const ads = await service.listAds('user-123', '1234567890', 'customers/123/adGroups/789');
+    expect(ads).toHaveLength(1);
+    expect(ads[0].resourceName).toBe('customers/123/adGroupAds/1');
+    expect(ads[0].status).toBe('ENABLED');
+    expect(ads[0].type).toBe('RESPONSIVE_SEARCH_AD');
+  });
+
+  it('returns empty array when no ads found', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
+    const ads = await service.listAds('user-123', '1234567890', 'customers/123/adGroups/789');
+    expect(ads).toHaveLength(0);
+  });
+});
+
+describe('createAssetGroup', () => {
+  it('sends mutate and returns resource name', async () => {
+    // First call: create asset group
+    // Subsequent calls: createTextAsset for each headline, long_headline, description
+    // Final call: create assetGroupAssets links
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/assetGroups/1' }] } }) // assetGroups:mutate
+      .mockResolvedValue({ data: { results: [{ resourceName: 'customers/123/assets/text-1' }] } }); // text assets + links
+
+    const result = await service.createAssetGroup('user-123', '1234567890', {
+      name: 'My Asset Group',
+      campaignResourceName: 'customers/123/campaigns/1',
+      headlines: ['Headline 1', 'Headline 2', 'Headline 3'],
+      longHeadlines: ['Long Headline 1'],
+      descriptions: ['Description 1', 'Description 2'],
+      squareImageAssets: ['customers/123/assets/sq1'],
+      landscapeImageAssets: ['customers/123/assets/ls1'],
+      logoAssets: ['customers/123/assets/logo1'],
+      finalUrl: 'https://example.com',
+    });
+
+    expect(result.resourceName).toBe('customers/123/assetGroups/1');
+    // Verify first call creates the asset group
+    const firstCallBody = mockAxiosPost.mock.calls[0][1];
+    expect(firstCallBody.operations[0].create.name).toBe('My Asset Group');
+    expect(firstCallBody.operations[0].create.campaign).toBe('customers/123/campaigns/1');
+    expect(firstCallBody.operations[0].create.finalUrls[0]).toBe('https://example.com');
+  });
+});
+
+describe('managerCustomerId as login-customer-id', () => {
+  it('uses manager_customer_id as login-customer-id when set on the account', async () => {
+    const { userDb } = require('../services/db');
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: 'user-123',
+      connected_accounts: [{
+        platform: 'google_ads',
+        account_id: '1234567890',
+        account_name: 'Client Account',
+        config: {
+          customer_id: '1234567890',
+          currency: 'USD',
+          access_token: 'valid-token',
+          refresh_token: 'refresh-token',
+          token_expires_at: Date.now() + 3600 * 1000,
+          manager_customer_id: '9999999999',
+        },
+      }],
+    });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
+    await service.search('1234567890', 'valid-token', 'SELECT campaign.id FROM campaign', '9999999999');
+    const headers = mockAxiosPost.mock.calls[0][2].headers;
+    expect(headers['login-customer-id']).toBe('9999999999');
   });
 });
