@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-28',
+    changes: [
+      'New: Claude Opus 4.8 Now Available in Agent Mode',
+      '- Claude Opus 4.8, Anthropic\'s latest and most capable model, is now available to all users in Agent Mode',
+      '- Select "Claude Opus 4.8" from the model dropdown when starting or continuing a session',
+      '- Powered by Google Vertex AI for low-latency access',
+    ],
+  },
+  {
     date: '2026-05-27',
     changes: [
       'Internal: Chat History Sessions Now Have Reviewer Links',
