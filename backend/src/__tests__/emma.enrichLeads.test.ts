@@ -75,6 +75,25 @@ describe('enrich_leads_preview', () => {
       tool.execute({ list_id: 'l', output_fields: [{ name: 'f', instruction: 'i' }] }, {}),
     ).rejects.toThrow(/Authentication required/);
   });
+
+  it('returns processedCount=0 with identityResolutionFailed>0 when all sampled leads lack identity data', async () => {
+    const identityFailureSummary = {
+      ...SUMMARY,
+      mode: 'preview' as const,
+      processedCount: 0,
+      failedCount: 2,
+      failureBreakdown: { identityResolutionFailed: 2, apolloFailed: 0, llmOrParseFailed: 0, updateFailed: 0, searchWebFailed: 0 },
+      samples: [],
+    };
+    (runEmmaEnrichment as jest.Mock).mockResolvedValue(identityFailureSummary);
+    const tool = emmaToolRegistry.getTool('enrich_leads_preview')!;
+    const result = await tool.execute(
+      { list_id: 'list_1778189476782_1au64sgvz', output_fields: [{ name: 'company', instruction: 'find company name' }] },
+      { userId: 'user1' },
+    );
+    expect(result.processedCount).toBe(0);
+    expect(result.failureBreakdown.identityResolutionFailed).toBe(2);
+  });
 });
 
 describe('enrich_leads_execute', () => {

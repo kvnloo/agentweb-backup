@@ -2,7 +2,7 @@
 
 // Maximum number of messages allowed per chat session.
 // See dev.md "Message Limit & Context Window Investigation (2026-03-19)" for planned changes.
-export const MAX_MESSAGE_SIZE_PER_SESSION = 500;
+export const MAX_MESSAGE_SIZE_PER_SESSION = 1000;
 
 // Maximum file size for uploads (100MB in bytes)
 export const MAX_FILE_SIZE = 100 * 1024 * 1024;

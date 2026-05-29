@@ -908,7 +908,21 @@ function getHeartbeatStatus() {
     // ignore if meta file not present
   }
 
-  // 8. Timestamp
+  // 8. Claude model
+  try {
+    const meta = {};
+    fs.readFileSync("/home/ec2-user/agentweb/.ec2-session-meta", "utf-8")
+      .split("\n")
+      .forEach((line) => {
+        const eq = line.indexOf("=");
+        if (eq > 0) meta[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+      });
+    if (meta.claude_model) parts.push(`Model: ${meta.claude_model}`);
+  } catch {
+    // ignore if meta file not present
+  }
+
+  // 9. Timestamp
   parts.push(`Updated: ${now.toISOString().slice(11, 19)}Z`);
 
   return parts.join(" | ");
