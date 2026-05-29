@@ -166,4 +166,73 @@ describe('searchUserAssets', () => {
     expect(results).toHaveLength(1);
     expect(results[0].isFavorited).toBe(false);
   });
+
+  it('finds HTML reports in uncached sessions by scanning messages', async () => {
+    const uncachedSession = {
+      sessionId: 'sess-uncached',
+      userId: 'user-1',
+      portalType: 'agent',
+      title: 'Uncached Session',
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-02T00:00:00Z',
+      // no assetCache
+    };
+    const htmlMessage = {
+      messageIndex: 0,
+      message: {
+        role: 'tool',
+        timestamp: '2026-01-02T00:00:00Z',
+        metadata: {
+          toolCalls: [{
+            name: 'save_file',
+            result: {
+              file_url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user-1/files/123/abc/report.html',
+              file_name: 'report.html',
+            },
+          }],
+        },
+      },
+    };
+    // First call returns sessions, second call returns messages for the uncached session
+    queryPromiseMock
+      .mockResolvedValueOnce({ Items: [uncachedSession] })
+      .mockResolvedValueOnce({ Items: [htmlMessage] });
+    const results = await chatbotDb.searchUserAssets('user-1', 'htmlReports');
+    expect(results).toHaveLength(1);
+    expect(results[0].url).toBe('https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user-1/files/123/abc/report.html');
+    expect(results[0].assetType).toBe('htmlReport');
+    expect(results[0].sessionId).toBe('sess-uncached');
+  });
+
+  it('skips archived sessions even when uncached', async () => {
+    const archivedSession = {
+      sessionId: 'sess-archived',
+      userId: 'user-1',
+      portalType: 'agent',
+      title: 'Archived Session',
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+      archived: true,
+      // no assetCache
+    };
+    queryPromiseMock.mockResolvedValueOnce({ Items: [archivedSession] });
+    const results = await chatbotDb.searchUserAssets('user-1');
+    expect(results).toHaveLength(0);
+  });
+
+  it('returns empty when uncached session has no matching messages', async () => {
+    const uncachedSession = {
+      sessionId: 'sess-empty',
+      userId: 'user-1',
+      portalType: 'agent',
+      title: 'Empty Session',
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    };
+    queryPromiseMock
+      .mockResolvedValueOnce({ Items: [uncachedSession] })
+      .mockResolvedValueOnce({ Items: [] });
+    const results = await chatbotDb.searchUserAssets('user-1');
+    expect(results).toHaveLength(0);
+  });
 });
