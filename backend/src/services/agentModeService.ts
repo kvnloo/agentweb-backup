@@ -239,6 +239,9 @@ export class AgentModeService {
   private videoGenerationDefaultModelSettingName = 'agent_mode_video_generation_default_model';
   private customerSupportDefaultModelSettingName = 'agent_mode_customer_support_default_model';
   private codingAgentDefaultModelSettingName = 'agent_mode_coding_agent_default_model';
+  // Model used by the describe_image vision tool. Independent of the chat/default
+  // model — describe_image is a vision utility Emma calls when she needs to "see" an image.
+  private visionModelSettingName = 'agent_mode_vision_model';
 
   constructor() {
     this.toolRegistry = new ToolRegistry();
@@ -876,6 +879,40 @@ export class AgentModeService {
     }
     // Fall back to Sonnet 4.6
     return fallbackModel;
+  }
+
+  /**
+   * Model used by the describe_image vision tool. This is intentionally separate
+   * from getDefaultModel() — describe_image is a vision utility for Emma, not the
+   * conversational model, so admins can point it at a cheaper/faster vision-capable
+   * model without affecting chat. Falls back to a known vision-capable model.
+   */
+  async getVisionModel(): Promise<string> {
+    const fallbackModel = this.llmModels['claude-opus-4-8'] ? 'claude-opus-4-8' : this.default_model;
+    try {
+      const setting = await settingsService.getSetting(this.visionModelSettingName);
+      const configuredModel = setting?.settingValue?.trim();
+      if (configuredModel) {
+        if (this.llmModels[configuredModel]) {
+          return configuredModel;
+        }
+        console.warn(`AgentMode: Unsupported vision model "${configuredModel}" in settings; using fallback.`);
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting vision model setting:', error);
+    }
+    return fallbackModel;
+  }
+
+  /**
+   * Vision-ready model options for the describe_image tool. Every chat model in the
+   * registry is multimodal except the Live (voice) model, so we expose all non-live
+   * models (respecting adminOnly).
+   */
+  async getVisionModelOptions(isAdmin: boolean = false): Promise<string[]> {
+    return Object.keys(this.llmModels).filter(
+      m => !this.llmModels[m].isLive && (isAdmin || !this.llmModels[m].adminOnly)
+    );
   }
 
   async getBackupModel(primaryModel: string): Promise<string | null> {
@@ -5155,9 +5192,9 @@ export class AgentModeService {
    * Analyze an image with a vision-capable LLM.
    *
    * @param llmModel - Optional. When omitted (the agent-mode `describe_image` tool
-   *   intentionally passes nothing here), the configured `agent_mode_default_model`
-   *   is used. This keeps image analysis on a single known vision-capable model
-   *   rather than whatever model the user selected for chat.
+   *   intentionally passes nothing here), the configured vision model
+   *   (`agent_mode_vision_model`) is used. describe_image is a vision utility, so it
+   *   runs on its own dedicated vision model — independent of the chat/default model.
    */
   public async describeImage(llmModel: string | undefined, imageUrl: string, prompt?: string): Promise<any> {
     try {
@@ -5168,7 +5205,7 @@ export class AgentModeService {
         };
       }
       if (!llmModel) {
-        llmModel = await this.getDefaultModel();
+        llmModel = await this.getVisionModel();
       }
       // Use custom prompt or default
       const analysisPrompt = prompt || 'Please analyze and describe this image in detail. Focus on visual elements, composition, colors, text, and any marketing or branding elements you can identify.';

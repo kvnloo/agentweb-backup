@@ -2401,6 +2401,17 @@ export const agentModeController = {
     }
   },
 
+  async getVisionModelOptions(req: Request, res: Response) {
+    try {
+      const { user } = await getUserFromToken(req);
+      const models = await agentModeService.getVisionModelOptions(user?.isAdmin === true);
+      res.json(models);
+    } catch (error) {
+      console.error('AgentMode: Get vision model options error:', error);
+      res.status(500).json({ error: 'Failed to get vision model options' });
+    }
+  },
+
   async getCustomerSupportDefaultModel(req: Request, res: Response) {
     try {
       const model = await agentModeService.getCustomerSupportDefaultModel();
