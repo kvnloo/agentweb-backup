@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-29',
     changes: [
+      'New: Configurable Vision Model for Image Analysis (Admin)',
+      '- Admins can now choose which model powers Emma\'s image-analysis tool (describe_image) from a new "Default Vision Model" selector in the Agent Mode settings',
+      '- The dropdown lists only vision-capable models that are verified available, and this choice is independent of the chat model and the agent-mode default model',
+    ],
+  },
+  {
+    date: '2026-05-29',
+    changes: [
       'Fixed: Emma Can Edit Landing Pages Again When Using Claude Opus 4.8',
       '- The code-editing agent Emma uses to update landing pages failed immediately with an "invalid model identifier" error whenever Claude Opus 4.8 was selected as its model',
       '- Opus 4.8 runs on Google Vertex AI, but the code editor was only wired up to AWS — it now routes to the correct provider, so landing page edits work with any available model',
