@@ -2,6 +2,29 @@
 source ~/.bashrc
 cd ~/agentweb
 
+# Switch from Bedrock to Vertex AI (claude-opus-4-8)
+unset CLAUDE_CODE_USE_BEDROCK
+VERTEX_SA_JSON=$(aws secretsmanager get-secret-value \
+  --secret-id "agentweb/test-env/vertex-sa" \
+  --region "${AWS_REGION:-us-west-2}" \
+  --query SecretString --output text 2>/dev/null)
+if [[ -n "$VERTEX_SA_JSON" ]]; then
+  echo "$VERTEX_SA_JSON" > /tmp/vertex-sa.json
+  chmod 600 /tmp/vertex-sa.json
+  export GOOGLE_APPLICATION_CREDENTIALS=/tmp/vertex-sa.json
+  export CLAUDE_CODE_USE_VERTEX=1
+  export ANTHROPIC_VERTEX_PROJECT_ID="gen-lang-client-0725723168"
+  export CLOUD_ML_REGION="global"
+  # Record model label for heartbeat display
+  grep -q '^claude_model=' ~/agentweb/.ec2-session-meta 2>/dev/null \
+    && sed -i 's|^claude_model=.*|claude_model=Opus 4.8 (Google Vertex)|' ~/agentweb/.ec2-session-meta \
+    || echo 'claude_model=Opus 4.8 (Google Vertex)' >> ~/agentweb/.ec2-session-meta
+else
+  grep -q '^claude_model=' ~/agentweb/.ec2-session-meta 2>/dev/null \
+    && sed -i 's|^claude_model=.*|claude_model=Sonnet 4.6 (AWS Bedrock)|' ~/agentweb/.ec2-session-meta \
+    || echo 'claude_model=Sonnet 4.6 (AWS Bedrock)' >> ~/agentweb/.ec2-session-meta
+fi
+
 NOTION_PAGE_ID=$(cat .notion-page-id 2>/dev/null)
 NOTION_TOKEN=$(cat .notion-token 2>/dev/null)
 
@@ -41,7 +64,7 @@ if [[ -n "$NOTION_PAGE_ID" && -n "$NOTION_TOKEN" ]]; then
     -d '{"properties": {"Status": {"status": {"name": "In progress"}}}}' > /dev/null
 fi
 
-RAW=$(claude --model us.anthropic.claude-sonnet-4-6 --permission-mode auto --output-format json -p "$(cat .claude-prompt)" 2>&1)
+RAW=$(claude --model claude-opus-4-8 --permission-mode auto --output-format json -p "$(cat .claude-prompt)" 2>&1)
 EXIT_CODE=$?
 
 # Save session ID so the relay can resume the exact same session on follow-up prompts
