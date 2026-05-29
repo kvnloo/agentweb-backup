@@ -9497,13 +9497,12 @@ Return JSON: {"content": "the note text"}`;
         messages: [
           {
             role: "system",
-            content: "You craft concise, human LinkedIn connection notes. Under 300 characters, no sales language, sounds like a real person. Always respond with valid JSON containing a content field.",
+            content: "You craft concise, human LinkedIn connection notes. Under 300 characters, no sales language, sounds like a real person. Respond with ONLY a JSON object: {\"content\": \"the note text\"}. No explanation, no markdown.",
           },
           { role: "user", content: messagePrompt },
         ],
         temperature: 0.7,
         max_tokens: 200,
-        response_format: { type: 'json_object' }
       } as any);
 
       const messageResponseContent = messageCompletion.choices[0].message.content;
@@ -9511,11 +9510,17 @@ Return JSON: {"content": "the note text"}`;
         throw new Error('No message content generated from LLM');
       }
 
-      // Parse the JSON response
+      // Parse the JSON response — Gemini may wrap it in markdown or prose
       let messageData;
       try {
-        const cleanedMessageContent = messageResponseContent.replace(/```json\s*|\s*```/g, '').trim();
-        messageData = JSON.parse(cleanedMessageContent);
+        const cleanedMsg = messageResponseContent.replace(/```json\s*/g, '').replace(/\s*```/g, '').trim();
+        const bs = cleanedMsg.indexOf('{');
+        const be = cleanedMsg.lastIndexOf('}');
+        if (bs !== -1 && be > bs) {
+          messageData = JSON.parse(cleanedMsg.slice(bs, be + 1));
+        } else {
+          messageData = { content: cleanedMsg };
+        }
       } catch (parseError) {
         console.error('AgentMode: Error parsing message draft JSON:', parseError);
         // Continue with email draft only if message draft fails

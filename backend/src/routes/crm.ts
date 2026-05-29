@@ -4368,6 +4368,106 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
 });
 
 /**
+ * @route POST /api/crm/lists/:listId/leads/:leadId/draft-invite-note
+ * @desc Generate a LinkedIn connection invite note (≤300 chars) using Gemini.
+ *       Does NOT require an email draft — drafts directly from lead profile + brand guidelines.
+ * @access Private
+ */
+router.post('/lists/:listId/leads/:leadId/draft-invite-note', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId, leadId } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list || (list as any).userId !== userId) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    const lead = await crmDb.getLeadById(listId, leadId);
+    if (!lead) {
+      return res.status(404).json({ message: 'Lead not found' });
+    }
+
+    const { agentModeService } = await import('../services/agentModeService');
+
+    // Get brand guidelines for context
+    const brandGuidelines = await agentModeService.readBrandGuidelines(userId);
+    const brandContext = brandGuidelines?.exists && brandGuidelines?.content
+      ? `\nSender context: ${String(brandGuidelines.content).slice(0, 500)}`
+      : '';
+
+    const firstName = (lead as any).firstName || '';
+    const lastName = (lead as any).lastName || '';
+    const title = (lead as any).title || '';
+    const company = (lead as any).company || '';
+    const notes = (lead as any).notes || '';
+    const leadName = [firstName, lastName].filter(Boolean).join(' ') || 'this person';
+
+    const leadDesc = [leadName !== 'this person' ? leadName : null, title, company ? `at ${company}` : null].filter(Boolean).join(', ');
+    const notesLine = notes ? ` They do: ${notes.slice(0, 200)}.` : '';
+    const brandLine = brandContext ? ` Sender background: ${brandContext.replace('\nSender context: ', '').slice(0, 200)}.` : '';
+
+    const prompt = `Write a LinkedIn connection invite note for ${leadDesc}.${notesLine}${brandLine}
+
+Write ONE short sentence (under 120 characters). Specific to their work. No Hi/Hello, no their name, no CTA, no emojis.
+
+Reply ONLY: {"content": "your one sentence"}`;
+
+    const geminiClient = await agentModeService.getGeminiClient();
+    const completion = await (geminiClient as any).chat.completions.create({
+      model: 'gemini-3.5-flash',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.8,
+      max_tokens: 2048,
+    });
+
+    const raw = completion.choices[0].message.content || '';
+    let content = '';
+    // Strip markdown fences
+    let cleaned = raw.replace(/```json\s*/g, '').replace(/\s*```/g, '').trim();
+    // If truncated mid-JSON (ends with a quote but no closing brace), complete it
+    if (cleaned.includes('"content"') && !cleaned.endsWith('}')) {
+      if (!cleaned.endsWith('"')) cleaned += '"';
+      cleaned += '}';
+    }
+    const braceStart = cleaned.indexOf('{');
+    const braceEnd = cleaned.lastIndexOf('}');
+    if (braceStart !== -1 && braceEnd > braceStart) {
+      try {
+        const parsed = JSON.parse(cleaned.slice(braceStart, braceEnd + 1));
+        let val = String(parsed.content || '');
+        // Gemini sometimes double-encodes: the value is itself JSON like {"content":"..."}
+        if (val.startsWith('{') && val.includes('"content"')) {
+          try { val = String(JSON.parse(val).content || val); } catch { /* keep val */ }
+        }
+        content = val.slice(0, 300);
+      } catch {
+        // Still can't parse — extract the text between the first " and last "
+        const firstQ = cleaned.indexOf('"', cleaned.indexOf('"content"') + 10);
+        const lastQ = cleaned.lastIndexOf('"');
+        if (firstQ !== -1 && lastQ > firstQ) {
+          content = cleaned.slice(firstQ + 1, lastQ).replace(/\\"/g, '"').slice(0, 300);
+        }
+      }
+    }
+
+    if (!content) {
+      return res.status(500).json({ message: 'Failed to generate invite note' });
+    }
+
+    return res.json({ success: true, content });
+  } catch (error: any) {
+    console.error('Error drafting invite note:', error);
+    return res.status(500).json({ message: error.message || 'Failed to draft invite note' });
+  }
+});
+
+/**
  * @route POST /api/crm/lists/:listId/leads/:leadId/engagements
  * @desc Add a custom engagement event to a lead
  * @access Private
