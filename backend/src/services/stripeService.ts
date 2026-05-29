@@ -285,7 +285,7 @@ export async function changeSubscriptionPrice(
 export async function syncSubscriptionFromStripe(
   userId: string,
   stripeCustomerId: string
-): Promise<{ subscription_status?: string; stripe_subscription_id?: string; subscriptionType?: string; current_period_end?: string; has_payment_method?: boolean } | null> {
+): Promise<{ subscription_status?: string; stripe_subscription_id?: string; subscriptionType?: string; current_period_end?: string; has_payment_method?: boolean; activeOffer?: any } | null> {
   try {
     // 1. Read the current user record to know which fields are already set
     const user = await userDb.getUserById(userId);
@@ -301,6 +301,7 @@ export async function syncSubscriptionFromStripe(
       customer: stripeCustomerId,
       status: 'all',
       limit: 10,
+      expand: ['data.discount.coupon'],
     });
 
     if (subscriptions.data.length === 0) {
@@ -342,6 +343,7 @@ export async function syncSubscriptionFromStripe(
             : (sub as any).current_period_end
           ).toISOString()
         : undefined,
+      activeOffer: extractActiveOffer(sub),
     };
 
     // Derive tier from price if available
@@ -354,9 +356,9 @@ export async function syncSubscriptionFromStripe(
     }
 
     // 5. Additive-only merge for most fields, but always overwrite current_period_end
-    // (it must reflect Stripe's truth — stale dates are why this sync exists)
-    const SYNC_FIELDS = ['subscription_status', 'stripe_subscription_id', 'subscriptionType', 'has_payment_method', 'current_period_end'] as const;
-    const ALWAYS_OVERWRITE: ReadonlyArray<string> = ['current_period_end'];
+    // and activeOffer (they must reflect Stripe's truth — stale data is why this sync exists).
+    const SYNC_FIELDS = ['subscription_status', 'stripe_subscription_id', 'subscriptionType', 'has_payment_method', 'current_period_end', 'activeOffer'] as const;
+    const ALWAYS_OVERWRITE: ReadonlyArray<string> = ['current_period_end', 'activeOffer'];
     const updates: Record<string, any> = {};
 
     for (const field of SYNC_FIELDS) {
@@ -432,7 +434,7 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
   if (stripeSubscriptionId) {
     try {
       const s = getStripeOrThrow();
-      subscription = await s.subscriptions.retrieve(stripeSubscriptionId);
+      subscription = await s.subscriptions.retrieve(stripeSubscriptionId, { expand: ['discount.coupon'] });
       actualStatus = subscription.status; // Could be 'trialing', 'active', etc.
       if (subscription.current_period_end) {
         currentPeriodEnd = new Date(subscription.current_period_end * 1000).toISOString();
@@ -453,6 +455,7 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
     stripe_subscription_id: stripeSubscriptionId,
     subscription_status: actualStatus,
     has_payment_method: true, // completed checkout = has payment method
+    activeOffer: extractActiveOffer(subscription),
     // has_used_trial was used to gate the 14-day trial. Trials were removed
     // (product decision, 2026-04). Existing `true` values in DynamoDB are
     // harmless residue; we just stop writing the flag on new checkouts.
@@ -610,6 +613,9 @@ export async function handleSubscriptionUpdated(
     }
   }
 
+  // Always sync activeOffer — set to null when discount is removed
+  updateData.activeOffer = extractActiveOffer(subscription);
+
   await userDb.updateUser(user.userId, updateData);
   syncUserUpdateToLeadList(user.email, {
     subscriptionType: updateData.subscriptionType,
@@ -617,7 +623,7 @@ export async function handleSubscriptionUpdated(
   });
 
   console.log(
-    `Subscription updated: user ${user.userId} → status=${subscription.status}, has_pm=${hasPaymentMethod}, periodEnd=${updateData.current_period_end || 'unchanged'}`
+    `Subscription updated: user ${user.userId} → status=${subscription.status}, has_pm=${hasPaymentMethod}, periodEnd=${updateData.current_period_end || 'unchanged'}, offer=${updateData.activeOffer?.couponId ?? 'none'}`
   );
 }
 
@@ -659,15 +665,16 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
     updateData.subscription_amount = invoice.amount_paid;
   }
 
-  // Sync current_period_end from the live subscription so the admin Users tab shows the correct end date
+  // Sync current_period_end and activeOffer from the live subscription
   const subIdToFetch = subscriptionId || user.stripe_subscription_id;
   if (subIdToFetch) {
     try {
       const s = getStripeOrThrow();
-      const subscription = await s.subscriptions.retrieve(subIdToFetch) as any;
+      const subscription = await s.subscriptions.retrieve(subIdToFetch, { expand: ['discount.coupon'] }) as any;
       if (subscription.current_period_end) {
         updateData.current_period_end = new Date(subscription.current_period_end * 1000).toISOString();
       }
+      updateData.activeOffer = extractActiveOffer(subscription);
     } catch (err) {
       console.warn(`[STRIPE] Failed to fetch subscription ${subIdToFetch} for period_end sync: ${err}`);
     }
@@ -933,6 +940,33 @@ export async function handleSubscriptionScheduleEnded(schedule: any): Promise<vo
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 /**
+ * Extract activeOffer from a Stripe subscription's discount field.
+ * Returns null when there is no discount or the discount has no coupon.
+ */
+function extractActiveOffer(subscription: any): {
+  couponId: string;
+  couponName: string | null;
+  percentOff: number | null;
+  amountOff: number | null;
+  duration: 'forever' | 'once' | 'repeating';
+  durationInMonths: number | null;
+  endsAt: string | null;
+} | null {
+  const discount = subscription?.discount;
+  if (!discount || !discount.coupon) return null;
+  const coupon = discount.coupon;
+  return {
+    couponId: coupon.id,
+    couponName: coupon.name ?? null,
+    percentOff: typeof coupon.percent_off === 'number' ? coupon.percent_off : null,
+    amountOff: typeof coupon.amount_off === 'number' ? coupon.amount_off : null,
+    duration: coupon.duration ?? 'once',
+    durationInMonths: typeof coupon.duration_in_months === 'number' ? coupon.duration_in_months : null,
+    endsAt: typeof discount.end === 'number' ? new Date(discount.end * 1000).toISOString() : null,
+  };
+}
+
+/**
  * Derive the subscription type from the checkout session's line items price ID.
  * Maps: Starter plan → "Starter" tier, Pro/Complete plan → "Pro" tier.
  * Super Premium is an internal-only tier and is never assigned via paid
@@ -1040,6 +1074,7 @@ export async function reconcileAllStripeUsers(): Promise<{
         customer: user.stripe_customer_id,
         status: 'all',
         limit: 10,
+        expand: ['data.discount.coupon'],
       });
 
       // Find the most relevant subscription: active > trialing > past_due > canceled
@@ -1119,6 +1154,15 @@ export async function reconcileAllStripeUsers(): Promise<{
           updates.current_period_end = periodEndIso;
           changes.push(`period_end synced`);
         }
+      }
+
+      // Sync activeOffer — always overwrite so removed discounts are cleared
+      const newOffer = extractActiveOffer(sub);
+      const existingOfferJson = user.activeOffer ? JSON.stringify(user.activeOffer) : null;
+      const newOfferJson = newOffer ? JSON.stringify(newOffer) : null;
+      if (existingOfferJson !== newOfferJson) {
+        updates.activeOffer = newOffer;
+        changes.push(newOffer ? `offer synced (${newOffer.couponId})` : `offer cleared`);
       }
 
       if (Object.keys(updates).length > 0) {
