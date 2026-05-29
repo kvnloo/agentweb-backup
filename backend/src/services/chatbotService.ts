@@ -18,6 +18,7 @@ import { AgentModeService } from './agentModeService';
 import { AGENT_MODE_SYSTEM_PROMPT, EMMA_SIDEBAR_ADDENDUM, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
+import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
 import { incrementUserTokenUsage } from './tokenUsageService';
 import { approvalDb } from './approvalDb';
 // Load environment variables from .env file
@@ -1870,7 +1871,20 @@ export class ChatbotDB {
     const lowerQuery = query?.toLowerCase();
 
     for (const session of sessions) {
-      if (!session.assetCache) continue;
+      if (session.archived) continue;
+
+      // For sessions without a populated asset cache, scan messages inline so
+      // S3-saved files (e.g. HTML reports from save_file) are discoverable.
+      let cache = session.assetCache;
+      if (!cache) {
+        try {
+          const messages = await this.getMessagesFromMessagesTable(session.sessionId);
+          cache = scanMessagesForAssets(messages, session);
+        } catch {
+          continue;
+        }
+      }
+
       const sessionId = session.sessionId;
       const sessionTitle = session.title || 'Untitled session';
       const favorites = session.favorites ?? {};
@@ -1887,9 +1901,9 @@ export class ChatbotDB {
         }
       };
 
-      if (!assetTypeFilter || assetTypeFilter === 'images') pushAssets(session.assetCache.images ?? [], 'image');
-      if (!assetTypeFilter || assetTypeFilter === 'videos') pushAssets(session.assetCache.videos ?? [], 'video');
-      if (!assetTypeFilter || assetTypeFilter === 'htmlReports') pushAssets(session.assetCache.htmlReports ?? [], 'htmlReport');
+      if (!assetTypeFilter || assetTypeFilter === 'images') pushAssets(cache.images ?? [], 'image');
+      if (!assetTypeFilter || assetTypeFilter === 'videos') pushAssets(cache.videos ?? [], 'video');
+      if (!assetTypeFilter || assetTypeFilter === 'htmlReports') pushAssets(cache.htmlReports ?? [], 'htmlReport');
     }
 
     // Sort newest first
