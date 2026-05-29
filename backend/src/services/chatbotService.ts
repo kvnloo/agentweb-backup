@@ -1837,8 +1837,9 @@ export class ChatbotDB {
   }
 
   /**
-   * Search assets (images, videos, HTML reports) across all agent mode sessions for a user.
-   * Returns assets grouped by type with sessionId and session title for context.
+   * Search assets (images, videos, HTML reports) across agent mode sessions AND task
+   * executions for a user. Returns matching assets with their URLs, filenames, creation
+   * dates, asset type, favorite status, and the session/task they came from.
    */
   async searchUserAssets(
     userId: string,
@@ -1856,7 +1857,9 @@ export class ChatbotDB {
     isFavorited: boolean;
     approvalStatus?: string;
   }>> {
-    const sessions = await this.getSessionsWithoutMessages(userId, 'agent');
+    const assetTypeFilter = type === 'all' || !type ? null : type;
+    const lowerQuery = query?.toLowerCase();
+
     const results: Array<{
       url: string;
       filename: string;
@@ -1867,8 +1870,8 @@ export class ChatbotDB {
       isFavorited: boolean;
     }> = [];
 
-    const assetTypeFilter = type === 'all' || !type ? null : type;
-    const lowerQuery = query?.toLowerCase();
+    // ── Agent mode sessions ──────────────────────────────────────────────────
+    const sessions = await this.getSessionsWithoutMessages(userId, 'agent');
 
     for (const session of sessions) {
       if (session.archived) continue;
@@ -1904,6 +1907,54 @@ export class ChatbotDB {
       if (!assetTypeFilter || assetTypeFilter === 'images') pushAssets(cache.images ?? [], 'image');
       if (!assetTypeFilter || assetTypeFilter === 'videos') pushAssets(cache.videos ?? [], 'video');
       if (!assetTypeFilter || assetTypeFilter === 'htmlReports') pushAssets(cache.htmlReports ?? [], 'htmlReport');
+    }
+
+    // ── Task executions ──────────────────────────────────────────────────────
+    // Task execution result_files are stored in AW-TaskExecutions and are
+    // never in the agent session cache, so they must be queried separately.
+    if (!favoritesOnly) {
+      try {
+        const allExecutions = await taskDb.getAllTaskExecutionsByUserId(userId) || [];
+        const allTasks = await taskDb.getTasksByUserId(userId);
+        const taskMap = new Map((allTasks || []).map((t: any) => [t.taskId, t]));
+
+        const isHtml = (filename: string) => filename.toLowerCase().endsWith('.html') || filename.toLowerCase().endsWith('.htm');
+        const isImage = (filename: string) => /\.(jpe?g|png|gif|webp|svg)$/i.test(filename);
+        const isVideo = (filename: string) => filename.toLowerCase().endsWith('.mp4');
+
+        for (const execution of allExecutions) {
+          if (execution.archived || !execution.result_files?.length) continue;
+          const task = taskMap.get(execution.taskId);
+          if (!task || task.status === 'archived') continue;
+
+          const generatedAt = execution.startTime || execution.createdAt || '';
+          const sessionId = `task-${execution.executionId}`;
+          const sessionTitle = task.name || 'Task execution';
+
+          for (const file of execution.result_files) {
+            const url: string = file.url || file.s3_url || '';
+            const filename: string = file.filename || url.split('/').pop() || '';
+            if (!url || !filename) continue;
+
+            if (lowerQuery && !filename.toLowerCase().includes(lowerQuery) && !url.toLowerCase().includes(lowerQuery)) continue;
+
+            let assetType: 'image' | 'video' | 'htmlReport' | null = null;
+            if ((!assetTypeFilter || assetTypeFilter === 'htmlReports') && (isHtml(filename) || file.is_html)) {
+              assetType = 'htmlReport';
+            } else if ((!assetTypeFilter || assetTypeFilter === 'images') && isImage(filename)) {
+              assetType = 'image';
+            } else if ((!assetTypeFilter || assetTypeFilter === 'videos') && isVideo(filename)) {
+              assetType = 'video';
+            }
+
+            if (assetType) {
+              results.push({ url, filename, generatedAt, assetType, sessionId, sessionTitle, isFavorited: false });
+            }
+          }
+        }
+      } catch {
+        // Non-fatal — task execution search failure should not block session results
+      }
     }
 
     // Sort newest first

@@ -1,4 +1,5 @@
 import { chatbotDb } from '../services/chatbotService';
+import { taskDb } from '../services/db';
 
 const queryPromiseMock = jest.fn();
 const batchGetPromiseMock = jest.fn();
@@ -34,7 +35,12 @@ jest.mock('../controllers/release', () => ({ getReleases: jest.fn() }));
 jest.mock('../controllers/api', () => ({ getApiDocs: jest.fn() }));
 jest.mock('../controllers/user-guide', () => ({ getUserGuide: jest.fn() }));
 jest.mock('../controllers/docsController', () => ({ getUserReleaseNotes: jest.fn() }));
-jest.mock('../services/db', () => ({ taskDb: {} }));
+jest.mock('../services/db', () => ({
+  taskDb: {
+    getAllTaskExecutionsByUserId: jest.fn(),
+    getTasksByUserId: jest.fn(),
+  },
+}));
 jest.mock('../utils/secretsManager', () => ({ getGCSPPrivateKey: jest.fn() }));
 
 const SESSION_WITH_ASSETS = {
@@ -79,6 +85,8 @@ describe('searchUserAssets', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     batchGetPromiseMock.mockResolvedValue({ Responses: {} });
+    (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([]);
+    (taskDb.getTasksByUserId as jest.Mock).mockResolvedValue([]);
   });
 
   it('returns all assets with isFavorited flag when no filters applied', async () => {
@@ -233,6 +241,63 @@ describe('searchUserAssets', () => {
       .mockResolvedValueOnce({ Items: [uncachedSession] })
       .mockResolvedValueOnce({ Items: [] });
     const results = await chatbotDb.searchUserAssets('user-1');
+    expect(results).toHaveLength(0);
+  });
+
+  it('finds HTML reports from task execution result_files', async () => {
+    queryPromiseMock.mockResolvedValueOnce({ Items: [] }); // no sessions
+    (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([{
+      executionId: 'exec-1',
+      taskId: 'task-1',
+      startTime: '2026-01-05T00:00:00Z',
+      archived: false,
+      result_files: [{
+        filename: 'html_1774280127396_xCures_Google_Search_Ads_Campaign_v6.html',
+        url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user-1/files/1774280127396/abc/html_1774280127396_xCures.html',
+      }],
+    }]);
+    (taskDb.getTasksByUserId as jest.Mock).mockResolvedValue([{
+      taskId: 'task-1',
+      name: 'xCures Campaign Report',
+      status: 'completed',
+    }]);
+    const results = await chatbotDb.searchUserAssets('user-1', 'htmlReports');
+    expect(results).toHaveLength(1);
+    expect(results[0].assetType).toBe('htmlReport');
+    expect(results[0].sessionId).toBe('task-exec-1');
+    expect(results[0].sessionTitle).toBe('xCures Campaign Report');
+    expect(results[0].filename).toBe('html_1774280127396_xCures_Google_Search_Ads_Campaign_v6.html');
+  });
+
+  it('filters task execution results by keyword query', async () => {
+    queryPromiseMock.mockResolvedValueOnce({ Items: [] });
+    (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([{
+      executionId: 'exec-2',
+      taskId: 'task-2',
+      startTime: '2026-01-05T00:00:00Z',
+      archived: false,
+      result_files: [
+        { filename: 'xcures_report.html', url: 'https://s3.example.com/xcures_report.html' },
+        { filename: 'other_report.html', url: 'https://s3.example.com/other_report.html' },
+      ],
+    }]);
+    (taskDb.getTasksByUserId as jest.Mock).mockResolvedValue([{ taskId: 'task-2', name: 'My Task', status: 'completed' }]);
+    const results = await chatbotDb.searchUserAssets('user-1', 'htmlReports', 'xcures');
+    expect(results).toHaveLength(1);
+    expect(results[0].filename).toBe('xcures_report.html');
+  });
+
+  it('skips archived task executions', async () => {
+    queryPromiseMock.mockResolvedValueOnce({ Items: [] });
+    (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([{
+      executionId: 'exec-3',
+      taskId: 'task-3',
+      startTime: '2026-01-05T00:00:00Z',
+      archived: true,
+      result_files: [{ filename: 'report.html', url: 'https://s3.example.com/report.html' }],
+    }]);
+    (taskDb.getTasksByUserId as jest.Mock).mockResolvedValue([{ taskId: 'task-3', name: 'Archived Task', status: 'completed' }]);
+    const results = await chatbotDb.searchUserAssets('user-1', 'htmlReports');
     expect(results).toHaveLength(0);
   });
 });
