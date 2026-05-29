@@ -9331,17 +9331,17 @@ const AgentModeSettings = () => {
             >
               {(supportedModels.length > 0
                 ? supportedModels
-                : ['anthropic.claude-sonnet-4-6', 'anthropic.claude-opus-4-6-v1']
-              ).filter(model => model.includes('anthropic.claude')).map((model) => (
+                : ['anthropic.claude-sonnet-4-6', 'anthropic.claude-opus-4-6-v1', 'claude-opus-4-8']
+              ).filter(model => model.includes('anthropic.claude') || model === 'claude-opus-4-8').map((model) => (
                 <MenuItem key={model} value={model}>
-                  {model}
+                  {model === 'claude-opus-4-8' ? 'claude-opus-4-8 (Vertex AI)' : model}
                 </MenuItem>
               ))}
             </Select>
           </FormControl>
 
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
-            Sets the default model for the coding agent (code editing tasks for landing pages). Defaults to Sonnet 4.6. Opus 4.6 is also available for more complex coding tasks.
+            Sets the default model for the coding agent (code editing tasks for landing pages). Defaults to Sonnet 4.6. Opus 4.6 (Bedrock) and Opus 4.8 (Vertex AI) are also available for more complex coding tasks.
           </Typography>
         </CardContent>
       </Card>
@@ -9374,6 +9374,7 @@ const AgentModeSettings = () => {
               <MenuItem value="anthropic.claude-sonnet-4-5-20250929-v1:0">
                 Claude Sonnet 4.5 (AWS Bedrock)
               </MenuItem>
+              <MenuItem value="claude-opus-4-8">Claude Opus 4.8 (Vertex AI)</MenuItem>
             </Select>
           </FormControl>
 
