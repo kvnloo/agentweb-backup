@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-28
+// Last updated: 2026-05-29
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,14 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-05-29',
+    changes: [
+      'Improved: Stripe Discount Offers Now Synced to User Records',
+      '- When a customer has an active coupon or promotional offer in Stripe (e.g. 90% off for 6 months), that offer is now stored on their user record',
+      '- The offer details (discount percentage, duration, expiry date) are kept up to date automatically via Stripe webhooks and daily reconciliation',
+    ],
+  },
   {
     date: '2026-05-28',
     changes: [
