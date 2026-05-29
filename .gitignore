@@ -129,3 +129,11 @@ customer-portal/
 
 # Ignore Claude Code worktrees (agent-specific, never committed)
 .claude/worktrees/
+
+# Cloud-dev runtime state (written by .claude-run.sh at launch — never commit)
+.claude-conversation-log
+.claude-prompt
+.claude-session-id
+.claude-total-cost
+.ec2-session-meta
+.notion-page-id
