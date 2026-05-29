@@ -159,10 +159,10 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
 /**
  * POST /api/oauth/google-ads/connect
  * Save the selected ad account as a connected_account with platform='google_ads'.
- * Body: { tokenSessionId, customerId, accountName, currency, managerCustomerId? }
+ * Body: { tokenSessionId, customerId, accountName, currency }
  */
 router.post('/connect', authenticateToken, async (req: any, res) => {
-  const { tokenSessionId, customerId, accountName, currency, managerCustomerId } = req.body;
+  const { tokenSessionId, customerId, accountName, currency } = req.body;
   const userId = req.user.userId;
 
   if (!tokenSessionId || !customerId) {
@@ -186,7 +186,6 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
         access_token: session.tokens.access_token,
         refresh_token: session.tokens.refresh_token,
         token_expires_at: tokenExpiresAt,
-        ...(managerCustomerId ? { manager_customer_id: managerCustomerId } : {}),
       },
     });
     res.json({ success: true });
