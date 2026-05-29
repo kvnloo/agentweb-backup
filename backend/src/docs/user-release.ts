@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-29',
     changes: [
+      'Fixed: Emma Can Edit Landing Pages Again When Using Claude Opus 4.8',
+      '- The code-editing agent Emma uses to update landing pages failed immediately with an "invalid model identifier" error whenever Claude Opus 4.8 was selected as its model',
+      '- Opus 4.8 runs on Google Vertex AI, but the code editor was only wired up to AWS — it now routes to the correct provider, so landing page edits work with any available model',
+    ],
+  },
+  {
+    date: '2026-05-29',
+    changes: [
       'Fixed: Landing Page Publish No Longer Stuck After Conflict Resolution',
       '- Publishing a landing page draft branch to production no longer fails with a 409 Merge Conflict error after a conflict has already been resolved',
       '- Previously, once a conflict was resolved by force-applying draft changes to main, the publish tool would still reject subsequent publish attempts — now it automatically force-advances main to the draft tip in this case',
