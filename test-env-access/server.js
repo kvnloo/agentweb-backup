@@ -733,9 +733,15 @@ function runClaude(prompt) {
     const model = isVertex ? "claude-opus-4-8" : "us.anthropic.claude-sonnet-4-6";
     const childEnv = { ...process.env, HOME: "/home/ec2-user", ...claudeEnvOverrides };
     delete childEnv.CLAUDE_CODE_USE_BEDROCK; // ensure unset when using Vertex
+    // The login shell (-lc) re-sources ~/.bashrc, which exports CLAUDE_CODE_USE_BEDROCK=1
+    // and AWS_BEARER_TOKEN_BEDROCK, overriding childEnv. Re-assert Vertex inline (runs after
+    // bashrc) so claude-opus-4-8 routes to Vertex instead of Bedrock (where the id is invalid).
+    const envFix = isVertex
+      ? `unset CLAUDE_CODE_USE_BEDROCK AWS_BEARER_TOKEN_BEDROCK; export CLAUDE_CODE_USE_VERTEX=1 ANTHROPIC_VERTEX_PROJECT_ID=gen-lang-client-0725723168 CLOUD_ML_REGION=global GOOGLE_APPLICATION_CREDENTIALS=${VERTEX_SA_PATH}; `
+      : "";
     const child = spawn(
       "bash",
-      ["-lc", `cd /home/ec2-user/agentweb && claude ${resumeFlag} --model ${model} --permission-mode bypassPermissions --output-format json -p '${escaped}'`],
+      ["-lc", `cd /home/ec2-user/agentweb && ${envFix}claude ${resumeFlag} --model ${model} --permission-mode bypassPermissions --output-format json -p '${escaped}'`],
       {
         uid: 1000, // ec2-user UID
         gid: 1000,
