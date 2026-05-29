@@ -90,6 +90,22 @@ describe('convertContentToAnthropicBlocks', () => {
     expect(convert('hello world')).toEqual([{ type: 'text', text: 'hello world' }]);
   });
 
+  it('converts a string item inside the array to a text block', () => {
+    expect(convert(['just text', { type: 'text', text: 'and more' }])).toEqual([
+      { type: 'text', text: 'just text' },
+      { type: 'text', text: 'and more' },
+    ]);
+  });
+
+  it('stringifies non-object primitive items (number, null) inside the array', () => {
+    const blocks = convert([42, null, { type: 'text', text: 'x' }]);
+    expect(blocks).toEqual([
+      { type: 'text', text: '42' },
+      { type: 'text', text: '' },
+      { type: 'text', text: 'x' },
+    ]);
+  });
+
   it('passes Anthropic-native blocks (image, tool_result) through unchanged', () => {
     const native = [
       { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'X' } },
