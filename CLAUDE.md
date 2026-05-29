@@ -374,9 +374,34 @@ The agent engine supports multiple LLM providers:
 - **Azure OpenAI** (GPT-4o, GPT-4.1)
 - **Google Gemini** (gemini-2.5-pro, gemini-2.5-flash)
 - **AWS Bedrock** (Claude models)
+- **Google Vertex AI** (claude-opus-4-8)
 - **OpenAI** (direct API)
 
 LLM selection is passed from backend via `aiModelConfig` in task execution record.
+
+#### Adding a New Google Vertex AI Claude Model
+
+Claude models on Vertex AI use a GCP service account for authentication (OAuth tokens minted at runtime).
+
+**Setup (one-time per environment):**
+
+1. In GCP Console, create a service account in the target project (e.g. `gen-lang-client-0725723168`) and grant it the **Agent Platform User** (`roles/aiplatform.user`) role.
+2. Download the service account JSON key.
+3. Store the entire JSON key file contents in AWS Secrets Manager:
+   - Dev: `dev/AgentWeb/Google/Vertex`
+   - Prod: `prod/AgentWeb/Google/Vertex`
+   ```bash
+   aws secretsmanager create-secret \
+     --name dev/AgentWeb/Google/Vertex \
+     --secret-string "$(cat /path/to/key.json)"
+   # repeat with prod/AgentWeb/Google/Vertex for production
+   ```
+
+**To add a new model:**
+1. Add an entry to `llmModels` in `backend/src/services/agentModeService.ts` using the model ID as the key (e.g. `claude-opus-4-8`). Set `supportsTemperature: false` if the model has deprecated temperature.
+2. Add pricing to `modelPricing` in the same file.
+3. The `getClientForModel` / `callLLM` lazy-load branch routes any key starting with `claude-` to `getVertexClient()` automatically.
+4. Add registry and lazy-load tests in `backend/src/__tests__/agentModeService.sonnet45.test.ts`.
 
 #### Adding a New AWS Bedrock Claude Model
 
@@ -528,6 +553,8 @@ Secrets stored in AWS Secrets Manager (accessed at runtime):
 - `dev/AgentWeb/Google/Search` - Google Custom Search API
 - `dev/AgentWeb/Google/SearchConsole` - Google Search Console service account JSON
 - `dev/AgentWeb/Google/Share` - Google Drive service account JSON for shared folders
+- `dev/AgentWeb/Google/Vertex` - GCP service account JSON for Vertex AI Claude models (e.g. claude-opus-4-8)
+- `prod/AgentWeb/Google/Vertex` - GCP service account JSON for Vertex AI Claude models (production)
 - `prod/AgentWeb/Google/PageSpeed` - PageSpeed Insights API key
 - `dev/AgentWeb/BaseHub` - BaseHub CMS credentials
 - `dev/AgentWeb/Webflow` or `dev/AgentWeb/Webflow/<userId>` - Webflow CMS credentials
