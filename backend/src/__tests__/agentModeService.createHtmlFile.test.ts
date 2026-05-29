@@ -36,10 +36,14 @@ jest.mock('crypto', () => ({
     update: jest.fn().mockReturnThis(),
     digest: jest.fn().mockReturnValue('mock-hash')
   })),
-  getRandomValues: jest.fn((arr) => {
-    for (let i = 0; i < arr.length; i++) {
-      arr[i] = Math.floor(Math.random() * 256);
-    }
+  randomUUID: jest.fn().mockReturnValue('mock-uuid-1234'),
+  randomBytes: jest.fn((size: number) => Buffer.alloc(size, 0)),
+  randomFillSync: jest.fn((arr: Uint8Array) => {
+    for (let i = 0; i < arr.length; i++) arr[i] = 0;
+    return arr;
+  }),
+  getRandomValues: jest.fn((arr: Uint8Array) => {
+    for (let i = 0; i < arr.length; i++) arr[i] = 0;
     return arr;
   })
 }));
@@ -66,6 +70,12 @@ describe('AgentModeService - createHtmlFile', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+
+    // Reset static flag so emma tools get re-registered on each test instance.
+    // Without this, if another test suite ran initialize() first and set
+    // toolsRegistered=true, the emma tool bridge (which registers create_html_file)
+    // is skipped and executeTool throws "Unknown tool: create_html_file".
+    (AgentModeService as any).toolsRegistered = false;
 
     // Create service instance
     agentModeService = new AgentModeService();
@@ -300,6 +310,8 @@ describe('AgentModeService - createHtmlFile', () => {
 
   describe('create_html_file function call handler', () => {
     beforeEach(() => {
+      // The execute handler in emma/tools.ts calls agentModeService.createHtmlFile on the
+      // module-level singleton. Spy on the singleton so assertions can verify it was called.
       jest.spyOn(singletonAgentService as any, 'createHtmlFile').mockImplementation(async (title, content_draft, format_requirements, userId, sessionId) => {
         if (!title) return { success: false, message: 'title is required' };
         if (!content_draft) return { success: false, message: 'content_draft is required' };
