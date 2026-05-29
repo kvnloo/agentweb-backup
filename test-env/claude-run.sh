@@ -15,6 +15,14 @@ if [[ -n "$VERTEX_SA_JSON" ]]; then
   export CLAUDE_CODE_USE_VERTEX=1
   export ANTHROPIC_VERTEX_PROJECT_ID="gen-lang-client-0725723168"
   export CLOUD_ML_REGION="global"
+  # Record model label for heartbeat display
+  grep -q '^claude_model=' ~/agentweb/.ec2-session-meta 2>/dev/null \
+    && sed -i 's|^claude_model=.*|claude_model=Opus 4.8 (Google Vertex)|' ~/agentweb/.ec2-session-meta \
+    || echo 'claude_model=Opus 4.8 (Google Vertex)' >> ~/agentweb/.ec2-session-meta
+else
+  grep -q '^claude_model=' ~/agentweb/.ec2-session-meta 2>/dev/null \
+    && sed -i 's|^claude_model=.*|claude_model=Sonnet 4.6 (AWS Bedrock)|' ~/agentweb/.ec2-session-meta \
+    || echo 'claude_model=Sonnet 4.6 (AWS Bedrock)' >> ~/agentweb/.ec2-session-meta
 fi
 
 NOTION_PAGE_ID=$(cat .notion-page-id 2>/dev/null)
