@@ -3821,8 +3821,12 @@ emmaToolRegistry.register({
       required: ["image_url"]
     }
   },
-  execute: async (args: any, context?: any) => {
-    return await agentModeService.describeImage(args.llmModel, args.image_url, args.prompt);
+  execute: async (args: any, _context?: any) => {
+    // Intentionally pass no model: describe_image always uses the configured
+    // agent_mode_default_model (resolved inside describeImage), not the chat's
+    // selected model. (`args.llmModel` was never populated — the schema doesn't
+    // expose it and the registry doesn't merge context into args.)
+    return await agentModeService.describeImage(undefined, args.image_url, args.prompt);
   }
 });
 
