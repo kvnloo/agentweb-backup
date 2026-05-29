@@ -1002,9 +1002,9 @@ export class AgentModeService {
                     }
                     if (content.length > 0) messages.push({ role: 'assistant', content });
                   } else if (msg.role === 'user') {
-                    const content = typeof msg.content === 'string'
-                      ? [{ type: 'text', text: msg.content }]
-                      : Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: String(msg.content) }];
+                    // Convert OpenAI-style content (incl. image_url blocks) to Anthropic-native
+                    // blocks. Passing image_url through verbatim triggers a Vertex 400.
+                    const content = AgentModeService.convertContentToAnthropicBlocks(msg.content);
                     messages.push({ role: 'user', content });
                   } else if (msg.role === 'tool') {
                     // Append tool result to the last user message or create a new one
@@ -1560,6 +1560,61 @@ export class AgentModeService {
       return blocks.length > 0 ? blocks : [{ text: '.' }];
     }
     return [{ text: String(content) }];
+  }
+
+  /**
+   * Convert OpenAI-format content (string, array, or object) to Anthropic-native
+   * content blocks.
+   *
+   * Critically, OpenAI-style `{ type: 'image_url', image_url: { url } }` blocks are
+   * converted to Anthropic `{ type: 'image', source: {...} }` blocks. The Anthropic
+   * Messages API — including Claude models served via Google Vertex AI — rejects the
+   * `image_url` tag with: 400 "Input tag 'image_url' found using 'type' does not match
+   * expected tags (image, document, ...)". Data URIs become base64 image sources;
+   * public http(s) URLs become url image sources.
+   */
+  private static convertContentToAnthropicBlocks(content: any): any[] {
+    if (content === null || content === undefined) return [{ type: 'text', text: '' }];
+    if (typeof content === 'string') return [{ type: 'text', text: content }];
+    if (!Array.isArray(content)) return [{ type: 'text', text: String(content) }];
+
+    const VALID_ANTHROPIC_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+    const blocks: any[] = [];
+    for (const item of content) {
+      if (typeof item === 'string') {
+        blocks.push({ type: 'text', text: item });
+      } else if (!item || typeof item !== 'object') {
+        blocks.push({ type: 'text', text: String(item ?? '') });
+      } else if (item.type === 'text') {
+        blocks.push({ type: 'text', text: item.text || '' });
+      } else if (item.type === 'image_url') {
+        const url = item.image_url?.url || '';
+        if (url.startsWith('data:')) {
+          // data:image/png;base64,... (allow extra params before ;base64,)
+          const m = url.match(/^data:(image\/[\w+.-]+)(?:;[^;]*)*;base64,(.+)$/s);
+          if (m) {
+            let mediaType = m[1].toLowerCase();
+            if (mediaType === 'image/jpg') mediaType = 'image/jpeg';
+            if (!VALID_ANTHROPIC_MEDIA_TYPES.has(mediaType)) mediaType = 'image/jpeg';
+            blocks.push({
+              type: 'image',
+              source: { type: 'base64', media_type: mediaType, data: m[2] },
+            });
+          } else {
+            console.warn(`AgentMode: Could not parse data URI for Anthropic image block, url prefix="${url.substring(0, 60)}"`);
+          }
+        } else if (url) {
+          // Public URL — Anthropic supports url image sources directly
+          blocks.push({ type: 'image', source: { type: 'url', url } });
+        }
+      } else if (item.type === 'image' || item.type === 'tool_result' || item.type === 'tool_use' || item.type === 'document') {
+        // Already an Anthropic-native block — pass through unchanged
+        blocks.push(item);
+      } else {
+        blocks.push({ type: 'text', text: JSON.stringify(item) });
+      }
+    }
+    return blocks.length > 0 ? blocks : [{ type: 'text', text: '.' }];
   }
 
   private llmModels: Record<string, LLMModelConfig> = {
@@ -5096,7 +5151,15 @@ export class AgentModeService {
     }
   }
 
-  public async describeImage(llmModel: string, imageUrl: string, prompt?: string): Promise<any> {
+  /**
+   * Analyze an image with a vision-capable LLM.
+   *
+   * @param llmModel - Optional. When omitted (the agent-mode `describe_image` tool
+   *   intentionally passes nothing here), the configured `agent_mode_default_model`
+   *   is used. This keeps image analysis on a single known vision-capable model
+   *   rather than whatever model the user selected for chat.
+   */
+  public async describeImage(llmModel: string | undefined, imageUrl: string, prompt?: string): Promise<any> {
     try {
       if (!imageUrl) {
         return {
@@ -5110,10 +5173,14 @@ export class AgentModeService {
       // Use custom prompt or default
       const analysisPrompt = prompt || 'Please analyze and describe this image in detail. Focus on visual elements, composition, colors, text, and any marketing or branding elements you can identify.';
 
-      // Bedrock Converse API requires base64 data URIs for images (not URLs).
-      // Download the image and convert to a data URI for Bedrock models.
+      // Claude models require the image as inline bytes rather than a bare URL:
+      //  - Bedrock Converse API requires base64 data URIs.
+      //  - Anthropic-on-Vertex (claude-*) can take a url source, but our images are
+      //    typically private S3 objects Anthropic's fetcher cannot reach, so we
+      //    download and presign them into a base64 data URI here.
+      // Download the image and convert to a data URI for these models.
       let resolvedImageUrl = imageUrl;
-      if (llmModel.startsWith('anthropic.') && !imageUrl.startsWith('data:')) {
+      if ((llmModel.startsWith('anthropic.') || llmModel.startsWith('claude-')) && !imageUrl.startsWith('data:')) {
         try {
           const axios = (await import('axios')).default;
           // For private S3 URLs from our bucket, generate a presigned URL so the download succeeds
