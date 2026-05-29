@@ -1209,18 +1209,47 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
     const GITHUB_TIMEOUT_MS = 30_000;
     const repoBase = `https://api.github.com/repos/${owner}/${repoName}`;
 
-    // Merge the draft branch into main
-    const mergeRes = await axios.post<any>(
-      `${repoBase}/merges`,
-      {
-        base: "main",
-        head: branch,
-        commit_message: `Publish landing page changes from ${branch}`,
-      },
-      { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
-    );
+    let mergeCommitSha: string;
 
-    console.log(`[LP GENERATION] Merged ${branch} into main: ${mergeRes.data.sha?.substring(0, 7)}`);
+    // Try a standard merge first; on conflict (409) fall back to force-advancing
+    // main to the draft branch tip. This is safe because landing page repos are
+    // exclusively managed by our system — there is no external contributor whose
+    // work we could clobber. A 409 means the branches diverged (e.g. a previous
+    // "resolve conflict with ours" commit was applied to main directly) and the
+    // draft still contains the canonical desired state.
+    try {
+      const mergeRes = await axios.post<any>(
+        `${repoBase}/merges`,
+        {
+          base: "main",
+          head: branch,
+          commit_message: `Publish landing page changes from ${branch}`,
+        },
+        { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+      );
+      mergeCommitSha = mergeRes.data.sha;
+      console.log(`[LP GENERATION] Merged ${branch} into main: ${mergeCommitSha?.substring(0, 7)}`);
+    } catch (mergeErr: any) {
+      if (mergeErr.response?.status !== 409) throw mergeErr;
+
+      console.warn(`[LP GENERATION] Standard merge returned 409; force-advancing main to draft branch tip`);
+
+      // Get the current SHA of the draft branch tip
+      const branchRes = await axios.get<any>(
+        `${repoBase}/git/ref/heads/${encodeURIComponent(branch)}`,
+        { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+      );
+      const draftSha: string = branchRes.data.object.sha;
+
+      // Force-update main to point at the draft branch tip
+      await axios.patch<any>(
+        `${repoBase}/git/refs/heads/main`,
+        { sha: draftSha, force: true },
+        { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+      );
+      mergeCommitSha = draftSha;
+      console.log(`[LP GENERATION] Force-advanced main to draft tip ${draftSha.substring(0, 7)}`);
+    }
 
     // Delete the draft branch
     try {
@@ -1243,7 +1272,7 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
 
     res.json({
       success: true,
-      merge_commit_sha: mergeRes.data.sha,
+      merge_commit_sha: mergeCommitSha,
       deployed_url: page.deployedUrl,
       message: `Changes from ${branch} have been published to main. Your site at ${page.deployedUrl} will update shortly.`,
     });
@@ -1254,8 +1283,6 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
 
     if (ghStatus === 404) {
       res.status(404).json({ error: "Branch not found. It may have already been merged or deleted." });
-    } else if (ghStatus === 409) {
-      res.status(409).json({ error: `Merge conflict: ${ghMessage}. Please resolve conflicts manually.` });
     } else {
       res.status(500).json({ error: `Failed to publish: ${ghMessage}` });
     }
