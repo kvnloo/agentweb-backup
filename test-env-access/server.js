@@ -695,6 +695,29 @@ function formatUsageLine(data) {
 }
 
 const SESSION_ID_FILE = "/home/ec2-user/agentweb/.claude-session-id";
+const VERTEX_SA_PATH = "/tmp/vertex-sa.json";
+
+// Vertex AI env vars for child Claude processes — populated at startup
+let claudeEnvOverrides = {};
+
+async function initClaudeEnv() {
+  try {
+    const saJson = await getCachedSecret("agentweb/test-env/vertex-sa");
+    if (saJson) {
+      fs.writeFileSync(VERTEX_SA_PATH, saJson, { mode: 0o600 });
+      claudeEnvOverrides = {
+        CLAUDE_CODE_USE_VERTEX: "1",
+        ANTHROPIC_VERTEX_PROJECT_ID: "gen-lang-client-0725723168",
+        CLOUD_ML_REGION: "global",
+        GOOGLE_APPLICATION_CREDENTIALS: VERTEX_SA_PATH,
+        CLAUDE_CODE_USE_BEDROCK: "",  // unset Bedrock
+      };
+      console.log("[claude-env] Vertex AI configured (claude-opus-4-8)");
+    }
+  } catch (err) {
+    console.warn("[claude-env] Could not load Vertex SA — falling back to Bedrock:", err.message);
+  }
+}
 
 function runClaude(prompt) {
   return new Promise((resolve, reject) => {
@@ -706,13 +729,17 @@ function runClaude(prompt) {
       const sessionId = fs.readFileSync(SESSION_ID_FILE, "utf-8").trim();
       if (sessionId) resumeFlag = `--resume ${sessionId}`;
     } catch {}
+    const isVertex = !!claudeEnvOverrides.CLAUDE_CODE_USE_VERTEX;
+    const model = isVertex ? "claude-opus-4-8" : "us.anthropic.claude-sonnet-4-6";
+    const childEnv = { ...process.env, HOME: "/home/ec2-user", ...claudeEnvOverrides };
+    delete childEnv.CLAUDE_CODE_USE_BEDROCK; // ensure unset when using Vertex
     const child = spawn(
       "bash",
-      ["-lc", `cd /home/ec2-user/agentweb && claude ${resumeFlag} --model us.anthropic.claude-sonnet-4-6 --permission-mode bypassPermissions --output-format json -p '${escaped}'`],
+      ["-lc", `cd /home/ec2-user/agentweb && claude ${resumeFlag} --model ${model} --permission-mode bypassPermissions --output-format json -p '${escaped}'`],
       {
         uid: 1000, // ec2-user UID
         gid: 1000,
-        env: { ...process.env, HOME: "/home/ec2-user" },
+        env: childEnv,
         timeout: 2 * 60 * 60 * 1000, // 2 hours
       }
     );
@@ -1042,6 +1069,9 @@ async function enforceAllowlist() {
 
 app.listen(PORT, () => {
   console.log(`IP allowlist service running on http://localhost:${PORT}`);
+  initClaudeEnv().catch((err) =>
+    console.error("[claude-env] Failed to init Claude env on startup:", err)
+  );
   checkForIpChange().catch((err) =>
     console.error("[ip-change] Failed to check for IP change on startup:", err)
   );
