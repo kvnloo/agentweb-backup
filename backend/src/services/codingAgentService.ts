@@ -11,6 +11,7 @@ import AnthropicBedrock from '@anthropic-ai/bedrock-sdk';
 import Anthropic from '@anthropic-ai/sdk';
 import { mcpFetch } from '../mcp/server/httpClient';
 import { agentModeService } from './agentModeService';
+import { getSecret } from '../utils/secretsManager';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -835,6 +836,107 @@ export function _setBedrockClientForTest(client: AnthropicBedrock | null): void 
   bedrockClient = client;
 }
 
+// ─── Vertex Client (native Anthropic format) ──────────────────────────────────
+// Claude models on Google Vertex AI (e.g. "claude-opus-4-8") are addressed by a
+// bare model id with NO "anthropic." prefix and are NOT available on Bedrock.
+// We hit the rawPredict endpoint directly, which speaks the native Anthropic
+// Messages format — the exact shape the coding agent already builds — so no
+// request/response conversion is needed (unlike agentModeService, which adapts
+// to/from OpenAI format).
+
+/** Minimal client surface the agent loop relies on — satisfied by both AnthropicBedrock and the Vertex wrapper. */
+interface AnthropicLikeClient {
+  messages: {
+    create: (params: Anthropic.MessageCreateParamsNonStreaming) => Promise<Anthropic.Message>;
+  };
+}
+
+const VERTEX_REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes per request
+
+let vertexClient: AnthropicLikeClient | null = null;
+let vertexClientPromise: Promise<AnthropicLikeClient> | null = null;
+
+async function getVertexClient(): Promise<AnthropicLikeClient> {
+  if (vertexClient) return vertexClient;
+  if (vertexClientPromise) return vertexClientPromise;
+
+  vertexClientPromise = (async () => {
+    const { GoogleAuth } = await import('google-auth-library');
+    const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+    const secretString = await getSecret(`${environment}/AgentWeb/Google/Vertex`);
+    const credentials = JSON.parse(secretString);
+    const auth = new GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+    });
+    const projectId = credentials.project_id;
+
+    const client: AnthropicLikeClient = {
+      messages: {
+        create: async (params) => {
+          const token = await auth.getAccessToken();
+          // The model id goes in the URL for Vertex; everything else is the
+          // native Anthropic request body (system, tools, messages, max_tokens).
+          const { model, ...rest } = params as any;
+          delete (rest as any).model;
+          const url = `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/global/publishers/anthropic/models/${model}:rawPredict`;
+          const body = { anthropic_version: 'vertex-2023-10-16', ...rest };
+
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), VERTEX_REQUEST_TIMEOUT_MS);
+          let response: Response;
+          try {
+            response = await fetch(url, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(body),
+              signal: controller.signal,
+            });
+          } finally {
+            clearTimeout(timeout);
+          }
+
+          if (!response.ok) {
+            const errText = await response.text();
+            const err: any = new Error(`Vertex AI error ${response.status}: ${errText}`);
+            err.status = response.status; // lets callWithRetry decide whether to retry
+            throw err;
+          }
+
+          // rawPredict returns a native Anthropic Message — consumed as-is.
+          return (await response.json()) as Anthropic.Message;
+        },
+      },
+    };
+
+    vertexClient = client;
+    return client;
+  })();
+
+  return vertexClientPromise;
+}
+
+// Exported for testing (allows mock injection)
+export function _setVertexClientForTest(client: AnthropicLikeClient | null): void {
+  vertexClient = client;
+  vertexClientPromise = null;
+}
+
+/**
+ * Pick the right LLM client for a given model id.
+ * - Bare "claude-*" ids (e.g. claude-opus-4-8) are Google Vertex AI models.
+ * - "anthropic.*" ids are AWS Bedrock models.
+ */
+async function getClientForModel(model: string): Promise<AnthropicLikeClient> {
+  if (model.startsWith('claude-')) {
+    return getVertexClient();
+  }
+  return getBedrockClient() as unknown as AnthropicLikeClient;
+}
+
 // Sleep helper — injectable for tests to skip real delays
 let _sleepFn: (ms: number) => Promise<void> = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 export function _setSleepFnForTest(fn: (ms: number) => Promise<void>): void {
@@ -846,10 +948,12 @@ export function _setSleepFnForTest(fn: (ms: number) => Promise<void>): void {
  * Maps model IDs to inference profile ARNs when needed.
  */
 async function callWithRetry(
-  client: AnthropicBedrock,
+  client: AnthropicLikeClient,
   params: Anthropic.MessageCreateParamsNonStreaming
 ): Promise<Anthropic.Message> {
-  // Map model IDs to inference profile ARNs for models that require them
+  // Map Bedrock model IDs to inference profile ARNs for models that require them.
+  // Vertex models (bare "claude-*") are not in this map and pass through unchanged —
+  // the Vertex client puts the model id in the request URL.
   const inferenceProfileMap: Record<string, string> = {
     'anthropic.claude-sonnet-4-5-20250929-v1:0': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
     'anthropic.claude-sonnet-4-6': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
@@ -865,10 +969,12 @@ async function callWithRetry(
     try {
       return await client.messages.create(updatedParams);
     } catch (error) {
-      if (error instanceof Anthropic.APIError && (error.status === 429 || (error.status && error.status >= 500))) {
-        lastError = error;
+      // Retry transient errors (rate limits / server errors) from either provider.
+      const status = (error as any)?.status;
+      if (typeof status === 'number' && (status === 429 || status >= 500)) {
+        lastError = error as Error;
         // Exponential backoff: 1s, 2s
-        await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
+        await _sleepFn(1000 * Math.pow(2, attempt));
         continue;
       }
       throw error; // Non-retryable error
@@ -969,7 +1075,7 @@ async function runCodingAgentInternal(
   model: string
 ): Promise<{ success: boolean; message: string; iterations: number; previewUrl?: string; branch?: string }> {
 
-  const client = getBedrockClient();
+  const client = await getClientForModel(model);
   const tools = getToolDefinitions();
 
   // Pre-fetch the file listing so the agent knows the repo structure from the first iteration.
