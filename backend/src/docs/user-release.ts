@@ -19,6 +19,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-29',
     changes: [
+      'Fixed: Image Analysis Works Again with Claude Opus 4.8',
+      '- Emma can once again analyze and describe images (charts, screenshots, logos, photos) when Claude Opus 4.8 is the active model',
+      '- Previously, asking Emma to read or describe an image failed with an internal error after Opus 4.8 became the default model',
+    ],
+  },
+  {
+    date: '2026-05-29',
+    changes: [
       'Fixed: Landing Page Publish No Longer Stuck After Conflict Resolution',
       '- Publishing a landing page draft branch to production no longer fails with a 409 Merge Conflict error after a conflict has already been resolved',
       '- Previously, once a conflict was resolved by force-applying draft changes to main, the publish tool would still reject subsequent publish attempts — now it automatically force-advances main to the draft tip in this case',
