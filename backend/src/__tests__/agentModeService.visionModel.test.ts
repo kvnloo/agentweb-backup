@@ -76,17 +76,34 @@ describe('AgentModeService - vision model (describe_image)', () => {
       expect(opts.length).toBeGreaterThan(0);
     });
 
-    it('includes multimodal chat models (GPT, Gemini, Claude Vertex)', async () => {
+    it('includes verified multimodal models (GPT, Gemini, Claude Bedrock/Vertex)', async () => {
       const opts = await service.getVisionModelOptions(true);
       expect(opts).toContain('gpt-5-chat-2');
+      expect(opts).toContain('gpt-5.4-nano');
       expect(opts).toContain('gemini-3-flash-preview');
+      expect(opts).toContain('anthropic.claude-sonnet-4-6');
       expect(opts).toContain('claude-opus-4-8');
+    });
+
+    it('excludes models that fail the vision probe (unserved id / unprovisioned account)', async () => {
+      const opts = await service.getVisionModelOptions(true);
+      // Gemini API returns 404 for this id
+      expect(opts).not.toContain('gemini-3-pro-preview');
+      // Not provisioned on the Bedrock account (403)
+      expect(opts).not.toContain('anthropic.claude-opus-4-7');
+    });
+
+    it('only returns models flagged supportsVision', async () => {
+      const opts = await service.getVisionModelOptions(true);
+      const allModels = await service.getSupportedModels(true);
+      // Every returned option must be a real registered model
+      opts.forEach(m => expect(allModels).toContain(m));
     });
 
     it('hides admin-only models from non-admin callers', async () => {
       const adminOpts = await service.getVisionModelOptions(true);
       const userOpts = await service.getVisionModelOptions(false);
-      // Opus 4.6/4.7 (Bedrock) are admin-only in the registry
+      // Opus 4.6 (Bedrock) is admin-only in the registry
       expect(adminOpts).toContain('anthropic.claude-opus-4-6-v1');
       expect(userOpts).not.toContain('anthropic.claude-opus-4-6-v1');
     });
