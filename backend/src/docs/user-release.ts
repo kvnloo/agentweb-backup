@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-28
+// Last updated: 2026-05-30
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,15 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-05-30',
+    changes: [
+      'Fixed: Generated Landing Pages with Hover Effects Now Build Reliably',
+      '- Landing pages that use hover interactions (e.g. cards or buttons that respond to the mouse) no longer fail to publish',
+      '- Previously these pages required a manual code fix after every generation before they could go live',
+      '- The generator now automatically prepares any interactive component correctly, so pages deploy on the first try',
+    ],
+  },
   {
     date: '2026-05-29',
     changes: [
