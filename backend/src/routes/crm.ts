@@ -4196,7 +4196,7 @@ router.post('/lists/:listId/check-linkedin-connections', async (req: Request, re
     if (!Array.isArray(urls) || urls.length === 0) return res.json({ connected: [] });
 
     const list = await crmDb.getLeadListById(listId);
-    if (!list || (list as any).userId !== userId) {
+    if (!list || !(await canAccessCrmList(userId, list as any))) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
@@ -4238,7 +4238,7 @@ router.post('/lists/:listId/sync-linkedin-connections', async (req: Request, res
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
     const list = await crmDb.getLeadListById(listId);
-    if (!list || (list as any).userId !== userId) {
+    if (!list || !(await canAccessCrmList(userId, list as any))) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
@@ -4281,7 +4281,7 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
     }
 
     const list = await crmDb.getLeadListById(listId);
-    if (!list || (list as any).userId !== userId) {
+    if (!list || !(await canAccessCrmList(userId, list as any))) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
@@ -4349,7 +4349,7 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     }
 
     const list = await crmDb.getLeadListById(listId);
-    if (!list || (list as any).userId !== userId) {
+    if (!list || !(await canAccessCrmList(userId, list as any))) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
@@ -4401,7 +4401,7 @@ router.post('/lists/:listId/leads/:leadId/draft-invite-note', async (req: Reques
     }
 
     const list = await crmDb.getLeadListById(listId);
-    if (!list || (list as any).userId !== userId) {
+    if (!list || !(await canAccessCrmList(userId, list as any))) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 

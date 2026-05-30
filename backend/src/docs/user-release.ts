@@ -11,6 +11,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-30',
     changes: [
+      'Fixed: LinkedIn Invite & Message Actions Now Work on Teammates\' Shared CRM Lists',
+      '- Org members opening a lead on a list owned by a teammate no longer see a "Lead list not found" error',
+      '- Drafting an invite note, sending a LinkedIn invite or message, and syncing/checking connections now use the same org-aware access as the rest of the CRM',
       'Fixed: Generated Landing Pages with Hover Effects Now Build Reliably',
       '- Landing pages that use hover interactions (e.g. cards or buttons that respond to the mouse) no longer fail to publish',
       '- Previously these pages required a manual code fix after every generation before they could go live',
