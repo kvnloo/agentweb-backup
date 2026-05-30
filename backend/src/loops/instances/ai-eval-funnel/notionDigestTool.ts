@@ -80,6 +80,28 @@ export class NotionDigestTool implements MutationTools<AiEvalProposalPayload> {
     }
 
     const title = this.buildTitle(proposal);
+
+    // Dedup: the loop fires the same rule every cron tick, so without this it
+    // files a fresh Notion task for (e.g.) capture-broken every single day.
+    // If an OPEN task already exists for this rule, skip — return a pointer to
+    // it instead of creating a duplicate. Done so BEFORE RCA enrichment to also
+    // save the Bedrock call. (Best-effort: a search failure falls through to
+    // create — better a rare duplicate than a dropped task.)
+    const existing = await this.findOpenDuplicate(proposal.sourceRuleId, token);
+    if (existing) {
+      return {
+        mutationId,
+        proposalId: proposal.proposalId,
+        kind: proposal.kind,
+        artifact: {
+          notionPageId: existing.id,
+          notionUrl: existing.url,
+          title,
+          deduped: true,
+        },
+      };
+    }
+
     // Enrich with RCA BEFORE building the body. The enricher never throws —
     // it returns a graceful error envelope on any failure path, so the Notion
     // task is always created (the failure mode is "task body says RCA
@@ -140,6 +162,50 @@ export class NotionDigestTool implements MutationTools<AiEvalProposalPayload> {
         artifact: { title, rcaEnrichment: enrichment },
         error: errorText,
       };
+    }
+  }
+
+  /** Find an OPEN (non-Done) task already filed for this rule, so we don't file
+   * a duplicate every cron tick. Matches on the stable title prefix
+   * `fix(ai-eval-funnel): <ruleId> `. Returns null on no match OR on any search
+   * error (dedup must never block task creation). A previously-Done task does
+   * NOT count — if the issue recurs after being fixed, a fresh task is wanted. */
+  private async findOpenDuplicate(
+    ruleId: string,
+    token: string,
+  ): Promise<{ id: string; url: string } | null> {
+    try {
+      const resp = await axios.post(
+        `${NOTION_API_URL}/data_sources/${this.dataSourceId}/query`,
+        {
+          filter: { property: 'Name', title: { contains: `fix(ai-eval-funnel): ${ruleId} ` } },
+          page_size: 20,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Notion-Version': NOTION_VERSION,
+            'Content-Type': 'application/json',
+          },
+          timeout: 15_000,
+        },
+      );
+      const results = ((resp.data as { results?: unknown[] })?.results ?? []) as Array<{
+        id?: string;
+        url?: string;
+        properties?: { Status?: { status?: { name?: string } | null } };
+      }>;
+      const open = results.find((p) => p.properties?.Status?.status?.name !== 'Done');
+      if (open) {
+        return {
+          id: open.id ?? '',
+          url: open.url ?? `https://www.notion.so/${(open.id ?? '').replace(/-/g, '')}`,
+        };
+      }
+      return null;
+    } catch (err) {
+      console.warn('[NotionDigestTool] dedup search failed (creating anyway):', String(err));
+      return null;
     }
   }
 
