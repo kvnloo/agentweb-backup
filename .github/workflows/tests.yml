@@ -33,6 +33,7 @@ jobs:
           filters: |
             backend:
               - 'backend/**'
+              - '.github/workflows/tests.yml'
             partner:
               - 'partner-portal/**'
 
