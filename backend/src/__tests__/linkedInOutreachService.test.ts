@@ -1070,6 +1070,19 @@ describe('LinkedInOutreachService', () => {
       expect(mockUnipileClient.messaging.getAllMessagesFromChat).not.toHaveBeenCalled();
     });
 
+    it('returns empty array when the resolved chat has no id (avoids account-wide message dump)', async () => {
+      (mockUnipileClient.messaging.getAllChatsFromAttendee as jest.Mock).mockResolvedValueOnce({
+        items: [{ id: undefined }],
+      });
+
+      const result = await linkedInOutreachService.getMessagesWithContact('attendee-id', 'acct-1');
+
+      expect(result).toEqual([]);
+      // Never call getAllMessagesFromChat with an empty chat_id — Unipile would
+      // return account-wide messages and dump unrelated conversations onto one lead.
+      expect(mockUnipileClient.messaging.getAllMessagesFromChat).not.toHaveBeenCalled();
+    });
+
     it('filters out is_event=1 system messages', async () => {
       (mockUnipileClient.messaging.getAllChatsFromAttendee as jest.Mock).mockResolvedValueOnce({
         items: [{ id: 'chat-789' }],

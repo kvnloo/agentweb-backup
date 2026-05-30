@@ -827,7 +827,14 @@ export class LinkedInOutreachService {
       return [];
     }
 
-    const chatId = chatsResult.items[0].id;
+    const chatId = chatsResult.items[0]?.id;
+    // Defense-in-depth: never call getAllMessagesFromChat without a concrete chat_id.
+    // An empty/undefined chat_id makes Unipile return account-wide messages, which would
+    // dump unrelated conversations onto a single lead.
+    if (!chatId) {
+      this.log('getMessagesWithContact: resolved chat has no id', { attendeeId, account_id });
+      return [];
+    }
     this.log('getMessagesWithContact: found chat', { chatId, attendeeId });
 
     // Step 2: fetch messages from the chat — is_sender is correctly set by Unipile
