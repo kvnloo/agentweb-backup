@@ -14237,6 +14237,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     try {
       console.log('AgentMode: Searching knowledge base for query:', query, 'maxResults:', maxResults);
 
+      // Guard: an empty/whitespace query matches everything in Vertex (returned the whole
+      // KB). Skip the search entirely and return nothing.
+      if (!query || !query.trim()) {
+        return {
+          success: true,
+          message: 'No search query provided.',
+          query: query || '',
+          results: [],
+          totalResults: 0,
+        };
+      }
+
       // Limit max results to 10
       const limitedMaxResults = Math.min(maxResults, 10);
 
@@ -14373,12 +14385,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
+      // Bound the merged results to what the caller asked for. Each source (Vertex, Drive,
+      // ClickUp docs/tasks) is collected up to limitedMaxResults independently, so the merged
+      // list can be several times larger than requested — cap it to avoid context bloat.
+      const boundedResults = results.slice(0, limitedMaxResults);
+
       return {
         success: true,
-        message: `Found ${results.length} knowledge base results for "${query}"`,
+        message: `Found ${boundedResults.length} knowledge base results for "${query}"`,
         query,
-        results,
-        totalResults: results.length
+        results: boundedResults,
+        totalResults: boundedResults.length
       };
     } catch (error) {
       console.error('AgentMode: Error searching knowledge base:', error);
