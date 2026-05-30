@@ -3,7 +3,7 @@
  * Production loops use sharedLearningStore (Phase 2 — writes to Dev-AW-LoopLearning).
  */
 
-import type { HistoryFilter, LearningEvent, LearningRecord, LearningStore } from '../types';
+import type { HistoryFilter, LearningEvent, LearningRecord, LearningStore, LoopId } from '../types';
 
 let counter = 0;
 
@@ -25,6 +25,15 @@ export class InMemoryLearningStore implements LearningStore {
       if (filter.status && e.decision && !filter.status.includes(e.decision.status)) return false;
       return true;
     });
+  }
+
+  async lastOutcomeForRule(loopId: LoopId, ruleId: string): Promise<LearningRecord | null> {
+    const matches = this.events
+      .filter(
+        (e) => e.loopId === loopId && e.verdict != null && e.proposal?.sourceRuleId === ruleId,
+      )
+      .sort((a, b) => b.sortKey.localeCompare(a.sortKey));
+    return matches[0] ?? null;
   }
 
   /** Test helper — total recorded events. */
