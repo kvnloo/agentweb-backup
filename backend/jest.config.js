@@ -5,7 +5,7 @@ module.exports = {
   testMatch: ['**/__tests__/**/*.test.ts'],
   clearMocks: true,
   verbose: false,
-  maxWorkers: 4, // Use all 4 vCPUs on the CI runner; workerIdleMemoryLimit below caps memory growth
+  maxWorkers: 2, // Limit to 2 workers to reduce memory usage in CI
   workerIdleMemoryLimit: '512MB', // Force garbage collection when workers are idle
   setupFilesAfterEnv: ['<rootDir>/src/__tests__/setup.ts'],
   transform: {
