@@ -16,11 +16,20 @@ Reported against list `list_1770238037853_wh6sswaay` ("LinkedIn Connections - Ru
 - Tests: `crm.syncLinkedInMessages.test.ts` (skip when not connected, stamp syncAt, prefer list account, `connected:true` on success).
 - Cleanup of existing bad data: `backend/src/scripts/cleanup-misattributed-linkedin-messages.ts` (dry-run by default). Dry run on this list flags all 1,021 events for deletion (all attributed to non-connections). NOT yet applied to prod — destructive, awaiting approval.
 
-### Bug B — "Lead list not found" when clicking some leads (NEEDS REPRO)
+### Bug B — "Lead list not found" when clicking leads + auto-sync (FIXED — hardening)
 
-**Symptom:** "clicking on some lead got Lead list not found."
+**Symptom (clarified by user):** "When I click on a lead, it will auto sync LinkedIn and I see the lead list not found error when I clicked many leads."
 
-**Investigation:** The list exists. A normal table row click → `openLeadDetail(lead)` → uses `selectedList.listId` (valid), so `getLeadListById` would not 404. The 404 message `'Lead list not found'` is a backend response surfaced by frontend toasts that print `err.response.data.message` (e.g. panel send/draft/sync actions). The panel passes `listId={selectedList?.listId ?? ''}` (`CRM.tsx:10132`); an empty/stale `selectedList` would make list-scoped actions 404. Could not deterministically reproduce a normal-click path on an existing list from static analysis — likely a stale/empty list context (e.g. deep-link race before `selectLeadList` commits, or a list deleted in another tab). **Pending user confirmation of the exact view + action that produced the error before shipping a fix** (avoiding a speculative change).
+**Investigation:** Clicking a lead → `openLeadDetail` fires two background actions for this list (it has a `linkedInAccountId` and leads have LinkedIn URLs): the LinkedIn message auto-sync (`POST .../sync-linkedin-messages`) and, for leads without a draft, an agent-mode auto-draft. Both, plus `GET .../engagements`, call `getLeadListById(selectedList.listId)` and return 404 `'Lead list not found'` only when that listId does not exist. The referenced list and its 37 leads exist, and normal clicks send a valid id — so the 404 indicates a **stale `selectedList`**: a list deleted/recreated in another tab/session or by a re-import while the open tab kept the old id. "Many leads" fits — every lead in the stale view 404s on click. Confirmed a real correctness gap: `fetchLeadLists` only *updated* `selectedList` when the list was still present and never *cleared* it when gone, so the stale selection persisted and each lead click kept 404ing.
+
+`handleDynamoDbError` always rethrows, so throttling under load yields a 500, never this 404 — ruling out load as the cause.
+
+**Fix (customer-portal `CRM.tsx`):**
+- `fetchLeadLists`: when the previously-selected list is no longer in the refreshed set, clear `selectedList`, close the detail panel, and drop the selected lead — so clicks stop auto-firing against a dead listId.
+- Added `isLeadListNotFound(err)` + `handleStaleLeadList()`: on a 404 `'Lead list not found'` from the lead-click auto-sync or `fetchEngagements`, show a single toast ("Lead list unavailable …") and refresh lists (self-heal), guarded by `staleListNoticeRef` against toast spam across many clicks.
+- Test: `CRM.test.tsx` "Stale lead list self-heal".
+
+NOTE: this hardens the stale-list path (the only code path that yields this 404 on the click flow). If the user still sees it on a list that genuinely exists, the next datum needed is the exact `listId` in the failing Network request vs. the URL's listId.
 
 ## Gemini Interactions API Sunset — June 8, 2026 Assessment (2026-05-27)
 
