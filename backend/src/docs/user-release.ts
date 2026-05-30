@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-29
+// Last updated: 2026-05-30
 
 export interface UserReleaseNote {
   date: string;
@@ -9,36 +9,26 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-30',
+    changes: [
+      'Fixed: Generated Landing Pages with Hover Effects Now Build Reliably',
+      '- Landing pages that use hover interactions (e.g. cards or buttons that respond to the mouse) no longer fail to publish',
+      '- Previously these pages required a manual code fix after every generation before they could go live',
+      '- The generator now automatically prepares any interactive component correctly, so pages deploy on the first try',
+    ],
+  },
+  {
     date: '2026-05-29',
     changes: [
-      'Improved: Stripe Discount Offers Now Synced to User Records',
-      '- When a customer has an active coupon or promotional offer in Stripe (e.g. 90% off for 6 months), that offer is now stored on their user record',
-      '- The offer details (discount percentage, duration, expiry date) are kept up to date automatically via Stripe webhooks and daily reconciliation',
-    ],
-  },
-  {
-    date: '2026-05-28',
-    changes: [
-      'New: Claude Opus 4.8 Now Available in Agent Mode',
-      '- Claude Opus 4.8, Anthropic\'s latest and most capable model, is now available to all users in Agent Mode',
-      '- Select "Claude Opus 4.8" from the model dropdown when starting or continuing a session',
-      '- Powered by Google Vertex AI for low-latency access',
-    ],
-  },
-  {
-    date: '2026-05-28',
-    changes: [
-      'Improved: Waitlist Form Typing Is Now Fast',
-      '- Fixed a performance issue on the landing page where typing in the waitlist form was very slow',
-      '- The form fields are now isolated in their own component so keystrokes no longer trigger a full re-render of the entire landing page',
-    ],
-  },
-  {
-    date: '2026-05-28',
-    changes: [
-      'Improved: Emma Can Now Configure Landing Page Subdomains',
-      '- Emma can now read and set the subdomain for your landing page project (e.g. yourname.agentwebforms.com)',
-      '- Subdomain configuration is project-wide — changing it updates all landing pages in the same project simultaneously, and Emma will inform you of this before making changes',
+      'New: Send LinkedIn Connection Invites Directly from the CRM Lead Panel',
+      '- When viewing a lead with a LinkedIn URL who is not yet connected, the LinkedIn tab now shows a "Send LinkedIn Invite" button',
+      '- A personalized connection note is automatically drafted using Gemini when you open the tab — specific to the lead\'s role and company, under 280 characters',
+      '- You can edit the note, redraft it instantly, or use "Draft with instructions" to give the AI specific guidance',
+      '- Save a draft note to the lead record so you can revisit it later',
+      '- After sending, the panel shows "Invite sent X ago" so you can track who has been contacted',
+      '- If already a 1st-degree connection, the existing Send Message flow is shown instead',
+      '- The draft dialog now has Email and LinkedIn tabs — use the LinkedIn tab to draft connection notes, the Email tab for outreach emails',
+      '- Gemini 3.5 Flash is now available and set as the default model for message drafting',
     ],
   },
   {
@@ -47,14 +37,6 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fixed: CRM Enrichment Now Skips Unenrichable Lists and Completes Batch Enrichment',
       '- When a list\'s leads lack email, LinkedIn URL, and full name, Emma now clearly flags it as unenrichable and skips it rather than reporting a confusing error',
       '- When you ask Emma to enrich multiple lists at once, she now previews all lists first and then automatically runs enrichment on all lists that passed the preview — without asking for per-list confirmation',
-    ],
-  },
-  {
-    date: '2026-05-28',
-    changes: [
-      'Fixed: CRM Outreach Emails Now Always Use the Configured Sender Name',
-      '- Email drafts generated for leads now correctly use the configured sender\'s name in the signature',
-      '- Previously, if the lead\'s notes contained a prior message signed by a different team member, the LLM would use that name instead of the actual sender',
     ],
   },
   {

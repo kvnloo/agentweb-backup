@@ -7,6 +7,7 @@ import { getAccountSummary } from '../services/accountSummaryService';
 import { dealDb, DealAuthError, DealNotFoundError, DEAL_STAGES, type DealStage } from '../services/dealDb';
 import { contactEventsDb, normalizeContactId } from '../services/contactEventsDb';
 import { chatbotDb } from '../services/chatbotService';
+import { getExecutionsWithAssets } from '../routes/tasks';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 
 // Register browser cookie persistence tools
@@ -3820,8 +3821,12 @@ emmaToolRegistry.register({
       required: ["image_url"]
     }
   },
-  execute: async (args: any, context?: any) => {
-    return await agentModeService.describeImage(args.llmModel, args.image_url, args.prompt);
+  execute: async (args: any, _context?: any) => {
+    // Intentionally pass no model: describe_image always uses the configured
+    // agent_mode_default_model (resolved inside describeImage), not the chat's
+    // selected model. (`args.llmModel` was never populated — the schema doesn't
+    // expose it and the registry doesn't merge context into args.)
+    return await agentModeService.describeImage(undefined, args.image_url, args.prompt);
   }
 });
 
@@ -6752,7 +6757,11 @@ emmaToolRegistry.register({
     const userId = context?.userId || context?.agentUserId;
     if (!userId) throw new Error('Authentication required');
 
-    const assets = await chatbotDb.searchUserAssets(
+    const lowerQuery = args.query?.toLowerCase();
+    const assetTypeFilter: string | null = args.type === 'all' || !args.type ? null : args.type;
+
+    // Agent mode session assets (images, videos, HTML reports from save_file, etc.)
+    const sessionAssets = await chatbotDb.searchUserAssets(
       userId,
       args.type,
       args.query,
@@ -6760,13 +6769,52 @@ emmaToolRegistry.register({
       args.approved_only
     );
 
-    if (assets.length === 0) {
+    // Task execution result_files — reuse the same code path as the Research Reports page.
+    // Only included when not filtering to favorites (task files have no favorite state).
+    const taskAssets: typeof sessionAssets = [];
+    if (!args.favorites_only && !args.approved_only) {
+      const assetTypeForTasks = (!assetTypeFilter || assetTypeFilter === 'htmlReports') ? 'html-reports'
+        : assetTypeFilter === 'images' ? 'images'
+        : assetTypeFilter === 'videos' ? 'videos'
+        : null;
+
+      if (assetTypeForTasks) {
+        const execResult = await getExecutionsWithAssets(userId, assetTypeForTasks as any, '');
+        for (const task of Object.values(execResult) as any[]) {
+          if (task.source !== 'task') continue;
+          for (const execution of task.executions || []) {
+            for (const file of execution.result_files || []) {
+              const url: string = file.url || file.s3_url || '';
+              const filename: string = file.filename || url.split('/').pop() || '';
+              if (!url || !filename) continue;
+              if (lowerQuery && !filename.toLowerCase().includes(lowerQuery) && !url.toLowerCase().includes(lowerQuery)) continue;
+              const assetType: 'image' | 'video' | 'htmlReport' = assetTypeForTasks === 'html-reports' ? 'htmlReport'
+                : assetTypeForTasks === 'images' ? 'image' : 'video';
+              taskAssets.push({
+                url,
+                filename,
+                assetType,
+                generatedAt: execution.startTime || '',
+                sessionId: `task-${execution.executionId}`,
+                sessionTitle: task.taskName || 'Task execution',
+                isFavorited: false,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    const allAssets = [...sessionAssets, ...taskAssets]
+      .sort((a, b) => b.generatedAt.localeCompare(a.generatedAt));
+
+    if (allAssets.length === 0) {
       return { message: 'No assets found matching your criteria.', assets: [] };
     }
 
     return {
-      count: assets.length,
-      assets: assets.map(a => ({
+      count: allAssets.length,
+      assets: allAssets.map(a => ({
         url: a.url,
         filename: a.filename,
         assetType: a.assetType,

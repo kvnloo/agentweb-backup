@@ -7845,6 +7845,9 @@ const AgentModeSettings = () => {
   const [savingCustomerSupportDefaultModel, setSavingCustomerSupportDefaultModel] = useState(false);
   const [codingAgentDefaultModel, setCodingAgentDefaultModel] = useState('');
   const [savingCodingAgentDefaultModel, setSavingCodingAgentDefaultModel] = useState(false);
+  const [visionModel, setVisionModel] = useState('');
+  const [visionModelOptions, setVisionModelOptions] = useState<string[]>([]);
+  const [savingVisionModel, setSavingVisionModel] = useState(false);
   const [backupModel, setBackupModel] = useState('');
   const [savingBackupModel, setSavingBackupModel] = useState(false);
   const [error, setError] = useState('');
@@ -7900,6 +7903,10 @@ const AgentModeSettings = () => {
 
       // Load coding agent default model
       await loadCodingAgentDefaultModel(models);
+
+      // Load vision model (describe_image tool) + its vision-ready options
+      const visionModels = await loadVisionModelOptions();
+      await loadVisionModel(visionModels);
 
       // Load backup model
       await loadBackupModel(models);
@@ -8500,6 +8507,74 @@ const AgentModeSettings = () => {
     }
   };
 
+  const visionFallbackModel = 'claude-opus-4-8';
+
+  const loadVisionModelOptions = async (): Promise<string[]> => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/agent-mode/public/vision-model-options'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (Array.isArray(response.data) && response.data.length > 0) {
+        setVisionModelOptions(response.data);
+        return response.data;
+      }
+    } catch (error) {
+      console.error('Error loading vision model options:', error);
+    }
+    setVisionModelOptions([]);
+    return [];
+  };
+
+  const loadVisionModel = async (models: string[] = []) => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/settings/agent_mode_vision_model'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (response.data && response.data.settingValue) {
+        const configuredModel = response.data.settingValue.trim();
+        if (configuredModel && (models.length === 0 || models.includes(configuredModel))) {
+          setVisionModel(configuredModel);
+          return;
+        }
+      }
+    } catch (settingsError: any) {
+      if (settingsError.response?.status !== 404) {
+        console.error('Error loading vision model:', settingsError);
+      }
+    }
+    // Default to Opus 4.8 (Vertex AI) — the current known-good vision model
+    setVisionModel(visionFallbackModel);
+  };
+
+  const saveVisionModel = async () => {
+    try {
+      setSavingVisionModel(true);
+      setError('');
+      setSuccess('');
+
+      if (visionModel) {
+        await axios.put(buildApiUrl('/api/settings/agent_mode_vision_model'), {
+          settingValue: visionModel,
+          description: 'Model used by the describe_image vision tool (independent of the chat/default model)'
+        }, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      } else {
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_vision_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      }
+
+      setSuccess('Default vision model updated successfully!');
+    } catch (error) {
+      console.error('Error saving vision model:', error);
+      setError('Failed to save default vision model');
+    } finally {
+      setSavingVisionModel(false);
+    }
+  };
+
   const loadBackupModel = async (models: string[] = []) => {
     const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
     try {
@@ -8645,7 +8720,7 @@ const AgentModeSettings = () => {
     }
   };
 
-  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'backupModel' | 'scheduledChatsDefaultModel' | 'reportGenerationDefaultModel' | 'imageGenerationDefaultModel' | 'imageApiDefaultModel' | 'videoApiDefaultModel' | 'videoGenerationDefaultModel' | 'customerSupportDefaultModel' | 'codingAgentDefaultModel') => {
+  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'backupModel' | 'scheduledChatsDefaultModel' | 'reportGenerationDefaultModel' | 'imageGenerationDefaultModel' | 'imageApiDefaultModel' | 'videoApiDefaultModel' | 'videoGenerationDefaultModel' | 'customerSupportDefaultModel' | 'codingAgentDefaultModel' | 'visionModel') => {
     try {
       setError('');
       setSuccess('');
@@ -8773,6 +8848,14 @@ const AgentModeSettings = () => {
 
         setCodingAgentDefaultModel('anthropic.claude-sonnet-4-6');
         setSuccess('Reset coding agent default model successfully!');
+      } else if (type === 'visionModel') {
+        setSavingVisionModel(true);
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_vision_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        setVisionModel(visionFallbackModel);
+        setSuccess('Reset default vision model successfully!');
       }
     } catch (error) {
       console.error('Error resetting setting:', error);
@@ -8804,6 +8887,8 @@ const AgentModeSettings = () => {
         setSavingCustomerSupportDefaultModel(false);
       } else if (type === 'codingAgentDefaultModel') {
         setSavingCodingAgentDefaultModel(false);
+      } else if (type === 'visionModel') {
+        setSavingVisionModel(false);
       }
     }
   };
@@ -9342,6 +9427,52 @@ const AgentModeSettings = () => {
 
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
             Sets the default model for the coding agent (code editing tasks for landing pages). Defaults to Sonnet 4.6. Opus 4.6 (Bedrock) and Opus 4.8 (Vertex AI) are also available for more complex coding tasks.
+          </Typography>
+        </CardContent>
+      </Card>
+
+      {/* Default Vision Model (describe_image tool) */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">Default Vision Model</Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                onClick={() => resetToDefault('visionModel')}
+                disabled={savingVisionModel}
+                sx={{ mr: 1 }}
+              >
+                Reset to Default
+              </Button>
+              <Button
+                variant="contained"
+                onClick={saveVisionModel}
+                disabled={savingVisionModel}
+              >
+                {savingVisionModel ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+
+          <FormControl fullWidth>
+            <InputLabel id="agent-mode-vision-model-label">Default Vision Model</InputLabel>
+            <Select
+              labelId="agent-mode-vision-model-label"
+              value={visionModel}
+              label="Default Vision Model"
+              onChange={(e) => setVisionModel(e.target.value as string)}
+            >
+              {(visionModelOptions.length > 0 ? visionModelOptions : [visionFallbackModel]).map((model) => (
+                <MenuItem key={model} value={model}>
+                  {model === 'claude-opus-4-8' ? 'claude-opus-4-8 (Vertex AI)' : model}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            Model used by Emma's <code>describe_image</code> tool to analyze images (charts, screenshots, photos). This is a vision utility and is independent of the chat model and the agent-mode default model. Defaults to Opus 4.8 (Vertex AI); pick a cheaper/faster vision-capable model (e.g. a Gemini or GPT model) to reduce cost.
           </Typography>
         </CardContent>
       </Card>

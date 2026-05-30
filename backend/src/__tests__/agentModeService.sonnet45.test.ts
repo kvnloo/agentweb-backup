@@ -327,26 +327,24 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(new Set(models).size).toBe(models.length);
     });
 
-    it('should keep original order when no default model is configured', async () => {
+    it('should put hardcoded default first when no default model is configured in settings', async () => {
       const { settingsService } = require('../services/settingsService');
       (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
 
-      const llmModels = (agentModeService as any).llmModels;
       const models = await agentModeService.getSupportedModels();
-      const naturalOrder = Object.keys(llmModels).filter((m: string) => !llmModels[m].adminOnly);
-      expect(models).toEqual(naturalOrder);
+      const hardcodedDefault = (agentModeService as any).default_model; // 'gpt-5.5'
+      expect(models[0]).toBe(hardcodedDefault);
     });
 
-    it('should keep original order when configured default is not in the model list', async () => {
+    it('should fall back to hardcoded default when configured default is not in the model list', async () => {
       const { settingsService } = require('../services/settingsService');
       (settingsService.getSetting as jest.Mock).mockResolvedValue({
         settingValue: 'nonexistent-model-xyz',
       });
 
-      const llmModels = (agentModeService as any).llmModels;
       const models = await agentModeService.getSupportedModels();
-      const naturalOrder = Object.keys(llmModels).filter((m: string) => !llmModels[m].adminOnly);
-      expect(models).toEqual(naturalOrder);
+      const hardcodedDefault = (agentModeService as any).default_model; // 'gpt-5.5'
+      expect(models[0]).toBe(hardcodedDefault);
     });
 
     it('should keep original order when settings service throws', async () => {

@@ -457,17 +457,34 @@ describe("POST /publish", () => {
     );
   });
 
-  it("FAIL: merge conflict → 409", async () => {
+  it("SUCCESS: merge conflict (409) falls back to force-advancing main", async () => {
+    // Standard merge returns 409
     mockedAxios.post.mockRejectedValueOnce({
       response: { status: 409, data: { message: "Merge conflict" } },
     });
+    // GET branch tip SHA
+    mockedAxios.get.mockResolvedValueOnce(
+      axiosRes({ object: { sha: "draft-tip-sha-abc" } })
+    );
+    // PATCH main ref (force-update)
+    mockedAxios.patch.mockResolvedValueOnce(axiosRes({ ref: "refs/heads/main" }));
+    // Delete draft branch
+    mockedAxios.delete.mockResolvedValueOnce(axiosRes({}));
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generated/page-123/publish")
       .send({ branch: "draft/session-12345678" });
 
-    expect(res.status).toBe(409);
-    expect(res.body.error).toMatch(/Merge conflict/);
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.merge_commit_sha).toBe("draft-tip-sha-abc");
+
+    // Verify force-patch was called on main with the draft SHA
+    expect(mockedAxios.patch).toHaveBeenCalledWith(
+      expect.stringContaining("/git/refs/heads/main"),
+      expect.objectContaining({ sha: "draft-tip-sha-abc", force: true }),
+      expect.any(Object)
+    );
   });
 
   it("FAIL: branch not found → 404", async () => {
