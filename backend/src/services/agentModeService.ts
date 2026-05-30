@@ -7,6 +7,8 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
+import { rankMemoriesByRelevance } from '../utils/memoryRanking';
+import { embedText } from '../utils/embeddings';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
@@ -2004,14 +2006,60 @@ export class AgentModeService {
         });
       }
 
-      // Inject account memory context (cross-session knowledge)
+      // Inject memory context (cross-session knowledge). Retrieve by *relevance* to the
+      // current message, not just recency — so a relevant older fact is surfaced even when
+      // the account has more than MEMORY_INJECTION_LIMIT stored memories. Small accounts
+      // (<= limit) inject everything, identical to the previous recency behavior.
       try {
         const { userDb, orgMemoryDb, orgDb } = await import('./db');
         const memoryUser = await userDb.getUserById(userId);
+
+        const MEMORY_INJECTION_LIMIT = 20;
+        // Embed the current message once, lazily, and reuse for both account + org memory.
+        // Only computed when a memory set actually exceeds the limit (no cost for small accounts).
+        let queryEmbedding: number[] | null | undefined;
+        const getQueryEmbedding = async (): Promise<number[] | null> => {
+          if (queryEmbedding === undefined) {
+            queryEmbedding = messageContent ? await embedText(messageContent) : null;
+          }
+          return queryEmbedding;
+        };
+
+        // Rank `all` memories by relevance to the message. Lazily embeds (and backfills)
+        // any legacy memory missing an embedding so ranking is fair and one-time.
+        const selectRelevantMemories = async (
+          all: any[],
+          backfill: (memoryId: string, embedding: number[]) => void
+        ): Promise<any[]> => {
+          if (all.length <= MEMORY_INJECTION_LIMIT) {
+            return rankMemoriesByRelevance(all, [], MEMORY_INJECTION_LIMIT);
+          }
+          const qEmbedding = await getQueryEmbedding();
+          if (!qEmbedding) {
+            // Embedding unavailable → degrade gracefully to recency.
+            return rankMemoriesByRelevance(all, [], MEMORY_INJECTION_LIMIT);
+          }
+          for (const m of all) {
+            if (!Array.isArray(m.embedding) || m.embedding.length === 0) {
+              const emb = await embedText(m.content);
+              if (emb) {
+                m.embedding = emb;
+                backfill(m.memoryId, emb);
+              }
+            }
+          }
+          return rankMemoriesByRelevance(all, qEmbedding, MEMORY_INJECTION_LIMIT);
+        };
+
         if (memoryUser?.memoryEnabled !== false) {
-          const recentMemories = await accountMemoryDb.getRecentMemories(userId, 20);
-          if (recentMemories.length > 0) {
-            const memoryLines = recentMemories.map(
+          const allMemories = await accountMemoryDb.getUserMemories(userId);
+          const relevantMemories = await selectRelevantMemories(allMemories, (memoryId, emb) => {
+            accountMemoryDb.setMemoryEmbedding(userId, memoryId, emb).catch((e) =>
+              console.error('Failed to backfill account memory embedding:', e)
+            );
+          });
+          if (relevantMemories.length > 0) {
+            const memoryLines = relevantMemories.map(
               (m: any) => `- [${m.category}] ${m.content}`
             );
             messages.push({
@@ -2025,9 +2073,14 @@ export class AgentModeService {
         if (memoryUser?.orgId) {
           const org = await orgDb.getOrgById(memoryUser.orgId);
           if (org && org.orgMemoryEnabled !== false) {
-            const recentOrgMemories = await orgMemoryDb.getRecentOrgMemories(memoryUser.orgId, 20);
-            if (recentOrgMemories.length > 0) {
-              const orgMemoryLines = recentOrgMemories.map(
+            const allOrgMemories = await orgMemoryDb.getOrgMemories(memoryUser.orgId);
+            const relevantOrgMemories = await selectRelevantMemories(allOrgMemories, (memoryId, emb) => {
+              orgMemoryDb.setMemoryEmbedding(memoryUser.orgId!, memoryId, emb).catch((e) =>
+                console.error('Failed to backfill org memory embedding:', e)
+              );
+            });
+            if (relevantOrgMemories.length > 0) {
+              const orgMemoryLines = relevantOrgMemories.map(
                 (m: any) => `- [${m.category}] ${m.content}`
               );
               messages.push({
