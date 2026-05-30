@@ -14,6 +14,29 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fixed: LinkedIn Invite & Message Actions Now Work on Teammates\' Shared CRM Lists',
       '- Org members opening a lead on a list owned by a teammate no longer see a "Lead list not found" error',
       '- Drafting an invite note, sending a LinkedIn invite or message, and syncing/checking connections now use the same org-aware access as the rest of the CRM',
+    ],
+  },
+  {
+    date: '2026-05-30',
+    changes: [
+      'Improved: Emma Recalls Relevant Saved Facts Regardless of Age',
+      '- Emma now surfaces the saved memories most relevant to your message, not just the 20 most recent',
+      '- Previously, once you had more than 20 saved facts, an older but relevant one could never be brought into the conversation',
+      '- Memories are matched by meaning, so a relevant detail from weeks ago shows up when it matters',
+    ],
+  },
+  {
+    date: '2026-05-30',
+    changes: [
+      'Fixed: Knowledge Base Search Returns a Focused Set of Results',
+      '- Knowledge base search now returns the number of results requested instead of several times more',
+      '- An empty or blank search no longer returns your entire knowledge base',
+      '- This keeps Emma\'s answers focused and faster by avoiding irrelevant extra content',
+    ],
+  },
+  {
+    date: '2026-05-30',
+    changes: [
       'Fixed: Generated Landing Pages with Hover Effects Now Build Reliably',
       '- Landing pages that use hover interactions (e.g. cards or buttons that respond to the mouse) no longer fail to publish',
       '- Previously these pages required a manual code fix after every generation before they could go live',
