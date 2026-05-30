@@ -6,8 +6,12 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
+  FormControl,
   IconButton,
+  InputLabel,
+  MenuItem,
   Paper,
+  Select,
   Table,
   TableBody,
   TableCell,
@@ -35,6 +39,7 @@ interface ScoringJudge {
   id: string;
   name: string;
   systemPrompt: string;
+  llmModel?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -42,6 +47,7 @@ interface ScoringJudge {
 export default function ScoringJudgesTab() {
   const { token } = useAuth();
   const [judges, setJudges] = useState<ScoringJudge[]>([]);
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -49,11 +55,13 @@ export default function ScoringJudgesTab() {
   const [editingDefault, setEditingDefault] = useState(false);
   const [name, setName] = useState('');
   const [systemPrompt, setSystemPrompt] = useState('');
+  const [llmModel, setLlmModel] = useState('');
   const [saving, setSaving] = useState(false);
 
   // Default judge prompt state
   const [defaultPrompt, setDefaultPrompt] = useState('');
   const [defaultPromptIsCustom, setDefaultPromptIsCustom] = useState(false);
+  const [defaultModel, setDefaultModel] = useState('');
 
   const headers = { Authorization: `Bearer ${token}` };
 
@@ -65,8 +73,10 @@ export default function ScoringJudgesTab() {
         axios.get(buildApiUrl('/api/settings/scoring-judges/default-prompt'), { headers }),
       ]);
       setJudges(judgesRes.data.judges || []);
+      setAvailableModels(judgesRes.data.availableModels || []);
       setDefaultPrompt(defaultRes.data.systemPrompt || '');
       setDefaultPromptIsCustom(defaultRes.data.isCustom || false);
+      setDefaultModel(defaultRes.data.llmModel || '');
     } catch (err) {
       console.error('Error fetching judges:', err);
       setError('Failed to load scoring judges');
@@ -84,6 +94,7 @@ export default function ScoringJudgesTab() {
     setEditingDefault(false);
     setName('');
     setSystemPrompt('');
+    setLlmModel('');
     setDialogOpen(true);
   };
 
@@ -92,6 +103,7 @@ export default function ScoringJudgesTab() {
     setEditingDefault(false);
     setName(judge.name);
     setSystemPrompt(judge.systemPrompt);
+    setLlmModel(judge.llmModel || '');
     setDialogOpen(true);
   };
 
@@ -100,6 +112,7 @@ export default function ScoringJudgesTab() {
     setEditingDefault(true);
     setName('Default');
     setSystemPrompt(defaultPrompt);
+    setLlmModel(defaultModel || '');
     setDialogOpen(true);
   };
 
@@ -112,22 +125,23 @@ export default function ScoringJudgesTab() {
       if (editingDefault) {
         const res = await axios.put(
           buildApiUrl('/api/settings/scoring-judges/default-prompt'),
-          { systemPrompt },
+          { systemPrompt, llmModel: llmModel || null },
           { headers }
         );
         setDefaultPrompt(res.data.systemPrompt);
         setDefaultPromptIsCustom(true);
+        setDefaultModel(res.data.llmModel || '');
       } else if (editingJudge) {
         const res = await axios.put(
           buildApiUrl(`/api/settings/scoring-judges/${editingJudge.id}`),
-          { name, systemPrompt },
+          { name, systemPrompt, llmModel: llmModel || null },
           { headers }
         );
         setJudges((prev) => prev.map((j) => (j.id === editingJudge.id ? res.data.judge : j)));
       } else {
         const res = await axios.post(
           buildApiUrl('/api/settings/scoring-judges'),
-          { name, systemPrompt },
+          { name, systemPrompt, llmModel: llmModel || undefined },
           { headers }
         );
         setJudges((prev) => [...prev, res.data.judge]);
@@ -147,6 +161,7 @@ export default function ScoringJudgesTab() {
       const res = await axios.delete(buildApiUrl('/api/settings/scoring-judges/default-prompt'), { headers });
       setDefaultPrompt(res.data.systemPrompt);
       setDefaultPromptIsCustom(false);
+      setDefaultModel('');
     } catch (err) {
       console.error('Error resetting default prompt:', err);
       setError('Failed to reset default prompt');
@@ -183,6 +198,7 @@ export default function ScoringJudgesTab() {
             <TableRow>
               <TableCell>Name</TableCell>
               <TableCell>System Prompt</TableCell>
+              <TableCell>Model</TableCell>
               <TableCell>Updated</TableCell>
               <TableCell width={120}>Actions</TableCell>
             </TableRow>
@@ -210,6 +226,11 @@ export default function ScoringJudgesTab() {
                     {defaultPrompt}
                   </Typography>
                 </Tooltip>
+              </TableCell>
+              <TableCell>
+                <Typography variant="body2" color={defaultModel ? 'text.primary' : 'text.secondary'}>
+                  {defaultModel || 'gemini-3.1-flash-lite'}
+                </Typography>
               </TableCell>
               <TableCell>—</TableCell>
               <TableCell>
@@ -244,6 +265,11 @@ export default function ScoringJudgesTab() {
                     </Typography>
                   </Tooltip>
                 </TableCell>
+                <TableCell>
+                  <Typography variant="body2" color={judge.llmModel ? 'text.primary' : 'text.secondary'}>
+                    {judge.llmModel || 'gemini-3.1-flash-lite'}
+                  </Typography>
+                </TableCell>
                 <TableCell>{new Date(judge.updatedAt).toLocaleDateString()}</TableCell>
                 <TableCell>
                   <IconButton size="small" onClick={() => handleOpenEdit(judge)}>
@@ -274,6 +300,21 @@ export default function ScoringJudgesTab() {
               placeholder="e.g. fangfang judge"
             />
           )}
+          <FormControl fullWidth size="small" sx={{ mt: editingDefault ? 1 : 0, mb: 2 }}>
+            <InputLabel>LLM Model</InputLabel>
+            <Select
+              value={llmModel}
+              label="LLM Model"
+              onChange={(e) => setLlmModel(e.target.value)}
+            >
+              <MenuItem value="">
+                <em>Default (gemini-3.1-flash-lite)</em>
+              </MenuItem>
+              {availableModels.map((m) => (
+                <MenuItem key={m} value={m}>{m}</MenuItem>
+              ))}
+            </Select>
+          </FormControl>
           <TextField
             label="System Prompt"
             fullWidth
@@ -282,7 +323,6 @@ export default function ScoringJudgesTab() {
             maxRows={20}
             value={systemPrompt}
             onChange={(e) => setSystemPrompt(e.target.value)}
-            sx={{ mt: editingDefault ? 1 : 0 }}
             placeholder="You are an expert at evaluating user satisfaction..."
             helperText={'The LLM will use this prompt to evaluate chat sessions. It must instruct the model to respond with JSON: {"score": 1-5, "reason": "..."}'}
           />

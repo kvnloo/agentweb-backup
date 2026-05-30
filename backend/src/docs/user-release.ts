@@ -53,6 +53,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-29',
     changes: [
+      'Improved: Admins Can Now Choose the LLM Model for Each Scoring Judge',
+      '- In the Admin → Scoring Judges tab, each judge (including the Default judge) now has an LLM Model dropdown so you can pick which model evaluates sessions',
+      '- Judges without an explicit model continue to use the standard fast scoring model (gemini-3.1-flash-lite)',
+      '- The scoring response budget was increased so reasoning ("thinking") models like gemini-3.5-flash return complete results instead of being truncated',
+    ],
+  },
+  {
+    date: '2026-05-29',
+    changes: [
       'New: Send LinkedIn Connection Invites Directly from the CRM Lead Panel',
       '- When viewing a lead with a LinkedIn URL who is not yet connected, the LinkedIn tab now shows a "Send LinkedIn Invite" button',
       '- A personalized connection note is automatically drafted using Gemini when you open the tab — specific to the lead\'s role and company, under 280 characters',
