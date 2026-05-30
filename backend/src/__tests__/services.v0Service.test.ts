@@ -134,6 +134,7 @@ import {
   remapFilesForSubPage,
   ensurePageMetadataTitle,
   buildPageSlug,
+  autoFixV0Files,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig } from "../services/v0Service";
@@ -1049,6 +1050,75 @@ describe("v0Service - ensurePageMetadataTitle", () => {
     const input = `export default function Page() {}`;
     expect(ensurePageMetadataTitle(input, "")).toBe(input);
     expect(ensurePageMetadataTitle(input, "   ")).toBe(input);
+  });
+});
+
+// =============================================================================
+// autoFixV0Files — adds 'use client' to components that need it
+// =============================================================================
+describe("v0Service - autoFixV0Files (use client injection)", () => {
+  const mk = (path: string, content: string) => [{ path, content: Buffer.from(content) }];
+  const firstLine = (files: Array<{ path: string; content: Buffer }>) =>
+    files[0].content.toString("utf-8").split("\n")[0];
+
+  it("adds 'use client' for onMouseEnter handler (Server Component hover bug)", () => {
+    const files = mk(
+      "components/card.tsx",
+      `export default function Card() {\n  return <div onMouseEnter={() => {}}>hi</div>;\n}`
+    );
+    const count = autoFixV0Files(files);
+    expect(count).toBe(1);
+    expect(firstLine(files)).toBe("'use client'");
+  });
+
+  it("adds 'use client' for onMouseLeave handler", () => {
+    const files = mk(
+      "components/card.tsx",
+      `export default function Card() {\n  return <div onMouseLeave={() => {}}>hi</div>;\n}`
+    );
+    expect(autoFixV0Files(files)).toBe(1);
+    expect(firstLine(files)).toBe("'use client'");
+  });
+
+  it("adds 'use client' for other event handlers (onFocus, onKeyDown, onMouseOver)", () => {
+    for (const handler of ["onFocus", "onKeyDown", "onMouseOver", "onBlur"]) {
+      const files = mk(
+        "components/x.tsx",
+        `export default function X() {\n  return <input ${handler}={() => {}} />;\n}`
+      );
+      expect(autoFixV0Files(files)).toBe(1);
+      expect(firstLine(files)).toBe("'use client'");
+    }
+  });
+
+  it("still adds 'use client' for onClick (existing behavior preserved)", () => {
+    const files = mk(
+      "components/btn.tsx",
+      `export default function Btn() {\n  return <button onClick={() => {}}>x</button>;\n}`
+    );
+    expect(autoFixV0Files(files)).toBe(1);
+    expect(firstLine(files)).toBe("'use client'");
+  });
+
+  it("does NOT add 'use client' to a pure Server Component with no handlers/hooks", () => {
+    const content = `export default function Hero() {\n  return <section className="hover:scale-105">Static</section>;\n}`;
+    const files = mk("components/hero.tsx", content);
+    expect(autoFixV0Files(files)).toBe(0);
+    expect(files[0].content.toString("utf-8")).toBe(content);
+  });
+
+  it("does NOT double-add 'use client' when already present", () => {
+    const content = `'use client'\n\nexport default function Card() {\n  return <div onMouseEnter={() => {}}>hi</div>;\n}`;
+    const files = mk("components/card.tsx", content);
+    expect(autoFixV0Files(files)).toBe(0);
+    expect(files[0].content.toString("utf-8")).toBe(content);
+  });
+
+  it("does NOT misfire on a TypeScript prop type annotation (onClick?: ...)", () => {
+    const content = `interface Props { onClick?: () => void }\nexport function takeProps(p: Props) { return p; }`;
+    const files = mk("lib/types.ts", content);
+    expect(autoFixV0Files(files)).toBe(0);
+    expect(files[0].content.toString("utf-8")).toBe(content);
   });
 });
 

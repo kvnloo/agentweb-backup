@@ -6,6 +6,12 @@
 # MCP config (contains API tokens)
 .mcp.json
 
+# Notion test-env credentials — NEVER commit. Source of truth is AWS Secrets
+# Manager (agentweb/test-env/notion-token). Cloud-dev EC2 instances write
+# these files at boot from the secret (see test-env/user-data-dev-auto.sh:396).
+.notion-token
+.notion-page-id
+
 # Dependencies
 node_modules/
 /.pnp
@@ -129,3 +135,11 @@ customer-portal/
 
 # Ignore Claude Code worktrees (agent-specific, never committed)
 .claude/worktrees/
+
+# Cloud-dev runtime state (written by .claude-run.sh at launch — never commit)
+.claude-conversation-log
+.claude-prompt
+.claude-session-id
+.claude-total-cost
+.ec2-session-meta
+.notion-page-id

@@ -1,3 +1,36 @@
+## CRM Lead List & LinkedIn Message Sync Bugs (2026-05-30)
+
+Reported against list `list_1770238037853_wh6sswaay` ("LinkedIn Connections - Rui", user `be754b6c-767e-44ec-b181-4042cfe45ea9`).
+
+### Bug A — non-connected leads show hundreds of unrelated LinkedIn messages (FIXED)
+
+**Symptom:** "first lead not even connected but many messages are synced."
+
+**Production data:** The list had 1,021 `linkedin-<listId>` message events. They were attributed to 10 profile URLs; one lead (`karthy-chandra`) held 996 of them. The 996 messages were the user's entire sent history to many different people, dated 2022–2024 (e.g. "Hey Kevin…"), stamped `processedAt` 2026-04-15. All events have eventId prefix `linkedin_msg_*` → they came from the **live Unipile sync** (`POST /sync-linkedin-messages`), which is auto-fired on every lead-detail panel open (`CRM.tsx openLeadDetail`).
+
+**Root cause:** `sync-linkedin-messages` synced for any lead with a LinkedIn URL, with no connection check. For a non-connected attendee, `linkedInOutreachService.getMessagesWithContact()` → `getAllChatsFromAttendee()` resolves to an unrelated chat and `getAllMessagesFromChat` dumps up to `MAX_PAGES*100` (~1000) messages onto that one lead. Cross-checked `AW-UnipileConnections` for account `LIBGE2pYS1eckwgo7wUIGQ` (69 real connections): **every** lead that received messages (karthy-chandra, billnbarry, aviharsh, …) is `connected=false`.
+
+**Fix:**
+- `crm.ts` `POST /sync-linkedin-messages`: gate on connection. Resolve the account as `list.linkedInAccountId || resolveAccountId(userId)`, then `getConnectionByProfileUrlAndAccount(leadLinkedIn, accountId)`. If not connected, stamp `linkedinMessageSyncAt` (so auto-sync doesn't re-hit Unipile every open) and return `{ synced: 0, connected: false }` without writing events. Connection cache is refreshed every ~10 min by `linkedInConnectionSyncCron`, matching the panel's 10-min auto-sync throttle.
+- `linkedInOutreachService.getMessagesWithContact`: defense-in-depth — return `[]` if the resolved chat has no `id` (an empty `chat_id` makes Unipile return account-wide messages).
+- Tests: `crm.syncLinkedInMessages.test.ts` (skip when not connected, stamp syncAt, prefer list account, `connected:true` on success).
+- Cleanup of existing bad data: `backend/src/scripts/cleanup-misattributed-linkedin-messages.ts` (dry-run by default). Dry run on this list flags all 1,021 events for deletion (all attributed to non-connections). NOT yet applied to prod — destructive, awaiting approval.
+
+### Bug B — "Lead list not found" when clicking leads + auto-sync (FIXED — hardening)
+
+**Symptom (clarified by user):** "When I click on a lead, it will auto sync LinkedIn and I see the lead list not found error when I clicked many leads."
+
+**Investigation:** Clicking a lead → `openLeadDetail` fires two background actions for this list (it has a `linkedInAccountId` and leads have LinkedIn URLs): the LinkedIn message auto-sync (`POST .../sync-linkedin-messages`) and, for leads without a draft, an agent-mode auto-draft. Both, plus `GET .../engagements`, call `getLeadListById(selectedList.listId)` and return 404 `'Lead list not found'` only when that listId does not exist. The referenced list and its 37 leads exist, and normal clicks send a valid id — so the 404 indicates a **stale `selectedList`**: a list deleted/recreated in another tab/session or by a re-import while the open tab kept the old id. "Many leads" fits — every lead in the stale view 404s on click. Confirmed a real correctness gap: `fetchLeadLists` only *updated* `selectedList` when the list was still present and never *cleared* it when gone, so the stale selection persisted and each lead click kept 404ing.
+
+`handleDynamoDbError` always rethrows, so throttling under load yields a 500, never this 404 — ruling out load as the cause.
+
+**Fix (customer-portal `CRM.tsx`):**
+- `fetchLeadLists`: when the previously-selected list is no longer in the refreshed set, clear `selectedList`, close the detail panel, and drop the selected lead — so clicks stop auto-firing against a dead listId.
+- Added `isLeadListNotFound(err)` + `handleStaleLeadList()`: on a 404 `'Lead list not found'` from the lead-click auto-sync or `fetchEngagements`, show a single toast ("Lead list unavailable …") and refresh lists (self-heal), guarded by `staleListNoticeRef` against toast spam across many clicks.
+- Test: `CRM.test.tsx` "Stale lead list self-heal".
+
+NOTE: this hardens the stale-list path (the only code path that yields this 404 on the click flow). If the user still sees it on a list that genuinely exists, the next datum needed is the exact `listId` in the failing Network request vs. the URL's listId.
+
 ## Gemini Interactions API Sunset — June 8, 2026 Assessment (2026-05-27)
 
 ### Background

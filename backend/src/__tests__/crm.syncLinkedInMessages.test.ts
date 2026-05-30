@@ -64,6 +64,12 @@ jest.mock('../services/linkedInOutreachService', () => ({
   },
 }));
 
+const mockGetConnectionByProfileUrlAndAccount = jest.fn();
+jest.mock('../services/unipileConnectionsDb', () => ({
+  getConnectionByProfileUrlAndAccount: (...args: any[]) =>
+    mockGetConnectionByProfileUrlAndAccount(...args),
+}));
+
 jest.mock('../services/agentModeService', () => ({ agentModeService: {} }));
 jest.mock('../utils/llmService', () => ({ createLLMService: jest.fn() }));
 jest.mock('../services/settingsService', () => ({ settingsService: {} }));
@@ -126,6 +132,12 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/sync-linkedin-messages', () 
     mockGetMessagesWithContact.mockResolvedValue([]);
     mockAddLinkedInMessageEvent.mockResolvedValue(undefined);
     mockUpdateLeadLinkedInSyncAt.mockResolvedValue(undefined);
+    // Default: lead IS a 1st-degree connection so the happy path proceeds.
+    mockGetConnectionByProfileUrlAndAccount.mockResolvedValue({
+      memberId: 'member-1',
+      publicProfileUrl: 'https://www.linkedin.com/in/john-doe/',
+      accountId: 'unipile-acct-1',
+    });
   });
 
   it('route is registered', () => {
@@ -292,5 +304,80 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/sync-linkedin-messages', () 
     );
     // account_id must be passed so Unipile can identify which side is is_sender=1
     expect(mockGetMessagesWithContact).toHaveBeenCalledWith('provider-id-1', 'unipile-acct-1');
+  });
+
+  // ─── Connection gate (bug: non-connected leads got hundreds of wrong messages) ──
+
+  it('skips sync when the lead is not a 1st-degree connection', async () => {
+    mockGetConnectionByProfileUrlAndAccount.mockResolvedValue(null);
+    const req: any = {
+      user: { userId: 'test-user-id' },
+      params: { listId: 'list-123', leadId: 'lead-456' },
+    };
+    const res = makeRes();
+    await handler!(req, res);
+
+    // Must NOT pull messages from Unipile or write any events for a non-connection.
+    expect(mockResolveProviderId).not.toHaveBeenCalled();
+    expect(mockGetMessagesWithContact).not.toHaveBeenCalled();
+    expect(mockAddLinkedInMessageEvent).not.toHaveBeenCalled();
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ synced: 0, connected: false }),
+    );
+  });
+
+  it('stamps syncAt when skipping a non-connected lead (avoids re-hitting Unipile)', async () => {
+    mockGetConnectionByProfileUrlAndAccount.mockResolvedValue(null);
+    const req: any = {
+      user: { userId: 'test-user-id' },
+      params: { listId: 'list-123', leadId: 'lead-456' },
+    };
+    const res = makeRes();
+    await handler!(req, res);
+
+    expect(mockUpdateLeadLinkedInSyncAt).toHaveBeenCalledWith(
+      'list-123',
+      'lead-456',
+      expect.any(String),
+    );
+  });
+
+  it('checks connection against the list-assigned LinkedIn account when present', async () => {
+    mockGetLeadListById.mockResolvedValue({
+      listId: 'list-123',
+      userId: 'test-user-id',
+      linkedInAccountId: 'list-acct-9',
+    });
+    mockGetConnectionByProfileUrlAndAccount.mockResolvedValue(null);
+    const req: any = {
+      user: { userId: 'test-user-id' },
+      params: { listId: 'list-123', leadId: 'lead-456' },
+    };
+    const res = makeRes();
+    await handler!(req, res);
+
+    // The list's assigned account takes precedence over the user's default account,
+    // both for the connection check and for reading messages.
+    expect(mockGetConnectionByProfileUrlAndAccount).toHaveBeenCalledWith(
+      LEAD_WITH_LINKEDIN.linkedin.toLowerCase(),
+      'list-acct-9',
+    );
+    expect(mockResolveAccountId).not.toHaveBeenCalled();
+  });
+
+  it('reports connected:true on a successful sync', async () => {
+    mockGetMessagesWithContact.mockResolvedValue([
+      { id: 'msg-1', provider_id: 'p1', text: 'Hi', is_sender: 1 as const, is_event: 0 as const, sender_id: 'a', timestamp: '2026-01-01T10:00:00.000Z' },
+    ]);
+    const req: any = {
+      user: { userId: 'test-user-id' },
+      params: { listId: 'list-123', leadId: 'lead-456' },
+    };
+    const res = makeRes();
+    await handler!(req, res);
+
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ synced: 1, connected: true }),
+    );
   });
 });

@@ -157,6 +157,13 @@ interface LLMModelConfig {
   supportsTemperature: boolean;
   /** True for Gemini Live models — uses persistent WebSocket, not HTTP generate */
   isLive?: boolean;
+  /**
+   * True if the model can be used as the describe_image vision model — i.e. it is
+   * multimodal AND reachable/provisioned in this deployment. Verified empirically
+   * (see getVisionModelOptions). Models that are text/voice-only, return 404 from
+   * their provider, or aren't provisioned on the account are intentionally omitted.
+   */
+  supportsVision?: boolean;
   /** Maximum number of tools this model/deployment accepts (e.g. Azure OpenAI gpt-5.x limits to 128) */
   maxTools?: number;
   /** True to restrict model to admin users only */
@@ -229,7 +236,7 @@ export class AgentModeService {
   private readonly FILE_CACHE_MAX_SIZE = 1000; // Max 1000 cached files
   private readonly FILE_CACHE_MAX_AGE_MS = 3600000; // 1 hour TTL
   private readonly FILE_CACHE_CLEANUP_INTERVAL_MS = 600000; // Cleanup every 10 minutes
-  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2';
+  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5.5';
   private defaultModelSettingName = 'agent_mode_default_model';
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
@@ -239,6 +246,9 @@ export class AgentModeService {
   private videoGenerationDefaultModelSettingName = 'agent_mode_video_generation_default_model';
   private customerSupportDefaultModelSettingName = 'agent_mode_customer_support_default_model';
   private codingAgentDefaultModelSettingName = 'agent_mode_coding_agent_default_model';
+  // Model used by the describe_image vision tool. Independent of the chat/default
+  // model — describe_image is a vision utility Emma calls when she needs to "see" an image.
+  private visionModelSettingName = 'agent_mode_vision_model';
 
   constructor() {
     this.toolRegistry = new ToolRegistry();
@@ -878,6 +888,40 @@ export class AgentModeService {
     return fallbackModel;
   }
 
+  /**
+   * Model used by the describe_image vision tool. This is intentionally separate
+   * from getDefaultModel() — describe_image is a vision utility for Emma, not the
+   * conversational model, so admins can point it at a cheaper/faster vision-capable
+   * model without affecting chat. Falls back to a known vision-capable model.
+   */
+  async getVisionModel(): Promise<string> {
+    const fallbackModel = this.llmModels['claude-opus-4-8'] ? 'claude-opus-4-8' : this.default_model;
+    try {
+      const setting = await settingsService.getSetting(this.visionModelSettingName);
+      const configuredModel = setting?.settingValue?.trim();
+      if (configuredModel) {
+        if (this.llmModels[configuredModel]) {
+          return configuredModel;
+        }
+        console.warn(`AgentMode: Unsupported vision model "${configuredModel}" in settings; using fallback.`);
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting vision model setting:', error);
+    }
+    return fallbackModel;
+  }
+
+  /**
+   * Vision-ready model options for the describe_image tool — only models flagged
+   * supportsVision (verified multimodal AND reachable in this deployment), respecting
+   * adminOnly. Excludes the Live voice model, unserved model ids, and unprovisioned models.
+   */
+  async getVisionModelOptions(isAdmin: boolean = false): Promise<string[]> {
+    return Object.keys(this.llmModels).filter(
+      m => this.llmModels[m].supportsVision === true && (isAdmin || !this.llmModels[m].adminOnly)
+    );
+  }
+
   async getBackupModel(primaryModel: string): Promise<string | null> {
     try {
       const setting = await settingsService.getSetting('agent_mode_backup_model');
@@ -1002,9 +1046,9 @@ export class AgentModeService {
                     }
                     if (content.length > 0) messages.push({ role: 'assistant', content });
                   } else if (msg.role === 'user') {
-                    const content = typeof msg.content === 'string'
-                      ? [{ type: 'text', text: msg.content }]
-                      : Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: String(msg.content) }];
+                    // Convert OpenAI-style content (incl. image_url blocks) to Anthropic-native
+                    // blocks. Passing image_url through verbatim triggers a Vertex 400.
+                    const content = AgentModeService.convertContentToAnthropicBlocks(msg.content);
                     messages.push({ role: 'user', content });
                   } else if (msg.role === 'tool') {
                     // Append tool result to the last user message or create a new one
@@ -1562,31 +1606,90 @@ export class AgentModeService {
     return [{ text: String(content) }];
   }
 
+  /**
+   * Convert OpenAI-format content (string, array, or object) to Anthropic-native
+   * content blocks.
+   *
+   * Critically, OpenAI-style `{ type: 'image_url', image_url: { url } }` blocks are
+   * converted to Anthropic `{ type: 'image', source: {...} }` blocks. The Anthropic
+   * Messages API — including Claude models served via Google Vertex AI — rejects the
+   * `image_url` tag with: 400 "Input tag 'image_url' found using 'type' does not match
+   * expected tags (image, document, ...)". Data URIs become base64 image sources;
+   * public http(s) URLs become url image sources.
+   */
+  private static convertContentToAnthropicBlocks(content: any): any[] {
+    if (content === null || content === undefined) return [{ type: 'text', text: '' }];
+    if (typeof content === 'string') return [{ type: 'text', text: content }];
+    if (!Array.isArray(content)) return [{ type: 'text', text: String(content) }];
+
+    const VALID_ANTHROPIC_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+    const blocks: any[] = [];
+    for (const item of content) {
+      if (typeof item === 'string') {
+        blocks.push({ type: 'text', text: item });
+      } else if (!item || typeof item !== 'object') {
+        blocks.push({ type: 'text', text: String(item ?? '') });
+      } else if (item.type === 'text') {
+        blocks.push({ type: 'text', text: item.text || '' });
+      } else if (item.type === 'image_url') {
+        const url = item.image_url?.url || '';
+        if (url.startsWith('data:')) {
+          // data:image/png;base64,... (allow extra params before ;base64,)
+          const m = url.match(/^data:(image\/[\w+.-]+)(?:;[^;]*)*;base64,(.+)$/s);
+          if (m) {
+            let mediaType = m[1].toLowerCase();
+            if (mediaType === 'image/jpg') mediaType = 'image/jpeg';
+            if (!VALID_ANTHROPIC_MEDIA_TYPES.has(mediaType)) mediaType = 'image/jpeg';
+            blocks.push({
+              type: 'image',
+              source: { type: 'base64', media_type: mediaType, data: m[2] },
+            });
+          } else {
+            console.warn(`AgentMode: Could not parse data URI for Anthropic image block, url prefix="${url.substring(0, 60)}"`);
+          }
+        } else if (url) {
+          // Public URL — Anthropic supports url image sources directly
+          blocks.push({ type: 'image', source: { type: 'url', url } });
+        }
+      } else if (item.type === 'image' || item.type === 'tool_result' || item.type === 'tool_use' || item.type === 'document') {
+        // Already an Anthropic-native block — pass through unchanged
+        blocks.push(item);
+      } else {
+        blocks.push({ type: 'text', text: JSON.stringify(item) });
+      }
+    }
+    return blocks.length > 0 ? blocks : [{ type: 'text', text: '.' }];
+  }
+
   private llmModels: Record<string, LLMModelConfig> = {
     // List openai models - create client dynamically for each deployment
     // Azure OpenAI enforces a 128-tool limit per request
-    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true, maxTools: 128 },
-    'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128 },
-    'gpt-5.4': { client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128 },
-    'gpt-5.4-nano': { client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128 },
-    'gpt-5.5': { client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128 },
+    // supportsVision flags below were verified empirically against the describe_image
+    // path (probe against a real image). All GPT-5 deployments handle vision.
+    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true, maxTools: 128, supportsVision: true },
+    'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true },
+    'gpt-5.4': { client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true },
+    'gpt-5.4-nano': { client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
+    'gpt-5.5': { client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     // List gemini models - client will be lazy-loaded
+    // gemini-3-pro-preview omitted from vision: the Gemini API returns 404 for this id (not served).
     'gemini-3-pro-preview': { client: null, supportsTemperature: true },
-    'gemini-3-flash-preview': { client: null, supportsTemperature: true },
-    'gemini-3.1-pro-preview': { client: null, supportsTemperature: true },
-    'gemini-3.1-flash-lite': { client: null, supportsTemperature: true },
-    'gemini-3.5-flash': { client: null, supportsTemperature: true },
-    // Gemini Live voice model — uses persistent WebSocket via liveVoiceService
+    'gemini-3-flash-preview': { client: null, supportsTemperature: true, supportsVision: true },
+    'gemini-3.1-pro-preview': { client: null, supportsTemperature: true, supportsVision: true },
+    'gemini-3.1-flash-lite': { client: null, supportsTemperature: true, supportsVision: true },
+    'gemini-3.5-flash': { client: null, supportsTemperature: true, supportsVision: true },
+    // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
-    'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true },
-    'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true },
-    'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true, adminOnly: true },
-    // NOTE: not available on this Bedrock account as of 2026-04-21 (admin-only, kept for future availability)
+    'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
+    'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true, supportsVision: true },
+    'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true, adminOnly: true, supportsVision: true },
+    // NOTE: not available on this Bedrock account as of 2026-04-21 (admin-only, kept for future availability).
+    // Vision capable, but omitted from vision options until provisioned (selecting it returns 403). Add supportsVision: true when enabled.
     'anthropic.claude-opus-4-7': { client: null, supportsTemperature: true, adminOnly: true },
     // Claude Opus 4.8 via Google Vertex AI — available to all users
     // temperature is deprecated for this model on Vertex AI
-    'claude-opus-4-8': { client: null, supportsTemperature: false },
+    'claude-opus-4-8': { client: null, supportsTemperature: false, supportsVision: true },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
@@ -5096,7 +5199,15 @@ export class AgentModeService {
     }
   }
 
-  public async describeImage(llmModel: string, imageUrl: string, prompt?: string): Promise<any> {
+  /**
+   * Analyze an image with a vision-capable LLM.
+   *
+   * @param llmModel - Optional. When omitted (the agent-mode `describe_image` tool
+   *   intentionally passes nothing here), the configured vision model
+   *   (`agent_mode_vision_model`) is used. describe_image is a vision utility, so it
+   *   runs on its own dedicated vision model — independent of the chat/default model.
+   */
+  public async describeImage(llmModel: string | undefined, imageUrl: string, prompt?: string): Promise<any> {
     try {
       if (!imageUrl) {
         return {
@@ -5105,15 +5216,19 @@ export class AgentModeService {
         };
       }
       if (!llmModel) {
-        llmModel = await this.getDefaultModel();
+        llmModel = await this.getVisionModel();
       }
       // Use custom prompt or default
       const analysisPrompt = prompt || 'Please analyze and describe this image in detail. Focus on visual elements, composition, colors, text, and any marketing or branding elements you can identify.';
 
-      // Bedrock Converse API requires base64 data URIs for images (not URLs).
-      // Download the image and convert to a data URI for Bedrock models.
+      // Claude models require the image as inline bytes rather than a bare URL:
+      //  - Bedrock Converse API requires base64 data URIs.
+      //  - Anthropic-on-Vertex (claude-*) can take a url source, but our images are
+      //    typically private S3 objects Anthropic's fetcher cannot reach, so we
+      //    download and presign them into a base64 data URI here.
+      // Download the image and convert to a data URI for these models.
       let resolvedImageUrl = imageUrl;
-      if (llmModel.startsWith('anthropic.') && !imageUrl.startsWith('data:')) {
+      if ((llmModel.startsWith('anthropic.') || llmModel.startsWith('claude-')) && !imageUrl.startsWith('data:')) {
         try {
           const axios = (await import('axios')).default;
           // For private S3 URLs from our bucket, generate a presigned URL so the download succeeds
@@ -9353,66 +9468,71 @@ ${emailDraftFormat === 'text'
         });
       }
 
-      // Create message draft for LinkedIn/Facebook/other platforms
-      const messagePrompt = `Based on the email draft you just created, now create a shorter message version suitable for LinkedIn, Facebook, or other messaging platforms.
+      // Create message draft optimised for LinkedIn connection invites (max 300 chars)
+      const leadName = [(lead as any).firstName, (lead as any).lastName].filter(Boolean).join(' ');
+      const leadTitle = (lead as any).title || '';
+      const leadCompany = (lead as any).company || '';
+      const leadDesc = [leadName || null, leadTitle, leadCompany ? `at ${leadCompany}` : null].filter(Boolean).join(', ');
+      const emailSummary = (emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent || '').slice(0, 300);
+      const messagePrompt = `You are writing a LinkedIn connection request note. The goal is to get the recipient to accept.
 
-## Email Draft Created:
-Subject: ${emailData.subject}
-Content: ${emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent}
+Recipient: ${leadDesc}
+Context from their email (use to understand the outreach angle): Subject: ${emailData.subject} — ${emailSummary}
 ${messageActivityContext}
 
-## Requirements for Message Draft:
-1. Keep it concise and conversational (150-300 characters ideal, max 500)
-2. Maintain the core message and call-to-action from the email
-3. If there is activity history, acknowledge prior touchpoints naturally (e.g. "following up on my earlier email")
-4. Make it platform-agnostic (works for LinkedIn, Facebook, Twitter DMs, etc.)
-5. Use a friendly, professional tone
-6. Include personalization (use lead's name if appropriate)
-7. No need for subject line or signature
-8. Focus on the key value proposition and CTA
+Write a note that:
+- Leads with something specific about THEIR work, role, or company — show you looked them up
+- Explains briefly WHY you want to connect, relevant to them
+- Sounds like one human writing to another — warm, direct, no corporate speak
+- Is under 280 characters total
+- Opens with their first name naturally (e.g. "John, saw your work on..." or "Sarah —")
+- Does NOT start with Hi or Hello
+- Does NOT have a call to action ("would love to chat", "let's connect")
+- Does NOT use: synergy, opportunity, exciting, leverage, passionate, innovative
+- No emojis
 
-Format the response as JSON with this structure:
-{
-  "content": "The complete message content (concise, 150-500 characters)"
-}`;
+Bad: "Your work in enterprise security is impressive. Would love to connect and explore synergies."
+Good: "Sarah, Island's browser-isolation is one of the smarter takes on shadow IT — solves it without blocking employees."
 
-      // Call LLM to generate message draft
-      const messageCompletion = await openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
-        messages: [
-          {
-            role: "system",
-            content: "You are an expert at crafting concise, engaging messages for social platforms like LinkedIn, Facebook, and Twitter. Create personalized, platform-agnostic messages that drive engagement. Always respond with valid JSON containing a content field.",
-          },
-          { role: "user", content: messagePrompt },
-        ],
+Reply with ONLY valid JSON: {"content": "the note text"}`;
+
+      // Use Gemini for message drafting (fast, cost-effective)
+      const geminiClient = await this.getGeminiClient();
+      const messageCompletion = await geminiClient.chat.completions.create({
+        model: 'gemini-3.5-flash',
+        messages: [{ role: "user", content: messagePrompt }],
         temperature: 0.8,
-        max_tokens: 500,
-        response_format: { type: 'json_object' }
-      });
+        max_tokens: 2048,
+      } as any);
 
       const messageResponseContent = messageCompletion.choices[0].message.content;
       if (!messageResponseContent) {
         throw new Error('No message content generated from LLM');
       }
 
-      // Parse the JSON response
+      // Parse the JSON response — Gemini may wrap it in markdown or prose
       let messageData;
       try {
-        const cleanedMessageContent = messageResponseContent.replace(/```json\s*|\s*```/g, '').trim();
-        messageData = JSON.parse(cleanedMessageContent);
+        const cleanedMsg = messageResponseContent.replace(/```json\s*/g, '').replace(/\s*```/g, '').trim();
+        const bs = cleanedMsg.indexOf('{');
+        const be = cleanedMsg.lastIndexOf('}');
+        if (bs !== -1 && be > bs) {
+          messageData = JSON.parse(cleanedMsg.slice(bs, be + 1));
+        } else {
+          messageData = { content: cleanedMsg };
+        }
       } catch (parseError) {
         console.error('AgentMode: Error parsing message draft JSON:', parseError);
         // Continue with email draft only if message draft fails
         messageData = null;
       }
 
-      // Create message draft object if we got valid data
+      // Create message draft object if we got valid data — hard-cap at 300 chars (LinkedIn invite limit)
       let messageDraft = null;
       if (messageData && messageData.content) {
         const now = new Date().toISOString();
         messageDraft = {
-          content: messageData.content,
+          content: String(messageData.content).slice(0, 300),
           createdAt: now,
           updatedAt: now,
           sessionId: sessionId

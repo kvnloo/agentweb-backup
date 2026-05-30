@@ -98,6 +98,10 @@ router.get('/public/llm-models', asyncHandler(agentModeController.getSupportedMo
 // Get models suitable for report generation (public)
 router.get('/public/reports-model-options', asyncHandler(agentModeController.getReportsModelOptions));
 
+// GET /api/agent-mode/public/vision-model-options
+// Get vision-capable models for the describe_image tool (public)
+router.get('/public/vision-model-options', asyncHandler(agentModeController.getVisionModelOptions));
+
 // GET /api/agent-mode/public/customer-support-default-model
 // Get default model for customer support agent (public)
 router.get('/public/customer-support-default-model', asyncHandler(agentModeController.getCustomerSupportDefaultModel));
