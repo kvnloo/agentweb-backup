@@ -39,7 +39,7 @@ jobs:
 
   # Type-check gate. The test jobs use ts-jest in transpile-only mode
   # (isolatedModules), so they do NOT catch type errors -- this job is the
-  # tsc gate, run once in parallel instead of serially inside every test shard.
+  # tsc gate, run once in parallel instead of serially inside every test job.
   backend-typecheck:
     name: Backend type-check (tsc)
     needs: detect-changes
@@ -65,17 +65,13 @@ jobs:
         working-directory: backend
         run: NODE_OPTIONS="--max-old-space-size=4096" npm run build --if-present
 
-  # Job A: heavy agentMode files, sharded across 2 parallel runners.
-  # No Build step here -- ts-jest compiles from src; tests never read dist/.
+  # Job A: heavy agentMode files. No Build step -- ts-jest compiles from src;
+  # tests never read dist/. Worker count comes from jest.config.js (maxWorkers: 4).
   backend-tests-a:
     name: Backend tests (agentMode)
     needs: detect-changes
     if: needs.detect-changes.outputs.backend == 'true'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2]
     steps:
       - name: Checkout PR head
         uses: actions/checkout@v4
@@ -92,12 +88,11 @@ jobs:
         working-directory: backend
         run: npm ci
 
-      - name: Run tests (agentMode files, shard ${{ matrix.shard }}/2)
+      - name: Run tests (agentMode files)
         working-directory: backend
         run: >
           npm test --
           --testPathPattern="agentMode"
-          --shard=${{ matrix.shard }}/2
           --forceExit
 
   # Job B: everything else + coverage reporting. No Build step (see Job A).
