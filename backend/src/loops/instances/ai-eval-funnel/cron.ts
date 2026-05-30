@@ -30,6 +30,7 @@ import { aiEvalRules } from './rules';
 import { CaptureGate } from '../../core/gates/captureGate';
 import { InMemoryLearningStore } from '../../core/learning/inMemoryLearningStore';
 import { DslRuleSet } from '../../core/policy/dslRuleSet';
+import { LlmAnalystRuleSet } from '../../core/policy/llmAnalystRuleSet';
 import { EventTableEventSource } from '../../core/sensors/eventTableEventSource';
 import { runLoop } from '../../core/orchestrator';
 import { productionLoopPorts } from '../../adapters/awsAdapters';
@@ -59,7 +60,31 @@ export function registerAiEvalFunnelForProduction(): void {
   }
 
   const sensor = new EventTableEventSource(ports.dynamo, AI_EVAL_LOOP_ID);
-  const ruleSet = new DslRuleSet(AI_EVAL_LOOP_ID, aiEvalRules);
+  // Policy layer. Default = the DSL threshold rules. Set AI_EVAL_LLM_ANALYST=true
+  // to swap in the LLM analyst, which reasons over the telemetry instead of
+  // firing fixed thresholds (catches what no rule predicted, and works at low
+  // volume). Gated so merging is inert until the flag is flipped in prod after a
+  // verification pass. The flowDescription is what gives the analyst its lens —
+  // note the landerPath caveat so it doesn't false-alarm on site-wide `landed`.
+  const ruleSet =
+    process.env.AI_EVAL_LLM_ANALYST === 'true'
+      ? new LlmAnalystRuleSet(AI_EVAL_LOOP_ID, ports.bedrock, {
+          model: aiEvalManifest.generator.model,
+          targetMetricName: aiEvalManifest.targetMetric.name,
+          maxProposals: 3,
+          chapterDimension: 'landerPath',
+          flowDescription:
+            'The /ai-eval landing page funnel. A visitor LANDS, fills a form with their ' +
+            'website URL + email (form_submitted), the backend runs an AI marketing eval ' +
+            '(eval_started -> eval_completed), shows a report (report_viewed), and prompts ' +
+            'signup (signup_clicked -> signed_up). IMPORTANT: the `landed` event fires on ' +
+            'EVERY marketing page (see the landerPath dimension), NOT just /ai-eval — only ' +
+            'landerPath=/ai-eval are real funnel entries, so do not treat total landed as the ' +
+            'funnel denominator. `eval_started` is the server-confirmed capture signal; ' +
+            '`form_submitted` is a client event that under-fires. Goal: more eval completers ' +
+            'become signups.',
+        })
+      : new DslRuleSet(AI_EVAL_LOOP_ID, aiEvalRules);
   const tools = new NotionDigestTool();
   const gate = new CaptureGate();
   const learning = new InMemoryLearningStore();
