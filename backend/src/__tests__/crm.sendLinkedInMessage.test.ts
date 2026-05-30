@@ -31,6 +31,7 @@ jest.mock('../controllers/templates', () => ({
 
 const mockGetLeadListById = jest.fn();
 const mockGetLeadById = jest.fn();
+const mockGetUserById = jest.fn();
 
 jest.mock('../services/db', () => ({
   crmDb: {
@@ -40,7 +41,7 @@ jest.mock('../services/db', () => ({
   },
   taskDb: { getTaskById: jest.fn() },
   subscriberDb: { getAllTaskSubscribers: jest.fn() },
-  userDb: { getUserById: jest.fn() },
+  userDb: { getUserById: (...args: any[]) => mockGetUserById(...args) },
 }));
 
 const mockAddLinkedInMessageEvent = jest.fn();
@@ -177,6 +178,28 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-message', () =
     const res = makeRes();
     await handler!(req, res);
     expect(res.status).toHaveBeenCalledWith(404);
+  });
+
+  it('allows an org member (same orgId, different userId) to send — not 404', async () => {
+    // List owned by a teammate; requester is in the same org.
+    mockGetLeadListById.mockResolvedValue({ listId: 'list-123', userId: 'owner-id' });
+    mockGetUserById.mockImplementation((id: string) =>
+      Promise.resolve(
+        id === 'test-user-id'
+          ? { userId: 'test-user-id', orgId: 'org-1' }
+          : { userId: 'owner-id', orgId: 'org-1' },
+      ),
+    );
+    const req: any = {
+      user: { userId: 'test-user-id' },
+      params: { listId: 'list-123', leadId: 'lead-456' },
+      body: { message: 'Hello!' },
+    };
+    const res = makeRes();
+    await handler!(req, res);
+    // Must NOT be rejected as "Lead list not found"; the send proceeds.
+    expect(res.status).not.toHaveBeenCalledWith(404);
+    expect(mockSendMessage).toHaveBeenCalled();
   });
 
   it('returns 404 when lead not found', async () => {
