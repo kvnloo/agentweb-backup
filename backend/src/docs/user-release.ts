@@ -15,6 +15,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Landing pages that use hover interactions (e.g. cards or buttons that respond to the mouse) no longer fail to publish',
       '- Previously these pages required a manual code fix after every generation before they could go live',
       '- The generator now automatically prepares any interactive component correctly, so pages deploy on the first try',
+      'Fixed: CRM No Longer Syncs Unrelated LinkedIn Messages onto Non-Connected Leads',
+      '- Opening a lead who is not a 1st-degree LinkedIn connection no longer pulls in message history from other conversations',
+      '- LinkedIn message history is now synced only for leads who are confirmed 1st-degree connections of the list\'s LinkedIn account',
+      '- This stops a non-connected lead from incorrectly showing hundreds of messages that belonged to other people',
     ],
   },
   {
