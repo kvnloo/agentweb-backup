@@ -59,7 +59,13 @@ export function registerAiEvalFunnelForProduction(): void {
     _resetRegistryForTesting();
   }
 
-  const sensor = new EventTableEventSource(ports.dynamo, AI_EVAL_LOOP_ID);
+  // Scope the loop to the /ai-eval funnel itself: keep only `landed` events on
+  // /ai-eval, dropping site-wide landings (blog, home, etc.) whose visitors have
+  // other intents and are not failed funnel entries. The loop measures
+  // /ai-eval -> /ai-eval, not all-traffic -> /ai-eval.
+  const sensor = new EventTableEventSource(ports.dynamo, AI_EVAL_LOOP_ID, {
+    scope: { eventType: 'landed', dimensionKey: 'landerPath', dimensionValue: '/ai-eval' },
+  });
   // Policy layer. Default = the DSL threshold rules. Set AI_EVAL_LLM_ANALYST=true
   // to swap in the LLM analyst, which reasons over the telemetry instead of
   // firing fixed thresholds (catches what no rule predicted, and works at low
