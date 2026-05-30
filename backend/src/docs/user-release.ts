@@ -11,10 +11,20 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-30',
     changes: [
+      'Fixed: LinkedIn Invite & Message Actions Now Work on Teammates\' Shared CRM Lists',
+      '- Org members opening a lead on a list owned by a teammate no longer see a "Lead list not found" error',
+      '- Drafting an invite note, sending a LinkedIn invite or message, and syncing/checking connections now use the same org-aware access as the rest of the CRM',
       'Fixed: Generated Landing Pages with Hover Effects Now Build Reliably',
       '- Landing pages that use hover interactions (e.g. cards or buttons that respond to the mouse) no longer fail to publish',
       '- Previously these pages required a manual code fix after every generation before they could go live',
       '- The generator now automatically prepares any interactive component correctly, so pages deploy on the first try',
+      'Fixed: CRM No Longer Syncs Unrelated LinkedIn Messages onto Non-Connected Leads',
+      '- Opening a lead who is not a 1st-degree LinkedIn connection no longer pulls in message history from other conversations',
+      '- LinkedIn message history is now synced only for leads who are confirmed 1st-degree connections of the list\'s LinkedIn account',
+      '- This stops a non-connected lead from incorrectly showing hundreds of messages that belonged to other people',
+      'Fixed: CRM Recovers Gracefully from a Deleted Lead List',
+      '- If the lead list you have open was deleted (for example in another tab or by a re-import), clicking leads no longer shows repeated "Lead list not found" errors',
+      '- The CRM now refreshes your lists and clears the stale selection automatically',
     ],
   },
   {

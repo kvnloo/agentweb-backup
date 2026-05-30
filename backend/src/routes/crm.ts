@@ -4027,9 +4027,26 @@ router.post('/lists/:listId/leads/:leadId/sync-linkedin-messages', async (req: R
     }
 
     const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
-    const accountId = await linkedInOutreachService.resolveAccountId(userId);
+    // Prefer the account explicitly assigned to this list (its LinkedIn relationships
+    // live there); fall back to the user's default connected account.
+    const accountId = (list as any).linkedInAccountId || await linkedInOutreachService.resolveAccountId(userId);
     if (!accountId) {
       return res.status(400).json({ message: 'No LinkedIn account connected. Connect a LinkedIn account in Settings first.' });
+    }
+
+    // Only sync message history for leads who are genuine 1st-degree connections of this
+    // account. For non-connected attendees Unipile resolves to an unrelated chat, which
+    // would otherwise dump hundreds of messages from other conversations onto this lead
+    // (observed: a non-connected lead showing the user's entire multi-year sent history).
+    // The connection cache is refreshed every ~10 min by linkedInConnectionSyncCron, which
+    // matches the panel's 10-min auto-sync throttle.
+    const { getConnectionByProfileUrlAndAccount } = await import('../services/unipileConnectionsDb');
+    const connection = await getConnectionByProfileUrlAndAccount(leadLinkedIn, accountId);
+    if (!connection) {
+      // Stamp syncAt so the panel's auto-sync does not re-hit Unipile on every open.
+      const skippedAt = new Date().toISOString();
+      await crmDb.updateLeadLinkedInSyncAt(listId, leadId, skippedAt);
+      return res.json({ synced: 0, connected: false, syncedAt: skippedAt });
     }
 
     const providerId = await linkedInOutreachService.resolveProviderId(leadLinkedIn, true, accountId);
@@ -4055,7 +4072,7 @@ router.post('/lists/:listId/leads/:leadId/sync-linkedin-messages', async (req: R
       crmDb.updateLeadLinkedInSyncAt(listId, leadId, syncAt),
     ]);
 
-    return res.json({ synced: messages.length, syncedAt: syncAt });
+    return res.json({ synced: messages.length, connected: true, syncedAt: syncAt });
   } catch (error: any) {
     console.error('Error syncing LinkedIn messages:', error);
     return res.status(500).json({ message: error.message || 'Failed to sync LinkedIn messages' });
@@ -4179,7 +4196,7 @@ router.post('/lists/:listId/check-linkedin-connections', async (req: Request, re
     if (!Array.isArray(urls) || urls.length === 0) return res.json({ connected: [] });
 
     const list = await crmDb.getLeadListById(listId);
-    if (!list || (list as any).userId !== userId) {
+    if (!list || !(await canAccessCrmList(userId, list as any))) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
@@ -4221,7 +4238,7 @@ router.post('/lists/:listId/sync-linkedin-connections', async (req: Request, res
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
     const list = await crmDb.getLeadListById(listId);
-    if (!list || (list as any).userId !== userId) {
+    if (!list || !(await canAccessCrmList(userId, list as any))) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
@@ -4264,7 +4281,7 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
     }
 
     const list = await crmDb.getLeadListById(listId);
-    if (!list || (list as any).userId !== userId) {
+    if (!list || !(await canAccessCrmList(userId, list as any))) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
@@ -4332,7 +4349,7 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     }
 
     const list = await crmDb.getLeadListById(listId);
-    if (!list || (list as any).userId !== userId) {
+    if (!list || !(await canAccessCrmList(userId, list as any))) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
@@ -4384,7 +4401,7 @@ router.post('/lists/:listId/leads/:leadId/draft-invite-note', async (req: Reques
     }
 
     const list = await crmDb.getLeadListById(listId);
-    if (!list || (list as any).userId !== userId) {
+    if (!list || !(await canAccessCrmList(userId, list as any))) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
