@@ -121,29 +121,76 @@ export async function sensorScan(
 // ---------------------------------------------------------------------------
 
 /**
- * Returns step names where at least one non-control variant has
- * lift_pct < 0 AND n >= promote_min_n.
- * These are candidates for copy mutation.
+ * Returns the step name(s) the loop should generate copy improvements for.
+ *
+ * Tier 1 — a non-control variant is measurably LOSING to control with enough
+ * traffic to trust the signal (lift_pct < 0 AND n >= promote_min_n). This is
+ * the "fix a confirmed loser" path.
+ *
+ * Tier 2 — when no such loser exists (the common case: every step is
+ * control-only, so lift_pct is always null and Tier 1 is always empty), fall
+ * back to the WEAKEST-converting eligible step and bootstrap a first challenger
+ * for it. Without this fallback the loop proposes nothing, ever — it only
+ * heartbeats funnel data. There is deliberately NO traffic gate on Tier 2: at
+ * pilot scale n is tiny, and a low-confidence proposal is cheap because the
+ * human approves/denies it in Slack. A step is only eligible if it has a
+ * control to mutate from AND (when an allowlist is set) is in that allowlist —
+ * otherwise validateBusinessRules would just reject whatever we generate.
+ *
+ * `opts.maxSteps` (default 1) caps how many steps Tier 2 returns.
+ * `opts.allowlist` (default none) restricts Tier 2 to allowlisted steps.
  */
 export function diagnoseUnderperforming(
   stats: StepStats[],
   config: OnboardingLoopConfig,
+  opts: { maxSteps?: number; allowlist?: string[] } = {},
 ): string[] {
   const { promote_min_n } = config.thresholds;
 
-  const underperformingSteps = new Set<string>();
-
+  // Tier 1 — confirmed loser with enough traffic.
+  const losing = new Set<string>();
   for (const s of stats) {
-    if (
-      s.lift_pct !== null &&
-      s.lift_pct < 0 &&
-      s.n >= promote_min_n
-    ) {
-      underperformingSteps.add(s.step);
+    if (s.lift_pct !== null && s.lift_pct < 0 && s.n >= promote_min_n) {
+      losing.add(s.step);
     }
   }
+  if (losing.size > 0) return [...losing];
 
-  return [...underperformingSteps];
+  // Tier 2 — no challenger exists yet → bootstrap one for the weakest step.
+  const maxSteps = Math.max(1, opts.maxSteps ?? 1);
+  const allowlist = opts.allowlist ?? [];
+  const isEligible = (step: string): boolean =>
+    (config.steps[step]?.active_variants?.length ?? 0) > 0 &&
+    (allowlist.length === 0 || allowlist.includes(step));
+
+  // Aggregate completion rate per step (works for control-only steps).
+  const byStep = new Map<string, { n: number; completions: number }>();
+  for (const s of stats) {
+    const agg = byStep.get(s.step) ?? { n: 0, completions: 0 };
+    agg.n += s.n;
+    agg.completions += s.completions;
+    byStep.set(s.step, agg);
+  }
+
+  const ranked = [...byStep.keys()]
+    .filter(isEligible)
+    .map((step) => {
+      const { n, completions } = byStep.get(step)!;
+      return { step, rate: n > 0 ? completions / n : 0, n };
+    })
+    // Worst completion rate first; ties broken by larger sample (more certain
+    // it's genuinely weak) then by name for deterministic output.
+    .sort((a, b) =>
+      a.rate !== b.rate ? a.rate - b.rate : b.n - a.n || a.step.localeCompare(b.step),
+    );
+
+  if (ranked.length > 0) {
+    return ranked.slice(0, maxSteps).map((r) => r.step);
+  }
+
+  // No funnel data at all yet (zero recent users) — still surface an eligible
+  // configured step so the loop delivers an idea on day one.
+  return Object.keys(config.steps).filter(isEligible).slice(0, maxSteps);
 }
 
 // ---------------------------------------------------------------------------
