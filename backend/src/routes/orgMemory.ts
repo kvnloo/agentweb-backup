@@ -1,6 +1,7 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { orgMemoryDb, orgDb, userDb } from '../services/db';
+import { embedText } from '../utils/embeddings';
 
 const router = express.Router();
 
@@ -97,7 +98,9 @@ router.post('/:orgId/memory', async (req, res) => {
       return res.status(400).json({ error: 'category is required and must be a string' });
     }
 
-    const memory = await orgMemoryDb.addMemory(orgId, category, content, userId);
+    // Embed at write time so the memory can later be retrieved by relevance (best-effort).
+    const embedding = (await embedText(content)) ?? undefined;
+    const memory = await orgMemoryDb.addMemory(orgId, category, content, userId, embedding);
     res.status(201).json({ memory });
   } catch (error: any) {
     const status = error.message?.includes('Invalid category') || error.message?.includes('Content') ? 400 : 500;

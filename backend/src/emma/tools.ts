@@ -5384,11 +5384,16 @@ emmaToolRegistry.register({
       return { success: false, message: 'Memory is disabled for this account.' };
     }
 
+    // Embed at write time so the memory can later be retrieved by relevance, not just
+    // recency. Best-effort: a failure must not block saving (read path falls back to recency).
+    const { embedText } = await import('../utils/embeddings');
+    const embedding = (await embedText(args.content)) ?? undefined;
     const memory = await accountMemoryDb.addMemory(
       userId,
       args.category,
       args.content,
-      context?.sessionId
+      context?.sessionId,
+      embedding
     );
     return {
       success: true,
@@ -5464,11 +5469,15 @@ emmaToolRegistry.register({
       return { success: false, message: 'Organization memory is disabled.' };
     }
 
+    // Embed at write time so the memory can later be retrieved by relevance (best-effort).
+    const { embedText } = await import('../utils/embeddings');
+    const embedding = (await embedText(args.content)) ?? undefined;
     const memory = await orgMemoryDb.addMemory(
       user.orgId,
       args.category,
       args.content,
-      userId
+      userId,
+      embedding
     );
     return {
       success: true,

@@ -6822,7 +6822,8 @@ export const accountMemoryDb = {
     userId: string,
     category: string,
     content: string,
-    sourceSessionId?: string
+    sourceSessionId?: string,
+    embedding?: number[]
   ) {
     if (!VALID_MEMORY_CATEGORIES.includes(category as MemoryCategory)) {
       throw new Error(`Invalid category: ${category}. Must be one of: ${VALID_MEMORY_CATEGORIES.join(', ')}`);
@@ -6846,6 +6847,10 @@ export const accountMemoryDb = {
     };
     if (sourceSessionId) {
       item.sourceSessionId = sourceSessionId;
+    }
+    // Persisted so memory can later be retrieved by semantic relevance, not just recency.
+    if (embedding && embedding.length > 0) {
+      item.embedding = embedding;
     }
 
     try {
@@ -6896,6 +6901,22 @@ export const accountMemoryDb = {
       return result.Items || [];
     } catch (error) {
       handleDynamoDbError(error, 'getRecentMemories');
+      throw error;
+    }
+  },
+
+  // Backfill an embedding onto an existing memory (e.g. one written before embeddings
+  // existed), so relevance retrieval pays the embedding cost at most once per memory.
+  async setMemoryEmbedding(userId: string, memoryId: string, embedding: number[]) {
+    try {
+      await dynamodb.update({
+        TableName: ACCOUNT_MEMORY_TABLE,
+        Key: { userId, memoryId },
+        UpdateExpression: 'SET embedding = :e',
+        ExpressionAttributeValues: { ':e': embedding },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'setMemoryEmbedding');
       throw error;
     }
   },
@@ -6966,7 +6987,8 @@ export const orgMemoryDb = {
     orgId: string,
     category: string,
     content: string,
-    sourceUserId?: string
+    sourceUserId?: string,
+    embedding?: number[]
   ) {
     if (!VALID_MEMORY_CATEGORIES.includes(category as MemoryCategory)) {
       throw new Error(`Invalid category: ${category}. Must be one of: ${VALID_MEMORY_CATEGORIES.join(', ')}`);
@@ -6990,6 +7012,10 @@ export const orgMemoryDb = {
     };
     if (sourceUserId) {
       item.sourceUserId = sourceUserId;
+    }
+    // Persisted so org memory can later be retrieved by semantic relevance, not just recency.
+    if (embedding && embedding.length > 0) {
+      item.embedding = embedding;
     }
 
     try {
@@ -7040,6 +7066,21 @@ export const orgMemoryDb = {
       return result.Items || [];
     } catch (error) {
       handleDynamoDbError(error, 'getRecentOrgMemories');
+      throw error;
+    }
+  },
+
+  // Backfill an embedding onto an existing org memory (see accountMemoryDb.setMemoryEmbedding).
+  async setMemoryEmbedding(orgId: string, memoryId: string, embedding: number[]) {
+    try {
+      await dynamodb.update({
+        TableName: ORG_MEMORY_TABLE,
+        Key: { orgId, memoryId },
+        UpdateExpression: 'SET embedding = :e',
+        ExpressionAttributeValues: { ':e': embedding },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'setMemoryEmbedding');
       throw error;
     }
   },
