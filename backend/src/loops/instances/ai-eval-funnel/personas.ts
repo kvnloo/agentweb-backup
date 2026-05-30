@@ -48,7 +48,7 @@ function mk(
 
 export function earlyDipperEvents(idx: number, baseOffsetMinutesAgo = 10): NormalizedEvent[] {
   const id = `dipper-${idx}`;
-  return [mk(id, 'landed', baseOffsetMinutesAgo)];
+  return [mk(id, 'landed', baseOffsetMinutesAgo, { landerPath: '/ai-eval' })];
 }
 
 // ---------------------------------------------------------------------------
@@ -62,7 +62,7 @@ export function earlyDipperEvents(idx: number, baseOffsetMinutesAgo = 10): Norma
 export function completerEvents(idx: number, baseOffsetMinutesAgo = 20): NormalizedEvent[] {
   const id = `completer-${idx}`;
   return [
-    mk(id, 'landed', baseOffsetMinutesAgo),
+    mk(id, 'landed', baseOffsetMinutesAgo, { landerPath: '/ai-eval' }),
     mk(id, 'form_submitted', baseOffsetMinutesAgo - 1),
     mk(id, 'eval_started', baseOffsetMinutesAgo - 1),
     mk(id, 'eval_completed', baseOffsetMinutesAgo - 3),
@@ -81,7 +81,7 @@ export function completerEvents(idx: number, baseOffsetMinutesAgo = 20): Normali
 export function evalFailureEvents(idx: number, baseOffsetMinutesAgo = 30): NormalizedEvent[] {
   const id = `failure-${idx}`;
   return [
-    mk(id, 'landed', baseOffsetMinutesAgo),
+    mk(id, 'landed', baseOffsetMinutesAgo, { landerPath: '/ai-eval' }),
     mk(id, 'form_submitted', baseOffsetMinutesAgo - 1),
     mk(id, 'eval_started', baseOffsetMinutesAgo - 1),
     mk(id, 'eval_failed', baseOffsetMinutesAgo - 2, {
@@ -96,7 +96,7 @@ export function evalFailureEvents(idx: number, baseOffsetMinutesAgo = 30): Norma
 export function timeoutEvents(idx: number, baseOffsetMinutesAgo = 40): NormalizedEvent[] {
   const id = `timeout-${idx}`;
   return [
-    mk(id, 'landed', baseOffsetMinutesAgo),
+    mk(id, 'landed', baseOffsetMinutesAgo, { landerPath: '/ai-eval' }),
     mk(id, 'form_submitted', baseOffsetMinutesAgo - 1),
     mk(id, 'eval_started', baseOffsetMinutesAgo - 1),
     mk(id, 'eval_abandoned', baseOffsetMinutesAgo - 4, {
@@ -110,7 +110,7 @@ export function timeoutEvents(idx: number, baseOffsetMinutesAgo = 40): Normalize
 export function complaintEvents(idx: number, baseOffsetMinutesAgo = 50): NormalizedEvent[] {
   const id = `complaint-${idx}`;
   return [
-    mk(id, 'landed', baseOffsetMinutesAgo),
+    mk(id, 'landed', baseOffsetMinutesAgo, { landerPath: '/ai-eval' }),
     mk(id, 'form_submitted', baseOffsetMinutesAgo - 1),
     mk(id, 'eval_started', baseOffsetMinutesAgo - 1),
     mk(id, 'eval_completed', baseOffsetMinutesAgo - 3),
@@ -128,12 +128,14 @@ export function complaintEvents(idx: number, baseOffsetMinutesAgo = 50): Normali
 // the relevant rules per the ACCEPTANCE_SPEC.
 //
 // Tuning notes (so a reviewer doesn't have to redo this math):
-//   landed_count = 100 dippers + 2 completers + 4 failures + 3 timeouts + 2 complaints
-//                = 111 landed events
-//   form_submitted_count = 2 + 4 + 3 + 2 = 11 (dippers don't submit)
-//   capture-broken: 11/111 = 0.099 < 0.1  → fires ✓
-//   top-of-funnel-cold: landed_count (111) < 100  → does NOT fire (intentional —
-//     we want exactly one rule per friction class, not extra duplicates)
+//   All landed events carry dimensions.landerPath='/ai-eval', so the
+//   landerPath-scoped rules see the full 111.
+//   landed_count[landerPath=/ai-eval] = 100 dippers + 2 completers + 4 failures
+//                + 3 timeouts + 2 complaints = 111 landed events
+//   eval_started_count = 2 + 4 + 3 + 2 = 11 (dippers don't submit/start)
+//   capture-broken: eval_started_count / landed[/ai-eval] = 11/111 = 0.099 < 0.1  → fires ✓
+//   top-of-funnel-cold: landed_count[landerPath=/ai-eval] (111) < 100  → does NOT fire
+//     (intentional — one rule per friction class, not extra duplicates)
 //   eval-failing: 4 failed / (4 + 3 + 2 + 2) started = 4/11 = 0.36 > 0.2 → fires ✓
 //   wait-too-long: 3 abandoned > 0 → fires ✓
 //   complaint-received: 2 > 0 → fires ✓
