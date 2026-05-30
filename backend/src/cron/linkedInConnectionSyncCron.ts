@@ -85,9 +85,17 @@ export async function syncConnectionsForAccount(
   const lastKnownAt = await getLatestConnectedAt(accountId).catch(() => null);
   const newConnections: UnipileConnection[] = [];
 
+  // First-ever sync for this account (empty cache): paginate through ALL connections.
+  // The incremental 3-page poll only captures the newest ~150, so an account that
+  // already had more connections than that when caching began would never get its
+  // older connections backfilled — making genuinely-connected leads look
+  // "not connected". Treat an empty cache as a full sync.
+  const isInitialSync = lastKnownAt === null;
+  const fullSync = opts.fullSync || isInitialSync;
+
   let cursor: string | undefined;
   let page = 0;
-  const MAX_PAGES = opts.fullSync ? 200 : 3; // 3 pages × 50 = 150 connections per 10-min poll
+  const MAX_PAGES = fullSync ? 200 : 3; // 3 pages × 50 = 150 connections per 10-min poll
 
   do {
     const result = await linkedInOutreachService.listConnections(accountId, cursor);
@@ -102,7 +110,7 @@ export async function syncConnectionsForAccount(
       const connectedAt: number = item.created_at ?? 0;
 
       // If sorting newest-first and we hit an already-known timestamp, stop paginating
-      if (!opts.fullSync && lastKnownAt !== null && connectedAt <= lastKnownAt) {
+      if (!fullSync && lastKnownAt !== null && connectedAt <= lastKnownAt) {
         hitOldRecord = true;
         break;
       }
