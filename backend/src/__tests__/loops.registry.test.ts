@@ -59,6 +59,7 @@ const stubGate: ApprovalGate = {
 const stubLearning: LearningStore = {
   record: jest.fn().mockResolvedValue(undefined),
   queryHistory: jest.fn().mockResolvedValue([]),
+  lastOutcomeForRule: jest.fn().mockResolvedValue(null),
 };
 
 const stubManifest: LoopManifest = {
