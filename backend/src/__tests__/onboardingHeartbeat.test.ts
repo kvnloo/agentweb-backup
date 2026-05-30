@@ -126,11 +126,15 @@ describe('computeHeartbeatMetrics', () => {
     });
   });
 
-  it('produces a "need challenger variant" reason when variantCount <= stepCount', () => {
+  it('control-only reason explains the loop drafts a daily challenger (heartbeat is now the exception)', () => {
+    // The heartbeat now only fires when a daily draft fails quality review, not
+    // because proposing is impossible. The reason must reflect that the loop
+    // DOES draft challengers — not the old "need a challenger variant" framing
+    // that made the no-op look like intended behavior.
     const m = computeHeartbeatMetrics([], baseConfig, NOW);
-    expect(m.reason).toContain('challenger variant');
-    expect(m.reason).toContain('1 variant(s)');
+    expect(m.reason).toContain('drafts a challenger');
     expect(m.reason).toContain('1 step(s)');
+    expect(m.reason).not.toContain('Need a challenger variant');
   });
 
   it('produces "healthy bounds" reason when challengers exist', () => {
