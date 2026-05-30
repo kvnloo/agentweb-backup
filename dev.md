@@ -1,3 +1,27 @@
+## CRM Lead List & LinkedIn Message Sync Bugs (2026-05-30)
+
+Reported against list `list_1770238037853_wh6sswaay` ("LinkedIn Connections - Rui", user `be754b6c-767e-44ec-b181-4042cfe45ea9`).
+
+### Bug A — non-connected leads show hundreds of unrelated LinkedIn messages (FIXED)
+
+**Symptom:** "first lead not even connected but many messages are synced."
+
+**Production data:** The list had 1,021 `linkedin-<listId>` message events. They were attributed to 10 profile URLs; one lead (`karthy-chandra`) held 996 of them. The 996 messages were the user's entire sent history to many different people, dated 2022–2024 (e.g. "Hey Kevin…"), stamped `processedAt` 2026-04-15. All events have eventId prefix `linkedin_msg_*` → they came from the **live Unipile sync** (`POST /sync-linkedin-messages`), which is auto-fired on every lead-detail panel open (`CRM.tsx openLeadDetail`).
+
+**Root cause:** `sync-linkedin-messages` synced for any lead with a LinkedIn URL, with no connection check. For a non-connected attendee, `linkedInOutreachService.getMessagesWithContact()` → `getAllChatsFromAttendee()` resolves to an unrelated chat and `getAllMessagesFromChat` dumps up to `MAX_PAGES*100` (~1000) messages onto that one lead. Cross-checked `AW-UnipileConnections` for account `LIBGE2pYS1eckwgo7wUIGQ` (69 real connections): **every** lead that received messages (karthy-chandra, billnbarry, aviharsh, …) is `connected=false`.
+
+**Fix:**
+- `crm.ts` `POST /sync-linkedin-messages`: gate on connection. Resolve the account as `list.linkedInAccountId || resolveAccountId(userId)`, then `getConnectionByProfileUrlAndAccount(leadLinkedIn, accountId)`. If not connected, stamp `linkedinMessageSyncAt` (so auto-sync doesn't re-hit Unipile every open) and return `{ synced: 0, connected: false }` without writing events. Connection cache is refreshed every ~10 min by `linkedInConnectionSyncCron`, matching the panel's 10-min auto-sync throttle.
+- `linkedInOutreachService.getMessagesWithContact`: defense-in-depth — return `[]` if the resolved chat has no `id` (an empty `chat_id` makes Unipile return account-wide messages).
+- Tests: `crm.syncLinkedInMessages.test.ts` (skip when not connected, stamp syncAt, prefer list account, `connected:true` on success).
+- Cleanup of existing bad data: `backend/src/scripts/cleanup-misattributed-linkedin-messages.ts` (dry-run by default). Dry run on this list flags all 1,021 events for deletion (all attributed to non-connections). NOT yet applied to prod — destructive, awaiting approval.
+
+### Bug B — "Lead list not found" when clicking some leads (NEEDS REPRO)
+
+**Symptom:** "clicking on some lead got Lead list not found."
+
+**Investigation:** The list exists. A normal table row click → `openLeadDetail(lead)` → uses `selectedList.listId` (valid), so `getLeadListById` would not 404. The 404 message `'Lead list not found'` is a backend response surfaced by frontend toasts that print `err.response.data.message` (e.g. panel send/draft/sync actions). The panel passes `listId={selectedList?.listId ?? ''}` (`CRM.tsx:10132`); an empty/stale `selectedList` would make list-scoped actions 404. Could not deterministically reproduce a normal-click path on an existing list from static analysis — likely a stale/empty list context (e.g. deep-link race before `selectLeadList` commits, or a list deleted in another tab). **Pending user confirmation of the exact view + action that produced the error before shipping a fix** (avoiding a speculative change).
+
 ## Gemini Interactions API Sunset — June 8, 2026 Assessment (2026-05-27)
 
 ### Background
