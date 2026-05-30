@@ -29,10 +29,17 @@ export const LOOP_EVENTS_TABLE = 'Dev-AW-LoopEvents';
 interface EventTableSensorOptions {
   /** Override the table name (e.g. for tests against a local-DDB). */
   tableName?: string;
+  /** Scope one event type to a single dimension value — e.g. keep only
+   * `landed` events with `landerPath=/ai-eval`, dropping the site-wide
+   * landings (blog, home, etc.) that otherwise pollute this loop's funnel.
+   * Visitors on other pages have other intents; they are not failed funnel
+   * entries. Other event types pass through untouched. */
+  scope?: { eventType: string; dimensionKey: string; dimensionValue: string };
 }
 
 export class EventTableEventSource implements EventSource {
   private readonly tableName: string;
+  private readonly scope?: EventTableSensorOptions['scope'];
 
   constructor(
     private readonly dynamo: DynamoPort,
@@ -40,6 +47,7 @@ export class EventTableEventSource implements EventSource {
     options: EventTableSensorOptions = {},
   ) {
     this.tableName = options.tableName ?? LOOP_EVENTS_TABLE;
+    this.scope = options.scope;
   }
 
   async fetchEvents(window: TimeWindow, filter?: EventFilter): Promise<NormalizedEvent[]> {
@@ -60,6 +68,14 @@ export class EventTableEventSource implements EventSource {
     for (const item of result.items) {
       const ev = itemToEvent(item);
       if (!ev) continue;
+      // Scope: drop off-funnel events (e.g. site-wide `landed` not on /ai-eval).
+      if (
+        this.scope &&
+        ev.eventType === this.scope.eventType &&
+        String(ev.dimensions?.[this.scope.dimensionKey] ?? '') !== this.scope.dimensionValue
+      ) {
+        continue;
+      }
       if (ev.ts < window.start || ev.ts > window.end) continue;
       if (filter?.eventTypes && !filter.eventTypes.includes(ev.eventType)) continue;
       if (filter?.subjectIds && !filter.subjectIds.includes(ev.subjectId)) continue;
