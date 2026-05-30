@@ -36,9 +36,11 @@ jobs:
             partner:
               - 'partner-portal/**'
 
-  # Job A: heavy agentMode files (~150 files, ~half the test time)
-  backend-tests-a:
-    name: Backend tests (agentMode)
+  # Type-check gate. The test jobs use ts-jest in transpile-only mode
+  # (isolatedModules), so they do NOT catch type errors -- this job is the
+  # tsc gate, run once in parallel instead of serially inside every test shard.
+  backend-typecheck:
+    name: Backend type-check (tsc)
     needs: detect-changes
     if: needs.detect-changes.outputs.backend == 'true'
     runs-on: ubuntu-latest
@@ -58,18 +60,46 @@ jobs:
         working-directory: backend
         run: npm ci
 
-      - name: Build
+      - name: Type-check (build)
         working-directory: backend
         run: NODE_OPTIONS="--max-old-space-size=4096" npm run build --if-present
 
-      - name: Run tests (agentMode files)
+  # Job A: heavy agentMode files, sharded across 2 parallel runners.
+  # No Build step here -- ts-jest compiles from src; tests never read dist/.
+  backend-tests-a:
+    name: Backend tests (agentMode)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Run tests (agentMode files, shard ${{ matrix.shard }}/2)
         working-directory: backend
         run: >
           npm test --
           --testPathPattern="agentMode"
+          --shard=${{ matrix.shard }}/2
           --forceExit
 
-  # Job B: everything else + coverage reporting
+  # Job B: everything else + coverage reporting. No Build step (see Job A).
   backend-tests-b:
     name: Backend tests (all other + coverage)
     needs: detect-changes
@@ -90,10 +120,6 @@ jobs:
       - name: Install dependencies
         working-directory: backend
         run: npm ci
-
-      - name: Build
-        working-directory: backend
-        run: NODE_OPTIONS="--max-old-space-size=4096" npm run build --if-present
 
       - name: Run tests with coverage (non-agentMode files)
         working-directory: backend
@@ -156,8 +182,8 @@ jobs:
 
   backend-staging-deploy:
     name: Backend deploy to staging (after tests pass)
-    needs: [detect-changes, backend-tests-a, backend-tests-b]
-    if: needs.detect-changes.outputs.backend == 'true' && needs.backend-tests-a.result == 'success' && needs.backend-tests-b.result == 'success'
+    needs: [detect-changes, backend-typecheck, backend-tests-a, backend-tests-b]
+    if: needs.detect-changes.outputs.backend == 'true' && needs.backend-typecheck.result == 'success' && needs.backend-tests-a.result == 'success' && needs.backend-tests-b.result == 'success'
     runs-on: ubuntu-latest
     environment: staging
     steps:
