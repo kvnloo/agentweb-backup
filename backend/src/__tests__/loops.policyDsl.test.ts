@@ -323,5 +323,79 @@ describe('evaluateParsed', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Dimension filters — `_count[key=value]`
+//
+// Fixes the capture-broken false alarm: <LandedTracker/> fires `landed` on
+// every frontend page (each tagged with dimensions.landerPath), so comparing
+// /ai-eval-only submits against site-wide landings is meaningless. The filter
+// lets a rule count only the events it means to.
+// ---------------------------------------------------------------------------
+
+describe('dimension filters', () => {
+  function mkd(subject: string, type: string, dims?: NormalizedEvent['dimensions']): NormalizedEvent {
+    return {
+      subjectId: asSubjectId(subject),
+      eventType: type,
+      ts: T0,
+      ...(dims ? { dimensions: dims } : {}),
+    };
+  }
+
+  it('parses a count with a dimension filter (value may contain "/")', () => {
+    expect(parseCondition('landed_count[landerPath=/ai-eval] < 100')).toEqual({
+      kind: 'count',
+      eventType: 'landed',
+      filter: { dimensionKey: 'landerPath', dimensionValue: '/ai-eval' },
+      op: '<',
+      threshold: 100,
+      windowDays: undefined,
+    });
+  });
+
+  it('parses a ratio with a denominator filter only', () => {
+    expect(
+      parseCondition('eval_started_count / landed_count[landerPath=/ai-eval] < 0.1 over 7d'),
+    ).toEqual({
+      kind: 'ratio',
+      numeratorType: 'eval_started',
+      denominatorType: 'landed',
+      denominatorFilter: { dimensionKey: 'landerPath', dimensionValue: '/ai-eval' },
+      op: '<',
+      threshold: 0.1,
+      windowDays: 7,
+    });
+  });
+
+  it('count filter only counts events whose dimension matches', () => {
+    const events = [
+      mkd('u1', 'landed', { landerPath: '/ai-eval' }),
+      mkd('u2', 'landed', { landerPath: '/' }),
+      mkd('u3', 'landed', { landerPath: '/blog' }),
+      mkd('u4', 'landed'), // no landerPath dimension → excluded
+    ];
+    // Unscoped sees all 4; scoped sees only the /ai-eval one.
+    expect(evaluate('landed_count >= 4', events, window)).toBe(true);
+    expect(evaluate('landed_count[landerPath=/ai-eval] >= 4', events, window)).toBe(false);
+    expect(evaluate('landed_count[landerPath=/ai-eval] = 1', events, window)).toBe(true);
+  });
+
+  it('capture-broken: scoping the denominator to /ai-eval flips a false alarm to healthy', () => {
+    // 30 site-wide landings (only 3 on /ai-eval) + 2 server-confirmed eval starts.
+    const events: NormalizedEvent[] = [];
+    for (let i = 0; i < 3; i++) events.push(mkd(`a${i}`, 'landed', { landerPath: '/ai-eval' }));
+    for (let i = 0; i < 27; i++) events.push(mkd(`b${i}`, 'landed', { landerPath: '/blog' }));
+    for (let i = 0; i < 2; i++) events.push(mkd(`e${i}`, 'eval_started'));
+
+    // Old (broken) rule: 2 / 30 = 0.067 < 0.1 → FALSE alarm fires.
+    expect(evaluate('eval_started_count / landed_count < 0.1', events, window)).toBe(true);
+    // Fixed rule: 2 / 3 = 0.67, NOT < 0.1 → does not fire. Capture is fine; the
+    // real story is just low /ai-eval volume (a top-of-funnel problem).
+    expect(
+      evaluate('eval_started_count / landed_count[landerPath=/ai-eval] < 0.1', events, window),
+    ).toBe(false);
+  });
+});
+
 // Ensure asVariantId import isn't dead.
 void asVariantId;

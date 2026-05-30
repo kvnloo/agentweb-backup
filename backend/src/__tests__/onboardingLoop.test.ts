@@ -312,6 +312,116 @@ describe('diagnoseUnderperforming', () => {
 });
 
 // ---------------------------------------------------------------------------
+// diagnoseUnderperforming — Tier 2 (bootstrap a challenger for the weakest
+// step when no challenger exists yet).
+//
+// ACCEPTANCE CRITERIA (human-written — these define the behavioral contract
+// that fixes the "loop never proposes anything, ever" bug):
+//   1. With only control variants present (so lift can never be computed),
+//      the loop MUST still return the weakest-converting eligible step so a
+//      proposal is generated. Previously returned [] → proposed nothing.
+//   2. Tier 1 (a real negative-lift loser) takes precedence over Tier 2.
+//   3. Tier 2 only considers steps that are mutate-eligible: they have a
+//      control to mutate from AND are in the allowlist when one is set.
+//   4. With zero funnel data, it still surfaces a configured eligible step so
+//      ideas flow on day one.
+// ---------------------------------------------------------------------------
+
+describe('diagnoseUnderperforming — Tier 2 bootstrap', () => {
+  // Mirror production: sensorScan only emits stats for configured steps, so the
+  // config must actually contain the steps under test (each with a control).
+  const cfg = (steps: string[]) =>
+    makeConfig({
+      steps: Object.fromEntries(
+        steps.map((s) => [s, { active_variants: [makeVariant(`${s}-ctrl`, 1, 'control')] }]),
+      ),
+    });
+
+  test('control-only step is proposed (core "never proposes" fix)', () => {
+    const stats: StepStats[] = [
+      { step: 'brand', variantId: 'ctrl', n: 100, completions: 50, completion_rate: 0.5, lift_pct: null },
+    ];
+    expect(diagnoseUnderperforming(stats, cfg(['brand']))).toEqual(['brand']);
+  });
+
+  test('all-positive-lift (no loser) still proposes the weakest step', () => {
+    const stats: StepStats[] = [
+      { step: 'welcome', variantId: 'treat', n: 100, completions: 60, completion_rate: 0.6, lift_pct: 5 },
+    ];
+    expect(diagnoseUnderperforming(stats, cfg(['welcome']))).toEqual(['welcome']);
+  });
+
+  test('a negative-lift signal too small for Tier 1 is still proposed by Tier 2', () => {
+    const stats: StepStats[] = [
+      { step: 'brand', variantId: 'treat', n: 10, completions: 2, completion_rate: 0.2, lift_pct: -15 },
+    ];
+    // n=10 < promote_min_n(80): Tier 1 skips it, Tier 2 surfaces it anyway.
+    expect(diagnoseUnderperforming(stats, cfg(['brand']))).toEqual(['brand']);
+  });
+
+  test('Tier 1 takes precedence: returns the confirmed loser, not the worst absolute step', () => {
+    const stats: StepStats[] = [
+      // welcome: control-only with a very low rate (would be the Tier-2 worst)
+      { step: 'welcome', variantId: 'w-ctrl', n: 100, completions: 5, completion_rate: 0.05, lift_pct: null },
+      // brand: a real negative-lift loser with enough traffic
+      { step: 'brand', variantId: 'b-treat', n: 100, completions: 40, completion_rate: 0.4, lift_pct: -12 },
+    ];
+    expect(diagnoseUnderperforming(stats, cfg(['welcome', 'brand']))).toEqual(['brand']);
+  });
+
+  test('picks the lowest-completion-rate step among several controls', () => {
+    const stats: StepStats[] = [
+      { step: 'welcome', variantId: 'w', n: 100, completions: 80, completion_rate: 0.8, lift_pct: null },
+      { step: 'brand', variantId: 'b', n: 100, completions: 30, completion_rate: 0.3, lift_pct: null },
+      { step: 'icp', variantId: 'i', n: 100, completions: 55, completion_rate: 0.55, lift_pct: null },
+    ];
+    expect(diagnoseUnderperforming(stats, cfg(['welcome', 'brand', 'icp']))).toEqual(['brand']);
+  });
+
+  test('maxSteps returns the N worst steps in worst-first order', () => {
+    const stats: StepStats[] = [
+      { step: 'welcome', variantId: 'w', n: 100, completions: 80, completion_rate: 0.8, lift_pct: null },
+      { step: 'brand', variantId: 'b', n: 100, completions: 30, completion_rate: 0.3, lift_pct: null },
+      { step: 'icp', variantId: 'i', n: 100, completions: 55, completion_rate: 0.55, lift_pct: null },
+    ];
+    expect(
+      diagnoseUnderperforming(stats, cfg(['welcome', 'brand', 'icp']), { maxSteps: 2 }),
+    ).toEqual(['brand', 'icp']);
+  });
+
+  test('allowlist restricts Tier 2 to allowlisted steps even if another is worse', () => {
+    const stats: StepStats[] = [
+      { step: 'welcome', variantId: 'w', n: 100, completions: 10, completion_rate: 0.1, lift_pct: null }, // worst
+      { step: 'brand', variantId: 'b', n: 100, completions: 40, completion_rate: 0.4, lift_pct: null },
+    ];
+    // 'welcome' is worse but not allowlisted → only 'brand' is eligible.
+    expect(
+      diagnoseUnderperforming(stats, cfg(['welcome', 'brand']), { allowlist: ['brand'] }),
+    ).toEqual(['brand']);
+  });
+
+  test('zero funnel data still proposes a configured eligible step (day-one ideas)', () => {
+    expect(diagnoseUnderperforming([], cfg(['welcome', 'brand']))).toEqual(['welcome']);
+  });
+
+  test('returns [] only when no step is eligible to mutate', () => {
+    const stats: StepStats[] = [
+      { step: 'ghost', variantId: 'g', n: 100, completions: 10, completion_rate: 0.1, lift_pct: null },
+    ];
+    // 'ghost' is not in the config (no control to mutate from) → nothing to do.
+    expect(diagnoseUnderperforming(stats, makeConfig())).toEqual([]);
+    // allowlist excludes the only configured step → nothing eligible.
+    expect(
+      diagnoseUnderperforming(
+        [{ step: 'brand', variantId: 'b', n: 100, completions: 10, completion_rate: 0.1, lift_pct: null }],
+        cfg(['brand']),
+        { allowlist: ['some_other_step'] },
+      ),
+    ).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // generateMutations
 // ---------------------------------------------------------------------------
 
@@ -870,6 +980,61 @@ describe('runOnboardingLoop', () => {
     expect(mockDynamoDBPut).toHaveBeenCalledWith(
       expect.objectContaining({
         Item: expect.objectContaining({ status: 'completed', reason: 'no_mutations' }),
+      }),
+    );
+  });
+
+  test('proposes a challenger for the weakest allowlisted step even with no losing variant (the "always give ideas" fix)', async () => {
+    process.env.ONBOARDING_LOOP_ENABLED = 'true';
+    process.env.ONBOARDING_LOOP_APPROVER_SLACK_USER_ID = 'U-harsha';
+    process.env.SLACK_BOT_TOKEN = 'xoxb-test';
+    process.env.ONBOARDING_LOOP_ALLOWLIST = 'brand_voice';
+
+    const config = makeConfig({
+      steps: {
+        // Control-only step → no lift can ever be computed → Tier 1 finds
+        // nothing. Pre-fix this produced a heartbeat. Now it must propose.
+        brand_voice: { active_variants: [makeVariant('ctrl', 1.0, 'control')] },
+      },
+    });
+    mockS3Config(config);
+    mockPutObject.mockReturnValue({ promise: () => Promise.resolve({ VersionId: 'v2' }) });
+    mockGetAllUsers.mockResolvedValue([makeUser('u1', false), makeUser('u2', false)]);
+
+    // The loop makes two LLM calls per step (generate, then critique). Sniff the
+    // prompt to tell them apart; echo back the generated variantIds in the
+    // critique so they score high and survive the >=8 gate.
+    mockGenerateJsonRobust.mockImplementation(async (_system: string, user: string) => {
+      if (user.includes('Variants to score')) {
+        const ids = [...user.matchAll(/"variantId":\s*"([^"]+)"/g)].map((m) => m[1]);
+        return {
+          critiques: ids.map((variantId) => ({
+            variantId,
+            clarity: 5,
+            specificity: 5,
+            tone: 5,
+            feedback: 'strong',
+          })),
+        };
+      }
+      return {
+        variants: [
+          { heading: 'Cut your reporting time in half', description: 'See how in 60 seconds.', cta: 'Show me' },
+        ],
+      };
+    });
+
+    await runOnboardingLoop();
+
+    // It DM'd a proposal (not just a heartbeat)…
+    expect(mockChatPostMessage).toHaveBeenCalled();
+    // …and logged the proposal for the weakest step, NOT reason='no_mutations'.
+    expect(mockDynamoDBPut).toHaveBeenCalledWith(
+      expect.objectContaining({
+        Item: expect.objectContaining({
+          status: 'completed',
+          proposedSteps: ['brand_voice'],
+        }),
       }),
     );
   });

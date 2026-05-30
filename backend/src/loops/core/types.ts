@@ -227,6 +227,11 @@ export interface ApprovalGate {
 // Layer 5 — Learning store
 // ---------------------------------------------------------------------------
 
+/** Verdict from the attribution job (layer 5): did the shipped mutation move
+ * the loop's target metric over the settle window? This is what makes the loop
+ * *self-improving* rather than only self-proposing. */
+export type OutcomeVerdict = 'improved' | 'no_change' | 'regressed' | 'inconclusive';
+
 /** A single appended entry in the learning store. Captures the full
  * provenance of a mutation: what triggered it, what was proposed, what shipped,
  * and (when outcome data is available later) whether it moved the metric. */
@@ -237,8 +242,20 @@ export interface LearningEvent {
   proposal?: MutationProposal<unknown>;
   mutation?: Mutation;
   decision?: Decision;
-  /** Filled in by a later attribution job, not at write time. */
+  /** Resolved ship-time T — when the mutation actually went live (decision
+   * resolved to approved/auto_shipped). Drives outcome attribution. */
+  shippedAt?: Date | null;
+  /** Target-metric ratio over the window BEFORE the ship: [T - windowDays, T]. */
+  metricBefore?: number | null;
+  /** Target-metric ratio over the window AFTER the ship: [T, T + windowDays]. */
+  metricAfter?: number | null;
+  /** (metricAfter - metricBefore) / metricBefore * 100. Filled by attribution. */
   observedLiftPct?: number | null;
+  /** Denominator events in the after-window — the sample backing the verdict. */
+  sampleN?: number | null;
+  /** Attribution verdict. Null until the settle window elapses + attribution
+   * runs. A non-null verdict marks this record as an attributed outcome. */
+  verdict?: OutcomeVerdict | null;
 }
 
 /** Filter for retrieving history. */
@@ -258,6 +275,11 @@ export interface LearningRecord extends LearningEvent {
 export interface LearningStore {
   record(event: LearningEvent): Promise<void>;
   queryHistory(filter: HistoryFilter): Promise<LearningRecord[]>;
+  /** Most recent record carrying a non-null `verdict` for the given rule, or
+   * null. Lets the policy layer apply a failure-driven cooldown — don't
+   * re-propose a fix whose last shipped version regressed or didn't move the
+   * metric. This read-back is what closes the loop. */
+  lastOutcomeForRule(loopId: LoopId, ruleId: string): Promise<LearningRecord | null>;
 }
 
 // ---------------------------------------------------------------------------

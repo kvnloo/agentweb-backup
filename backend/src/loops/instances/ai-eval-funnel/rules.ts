@@ -27,10 +27,13 @@ export interface AiEvalProposalPayload {
 export const aiEvalRules: readonly Rule<AiEvalProposalPayload>[] = [
   {
     id: 'top-of-funnel-cold',
-    when: 'landed_count < 100 over 7d',
+    // Scope to /ai-eval landings only. <LandedTracker/> fires `landed` on EVERY
+    // frontend page (carrying dimensions.landerPath), so an unscoped count mixes
+    // blog/home/etc. traffic into the /ai-eval funnel.
+    when: 'landed_count[landerPath=/ai-eval] < 100 over 7d',
     then: {
       hypothesis:
-        'Top of funnel is cold — fewer than 100 landings in the last 7 days. ' +
+        'Top of funnel is cold — fewer than 100 /ai-eval landings in the last 7 days. ' +
         'Propose stronger hero + CTA rewrites; flag ad creative refresh in the Slack DM.',
       kind: 'copy',
       payload: {
@@ -43,10 +46,19 @@ export const aiEvalRules: readonly Rule<AiEvalProposalPayload>[] = [
   },
   {
     id: 'capture-broken',
-    when: 'form_submitted_count / landed_count < 0.1 over 7d',
+    // Two corrections vs the original `form_submitted_count / landed_count`:
+    //  1. Denominator scoped to landerPath=/ai-eval — `landed` fires on every
+    //     frontend page, so dividing /ai-eval submits by site-wide landings made
+    //     this rule a permanent false alarm.
+    //  2. Numerator uses server-confirmed `eval_started` (fired by the backend
+    //     when the capture POST creates a session) instead of the client-side
+    //     `form_submitted`, which silently under-fires (ad-block / navigation
+    //     drops the beacon). Both events are /ai-eval-only, so no filter needed
+    //     on the numerator.
+    when: 'eval_started_count / landed_count[landerPath=/ai-eval] < 0.1 over 7d',
     then: {
       hypothesis:
-        'Lots of landings but very few form submits — capture is broken. ' +
+        'Lots of /ai-eval landings but very few capture (server-confirmed eval starts) — capture is broken. ' +
         'Propose hero_heading and form-label mutations that lower perceived effort.',
       kind: 'copy',
       payload: {

@@ -27,6 +27,41 @@ A **loop instance** is a `LoopManifest` (see `MANIFEST_SCHEMA.md`) that names on
 
 Smoke-test the loop with the persona harness (`core/smoke-harness/`) before turning it on against real traffic.
 
+## Design guardrails — keep the loop honest (avoid local maxima)
+
+A loop is gradient descent: it hill-climbs to the best version of whatever basin
+it starts in. By itself it converges to a *local* maximum — "the best version of
+a mediocre flow" — never a global one, because a global jump requires moving
+*through* a worse intermediate, which hill-climbing won't do. Escaping local
+maxima needs **exploration** (big jumps), which the loop does not do. Three
+guardrails keep every loop instance trending toward the global maximum, not just
+polishing a local one:
+
+1. **Don't lock the loop into micro-edits.** A loop whose `mutationSurface` is
+   only "rewrite the headline" can *only ever* reach "best copy on this flow" —
+   architecturally welded into one basin. Keep the surface able to express
+   **structural** changes (different step order, fewer steps, a different
+   first-value moment), so basin-jumps are at least possible.
+
+2. **Keep a human (and real users) as the basin-jumper.** The loop does
+   *exploitation* (perfect the current basin). *Exploration* — proposing a
+   fundamentally different approach — comes from founder insight + user
+   conversations + first-principles redesign, NOT from the loop. Don't outsource
+   basin-jumping to the loop; it structurally can't do it. (At scale, add
+   explicit exploration *into* the loop — several distinct approaches running in
+   parallel = random restarts, occasional deliberately-radical variants =
+   simulated-annealing temperature, keep-the-best-basin.)
+
+3. **Climb the right hill.** Point `targetMetric` at the true downstream outcome
+   you can attribute (activation / retention / revenue), NOT a proxy (clicks,
+   "completed onboarding"). Optimizing a proxy climbs to the *proxy's* peak,
+   which can be miles from the real goal. Wrong hill → guaranteed wrong summit,
+   no matter how well the loop climbs.
+
+You never *prove* you're at the global max — you keep an escape hatch alive. At
+seed stage the escape hatch is the founder; don't burn cycles making the loop
+search globally, just honor these three so future-you isn't trapped.
+
 ## What's NOT in the framework
 
 - Bedrock client implementation. Provided by the host through `BedrockPort`.

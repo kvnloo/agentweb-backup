@@ -124,13 +124,20 @@ export async function runOnboardingLoop(): Promise<void> {
     const stats: StepStats[] = await sensorScan(users, config);
     console.log(`[OnboardingLoop] sensorScan: ${stats.length} step-variant data points`);
 
-    const underperformingSteps = diagnoseUnderperforming(stats, config);
-    console.log(`[OnboardingLoop] Underperforming steps: ${underperformingSteps.join(', ') || 'none'}`);
-
     const allowlist = (process.env.ONBOARDING_LOOP_ALLOWLIST ?? '')
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean);
+
+    // Steps to improve. Tier 1: a challenger measurably losing to control.
+    // Tier 2 (no challenger yet — the usual case): bootstrap one for the
+    // weakest-converting allowlisted step so the loop proposes a concrete
+    // improvement idea every day instead of only ever reporting "nothing to do."
+    const underperformingSteps = diagnoseUnderperforming(stats, config, {
+      maxSteps: 1,
+      allowlist,
+    });
+    console.log(`[OnboardingLoop] Steps to improve: ${underperformingSteps.join(', ') || 'none'}`);
 
     // Build LLM service once — fail fast if config/creds are wrong
     const llmRaw = new LLMService('anthropic.claude-sonnet-4-6', 0.3);
@@ -314,7 +321,7 @@ export function computeHeartbeatMetrics(
   );
   const reason =
     variantCount <= stepNames.length
-      ? `Only ${variantCount} variant(s) across ${stepNames.length} step(s). Need a challenger variant per step to detect lift.`
+      ? `Only control copy is live across ${stepNames.length} step(s). The loop drafts a challenger for the weakest step daily — today's draft didn't clear quality review, so nothing new shipped.`
       : 'All non-control variants are within healthy bounds vs control.';
 
   const inWindow = (iso: unknown, windowMs: number): boolean => {
