@@ -11615,16 +11615,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         data: allData,
       };
 
-      const filename = `insights_${actualNodeId}_${Date.now()}.json`;
-
-      const s3Result = await uploadFileToS3(
-        JSON.stringify(envelope, null, 2),
-        filename,
-        userId,
-        "application/json"
-      );
-
-      return { success: true, s3_url: s3Result.url, totalRows: allData.length };
+      // Return the insights data inline rather than uploading to S3 ourselves.
+      // The agent-mode tool pipeline already offloads any oversized tool response
+      // to S3 under a readable `tool-responses/<sessionId>` key (retrievable via
+      // read_tool_response / search_tool_response) and keeps small responses inline.
+      // Doing our own upload produced an unreadable `s3_url` (no s3_key, wrong
+      // content path), which broke every file-reading tool and the daily digest.
+      return {
+        success: true,
+        totalRows: allData.length,
+        metadata: envelope.metadata,
+        data: allData,
+      };
 
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
