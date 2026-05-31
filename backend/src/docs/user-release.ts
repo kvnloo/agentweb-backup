@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-30
+// Last updated: 2026-05-31
 
 export interface UserReleaseNote {
   date: string;
@@ -16,6 +16,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- The "Send LinkedIn Invite" button is hidden for these leads so you don\'t accidentally invite the same person twice',
       '- This works even for invitations you sent directly on LinkedIn (outside the CRM) — pending invites are synced from your connected account every few minutes',
       '- Once a lead accepts, they automatically switch to "1st-degree connection" with the Send Message flow',
+    ],
+  },
+  {
+    date: '2026-05-31',
+    changes: [
+      'Fixed: Meta Ads Reporting Now Reliably Returns Your Campaign Metrics',
+      '- Emma can now read the exact Meta Ads metrics it pulls (spend, leads, conversions) directly, instead of occasionally losing them in an unreadable file',
+      '- This fixes intermittent failures of the daily Meta Ads campaign digest, including precise "yesterday" numbers and lead/registration counts',
+      '- Larger reports continue to work and remain fully accessible to Emma',
     ],
   },
   {
