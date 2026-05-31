@@ -1218,8 +1218,14 @@ export class AgentModeService {
         } as any,
       });
     } else {
+      // Pin SigV4 explicitly. If AWS_BEARER_TOKEN_BEDROCK is present in the
+      // environment (e.g. cloud-dev boxes set it for the Claude Code CLI), the
+      // SDK would otherwise default to bearer-first auth and send that token —
+      // scoped to the Opus 4.8 account (231030591963) — for every Bedrock call,
+      // 403ing models like Sonnet/Opus 4.6 that live in the default account.
       bedrockClient = new BedrockRuntimeClient({
         region,
+        authSchemePreference: ['sigv4'],
         credentials: process.env.AWS_ACCESS_KEY_ID ? {
           accessKeyId: process.env.AWS_ACCESS_KEY_ID,
           secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
