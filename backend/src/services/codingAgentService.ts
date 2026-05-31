@@ -837,12 +837,11 @@ export function _setBedrockClientForTest(client: AnthropicBedrock | null): void 
 }
 
 // ─── Vertex Client (native Anthropic format) ──────────────────────────────────
-// Claude models on Google Vertex AI (e.g. "claude-opus-4-8") are addressed by a
-// bare model id with NO "anthropic." prefix and are NOT available on Bedrock.
-// We hit the rawPredict endpoint directly, which speaks the native Anthropic
-// Messages format — the exact shape the coding agent already builds — so no
-// request/response conversion is needed (unlike agentModeService, which adapts
-// to/from OpenAI format).
+// Claude models on Google Vertex AI (e.g. "claude-sonnet-4-6") are addressed by a
+// bare model id with NO "anthropic." prefix. We hit the rawPredict endpoint
+// directly, which speaks the native Anthropic Messages format — the exact shape
+// the coding agent already builds — so no request/response conversion is needed
+// (unlike agentModeService, which adapts to/from OpenAI format).
 
 /** Minimal client surface the agent loop relies on — satisfied by both AnthropicBedrock and the Vertex wrapper. */
 interface AnthropicLikeClient {
@@ -1000,12 +999,12 @@ export function _setBedrockBearerClientForTest(client: AnthropicLikeClient | nul
 
 /**
  * Pick the right LLM client for a given model id.
- * - "claude-opus-4-8" is on AWS Bedrock in a separate account (bearer-token auth).
- * - Other bare "claude-*" ids (e.g. claude-sonnet-*) are Google Vertex AI models.
- * - "anthropic.*" ids are AWS Bedrock models (default IAM credentials).
+ * - "anthropic.claude-opus-4-8" is on AWS Bedrock in a separate account (bearer-token auth).
+ * - Bare "claude-*" ids (e.g. claude-sonnet-*) are Google Vertex AI models.
+ * - Other "anthropic.*" ids are AWS Bedrock models (default IAM credentials).
  */
 async function getClientForModel(model: string): Promise<AnthropicLikeClient> {
-  if (model === 'claude-opus-4-8') {
+  if (model === 'anthropic.claude-opus-4-8') {
     return getBedrockBearerClient();
   }
   if (model.startsWith('claude-')) {

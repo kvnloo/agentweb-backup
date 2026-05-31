@@ -125,11 +125,11 @@ describe('SessionScoring - model selection', () => {
 
   it('getDefaultScoringModel returns the custom setting value when present', async () => {
     mockGetSetting.mockImplementation(async (key: string) => {
-      if (key === 'default-scoring-model') return { settingValue: 'claude-opus-4-8' } as any;
+      if (key === 'default-scoring-model') return { settingValue: 'anthropic.claude-opus-4-8' } as any;
       return null as any;
     });
 
-    await expect(getDefaultScoringModel()).resolves.toBe('claude-opus-4-8');
+    await expect(getDefaultScoringModel()).resolves.toBe('anthropic.claude-opus-4-8');
   });
 
   it('getDefaultScoringModel returns the hardcoded default when no setting exists', async () => {

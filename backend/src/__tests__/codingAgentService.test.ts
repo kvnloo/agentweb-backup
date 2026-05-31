@@ -1074,7 +1074,7 @@ describe('applySearchReplace — new file creation', () => {
 
 // ─── Model → provider routing ─────────────────────────────────────────────────
 // Routing must send each model id to the client that can actually serve it:
-// - claude-opus-4-8 → Bedrock bearer-token client (separate AWS account)
+// - anthropic.claude-opus-4-8 → Bedrock bearer-token client (separate AWS account)
 // - other bare claude-* → Vertex
 // - anthropic.* → Bedrock (default IAM credentials)
 describe('runCodingAgent — model provider routing', () => {
@@ -1082,7 +1082,7 @@ describe('runCodingAgent — model provider routing', () => {
     pageId: 'test-page-123',
     userId: 'user-456',
     sessionId: 'session-789',
-    llmModel: 'claude-opus-4-8',
+    llmModel: 'anthropic.claude-opus-4-8',
   };
 
   const bedrockCreate = jest.fn();
@@ -1115,8 +1115,8 @@ describe('runCodingAgent — model provider routing', () => {
     _setBedrockBearerClientForTest(null);
   });
 
-  test('routes Opus 4.8 (claude-opus-4-8) to the Bedrock bearer client, not Vertex or default Bedrock', async () => {
-    modelSpy.mockResolvedValue('claude-opus-4-8');
+  test('routes Opus 4.8 (anthropic.claude-opus-4-8) to the Bedrock bearer client, not Vertex or default Bedrock', async () => {
+    modelSpy.mockResolvedValue('anthropic.claude-opus-4-8');
     bearerCreate.mockResolvedValueOnce({
       content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Done.', status: 'success' } }],
       stop_reason: 'tool_use',
@@ -1130,7 +1130,7 @@ describe('runCodingAgent — model provider routing', () => {
     expect(bedrockCreate).not.toHaveBeenCalled();
     // The bare model id must be passed through to the bearer client unchanged;
     // the client maps it to the inference profile internally.
-    expect(bearerCreate.mock.calls[0][0].model).toBe('claude-opus-4-8');
+    expect(bearerCreate.mock.calls[0][0].model).toBe('anthropic.claude-opus-4-8');
   });
 
   test('routes a Vertex model (claude-sonnet-*) to the Vertex client, not Bedrock', async () => {
@@ -1165,7 +1165,7 @@ describe('runCodingAgent — model provider routing', () => {
   });
 
   test('retries a transient 5xx from the Opus 4.8 bearer client, then succeeds', async () => {
-    modelSpy.mockResolvedValue('claude-opus-4-8');
+    modelSpy.mockResolvedValue('anthropic.claude-opus-4-8');
     const transient: any = new Error('Bedrock (Opus 4.8) error 503: overloaded');
     transient.status = 503;
     bearerCreate

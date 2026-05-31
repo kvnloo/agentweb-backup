@@ -112,22 +112,22 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
     it('should include Claude Opus 4.8 in the supported models for admins', async () => {
       const models = await agentModeService.getSupportedModels(true);
-      expect(models).toContain('claude-opus-4-8');
+      expect(models).toContain('anthropic.claude-opus-4-8');
     });
 
     it('should include Claude Opus 4.8 in the supported models for non-admins', async () => {
       const models = await agentModeService.getSupportedModels(false);
-      expect(models).toContain('claude-opus-4-8');
+      expect(models).toContain('anthropic.claude-opus-4-8');
     });
 
     it('should include Claude Opus 4.8 by default', async () => {
       const models = await agentModeService.getSupportedModels();
-      expect(models).toContain('claude-opus-4-8');
+      expect(models).toContain('anthropic.claude-opus-4-8');
     });
 
     it('should have null client initially for Opus 4.8 (lazy-loaded)', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['claude-opus-4-8'].client).toBeNull();
+      expect(llmModels['anthropic.claude-opus-4-8'].client).toBeNull();
     });
 
     it('should have temperature support enabled for Sonnet 4.5', async () => {
@@ -503,7 +503,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
   });
 
   describe('Bedrock client lazy-loading (Opus 4.8)', () => {
-    it('should lazy-load the Bedrock client for claude-opus-4-8 on first callLLM', async () => {
+    it('should lazy-load the Bedrock client for anthropic.claude-opus-4-8 on first callLLM', async () => {
       // Opus 4.8 runs on Bedrock (separate account, bearer-token auth) despite its
       // bare "claude-" id, so it must route to getBedrockClient, not Vertex.
       const mockCreate = jest.fn().mockResolvedValue({
@@ -520,13 +520,13 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         { role: 'user', content: 'Hello' },
       ];
 
-      await (agentModeService as any).callLLM('claude-opus-4-8', messages);
+      await (agentModeService as any).callLLM('anthropic.claude-opus-4-8', messages);
 
-      expect((agentModeService as any).getBedrockClient).toHaveBeenCalledWith('claude-opus-4-8');
+      expect((agentModeService as any).getBedrockClient).toHaveBeenCalledWith('anthropic.claude-opus-4-8');
       expect(vertexSpy).not.toHaveBeenCalled();
 
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['claude-opus-4-8'].client).toBe(mockBedrockClient);
+      expect(llmModels['anthropic.claude-opus-4-8'].client).toBe(mockBedrockClient);
     });
   });
 

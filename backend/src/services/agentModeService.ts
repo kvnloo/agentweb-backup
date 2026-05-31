@@ -897,7 +897,7 @@ export class AgentModeService {
    * model without affecting chat. Falls back to a known vision-capable model.
    */
   async getVisionModel(): Promise<string> {
-    const fallbackModel = this.llmModels['claude-opus-4-8'] ? 'claude-opus-4-8' : this.default_model;
+    const fallbackModel = this.llmModels['anthropic.claude-opus-4-8'] ? 'anthropic.claude-opus-4-8' : this.default_model;
     try {
       const setting = await settingsService.getSetting(this.visionModelSettingName);
       const configuredModel = setting?.settingValue?.trim();
@@ -1178,9 +1178,7 @@ export class AgentModeService {
   }
 
   public async getClientForModel(model: string): Promise<any> {
-    // Opus 4.8 runs on Bedrock (separate account, bearer-token auth) despite its
-    // bare "claude-" id; all other "claude-*" ids are Vertex.
-    if (model.startsWith('anthropic.') || model === 'claude-opus-4-8') {
+    if (model.startsWith('anthropic.')) {
       return this.getBedrockClient(model);
     }
     if (model.startsWith('gpt-')) {
@@ -1205,7 +1203,7 @@ export class AgentModeService {
     // default IAM credentials (992382574572) cannot reach. Authenticate that model
     // with a long-term Bedrock API key (bearer token) instead of SigV4, scoped to a
     // dedicated client so all other models keep using the default credential chain.
-    const isOpus48 = modelId === 'claude-opus-4-8';
+    const isOpus48 = modelId === 'anthropic.claude-opus-4-8';
     let bedrockClient: any;
     if (isOpus48) {
       const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
@@ -1244,7 +1242,7 @@ export class AgentModeService {
       // If a user hits it today they get a 400 from Bedrock which is now correctly handled by httpStatus check.
       'anthropic.claude-opus-4-7': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-7',
       // Opus 4.8 lives in account 231030591963 (reached via bearer token above).
-      'claude-opus-4-8': 'us.anthropic.claude-opus-4-8',
+      'anthropic.claude-opus-4-8': 'us.anthropic.claude-opus-4-8',
     };
     const actualModelId = inferenceProfileMap[modelId] || modelId;
 
@@ -1714,9 +1712,9 @@ export class AgentModeService {
     // NOTE: not available on this Bedrock account as of 2026-04-21 (admin-only, kept for future availability).
     // Vision capable, but omitted from vision options until provisioned (selecting it returns 403). Add supportsVision: true when enabled.
     'anthropic.claude-opus-4-7': { client: null, supportsTemperature: true, adminOnly: true },
-    // Claude Opus 4.8 via Google Vertex AI — available to all users
-    // temperature is deprecated for this model on Vertex AI
-    'claude-opus-4-8': { client: null, supportsTemperature: false, supportsVision: true },
+    // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
+    // temperature is deprecated for this model
+    'anthropic.claude-opus-4-8': { client: null, supportsTemperature: false, supportsVision: true },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
@@ -1730,7 +1728,7 @@ export class AgentModeService {
   }
 
   async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
-    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || !this.llmModels[m].adminOnly));
+    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || (!this.llmModels[m].adminOnly && !m.includes('opus'))));
   }
   /**
    * Make an LLM call with the specified model and parameters
@@ -1801,7 +1799,7 @@ export class AgentModeService {
       if (model.startsWith('gemini-')) {
         client = await this.getGeminiClient();
         this.llmModels[model].client = client;
-      } else if (model.startsWith('anthropic.') || model === 'claude-opus-4-8') {
+      } else if (model.startsWith('anthropic.')) {
         client = await this.getBedrockClient(model);
         this.llmModels[model].client = client;
       } else if (model.startsWith('claude-')) {
@@ -1875,7 +1873,7 @@ export class AgentModeService {
       'anthropic.claude-sonnet-4-5-20250929-v1:0': [3, 15],
       'anthropic.claude-sonnet-4-6': [3, 15],
       'anthropic.claude-opus-4-6-v1': [15, 75],
-      'claude-opus-4-8': [15, 75],
+      'anthropic.claude-opus-4-8': [15, 75],
       'gpt-5-chat-2': [2.5, 10],
       'gpt-5.2-chat': [3, 12],
       'gemini-3-pro-preview': [1.25, 10],
