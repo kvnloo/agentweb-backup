@@ -1,4 +1,5 @@
 import { AgentModeService } from '../services/agentModeService';
+import { getSecret } from '../utils/secretsManager';
 
 // Mock the dependencies
 jest.mock('../services/db', () => ({
@@ -56,6 +57,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     process.env.AWS_REGION = 'us-west-2';
     process.env.AWS_ACCESS_KEY_ID = 'test-key';
     process.env.AWS_SECRET_ACCESS_KEY = 'test-secret';
+    // Bearer-token models (Opus 4.7/4.8) read the Bedrock API key from Secrets Manager.
+    (getSecret as jest.Mock).mockResolvedValue('ABSK-test-bearer-token');
   });
 
   afterEach(() => {
@@ -584,7 +587,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       );
     });
 
-    it('should map Opus 4.7 to its inference profile ARN', async () => {
+    it('should map Opus 4.7 to its bearer-account inference profile id', async () => {
       const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
 
       await (agentModeService as any).callLLM(
@@ -594,7 +597,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       expect(ConverseCommand).toHaveBeenCalledWith(
         expect.objectContaining({
-          modelId: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-7',
+          modelId: 'us.anthropic.claude-opus-4-7',
         })
       );
     });

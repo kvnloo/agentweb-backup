@@ -89,8 +89,11 @@ describe('AgentModeService - vision model (describe_image)', () => {
       const opts = await service.getVisionModelOptions(true);
       // Gemini API returns 404 for this id
       expect(opts).not.toContain('gemini-3-pro-preview');
-      // Not provisioned on the Bedrock account (403)
-      expect(opts).not.toContain('anthropic.claude-opus-4-7');
+    });
+
+    it('includes Opus 4.7 for admins (served via the bearer-token account)', async () => {
+      const opts = await service.getVisionModelOptions(true);
+      expect(opts).toContain('anthropic.claude-opus-4-7');
     });
 
     it('only returns models flagged supportsVision', async () => {

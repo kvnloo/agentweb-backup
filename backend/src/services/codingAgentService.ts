@@ -930,7 +930,12 @@ export function _setVertexClientForTest(client: AnthropicLikeClient | null): voi
 // authenticate with a long-term Bedrock API key (bearer token) and hit the
 // invoke endpoint directly — it speaks native Anthropic Messages format, exactly
 // what the coding agent already builds.
-const OPUS_48_BEDROCK_MODEL = 'us.anthropic.claude-opus-4-8';
+// App model id -> Bedrock invoke-endpoint profile id, for the models served from
+// the separate bearer-token account (231030591963).
+const BEARER_TOKEN_INVOKE_MODELS: Record<string, string> = {
+  'anthropic.claude-opus-4-7': 'us.anthropic.claude-opus-4-7',
+  'anthropic.claude-opus-4-8': 'us.anthropic.claude-opus-4-8',
+};
 
 let bedrockBearerClient: AnthropicLikeClient | null = null;
 let bedrockBearerClientPromise: Promise<AnthropicLikeClient> | null = null;
@@ -951,7 +956,8 @@ async function getBedrockBearerClient(): Promise<AnthropicLikeClient> {
           // is the native Anthropic request body, with the required version field.
           const { model, ...rest } = params as any;
           delete (rest as any).model;
-          const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${OPUS_48_BEDROCK_MODEL}/invoke`;
+          const profileId = BEARER_TOKEN_INVOKE_MODELS[model] ?? model;
+          const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${profileId}/invoke`;
           const body = { anthropic_version: 'bedrock-2023-05-31', ...rest };
 
           const controller = new AbortController();
@@ -973,7 +979,7 @@ async function getBedrockBearerClient(): Promise<AnthropicLikeClient> {
 
           if (!response.ok) {
             const errText = await response.text();
-            const err: any = new Error(`Bedrock (Opus 4.8) error ${response.status}: ${errText}`);
+            const err: any = new Error(`Bedrock (${profileId}) error ${response.status}: ${errText}`);
             err.status = response.status; // lets callWithRetry decide whether to retry
             throw err;
           }
@@ -999,12 +1005,13 @@ export function _setBedrockBearerClientForTest(client: AnthropicLikeClient | nul
 
 /**
  * Pick the right LLM client for a given model id.
- * - "anthropic.claude-opus-4-8" is on AWS Bedrock in a separate account (bearer-token auth).
+ * - Opus 4.7 / 4.8 ("anthropic.claude-opus-4-7|4-8") are on AWS Bedrock in a
+ *   separate account (bearer-token auth).
  * - Bare "claude-*" ids (e.g. claude-sonnet-*) are Google Vertex AI models.
  * - Other "anthropic.*" ids are AWS Bedrock models (default IAM credentials).
  */
 async function getClientForModel(model: string): Promise<AnthropicLikeClient> {
-  if (model === 'anthropic.claude-opus-4-8') {
+  if (model in BEARER_TOKEN_INVOKE_MODELS) {
     return getBedrockBearerClient();
   }
   if (model.startsWith('claude-')) {
