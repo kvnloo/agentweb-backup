@@ -91,11 +91,6 @@ describe('AgentModeService - vision model (describe_image)', () => {
       expect(opts).not.toContain('gemini-3-pro-preview');
     });
 
-    it('includes Opus 4.7 for admins (served via the bearer-token account)', async () => {
-      const opts = await service.getVisionModelOptions(true);
-      expect(opts).toContain('anthropic.claude-opus-4-7');
-    });
-
     it('only returns models flagged supportsVision', async () => {
       const opts = await service.getVisionModelOptions(true);
       const allModels = await service.getSupportedModels(true);

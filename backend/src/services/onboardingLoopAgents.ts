@@ -2,8 +2,7 @@
  * Onboarding loop agents — six pure functions forming the daily improvement pipeline.
  *
  * LLM model: anthropic.claude-sonnet-4-6 for both Generator and Critic.
- * (claude-opus-4-7 is the intended fallback if sonnet is unavailable, but
- * LLMService will throw on construction if the Bedrock ARN doesn't resolve —
+ * (LLMService will throw on construction if the Bedrock ARN doesn't resolve —
  * the caller in onboardingLoop.ts handles that by skipping the cycle.)
  *
  * NO PII flows into any LLM call — only aggregated stats (step, variantId, n,

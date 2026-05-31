@@ -933,7 +933,6 @@ export function _setVertexClientForTest(client: AnthropicLikeClient | null): voi
 // App model id -> Bedrock invoke-endpoint profile id, for the models served from
 // the separate bearer-token account (231030591963).
 const BEARER_TOKEN_INVOKE_MODELS: Record<string, string> = {
-  'anthropic.claude-opus-4-7': 'us.anthropic.claude-opus-4-7',
   'anthropic.claude-opus-4-8': 'us.anthropic.claude-opus-4-8',
 };
 
@@ -1005,8 +1004,7 @@ export function _setBedrockBearerClientForTest(client: AnthropicLikeClient | nul
 
 /**
  * Pick the right LLM client for a given model id.
- * - Opus 4.7 / 4.8 ("anthropic.claude-opus-4-7|4-8") are on AWS Bedrock in a
- *   separate account (bearer-token auth).
+ * - "anthropic.claude-opus-4-8" is on AWS Bedrock in a separate account (bearer-token auth).
  * - Bare "claude-*" ids (e.g. claude-sonnet-*) are Google Vertex AI models.
  * - Other "anthropic.*" ids are AWS Bedrock models (default IAM credentials).
  */
