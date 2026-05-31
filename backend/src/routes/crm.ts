@@ -4142,7 +4142,7 @@ router.post('/check-linkedin-connections', async (req: Request, res: Response) =
     const { urls, listId: inboxListId } = req.body;
 
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
-    if (!Array.isArray(urls) || urls.length === 0) return res.json({ connected: [] });
+    if (!Array.isArray(urls) || urls.length === 0) return res.json({ connected: [], invited: [] });
 
     // InboxView spans multiple lists — use the linkedInAccountId from the first list
     // that has one configured. If none of the user's lists have one, return empty.
@@ -4157,20 +4157,25 @@ router.post('/check-linkedin-connections', async (req: Request, res: Response) =
         if (l.linkedInAccountId) { accountId = l.linkedInAccountId; break; }
       }
     }
-    if (!accountId) return res.json({ connected: [] });
+    if (!accountId) return res.json({ connected: [], invited: [] });
 
     const { getConnectionByProfileUrlAndAccount } = await import('../services/unipileConnectionsDb');
+    const { getSentInvitationByProfileUrlAndAccount } = await import('../services/unipileSentInvitationsDb');
 
     const connected: Array<{ url: string; connectedAt: number | null }> = [];
+    const invited: Array<{ url: string; sentAt: string | null }> = [];
     await Promise.all(urls.map(async (url: string) => {
+      const normalizedUrl = url.trim().toLowerCase().replace(/\/?$/, '/');
       const conn = await getConnectionByProfileUrlAndAccount(url, accountId!).catch(() => null);
-      if (conn) connected.push({
-        url: url.trim().toLowerCase().replace(/\/?$/, '/'),
-        connectedAt: conn.connectedAt ?? null,
-      });
+      if (conn) {
+        connected.push({ url: normalizedUrl, connectedAt: conn.connectedAt ?? null });
+        return;
+      }
+      const inv = await getSentInvitationByProfileUrlAndAccount(url, accountId!).catch(() => null);
+      if (inv) invited.push({ url: normalizedUrl, sentAt: inv.sentAt ?? null });
     }));
 
-    return res.json({ connected });
+    return res.json({ connected, invited });
   } catch (error: any) {
     console.error('Error checking LinkedIn connections:', error);
     return res.status(500).json({ message: error.message || 'Failed to check LinkedIn connections' });
@@ -4203,20 +4208,25 @@ router.post('/lists/:listId/check-linkedin-connections', async (req: Request, re
     // Only check connections using the LinkedIn account explicitly assigned to this list.
     // No fallback to user-level or site-wide accounts.
     const accountId: string | null = (list as any).linkedInAccountId ?? null;
-    if (!accountId) return res.json({ connected: [] });
+    if (!accountId) return res.json({ connected: [], invited: [] });
 
     const { getConnectionByProfileUrlAndAccount } = await import('../services/unipileConnectionsDb');
+    const { getSentInvitationByProfileUrlAndAccount } = await import('../services/unipileSentInvitationsDb');
 
     const connected: Array<{ url: string; connectedAt: number | null }> = [];
+    const invited: Array<{ url: string; sentAt: string | null }> = [];
     await Promise.all(urls.map(async (url: string) => {
+      const normalizedUrl = url.trim().toLowerCase().replace(/\/?$/, '/');
       const conn = await getConnectionByProfileUrlAndAccount(url, accountId).catch(() => null);
-      if (conn) connected.push({
-        url: url.trim().toLowerCase().replace(/\/?$/, '/'),
-        connectedAt: conn.connectedAt ?? null,
-      });
+      if (conn) {
+        connected.push({ url: normalizedUrl, connectedAt: conn.connectedAt ?? null });
+        return; // already connected — pending-invite state is irrelevant
+      }
+      const inv = await getSentInvitationByProfileUrlAndAccount(url, accountId).catch(() => null);
+      if (inv) invited.push({ url: normalizedUrl, sentAt: inv.sentAt ?? null });
     }));
 
-    return res.json({ connected });
+    return res.json({ connected, invited });
   } catch (error: any) {
     console.error('Error checking LinkedIn connections:', error);
     return res.status(500).json({ message: error.message || 'Failed to check LinkedIn connections' });
@@ -4376,6 +4386,28 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
 
     const sentAt = new Date().toISOString();
     await crmDb.updateLead(listId, leadId, { linkedInInviteSentAt: sentAt });
+
+    // Record the pending invitation in the cache immediately so the UI shows
+    // "Invitation pending" and suppresses re-inviting without waiting for the
+    // ~10-min cron. The cron later reconciles (prunes once accepted/withdrawn).
+    try {
+      const { upsertSentInvitation } = await import('../services/unipileSentInvitationsDb');
+      const { normalizeLinkedInUrl } = await import('../services/unipileConnectionsDb');
+      const normalized = normalizeLinkedInUrl(leadLinkedIn);
+      const publicId = normalized.replace(/\/$/, '').split('/in/')[1] || normalized;
+      await upsertSentInvitation({
+        accountId,
+        invitedUserPublicId: publicId,
+        publicProfileUrl: normalized,
+        invitationId: '',
+        invitedUserName: [lead.firstName, lead.lastName].filter(Boolean).join(' ') || '',
+        invitationText: note ?? '',
+        sentAt,
+        syncedAt: sentAt,
+      });
+    } catch (cacheErr) {
+      console.warn('Failed to cache sent invitation (non-fatal):', cacheErr);
+    }
 
     return res.json({ success: true, linkedInInviteSentAt: sentAt });
   } catch (error: any) {
