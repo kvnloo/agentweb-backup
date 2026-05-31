@@ -575,7 +575,7 @@ emmaToolRegistry.register({
   definition: {
     name: "call_meta_ads_insights_api",
     description:
-      "Fetch performance reporting data from Meta Ads (impressions, clicks, spend, conversions, ROAS, etc.). Use this for custom queries with specific fields, date ranges, breakdowns, or filtering. Handles Meta's async reporting internally — returns an S3 URL to JSON results when ready. You MUST provide either date_preset or time_range (defaults to all-time if omitted, which can be very large). For a quick pre-built dashboard summary of specific campaigns, use get_meta_ads_metrics instead.",
+      "Fetch performance reporting data from Meta Ads (impressions, clicks, spend, conversions, ROAS, etc.). Use this for custom queries with specific fields, date ranges, breakdowns, or filtering. Handles Meta's async reporting internally and returns the insights rows inline as { totalRows, metadata, data }. (If the result set is very large it may be offloaded to an S3 key readable with read_tool_response/search_tool_response.) You MUST provide either date_preset or time_range (defaults to all-time if omitted, which can be very large). For a quick pre-built dashboard summary of specific campaigns, use get_meta_ads_metrics instead.",
     inputSchema: {
       type: "object",
       properties: {
