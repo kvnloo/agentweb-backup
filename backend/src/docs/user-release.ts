@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-28
+// Last updated: 2026-05-30
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,57 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-05-30',
+    changes: [
+      'Fixed: LinkedIn Invite & Message Actions Now Work on Teammates\' Shared CRM Lists',
+      '- Org members opening a lead on a list owned by a teammate no longer see a "Lead list not found" error',
+      '- Drafting an invite note, sending a LinkedIn invite or message, and syncing/checking connections now use the same org-aware access as the rest of the CRM',
+    ],
+  },
+  {
+    date: '2026-05-30',
+    changes: [
+      'Improved: Emma Recalls Relevant Saved Facts Regardless of Age',
+      '- Emma now surfaces the saved memories most relevant to your message, not just the 20 most recent',
+      '- Previously, once you had more than 20 saved facts, an older but relevant one could never be brought into the conversation',
+      '- Memories are matched by meaning, so a relevant detail from weeks ago shows up when it matters',
+    ],
+  },
+  {
+    date: '2026-05-30',
+    changes: [
+      'Fixed: Knowledge Base Search Returns a Focused Set of Results',
+      '- Knowledge base search now returns the number of results requested instead of several times more',
+      '- An empty or blank search no longer returns your entire knowledge base',
+      '- This keeps Emma\'s answers focused and faster by avoiding irrelevant extra content',
+    ],
+  },
+  {
+    date: '2026-05-30',
+    changes: [
+      'Fixed: Generated Landing Pages with Hover Effects Now Build Reliably',
+      '- Landing pages that use hover interactions (e.g. cards or buttons that respond to the mouse) no longer fail to publish',
+      '- Previously these pages required a manual code fix after every generation before they could go live',
+      '- The generator now automatically prepares any interactive component correctly, so pages deploy on the first try',
+      'Fixed: CRM No Longer Syncs Unrelated LinkedIn Messages onto Non-Connected Leads',
+      '- Opening a lead who is not a 1st-degree LinkedIn connection no longer pulls in message history from other conversations',
+      '- LinkedIn message history is now synced only for leads who are confirmed 1st-degree connections of the list\'s LinkedIn account',
+      '- This stops a non-connected lead from incorrectly showing hundreds of messages that belonged to other people',
+      'Fixed: CRM Recovers Gracefully from a Deleted Lead List',
+      '- If the lead list you have open was deleted (for example in another tab or by a re-import), clicking leads no longer shows repeated "Lead list not found" errors',
+      '- The CRM now refreshes your lists and clears the stale selection automatically',
+    ],
+  },
+  {
+    date: '2026-05-29',
+    changes: [
+      'Improved: Admins Can Now Choose the LLM Model for Each Scoring Judge',
+      '- In the Admin → Scoring Judges tab, each judge (including the Default judge) now has an LLM Model dropdown so you can pick which model evaluates sessions',
+      '- Judges without an explicit model continue to use the standard fast scoring model (gemini-3.1-flash-lite)',
+      '- The scoring response budget was increased so reasoning ("thinking") models like gemini-3.5-flash return complete results instead of being truncated',
+    ],
+  },
   {
     date: '2026-05-29',
     changes: [

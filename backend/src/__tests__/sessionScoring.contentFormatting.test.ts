@@ -71,7 +71,7 @@ Three key trends to watch:
       ]),
       expect.objectContaining({
         temperature: 0,
-        max_completion_tokens: 300,
+        max_completion_tokens: 2000,
         response_format: { type: 'json_object' },
       })
     );

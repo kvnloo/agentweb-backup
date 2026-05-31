@@ -10,12 +10,19 @@
  * Supported condition syntax (case-sensitive, whitespace-tolerant):
  *
  *   1. Count threshold:
- *        "<eventType>_count <op> <number>"
- *        e.g. "landed_count < 100", "complaint_received_count > 0"
+ *        "<eventType>_count[<dim>=<val>]? <op> <number>"
+ *        e.g. "landed_count < 100", "complaint_received_count > 0",
+ *             "landed_count[landerPath=/ai-eval] < 100"
  *
  *   2. Ratio threshold:
- *        "<eventTypeA>_count / <eventTypeB>_count <op> <number>"
- *        e.g. "form_submitted_count / landed_count < 0.1"
+ *        "<eventTypeA>_count[<dim>=<val>]? / <eventTypeB>_count[<dim>=<val>]? <op> <number>"
+ *        e.g. "form_submitted_count / landed_count < 0.1",
+ *             "eval_started_count / landed_count[landerPath=/ai-eval] < 0.1"
+ *
+ *   Dimension filter (optional, on any count): "[<key>=<value>]" immediately
+ *   after "_count" restricts the count to events whose dimensions[key] === value.
+ *   The value may contain "/" (e.g. a pathname). Use it to compare like-for-like
+ *   when one event is fired site-wide but the other only on one page.
  *
  *   3. Zero shortcut:
  *        "<eventType>_count = 0"
@@ -44,10 +51,22 @@ import type { NormalizedEvent, TimeWindow } from '../types';
 
 export type Operator = '<' | '>' | '<=' | '>=' | '=' | '!=';
 
+/** Optional dimension filter on a count, e.g. `landed_count[landerPath=/ai-eval]`.
+ * Restricts the count to events whose `dimensions[dimensionKey]` equals
+ * `dimensionValue`. Without it, `landed_count` counts landings across every
+ * page that fires the event — comparing that to a single-page numerator
+ * produces a meaningless ratio (this is exactly what made `capture-broken`
+ * a permanent false alarm). */
+export interface EventFilter {
+  dimensionKey: string;
+  dimensionValue: string;
+}
+
 export type ParsedCondition =
   | {
       kind: 'count';
       eventType: string;
+      filter?: EventFilter;
       op: Operator;
       threshold: number;
       windowDays?: number;
@@ -55,7 +74,9 @@ export type ParsedCondition =
   | {
       kind: 'ratio';
       numeratorType: string;
+      numeratorFilter?: EventFilter;
       denominatorType: string;
+      denominatorFilter?: EventFilter;
       op: Operator;
       threshold: number;
       windowDays?: number;
@@ -71,9 +92,28 @@ export type ParsedCondition =
 // Parser
 // ---------------------------------------------------------------------------
 
-const COUNT_PATTERN = /^([a-z_][a-z0-9_]*)_count\s*(<=|>=|!=|<|>|=)\s*(-?\d+(?:\.\d+)?)(?:\s+over\s+(\d+)d)?$/i;
-const RATIO_PATTERN = /^([a-z_][a-z0-9_]*)_count\s*\/\s*([a-z_][a-z0-9_]*)_count\s*(<=|>=|!=|<|>|=)\s*(-?\d+(?:\.\d+)?)(?:\s+over\s+(\d+)d)?$/i;
+// Optional `[dimensionKey=dimensionValue]` filter immediately after `_count`.
+// The value may contain anything except `]` (so pathnames like `/ai-eval` work).
+const FILTER = String.raw`(?:\[([a-z_][a-z0-9_]*)=([^\]]+)\])?`;
+const COUNT_PATTERN = new RegExp(
+  String.raw`^([a-z_][a-z0-9_]*)_count` + FILTER + String.raw`\s*(<=|>=|!=|<|>|=)\s*(-?\d+(?:\.\d+)?)(?:\s+over\s+(\d+)d)?$`,
+  'i',
+);
+const RATIO_PATTERN = new RegExp(
+  String.raw`^([a-z_][a-z0-9_]*)_count` +
+    FILTER +
+    String.raw`\s*\/\s*([a-z_][a-z0-9_]*)_count` +
+    FILTER +
+    String.raw`\s*(<=|>=|!=|<|>|=)\s*(-?\d+(?:\.\d+)?)(?:\s+over\s+(\d+)d)?$`,
+  'i',
+);
 const COINCIDENCE_PATTERN = /^([a-z_][a-z0-9_]*)\s+but\s+no\s+([a-z_][a-z0-9_]*)\s+within\s+(\d+)h$/i;
+
+/** Build an EventFilter from the optional `[key=value]` capture groups. */
+function toFilter(key: string | undefined, value: string | undefined): EventFilter | undefined {
+  if (!key || value === undefined) return undefined;
+  return { dimensionKey: key, dimensionValue: value.trim() };
+}
 
 export class ConditionParseError extends Error {
   constructor(public readonly condition: string, public readonly reason: string) {
@@ -93,11 +133,15 @@ export function parseCondition(condition: string): ParsedCondition {
   // Try ratio first (more specific than count).
   const ratioMatch = RATIO_PATTERN.exec(trimmed);
   if (ratioMatch) {
-    const [, num, den, op, threshold, windowDays] = ratioMatch;
+    const [, num, numFk, numFv, den, denFk, denFv, op, threshold, windowDays] = ratioMatch;
+    const numeratorFilter = toFilter(numFk, numFv);
+    const denominatorFilter = toFilter(denFk, denFv);
     return {
       kind: 'ratio',
       numeratorType: num,
+      ...(numeratorFilter ? { numeratorFilter } : {}),
       denominatorType: den,
+      ...(denominatorFilter ? { denominatorFilter } : {}),
       op: op as Operator,
       threshold: Number(threshold),
       windowDays: windowDays ? Number(windowDays) : undefined,
@@ -106,10 +150,12 @@ export function parseCondition(condition: string): ParsedCondition {
 
   const countMatch = COUNT_PATTERN.exec(trimmed);
   if (countMatch) {
-    const [, eventType, op, threshold, windowDays] = countMatch;
+    const [, eventType, fk, fv, op, threshold, windowDays] = countMatch;
+    const filter = toFilter(fk, fv);
     return {
       kind: 'count',
       eventType,
+      ...(filter ? { filter } : {}),
       op: op as Operator,
       threshold: Number(threshold),
       windowDays: windowDays ? Number(windowDays) : undefined,
@@ -152,11 +198,21 @@ export function applyOp(left: number, op: Operator, right: number): boolean {
   }
 }
 
-/** Count events of a given type within the window. */
-function countByType(events: readonly NormalizedEvent[], eventType: string): number {
+/** Count events of a given type within the window, optionally restricted to
+ * events matching a single dimension key/value. */
+function countByType(
+  events: readonly NormalizedEvent[],
+  eventType: string,
+  filter?: EventFilter,
+): number {
   let n = 0;
   for (const e of events) {
-    if (e.eventType === eventType) n++;
+    if (e.eventType !== eventType) continue;
+    if (filter) {
+      const v = e.dimensions?.[filter.dimensionKey];
+      if (v === undefined || v === null || String(v) !== filter.dimensionValue) continue;
+    }
+    n++;
   }
   return n;
 }
@@ -180,12 +236,12 @@ export function evaluateParsed(
 ): boolean {
   switch (parsed.kind) {
     case 'count': {
-      const n = countByType(events, parsed.eventType);
+      const n = countByType(events, parsed.eventType, parsed.filter);
       return applyOp(n, parsed.op, parsed.threshold);
     }
     case 'ratio': {
-      const num = countByType(events, parsed.numeratorType);
-      const den = countByType(events, parsed.denominatorType);
+      const num = countByType(events, parsed.numeratorType, parsed.numeratorFilter);
+      const den = countByType(events, parsed.denominatorType, parsed.denominatorFilter);
       if (den === 0) {
         // Convention: when the denominator is 0 we don't fire any ratio
         // rule — there's no signal to interpret. "form_submitted / landed

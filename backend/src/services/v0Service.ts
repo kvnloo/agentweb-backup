@@ -1301,9 +1301,10 @@ async function unzipBuffer(buffer: Buffer | ArrayBuffer): Promise<Array<{ path: 
  * Known issues:
  * 1. `<style jsx>` in Server Components → add 'use client' directive
  * 2. Missing 'use client' for files using hooks (useState, useEffect, etc.)
+ *    or any JSX event handler (onClick, onMouseEnter, onMouseLeave, onFocus, ...)
  * 3. @import "shadcn" in CSS → replace with standard Tailwind imports
  */
-function autoFixV0Files(files: Array<{ path: string; content: Buffer }>): number {
+export function autoFixV0Files(files: Array<{ path: string; content: Buffer }>): number {
   let fixCount = 0;
 
   for (const file of files) {
@@ -1322,9 +1323,13 @@ function autoFixV0Files(files: Array<{ path: string; content: Buffer }>): number
       /\buseRef\b/.test(content) ||
       /\buseCallback\b/.test(content) ||
       /\buseMemo\b/.test(content) ||
-      /\bonClick\b/.test(content) ||
-      /\bonChange\b/.test(content) ||
-      /\bonSubmit\b/.test(content);
+      // Any JSX event-handler prop (onClick, onChange, onSubmit, onMouseEnter,
+      // onMouseLeave, onFocus, onKeyDown, ...) makes a component interactive and
+      // therefore requires "use client". v0 frequently emits onMouseEnter/onMouseLeave
+      // for hover effects on otherwise-server components, which triggers the Next.js
+      // prerender error: "Event handlers cannot be passed to Client Component props."
+      // The `=\s*\{` guard matches only JSX usage, not type annotations like `onClick?: ...`.
+      /\bon[A-Z][a-zA-Z]*\s*=\s*\{/.test(content);
 
     if (needsClient) {
       file.content = Buffer.from("'use client'\n\n" + content);

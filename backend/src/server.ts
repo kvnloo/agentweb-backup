@@ -601,6 +601,39 @@ createTestAccount().then(async () => {
         console.log('[AiEvalLoop] Disabled (set AI_EVAL_LOOP_ENABLED=true to enable)');
       }
 
+      // Onboarding loop V2 (framework port, REVAMP) — daily at 17:00 UTC (9am
+      // PT), offset from the legacy onboarding loop (15:00) + ai-eval (16:00) so
+      // they don't race for Slack/Bedrock. Gated by ONBOARDING_LOOP_V2=true; runs
+      // ALONGSIDE the legacy onboarding cron until cutover.
+      if (process.env.ONBOARDING_LOOP_V2 === 'true') {
+        try {
+          const ONBOARDING_V2_INTERVAL_MS = 24 * 60 * 60 * 1000;
+          const { runOnboardingLoopV2Once } = await import('./loops/instances/onboarding');
+
+          const nowForObV2 = new Date();
+          const nextObV2Run = new Date(nowForObV2);
+          nextObV2Run.setUTCHours(17, 0, 0, 0);
+          if (nextObV2Run <= nowForObV2) {
+            nextObV2Run.setUTCDate(nextObV2Run.getUTCDate() + 1);
+          }
+          const msUntilObV2 = nextObV2Run.getTime() - nowForObV2.getTime();
+
+          console.log(
+            `[OnboardingLoopV2] Initialized — first run at 17:00 UTC (in ${Math.round(msUntilObV2 / 60000)} min)`,
+          );
+          setTimeout(() => {
+            runOnboardingLoopV2Once().catch(e => console.error('[OnboardingLoopV2] Error:', e));
+            setInterval(() => {
+              runOnboardingLoopV2Once().catch(e => console.error('[OnboardingLoopV2] Error:', e));
+            }, ONBOARDING_V2_INTERVAL_MS);
+          }, msUntilObV2);
+        } catch (error) {
+          console.error('[OnboardingLoopV2] Failed to initialize:', error);
+        }
+      } else {
+        console.log('[OnboardingLoopV2] Disabled (set ONBOARDING_LOOP_V2=true to enable)');
+      }
+
     }, 30000); // Delay 30s after startup to allow Agent Mode to boot first
   });
 }); 

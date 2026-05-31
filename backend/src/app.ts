@@ -87,6 +87,7 @@ import { registerAiEvalFunnelForProduction } from "./loops/instances/ai-eval-fun
 import brandBuildRoutes from "./routes/brandBuild";
 import adGenRoutes from "./routes/adGen";
 import onboardingStepsRoutes from "./routes/onboardingSteps";
+import outreachOnboardingRoutes from "./routes/outreachOnboarding";
 import usersRoutes from "./routes/users";
 import charactersRoutes from "./routes/characters";
 import contractorRoutes from "./routes/contractor";
@@ -320,6 +321,7 @@ try {
 app.use("/api/onboarding", brandBuildRoutes);
 app.use("/api/onboarding", adGenRoutes);
 app.use("/api/onboarding", onboardingStepsRoutes);
+app.use("/api/onboarding", outreachOnboardingRoutes);
 app.use("/api", socialPostsRoutes);
 app.use("/r", resultEndpointsRoutes);
 app.get("/asset/:assetHash/stats", getAssetStats);
