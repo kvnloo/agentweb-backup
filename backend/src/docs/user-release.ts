@@ -9,6 +9,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-05-31',
+    changes: [
+      'New: CRM Shows "Invitation Pending" for Leads You\'ve Already Invited on LinkedIn',
+      '- Leads with a sent-but-not-yet-accepted LinkedIn connection request now show an "Invitation pending" status (amber LinkedIn icon) and display when the invite was sent',
+      '- The "Send LinkedIn Invite" button is hidden for these leads so you don\'t accidentally invite the same person twice',
+      '- This works even for invitations you sent directly on LinkedIn (outside the CRM) — pending invites are synced from your connected account every few minutes',
+      '- Once a lead accepts, they automatically switch to "1st-degree connection" with the Send Message flow',
+    ],
+  },
+  {
     date: '2026-05-30',
     changes: [
       'Fixed: LinkedIn Invite & Message Actions Now Work on Teammates\' Shared CRM Lists',
