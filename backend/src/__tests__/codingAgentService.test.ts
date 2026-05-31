@@ -1,4 +1,4 @@
-import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, _setBedrockClientForTest, _setVertexClientForTest, _setSleepFnForTest } from '../services/codingAgentService';
+import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest } from '../services/codingAgentService';
 import { agentModeService } from '../services/agentModeService';
 
 // Mock mcpFetch
@@ -1073,9 +1073,10 @@ describe('applySearchReplace — new file creation', () => {
 });
 
 // ─── Model → provider routing ─────────────────────────────────────────────────
-// Regression for "400 The provided model identifier is invalid": switching the
-// coding-agent default model to a Vertex model (claude-opus-4-8) must route to
-// the Vertex client, not the Bedrock client (which rejects bare claude-* ids).
+// Routing must send each model id to the client that can actually serve it:
+// - claude-opus-4-8 → Bedrock bearer-token client (separate AWS account)
+// - other bare claude-* → Vertex
+// - anthropic.* → Bedrock (default IAM credentials)
 describe('runCodingAgent — model provider routing', () => {
   const mockContext: CodingAgentContext = {
     pageId: 'test-page-123',
@@ -1086,6 +1087,7 @@ describe('runCodingAgent — model provider routing', () => {
 
   const bedrockCreate = jest.fn();
   const vertexCreate = jest.fn();
+  const bearerCreate = jest.fn();
   let modelSpy: jest.SpyInstance;
 
   beforeEach(() => {
@@ -1093,8 +1095,10 @@ describe('runCodingAgent — model provider routing', () => {
     mockedMcpFetch.mockReset();
     bedrockCreate.mockReset();
     vertexCreate.mockReset();
+    bearerCreate.mockReset();
     _setBedrockClientForTest({ messages: { create: bedrockCreate } } as any);
     _setVertexClientForTest({ messages: { create: vertexCreate } } as any);
+    _setBedrockBearerClientForTest({ messages: { create: bearerCreate } } as any);
     _setSleepFnForTest(async () => {});
     // Pre-flight list_files succeeds so the loop reaches the LLM call.
     mockedMcpFetch.mockResolvedValue({ files: [{ path: 'app/page.tsx', size: 100 }] });
@@ -1108,10 +1112,29 @@ describe('runCodingAgent — model provider routing', () => {
   afterAll(() => {
     _setBedrockClientForTest(null);
     _setVertexClientForTest(null);
+    _setBedrockBearerClientForTest(null);
   });
 
-  test('routes a Vertex model (claude-opus-4-8) to the Vertex client, not Bedrock', async () => {
+  test('routes Opus 4.8 (claude-opus-4-8) to the Bedrock bearer client, not Vertex or default Bedrock', async () => {
     modelSpy.mockResolvedValue('claude-opus-4-8');
+    bearerCreate.mockResolvedValueOnce({
+      content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Done.', status: 'success' } }],
+      stop_reason: 'tool_use',
+    });
+
+    const result = await runCodingAgent('change the heading', mockContext);
+
+    expect(result.success).toBe(true);
+    expect(bearerCreate).toHaveBeenCalledTimes(1);
+    expect(vertexCreate).not.toHaveBeenCalled();
+    expect(bedrockCreate).not.toHaveBeenCalled();
+    // The bare model id must be passed through to the bearer client unchanged;
+    // the client maps it to the inference profile internally.
+    expect(bearerCreate.mock.calls[0][0].model).toBe('claude-opus-4-8');
+  });
+
+  test('routes a Vertex model (claude-sonnet-*) to the Vertex client, not Bedrock', async () => {
+    modelSpy.mockResolvedValue('claude-sonnet-4-6');
     vertexCreate.mockResolvedValueOnce({
       content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Done.', status: 'success' } }],
       stop_reason: 'tool_use',
@@ -1122,8 +1145,8 @@ describe('runCodingAgent — model provider routing', () => {
     expect(result.success).toBe(true);
     expect(vertexCreate).toHaveBeenCalledTimes(1);
     expect(bedrockCreate).not.toHaveBeenCalled();
-    // The model id must be passed through to the Vertex client unchanged.
-    expect(vertexCreate.mock.calls[0][0].model).toBe('claude-opus-4-8');
+    expect(bearerCreate).not.toHaveBeenCalled();
+    expect(vertexCreate.mock.calls[0][0].model).toBe('claude-sonnet-4-6');
   });
 
   test('routes a Bedrock model (anthropic.*) to the Bedrock client, not Vertex', async () => {
@@ -1138,13 +1161,14 @@ describe('runCodingAgent — model provider routing', () => {
     expect(result.success).toBe(true);
     expect(bedrockCreate).toHaveBeenCalledTimes(1);
     expect(vertexCreate).not.toHaveBeenCalled();
+    expect(bearerCreate).not.toHaveBeenCalled();
   });
 
-  test('retries a transient 5xx from the Vertex client, then succeeds', async () => {
+  test('retries a transient 5xx from the Opus 4.8 bearer client, then succeeds', async () => {
     modelSpy.mockResolvedValue('claude-opus-4-8');
-    const transient: any = new Error('Vertex AI error 503: overloaded');
+    const transient: any = new Error('Bedrock (Opus 4.8) error 503: overloaded');
     transient.status = 503;
-    vertexCreate
+    bearerCreate
       .mockRejectedValueOnce(transient)
       .mockResolvedValueOnce({
         content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Done.', status: 'success' } }],
@@ -1154,6 +1178,6 @@ describe('runCodingAgent — model provider routing', () => {
     const result = await runCodingAgent('change the heading', mockContext);
 
     expect(result.success).toBe(true);
-    expect(vertexCreate).toHaveBeenCalledTimes(2);
+    expect(bearerCreate).toHaveBeenCalledTimes(2);
   });
 });

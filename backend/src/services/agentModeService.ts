@@ -1178,7 +1178,9 @@ export class AgentModeService {
   }
 
   public async getClientForModel(model: string): Promise<any> {
-    if (model.startsWith('anthropic.')) {
+    // Opus 4.8 runs on Bedrock (separate account, bearer-token auth) despite its
+    // bare "claude-" id; all other "claude-*" ids are Vertex.
+    if (model.startsWith('anthropic.') || model === 'claude-opus-4-8') {
       return this.getBedrockClient(model);
     }
     if (model.startsWith('gpt-')) {
@@ -1198,17 +1200,38 @@ export class AgentModeService {
 
     const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
     const BEDROCK_REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes per request
-    const bedrockClient = new BedrockRuntimeClient({
-      region,
-      credentials: process.env.AWS_ACCESS_KEY_ID ? {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
-      } : undefined,
-      requestHandler: {
-        connectionTimeout: 10_000, // 10s to establish connection
-        requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS,
-      } as any,
-    });
+
+    // Opus 4.8 is served from a separate AWS account (231030591963) that the app's
+    // default IAM credentials (992382574572) cannot reach. Authenticate that model
+    // with a long-term Bedrock API key (bearer token) instead of SigV4, scoped to a
+    // dedicated client so all other models keep using the default credential chain.
+    const isOpus48 = modelId === 'claude-opus-4-8';
+    let bedrockClient: any;
+    if (isOpus48) {
+      const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+      const bearerToken = (await getSecret(`${environment}/AgentWeb/Bedrock/ApiKey`)).trim();
+      bedrockClient = new BedrockRuntimeClient({
+        region,
+        token: { token: bearerToken },
+        authSchemePreference: ['httpBearerAuth'],
+        requestHandler: {
+          connectionTimeout: 10_000,
+          requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS,
+        } as any,
+      });
+    } else {
+      bedrockClient = new BedrockRuntimeClient({
+        region,
+        credentials: process.env.AWS_ACCESS_KEY_ID ? {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
+        } : undefined,
+        requestHandler: {
+          connectionTimeout: 10_000, // 10s to establish connection
+          requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS,
+        } as any,
+      });
+    }
 
     // Map certain model IDs to their corresponding inference profile ARNs
     // Note: Newer Claude models require using inference profiles for cross-region access
@@ -1220,6 +1243,8 @@ export class AgentModeService {
       // Kept in registry because: (1) admin-only so no user-facing risk, (2) may become available later.
       // If a user hits it today they get a 400 from Bedrock which is now correctly handled by httpStatus check.
       'anthropic.claude-opus-4-7': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-7',
+      // Opus 4.8 lives in account 231030591963 (reached via bearer token above).
+      'claude-opus-4-8': 'us.anthropic.claude-opus-4-8',
     };
     const actualModelId = inferenceProfileMap[modelId] || modelId;
 
@@ -1776,7 +1801,7 @@ export class AgentModeService {
       if (model.startsWith('gemini-')) {
         client = await this.getGeminiClient();
         this.llmModels[model].client = client;
-      } else if (model.startsWith('anthropic.')) {
+      } else if (model.startsWith('anthropic.') || model === 'claude-opus-4-8') {
         client = await this.getBedrockClient(model);
         this.llmModels[model].client = client;
       } else if (model.startsWith('claude-')) {

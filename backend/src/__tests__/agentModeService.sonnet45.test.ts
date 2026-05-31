@@ -502,15 +502,18 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     });
   });
 
-  describe('Vertex AI client lazy-loading', () => {
-    it('should lazy-load Vertex client for claude-opus-4-8 on first callLLM', async () => {
+  describe('Bedrock client lazy-loading (Opus 4.8)', () => {
+    it('should lazy-load the Bedrock client for claude-opus-4-8 on first callLLM', async () => {
+      // Opus 4.8 runs on Bedrock (separate account, bearer-token auth) despite its
+      // bare "claude-" id, so it must route to getBedrockClient, not Vertex.
       const mockCreate = jest.fn().mockResolvedValue({
         choices: [{ message: { role: 'assistant', content: 'Hi!', tool_calls: undefined }, finish_reason: 'stop' }],
         usage: { prompt_tokens: 9, completion_tokens: 13, total_tokens: 22 },
       });
-      const mockVertexClient = { chat: { completions: { create: mockCreate } } };
+      const mockBedrockClient = { chat: { completions: { create: mockCreate } } };
 
-      jest.spyOn(agentModeService as any, 'getVertexClient').mockResolvedValue(mockVertexClient);
+      jest.spyOn(agentModeService as any, 'getBedrockClient').mockResolvedValue(mockBedrockClient);
+      const vertexSpy = jest.spyOn(agentModeService as any, 'getVertexClient');
 
       const messages = [
         { role: 'system', content: 'You are a helpful assistant.' },
@@ -519,10 +522,11 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       await (agentModeService as any).callLLM('claude-opus-4-8', messages);
 
-      expect((agentModeService as any).getVertexClient).toHaveBeenCalled();
+      expect((agentModeService as any).getBedrockClient).toHaveBeenCalledWith('claude-opus-4-8');
+      expect(vertexSpy).not.toHaveBeenCalled();
 
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['claude-opus-4-8'].client).toBe(mockVertexClient);
+      expect(llmModels['claude-opus-4-8'].client).toBe(mockBedrockClient);
     });
   });
 
