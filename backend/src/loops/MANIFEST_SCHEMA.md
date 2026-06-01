@@ -56,7 +56,7 @@ This document is the authoritative reference for what a manifest contains. For r
 ```ts
 {
   candidatesPerCycle: number      // typically 30-50
-  model: string                   // 'claude-opus-4-7' or 'claude-sonnet-4-6'
+  model: string                   // 'anthropic.claude-opus-4-8' or 'anthropic.claude-sonnet-4-6'
   systemPrompt: string            // loop-specific voice + ICP context
 }
 ```

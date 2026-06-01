@@ -45,19 +45,19 @@ describe('AgentModeService - vision model (describe_image)', () => {
       expect(await service.getVisionModel()).toBe('gemini-3-flash-preview');
     });
 
-    it('falls back to claude-opus-4-8 when no setting exists', async () => {
+    it('falls back to anthropic.claude-opus-4-8 when no setting exists', async () => {
       (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
-      expect(await service.getVisionModel()).toBe('claude-opus-4-8');
+      expect(await service.getVisionModel()).toBe('anthropic.claude-opus-4-8');
     });
 
     it('falls back when the configured model is not in the registry', async () => {
       (settingsService.getSetting as jest.Mock).mockResolvedValue({ settingValue: 'not-a-real-model' });
-      expect(await service.getVisionModel()).toBe('claude-opus-4-8');
+      expect(await service.getVisionModel()).toBe('anthropic.claude-opus-4-8');
     });
 
     it('falls back when the setting lookup throws', async () => {
       (settingsService.getSetting as jest.Mock).mockRejectedValue(new Error('boom'));
-      expect(await service.getVisionModel()).toBe('claude-opus-4-8');
+      expect(await service.getVisionModel()).toBe('anthropic.claude-opus-4-8');
     });
 
     it('does NOT consult the chat/default model setting', async () => {
@@ -82,15 +82,13 @@ describe('AgentModeService - vision model (describe_image)', () => {
       expect(opts).toContain('gpt-5.4-nano');
       expect(opts).toContain('gemini-3-flash-preview');
       expect(opts).toContain('anthropic.claude-sonnet-4-6');
-      expect(opts).toContain('claude-opus-4-8');
+      expect(opts).toContain('anthropic.claude-opus-4-8');
     });
 
     it('excludes models that fail the vision probe (unserved id / unprovisioned account)', async () => {
       const opts = await service.getVisionModelOptions(true);
       // Gemini API returns 404 for this id
       expect(opts).not.toContain('gemini-3-pro-preview');
-      // Not provisioned on the Bedrock account (403)
-      expect(opts).not.toContain('anthropic.claude-opus-4-7');
     });
 
     it('only returns models flagged supportsVision', async () => {
@@ -112,7 +110,7 @@ describe('AgentModeService - vision model (describe_image)', () => {
   describe('describeImage() model resolution', () => {
     it('uses getVisionModel (not getDefaultModel) when no model is passed', async () => {
       const visionSpy = jest.spyOn(service, 'getVisionModel').mockResolvedValue('gemini-3-flash-preview');
-      const defaultSpy = jest.spyOn(service, 'getDefaultModel').mockResolvedValue('claude-opus-4-8');
+      const defaultSpy = jest.spyOn(service, 'getDefaultModel').mockResolvedValue('anthropic.claude-opus-4-8');
       const callLLMSpy = jest
         .spyOn(service, 'callLLM')
         .mockResolvedValue({ choices: [{ message: { content: 'ok' } }] } as any);

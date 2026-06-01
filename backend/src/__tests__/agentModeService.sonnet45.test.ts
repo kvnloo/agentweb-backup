@@ -1,4 +1,5 @@
 import { AgentModeService } from '../services/agentModeService';
+import { getSecret } from '../utils/secretsManager';
 
 // Mock the dependencies
 jest.mock('../services/db', () => ({
@@ -56,6 +57,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     process.env.AWS_REGION = 'us-west-2';
     process.env.AWS_ACCESS_KEY_ID = 'test-key';
     process.env.AWS_SECRET_ACCESS_KEY = 'test-secret';
+    // Bearer-token models (Opus 4.8) read the Bedrock API key from Secrets Manager.
+    (getSecret as jest.Mock).mockResolvedValue('ABSK-test-bearer-token');
   });
 
   afterEach(() => {
@@ -90,44 +93,24 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(models).not.toContain('anthropic.claude-opus-4-6-v1');
     });
 
-    it('should include Claude Opus 4.7 in the supported models for admins', async () => {
-      const models = await agentModeService.getSupportedModels(true);
-      expect(models).toContain('anthropic.claude-opus-4-7');
-    });
-
-    it('should NOT include Claude Opus 4.7 in the supported models for non-admins', async () => {
-      const models = await agentModeService.getSupportedModels(false);
-      expect(models).not.toContain('anthropic.claude-opus-4-7');
-    });
-
-    it('should NOT include Claude Opus 4.7 by default (non-admin)', async () => {
-      const models = await agentModeService.getSupportedModels();
-      expect(models).not.toContain('anthropic.claude-opus-4-7');
-    });
-
-    it('should have null client initially for Opus 4.7 (lazy-loaded)', () => {
-      const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['anthropic.claude-opus-4-7'].client).toBeNull();
-    });
-
     it('should include Claude Opus 4.8 in the supported models for admins', async () => {
       const models = await agentModeService.getSupportedModels(true);
-      expect(models).toContain('claude-opus-4-8');
+      expect(models).toContain('anthropic.claude-opus-4-8');
     });
 
     it('should include Claude Opus 4.8 in the supported models for non-admins', async () => {
       const models = await agentModeService.getSupportedModels(false);
-      expect(models).toContain('claude-opus-4-8');
+      expect(models).toContain('anthropic.claude-opus-4-8');
     });
 
     it('should include Claude Opus 4.8 by default', async () => {
       const models = await agentModeService.getSupportedModels();
-      expect(models).toContain('claude-opus-4-8');
+      expect(models).toContain('anthropic.claude-opus-4-8');
     });
 
     it('should have null client initially for Opus 4.8 (lazy-loaded)', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['claude-opus-4-8'].client).toBeNull();
+      expect(llmModels['anthropic.claude-opus-4-8'].client).toBeNull();
     });
 
     it('should have temperature support enabled for Sonnet 4.5', async () => {
@@ -414,21 +397,6 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['anthropic.claude-opus-4-6-v1'].client).not.toBeNull();
     });
 
-    it('should lazy-load Bedrock client for Opus 4.7 on first callLLM', async () => {
-      const messages = [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: 'Hello' },
-      ];
-
-      await (agentModeService as any).callLLM(
-        'anthropic.claude-opus-4-7',
-        messages
-      );
-
-      const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['anthropic.claude-opus-4-7'].client).not.toBeNull();
-    });
-
   });
 
   describe('Gemini client lazy-loading', () => {
@@ -502,27 +470,31 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     });
   });
 
-  describe('Vertex AI client lazy-loading', () => {
-    it('should lazy-load Vertex client for claude-opus-4-8 on first callLLM', async () => {
+  describe('Bedrock client lazy-loading (Opus 4.8)', () => {
+    it('should lazy-load the Bedrock client for anthropic.claude-opus-4-8 on first callLLM', async () => {
+      // Opus 4.8 runs on Bedrock (separate account, bearer-token auth) despite its
+      // bare "claude-" id, so it must route to getBedrockClient, not Vertex.
       const mockCreate = jest.fn().mockResolvedValue({
         choices: [{ message: { role: 'assistant', content: 'Hi!', tool_calls: undefined }, finish_reason: 'stop' }],
         usage: { prompt_tokens: 9, completion_tokens: 13, total_tokens: 22 },
       });
-      const mockVertexClient = { chat: { completions: { create: mockCreate } } };
+      const mockBedrockClient = { chat: { completions: { create: mockCreate } } };
 
-      jest.spyOn(agentModeService as any, 'getVertexClient').mockResolvedValue(mockVertexClient);
+      jest.spyOn(agentModeService as any, 'getBedrockClient').mockResolvedValue(mockBedrockClient);
+      const vertexSpy = jest.spyOn(agentModeService as any, 'getVertexClient');
 
       const messages = [
         { role: 'system', content: 'You are a helpful assistant.' },
         { role: 'user', content: 'Hello' },
       ];
 
-      await (agentModeService as any).callLLM('claude-opus-4-8', messages);
+      await (agentModeService as any).callLLM('anthropic.claude-opus-4-8', messages);
 
-      expect((agentModeService as any).getVertexClient).toHaveBeenCalled();
+      expect((agentModeService as any).getBedrockClient).toHaveBeenCalledWith('anthropic.claude-opus-4-8');
+      expect(vertexSpy).not.toHaveBeenCalled();
 
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['claude-opus-4-8'].client).toBe(mockVertexClient);
+      expect(llmModels['anthropic.claude-opus-4-8'].client).toBe(mockBedrockClient);
     });
   });
 
@@ -576,21 +548,6 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(ConverseCommand).toHaveBeenCalledWith(
         expect.objectContaining({
           modelId: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
-        })
-      );
-    });
-
-    it('should map Opus 4.7 to its inference profile ARN', async () => {
-      const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
-
-      await (agentModeService as any).callLLM(
-        'anthropic.claude-opus-4-7',
-        [{ role: 'system', content: 'Test' }, { role: 'user', content: 'Hello' }]
-      );
-
-      expect(ConverseCommand).toHaveBeenCalledWith(
-        expect.objectContaining({
-          modelId: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-7',
         })
       );
     });

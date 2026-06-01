@@ -188,6 +188,10 @@ const DIAGNOSIS_TIMEOUT_MS = 10_000;
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'avif', 'heic', 'heif']);
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wmv', 'm4v', 'ogv', '3gp', 'ts']);
 
+// Models served from the separate Bedrock account (231030591963) reached via a
+// long-term API key (bearer token) rather than the app's default SigV4 creds.
+const BEARER_TOKEN_MODELS = new Set(['anthropic.claude-opus-4-8']);
+
 // Context passed to the diagnosis agent when the main agent fails
 export interface DiagnosisContext {
   errorType: 'transient' | 'context_limit' | 'content_filter' | 'rate_limit' | 'unknown';
@@ -897,7 +901,7 @@ export class AgentModeService {
    * model without affecting chat. Falls back to a known vision-capable model.
    */
   async getVisionModel(): Promise<string> {
-    const fallbackModel = this.llmModels['claude-opus-4-8'] ? 'claude-opus-4-8' : this.default_model;
+    const fallbackModel = this.llmModels['anthropic.claude-opus-4-8'] ? 'anthropic.claude-opus-4-8' : this.default_model;
     try {
       const setting = await settingsService.getSetting(this.visionModelSettingName);
       const configuredModel = setting?.settingValue?.trim();
@@ -1198,17 +1202,44 @@ export class AgentModeService {
 
     const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
     const BEDROCK_REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes per request
-    const bedrockClient = new BedrockRuntimeClient({
-      region,
-      credentials: process.env.AWS_ACCESS_KEY_ID ? {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
-      } : undefined,
-      requestHandler: {
-        connectionTimeout: 10_000, // 10s to establish connection
-        requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS,
-      } as any,
-    });
+
+    // Opus 4.8 is served from a separate AWS account (231030591963) that the app's
+    // default IAM credentials (992382574572) cannot reach. Authenticate that model
+    // with a long-term Bedrock API key (bearer token) instead of SigV4, scoped to a
+    // dedicated client so all other models keep using the default credential chain.
+    const usesBearerToken = BEARER_TOKEN_MODELS.has(modelId);
+    let bedrockClient: any;
+    if (usesBearerToken) {
+      const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+      const bearerToken = (await getSecret(`${environment}/AgentWeb/Bedrock/ApiKey`)).trim();
+      bedrockClient = new BedrockRuntimeClient({
+        region,
+        token: { token: bearerToken },
+        authSchemePreference: ['httpBearerAuth'],
+        requestHandler: {
+          connectionTimeout: 10_000,
+          requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS,
+        } as any,
+      });
+    } else {
+      // Pin SigV4 explicitly. If AWS_BEARER_TOKEN_BEDROCK is present in the
+      // environment (e.g. cloud-dev boxes set it for the Claude Code CLI), the
+      // SDK would otherwise default to bearer-first auth and send that token —
+      // scoped to the Opus 4.8 account (231030591963) — for every Bedrock call,
+      // 403ing models like Sonnet/Opus 4.6 that live in the default account.
+      bedrockClient = new BedrockRuntimeClient({
+        region,
+        authSchemePreference: ['sigv4'],
+        credentials: process.env.AWS_ACCESS_KEY_ID ? {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
+        } : undefined,
+        requestHandler: {
+          connectionTimeout: 10_000, // 10s to establish connection
+          requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS,
+        } as any,
+      });
+    }
 
     // Map certain model IDs to their corresponding inference profile ARNs
     // Note: Newer Claude models require using inference profiles for cross-region access
@@ -1216,10 +1247,8 @@ export class AgentModeService {
       'anthropic.claude-sonnet-4-5-20250929-v1:0': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
       'anthropic.claude-sonnet-4-6': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
       'anthropic.claude-opus-4-6-v1': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
-      // NOTE: claude-opus-4-7 is registered but NOT available on this Bedrock account as of 2026-04-21.
-      // Kept in registry because: (1) admin-only so no user-facing risk, (2) may become available later.
-      // If a user hits it today they get a 400 from Bedrock which is now correctly handled by httpStatus check.
-      'anthropic.claude-opus-4-7': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-7',
+      // Opus 4.8 lives in account 231030591963 (reached via bearer token above).
+      'anthropic.claude-opus-4-8': 'us.anthropic.claude-opus-4-8',
     };
     const actualModelId = inferenceProfileMap[modelId] || modelId;
 
@@ -1686,12 +1715,9 @@ export class AgentModeService {
     'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
     'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true, supportsVision: true },
     'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true, adminOnly: true, supportsVision: true },
-    // NOTE: not available on this Bedrock account as of 2026-04-21 (admin-only, kept for future availability).
-    // Vision capable, but omitted from vision options until provisioned (selecting it returns 403). Add supportsVision: true when enabled.
-    'anthropic.claude-opus-4-7': { client: null, supportsTemperature: true, adminOnly: true },
-    // Claude Opus 4.8 via Google Vertex AI — available to all users
-    // temperature is deprecated for this model on Vertex AI
-    'claude-opus-4-8': { client: null, supportsTemperature: false, supportsVision: true },
+    // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
+    // temperature is deprecated for this model
+    'anthropic.claude-opus-4-8': { client: null, supportsTemperature: false, supportsVision: true },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
@@ -1705,7 +1731,7 @@ export class AgentModeService {
   }
 
   async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
-    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || !this.llmModels[m].adminOnly));
+    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || (!this.llmModels[m].adminOnly && !m.includes('opus'))));
   }
   /**
    * Make an LLM call with the specified model and parameters
@@ -1850,7 +1876,7 @@ export class AgentModeService {
       'anthropic.claude-sonnet-4-5-20250929-v1:0': [3, 15],
       'anthropic.claude-sonnet-4-6': [3, 15],
       'anthropic.claude-opus-4-6-v1': [15, 75],
-      'claude-opus-4-8': [15, 75],
+      'anthropic.claude-opus-4-8': [15, 75],
       'gpt-5-chat-2': [2.5, 10],
       'gpt-5.2-chat': [3, 12],
       'gemini-3-pro-preview': [1.25, 10],

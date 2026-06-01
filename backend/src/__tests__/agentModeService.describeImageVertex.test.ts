@@ -54,7 +54,7 @@ describe('describeImage — Vertex Claude (claude-*) image download', () => {
       .spyOn(service, 'callLLM')
       .mockResolvedValue({ choices: [{ message: { content: 'a chart' } }] } as any);
 
-    const result = await service.describeImage('claude-opus-4-8', 'https://example.com/chart.png');
+    const result = await service.describeImage('anthropic.claude-opus-4-8', 'https://example.com/chart.png');
 
     expect(result.success).toBe(true);
     expect(result.description).toBe('a chart');
@@ -76,7 +76,7 @@ describe('describeImage — Vertex Claude (claude-*) image download', () => {
       .spyOn(service, 'callLLM')
       .mockResolvedValue({ choices: [{ message: { content: 'ok' } }] } as any);
 
-    const result = await service.describeImage('claude-opus-4-8', dataUri);
+    const result = await service.describeImage('anthropic.claude-opus-4-8', dataUri);
 
     expect(result.success).toBe(true);
     expect(mockAxiosGet).not.toHaveBeenCalled();
@@ -86,7 +86,7 @@ describe('describeImage — Vertex Claude (claude-*) image download', () => {
   });
 
   it('returns a friendly error when no image URL is provided', async () => {
-    const result = await service.describeImage('claude-opus-4-8', '');
+    const result = await service.describeImage('anthropic.claude-opus-4-8', '');
     expect(result.success).toBe(false);
     expect(result.message).toMatch(/No image URL/i);
   });
