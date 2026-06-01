@@ -66,6 +66,7 @@ jest.mock("../services/db", () => ({
 const mockListDomainsForPages = jest.fn();
 jest.mock("../services/customDomainService", () => ({
   listDomains: (...args: any[]) => mockListDomainsForPages(...args),
+  SUBDOMAIN_BASE: "agentwebforms.com",
 }));
 
 // Mock the v0Service module (service-level mock for route tests)
@@ -565,7 +566,7 @@ describe("GET /api/landing-pages/v0/generated", () => {
 
   it("FAIL: page with vercelProjectId but no customDomainUrl → enriched from AW-CustomDomains", async () => {
     mockGetLandingPagesByOwner.mockResolvedValueOnce([
-      { id: "page-1", name: "Page 1", vercelProjectId: "proj-1", status: "deployed" },
+      { id: "page-1", name: "Page 1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed" },
     ]);
     mockListDomainsForPages.mockResolvedValueOnce([
       { id: "dom-1", domain: "mysite.agentwebforms.com", vercelProjectId: "proj-1", status: "active", updatedAt: "2026-01-02T00:00:00Z" },
@@ -579,11 +580,11 @@ describe("GET /api/landing-pages/v0/generated", () => {
 
   it("FAIL: multiple domains for same project → uses most recent one", async () => {
     mockGetLandingPagesByOwner.mockResolvedValueOnce([
-      { id: "page-1", name: "Page 1", vercelProjectId: "proj-1", status: "deployed" },
+      { id: "page-1", name: "Page 1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed" },
     ]);
     mockListDomainsForPages.mockResolvedValueOnce([
-      { id: "dom-1", domain: "old.agentwebforms.com", vercelProjectId: "proj-1", status: "active", updatedAt: "2026-01-01T00:00:00Z" },
-      { id: "dom-2", domain: "new.agentwebforms.com", vercelProjectId: "proj-1", status: "active", updatedAt: "2026-01-02T00:00:00Z" },
+      { id: "dom-1", domain: "old.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", status: "active", updatedAt: "2026-01-01T00:00:00Z" },
+      { id: "dom-2", domain: "new.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", status: "active", updatedAt: "2026-01-02T00:00:00Z" },
     ]);
 
     const res = await request(app).get("/api/landing-pages/v0/generated");
@@ -592,12 +593,12 @@ describe("GET /api/landing-pages/v0/generated", () => {
     expect(res.body.pages[0].customDomainUrl).toBe("https://new.agentwebforms.com");
   });
 
-  it("FAIL: page already has customDomainUrl → not overwritten by domain lookup", async () => {
+  it("FAIL: stored customDomainUrl matching the attached domain → kept as-is", async () => {
     mockGetLandingPagesByOwner.mockResolvedValueOnce([
-      { id: "page-1", name: "Page 1", vercelProjectId: "proj-1", customDomainUrl: "https://existing.agentwebforms.com", status: "deployed" },
+      { id: "page-1", name: "Page 1", userId: "test-user-id", vercelProjectId: "proj-1", customDomainUrl: "https://existing.agentwebforms.com", status: "deployed" },
     ]);
     mockListDomainsForPages.mockResolvedValueOnce([
-      { id: "dom-1", domain: "other.agentwebforms.com", vercelProjectId: "proj-1", status: "active", updatedAt: "2026-01-02T00:00:00Z" },
+      { id: "dom-1", domain: "existing.agentwebforms.com", vercelProjectId: "proj-1", status: "active", updatedAt: "2026-01-02T00:00:00Z" },
     ]);
 
     const res = await request(app).get("/api/landing-pages/v0/generated");
@@ -606,9 +607,69 @@ describe("GET /api/landing-pages/v0/generated", () => {
     expect(res.body.pages[0].customDomainUrl).toBe("https://existing.agentwebforms.com");
   });
 
+  it("FAIL: stored customDomainUrl pointing at a detached host → corrected to the attached domain", async () => {
+    // Reproduces the every.io bug: the page stored an old subdomain that is no
+    // longer attached to the Vercel project (DEPLOYMENT_NOT_FOUND), while
+    // AW-CustomDomains has the current, attached subdomain. The attached domain
+    // is authoritative and must replace the stale stored value.
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([
+      { id: "page-1", name: "Page 1", userId: "test-user-id", vercelProjectId: "proj-1", customDomainUrl: "https://everyio-day-zero-founders.agentwebforms.com", status: "deployed" },
+    ]);
+    mockListDomainsForPages.mockResolvedValueOnce([
+      { id: "dom-1", domain: "everyio.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", status: "active", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    expect(res.body.pages[0].customDomainUrl).toBe("https://everyio.agentwebforms.com");
+  });
+
+  it("FAIL: real custom domain stored → preferred over an agentwebforms subdomain on the same project", async () => {
+    // A page with a verified custom domain (type "custom") must not be rewritten
+    // to an auto-assigned subdomain just because one also exists for the project.
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([
+      { id: "page-1", name: "Page 1", userId: "test-user-id", vercelProjectId: "proj-1", customDomainUrl: "https://hireemma.ai", status: "deployed" },
+    ]);
+    mockListDomainsForPages.mockResolvedValueOnce([
+      { id: "dom-sub", domain: "hireemma-xyz.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", status: "active", updatedAt: "2026-02-01T00:00:00Z" },
+      { id: "dom-cust", domain: "hireemma.ai", vercelProjectId: "proj-1", type: "custom", status: "active", updatedAt: "2026-01-01T00:00:00Z" },
+    ]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    expect(res.body.pages[0].customDomainUrl).toBe("https://hireemma.ai");
+  });
+
+  it("FAIL: org member viewing a shared page → enriched from the page OWNER's domains", async () => {
+    // The caller (member) owns no domains; the shared page's owner does. The
+    // member must see the same attached subdomain the owner sees, not a stale
+    // or blank URL. Lookups are scoped per page owner, not per caller.
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([]); // member owns no pages
+    mockGetLandingPagesByOrg.mockResolvedValueOnce([
+      { id: "page-1", name: "Shared", userId: "owner-id", vercelProjectId: "proj-1", customDomainUrl: "https://stale.agentwebforms.com", status: "deployed" },
+    ]);
+    // Member is in an org with landingPages sharing enabled
+    mockGetUserById.mockResolvedValueOnce({ userId: "test-user-id", orgId: "org-1", orgRole: "member" });
+    mockGetOrgById.mockResolvedValueOnce({ id: "org-1", shareSettings: { landingPages: { enabled: true } } });
+    // listDomains(caller) → none; listDomains(owner) → the attached subdomain
+    mockListDomainsForPages.mockImplementation(async (uid: string) =>
+      uid === "owner-id"
+        ? [{ id: "dom-1", domain: "everyio.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", status: "active", updatedAt: "2026-01-02T00:00:00Z" }]
+        : []
+    );
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    const page = res.body.pages.find((p: any) => p.id === "page-1");
+    expect(page.customDomainUrl).toBe("https://everyio.agentwebforms.com");
+  });
+
   it("FAIL: domain lookup fails → still returns pages without crash", async () => {
     mockGetLandingPagesByOwner.mockResolvedValueOnce([
-      { id: "page-1", name: "Page 1", vercelProjectId: "proj-1", status: "deployed" },
+      { id: "page-1", name: "Page 1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed" },
     ]);
     mockListDomainsForPages.mockRejectedValueOnce(new Error("DynamoDB error"));
 
@@ -621,7 +682,7 @@ describe("GET /api/landing-pages/v0/generated", () => {
 
   it("FAIL: page with no vercelProjectId → customDomainUrl not populated", async () => {
     mockGetLandingPagesByOwner.mockResolvedValueOnce([
-      { id: "page-1", name: "Page 1", status: "draft" },
+      { id: "page-1", name: "Page 1", userId: "test-user-id", status: "draft" },
     ]);
     mockListDomainsForPages.mockResolvedValueOnce([
       { id: "dom-1", domain: "mysite.agentwebforms.com", vercelProjectId: "proj-1", status: "active", updatedAt: "2026-01-02T00:00:00Z" },
@@ -635,7 +696,7 @@ describe("GET /api/landing-pages/v0/generated", () => {
 
   it("FAIL: sub-page with slug enriched from AW-CustomDomains → customDomainUrl includes /{slug}", async () => {
     mockGetLandingPagesByOwner.mockResolvedValueOnce([
-      { id: "page-sub", name: "Pricing", vercelProjectId: "proj-1", slug: "pricing-page", status: "deployed" },
+      { id: "page-sub", name: "Pricing", userId: "test-user-id", vercelProjectId: "proj-1", slug: "pricing-page", status: "deployed" },
     ]);
     mockListDomainsForPages.mockResolvedValueOnce([
       { id: "dom-1", domain: "mysite.agentwebforms.com", vercelProjectId: "proj-1", status: "active", updatedAt: "2026-01-02T00:00:00Z" },
