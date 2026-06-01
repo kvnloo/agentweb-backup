@@ -16,11 +16,19 @@ jest.mock('../services/googleAdsService', () => ({
     listAdGroups: jest.fn().mockResolvedValue([]),
     createAdGroup: jest.fn().mockResolvedValue({ resourceName: 'customers/123/adGroups/1' }),
     updateAdGroup: jest.fn().mockResolvedValue(undefined),
+    listKeywords: jest.fn().mockResolvedValue([
+      { resourceName: 'customers/123/adGroupCriteria/789~1', text: 'running shoes', matchType: 'BROAD', status: 'ENABLED', negative: false },
+    ]),
+    updateKeyword: jest.fn().mockResolvedValue(undefined),
+    removeKeyword: jest.fn().mockResolvedValue(undefined),
     listAds: jest.fn().mockResolvedValue([
       { id: '1', adGroup: 'customers/123/adGroups/1', type: 'RESPONSIVE_SEARCH_AD', status: 'PAUSED' },
     ]),
+    updateAd: jest.fn().mockResolvedValue(undefined),
+    removeAd: jest.fn().mockResolvedValue(undefined),
     createAd: jest.fn().mockResolvedValue({ resourceName: 'customers/123/adGroupAds/1' }),
     uploadAsset: jest.fn().mockResolvedValue('customers/123/assets/1'),
+    attachCampaignAssets: jest.fn().mockResolvedValue(undefined),
     createAssetGroup: jest.fn().mockResolvedValue({ resourceName: 'customers/123/assetGroups/1' }),
     queryReporting: jest.fn().mockResolvedValue([
       { campaign: { id: '1' }, metrics: { clicks: '100' } },
@@ -366,5 +374,143 @@ describe('handleCallGoogleAdsReportingApi', () => {
     });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/query/i);
+  });
+});
+
+describe('handleCallGoogleAdsApi — KEYWORD actions', () => {
+  it('handles KEYWORD LIST action', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'KEYWORD',
+      action: 'LIST',
+      ad_group_resource_name: 'customers/123/adGroups/789',
+    });
+    expect(result.success).toBe(true);
+    expect(result.keywords).toBeDefined();
+    expect(result.keywords).toHaveLength(1);
+  });
+
+  it('returns error for KEYWORD LIST without ad_group_resource_name', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'KEYWORD',
+      action: 'LIST',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('handles KEYWORD UPDATE action', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'KEYWORD',
+      action: 'UPDATE',
+      criterion_resource_name: 'customers/123/adGroupCriteria/789~1',
+      status: 'PAUSED',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('returns error for KEYWORD UPDATE without criterion_resource_name', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'KEYWORD',
+      action: 'UPDATE',
+      status: 'PAUSED',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('handles KEYWORD REMOVE action', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'KEYWORD',
+      action: 'REMOVE',
+      criterion_resource_name: 'customers/123/adGroupCriteria/789~1',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('returns error for KEYWORD REMOVE without criterion_resource_name', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'KEYWORD',
+      action: 'REMOVE',
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('handleCallGoogleAdsApi — AD UPDATE/REMOVE actions', () => {
+  it('handles AD UPDATE action', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'AD',
+      action: 'UPDATE',
+      ad_resource_name: 'customers/123/adGroupAds/1',
+      status: 'PAUSED',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('returns error for AD UPDATE without ad_resource_name', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'AD',
+      action: 'UPDATE',
+      status: 'PAUSED',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('handles AD REMOVE action', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'AD',
+      action: 'REMOVE',
+      ad_resource_name: 'customers/123/adGroupAds/1',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('returns error for AD REMOVE without ad_resource_name', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'AD',
+      action: 'REMOVE',
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('handleCallGoogleAdsApi — CAMPAIGN_ASSET ATTACH', () => {
+  it('handles CAMPAIGN_ASSET ATTACH action', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN_ASSET',
+      action: 'ATTACH',
+      campaign_resource_name: 'customers/123/campaigns/1',
+      assets: [{ fieldType: 'BUSINESS_NAME', text: 'My Brand' }],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('returns error for CAMPAIGN_ASSET ATTACH without campaign_resource_name', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN_ASSET',
+      action: 'ATTACH',
+      assets: [{ fieldType: 'BUSINESS_NAME', text: 'My Brand' }],
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('returns error for CAMPAIGN_ASSET ATTACH without assets', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN_ASSET',
+      action: 'ATTACH',
+      campaign_resource_name: 'customers/123/campaigns/1',
+    });
+    expect(result.success).toBe(false);
   });
 });

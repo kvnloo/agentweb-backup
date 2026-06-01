@@ -23089,7 +23089,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   public async handleCallGoogleAdsApi(userId: string, args: {
     customer_id: string;
-    entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'ASSET_GROUP' | 'LOCATION';
+    entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION';
     action: string;
     [key: string]: any;
   }): Promise<any> {
@@ -23134,6 +23134,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             biddingStrategyTarget: args.bidding_strategy_target,
             locationTargetIds: args.location_target_ids || [],
             status: args.status || 'PAUSED',
+            brandBusinessName: args.brand_business_name,
+            brandLogoAssetResourceName: args.brand_logo_asset_resource_name,
           });
           return { success: true, campaignResourceName: campaign.resourceName };
         }
@@ -23142,6 +23144,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
             name: args.name,
             status: args.status,
+            biddingStrategy: args.bidding_strategy,
+            biddingStrategyTarget: args.bidding_strategy_target,
+            budgetResourceName: args.budget_resource_name,
           });
           return { success: true, message: 'Campaign updated' };
         }
@@ -23149,8 +23154,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       if (entity_type === 'BUDGET' && action === 'CREATE') {
         if (!args.name || args.amount_micros === undefined) return { success: false, error: 'name and amount_micros are required to create a budget' };
-        const budget = await googleAdsService.createBudget(userId, customer_id, { name: args.name, amountMicros: args.amount_micros });
+        const budget = await googleAdsService.createBudget(userId, customer_id, { name: args.name, amountMicros: args.amount_micros, explicitlyShared: args.explicitly_shared });
         return { success: true, budgetResourceName: budget.resourceName };
+      }
+      if (entity_type === 'BUDGET' && action === 'UPDATE') {
+        if (!args.budget_resource_name || args.amount_micros === undefined) return { success: false, error: 'budget_resource_name and amount_micros are required for BUDGET UPDATE' };
+        await googleAdsService.updateBudget(userId, customer_id, args.budget_resource_name, args.amount_micros);
+        return { success: true, message: 'Budget updated' };
       }
       if (entity_type === 'BUDGET' && action === 'REMOVE') {
         if (!args.budget_resource_name) return { success: false, error: 'budget_resource_name is required for BUDGET REMOVE. Note: budget must not be attached to any campaign (reference_count must be 0).' };
@@ -23180,6 +23190,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             name: args.name,
             status: args.status,
             cpcBidMicros: args.cpc_bid_micros,
+            adRotationMode: args.ad_rotation_mode,
+            targetCpaMicros: args.target_cpa_micros,
+            targetRoas: args.target_roas,
           });
           return { success: true, message: 'Ad group updated' };
         }
@@ -23191,6 +23204,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
 
       if (entity_type === 'KEYWORD') {
+        if (action === 'LIST') {
+          if (!args.ad_group_resource_name) return { success: false, error: 'ad_group_resource_name is required for KEYWORD LIST' };
+          const keywords = await googleAdsService.listKeywords(userId, customer_id, args.ad_group_resource_name);
+          return { success: true, keywords };
+        }
         if (action === 'ADD') {
           if (!args.ad_group_resource_name || !args.keywords) return { success: false, error: 'ad_group_resource_name and keywords array are required' };
           await googleAdsService.addKeywords(userId, customer_id, args.ad_group_resource_name, args.keywords);
@@ -23205,6 +23223,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             adGroupResourceName: args.ad_group_resource_name,
           }, args.keywords);
           return { success: true, message: `Added ${args.keywords.length} negative keyword(s)` };
+        }
+        if (action === 'UPDATE') {
+          if (!args.criterion_resource_name) return { success: false, error: 'criterion_resource_name is required for KEYWORD UPDATE' };
+          await googleAdsService.updateKeyword(userId, customer_id, args.criterion_resource_name, {
+            status: args.status,
+            cpcBidMicros: args.cpc_bid_micros,
+          });
+          return { success: true, message: 'Keyword updated' };
+        }
+        if (action === 'REMOVE') {
+          if (!args.criterion_resource_name) return { success: false, error: 'criterion_resource_name is required for KEYWORD REMOVE' };
+          await googleAdsService.removeKeyword(userId, customer_id, args.criterion_resource_name);
+          return { success: true, message: 'Keyword removed' };
         }
       }
 
@@ -23234,6 +23265,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           });
           return { success: true, adResourceName: ad.resourceName };
         }
+        if (action === 'UPDATE') {
+          if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD UPDATE' };
+          await googleAdsService.updateAd(userId, customer_id, args.ad_resource_name, {
+            status: args.status,
+          });
+          return { success: true, message: 'Ad updated' };
+        }
+        if (action === 'REMOVE') {
+          if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD REMOVE' };
+          await googleAdsService.removeAd(userId, customer_id, args.ad_resource_name);
+          return { success: true, message: 'Ad removed' };
+        }
+      }
+
+      if (entity_type === 'CAMPAIGN_ASSET' && action === 'ATTACH') {
+        if (!args.campaign_resource_name || !args.assets) return { success: false, error: 'campaign_resource_name and assets array are required for CAMPAIGN_ASSET ATTACH' };
+        await googleAdsService.attachCampaignAssets(userId, customer_id, args.campaign_resource_name, args.assets);
+        return { success: true, message: `Attached ${args.assets.length} asset(s) to campaign` };
       }
 
       if (entity_type === 'ASSET' && action === 'UPLOAD') {
@@ -23272,7 +23321,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true };
       console.error('[AgentMode] handleCallGoogleAdsApi error:', error);
       const gadsErrors: any[] = error?.response?.data?.error?.details?.[0]?.errors || [];
-      const gadsError = gadsErrors.length ? gadsErrors.map((e: any) => e.message).join('; ') : undefined;
+      const gadsError = gadsErrors.length
+        ? gadsErrors.map((e: any) => {
+            const code = Object.values(e.errorCode || {})[0];
+            return code ? `${code}: ${e.message}` : e.message;
+          }).join('; ')
+        : undefined;
       return { success: false, error: gadsError || error.message || 'Unknown error' };
     }
   }

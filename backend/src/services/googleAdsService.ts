@@ -63,6 +63,10 @@ export class GoogleAdsService {
     return this.callApi('POST', `/customers/${customerId}/${resource}:mutate`, accessToken, { operations });
   }
 
+  async batchMutate(customerId: string, accessToken: string, mutateOperations: any[]): Promise<any> {
+    return this.callApi('POST', `/customers/${customerId}/googleAds:mutate`, accessToken, { mutateOperations });
+  }
+
   makeAuthError(message: string): Error {
     const err = new Error(message);
     (err as any).isGoogleAdsAuthError = true;
@@ -174,6 +178,7 @@ export class GoogleAdsService {
   async createBudget(userId: string, customerId: string, params: {
     name: string;
     amountMicros: number;
+    explicitlyShared?: boolean;
   }): Promise<{ resourceName: string }> {
     const { accessToken } = await this.getAccountCredentials(userId, customerId);
     const data = await this.mutate(customerId, accessToken, 'campaignBudgets', [{
@@ -181,9 +186,18 @@ export class GoogleAdsService {
         name: params.name,
         amountMicros: String(params.amountMicros),
         deliveryMethod: 'STANDARD',
+        explicitlyShared: params.explicitlyShared ?? false,
       },
     }]);
     return { resourceName: data.results[0].resourceName };
+  }
+
+  async updateBudget(userId: string, customerId: string, budgetResourceName: string, amountMicros: number): Promise<void> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'campaignBudgets', [{
+      update: { resourceName: budgetResourceName, amountMicros: String(amountMicros) },
+      updateMask: 'amount_micros',
+    }]);
   }
 
   async removeBudget(userId: string, customerId: string, budgetResourceName: string): Promise<void> {
@@ -215,6 +229,8 @@ export class GoogleAdsService {
     biddingStrategyTarget?: number;
     locationTargetIds: number[];
     status?: 'ENABLED' | 'PAUSED';
+    brandBusinessName?: string;
+    brandLogoAssetResourceName?: string;
   }): Promise<{ resourceName: string }> {
     const { accessToken } = await this.getAccountCredentials(userId, customerId);
 
@@ -235,18 +251,60 @@ export class GoogleAdsService {
     };
     else if (params.biddingStrategy === 'MANUAL_CPC') biddingField.manualCpc = { enhancedCpcEnabled: false };
 
-    const data = await this.mutate(customerId, accessToken, 'campaigns', [{
-      create: {
-        name: params.name,
-        advertisingChannelType: params.type,
-        campaignBudget: params.budgetResourceName,
-        status: params.status || 'PAUSED',
-        containsEuPoliticalAdvertising: 'DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING',
-        ...biddingField,
-      },
-    }]);
+    const campaignCreate = {
+      name: params.name,
+      advertisingChannelType: params.type,
+      campaignBudget: params.budgetResourceName,
+      status: params.status || 'PAUSED',
+      containsEuPoliticalAdvertising: 'DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING',
+      ...biddingField,
+    };
 
-    const campaignResourceName = data.results[0].resourceName;
+    let campaignResourceName: string;
+
+    if (params.type === 'PERFORMANCE_MAX' && (params.brandBusinessName || params.brandLogoAssetResourceName)) {
+      const tempCampaignName = `customers/${customerId}/campaigns/-1`;
+      const mutateOps: any[] = [];
+      let textAssetIndex = -1;
+
+      if (params.brandBusinessName) {
+        textAssetIndex = mutateOps.length;
+        mutateOps.push({
+          assetOperation: {
+            create: {
+              resourceName: `customers/${customerId}/assets/-2`,
+              name: params.brandBusinessName.substring(0, 50),
+              type: 'TEXT',
+              textAsset: { text: params.brandBusinessName },
+            },
+          },
+        });
+      }
+
+      mutateOps.push({ campaignOperation: { create: { resourceName: tempCampaignName, ...campaignCreate } } });
+
+      if (params.brandBusinessName) {
+        mutateOps.push({
+          campaignAssetOperation: {
+            create: { campaign: tempCampaignName, asset: `customers/${customerId}/assets/-2`, fieldType: 'BUSINESS_NAME' },
+          },
+        });
+      }
+      if (params.brandLogoAssetResourceName) {
+        mutateOps.push({
+          campaignAssetOperation: {
+            create: { campaign: tempCampaignName, asset: params.brandLogoAssetResourceName, fieldType: 'LOGO' },
+          },
+        });
+      }
+
+      const batchResult = await this.batchMutate(customerId, accessToken, mutateOps);
+      const campaignOpIndex = params.brandBusinessName ? 1 : 0;
+      campaignResourceName = batchResult.mutateOperationResponses[campaignOpIndex].campaignResult.resourceName;
+    } else {
+      const data = await this.mutate(customerId, accessToken, 'campaigns', [{ create: campaignCreate }]);
+      campaignResourceName = data.results[0].resourceName;
+    }
 
     if (params.locationTargetIds.length > 0) {
       await this.mutate(customerId, accessToken, 'campaignCriteria', params.locationTargetIds.map(id => ({
@@ -263,13 +321,35 @@ export class GoogleAdsService {
   async updateCampaign(userId: string, customerId: string, campaignResourceName: string, params: {
     name?: string;
     status?: 'ENABLED' | 'PAUSED';
+    biddingStrategy?: string;
+    biddingStrategyTarget?: number;
+    budgetResourceName?: string;
   }): Promise<void> {
     const { accessToken } = await this.getAccountCredentials(userId, customerId);
     const updateMask: string[] = [];
     const update: any = { resourceName: campaignResourceName };
     if (params.name) { update.name = params.name; updateMask.push('name'); }
     if (params.status) { update.status = params.status; updateMask.push('status'); }
-    if (updateMask.length === 0) return; // nothing to update — avoid no-op API call
+    if (params.budgetResourceName) { update.campaignBudget = params.budgetResourceName; updateMask.push('campaign_budget'); }
+    if (params.biddingStrategy) {
+      if (params.biddingStrategy === 'MAXIMIZE_CONVERSIONS') {
+        update.maximizeConversions = { targetCpaMicros: '0' };
+        updateMask.push('maximize_conversions.target_cpa_micros');
+      } else if (params.biddingStrategy === 'MAXIMIZE_CONVERSION_VALUE') {
+        update.maximizeConversionValue = { targetRoas: 0 };
+        updateMask.push('maximize_conversion_value.target_roas');
+      } else if (params.biddingStrategy === 'TARGET_CPA') {
+        update.targetCpa = { targetCpaMicros: String(Math.round((params.biddingStrategyTarget || 0) * 1_000_000)) };
+        updateMask.push('target_cpa.target_cpa_micros');
+      } else if (params.biddingStrategy === 'TARGET_ROAS') {
+        update.targetRoas = { targetRoas: params.biddingStrategyTarget || 1 };
+        updateMask.push('target_roas.target_roas');
+      } else if (params.biddingStrategy === 'MANUAL_CPC') {
+        update.manualCpc = { enhancedCpcEnabled: false };
+        updateMask.push('manual_cpc.enhanced_cpc_enabled');
+      }
+    }
+    if (updateMask.length === 0) return;
     await this.mutate(customerId, accessToken, 'campaigns', [{ update, updateMask: updateMask.join(',') }]);
   }
 
@@ -352,6 +432,9 @@ export class GoogleAdsService {
     name?: string;
     status?: 'ENABLED' | 'PAUSED';
     cpcBidMicros?: number;
+    adRotationMode?: 'OPTIMIZE' | 'ROTATE_FOREVER';
+    targetCpaMicros?: number;
+    targetRoas?: number;
   }): Promise<void> {
     const { accessToken } = await this.getAccountCredentials(userId, customerId);
     const updateMask: string[] = [];
@@ -359,6 +442,9 @@ export class GoogleAdsService {
     if (params.name) { update.name = params.name; updateMask.push('name'); }
     if (params.status) { update.status = params.status; updateMask.push('status'); }
     if (params.cpcBidMicros !== undefined) { update.cpcBidMicros = String(params.cpcBidMicros); updateMask.push('cpc_bid_micros'); }
+    if (params.adRotationMode) { update.adRotationMode = params.adRotationMode; updateMask.push('ad_rotation_mode'); }
+    if (params.targetCpaMicros !== undefined) { update.targetCpaMicros = String(params.targetCpaMicros); updateMask.push('target_cpa_micros'); }
+    if (params.targetRoas !== undefined) { update.targetRoas = params.targetRoas; updateMask.push('target_roas'); }
     if (updateMask.length === 0) return;
     await this.mutate(customerId, accessToken, 'adGroups', [{ update, updateMask: updateMask.join(',') }]);
   }
@@ -411,18 +497,52 @@ export class GoogleAdsService {
     }
   }
 
+  async listKeywords(userId: string, customerId: string, adGroupResourceName: string): Promise<any[]> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const query = `SELECT ad_group_criterion.resource_name, ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, ad_group_criterion.status, ad_group_criterion.negative FROM ad_group_criterion WHERE ad_group_criterion.ad_group = '${adGroupResourceName}' AND ad_group_criterion.type = 'KEYWORD'`;
+    const results = await this.search(customerId, accessToken, query);
+    return results.map((r: any) => ({
+      resourceName: r.adGroupCriterion.resourceName,
+      text: r.adGroupCriterion.keyword?.text,
+      matchType: r.adGroupCriterion.keyword?.matchType,
+      status: r.adGroupCriterion.status,
+      negative: r.adGroupCriterion.negative,
+    }));
+  }
+
+  async updateKeyword(userId: string, customerId: string, criterionResourceName: string, params: {
+    status?: 'ENABLED' | 'PAUSED';
+    cpcBidMicros?: number;
+  }): Promise<void> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const updateMask: string[] = [];
+    const update: any = { resourceName: criterionResourceName };
+    if (params.status) { update.status = params.status; updateMask.push('status'); }
+    if (params.cpcBidMicros !== undefined) { update.cpcBidMicros = String(params.cpcBidMicros); updateMask.push('cpc_bid_micros'); }
+    if (updateMask.length === 0) return;
+    await this.mutate(customerId, accessToken, 'adGroupCriteria', [{ update, updateMask: updateMask.join(',') }]);
+  }
+
+  async removeKeyword(userId: string, customerId: string, criterionResourceName: string): Promise<void> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'adGroupCriteria', [{ remove: criterionResourceName }]);
+  }
+
   // ── Ads ──────────────────────────────────────────────────────────────────
 
   async listAds(userId: string, customerId: string, adGroupResourceName: string): Promise<any[]> {
     const { accessToken } = await this.getAccountCredentials(userId, customerId);
     const results = await this.search(customerId, accessToken,
-      `SELECT ad_group_ad.resource_name, ad_group_ad.status, ad_group_ad.ad.id, ad_group_ad.ad.type FROM ad_group_ad WHERE ad_group_ad.ad_group = '${adGroupResourceName}'`,
+      `SELECT ad_group_ad.resource_name, ad_group_ad.status, ad_group_ad.ad.id, ad_group_ad.ad.type, ad_group_ad.ad.final_urls, ad_group_ad.ad.responsive_search_ad.headlines, ad_group_ad.ad.responsive_search_ad.descriptions, ad_group_ad.ad.responsive_display_ad.headlines, ad_group_ad.ad.responsive_display_ad.descriptions FROM ad_group_ad WHERE ad_group_ad.ad_group = '${adGroupResourceName}'`,
     );
     return results.map((r: any) => ({
       resourceName: r.adGroupAd.resourceName,
       adId: String(r.adGroupAd.ad.id),
       status: r.adGroupAd.status,
       type: r.adGroupAd.ad.type,
+      finalUrls: r.adGroupAd.ad.finalUrls,
+      headlines: (r.adGroupAd.ad.responsiveSearchAd?.headlines || r.adGroupAd.ad.responsiveDisplayAd?.headlines || []).map((h: any) => h.text),
+      descriptions: (r.adGroupAd.ad.responsiveSearchAd?.descriptions || r.adGroupAd.ad.responsiveDisplayAd?.descriptions || []).map((d: any) => d.text),
     }));
   }
 
@@ -466,6 +586,22 @@ export class GoogleAdsService {
     return { resourceName: data.results[0].resourceName };
   }
 
+  async updateAd(userId: string, customerId: string, adGroupAdResourceName: string, params: {
+    status?: 'ENABLED' | 'PAUSED';
+  }): Promise<void> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const updateMask: string[] = [];
+    const update: any = { resourceName: adGroupAdResourceName };
+    if (params.status) { update.status = params.status; updateMask.push('status'); }
+    if (updateMask.length === 0) return;
+    await this.mutate(customerId, accessToken, 'adGroupAds', [{ update, updateMask: updateMask.join(',') }]);
+  }
+
+  async removeAd(userId: string, customerId: string, adGroupAdResourceName: string): Promise<void> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'adGroupAds', [{ remove: adGroupAdResourceName }]);
+  }
+
   // ── Assets ───────────────────────────────────────────────────────────────
 
   async uploadAsset(userId: string, customerId: string, asset: {
@@ -477,10 +613,17 @@ export class GoogleAdsService {
 
     const assetContent: any = {};
     if (asset.type === 'IMAGE' || asset.type === 'LOGO') {
-      if (typeof asset.data === 'string') {
-        throw new Error('IMAGE/LOGO asset data must be a Buffer, not a string');
+      let imageBuffer: Buffer;
+      if (Buffer.isBuffer(asset.data)) {
+        imageBuffer = asset.data;
+      } else if (typeof asset.data === 'string' && (asset.data.startsWith('http://') || asset.data.startsWith('https://'))) {
+        const axios = require('axios');
+        const response = await axios.get(asset.data, { responseType: 'arraybuffer' });
+        imageBuffer = Buffer.from(response.data);
+      } else {
+        throw new Error('IMAGE/LOGO asset data must be a Buffer or a URL string');
       }
-      assetContent.imageAsset = { data: asset.data.toString('base64') };
+      assetContent.imageAsset = { data: imageBuffer.toString('base64') };
     } else {
       // VIDEO: data is a YouTube video ID string
       if (Buffer.isBuffer(asset.data)) {
@@ -489,10 +632,32 @@ export class GoogleAdsService {
       assetContent.youtubeVideoAsset = { youtubeVideoId: asset.data };
     }
 
+    // LOGO is a fieldType for CampaignAsset, not a valid AssetType — always upload as IMAGE
+    const assetType = asset.type === 'LOGO' ? 'IMAGE' : asset.type === 'VIDEO' ? 'YOUTUBE_VIDEO' : 'IMAGE';
     const data = await this.mutate(customerId, accessToken, 'assets', [{
-      create: { name: asset.name, type: asset.type, ...assetContent },
+      create: { name: asset.name, type: assetType, ...assetContent },
     }]);
     return data.results[0].resourceName;
+  }
+
+  async attachCampaignAssets(userId: string, customerId: string, campaignResourceName: string, assets: {
+    fieldType: 'BUSINESS_NAME' | 'LOGO' | 'SQUARE_MARKETING_IMAGE' | 'MARKETING_IMAGE' | 'HEADLINE' | 'DESCRIPTION';
+    assetResourceName?: string;
+    text?: string;
+  }[]): Promise<void> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const operations: any[] = [];
+    for (const asset of assets) {
+      let assetResourceName = asset.assetResourceName;
+      if (!assetResourceName && asset.text) {
+        const textData = await this.mutate(customerId, accessToken, 'assets', [{
+          create: { name: asset.text.substring(0, 50), type: 'TEXT', textAsset: { text: asset.text } },
+        }]);
+        assetResourceName = textData.results[0].resourceName;
+      }
+      operations.push({ create: { campaign: campaignResourceName, asset: assetResourceName, fieldType: asset.fieldType } });
+    }
+    await this.mutate(customerId, accessToken, 'campaignAssets', operations);
   }
 
   // ── Asset Groups (PMax) ───────────────────────────────────────────────────
@@ -518,40 +683,79 @@ export class GoogleAdsService {
   }): Promise<{ resourceName: string }> {
     const { accessToken } = await this.getAccountCredentials(userId, customerId);
 
-    const assetGroupData = await this.mutate(customerId, accessToken, 'assetGroups', [{
-      create: {
-        name: params.name,
-        campaign: params.campaignResourceName,
-        status: 'ENABLED',
-        finalUrls: [params.finalUrl],
-      },
-    }]);
-    const assetGroupResourceName = assetGroupData.results[0].resourceName;
+    // Build everything as a single batch mutate — order: assets first, then asset group, then links
+    const assetOps: any[] = [];
+    const linkOps: any[] = [];
+    let tempIdx = -2; // -1 reserved for asset group
 
-    const headlineResourceNames = await Promise.all(params.headlines.map(t => this.createTextAsset(customerId, accessToken, t)));
-    const longHeadlineResourceNames = await Promise.all(params.longHeadlines.map(t => this.createTextAsset(customerId, accessToken, t)));
-    const descriptionResourceNames = await Promise.all(params.descriptions.map(t => this.createTextAsset(customerId, accessToken, t)));
+    const tempAssetGroupName = `customers/${customerId}/assetGroups/-1`;
 
     type AssetFieldType = 'HEADLINE' | 'LONG_HEADLINE' | 'DESCRIPTION' | 'MARKETING_IMAGE' | 'SQUARE_MARKETING_IMAGE' | 'LOGO' | 'YOUTUBE_VIDEO';
-    const assetLinkOps: any[] = [];
 
-    const addLinks = (resourceNames: string[], fieldType: AssetFieldType) => {
-      for (const asset of resourceNames) {
-        assetLinkOps.push({ create: { assetGroup: assetGroupResourceName, asset, fieldType } });
+    const addTextAssets = (texts: string[], fieldType: AssetFieldType) => {
+      for (const text of texts) {
+        const tempName = `customers/${customerId}/assets/${tempIdx--}`;
+        assetOps.push({
+          assetOperation: {
+            create: { resourceName: tempName, name: text.substring(0, 50), type: 'TEXT', textAsset: { text } },
+          },
+        });
+        linkOps.push({
+          assetGroupAssetOperation: {
+            create: { assetGroup: tempAssetGroupName, asset: tempName, fieldType },
+          },
+        });
       }
     };
 
-    addLinks(headlineResourceNames, 'HEADLINE');
-    addLinks(longHeadlineResourceNames, 'LONG_HEADLINE');
-    addLinks(descriptionResourceNames, 'DESCRIPTION');
-    addLinks(params.squareImageAssets, 'SQUARE_MARKETING_IMAGE');
-    addLinks(params.landscapeImageAssets, 'MARKETING_IMAGE');
-    addLinks(params.logoAssets, 'LOGO');
-    if (params.videoAssets) addLinks(params.videoAssets, 'YOUTUBE_VIDEO');
+    const addImageAssets = (resourceNames: string[], fieldType: AssetFieldType) => {
+      for (const asset of resourceNames) {
+        linkOps.push({
+          assetGroupAssetOperation: {
+            create: { assetGroup: tempAssetGroupName, asset, fieldType },
+          },
+        });
+      }
+    };
 
-    if (assetLinkOps.length > 0) {
-      await this.mutate(customerId, accessToken, 'assetGroupAssets', assetLinkOps);
+    addTextAssets(params.headlines, 'HEADLINE');
+    addTextAssets(params.longHeadlines, 'LONG_HEADLINE');
+    addTextAssets(params.descriptions, 'DESCRIPTION');
+    addImageAssets(params.squareImageAssets, 'SQUARE_MARKETING_IMAGE');
+    addImageAssets(params.landscapeImageAssets, 'MARKETING_IMAGE');
+    addImageAssets(params.logoAssets, 'LOGO');
+    if (params.videoAssets) addImageAssets(params.videoAssets, 'YOUTUBE_VIDEO');
+
+    const assetGroupOp = {
+      assetGroupOperation: {
+        create: {
+          resourceName: tempAssetGroupName,
+          name: params.name,
+          campaign: params.campaignResourceName,
+          status: 'PAUSED',
+          finalUrls: [params.finalUrl],
+        },
+      },
+    };
+
+    // Order: text assets → asset group → links
+    let mutateOps = [...assetOps, assetGroupOp, ...linkOps];
+    let batchResult: any;
+    try {
+      batchResult = await this.batchMutate(customerId, accessToken, mutateOps);
+    } catch (err: any) {
+      // If brand guidelines enforced: logo must not be in asset group — retry without LOGO links
+      const errStr = JSON.stringify(err?.response?.data || err?.message || '');
+      if (errStr.includes('BRAND_ASSETS_NOT_LINKED_AT_CAMPAIGN_LEVEL') && errStr.includes('LOGO')) {
+        const linkOpsNoLogo = linkOps.filter((op: any) => op.assetGroupAssetOperation?.create?.fieldType !== 'LOGO');
+        mutateOps = [...assetOps, assetGroupOp, ...linkOpsNoLogo];
+        batchResult = await this.batchMutate(customerId, accessToken, mutateOps);
+      } else {
+        throw err;
+      }
     }
+    const assetGroupResultIdx = assetOps.length; // asset group is after text assets
+    const assetGroupResourceName = batchResult.mutateOperationResponses[assetGroupResultIdx].assetGroupResult.resourceName;
 
     return { resourceName: assetGroupResourceName };
   }
