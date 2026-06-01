@@ -19946,6 +19946,17 @@ Please generate a complete, professional HTML document that properly formats and
     types?: string[]
   ): Promise<any> {
     try {
+      // Validate html_source up front so a missing/non-string value returns a
+      // clean error instead of throwing "Cannot read properties of undefined
+      // (reading 'startsWith')" below.
+      if (typeof htmlSource !== 'string' || htmlSource.trim().length === 0) {
+        return {
+          success: false,
+          message: 'Failed to create HTML template',
+          error: 'html_source is required and must be a non-empty string (raw HTML content or an S3/HTTPS URL).'
+        };
+      }
+
       // Org-level create gating: only org owner or listed htmlTemplates editor
       const { userDb, orgDb } = await import('./db');
       const { canManageOrgFeature } = await import('./orgShareService');

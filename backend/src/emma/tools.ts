@@ -4886,7 +4886,7 @@ emmaToolRegistry.register({
   name: "create_html_file",
   definition: {
     name: "create_html_file",
-    description: "Create a well-formatted HTML report, summary, analysis, audit, or any non-blog document. Use this for reports, weekly summaries, performance analyses, audits, GTM plans, or any structured HTML document that is NOT a blog article. For blog articles intended for CMS publishing, use create_blog_article instead. For a deployable landing page with a public URL hosted on Vercel, use generate_landing_page instead.",
+    description: "Create a well-formatted, standalone HTML document and return it as a file (S3 URL) the user can preview, download, or send. Use this for a ONE-OFF email or newsletter in HTML format, a report, weekly summary, performance analysis, audit, GTM plan, or any structured HTML document that is NOT a blog article. This is the right tool whenever the user wants to draft, build, preview, or send a specific HTML email/newsletter/document — i.e. a finished piece of content, NOT a reusable template. For a REUSABLE, SAVED email template with {{variable}} placeholders stored in the Templates library, use create_html_template instead. For blog articles intended for CMS publishing, use create_blog_article instead. For a deployable landing page with a public URL hosted on Vercel, use generate_landing_page instead.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4912,7 +4912,7 @@ emmaToolRegistry.register({
   name: "create_html_template",
   definition: {
     name: "create_html_template",
-    description: "Create an HTML template from an existing HTML file or HTML content. The template will be saved to the Templates section where it can be edited and previewed. Use this when you want to convert HTML into a reusable template with variables like {{user_name}} or {{items_n}} for dynamic content. NOTE: Do NOT use this to create a new landing page from scratch — use generate_landing_page for deployable landing pages hosted on Vercel.",
+    description: "Create a REUSABLE email template and SAVE it to the user's Templates library, parameterized with {{variable}} placeholders (e.g. {{user_name}}, {{items_n}}) for dynamic content. ONLY use this when the user EXPLICITLY asks to create or save a reusable template they can reuse later with different data. Do NOT use this to draft, build, preview, or send a one-off email or newsletter — that is a finished HTML document, so use create_html_file instead (it does NOT save anything to the Templates library). NOTE: Do NOT use this to create a new landing page from scratch — use generate_landing_page for deployable landing pages hosted on Vercel.",
     inputSchema: {
       type: "object",
       properties: {
