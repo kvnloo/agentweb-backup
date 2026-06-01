@@ -930,38 +930,39 @@ export class ImageService {
         { maxRetries: 3, baseDelayMs: 3000 }
       );
 
-      // Process streaming response to find image data
+      // Process streaming response to find image data.
+      //
+      // Gemini 3 image models ("thinking" models, e.g. gemini-3-pro-image-preview
+      // and gemini-3.1-flash-image-preview) emit up to two INTERIM draft images
+      // before the final rendered image. Per Google's docs, "the last image within
+      // Thinking is also the final rendered image", and interim drafts are flagged
+      // with part.thought === true. We must therefore keep the LAST non-thought
+      // image part — NOT the first. Keeping the first part returns a draft, which
+      // on an edit closely resembles the input and appears to ignore the prompt.
       let imageData: string | undefined;
       let mimeType: string | undefined;
       let chunkCount = 0;
-      
+
       for await (const chunk of response) {
         chunkCount++;
-        
+
         if (!chunk.candidates || !chunk.candidates[0]?.content?.parts) {
           continue;
         }
 
         const parts = chunk.candidates[0].content.parts;
         for (const part of parts) {
-          if ((part as any).inlineData) {
-            const inlineData = (part as any).inlineData;
-            if (inlineData.data) {
-              imageData = inlineData.data;
-              mimeType = inlineData.mimeType || 'image/png';
-              break;
-            }
-          } else if ((part as any).inline_data) {
-            const inlineData = (part as any).inline_data;
-            if (inlineData.data) {
-              imageData = inlineData.data;
-              mimeType = inlineData.mimeType || 'image/png';
-              break;
-            }
+          // Skip interim "thought" draft images so they never overwrite the final render.
+          if ((part as any).thought) {
+            continue;
+          }
+          const inlineData = (part as any).inlineData || (part as any).inline_data;
+          if (inlineData?.data) {
+            // Overwrite on each image part: the final render is the last one streamed.
+            imageData = inlineData.data;
+            mimeType = inlineData.mimeType || 'image/png';
           }
         }
-        
-        if (imageData) break;
       }
 
       if (!imageData) {

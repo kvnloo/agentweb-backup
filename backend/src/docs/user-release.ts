@@ -29,6 +29,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-01',
     changes: [
+      'Fixed: Editing an Image Now Reflects Your Requested Changes',
+      '- When revising an existing image (e.g. updating text overlays) with the latest Gemini image models, the result sometimes came back nearly identical to the original, ignoring your instructions',
+      '- These models render a couple of quick draft versions before the finished image; we were occasionally saving an early draft instead of the final edited result',
+      '- Image edits now always return the final rendered image, so your requested changes show up',
+    ],
+  },
+  {
+    date: '2026-06-01',
+    changes: [
       'Fixed: Sent LinkedIn Messages No Longer Appear Twice in a Lead\'s Activity',
       '- A LinkedIn message you sent from the CRM was being recorded both at send time and again when the activity sync re-imported it from LinkedIn, so it showed (and counted) twice',
       '- The activity timeline and message counts now de-duplicate these, showing each sent message once',
