@@ -19,6 +19,16 @@ jest.mock('../services/enrichmentSiblingConfigFields', () => ({
   buildSiblingFieldMappingTable: jest.fn().mockResolvedValue({ canonical: new Map(), llm: new Map() }),
 }));
 
+jest.mock('../services/db', () => ({
+  crmDb: {
+    createEnrichmentSnapshotItem: jest.fn().mockResolvedValue(undefined),
+    createEnrichmentJobMeta: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
+import { crmDb } from '../services/db';
+const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
+
 const LIST_ID = 'list-1';
 const USER_ID = 'user-1';
 
@@ -1620,5 +1630,162 @@ describe('runEnrichment — cross-group field propagation', () => {
     // Verify by checking the fill reached allFills (setLeadFields was called with company_name).
     const setCall = (deps.setLeadFields as jest.Mock).mock.calls[0]?.[0];
     expect(setCall?.topLevel?.company_name ?? setCall?.customFields?.company_name).toBe('Acme Corp');
+  });
+});
+
+// ─── Snapshot & job-meta persistence ─────────────────────────────────────────
+
+describe('runEnrichment — snapshot and job-meta persistence', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('does not write snapshots or job meta in preview mode', async () => {
+    const lead = makeLead({ leadId: 'lead-snap-1', customFields: { company_name: 'OldCo' } });
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([lead]),
+      resolveIdentity: jest.fn().mockResolvedValue({ ok: true, resolved: {}, siblings: [] }),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [{ field: 'company_name', value: 'NewCo', meta: { source: 'apollo' } }],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+      }),
+    });
+
+    await runEnrichment(makeInput({ mode: 'preview' }), deps);
+
+    expect(mockCrmDb.createEnrichmentSnapshotItem).not.toHaveBeenCalled();
+    expect(mockCrmDb.createEnrichmentJobMeta).not.toHaveBeenCalled();
+  });
+
+  it('writes one snapshot per successfully written lead', async () => {
+    const lead = makeLead({
+      leadId: 'lead-snap-2',
+      customFields: { company_name: 'OldCo' },
+    });
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([lead]),
+      resolveIdentity: jest.fn().mockResolvedValue({ ok: true, resolved: {}, siblings: [] }),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [{ field: 'company_name', value: 'NewCo', meta: { source: 'apollo' } }],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+      }),
+    });
+
+    await runEnrichment(makeInput(), deps);
+
+    expect(mockCrmDb.createEnrichmentSnapshotItem).toHaveBeenCalledTimes(1);
+    const call = (mockCrmDb.createEnrichmentSnapshotItem as jest.Mock).mock.calls[0][0];
+    expect(call.leadId).toBe('lead-snap-2');
+    expect(call.previousCustomFields).toEqual({ company_name: 'OldCo' });
+    expect(typeof call.jobId).toBe('string');
+    expect(typeof call.expiresAt).toBe('number');
+  });
+
+  it('snapshots null for a custom field the lead does not have yet', async () => {
+    const lead = makeLead({ leadId: 'lead-snap-3', customFields: {} });
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([lead]),
+      resolveIdentity: jest.fn().mockResolvedValue({ ok: true, resolved: {}, siblings: [] }),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [{ field: 'company_name', value: 'NewCo', meta: { source: 'apollo' } }],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+      }),
+    });
+
+    await runEnrichment(makeInput(), deps);
+
+    const call = (mockCrmDb.createEnrichmentSnapshotItem as jest.Mock).mock.calls[0][0];
+    expect(call.previousCustomFields).toEqual({ company_name: null });
+  });
+
+  it('snapshots existing standard field value before overwrite', async () => {
+    const lead = makeLead({
+      leadId: 'lead-snap-4',
+      firstName: 'OldFirst',
+      customFields: {},
+    });
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([lead]),
+      resolveIdentity: jest.fn().mockResolvedValue({ ok: true, resolved: {}, siblings: [] }),
+      extractUngroupedFieldsViaWeb: jest.fn().mockResolvedValue({
+        fields: [{ field: 'firstName', value: 'NewFirst', meta: { source: 'web' } }],
+        missing: [],
+        tierFills: { crm: 0, apollo: 0, web: 1, missing: 0 },
+      }),
+    });
+
+    await runEnrichment(makeInput({
+      config: makeConfig({
+        fields: [{
+          name: 'firstName',
+          type: 'string',
+          instruction: 'first name',
+          include: true,
+          overwritePolicy: 'fill_if_empty',
+        }],
+      }),
+    }), deps);
+
+    const call = (mockCrmDb.createEnrichmentSnapshotItem as jest.Mock).mock.calls[0][0];
+    expect(call.previousStandardFields).toEqual({ firstName: 'OldFirst' });
+    expect(call.previousCustomFields).toEqual({});
+  });
+
+  it('writes job meta with correct counts after a successful run', async () => {
+    const lead = makeLead({ leadId: 'lead-meta-1', customFields: { company_name: 'OldCo' } });
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([lead]),
+      resolveIdentity: jest.fn().mockResolvedValue({ ok: true, resolved: {}, siblings: [] }),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [{ field: 'company_name', value: 'NewCo', meta: { source: 'apollo' } }],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+      }),
+    });
+
+    await runEnrichment(makeInput(), deps);
+
+    expect(mockCrmDb.createEnrichmentJobMeta).toHaveBeenCalledTimes(1);
+    const meta = (mockCrmDb.createEnrichmentJobMeta as jest.Mock).mock.calls[0][0];
+    expect(meta.listId).toBe(LIST_ID);
+    expect(meta.userId).toBe(USER_ID);
+    expect(meta.processedCount).toBe(1);
+    expect(meta.status).toBe('completed');
+    expect(meta.failureBreakdown.updateFailed).toBe(0);
+    expect(typeof meta.jobId).toBe('string');
+    expect(typeof meta.expiresAt).toBe('number');
+    expect(meta.expiresAt).toBeGreaterThan(Math.floor(Date.now() / 1000));
+  });
+
+  it('does not write job meta when no leads processed and no failures', async () => {
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([]),
+    });
+
+    await runEnrichment(makeInput(), deps);
+
+    expect(mockCrmDb.createEnrichmentJobMeta).not.toHaveBeenCalled();
+  });
+
+  it('snapshot write failure does not abort enrichment', async () => {
+    (mockCrmDb.createEnrichmentSnapshotItem as jest.Mock).mockRejectedValue(new Error('DynamoDB error'));
+    const lead = makeLead({ leadId: 'lead-snap-6', customFields: {} });
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([lead]),
+      resolveIdentity: jest.fn().mockResolvedValue({ ok: true, resolved: {}, siblings: [] }),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [{ field: 'company_name', value: 'NewCo', meta: { source: 'apollo' } }],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+      }),
+    });
+
+    const result = await runEnrichment(makeInput(), deps);
+
+    expect(result.processed).toBe(1);
+    expect(deps.setLeadFields).toHaveBeenCalledTimes(1);
   });
 });

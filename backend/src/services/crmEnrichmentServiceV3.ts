@@ -27,6 +27,7 @@ import {
 } from './enrichmentSiblingConfigFields';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { STANDARD_ENRICHABLE_FIELDS } from './enrichmentConfigService';
+import { crmDb } from './db';
 
 // ─── Socket progress options ─────────────────────────────────────────────────
 //
@@ -217,6 +218,25 @@ export interface OrchestratorDeps {
  *  from STANDARD_ENRICHABLE_FIELDS plus `website` — a genuine top-level
  *  AW-Leads column that is not part of the enrichable-fields list. */
 const STANDARD_LEAD_COLUMNS = new Set<string>([...STANDARD_ENRICHABLE_FIELDS, 'website']);
+
+function buildSnapshotFields(
+  lead: LeadRecord,
+  fills: Array<{ field: string }>,
+): {
+  previousStandardFields: Record<string, string | null>;
+  previousCustomFields: Record<string, string | null>;
+} {
+  const previousStandardFields: Record<string, string | null> = {};
+  const previousCustomFields: Record<string, string | null> = {};
+  for (const { field } of fills) {
+    if (STANDARD_LEAD_COLUMNS.has(field)) {
+      previousStandardFields[field] = (lead as any)[field] ?? null;
+    } else {
+      previousCustomFields[field] = lead.customFields?.[field] ?? null;
+    }
+  }
+  return { previousStandardFields, previousCustomFields };
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -743,6 +763,7 @@ export async function runEnrichment(
   options?: RunEnrichmentOptions,
 ): Promise<RunEnrichmentResult> {
   const runId = randomUUID();
+  const jobExpiresAt = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
   const startedAt = Date.now();
 
   const progressEvent = options?.progressEvent || 'crm-enrichment-progress';
@@ -953,6 +974,17 @@ export async function runEnrichment(
       const writeResults = await Promise.all(
         pendingWrites.map(async ({ lead, outcome }) => {
           const wStart = Date.now();
+          // Filter injected dep fills (synthetic fields added for smart-field resolution) from
+          // the snapshot — they were never in the user's config and should not be reverted.
+          const writableFills = outcome.fills.filter(f => !injectedDepNames.has(f.field));
+          const { previousStandardFields, previousCustomFields } = buildSnapshotFields(lead, writableFills);
+          crmDb.createEnrichmentSnapshotItem({
+            jobId: runId,
+            leadId: lead.leadId,
+            previousStandardFields,
+            previousCustomFields,
+            expiresAt: jobExpiresAt,
+          }).catch((err: any) => console.error(`[v3] Failed to write enrichment snapshot runId=${runId} leadId=${lead.leadId}:`, err));
           const writeResult = await writeLeadOutcome(lead, outcome, input, deps, runId);
           console.log(`[v3:${input.listId}:${lead.leadId}] write in ${Date.now() - wStart}ms (ok=${writeResult.ok})`);
           return writeResult;
@@ -1025,6 +1057,25 @@ export async function runEnrichment(
     tierFillBreakdown: result.tierFillBreakdown,
     durationMs: result.durationMs,
   });
+
+  if (input.mode !== 'preview' && (processed > 0 || llmOrParseFailed > 0 || updateFailed > 0)) {
+    crmDb.createEnrichmentJobMeta({
+      jobId: runId,
+      listId: input.listId,
+      userId: input.userId,
+      outputFields: includedFieldNames,
+      createdAt: new Date().toISOString(),
+      status: 'completed',
+      expiresAt: jobExpiresAt,
+      processedCount: processed,
+      failureBreakdown: {
+        searchWebFailed: 0,
+        linkedinFailed: apolloFailed,
+        llmOrParseFailed,
+        updateFailed,
+      },
+    }).catch((err: any) => console.error(`[v3] Failed to write enrichment job meta runId=${runId}:`, err));
+  }
 
   return result;
 }

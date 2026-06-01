@@ -5044,54 +5044,78 @@ export const crmDb = {
       }
 
       if (updates.email !== undefined) {
-        const emailValue = updates.email.trim().toLowerCase();
+        const emailValue = (updates.email ?? '').trim().toLowerCase();
         if (emailValue) {
           // Only set email if it's not empty (GSI key cannot be empty string)
           setExpressions.push('email = :email');
           expressionAttributeValues[':email'] = emailValue;
         } else {
-          // Remove email attribute if it's being set to empty
+          // Remove email attribute if it's being set to empty/null
           removeExpressions.push('email');
         }
       }
 
       if (updates.firstName !== undefined) {
-        setExpressions.push('firstName = :firstName');
-        expressionAttributeValues[':firstName'] = updates.firstName;
+        if (updates.firstName) {
+          setExpressions.push('firstName = :firstName');
+          expressionAttributeValues[':firstName'] = updates.firstName;
+        } else {
+          removeExpressions.push('firstName');
+        }
       }
 
       if (updates.lastName !== undefined) {
-        setExpressions.push('lastName = :lastName');
-        expressionAttributeValues[':lastName'] = updates.lastName;
+        if (updates.lastName) {
+          setExpressions.push('lastName = :lastName');
+          expressionAttributeValues[':lastName'] = updates.lastName;
+        } else {
+          removeExpressions.push('lastName');
+        }
       }
 
       if (updates.phone !== undefined) {
-        setExpressions.push('phone = :phone');
-        expressionAttributeValues[':phone'] = updates.phone;
+        if (updates.phone) {
+          setExpressions.push('phone = :phone');
+          expressionAttributeValues[':phone'] = updates.phone;
+        } else {
+          removeExpressions.push('phone');
+        }
       }
 
       if (updates.company !== undefined) {
-        setExpressions.push('company = :company');
-        expressionAttributeValues[':company'] = updates.company;
+        if (updates.company) {
+          setExpressions.push('company = :company');
+          expressionAttributeValues[':company'] = updates.company;
+        } else {
+          removeExpressions.push('company');
+        }
       }
 
       if (updates.title !== undefined) {
-        setExpressions.push('title = :title');
-        expressionAttributeValues[':title'] = updates.title;
+        if (updates.title) {
+          setExpressions.push('title = :title');
+          expressionAttributeValues[':title'] = updates.title;
+        } else {
+          removeExpressions.push('title');
+        }
       }
 
       if (updates.notes !== undefined) {
-        setExpressions.push('notes = :notes');
-        expressionAttributeValues[':notes'] = updates.notes;
+        if (updates.notes) {
+          setExpressions.push('notes = :notes');
+          expressionAttributeValues[':notes'] = updates.notes;
+        } else {
+          removeExpressions.push('notes');
+        }
       }
 
       if (updates.linkedin !== undefined) {
-        const trimmedLinkedin = updates.linkedin.trim();
+        const trimmedLinkedin = (updates.linkedin ?? '').trim();
         if (trimmedLinkedin) {
           setExpressions.push('linkedin = :linkedin');
           expressionAttributeValues[':linkedin'] = trimmedLinkedin;
         } else {
-          // Keep LinkedinLookupIndex sparse — empty values must not appear.
+          // Keep LinkedinLookupIndex sparse — empty/null values must not appear.
           removeExpressions.push('linkedin');
         }
       }
@@ -5106,9 +5130,9 @@ export const crmDb = {
         updates.company !== undefined;
       if (nameCompanyTouched) {
         const current = existingLeadForGuard as any;
-        const mergedFirst = updates.firstName !== undefined ? updates.firstName : (current?.firstName || '');
-        const mergedLast = updates.lastName !== undefined ? updates.lastName : (current?.lastName || '');
-        const mergedCompany = updates.company !== undefined ? updates.company : (current?.company || '');
+        const mergedFirst = updates.firstName !== undefined ? (updates.firstName ?? '') : (current?.firstName || '');
+        const mergedLast = updates.lastName !== undefined ? (updates.lastName ?? '') : (current?.lastName || '');
+        const mergedCompany = updates.company !== undefined ? (updates.company ?? '') : (current?.company || '');
         const nck = computeNameCompanyKey(mergedFirst, mergedLast, mergedCompany);
         if (nck) {
           setExpressions.push('nameCompanyKey = :nameCompanyKey');
@@ -5119,8 +5143,13 @@ export const crmDb = {
       }
 
       if (updates.companyLinkedin !== undefined) {
-        setExpressions.push('companyLinkedin = :companyLinkedin');
-        expressionAttributeValues[':companyLinkedin'] = updates.companyLinkedin.trim();
+        const trimmedCompanyLinkedin = (updates.companyLinkedin ?? '').trim();
+        if (trimmedCompanyLinkedin) {
+          setExpressions.push('companyLinkedin = :companyLinkedin');
+          expressionAttributeValues[':companyLinkedin'] = trimmedCompanyLinkedin;
+        } else {
+          removeExpressions.push('companyLinkedin');
+        }
       }
 
       if (updates.linkedInInviteSentAt !== undefined) {
