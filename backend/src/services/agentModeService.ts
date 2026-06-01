@@ -23245,6 +23245,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
       }
 
+      if (entity_type === 'BUDGET' && action === 'LIST') {
+        const { accessToken } = await googleAdsService.getAccountCredentials(userId, customer_id);
+        const results = await googleAdsService.search(customer_id, accessToken,
+          'SELECT campaign_budget.resource_name, campaign_budget.name, campaign_budget.amount_micros, campaign_budget.explicitly_shared, campaign_budget.reference_count FROM campaign_budget ORDER BY campaign_budget.name'
+        );
+        const budgets = results.map((r: any) => ({
+          resourceName: r.campaignBudget.resourceName,
+          name: r.campaignBudget.name,
+          amountMicros: r.campaignBudget.amountMicros,
+          explicitlyShared: r.campaignBudget.explicitlyShared,
+          referenceCount: r.campaignBudget.referenceCount,
+        }));
+        return { success: true, budgets };
+      }
       if (entity_type === 'BUDGET' && action === 'CREATE') {
         if (!args.name || args.amount_micros === undefined) return { success: false, error: 'name and amount_micros are required to create a budget' };
         const budget = await googleAdsService.createBudget(userId, customer_id, { name: args.name, amountMicros: args.amount_micros, explicitlyShared: args.explicitly_shared });

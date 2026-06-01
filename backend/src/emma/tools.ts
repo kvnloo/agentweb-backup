@@ -7142,7 +7142,7 @@ emmaToolRegistry.register({
     description: `Manage Google Ads entities via the Google Ads API.
 
 ACTION MATRIX:
-  BUDGET      → CREATE (name, amount_micros), UPDATE (budget_resource_name, amount_micros), REMOVE (budget_resource_name; must not be attached to any campaign)
+  BUDGET      → LIST, CREATE (name, amount_micros), UPDATE (budget_resource_name, amount_micros), REMOVE (budget_resource_name; must not be attached to any campaign)
   CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy?, bidding_strategy_target?, budget_resource_name?), REMOVE (campaign_resource_name)
               For PERFORMANCE_MAX: pass brand_business_name and brand_logo_asset_resource_name — backend batches campaign creation + brand asset attachment atomically
   AD_GROUP    → LIST (campaign_resource_name)
