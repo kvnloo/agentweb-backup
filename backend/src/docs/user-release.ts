@@ -38,6 +38,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-05-30',
     changes: [
+      'Fixed: CRM Now Detects All of Your Existing LinkedIn Connections',
+      '- The connection cache only kept the ~150 most recent connections, so leads you connected with long ago looked "not connected"',
+      '- This caused the CRM to offer "Send LinkedIn Invite" for people you are already connected to (which then failed as "already connected")',
+      '- New LinkedIn accounts now fully backfill all connections on first sync, and you can force a full refresh from a list',
       'Fixed: LinkedIn Invite & Message Actions Now Work on Teammates\' Shared CRM Lists',
       '- Org members opening a lead on a list owned by a teammate no longer see a "Lead list not found" error',
       '- Drafting an invite note, sending a LinkedIn invite or message, and syncing/checking connections now use the same org-aware access as the rest of the CRM',
