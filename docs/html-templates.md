@@ -50,21 +50,34 @@ Agent: Uses create_html_template with:
   - additional_instructions: "Add variables for user name and company"
 
 User: "Build my May newsletter into a branded HTML email"
-Agent: Uses create_html_file (NOT create_html_template) — this is a one-off
-       HTML document, not a reusable template.
+Agent: Uses create_html_file with document_type: "email" (NOT create_html_template) —
+       this is a one-off HTML email, not a reusable template.
 ```
 
-**`create_html_file`** - Generate a standalone, one-off HTML document (NOT a saved template)
+**`create_html_file`** - Generate a standalone, one-off HTML document or email (NOT a saved template)
 ```typescript
 // Parameters:
 {
-  title: string,
+  title: string,                  // Document title, or the subject/headline for an email
   content_draft: string,
-  format_requirements: string  // Optional styling/structure requirements
+  format_requirements: string,    // Optional styling/structure requirements
+  document_type: "document" | "email"  // Optional, default "document".
+                                  // "email" => email-client-safe HTML (table layout,
+                                  // inline CSS, 600px container, no JS) for one-off
+                                  // newsletters/marketing emails.
 }
 // Returns S3 URL to generated HTML file.
-// Use for one-off emails/newsletters, reports, summaries, audits, GTM plans, etc.
+// Use document_type "email" for one-off emails/newsletters; "document" (default)
+// for reports, summaries, audits, GTM plans, etc.
 ```
+
+> **One-off newsletter email without a template.** Previously a newsletter email
+> required a saved template plus `create_html_from_template`. Now Emma can generate a
+> finished, ready-to-send newsletter email directly with
+> `create_html_file({ document_type: "email", ... })` — no template needed. The email
+> mode emits table-based, inline-styled, email-client-safe HTML (Gmail/Outlook/Apple
+> Mail) and fills in real content (no `{{variable}}` placeholders). Use
+> `create_html_template` only when the user explicitly wants a reusable, saved template.
 
 **`create_html_from_template`** - Generate HTML from existing template
 ```typescript
