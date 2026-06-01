@@ -24,6 +24,10 @@ export interface CodingAgentContext {
   draftBranch?: string;
   socketEmit?: (room: string, event: string, payload: any) => void;
   executeMcpTool?: (toolName: string, args: any) => Promise<any>;
+  /** Optional per-turn token-usage callback. Invoked once per LLM response with
+   * that turn's usage. Used by the eval harness to measure real cost through the
+   * production path; unset in normal operation (no behavior change). */
+  onUsage?: (usage: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }) => void;
 }
 
 interface SearchReplaceEdit {
@@ -1420,6 +1424,11 @@ async function runCodingAgentInternal(
         tools,
         messages,
       });
+
+      // Report this turn's token usage if a consumer is listening (eval harness).
+      if (context.onUsage && response.usage) {
+        context.onUsage(response.usage as any);
+      }
 
       // Add assistant message to history
       messages.push({ role: 'assistant', content: response.content });
