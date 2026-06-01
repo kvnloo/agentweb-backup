@@ -514,20 +514,31 @@ describe('listAds', () => {
 });
 
 describe('createAssetGroup', () => {
-  it('sends mutate and returns resource name', async () => {
-    // First call: create asset group
-    // Subsequent calls: createTextAsset for each headline, long_headline, description
-    // Final call: create assetGroupAssets links
-    mockAxiosPost
-      .mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/assetGroups/1' }] } }) // assetGroups:mutate
-      .mockResolvedValue({ data: { results: [{ resourceName: 'customers/123/assets/text-1' }] } }); // text assets + links
+  it('sends single batchMutate and returns resource name', async () => {
+    // New impl: single googleAds:mutate call with all ops (text assets + asset group + links)
+    // Input: 1 headline, 1 long headline, 1 description = 3 text asset ops; asset group at index 3
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        mutateOperationResponses: [
+          { assetResult: { resourceName: 'customers/123/assets/-2' } },
+          { assetResult: { resourceName: 'customers/123/assets/-3' } },
+          { assetResult: { resourceName: 'customers/123/assets/-4' } },
+          { assetGroupResult: { resourceName: 'customers/123/assetGroups/1' } },
+          { assetGroupAssetResult: { resourceName: 'customers/123/assetGroupAssets/1' } },
+          { assetGroupAssetResult: { resourceName: 'customers/123/assetGroupAssets/2' } },
+          { assetGroupAssetResult: { resourceName: 'customers/123/assetGroupAssets/3' } },
+          { assetGroupAssetResult: { resourceName: 'customers/123/assetGroupAssets/4' } },
+          { assetGroupAssetResult: { resourceName: 'customers/123/assetGroupAssets/5' } },
+        ],
+      },
+    });
 
     const result = await service.createAssetGroup('user-123', '1234567890', {
       name: 'My Asset Group',
       campaignResourceName: 'customers/123/campaigns/1',
-      headlines: ['Headline 1', 'Headline 2', 'Headline 3'],
+      headlines: ['Headline 1'],
       longHeadlines: ['Long Headline 1'],
-      descriptions: ['Description 1', 'Description 2'],
+      descriptions: ['Description 1'],
       squareImageAssets: ['customers/123/assets/sq1'],
       landscapeImageAssets: ['customers/123/assets/ls1'],
       logoAssets: ['customers/123/assets/logo1'],
@@ -535,11 +546,273 @@ describe('createAssetGroup', () => {
     });
 
     expect(result.resourceName).toBe('customers/123/assetGroups/1');
-    // Verify first call creates the asset group
-    const firstCallBody = mockAxiosPost.mock.calls[0][1];
-    expect(firstCallBody.operations[0].create.name).toBe('My Asset Group');
-    expect(firstCallBody.operations[0].create.campaign).toBe('customers/123/campaigns/1');
-    expect(firstCallBody.operations[0].create.finalUrls[0]).toBe('https://example.com');
+    // Single batchMutate call to googleAds:mutate
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.mutateOperations).toBeDefined();
+    // Text assets come first
+    expect(body.mutateOperations[0].assetOperation.create.textAsset.text).toBe('Headline 1');
+    // Asset group is after text assets (index 3)
+    expect(body.mutateOperations[3].assetGroupOperation.create.name).toBe('My Asset Group');
+    expect(body.mutateOperations[3].assetGroupOperation.create.campaign).toBe('customers/123/campaigns/1');
+    expect(body.mutateOperations[3].assetGroupOperation.create.finalUrls[0]).toBe('https://example.com');
+  });
+
+  it('retries without LOGO links on BRAND_ASSETS_NOT_LINKED_AT_CAMPAIGN_LEVEL error', async () => {
+    const brandError = {
+      response: {
+        data: {
+          error: { message: 'BRAND_ASSETS_NOT_LINKED_AT_CAMPAIGN_LEVEL LOGO field not allowed' },
+        },
+      },
+      message: 'BRAND_ASSETS_NOT_LINKED_AT_CAMPAIGN_LEVEL LOGO',
+    };
+    mockAxiosPost
+      .mockRejectedValueOnce(brandError)
+      .mockResolvedValueOnce({
+        data: {
+          mutateOperationResponses: [
+            { assetResult: { resourceName: 'customers/123/assets/-2' } },
+            { assetResult: { resourceName: 'customers/123/assets/-3' } },
+            { assetResult: { resourceName: 'customers/123/assets/-4' } },
+            { assetGroupResult: { resourceName: 'customers/123/assetGroups/1' } },
+            { assetGroupAssetResult: {} },
+            { assetGroupAssetResult: {} },
+            { assetGroupAssetResult: {} },
+            { assetGroupAssetResult: {} },
+          ],
+        },
+      });
+
+    const result = await service.createAssetGroup('user-123', '1234567890', {
+      name: 'Brand Group',
+      campaignResourceName: 'customers/123/campaigns/1',
+      headlines: ['H1'],
+      longHeadlines: ['LH1'],
+      descriptions: ['D1'],
+      squareImageAssets: ['customers/123/assets/sq1'],
+      landscapeImageAssets: ['customers/123/assets/ls1'],
+      logoAssets: ['customers/123/assets/logo1'],
+      finalUrl: 'https://example.com',
+    });
+
+    expect(result.resourceName).toBe('customers/123/assetGroups/1');
+    expect(mockAxiosPost).toHaveBeenCalledTimes(2);
+    // Second call should not contain LOGO link ops
+    const retryBody = mockAxiosPost.mock.calls[1][1];
+    const logoLinks = retryBody.mutateOperations.filter(
+      (op: any) => op.assetGroupAssetOperation?.create?.fieldType === 'LOGO',
+    );
+    expect(logoLinks).toHaveLength(0);
+  });
+});
+
+describe('listKeywords', () => {
+  it('returns keyword list for ad group', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          adGroupCriterion: {
+            resourceName: 'customers/123/adGroupCriteria/789~1',
+            keyword: { text: 'running shoes', matchType: 'BROAD' },
+            status: 'ENABLED',
+            negative: false,
+          },
+        }],
+      },
+    });
+    const keywords = await service.listKeywords('user-123', '1234567890', 'customers/123/adGroups/789');
+    expect(keywords).toHaveLength(1);
+    expect(keywords[0].text).toBe('running shoes');
+    expect(keywords[0].matchType).toBe('BROAD');
+    expect(keywords[0].status).toBe('ENABLED');
+    expect(keywords[0].negative).toBe(false);
+  });
+
+  it('returns empty array when no keywords', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
+    const keywords = await service.listKeywords('user-123', '1234567890', 'customers/123/adGroups/789');
+    expect(keywords).toHaveLength(0);
+  });
+});
+
+describe('updateKeyword', () => {
+  it('sends status update with correct updateMask', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateKeyword('user-123', '1234567890', 'customers/123/adGroupCriteria/789~1', { status: 'PAUSED' });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.resourceName).toBe('customers/123/adGroupCriteria/789~1');
+    expect(body.operations[0].update.status).toBe('PAUSED');
+    expect(body.operations[0].updateMask).toContain('status');
+  });
+
+  it('sends cpcBidMicros update with correct updateMask', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateKeyword('user-123', '1234567890', 'customers/123/adGroupCriteria/789~1', { cpcBidMicros: 1000000 });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.cpcBidMicros).toBe('1000000');
+    expect(body.operations[0].updateMask).toContain('cpc_bid_micros');
+  });
+
+  it('does nothing when no params provided', async () => {
+    await service.updateKeyword('user-123', '1234567890', 'customers/123/adGroupCriteria/789~1', {});
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+});
+
+describe('removeKeyword', () => {
+  it('sends remove operation for criterion', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.removeKeyword('user-123', '1234567890', 'customers/123/adGroupCriteria/789~1');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].remove).toBe('customers/123/adGroupCriteria/789~1');
+  });
+});
+
+describe('updateAd', () => {
+  it('sends status update with correct updateMask', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateAd('user-123', '1234567890', 'customers/123/adGroupAds/1', { status: 'PAUSED' });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.resourceName).toBe('customers/123/adGroupAds/1');
+    expect(body.operations[0].update.status).toBe('PAUSED');
+    expect(body.operations[0].updateMask).toContain('status');
+  });
+
+  it('does nothing when no params provided', async () => {
+    await service.updateAd('user-123', '1234567890', 'customers/123/adGroupAds/1', {});
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+});
+
+describe('removeAd', () => {
+  it('sends remove operation for adGroupAd', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.removeAd('user-123', '1234567890', 'customers/123/adGroupAds/1');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].remove).toBe('customers/123/adGroupAds/1');
+  });
+});
+
+describe('uploadAsset — URL input', () => {
+  it('fetches image from URL and uploads as base64', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: Buffer.from('fake-image-bytes') });
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/assets/2' }] },
+    });
+    const result = await service.uploadAsset('user-123', '1234567890', {
+      type: 'IMAGE',
+      name: 'logo.jpg',
+      data: 'https://example.com/logo.jpg',
+    });
+    expect(result).toBe('customers/123/assets/2');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.imageAsset.data).toBeDefined();
+    expect(body.operations[0].create.type).toBe('IMAGE');
+  });
+
+  it('maps LOGO type to IMAGE for upload', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: Buffer.from('logo-bytes') });
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/assets/3' }] },
+    });
+    await service.uploadAsset('user-123', '1234567890', {
+      type: 'LOGO',
+      name: 'brand-logo.jpg',
+      data: 'https://example.com/brand-logo.jpg',
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.type).toBe('IMAGE');
+  });
+
+  it('throws for IMAGE with non-URL non-Buffer data', async () => {
+    await expect(service.uploadAsset('user-123', '1234567890', {
+      type: 'IMAGE',
+      name: 'test.jpg',
+      data: 'not-a-url' as any,
+    })).rejects.toThrow('IMAGE/LOGO asset data must be a Buffer or a URL string');
+  });
+});
+
+describe('attachCampaignAssets', () => {
+  it('creates text asset and attaches as BUSINESS_NAME', async () => {
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/assets/text-1' }] } }) // text asset creation
+      .mockResolvedValueOnce({ data: { results: [{}] } }); // campaignAssets mutate
+    await service.attachCampaignAssets('user-123', '1234567890', 'customers/123/campaigns/1', [
+      { fieldType: 'BUSINESS_NAME', text: 'My Brand' },
+    ]);
+    const firstBody = mockAxiosPost.mock.calls[0][1];
+    expect(firstBody.operations[0].create.textAsset.text).toBe('My Brand');
+    const secondBody = mockAxiosPost.mock.calls[1][1];
+    expect(secondBody.operations[0].create.campaign).toBe('customers/123/campaigns/1');
+    expect(secondBody.operations[0].create.fieldType).toBe('BUSINESS_NAME');
+    expect(secondBody.operations[0].create.asset).toBe('customers/123/assets/text-1');
+  });
+
+  it('attaches existing asset by resource name without creating text asset', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.attachCampaignAssets('user-123', '1234567890', 'customers/123/campaigns/1', [
+      { fieldType: 'LOGO', assetResourceName: 'customers/123/assets/logo-1' },
+    ]);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.fieldType).toBe('LOGO');
+    expect(body.operations[0].create.asset).toBe('customers/123/assets/logo-1');
+  });
+});
+
+describe('updateAdGroup — adRotationMode and status', () => {
+  it('sends adRotationMode update', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateAdGroup('user-123', '1234567890', 'customers/123/adGroups/789', { adRotationMode: 'OPTIMIZE' });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.adRotationMode).toBe('OPTIMIZE');
+    expect(body.operations[0].updateMask).toContain('ad_rotation_mode');
+  });
+
+  it('sends status update', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateAdGroup('user-123', '1234567890', 'customers/123/adGroups/789', { status: 'PAUSED' });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.status).toBe('PAUSED');
+    expect(body.operations[0].updateMask).toContain('status');
+  });
+});
+
+describe('createCampaign — PMax with brand guidelines', () => {
+  it('sends batchMutate with text asset + campaign + campaignAsset ops', async () => {
+    // mutateOperationResponses: [0]=assetResult, [1]=campaignResult, [2]=campaignAssetResult, [3]=campaignAssetResult
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        mutateOperationResponses: [
+          { assetResult: { resourceName: 'customers/123/assets/-2' } },
+          { campaignResult: { resourceName: 'customers/123/campaigns/1' } },
+          { campaignAssetResult: { resourceName: 'customers/123/campaignAssets/1' } },
+          { campaignAssetResult: { resourceName: 'customers/123/campaignAssets/2' } },
+        ],
+      },
+    });
+    const result = await service.createCampaign('user-123', '1234567890', {
+      name: 'PMax Brand Campaign',
+      type: 'PERFORMANCE_MAX',
+      budgetResourceName: 'customers/123/campaignBudgets/1',
+      biddingStrategy: 'MAXIMIZE_CONVERSION_VALUE',
+      locationTargetIds: [],
+      brandBusinessName: 'My Brand',
+      brandLogoAssetResourceName: 'customers/123/assets/logo-1',
+    });
+    expect(result.resourceName).toBe('customers/123/campaigns/1');
+    const body = mockAxiosPost.mock.calls[0][1];
+    // First op: text asset for business name
+    expect(body.mutateOperations[0].assetOperation.create.textAsset.text).toBe('My Brand');
+    // Second op: campaign
+    expect(body.mutateOperations[1].campaignOperation.create.name).toBe('PMax Brand Campaign');
+    // Third op: BUSINESS_NAME campaign asset
+    expect(body.mutateOperations[2].campaignAssetOperation.create.fieldType).toBe('BUSINESS_NAME');
+    // Fourth op: LOGO campaign asset
+    expect(body.mutateOperations[3].campaignAssetOperation.create.fieldType).toBe('LOGO');
+    expect(body.mutateOperations[3].campaignAssetOperation.create.asset).toBe('customers/123/assets/logo-1');
   });
 });
 
