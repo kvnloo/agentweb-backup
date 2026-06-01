@@ -31,7 +31,7 @@ import {
   resolveSiteForCaller,
 } from "../services/v0Service";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
-import { listDomains, CustomDomainRecord } from "../services/customDomainService";
+import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/customDomainService";
 
 const router = Router();
 
@@ -490,31 +490,72 @@ router.get("/generated", async (req, res: Response) => {
       return true;
     });
 
-    // Enrich pages that have a vercelProjectId but no customDomainUrl saved,
-    // by looking up the most recent active domain in AW-CustomDomains.
-    // This handles historical records created before customDomainUrl persistence was added.
+    // Resolve each page's public URL from the domain ACTUALLY attached to its
+    // Vercel project (AW-CustomDomains is the source of truth). This does two
+    // things:
+    //   1. Fills in customDomainUrl for historical records that never persisted
+    //      one.
+    //   2. Corrects a stored managed subdomain (*.agentwebforms.com) that has
+    //      gone stale — e.g. the page kept an old subdomain that is no longer
+    //      attached to the project, which serves a Vercel DEPLOYMENT_NOT_FOUND
+    //      404. The attached subdomain replaces it.
+    // Lookups are scoped per PAGE OWNER, not the caller: an org member viewing
+    // a shared page owns no domains, so a caller-scoped lookup would skip
+    // enrichment entirely and surface the stale URL.
     try {
-      const domains = await listDomains(userId);
-      if (domains.length > 0) {
-        // Build a map: vercelProjectId → most recent domain record
-        const latestByProject = new Map<string, CustomDomainRecord>();
+      const ownerIds = [...new Set(pages.map((p) => p.userId).filter(Boolean))];
+      const domainsByOwner = await Promise.all(
+        ownerIds.map(async (ownerId) => [ownerId, await listDomains(ownerId)] as const),
+      );
+
+      // Map: `${ownerId}::${vercelProjectId}` → best attached domain record.
+      // Prefer a verified custom domain over a managed subdomain; break ties by
+      // most-recently-updated.
+      const bestByOwnerProject = new Map<string, CustomDomainRecord>();
+      const rank = (d: CustomDomainRecord) => (d.type === "custom" ? 1 : 0);
+      for (const [ownerId, domains] of domainsByOwner) {
         for (const d of domains) {
           if (!d.vercelProjectId) continue;
-          const existing = latestByProject.get(d.vercelProjectId);
-          if (!existing || d.updatedAt > existing.updatedAt) {
-            latestByProject.set(d.vercelProjectId, d);
+          const key = `${ownerId}::${d.vercelProjectId}`;
+          const existing = bestByOwnerProject.get(key);
+          if (
+            !existing ||
+            rank(d) > rank(existing) ||
+            (rank(d) === rank(existing) && d.updatedAt > existing.updatedAt)
+          ) {
+            bestByOwnerProject.set(key, d);
           }
         }
-        for (const page of pages) {
-          if (!page.customDomainUrl && page.vercelProjectId) {
-            const domain = latestByProject.get(page.vercelProjectId);
-            if (domain) {
-              // Sub-pages have a slug and live at /{slug} under the custom domain
-              page.customDomainUrl = page.slug
-                ? `https://${domain.domain}/${page.slug}`
-                : `https://${domain.domain}`;
-            }
-          }
+      }
+
+      for (const page of pages) {
+        if (!page.vercelProjectId || !page.userId) continue;
+        const best = bestByOwnerProject.get(`${page.userId}::${page.vercelProjectId}`);
+        if (!best) continue;
+        // Sub-pages have a slug and live at /{slug} under the attached domain.
+        const targetUrl = page.slug
+          ? `https://${best.domain}/${page.slug}`
+          : `https://${best.domain}`;
+
+        if (!page.customDomainUrl) {
+          page.customDomainUrl = targetUrl;
+          continue;
+        }
+        // Only correct stored MANAGED subdomains (*.agentwebforms.com): those
+        // are the ones that can silently detach. A real custom domain stored on
+        // the page is user-managed and left untouched.
+        let storedHost: string | null = null;
+        try {
+          storedHost = new URL(page.customDomainUrl).host;
+        } catch {
+          /* malformed stored URL — fall through to leave it as-is */
+        }
+        if (
+          storedHost &&
+          storedHost.endsWith(`.${SUBDOMAIN_BASE}`) &&
+          storedHost !== best.domain
+        ) {
+          page.customDomainUrl = targetUrl;
         }
       }
     } catch {
