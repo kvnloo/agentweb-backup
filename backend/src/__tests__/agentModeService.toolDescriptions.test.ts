@@ -171,6 +171,52 @@ describe('AgentModeService - Tool Descriptions', () => {
   });
 
 
+  describe('HTML File vs HTML Template Tool Descriptions', () => {
+    it('create_html_file should steer one-off emails/newsletters here, not to a template', () => {
+      const tools = agentModeService.getAvailableTools();
+      const createHtmlFile = tools.find(
+        (tool: any) => tool.function?.name === 'create_html_file'
+      );
+
+      expect(createHtmlFile).toBeDefined();
+      const desc = createHtmlFile?.function?.description || '';
+      // Must explicitly cover the one-off email/newsletter case
+      expect(desc.toLowerCase()).toContain('newsletter');
+      expect(desc.toLowerCase()).toContain('email');
+      // Must point reusable/saved templates elsewhere
+      expect(desc).toContain('create_html_template');
+    });
+
+    it('create_html_template should be reserved for reusable, saved templates', () => {
+      const tools = agentModeService.getAvailableTools();
+      const createHtmlTemplate = tools.find(
+        (tool: any) => tool.function?.name === 'create_html_template'
+      );
+
+      expect(createHtmlTemplate).toBeDefined();
+      const desc = createHtmlTemplate?.function?.description || '';
+      // Must convey reusable + saved-to-library intent
+      expect(desc.toLowerCase()).toContain('reusable');
+      expect(desc.toLowerCase()).toContain('templates library');
+      // Must redirect one-off email/newsletter drafting to create_html_file
+      expect(desc).toContain('create_html_file');
+    });
+
+    it('the two HTML tools should have distinct descriptions', () => {
+      const tools = agentModeService.getAvailableTools();
+      const createHtmlFile = tools.find(
+        (tool: any) => tool.function?.name === 'create_html_file'
+      );
+      const createHtmlTemplate = tools.find(
+        (tool: any) => tool.function?.name === 'create_html_template'
+      );
+
+      expect(createHtmlFile?.function?.description).not.toBe(
+        createHtmlTemplate?.function?.description
+      );
+    });
+  });
+
   describe('Market Strategy Tool Descriptions', () => {
     it('should have update_market_strategy tool with buyerPersonas field in ICP description', () => {
       const tools = agentModeService.getAvailableTools();
