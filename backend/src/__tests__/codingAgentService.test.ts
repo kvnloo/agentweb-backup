@@ -437,6 +437,111 @@ describe('runCodingAgent', () => {
     expect(result.iterations).toBeGreaterThanOrEqual(1);
   });
 
+  test('take_screenshot feeds the captured image back to the model as a vision block', async () => {
+    const mockExecuteMcpTool = jest.fn().mockResolvedValueOnce({
+      content: 'Screenshot taken',
+      raw: { content: [{ type: 'image', mimeType: 'image/jpeg', data: 'BASE64IMAGEDATA' }] }
+    });
+    const contextWithBrowser: CodingAgentContext = {
+      ...mockContext,
+      executeMcpTool: mockExecuteMcpTool,
+    };
+
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'take_screenshot', input: { full_page: true } }
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Looks good.', status: 'success' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    const result = await runCodingAgent('screenshot the page', contextWithBrowser);
+
+    expect(result.success).toBe(true);
+    expect(mockExecuteMcpTool).toHaveBeenCalledWith('playwright_browser_take_screenshot', { type: 'jpeg', fullPage: true });
+
+    // The second LLM call must receive the screenshot as an image content block,
+    // not just the string "Screenshot taken successfully." — otherwise the model is blind.
+    const secondCallMessages = mockCreate.mock.calls[1][0].messages;
+    const toolResultMsg = secondCallMessages.find(
+      (m: any) => m.role === 'user' && Array.isArray(m.content) && m.content.some((b: any) => b.type === 'tool_result')
+    );
+    expect(toolResultMsg).toBeDefined();
+    const trBlock = toolResultMsg.content.find((b: any) => b.type === 'tool_result');
+    expect(Array.isArray(trBlock.content)).toBe(true);
+    const imageBlock = trBlock.content.find((b: any) => b.type === 'image');
+    expect(imageBlock).toBeDefined();
+    expect(imageBlock.source).toMatchObject({ type: 'base64', media_type: 'image/jpeg', data: 'BASE64IMAGEDATA' });
+  });
+
+  test('take_screenshot returns a text error (no image block) when browser tools are unavailable', async () => {
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'take_screenshot', input: {} }
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Browser not available.', status: 'error' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    // No executeMcpTool on mockContext
+    await runCodingAgent('screenshot the page', mockContext);
+
+    const secondCallMessages = mockCreate.mock.calls[1][0].messages;
+    const toolResultMsg = secondCallMessages.find(
+      (m: any) => m.role === 'user' && Array.isArray(m.content) && m.content.some((b: any) => b.type === 'tool_result')
+    );
+    const trBlock = toolResultMsg.content.find((b: any) => b.type === 'tool_result');
+    expect(typeof trBlock.content).toBe('string');
+    expect(trBlock.content).toMatch(/not available/i);
+  });
+
+  test('take_screenshot falls back to text when MCP returns no image data', async () => {
+    const mockExecuteMcpTool = jest.fn().mockResolvedValueOnce({
+      content: 'no image here',
+      raw: { content: [] }
+    });
+    const contextWithBrowser: CodingAgentContext = {
+      ...mockContext,
+      executeMcpTool: mockExecuteMcpTool,
+    };
+
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'take_screenshot', input: {} }
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'done', status: 'success' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    const result = await runCodingAgent('screenshot the page', contextWithBrowser);
+
+    expect(result.success).toBe(true);
+    const secondCallMessages = mockCreate.mock.calls[1][0].messages;
+    const toolResultMsg = secondCallMessages.find(
+      (m: any) => m.role === 'user' && Array.isArray(m.content) && m.content.some((b: any) => b.type === 'tool_result')
+    );
+    const trBlock = toolResultMsg.content.find((b: any) => b.type === 'tool_result');
+    expect(typeof trBlock.content).toBe('string');
+  });
+
   test('list_commits tool returns formatted commit history', async () => {
     mockCreate
       .mockResolvedValueOnce({
