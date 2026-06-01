@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-31
+// Last updated: 2026-06-01
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,15 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-06-01',
+    changes: [
+      'Fixed: Exported PDFs No Longer Overlap or Overwrite Sections',
+      '- Converting a rich report (with section cards and tables) to PDF now keeps every section readable instead of letting tall sections overflow onto the next one',
+      '- Long tables now break cleanly across pages, with rows kept intact and headings staying attached to the content below them',
+      '- This applies to both the in-chat "convert to PDF" action and the Export to PDF option',
+    ],
+  },
   {
     date: '2026-06-01',
     changes: [
