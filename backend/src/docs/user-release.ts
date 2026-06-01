@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-01',
     changes: [
+      'Fixed: Landing Page Edits With Emma No Longer Time Out',
+      '- Asking Emma to update a landing page (change text, colors, sections, etc.) could time out before finishing, leaving no preview and no changes',
+      '- Edits now stream as they\'re produced, so larger multi-change requests complete reliably and return a staging preview link',
+      '- If a request does stall, Emma now tells you it timed out instead of failing silently',
+    ],
+  },
+  {
+    date: '2026-06-01',
+    changes: [
       'Improved: Emma Can Now Visually Check Your Landing Page While Editing It',
       '- When Emma edits a landing page, she can now actually see a screenshot of the rendered result instead of editing blind',
       '- This lets her catch visual issues (layout, spacing, colors) before handing the preview back to you',
