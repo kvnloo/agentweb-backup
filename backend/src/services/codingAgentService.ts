@@ -44,6 +44,21 @@ interface ApplyResult {
   errors: string[];
 }
 
+/**
+ * Structured result for tools that produce an image (e.g. take_screenshot).
+ * The agent loop renders this as an Anthropic image content block so the model
+ * can visually analyze the screenshot, rather than receiving an opaque string.
+ */
+interface ToolImageResult {
+  kind: 'image';
+  mediaType: string;
+  data: string; // base64-encoded image
+}
+
+function isToolImageResult(r: unknown): r is ToolImageResult {
+  return typeof r === 'object' && r !== null && (r as any).kind === 'image';
+}
+
 const DEFAULT_MAX_ITERATIONS = 50;
 const DEFAULT_CODING_AGENT_MODEL = 'anthropic.claude-sonnet-4-6'; // Fallback if settings fetch fails
 const AGENT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes max for the entire agent run
@@ -433,7 +448,7 @@ function getToolDefinitions(): Anthropic.Tool[] {
     },
     {
       name: 'take_screenshot',
-      description: 'Take a screenshot of the current browser page. Use after browse_page to capture a visual snapshot. Returns a description of the screenshot.',
+      description: 'Take a screenshot of the current browser page. Use after browse_page to capture a visual snapshot. The image is returned to you directly — actually look at it to verify visual correctness (layout, spacing, colors), do not assume the page is correct.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -454,7 +469,7 @@ async function executeTool(
   toolName: string,
   args: any,
   context: CodingAgentContext
-): Promise<string> {
+): Promise<string | ToolImageResult> {
   const basePath = `/api/landing-pages/v0/generated/${context.pageId}`;
   const branch = context.draftBranch || "main";
   const branchQuery: Record<string, string> = branch !== "main" ? { branch } : {};
@@ -756,7 +771,15 @@ async function executeTool(
         type: 'jpeg',
         fullPage: args.full_page || false
       });
-      return typeof result?.content === 'string' ? result.content : 'Screenshot taken successfully.';
+      // The Playwright MCP returns the image in result.raw.content as an image block.
+      // Surface it as a structured image result so the agent loop can feed the actual
+      // pixels back to the model — otherwise the model is blind to what it captured.
+      const imageContent = (result?.raw?.content as any[])?.find((c: any) => c?.type === 'image');
+      if (imageContent?.data) {
+        return { kind: 'image', mediaType: imageContent.mimeType || 'image/jpeg', data: imageContent.data };
+      }
+      // No image came back — fall back to whatever text the MCP provided.
+      return typeof result?.content === 'string' ? result.content : 'Screenshot taken, but no image data was returned.';
     }
 
     default:
@@ -1240,7 +1263,7 @@ async function runCodingAgentInternal(
         }
 
         // Execute the tool
-        let toolResult: string;
+        let toolResult: string | ToolImageResult;
         try {
           toolResult = await executeTool(fnName, fnArgs, context);
 
@@ -1258,11 +1281,24 @@ async function runCodingAgentInternal(
           toolResult = `Error executing ${fnName}: ${error instanceof Error ? error.message : String(error)}`;
         }
 
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: block.id,
-          content: truncateToolResult(toolResult)
-        });
+        if (isToolImageResult(toolResult)) {
+          // Feed the screenshot back as a vision input so the model can actually see it
+          // and verify visual correctness (mirrors the main agent-mode loop).
+          toolResults.push({
+            type: 'tool_result',
+            tool_use_id: block.id,
+            content: [
+              { type: 'text', text: 'Screenshot captured. Analyze the image below to verify the result visually.' },
+              { type: 'image', source: { type: 'base64', media_type: toolResult.mediaType as any, data: toolResult.data } }
+            ]
+          });
+        } else {
+          toolResults.push({
+            type: 'tool_result',
+            tool_use_id: block.id,
+            content: truncateToolResult(toolResult)
+          });
+        }
       }
 
       // Add tool results as a user message
