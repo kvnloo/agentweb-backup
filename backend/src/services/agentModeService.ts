@@ -192,6 +192,15 @@ const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wm
 // long-term API key (bearer token) rather than the app's default SigV4 creds.
 const BEARER_TOKEN_MODELS = new Set(['anthropic.claude-opus-4-8']);
 
+// Legacy model ids persisted by sessions/schedules created before a model was
+// renamed. Maps the old id to its current registry key so old sessions keep
+// working instead of throwing "Invalid model". Opus 4.8 was renamed from the
+// bare Vertex id "claude-opus-4-8" to the Bedrock id "anthropic.claude-opus-4-8"
+// in commit c86c8ec1.
+const LEGACY_MODEL_ALIASES: Record<string, string> = {
+  'claude-opus-4-8': 'anthropic.claude-opus-4-8',
+};
+
 // Context passed to the diagnosis agent when the main agent fails
 export interface DiagnosisContext {
   errorType: 'transient' | 'context_limit' | 'content_filter' | 'rate_limit' | 'unknown';
@@ -1742,11 +1751,26 @@ export class AgentModeService {
    */
 
 
+  /**
+   * Resolve a possibly-legacy model id to its current registry key. Sessions and
+   * schedules created before a model rename persist the old id; this maps it
+   * forward so requests don't fail with "Invalid model". Unknown/canonical ids
+   * (and undefined) pass through unchanged.
+   */
+  public normalizeModelId<T extends string | undefined>(model: T): T {
+    if (model && LEGACY_MODEL_ALIASES[model]) {
+      return LEGACY_MODEL_ALIASES[model] as T;
+    }
+    return model;
+  }
+
   async callLLM(
     model: string,
     messages: any[],
     options?: LLMCallOptions
   ) {
+    // Map legacy/renamed model ids forward before validation or routing.
+    model = this.normalizeModelId(model);
 
     // Validate that the model exists
     if (!this.llmModels[model]) {
@@ -1956,6 +1980,10 @@ export class AgentModeService {
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
     try {
+      // Map legacy/renamed model ids forward (e.g. old sessions persisted the
+      // pre-rename "claude-opus-4-8") so metadata, pricing, and routing all use
+      // the canonical registry key.
+      llmModel = this.normalizeModelId(llmModel);
       // Track backup model usage
       const originalLlmModel = llmModel;
       let backupModelUsed = false;

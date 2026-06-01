@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-01',
     changes: [
+      'Fixed: Older Agent Mode Chats No Longer Fail With an Unknown Error',
+      '- Some existing chats stopped responding with "an unknown error occurred while generating a response" after a recent model update renamed Claude Opus 4.8 behind the scenes',
+      '- These chats had the old model name saved on them, which was no longer recognized; the saved name is now matched to the current one automatically',
+      '- You can continue any affected conversation normally — no need to start a new chat or re-pick the model',
+    ],
+  },
+  {
+    date: '2026-06-01',
+    changes: [
       'Fixed: Sent LinkedIn Messages No Longer Appear Twice in a Lead\'s Activity',
       '- A LinkedIn message you sent from the CRM was being recorded both at send time and again when the activity sync re-imported it from LinkedIn, so it showed (and counted) twice',
       '- The activity timeline and message counts now de-duplicate these, showing each sent message once',
