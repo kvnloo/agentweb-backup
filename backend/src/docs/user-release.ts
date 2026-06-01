@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-01',
     changes: [
+      'Improved: Emma Can Now Visually Check Your Landing Page While Editing It',
+      '- When Emma edits a landing page, she can now actually see a screenshot of the rendered result instead of editing blind',
+      '- This lets her catch visual issues (layout, spacing, colors) before handing the preview back to you',
+      '- Previously the screenshot step did nothing useful, so visual problems could slip through',
+    ],
+  },
+  {
+    date: '2026-06-01',
+    changes: [
       'Fixed: Exported PDFs No Longer Overlap or Overwrite Sections',
       '- Converting a rich report (with section cards and tables) to PDF now keeps every section readable instead of letting tall sections overflow onto the next one',
       '- Long tables now break cleanly across pages, with rows kept intact and headings staying attached to the content below them',
