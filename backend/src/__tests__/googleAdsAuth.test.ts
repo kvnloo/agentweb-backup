@@ -78,7 +78,7 @@ describe('GET /callback', () => {
     const res = await request(app)
       .get('/callback?error=access_denied')
       .expect(302);
-    expect(res.headers.location).toContain('error=google_ads_access_denied');
+    expect(res.headers.location).toContain('error=access_denied');
   });
 });
 
@@ -140,13 +140,33 @@ describe('POST /connect', () => {
     expect(res.body.error).toMatch(/invalid or expired/i);
   });
 
+  it('returns 400 when customerId is not in the session adAccounts', async () => {
+    const state = makeState('user-123');
+    const finalizeRes = await request(app)
+      .post('/finalize')
+      .send({ code: 'auth-code', state })
+      .expect(200);
+
+    const res = await request(app)
+      .post('/connect')
+      .send({
+        tokenSessionId: finalizeRes.body.tokenSessionId,
+        customerId: '9999999999', // not in mocked adAccounts
+        accountName: 'Ghost Account',
+        currency: 'USD',
+      })
+      .expect(400);
+
+    expect(res.body.error).toMatch(/not found in your authorized accounts/i);
+    expect(createAccount).not.toHaveBeenCalled();
+  });
+
 });
 
-describe('DELETE /disconnect', () => {
+describe('DELETE /disconnect/:customerId', () => {
   it('removes the account', async () => {
     const res = await request(app)
-      .delete('/disconnect')
-      .send({ customerId: '1234567890' })
+      .delete('/disconnect/1234567890')
       .expect(200);
     expect(res.body.success).toBe(true);
     expect(deleteAccountById).toHaveBeenCalledWith('user-123', 'google_ads', '1234567890');

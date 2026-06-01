@@ -98,7 +98,7 @@ router.get('/init', authenticateToken, async (req: any, res) => {
 router.get('/callback', (req, res) => {
   const { code, state, error } = req.query;
   const frontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-  if (error) return res.redirect(`${frontendUrl}/oauth/google-ads/callback?error=google_ads_access_denied&details=${error}`);
+  if (error) return res.redirect(`${frontendUrl}/oauth/google-ads/callback?error=${encodeURIComponent(error as string)}`);
   if (!code) return res.redirect(`${frontendUrl}/oauth/google-ads/callback?error=no_code_provided`);
   res.redirect(`${frontendUrl}/oauth/google-ads/callback?code=${code}&state=${state}`);
 });
@@ -174,6 +174,11 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
     return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
   }
 
+  const accountInSession = session.adAccounts.find(a => a.customerId === customerId);
+  if (!accountInSession) {
+    return res.status(400).json({ error: 'Account not found in your authorized accounts' });
+  }
+
   try {
     const tokenExpiresAt = Date.now() + session.tokens.expires_in * 1000;
     await createAccount(userId, 'google_ads', {
@@ -196,12 +201,11 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
 });
 
 /**
- * DELETE /api/oauth/google-ads/disconnect
+ * DELETE /api/oauth/google-ads/disconnect/:customerId
  * Remove a connected Google Ads account.
- * Body: { customerId }
  */
-router.delete('/disconnect', authenticateToken, async (req: any, res) => {
-  const { customerId } = req.body;
+router.delete('/disconnect/:customerId', authenticateToken, async (req: any, res) => {
+  const { customerId } = req.params;
   const userId = req.user.userId;
   if (!customerId) {
     return res.status(400).json({ error: 'Missing customerId' });

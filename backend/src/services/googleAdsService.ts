@@ -40,12 +40,16 @@ export class GoogleAdsService {
       'Content-Type': 'application/json',
     };
     const url = `${GOOGLE_ADS_API_BASE}${path}`;
-    console.log('[GoogleAds] callApi request:', method, url, body ? JSON.stringify(body, null, 2) : '(no body)');
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[GoogleAds] callApi request:', method, url, body ? JSON.stringify(body, null, 2) : '(no body)');
+    }
     try {
       const response = method === 'GET'
         ? await axios.get(url, { headers })
         : await axios.post(url, body, { headers });
-      console.log('[GoogleAds] callApi response:', JSON.stringify(response.data, null, 2));
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('[GoogleAds] callApi response:', JSON.stringify(response.data, null, 2));
+      }
       return response.data;
     } catch (err: any) {
       const detail = err?.response?.data;
@@ -617,9 +621,8 @@ export class GoogleAdsService {
       if (Buffer.isBuffer(asset.data)) {
         imageBuffer = asset.data;
       } else if (typeof asset.data === 'string' && (asset.data.startsWith('http://') || asset.data.startsWith('https://'))) {
-        const axios = require('axios');
         const response = await axios.get(asset.data, { responseType: 'arraybuffer' });
-        imageBuffer = Buffer.from(response.data);
+        imageBuffer = Buffer.from(response.data as ArrayBuffer);
       } else {
         throw new Error('IMAGE/LOGO asset data must be a Buffer or a URL string');
       }
@@ -654,6 +657,9 @@ export class GoogleAdsService {
           create: { name: asset.text.substring(0, 50), type: 'TEXT', textAsset: { text: asset.text } },
         }]);
         assetResourceName = textData.results[0].resourceName;
+      }
+      if (!assetResourceName) {
+        throw new Error(`attachCampaignAssets: asset with fieldType "${asset.fieldType}" must provide either assetResourceName or text`);
       }
       operations.push({ create: { campaign: campaignResourceName, asset: assetResourceName, fieldType: asset.fieldType } });
     }
