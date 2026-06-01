@@ -22,6 +22,12 @@ import {
   normalizeLinkedInUrl,
   UnipileConnection,
 } from '../services/unipileConnectionsDb';
+import {
+  upsertSentInvitations,
+  pruneStaleSentInvitations,
+  profileUrlFromPublicId,
+  UnipileSentInvitation,
+} from '../services/unipileSentInvitationsDb';
 
 const openai = new OpenAI({
   apiKey: process.env.AZURE_OPENAI_API_KEY,
@@ -132,6 +138,64 @@ export async function syncConnectionsForAccount(
 
   console.log(`${TAG} account=${accountId} synced ${newConnections.length} new connections (pages=${page})`);
   return newConnections;
+}
+
+/**
+ * Sync PENDING sent invitations for one Unipile account into the
+ * AW-UnipileSentInvitations cache, then prune rows that are no longer pending.
+ *
+ * Unipile's getAllInvitationsSent feed contains only invitations that are still
+ * outstanding — once accepted or withdrawn they drop off. So we pull the full
+ * feed, upsert each, and delete any cached row not present in the feed. A cached
+ * row therefore means "we invited this person and they haven't accepted yet",
+ * which the CRM uses to suppress re-inviting.
+ *
+ * Always paginates fully (the feed is bounded by LinkedIn's pending-invite cap).
+ */
+export async function syncSentInvitationsForAccount(accountId: string): Promise<number> {
+  const toUpsert: UnipileSentInvitation[] = [];
+  const stillPendingPublicIds = new Set<string>();
+  const now = new Date().toISOString();
+
+  let cursor: string | undefined;
+  let page = 0;
+  const MAX_PAGES = 50; // 50 × 100 = 5000 pending invites — well above LinkedIn's limits
+
+  do {
+    const result = await linkedInOutreachService.listSentInvitations(accountId, cursor);
+    const items: any[] = result?.items ?? [];
+    if (items.length === 0) break;
+
+    for (const item of items) {
+      // Unipile may return the public id directly, or only a profile/public URL.
+      const publicId: string =
+        item.invited_user_public_id ||
+        item.invited_user_public_identifier ||
+        '';
+      if (!publicId) continue;
+
+      stillPendingPublicIds.add(publicId);
+      toUpsert.push({
+        accountId,
+        invitedUserPublicId: publicId,
+        publicProfileUrl: profileUrlFromPublicId(publicId),
+        invitationId: item.id ?? '',
+        invitedUserName: item.invited_user ?? '',
+        invitationText: item.invitation_text ?? '',
+        sentAt: item.parsed_datetime ?? now,
+        syncedAt: now,
+      });
+    }
+
+    cursor = (result as any)?.cursor ?? undefined;
+    page++;
+  } while (cursor && page < MAX_PAGES);
+
+  await upsertSentInvitations(toUpsert);
+  const pruned = await pruneStaleSentInvitations(accountId, stillPendingPublicIds);
+
+  console.log(`${TAG} account=${accountId} pending invitations: ${toUpsert.length} upserted, ${pruned} pruned (pages=${page})`);
+  return toUpsert.length;
 }
 
 /**
@@ -339,6 +403,13 @@ export async function runLinkedInConnectionSync(): Promise<void> {
         allNewConnections.push(...newConns);
       } catch (err) {
         console.error(`${TAG} Sync failed for account ${accountId}:`, err);
+      }
+      // Refresh pending sent-invitations independently — a failure here must not
+      // block connection sync (and vice versa).
+      try {
+        await syncSentInvitationsForAccount(accountId);
+      } catch (err) {
+        console.error(`${TAG} Sent-invitation sync failed for account ${accountId}:`, err);
       }
     }
 

@@ -242,7 +242,7 @@ describe('AgentModeService - callMetaAdsInsightsApiWrapper', () => {
       mockUserDb.getUserById.mockResolvedValue(mockUser);
     });
 
-    it('should submit report, poll until complete, and return results via S3', async () => {
+    it('should submit report, poll until complete, and return results inline', async () => {
       // 1. Submit report
       mockedAxios.post.mockResolvedValueOnce({
         status: 200,
@@ -281,16 +281,21 @@ describe('AgentModeService - callMetaAdsInsightsApiWrapper', () => {
       const result = await insightsPromise;
 
       expect(mockedAxios.post).toHaveBeenCalled();
-      expect(mockedAxios.get).toHaveBeenCalledTimes(3); 
-      expect(mockUploadFileToS3).toHaveBeenCalled();
-      expect(result.s3_url).toBe('https://s3.amazonaws.com/mock-bucket/mock-file.json');
-      
-      const savedData = JSON.parse(mockUploadFileToS3.mock.calls[0][0]);
-      expect(savedData.data).toHaveLength(1);
-      expect(savedData.data[0].impressions).toBe('100');
+      expect(mockedAxios.get).toHaveBeenCalledTimes(3);
+      // Data is returned inline; the wrapper must NOT do its own S3 upload
+      // (large responses are offloaded later by the generic tool pipeline).
+      expect(mockUploadFileToS3).not.toHaveBeenCalled();
+      expect(result.success).toBe(true);
+      expect(result.s3_url).toBeUndefined();
+      expect(result.totalRows).toBe(1);
+      expect(result.data).toHaveLength(1);
+      expect(result.data[0].impressions).toBe('100');
+      expect(result.data[0].clicks).toBe('10');
+      expect(result.metadata.tool).toBe('call_meta_ads_insights_api');
+      expect(result.metadata.object_type).toBe('account');
     });
 
-    it('should handle paginated results and upload to S3', async () => {
+    it('should handle paginated results and return them inline', async () => {
       mockedAxios.post.mockResolvedValueOnce({
         status: 200,
         data: { report_run_id: 'report-123' }
@@ -329,11 +334,13 @@ describe('AgentModeService - callMetaAdsInsightsApiWrapper', () => {
       await jest.runAllTimersAsync();
       const result = await insightsPromise;
 
-      expect(result.s3_url).toBe('https://s3.amazonaws.com/mock-bucket/mock-file.json');
-      const savedData = JSON.parse(mockUploadFileToS3.mock.calls[0][0]);
-      expect(savedData.data).toHaveLength(2);
-      expect(savedData.data[0].impressions).toBe('100');
-      expect(savedData.data[1].impressions).toBe('200');
+      expect(mockUploadFileToS3).not.toHaveBeenCalled();
+      expect(result.success).toBe(true);
+      expect(result.s3_url).toBeUndefined();
+      expect(result.totalRows).toBe(2);
+      expect(result.data).toHaveLength(2);
+      expect(result.data[0].impressions).toBe('100');
+      expect(result.data[1].impressions).toBe('200');
     });
 
     it('should return error if job fails', async () => {
