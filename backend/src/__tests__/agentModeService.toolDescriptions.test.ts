@@ -202,6 +202,19 @@ describe('AgentModeService - Tool Descriptions', () => {
       expect(desc).toContain('create_html_file');
     });
 
+    it('create_html_file should expose a document_type=email option for newsletters', () => {
+      const tools = agentModeService.getAvailableTools();
+      const createHtmlFile = tools.find(
+        (tool: any) => tool.function?.name === 'create_html_file'
+      );
+
+      const docType = createHtmlFile?.function?.parameters?.properties?.document_type;
+      expect(docType).toBeDefined();
+      expect(docType?.enum).toEqual(expect.arrayContaining(['document', 'email']));
+      // Description should tell the model to use email mode for newsletters
+      expect((createHtmlFile?.function?.description || '').toLowerCase()).toContain('newsletter');
+    });
+
     it('the two HTML tools should have distinct descriptions', () => {
       const tools = agentModeService.getAvailableTools();
       const createHtmlFile = tools.find(
