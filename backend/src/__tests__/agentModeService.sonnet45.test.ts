@@ -498,6 +498,61 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     });
   });
 
+  describe('Legacy model id normalization (Opus 4.8 rename)', () => {
+    // Sessions created before commit c86c8ec1 persisted the bare "claude-opus-4-8"
+    // id (Vertex era). After the rename to "anthropic.claude-opus-4-8" (Bedrock),
+    // those legacy ids must be transparently mapped so old sessions keep working
+    // instead of throwing "Invalid model 'claude-opus-4-8'".
+    it('should NOT throw "Invalid model" for the legacy claude-opus-4-8 id', async () => {
+      const mockCreate = jest.fn().mockResolvedValue({
+        choices: [{ message: { role: 'assistant', content: 'Hi!', tool_calls: undefined }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 9, completion_tokens: 13, total_tokens: 22 },
+      });
+      const mockBedrockClient = { chat: { completions: { create: mockCreate } } };
+      jest.spyOn(agentModeService as any, 'getBedrockClient').mockResolvedValue(mockBedrockClient);
+
+      const messages = [
+        { role: 'system', content: 'You are a helpful assistant.' },
+        { role: 'user', content: 'Hello' },
+      ];
+
+      await expect(
+        (agentModeService as any).callLLM('claude-opus-4-8', messages)
+      ).resolves.toBeDefined();
+    });
+
+    it('should route the legacy claude-opus-4-8 id to the Bedrock client, not Vertex', async () => {
+      const mockCreate = jest.fn().mockResolvedValue({
+        choices: [{ message: { role: 'assistant', content: 'Hi!', tool_calls: undefined }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 9, completion_tokens: 13, total_tokens: 22 },
+      });
+      const mockBedrockClient = { chat: { completions: { create: mockCreate } } };
+      jest.spyOn(agentModeService as any, 'getBedrockClient').mockResolvedValue(mockBedrockClient);
+      const vertexSpy = jest.spyOn(agentModeService as any, 'getVertexClient');
+
+      const messages = [
+        { role: 'system', content: 'You are a helpful assistant.' },
+        { role: 'user', content: 'Hello' },
+      ];
+
+      await (agentModeService as any).callLLM('claude-opus-4-8', messages);
+
+      // Must resolve to the canonical Bedrock id, never the Vertex client.
+      expect((agentModeService as any).getBedrockClient).toHaveBeenCalledWith('anthropic.claude-opus-4-8');
+      expect(vertexSpy).not.toHaveBeenCalled();
+    });
+
+    it('normalizeModelId maps the legacy id to the canonical Bedrock id', () => {
+      expect((agentModeService as any).normalizeModelId('claude-opus-4-8')).toBe('anthropic.claude-opus-4-8');
+    });
+
+    it('normalizeModelId leaves canonical and unknown ids unchanged', () => {
+      expect((agentModeService as any).normalizeModelId('anthropic.claude-opus-4-8')).toBe('anthropic.claude-opus-4-8');
+      expect((agentModeService as any).normalizeModelId('gpt-5.5')).toBe('gpt-5.5');
+      expect((agentModeService as any).normalizeModelId(undefined)).toBeUndefined();
+    });
+  });
+
   describe('Inference profile ARN mapping', () => {
     beforeEach(() => {
       mockBedrockSend.mockResolvedValue({
