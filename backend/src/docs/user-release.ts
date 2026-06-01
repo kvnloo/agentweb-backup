@@ -9,6 +9,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-06-01',
+    changes: [
+      'Fixed: Sent LinkedIn Messages No Longer Appear Twice in a Lead\'s Activity',
+      '- A LinkedIn message you sent from the CRM was being recorded both at send time and again when the activity sync re-imported it from LinkedIn, so it showed (and counted) twice',
+      '- The activity timeline and message counts now de-duplicate these, showing each sent message once',
+    ],
+  },
+  {
     date: '2026-05-31',
     changes: [
       'New: CRM Shows "Invitation Pending" for Leads You\'ve Already Invited on LinkedIn',
