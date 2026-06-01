@@ -437,7 +437,8 @@ router.post('/create-html', async (req: Request, res: Response) => {
     const svc = await getAgentModeService();
     const result = await svc.createHtmlFile(
       req.body.title, req.body.content_draft,
-      req.body.format_requirements || '', userId(req), req.body.session_id || ''
+      req.body.format_requirements || '', userId(req), req.body.session_id || '',
+      req.body.document_type === 'email' ? 'email' : 'document'
     );
     res.json(result);
   } catch (err: any) {
