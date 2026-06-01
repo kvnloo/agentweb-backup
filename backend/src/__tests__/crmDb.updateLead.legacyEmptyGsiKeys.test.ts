@@ -185,3 +185,83 @@ describe('crmDb.updateLead — legacy empty-string GSI key self-heal', () => {
     ).resolves.not.toThrow();
   });
 });
+
+// ─── Null standard field handling (revert enrichment path) ───────────────────
+
+describe('crmDb.updateLead — null standard fields → REMOVE', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    updatePromiseMock.mockResolvedValue({ Attributes: {} });
+    getPromiseMock.mockResolvedValue({
+      Item: { listId: 'list-1', leadId: 'lead-1', email: 'jane@acme.com' },
+    });
+  });
+
+  it('REMOVEs email when passed as null', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { email: null as any });
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toMatch(/REMOVE\b.*\bemail\b/);
+    expect(params.ExpressionAttributeValues).not.toHaveProperty(':email');
+  });
+
+  it('REMOVEs linkedin when passed as null', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { linkedin: null as any });
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toMatch(/REMOVE\b.*\blinkedin\b/);
+    expect(params.ExpressionAttributeValues).not.toHaveProperty(':linkedin');
+  });
+
+  it('REMOVEs companyLinkedin when passed as null', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { companyLinkedin: null as any });
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toMatch(/REMOVE\b.*\bcompanyLinkedin\b/);
+    expect(params.ExpressionAttributeValues).not.toHaveProperty(':companyLinkedin');
+  });
+
+  it('REMOVEs firstName when passed as null', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { firstName: null as any });
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toMatch(/REMOVE\b.*\bfirstName\b/);
+    expect(params.ExpressionAttributeValues).not.toHaveProperty(':firstName');
+  });
+
+  it('REMOVEs phone when passed as null', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { phone: null as any });
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toMatch(/REMOVE\b.*\bphone\b/);
+  });
+
+  it('REMOVEs company when passed as null', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { company: null as any });
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toMatch(/REMOVE\b.*\bcompany\b/);
+  });
+
+  it('REMOVEs title when passed as null', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { title: null as any });
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toMatch(/REMOVE\b.*\btitle\b/);
+  });
+
+  it('REMOVEs notes when passed as null', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { notes: null as any });
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toMatch(/REMOVE\b.*\bnotes\b/);
+  });
+
+  it('does not throw when all standard fields are null (revert of fully-enriched lead)', async () => {
+    await expect(
+      crmDb.updateLead('list-1', 'lead-1', {
+        email: null as any,
+        firstName: null as any,
+        lastName: null as any,
+        company: null as any,
+        phone: null as any,
+        title: null as any,
+        linkedin: null as any,
+        companyLinkedin: null as any,
+        notes: null as any,
+      }),
+    ).resolves.not.toThrow();
+  });
+});
