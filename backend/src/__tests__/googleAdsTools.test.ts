@@ -42,6 +42,7 @@ jest.mock('../services/googleAdsService', () => ({
 }));
 
 import { AgentModeService } from '../services/agentModeService';
+import { googleAdsService } from '../services/googleAdsService';
 
 let service: AgentModeService;
 beforeEach(() => {
@@ -512,5 +513,100 @@ describe('handleCallGoogleAdsApi — CAMPAIGN_ASSET ATTACH', () => {
       campaign_resource_name: 'customers/123/campaigns/1',
     });
     expect(result.success).toBe(false);
+  });
+});
+
+describe('handleCallGoogleAdsApi — error handling', () => {
+  it('short-circuits auth errors with authError flag', async () => {
+    (googleAdsService.listCampaigns as jest.Mock).mockRejectedValueOnce(
+      Object.assign(new Error('Google Ads account not found'), { isGoogleAdsAuthError: true })
+    );
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'LIST',
+    });
+    expect(result).toEqual({ success: false, error: 'Google Ads account not found', authError: true });
+  });
+
+  it('formats Google Ads API error details as "CODE: message"', async () => {
+    (googleAdsService.listCampaigns as jest.Mock).mockRejectedValueOnce({
+      response: { data: { error: { details: [{ errors: [
+        { errorCode: { queryError: 'BAD_FIELD' }, message: 'Unrecognized field.' },
+        { errorCode: { queryError: 'BAD_VALUE' }, message: 'Bad value.' },
+      ] }] } } },
+    });
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'LIST',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('BAD_FIELD: Unrecognized field.; BAD_VALUE: Bad value.');
+  });
+
+  it('falls back to error.message for non-Google-Ads errors', async () => {
+    (googleAdsService.listCampaigns as jest.Mock).mockRejectedValueOnce(new Error('socket hang up'));
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'LIST',
+    });
+    expect(result).toEqual({ success: false, error: 'socket hang up' });
+  });
+
+  it('falls back to "Unknown error" when no message is present', async () => {
+    (googleAdsService.listCampaigns as jest.Mock).mockRejectedValueOnce({});
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'LIST',
+    });
+    expect(result).toEqual({ success: false, error: 'Unknown error' });
+  });
+
+  it('returns a structured error for an unsupported entity_type/action', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'AD',
+      action: 'FROBNICATE',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/Unsupported entity_type/);
+  });
+});
+
+describe('handleCallGoogleAdsReportingApi — error handling', () => {
+  it('short-circuits auth errors with authError flag', async () => {
+    (googleAdsService.getQuickMetrics as jest.Mock).mockRejectedValueOnce(
+      Object.assign(new Error('Reconnect Google Ads in Settings.'), { isGoogleAdsAuthError: true })
+    );
+    const result = await service.handleCallGoogleAdsReportingApi('user-123', {
+      customer_id: '1234567890',
+      mode: 'dashboard',
+    });
+    expect(result).toEqual({ success: false, error: 'Reconnect Google Ads in Settings.', authError: true });
+  });
+
+  it('formats Google Ads API error details from the reporting path', async () => {
+    (googleAdsService.queryReporting as jest.Mock).mockRejectedValueOnce({
+      response: { data: { error: { details: [{ errors: [{ message: 'Invalid GAQL.' }] }] } } },
+    });
+    const result = await service.handleCallGoogleAdsReportingApi('user-123', {
+      customer_id: '1234567890',
+      mode: 'raw',
+      query: 'SELECT bogus FROM nowhere',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('Invalid GAQL.');
+  });
+
+  it('rejects an invalid mode', async () => {
+    const result = await service.handleCallGoogleAdsReportingApi('user-123', {
+      customer_id: '1234567890',
+      mode: 'sideways' as any,
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('mode must be "raw" or "dashboard"');
   });
 });

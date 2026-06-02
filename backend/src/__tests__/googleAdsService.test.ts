@@ -40,11 +40,24 @@ jest.mock('../services/connectedAccountsDb', () => ({
   // normalizeAccounts is NOT exported — do not mock it here
 }));
 
+const mockAssertPublicHostname = jest.fn();
+jest.mock('../utils/ssrfGuard', () => ({
+  assertPublicHostname: (...args: any[]) => mockAssertPublicHostname(...args),
+  SsrfBlockedError: class SsrfBlockedError extends Error {
+    constructor(message = 'URL resolves to a private/internal address') {
+      super(message);
+      this.name = 'SsrfBlockedError';
+    }
+  },
+}));
+import { SsrfBlockedError } from '../utils/ssrfGuard';
+
 import { GoogleAdsService } from '../services/googleAdsService';
 
 let service: GoogleAdsService;
 beforeEach(() => {
   jest.clearAllMocks();
+  mockAssertPublicHostname.mockResolvedValue(undefined);
   service = new GoogleAdsService();
 });
 
@@ -63,6 +76,29 @@ describe('API version', () => {
     await service.search('1234567890', 'test-access-token', 'SELECT campaign.id FROM campaign');
     const headers = mockAxiosPost.mock.calls[0][2].headers;
     expect(headers['login-customer-id']).toBe('1234567890');
+  });
+});
+
+describe('search — pagination', () => {
+  it('follows nextPageToken and concatenates all pages', async () => {
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [{ id: '1' }, { id: '2' }], nextPageToken: 'tok-2' } })
+      .mockResolvedValueOnce({ data: { results: [{ id: '3' }] } });
+
+    const results = await service.search('1234567890', 'test-access-token', 'SELECT campaign.id FROM campaign');
+
+    expect(results).toEqual([{ id: '1' }, { id: '2' }, { id: '3' }]);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(2);
+    // first page request carries no pageToken; second page sends the token
+    expect(mockAxiosPost.mock.calls[0][1].pageToken).toBeUndefined();
+    expect(mockAxiosPost.mock.calls[1][1].pageToken).toBe('tok-2');
+  });
+
+  it('returns a single page when there is no nextPageToken', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ id: '1' }] } });
+    const results = await service.search('1234567890', 'test-access-token', 'SELECT campaign.id FROM campaign');
+    expect(results).toEqual([{ id: '1' }]);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -379,6 +415,17 @@ describe('createAd — Responsive Display Ad', () => {
     const body = mockAxiosPost.mock.calls[0][1];
     expect(body.operations[0].create.ad.responsiveDisplayAd).toBeDefined();
     expect(body.operations[0].create.ad.responsiveDisplayAd.marketingImages).toHaveLength(1);
+  });
+
+  it('rejects an unknown ad type instead of silently building a display ad', async () => {
+    await expect(service.createAd('user-123', '1234567890', {
+      adGroupResourceName: 'customers/123/adGroups/789',
+      type: 'SEARCH' as any,
+      headlines: ['Headline 1'],
+      descriptions: ['Description 1'],
+      finalUrl: 'https://example.com',
+    })).rejects.toThrow(/Unsupported ad type/);
+    expect(mockAxiosPost).not.toHaveBeenCalled();
   });
 });
 
@@ -730,7 +777,49 @@ describe('uploadAsset — URL input', () => {
       type: 'IMAGE',
       name: 'test.jpg',
       data: 'not-a-url' as any,
-    })).rejects.toThrow('IMAGE/LOGO asset data must be a Buffer or a URL string');
+    })).rejects.toThrow('IMAGE/LOGO asset data must be a Buffer or an https:// URL string');
+  });
+});
+
+describe('uploadAsset — SSRF protection', () => {
+  it('runs the SSRF guard before fetching and hardens the request', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: Buffer.from('img') });
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/assets/9' }] },
+    });
+    await service.uploadAsset('user-123', '1234567890', {
+      type: 'IMAGE',
+      name: 'hero.jpg',
+      data: 'https://example.com/hero.jpg',
+    });
+    expect(mockAssertPublicHostname).toHaveBeenCalledWith('https://example.com/hero.jpg');
+    // guard must run before the outbound fetch
+    expect(mockAssertPublicHostname.mock.invocationCallOrder[0])
+      .toBeLessThan(mockAxiosGet.mock.invocationCallOrder[0]);
+    const opts = mockAxiosGet.mock.calls[0][1];
+    expect(opts.maxRedirects).toBe(0);
+    expect(opts.maxContentLength).toBeGreaterThan(0);
+    expect(opts.maxBodyLength).toBeGreaterThan(0);
+  });
+
+  it('rejects when the SSRF guard blocks the URL and never fetches', async () => {
+    mockAssertPublicHostname.mockRejectedValueOnce(new SsrfBlockedError());
+    await expect(service.uploadAsset('user-123', '1234567890', {
+      type: 'IMAGE',
+      name: 'evil.jpg',
+      data: 'https://169.254.169.254/latest/meta-data/',
+    })).rejects.toBeInstanceOf(SsrfBlockedError);
+    expect(mockAxiosGet).not.toHaveBeenCalled();
+  });
+
+  it('rejects http:// URLs without invoking the guard or fetching', async () => {
+    await expect(service.uploadAsset('user-123', '1234567890', {
+      type: 'IMAGE',
+      name: 'plain.jpg',
+      data: 'http://example.com/plain.jpg',
+    })).rejects.toThrow('IMAGE/LOGO asset data must be a Buffer or an https:// URL string');
+    expect(mockAssertPublicHostname).not.toHaveBeenCalled();
+    expect(mockAxiosGet).not.toHaveBeenCalled();
   });
 });
 
