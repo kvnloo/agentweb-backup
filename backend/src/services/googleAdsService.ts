@@ -580,7 +580,7 @@ export class GoogleAdsService {
           descriptions: params.descriptions.map(text => ({ text })),
         },
       };
-    } else {
+    } else if (params.type === 'RESPONSIVE_DISPLAY_AD') {
       adContent = {
         responsiveDisplayAd: {
           headlines: params.headlines.map(text => ({ text })),
@@ -590,6 +590,10 @@ export class GoogleAdsService {
           }),
         },
       };
+    } else {
+      // Reject unknown types rather than silently defaulting to a display ad —
+      // the agent could otherwise spend on the wrong ad format.
+      throw new Error(`Unsupported ad type "${params.type}". Use RESPONSIVE_SEARCH_AD or RESPONSIVE_DISPLAY_AD.`);
     }
 
     const data = await this.mutate(customerId, accessToken, 'adGroupAds', [{
