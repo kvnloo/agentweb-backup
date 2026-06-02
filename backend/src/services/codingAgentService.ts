@@ -12,8 +12,25 @@ import Anthropic from '@anthropic-ai/sdk';
 import { mcpFetch } from '../mcp/server/httpClient';
 import { agentModeService } from './agentModeService';
 import { getSecret } from '../utils/secretsManager';
+import { getLandingPageById, getLandingPagesByOwner, GeneratedLandingPage } from './v0Service';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
+
+/**
+ * The set of files a coding-agent run is allowed to touch. Many landing pages share
+ * ONE GitHub repo — each page is an `app/<slug>/` sub-route directory (plus the root
+ * page, which owns the top-level `app/` files). A run scoped to one pageId must not
+ * edit a sibling page's directory. This describes that boundary; `isPathInScope`
+ * applies it.
+ */
+export interface PageScope {
+  /** This page's slug, e.g. "every-io-day-zero-pre-seed-fou". Empty for the root page. */
+  slug: string;
+  /** True if this is the site's root page (owns top-level app/ files, e.g. app/page.tsx). */
+  isRootPage: boolean;
+  /** Slugs of OTHER pages in the same repo — their app/<slug>/ dirs are off-limits. */
+  siblingSlugs: string[];
+}
 
 export interface CodingAgentContext {
   pageId: string;
@@ -22,6 +39,12 @@ export interface CodingAgentContext {
   llmModel: string;
   /** Draft branch name for staging edits (e.g. "draft/abc12345"). If unset, edits go to main. */
   draftBranch?: string;
+  /**
+   * Editable file boundary for this run. Resolved from the page record before the
+   * agent loop starts. When unset (e.g. resolution failed), edits are unrestricted —
+   * the agent falls back to its prior behavior rather than blocking all work.
+   */
+  scope?: PageScope;
   socketEmit?: (room: string, event: string, payload: any) => void;
   executeMcpTool?: (toolName: string, args: any) => Promise<any>;
   /** Optional per-turn token-usage callback. Invoked once per LLM response with
@@ -114,6 +137,101 @@ The tool will create the file if it doesn't exist. No need to read it first.
 - For the user's own brand logo: the task_description will include the logo URL (from brand guidelines or an S3 link). Use that URL directly in the img tag.
 
 Skip steps that aren't needed. For a simple text change, you might just: read the file, edit it, check deployment, and report. Use your judgment.`;
+
+// ─── Page Scope ───────────────────────────────────────────────────────────────
+// Many landing pages live in ONE shared GitHub repo: the root page owns the
+// top-level app/ files (app/page.tsx, app/layout.tsx, components/, …) and every
+// other page is an app/<slug>/ sub-route. A run scoped to one pageId must stay
+// inside that page's files, or it bleeds edits into sibling pages (the scope-creep
+// bug this guards against). These helpers compute and enforce that boundary.
+
+/** Strip a leading "./" or "/" and collapse backslashes so comparisons are stable. */
+function normalizeRepoPath(filePath: string): string {
+  return (filePath || '')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+    .replace(/^\/+/, '');
+}
+
+/**
+ * Build the editable boundary for `page` given all pages in the same repo.
+ * A page with no slug (or an explicit isRootPage flag) is the root page.
+ */
+export function resolvePageScope(
+  page: Pick<GeneratedLandingPage, 'id' | 'slug' | 'isRootPage'>,
+  repoPages: Pick<GeneratedLandingPage, 'id' | 'slug' | 'isRootPage'>[]
+): PageScope {
+  const slug = (page.slug || '').trim();
+  const isRootPage = !!page.isRootPage || slug === '';
+  const siblingSlugs = Array.from(
+    new Set(
+      repoPages
+        .filter((p) => p.id !== page.id && !!p.slug)
+        .map((p) => (p.slug as string).trim())
+        .filter((s) => s !== '' && s !== slug)
+    )
+  );
+  return { slug, isRootPage, siblingSlugs };
+}
+
+/** True if `filePath` is one the agent is allowed to edit under `scope`. */
+export function isPathInScope(filePath: string, scope: PageScope): boolean {
+  const path = normalizeRepoPath(filePath);
+  if (!path) return false;
+
+  if (scope.isRootPage) {
+    // Root page owns everything EXCEPT other pages' app/<slug>/ directories.
+    for (const sib of scope.siblingSlugs) {
+      if (path === `app/${sib}` || path.startsWith(`app/${sib}/`)) return false;
+    }
+    return true;
+  }
+
+  // Sub-page: edits must live under this page's own directory.
+  if (!scope.slug) return true; // Unknown slug — don't block (defensive fallback).
+  return path === `app/${scope.slug}` || path.startsWith(`app/${scope.slug}/`);
+}
+
+/** Drop file-listing lines (formatted "path (N bytes)") that fall outside `scope`. */
+export function filterFileListingToScope(listing: string, scope: PageScope): string {
+  const kept = listing
+    .split('\n')
+    .filter((line) => {
+      const path = line.split(' (')[0].trim();
+      return path !== '' && isPathInScope(path, scope);
+    });
+  return kept.join('\n') || '(no files in your editable scope)';
+}
+
+/** The scope rules appended to the system prompt for a scoped run. */
+export function buildScopeSystemClause(scope: PageScope): string {
+  if (scope.isRootPage) {
+    const others = scope.siblingSlugs.length
+      ? scope.siblingSlugs.map((s) => `app/${s}/`).join(', ')
+      : '(none yet)';
+    return `
+
+## Edit scope (STRICT — enforced)
+You are editing the site's ROOT page. You MAY edit top-level files such as \`app/page.tsx\`, \`app/layout.tsx\`, \`app/globals.css\`, and shared \`components/\`.
+You may NOT edit other pages' directories: ${others}. Writes to those paths are rejected.
+Make ONLY the specific change the user asked for. Do not relabel copy, rename sections, or touch unrelated pages or components.`;
+  }
+  return `
+
+## Edit scope (STRICT — enforced)
+You are editing ONE page, which lives entirely under \`app/${scope.slug}/\`. You may ONLY create or modify files under \`app/${scope.slug}/\` (e.g. \`app/${scope.slug}/page.tsx\`, \`app/${scope.slug}/_components/...\`).
+Do NOT edit other pages' directories (other \`app/*/\` folders), shared files in \`components/\`, \`app/layout.tsx\`, \`app/globals.css\`, or config — those affect other pages and writes to them are rejected. If the change seems to need a shared component, copy/adjust it inside \`app/${scope.slug}/_components/\` instead.
+Make ONLY the specific change the user asked for. Do not relabel copy, rename sections, or touch other pages.`;
+}
+
+/** Corrective message returned to the agent when it tries to write outside scope. */
+function scopeViolationMessage(filePath: string, scope: PageScope): string {
+  if (scope.isRootPage) {
+    return `Refusing to edit "${filePath}": it belongs to another landing page, not the root page you are editing. You may only edit files outside the other pages' directories.`;
+  }
+  return `Refusing to edit "${filePath}": it is outside this page's directory "app/${scope.slug}/". You may ONLY edit files under "app/${scope.slug}/". To change shared UI for THIS page only, create or edit a component under "app/${scope.slug}/_components/" instead.`;
+}
 
 // ─── Search/Replace Engine ──────────────────────────────────────────────────
 
@@ -481,6 +599,18 @@ async function executeTool(
   const basePath = `/api/landing-pages/v0/generated/${context.pageId}`;
   const branch = context.draftBranch || "main";
   const branchQuery: Record<string, string> = branch !== "main" ? { branch } : {};
+
+  // Hard scope guard: block writes outside this page's editable boundary. Reads
+  // (read_file/search_in_file) stay unrestricted so the agent can still inspect
+  // shared code for context — only mutations are confined. No scope => no limit.
+  if (
+    context.scope &&
+    (toolName === 'edit_file' || toolName === 'revert_file') &&
+    args.file_path &&
+    !isPathInScope(args.file_path, context.scope)
+  ) {
+    return scopeViolationMessage(args.file_path, context.scope);
+  }
 
   switch (toolName) {
     case 'list_files': {
@@ -1368,6 +1498,34 @@ function extractFailureSummary(
   return { message: parts.join(' '), previewUrl };
 }
 
+/**
+ * Resolve the editable boundary for a run from the page record and its repo
+ * siblings (the owner's other pages — sub-pages share one repo with the root).
+ * Best-effort: any failure (missing record, DB error) returns undefined so the
+ * agent runs unrestricted rather than blocking all edits on a lookup hiccup.
+ */
+async function resolvePageScopeForContext(
+  context: CodingAgentContext
+): Promise<PageScope | undefined> {
+  try {
+    const page = await getLandingPageById(context.pageId);
+    if (!page) return undefined;
+    let repoPages: GeneratedLandingPage[] = [page];
+    try {
+      const ownerPages = await getLandingPagesByOwner(page.userId);
+      if (ownerPages.length > 0) repoPages = ownerPages;
+    } catch (e) {
+      // Couldn't list siblings — scope to just this page (still blocks sub-pages
+      // for the root, since siblingSlugs is empty, but never over-blocks).
+      console.warn('[CODING AGENT] Could not list owner pages for scope; using page alone:', e);
+    }
+    return resolvePageScope(page, repoPages);
+  } catch (e) {
+    console.warn('[CODING AGENT] Page scope resolution failed; running unrestricted:', e);
+    return undefined;
+  }
+}
+
 // ─── Main Agent Loop ────────────────────────────────────────────────────────
 
 async function runCodingAgentInternal(
@@ -1380,17 +1538,37 @@ async function runCodingAgentInternal(
   const client = await getClientForModel(model);
   const tools = getToolDefinitions();
 
+  // Resolve this run's editable boundary so a single-page task can't bleed edits
+  // into sibling pages that share the same repo. Best-effort: if lookup fails we
+  // leave scope unset and the agent runs unrestricted (prior behavior) rather
+  // than blocking all work. An explicit context.scope (e.g. from the eval harness)
+  // takes precedence; otherwise resolve from the page record.
+  const scope = context.scope ?? (await resolvePageScopeForContext(context));
+  // Thread the resolved scope through to executeTool's write guard without
+  // mutating the caller's context object.
+  const scopedContext: CodingAgentContext = { ...context, scope };
+
   // Pre-fetch the file listing so the agent knows the repo structure from the first iteration.
   // This prevents it from blindly guessing file paths (e.g. editing index.html instead of app/page.tsx).
   let fileListingPreamble = '';
   try {
-    const fileList = await executeTool('list_files', {}, context);
-    fileListingPreamble = `\n\n## Repository file listing (use this to orient yourself — do not call list_files again)\n\`\`\`\n${fileList}\n\`\`\`\n\n`;
+    const fileList = await executeTool('list_files', {}, scopedContext);
+    // Filter the listing to the page's scope so the agent never even sees sibling
+    // pages' files — removing the temptation to edit them.
+    const scopedList = scope
+      ? filterFileListingToScope(typeof fileList === 'string' ? fileList : '', scope)
+      : (fileList as string);
+    fileListingPreamble = `\n\n## Repository file listing (use this to orient yourself — do not call list_files again)\n\`\`\`\n${scopedList}\n\`\`\`\n\n`;
   } catch (e) {
     if (is403Error(e)) throw e; // Authorization failure — propagate immediately
     // Non-fatal: agent can still call list_files itself
     console.warn('[CODING AGENT] Pre-fetch of file listing failed, agent will list files manually:', e);
   }
+
+  // Append the strict scope rules to the system prompt for this run.
+  const systemPrompt = scope
+    ? CODING_AGENT_SYSTEM_PROMPT + buildScopeSystemClause(scope)
+    : CODING_AGENT_SYSTEM_PROMPT;
 
   const messages: Anthropic.MessageParam[] = [
     { role: 'user', content: fileListingPreamble + taskDescription }
@@ -1420,7 +1598,7 @@ async function runCodingAgentInternal(
       const response = await callWithRetry(client, {
         model,
         max_tokens: 16384,
-        system: CODING_AGENT_SYSTEM_PROMPT,
+        system: systemPrompt,
         tools,
         messages,
       });
@@ -1468,7 +1646,7 @@ async function runCodingAgentInternal(
         // Execute the tool
         let toolResult: string | ToolImageResult;
         try {
-          toolResult = await executeTool(fnName, fnArgs, context);
+          toolResult = await executeTool(fnName, fnArgs, scopedContext);
 
           // Emit progress about tool execution
           if (context.socketEmit) {
