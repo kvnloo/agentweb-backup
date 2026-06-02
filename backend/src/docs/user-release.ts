@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-06-01
+// Last updated: 2026-06-02
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,15 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-06-02',
+    changes: [
+      'Fixed: Shared Landing Pages No Longer Show a Broken (404) Link for Team Members',
+      '- When a landing page\'s subdomain was changed, team members viewing the shared page could still see the old address, which led to a "page not found" error',
+      '- Landing page links now always resolve to the subdomain currently connected to the site, for the page owner and every team member alike',
+      '- This corrects stale managed (agentwebforms.com) addresses automatically; your own custom domains are left exactly as configured',
+    ],
+  },
   {
     date: '2026-06-01',
     changes: [

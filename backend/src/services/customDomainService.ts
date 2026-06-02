@@ -11,7 +11,7 @@ const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 const TABLE_NAME = `${TABLE_PREFIX}AW-CustomDomains`;
 const LANDING_PAGES_TABLE = `${TABLE_PREFIX}AW-LandingPages`;
 
-const SUBDOMAIN_BASE = "agentwebforms.com";
+export const SUBDOMAIN_BASE = "agentwebforms.com";
 const VERCEL_API_BASE = "https://api.vercel.com";
 
 // ---------------------------------------------------------------------------
