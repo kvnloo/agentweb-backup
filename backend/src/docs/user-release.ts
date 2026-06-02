@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-02',
     changes: [
+      'Fixed: HubSpot Sync Now Reliably Pushes Leads (Including Notes) and Auto-Syncs New Ones',
+      '- Lists whose mapping included a "Notes" field could fail to push every contact ("Property \\"notes\\" does not exist"); the missing field is now created automatically before syncing, regardless of how it was mapped',
+      '- New and edited leads added to a synced list now push to HubSpot automatically by default — previously auto-sync could be left off after setup, so new leads silently never appeared in HubSpot',
+      '- Saving a connection without a pasted access token is now blocked with a clear prompt, instead of saving an unusable configuration that you had to set up a second time',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
       'Fixed: Shared Plan Links No Longer Get Stuck on a Login Page',
       '- Opening a shared plan link for a plan that requires sign-in sent recipients to the login screen and dropped the share access, so the link looked broken',
       '- Shared plan links now open the conversation directly using the link itself as the access pass — no forced login for the people you share with',

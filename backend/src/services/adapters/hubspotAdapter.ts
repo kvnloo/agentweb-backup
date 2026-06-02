@@ -20,6 +20,16 @@ import { crmDb } from '../db';
  * DB reads occur across the many API calls in a sync.
  */
 export class HubspotAdapter implements CrmAdapter {
+    /**
+     * HubSpot contact properties that exist natively on every portal. Anything
+     * mapped to a property outside this set — regardless of whether it lives in
+     * contactFieldMapping or customFieldMapping — must be pre-created before a
+     * push, otherwise HubSpot rejects the upsert with PROPERTY_DOESNT_EXIST.
+     */
+    private static readonly STANDARD_CONTACT_PROPS = new Set([
+        'email', 'firstname', 'lastname', 'phone', 'jobtitle', 'company', 'hs_linkedin_url',
+    ]);
+
     private formatError(err: any): string {
         return err?.response?.data?.message
             || err?.response?.data?.error
@@ -56,9 +66,21 @@ export class HubspotAdapter implements CrmAdapter {
         const result: SyncResult = { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
         const svc = await this.getSvc(auth); // token resolved ONCE here
 
-        // ── 1. Pre-create any missing custom contact properties ──────────────────
-        const customContactMappings = config.customFieldMapping.filter(m => m.enabled && m.direction !== 'pull');
-        for (const m of customContactMappings) {
+        // ── 1. Pre-create any missing non-standard contact properties ────────────
+        // buildHubSpotProps pushes properties from BOTH contactFieldMapping and
+        // customFieldMapping, so any non-standard property in either list must be
+        // ensured here — not just those in customFieldMapping. (Legacy configs may
+        // place a non-standard property such as "notes" in contactFieldMapping.)
+        const pushContactMappings = [
+            ...config.contactFieldMapping,
+            ...config.customFieldMapping,
+        ].filter(m => m.enabled && m.direction !== 'pull');
+        const ensuredProps = new Set<string>();
+        for (const m of pushContactMappings) {
+            const crmProperty = m.crmProperty.toLowerCase();
+            if (HubspotAdapter.STANDARD_CONTACT_PROPS.has(crmProperty)) continue;
+            if (ensuredProps.has(crmProperty)) continue;
+            ensuredProps.add(crmProperty);
             const label = m.crmProperty.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
             try {
                 const propertyName = await svc.ensureContactProperty(m.crmProperty, label);
@@ -391,10 +413,9 @@ export class HubspotAdapter implements CrmAdapter {
      * Extracts non-standard properties from a props object as customFields.
      */
     private extractCustomFields(props: Record<string, string>): Record<string, string> | undefined {
-        const standard = new Set(['email', 'firstname', 'lastname', 'phone', 'jobtitle', 'company', 'hs_linkedin_url']);
         const custom: Record<string, string> = {};
         for (const [k, v] of Object.entries(props)) {
-            if (!standard.has(k)) custom[k] = v;
+            if (!HubspotAdapter.STANDARD_CONTACT_PROPS.has(k.toLowerCase())) custom[k] = v;
         }
         return Object.keys(custom).length > 0 ? custom : undefined;
     }
