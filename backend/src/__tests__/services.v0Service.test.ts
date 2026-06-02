@@ -309,6 +309,73 @@ describe("v0Service - generateLandingPage", () => {
     expect(mockChatsCreate).toHaveBeenCalledTimes(1);
     expect(result.id).toBe("test-uuid-1234");
   });
+
+  it("SUCCESS: recycles a prior failed record (no v0 chat) instead of orphaning it", async () => {
+    // Query #1 (findUserSiteRecord) → no site repo exists.
+    // Query #2 (listLandingPages) → one prior failed first-page record with no v0ChatId.
+    mockQuery
+      .mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) })
+      .mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Items: [
+              {
+                id: "failed-page-id",
+                userId: "user-1",
+                name: "Old",
+                prompt: "old",
+                status: "failed",
+                iterations: 0,
+                errorMessage: 'HTTP 500: {"error":{"code":"500"}}',
+                createdAt: "t",
+                updatedAt: "t",
+              },
+            ],
+          }),
+      });
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_recycled" });
+
+    const result = await generateLandingPage("user-1", "Retry page", "Retry", {});
+
+    // Reuses the failed record's id rather than minting "test-uuid-1234".
+    expect(result.id).toBe("failed-page-id");
+    // Re-puts the record (reset to generating) under the recycled id.
+    expect(mockPut).toHaveBeenCalledWith(
+      expect.objectContaining({
+        Item: expect.objectContaining({ id: "failed-page-id", status: "generating" }),
+      })
+    );
+  });
+
+  it("SUCCESS: does NOT recycle a failed record that already has a v0ChatId", async () => {
+    // A page that failed *after* v0 chat creation is recoverable via deploy — don't recycle it.
+    mockQuery
+      .mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) })
+      .mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Items: [
+              {
+                id: "has-chat-id",
+                userId: "user-1",
+                name: "Old",
+                prompt: "old",
+                status: "failed",
+                v0ChatId: "chat_existing",
+                iterations: 0,
+                createdAt: "t",
+                updatedAt: "t",
+              },
+            ],
+          }),
+      });
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_new" });
+
+    const result = await generateLandingPage("user-1", "Retry page", "Retry", {});
+
+    // New uuid is minted — the chat-bearing failed record is left alone.
+    expect(result.id).toBe("test-uuid-1234");
+  });
 });
 
 // =============================================================================
