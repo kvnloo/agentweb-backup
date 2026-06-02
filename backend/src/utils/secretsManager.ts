@@ -363,18 +363,6 @@ export interface GoogleAdsCredentials {
  * @returns Google Ads API credentials
  */
 export async function getGoogleAdsCredentials(): Promise<GoogleAdsCredentials> {
-  return {
-    clientId: "654074271674-rgofgbpfhohhldn600i888gcm6tmj2q4.apps.googleusercontent.com",
-    clientSecret: "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",
-    developerToken: "pVVUcAor37bQ_cK7CXsJwg"
-  };
-
-  return {
-    clientId: '1086648238757-u6n6q3q3j55ld102nsikqp1conmq62vn.apps.googleusercontent.com',
-    clientSecret: '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',
-    developerToken: 'PqNx8Yjq2ZLIMn525cu9GA',
-  };
-
   try {
     const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production'
