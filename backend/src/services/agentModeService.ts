@@ -9578,7 +9578,15 @@ ${emailDraftFormat === 'text'
         });
       }
 
-      // Create message draft optimised for LinkedIn connection invites (max 300 chars)
+      // Create message draft optimised for LinkedIn connection invites. The char limit
+      // depends on the sending account tier: 300 for Premium, 200 for free. Resolve the
+      // account the same way the send-invite route does (list-assigned → user's own).
+      const { linkedInOutreachService } = await import('./linkedInOutreachService');
+      const inviteAccountId = (list as any)?.linkedInAccountId
+        || await linkedInOutreachService.resolveUserOwnedAccountId(userId);
+      const inviteCharLimit = inviteAccountId
+        ? await linkedInOutreachService.getInviteCharLimitForAccount(userId, inviteAccountId)
+        : 200;
       const leadName = [(lead as any).firstName, (lead as any).lastName].filter(Boolean).join(' ');
       const leadTitle = (lead as any).title || '';
       const leadCompany = (lead as any).company || '';
@@ -9594,7 +9602,7 @@ Write a note that:
 - Leads with something specific about THEIR work, role, or company — show you looked them up
 - Explains briefly WHY you want to connect, relevant to them
 - Sounds like one human writing to another — warm, direct, no corporate speak
-- Is under 280 characters total
+- Is under ${inviteCharLimit} characters total
 - Opens with their first name naturally (e.g. "John, saw your work on..." or "Sarah —")
 - Does NOT start with Hi or Hello
 - Does NOT have a call to action ("would love to chat", "let's connect")
@@ -9637,12 +9645,13 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         messageData = null;
       }
 
-      // Create message draft object if we got valid data — hard-cap at 300 chars (LinkedIn invite limit)
+      // Create message draft object if we got valid data — hard-cap at the account's
+      // LinkedIn invite limit (300 Premium / 200 free).
       let messageDraft = null;
       if (messageData && messageData.content) {
         const now = new Date().toISOString();
         messageDraft = {
-          content: String(messageData.content).slice(0, 300),
+          content: String(messageData.content).slice(0, inviteCharLimit),
           createdAt: now,
           updatedAt: now,
           sessionId: sessionId
@@ -14244,7 +14253,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
     // LinkedIn invite message too long — tell the LLM to shorten and retry, not report success
     if (toolName === 'linkedin_outreach' && safeMessage.toLowerCase().includes('too long')) {
-      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: The invitation message exceeded LinkedIn's 300-character limit. Do NOT report this as a success. Shorten the message to 300 characters or fewer (trim filler words, remove the sign-off line, keep only the core personalisation) and retry the send-invite call immediately.`;
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: The invitation message exceeded LinkedIn's per-account character limit (see the reason above for the exact limit — 200 for free accounts, 300 for Premium). Do NOT report this as a success. Shorten the message to within that limit (trim filler words, remove the sign-off line, keep only the core personalisation) and retry the send-invite call immediately.`;
     }
     // save_file / create_html_file parameter errors — guide LLM to use correct schema names
     if ((toolName === 'save_file' || toolName === 'create_html_file') &&
@@ -22175,7 +22184,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'send-invite': {
           if (!target) throw new Error('Either profile_url or provider_id is required for send-invite');
-          const inviteResult = await linkedInOutreachService.sendInvitation(account_id, target, isUrl, message);
+          // Premium accounts allow 300-char invites; free accounts 200.
+          const inviteCharLimit = await linkedInOutreachService.getInviteCharLimitForAccount(userId, account_id);
+          const inviteResult = await linkedInOutreachService.sendInvitation(account_id, target, isUrl, message, inviteCharLimit);
           return { success: true, data: inviteResult };
         }
 

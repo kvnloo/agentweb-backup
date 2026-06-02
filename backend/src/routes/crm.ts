@@ -4388,7 +4388,9 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     }
 
     const note = message && typeof message === 'string' && message.trim() ? message.trim() : undefined;
-    await linkedInOutreachService.sendInvitation(accountId, leadLinkedIn, true, note);
+    // Premium accounts allow 300-char invites; free accounts 200. Resolve per-account.
+    const inviteCharLimit = await linkedInOutreachService.getInviteCharLimitForAccount(userId, accountId);
+    await linkedInOutreachService.sendInvitation(accountId, leadLinkedIn, true, note, inviteCharLimit);
 
     const sentAt = new Date().toISOString();
     await crmDb.updateLead(listId, leadId, { linkedInInviteSentAt: sentAt });
@@ -4448,6 +4450,18 @@ router.post('/lists/:listId/leads/:leadId/draft-invite-note', async (req: Reques
       return res.status(404).json({ message: 'Lead not found' });
     }
 
+    // Resolve the LinkedIn account that will send this invite (same precedence as
+    // send-linkedin-invite) so the note is drafted to the right char limit: 300 for
+    // Premium accounts, 200 for free. Falls back to 200 when no account resolves.
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const { accountId: requestedAccountId } = req.body || {};
+    const inviteAccountId = (requestedAccountId && typeof requestedAccountId === 'string')
+      ? requestedAccountId
+      : ((list as any).linkedInAccountId || await linkedInOutreachService.resolveUserOwnedAccountId(userId));
+    const inviteCharLimit = inviteAccountId
+      ? await linkedInOutreachService.getInviteCharLimitForAccount(userId, inviteAccountId)
+      : 200;
+
     const { agentModeService } = await import('../services/agentModeService');
 
     // Get brand guidelines for context
@@ -4475,7 +4489,7 @@ Write a note that:
 - Leads with something specific and genuine about THEIR work, role, or company — show you actually looked them up
 - Explains briefly WHY you want to connect in a way that's relevant to them (shared space, complementary work, genuine curiosity)
 - Sounds like one human writing to another — warm, direct, no corporate speak
-- Is under 280 characters total (hard LinkedIn limit)
+- Is under ${inviteCharLimit} characters total (hard LinkedIn limit for this account)
 - Opens with their first name naturally (e.g. "John, saw your work on..." or "Sarah —")
 - Does NOT start with Hi or Hello
 - Does NOT have a call to action or ask ("would love to chat", "let's connect")
@@ -4514,13 +4528,13 @@ Reply with ONLY valid JSON, nothing else: {"content": "the note text"}`;
         if (val.startsWith('{') && val.includes('"content"')) {
           try { val = String(JSON.parse(val).content || val); } catch { /* keep val */ }
         }
-        content = val.slice(0, 300);
+        content = val.slice(0, inviteCharLimit);
       } catch {
         // Still can't parse — extract the text between the first " and last "
         const firstQ = cleaned.indexOf('"', cleaned.indexOf('"content"') + 10);
         const lastQ = cleaned.lastIndexOf('"');
         if (firstQ !== -1 && lastQ > firstQ) {
-          content = cleaned.slice(firstQ + 1, lastQ).replace(/\\"/g, '"').slice(0, 300);
+          content = cleaned.slice(firstQ + 1, lastQ).replace(/\\"/g, '"').slice(0, inviteCharLimit);
         }
       }
     }
