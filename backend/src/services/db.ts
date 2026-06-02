@@ -6327,6 +6327,7 @@ export const crmDb = {
     previousStandardFields: Record<string, string | null>;
     previousCustomFields: Record<string, string | null>;
     previousEnrichmentMetadata: Record<string, any>;
+    fieldsEnriched: Array<{ field: string; provider: string; fromCache: boolean }>;
     expiresAt: number;
   }): Promise<void> {
     try {
@@ -6338,6 +6339,7 @@ export const crmDb = {
           previousStandardFields: item.previousStandardFields,
           previousCustomFields: item.previousCustomFields,
           previousEnrichmentMetadata: item.previousEnrichmentMetadata,
+          fieldsEnriched: item.fieldsEnriched,
           expiresAt: item.expiresAt,
         },
       }).promise();
@@ -6360,6 +6362,15 @@ export const crmDb = {
     failureBreakdown?: { searchWebFailed: number; linkedinFailed: number; llmOrParseFailed: number; updateFailed: number };
     /** Per-lead failure records (capped to ~50 to keep row size bounded). Item #11. */
     failures?: Array<{ leadId: string; email?: string; step: string; message: string }>;
+    /** Per-provider live vs cached counts across all leads in this run. */
+    sourceBreakdown?: {
+      apollo:    { live: number; cached: number };
+      unipile:   { live: number; cached: number };
+      enrichSo:  { live: number; cached: number };
+      webSearch: { live: number; cached: number };
+      sibling:   { live: number; cached: number };
+      llm:       { live: number; cached: number };
+    };
   }): Promise<void> {
     try {
       const item: any = {
@@ -6378,6 +6389,7 @@ export const crmDb = {
         // Cap to 50 entries to stay well under DynamoDB's 400KB row limit
         item.failures = meta.failures.slice(0, 50);
       }
+      if (meta.sourceBreakdown) item.sourceBreakdown = meta.sourceBreakdown;
       await dynamodb.put({
         TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
         Item: item,

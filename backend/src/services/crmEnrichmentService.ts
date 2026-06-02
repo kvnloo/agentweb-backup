@@ -1815,13 +1815,23 @@ export class CrmEnrichmentService {
           const previousCustomFields = CrmEnrichmentService.pickCustomFieldValues(lead.customFields, customUpdates);
           const allUpdatedFields = [...Object.keys(standardUpdates), ...Object.keys(customUpdates)];
           const previousEnrichmentMetadata: Record<string, any> = {};
+          const fieldsEnriched: Array<{ field: string; provider: string; fromCache: boolean }> = [];
           for (const field of allUpdatedFields) {
             previousEnrichmentMetadata[field] = lead.enrichmentMetadata?.[field] ?? null;
+            const meta = fieldMeta[field];
+            if (meta) {
+              fieldsEnriched.push({
+                field,
+                provider: meta.provider ?? meta.source ?? 'unknown',
+                fromCache: meta.fromCache ?? false,
+              });
+            }
           }
           try {
             await crmDb.createEnrichmentSnapshotItem({
               jobId, leadId: lead.leadId,
               previousStandardFields, previousCustomFields, previousEnrichmentMetadata,
+              fieldsEnriched,
               expiresAt: jobExpiresAt,
             });
           } catch (err: any) {
