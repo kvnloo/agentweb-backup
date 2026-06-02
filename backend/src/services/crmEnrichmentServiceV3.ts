@@ -481,7 +481,7 @@ async function processLead(
     allFills.push(...tier0bResult.fills.map(f => ({
       field: f.field,
       value: f.value,
-      meta: f.meta,
+      meta: { ...f.meta, fromCache: true },
     })));
     // Merge into enrichedLead so waterfall sees these fields as already filled
     for (const f of tier0bResult.fills) {
@@ -678,6 +678,7 @@ async function processLead(
               confidence: 'medium',
               ...(evalResult.model ? { provider: evalResult.model } : {}),
               ...(evalResult.reasoning ? { sourceQuote: evalResult.reasoning } : {}),
+              fromCache: false,
             },
           });
         }

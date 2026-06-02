@@ -65,6 +65,8 @@ export interface ApolloFetchContext {
   personFetchAttempted: boolean;
   orgFetchFailed: boolean;
   personFetchFailed: boolean;
+  orgFromCache?: boolean;
+  personFromCache?: boolean;
 }
 
 export function createApolloFetchContext(): ApolloFetchContext {
@@ -77,6 +79,8 @@ export function createApolloFetchContext(): ApolloFetchContext {
     personFetchAttempted: false,
     orgFetchFailed: false,
     personFetchFailed: false,
+    orgFromCache: undefined,
+    personFromCache: undefined,
   };
 }
 
@@ -120,6 +124,7 @@ export interface LLMExtractResult {
 export interface ApolloFetchResult {
   mapped: Record<string, string>;
   raw: any;
+  fromCache?: boolean;
 }
 
 export interface WaterfallDeps {
@@ -140,11 +145,12 @@ export interface WaterfallDeps {
     last_name?: string;
     title?: string;
     linkedin_url?: string;
+    fromCache?: boolean;
   } | null>;
   /** Tier 5: company enrichment via Unipile (runs after Tier 4 web).
    *  Only fires when lead.linkedin is present. getProfile → company_id → getCompany.
    *  Returns companyRaw (full company profile) and company_name from work_experience. */
-  findUnipileCompany?(lead: LeadRecord): Promise<{ company_name?: string; companyRaw: any } | null>;
+  findUnipileCompany?(lead: LeadRecord): Promise<{ company_name?: string; companyRaw: any; fromCache?: boolean } | null>;
   /** Tier 3.5: Apollo broker chain (run_waterfall_email). Optional — only
    *  wired when the caller has a persisted lead to receive the webhook result. */
   apolloBrokerChain?: (
@@ -191,6 +197,7 @@ async function ensureApolloFetched(
       const result = await deps.fetchApolloOrg(lead);
       ctx.orgRaw = result?.mapped ?? null;
       ctx.orgRawJson = result?.raw ?? null;
+      ctx.orgFromCache = result?.fromCache;
       const mappedCount = ctx.orgRaw ? Object.keys(ctx.orgRaw).length : 0;
       const rawKeys = ctx.orgRawJson ? Object.keys(ctx.orgRawJson).length : 0;
       console.log(`${atag} ${ctx.orgRaw ? `HIT mapped_fields=${mappedCount} raw_keys=${rawKeys}` : 'MISS no org data'}`);
@@ -211,6 +218,7 @@ async function ensureApolloFetched(
     const result = await deps.fetchApolloPerson(lead);
     ctx.personRaw = result?.mapped ?? null;
     ctx.personRawJson = result?.raw ?? null;
+    ctx.personFromCache = result?.fromCache;
     const mappedCount = ctx.personRaw ? Object.keys(ctx.personRaw).length : 0;
     const rawKeys = ctx.personRawJson ? Object.keys(ctx.personRawJson).length : 0;
     console.log(`${atag} ${ctx.personRaw ? `HIT mapped_fields=${mappedCount} raw_keys=${rawKeys}` : 'MISS no person data'}`);
@@ -231,7 +239,10 @@ function getLeadFieldValue(lead: LeadRecord, field: string): string | undefined 
   return undefined;
 }
 
-function metaApollo(field: string, opts?: { llmExtracted?: boolean }): EnrichedFieldMeta {
+function metaApollo(
+  field: string,
+  opts?: { llmExtracted?: boolean; fromCache?: boolean },
+): EnrichedFieldMeta {
   // Tier 2 (deterministic direct-map) uses the raw registry confidence; Tier 3
   // (LLM extraction over Apollo raw JSON) passes { llmExtracted: true }, which
   // downgrades one notch — LLM extraction is less reliable than a direct map.
@@ -244,6 +255,7 @@ function metaApollo(field: string, opts?: { llmExtracted?: boolean }): EnrichedF
     provider: 'apollo',
     confidence,
     enrichedAt: new Date().toISOString(),
+    fromCache: opts?.fromCache,
   };
 }
 
@@ -255,15 +267,17 @@ function metaWeb(sourceUrl?: string, sourceQuote?: string): EnrichedFieldMeta {
     ...(sourceUrl ? { sourceUrl } : {}),
     ...(sourceQuote ? { sourceQuote } : {}),
     enrichedAt: new Date().toISOString(),
+    fromCache: false,
   };
 }
 
-function metaUnipile(): EnrichedFieldMeta {
+function metaUnipile(opts?: { fromCache?: boolean }): EnrichedFieldMeta {
   return {
     source: 'api',
     provider: 'unipile',
     confidence: 'medium',
     enrichedAt: new Date().toISOString(),
+    fromCache: opts?.fromCache,
   };
 }
 
@@ -320,7 +334,7 @@ export async function runWaterfall(
       continue;
     }
     console.log(`${tag} T1 HIT  field=${f} value="${String(value).slice(0, 60)}"`);
-    crmHits.push({ field: f, value, meta: meta! });
+    crmHits.push({ field: f, value, meta: { ...meta!, fromCache: true } });
   }
   filled.push(...crmHits);
   remaining = remaining.filter(f => !crmHits.find(c => c.field === f));
@@ -354,7 +368,11 @@ export async function runWaterfall(
       const value = apolloRaw[f];
       if (typeof value === 'string' && value.length > 0) {
         console.log(`${tag} T2 HIT  field=${f} value="${String(value).slice(0, 60)}"`);
-        apolloHits.push({ field: f, value, meta: metaApollo(f) });
+        apolloHits.push({
+          field: f,
+          value,
+          meta: metaApollo(f, { fromCache: apolloCtx.orgFromCache ?? apolloCtx.personFromCache }),
+        });
       } else {
         console.log(`${tag} T2 MISS field=${f} reason=not_in_apollo_mapped`);
       }
@@ -396,7 +414,14 @@ export async function runWaterfall(
       const entry = llmResult.filled[f];
       if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
         console.log(`${tag} T3 HIT  field=${f} value="${String(entry.value).slice(0, 60)}"`);
-        filled.push({ field: f, value: entry.value, meta: metaApollo(f, { llmExtracted: true }) });
+        filled.push({
+          field: f,
+          value: entry.value,
+          meta: metaApollo(f, {
+            llmExtracted: true,
+            fromCache: apolloCtx.orgFromCache ?? apolloCtx.personFromCache,
+          }),
+        });
         tier3Fills += 1;
       } else {
         console.log(`${tag} T3 MISS field=${f} reason=llm_returned_empty`);
@@ -501,7 +526,7 @@ export async function runWaterfall(
           const value = result[f as keyof typeof result];
           if (typeof value === 'string' && value.length > 0) {
             console.log(`${tag} T3.5b HIT  field=${f} value="${value.slice(0, 60)}"`);
-            filled.push({ field: f, value, meta: metaUnipile() });
+            filled.push({ field: f, value, meta: metaUnipile({ fromCache: result.fromCache }) });
             unipileFills += 1;
           } else {
             console.log(`${tag} T3.5b MISS field=${f} reason=not_in_result`);
@@ -587,7 +612,7 @@ export async function runWaterfall(
           const entry = llmResult.filled[f];
           if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
             console.log(`${tag} T5 HIT  field=${f} value="${String(entry.value).slice(0, 60)}"`);
-            filled.push({ field: f, value: entry.value, meta: metaUnipile() });
+            filled.push({ field: f, value: entry.value, meta: metaUnipile({ fromCache: result.fromCache }) });
             unipileFills += 1;
           } else {
             console.log(`${tag} T5 MISS field=${f} reason=llm_returned_empty`);
@@ -597,7 +622,7 @@ export async function runWaterfall(
       } else if (result?.company_name && remaining.includes('company_name')) {
         // companyRaw unavailable but company_name from work_experience is enough
         console.log(`${tag} T5 HIT  field=company_name value="${result.company_name.slice(0, 60)}" (no companyRaw)`);
-        filled.push({ field: 'company_name', value: result.company_name, meta: metaUnipile() });
+        filled.push({ field: 'company_name', value: result.company_name, meta: metaUnipile({ fromCache: result.fromCache }) });
         unipileFills += 1;
         remaining = remaining.filter(f => f !== 'company_name');
       } else {
