@@ -559,6 +559,111 @@ describe('ExternalCrmSyncService', () => {
         expect(createCall[1].properties.aw_user_id).toBeUndefined();
       }
     });
+
+    it('pre-creates a non-standard property even when it lives in contactFieldMapping (legacy "notes" config)', async () => {
+      // Legacy configs placed "notes" in contactFieldMapping. Since "notes" is not
+      // a native HubSpot contact property, it must still be ensured before push,
+      // otherwise HubSpot rejects the upsert with PROPERTY_DOESNT_EXIST.
+      const config = makeConfig({
+        contactFieldMapping: [
+          { agentwebField: 'email', crmProperty: 'email', direction: 'both', enabled: true },
+          { agentwebField: 'notes', crmProperty: 'notes', direction: 'both', enabled: true },
+        ],
+        dealFieldMapping: [],
+        customFieldMapping: [],
+      });
+      mockListWithConfig(config);
+      mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [{ leadId: 'l1', email: 'test@test.com', notes: 'hello' }],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+      mockCrmDb.updateLead.mockResolvedValue(undefined as any);
+
+      const result = await service.pushAllLeads('user1', 'list1', 'hubspot');
+
+      expect(result.errorCount).toBe(0);
+      expect(mockHubSpotServiceInstance.ensureContactProperty).toHaveBeenCalledWith('notes', 'Notes');
+    });
+
+    it('does NOT pre-create standard contact properties', async () => {
+      const config = makeConfig({
+        contactFieldMapping: [
+          { agentwebField: 'email', crmProperty: 'email', direction: 'both', enabled: true },
+          { agentwebField: 'firstName', crmProperty: 'firstname', direction: 'both', enabled: true },
+          { agentwebField: 'company', crmProperty: 'company', direction: 'both', enabled: true },
+          { agentwebField: 'linkedin', crmProperty: 'hs_linkedin_url', direction: 'push', enabled: true },
+        ],
+        dealFieldMapping: [],
+        customFieldMapping: [],
+      });
+      mockListWithConfig(config);
+      mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [{ leadId: 'l1', email: 'test@test.com', firstName: 'A', company: 'Acme', linkedin: 'x' }],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+      mockCrmDb.updateLead.mockResolvedValue(undefined as any);
+
+      await service.pushAllLeads('user1', 'list1', 'hubspot');
+
+      expect(mockHubSpotServiceInstance.ensureContactProperty).not.toHaveBeenCalled();
+    });
+
+    it('ensures each non-standard property only once across contact and custom mappings', async () => {
+      // Same crmProperty appearing in both lists should be ensured a single time.
+      const config = makeConfig({
+        contactFieldMapping: [
+          { agentwebField: 'email', crmProperty: 'email', direction: 'both', enabled: true },
+          { agentwebField: 'notes', crmProperty: 'notes', direction: 'both', enabled: true },
+        ],
+        dealFieldMapping: [],
+        customFieldMapping: [
+          { agentwebField: 'notes', crmProperty: 'notes', direction: 'both', enabled: true },
+          { agentwebField: 'icpSegment', crmProperty: 'icpsegment', direction: 'push', enabled: true },
+        ],
+      });
+      mockListWithConfig(config);
+      mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [{ leadId: 'l1', email: 'test@test.com', notes: 'hi', customFields: { icpSegment: 'smb' } }],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+      mockCrmDb.updateLead.mockResolvedValue(undefined as any);
+
+      await service.pushAllLeads('user1', 'list1', 'hubspot');
+
+      const notesCalls = mockHubSpotServiceInstance.ensureContactProperty.mock.calls
+        .filter(c => c[0] === 'notes');
+      expect(notesCalls).toHaveLength(1);
+      expect(mockHubSpotServiceInstance.ensureContactProperty).toHaveBeenCalledWith('icpsegment', 'Icpsegment');
+    });
+
+    it('does NOT pre-create pull-only non-standard mappings', async () => {
+      const config = makeConfig({
+        contactFieldMapping: [
+          { agentwebField: 'email', crmProperty: 'email', direction: 'both', enabled: true },
+          { agentwebField: 'notes', crmProperty: 'notes', direction: 'pull', enabled: true },
+        ],
+        dealFieldMapping: [],
+        customFieldMapping: [],
+      });
+      mockListWithConfig(config);
+      mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [{ leadId: 'l1', email: 'test@test.com', notes: 'hi' }],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+      mockCrmDb.updateLead.mockResolvedValue(undefined as any);
+
+      await service.pushAllLeads('user1', 'list1', 'hubspot');
+
+      expect(mockHubSpotServiceInstance.ensureContactProperty).not.toHaveBeenCalled();
+    });
   });
 
   // ─── pushAllLeads (Attio) ─────────────────────────────────────────────────
