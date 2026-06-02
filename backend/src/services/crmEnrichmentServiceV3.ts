@@ -11,9 +11,11 @@
 import { randomUUID } from 'crypto';
 import {
   createApolloFetchContext,
+  createEnrichSoFetchContext,
   type GroupResult,
   type FieldFill,
   type ApolloFetchContext,
+  type EnrichSoFetchContext,
 } from './enrichmentGroupWaterfall';
 import { normalizeFills } from './enrichmentNormalizer';
 import { FIELD_GROUPS } from './enrichmentGroups';
@@ -170,6 +172,7 @@ export interface OrchestratorDeps {
     requestedFields: string[];
     configFieldsByName: Record<string, { instruction?: string } | undefined>;
     apolloCtx: ApolloFetchContext;
+    enrichSoCtx: EnrichSoFetchContext;
     refreshFields: Set<string>;
     leadHint?: { listId: string; leadId: string };
   }): Promise<GroupResult>;
@@ -419,6 +422,7 @@ async function processLead(
   const perGroupTierFills = new Map<string, TierCount>();
   const allFills: FieldFill[] = [];
   const apolloCtx = createApolloFetchContext();
+  const enrichSoCtx = createEnrichSoFetchContext();
   const leadStart = Date.now();
   console.log(`[v3:${input.listId}:${lead.leadId}] start (email=${lead.email ?? '∅'}, company=${lead.company ?? '∅'})`);
 
@@ -513,6 +517,7 @@ async function processLead(
         requestedFields: fields,
         configFieldsByName,
         apolloCtx,
+        enrichSoCtx,
         refreshFields: refreshSet,
         leadHint: { listId: input.listId, leadId: lead.leadId },
       });

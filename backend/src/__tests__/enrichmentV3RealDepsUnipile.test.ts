@@ -14,7 +14,7 @@ import * as profileFactory from '../services/unipileProfileServiceFactory';
 import * as companyFactory from '../services/unipileCompanyServiceFactory';
 import * as apolloServiceModule from '../services/apolloService';
 import * as llmServiceModule from '../utils/llmService';
-import { createApolloFetchContext } from '../services/enrichmentGroupWaterfall';
+import { createApolloFetchContext, createEnrichSoFetchContext } from '../services/enrichmentGroupWaterfall';
 import type { LeadRecord } from '../services/crmEnrichmentService';
 
 const PERSON_PROFILE_RAW = {
@@ -95,6 +95,7 @@ describe('findUnipilePerson — no accountId', () => {
       requestedFields: ['first_name'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -121,6 +122,7 @@ describe('findUnipilePerson — Case A (has linkedin → getProfile)', () => {
       requestedFields: ['first_name', 'last_name', 'title', 'linkedin_url'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -149,6 +151,7 @@ describe('findUnipilePerson — Case A (has linkedin → getProfile)', () => {
       requestedFields: ['first_name', 'last_name'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -171,6 +174,7 @@ describe('findUnipilePerson — Case A (has linkedin → getProfile)', () => {
       requestedFields: ['first_name'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -201,6 +205,7 @@ describe('findUnipilePerson — Case A (has linkedin → getProfile)', () => {
       requestedFields: ['title'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -230,6 +235,7 @@ describe('findUnipilePerson — Case B (no linkedin → searchPeople + LLM)', ()
       requestedFields: ['first_name', 'last_name', 'linkedin_url', 'title'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -257,6 +263,7 @@ describe('findUnipilePerson — Case B (no linkedin → searchPeople + LLM)', ()
       requestedFields: ['linkedin_url'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -286,6 +293,7 @@ describe('findUnipilePerson — Case B (no linkedin → searchPeople + LLM)', ()
       requestedFields: ['linkedin_url'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -308,6 +316,7 @@ describe('findUnipilePerson — Case B (no linkedin → searchPeople + LLM)', ()
       requestedFields: ['linkedin_url'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -329,6 +338,7 @@ describe('findUnipilePerson — Case B (no linkedin → searchPeople + LLM)', ()
       requestedFields: ['linkedin_url'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -350,6 +360,7 @@ describe('findUnipilePerson — Case B (no linkedin → searchPeople + LLM)', ()
       requestedFields: ['linkedin_url'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -372,6 +383,7 @@ describe('findUnipilePerson — Case B (no linkedin → searchPeople + LLM)', ()
       requestedFields: ['linkedin_url'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -394,6 +406,7 @@ describe('findUnipilePerson — Case B (no linkedin → searchPeople + LLM)', ()
       requestedFields: ['linkedin_url'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -416,6 +429,7 @@ describe('findUnipilePerson — Case B (no linkedin → searchPeople + LLM)', ()
       requestedFields: ['linkedin_url'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -447,6 +461,7 @@ describe('findUnipileCompany — Tier 5 (company group, after web)', () => {
       requestedFields: ['company_name'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -475,6 +490,7 @@ describe('findUnipileCompany — Tier 5 (company group, after web)', () => {
       requestedFields: ['company_name'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -497,6 +513,7 @@ describe('findUnipileCompany — Tier 5 (company group, after web)', () => {
       requestedFields: ['company_name'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -531,6 +548,7 @@ describe('findUnipilePerson — 429 rotation', () => {
       requestedFields: ['first_name'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -561,6 +579,7 @@ describe('findUnipilePerson — 429 rotation', () => {
       requestedFields: ['first_name'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -589,6 +608,7 @@ describe('findUnipilePerson — 429 rotation', () => {
       requestedFields: ['first_name'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -618,6 +638,7 @@ describe('findUnipileCompany — 429 rotation', () => {
       requestedFields: ['company_name'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -646,6 +667,7 @@ describe('findUnipileCompany — 429 rotation', () => {
       requestedFields: ['company_name'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 

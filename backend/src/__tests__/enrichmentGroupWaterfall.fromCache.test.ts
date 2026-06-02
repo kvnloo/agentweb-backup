@@ -37,7 +37,7 @@ describe('EnrichedFieldMeta — fromCache field', () => {
 
 // ─── runWaterfall Apollo fromCache propagation ────────────────────────────────
 
-import { runWaterfall, createApolloFetchContext } from '../services/enrichmentGroupWaterfall';
+import { runWaterfall, createApolloFetchContext, createEnrichSoFetchContext } from '../services/enrichmentGroupWaterfall';
 import type { WaterfallDeps, RunWaterfallInput } from '../services/enrichmentGroupWaterfall';
 import type { LeadRecord } from '../services/crmEnrichmentService';
 
@@ -83,6 +83,7 @@ describe('runWaterfall — Apollo fromCache propagation', () => {
         requestedFields: ['employee_count'],
         configFieldsByName: {},
         apolloCtx: createApolloFetchContext(),
+        enrichSoCtx: createEnrichSoFetchContext(),
         refreshFields: new Set(),
       },
       deps,
@@ -110,6 +111,7 @@ describe('runWaterfall — Apollo fromCache propagation', () => {
         requestedFields: ['employee_count'],
         configFieldsByName: {},
         apolloCtx: createApolloFetchContext(),
+        enrichSoCtx: createEnrichSoFetchContext(),
         refreshFields: new Set(),
       },
       deps,
@@ -138,6 +140,7 @@ describe('runWaterfall — Unipile fromCache propagation', () => {
         requestedFields: ['title'],
         configFieldsByName: {},
         apolloCtx: createApolloFetchContext(),
+        enrichSoCtx: createEnrichSoFetchContext(),
         refreshFields: new Set(),
       },
       deps,
@@ -164,6 +167,7 @@ describe('runWaterfall — Unipile fromCache propagation', () => {
         requestedFields: ['title'],
         configFieldsByName: {},
         apolloCtx: createApolloFetchContext(),
+        enrichSoCtx: createEnrichSoFetchContext(),
         refreshFields: new Set(),
       },
       deps,
@@ -199,6 +203,7 @@ describe('runWaterfall — Tier 1 CRM fromCache', () => {
         requestedFields: ['company_description'],
         configFieldsByName: {},
         apolloCtx: createApolloFetchContext(),
+        enrichSoCtx: createEnrichSoFetchContext(),
         refreshFields: new Set(),
       },
       deps,
@@ -233,6 +238,7 @@ describe('runWaterfall — web search fromCache', () => {
         requestedFields: ['company_description'],
         configFieldsByName: {},
         apolloCtx: createApolloFetchContext(),
+        enrichSoCtx: createEnrichSoFetchContext(),
         refreshFields: new Set(),
       },
       deps,

@@ -84,6 +84,30 @@ export function createApolloFetchContext(): ApolloFetchContext {
   };
 }
 
+// ─── EnrichSo fetch context (per-lead memoization) ───────────────────────────
+
+export interface EnrichSoFetchResult {
+  firstName?: string;
+  lastName?: string;
+  jobTitle?: string;
+  profileUrl?: string;
+  companyName?: string;
+  companyLocation?: string;
+  companyLinkedInUrl?: string;
+  pastCompanies?: string[];
+  education?: string[];
+  fromCache?: boolean;
+}
+
+export interface EnrichSoFetchContext {
+  result: EnrichSoFetchResult | null;
+  fetchAttempted: boolean;
+}
+
+export function createEnrichSoFetchContext(): EnrichSoFetchContext {
+  return { result: null, fetchAttempted: false };
+}
+
 // ─── Public types ─────────────────────────────────────────────────────────────
 
 export interface FieldFill {
@@ -157,6 +181,9 @@ export interface WaterfallDeps {
     input: { firstName: string; lastName: string; emailDomain?: string; company?: string; linkedin?: string },
     leadHint: { listId: string; leadId: string },
   ) => Promise<{ email: string; emailStatus?: string } | null>;
+  /** Tier 3.5b-enrich.so: reverse-lookup by email → person + company fields.
+   *  Memoized via EnrichSoFetchContext — called at most once per lead. */
+  findEnrichSoPerson?(email: string): Promise<EnrichSoFetchResult | null>;
 }
 
 export interface RunWaterfallInput {
@@ -166,6 +193,7 @@ export interface RunWaterfallInput {
   requestedFields: string[];
   configFieldsByName: Record<string, { instruction?: string } | undefined>;
   apolloCtx: ApolloFetchContext;
+  enrichSoCtx: EnrichSoFetchContext;
   refreshFields: Set<string>;   // entries shaped "<leadId>:<fieldName>"
   /** When set, enables Tier 3.5 Apollo broker chain for the person_identity
    *  group. The webhook writes the async result back to this lead. */
@@ -281,6 +309,36 @@ function metaUnipile(opts?: { fromCache?: boolean }): EnrichedFieldMeta {
   };
 }
 
+function metaEnrichSo(opts?: { fromCache?: boolean }): EnrichedFieldMeta {
+  return {
+    source: 'api',
+    provider: 'enrich.so',
+    confidence: 'medium',
+    enrichedAt: new Date().toISOString(),
+    fromCache: opts?.fromCache,
+  };
+}
+
+async function ensureEnrichSoFetched(
+  ctx: EnrichSoFetchContext,
+  email: string,
+  deps: WaterfallDeps,
+  tag: string,
+): Promise<EnrichSoFetchResult | null> {
+  if (ctx.fetchAttempted) return ctx.result;
+  ctx.fetchAttempted = true;
+  if (!deps.findEnrichSoPerson) return null;
+  try {
+    const result = await deps.findEnrichSoPerson(email);
+    ctx.result = result;
+    return result;
+  } catch (err) {
+    console.warn(`${tag} enrichSo fetch failed:`, (err as Error).message);
+    ctx.result = null;
+    return null;
+  }
+}
+
 /** True when an LLM-extracted entry carries a non-empty value — i.e. it
  *  actually produced a fill. A present-but-empty entry counts as NOT filled
  *  (matching the bare-string era where `''` was falsy), so the field stays
@@ -295,7 +353,7 @@ export async function runWaterfall(
   input: RunWaterfallInput,
   deps: WaterfallDeps,
 ): Promise<GroupResult> {
-  const { lead, groupName, requestedFields, apolloCtx, refreshFields } = input;
+  const { lead, groupName, requestedFields, apolloCtx, enrichSoCtx, refreshFields } = input;
   const groupConfig = FIELD_GROUPS[groupName];
 
   // Filter to fields actually in this group.
@@ -492,6 +550,79 @@ export async function runWaterfall(
   }
 
   if (remaining.length === 0) {
+    return {
+      fields: filled,
+      missing: [],
+      tierFills: {
+        crm: crmHits.length,
+        apollo: apolloHits.length + tier3Fills,
+        web: 0,
+        missing: 0,
+      },
+    };
+  }
+
+  // ─ Tier 3.5b-enrich.so: reverse-lookup by email ────────────────────────────
+  // Fires for person AND company groups when lead has email and enrich.so dep is wired.
+  // Memoized via enrichSoCtx — at most one API call per lead across all groups.
+  // Person fields: first_name, last_name, title, linkedin_url
+  // Company fields: company_name, hq_location, company_linkedin_url
+  // Career fields: prior_companies, education
+  const ENRICHSO_PERSON_FIELDS: Record<string, keyof EnrichSoFetchResult> = {
+    first_name: 'firstName',
+    last_name: 'lastName',
+    title: 'jobTitle',
+    linkedin_url: 'profileUrl',
+  };
+  const ENRICHSO_COMPANY_FIELDS: Record<string, keyof EnrichSoFetchResult> = {
+    company_name: 'companyName',
+    company_linkedin_url: 'companyLinkedInUrl',
+  };
+  const ENRICHSO_CAREER_FIELDS = new Set(['prior_companies', 'education']);
+  const allEnrichSoFields = [...Object.keys(ENRICHSO_PERSON_FIELDS), ...Object.keys(ENRICHSO_COMPANY_FIELDS), ...ENRICHSO_CAREER_FIELDS];
+  let enrichSoFills = 0;
+  if (deps.findEnrichSoPerson && remaining.some(f => allEnrichSoFields.includes(f))) {
+    const effectiveEmail = lead.email || filled.find(f => f.field === 'email')?.value;
+    if (effectiveEmail) {
+      console.log(`${tag} T3.5b-es attempt email=${effectiveEmail} attempted=${enrichSoCtx.fetchAttempted}`);
+      const esResult = await ensureEnrichSoFetched(enrichSoCtx, effectiveEmail, deps, tag);
+      if (esResult) {
+        for (const f of remaining) {
+          if (ENRICHSO_PERSON_FIELDS[f]) {
+            const value = esResult[ENRICHSO_PERSON_FIELDS[f]];
+            if (typeof value === 'string' && value.length > 0) {
+              console.log(`${tag} T3.5b-es HIT  field=${f} value="${value.slice(0, 60)}"`);
+              filled.push({ field: f, value, meta: metaEnrichSo({ fromCache: esResult.fromCache }) });
+              enrichSoFills++;
+            }
+          } else if (ENRICHSO_COMPANY_FIELDS[f]) {
+            const value = esResult[ENRICHSO_COMPANY_FIELDS[f]];
+            if (typeof value === 'string' && value.length > 0) {
+              console.log(`${tag} T3.5b-es HIT  field=${f} value="${value.slice(0, 60)}"`);
+              filled.push({ field: f, value, meta: metaEnrichSo({ fromCache: esResult.fromCache }) });
+              enrichSoFills++;
+            }
+          } else if (ENRICHSO_CAREER_FIELDS.has(f)) {
+            const raw = f === 'prior_companies' ? esResult.pastCompanies : esResult.education;
+            if (Array.isArray(raw) && raw.length > 0) {
+              const value = JSON.stringify(raw);
+              console.log(`${tag} T3.5b-es HIT  field=${f} value="${value.slice(0, 60)}"`);
+              filled.push({ field: f, value, meta: metaEnrichSo({ fromCache: esResult.fromCache }) });
+              enrichSoFills++;
+            }
+          }
+        }
+        remaining = remaining.filter(f => !filled.find(x => x.field === f));
+      } else {
+        console.log(`${tag} T3.5b-es MISS enrich.so returned null`);
+      }
+    } else {
+      console.log(`${tag} T3.5b-es SKIP no email available`);
+    }
+  }
+
+  if (remaining.length === 0) {
+    console.log(`${tag} DONE all filled by T1-T3.5b-es`);
     return {
       fields: filled,
       missing: [],

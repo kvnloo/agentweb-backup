@@ -11,6 +11,7 @@
 import {
   runWaterfall,
   createApolloFetchContext,
+  createEnrichSoFetchContext,
   APOLLO_GROUP_COVERAGE,
   type WaterfallDeps,
   type RunWaterfallInput,
@@ -64,6 +65,7 @@ function makeInput(overrides: Partial<RunWaterfallInput> = {}): RunWaterfallInpu
     requestedFields: ['company_name'],
     configFieldsByName: {},
     apolloCtx: createApolloFetchContext(),
+    enrichSoCtx: createEnrichSoFetchContext(),
     refreshFields: new Set<string>(),
     ...overrides,
   };
@@ -1089,6 +1091,160 @@ describe('runWaterfall — Tier 3.5b (Unipile person enrichment)', () => {
     delete (deps as any).findUnipilePerson;
     const result = await runWaterfall(
       makeInput({ groupName: 'person_identity', requestedFields: ['first_name'] }),
+      deps,
+    );
+
+    expect(result.missing).toContain('first_name');
+  });
+});
+
+// ─── Tier 3.5b-enrich.so ────────────────────────────────────────────────────
+
+describe('runWaterfall — T3.5b-enrich.so (reverse lookup)', () => {
+  it('fills person fields from enrich.so when email present and fields remaining', async () => {
+    const findEnrichSoPerson = jest.fn().mockResolvedValue({
+      firstName: 'Jane',
+      lastName: 'Doe',
+      jobTitle: 'VP Engineering',
+      profileUrl: 'https://www.linkedin.com/in/janedoe',
+      fromCache: false,
+    });
+    const deps = makeDeps({ findEnrichSoPerson });
+
+    const result = await runWaterfall(
+      makeInput({
+        groupName: 'person_identity',
+        requestedFields: ['first_name', 'last_name', 'title', 'linkedin_url'],
+        lead: makeLead({ email: 'jane@acme.com' }),
+      }),
+      deps,
+    );
+
+    expect(findEnrichSoPerson).toHaveBeenCalledWith('jane@acme.com');
+    expect(result.fields.find(f => f.field === 'first_name')?.value).toBe('Jane');
+    expect(result.fields.find(f => f.field === 'last_name')?.value).toBe('Doe');
+    expect(result.fields.find(f => f.field === 'title')?.value).toBe('VP Engineering');
+    expect(result.fields.find(f => f.field === 'linkedin_url')?.value).toBe('https://www.linkedin.com/in/janedoe');
+  });
+
+  it('sets fromCache correctly on enrich.so fills', async () => {
+    const findEnrichSoPerson = jest.fn().mockResolvedValue({
+      firstName: 'Jane',
+      fromCache: true,
+    });
+    const deps = makeDeps({ findEnrichSoPerson });
+
+    const result = await runWaterfall(
+      makeInput({
+        groupName: 'person_identity',
+        requestedFields: ['first_name'],
+        lead: makeLead({ email: 'jane@acme.com' }),
+      }),
+      deps,
+    );
+
+    expect(result.fields.find(f => f.field === 'first_name')?.meta.fromCache).toBe(true);
+    expect(result.fields.find(f => f.field === 'first_name')?.meta.provider).toBe('enrich.so');
+  });
+
+  it('fills company fields from enrich.so', async () => {
+    const findEnrichSoPerson = jest.fn().mockResolvedValue({
+      companyName: 'Acme Corp',
+      companyLinkedInUrl: 'https://www.linkedin.com/company/acme',
+      fromCache: false,
+    });
+    const deps = makeDeps({ findEnrichSoPerson });
+
+    const result = await runWaterfall(
+      makeInput({
+        groupName: 'company_firmographic',
+        requestedFields: ['company_name', 'company_linkedin_url'],
+        lead: makeLead({ email: 'jane@acme.com' }),
+      }),
+      deps,
+    );
+
+    expect(result.fields.find(f => f.field === 'company_name')?.value).toBe('Acme Corp');
+    expect(result.fields.find(f => f.field === 'company_linkedin_url')?.value).toBe('https://www.linkedin.com/company/acme');
+  });
+
+  it('fills career fields as JSON stringified arrays', async () => {
+    const findEnrichSoPerson = jest.fn().mockResolvedValue({
+      pastCompanies: ['OldCo', 'StartupX'],
+      education: ['MIT (BS Computer Science)'],
+      fromCache: false,
+    });
+    const deps = makeDeps({ findEnrichSoPerson });
+
+    const result = await runWaterfall(
+      makeInput({
+        groupName: 'person_career',
+        requestedFields: ['prior_companies', 'education'],
+        lead: makeLead({ email: 'jane@acme.com' }),
+      }),
+      deps,
+    );
+
+    expect(result.fields.find(f => f.field === 'prior_companies')?.value).toBe(JSON.stringify(['OldCo', 'StartupX']));
+    expect(result.fields.find(f => f.field === 'education')?.value).toBe(JSON.stringify(['MIT (BS Computer Science)']));
+  });
+
+  it('skips when no email available', async () => {
+    const findEnrichSoPerson = jest.fn().mockResolvedValue({ firstName: 'Jane' });
+    const deps = makeDeps({ findEnrichSoPerson });
+
+    const result = await runWaterfall(
+      makeInput({
+        groupName: 'person_identity',
+        requestedFields: ['first_name'],
+        lead: makeLead({ email: undefined }),
+      }),
+      deps,
+    );
+
+    expect(findEnrichSoPerson).not.toHaveBeenCalled();
+    expect(result.missing).toContain('first_name');
+  });
+
+  it('memoizes — calls findEnrichSoPerson only once across multiple uses', async () => {
+    const findEnrichSoPerson = jest.fn().mockResolvedValue({
+      firstName: 'Jane',
+      fromCache: false,
+    });
+    const deps = makeDeps({ findEnrichSoPerson });
+    const enrichSoCtx = createEnrichSoFetchContext();
+
+    await runWaterfall(
+      makeInput({ groupName: 'person_identity', requestedFields: ['first_name'], enrichSoCtx }),
+      deps,
+    );
+    await runWaterfall(
+      makeInput({ groupName: 'person_career', requestedFields: ['prior_companies'], enrichSoCtx }),
+      deps,
+    );
+
+    expect(findEnrichSoPerson).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips when findEnrichSoPerson dep absent', async () => {
+    const deps = makeDeps();
+    const result = await runWaterfall(
+      makeInput({ groupName: 'person_identity', requestedFields: ['first_name'] }),
+      deps,
+    );
+    expect(result.missing).toContain('first_name');
+  });
+
+  it('handles enrich.so returning null gracefully', async () => {
+    const findEnrichSoPerson = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({ findEnrichSoPerson });
+
+    const result = await runWaterfall(
+      makeInput({
+        groupName: 'person_identity',
+        requestedFields: ['first_name'],
+        lead: makeLead({ email: 'jane@acme.com' }),
+      }),
       deps,
     );
 

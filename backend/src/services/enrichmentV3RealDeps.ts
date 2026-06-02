@@ -16,7 +16,7 @@ import { CrmEnrichmentService, type LeadRecord } from './crmEnrichmentService';
 import { sanitizePhone } from '../utils/phoneValidation';
 import type { IdentityResolverDeps } from './enrichmentIdentityResolver';
 import { resolveIdentity as pureResolveIdentity } from './enrichmentIdentityResolver';
-import { runWaterfall as pureRunWaterfall, type LLMFilledValue } from './enrichmentGroupWaterfall';
+import { runWaterfall as pureRunWaterfall, type LLMFilledValue, type EnrichSoFetchResult } from './enrichmentGroupWaterfall';
 import { apolloAsyncRequestCacheKey, APOLLO_SCHEMA_VERSION } from './apolloCacheKeys';
 import { FIELD_GROUPS } from './enrichmentGroups';
 import { trimQuote } from '../utils/enrichedFieldValue';
@@ -1019,6 +1019,30 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
         );
         if (result?.email) return { email: result.email, emailStatus: result.emailStatus };
         return null;
+      },
+
+      // Tier 3.5b-enrich.so: reverse-lookup by email → person + company fields.
+      findEnrichSoPerson: async (email: string): Promise<EnrichSoFetchResult | null> => {
+        try {
+          const enrichSo = getEnrichSoService();
+          const result = await enrichSo.reverseLookup(email, { userId });
+          if (!result?.found) return null;
+          return {
+            firstName: result.firstName,
+            lastName: result.lastName,
+            jobTitle: result.jobTitle,
+            profileUrl: result.profileUrl,
+            companyName: result.companyName,
+            companyLocation: result.companyLocation,
+            companyLinkedInUrl: result.companyLinkedInUrl,
+            pastCompanies: result.pastCompanies,
+            education: result.education,
+            fromCache: result.fromCache,
+          };
+        } catch (err) {
+          console.warn('[v3 deps] findEnrichSoPerson failed:', (err as Error).message);
+          return null;
+        }
       },
     }),
 
