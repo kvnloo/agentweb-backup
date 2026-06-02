@@ -7142,7 +7142,7 @@ emmaToolRegistry.register({
     description: `Manage Google Ads entities via the Google Ads API.
 
 ACTION MATRIX:
-  BUDGET      → LIST, CREATE (name, amount_micros), UPDATE (budget_resource_name, amount_micros), REMOVE (budget_resource_name; must not be attached to any campaign)
+  BUDGET      → LIST, CREATE (name, amount_micros, explicitly_shared?), UPDATE (budget_resource_name, amount_micros), REMOVE (budget_resource_name; must not be attached to any campaign)
   CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy?, bidding_strategy_target?, budget_resource_name?), REMOVE (campaign_resource_name)
               For PERFORMANCE_MAX: pass brand_business_name and brand_logo_asset_resource_name — backend batches campaign creation + brand asset attachment atomically
   AD_GROUP    → LIST (campaign_resource_name)
@@ -7155,7 +7155,7 @@ ACTION MATRIX:
   ASSET       → UPLOAD
   CAMPAIGN_ASSET → ATTACH (campaign_resource_name, assets[{fieldType, assetResourceName?, text?}])
               fieldType values: BUSINESS_NAME (use text), LOGO, SQUARE_MARKETING_IMAGE, MARKETING_IMAGE (use assetResourceName)
-              Required for PMax brand guidelines: attach BUSINESS_NAME (text) + LOGO (assetResourceName) before creating campaign
+              Note: brand guidelines are handled automatically in CAMPAIGN CREATE — use ATTACH only for adding additional campaign-level assets after campaign creation
   ASSET_GROUP → CREATE
   LOCATION    → SEARCH`,
     inputSchema: {
@@ -7168,6 +7168,7 @@ ACTION MATRIX:
         type: { type: 'string', description: 'Campaign type (SEARCH|DISPLAY|PERFORMANCE_MAX) or ad group type (SEARCH_STANDARD|DISPLAY_STANDARD).' },
         budget_resource_name: { type: 'string', description: 'From BUDGET CREATE. Required for CAMPAIGN CREATE.' },
         amount_micros: { type: 'number', description: 'Budget in micros. $10/day = 10000000.' },
+        explicitly_shared: { type: 'boolean', description: 'Whether the budget is explicitly shared across campaigns. Optional for BUDGET CREATE.' },
         bidding_strategy: { type: 'string', enum: ['MAXIMIZE_CONVERSIONS', 'TARGET_CPA', 'TARGET_ROAS', 'MAXIMIZE_CONVERSION_VALUE', 'TARGET_IMPRESSION_SHARE', 'MANUAL_CPC'] },
         bidding_strategy_target: { type: 'number' },
         location_target_ids: { type: 'array', items: { type: 'number' }, description: 'From LOCATION SEARCH.' },
