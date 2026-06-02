@@ -393,15 +393,74 @@ export async function generateLandingPage(
   // created (e.g. v0 returned HTTP 500) leaves an orphaned record with no v0ChatId
   // and no GitHub repo. Recycle the newest such record instead of creating yet
   // another orphan, so repeated retries don't pile up dead "failed" pages.
-  const recyclable = existingPages.find(
-    (p) => p.status === "failed" && !p.v0ChatId && !p.githubRepoUrl && !p.slug
-  );
+  const recyclable = existingPages.find(isOrphanedFailedPage);
   if (recyclable) {
     console.log(`[V0 SERVICE] Recycling failed page record ${recyclable.id} (no v0 chat) for retry`);
+    // Recycling reuses ONE orphan's id; archive any OTHER orphaned failed records so a
+    // backlog from earlier failures (e.g. a sustained v0 outage) doesn't linger on the
+    // user's page list. Best-effort — never blocks the new generation.
+    await cleanupOrphanedFailedPages(userId, existingPages, recyclable.id);
   }
 
   // ── First page: call v0 → create repo → deploy ──
   return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id);
+}
+
+/**
+ * An orphaned failed page is a first-page record whose generation failed before a v0 chat
+ * was ever created: status "failed", no v0ChatId, no githubRepoUrl, and not a sub-page (no
+ * slug). These can never be recovered via deploy_landing_page, so they only clutter the
+ * user's page list. (listLandingPages already excludes archived records.)
+ */
+export function isOrphanedFailedPage(p: GeneratedLandingPage): boolean {
+  return p.status === "failed" && !p.v0ChatId && !p.githubRepoUrl && !p.slug;
+}
+
+/**
+ * Archive orphaned failed page records (see {@link isOrphanedFailedPage}), optionally keeping
+ * one — the record being recycled for the current retry. Without this, a backlog of dead
+ * "failed" pages from repeated past failures lingers on the user's page list. Best-effort:
+ * a failure to archive one record is logged and skipped so it never blocks generation.
+ * Returns the number of records archived.
+ */
+export async function cleanupOrphanedFailedPages(
+  userId: string,
+  pages: GeneratedLandingPage[],
+  keepId?: string
+): Promise<number> {
+  const orphans = pages.filter((p) => isOrphanedFailedPage(p) && p.id !== keepId);
+  if (orphans.length === 0) return 0;
+
+  console.log(
+    `[V0 SERVICE] Archiving ${orphans.length} orphaned failed page(s) for user ${userId}: ${orphans
+      .map((o) => o.id)
+      .join(", ")}`
+  );
+
+  let archived = 0;
+  for (const orphan of orphans) {
+    try {
+      await dynamodb
+        .update({
+          TableName: TABLE_NAME,
+          Key: { id: orphan.id },
+          UpdateExpression:
+            "SET archived = :archived, archivedAt = :archivedAt, updatedAt = :updatedAt",
+          ExpressionAttributeValues: {
+            ":archived": true,
+            ":archivedAt": new Date().toISOString(),
+            ":updatedAt": new Date().toISOString(),
+          },
+        })
+        .promise();
+      archived++;
+    } catch (err: any) {
+      console.error(
+        `[V0 SERVICE] Failed to archive orphaned page ${orphan.id}: ${err.message}`
+      );
+    }
+  }
+  return archived;
 }
 
 /**
@@ -1024,7 +1083,12 @@ export async function deployLandingPage(
   }
 
   if (!record.v0ChatId) {
-    throw new Error("Landing page has no v0 chat — generate first");
+    // This record never got a v0 chat (generation failed upstream before chat creation).
+    // It cannot be deployed/iterated; the recovery path is a fresh generate_landing_page
+    // call, which recycles this record and archives any other stale failed records.
+    throw new Error(
+      "Landing page has no v0 chat — generation did not complete. Retry with generate_landing_page (the stale record is reused automatically)."
+    );
   }
 
   if (!["draft", "failed", "deploying"].includes(record.status)) {
@@ -2227,7 +2291,12 @@ export async function iterateLandingPage(
   }
 
   if (!record.v0ChatId) {
-    throw new Error("Landing page has no v0 chat — generate first");
+    // This record never got a v0 chat (generation failed upstream before chat creation).
+    // It cannot be deployed/iterated; the recovery path is a fresh generate_landing_page
+    // call, which recycles this record and archives any other stale failed records.
+    throw new Error(
+      "Landing page has no v0 chat — generation did not complete. Retry with generate_landing_page (the stale record is reused automatically)."
+    );
   }
 
   try {

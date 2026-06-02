@@ -57,6 +57,7 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fixed: Landing Page Generation No Longer Fails on Temporary v0 Outages',
       '- A temporary error from the page-generation service (HTTP 500) would immediately fail the whole request, leaving a dead "failed" page and forcing you to start over; these transient errors (and rate limits) are now retried automatically with backoff',
       '- Retrying a generation that failed before any content was created now reuses the existing failed page record instead of leaving behind a pile of orphaned empty pages',
+      '- Any leftover empty "failed" pages from earlier retries are now cleaned up automatically on your next generation, so your landing pages list stays tidy after an outage',
     ],
   },
   {
