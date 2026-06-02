@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { getGoogleAdsCredentials } from '../utils/secretsManager';
+import { assertPublicHostname } from '../utils/ssrfGuard';
 import { userDb } from './db';                          // sibling in services/
 import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
 
@@ -620,11 +621,29 @@ export class GoogleAdsService {
       let imageBuffer: Buffer;
       if (Buffer.isBuffer(asset.data)) {
         imageBuffer = asset.data;
-      } else if (typeof asset.data === 'string' && (asset.data.startsWith('http://') || asset.data.startsWith('https://'))) {
-        const response = await axios.get(asset.data, { responseType: 'arraybuffer' });
+      } else if (typeof asset.data === 'string' && asset.data.startsWith('https://')) {
+        // The URL is agent/LLM-supplied (call_google_ads_api `data` arg, reachable
+        // via chat or indirect prompt injection), so guard against SSRF before the
+        // server-side fetch: block private/internal hosts, disable redirects (a 302
+        // to a private IP would otherwise bypass the guard), and cap the size.
+        // Mirrors the established pattern in routes/crm.ts.
+        await assertPublicHostname(asset.data);
+        const MAX_ASSET_BYTES = 10 * 1024 * 1024; // 10 MB
+        // `as any` routes around the legacy @types/axios shim in this repo that
+        // doesn't carry maxRedirects/validateStatus on its config interface
+        // (same workaround as routes/crm.ts). validateStatus rejects 3xx so a
+        // redirect (which maxRedirects:0 stops following) surfaces as an error.
+        const response = await axios.get(asset.data, {
+          responseType: 'arraybuffer',
+          maxRedirects: 0,
+          maxContentLength: MAX_ASSET_BYTES,
+          maxBodyLength: MAX_ASSET_BYTES,
+          timeout: 15000,
+          validateStatus: (s: number) => s >= 200 && s < 300,
+        } as any);
         imageBuffer = Buffer.from(response.data as ArrayBuffer);
       } else {
-        throw new Error('IMAGE/LOGO asset data must be a Buffer or a URL string');
+        throw new Error('IMAGE/LOGO asset data must be a Buffer or an https:// URL string');
       }
       assetContent.imageAsset = { data: imageBuffer.toString('base64') };
     } else {
