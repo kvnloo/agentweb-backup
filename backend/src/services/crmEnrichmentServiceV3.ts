@@ -228,17 +228,20 @@ function buildSnapshotFields(
 ): {
   previousStandardFields: Record<string, string | null>;
   previousCustomFields: Record<string, string | null>;
+  previousEnrichmentMetadata: Record<string, any>;
 } {
   const previousStandardFields: Record<string, string | null> = {};
   const previousCustomFields: Record<string, string | null> = {};
+  const previousEnrichmentMetadata: Record<string, any> = {};
   for (const { field } of fills) {
     if (STANDARD_LEAD_COLUMNS.has(field)) {
       previousStandardFields[field] = (lead as any)[field] ?? null;
     } else {
       previousCustomFields[field] = lead.customFields?.[field] ?? null;
     }
+    previousEnrichmentMetadata[field] = lead.enrichmentMetadata?.[field] ?? null;
   }
-  return { previousStandardFields, previousCustomFields };
+  return { previousStandardFields, previousCustomFields, previousEnrichmentMetadata };
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -983,12 +986,13 @@ export async function runEnrichment(
           // Filter injected dep fills (synthetic fields added for smart-field resolution) from
           // the snapshot — they were never in the user's config and should not be reverted.
           const writableFills = outcome.fills.filter(f => !injectedDepNames.has(f.field));
-          const { previousStandardFields, previousCustomFields } = buildSnapshotFields(lead, writableFills);
+          const { previousStandardFields, previousCustomFields, previousEnrichmentMetadata } = buildSnapshotFields(lead, writableFills);
           crmDb.createEnrichmentSnapshotItem({
             jobId: runId,
             leadId: lead.leadId,
             previousStandardFields,
             previousCustomFields,
+            previousEnrichmentMetadata,
             expiresAt: jobExpiresAt,
           }).catch((err: any) => console.error(`[v3] Failed to write enrichment snapshot runId=${runId} leadId=${lead.leadId}:`, err));
           const writeResult = await writeLeadOutcome(lead, outcome, input, deps, runId);

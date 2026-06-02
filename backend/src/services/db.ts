@@ -6326,6 +6326,7 @@ export const crmDb = {
     leadId: string;
     previousStandardFields: Record<string, string | null>;
     previousCustomFields: Record<string, string | null>;
+    previousEnrichmentMetadata: Record<string, any>;
     expiresAt: number;
   }): Promise<void> {
     try {
@@ -6336,6 +6337,7 @@ export const crmDb = {
           leadId: item.leadId,
           previousStandardFields: item.previousStandardFields,
           previousCustomFields: item.previousCustomFields,
+          previousEnrichmentMetadata: item.previousEnrichmentMetadata,
           expiresAt: item.expiresAt,
         },
       }).promise();

@@ -1813,10 +1813,15 @@ export class CrmEnrichmentService {
           // Snapshot previous values before overwriting
           const previousStandardFields = CrmEnrichmentService.pickMappedStandardFields(lead, standardUpdates);
           const previousCustomFields = CrmEnrichmentService.pickCustomFieldValues(lead.customFields, customUpdates);
+          const allUpdatedFields = [...Object.keys(standardUpdates), ...Object.keys(customUpdates)];
+          const previousEnrichmentMetadata: Record<string, any> = {};
+          for (const field of allUpdatedFields) {
+            previousEnrichmentMetadata[field] = lead.enrichmentMetadata?.[field] ?? null;
+          }
           try {
             await crmDb.createEnrichmentSnapshotItem({
               jobId, leadId: lead.leadId,
-              previousStandardFields, previousCustomFields,
+              previousStandardFields, previousCustomFields, previousEnrichmentMetadata,
               expiresAt: jobExpiresAt,
             });
           } catch (err: any) {
@@ -2191,9 +2196,19 @@ export class CrmEnrichmentService {
             }
           }
 
+          const restoredEnrichmentMetadata: Record<string, any> = { ...(currentLead.enrichmentMetadata || {}) };
+          for (const [key, prevMeta] of Object.entries(snapshot.previousEnrichmentMetadata || {})) {
+            if (prevMeta === null || prevMeta === undefined) {
+              delete restoredEnrichmentMetadata[key];
+            } else {
+              restoredEnrichmentMetadata[key] = prevMeta;
+            }
+          }
+
           await crmDb.updateLead(listId, snapshot.leadId, {
             ...(snapshot.previousStandardFields || {}),
             customFields: restoredCustomFields,
+            enrichmentMetadata: restoredEnrichmentMetadata,
           });
 
           revertedCount++;
