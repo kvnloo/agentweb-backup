@@ -21,7 +21,7 @@ The platform includes a comprehensive email template system accessible in the cu
 
 #### MCP Tools for HTML/Template Management
 
-**`create_html_template`** - Convert HTML to reusable email template
+**`create_html_template`** - Create a REUSABLE email template and SAVE it to the Templates library
 ```typescript
 // Parameters:
 {
@@ -32,26 +32,52 @@ The platform includes a comprehensive email template system accessible in the cu
 }
 ```
 
+> **When to use which tool — template vs. file.** `create_html_template` produces a
+> *reusable, parameterized template* (with `{{variable}}` placeholders) that is **saved
+> to the user's Templates library**. Only use it when the user **explicitly** asks to
+> create or save a reusable template. For a **one-off email or newsletter in HTML
+> format** (a finished piece of content the user wants to draft, build, preview, or
+> send), use **`create_html_file`** instead — it returns an HTML file (S3 URL) and does
+> **not** save anything to the Templates library.
+
 Example usage in agent mode:
 ```
-User: "Take this HTML file and create an email template for welcome messages"
+User: "Save this as a reusable welcome-email template"
 Agent: Uses create_html_template with:
   - html_source: "https://s3.amazonaws.com/bucket/welcome.html"
   - template_name: "welcome_email"
   - subject: "Welcome to {{company_name}}!"
   - additional_instructions: "Add variables for user name and company"
+
+User: "Build my May newsletter into a branded HTML email"
+Agent: Uses create_html_file with document_type: "email" (NOT create_html_template) —
+       this is a one-off HTML email, not a reusable template.
 ```
 
-**`create_html_file`** - Generate standalone HTML file (not template)
+**`create_html_file`** - Generate a standalone, one-off HTML document or email (NOT a saved template)
 ```typescript
 // Parameters:
 {
-  title: string,
+  title: string,                  // Document title, or the subject/headline for an email
   content_draft: string,
-  format_requirements: string  // Optional styling/structure requirements
+  format_requirements: string,    // Optional styling/structure requirements
+  document_type: "document" | "email"  // Optional, default "document".
+                                  // "email" => email-client-safe HTML (table layout,
+                                  // inline CSS, 600px container, no JS) for one-off
+                                  // newsletters/marketing emails.
 }
-// Returns S3 URL to generated HTML file
+// Returns S3 URL to generated HTML file.
+// Use document_type "email" for one-off emails/newsletters; "document" (default)
+// for reports, summaries, audits, GTM plans, etc.
 ```
+
+> **One-off newsletter email without a template.** Previously a newsletter email
+> required a saved template plus `create_html_from_template`. Now Emma can generate a
+> finished, ready-to-send newsletter email directly with
+> `create_html_file({ document_type: "email", ... })` — no template needed. The email
+> mode emits table-based, inline-styled, email-client-safe HTML (Gmail/Outlook/Apple
+> Mail) and fills in real content (no `{{variable}}` placeholders). Use
+> `create_html_template` only when the user explicitly wants a reusable, saved template.
 
 **`create_html_from_template`** - Generate HTML from existing template
 ```typescript

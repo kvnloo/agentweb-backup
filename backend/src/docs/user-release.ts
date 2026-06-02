@@ -38,6 +38,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-01',
     changes: [
+      'New: Emma Can Draft a One-Off Newsletter Email Without a Saved Template',
+      '- You can now ask Emma to build a newsletter or marketing email and she will produce a finished, ready-to-send HTML email directly — no need to first create a saved template',
+      '- These emails are built to display correctly across email clients (Gmail, Outlook, Apple Mail)',
+      'Fixed: Drafting an HTML Email No Longer Adds an Unwanted Saved Template',
+      '- When you asked Emma to build or draft a one-off HTML email or newsletter, she sometimes created a reusable saved template in your Templates library instead of just giving you the email',
+      '- Emma now produces a standalone HTML email/newsletter for these requests, and only adds something to your Templates library when you explicitly ask to save a reusable template',
+    ],
+  },
+  {
+    date: '2026-06-01',
+    changes: [
       'Fixed: Older Agent Mode Chats No Longer Fail With an Unknown Error',
       '- Some existing chats stopped responding with "an unknown error occurred while generating a response" after a recent model update renamed Claude Opus 4.8 behind the scenes',
       '- These chats had the old model name saved on them, which was no longer recognized; the saved name is now matched to the current one automatically',

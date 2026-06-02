@@ -267,6 +267,41 @@ describe('AgentModeService - createHtmlTemplate', () => {
       expect(result.error).toContain('Not Found');
     });
 
+    it('should return a clean error when html_source is undefined (no startsWith crash)', async () => {
+      // Reproduces "Cannot read properties of undefined (reading 'startsWith')"
+      const result = await agentModeService.createHtmlTemplate(
+        undefined as any,
+        undefined,
+        'test_template',
+        'Test Subject',
+        'Build a newsletter',
+        'test-user-123',
+        'test-session-123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('html_source is required');
+      expect(result.error).not.toContain('startsWith');
+      // Must fail validation before invoking the LLM
+      expect(mockGenerateHTML).not.toHaveBeenCalled();
+    });
+
+    it('should return a clean error when html_source is an empty string', async () => {
+      const result = await agentModeService.createHtmlTemplate(
+        '   ',
+        undefined,
+        'test_template',
+        'Test Subject',
+        '',
+        'test-user-123',
+        'test-session-123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('html_source is required');
+      expect(mockGenerateHTML).not.toHaveBeenCalled();
+    });
+
     it('should handle LLM generation errors', async () => {
       // Setup mocks
       mockGenerateHTML.mockResolvedValue(''); // Empty response
