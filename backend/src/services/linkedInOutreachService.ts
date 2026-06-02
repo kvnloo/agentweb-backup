@@ -338,13 +338,41 @@ export class LinkedInOutreachService {
    * @param isUrl          - true if profileUrlOrId is a profile URL, false if it is already a provider_id.
    * @param message        - Optional personalised note to attach to the invitation.
    */
-  // LinkedIn (via Unipile) rejects invitation notes longer than 300 characters.
+  // LinkedIn invitation-note limits depend on the account tier:
+  //  - Free accounts: 200 characters
+  //  - Premium accounts: 300 characters (also LinkedIn's absolute maximum)
   static readonly INVITE_MESSAGE_MAX_CHARS = 300;
+  static readonly INVITE_MESSAGE_MAX_CHARS_FREE = 200;
 
-  async sendInvitation(account_id: string, profileUrlOrId: string, isUrl: boolean, message?: string): Promise<any> {
-    if (message !== undefined && message.length > LinkedInOutreachService.INVITE_MESSAGE_MAX_CHARS) {
+  /**
+   * Resolve the invitation-note character limit for a given account: 300 for a
+   * Premium account (config.is_premium === true), 200 otherwise. Falls back to the
+   * free limit if the account can't be read, so we never over-promise capacity.
+   */
+  async getInviteCharLimitForAccount(userId: string, accountId: string): Promise<number> {
+    try {
+      const { getAccountsByUserIdIncludingOrgShared } = await import('./connectedAccountsDb');
+      const accounts = await getAccountsByUserIdIncludingOrgShared(userId);
+      const account = (accounts as any[]).find(
+        (a) => a.platform === 'unipile' && a.account_id === accountId
+      );
+      if (account?.config?.is_premium === true) {
+        return LinkedInOutreachService.INVITE_MESSAGE_MAX_CHARS;
+      }
+    } catch { /* ignore — fall through to the free limit */ }
+    return LinkedInOutreachService.INVITE_MESSAGE_MAX_CHARS_FREE;
+  }
+
+  async sendInvitation(
+    account_id: string,
+    profileUrlOrId: string,
+    isUrl: boolean,
+    message?: string,
+    maxChars: number = LinkedInOutreachService.INVITE_MESSAGE_MAX_CHARS
+  ): Promise<any> {
+    if (message !== undefined && message.length > maxChars) {
       throw new Error(
-        `Invitation message is too long (${message.length} characters). LinkedIn limits invitation notes to ${LinkedInOutreachService.INVITE_MESSAGE_MAX_CHARS} characters. Please shorten the message and retry.`
+        `Invitation message is too long (${message.length} characters). LinkedIn limits invitation notes to ${maxChars} characters for this account. Please shorten the message and retry.`
       );
     }
     try {
@@ -961,6 +989,27 @@ export class LinkedInOutreachService {
       }
     } catch { /* ignore parse errors or settings fetch failures */ }
 
+    return null;
+  }
+
+  /**
+   * Resolve ONLY the user's own connected Unipile account_id — no site-wide
+   * shared-account fallback.
+   *
+   * Use this for user-initiated CRM actions (LinkedIn message sync, sending a
+   * connection invite) that must run from a LinkedIn sender the user has actually
+   * configured. The site-wide shared pool used by `resolveAccountId` is for
+   * background/system features (enrichment, drip sequences); borrowing one of
+   * those accounts for a user's manual outreach would send from an account the
+   * user never connected. Returns null when the user has no own Unipile account.
+   */
+  async resolveUserOwnedAccountId(userId: string): Promise<string | null> {
+    try {
+      const { getAccountsByUserId } = await import('./connectedAccountsDb');
+      const accounts = await getAccountsByUserId(userId);
+      const userAccount = (accounts as any[]).find((a) => a.platform === 'unipile');
+      if (userAccount?.account_id) return userAccount.account_id;
+    } catch { /* ignore */ }
     return null;
   }
 

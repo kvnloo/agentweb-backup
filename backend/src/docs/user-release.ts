@@ -11,6 +11,31 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-02',
     changes: [
+      'New: Mark a LinkedIn Account as Premium for Longer Connection Notes',
+      '- LinkedIn limits connection-invite notes to 200 characters on free accounts and 300 on Premium; invite notes now default to a 200-character limit so they\'re never silently rejected',
+      '- In Settings → Connected accounts, you can mark a LinkedIn Outreach account as Premium (or back to Free) from its menu — Premium accounts show a Premium badge and allow notes up to 300 characters',
+      '- The CRM compose panel\'s character counter, the "Send LinkedIn Invite" button, and the AI note drafting all follow the connected account\'s actual limit',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'Improved: AI-Drafted LinkedIn Invite Notes Are Saved Automatically',
+      '- When you generate or redraft a connection-invite note with AI, it\'s now saved to the lead automatically — it no longer disappears if you navigate away before clicking Save',
+      '- If you edit the note yourself, click Save draft to keep your changes, as before',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'Fixed: LinkedIn Sync and Invites Require a Connected LinkedIn Account',
+      '- Syncing LinkedIn messages and sending a LinkedIn connection invite now require a LinkedIn Outreach account that you\'ve connected (or one assigned to the list)',
+      '- Previously these could run without a sender configured; if no LinkedIn account is connected, you\'ll now see a clear prompt to connect one in Settings first',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
       'Fixed: HubSpot Sync Now Reliably Pushes Leads (Including Notes) and Auto-Syncs New Ones',
       '- Lists whose mapping included a "Notes" field could fail to push every contact ("Property \\"notes\\" does not exist"); the missing field is now created automatically before syncing, regardless of how it was mapped',
       '- New and edited leads added to a synced list now push to HubSpot automatically by default — previously auto-sync could be left off after setup, so new leads silently never appeared in HubSpot',

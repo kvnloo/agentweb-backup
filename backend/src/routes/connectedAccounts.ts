@@ -1,6 +1,6 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
-import { getAccountsByUserId, getAccountsByUserIdIncludingOrgShared, deleteAccount, deleteAccountById, getAccountByPlatform, FathomConfig } from '../services/connectedAccountsDb';
+import { getAccountsByUserId, getAccountsByUserIdIncludingOrgShared, deleteAccount, deleteAccountById, getAccountByPlatform, updateAccountConfig, FathomConfig } from '../services/connectedAccountsDb';
 import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { FathomApiService } from '../services/fathomApiService';
@@ -80,6 +80,8 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         follower_count: (acc.config as any).follower_count,
         created_at: acc.created_at,
         sharedWithOrg: (acc as any).sharedWithOrg ?? false,
+        // LinkedIn Outreach (unipile) only: Premium accounts allow 300-char invites.
+        is_premium: acc.platform === 'unipile' ? ((acc.config as any).is_premium === true) : undefined,
         // Status fields
         status,
         expires_at: acc.config.token_expires_at,
@@ -163,6 +165,30 @@ router.delete('/connected-accounts/:platform/:accountId', authenticateToken, asy
   } catch (error) {
     console.error('Delete Account By ID Error:', error);
     res.status(500).json({ error: 'Failed to delete connected account' });
+  }
+});
+
+// Mark a LinkedIn Outreach (unipile) account as Premium / free. Premium accounts
+// allow 300-char invitation notes; free accounts are limited to 200.
+router.patch('/connected-accounts/unipile/:accountId/premium', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { accountId } = req.params;
+  const { isPremium } = req.body;
+
+  if (typeof isPremium !== 'boolean') {
+    return res.status(400).json({ error: 'isPremium must be a boolean' });
+  }
+
+  try {
+    await updateAccountConfig(userId, 'unipile', accountId, { is_premium: isPremium });
+    res.json({ success: true, accountId, is_premium: isPremium });
+  } catch (error: any) {
+    // updateAccountConfig throws when the account isn't connected to this user
+    if (typeof error?.message === 'string' && error.message.includes('No unipile account')) {
+      return res.status(404).json({ error: error.message });
+    }
+    console.error('Update LinkedIn Premium flag error:', error);
+    res.status(500).json({ error: 'Failed to update LinkedIn Premium status' });
   }
 });
 
