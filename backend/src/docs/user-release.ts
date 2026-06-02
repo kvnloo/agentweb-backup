@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-02',
     changes: [
+      'Fixed: Shared Plan Links No Longer Get Stuck on a Login Page',
+      '- Opening a shared plan link for a plan that requires sign-in sent recipients to the login screen and dropped the share access, so the link looked broken',
+      '- Shared plan links now open the conversation directly using the link itself as the access pass — no forced login for the people you share with',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
       'Fixed: Automated LinkedIn Engagement Comments Now Read Like a Real Person',
       '- Comments and replies are no longer occasionally posted as the assistant\'s own filler (for example "Please provide the post content so I can tailor a response") — these are now detected and skipped instead of published',
       '- Removed the repetitive, jargon-heavy phrasing that made many comments sound templated (e.g. always opening the same way or stacking corporate buzzwords)',
