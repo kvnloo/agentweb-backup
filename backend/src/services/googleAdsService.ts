@@ -60,8 +60,19 @@ export class GoogleAdsService {
   }
 
   async search(customerId: string, accessToken: string, query: string): Promise<any[]> {
-    const data = await this.callApi('POST', `/customers/${customerId}/googleAds:search`, accessToken, { query });
-    return data.results || [];
+    const MAX_PAGES = 50; // safety cap (~500k rows at the default page size) to avoid a runaway loop
+    const all: any[] = [];
+    let pageToken: string | undefined;
+    let pages = 0;
+    do {
+      const body: any = { query };
+      if (pageToken) body.pageToken = pageToken;
+      const data = await this.callApi('POST', `/customers/${customerId}/googleAds:search`, accessToken, body);
+      if (data.results) all.push(...data.results);
+      pageToken = data.nextPageToken;
+      pages++;
+    } while (pageToken && pages < MAX_PAGES);
+    return all;
   }
 
   async mutate(customerId: string, accessToken: string, resource: string, operations: any[]): Promise<any> {
