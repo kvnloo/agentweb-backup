@@ -36,6 +36,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-02',
     changes: [
+      'Fixed: Landing Page Generation No Longer Fails on Temporary v0 Outages',
+      '- A temporary error from the page-generation service (HTTP 500) would immediately fail the whole request, leaving a dead "failed" page and forcing you to start over; these transient errors (and rate limits) are now retried automatically with backoff',
+      '- Retrying a generation that failed before any content was created now reuses the existing failed page record instead of leaving behind a pile of orphaned empty pages',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
       'Fixed: HubSpot Sync Now Reliably Pushes Leads (Including Notes) and Auto-Syncs New Ones',
       '- Lists whose mapping included a "Notes" field could fail to push every contact ("Property \\"notes\\" does not exist"); the missing field is now created automatically before syncing, regardless of how it was mapped',
       '- New and edited leads added to a synced list now push to HubSpot automatically by default — previously auto-sync could be left off after setup, so new leads silently never appeared in HubSpot',
