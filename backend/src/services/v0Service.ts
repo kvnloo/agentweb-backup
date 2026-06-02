@@ -1878,6 +1878,28 @@ async function getVercelBuildErrors(deploymentId: string, vercelToken: string): 
 }
 
 /**
+ * Probe a landing page's own public URL to confirm the route is actually live
+ * (not 404ing). Used to gate auto-heal so a page is never marked "deployed"
+ * while its URL is broken. Returns false on any non-2xx/3xx or network error;
+ * returns true if no URL is known (nothing to disprove — fall back to caller's
+ * other signals).
+ */
+async function isLandingPageUrlLive(url?: string): Promise<boolean> {
+  if (!url) return true;
+  try {
+    const res = await axios.get<any>(url, {
+      timeout: VERCEL_POLL_TIMEOUT_MS,
+      // Resolve (don't throw) for all statuses so we can inspect the code.
+      validateStatus: () => true,
+    });
+    const status = res.status;
+    return status >= 200 && status < 400;
+  } catch (_e) {
+    return false;
+  }
+}
+
+/**
  * Get the current deployment status and build logs for a landing page.
  * Exposed as a tool so Emma can check on builds.
  */
@@ -1907,25 +1929,40 @@ export async function getDeploymentStatus(
     return { status: record.status, buildStatus: "error", buildError, deployedUrl: record.deployedUrl };
   }
 
-  // Auto-heal: if Vercel shows the project is READY but our record says failed/deploying, sync it.
+  // Auto-heal: if Vercel shows the project is READY but our record says
+  // failed/deploying, sync it — BUT only after confirming the page's own live
+  // URL actually resolves. Project-level READY is not enough for sub-pages:
+  // the latest build can be READY yet not contain this page's app/<slug>/ route
+  // (it built an older commit), so healing on READY alone marked a page
+  // "deployed" while its URL 404'd (the empathiaai bug). Verifying the live URL
+  // enforces the real user-facing invariant for both root and sub-pages.
   if (state === "READY" && (record.status === "failed" || record.status === "deploying")) {
-    try {
-      await dynamodb.update({
-        TableName: TABLE_NAME,
-        Key: { id },
-        UpdateExpression: "SET #status = :status, updatedAt = :updatedAt REMOVE errorMessage",
-        ExpressionAttributeNames: { "#status": "status" },
-        ExpressionAttributeValues: {
-          ":status": "deployed",
-          ":updatedAt": new Date().toISOString(),
-        },
-      }).promise();
-    } catch (_e) {
-      // Best-effort — don't block the status response
+    const liveUrlOk = await isLandingPageUrlLive(record.deployedUrl);
+    if (liveUrlOk) {
+      try {
+        await dynamodb.update({
+          TableName: TABLE_NAME,
+          Key: { id },
+          UpdateExpression: "SET #status = :status, updatedAt = :updatedAt REMOVE errorMessage",
+          ExpressionAttributeNames: { "#status": "status" },
+          ExpressionAttributeValues: {
+            ":status": "deployed",
+            ":updatedAt": new Date().toISOString(),
+          },
+        }).promise();
+      } catch (_e) {
+        // Best-effort — don't block the status response
+      }
+      return {
+        status: "deployed",
+        buildStatus: "success",
+        deployedUrl: record.deployedUrl,
+      };
     }
+    // Project is READY but this page's route is not live — do not heal.
     return {
-      status: "deployed",
-      buildStatus: "success",
+      status: record.status,
+      buildStatus: "route_not_live",
       deployedUrl: record.deployedUrl,
     };
   }
