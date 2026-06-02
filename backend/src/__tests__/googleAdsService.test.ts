@@ -40,11 +40,24 @@ jest.mock('../services/connectedAccountsDb', () => ({
   // normalizeAccounts is NOT exported — do not mock it here
 }));
 
+const mockAssertPublicHostname = jest.fn();
+jest.mock('../utils/ssrfGuard', () => ({
+  assertPublicHostname: (...args: any[]) => mockAssertPublicHostname(...args),
+  SsrfBlockedError: class SsrfBlockedError extends Error {
+    constructor(message = 'URL resolves to a private/internal address') {
+      super(message);
+      this.name = 'SsrfBlockedError';
+    }
+  },
+}));
+import { SsrfBlockedError } from '../utils/ssrfGuard';
+
 import { GoogleAdsService } from '../services/googleAdsService';
 
 let service: GoogleAdsService;
 beforeEach(() => {
   jest.clearAllMocks();
+  mockAssertPublicHostname.mockResolvedValue(undefined);
   service = new GoogleAdsService();
 });
 
@@ -63,6 +76,29 @@ describe('API version', () => {
     await service.search('1234567890', 'test-access-token', 'SELECT campaign.id FROM campaign');
     const headers = mockAxiosPost.mock.calls[0][2].headers;
     expect(headers['login-customer-id']).toBe('1234567890');
+  });
+});
+
+describe('search — pagination', () => {
+  it('follows nextPageToken and concatenates all pages', async () => {
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [{ id: '1' }, { id: '2' }], nextPageToken: 'tok-2' } })
+      .mockResolvedValueOnce({ data: { results: [{ id: '3' }] } });
+
+    const results = await service.search('1234567890', 'test-access-token', 'SELECT campaign.id FROM campaign');
+
+    expect(results).toEqual([{ id: '1' }, { id: '2' }, { id: '3' }]);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(2);
+    // first page request carries no pageToken; second page sends the token
+    expect(mockAxiosPost.mock.calls[0][1].pageToken).toBeUndefined();
+    expect(mockAxiosPost.mock.calls[1][1].pageToken).toBe('tok-2');
+  });
+
+  it('returns a single page when there is no nextPageToken', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ id: '1' }] } });
+    const results = await service.search('1234567890', 'test-access-token', 'SELECT campaign.id FROM campaign');
+    expect(results).toEqual([{ id: '1' }]);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -200,6 +236,39 @@ describe('createBudget', () => {
     const callBody = mockAxiosPost.mock.calls[0][1];
     expect(callBody.operations[0].create.amountMicros).toBe('10000000');
     expect(callBody.operations[0].create.deliveryMethod).toBe('STANDARD');
+  });
+});
+
+describe('listBudgets', () => {
+  it('returns mapped budgets from GAQL search', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          campaignBudget: {
+            resourceName: 'customers/123/campaignBudgets/1',
+            name: 'My Budget',
+            amountMicros: '50000000',
+            explicitlyShared: false,
+            referenceCount: 2,
+          },
+        }],
+      },
+    });
+    const budgets = await service.listBudgets('user-123', '1234567890');
+    expect(budgets).toHaveLength(1);
+    expect(budgets[0].resourceName).toBe('customers/123/campaignBudgets/1');
+    expect(budgets[0].name).toBe('My Budget');
+    expect(budgets[0].amountMicros).toBe('50000000');
+    expect(budgets[0].explicitlyShared).toBe(false);
+    expect(budgets[0].referenceCount).toBe(2);
+  });
+
+  it('sends correct GAQL fields in the search query', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
+    await service.listBudgets('user-123', '1234567890');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.query).toContain('campaign_budget.resource_name');
+    expect(body.query).toContain('campaign_budget.amount_micros');
   });
 });
 
@@ -380,6 +449,17 @@ describe('createAd — Responsive Display Ad', () => {
     expect(body.operations[0].create.ad.responsiveDisplayAd).toBeDefined();
     expect(body.operations[0].create.ad.responsiveDisplayAd.marketingImages).toHaveLength(1);
   });
+
+  it('rejects an unknown ad type instead of silently building a display ad', async () => {
+    await expect(service.createAd('user-123', '1234567890', {
+      adGroupResourceName: 'customers/123/adGroups/789',
+      type: 'SEARCH' as any,
+      headlines: ['Headline 1'],
+      descriptions: ['Description 1'],
+      finalUrl: 'https://example.com',
+    })).rejects.toThrow(/Unsupported ad type/);
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
 });
 
 describe('uploadAsset', () => {
@@ -445,6 +525,47 @@ describe('getQuickMetrics — with campaignIds filter', () => {
     const body = mockAxiosPost.mock.calls[0][1];
     expect(body.query).toContain('campaign.id IN (1,2)');
     expect(body.query).toContain('DURING LAST_7_DAYS');
+  });
+});
+
+describe('getQuickMetrics — spend totals use raw micros not toFixed strings', () => {
+  it('totals.spend is sum of raw spend, not sum of toFixed(2) strings', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [
+          { campaign: { id: '1', name: 'A', status: 'ENABLED' }, metrics: { costMicros: '1', clicks: '0', impressions: '0', conversions: '0' } },
+          { campaign: { id: '2', name: 'B', status: 'ENABLED' }, metrics: { costMicros: '1', clicks: '0', impressions: '0', conversions: '0' } },
+        ],
+      },
+    });
+    const summary = await service.getQuickMetrics('user-123', '1234567890', { datePreset: 'LAST_30_DAYS' });
+    // 1 micro + 1 micro = 0.000002, not 0.00 + 0.00 = 0.00
+    expect(summary.totals.spend).toBeCloseTo(0.000002, 9);
+  });
+});
+
+describe('updateCampaign — TARGET_IMPRESSION_SHARE', () => {
+  it('sends correct fields when switching to TARGET_IMPRESSION_SHARE', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+      biddingStrategy: 'TARGET_IMPRESSION_SHARE',
+      biddingStrategyTarget: 0.7,
+      cpcBidCeilingMicros: 5_000_000,
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    const update = body.operations[0].update;
+    expect(update.targetImpressionShare.locationFractionMicros).toBe('700000');
+    expect(update.targetImpressionShare.cpcBidCeilingMicros).toBe('5000000');
+    expect(body.operations[0].updateMask).toContain('target_impression_share.cpc_bid_ceiling_micros');
+  });
+
+  it('uses 100_000_000 as default cpcBidCeilingMicros', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+      biddingStrategy: 'TARGET_IMPRESSION_SHARE',
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.targetImpressionShare.cpcBidCeilingMicros).toBe('100000000');
   });
 });
 
@@ -730,7 +851,49 @@ describe('uploadAsset — URL input', () => {
       type: 'IMAGE',
       name: 'test.jpg',
       data: 'not-a-url' as any,
-    })).rejects.toThrow('IMAGE/LOGO asset data must be a Buffer or a URL string');
+    })).rejects.toThrow('IMAGE/LOGO asset data must be a Buffer or an https:// URL string');
+  });
+});
+
+describe('uploadAsset — SSRF protection', () => {
+  it('runs the SSRF guard before fetching and hardens the request', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: Buffer.from('img') });
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/assets/9' }] },
+    });
+    await service.uploadAsset('user-123', '1234567890', {
+      type: 'IMAGE',
+      name: 'hero.jpg',
+      data: 'https://example.com/hero.jpg',
+    });
+    expect(mockAssertPublicHostname).toHaveBeenCalledWith('https://example.com/hero.jpg');
+    // guard must run before the outbound fetch
+    expect(mockAssertPublicHostname.mock.invocationCallOrder[0])
+      .toBeLessThan(mockAxiosGet.mock.invocationCallOrder[0]);
+    const opts = mockAxiosGet.mock.calls[0][1];
+    expect(opts.maxRedirects).toBe(0);
+    expect(opts.maxContentLength).toBeGreaterThan(0);
+    expect(opts.maxBodyLength).toBeGreaterThan(0);
+  });
+
+  it('rejects when the SSRF guard blocks the URL and never fetches', async () => {
+    mockAssertPublicHostname.mockRejectedValueOnce(new SsrfBlockedError());
+    await expect(service.uploadAsset('user-123', '1234567890', {
+      type: 'IMAGE',
+      name: 'evil.jpg',
+      data: 'https://169.254.169.254/latest/meta-data/',
+    })).rejects.toBeInstanceOf(SsrfBlockedError);
+    expect(mockAxiosGet).not.toHaveBeenCalled();
+  });
+
+  it('rejects http:// URLs without invoking the guard or fetching', async () => {
+    await expect(service.uploadAsset('user-123', '1234567890', {
+      type: 'IMAGE',
+      name: 'plain.jpg',
+      data: 'http://example.com/plain.jpg',
+    })).rejects.toThrow('IMAGE/LOGO asset data must be a Buffer or an https:// URL string');
+    expect(mockAssertPublicHostname).not.toHaveBeenCalled();
+    expect(mockAxiosGet).not.toHaveBeenCalled();
   });
 });
 
@@ -815,4 +978,5 @@ describe('createCampaign — PMax with brand guidelines', () => {
     expect(body.mutateOperations[3].campaignAssetOperation.create.asset).toBe('customers/123/assets/logo-1');
   });
 });
+
 

@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { getGoogleAdsCredentials } from '../utils/secretsManager';
+import { assertPublicHostname } from '../utils/ssrfGuard';
 import { userDb } from './db';                          // sibling in services/
 import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
 
@@ -59,8 +60,19 @@ export class GoogleAdsService {
   }
 
   async search(customerId: string, accessToken: string, query: string): Promise<any[]> {
-    const data = await this.callApi('POST', `/customers/${customerId}/googleAds:search`, accessToken, { query });
-    return data.results || [];
+    const MAX_PAGES = 50; // safety cap (~500k rows at the default page size) to avoid a runaway loop
+    const all: any[] = [];
+    let pageToken: string | undefined;
+    let pages = 0;
+    do {
+      const body: any = { query };
+      if (pageToken) body.pageToken = pageToken;
+      const data = await this.callApi('POST', `/customers/${customerId}/googleAds:search`, accessToken, body);
+      if (data.results) all.push(...data.results);
+      pageToken = data.nextPageToken;
+      pages++;
+    } while (pageToken && pages < MAX_PAGES);
+    return all;
   }
 
   async mutate(customerId: string, accessToken: string, resource: string, operations: any[]): Promise<any> {
@@ -140,6 +152,8 @@ export class GoogleAdsService {
   }
 
   // ── Account listing (used during OAuth finalize) ─────────────────────────
+  // MCC/manager accounts are intentionally unsupported — only standard (leaf) customer
+  // accounts are exposed. Same approach as the Meta Ads implementation.
 
   async listAccessibleAccounts(accessToken: string): Promise<GoogleAdAccount[]> {
     const secrets = await getGoogleAdsCredentials();
@@ -209,6 +223,20 @@ export class GoogleAdsService {
     await this.mutate(customerId, accessToken, 'campaignBudgets', [{ remove: budgetResourceName }]);
   }
 
+  async listBudgets(userId: string, customerId: string): Promise<{ resourceName: string; name: string; amountMicros: string; explicitlyShared: boolean; referenceCount: number }[]> {
+    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const results = await this.search(customerId, accessToken,
+      'SELECT campaign_budget.resource_name, campaign_budget.name, campaign_budget.amount_micros, campaign_budget.explicitly_shared, campaign_budget.reference_count FROM campaign_budget ORDER BY campaign_budget.name'
+    );
+    return results.map((r: any) => ({
+      resourceName: r.campaignBudget.resourceName,
+      name: r.campaignBudget.name,
+      amountMicros: r.campaignBudget.amountMicros,
+      explicitlyShared: r.campaignBudget.explicitlyShared,
+      referenceCount: r.campaignBudget.referenceCount,
+    }));
+  }
+
   // ── Campaigns ────────────────────────────────────────────────────────────
 
   async listCampaigns(userId: string, customerId: string): Promise<{ resourceName: string; id: string; name: string; status: string; type: string }[]> {
@@ -231,6 +259,7 @@ export class GoogleAdsService {
     budgetResourceName: string;
     biddingStrategy: 'MAXIMIZE_CONVERSIONS' | 'TARGET_CPA' | 'TARGET_ROAS' | 'MAXIMIZE_CONVERSION_VALUE' | 'TARGET_IMPRESSION_SHARE' | 'MANUAL_CPC';
     biddingStrategyTarget?: number;
+    cpcBidCeilingMicros?: number;
     locationTargetIds: number[];
     status?: 'ENABLED' | 'PAUSED';
     brandBusinessName?: string;
@@ -251,7 +280,7 @@ export class GoogleAdsService {
     else if (params.biddingStrategy === 'TARGET_IMPRESSION_SHARE') biddingField.targetImpressionShare = {
       location: 'ANYWHERE_ON_PAGE',
       locationFractionMicros: String(Math.round((params.biddingStrategyTarget || 1) * 1_000_000)),
-      cpcBidCeilingMicros: '10000000',
+      cpcBidCeilingMicros: String(params.cpcBidCeilingMicros ?? 100_000_000),
     };
     else if (params.biddingStrategy === 'MANUAL_CPC') biddingField.manualCpc = { enhancedCpcEnabled: false };
 
@@ -327,6 +356,7 @@ export class GoogleAdsService {
     status?: 'ENABLED' | 'PAUSED';
     biddingStrategy?: string;
     biddingStrategyTarget?: number;
+    cpcBidCeilingMicros?: number;
     budgetResourceName?: string;
   }): Promise<void> {
     const { accessToken } = await this.getAccountCredentials(userId, customerId);
@@ -348,6 +378,13 @@ export class GoogleAdsService {
       } else if (params.biddingStrategy === 'TARGET_ROAS') {
         update.targetRoas = { targetRoas: params.biddingStrategyTarget || 1 };
         updateMask.push('target_roas.target_roas');
+      } else if (params.biddingStrategy === 'TARGET_IMPRESSION_SHARE') {
+        update.targetImpressionShare = {
+          location: 'ANYWHERE_ON_PAGE',
+          locationFractionMicros: String(Math.round((params.biddingStrategyTarget || 1) * 1_000_000)),
+          cpcBidCeilingMicros: String(params.cpcBidCeilingMicros ?? 100_000_000),
+        };
+        updateMask.push('target_impression_share.location', 'target_impression_share.location_fraction_micros', 'target_impression_share.cpc_bid_ceiling_micros');
       } else if (params.biddingStrategy === 'MANUAL_CPC') {
         update.manualCpc = { enhancedCpcEnabled: false };
         updateMask.push('manual_cpc.enhanced_cpc_enabled');
@@ -568,7 +605,7 @@ export class GoogleAdsService {
           descriptions: params.descriptions.map(text => ({ text })),
         },
       };
-    } else {
+    } else if (params.type === 'RESPONSIVE_DISPLAY_AD') {
       adContent = {
         responsiveDisplayAd: {
           headlines: params.headlines.map(text => ({ text })),
@@ -578,6 +615,10 @@ export class GoogleAdsService {
           }),
         },
       };
+    } else {
+      // Reject unknown types rather than silently defaulting to a display ad —
+      // the agent could otherwise spend on the wrong ad format.
+      throw new Error(`Unsupported ad type "${params.type}". Use RESPONSIVE_SEARCH_AD or RESPONSIVE_DISPLAY_AD.`);
     }
 
     const data = await this.mutate(customerId, accessToken, 'adGroupAds', [{
@@ -620,11 +661,29 @@ export class GoogleAdsService {
       let imageBuffer: Buffer;
       if (Buffer.isBuffer(asset.data)) {
         imageBuffer = asset.data;
-      } else if (typeof asset.data === 'string' && (asset.data.startsWith('http://') || asset.data.startsWith('https://'))) {
-        const response = await axios.get(asset.data, { responseType: 'arraybuffer' });
+      } else if (typeof asset.data === 'string' && asset.data.startsWith('https://')) {
+        // The URL is agent/LLM-supplied (call_google_ads_api `data` arg, reachable
+        // via chat or indirect prompt injection), so guard against SSRF before the
+        // server-side fetch: block private/internal hosts, disable redirects (a 302
+        // to a private IP would otherwise bypass the guard), and cap the size.
+        // Mirrors the established pattern in routes/crm.ts.
+        await assertPublicHostname(asset.data);
+        const MAX_ASSET_BYTES = 10 * 1024 * 1024; // 10 MB
+        // `as any` routes around the legacy @types/axios shim in this repo that
+        // doesn't carry maxRedirects/validateStatus on its config interface
+        // (same workaround as routes/crm.ts). validateStatus rejects 3xx so a
+        // redirect (which maxRedirects:0 stops following) surfaces as an error.
+        const response = await axios.get(asset.data, {
+          responseType: 'arraybuffer',
+          maxRedirects: 0,
+          maxContentLength: MAX_ASSET_BYTES,
+          maxBodyLength: MAX_ASSET_BYTES,
+          timeout: 15000,
+          validateStatus: (s: number) => s >= 200 && s < 300,
+        } as any);
         imageBuffer = Buffer.from(response.data as ArrayBuffer);
       } else {
-        throw new Error('IMAGE/LOGO asset data must be a Buffer or a URL string');
+        throw new Error('IMAGE/LOGO asset data must be a Buffer or an https:// URL string');
       }
       assetContent.imageAsset = { data: imageBuffer.toString('base64') };
     } else {
@@ -788,7 +847,7 @@ export class GoogleAdsService {
 
     const campaigns = results.map((r: any) => {
       const m = r.metrics;
-      const spend = Number(m.costMicros || 0) / 1_000_000;
+      const spendRaw = Number(m.costMicros || 0) / 1_000_000;
       const clicks = Number(m.clicks || 0);
       const impressions = Number(m.impressions || 0);
       return {
@@ -798,16 +857,17 @@ export class GoogleAdsService {
         impressions,
         clicks,
         ctr: impressions > 0 ? (clicks / impressions) * 100 : 0,
-        spendFormatted: spend.toFixed(2),
+        spendRaw,
+        spendFormatted: spendRaw.toFixed(2),
         conversions: Number(m.conversions || 0),
-        avgCpc: clicks > 0 ? (spend / clicks).toFixed(2) : '0.00',
+        avgCpc: clicks > 0 ? (spendRaw / clicks).toFixed(2) : '0.00',
       };
     });
 
     const totals = campaigns.reduce((acc, c) => ({
       impressions: acc.impressions + c.impressions,
       clicks: acc.clicks + c.clicks,
-      spend: acc.spend + parseFloat(c.spendFormatted),
+      spend: acc.spend + c.spendRaw,
       conversions: acc.conversions + c.conversions,
     }), { impressions: 0, clicks: 0, spend: 0, conversions: 0 });
 

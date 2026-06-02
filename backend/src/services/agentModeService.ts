@@ -23225,6 +23225,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             budgetResourceName: args.budget_resource_name,
             biddingStrategy: args.bidding_strategy,
             biddingStrategyTarget: args.bidding_strategy_target,
+            cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
             locationTargetIds: args.location_target_ids || [],
             status: args.status || 'PAUSED',
             brandBusinessName: args.brand_business_name,
@@ -23239,6 +23240,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             status: args.status,
             biddingStrategy: args.bidding_strategy,
             biddingStrategyTarget: args.bidding_strategy_target,
+            cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
             budgetResourceName: args.budget_resource_name,
           });
           return { success: true, message: 'Campaign updated' };
@@ -23246,17 +23248,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
 
       if (entity_type === 'BUDGET' && action === 'LIST') {
-        const { accessToken } = await googleAdsService.getAccountCredentials(userId, customer_id);
-        const results = await googleAdsService.search(customer_id, accessToken,
-          'SELECT campaign_budget.resource_name, campaign_budget.name, campaign_budget.amount_micros, campaign_budget.explicitly_shared, campaign_budget.reference_count FROM campaign_budget ORDER BY campaign_budget.name'
-        );
-        const budgets = results.map((r: any) => ({
-          resourceName: r.campaignBudget.resourceName,
-          name: r.campaignBudget.name,
-          amountMicros: r.campaignBudget.amountMicros,
-          explicitlyShared: r.campaignBudget.explicitlyShared,
-          referenceCount: r.campaignBudget.referenceCount,
-        }));
+        const budgets = await googleAdsService.listBudgets(userId, customer_id);
         return { success: true, budgets };
       }
       if (entity_type === 'BUDGET' && action === 'CREATE') {
@@ -23362,9 +23354,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!args.ad_group_resource_name || !args.type || !args.headlines || !args.descriptions || !args.final_url) {
             return { success: false, error: 'ad_group_resource_name, type, headlines, descriptions, and final_url are required to create an ad' };
           }
+          let adType = args.type as string;
+          if (adType === 'SEARCH') adType = 'RESPONSIVE_SEARCH_AD';
+          else if (adType === 'DISPLAY') adType = 'RESPONSIVE_DISPLAY_AD';
           const ad = await googleAdsService.createAd(userId, customer_id, {
             adGroupResourceName: args.ad_group_resource_name,
-            type: args.type,
+            type: adType as 'RESPONSIVE_SEARCH_AD' | 'RESPONSIVE_DISPLAY_AD',
             headlines: args.headlines,
             descriptions: args.descriptions,
             finalUrl: args.final_url,

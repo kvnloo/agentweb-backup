@@ -3,7 +3,7 @@ import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getGoogleAdsConfig } from '../config/integrations';
-import { createAccount, deleteAccountById } from '../services/connectedAccountsDb';
+import { createAccount } from '../services/connectedAccountsDb';
 import { googleAdsService } from '../services/googleAdsService';
 import { authenticateToken } from '../middleware/auth';
 
@@ -100,7 +100,7 @@ router.get('/callback', (req, res) => {
   const frontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
   if (error) return res.redirect(`${frontendUrl}/oauth/google-ads/callback?error=${encodeURIComponent(error as string)}`);
   if (!code) return res.redirect(`${frontendUrl}/oauth/google-ads/callback?error=no_code_provided`);
-  res.redirect(`${frontendUrl}/oauth/google-ads/callback?code=${code}&state=${state}`);
+  res.redirect(`${frontendUrl}/oauth/google-ads/callback?code=${encodeURIComponent(code as string)}&state=${encodeURIComponent(state as string)}`);
 });
 
 /**
@@ -197,25 +197,6 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
   } catch (error: any) {
     console.error('[Google Ads OAuth /connect]', error);
     res.status(500).json({ error: 'Failed to save Google Ads account' });
-  }
-});
-
-/**
- * DELETE /api/oauth/google-ads/disconnect/:customerId
- * Remove a connected Google Ads account.
- */
-router.delete('/disconnect/:customerId', authenticateToken, async (req: any, res) => {
-  const { customerId } = req.params;
-  const userId = req.user.userId;
-  if (!customerId) {
-    return res.status(400).json({ error: 'Missing customerId' });
-  }
-  try {
-    await deleteAccountById(userId, 'google_ads', customerId);
-    res.json({ success: true });
-  } catch (error: any) {
-    console.error('[Google Ads OAuth /disconnect]', error);
-    res.status(500).json({ error: 'Failed to disconnect Google Ads account' });
   }
 });
 
