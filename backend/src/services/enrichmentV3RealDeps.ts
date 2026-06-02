@@ -81,6 +81,7 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
           city: p.city,
           state: p.state,
           country: p.country,
+          fromCache: result.fromCache,
         };
       } catch (err) {
         console.warn('[v3 deps] apolloPeopleMatch failed:', (err as Error).message);
@@ -135,6 +136,7 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
           firstName: result.firstName,
           lastName: result.lastName,
           company: result.companyName,
+          fromCache: result.fromCache,
         };
       } catch (err) {
         console.warn('[v3 deps] enrichSoReverseLookup failed:', (err as Error).message);
