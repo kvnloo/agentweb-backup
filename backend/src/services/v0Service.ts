@@ -750,10 +750,11 @@ async function addPageToExistingRepo(
       },
       { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
     );
+    const pushedCommitSha: string = commitRes.data.sha;
 
     await axios.patch<any>(
       `https://api.github.com/repos/${repoFullName}/git/refs/heads/main`,
-      { sha: commitRes.data.sha },
+      { sha: pushedCommitSha },
       { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
     );
 
@@ -761,11 +762,13 @@ async function addPageToExistingRepo(
     // pollVercelDeployment uses this to ignore pre-existing READY deployments.
     const pushTimestampMs = Date.now();
 
-    console.log(`[V0 SERVICE] Pushed ${filesToCommit.length} files for /${slug} to ${repoFullName} — polling Vercel for build status`);
+    console.log(`[V0 SERVICE] Pushed ${filesToCommit.length} files for /${slug} to ${repoFullName} (${pushedCommitSha.substring(0, 7)}) — polling Vercel for build status`);
 
-    // Poll Vercel deployment to verify the build succeeds before marking as deployed
+    // Poll Vercel deployment to verify the build succeeds before marking as deployed.
+    // Match on the exact commit we just pushed so a stale build that lacks the new
+    // app/<slug>/ route is never mistaken for a successful deploy (the 404 bug).
     const vercelToken = await getVercelToken();
-    const deploymentResult = await pollVercelDeployment(existingPage.vercelProjectId!, vercelToken, pushTimestampMs);
+    const deploymentResult = await pollVercelDeployment(existingPage.vercelProjectId!, vercelToken, pushTimestampMs, pushedCommitSha);
 
     if (deploymentResult.buildStatus === "error" || deploymentResult.buildStatus === "timeout") {
       const errorMsg = `Vercel build failed for /${slug}: ${deploymentResult.buildError || "Unknown build error"}`;
@@ -1131,7 +1134,7 @@ export async function deployLandingPage(
     console.log("[V0 SERVICE] Step 3: Creating GitHub repo and pushing files");
     const slug = buildPageSlug(record.name);
     const repoName = `lp-${slug}-${id.slice(0, 8)}`;
-    const { githubRepoUrl, repoFullName } = await createGitHubRepoAndPush(repoName, zipBuffer, record.name);
+    const { githubRepoUrl, repoFullName, commitSha } = await createGitHubRepoAndPush(repoName, zipBuffer, record.name);
 
     // Save GitHub repo URL immediately so it's not lost if Vercel step fails
     await dynamodb
@@ -1150,7 +1153,7 @@ export async function deployLandingPage(
 
     // Step 4: Create Vercel project linked to the GitHub repo
     console.log(`[V0 SERVICE] Step 4: Creating Vercel project linked to ${repoFullName}`);
-    const { deployedUrl, vercelProjectId, buildStatus, buildError } = await createVercelProject(repoFullName, repoName);
+    const { deployedUrl, vercelProjectId, buildStatus, buildError } = await createVercelProject(repoFullName, repoName, commitSha);
 
     // Step 5: Update DB record
     const now = new Date().toISOString();
@@ -1460,7 +1463,7 @@ async function createGitHubRepoAndPush(
   repoName: string,
   zipData: any,
   description: string
-): Promise<{ githubRepoUrl: string; repoFullName: string }> {
+): Promise<{ githubRepoUrl: string; repoFullName: string; commitSha: string }> {
   const { token, org } = await getGitHubOrgToken();
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -1636,15 +1639,16 @@ async function createGitHubRepoAndPush(
   );
 
   // Step E: Update the ref to point to the new commit
+  const commitSha: string = commitRes.data.sha;
   await axios.patch<any>(
     `https://api.github.com/repos/${repoFullName}/git/refs/heads/main`,
-    { sha: commitRes.data.sha },
+    { sha: commitSha },
     { headers, timeout: GITHUB_API_TIMEOUT_MS }
   );
 
-  console.log(`[V0 SERVICE] Pushed ${files.length} files to ${repoFullName}`);
+  console.log(`[V0 SERVICE] Pushed ${files.length} files to ${repoFullName} (${commitSha.substring(0, 7)})`);
 
-  return { githubRepoUrl, repoFullName };
+  return { githubRepoUrl, repoFullName, commitSha };
 }
 
 /**
@@ -1653,7 +1657,8 @@ async function createGitHubRepoAndPush(
  */
 async function createVercelProject(
   repoFullName: string,
-  projectName: string
+  projectName: string,
+  expectedCommitSha?: string
 ): Promise<{ deployedUrl: string; vercelProjectId: string; buildStatus: string; buildError?: string }> {
   const vercelToken = await getVercelToken();
   const headers = {
@@ -1725,8 +1730,9 @@ async function createVercelProject(
     console.warn(`[V0 SERVICE] Manual deploy trigger failed (may already be deploying): ${deployErr.message}`);
   }
 
-  // Poll for deployment status — only accept deployments created after our trigger
-  const deploymentResult = await pollVercelDeployment(vercelProjectId, vercelToken, deployTriggerMs);
+  // Poll for deployment status — only accept the build for the commit we pushed
+  // (created after our trigger), so a stale build is never taken as success.
+  const deploymentResult = await pollVercelDeployment(vercelProjectId, vercelToken, deployTriggerMs, expectedCommitSha);
 
   // After deployment, fetch the project to get the real production alias.
   // Vercel truncates long project names in domains (e.g. our requested name
@@ -1755,28 +1761,61 @@ async function createVercelProject(
 }
 
 /**
- * Poll Vercel for a deployment created at or after `sinceMs` (Unix ms).
- * Passing sinceMs prevents catching a previously-READY deployment when a new
+ * Read the GitHub commit SHA a Vercel deployment was built from.
+ * Vercel exposes this under meta.githubCommitSha (other git providers use
+ * gitlabCommitSha / bitbucketCommitSha); we only use GitHub.
+ */
+function deploymentCommitSha(deployment: any): string | undefined {
+  return deployment?.meta?.githubCommitSha || deployment?.meta?.gitCommitSha;
+}
+
+/**
+ * Poll Vercel for the build of a specific commit.
+ *
+ * Passing `sinceMs` prevents catching a previously-READY deployment when a new
  * build has just been triggered by a GitHub push.
+ *
+ * Passing `expectedCommitSha` is critical: the page must only be marked
+ * "deployed" when the build *for the commit we just pushed* goes live. Without
+ * this guard the newest deployment (often a stale build that predates our push
+ * and does NOT contain the new app/<slug>/ route) was accepted as success, so
+ * the record was marked deployed while the live site 404'd the route. We now
+ * scan recent deployments for the matching commit and ignore everything else.
  */
 async function pollVercelDeployment(
   projectId: string,
   vercelToken: string,
-  sinceMs?: number
+  sinceMs?: number,
+  expectedCommitSha?: string
 ): Promise<{ buildStatus: string; buildError?: string }> {
   const headers = { Authorization: `Bearer ${vercelToken}` };
+  // When matching a specific commit, look at more than just the newest
+  // deployment — a stale build can momentarily be the latest entry.
+  const limit = expectedCommitSha ? 10 : 1;
 
   for (let attempt = 0; attempt < vercelPollMaxAttempts; attempt++) {
     try {
       const sinceParam = sinceMs !== undefined ? `&since=${sinceMs}` : "";
       const deploymentsRes = await axios.get<any>(
-        `https://api.vercel.com/v6/deployments?projectId=${projectId}&limit=1${sinceParam}`,
+        `https://api.vercel.com/v6/deployments?projectId=${projectId}&limit=${limit}${sinceParam}`,
         { headers, timeout: VERCEL_POLL_TIMEOUT_MS }
       );
 
-      const deployment = deploymentsRes.data?.deployments?.[0];
+      const deployments: any[] = deploymentsRes.data?.deployments || [];
+
+      // Pick the deployment to evaluate. With a target commit, only consider the
+      // build for that exact commit; otherwise fall back to the newest one.
+      const deployment = expectedCommitSha
+        ? deployments.find((d) => deploymentCommitSha(d) === expectedCommitSha)
+        : deployments[0];
+
       if (!deployment) {
-        console.log(`[V0 SERVICE] No deployment found yet${sinceMs !== undefined ? ` after ${new Date(sinceMs).toISOString()}` : ""} (attempt ${attempt + 1})`);
+        console.log(
+          `[V0 SERVICE] No deployment found yet` +
+            (expectedCommitSha ? ` for commit ${expectedCommitSha.substring(0, 7)}` : "") +
+            (sinceMs !== undefined ? ` after ${new Date(sinceMs).toISOString()}` : "") +
+            ` (attempt ${attempt + 1})`
+        );
         await new Promise(r => setTimeout(r, vercelPollIntervalMs));
         continue;
       }
@@ -1839,6 +1878,28 @@ async function getVercelBuildErrors(deploymentId: string, vercelToken: string): 
 }
 
 /**
+ * Probe a landing page's own public URL to confirm the route is actually live
+ * (not 404ing). Used to gate auto-heal so a page is never marked "deployed"
+ * while its URL is broken. Returns false on any non-2xx/3xx or network error;
+ * returns true if no URL is known (nothing to disprove — fall back to caller's
+ * other signals).
+ */
+async function isLandingPageUrlLive(url?: string): Promise<boolean> {
+  if (!url) return true;
+  try {
+    const res = await axios.get<any>(url, {
+      timeout: VERCEL_POLL_TIMEOUT_MS,
+      // Resolve (don't throw) for all statuses so we can inspect the code.
+      validateStatus: () => true,
+    });
+    const status = res.status;
+    return status >= 200 && status < 400;
+  } catch (_e) {
+    return false;
+  }
+}
+
+/**
  * Get the current deployment status and build logs for a landing page.
  * Exposed as a tool so Emma can check on builds.
  */
@@ -1868,25 +1929,40 @@ export async function getDeploymentStatus(
     return { status: record.status, buildStatus: "error", buildError, deployedUrl: record.deployedUrl };
   }
 
-  // Auto-heal: if Vercel shows the project is READY but our record says failed/deploying, sync it.
+  // Auto-heal: if Vercel shows the project is READY but our record says
+  // failed/deploying, sync it — BUT only after confirming the page's own live
+  // URL actually resolves. Project-level READY is not enough for sub-pages:
+  // the latest build can be READY yet not contain this page's app/<slug>/ route
+  // (it built an older commit), so healing on READY alone marked a page
+  // "deployed" while its URL 404'd (the empathiaai bug). Verifying the live URL
+  // enforces the real user-facing invariant for both root and sub-pages.
   if (state === "READY" && (record.status === "failed" || record.status === "deploying")) {
-    try {
-      await dynamodb.update({
-        TableName: TABLE_NAME,
-        Key: { id },
-        UpdateExpression: "SET #status = :status, updatedAt = :updatedAt REMOVE errorMessage",
-        ExpressionAttributeNames: { "#status": "status" },
-        ExpressionAttributeValues: {
-          ":status": "deployed",
-          ":updatedAt": new Date().toISOString(),
-        },
-      }).promise();
-    } catch (_e) {
-      // Best-effort — don't block the status response
+    const liveUrlOk = await isLandingPageUrlLive(record.deployedUrl);
+    if (liveUrlOk) {
+      try {
+        await dynamodb.update({
+          TableName: TABLE_NAME,
+          Key: { id },
+          UpdateExpression: "SET #status = :status, updatedAt = :updatedAt REMOVE errorMessage",
+          ExpressionAttributeNames: { "#status": "status" },
+          ExpressionAttributeValues: {
+            ":status": "deployed",
+            ":updatedAt": new Date().toISOString(),
+          },
+        }).promise();
+      } catch (_e) {
+        // Best-effort — don't block the status response
+      }
+      return {
+        status: "deployed",
+        buildStatus: "success",
+        deployedUrl: record.deployedUrl,
+      };
     }
+    // Project is READY but this page's route is not live — do not heal.
     return {
-      status: "deployed",
-      buildStatus: "success",
+      status: record.status,
+      buildStatus: "route_not_live",
       deployedUrl: record.deployedUrl,
     };
   }

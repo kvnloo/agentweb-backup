@@ -20,6 +20,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-02',
     changes: [
+      'Fixed: New Landing Pages No Longer Get Marked "Live" While Showing a 404',
+      '- When adding an extra page to an existing site, the page could be reported as deployed even though its build never went live, so visiting the link returned a "page not found" error',
+      '- We now confirm the deployment for the exact version we just published is the one that goes live before marking the page deployed — a stale, earlier build is never mistaken for success',
+      '- If that build does not come up in time, the page is now clearly marked failed (so you can retry) instead of silently showing a broken link',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
       'New: Mark a LinkedIn Account as Premium for Longer Connection Notes',
       '- LinkedIn limits connection-invite notes to 200 characters on free accounts and 300 on Premium; invite notes now default to a 200-character limit so they\'re never silently rejected',
       '- In Settings → Connected accounts, you can mark a LinkedIn Outreach account as Premium (or back to Free) from its menu — Premium accounts show a Premium badge and allow notes up to 300 characters',
