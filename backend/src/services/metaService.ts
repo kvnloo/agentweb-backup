@@ -835,7 +835,23 @@ export class MetaService {
         filename: filename,
         bytes: fileBuffer.toString('base64'),
       });
-      return adImage._data;
+      // Meta's /adimages endpoint returns the result keyed by the uploaded filename,
+      // e.g. { images: { "<filename>": { hash, url, ... } } }. The SDK stores this raw
+      // payload on `_data`, so we must unwrap the (single) entry to expose a flat
+      // { hash, url, ... } object. Returning the raw map forces every caller to dig the
+      // hash out of a filename-keyed object, which is where distinct creatives end up
+      // mapped to the wrong hash under batch uploads.
+      const data = adImage._data || {};
+      if (data.images && typeof data.images === 'object') {
+        const keys = Object.keys(data.images);
+        if (keys.length > 0) {
+          const entry = data.images[keys[0]];
+          this.log(`Image uploaded`, { filename, hash: entry?.hash });
+          return entry;
+        }
+      }
+      // Fallback: response was already flat (e.g. { hash, url }).
+      return data;
     } catch (error) {
       return this.handleError(error, 'uploadImage');
     }
