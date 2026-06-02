@@ -135,6 +135,7 @@ import {
   ensurePageMetadataTitle,
   buildPageSlug,
   autoFixV0Files,
+  getDeploymentStatus,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig } from "../services/v0Service";
@@ -536,6 +537,55 @@ describe("v0Service - deployLandingPage", () => {
     await expect(deployLandingPage("sub-page-1", "user-1")).rejects.toThrow(
       "sub-page"
     );
+  });
+});
+
+// =============================================================================
+// getDeploymentStatus — auto-heal must verify the page's own live URL
+// =============================================================================
+describe("v0Service - getDeploymentStatus (auto-heal URL verification)", () => {
+  // A failed sub-page whose project's latest Vercel deployment is READY, but
+  // whose own /slug route 404s (the build never contained the route). The
+  // empathiaai bug: project-level READY healed the record to "deployed" while
+  // the live URL stayed broken. Auto-heal must NOT promote it.
+  const failedSubPage = {
+    id: "sub-1",
+    userId: "user-1",
+    name: "PHSA Re-engagement",
+    status: "failed",
+    slug: "phsa-re-engagement",
+    vercelProjectId: "prj_test123",
+    deployedUrl: "https://lp-test.agentwebforms.com/phsa-re-engagement",
+  };
+
+  it("FAIL: project READY but sub-page URL 404s → record stays failed (not healed)", async () => {
+    mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: failedSubPage }) });
+    // Vercel: latest project deployment is READY
+    mockAxiosGet.mockResolvedValueOnce({
+      data: { deployments: [{ uid: "dpl_ready", readyState: "READY" }] },
+    });
+    // Live URL probe: the sub-page route 404s
+    mockAxiosGet.mockResolvedValueOnce({ status: 404, data: "" });
+
+    const result = await getDeploymentStatus("sub-1", "user-1");
+
+    expect(result.status).toBe("failed");
+    // Must NOT have written status=deployed to DynamoDB
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: project READY and sub-page URL resolves → record healed to deployed", async () => {
+    mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: failedSubPage }) });
+    mockAxiosGet.mockResolvedValueOnce({
+      data: { deployments: [{ uid: "dpl_ready", readyState: "READY" }] },
+    });
+    // Live URL probe: route resolves
+    mockAxiosGet.mockResolvedValueOnce({ status: 200, data: "<html>ok</html>" });
+
+    const result = await getDeploymentStatus("sub-1", "user-1");
+
+    expect(result.status).toBe("deployed");
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
 });
 
