@@ -238,6 +238,84 @@ describe('readFileContent', () => {
       expect(result.message).toBe('Invalid URL format. Must be HTTP or HTTPS.');
     });
 
+    it('should append a knowledge-base recovery hint when a fetch fails', async () => {
+      const axios = require('axios');
+      axios.get.mockRejectedValue(new Error('Network error'));
+
+      const result = await (agentModeService as any).readFileContent('https://example.com/file.html');
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Failed to read file content');
+      // Agent should be steered to the knowledge-base tools instead of dead-ending.
+      expect(result.message).toContain('list_knowledge_base_files');
+    });
+  });
+
+  describe('truncated / malformed URL detection', () => {
+    it('should detect a URL cut off with an ellipsis character (…) and not attempt a fetch', async () => {
+      const axios = require('axios');
+      axios.get.mockResolvedValue({ data: Buffer.from('x'), headers: {} });
+
+      const result = await (agentModeService as any).readFileContent(
+        'https://s3.amazonaws.com/bucket/users/abc/files/172345…'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Truncated or malformed URL');
+      expect(result.message).toContain('cut off');
+      expect(result.message).toContain('list_knowledge_base_files');
+      // Must not even try to fetch a known-broken URL.
+      expect(axios.get).not.toHaveBeenCalled();
+    });
+
+    it('should detect a URL ending in "..." as truncated', async () => {
+      const axios = require('axios');
+      axios.get.mockResolvedValue({ data: Buffer.from('x'), headers: {} });
+
+      const result = await (agentModeService as any).readFileContent(
+        'https://s3.amazonaws.com/bucket/file.pdf?X-Amz-Signature=abc123...'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Truncated or malformed URL');
+      expect(result.message).toContain('list_knowledge_base_files');
+      expect(axios.get).not.toHaveBeenCalled();
+    });
+
+    it('should detect a URL with embedded whitespace as truncated/broken', async () => {
+      const axios = require('axios');
+      axios.get.mockResolvedValue({ data: Buffer.from('x'), headers: {} });
+
+      const result = await (agentModeService as any).readFileContent(
+        'https://example.com/path/to file with spaces.pdf'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Truncated or malformed URL');
+      expect(axios.get).not.toHaveBeenCalled();
+    });
+
+    it('should NOT flag a valid long presigned S3 URL as truncated', async () => {
+      const testContent = 'real content';
+      const axios = require('axios');
+      axios.get.mockResolvedValue({
+        data: Buffer.from(testContent),
+        headers: { 'content-type': 'text/plain' },
+      });
+
+      const presigned =
+        'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/abc/files/report.txt' +
+        '?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIA%2F20260601%2Fus-west-2%2Fs3%2Faws4_request' +
+        '&X-Amz-Date=20260601T000000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host' +
+        '&X-Amz-Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+
+      const result = await (agentModeService as any).readFileContent(presigned);
+
+      expect(result.success).toBe(true);
+      expect(result.content).toBe(testContent);
+      expect(axios.get).toHaveBeenCalled();
+    });
+
     it('should handle PDF parsing errors', async () => {
       const mockResponse = {
         data: Buffer.from('corrupted pdf data'),
