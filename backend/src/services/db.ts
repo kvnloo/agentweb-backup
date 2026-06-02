@@ -45,6 +45,51 @@ const handleDynamoDbError = (error: any, operation: string) => {
   throw error;
 };
 
+/**
+ * De-duplicate LinkedIn message events.
+ *
+ * When a user sends a LinkedIn message from the CRM, the send endpoint writes a
+ * synthetic event (eventId `linkedin_sent_<ts>_<leadId>`, senderId = accountId)
+ * for instant UI feedback. The periodic message sync later re-imports the SAME
+ * message from Unipile keyed on the message's stable provider_id (eventId
+ * `linkedin_msg_<provider_id>`). The two have different eventIds, so without
+ * this the same outbound message appears (and counts) twice.
+ *
+ * Strategy: prefer the synced `linkedin_msg_*` event (it has the real provider
+ * id and timestamp). Drop a synthetic `linkedin_sent_*` SENT event when a synced
+ * SENT event with the same normalized text exists for the lead. Matching on text
+ * (not timestamp) is robust because send-time and sync-time timestamps differ.
+ */
+const dedupeLinkedInMessageEvents = <T extends { eventId?: string; eventType?: string; data?: any; eventData?: any }>(
+  events: T[],
+): T[] => {
+  const norm = (e: any): string => {
+    const data = e?.data ?? e?.eventData ?? {};
+    return String(data?.text ?? '').trim().toLowerCase();
+  };
+  const isSent = (e: any) => String(e?.eventType || '').toLowerCase().includes('sent');
+  const isSynced = (e: any) => String(e?.eventId || '').startsWith('linkedin_msg_');
+  const isSynthetic = (e: any) => String(e?.eventId || '').startsWith('linkedin_sent_');
+
+  // Texts that already have a synced SENT event.
+  const syncedSentText = new Set<string>();
+  for (const e of events) {
+    if (isSynced(e) && isSent(e)) {
+      const t = norm(e);
+      if (t) syncedSentText.add(t);
+    }
+  }
+  if (syncedSentText.size === 0) return events;
+
+  return events.filter((e) => {
+    if (isSynthetic(e) && isSent(e)) {
+      const t = norm(e);
+      if (t && syncedSentText.has(t)) return false; // drop the synthetic duplicate
+    }
+    return true;
+  });
+};
+
 const ENGAGED_EVENT_KEYWORDS = ["clicked", "replied", "received"];
 
 const engagementMatchesKeyword = (engagement: any): boolean => {
@@ -5806,7 +5851,10 @@ export const crmDb = {
       const leadLinkedIn = lead.linkedin?.toLowerCase();
       if (leadLinkedIn) {
         const emailEventsDb = require('./emailEventsDb').emailEventsDb;
-        const linkedInEvents = await emailEventsDb.getEventsByEmailDomainAndLeadEmail(`linkedin-${listId}`, leadLinkedIn);
+        const linkedInEventsRaw = await emailEventsDb.getEventsByEmailDomainAndLeadEmail(`linkedin-${listId}`, leadLinkedIn);
+        // Drop synthetic send-time events the sync later re-imported so a single
+        // sent message isn't double-counted.
+        const linkedInEvents = dedupeLinkedInMessageEvents(linkedInEventsRaw);
 
         // Filter for only SENT messages (eventType contains "sent")
         const sentMessages = linkedInEvents.filter((event: any) => event.eventType && event.eventType.toLowerCase().includes('sent'));
@@ -5859,9 +5907,12 @@ export const crmDb = {
 
       // Always get LinkedIn message events for this lead (stored with LinkedIn URL as leadEmail)
       // This should work even if user doesn't have emailDomain configured for regular emails
-      const linkedInEvents = leadLinkedIn
+      const linkedInEventsRaw = leadLinkedIn
         ? await emailEventsDb.getEventsByEmailDomainAndLeadEmail(`linkedin-${listId}`, leadLinkedIn)
         : [];
+      // Drop synthetic send-time events that the sync later re-imported (avoids
+      // the same outbound message showing twice in the activity timeline).
+      const linkedInEvents = dedupeLinkedInMessageEvents(linkedInEventsRaw);
 
       const filteredEvents = [...emailEvents, ...linkedInEvents];
 

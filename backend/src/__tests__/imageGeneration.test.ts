@@ -345,6 +345,137 @@ describe('ImageService', () => {
     });
   });
 
+  describe('Gemini 3 Thinking Image Part Selection', () => {
+    // Gemini 3 image models ("thinking" models) stream up to two interim DRAFT
+    // images before the final rendered image, and flag drafts with part.thought.
+    // The service must keep the LAST (final, non-thought) image part — not the
+    // first — otherwise an edit returns a draft that ignores the requested changes.
+    const FINAL_DATA = Buffer.from('final-edited-image').toString('base64');
+    const DRAFT_DATA = Buffer.from('interim-draft-image').toString('base64');
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it('should keep the LAST streamed image part (final render), not the first draft', async () => {
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue('test-api-key');
+      let capturedBuffer: Buffer | undefined;
+      (s3Utils.uploadFileToS3 as jest.Mock).mockImplementation(async (buffer: Buffer) => {
+        capturedBuffer = buffer;
+        return { success: true, url: 'https://s3.amazonaws.com/bucket/image.png' };
+      });
+
+      // Stream: draft image first, final image last (separate chunks).
+      mockGenerateContentStream.mockReturnValue({
+        [Symbol.asyncIterator]: async function* () {
+          yield { candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: DRAFT_DATA } }] } }] };
+          yield { candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: FINAL_DATA } }] } }] };
+        }
+      });
+
+      const result = await imageService.generateImage({
+        prompt: 'Test prompt',
+        filename: 'test.png',
+        userId: 'user123',
+        imageModel: 'gemini-3.1-flash-image-preview',
+        size: '1:1',
+        removeC2PA: false
+      });
+
+      expect(result.success).toBe(true);
+      expect(capturedBuffer).toBeDefined();
+      expect(capturedBuffer!.toString('base64')).toBe(FINAL_DATA);
+    });
+
+    it('should keep the last image part when multiple parts arrive in one chunk', async () => {
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue('test-api-key');
+      let capturedBuffer: Buffer | undefined;
+      (s3Utils.uploadFileToS3 as jest.Mock).mockImplementation(async (buffer: Buffer) => {
+        capturedBuffer = buffer;
+        return { success: true, url: 'https://s3.amazonaws.com/bucket/image.png' };
+      });
+
+      mockGenerateContentStream.mockReturnValue({
+        [Symbol.asyncIterator]: async function* () {
+          yield { candidates: [{ content: { parts: [
+            { inlineData: { mimeType: 'image/png', data: DRAFT_DATA } },
+            { inlineData: { mimeType: 'image/png', data: FINAL_DATA } }
+          ] } }] };
+        }
+      });
+
+      const result = await imageService.generateImage({
+        prompt: 'Test prompt',
+        filename: 'test.png',
+        userId: 'user123',
+        imageModel: 'gemini-3.1-flash-image-preview',
+        size: '1:1',
+        removeC2PA: false
+      });
+
+      expect(result.success).toBe(true);
+      expect(capturedBuffer!.toString('base64')).toBe(FINAL_DATA);
+    });
+
+    it('should skip image parts flagged as thought (interim) and keep the real final image', async () => {
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue('test-api-key');
+      let capturedBuffer: Buffer | undefined;
+      (s3Utils.uploadFileToS3 as jest.Mock).mockImplementation(async (buffer: Buffer) => {
+        capturedBuffer = buffer;
+        return { success: true, url: 'https://s3.amazonaws.com/bucket/image.png' };
+      });
+
+      // Final non-thought image arrives, then a trailing thought image: the
+      // thought image must NOT overwrite the real final render.
+      mockGenerateContentStream.mockReturnValue({
+        [Symbol.asyncIterator]: async function* () {
+          yield { candidates: [{ content: { parts: [{ thought: true, inlineData: { mimeType: 'image/png', data: DRAFT_DATA } }] } }] };
+          yield { candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: FINAL_DATA } }] } }] };
+          yield { candidates: [{ content: { parts: [{ thought: true, inlineData: { mimeType: 'image/png', data: DRAFT_DATA } }] } }] };
+        }
+      });
+
+      const result = await imageService.generateImage({
+        prompt: 'Test prompt',
+        filename: 'test.png',
+        userId: 'user123',
+        imageModel: 'gemini-3.1-flash-image-preview',
+        size: '1:1',
+        removeC2PA: false
+      });
+
+      expect(result.success).toBe(true);
+      expect(capturedBuffer!.toString('base64')).toBe(FINAL_DATA);
+    });
+
+    it('should still return the single image when only one image part is streamed', async () => {
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue('test-api-key');
+      let capturedBuffer: Buffer | undefined;
+      (s3Utils.uploadFileToS3 as jest.Mock).mockImplementation(async (buffer: Buffer) => {
+        capturedBuffer = buffer;
+        return { success: true, url: 'https://s3.amazonaws.com/bucket/image.png' };
+      });
+
+      mockGenerateContentStream.mockReturnValue({
+        [Symbol.asyncIterator]: async function* () {
+          yield { candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: FINAL_DATA } }] } }] };
+        }
+      });
+
+      const result = await imageService.generateImage({
+        prompt: 'Test prompt',
+        filename: 'test.png',
+        userId: 'user123',
+        imageModel: 'gemini-3.1-flash-image-preview',
+        size: '1:1',
+        removeC2PA: false
+      });
+
+      expect(result.success).toBe(true);
+      expect(capturedBuffer!.toString('base64')).toBe(FINAL_DATA);
+    });
+  });
+
   describe('Ratio Format Handling', () => {
     it('should preserve ratio format for Runway Gemini model (with x)', async () => {
       const mockApiKey = 'test-api-key';

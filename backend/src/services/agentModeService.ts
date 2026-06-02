@@ -23,6 +23,7 @@ import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
 import { skillService } from './skillService';
 import { extractVariables } from '../utils/templateParser';
+import { applyPrintLayoutFixes } from '../utils/pdfPrintLayout';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData } from '../utils/llmService';
@@ -192,6 +193,15 @@ const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wm
 // Models served from the separate Bedrock account (231030591963) reached via a
 // long-term API key (bearer token) rather than the app's default SigV4 creds.
 const BEARER_TOKEN_MODELS = new Set(['anthropic.claude-opus-4-8']);
+
+// Legacy model ids persisted by sessions/schedules created before a model was
+// renamed. Maps the old id to its current registry key so old sessions keep
+// working instead of throwing "Invalid model". Opus 4.8 was renamed from the
+// bare Vertex id "claude-opus-4-8" to the Bedrock id "anthropic.claude-opus-4-8"
+// in commit c86c8ec1.
+const LEGACY_MODEL_ALIASES: Record<string, string> = {
+  'claude-opus-4-8': 'anthropic.claude-opus-4-8',
+};
 
 // Context passed to the diagnosis agent when the main agent fails
 export interface DiagnosisContext {
@@ -1743,11 +1753,26 @@ export class AgentModeService {
    */
 
 
+  /**
+   * Resolve a possibly-legacy model id to its current registry key. Sessions and
+   * schedules created before a model rename persist the old id; this maps it
+   * forward so requests don't fail with "Invalid model". Unknown/canonical ids
+   * (and undefined) pass through unchanged.
+   */
+  public normalizeModelId<T extends string | undefined>(model: T): T {
+    if (model && LEGACY_MODEL_ALIASES[model]) {
+      return LEGACY_MODEL_ALIASES[model] as T;
+    }
+    return model;
+  }
+
   async callLLM(
     model: string,
     messages: any[],
     options?: LLMCallOptions
   ) {
+    // Map legacy/renamed model ids forward before validation or routing.
+    model = this.normalizeModelId(model);
 
     // Validate that the model exists
     if (!this.llmModels[model]) {
@@ -1957,6 +1982,10 @@ export class AgentModeService {
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
     try {
+      // Map legacy/renamed model ids forward (e.g. old sessions persisted the
+      // pre-rename "claude-opus-4-8") so metadata, pricing, and routing all use
+      // the canonical registry key.
+      llmModel = this.normalizeModelId(llmModel);
       // Track backup model usage
       const originalLlmModel = llmModel;
       let backupModelUsed = false;
@@ -4107,6 +4136,7 @@ export class AgentModeService {
         s3_url: actualResult.s3_url,
         filename: actualResult.filename,
         title: actualResult.title,
+        document_type: actualResult.document_type,
       };
     }
 
@@ -5116,6 +5146,7 @@ export class AgentModeService {
           s3_url: `https://mock-s3-bucket.s3.amazonaws.com/html_${Date.now()}_${args.title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`,
           filename: `html_${Date.now()}_${args.title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`,
           title: args.title,
+          document_type: args.document_type === 'email' ? 'email' : 'document',
           message: 'Mock HTML file created successfully'
         };
 
@@ -16283,6 +16314,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         });
         const page = await browser.newPage();
         await page.goto(sourceUrl, { waitUntil: 'networkidle0', timeout: 30000 });
+        // Prevent sections/tables taller than a page from overflowing and
+        // overwriting adjacent sections (relax unsatisfiable break-inside:avoid).
+        await applyPrintLayoutFixes(page, 'A4', '20mm', '20mm');
         const pdfBuffer = await page.pdf({
           format: 'A4',
           printBackground: true,
@@ -19792,7 +19826,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
     contentDraft: string,
     formatRequirements: string,
     userId: string,
-    sessionId: string
+    sessionId: string,
+    documentType: 'document' | 'email' = 'document'
   ): Promise<any> {
     try {
       if (!title || typeof title !== 'string') {
@@ -19802,6 +19837,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         throw new Error('content_draft is required and must be a non-empty string');
       }
 
+      const isEmail = documentType === 'email';
+
       // Use Claude model by default (check for Claude in model name)
       const defaultClaudeModel = 'anthropic.claude-sonnet-4-6';
 
@@ -19810,8 +19847,39 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       // Use high token limit for HTML generation — reports like GTM audits can be large
       const llmService = createLLMService(defaultClaudeModel, 0.8, 64000);
 
+      // Email mode produces a one-off newsletter/marketing email rendered in
+      // HTML that is safe across email clients (Gmail, Outlook, Apple Mail).
+      // This is a finished email, NOT a reusable {{variable}} template.
+      const emailSystemPrompt = `You are an expert HTML email designer. Your task is to create a complete, polished, ready-to-send marketing/newsletter email in HTML from the provided subject/title and content draft.
+
+EMAIL-CLIENT COMPATIBILITY (CRITICAL — emails are not web pages):
+- Use a table-based layout (<table role="presentation" ...>) for ALL structure — do NOT rely on flexbox, grid, float, or position
+- Use INLINE styles on every element (style="..."). Email clients strip or ignore <style> blocks and external CSS
+- Center the email in a 600px-wide container table (max-width: 600px); use a full-width outer wrapper table with a light background color
+- Use only web-safe fonts (Arial, Helvetica, Georgia, sans-serif) with explicit font-family fallbacks
+- Use absolute https:// URLs for all images, and always include width, alt text, and display:block
+- Use VML-free, JavaScript-free markup — NO <script>, NO external <link>, NO web fonts, NO charts/canvas
+- Specify explicit colors as hex (e.g. #1a1a1a) and set bgcolor on table cells where relevant
+- Make buttons as bulletproof anchor "buttons": an <a> with inline padding, background-color, border-radius, and color
+- Add a viewport meta tag and set body { margin:0; padding:0; } for consistent rendering
+- Keep total width responsive: the container should gracefully shrink on mobile (use width:100% with max-width:600px)
+
+EMAIL STRUCTURE:
+- Begin with a clear header (brand name or logo area) and a strong headline derived from the subject/title
+- Organize the content draft into scannable sections with headings, short paragraphs, and bullet lists where helpful
+- Include a clear call-to-action button if the content implies one
+- End with a simple footer (sender/company line and an unsubscribe placeholder link)
+
+DATA ACCURACY RULES (CRITICAL):
+- NEVER invent, estimate, approximate, or round numeric values
+- Use ONLY the exact numbers, names, dates, and links provided in the content draft — copy them verbatim
+- If a value is not present in the content draft, omit it rather than guessing
+${formatRequirements ? `\nAdditional Format Requirements:\n${formatRequirements}` : ''}
+
+Return ONLY the complete HTML email document (DOCTYPE through </html>), production-ready and well-formatted. Do NOT use {{variable}} placeholders — fill in the actual content. This is a finished, one-off email, not a reusable template.`;
+
       // Build system prompt for HTML generation
-      const systemPrompt = `You are an expert web developer and HTML designer. Your task is to create a well-formatted, professional HTML document from the provided title and content draft.
+      const documentSystemPrompt = `You are an expert web developer and HTML designer. Your task is to create a well-formatted, professional HTML document from the provided title and content draft.
 
 Requirements:
 - Create a complete, valid HTML5 document with proper DOCTYPE, html, head, and body tags
@@ -19854,8 +19922,21 @@ Option B — Inline Chart.js (for interactive charts):
 
 The HTML should be production-ready and well-formatted.`;
 
+      const systemPrompt = isEmail ? emailSystemPrompt : documentSystemPrompt;
+
       // Build user prompt
-      const userPrompt = `Create a well-formatted HTML document with the following:
+      const userPrompt = isEmail
+        ? `Create a complete, ready-to-send HTML email with the following:
+
+Subject / Title: ${title}
+
+Content Draft:
+${contentDraft}
+
+${formatRequirements ? `\nFormat Requirements:\n${formatRequirements}` : ''}
+
+Please generate a complete, email-client-safe HTML email that presents this content as a polished newsletter/marketing email.`
+        : `Create a well-formatted HTML document with the following:
 
 Title: ${title}
 
@@ -19867,7 +19948,7 @@ ${formatRequirements ? `\nFormat Requirements:\n${formatRequirements}` : ''}
 Please generate a complete, professional HTML document that properly formats and presents this content.`;
 
       // Generate HTML using LLMService
-      console.log('AgentMode: Generating HTML file with LLMService (Claude model)');
+      console.log(`AgentMode: Generating HTML ${isEmail ? 'email' : 'file'} with LLMService (Claude model)`);
       const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'));
 
       if (!htmlContent || htmlContent.trim().length === 0) {
@@ -19891,7 +19972,8 @@ Please generate a complete, professional HTML document that properly formats and
         s3_url: s3Url,
         filename: filename,
         title: title,
-        message: 'HTML file created successfully'
+        document_type: documentType,
+        message: isEmail ? 'HTML email created successfully' : 'HTML file created successfully'
       };
     } catch (error) {
       console.error('Error creating HTML file:', error);
@@ -19915,6 +19997,17 @@ Please generate a complete, professional HTML document that properly formats and
     types?: string[]
   ): Promise<any> {
     try {
+      // Validate html_source up front so a missing/non-string value returns a
+      // clean error instead of throwing "Cannot read properties of undefined
+      // (reading 'startsWith')" below.
+      if (typeof htmlSource !== 'string' || htmlSource.trim().length === 0) {
+        return {
+          success: false,
+          message: 'Failed to create HTML template',
+          error: 'html_source is required and must be a non-empty string (raw HTML content or an S3/HTTPS URL).'
+        };
+      }
+
       // Org-level create gating: only org owner or listed htmlTemplates editor
       const { userDb, orgDb } = await import('./db');
       const { canManageOrgFeature } = await import('./orgShareService');

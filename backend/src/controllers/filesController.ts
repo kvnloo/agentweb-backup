@@ -13,6 +13,7 @@ import {
 } from "../utils/s3Utils";
 import { ChatbotDB } from "../services/chatbotService";
 import { AuthenticatedRequest } from "../middleware/auth";
+import { applyPrintLayoutFixes } from "../utils/pdfPrintLayout";
 
 const DEFAULT_BUCKET = process.env.AWS_S3_BUCKET || "agentweb-user-files";
 
@@ -399,6 +400,9 @@ export const exportHtmlToPdf = async (req: Request, res: Response) => {
     });
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: "networkidle0", timeout: 30000 });
+    // Prevent sections/tables taller than a page from overflowing and
+    // overwriting adjacent sections (relax unsatisfiable break-inside:avoid).
+    await applyPrintLayoutFixes(page, "A4", "20mm", "20mm");
     const pdfBuffer = await page.pdf({
       format: "A4",
       printBackground: true,

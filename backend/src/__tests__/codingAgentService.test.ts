@@ -1,4 +1,4 @@
-import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest } from '../services/codingAgentService';
+import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest, _parseEventStreamFrames, _accumulateBedrockStream } from '../services/codingAgentService';
 import { agentModeService } from '../services/agentModeService';
 
 // Mock mcpFetch
@@ -435,6 +435,111 @@ describe('runCodingAgent', () => {
 
     // Should still complete (agent handles the error message from the tool)
     expect(result.iterations).toBeGreaterThanOrEqual(1);
+  });
+
+  test('take_screenshot feeds the captured image back to the model as a vision block', async () => {
+    const mockExecuteMcpTool = jest.fn().mockResolvedValueOnce({
+      content: 'Screenshot taken',
+      raw: { content: [{ type: 'image', mimeType: 'image/jpeg', data: 'BASE64IMAGEDATA' }] }
+    });
+    const contextWithBrowser: CodingAgentContext = {
+      ...mockContext,
+      executeMcpTool: mockExecuteMcpTool,
+    };
+
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'take_screenshot', input: { full_page: true } }
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Looks good.', status: 'success' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    const result = await runCodingAgent('screenshot the page', contextWithBrowser);
+
+    expect(result.success).toBe(true);
+    expect(mockExecuteMcpTool).toHaveBeenCalledWith('playwright_browser_take_screenshot', { type: 'jpeg', fullPage: true });
+
+    // The second LLM call must receive the screenshot as an image content block,
+    // not just the string "Screenshot taken successfully." — otherwise the model is blind.
+    const secondCallMessages = mockCreate.mock.calls[1][0].messages;
+    const toolResultMsg = secondCallMessages.find(
+      (m: any) => m.role === 'user' && Array.isArray(m.content) && m.content.some((b: any) => b.type === 'tool_result')
+    );
+    expect(toolResultMsg).toBeDefined();
+    const trBlock = toolResultMsg.content.find((b: any) => b.type === 'tool_result');
+    expect(Array.isArray(trBlock.content)).toBe(true);
+    const imageBlock = trBlock.content.find((b: any) => b.type === 'image');
+    expect(imageBlock).toBeDefined();
+    expect(imageBlock.source).toMatchObject({ type: 'base64', media_type: 'image/jpeg', data: 'BASE64IMAGEDATA' });
+  });
+
+  test('take_screenshot returns a text error (no image block) when browser tools are unavailable', async () => {
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'take_screenshot', input: {} }
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Browser not available.', status: 'error' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    // No executeMcpTool on mockContext
+    await runCodingAgent('screenshot the page', mockContext);
+
+    const secondCallMessages = mockCreate.mock.calls[1][0].messages;
+    const toolResultMsg = secondCallMessages.find(
+      (m: any) => m.role === 'user' && Array.isArray(m.content) && m.content.some((b: any) => b.type === 'tool_result')
+    );
+    const trBlock = toolResultMsg.content.find((b: any) => b.type === 'tool_result');
+    expect(typeof trBlock.content).toBe('string');
+    expect(trBlock.content).toMatch(/not available/i);
+  });
+
+  test('take_screenshot falls back to text when MCP returns no image data', async () => {
+    const mockExecuteMcpTool = jest.fn().mockResolvedValueOnce({
+      content: 'no image here',
+      raw: { content: [] }
+    });
+    const contextWithBrowser: CodingAgentContext = {
+      ...mockContext,
+      executeMcpTool: mockExecuteMcpTool,
+    };
+
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'take_screenshot', input: {} }
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'done', status: 'success' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    const result = await runCodingAgent('screenshot the page', contextWithBrowser);
+
+    expect(result.success).toBe(true);
+    const secondCallMessages = mockCreate.mock.calls[1][0].messages;
+    const toolResultMsg = secondCallMessages.find(
+      (m: any) => m.role === 'user' && Array.isArray(m.content) && m.content.some((b: any) => b.type === 'tool_result')
+    );
+    const trBlock = toolResultMsg.content.find((b: any) => b.type === 'tool_result');
+    expect(typeof trBlock.content).toBe('string');
   });
 
   test('list_commits tool returns formatted commit history', async () => {
@@ -1179,5 +1284,181 @@ describe('runCodingAgent — model provider routing', () => {
 
     expect(result.success).toBe(true);
     expect(bearerCreate).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ─── Bedrock streaming: frame parser + accumulator ────────────────────────────
+// The bearer-token Opus path streams `application/vnd.amazon.eventstream` frames.
+// These tests build real frames (matching AWS framing) and verify we reconstruct
+// the exact non-streaming Anthropic.Message shape the agent loop consumes.
+
+/** Encode one eventstream frame. Layout: [totalLen][headersLen][preludeCRC][headers][payload][msgCRC].
+ * The parser does not validate CRCs, so we zero them. Headers are string-typed (type 7). */
+function encodeFrame(headers: Record<string, string>, payload: Buffer): Buffer {
+  const headerParts: Buffer[] = [];
+  for (const [name, value] of Object.entries(headers)) {
+    const nameBuf = Buffer.from(name, 'utf8');
+    const valBuf = Buffer.from(value, 'utf8');
+    const h = Buffer.alloc(1 + nameBuf.length + 1 + 2 + valBuf.length);
+    let o = 0;
+    h.writeUInt8(nameBuf.length, o); o += 1;
+    nameBuf.copy(h, o); o += nameBuf.length;
+    h.writeUInt8(7, o); o += 1; // string type
+    h.writeUInt16BE(valBuf.length, o); o += 2;
+    valBuf.copy(h, o);
+    headerParts.push(h);
+  }
+  const headerBuf = Buffer.concat(headerParts);
+  const totalLen = 4 + 4 + 4 + headerBuf.length + payload.length + 4;
+  const frame = Buffer.alloc(totalLen);
+  let o = 0;
+  frame.writeUInt32BE(totalLen, o); o += 4;
+  frame.writeUInt32BE(headerBuf.length, o); o += 4;
+  frame.writeUInt32BE(0, o); o += 4; // prelude CRC (unchecked)
+  headerBuf.copy(frame, o); o += headerBuf.length;
+  payload.copy(frame, o); o += payload.length;
+  frame.writeUInt32BE(0, o); // message CRC (unchecked)
+  return frame;
+}
+
+/** Wrap a native Anthropic streaming event into a Bedrock "event/chunk" frame
+ * (payload is JSON with a base64 `bytes` field), exactly as the live endpoint does. */
+function chunkFrame(event: any): Buffer {
+  const payload = Buffer.from(JSON.stringify({ bytes: Buffer.from(JSON.stringify(event), 'utf8').toString('base64') }), 'utf8');
+  return encodeFrame({ ':message-type': 'event', ':event-type': 'chunk', ':content-type': 'application/json' }, payload);
+}
+
+function streamFromBuffers(buffers: Buffer[]): ReadableStream<Uint8Array> {
+  let i = 0;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (i < buffers.length) controller.enqueue(new Uint8Array(buffers[i++]));
+      else controller.close();
+    },
+  });
+}
+
+// A canonical text + tool_use event sequence, mirroring what the probe captured live.
+const TEXT_AND_TOOL_EVENTS = [
+  { type: 'message_start', message: { id: 'msg_1', type: 'message', role: 'assistant', model: 'claude-opus-4-8', content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 0 } } },
+  { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+  { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: "I'll edit " } },
+  { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'the file.' } },
+  { type: 'content_block_stop', index: 0 },
+  { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'toolu_1', name: 'edit_file', input: {} } },
+  { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"file_path":"app/' } },
+  { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: 'page.tsx"}' } },
+  { type: 'content_block_stop', index: 1 },
+  { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: { output_tokens: 42 } },
+  { type: 'message_stop', 'amazon-bedrock-invocationMetrics': { inputTokenCount: 10, outputTokenCount: 42 } },
+];
+
+describe('_parseEventStreamFrames', () => {
+  test('parses a single complete frame and exposes its headers and payload', () => {
+    const payload = Buffer.from('{"hello":"world"}', 'utf8');
+    const frame = encodeFrame({ ':message-type': 'event', ':event-type': 'chunk' }, payload);
+    const state = { buf: Buffer.alloc(0) };
+    const frames = [..._parseEventStreamFrames(state, new Uint8Array(frame))];
+    expect(frames).toHaveLength(1);
+    expect(frames[0].headers[':message-type']).toBe('event');
+    expect(frames[0].headers[':event-type']).toBe('chunk');
+    expect(frames[0].payload.toString('utf8')).toBe('{"hello":"world"}');
+    expect(state.buf.length).toBe(0);
+  });
+
+  test('buffers a partial frame split across chunks until complete', () => {
+    const payload = Buffer.from('{"a":1}', 'utf8');
+    const frame = encodeFrame({ ':message-type': 'event' }, payload);
+    const state = { buf: Buffer.alloc(0) };
+    const mid = Math.floor(frame.length / 2);
+    // First half yields nothing (incomplete)
+    expect([..._parseEventStreamFrames(state, new Uint8Array(frame.subarray(0, mid)))]).toHaveLength(0);
+    // Second half completes it
+    const frames = [..._parseEventStreamFrames(state, new Uint8Array(frame.subarray(mid)))];
+    expect(frames).toHaveLength(1);
+    expect(frames[0].payload.toString('utf8')).toBe('{"a":1}');
+  });
+
+  test('parses two frames delivered in one chunk', () => {
+    const f1 = encodeFrame({ ':message-type': 'event' }, Buffer.from('first', 'utf8'));
+    const f2 = encodeFrame({ ':message-type': 'event' }, Buffer.from('second', 'utf8'));
+    const state = { buf: Buffer.alloc(0) };
+    const frames = [..._parseEventStreamFrames(state, new Uint8Array(Buffer.concat([f1, f2])))];
+    expect(frames.map(f => f.payload.toString('utf8'))).toEqual(['first', 'second']);
+  });
+});
+
+describe('_accumulateBedrockStream', () => {
+  test('reconstructs a text + tool_use message from a streamed event sequence', async () => {
+    const frames = TEXT_AND_TOOL_EVENTS.map(chunkFrame);
+    const activity = jest.fn();
+    const msg = await _accumulateBedrockStream(streamFromBuffers(frames), 'us.anthropic.claude-opus-4-8', activity);
+
+    expect(msg.stop_reason).toBe('tool_use');
+    expect(msg.content).toHaveLength(2);
+    expect(msg.content[0]).toEqual({ type: 'text', text: "I'll edit the file." });
+    expect(msg.content[1]).toMatchObject({ type: 'tool_use', id: 'toolu_1', name: 'edit_file', input: { file_path: 'app/page.tsx' } });
+    // usage from message_start should be merged with message_delta's output_tokens
+    expect(msg.usage.output_tokens).toBe(42);
+    // onActivity fires at least once per chunk read
+    expect(activity).toHaveBeenCalled();
+  });
+
+  test('splitting frames mid-stream still reconstructs correctly (chunk boundaries are irrelevant)', async () => {
+    const all = Buffer.concat(TEXT_AND_TOOL_EVENTS.map(chunkFrame));
+    // Deliver the whole byte stream in 7-byte slices to stress the buffering path.
+    const slices: Buffer[] = [];
+    for (let i = 0; i < all.length; i += 7) slices.push(all.subarray(i, i + 7));
+    const msg = await _accumulateBedrockStream(streamFromBuffers(slices), 'p', () => {});
+    expect(msg.content[1]).toMatchObject({ name: 'edit_file', input: { file_path: 'app/page.tsx' } });
+  });
+
+  test('throws a retryable (5xx) error when the stream ends without message_start', async () => {
+    await expect(
+      _accumulateBedrockStream(streamFromBuffers([]), 'p', () => {})
+    ).rejects.toMatchObject({ status: 500 });
+  });
+
+  test('surfaces a Bedrock throttling exception frame as a retryable 429', async () => {
+    const start = chunkFrame(TEXT_AND_TOOL_EVENTS[0]);
+    const exceptionFrame = encodeFrame(
+      { ':message-type': 'exception', ':exception-type': 'ThrottlingException' },
+      Buffer.from('{"message":"Too many requests"}', 'utf8')
+    );
+    await expect(
+      _accumulateBedrockStream(streamFromBuffers([start, exceptionFrame]), 'p', () => {})
+    ).rejects.toMatchObject({ status: 429 });
+  });
+});
+
+// ─── Bearer client: abort surfaces as an honest timeout, not a generic error ──
+describe('runCodingAgent — bearer-token request timeout surfacing', () => {
+  const mockContext: CodingAgentContext = {
+    pageId: 'p', userId: 'u', sessionId: 's', llmModel: 'anthropic.claude-opus-4-8',
+  };
+  let modelSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedMcpFetch.mockReset();
+    mockedMcpFetch.mockResolvedValue({ files: [{ path: 'app/page.tsx', size: 100 }] });
+    _setSleepFnForTest(async () => {});
+    modelSpy = jest.spyOn(agentModeService, 'getCodingAgentDefaultModel').mockResolvedValue('anthropic.claude-opus-4-8');
+  });
+  afterEach(() => { modelSpy.mockRestore(); _setBedrockBearerClientForTest(null); });
+
+  test('a 408 timeout error from the client is reported (not retried into oblivion)', async () => {
+    const timeoutErr: any = new Error('Bedrock (us.anthropic.claude-opus-4-8) request timed out after 120s of inactivity');
+    timeoutErr.status = 408;
+    timeoutErr.isTimeout = true;
+    const bearerCreate = jest.fn().mockRejectedValue(timeoutErr);
+    _setBedrockBearerClientForTest({ messages: { create: bearerCreate } } as any);
+
+    const result = await runCodingAgent('edit the page', mockContext);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toMatch(/timed out|inactivity/i);
+    // 408 is not in callWithRetry's retry set (only 429/5xx), so exactly one attempt.
+    expect(bearerCreate).toHaveBeenCalledTimes(1);
   });
 });

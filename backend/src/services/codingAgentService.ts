@@ -24,6 +24,10 @@ export interface CodingAgentContext {
   draftBranch?: string;
   socketEmit?: (room: string, event: string, payload: any) => void;
   executeMcpTool?: (toolName: string, args: any) => Promise<any>;
+  /** Optional per-turn token-usage callback. Invoked once per LLM response with
+   * that turn's usage. Used by the eval harness to measure real cost through the
+   * production path; unset in normal operation (no behavior change). */
+  onUsage?: (usage: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }) => void;
 }
 
 interface SearchReplaceEdit {
@@ -44,9 +48,28 @@ interface ApplyResult {
   errors: string[];
 }
 
+/**
+ * Structured result for tools that produce an image (e.g. take_screenshot).
+ * The agent loop renders this as an Anthropic image content block so the model
+ * can visually analyze the screenshot, rather than receiving an opaque string.
+ */
+interface ToolImageResult {
+  kind: 'image';
+  mediaType: string;
+  data: string; // base64-encoded image
+}
+
+function isToolImageResult(r: unknown): r is ToolImageResult {
+  return typeof r === 'object' && r !== null && (r as any).kind === 'image';
+}
+
 const DEFAULT_MAX_ITERATIONS = 50;
 const DEFAULT_CODING_AGENT_MODEL = 'anthropic.claude-sonnet-4-6'; // Fallback if settings fetch fails
-const AGENT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes max for the entire agent run
+// Hard backstop for the entire agent run. Must comfortably fit several LLM turns:
+// each turn can legitimately take a few minutes on a slow model (e.g. Opus), and a
+// real edit needs ~8-12 turns (read → search → edit → check_deployment → fix). A
+// tight budget here is what silently killed broad edits before they could finish.
+const AGENT_TIMEOUT_MS = 20 * 60 * 1000; // 20 minutes max for the entire agent run
 const MAX_TOOL_RESULT_CHARS = 30000; // Truncate tool results to prevent context bloat
 const MAX_RETRIES = 2;
 
@@ -433,7 +456,7 @@ function getToolDefinitions(): Anthropic.Tool[] {
     },
     {
       name: 'take_screenshot',
-      description: 'Take a screenshot of the current browser page. Use after browse_page to capture a visual snapshot. Returns a description of the screenshot.',
+      description: 'Take a screenshot of the current browser page. Use after browse_page to capture a visual snapshot. The image is returned to you directly — actually look at it to verify visual correctness (layout, spacing, colors), do not assume the page is correct.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -454,7 +477,7 @@ async function executeTool(
   toolName: string,
   args: any,
   context: CodingAgentContext
-): Promise<string> {
+): Promise<string | ToolImageResult> {
   const basePath = `/api/landing-pages/v0/generated/${context.pageId}`;
   const branch = context.draftBranch || "main";
   const branchQuery: Record<string, string> = branch !== "main" ? { branch } : {};
@@ -756,7 +779,15 @@ async function executeTool(
         type: 'jpeg',
         fullPage: args.full_page || false
       });
-      return typeof result?.content === 'string' ? result.content : 'Screenshot taken successfully.';
+      // The Playwright MCP returns the image in result.raw.content as an image block.
+      // Surface it as a structured image result so the agent loop can feed the actual
+      // pixels back to the model — otherwise the model is blind to what it captured.
+      const imageContent = (result?.raw?.content as any[])?.find((c: any) => c?.type === 'image');
+      if (imageContent?.data) {
+        return { kind: 'image', mediaType: imageContent.mimeType || 'image/jpeg', data: imageContent.data };
+      }
+      // No image came back — fall back to whatever text the MCP provided.
+      return typeof result?.content === 'string' ? result.content : 'Screenshot taken, but no image data was returned.';
     }
 
     default:
@@ -894,6 +925,18 @@ async function getVertexClient(): Promise<AnthropicLikeClient> {
               body: JSON.stringify(body),
               signal: controller.signal,
             });
+          } catch (err: any) {
+            // Surface a per-request timeout honestly rather than letting the bare
+            // AbortError bubble up as a generic (and unretried) failure.
+            if (err?.name === 'AbortError') {
+              const timeoutErr: any = new Error(
+                `Vertex AI request timed out after ${VERTEX_REQUEST_TIMEOUT_MS / 1000}s`
+              );
+              timeoutErr.status = 408;
+              timeoutErr.isTimeout = true;
+              throw timeoutErr;
+            }
+            throw err;
           } finally {
             clearTimeout(timeout);
           }
@@ -936,6 +979,141 @@ const BEARER_TOKEN_INVOKE_MODELS: Record<string, string> = {
   'anthropic.claude-opus-4-8': 'us.anthropic.claude-opus-4-8',
 };
 
+// Idle (inter-chunk) timeout for the streaming bearer path. Because we stream,
+// we don't need a hard cap on total request duration — a long-but-progressing
+// generation is healthy. We only abort if the model goes silent for this long,
+// which is the real signature of a hung request. This is what makes the overall
+// AGENT_TIMEOUT_MS budget usable: slow turns finish instead of being guillotined.
+const BEARER_STREAM_IDLE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes of no stream activity
+
+/**
+ * Parse AWS `application/vnd.amazon.eventstream` framing out of a growing byte
+ * buffer. Each frame is: [totalLen:4][headersLen:4][preludeCRC:4][headers][payload][msgCRC:4],
+ * all big-endian. We only need string-valued headers (`:message-type`,
+ * `:event-type`, `:exception-type`), so header parsing handles the string type (7).
+ * Mutates `state.buf`, yielding one `{ headers, payload }` per complete frame.
+ * Exported for unit testing the binary parser without a live socket.
+ */
+export function* _parseEventStreamFrames(
+  state: { buf: Buffer },
+  chunk: Uint8Array
+): Generator<{ headers: Record<string, string>; payload: Buffer }> {
+  state.buf = state.buf.length ? Buffer.concat([state.buf, chunk]) : Buffer.from(chunk);
+  while (state.buf.length >= 12) {
+    const totalLen = state.buf.readUInt32BE(0);
+    if (totalLen < 16 || state.buf.length < totalLen) break; // incomplete frame — wait for more
+    const headersLen = state.buf.readUInt32BE(4);
+    const headers: Record<string, string> = {};
+    let o = 12;
+    const headersEnd = 12 + headersLen;
+    while (o < headersEnd) {
+      const nameLen = state.buf.readUInt8(o); o += 1;
+      const name = state.buf.toString('utf8', o, o + nameLen); o += nameLen;
+      const type = state.buf.readUInt8(o); o += 1;
+      if (type === 7) { // string header — the only type Bedrock emits for these events
+        const vl = state.buf.readUInt16BE(o); o += 2;
+        headers[name] = state.buf.toString('utf8', o, o + vl); o += vl;
+      } else {
+        break; // unexpected header type — stop parsing this frame's headers defensively
+      }
+    }
+    const payload = state.buf.subarray(headersEnd, totalLen - 4);
+    state.buf = state.buf.subarray(totalLen);
+    yield { headers, payload: Buffer.from(payload) };
+  }
+}
+
+/**
+ * Reconstruct a complete `Anthropic.Message` from a Bedrock streaming response
+ * body. Bedrock wraps each native Anthropic streaming event in an eventstream
+ * frame whose JSON payload has a base64 `bytes` field. We decode those into the
+ * standard event sequence (message_start → content_block_* → message_delta →
+ * message_stop) and fold them back into the same non-streaming Message shape the
+ * agent loop already consumes — so callers can't tell streaming was used.
+ *
+ * Resets `onActivity()` on every chunk so the caller can implement an idle timeout.
+ * Exported for unit testing the accumulator against synthetic frames.
+ */
+export async function _accumulateBedrockStream(
+  body: ReadableStream<Uint8Array>,
+  profileId: string,
+  onActivity: () => void
+): Promise<Anthropic.Message> {
+  const reader = body.getReader();
+  const state = { buf: Buffer.alloc(0) };
+  let message: any = null;
+  const jsonBufs: Record<number, string> = {};
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      onActivity();
+      if (!value) continue;
+      for (const frame of _parseEventStreamFrames(state, value)) {
+        const messageType = frame.headers[':message-type'];
+        let payload: any;
+        try {
+          payload = JSON.parse(frame.payload.toString('utf8'));
+        } catch {
+          continue; // non-JSON frame — ignore
+        }
+        // Error frames from Bedrock arrive as exceptions, not event chunks.
+        if (messageType === 'exception' || messageType === 'error' || frame.headers[':exception-type']) {
+          const err: any = new Error(
+            `Bedrock (${profileId}) stream error: ${frame.headers[':exception-type'] || ''} ${JSON.stringify(payload)}`.trim()
+          );
+          // Bedrock surfaces throttling as a stream exception; treat it as retryable.
+          err.status = /throttl|TooManyRequests|ServiceUnavailable/i.test(JSON.stringify(frame.headers) + JSON.stringify(payload)) ? 429 : 500;
+          throw err;
+        }
+        if (!payload.bytes) continue;
+        const event = JSON.parse(Buffer.from(payload.bytes, 'base64').toString('utf8'));
+        switch (event.type) {
+          case 'message_start':
+            message = { ...event.message, content: [] };
+            break;
+          case 'content_block_start':
+            if (message) { message.content[event.index] = { ...event.content_block }; jsonBufs[event.index] = ''; }
+            break;
+          case 'content_block_delta':
+            if (!message) break;
+            if (event.delta?.type === 'text_delta') {
+              message.content[event.index].text = (message.content[event.index].text || '') + event.delta.text;
+            } else if (event.delta?.type === 'input_json_delta') {
+              jsonBufs[event.index] = (jsonBufs[event.index] || '') + event.delta.partial_json;
+            }
+            break;
+          case 'content_block_stop':
+            if (message?.content[event.index]?.type === 'tool_use') {
+              const raw = jsonBufs[event.index];
+              message.content[event.index].input = raw ? JSON.parse(raw) : {};
+            }
+            break;
+          case 'message_delta':
+            if (!message) break;
+            if (event.delta?.stop_reason) message.stop_reason = event.delta.stop_reason;
+            if (event.delta?.stop_sequence !== undefined) message.stop_sequence = event.delta.stop_sequence;
+            if (event.usage) message.usage = { ...message.usage, ...event.usage };
+            break;
+          // message_stop carries only Bedrock metrics — nothing to fold in.
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock?.();
+  }
+
+  if (!message) {
+    const err: any = new Error(`Bedrock (${profileId}) stream ended without a message_start event`);
+    err.status = 500; // treat an empty/garbled stream as a retryable server error
+    throw err;
+  }
+  // Drop any holes left by sparse indexing so downstream sees a dense content array.
+  message.content = (message.content as any[]).filter(Boolean);
+  return message as Anthropic.Message;
+}
+
 let bedrockBearerClient: AnthropicLikeClient | null = null;
 let bedrockBearerClientPromise: Promise<AnthropicLikeClient> | null = null;
 
@@ -953,14 +1131,25 @@ async function getBedrockBearerClient(): Promise<AnthropicLikeClient> {
         create: async (params) => {
           // The model id goes in the URL for the Bedrock invoke endpoint; the rest
           // is the native Anthropic request body, with the required version field.
+          // We stream (invoke-with-response-stream) rather than block on a single
+          // /invoke call: a long generation no longer ties up the whole turn, and a
+          // genuinely stuck request is caught by the idle timeout below.
           const { model, ...rest } = params as any;
           delete (rest as any).model;
           const profileId = BEARER_TOKEN_INVOKE_MODELS[model] ?? model;
-          const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${profileId}/invoke`;
+          const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${profileId}/invoke-with-response-stream`;
           const body = { anthropic_version: 'bedrock-2023-05-31', ...rest };
 
+          // Idle timeout: abort only if the stream goes silent. Reset on every chunk.
           const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), VERTEX_REQUEST_TIMEOUT_MS);
+          let idleTimer: NodeJS.Timeout | undefined;
+          const armIdleTimer = () => {
+            if (idleTimer) clearTimeout(idleTimer);
+            idleTimer = setTimeout(() => controller.abort(), BEARER_STREAM_IDLE_TIMEOUT_MS);
+          };
+          const clearIdleTimer = () => { if (idleTimer) clearTimeout(idleTimer); };
+          armIdleTimer();
+
           let response: Response;
           try {
             response = await fetch(url, {
@@ -968,23 +1157,55 @@ async function getBedrockBearerClient(): Promise<AnthropicLikeClient> {
               headers: {
                 'Authorization': `Bearer ${bearerToken}`,
                 'Content-Type': 'application/json',
+                'Accept': 'application/vnd.amazon.eventstream',
               },
               body: JSON.stringify(body),
               signal: controller.signal,
             });
-          } finally {
-            clearTimeout(timeout);
+          } catch (err: any) {
+            clearIdleTimer();
+            // Distinguish an idle-timeout abort from other network errors so it's
+            // reported honestly instead of being swallowed as a generic failure.
+            if (err?.name === 'AbortError') {
+              const timeoutErr: any = new Error(
+                `Bedrock (${profileId}) request timed out after ${BEARER_STREAM_IDLE_TIMEOUT_MS / 1000}s of inactivity`
+              );
+              timeoutErr.status = 408; // request timeout — not auto-retried by callWithRetry
+              timeoutErr.isTimeout = true;
+              throw timeoutErr;
+            }
+            throw err;
           }
 
           if (!response.ok) {
+            clearIdleTimer();
             const errText = await response.text();
             const err: any = new Error(`Bedrock (${profileId}) error ${response.status}: ${errText}`);
             err.status = response.status; // lets callWithRetry decide whether to retry
             throw err;
           }
+          if (!response.body) {
+            clearIdleTimer();
+            const err: any = new Error(`Bedrock (${profileId}) returned no response body`);
+            err.status = 500;
+            throw err;
+          }
 
-          // The invoke endpoint returns a native Anthropic Message — consumed as-is.
-          return (await response.json()) as Anthropic.Message;
+          try {
+            return await _accumulateBedrockStream(response.body, profileId, armIdleTimer);
+          } catch (err: any) {
+            if (err?.name === 'AbortError') {
+              const timeoutErr: any = new Error(
+                `Bedrock (${profileId}) stream stalled after ${BEARER_STREAM_IDLE_TIMEOUT_MS / 1000}s of inactivity`
+              );
+              timeoutErr.status = 408;
+              timeoutErr.isTimeout = true;
+              throw timeoutErr;
+            }
+            throw err;
+          } finally {
+            clearIdleTimer();
+          }
         },
       },
     };
@@ -1204,6 +1425,11 @@ async function runCodingAgentInternal(
         messages,
       });
 
+      // Report this turn's token usage if a consumer is listening (eval harness).
+      if (context.onUsage && response.usage) {
+        context.onUsage(response.usage as any);
+      }
+
       // Add assistant message to history
       messages.push({ role: 'assistant', content: response.content });
 
@@ -1240,7 +1466,7 @@ async function runCodingAgentInternal(
         }
 
         // Execute the tool
-        let toolResult: string;
+        let toolResult: string | ToolImageResult;
         try {
           toolResult = await executeTool(fnName, fnArgs, context);
 
@@ -1258,11 +1484,24 @@ async function runCodingAgentInternal(
           toolResult = `Error executing ${fnName}: ${error instanceof Error ? error.message : String(error)}`;
         }
 
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: block.id,
-          content: truncateToolResult(toolResult)
-        });
+        if (isToolImageResult(toolResult)) {
+          // Feed the screenshot back as a vision input so the model can actually see it
+          // and verify visual correctness (mirrors the main agent-mode loop).
+          toolResults.push({
+            type: 'tool_result',
+            tool_use_id: block.id,
+            content: [
+              { type: 'text', text: 'Screenshot captured. Analyze the image below to verify the result visually.' },
+              { type: 'image', source: { type: 'base64', media_type: toolResult.mediaType as any, data: toolResult.data } }
+            ]
+          });
+        } else {
+          toolResults.push({
+            type: 'tool_result',
+            tool_use_id: block.id,
+            content: truncateToolResult(toolResult)
+          });
+        }
       }
 
       // Add tool results as a user message

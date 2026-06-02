@@ -1,3 +1,35 @@
+## Coding Agent Timeout Fix + Sonnet 4.6 vs Opus 4.8 Eval (2026-06-01)
+
+Reported via session `ac42f498-a553-48b1-a63e-54503ec3ae33` (user `lyndi@every.io`): a landing-page compliance edit via `coding_agent` timed out before completing; the session showed "No tasks have been run."
+
+### Root cause (FIXED)
+
+The bug report hypothesized the edit was "too broad" and should be split into single-concern passes. **The evidence contradicts that.** Tracing the session messages against the code: both `coding_agent` calls — the broad one AND a narrow retry (font + CTA only) — returned `iterations: -1`. That value is produced *only* by the outer `timeoutPromise` in `runCodingAgent` winning the `Promise.race`; the loop never returned, didn't hit the 50-iteration ceiling, and didn't error. Task breadth was not the cause.
+
+The trigger: the coding-agent default model (`agent_mode_coding_agent_default_model` setting) had been switched to `anthropic.claude-opus-4-8` hours earlier. Opus 4.8 routes through the bearer-token Bedrock client, which used the **blocking `/invoke` endpoint**. Each non-streaming turn (up to 16K tokens) had to fully complete before the loop advanced, and the 10-minute run budget allowed only ~2 slow Opus turns — exhausting the budget before the agent could read → edit → deploy.
+
+**Fix (`backend/src/services/codingAgentService.ts`, 3 commits):**
+- **Stream the bearer path:** replaced `/invoke` with `invoke-with-response-stream`. Added `_parseEventStreamFrames` (hand-rolled `vnd.amazon.eventstream` binary frame parser, no new dependency) + `_accumulateBedrockStream` (folds the streamed Anthropic events back into the exact `Anthropic.Message` the loop already consumes — `create()` contract unchanged). Wire format was empirically confirmed against the live dev endpoint (text + tool_use) before writing the parser.
+- **Coherent timeouts:** replaced the fixed 5-min per-request cap with a **2-min inter-chunk idle timeout** (a long-but-progressing generation is healthy; only true stalls abort), and raised `AGENT_TIMEOUT_MS` 10m → 20m so several legitimate slow turns fit.
+- **Honest aborts:** idle-timeout aborts are tagged `status: 408` + `isTimeout`, reported as "timed out" (not swallowed as a generic error) and not retried by `callWithRetry`. Applied to both the bearer and Vertex paths.
+- **Cost observability:** added a guarded `context.onUsage` hook (the loop previously discarded `response.usage`); no behavior change when unset.
+- Tests: `codingAgentService.test.ts` (+8) cover frame parsing (whole/partial/multi), message reconstruction, empty-stream → retryable 5xx, throttling-exception → 429, and 408-is-reported-not-retried. 61/61 pass. Verified end-to-end in a real browser (Opus 4.8 path completed iters=6, deployed, preview headline correct).
+
+### Eval: Sonnet 4.6 vs Opus 4.8 (recommendation: STAY ON SONNET 4.6)
+
+Built a real eval harness driving the actual `runCodingAgent` loop against a real test page (24 runs: 4 edit tasks of increasing complexity × 2 models × trials). Each run used a fresh `draft/` branch, deployed to a real Vercel preview, and correctness was scored objectively from the deployed DOM (required strings present, replaced strings absent). Cost measured via the `onUsage` hook. Eval branches/PRs cleaned up after.
+
+| Metric | Sonnet 4.6 | Opus 4.8 |
+|---|---|---|
+| Success rate | **12/12 (100%)** | **8/12 (67%)** |
+| Correct when completed | 12/12 | 8/8 |
+| Latency (avg / median) | 51s / 51s | 79s / 54s (up to 166s) |
+| Cost per successful edit | **$0.09** | **$0.48 (5.3×)** |
+
+All 4 Opus failures were identical: `Bedrock request timed out after 120s of inactivity` — the bearer-token Bedrock account intermittently stalls with zero stream bytes (one stalled on the very first call). A clean confirmation run got Opus 8/8, confirming these are intermittent infrastructure stalls, not quality issues. On correctness the models tied — Opus produced no better edits, including on the 3-change task.
+
+**Recommendation:** keep the coding agent on **Sonnet 4.6**. Opus 4.8 offers no correctness advantage on these edit tasks while costing 5×, running slower, and being less reliable (bearer-account stalls). Prod is already set back to Sonnet 4.6. The streaming fix is still worth keeping — it makes Opus usable when the account is healthy, and its honest 408 timeout is what surfaced the stall pattern.
+
 ## CRM Lead List & LinkedIn Message Sync Bugs (2026-05-30)
 
 Reported against list `list_1770238037853_wh6sswaay` ("LinkedIn Connections - Rui", user `be754b6c-767e-44ec-b181-4042cfe45ea9`).
