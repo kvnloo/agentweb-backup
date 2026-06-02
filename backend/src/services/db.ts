@@ -6376,6 +6376,7 @@ export const crmDb = {
       const item: any = {
         jobId: meta.jobId,
         leadId: '_meta',
+        jobType: 'meta',
         listId: meta.listId,
         userId: meta.userId,
         outputFields: meta.outputFields,
@@ -6411,6 +6412,40 @@ export const crmDb = {
       }).promise();
     } catch (error) {
       handleDynamoDbError(error, 'updateEnrichmentJobStatus');
+      throw error;
+    }
+  },
+
+  async getEnrichmentJobsByUserId(userId: string, limit = 20): Promise<any[]> {
+    try {
+      const result = await dynamodb.query({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
+        IndexName: 'userId-createdAt-index',
+        KeyConditionExpression: 'userId = :userId',
+        ExpressionAttributeValues: { ':userId': userId },
+        ScanIndexForward: false,
+        Limit: limit,
+      }).promise();
+      return (result.Items || []).filter((item: any) => item.leadId === '_meta');
+    } catch (error) {
+      handleDynamoDbError(error, 'getEnrichmentJobsByUserId');
+      throw error;
+    }
+  },
+
+  async getRecentEnrichmentJobs(limit = 20): Promise<any[]> {
+    try {
+      const result = await dynamodb.query({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
+        IndexName: 'jobType-createdAt-index',
+        KeyConditionExpression: 'jobType = :jobType',
+        ExpressionAttributeValues: { ':jobType': 'meta' },
+        ScanIndexForward: false,
+        Limit: limit,
+      }).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, 'getRecentEnrichmentJobs');
       throw error;
     }
   },

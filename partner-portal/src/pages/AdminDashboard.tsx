@@ -62,6 +62,7 @@ import AlertEmailsTab from "../components/admin/AlertEmailsTab";
 import OnboardingTab from "../components/admin/OnboardingTab";
 import ConnectedAccountsTab from "../components/admin/ConnectedAccountsTab";
 import ContractorsTab from "../components/admin/ContractorsTab";
+import EnrichmentHistoryTab from "../components/admin/EnrichmentHistoryTab";
 import {
   UserGrowthChart,
   TaskGrowthChart,
@@ -727,6 +728,7 @@ export default function AdminDashboard() {
     'onboarding': 20,
     'connected-accounts': 21,
     'contractors': 22,
+    'enrichment-history': 23,
   };
   
   // Get initial tab value from URL or default to Users
@@ -3103,6 +3105,7 @@ export default function AdminDashboard() {
             <Tab label="Onboarding" {...a11yProps(20)} />
             <Tab label="Connected Accounts" {...a11yProps(21)} />
             <Tab label="Contractors" {...a11yProps(22)} />
+            <Tab label="Enrichment History" {...a11yProps(23)} />
           </Tabs>
         </Box>
 
@@ -6228,6 +6231,10 @@ export default function AdminDashboard() {
 
         <TabPanel value={tabValue} index={22}>
           <ContractorsTab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={23}>
+          <EnrichmentHistoryTab />
         </TabPanel>
       </Paper>
 

@@ -5295,4 +5295,65 @@ router.delete("/skill-assignments/:assignmentId", async (req, res) => {
   }
 });
 
+// GET /api/admin/lists/:listId/enrichment-jobs — enrichment job history for a list
+router.get("/lists/:listId/enrichment-jobs", async (req, res) => {
+  try {
+    const { listId } = req.params;
+    const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
+
+    const jobs = await crmDb.getEnrichmentJobsByListId(listId, limit);
+    return res.json({ jobs });
+  } catch (error: any) {
+    console.error("Error fetching enrichment jobs:", error.message);
+    return res.status(500).json({ message: "Failed to fetch enrichment jobs" });
+  }
+});
+
+// GET /api/admin/lists/:listId/enrichment-jobs/:jobId — single job with per-lead breakdown
+router.get("/lists/:listId/enrichment-jobs/:jobId", async (req, res) => {
+  try {
+    const { listId, jobId } = req.params;
+
+    const [metaRows, snapshots] = await Promise.all([
+      crmDb.getEnrichmentJobsByListId(listId, 100),
+      crmDb.getEnrichmentSnapshotsByJobId(jobId),
+    ]);
+
+    const meta = metaRows.find((r: any) => r.jobId === jobId);
+    if (!meta) {
+      return res.status(404).json({ message: "Enrichment job not found" });
+    }
+
+    return res.json({ job: meta, leads: snapshots });
+  } catch (error: any) {
+    console.error("Error fetching enrichment job detail:", error.message);
+    return res.status(500).json({ message: "Failed to fetch enrichment job detail" });
+  }
+});
+
+// GET /api/admin/enrichment-jobs?limit=N — system-wide recent enrichment jobs
+router.get("/enrichment-jobs", async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
+    const jobs = await crmDb.getRecentEnrichmentJobs(limit);
+    return res.json({ jobs });
+  } catch (error: any) {
+    console.error("Error fetching recent enrichment jobs:", error.message);
+    return res.status(500).json({ message: "Failed to fetch enrichment jobs" });
+  }
+});
+
+// GET /api/admin/users/:userId/enrichment-jobs — all jobs for a user
+router.get("/users/:userId/enrichment-jobs", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
+    const jobs = await crmDb.getEnrichmentJobsByUserId(userId, limit);
+    return res.json({ jobs });
+  } catch (error: any) {
+    console.error("Error fetching user enrichment jobs:", error.message);
+    return res.status(500).json({ message: "Failed to fetch enrichment jobs" });
+  }
+});
+
 export default router;
