@@ -239,6 +239,45 @@ describe('ExternalCrmSyncService', () => {
       expect(saved.autoSyncEnabled).toBe(true);
     });
 
+    it('defaults autoSyncEnabled to true for a brand-new config', async () => {
+      // A user who sets up a sync expects new/edited leads to flow automatically.
+      // The DB default must match the UI toggle (which defaults ON), otherwise a
+      // partial save (e.g. from Test Connection) silently disables auto-sync.
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', { apiKey: 'my-token' });
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
+      expect(saved.autoSyncEnabled).toBe(true);
+    });
+
+    it('honours an explicit autoSyncEnabled=false on a new config', async () => {
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', { apiKey: 'my-token', autoSyncEnabled: false });
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
+      expect(saved.autoSyncEnabled).toBe(false);
+    });
+
+    it('preserves an existing autoSyncEnabled=false across a partial save', async () => {
+      // Test Connection persists a partial config with no autoSyncEnabled — it must
+      // not flip an existing explicit choice back to the default.
+      const existing = makeConfig({ autoSyncEnabled: false, apiKeyEncrypted: 'enc:old' });
+      mockListWithConfig(existing);
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', { apiKey: 'new-token' });
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
+      expect(saved.autoSyncEnabled).toBe(false);
+    });
+
     it('stores accountId when provided (OAuth path)', async () => {
       mockNoConfig();
       mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
