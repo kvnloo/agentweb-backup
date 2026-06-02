@@ -1260,11 +1260,15 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     mockAxiosPatch.mockResolvedValueOnce({ data: {} });
   };
 
-  // Setup: mock Vercel deployment polling (success)
+  // Setup: mock Vercel deployment polling (success).
+  // The deployment's githubCommitSha matches the commit pushed by setupGitHubMocks
+  // ("commit_sha") so the SHA-match guard in pollVercelDeployment accepts it.
   const setupVercelDeploySuccessMock = () => {
     mockAxiosGet.mockResolvedValueOnce({
       data: {
-        deployments: [{ uid: "dpl_123", readyState: "READY" }],
+        deployments: [
+          { uid: "dpl_123", readyState: "READY", meta: { githubCommitSha: "commit_sha" } },
+        ],
       },
     });
   };
@@ -1284,6 +1288,72 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       ],
     });
   };
+
+  // Setup: Vercel returns a READY deployment for a DIFFERENT commit (the stale
+  // root deployment), then never produces one for our commit. This reproduces the
+  // empathiaai.com bug: a sub-page was marked "deployed" against a build that did
+  // not contain its app/<slug>/ route, so the page permanently 404'd.
+  const setupVercelStaleDeploymentMock = () => {
+    for (let i = 0; i < 30; i++) {
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          deployments: [
+            { uid: "dpl_stale", readyState: "READY", meta: { githubCommitSha: "OLD_ROOT_SHA" } },
+          ],
+        },
+      });
+    }
+  };
+
+  it("FAIL: READY deployment for a different commit → not accepted, record set to failed (empathiaai 404 bug)", async () => {
+    setupSiteRecordMock();
+    await setupV0Mocks();
+    setupGitHubMocks(); // pushes commit "commit_sha"
+    setupVercelStaleDeploymentMock(); // Vercel only has READY for "OLD_ROOT_SHA"
+
+    const result = await generateLandingPage(
+      "user-1",
+      "Create re-engagement page",
+      "PHSA Re-engagement",
+      {}
+    );
+
+    // The build for our commit never went live, so the page must NOT be marked
+    // deployed — that false-positive is exactly what produced the 404.
+    expect(result.status).toBe("failed");
+    expect(result.errorMessage).toContain("timed out");
+  });
+
+  it("SUCCESS: ignores stale READY for old commit, accepts READY once our commit deploys", async () => {
+    setupSiteRecordMock();
+    await setupV0Mocks();
+    setupGitHubMocks(); // pushes commit "commit_sha"
+    // First poll: stale root deployment is newest & READY but for a different commit
+    mockAxiosGet.mockResolvedValueOnce({
+      data: {
+        deployments: [
+          { uid: "dpl_stale", readyState: "READY", meta: { githubCommitSha: "OLD_ROOT_SHA" } },
+        ],
+      },
+    });
+    // Second poll: our commit's build is now the newest and READY
+    mockAxiosGet.mockResolvedValueOnce({
+      data: {
+        deployments: [
+          { uid: "dpl_ours", readyState: "READY", meta: { githubCommitSha: "commit_sha" } },
+        ],
+      },
+    });
+
+    const result = await generateLandingPage(
+      "user-1",
+      "Create re-engagement page",
+      "Infoway Re-engagement",
+      {}
+    );
+
+    expect(result.status).toBe("deployed");
+  });
 
   it("FAIL: Vercel build fails → record status set to failed with build error", async () => {
     setupSiteRecordMock();
@@ -1355,10 +1425,12 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
         deployments: [{ uid: "dpl_123", readyState: "BUILDING" }],
       },
     });
-    // Second poll: READY
+    // Second poll: READY (matching the pushed commit_sha)
     mockAxiosGet.mockResolvedValueOnce({
       data: {
-        deployments: [{ uid: "dpl_123", readyState: "READY" }],
+        deployments: [
+          { uid: "dpl_123", readyState: "READY", meta: { githubCommitSha: "commit_sha" } },
+        ],
       },
     });
 
@@ -1437,7 +1509,7 @@ describe("v0Service - loadDefaultTemplateOutline fallback", () => {
     mockAxiosPost.mockResolvedValueOnce({ data: { sha: "tree_sha" } });           // tree
     mockAxiosPost.mockResolvedValueOnce({ data: { sha: "commit_sha" } });         // commit
     mockAxiosPatch.mockResolvedValueOnce({ data: {} });                           // patch ref
-    mockAxiosGet.mockResolvedValueOnce({ data: { deployments: [{ uid: "dpl_1", readyState: "READY" }] } }); // Vercel
+    mockAxiosGet.mockResolvedValueOnce({ data: { deployments: [{ uid: "dpl_1", readyState: "READY", meta: { githubCommitSha: "commit_sha" } }] } }); // Vercel
   };
 
   // FAIL tests — boundary/error cases
