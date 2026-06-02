@@ -220,6 +220,29 @@ describe('LinkedInOutreachService', () => {
       await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, undefined);
       expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalled();
     });
+
+    // ─── Per-account char limit (free 200 / premium 300) ──────────────────────
+    it('rejects a 201-char message when maxChars is 200 (free account)', async () => {
+      const msg = 'a'.repeat(201);
+      await expect(
+        linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, msg, 200)
+      ).rejects.toThrow('200 characters');
+      expect(mockUnipileClient.users.sendInvitation).not.toHaveBeenCalled();
+    });
+
+    it('accepts a 200-char message when maxChars is 200 (free account)', async () => {
+      const msg = 'a'.repeat(200);
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, msg, 200);
+      expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledWith(
+        expect.objectContaining({ message: msg })
+      );
+    });
+
+    it('accepts a 300-char message when maxChars is 300 (premium account)', async () => {
+      const msg = 'a'.repeat(300);
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, msg, 300);
+      expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalled();
+    });
   });
 
   describe('sendMessage', () => {
@@ -1086,6 +1109,47 @@ describe('LinkedInOutreachService', () => {
       const result = await linkedInOutreachService.resolveUserOwnedAccountId('user-4');
 
       expect(result).toBeNull();
+    });
+  });
+
+  describe('getInviteCharLimitForAccount', () => {
+    const mockGetAccountsByUserIdIncludingOrgShared = jest.fn();
+
+    beforeEach(() => {
+      jest.resetModules();
+      jest.doMock('../services/connectedAccountsDb', () => ({
+        getAccountsByUserIdIncludingOrgShared: mockGetAccountsByUserIdIncludingOrgShared,
+      }));
+    });
+
+    it('returns 300 for a Premium account (config.is_premium === true)', async () => {
+      mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
+        { platform: 'unipile', account_id: 'acct-1', config: { is_premium: true } },
+      ]);
+      const limit = await linkedInOutreachService.getInviteCharLimitForAccount('user-1', 'acct-1');
+      expect(limit).toBe(300);
+    });
+
+    it('returns 200 for a free account (is_premium absent/false)', async () => {
+      mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
+        { platform: 'unipile', account_id: 'acct-1', config: {} },
+      ]);
+      const limit = await linkedInOutreachService.getInviteCharLimitForAccount('user-1', 'acct-1');
+      expect(limit).toBe(200);
+    });
+
+    it('returns 200 when the account is not found for the user', async () => {
+      mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
+        { platform: 'unipile', account_id: 'other-acct', config: { is_premium: true } },
+      ]);
+      const limit = await linkedInOutreachService.getInviteCharLimitForAccount('user-1', 'acct-1');
+      expect(limit).toBe(200);
+    });
+
+    it('returns 200 (free, never over-promises) when the lookup throws', async () => {
+      mockGetAccountsByUserIdIncludingOrgShared.mockRejectedValue(new Error('db down'));
+      const limit = await linkedInOutreachService.getInviteCharLimitForAccount('user-1', 'acct-1');
+      expect(limit).toBe(200);
     });
   });
 

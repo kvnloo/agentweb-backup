@@ -233,6 +233,81 @@ describe('Connected Accounts Routes', () => {
             expect(ids).toContain('gmail-own');
         });
 
+        it('surfaces is_premium=true for a Premium unipile account', async () => {
+            const premiumUnipile = {
+                platform: 'unipile',
+                account_id: 'uni-premium',
+                account_name: 'Premium LinkedIn',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+                config: {
+                    account_type: 'personal',
+                    unipile_account_id: 'uni-premium',
+                    access_token: 'tok',
+                    token_expires_at: 9999999999999,
+                    is_premium: true,
+                }
+            };
+            (connectedAccountsDb.getAccountsByUserIdIncludingOrgShared as jest.Mock).mockResolvedValue([premiumUnipile]);
+            const { linkedInOutreachService } = require('../services/linkedInOutreachService');
+            linkedInOutreachService.getStatusesForAccounts.mockResolvedValue(new Map([['uni-premium', 'OK']]));
+
+            const response = await request(app).get('/api/oauth/connected-accounts');
+
+            expect(response.status).toBe(200);
+            expect(response.body.accounts[0].is_premium).toBe(true);
+        });
+
+        it('defaults is_premium=false for a unipile account without the flag', async () => {
+            const freeUnipile = {
+                platform: 'unipile',
+                account_id: 'uni-free',
+                account_name: 'Free LinkedIn',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+                config: {
+                    account_type: 'personal',
+                    unipile_account_id: 'uni-free',
+                    access_token: 'tok',
+                    token_expires_at: 9999999999999,
+                }
+            };
+            (connectedAccountsDb.getAccountsByUserIdIncludingOrgShared as jest.Mock).mockResolvedValue([freeUnipile]);
+            const { linkedInOutreachService } = require('../services/linkedInOutreachService');
+            linkedInOutreachService.getStatusesForAccounts.mockResolvedValue(new Map([['uni-free', 'OK']]));
+
+            const response = await request(app).get('/api/oauth/connected-accounts');
+
+            expect(response.status).toBe(200);
+            expect(response.body.accounts[0].is_premium).toBe(false);
+        });
+
+        it('does not set is_premium for non-unipile accounts', async () => {
+            const mockAccounts = [
+                {
+                    platform: 'gmail',
+                    account_id: 'user@gmail.com',
+                    account_name: 'Test User',
+                    created_at: new Date().toISOString(),
+                    updated_at: new Date().toISOString(),
+                    config: {
+                        account_type: 'gmail',
+                        email: 'user@gmail.com',
+                        access_token: 'access-token',
+                        refresh_token: 'refresh-token',
+                        token_expires_at: Date.now() + 3600000,
+                        granted_scopes: [],
+                    }
+                }
+            ];
+            (connectedAccountsDb.getAccountsByUserIdIncludingOrgShared as jest.Mock).mockResolvedValue(mockAccounts);
+
+            const response = await request(app).get('/api/oauth/connected-accounts');
+
+            expect(response.status).toBe(200);
+            expect(response.body.accounts[0].is_premium).toBeUndefined();
+        });
+
         it('does not include org-shared accounts when getAccountsByUserIdIncludingOrgShared only returns own accounts', async () => {
             const ownAccount = {
                 platform: 'unipile',
@@ -292,6 +367,74 @@ describe('Connected Accounts Routes', () => {
             (connectedAccountsDb.deleteAccountById as jest.Mock).mockRejectedValue(new Error('DB error'));
 
             const response = await request(app).delete('/api/oauth/connected-accounts/gmail/user@gmail.com');
+            expect(response.status).toBe(500);
+        });
+    });
+
+    describe('PATCH /connected-accounts/unipile/:accountId/premium', () => {
+        it('sets is_premium=true and returns success', async () => {
+            (connectedAccountsDb.updateAccountConfig as jest.Mock).mockResolvedValue(undefined);
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/unipile/uni-1/premium')
+                .send({ isPremium: true });
+
+            expect(response.status).toBe(200);
+            expect(response.body).toEqual(expect.objectContaining({ success: true, is_premium: true }));
+            expect(connectedAccountsDb.updateAccountConfig).toHaveBeenCalledWith(
+                'test_user_id', 'unipile', 'uni-1', { is_premium: true }
+            );
+        });
+
+        it('sets is_premium=false and returns success', async () => {
+            (connectedAccountsDb.updateAccountConfig as jest.Mock).mockResolvedValue(undefined);
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/unipile/uni-1/premium')
+                .send({ isPremium: false });
+
+            expect(response.status).toBe(200);
+            expect(connectedAccountsDb.updateAccountConfig).toHaveBeenCalledWith(
+                'test_user_id', 'unipile', 'uni-1', { is_premium: false }
+            );
+        });
+
+        it('returns 400 when isPremium is not a boolean', async () => {
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/unipile/uni-1/premium')
+                .send({ isPremium: 'yes' });
+
+            expect(response.status).toBe(400);
+            expect(connectedAccountsDb.updateAccountConfig).not.toHaveBeenCalled();
+        });
+
+        it('returns 400 when isPremium is missing', async () => {
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/unipile/uni-1/premium')
+                .send({});
+
+            expect(response.status).toBe(400);
+        });
+
+        it('returns 404 when the account is not connected to the user', async () => {
+            (connectedAccountsDb.updateAccountConfig as jest.Mock).mockRejectedValue(
+                new Error('No unipile account with id "uni-x" connected')
+            );
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/unipile/uni-x/premium')
+                .send({ isPremium: true });
+
+            expect(response.status).toBe(404);
+        });
+
+        it('returns 500 when updateAccountConfig throws an unexpected error', async () => {
+            (connectedAccountsDb.updateAccountConfig as jest.Mock).mockRejectedValue(new Error('DB down'));
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/unipile/uni-1/premium')
+                .send({ isPremium: true });
+
             expect(response.status).toBe(500);
         });
     });

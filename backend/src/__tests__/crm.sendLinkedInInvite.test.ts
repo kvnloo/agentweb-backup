@@ -64,12 +64,14 @@ jest.mock('../services/unipileConnectionsDb', () => ({
 const mockResolveAccountId = jest.fn();
 const mockResolveUserOwnedAccountId = jest.fn();
 const mockSendInvitation = jest.fn();
+const mockGetInviteCharLimitForAccount = jest.fn();
 
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
     resolveUserOwnedAccountId: (...args: any[]) => mockResolveUserOwnedAccountId(...args),
     sendInvitation: (...args: any[]) => mockSendInvitation(...args),
+    getInviteCharLimitForAccount: (...args: any[]) => mockGetInviteCharLimitForAccount(...args),
   },
 }));
 
@@ -131,6 +133,7 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
     mockGetLeadById.mockResolvedValue(LEAD_WITH_LINKEDIN);
     mockResolveUserOwnedAccountId.mockResolvedValue('user-own-acct');
     mockResolveAccountId.mockResolvedValue('site-wide-shared-acct');
+    mockGetInviteCharLimitForAccount.mockResolvedValue(200);
     mockSendInvitation.mockResolvedValue({ ok: true });
     mockUpdateLead.mockResolvedValue(undefined);
     mockUpsertSentInvitation.mockResolvedValue(undefined);
@@ -197,7 +200,7 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
     const req: any = { user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: {} };
     const res = makeRes();
     await handler!(req, res);
-    expect(mockSendInvitation).toHaveBeenCalledWith('list-acct-9', LEAD_WITH_LINKEDIN.linkedin, true, undefined);
+    expect(mockSendInvitation).toHaveBeenCalledWith('list-acct-9', LEAD_WITH_LINKEDIN.linkedin, true, undefined, 200);
     expect(mockResolveUserOwnedAccountId).not.toHaveBeenCalled();
   });
 
@@ -210,7 +213,7 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
     };
     const res = makeRes();
     await handler!(req, res);
-    expect(mockSendInvitation).toHaveBeenCalledWith('caller-acct-1', LEAD_WITH_LINKEDIN.linkedin, true, undefined);
+    expect(mockSendInvitation).toHaveBeenCalledWith('caller-acct-1', LEAD_WITH_LINKEDIN.linkedin, true, undefined, 200);
     expect(mockResolveUserOwnedAccountId).not.toHaveBeenCalled();
   });
 
@@ -219,7 +222,7 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
     const res = makeRes();
     await handler!(req, res);
     expect(mockResolveUserOwnedAccountId).toHaveBeenCalledWith('test-user-id');
-    expect(mockSendInvitation).toHaveBeenCalledWith('user-own-acct', LEAD_WITH_LINKEDIN.linkedin, true, undefined);
+    expect(mockSendInvitation).toHaveBeenCalledWith('user-own-acct', LEAD_WITH_LINKEDIN.linkedin, true, undefined, 200);
   });
 
   it('sends the invite, stamps linkedInInviteSentAt, and returns success on happy path', async () => {
@@ -231,11 +234,24 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
     const res = makeRes();
     await handler!(req, res);
 
-    // note is trimmed
-    expect(mockSendInvitation).toHaveBeenCalledWith('user-own-acct', LEAD_WITH_LINKEDIN.linkedin, true, 'Hi John — nice work on X');
+    // note is trimmed; free-account limit (200) is passed through
+    expect(mockSendInvitation).toHaveBeenCalledWith('user-own-acct', LEAD_WITH_LINKEDIN.linkedin, true, 'Hi John — nice work on X', 200);
     expect(mockUpdateLead).toHaveBeenCalledWith('list-123', 'lead-456', expect.objectContaining({
       linkedInInviteSentAt: expect.any(String),
     }));
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+  });
+
+  it('passes the Premium char limit (300) through to sendInvitation for a Premium account', async () => {
+    mockGetInviteCharLimitForAccount.mockResolvedValue(300);
+    const req: any = {
+      user: { userId: 'test-user-id' },
+      params: { listId: 'list-123', leadId: 'lead-456' },
+      body: { message: 'hello' },
+    };
+    const res = makeRes();
+    await handler!(req, res);
+    expect(mockGetInviteCharLimitForAccount).toHaveBeenCalledWith('test-user-id', 'user-own-acct');
+    expect(mockSendInvitation).toHaveBeenCalledWith('user-own-acct', LEAD_WITH_LINKEDIN.linkedin, true, 'hello', 300);
   });
 });
