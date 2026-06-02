@@ -4731,7 +4731,7 @@ emmaToolRegistry.register({
   name: "read_file_content",
   definition: {
     name: "read_file_content",
-    description: 'Read and extract text content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, Excel/XLSX spreadsheets, Word documents (docx, doc), and other common formats. Do NOT use this for image files (jpg, jpeg, png, gif, webp, svg) — use describe_image instead. Do NOT use this for video files (mp4, mov, avi, webm, mkv) — use describe_video instead.',
+    description: 'Read and extract text content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, Excel/XLSX spreadsheets, Word documents (docx, doc), and other common formats. Do NOT use this for image files (jpg, jpeg, png, gif, webp, svg) — use describe_image instead. Do NOT use this for video files (mp4, mov, avi, webm, mkv) — use describe_video instead. If this tool reports the URL is cut off/truncated or the fetch fails, do NOT keep retrying the same link — the user often cannot re-supply a long URL. Instead retrieve the file from the knowledge base with list_knowledge_base_files / search_knowledge_base and read_knowledge_base_files, or ask the user for the complete link.',
     inputSchema: {
       type: "object",
       properties: {

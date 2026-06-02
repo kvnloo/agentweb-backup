@@ -16357,6 +16357,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   // Read file content from URL with support for various file types
   public async readFileContent(fileUrl: string): Promise<any> {
+    // Steers the agent toward retrieval paths that don't depend on a long
+    // pasted link — the user often can't re-supply a URL that the UI cut off.
+    const KB_RECOVERY_HINT =
+      'If this file lives in the knowledge base, retrieve it with list_knowledge_base_files ' +
+      'or search_knowledge_base and then read_knowledge_base_files instead of relying on a pasted URL.';
+
     try {
       console.log('AgentMode: Reading file content from URL:', fileUrl);
 
@@ -16366,6 +16372,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           success: false,
           message: 'Invalid URL format. Must be HTTP or HTTPS.',
           error: 'Invalid URL format'
+        };
+      }
+
+      // Detect a URL that was cut off before it reached us (e.g. copied from a
+      // UI that ellipsis-truncated it). Fetching it would fail with an opaque
+      // 403/404, so we bail early with an actionable message instead.
+      const truncationReason = this.detectTruncatedUrl(fileUrl);
+      if (truncationReason) {
+        return {
+          success: false,
+          message:
+            `The provided URL appears to be cut off (${truncationReason}), so the file cannot be read. ` +
+            `Ask the user for the complete, unbroken link. ${KB_RECOVERY_HINT}`,
+          error: 'Truncated or malformed URL',
+          file_url: fileUrl
         };
       }
 
@@ -16530,11 +16551,39 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       return {
         success: false,
-        message: errorMessage,
+        message: `${errorMessage}. ${KB_RECOVERY_HINT}`,
         error: error.message,
         file_url: fileUrl
       };
     }
+  }
+
+  /**
+   * Detect a URL that was visibly cut off before reaching us (copied from a UI
+   * that ellipsis-truncated it, a wrapped/clipped clipboard paste, etc.).
+   * Returns a short human-readable reason, or null if the URL looks intact.
+   * This is intentionally conservative — it only flags telltale truncation
+   * markers so legitimate long presigned URLs are never rejected.
+   */
+  private detectTruncatedUrl(fileUrl: string): string | null {
+    // Ellipsis character inserted by UI truncation.
+    if (fileUrl.includes('…')) {
+      return 'it contains an ellipsis (…) where text was clipped';
+    }
+    // Trailing "..." is the ASCII form of the same clipping.
+    if (/\.\.\.\s*$/.test(fileUrl)) {
+      return 'it ends with "..." indicating the link was cut short';
+    }
+    // Whitespace inside a URL means it was wrapped/broken across lines.
+    if (/\s/.test(fileUrl.trim())) {
+      return 'it contains whitespace, so the link was likely broken across lines';
+    }
+    // A query string that ends mid-key (e.g. ".../file?X-Amz-Signature=") has
+    // an empty trailing value — a classic sign the signature got chopped.
+    if (/[?&][^=&]+=$/.test(fileUrl)) {
+      return 'a query parameter has no value, so the link was likely cut off';
+    }
+    return null;
   }
 
   /**
