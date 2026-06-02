@@ -54,7 +54,13 @@ export async function withRetry<T>(
       return await fn();
     } catch (err: any) {
       lastError = err;
+      // The v0 SDK throws `Error("HTTP <status>: <body>")` on any non-2xx response.
+      // Transient server-side failures (5xx) and rate limiting (429) should be
+      // retried with backoff — a v0 500 is the documented symptom of a v0 outage
+      // that often recovers within seconds.
+      const isRetryableHttpStatus = /\bHTTP (429|408|5\d\d)\b/.test(err.message || "");
       const isRetryable =
+        isRetryableHttpStatus ||
         err.message?.includes("fetch failed") ||
         err.message?.includes("ECONNREFUSED") ||
         err.message?.includes("ENOTFOUND") ||
@@ -383,8 +389,19 @@ export async function generateLandingPage(
     return reusable;
   }
 
+  // Recovery: a prior first-page attempt that failed *before* a v0 chat was ever
+  // created (e.g. v0 returned HTTP 500) leaves an orphaned record with no v0ChatId
+  // and no GitHub repo. Recycle the newest such record instead of creating yet
+  // another orphan, so repeated retries don't pile up dead "failed" pages.
+  const recyclable = existingPages.find(
+    (p) => p.status === "failed" && !p.v0ChatId && !p.githubRepoUrl && !p.slug
+  );
+  if (recyclable) {
+    console.log(`[V0 SERVICE] Recycling failed page record ${recyclable.id} (no v0 chat) for retry`);
+  }
+
   // ── First page: call v0 → create repo → deploy ──
-  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml);
+  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id);
 }
 
 /**
@@ -396,9 +413,11 @@ async function generateFirstPage(
   name: string,
   brandContext: BrandContext,
   leadListId?: string,
-  templateHtml?: string
+  templateHtml?: string,
+  existingId?: string
 ): Promise<GeneratedLandingPage> {
-  const id = uuidv4();
+  // Reuse a recyclable failed record's id when retrying, otherwise mint a new one.
+  const id = existingId ?? uuidv4();
   const now = new Date().toISOString();
 
   // Auto-load the HTML template structure as design inspiration for v0.
