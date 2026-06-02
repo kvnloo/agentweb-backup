@@ -965,6 +965,27 @@ export class LinkedInOutreachService {
   }
 
   /**
+   * Resolve ONLY the user's own connected Unipile account_id — no site-wide
+   * shared-account fallback.
+   *
+   * Use this for user-initiated CRM actions (LinkedIn message sync, sending a
+   * connection invite) that must run from a LinkedIn sender the user has actually
+   * configured. The site-wide shared pool used by `resolveAccountId` is for
+   * background/system features (enrichment, drip sequences); borrowing one of
+   * those accounts for a user's manual outreach would send from an account the
+   * user never connected. Returns null when the user has no own Unipile account.
+   */
+  async resolveUserOwnedAccountId(userId: string): Promise<string | null> {
+    try {
+      const { getAccountsByUserId } = await import('./connectedAccountsDb');
+      const accounts = await getAccountsByUserId(userId);
+      const userAccount = (accounts as any[]).find((a) => a.platform === 'unipile');
+      if (userAccount?.account_id) return userAccount.account_id;
+    } catch { /* ignore */ }
+    return null;
+  }
+
+  /**
    * Enrichment-specific account resolution. Differs from resolveAccountId in three ways:
    * 1. Tries ALL user accounts (not just the first), skipping dead ones with a connectivity check.
    * 2. Site-wide accounts are the last resort, never the first choice.

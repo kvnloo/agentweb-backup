@@ -4028,8 +4028,10 @@ router.post('/lists/:listId/leads/:leadId/sync-linkedin-messages', async (req: R
 
     const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
     // Prefer the account explicitly assigned to this list (its LinkedIn relationships
-    // live there); fall back to the user's default connected account.
-    const accountId = (list as any).linkedInAccountId || await linkedInOutreachService.resolveAccountId(userId);
+    // live there); fall back to the user's OWN connected account. Do NOT fall back to
+    // the site-wide shared pool — syncing must run from a LinkedIn sender the user
+    // actually configured, otherwise it would read messages from an unrelated account.
+    const accountId = (list as any).linkedInAccountId || await linkedInOutreachService.resolveUserOwnedAccountId(userId);
     if (!accountId) {
       return res.status(400).json({ message: 'No LinkedIn account connected. Connect a LinkedIn account in Settings first.' });
     }
@@ -4374,9 +4376,13 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     }
 
     const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    // Use the caller-specified account if provided, then the list-assigned account,
+    // then the user's OWN connected account. Do NOT fall back to the site-wide shared
+    // pool — an invite must be sent from a LinkedIn sender the user actually configured,
+    // never silently from a shared account they never connected.
     const accountId = (requestedAccountId && typeof requestedAccountId === 'string')
       ? requestedAccountId
-      : await linkedInOutreachService.resolveAccountId(userId);
+      : ((list as any).linkedInAccountId || await linkedInOutreachService.resolveUserOwnedAccountId(userId));
     if (!accountId) {
       return res.status(400).json({ message: 'No LinkedIn account connected. Connect LinkedIn outreach in Settings first.' });
     }
