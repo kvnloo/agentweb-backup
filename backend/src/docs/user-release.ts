@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-02',
     changes: [
+      'Fixed: Automated LinkedIn Engagement Comments Now Read Like a Real Person',
+      '- Comments and replies are no longer occasionally posted as the assistant\'s own filler (for example "Please provide the post content so I can tailor a response") — these are now detected and skipped instead of published',
+      '- Removed the repetitive, jargon-heavy phrasing that made many comments sound templated (e.g. always opening the same way or stacking corporate buzzwords)',
+      '- When a quality comment can\'t be generated for a given post, the system now skips commenting rather than posting a generic, bot-like line; likes and reactions still go through',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
       'Fixed: Shared Landing Pages No Longer Show a Broken (404) Link for Team Members',
       '- When a landing page\'s subdomain was changed, team members viewing the shared page could still see the old address, which led to a "page not found" error',
       '- Landing page links now always resolve to the subdomain currently connected to the site, for the page owner and every team member alike',
