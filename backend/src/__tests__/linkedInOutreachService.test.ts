@@ -1030,6 +1030,65 @@ describe('LinkedInOutreachService', () => {
     });
   });
 
+  describe('resolveUserOwnedAccountId', () => {
+    const mockGetAccountsByUserId = jest.fn();
+    const mockGetSetting = jest.fn();
+
+    beforeEach(() => {
+      jest.resetModules();
+      jest.doMock('../services/connectedAccountsDb', () => ({
+        getAccountsByUserId: mockGetAccountsByUserId,
+      }));
+      jest.doMock('../services/settingsService', () => ({
+        settingsService: { getSetting: mockGetSetting },
+      }));
+    });
+
+    it('returns the user own account_id when the user has a connected unipile account', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'user-acct-123' },
+      ]);
+
+      const result = await linkedInOutreachService.resolveUserOwnedAccountId('user-1');
+
+      expect(result).toBe('user-acct-123');
+    });
+
+    it('returns null when the user has no own account, even if site-wide accounts exist', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([]);
+      mockGetSetting.mockResolvedValue({
+        settingValue: JSON.stringify([
+          { account_id: 'site-acct-abc', enabled: true },
+        ]),
+      });
+
+      const result = await linkedInOutreachService.resolveUserOwnedAccountId('user-2');
+
+      // No site-wide fallback — must NOT borrow a shared account.
+      expect(result).toBeNull();
+      expect(mockGetSetting).not.toHaveBeenCalled();
+    });
+
+    it('returns null when getAccountsByUserId throws', async () => {
+      mockGetAccountsByUserId.mockRejectedValue(new Error('db down'));
+
+      const result = await linkedInOutreachService.resolveUserOwnedAccountId('user-3');
+
+      expect(result).toBeNull();
+    });
+
+    it('ignores non-unipile accounts', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'linkedin', account_id: 'li-ads-1' },
+        { platform: 'google', account_id: 'g-1' },
+      ]);
+
+      const result = await linkedInOutreachService.resolveUserOwnedAccountId('user-4');
+
+      expect(result).toBeNull();
+    });
+  });
+
   describe('getMessagesWithContact', () => {
     it('uses getAllChatsFromAttendee to find chat then getAllMessagesFromChat for messages', async () => {
       const mockMessages = [
