@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-02',
     changes: [
+      'Fixed: Editing One Landing Page No Longer Changes Your Other Pages',
+      '- When you asked Emma to update a single landing page, she could occasionally edit files belonging to your other pages that share the same site, causing unintended changes',
+      '- Edits are now confined to the page you asked about: a single page can only touch its own files, and edits to other pages\' sections are rejected',
+      '- Emma also stays focused on exactly what you asked for and won\'t relabel or rewrite copy you didn\'t mention',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
       'New: Mark a LinkedIn Account as Premium for Longer Connection Notes',
       '- LinkedIn limits connection-invite notes to 200 characters on free accounts and 300 on Premium; invite notes now default to a 200-character limit so they\'re never silently rejected',
       '- In Settings → Connected accounts, you can mark a LinkedIn Outreach account as Premium (or back to Free) from its menu — Premium accounts show a Premium badge and allow notes up to 300 characters',

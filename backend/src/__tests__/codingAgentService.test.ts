@@ -1,9 +1,19 @@
-import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest, _parseEventStreamFrames, _accumulateBedrockStream } from '../services/codingAgentService';
+import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isPathInScope, filterFileListingToScope, buildScopeSystemClause, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest, _parseEventStreamFrames, _accumulateBedrockStream } from '../services/codingAgentService';
 import { agentModeService } from '../services/agentModeService';
 
 // Mock mcpFetch
 jest.mock('../mcp/server/httpClient', () => ({
   mcpFetch: jest.fn()
+}));
+
+// Mock v0Service so scope resolution doesn't hit DynamoDB. By default both lookups
+// return empty (page not found) → scope stays undefined → the agent runs
+// unrestricted, matching the pre-scope behavior the bulk of these tests assert.
+const mockGetLandingPageById = jest.fn();
+const mockGetLandingPagesByOwner = jest.fn();
+jest.mock('../services/v0Service', () => ({
+  getLandingPageById: (...a: any[]) => mockGetLandingPageById(...a),
+  getLandingPagesByOwner: (...a: any[]) => mockGetLandingPagesByOwner(...a),
 }));
 
 import { mcpFetch } from '../mcp/server/httpClient';
@@ -1460,5 +1470,304 @@ describe('runCodingAgent — bearer-token request timeout surfacing', () => {
     expect(result.message).toMatch(/timed out|inactivity/i);
     // 408 is not in callWithRetry's retry set (only 429/5xx), so exactly one attempt.
     expect(bearerCreate).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── Page scope: pure helpers ─────────────────────────────────────────────────
+// Many pages share one repo; each is an app/<slug>/ dir (root page owns top-level
+// app/ files). These helpers compute and apply the editable boundary.
+describe('resolvePageScope', () => {
+  const root = { id: 'root-1', isRootPage: true };
+  const subA = { id: 'sub-a', slug: 'every-io-day-zero-pre-seed-fou' };
+  const subB = { id: 'sub-b', slug: 'every-io-seed-stage-founders' };
+
+  test('sub-page scope lists its slug and excludes itself from siblings', () => {
+    const scope = resolvePageScope(subA, [root, subA, subB]);
+    expect(scope.isRootPage).toBe(false);
+    expect(scope.slug).toBe('every-io-day-zero-pre-seed-fou');
+    expect(scope.siblingSlugs).toEqual(['every-io-seed-stage-founders']);
+  });
+
+  test('a page with no slug is treated as the root page', () => {
+    const scope = resolvePageScope({ id: 'root-1' }, [{ id: 'root-1' }, subA]);
+    expect(scope.isRootPage).toBe(true);
+    expect(scope.slug).toBe('');
+    expect(scope.siblingSlugs).toEqual([subA.slug]);
+  });
+
+  test('explicit isRootPage flag still collects sibling slugs to protect', () => {
+    const scope = resolvePageScope(root, [root, subA, subB]);
+    expect(scope.isRootPage).toBe(true);
+    expect(scope.siblingSlugs.sort()).toEqual([subA.slug, subB.slug].sort());
+  });
+
+  test('deduplicates sibling slugs and drops blanks', () => {
+    const scope = resolvePageScope(subA, [
+      subA,
+      subB,
+      { id: 'sub-c', slug: 'every-io-seed-stage-founders' }, // dup slug
+      { id: 'sub-d', slug: '' }, // blank
+    ]);
+    expect(scope.siblingSlugs).toEqual(['every-io-seed-stage-founders']);
+  });
+});
+
+describe('isPathInScope', () => {
+  const subScope = { slug: 'my-page', isRootPage: false, siblingSlugs: ['other-page'] };
+  const rootScope = { slug: '', isRootPage: true, siblingSlugs: ['my-page', 'other-page'] };
+
+  // --- sub-page: only its own directory ---
+  test('sub-page allows files inside its own app/<slug>/ directory', () => {
+    expect(isPathInScope('app/my-page/page.tsx', subScope)).toBe(true);
+    expect(isPathInScope('app/my-page/_components/landing/TrustBar.tsx', subScope)).toBe(true);
+  });
+
+  test('sub-page rejects a sibling page directory', () => {
+    expect(isPathInScope('app/other-page/_components/trust-bar.tsx', subScope)).toBe(false);
+  });
+
+  test('sub-page rejects shared components and root files', () => {
+    expect(isPathInScope('components/landing/trust-bar.tsx', subScope)).toBe(false);
+    expect(isPathInScope('app/layout.tsx', subScope)).toBe(false);
+    expect(isPathInScope('app/globals.css', subScope)).toBe(false);
+    expect(isPathInScope('app/page.tsx', subScope)).toBe(false);
+  });
+
+  test('sub-page does not treat a prefix collision as in-scope', () => {
+    // "app/my-page-2/" must NOT match scope "my-page"
+    expect(isPathInScope('app/my-page-2/page.tsx', subScope)).toBe(false);
+  });
+
+  test('normalizes leading ./ and / before matching', () => {
+    expect(isPathInScope('./app/my-page/page.tsx', subScope)).toBe(true);
+    expect(isPathInScope('/app/my-page/page.tsx', subScope)).toBe(true);
+    expect(isPathInScope('app\\my-page\\page.tsx', subScope)).toBe(true);
+  });
+
+  // --- root page: everything except sibling dirs ---
+  test('root page allows top-level and shared files', () => {
+    expect(isPathInScope('app/page.tsx', rootScope)).toBe(true);
+    expect(isPathInScope('app/layout.tsx', rootScope)).toBe(true);
+    expect(isPathInScope('components/landing/trust-bar.tsx', rootScope)).toBe(true);
+    expect(isPathInScope('app/globals.css', rootScope)).toBe(true);
+  });
+
+  test('root page rejects any sub-page directory', () => {
+    expect(isPathInScope('app/my-page/page.tsx', rootScope)).toBe(false);
+    expect(isPathInScope('app/other-page/_components/x.tsx', rootScope)).toBe(false);
+  });
+
+  test('empty path is never in scope', () => {
+    expect(isPathInScope('', subScope)).toBe(false);
+    expect(isPathInScope('   ', rootScope)).toBe(false);
+  });
+});
+
+describe('filterFileListingToScope', () => {
+  test('keeps only in-scope lines from a formatted listing', () => {
+    const scope = { slug: 'my-page', isRootPage: false, siblingSlugs: ['other-page'] };
+    const listing = [
+      'app/my-page/page.tsx (1200 bytes)',
+      'app/my-page/_components/TrustBar.tsx (800 bytes)',
+      'app/other-page/page.tsx (1000 bytes)',
+      'components/landing/trust-bar.tsx (500 bytes)',
+      'app/layout.tsx (300 bytes)',
+    ].join('\n');
+
+    const filtered = filterFileListingToScope(listing, scope);
+
+    expect(filtered).toContain('app/my-page/page.tsx');
+    expect(filtered).toContain('app/my-page/_components/TrustBar.tsx');
+    expect(filtered).not.toContain('app/other-page/page.tsx');
+    expect(filtered).not.toContain('components/landing/trust-bar.tsx');
+    expect(filtered).not.toContain('app/layout.tsx');
+  });
+
+  test('returns a placeholder when nothing is in scope', () => {
+    const scope = { slug: 'my-page', isRootPage: false, siblingSlugs: [] };
+    const filtered = filterFileListingToScope('app/other/page.tsx (10 bytes)', scope);
+    expect(filtered).toMatch(/no files/i);
+  });
+});
+
+describe('buildScopeSystemClause', () => {
+  test('sub-page clause names the allowed directory and forbids shared files', () => {
+    const clause = buildScopeSystemClause({ slug: 'my-page', isRootPage: false, siblingSlugs: ['other'] });
+    expect(clause).toContain('app/my-page/');
+    expect(clause).toMatch(/STRICT/);
+    expect(clause).toMatch(/only the specific change/i);
+  });
+
+  test('root-page clause lists sibling dirs as off-limits', () => {
+    const clause = buildScopeSystemClause({ slug: '', isRootPage: true, siblingSlugs: ['a', 'b'] });
+    expect(clause).toContain('app/a/');
+    expect(clause).toContain('app/b/');
+    expect(clause).toMatch(/ROOT page/i);
+  });
+});
+
+// ─── Page scope: enforcement in the agent loop ────────────────────────────────
+describe('runCodingAgent — scope enforcement', () => {
+  const scopedContext: CodingAgentContext = {
+    pageId: 'sub-a',
+    userId: 'user-456',
+    sessionId: 'session-789',
+    llmModel: 'anthropic.claude-sonnet-4-6',
+    draftBranch: 'draft/abc12345',
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedMcpFetch.mockReset();
+    mockCreate.mockReset();
+    mockGetLandingPageById.mockReset();
+    mockGetLandingPagesByOwner.mockReset();
+    _setBedrockClientForTest(mockClient);
+    _setSleepFnForTest(async () => {});
+    // The page under edit is a sub-page; a sibling sub-page shares the repo.
+    mockGetLandingPageById.mockResolvedValue({ id: 'sub-a', userId: 'user-456', slug: 'my-page' });
+    mockGetLandingPagesByOwner.mockResolvedValue([
+      { id: 'sub-a', userId: 'user-456', slug: 'my-page' },
+      { id: 'sub-b', userId: 'user-456', slug: 'other-page' },
+    ]);
+  });
+
+  afterAll(() => {
+    _setBedrockClientForTest(null);
+  });
+
+  test('blocks an edit to a sibling page directory without writing, and feeds back a corrective message', async () => {
+    // Pre-fetch list_files
+    mockedMcpFetch.mockResolvedValueOnce({
+      files: [
+        { path: 'app/my-page/page.tsx', size: 1000 },
+        { path: 'app/other-page/page.tsx', size: 1000 },
+      ],
+    });
+
+    // LLM tries to edit the SIBLING page's file
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_file', input: {
+          file_path: 'app/other-page/_components/trust-bar.tsx',
+          edits: [{ search: 'As seen in', replace: 'Backed by' }],
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    // Then the LLM gives up / reports
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Cannot edit that file.', status: 'error' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    await runCodingAgent('change the trust bar copy', scopedContext);
+
+    // The only mcpFetch call should be the pre-fetch list_files — NO github-edit PUT,
+    // and NOT even the file-content GET that edit_file normally does first.
+    const putCalls = mockedMcpFetch.mock.calls.filter(c => c[0]?.method === 'PUT');
+    expect(putCalls).toHaveLength(0);
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
+
+    // The agent must have received the corrective message as the tool result.
+    const secondCallMessages = mockCreate.mock.calls[1][0].messages;
+    const toolResultMsg = secondCallMessages.find(
+      (m: any) => m.role === 'user' && Array.isArray(m.content) && m.content.some((b: any) => b.type === 'tool_result')
+    );
+    const trBlock = toolResultMsg.content.find((b: any) => b.type === 'tool_result');
+    expect(trBlock.content).toMatch(/outside this page's directory|app\/my-page/i);
+  });
+
+  test('allows an edit inside the page\'s own directory', async () => {
+    // Pre-fetch list_files
+    mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/my-page/page.tsx', size: 1000 }] });
+
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_file', input: {
+          file_path: 'app/my-page/_components/landing/TrustBar.tsx',
+          edits: [{ search: '<img src="placeholder" />', replace: '<img src="https://logo" />' }],
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    // edit_file: GET current content, then PUT
+    mockedMcpFetch
+      .mockResolvedValueOnce({ content: '<img src="placeholder" />' })
+      .mockResolvedValueOnce({ success: true, is_staging: true, commit_url: 'https://github.com/x/commit/abc' });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Logo updated.', status: 'success' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    const result = await runCodingAgent('replace the placeholder logo', scopedContext);
+
+    expect(result.success).toBe(true);
+    const putCalls = mockedMcpFetch.mock.calls.filter(c => c[0]?.method === 'PUT');
+    expect(putCalls).toHaveLength(1);
+    expect((putCalls[0][0] as any).body.file_path).toBe('app/my-page/_components/landing/TrustBar.tsx');
+  });
+
+  test('filters the pre-fetched file listing and injects the scope clause into the system prompt', async () => {
+    mockedMcpFetch.mockResolvedValueOnce({
+      files: [
+        { path: 'app/my-page/page.tsx', size: 1000 },
+        { path: 'app/other-page/page.tsx', size: 1000 },
+        { path: 'components/landing/trust-bar.tsx', size: 500 },
+      ],
+    });
+    mockCreate.mockResolvedValueOnce({
+      content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'done', status: 'success' } }],
+      stop_reason: 'tool_use'
+    });
+
+    await runCodingAgent('do something', scopedContext);
+
+    const firstCall = mockCreate.mock.calls[0][0];
+    // System prompt carries the strict scope clause for this page.
+    expect(firstCall.system).toContain('app/my-page/');
+    expect(firstCall.system).toMatch(/STRICT/);
+    // The user message's file listing is filtered to the page's scope.
+    const userMsg = firstCall.messages.find((m: any) => m.role === 'user');
+    const userText = typeof userMsg.content === 'string'
+      ? userMsg.content
+      : userMsg.content.map((b: any) => b.text || '').join('');
+    expect(userText).toContain('app/my-page/page.tsx');
+    expect(userText).not.toContain('app/other-page/page.tsx');
+    expect(userText).not.toContain('components/landing/trust-bar.tsx');
+  });
+
+  test('falls back to unrestricted editing when the page record is not found', async () => {
+    // No page record → scope undefined → no blocking, no listing filter.
+    mockGetLandingPageById.mockResolvedValue(null);
+
+    mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/anything.tsx', size: 100 }] });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_file', input: {
+          file_path: 'app/other-page/page.tsx',
+          edits: [{ search: 'a', replace: 'b' }],
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    mockedMcpFetch
+      .mockResolvedValueOnce({ content: 'a' })
+      .mockResolvedValueOnce({ success: true, is_staging: true });
+    mockCreate.mockResolvedValueOnce({
+      content: [{ type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'done', status: 'success' } }],
+      stop_reason: 'tool_use'
+    });
+
+    const result = await runCodingAgent('edit anything', scopedContext);
+
+    expect(result.success).toBe(true);
+    // The write went through because scope resolution found no page.
+    const putCalls = mockedMcpFetch.mock.calls.filter(c => c[0]?.method === 'PUT');
+    expect(putCalls).toHaveLength(1);
   });
 });
