@@ -4675,3 +4675,18 @@ The email notification a list owner should receive when a lead accepts their Lin
 
 - `linkedInConnectionSync.notifyNewConnections.test.ts` — added slash-variant matching, variant dedup, and sender-gate cases; made the `normalizeLinkedInUrl` mock mirror the real (trailing-slash) behavior.
 - `leadListAlertService.linkedInConnectionAccepted.test.ts` — added a case asserting Slack is never called even when a `slackChannel` is set.
+
+## PRODUCTION INCIDENT — notification flood on initial backfill (2026-06-03 16:33–16:42 UTC)
+
+While PR #1752 (above) was in review (NOT deployed), a live flood of "invitation accepted" emails hit `murray.newlands@gmail.com`.
+
+### Diagnosis (from prod logs + DynamoDB)
+
+- User `9fde4157-e73f-4f0e-9d3a-ac8fe97b35ec`, list `list_1776558909356_4e0g4dxrt` ("Master Contact Data with Enrichment"): **132,363 leads, 32,298 with LinkedIn URLs**, freshly imported.
+- Unipile account `LIBGE2pYS1eckwgo7wUIGQ` (**3,447 cached connections**) ran a **one-time full backfill**. Commit `570dc302` (merged to `main` the same day) extended the forced full backfill from *empty* caches to *partial* caches too (gated on a new `__fullsync__` marker), so every pre-existing account backfills once. `notifyNewConnections` then treated every historical connection (e.g. `connectedAt` = Mar 22) as a freshly-accepted invitation → ~86 emails (+ Slack) in 9 minutes, all to one owner.
+- The list had **no `linkedInAccountId` assigned**, yet it still notified (the missing sender gate).
+- Dedup (`lead.system.linkedInConnectionNotifiedAt`) WAS working — each lead fired once — so it was a one-time burst, not a per-cron repeat. It self-terminated once the backfill completed (flat at 16:42; no growth across the 16:50 cron boundary).
+
+### Root-cause fix (added to PR #1752)
+
+`runLinkedInConnectionSync` now checks the `__fullsync__` marker (`getFullSyncCompletedAt`) BEFORE syncing each account. If absent, this run is the one-time full backfill — covering **both empty AND partial caches** (the partial-cache path is what actually flooded) — so it caches the connections silently and skips BOTH `notifyNewConnections` and `enrollNewConnections`. Keying off the fullsync marker (not the watermark) is essential: the flood account had a non-null watermark, so a watermark-based check would have missed it. Combined with the sender-gate fix, this list would have sent **zero** emails. Covered by `linkedInConnectionSync.initialBackfillNoNotify.test.ts` (includes a partial-cache case).
