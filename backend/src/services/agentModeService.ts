@@ -12695,10 +12695,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error uploading Meta ad image:', error);
+      // metaService.handleError attaches a structuredError ({ code, error_subcode,
+      // error_user_msg, ... }) so callers see Meta's actual reason instead of the bare
+      // "Invalid parameter". Surface it so the agent knows e.g. an image is too large.
+      const structured = error.structuredError;
+      const detail = structured?.error_user_msg || structured?.error_user_title;
+      const baseMessage = error.message || 'Failed to upload Meta ad image.';
       return {
         success: false,
-        message: error.message || 'Failed to upload Meta ad image.',
-        error: error.message
+        message: detail ? `${baseMessage} (${detail})` : baseMessage,
+        error: baseMessage,
+        meta_error: structured
+          ? {
+              code: structured.code,
+              error_subcode: structured.error_subcode,
+              error_user_title: structured.error_user_title,
+              error_user_msg: structured.error_user_msg,
+              classification: structured.classification,
+            }
+          : undefined,
       };
     }
   }

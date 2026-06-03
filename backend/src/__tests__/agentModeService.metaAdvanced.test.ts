@@ -132,6 +132,37 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
         expect(result.success).toBe(false);
         expect(result.message).toContain('Invalid image format');
       });
+
+      it('should surface Meta structured error details instead of a bare message', async () => {
+        const imageUrl = 'https://example.com/oversized.png';
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (axios.get as jest.Mock).mockResolvedValue({ data: Buffer.from('image data') });
+
+        // Simulate metaService.handleError attaching a structuredError to the thrown error.
+        const err: any = new Error('Invalid parameter');
+        err.structuredError = {
+          code: 100,
+          error_subcode: 1487837,
+          error_user_title: 'Image too large',
+          error_user_msg: 'The image dimensions exceed the maximum allowed.',
+          classification: 'VALIDATION_ERROR',
+        };
+        (metaService.uploadImage as jest.Mock).mockRejectedValue(err);
+
+        const result = await agentModeService.uploadMetaAdsImage('user123', imageUrl);
+
+        expect(result.success).toBe(false);
+        // The user-facing reason should be appended to the generic message.
+        expect(result.message).toContain('The image dimensions exceed the maximum allowed.');
+        expect(result.meta_error).toEqual({
+          code: 100,
+          error_subcode: 1487837,
+          error_user_title: 'Image too large',
+          error_user_msg: 'The image dimensions exceed the maximum allowed.',
+          classification: 'VALIDATION_ERROR',
+        });
+      });
     });
 
     describe('uploadMetaAdsVideo', () => {
