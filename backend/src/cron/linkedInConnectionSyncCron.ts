@@ -374,10 +374,38 @@ Respond with JSON: {"content": "the message text"}`;
   });
 }
 
+/**
+ * Look up CRM leads matching a connection's LinkedIn profile URL.
+ *
+ * The connection URL is normalized with a trailing slash (e.g. ".../in/john/"),
+ * but leads store their LinkedIn URL WITHOUT a trailing slash (CSV import and
+ * enrichment both strip it). findLeadsByLinkedin does an exact GSI match, so a
+ * single slash-terminated lookup silently misses every lead — which is why
+ * acceptance notifications stopped firing. Query both variants and dedup.
+ */
+async function findLeadsForConnectionUrl(profileUrl: string): Promise<any[]> {
+  const withSlash = normalizeLinkedInUrl(profileUrl); // lowercase + trailing slash
+  const withoutSlash = withSlash.replace(/\/+$/, '');
+  const variants = withSlash === withoutSlash ? [withSlash] : [withoutSlash, withSlash];
+
+  const seen = new Set<string>();
+  const out: any[] = [];
+  for (const variant of variants) {
+    const leads = (await crmDb.findLeadsByLinkedin(variant)) || [];
+    for (const lead of leads as any[]) {
+      const key = `${lead.listId}#${lead.leadId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(lead);
+    }
+  }
+  return out;
+}
+
 export async function notifyNewConnections(newConnections: UnipileConnection[]): Promise<void> {
   for (const conn of newConnections) {
     try {
-      const leads = await crmDb.findLeadsByLinkedin(conn.publicProfileUrl);
+      const leads = await findLeadsForConnectionUrl(conn.publicProfileUrl);
       for (const lead of leads as any[]) {
         if (!lead.listId) continue;
         // Dedup: skip if we already sent a notification for this lead's connection event.
@@ -388,6 +416,16 @@ export async function notifyNewConnections(newConnections: UnipileConnection[]):
         try {
           const list = await crmDb.getLeadListById(lead.listId);
           if (!list) continue;
+          // Only notify at the lead-list level when the list has an assigned
+          // LinkedIn sender, AND this connection was synced from that exact
+          // sender account. Otherwise a connection accepted on an unrelated
+          // account (e.g. the shared site-wide pool) would wrongly notify the
+          // owner of a list that never sent the invite.
+          const listSenderAccountId: string | null = (list as any).linkedInAccountId ?? null;
+          if (!listSenderAccountId || listSenderAccountId !== conn.accountId) {
+            console.log(`${TAG} Skipping notification for lead ${lead.leadId} — list ${lead.listId} has no matching assigned LinkedIn sender (list sender=${listSenderAccountId ?? 'none'}, connection account=${conn.accountId})`);
+            continue;
+          }
           // Mark as notified before sending — prevents duplicate sends if this throws.
           await crmDb.updateLead(lead.listId, lead.leadId, {
             system: { ...((lead.system as Record<string, any>) ?? {}), linkedInConnectionNotifiedAt: new Date().toISOString() },
