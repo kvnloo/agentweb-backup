@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-03',
     changes: [
+      'Fixed: Large Facebook/Meta Ad Images Upload Instead of Failing',
+      '- High-resolution creatives (for example 4096×4096 renders) were rejected by Meta with an unhelpful "Invalid parameter" error, blocking bulk ad creation',
+      '- We now automatically scale oversized images down to a size Meta accepts (preserving the aspect ratio, and keeping logos crisp) before uploading, so you no longer have to manually resize and re-upload them',
+      '- If an upload still fails, we now show Meta\'s actual reason instead of a generic error, so it\'s clear what to fix',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
       'Improved: Auto-Drafted LinkedIn Follow-Up Messages Are More Personal',
       '- When a lead accepts your connection request, the follow-up message we pre-draft for you now reflects your brand voice and your offer, instead of reading like generic filler',
       '- The draft also takes prior emails and LinkedIn messages into account: if the lead already replied to you, it picks up that thread rather than re-introducing yourself',
