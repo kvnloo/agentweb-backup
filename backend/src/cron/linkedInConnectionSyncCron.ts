@@ -471,8 +471,23 @@ export async function runLinkedInConnectionSync(): Promise<void> {
     const allNewConnections: UnipileConnection[] = [];
     for (const accountId of accountIds) {
       try {
+        // Detect a one-time full backfill BEFORE syncing. syncConnectionsForAccount
+        // forces a full backfill (then sets the __fullsync__ marker) whenever that
+        // marker is absent — covering BOTH empty caches and partial caches populated
+        // by incremental polls before the backfill fix landed. That backfill pulls
+        // ALL historical connections into the cache; those are old accepted
+        // invitations, NOT freshly accepted ones. Treating them as new would
+        // email/enroll the list owner for every pre-existing connection at once
+        // (observed: a one-time burst of acceptance emails). Cache them silently and
+        // only process genuinely-new connections on subsequent incremental runs.
+        const wasBackfill = (await getFullSyncCompletedAt(accountId).catch(() => null)) === null;
+
         const newConns = await syncConnectionsForAccount(accountId);
-        allNewConnections.push(...newConns);
+        if (wasBackfill) {
+          console.log(`${TAG} account=${accountId} one-time backfill cached ${newConns.length} connection(s) — skipping accepted-notifications and enrollment`);
+        } else {
+          allNewConnections.push(...newConns);
+        }
       } catch (err) {
         console.error(`${TAG} Sync failed for account ${accountId}:`, err);
       }
