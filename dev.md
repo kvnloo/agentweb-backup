@@ -4648,3 +4648,30 @@ Rather than increasing upload limits or adding server-side zip extraction (which
 ### Recommendation for the product
 
 If large brand guideline uploads become a common need, consider adding a "Connect Google Drive folder" shortcut in the Brand Guidelines UI that guides users through sharing a folder with the service account — avoiding the upload flow entirely for large asset libraries.
+
+---
+
+# June 3, 2026: Investigation — LinkedIn "Invitation Accepted" Notifications Stopped Sending
+
+## Symptom
+
+The email notification a list owner should receive when a lead accepts their LinkedIn connection request stopped firing. Separately, when it *did* fire it also posted to Slack (which it should not), and it fired for lists that never sent the invite.
+
+## Root causes
+
+1. **Trailing-slash URL mismatch (the "stopped sending" bug).** `linkedInConnectionSyncCron.notifyNewConnections` looked up CRM leads via `crmDb.findLeadsByLinkedin(conn.publicProfileUrl)`. The connection URL is normalized by `unipileConnectionsDb.normalizeLinkedInUrl`, which **forces a trailing slash** (`.../in/john/`). But leads store their `linkedin` value **without** a trailing slash — CSV import (`crm.ts` normalizer) and enrichment (`enrichmentGroups.normalizeLinkedInUrl`) both strip it, and `db.createLead` only `.trim()`s. `findLeadsByLinkedin` does an **exact** GSI match on `LinkedinLookupIndex`, so the slash-terminated key never matched → zero leads → no email. The `__latest__` watermark had already advanced, so the connection was never reconsidered → permanent miss. (The sibling `enrollNewConnections` was unaffected because it normalizes *both* sides before comparing.)
+
+2. **Slack notification.** `leadListAlertService.notifyLinkedInConnectionAccepted` posted to Slack via `sendLeadNotification` whenever the owner had a `slackChannel`. These acceptance alerts should be email-only.
+
+3. **No sender gate.** The notification fired for any list containing the matching lead, regardless of whether the list had an assigned LinkedIn sender (`list.linkedInAccountId`).
+
+## Fixes
+
+- `notifyNewConnections` now queries both the slash and no-slash URL variants (deduping by `listId#leadId`) via a new `findLeadsForConnectionUrl` helper.
+- It now only notifies when `list.linkedInAccountId` is set **and** equals the connection's `accountId` (the sender that actually sent the invite).
+- Removed the Slack block from `notifyLinkedInConnectionAccepted`. Generic lead-list alerts in `notifyLeadListOwnerIfConfigured` still post to Slack.
+
+## Tests
+
+- `linkedInConnectionSync.notifyNewConnections.test.ts` — added slash-variant matching, variant dedup, and sender-gate cases; made the `normalizeLinkedInUrl` mock mirror the real (trailing-slash) behavior.
+- `leadListAlertService.linkedInConnectionAccepted.test.ts` — added a case asserting Slack is never called even when a `slackChannel` is set.
