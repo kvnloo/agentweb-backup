@@ -40,6 +40,28 @@ const openai = new OpenAI({
 
 const TAG = '[linkedInConnectionSync]';
 
+/**
+ * Kill-switches for the side effects of detecting a newly-accepted LinkedIn
+ * connection. Both default to DISABLED (muted) and must be explicitly turned on
+ * by setting the env var to "true". This is a deliberate fail-safe added after
+ * the 2026-06-03 notification flood (see docs/postmortem-2026-06-03-linkedin-connection-notification-flood.md):
+ * a one-time connection backfill caused thousands of "invitation accepted"
+ * emails/Slack messages and auto-enrollments to fire for historical, already-old
+ * connections — at a scale that risked spamming clients' prospects.
+ *
+ *  - LINKEDIN_CONNECTION_NOTIFY:  owner email/Slack alerts ("X accepted your invite")
+ *  - LINKEDIN_CONNECTION_ENROLL:  auto-enroll accepted leads into drip sequences
+ *                                 (this is what triggers OUTBOUND messages to leads)
+ *
+ * Connection caching itself is unaffected — the "already connected" detection
+ * other CRM features rely on keeps working.
+ *
+ * Read at call time (not module load) so the flag can be flipped via the EB
+ * environment without import-order concerns.
+ */
+const isNotifyEnabled = (): boolean => process.env.LINKEDIN_CONNECTION_NOTIFY === 'true';
+const isEnrollEnabled = (): boolean => process.env.LINKEDIN_CONNECTION_ENROLL === 'true';
+
 /** Returns all Unipile account IDs to sync: site-wide settings + all per-user connected accounts. */
 async function getAllUnipileAccountIds(): Promise<string[]> {
   const ids = new Set<string>();
@@ -228,6 +250,13 @@ export async function syncSentInvitationsForAccount(accountId: string): Promise<
 export async function enrollNewConnections(newConnections: UnipileConnection[]): Promise<number> {
   if (newConnections.length === 0) return 0;
 
+  // Kill-switch: auto-enrollment is what sends OUTBOUND messages to leads, so it
+  // is muted by default. Set LINKEDIN_CONNECTION_ENROLL=true to re-enable.
+  if (!isEnrollEnabled()) {
+    console.log(`${TAG} Auto-enrollment muted (LINKEDIN_CONNECTION_ENROLL not 'true') — skipping ${newConnections.length} connection(s)`);
+    return 0;
+  }
+
   const sequences = await dripSequenceDb.getAllSequencesByTriggerType('linkedin_connection_accepted');
   if (sequences.length === 0) return 0;
 
@@ -403,6 +432,14 @@ async function findLeadsForConnectionUrl(profileUrl: string): Promise<any[]> {
 }
 
 export async function notifyNewConnections(newConnections: UnipileConnection[]): Promise<void> {
+  // Kill-switch: owner email/Slack alerts are muted by default after the
+  // 2026-06-03 flood. Set LINKEDIN_CONNECTION_NOTIFY=true to re-enable.
+  if (!isNotifyEnabled()) {
+    if (newConnections.length > 0) {
+      console.log(`${TAG} Acceptance notifications muted (LINKEDIN_CONNECTION_NOTIFY not 'true') — skipping ${newConnections.length} connection(s)`);
+    }
+    return;
+  }
   for (const conn of newConnections) {
     try {
       const leads = await findLeadsForConnectionUrl(conn.publicProfileUrl);
