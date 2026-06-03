@@ -410,6 +410,12 @@ COPY_AD WORKFLOW (clone an existing ad with optional overrides):
   4. Returns new_ad_id and new_creative_id
   NOTE: AD LIST now includes creative.object_story_spec so you can inspect image/video/URL details before copying.
 
+CHANGING AN AD'S CREATIVE/IMAGE (AD UPDATE):
+  Meta ads cannot mutate a creative in place — you must point the ad at a different creative.
+  - To swap to a creative you already built: AD UPDATE with params.creative_id (the system nests it correctly; a top-level creative_id is silently dropped by Meta and the old image keeps showing).
+  - To change copy/destination/image content: AD UPDATE with link_url / body / title / image_hash / image_url — the system auto-builds a new creative from the old one and swaps it in.
+  Either way the change is reflected on the SAME ad_id; deleting and recreating the ad is NOT required.
+
 CAMPAIGN OBJECTIVES (valid values for 'objective'):
   OUTCOME_TRAFFIC, OUTCOME_AWARENESS, OUTCOME_ENGAGEMENT, OUTCOME_SALES, OUTCOME_LEADS, OUTCOME_APP_PROMOTION
 
@@ -533,7 +539,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
             title: { type: "string", description: "Ad headline." },
             link_url: { type: "string", description: "Destination URL." },
             call_to_action_type: { type: "string", description: "CTA button (e.g., LEARN_MORE, SHOP_NOW, SIGN_UP)." },
-            creative_id: { type: "string", description: "Creative ID for AD CREATE." },
+            creative_id: { type: "string", description: "Creative ID. For AD CREATE: the creative to attach. For AD UPDATE: swap the ad onto this existing creative (nested as { creative: { creative_id } } — a top-level creative_id is silently ignored by Meta)." },
 
             // --- Custom Audience ---
             subtype: { type: "string", enum: ["CUSTOM", "LOOKALIKE"], description: "Audience subtype." },

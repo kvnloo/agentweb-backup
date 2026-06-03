@@ -335,6 +335,59 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.getAdCreative).not.toHaveBeenCalled();
       });
 
+      it('should nest a directly-supplied creative_id (Meta ignores a top-level creative_id)', async () => {
+        const params = { creative_id: 'new_creative_B' };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(true);
+        expect(result.new_creative_id).toBe('new_creative_B');
+        // Must nest as { creative: { creative_id } } — a top-level creative_id is silently
+        // dropped by Meta (the API returns success but the ad keeps its old creative).
+        expect(metaService.updateAd).toHaveBeenCalledWith(
+          'mock-access-token',
+          'ad_123',
+          { creative: { creative_id: 'new_creative_B' } }
+        );
+        // Must NOT pass a bare top-level creative_id to Meta
+        expect(metaService.updateAd).not.toHaveBeenCalledWith(
+          'mock-access-token',
+          'ad_123',
+          { creative_id: 'new_creative_B' }
+        );
+        // A pre-built creative_id needs no rebuild from the old creative
+        expect(metaService.getAd).not.toHaveBeenCalled();
+        expect(metaService.getAdCreative).not.toHaveBeenCalled();
+        expect(metaService.createAdCreative).not.toHaveBeenCalled();
+      });
+
+      it('should apply ad-level params (status) alongside a direct creative_id swap', async () => {
+        const params = { creative_id: 'new_creative_B', status: 'ACTIVE' };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(true);
+        expect(result.new_creative_id).toBe('new_creative_B');
+        // The creative swap is issued as a nested creative param
+        expect(metaService.updateAd).toHaveBeenCalledWith(
+          'mock-access-token',
+          'ad_123',
+          { creative: { creative_id: 'new_creative_B' } }
+        );
+        // The ad-level status change is issued separately, without the creative_id
+        expect(metaService.updateAd).toHaveBeenCalledWith(
+          'mock-access-token',
+          'ad_123',
+          { status: 'ACTIVE' }
+        );
+      });
+
       it('should use creative swap when link_url is in params', async () => {
         const params = { link_url: 'https://new-landing-page.com' };
 
