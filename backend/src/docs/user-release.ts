@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-03',
     changes: [
+      'Improved: Auto-Drafted LinkedIn Follow-Up Messages Are More Personal',
+      '- When a lead accepts your connection request, the follow-up message we pre-draft for you now reflects your brand voice and your offer, instead of reading like generic filler',
+      '- The draft also takes prior emails and LinkedIn messages into account: if the lead already replied to you, it picks up that thread rather than re-introducing yourself',
+      '- The wording now matches the quality of the connection-invite notes — leading with something specific to the person and avoiding corporate buzzwords',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
       'Fixed: CRM No Longer Offers "Send LinkedIn Invite" for People You\'re Already Connected To',
       '- Some LinkedIn accounts only had a partial list of their connections cached, so leads you connected with a while ago still showed a "Send LinkedIn Invite" button — which then failed with "already connected"',
       '- We now do a one-time full backfill of every connection for these accounts, so existing connections are correctly recognised',
