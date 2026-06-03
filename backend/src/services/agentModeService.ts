@@ -12466,6 +12466,29 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
 
+      // A pre-built creative_id passed directly must be nested as { creative: { creative_id } }.
+      // Meta's POST /{ad-id} endpoint silently ignores a top-level creative_id (returns success
+      // but the ad keeps its old creative), so handle it explicitly before any other branch.
+      if (params.creative_id) {
+        const newCreativeId = params.creative_id;
+        await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } });
+
+        // Apply any other ad-level params (status, name, etc.) in a separate update
+        const adLevelParams: any = {};
+        for (const key of Object.keys(params)) {
+          if (key !== 'creative_id') adLevelParams[key] = params[key];
+        }
+        if (Object.keys(adLevelParams).length > 0) {
+          await metaService.updateAd(accessToken, adId, adLevelParams);
+        }
+
+        return {
+          success: true,
+          message: `Ad updated successfully. Swapped in creative ${newCreativeId}.`,
+          new_creative_id: newCreativeId
+        };
+      }
+
       // Detect if params contain creative content keys that require a creative swap
       const creativeKeys = Object.keys(params).filter(k =>
         AgentModeService.CREATIVE_CONTENT_KEYS.includes(k)
