@@ -2,6 +2,13 @@ import { chatbotDb, ChatSession, ChatMessage } from "./chatbotService";
 
 const SCORING_MODEL = "gemini-3.1-flash-lite";
 
+// Token budget for the JSON scoring response. Must be generous enough for
+// "thinking" models (e.g. gemini-3.5-flash) whose internal reasoning consumes
+// the completion budget before the JSON is emitted — too low a cap causes
+// finish_reason=length with truncated/empty JSON. Non-thinking models still
+// stop after ~80 tokens, so a high cap adds no cost for them.
+const SCORING_MAX_COMPLETION_TOKENS = 2000;
+
 const MAX_TOOL_CONTENT_FOR_SCORING = 500; // chars per tool result in scoring context
 
 /**
@@ -105,6 +112,17 @@ async function getDefaultScoringPrompt(): Promise<string> {
   return DEFAULT_SCORING_SYSTEM_PROMPT;
 }
 
+export async function getDefaultScoringModel(): Promise<string> {
+  try {
+    const { settingsService } = await import("./settingsService");
+    const setting = await settingsService.getSetting("default-scoring-model");
+    if (setting?.settingValue) return setting.settingValue;
+  } catch (err) {
+    console.error("Failed to load custom default scoring model, using hardcoded:", err);
+  }
+  return SCORING_MODEL;
+}
+
 type ScoringResult = {
   score: number;
   reason: string;
@@ -157,16 +175,17 @@ export async function scoreSession(
   // Lazy-import to avoid pulling heavy dependencies at module load time
   const { agentModeService } = await import("./agentModeService");
   const systemPrompt = await getDefaultScoringPrompt();
+  const model = await getDefaultScoringModel();
 
   const llmPromise = agentModeService.callLLM(
-    SCORING_MODEL,
+    model,
     [
       { role: "system", content: systemPrompt },
       { role: "user", content: `Evaluate this conversation:\n\n${conversationText}` },
     ],
     {
       temperature: 0,
-      max_completion_tokens: 300,
+      max_completion_tokens: SCORING_MAX_COMPLETION_TOKENS,
       response_format: { type: "json_object" },
     }
   );
@@ -193,6 +212,7 @@ export interface ScoringJudge {
   id: string;
   name: string;
   systemPrompt: string;
+  llmModel?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -213,14 +233,14 @@ export async function scoreSessionWithJudge(
   const { agentModeService } = await import("./agentModeService");
 
   const llmPromise = agentModeService.callLLM(
-    SCORING_MODEL,
+    judge.llmModel || SCORING_MODEL,
     [
       { role: "system", content: judge.systemPrompt },
       { role: "user", content: `Evaluate this conversation:\n\n${conversationText}` },
     ],
     {
       temperature: 0,
-      max_completion_tokens: 300,
+      max_completion_tokens: SCORING_MAX_COMPLETION_TOKENS,
       response_format: { type: "json_object" },
     }
   );

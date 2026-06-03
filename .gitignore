@@ -136,7 +136,9 @@ customer-portal/
 # Ignore Claude Code worktrees (agent-specific, never committed)
 .claude/worktrees/
 
-# Cloud-dev runtime state (written by .claude-run.sh at launch — never commit)
+# Cloud-dev runtime state (copied/written at launch from test-env/ — never commit)
+.claude-run.sh
+.claude-comment.py
 .claude-conversation-log
 .claude-prompt
 .claude-session-id

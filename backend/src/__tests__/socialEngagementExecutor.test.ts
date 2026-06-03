@@ -1,4 +1,4 @@
-import { SocialEngagementExecutor, SocialEngagementTimerScheduler } from '../cron/socialEngagementExecutor';
+import { SocialEngagementExecutor, SocialEngagementTimerScheduler, sanitizeGeneratedComment } from '../cron/socialEngagementExecutor';
 
 // ─── Mock all external dependencies ─────────────────────────────────────────
 
@@ -380,19 +380,43 @@ describe('SocialEngagementExecutor', () => {
       expect(mockAdapter.createReaction).not.toHaveBeenCalled();
     });
 
-    it('should use fallback comment text when LLM fails', async () => {
+    it('should skip the comment (post nothing) when LLM generation fails', async () => {
       const action = makeAction({ variableValues: { ...makeAction().variableValues, actionType: 'comment' } });
       mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
       mockAgentModeService.getGeminiClient.mockRejectedValue(new Error('LLM unavailable'));
 
       const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
 
-      expect(mockAdapter.createComment).toHaveBeenCalledWith(
-        expect.any(Object),
-        expect.any(String),
-        expect.stringMatching(/\S+/),
-        expect.any(String)
+      // A canned bot-like fallback is worse than no comment — must skip, not post.
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
+      // Action still completes (not retried) so we don't loop on a dead post.
+      expect(mockTrackingDb.recordEngagement).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'completed' })
       );
+    });
+
+    it('should skip the comment when the LLM returns a refusal / meta response', async () => {
+      const action = makeAction({ variableValues: { ...makeAction().variableValues, actionType: 'comment' } });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(
+        makeMockGeminiClient('Please provide the text of the LinkedIn post so I can tailor the critique.') as any
+      );
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
+    });
+
+    it('should skip the comment when post content is too short to comment on', async () => {
+      const action = makeAction({ variableValues: { ...makeAction().variableValues, actionType: 'comment' } });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAdapter.getPost.mockResolvedValue('   .  '); // whitespace/near-empty
+      mockAgentModeService.getGeminiClient.mockResolvedValue(makeMockGeminiClient('Some comment') as any);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      // Should never even call the LLM, and never post.
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
     });
   });
 
@@ -748,12 +772,12 @@ describe('SocialEngagementExecutor', () => {
       );
     });
 
-    it('should use fallback reply text when LLM fails', async () => {
+    it('should skip the reply (post nothing) when LLM generation fails', async () => {
       const action = makeAction({
         variableValues: {
           postId: 'urn:li:share:123',
           commentId: 'urn:li:comment:456',
-          commentText: 'Nice!',
+          commentText: 'Nice insight about scaling teams!',
           platform: 'linkedin',
           ownerAccountId: 'acc-engager-1',
           engagingAccountId: 'acc-engager-1',
@@ -766,13 +790,28 @@ describe('SocialEngagementExecutor', () => {
 
       const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
 
-      expect(mockAdapter.createComment).toHaveBeenCalledWith(
-        expect.any(Object),
-        expect.any(String),
-        expect.stringMatching(/\S+/),
-        expect.any(String),
-        expect.any(String)
-      );
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
+    });
+
+    it('should skip the reply when the original comment text is unavailable', async () => {
+      const action = makeAction({
+        variableValues: {
+          postId: 'urn:li:share:123',
+          commentId: 'urn:li:comment:456',
+          commentText: '',
+          platform: 'linkedin',
+          ownerAccountId: 'acc-engager-1',
+          engagingAccountId: 'acc-engager-1',
+          actionType: 'reply_comment',
+          targetType: 'comment',
+        },
+      });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(makeMockGeminiClient('Some reply') as any);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
     });
   });
 
@@ -1074,5 +1113,48 @@ describe('SocialEngagementTimerScheduler', () => {
     await jest.advanceTimersByTimeAsync(100);
 
     expect(executor.processQueue).toHaveBeenCalled();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('sanitizeGeneratedComment', () => {
+  it('returns null for empty / nullish input', () => {
+    expect(sanitizeGeneratedComment(undefined)).toBeNull();
+    expect(sanitizeGeneratedComment(null)).toBeNull();
+    expect(sanitizeGeneratedComment('')).toBeNull();
+    expect(sanitizeGeneratedComment('   ')).toBeNull();
+  });
+
+  it('strips wrapping quotes and backticks', () => {
+    expect(sanitizeGeneratedComment('"This is a real comment."')).toBe('This is a real comment.');
+    expect(sanitizeGeneratedComment('`This is a real comment.`')).toBe('This is a real comment.');
+    expect(sanitizeGeneratedComment('“This is a real comment.”')).toBe('This is a real comment.');
+  });
+
+  it('rejects refusal / meta responses that were being posted verbatim', () => {
+    const refusals = [
+      'Please provide the text of the LinkedIn post so I can tailor the critique to the specific claims.',
+      'Since you didn\'t provide the post content, please share it.',
+      'Please provide the post content you would like me to respond to, and I will craft an analytical comment.',
+      'Please provide the post content you are referring to, and I will craft a response that aligns with Rui\'s analytical perspective.',
+      'As an AI language model, I cannot do that.',
+      'No content was provided.',
+      '[No content available]',
+      'SKIP',
+    ];
+    for (const r of refusals) {
+      expect(sanitizeGeneratedComment(r)).toBeNull();
+    }
+  });
+
+  it('salvages the real comment when the model prefixes a meta-preamble ending in a colon', () => {
+    const raw = 'Since you haven\'t provided the specific post content, here is a versatile, professional comment suitable for most enterprise AI discussions: Scaling these solutions hinges on integration into existing architectures.';
+    expect(sanitizeGeneratedComment(raw)).toBe('Scaling these solutions hinges on integration into existing architectures.');
+  });
+
+  it('passes through a genuine, specific comment unchanged', () => {
+    const good = 'The 94% failure rate jumped out at me — most teams underestimate how brittle these pipelines get in production.';
+    expect(sanitizeGeneratedComment(good)).toBe(good);
   });
 });

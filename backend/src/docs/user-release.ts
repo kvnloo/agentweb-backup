@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-05-30
+// Last updated: 2026-06-03
 
 export interface UserReleaseNote {
   date: string;
@@ -9,11 +9,278 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-06-03',
+    changes: [
+      'Fixed: Large Facebook/Meta Ad Images Upload Instead of Failing',
+      '- High-resolution creatives (for example 4096×4096 renders) were rejected by Meta with an unhelpful "Invalid parameter" error, blocking bulk ad creation',
+      '- We now automatically scale oversized images down to a size Meta accepts (preserving the aspect ratio, and keeping logos crisp) before uploading, so you no longer have to manually resize and re-upload them',
+      '- If an upload still fails, we now show Meta\'s actual reason instead of a generic error, so it\'s clear what to fix',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
+      'Improved: Auto-Drafted LinkedIn Follow-Up Messages Are More Personal',
+      '- When a lead accepts your connection request, the follow-up message we pre-draft for you now reflects your brand voice and your offer, instead of reading like generic filler',
+      '- The draft also takes prior emails and LinkedIn messages into account: if the lead already replied to you, it picks up that thread rather than re-introducing yourself',
+      '- The wording now matches the quality of the connection-invite notes — leading with something specific to the person and avoiding corporate buzzwords',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
+      'Fixed: CRM No Longer Offers "Send LinkedIn Invite" for People You\'re Already Connected To',
+      '- Some LinkedIn accounts only had a partial list of their connections cached, so leads you connected with a while ago still showed a "Send LinkedIn Invite" button — which then failed with "already connected"',
+      '- We now do a one-time full backfill of every connection for these accounts, so existing connections are correctly recognised',
+      '- As an extra safeguard, if a send attempt discovers you\'re already connected, that connection is added to the cache immediately so the button disappears right away',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
+      'Fixed: "LinkedIn Invitation Accepted" Email Notifications Are Sending Again (and No Longer Over-Send)',
+      '- These notifications had stopped firing because an accepted connection\'s profile URL never matched the stored lead, so no email went out',
+      '- The alert now fires only when the lead\'s list has a LinkedIn sender assigned and the invitation was accepted on that exact sender account',
+      '- Connecting a LinkedIn account no longer triggers a flood of "accepted" emails for connections you made long ago — the one-time backfill of your existing connections now runs silently',
+      '- These acceptance alerts are now email-only — they no longer post to Slack',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
+      'Fixed: LinkedIn Invite Status Updates Instantly Without a Page Reload',
+      '- After sending a LinkedIn connection invite from a lead, the lead\'s row didn\'t show the "invitation pending" marker until you reloaded the page',
+      '- The pending status now appears immediately on the lead row the moment the invite is sent',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
+      'Fixed: Analytics Tracking on the hireemma.ai Site',
+      '- Event tracking calls from the hireemma.ai website were being blocked by the browser because the domain was not on the API\'s allowed list',
+      '- hireemma.ai is now allowed, so its analytics events are recorded successfully instead of failing in the browser',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
+      'Fixed: Emma Can Edit Every Page of a Multi-Page Landing Site Again',
+      '- When a site has several pages that share one project, Emma could refuse to edit a page other than the one you opened — even one she had just edited moments earlier in the same chat',
+      '- Emma can now edit any page or shared file within the same site/project, so cross-page tweaks (like aligning a form on another page) go through reliably',
+      '- She still makes only the change you asked for and won\'t touch unrelated pages or copy on her own',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
+      'Fixed: Facebook/Meta Ad Images No Longer Get Swapped or Duplicated',
+      '- When uploading several ad images at once, distinct images could come back sharing the same image ID, so an ad could end up showing the wrong picture',
+      '- Each uploaded image now reliably returns its own correct ID, so the right creative is matched to the right ad',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'Fixed: Editing One Landing Page No Longer Changes Your Other Pages',
+      '- When you asked Emma to update a single landing page, she could occasionally edit files belonging to your other pages that share the same site, causing unintended changes',
+      '- Edits are now confined to the page you asked about: a single page can only touch its own files, and edits to other pages\' sections are rejected',
+      '- Emma also stays focused on exactly what you asked for and won\'t relabel or rewrite copy you didn\'t mention',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'Fixed: New Landing Pages No Longer Get Marked "Live" While Showing a 404',
+      '- When adding an extra page to an existing site, the page could be reported as deployed even though its build never went live, so visiting the link returned a "page not found" error',
+      '- We now confirm the deployment for the exact version we just published is the one that goes live before marking the page deployed — a stale, earlier build is never mistaken for success',
+      '- If that build does not come up in time, the page is now clearly marked failed (so you can retry) instead of silently showing a broken link',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'New: Mark a LinkedIn Account as Premium for Longer Connection Notes',
+      '- LinkedIn limits connection-invite notes to 200 characters on free accounts and 300 on Premium; invite notes now default to a 200-character limit so they\'re never silently rejected',
+      '- In Settings → Connected accounts, you can mark a LinkedIn Outreach account as Premium (or back to Free) from its menu — Premium accounts show a Premium badge and allow notes up to 300 characters',
+      '- The CRM compose panel\'s character counter, the "Send LinkedIn Invite" button, and the AI note drafting all follow the connected account\'s actual limit',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'Improved: AI-Drafted LinkedIn Invite Notes Are Saved Automatically',
+      '- When you generate or redraft a connection-invite note with AI, it\'s now saved to the lead automatically — it no longer disappears if you navigate away before clicking Save',
+      '- If you edit the note yourself, click Save draft to keep your changes, as before',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'Fixed: LinkedIn Sync and Invites Require a Connected LinkedIn Account',
+      '- Syncing LinkedIn messages and sending a LinkedIn connection invite now require a LinkedIn Outreach account that you\'ve connected (or one assigned to the list)',
+      '- Previously these could run without a sender configured; if no LinkedIn account is connected, you\'ll now see a clear prompt to connect one in Settings first',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'Fixed: Landing Page Generation No Longer Fails on Temporary v0 Outages',
+      '- A temporary error from the page-generation service (HTTP 500) would immediately fail the whole request, leaving a dead "failed" page and forcing you to start over; these transient errors (and rate limits) are now retried automatically with backoff',
+      '- Retrying a generation that failed before any content was created now reuses the existing failed page record instead of leaving behind a pile of orphaned empty pages',
+      '- Any leftover empty "failed" pages from earlier retries are now cleaned up automatically on your next generation, so your landing pages list stays tidy after an outage',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'Fixed: HubSpot Sync Now Reliably Pushes Leads (Including Notes) and Auto-Syncs New Ones',
+      '- Lists whose mapping included a "Notes" field could fail to push every contact ("Property \\"notes\\" does not exist"); the missing field is now created automatically before syncing, regardless of how it was mapped',
+      '- New and edited leads added to a synced list now push to HubSpot automatically by default — previously auto-sync could be left off after setup, so new leads silently never appeared in HubSpot',
+      '- Saving a connection without a pasted access token is now blocked with a clear prompt, instead of saving an unusable configuration that you had to set up a second time',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'Fixed: Shared Plan Links No Longer Get Stuck on a Login Page',
+      '- Opening a shared plan link for a plan that requires sign-in sent recipients to the login screen and dropped the share access, so the link looked broken',
+      '- Shared plan links now open the conversation directly using the link itself as the access pass — no forced login for the people you share with',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'Fixed: Automated LinkedIn Engagement Comments Now Read Like a Real Person',
+      '- Comments and replies are no longer occasionally posted as the assistant\'s own filler (for example "Please provide the post content so I can tailor a response") — these are now detected and skipped instead of published',
+      '- Removed the repetitive, jargon-heavy phrasing that made many comments sound templated (e.g. always opening the same way or stacking corporate buzzwords)',
+      '- When a quality comment can\'t be generated for a given post, the system now skips commenting rather than posting a generic, bot-like line; likes and reactions still go through',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'Fixed: Shared Landing Pages No Longer Show a Broken (404) Link for Team Members',
+      '- When a landing page\'s subdomain was changed, team members viewing the shared page could still see the old address, which led to a "page not found" error',
+      '- Landing page links now always resolve to the subdomain currently connected to the site, for the page owner and every team member alike',
+      '- This corrects stale managed (agentwebforms.com) addresses automatically; your own custom domains are left exactly as configured',
+    ],
+  },
+  {
+    date: '2026-06-01',
+    changes: [
+      'Fixed: Landing Page Edits With Emma No Longer Time Out',
+      '- Asking Emma to update a landing page (change text, colors, sections, etc.) could time out before finishing, leaving no preview and no changes',
+      '- Edits now stream as they\'re produced, so larger multi-change requests complete reliably and return a staging preview link',
+      '- If a request does stall, Emma now tells you it timed out instead of failing silently',
+    ],
+  },
+  {
+    date: '2026-06-01',
+    changes: [
+      'Improved: Emma Can Now Visually Check Your Landing Page While Editing It',
+      '- When Emma edits a landing page, she can now actually see a screenshot of the rendered result instead of editing blind',
+      '- This lets her catch visual issues (layout, spacing, colors) before handing the preview back to you',
+      '- Previously the screenshot step did nothing useful, so visual problems could slip through',
+    ],
+  },
+  {
+    date: '2026-06-01',
+    changes: [
+      'Fixed: Exported PDFs No Longer Overlap or Overwrite Sections',
+      '- Converting a rich report (with section cards and tables) to PDF now keeps every section readable instead of letting tall sections overflow onto the next one',
+      '- Long tables now break cleanly across pages, with rows kept intact and headings staying attached to the content below them',
+      '- This applies to both the in-chat "convert to PDF" action and the Export to PDF option',
+    ],
+  },
+  {
+    date: '2026-06-01',
+    changes: [
+      'New: Emma Can Draft a One-Off Newsletter Email Without a Saved Template',
+      '- You can now ask Emma to build a newsletter or marketing email and she will produce a finished, ready-to-send HTML email directly — no need to first create a saved template',
+      '- These emails are built to display correctly across email clients (Gmail, Outlook, Apple Mail)',
+      'Fixed: Drafting an HTML Email No Longer Adds an Unwanted Saved Template',
+      '- When you asked Emma to build or draft a one-off HTML email or newsletter, she sometimes created a reusable saved template in your Templates library instead of just giving you the email',
+      '- Emma now produces a standalone HTML email/newsletter for these requests, and only adds something to your Templates library when you explicitly ask to save a reusable template',
+    ],
+  },
+  {
+    date: '2026-06-01',
+    changes: [
+      'Fixed: Older Agent Mode Chats No Longer Fail With an Unknown Error',
+      '- Some existing chats stopped responding with "an unknown error occurred while generating a response" after a recent model update renamed Claude Opus 4.8 behind the scenes',
+      '- These chats had the old model name saved on them, which was no longer recognized; the saved name is now matched to the current one automatically',
+      '- You can continue any affected conversation normally — no need to start a new chat or re-pick the model',
+    ],
+  },
+  {
+    date: '2026-06-01',
+    changes: [
+      'Fixed: Editing an Image Now Reflects Your Requested Changes',
+      '- When revising an existing image (e.g. updating text overlays) with the latest Gemini image models, the result sometimes came back nearly identical to the original, ignoring your instructions',
+      '- These models render a couple of quick draft versions before the finished image; we were occasionally saving an early draft instead of the final edited result',
+      '- Image edits now always return the final rendered image, so your requested changes show up',
+    ],
+  },
+  {
+    date: '2026-06-01',
+    changes: [
+      'Fixed: Sent LinkedIn Messages No Longer Appear Twice in a Lead\'s Activity',
+      '- A LinkedIn message you sent from the CRM was being recorded both at send time and again when the activity sync re-imported it from LinkedIn, so it showed (and counted) twice',
+      '- The activity timeline and message counts now de-duplicate these, showing each sent message once',
+    ],
+  },
+  {
+    date: '2026-05-31',
+    changes: [
+      'New: CRM Shows "Invitation Pending" for Leads You\'ve Already Invited on LinkedIn',
+      '- Leads with a sent-but-not-yet-accepted LinkedIn connection request now show an "Invitation pending" status (amber LinkedIn icon) and display when the invite was sent',
+      '- The "Send LinkedIn Invite" button is hidden for these leads so you don\'t accidentally invite the same person twice',
+      '- This works even for invitations you sent directly on LinkedIn (outside the CRM) — pending invites are synced from your connected account every few minutes',
+      '- Once a lead accepts, they automatically switch to "1st-degree connection" with the Send Message flow',
+    ],
+  },
+  {
+    date: '2026-05-31',
+    changes: [
+      'Fixed: Meta Ads Reporting Now Reliably Returns Your Campaign Metrics',
+      '- Emma can now read the exact Meta Ads metrics it pulls (spend, leads, conversions) directly, instead of occasionally losing them in an unreadable file',
+      '- This fixes intermittent failures of the daily Meta Ads campaign digest, including precise "yesterday" numbers and lead/registration counts',
+      '- Larger reports continue to work and remain fully accessible to Emma',
+    ],
+  },
+  {
     date: '2026-05-30',
     changes: [
+      'Fixed: CRM Now Detects All of Your Existing LinkedIn Connections',
+      '- The connection cache only kept the ~150 most recent connections, so leads you connected with long ago looked "not connected"',
+      '- This caused the CRM to offer "Send LinkedIn Invite" for people you are already connected to (which then failed as "already connected")',
+      '- New LinkedIn accounts now fully backfill all connections on first sync, and you can force a full refresh from a list',
       'Fixed: LinkedIn Invite & Message Actions Now Work on Teammates\' Shared CRM Lists',
       '- Org members opening a lead on a list owned by a teammate no longer see a "Lead list not found" error',
       '- Drafting an invite note, sending a LinkedIn invite or message, and syncing/checking connections now use the same org-aware access as the rest of the CRM',
+    ],
+  },
+  {
+    date: '2026-05-30',
+    changes: [
+      'Improved: Emma Recalls Relevant Saved Facts Regardless of Age',
+      '- Emma now surfaces the saved memories most relevant to your message, not just the 20 most recent',
+      '- Previously, once you had more than 20 saved facts, an older but relevant one could never be brought into the conversation',
+      '- Memories are matched by meaning, so a relevant detail from weeks ago shows up when it matters',
+    ],
+  },
+  {
+    date: '2026-05-30',
+    changes: [
+      'Fixed: Knowledge Base Search Returns a Focused Set of Results',
+      '- Knowledge base search now returns the number of results requested instead of several times more',
+      '- An empty or blank search no longer returns your entire knowledge base',
+      '- This keeps Emma\'s answers focused and faster by avoiding irrelevant extra content',
+    ],
+  },
+  {
+    date: '2026-05-30',
+    changes: [
       'Fixed: Generated Landing Pages with Hover Effects Now Build Reliably',
       '- Landing pages that use hover interactions (e.g. cards or buttons that respond to the mouse) no longer fail to publish',
       '- Previously these pages required a manual code fix after every generation before they could go live',
@@ -25,6 +292,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fixed: CRM Recovers Gracefully from a Deleted Lead List',
       '- If the lead list you have open was deleted (for example in another tab or by a re-import), clicking leads no longer shows repeated "Lead list not found" errors',
       '- The CRM now refreshes your lists and clears the stale selection automatically',
+    ],
+  },
+  {
+    date: '2026-05-29',
+    changes: [
+      'Improved: Admins Can Now Choose the LLM Model for Each Scoring Judge',
+      '- In the Admin → Scoring Judges tab, each judge (including the Default judge) now has an LLM Model dropdown so you can pick which model evaluates sessions',
+      '- Judges without an explicit model continue to use the standard fast scoring model (gemini-3.1-flash-lite)',
+      '- The scoring response budget was increased so reasoning ("thinking") models like gemini-3.5-flash return complete results instead of being truncated',
     ],
   },
   {

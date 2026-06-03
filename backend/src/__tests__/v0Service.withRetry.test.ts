@@ -125,4 +125,54 @@ describe("withRetry", () => {
     expect(result).toBe("ok");
     expect(fn).toHaveBeenCalledTimes(2);
   });
+
+  // The v0 SDK throws `Error("HTTP <status>: <body>")` on non-2xx responses.
+  // Transient 5xx/429 should be retried — this is the v0-outage symptom in the bug report.
+  it("SUCCESS: retries on v0 HTTP 500 and recovers", async () => {
+    const fn = jest.fn()
+      .mockRejectedValueOnce(new Error('HTTP 500: {"error":{"code":"500","message":"Internal Server Error"}}'))
+      .mockResolvedValueOnce("recovered");
+
+    const result = await withRetry(fn, "v0 chat creation", 3, FAST);
+    expect(result).toBe("recovered");
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  it("SUCCESS: retries on HTTP 503 and 502", async () => {
+    const fn = jest.fn()
+      .mockRejectedValueOnce(new Error("HTTP 503: Service Unavailable"))
+      .mockRejectedValueOnce(new Error("HTTP 502: Bad Gateway"))
+      .mockResolvedValueOnce("ok");
+
+    const result = await withRetry(fn, "test-op", 3, FAST);
+    expect(result).toBe("ok");
+    expect(fn).toHaveBeenCalledTimes(3);
+  });
+
+  it("SUCCESS: retries on HTTP 429 rate limit", async () => {
+    const fn = jest.fn()
+      .mockRejectedValueOnce(new Error("HTTP 429: Too Many Requests"))
+      .mockResolvedValueOnce("ok");
+
+    const result = await withRetry(fn, "test-op", 3, FAST);
+    expect(result).toBe("ok");
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  it("FAIL: exhausts retries on persistent HTTP 500", async () => {
+    const err = new Error('HTTP 500: {"error":{"code":"500","message":"Internal Server Error"}}');
+    const fn = jest.fn()
+      .mockRejectedValueOnce(err)
+      .mockRejectedValueOnce(err)
+      .mockRejectedValueOnce(err);
+
+    await expect(withRetry(fn, "v0 chat creation", 3, FAST)).rejects.toThrow("HTTP 500");
+    expect(fn).toHaveBeenCalledTimes(3);
+  });
+
+  it("FAIL: does NOT retry on HTTP 4xx client errors (e.g. 400, 401, 404)", async () => {
+    const fn = jest.fn().mockRejectedValueOnce(new Error("HTTP 400: Bad Request"));
+    await expect(withRetry(fn, "test-op", 3, FAST)).rejects.toThrow("HTTP 400");
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
 });

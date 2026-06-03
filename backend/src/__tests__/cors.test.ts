@@ -152,6 +152,33 @@ describe('CORS Access-Control-Allow-Methods', () => {
     expect(res.headers['access-control-allow-credentials']).toBe('true');
   });
 
+  it('should allow the hireemma.ai apex origin', async () => {
+    const res = await request(app)
+      .options('/api/loop-events')
+      .set('Origin', 'https://hireemma.ai')
+      .set('Access-Control-Request-Method', 'POST');
+
+    expect(res.headers['access-control-allow-origin']).toBe('https://hireemma.ai');
+  });
+
+  it('should allow the www.hireemma.ai origin', async () => {
+    const res = await request(app)
+      .options('/api/loop-events')
+      .set('Origin', 'https://www.hireemma.ai')
+      .set('Access-Control-Request-Method', 'POST');
+
+    expect(res.headers['access-control-allow-origin']).toBe('https://www.hireemma.ai');
+  });
+
+  it('should reject a non-whitelisted external origin on loop-events', async () => {
+    const res = await request(app)
+      .options('/api/loop-events')
+      .set('Origin', 'https://evil.example.com')
+      .set('Access-Control-Request-Method', 'POST');
+
+    expect(res.headers['access-control-allow-origin']).toBeUndefined();
+  });
+
   it('public endpoints should only advertise GET, POST, OPTIONS methods', async () => {
     const res = await request(app)
       .options('/api/lead-magnet/test')

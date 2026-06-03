@@ -411,14 +411,19 @@ describe('MetaService', () => {
     });
 
     describe('Upload Operations', () => {
-        it('should upload an image', async () => {
-            const mockImageData = { hash: 'image_hash_123' };
+        it('should upload an image and unwrap Meta\'s filename-keyed images map', async () => {
+            // Meta's /adimages endpoint returns the result keyed by the uploaded filename.
+            const filename = 'test-image.jpg';
+            const mockImageData = {
+                images: {
+                    [filename]: { hash: 'image_hash_123', url: 'https://scontent.example/img.jpg' },
+                },
+            };
             const mockCreateAdImage = jest.fn().mockResolvedValue({ _data: mockImageData });
             (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
                 createAdImage: mockCreateAdImage,
             }));
 
-            const filename = 'test-image.jpg';
             const fileBuffer = Buffer.from('test image data');
 
             const result = await service.uploadImage(mockAdAccountId, mockAccessToken, filename, fileBuffer);
@@ -428,7 +433,41 @@ describe('MetaService', () => {
                 filename: filename,
                 bytes: fileBuffer.toString('base64'),
             });
-            expect(result).toEqual(mockImageData);
+            // The flat { hash, url } entry must be unwrapped from the images map.
+            expect(result).toEqual({ hash: 'image_hash_123', url: 'https://scontent.example/img.jpg' });
+        });
+
+        it('should return distinct hashes for distinct images keyed by different filenames', async () => {
+            const calls = [
+                { filename: 'creative-A.png', hash: 'hash_A' },
+                { filename: 'creative-B.png', hash: 'hash_B' },
+            ];
+            const mockCreateAdImage = jest.fn()
+                .mockResolvedValueOnce({ _data: { images: { 'creative-A.png': { hash: 'hash_A' } } } })
+                .mockResolvedValueOnce({ _data: { images: { 'creative-B.png': { hash: 'hash_B' } } } });
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                createAdImage: mockCreateAdImage,
+            }));
+
+            const buf = Buffer.from('x');
+            const results = [];
+            for (const c of calls) {
+                results.push(await service.uploadImage(mockAdAccountId, mockAccessToken, c.filename, buf));
+            }
+
+            expect(results[0]).toEqual({ hash: 'hash_A' });
+            expect(results[1]).toEqual({ hash: 'hash_B' });
+        });
+
+        it('should fall back to flat _data when no images map is present', async () => {
+            const mockCreateAdImage = jest.fn().mockResolvedValue({ _data: { hash: 'flat_hash' } });
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                createAdImage: mockCreateAdImage,
+            }));
+
+            const result = await service.uploadImage(mockAdAccountId, mockAccessToken, 'f.jpg', Buffer.from('x'));
+
+            expect(result).toEqual({ hash: 'flat_hash' });
         });
 
         it('should upload a video', async () => {

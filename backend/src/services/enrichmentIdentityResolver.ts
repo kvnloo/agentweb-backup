@@ -27,12 +27,14 @@ export interface ApolloPersonResult {
   city?: string;
   state?: string;
   country?: string;
+  fromCache?: boolean;
 }
 
 export interface EnrichSoReverseResult {
   firstName?: string;
   lastName?: string;
   company?: string;
+  fromCache?: boolean;
 }
 
 /**
@@ -142,7 +144,7 @@ export type ResolveIdentityResult =
   | { ok: true; resolved: Partial<LeadRecord> & { emailDomain?: string }; siblings: SiblingLeadResult[]; emailPattern?: string }
   | { ok: false; reason: 'no_identity_signal' | 'identity_unresolvable' };
 
-function makeApiMeta(provider: IdentityProvider, field?: string): EnrichedFieldMeta {
+function makeApiMeta(provider: IdentityProvider, field?: string, fromCache?: boolean): EnrichedFieldMeta {
   // Per-field confidence: apollo / enrich.so use the registry (so e.g.
   // enrich.so firstName='high' but company='medium'); unipile and pattern have
   // no registry entry and default to 'medium'. A missing field name also
@@ -156,6 +158,7 @@ function makeApiMeta(provider: IdentityProvider, field?: string): EnrichedFieldM
     provider,
     confidence,
     enrichedAt: new Date().toISOString(),
+    fromCache,
   };
 }
 
@@ -352,7 +355,7 @@ export async function resolveIdentity(
       const foundLinkedin = await deps.findLinkedInUrl({ firstName, lastName, company });
       if (foundLinkedin) {
         resolved.linkedin = foundLinkedin;
-        meta.linkedin = makeApiMeta('unipile', 'linkedin');
+        meta.linkedin = makeApiMeta('unipile', 'linkedin', false);
       }
     } catch (err) {
       console.warn(`${logTag} step 2 findLinkedInUrl failed:`, (err as Error).message);
@@ -400,7 +403,7 @@ export async function resolveIdentity(
           email = apolloResult.email;
           resolved.email = apolloResult.email;
           meta.email = {
-            ...makeApiMeta('apollo', 'email'),
+            ...makeApiMeta('apollo', 'email', apolloResult.fromCache),
             confidence: apolloEmailStatusToConfidence(apolloResult.emailStatus ?? ''),
           };
           emailTrusted = true;
@@ -414,29 +417,29 @@ export async function resolveIdentity(
         if (matchConfident) {
           if (apolloResult.firstName && !lead.firstName && !resolved.firstName) {
             resolved.firstName = apolloResult.firstName;
-            meta.firstName = makeApiMeta('apollo', 'firstName');
+            meta.firstName = makeApiMeta('apollo', 'firstName', apolloResult.fromCache);
           }
           if (apolloResult.lastName && !lead.lastName && !resolved.lastName) {
             resolved.lastName = apolloResult.lastName;
-            meta.lastName = makeApiMeta('apollo', 'lastName');
+            meta.lastName = makeApiMeta('apollo', 'lastName', apolloResult.fromCache);
           }
           if (apolloResult.title && !lead.title && !resolved.title) {
             resolved.title = apolloResult.title;
-            meta.title = makeApiMeta('apollo', 'title');
+            meta.title = makeApiMeta('apollo', 'title', apolloResult.fromCache);
           }
           if (apolloResult.linkedin && !lead.linkedin && !resolved.linkedin) {
             resolved.linkedin = apolloResult.linkedin;
-            meta.linkedin = makeApiMeta('apollo', 'linkedin');
+            meta.linkedin = makeApiMeta('apollo', 'linkedin', apolloResult.fromCache);
           }
           if (apolloResult.company && !lead.company) {
             // Apollo wins over Tier 0.5 LLM company — only guard against
             // overwriting what the user explicitly imported on the lead.
             resolved.company = apolloResult.company;
-            meta.company = makeApiMeta('apollo', 'company');
+            meta.company = makeApiMeta('apollo', 'company', apolloResult.fromCache);
           }
           if (apolloResult.website && !lead.website && !resolved.website) {
             resolved.website = apolloResult.website;
-            meta.website = makeApiMeta('apollo', 'website');
+            meta.website = makeApiMeta('apollo', 'website', apolloResult.fromCache);
           }
         }
       }
@@ -465,14 +468,14 @@ export async function resolveIdentity(
       if (found?.email) {
         email = found.email;
         resolved.email = found.email;
-        meta.email = makeApiMeta('enrich.so', 'email');
+        meta.email = makeApiMeta('enrich.so', 'email', false);
         // Chain: reverse-lookup on the resolved email fills company.
         // Names are already known (gate ensures firstName+lastName present).
         try {
           const enrichSo = await deps.enrichSoReverseLookup({ email });
           if (enrichSo?.company && !lead.company && !resolved.company) {
             resolved.company = enrichSo.company;
-            meta.company = makeApiMeta('enrich.so', 'company');
+            meta.company = makeApiMeta('enrich.so', 'company', enrichSo.fromCache);
           }
         } catch (err) {
           console.warn(`${logTag} step 5.5 enrichSoReverseLookup chain failed:`, (err as Error).message);
@@ -514,7 +517,7 @@ export async function resolveIdentity(
         email = brokerResult.email;
         resolved.email = brokerResult.email;
         meta.email = {
-          ...makeApiMeta('apollo', 'email'),
+          ...makeApiMeta('apollo', 'email', false),
           confidence: apolloEmailStatusToConfidence(brokerResult.emailStatus ?? ''),
         };
       }
@@ -574,15 +577,15 @@ export async function resolveIdentity(
         if (enrichSo) {
           if (enrichSo.company) {
             resolved.company = enrichSo.company;
-            meta.company = makeApiMeta('enrich.so', 'company');
+            meta.company = makeApiMeta('enrich.so', 'company', enrichSo.fromCache);
           }
           if (enrichSo.firstName && !lead.firstName && !resolved.firstName) {
             resolved.firstName = enrichSo.firstName;
-            meta.firstName = makeApiMeta('enrich.so', 'firstName');
+            meta.firstName = makeApiMeta('enrich.so', 'firstName', enrichSo.fromCache);
           }
           if (enrichSo.lastName && !lead.lastName && !resolved.lastName) {
             resolved.lastName = enrichSo.lastName;
-            meta.lastName = makeApiMeta('enrich.so', 'lastName');
+            meta.lastName = makeApiMeta('enrich.so', 'lastName', enrichSo.fromCache);
           }
         }
       } catch (err) {

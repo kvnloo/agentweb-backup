@@ -695,28 +695,15 @@ function formatUsageLine(data) {
 }
 
 const SESSION_ID_FILE = "/home/ec2-user/agentweb/.claude-session-id";
-const VERTEX_SA_PATH = "/tmp/vertex-sa.json";
 
-// Vertex AI env vars for child Claude processes — populated at startup
+// Env overrides for child Claude processes — populated at startup
 let claudeEnvOverrides = {};
 
 async function initClaudeEnv() {
-  try {
-    const saJson = await getCachedSecret("agentweb/test-env/vertex-sa");
-    if (saJson) {
-      fs.writeFileSync(VERTEX_SA_PATH, saJson, { mode: 0o600 });
-      claudeEnvOverrides = {
-        CLAUDE_CODE_USE_VERTEX: "1",
-        ANTHROPIC_VERTEX_PROJECT_ID: "gen-lang-client-0725723168",
-        CLOUD_ML_REGION: "global",
-        GOOGLE_APPLICATION_CREDENTIALS: VERTEX_SA_PATH,
-        CLAUDE_CODE_USE_BEDROCK: "",  // unset Bedrock
-      };
-      console.log("[claude-env] Vertex AI configured (claude-opus-4-8)");
-    }
-  } catch (err) {
-    console.warn("[claude-env] Could not load Vertex SA — falling back to Bedrock:", err.message);
-  }
+  // Opus 4.8 runs via AWS Bedrock. The Bedrock env (CLAUDE_CODE_USE_BEDROCK=1,
+  // AWS_BEARER_TOKEN_BEDROCK) is exported from ~/.bashrc and inherited by child
+  // Claude processes, so no overrides are needed here.
+  claudeEnvOverrides = {};
 }
 
 function runClaude(prompt) {
@@ -729,16 +716,11 @@ function runClaude(prompt) {
       const sessionId = fs.readFileSync(SESSION_ID_FILE, "utf-8").trim();
       if (sessionId) resumeFlag = `--resume ${sessionId}`;
     } catch {}
-    const isVertex = !!claudeEnvOverrides.CLAUDE_CODE_USE_VERTEX;
-    const model = isVertex ? "claude-opus-4-8" : "us.anthropic.claude-sonnet-4-6";
+    const model = "us.anthropic.claude-opus-4-8";
     const childEnv = { ...process.env, HOME: "/home/ec2-user", ...claudeEnvOverrides };
-    delete childEnv.CLAUDE_CODE_USE_BEDROCK; // ensure unset when using Vertex
-    // The login shell (-lc) re-sources ~/.bashrc, which exports CLAUDE_CODE_USE_BEDROCK=1
-    // and AWS_BEARER_TOKEN_BEDROCK, overriding childEnv. Re-assert Vertex inline (runs after
-    // bashrc) so claude-opus-4-8 routes to Vertex instead of Bedrock (where the id is invalid).
-    const envFix = isVertex
-      ? `unset CLAUDE_CODE_USE_BEDROCK AWS_BEARER_TOKEN_BEDROCK; export CLAUDE_CODE_USE_VERTEX=1 ANTHROPIC_VERTEX_PROJECT_ID=gen-lang-client-0725723168 CLOUD_ML_REGION=global GOOGLE_APPLICATION_CREDENTIALS=${VERTEX_SA_PATH}; `
-      : "";
+    // Bedrock config (CLAUDE_CODE_USE_BEDROCK=1, AWS_BEARER_TOKEN_BEDROCK) comes from
+    // ~/.bashrc via the login shell (-lc), so no inline env override is needed.
+    const envFix = "";
     const child = spawn(
       "bash",
       ["-lc", `cd /home/ec2-user/agentweb && ${envFix}claude ${resumeFlag} --model ${model} --permission-mode bypassPermissions --output-format json -p '${escaped}'`],

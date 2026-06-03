@@ -1926,6 +1926,8 @@ const createEnrichmentHistoryTable = async () => {
       { AttributeName: 'leadId', AttributeType: 'S' },
       { AttributeName: 'listId', AttributeType: 'S' },
       { AttributeName: 'createdAt', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'jobType', AttributeType: 'S' },
     ],
     KeySchema: [
       { AttributeName: 'jobId', KeyType: 'HASH' },
@@ -1936,6 +1938,22 @@ const createEnrichmentHistoryTable = async () => {
         IndexName: 'listId-createdAt-index',
         KeySchema: [
           { AttributeName: 'listId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        IndexName: 'userId-createdAt-index',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        IndexName: 'jobType-createdAt-index',
+        KeySchema: [
+          { AttributeName: 'jobType', KeyType: 'HASH' },
           { AttributeName: 'createdAt', KeyType: 'RANGE' },
         ],
         Projection: { ProjectionType: 'ALL' },
@@ -2042,6 +2060,7 @@ const main = async () => {
     await createDripSequencesTable();
     await createSequenceEnrollmentsTable();
     await createUnipileConnectionsTable();
+    await createUnipileSentInvitationsTable();
     await createDripCampaignsTable();
     await createDripSendsTable();
     await createEnrichmentHistoryTable();
@@ -2513,6 +2532,42 @@ const createUnipileConnectionsTable = async () => {
     KeySchema: [
       { AttributeName: 'accountId', KeyType: 'HASH' },
       { AttributeName: 'memberId', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'publicProfileUrl-index',
+        KeySchema: [
+          { AttributeName: 'publicProfileUrl', KeyType: 'HASH' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+const createUnipileSentInvitationsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-UnipileSentInvitations`,
+    AttributeDefinitions: [
+      { AttributeName: 'accountId', AttributeType: 'S' },
+      { AttributeName: 'invitedUserPublicId', AttributeType: 'S' },
+      { AttributeName: 'publicProfileUrl', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'accountId', KeyType: 'HASH' },
+      { AttributeName: 'invitedUserPublicId', KeyType: 'RANGE' },
     ],
     GlobalSecondaryIndexes: [
       {

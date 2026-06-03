@@ -12,8 +12,26 @@ import Anthropic from '@anthropic-ai/sdk';
 import { mcpFetch } from '../mcp/server/httpClient';
 import { agentModeService } from './agentModeService';
 import { getSecret } from '../utils/secretsManager';
+import { getLandingPageById, getLandingPagesByOwner, GeneratedLandingPage } from './v0Service';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
+
+/**
+ * The repo a coding-agent run edits. Many landing pages share ONE GitHub repo —
+ * each page is an `app/<slug>/` route directory (plus the root page, which owns
+ * the top-level `app/` files). A run keyed on one pageId may be just one route of
+ * such a multi-route project, and the file API is already confined to that one
+ * repo, so the whole repo is editable. The safety guard `isSafeRepoPath` only
+ * blocks paths that escape the repo.
+ */
+export interface PageScope {
+  /** The GitHub repo this run edits. The coding agent's file API is already
+   * confined to this one repo, so the editable boundary is the whole repo. */
+  repoUrl: string;
+  /** Slugs of all route directories (app/<slug>/) in this repo — informational,
+   * surfaced to the agent so it knows which sibling routes share the project. */
+  routeSlugs: string[];
+}
 
 export interface CodingAgentContext {
   pageId: string;
@@ -22,8 +40,18 @@ export interface CodingAgentContext {
   llmModel: string;
   /** Draft branch name for staging edits (e.g. "draft/abc12345"). If unset, edits go to main. */
   draftBranch?: string;
+  /**
+   * Editable file boundary for this run. Resolved from the page record before the
+   * agent loop starts. When unset (e.g. resolution failed), edits are unrestricted —
+   * the agent falls back to its prior behavior rather than blocking all work.
+   */
+  scope?: PageScope;
   socketEmit?: (room: string, event: string, payload: any) => void;
   executeMcpTool?: (toolName: string, args: any) => Promise<any>;
+  /** Optional per-turn token-usage callback. Invoked once per LLM response with
+   * that turn's usage. Used by the eval harness to measure real cost through the
+   * production path; unset in normal operation (no behavior change). */
+  onUsage?: (usage: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }) => void;
 }
 
 interface SearchReplaceEdit {
@@ -44,9 +72,28 @@ interface ApplyResult {
   errors: string[];
 }
 
+/**
+ * Structured result for tools that produce an image (e.g. take_screenshot).
+ * The agent loop renders this as an Anthropic image content block so the model
+ * can visually analyze the screenshot, rather than receiving an opaque string.
+ */
+interface ToolImageResult {
+  kind: 'image';
+  mediaType: string;
+  data: string; // base64-encoded image
+}
+
+function isToolImageResult(r: unknown): r is ToolImageResult {
+  return typeof r === 'object' && r !== null && (r as any).kind === 'image';
+}
+
 const DEFAULT_MAX_ITERATIONS = 50;
 const DEFAULT_CODING_AGENT_MODEL = 'anthropic.claude-sonnet-4-6'; // Fallback if settings fetch fails
-const AGENT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes max for the entire agent run
+// Hard backstop for the entire agent run. Must comfortably fit several LLM turns:
+// each turn can legitimately take a few minutes on a slow model (e.g. Opus), and a
+// real edit needs ~8-12 turns (read → search → edit → check_deployment → fix). A
+// tight budget here is what silently killed broad edits before they could finish.
+const AGENT_TIMEOUT_MS = 20 * 60 * 1000; // 20 minutes max for the entire agent run
 const MAX_TOOL_RESULT_CHARS = 30000; // Truncate tool results to prevent context bloat
 const MAX_RETRIES = 2;
 
@@ -91,6 +138,82 @@ The tool will create the file if it doesn't exist. No need to read it first.
 - For the user's own brand logo: the task_description will include the logo URL (from brand guidelines or an S3 link). Use that URL directly in the img tag.
 
 Skip steps that aren't needed. For a simple text change, you might just: read the file, edit it, check deployment, and report. Use your judgment.`;
+
+// ─── Page Scope ───────────────────────────────────────────────────────────────
+// Many landing pages live in ONE shared GitHub repo: a root page owns the
+// top-level app/ files (app/page.tsx, app/layout.tsx, components/, …) and every
+// other page is an app/<slug>/ route. A run is keyed on one pageId, but that
+// pageId may be just one route of a larger multi-route project — and the coding
+// agent's file API is ALREADY physically confined to that one repo. So the
+// editable boundary is the WHOLE repo: a run may freely edit any route directory
+// or shared file in its own project. The only writes rejected are unsafe paths
+// that escape the repo. (We keep soft "make only the change asked for" guidance
+// in the prompt to discourage over-reach without hard-blocking sibling routes.)
+
+/** Strip a leading "./" or "/" and collapse backslashes so comparisons are stable. */
+function normalizeRepoPath(filePath: string): string {
+  return (filePath || '')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+    .replace(/^\/+/, '');
+}
+
+/**
+ * Build the editable boundary for `page` given all of the owner's pages. The
+ * boundary is the page's repo; route slugs are collected from the OTHER pages
+ * that share the same githubRepoUrl (purely informational for the prompt).
+ */
+export function resolvePageScope(
+  page: Pick<GeneratedLandingPage, 'id' | 'slug' | 'githubRepoUrl'>,
+  repoPages: Pick<GeneratedLandingPage, 'id' | 'slug' | 'githubRepoUrl'>[]
+): PageScope {
+  const repoUrl = (page.githubRepoUrl || '').trim();
+  const routeSlugs = Array.from(
+    new Set(
+      repoPages
+        // Only pages in the SAME repo are routes of this project. The owner may
+        // have other landing pages in entirely separate repos — those are not
+        // reachable here and must not be counted.
+        .filter((p) => (p.githubRepoUrl || '').trim() === repoUrl && !!p.slug)
+        .map((p) => (p.slug as string).trim())
+        .filter((s) => s !== '')
+    )
+  );
+  return { repoUrl, routeSlugs };
+}
+
+/**
+ * True if `filePath` is a safe, repo-relative path the agent may write. Repo-wide
+ * scope means any in-repo file is editable; we only reject paths that escape the
+ * repo (empty, absolute, or parent-traversal). Scope-agnostic by design.
+ */
+export function isSafeRepoPath(filePath: string): boolean {
+  const path = normalizeRepoPath(filePath);
+  if (!path) return false;
+  // Reject any parent-traversal segment — it could climb out of the repo root.
+  if (path === '..' || path.startsWith('../') || path.includes('/../') || path.endsWith('/..')) {
+    return false;
+  }
+  return true;
+}
+
+/** The scope guidance appended to the system prompt for a scoped run. */
+export function buildScopeSystemClause(scope: PageScope): string {
+  const routes = scope.routeSlugs.length
+    ? scope.routeSlugs.map((s) => `\`app/${s}/\``).join(', ')
+    : '(this project has a single route)';
+  return `
+
+## Edit scope
+You are editing ONE GitHub repository (one Vercel project). This project may contain MULTIPLE page routes that all live in the same repo — its route directories are: ${routes}. You MAY edit any file in this repo, including any of those route directories and shared files (\`components/\`, \`app/layout.tsx\`, \`app/globals.css\`, etc.) when the task calls for it.
+Make ONLY the specific change the user asked for. Do not relabel copy, rename sections, or touch routes, components, or files unrelated to the request — even though you are permitted to.`;
+}
+
+/** Corrective message returned to the agent when it tries to write an unsafe path. */
+function scopeViolationMessage(filePath: string): string {
+  return `Refusing to edit "${filePath}": that path is outside the repository (it uses an absolute path or "../" traversal). Use a repo-relative path such as "app/<route>/page.tsx" or "components/...".`;
+}
 
 // ─── Search/Replace Engine ──────────────────────────────────────────────────
 
@@ -433,7 +556,7 @@ function getToolDefinitions(): Anthropic.Tool[] {
     },
     {
       name: 'take_screenshot',
-      description: 'Take a screenshot of the current browser page. Use after browse_page to capture a visual snapshot. Returns a description of the screenshot.',
+      description: 'Take a screenshot of the current browser page. Use after browse_page to capture a visual snapshot. The image is returned to you directly — actually look at it to verify visual correctness (layout, spacing, colors), do not assume the page is correct.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -454,10 +577,21 @@ async function executeTool(
   toolName: string,
   args: any,
   context: CodingAgentContext
-): Promise<string> {
+): Promise<string | ToolImageResult> {
   const basePath = `/api/landing-pages/v0/generated/${context.pageId}`;
   const branch = context.draftBranch || "main";
   const branchQuery: Record<string, string> = branch !== "main" ? { branch } : {};
+
+  // Safety guard: block writes whose path escapes the repo (absolute or "../"
+  // traversal). Edits across route directories within the SAME repo are allowed —
+  // many routes share one repo and are one project. Reads stay unrestricted.
+  if (
+    (toolName === 'edit_file' || toolName === 'revert_file') &&
+    args.file_path &&
+    !isSafeRepoPath(args.file_path)
+  ) {
+    return scopeViolationMessage(args.file_path);
+  }
 
   switch (toolName) {
     case 'list_files': {
@@ -756,7 +890,15 @@ async function executeTool(
         type: 'jpeg',
         fullPage: args.full_page || false
       });
-      return typeof result?.content === 'string' ? result.content : 'Screenshot taken successfully.';
+      // The Playwright MCP returns the image in result.raw.content as an image block.
+      // Surface it as a structured image result so the agent loop can feed the actual
+      // pixels back to the model — otherwise the model is blind to what it captured.
+      const imageContent = (result?.raw?.content as any[])?.find((c: any) => c?.type === 'image');
+      if (imageContent?.data) {
+        return { kind: 'image', mediaType: imageContent.mimeType || 'image/jpeg', data: imageContent.data };
+      }
+      // No image came back — fall back to whatever text the MCP provided.
+      return typeof result?.content === 'string' ? result.content : 'Screenshot taken, but no image data was returned.';
     }
 
     default:
@@ -837,12 +979,11 @@ export function _setBedrockClientForTest(client: AnthropicBedrock | null): void 
 }
 
 // ─── Vertex Client (native Anthropic format) ──────────────────────────────────
-// Claude models on Google Vertex AI (e.g. "claude-opus-4-8") are addressed by a
-// bare model id with NO "anthropic." prefix and are NOT available on Bedrock.
-// We hit the rawPredict endpoint directly, which speaks the native Anthropic
-// Messages format — the exact shape the coding agent already builds — so no
-// request/response conversion is needed (unlike agentModeService, which adapts
-// to/from OpenAI format).
+// Claude models on Google Vertex AI (e.g. "claude-sonnet-4-6") are addressed by a
+// bare model id with NO "anthropic." prefix. We hit the rawPredict endpoint
+// directly, which speaks the native Anthropic Messages format — the exact shape
+// the coding agent already builds — so no request/response conversion is needed
+// (unlike agentModeService, which adapts to/from OpenAI format).
 
 /** Minimal client surface the agent loop relies on — satisfied by both AnthropicBedrock and the Vertex wrapper. */
 interface AnthropicLikeClient {
@@ -895,6 +1036,18 @@ async function getVertexClient(): Promise<AnthropicLikeClient> {
               body: JSON.stringify(body),
               signal: controller.signal,
             });
+          } catch (err: any) {
+            // Surface a per-request timeout honestly rather than letting the bare
+            // AbortError bubble up as a generic (and unretried) failure.
+            if (err?.name === 'AbortError') {
+              const timeoutErr: any = new Error(
+                `Vertex AI request timed out after ${VERTEX_REQUEST_TIMEOUT_MS / 1000}s`
+              );
+              timeoutErr.status = 408;
+              timeoutErr.isTimeout = true;
+              throw timeoutErr;
+            }
+            throw err;
           } finally {
             clearTimeout(timeout);
           }
@@ -925,12 +1078,272 @@ export function _setVertexClientForTest(client: AnthropicLikeClient | null): voi
   vertexClientPromise = null;
 }
 
+// ─── Bedrock bearer-token client (Opus 4.8, native Anthropic format) ──────────
+// Opus 4.8 lives in a separate AWS account (231030591963) the app's default IAM
+// credentials can't reach, so it can't use the AnthropicBedrock SDK (SigV4). We
+// authenticate with a long-term Bedrock API key (bearer token) and hit the
+// invoke endpoint directly — it speaks native Anthropic Messages format, exactly
+// what the coding agent already builds.
+// App model id -> Bedrock invoke-endpoint profile id, for the models served from
+// the separate bearer-token account (231030591963).
+const BEARER_TOKEN_INVOKE_MODELS: Record<string, string> = {
+  'anthropic.claude-opus-4-8': 'us.anthropic.claude-opus-4-8',
+};
+
+// Idle (inter-chunk) timeout for the streaming bearer path. Because we stream,
+// we don't need a hard cap on total request duration — a long-but-progressing
+// generation is healthy. We only abort if the model goes silent for this long,
+// which is the real signature of a hung request. This is what makes the overall
+// AGENT_TIMEOUT_MS budget usable: slow turns finish instead of being guillotined.
+const BEARER_STREAM_IDLE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes of no stream activity
+
+/**
+ * Parse AWS `application/vnd.amazon.eventstream` framing out of a growing byte
+ * buffer. Each frame is: [totalLen:4][headersLen:4][preludeCRC:4][headers][payload][msgCRC:4],
+ * all big-endian. We only need string-valued headers (`:message-type`,
+ * `:event-type`, `:exception-type`), so header parsing handles the string type (7).
+ * Mutates `state.buf`, yielding one `{ headers, payload }` per complete frame.
+ * Exported for unit testing the binary parser without a live socket.
+ */
+export function* _parseEventStreamFrames(
+  state: { buf: Buffer },
+  chunk: Uint8Array
+): Generator<{ headers: Record<string, string>; payload: Buffer }> {
+  state.buf = state.buf.length ? Buffer.concat([state.buf, chunk]) : Buffer.from(chunk);
+  while (state.buf.length >= 12) {
+    const totalLen = state.buf.readUInt32BE(0);
+    if (totalLen < 16 || state.buf.length < totalLen) break; // incomplete frame — wait for more
+    const headersLen = state.buf.readUInt32BE(4);
+    const headers: Record<string, string> = {};
+    let o = 12;
+    const headersEnd = 12 + headersLen;
+    while (o < headersEnd) {
+      const nameLen = state.buf.readUInt8(o); o += 1;
+      const name = state.buf.toString('utf8', o, o + nameLen); o += nameLen;
+      const type = state.buf.readUInt8(o); o += 1;
+      if (type === 7) { // string header — the only type Bedrock emits for these events
+        const vl = state.buf.readUInt16BE(o); o += 2;
+        headers[name] = state.buf.toString('utf8', o, o + vl); o += vl;
+      } else {
+        break; // unexpected header type — stop parsing this frame's headers defensively
+      }
+    }
+    const payload = state.buf.subarray(headersEnd, totalLen - 4);
+    state.buf = state.buf.subarray(totalLen);
+    yield { headers, payload: Buffer.from(payload) };
+  }
+}
+
+/**
+ * Reconstruct a complete `Anthropic.Message` from a Bedrock streaming response
+ * body. Bedrock wraps each native Anthropic streaming event in an eventstream
+ * frame whose JSON payload has a base64 `bytes` field. We decode those into the
+ * standard event sequence (message_start → content_block_* → message_delta →
+ * message_stop) and fold them back into the same non-streaming Message shape the
+ * agent loop already consumes — so callers can't tell streaming was used.
+ *
+ * Resets `onActivity()` on every chunk so the caller can implement an idle timeout.
+ * Exported for unit testing the accumulator against synthetic frames.
+ */
+export async function _accumulateBedrockStream(
+  body: ReadableStream<Uint8Array>,
+  profileId: string,
+  onActivity: () => void
+): Promise<Anthropic.Message> {
+  const reader = body.getReader();
+  const state = { buf: Buffer.alloc(0) };
+  let message: any = null;
+  const jsonBufs: Record<number, string> = {};
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      onActivity();
+      if (!value) continue;
+      for (const frame of _parseEventStreamFrames(state, value)) {
+        const messageType = frame.headers[':message-type'];
+        let payload: any;
+        try {
+          payload = JSON.parse(frame.payload.toString('utf8'));
+        } catch {
+          continue; // non-JSON frame — ignore
+        }
+        // Error frames from Bedrock arrive as exceptions, not event chunks.
+        if (messageType === 'exception' || messageType === 'error' || frame.headers[':exception-type']) {
+          const err: any = new Error(
+            `Bedrock (${profileId}) stream error: ${frame.headers[':exception-type'] || ''} ${JSON.stringify(payload)}`.trim()
+          );
+          // Bedrock surfaces throttling as a stream exception; treat it as retryable.
+          err.status = /throttl|TooManyRequests|ServiceUnavailable/i.test(JSON.stringify(frame.headers) + JSON.stringify(payload)) ? 429 : 500;
+          throw err;
+        }
+        if (!payload.bytes) continue;
+        const event = JSON.parse(Buffer.from(payload.bytes, 'base64').toString('utf8'));
+        switch (event.type) {
+          case 'message_start':
+            message = { ...event.message, content: [] };
+            break;
+          case 'content_block_start':
+            if (message) { message.content[event.index] = { ...event.content_block }; jsonBufs[event.index] = ''; }
+            break;
+          case 'content_block_delta':
+            if (!message) break;
+            if (event.delta?.type === 'text_delta') {
+              message.content[event.index].text = (message.content[event.index].text || '') + event.delta.text;
+            } else if (event.delta?.type === 'input_json_delta') {
+              jsonBufs[event.index] = (jsonBufs[event.index] || '') + event.delta.partial_json;
+            }
+            break;
+          case 'content_block_stop':
+            if (message?.content[event.index]?.type === 'tool_use') {
+              const raw = jsonBufs[event.index];
+              message.content[event.index].input = raw ? JSON.parse(raw) : {};
+            }
+            break;
+          case 'message_delta':
+            if (!message) break;
+            if (event.delta?.stop_reason) message.stop_reason = event.delta.stop_reason;
+            if (event.delta?.stop_sequence !== undefined) message.stop_sequence = event.delta.stop_sequence;
+            if (event.usage) message.usage = { ...message.usage, ...event.usage };
+            break;
+          // message_stop carries only Bedrock metrics — nothing to fold in.
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock?.();
+  }
+
+  if (!message) {
+    const err: any = new Error(`Bedrock (${profileId}) stream ended without a message_start event`);
+    err.status = 500; // treat an empty/garbled stream as a retryable server error
+    throw err;
+  }
+  // Drop any holes left by sparse indexing so downstream sees a dense content array.
+  message.content = (message.content as any[]).filter(Boolean);
+  return message as Anthropic.Message;
+}
+
+let bedrockBearerClient: AnthropicLikeClient | null = null;
+let bedrockBearerClientPromise: Promise<AnthropicLikeClient> | null = null;
+
+async function getBedrockBearerClient(): Promise<AnthropicLikeClient> {
+  if (bedrockBearerClient) return bedrockBearerClient;
+  if (bedrockBearerClientPromise) return bedrockBearerClientPromise;
+
+  bedrockBearerClientPromise = (async () => {
+    const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+    const bearerToken = (await getSecret(`${environment}/AgentWeb/Bedrock/ApiKey`)).trim();
+    const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
+
+    const client: AnthropicLikeClient = {
+      messages: {
+        create: async (params) => {
+          // The model id goes in the URL for the Bedrock invoke endpoint; the rest
+          // is the native Anthropic request body, with the required version field.
+          // We stream (invoke-with-response-stream) rather than block on a single
+          // /invoke call: a long generation no longer ties up the whole turn, and a
+          // genuinely stuck request is caught by the idle timeout below.
+          const { model, ...rest } = params as any;
+          delete (rest as any).model;
+          const profileId = BEARER_TOKEN_INVOKE_MODELS[model] ?? model;
+          const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${profileId}/invoke-with-response-stream`;
+          const body = { anthropic_version: 'bedrock-2023-05-31', ...rest };
+
+          // Idle timeout: abort only if the stream goes silent. Reset on every chunk.
+          const controller = new AbortController();
+          let idleTimer: NodeJS.Timeout | undefined;
+          const armIdleTimer = () => {
+            if (idleTimer) clearTimeout(idleTimer);
+            idleTimer = setTimeout(() => controller.abort(), BEARER_STREAM_IDLE_TIMEOUT_MS);
+          };
+          const clearIdleTimer = () => { if (idleTimer) clearTimeout(idleTimer); };
+          armIdleTimer();
+
+          let response: Response;
+          try {
+            response = await fetch(url, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${bearerToken}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/vnd.amazon.eventstream',
+              },
+              body: JSON.stringify(body),
+              signal: controller.signal,
+            });
+          } catch (err: any) {
+            clearIdleTimer();
+            // Distinguish an idle-timeout abort from other network errors so it's
+            // reported honestly instead of being swallowed as a generic failure.
+            if (err?.name === 'AbortError') {
+              const timeoutErr: any = new Error(
+                `Bedrock (${profileId}) request timed out after ${BEARER_STREAM_IDLE_TIMEOUT_MS / 1000}s of inactivity`
+              );
+              timeoutErr.status = 408; // request timeout — not auto-retried by callWithRetry
+              timeoutErr.isTimeout = true;
+              throw timeoutErr;
+            }
+            throw err;
+          }
+
+          if (!response.ok) {
+            clearIdleTimer();
+            const errText = await response.text();
+            const err: any = new Error(`Bedrock (${profileId}) error ${response.status}: ${errText}`);
+            err.status = response.status; // lets callWithRetry decide whether to retry
+            throw err;
+          }
+          if (!response.body) {
+            clearIdleTimer();
+            const err: any = new Error(`Bedrock (${profileId}) returned no response body`);
+            err.status = 500;
+            throw err;
+          }
+
+          try {
+            return await _accumulateBedrockStream(response.body, profileId, armIdleTimer);
+          } catch (err: any) {
+            if (err?.name === 'AbortError') {
+              const timeoutErr: any = new Error(
+                `Bedrock (${profileId}) stream stalled after ${BEARER_STREAM_IDLE_TIMEOUT_MS / 1000}s of inactivity`
+              );
+              timeoutErr.status = 408;
+              timeoutErr.isTimeout = true;
+              throw timeoutErr;
+            }
+            throw err;
+          } finally {
+            clearIdleTimer();
+          }
+        },
+      },
+    };
+
+    bedrockBearerClient = client;
+    return client;
+  })();
+
+  return bedrockBearerClientPromise;
+}
+
+// Exported for testing (allows mock injection)
+export function _setBedrockBearerClientForTest(client: AnthropicLikeClient | null): void {
+  bedrockBearerClient = client;
+  bedrockBearerClientPromise = null;
+}
+
 /**
  * Pick the right LLM client for a given model id.
- * - Bare "claude-*" ids (e.g. claude-opus-4-8) are Google Vertex AI models.
- * - "anthropic.*" ids are AWS Bedrock models.
+ * - "anthropic.claude-opus-4-8" is on AWS Bedrock in a separate account (bearer-token auth).
+ * - Bare "claude-*" ids (e.g. claude-sonnet-*) are Google Vertex AI models.
+ * - Other "anthropic.*" ids are AWS Bedrock models (default IAM credentials).
  */
 async function getClientForModel(model: string): Promise<AnthropicLikeClient> {
+  if (model in BEARER_TOKEN_INVOKE_MODELS) {
+    return getBedrockBearerClient();
+  }
   if (model.startsWith('claude-')) {
     return getVertexClient();
   }
@@ -1066,6 +1479,35 @@ function extractFailureSummary(
   return { message: parts.join(' '), previewUrl };
 }
 
+/**
+ * Resolve the editable boundary for a run from the page record and the owner's
+ * other pages that share the same repo (a multi-route project = many page
+ * records, one repo). Best-effort: any failure (missing record, DB error)
+ * returns undefined so the agent runs unrestricted rather than blocking all
+ * edits on a lookup hiccup.
+ */
+async function resolvePageScopeForContext(
+  context: CodingAgentContext
+): Promise<PageScope | undefined> {
+  try {
+    const page = await getLandingPageById(context.pageId);
+    if (!page) return undefined;
+    let repoPages: GeneratedLandingPage[] = [page];
+    try {
+      const ownerPages = await getLandingPagesByOwner(page.userId);
+      if (ownerPages.length > 0) repoPages = ownerPages;
+    } catch (e) {
+      // Couldn't list the owner's pages — scope to just this page (still yields a
+      // valid repo-wide scope, only without the sibling route slugs for the prompt).
+      console.warn('[CODING AGENT] Could not list owner pages for scope; using page alone:', e);
+    }
+    return resolvePageScope(page, repoPages);
+  } catch (e) {
+    console.warn('[CODING AGENT] Page scope resolution failed; running unrestricted:', e);
+    return undefined;
+  }
+}
+
 // ─── Main Agent Loop ────────────────────────────────────────────────────────
 
 async function runCodingAgentInternal(
@@ -1078,17 +1520,34 @@ async function runCodingAgentInternal(
   const client = await getClientForModel(model);
   const tools = getToolDefinitions();
 
+  // Resolve this run's editable boundary so a single-page task can't bleed edits
+  // into sibling pages that share the same repo. Best-effort: if lookup fails we
+  // leave scope unset and the agent runs unrestricted (prior behavior) rather
+  // than blocking all work. An explicit context.scope (e.g. from the eval harness)
+  // takes precedence; otherwise resolve from the page record.
+  const scope = context.scope ?? (await resolvePageScopeForContext(context));
+  // Thread the resolved scope through to executeTool's write guard without
+  // mutating the caller's context object.
+  const scopedContext: CodingAgentContext = { ...context, scope };
+
   // Pre-fetch the file listing so the agent knows the repo structure from the first iteration.
   // This prevents it from blindly guessing file paths (e.g. editing index.html instead of app/page.tsx).
+  // The full repo is shown — all route directories and shared files — because a
+  // multi-route project lives in one repo and edits may legitimately span routes.
   let fileListingPreamble = '';
   try {
-    const fileList = await executeTool('list_files', {}, context);
-    fileListingPreamble = `\n\n## Repository file listing (use this to orient yourself — do not call list_files again)\n\`\`\`\n${fileList}\n\`\`\`\n\n`;
+    const fileList = await executeTool('list_files', {}, scopedContext);
+    fileListingPreamble = `\n\n## Repository file listing (use this to orient yourself — do not call list_files again)\n\`\`\`\n${typeof fileList === 'string' ? fileList : ''}\n\`\`\`\n\n`;
   } catch (e) {
     if (is403Error(e)) throw e; // Authorization failure — propagate immediately
     // Non-fatal: agent can still call list_files itself
     console.warn('[CODING AGENT] Pre-fetch of file listing failed, agent will list files manually:', e);
   }
+
+  // Append the strict scope rules to the system prompt for this run.
+  const systemPrompt = scope
+    ? CODING_AGENT_SYSTEM_PROMPT + buildScopeSystemClause(scope)
+    : CODING_AGENT_SYSTEM_PROMPT;
 
   const messages: Anthropic.MessageParam[] = [
     { role: 'user', content: fileListingPreamble + taskDescription }
@@ -1118,10 +1577,15 @@ async function runCodingAgentInternal(
       const response = await callWithRetry(client, {
         model,
         max_tokens: 16384,
-        system: CODING_AGENT_SYSTEM_PROMPT,
+        system: systemPrompt,
         tools,
         messages,
       });
+
+      // Report this turn's token usage if a consumer is listening (eval harness).
+      if (context.onUsage && response.usage) {
+        context.onUsage(response.usage as any);
+      }
 
       // Add assistant message to history
       messages.push({ role: 'assistant', content: response.content });
@@ -1159,9 +1623,9 @@ async function runCodingAgentInternal(
         }
 
         // Execute the tool
-        let toolResult: string;
+        let toolResult: string | ToolImageResult;
         try {
-          toolResult = await executeTool(fnName, fnArgs, context);
+          toolResult = await executeTool(fnName, fnArgs, scopedContext);
 
           // Emit progress about tool execution
           if (context.socketEmit) {
@@ -1177,11 +1641,24 @@ async function runCodingAgentInternal(
           toolResult = `Error executing ${fnName}: ${error instanceof Error ? error.message : String(error)}`;
         }
 
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: block.id,
-          content: truncateToolResult(toolResult)
-        });
+        if (isToolImageResult(toolResult)) {
+          // Feed the screenshot back as a vision input so the model can actually see it
+          // and verify visual correctness (mirrors the main agent-mode loop).
+          toolResults.push({
+            type: 'tool_result',
+            tool_use_id: block.id,
+            content: [
+              { type: 'text', text: 'Screenshot captured. Analyze the image below to verify the result visually.' },
+              { type: 'image', source: { type: 'base64', media_type: toolResult.mediaType as any, data: toolResult.data } }
+            ]
+          });
+        } else {
+          toolResults.push({
+            type: 'tool_result',
+            tool_use_id: block.id,
+            content: truncateToolResult(toolResult)
+          });
+        }
       }
 
       // Add tool results as a user message

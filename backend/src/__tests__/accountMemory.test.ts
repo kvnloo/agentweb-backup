@@ -274,6 +274,11 @@ describe('Memory API Routes', () => {
       };
     });
 
+    // Mock the embeddings util so the write path embeds deterministically without a network call
+    jest.mock('../utils/embeddings', () => ({
+      embedText: jest.fn().mockResolvedValue([0.1, 0.2, 0.3]),
+    }));
+
     const supertest = require('supertest');
     const express = require('express');
     const { default: memoryRoutes } = await import('../routes/memory');
@@ -332,7 +337,8 @@ describe('Memory API Routes', () => {
 
     expect(res.status).toBe(201);
     expect(res.body.memory.memoryId).toBe('mem1');
-    expect(mockDb.addMemory).toHaveBeenCalledWith('user1', 'preference', 'test fact', undefined);
+    // Now also persists an embedding (5th arg) computed at write time for relevance retrieval
+    expect(mockDb.addMemory).toHaveBeenCalledWith('user1', 'preference', 'test fact', undefined, [0.1, 0.2, 0.3]);
   });
 
   it('POST /api/memory should reject missing content', async () => {

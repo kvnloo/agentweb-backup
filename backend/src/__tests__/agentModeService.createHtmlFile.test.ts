@@ -284,6 +284,67 @@ describe('AgentModeService - createHtmlFile', () => {
       expect(result.filename).toMatch(/^html_\d+_A{1,50}\.html$/);
     });
 
+    it('should default to document mode and report an HTML file', async () => {
+      const result = await (agentModeService as any).createHtmlFile(
+        'Test Title',
+        'Test content',
+        '',
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.document_type).toBe('document');
+      expect(result.message).toBe('HTML file created successfully');
+      // Document mode uses the general HTML-document system prompt
+      expect(mockGenerateHTML).toHaveBeenCalledWith(
+        expect.stringContaining('professional HTML document'),
+        expect.stringContaining('professional HTML document'),
+        expect.any(Function)
+      );
+    });
+
+    it('should use an email-client-safe prompt when document_type is email', async () => {
+      const result = await (agentModeService as any).createHtmlFile(
+        'Aquila May 2026 Newsletter',
+        'Big product news this month...',
+        '',
+        'user123',
+        'session123',
+        'email'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.document_type).toBe('email');
+      expect(result.message).toBe('HTML email created successfully');
+
+      const [systemPrompt, userPrompt] = mockGenerateHTML.mock.calls[0];
+      // Email mode must steer toward email-client-safe markup
+      expect(systemPrompt).toContain('HTML email designer');
+      expect(systemPrompt).toContain('table-based layout');
+      expect(systemPrompt).toContain('INLINE styles');
+      // And must NOT produce reusable {{variable}} templates
+      expect(systemPrompt).toContain('not a reusable template');
+      expect(userPrompt).toContain('ready-to-send HTML email');
+    });
+
+    it('should pass format requirements through in email mode', async () => {
+      await (agentModeService as any).createHtmlFile(
+        'Aquila May 2026 Newsletter',
+        'Content',
+        'Use brand color #1a73e8 and a Book a Demo CTA',
+        'user123',
+        'session123',
+        'email'
+      );
+
+      expect(mockGenerateHTML).toHaveBeenCalledWith(
+        expect.stringContaining('#1a73e8'),
+        expect.any(String),
+        expect.any(Function)
+      );
+    });
+
     it('should log success message', async () => {
       const consoleLogSpy = jest.spyOn(console, 'log').mockImplementation();
 
@@ -345,7 +406,56 @@ describe('AgentModeService - createHtmlFile', () => {
         'Test content',
         'Use modern design',
         'user123',
-        'session123'
+        'session123',
+        'document'
+      );
+    });
+
+    it('should pass document_type=email through to createHtmlFile', async () => {
+      const result = await (agentModeService as any).executeTool(
+        'gpt-4',
+        'create_html_file',
+        {
+          title: 'Aquila May 2026 Newsletter',
+          content_draft: 'Newsletter content',
+          document_type: 'email'
+        },
+        'user123',
+        'session123',
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect((singletonAgentService as any).createHtmlFile).toHaveBeenCalledWith(
+        'Aquila May 2026 Newsletter',
+        'Newsletter content',
+        '',
+        'user123',
+        'session123',
+        'email'
+      );
+    });
+
+    it('should default document_type to document when omitted', async () => {
+      await (agentModeService as any).executeTool(
+        'gpt-4',
+        'create_html_file',
+        {
+          title: 'Test Title',
+          content_draft: 'Test content'
+        },
+        'user123',
+        'session123',
+        false
+      );
+
+      expect((singletonAgentService as any).createHtmlFile).toHaveBeenCalledWith(
+        'Test Title',
+        'Test content',
+        '',
+        'user123',
+        'session123',
+        'document'
       );
     });
 
@@ -368,7 +478,8 @@ describe('AgentModeService - createHtmlFile', () => {
         'Test content',
         '',
         'user123',
-        'session123'
+        'session123',
+        'document'
       );
     });
 

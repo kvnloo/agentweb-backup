@@ -45,6 +45,51 @@ const handleDynamoDbError = (error: any, operation: string) => {
   throw error;
 };
 
+/**
+ * De-duplicate LinkedIn message events.
+ *
+ * When a user sends a LinkedIn message from the CRM, the send endpoint writes a
+ * synthetic event (eventId `linkedin_sent_<ts>_<leadId>`, senderId = accountId)
+ * for instant UI feedback. The periodic message sync later re-imports the SAME
+ * message from Unipile keyed on the message's stable provider_id (eventId
+ * `linkedin_msg_<provider_id>`). The two have different eventIds, so without
+ * this the same outbound message appears (and counts) twice.
+ *
+ * Strategy: prefer the synced `linkedin_msg_*` event (it has the real provider
+ * id and timestamp). Drop a synthetic `linkedin_sent_*` SENT event when a synced
+ * SENT event with the same normalized text exists for the lead. Matching on text
+ * (not timestamp) is robust because send-time and sync-time timestamps differ.
+ */
+const dedupeLinkedInMessageEvents = <T extends { eventId?: string; eventType?: string; data?: any; eventData?: any }>(
+  events: T[],
+): T[] => {
+  const norm = (e: any): string => {
+    const data = e?.data ?? e?.eventData ?? {};
+    return String(data?.text ?? '').trim().toLowerCase();
+  };
+  const isSent = (e: any) => String(e?.eventType || '').toLowerCase().includes('sent');
+  const isSynced = (e: any) => String(e?.eventId || '').startsWith('linkedin_msg_');
+  const isSynthetic = (e: any) => String(e?.eventId || '').startsWith('linkedin_sent_');
+
+  // Texts that already have a synced SENT event.
+  const syncedSentText = new Set<string>();
+  for (const e of events) {
+    if (isSynced(e) && isSent(e)) {
+      const t = norm(e);
+      if (t) syncedSentText.add(t);
+    }
+  }
+  if (syncedSentText.size === 0) return events;
+
+  return events.filter((e) => {
+    if (isSynthetic(e) && isSent(e)) {
+      const t = norm(e);
+      if (t && syncedSentText.has(t)) return false; // drop the synthetic duplicate
+    }
+    return true;
+  });
+};
+
 const ENGAGED_EVENT_KEYWORDS = ["clicked", "replied", "received"];
 
 const engagementMatchesKeyword = (engagement: any): boolean => {
@@ -3752,6 +3797,22 @@ export const crmDb = {
     }
   },
 
+  async getAllLeadLists() {
+    const items: any[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await dynamodb.scan({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        ProjectionExpression: 'listId, #n, userId',
+        ExpressionAttributeNames: { '#n': 'name' },
+        ExclusiveStartKey: lastEvaluatedKey,
+      }).promise();
+      items.push(...(result.Items || []));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+    return items;
+  },
+
   // Returns true if userId owns the list OR is an org member of the same org as the list owner.
   async canOrgMemberAccessList(userId: string, list: { userId?: string } | Record<string, any>): Promise<boolean> {
     if (list.userId === userId) return true;
@@ -4999,54 +5060,78 @@ export const crmDb = {
       }
 
       if (updates.email !== undefined) {
-        const emailValue = updates.email.trim().toLowerCase();
+        const emailValue = (updates.email ?? '').trim().toLowerCase();
         if (emailValue) {
           // Only set email if it's not empty (GSI key cannot be empty string)
           setExpressions.push('email = :email');
           expressionAttributeValues[':email'] = emailValue;
         } else {
-          // Remove email attribute if it's being set to empty
+          // Remove email attribute if it's being set to empty/null
           removeExpressions.push('email');
         }
       }
 
       if (updates.firstName !== undefined) {
-        setExpressions.push('firstName = :firstName');
-        expressionAttributeValues[':firstName'] = updates.firstName;
+        if (updates.firstName) {
+          setExpressions.push('firstName = :firstName');
+          expressionAttributeValues[':firstName'] = updates.firstName;
+        } else {
+          removeExpressions.push('firstName');
+        }
       }
 
       if (updates.lastName !== undefined) {
-        setExpressions.push('lastName = :lastName');
-        expressionAttributeValues[':lastName'] = updates.lastName;
+        if (updates.lastName) {
+          setExpressions.push('lastName = :lastName');
+          expressionAttributeValues[':lastName'] = updates.lastName;
+        } else {
+          removeExpressions.push('lastName');
+        }
       }
 
       if (updates.phone !== undefined) {
-        setExpressions.push('phone = :phone');
-        expressionAttributeValues[':phone'] = updates.phone;
+        if (updates.phone) {
+          setExpressions.push('phone = :phone');
+          expressionAttributeValues[':phone'] = updates.phone;
+        } else {
+          removeExpressions.push('phone');
+        }
       }
 
       if (updates.company !== undefined) {
-        setExpressions.push('company = :company');
-        expressionAttributeValues[':company'] = updates.company;
+        if (updates.company) {
+          setExpressions.push('company = :company');
+          expressionAttributeValues[':company'] = updates.company;
+        } else {
+          removeExpressions.push('company');
+        }
       }
 
       if (updates.title !== undefined) {
-        setExpressions.push('title = :title');
-        expressionAttributeValues[':title'] = updates.title;
+        if (updates.title) {
+          setExpressions.push('title = :title');
+          expressionAttributeValues[':title'] = updates.title;
+        } else {
+          removeExpressions.push('title');
+        }
       }
 
       if (updates.notes !== undefined) {
-        setExpressions.push('notes = :notes');
-        expressionAttributeValues[':notes'] = updates.notes;
+        if (updates.notes) {
+          setExpressions.push('notes = :notes');
+          expressionAttributeValues[':notes'] = updates.notes;
+        } else {
+          removeExpressions.push('notes');
+        }
       }
 
       if (updates.linkedin !== undefined) {
-        const trimmedLinkedin = updates.linkedin.trim();
+        const trimmedLinkedin = (updates.linkedin ?? '').trim();
         if (trimmedLinkedin) {
           setExpressions.push('linkedin = :linkedin');
           expressionAttributeValues[':linkedin'] = trimmedLinkedin;
         } else {
-          // Keep LinkedinLookupIndex sparse — empty values must not appear.
+          // Keep LinkedinLookupIndex sparse — empty/null values must not appear.
           removeExpressions.push('linkedin');
         }
       }
@@ -5061,9 +5146,9 @@ export const crmDb = {
         updates.company !== undefined;
       if (nameCompanyTouched) {
         const current = existingLeadForGuard as any;
-        const mergedFirst = updates.firstName !== undefined ? updates.firstName : (current?.firstName || '');
-        const mergedLast = updates.lastName !== undefined ? updates.lastName : (current?.lastName || '');
-        const mergedCompany = updates.company !== undefined ? updates.company : (current?.company || '');
+        const mergedFirst = updates.firstName !== undefined ? (updates.firstName ?? '') : (current?.firstName || '');
+        const mergedLast = updates.lastName !== undefined ? (updates.lastName ?? '') : (current?.lastName || '');
+        const mergedCompany = updates.company !== undefined ? (updates.company ?? '') : (current?.company || '');
         const nck = computeNameCompanyKey(mergedFirst, mergedLast, mergedCompany);
         if (nck) {
           setExpressions.push('nameCompanyKey = :nameCompanyKey');
@@ -5074,8 +5159,13 @@ export const crmDb = {
       }
 
       if (updates.companyLinkedin !== undefined) {
-        setExpressions.push('companyLinkedin = :companyLinkedin');
-        expressionAttributeValues[':companyLinkedin'] = updates.companyLinkedin.trim();
+        const trimmedCompanyLinkedin = (updates.companyLinkedin ?? '').trim();
+        if (trimmedCompanyLinkedin) {
+          setExpressions.push('companyLinkedin = :companyLinkedin');
+          expressionAttributeValues[':companyLinkedin'] = trimmedCompanyLinkedin;
+        } else {
+          removeExpressions.push('companyLinkedin');
+        }
       }
 
       if (updates.linkedInInviteSentAt !== undefined) {
@@ -5806,7 +5896,10 @@ export const crmDb = {
       const leadLinkedIn = lead.linkedin?.toLowerCase();
       if (leadLinkedIn) {
         const emailEventsDb = require('./emailEventsDb').emailEventsDb;
-        const linkedInEvents = await emailEventsDb.getEventsByEmailDomainAndLeadEmail(`linkedin-${listId}`, leadLinkedIn);
+        const linkedInEventsRaw = await emailEventsDb.getEventsByEmailDomainAndLeadEmail(`linkedin-${listId}`, leadLinkedIn);
+        // Drop synthetic send-time events the sync later re-imported so a single
+        // sent message isn't double-counted.
+        const linkedInEvents = dedupeLinkedInMessageEvents(linkedInEventsRaw);
 
         // Filter for only SENT messages (eventType contains "sent")
         const sentMessages = linkedInEvents.filter((event: any) => event.eventType && event.eventType.toLowerCase().includes('sent'));
@@ -5859,9 +5952,12 @@ export const crmDb = {
 
       // Always get LinkedIn message events for this lead (stored with LinkedIn URL as leadEmail)
       // This should work even if user doesn't have emailDomain configured for regular emails
-      const linkedInEvents = leadLinkedIn
+      const linkedInEventsRaw = leadLinkedIn
         ? await emailEventsDb.getEventsByEmailDomainAndLeadEmail(`linkedin-${listId}`, leadLinkedIn)
         : [];
+      // Drop synthetic send-time events that the sync later re-imported (avoids
+      // the same outbound message showing twice in the activity timeline).
+      const linkedInEvents = dedupeLinkedInMessageEvents(linkedInEventsRaw);
 
       const filteredEvents = [...emailEvents, ...linkedInEvents];
 
@@ -6246,6 +6342,8 @@ export const crmDb = {
     leadId: string;
     previousStandardFields: Record<string, string | null>;
     previousCustomFields: Record<string, string | null>;
+    previousEnrichmentMetadata: Record<string, any>;
+    fieldsEnriched: Array<{ field: string; provider: string; fromCache: boolean }>;
     expiresAt: number;
   }): Promise<void> {
     try {
@@ -6256,6 +6354,8 @@ export const crmDb = {
           leadId: item.leadId,
           previousStandardFields: item.previousStandardFields,
           previousCustomFields: item.previousCustomFields,
+          previousEnrichmentMetadata: item.previousEnrichmentMetadata,
+          fieldsEnriched: item.fieldsEnriched,
           expiresAt: item.expiresAt,
         },
       }).promise();
@@ -6274,15 +6374,35 @@ export const crmDb = {
     status: 'completed' | 'undone';
     expiresAt: number;
     processedCount: number;
+    failedCount?: number;
+    skippedCount?: number;
+    /** Lead IDs attempted in this run. Used for cross-run unique-lead dedup. Omitted when run exceeds 5000 leads. */
+    attemptedLeadIds?: string[];
+    /** True when attemptedLeadIds was omitted due to run size — dedup stats unavailable for this job. */
+    leadsDeduplicationUnavailable?: boolean;
+    /** Lead IDs skipped in this run. Used for cross-run unique skipped dedup. Omitted when skipped count exceeds 5000. */
+    skippedLeadIds?: string[];
+    /** True when skippedLeadIds was omitted due to size. */
+    skippedDeduplicationUnavailable?: boolean;
     /** Aggregate counts per failure step (search/linkedin/llm/update). Item #11. */
     failureBreakdown?: { searchWebFailed: number; linkedinFailed: number; llmOrParseFailed: number; updateFailed: number };
     /** Per-lead failure records (capped to ~50 to keep row size bounded). Item #11. */
     failures?: Array<{ leadId: string; email?: string; step: string; message: string }>;
+    /** Per-provider live vs cached counts across all leads in this run. */
+    sourceBreakdown?: {
+      apollo:    { live: number; cached: number };
+      unipile:   { live: number; cached: number };
+      enrichSo:  { live: number; cached: number };
+      webSearch: { live: number; cached: number };
+      sibling:   { live: number; cached: number };
+      llm:       { live: number; cached: number };
+    };
   }): Promise<void> {
     try {
       const item: any = {
         jobId: meta.jobId,
         leadId: '_meta',
+        jobType: 'meta',
         listId: meta.listId,
         userId: meta.userId,
         outputFields: meta.outputFields,
@@ -6291,11 +6411,18 @@ export const crmDb = {
         expiresAt: meta.expiresAt,
         processedCount: meta.processedCount,
       };
+      if (meta.failedCount !== undefined) item.failedCount = meta.failedCount;
+      if (meta.skippedCount !== undefined) item.skippedCount = meta.skippedCount;
+      if (meta.attemptedLeadIds && meta.attemptedLeadIds.length > 0) item.attemptedLeadIds = meta.attemptedLeadIds;
+      if (meta.leadsDeduplicationUnavailable) item.leadsDeduplicationUnavailable = true;
+      if (meta.skippedLeadIds && meta.skippedLeadIds.length > 0) item.skippedLeadIds = meta.skippedLeadIds;
+      if (meta.skippedDeduplicationUnavailable) item.skippedDeduplicationUnavailable = true;
       if (meta.failureBreakdown) item.failureBreakdown = meta.failureBreakdown;
       if (meta.failures && meta.failures.length > 0) {
         // Cap to 50 entries to stay well under DynamoDB's 400KB row limit
         item.failures = meta.failures.slice(0, 50);
       }
+      if (meta.sourceBreakdown) item.sourceBreakdown = meta.sourceBreakdown;
       await dynamodb.put({
         TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
         Item: item,
@@ -6321,31 +6448,173 @@ export const crmDb = {
     }
   },
 
-  async getEnrichmentJobsByListId(listId: string, limit = 10): Promise<any[]> {
+  async batchGetListNames(listIds: string[]): Promise<Record<string, string>> {
+    const unique = [...new Set(listIds)].filter(Boolean);
+    if (!unique.length) return {};
+    const CHUNK = 100;
+    const chunks: string[][] = [];
+    for (let i = 0; i < unique.length; i += CHUNK) chunks.push(unique.slice(i, i + CHUNK));
+    const results = await Promise.all(chunks.map(chunk =>
+      dynamodb.batchGet({
+        RequestItems: {
+          [`${TABLE_PREFIX}AW-LeadLists`]: {
+            Keys: chunk.map(id => ({ listId: id })),
+            ProjectionExpression: 'listId, #n',
+            ExpressionAttributeNames: { '#n': 'name' },
+          },
+        },
+      }).promise().then(r => r.Responses?.[`${TABLE_PREFIX}AW-LeadLists`] || [])
+    ));
+    return Object.fromEntries(results.flat().map((item: any) => [item.listId, item.name]));
+  },
+
+  parseEnrichmentNextToken(token: string): AWS.DynamoDB.DocumentClient.Key {
     try {
+      return JSON.parse(Buffer.from(token, 'base64').toString());
+    } catch {
+      const err: any = new Error('Invalid pagination token');
+      err.statusCode = 400;
+      throw err;
+    }
+  },
+
+  async getEnrichmentJobsByUserId(
+    userId: string,
+    startDate?: string,
+    endDate?: string,
+    pageSize = 50,
+    nextToken?: string,
+  ): Promise<{ jobs: any[]; nextToken?: string }> {
+    try {
+      const keyExpr = startDate && endDate
+        ? 'userId = :userId AND createdAt BETWEEN :start AND :end'
+        : 'userId = :userId';
+      const exprValues: Record<string, string> = { ':userId': userId };
+      if (startDate && endDate) {
+        exprValues[':start'] = startDate;
+        exprValues[':end'] = endDate;
+      }
+      const result = await dynamodb.query({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
+        IndexName: 'userId-createdAt-index',
+        KeyConditionExpression: keyExpr,
+        ExpressionAttributeValues: exprValues,
+        ScanIndexForward: false,
+        Limit: pageSize,
+        ...(nextToken ? { ExclusiveStartKey: this.parseEnrichmentNextToken(nextToken) } : {}),
+      }).promise();
+      const jobs = (result.Items || []).filter((item: any) => item.leadId === '_meta');
+      const listNames = await this.batchGetListNames(jobs.map((j: any) => j.listId));
+      const filtered = jobs.filter((j: any) => listNames[j.listId]).map((j: any) => ({ ...j, listName: listNames[j.listId] }));
+      const newNextToken = result.LastEvaluatedKey
+        ? Buffer.from(JSON.stringify(result.LastEvaluatedKey)).toString('base64')
+        : undefined;
+      return { jobs: filtered, nextToken: newNextToken };
+    } catch (error) {
+      handleDynamoDbError(error, 'getEnrichmentJobsByUserId');
+      throw error;
+    }
+  },
+
+  // NOTE: forward-only — jobType='meta' is only written on rows created after this
+  // attribute was introduced. The jobType-createdAt-index GSI is sparse, so pre-deploy
+  // _meta rows are invisible to this query. No backfill was done because old rows lack
+  // sourceBreakdown/processedCount aggregates and would show empty stats anyway.
+  async getRecentEnrichmentJobs(
+    startDate?: string,
+    endDate?: string,
+    pageSize = 50,
+    nextToken?: string,
+  ): Promise<{ jobs: any[]; nextToken?: string }> {
+    try {
+      const keyExpr = startDate && endDate
+        ? 'jobType = :jobType AND createdAt BETWEEN :start AND :end'
+        : 'jobType = :jobType';
+      const exprValues: Record<string, string> = { ':jobType': 'meta' };
+      if (startDate && endDate) {
+        exprValues[':start'] = startDate;
+        exprValues[':end'] = endDate;
+      }
+      const result = await dynamodb.query({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
+        IndexName: 'jobType-createdAt-index',
+        KeyConditionExpression: keyExpr,
+        ExpressionAttributeValues: exprValues,
+        ScanIndexForward: false,
+        Limit: pageSize,
+        ...(nextToken ? { ExclusiveStartKey: this.parseEnrichmentNextToken(nextToken) } : {}),
+      }).promise();
+      const jobs = result.Items || [];
+      const listNames = await this.batchGetListNames(jobs.map((j: any) => j.listId));
+      const filtered = jobs.filter((j: any) => listNames[j.listId]).map((j: any) => ({ ...j, listName: listNames[j.listId] }));
+      const newNextToken = result.LastEvaluatedKey
+        ? Buffer.from(JSON.stringify(result.LastEvaluatedKey)).toString('base64')
+        : undefined;
+      return { jobs: filtered, nextToken: newNextToken };
+    } catch (error) {
+      handleDynamoDbError(error, 'getRecentEnrichmentJobs');
+      throw error;
+    }
+  },
+
+  async getEnrichmentJobsByListId(
+    listId: string,
+    startDate?: string,
+    endDate?: string,
+    pageSize = 20,
+    nextToken?: string,
+  ): Promise<{ jobs: any[]; nextToken?: string }> {
+    try {
+      const keyExpr = startDate && endDate
+        ? 'listId = :listId AND createdAt BETWEEN :start AND :end'
+        : 'listId = :listId';
+      const exprValues: Record<string, string> = { ':listId': listId };
+      if (startDate && endDate) {
+        exprValues[':start'] = startDate;
+        exprValues[':end'] = endDate;
+      }
       const result = await dynamodb.query({
         TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
         IndexName: 'listId-createdAt-index',
-        KeyConditionExpression: 'listId = :listId',
-        ExpressionAttributeValues: { ':listId': listId },
+        KeyConditionExpression: keyExpr,
+        ExpressionAttributeValues: exprValues,
         ScanIndexForward: false,
-        Limit: limit,
+        Limit: pageSize,
+        ...(nextToken ? { ExclusiveStartKey: this.parseEnrichmentNextToken(nextToken) } : {}),
       }).promise();
-      return (result.Items || []).filter((item: any) => item.leadId === '_meta');
+      const jobs = (result.Items || []).filter((item: any) => item.leadId === '_meta');
+      const newNextToken = result.LastEvaluatedKey
+        ? Buffer.from(JSON.stringify(result.LastEvaluatedKey)).toString('base64')
+        : undefined;
+      return { jobs, nextToken: newNextToken };
     } catch (error) {
       handleDynamoDbError(error, 'getEnrichmentJobsByListId');
       throw error;
     }
   },
 
-  async getEnrichmentSnapshotsByJobId(jobId: string): Promise<any[]> {
+  async getEnrichmentJobMeta(jobId: string): Promise<any | null> {
+    try {
+      const result = await dynamodb.get({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
+        Key: { jobId, leadId: '_meta' },
+      }).promise();
+      return result.Item ?? null;
+    } catch (error) {
+      handleDynamoDbError(error, 'getEnrichmentJobMeta');
+      throw error;
+    }
+  },
+
+  async getEnrichmentSnapshotsByJobId(jobId: string, limit = 200): Promise<any[]> {
     try {
       const result = await dynamodb.query({
         TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
         KeyConditionExpression: 'jobId = :jobId',
         ExpressionAttributeValues: { ':jobId': jobId },
+        Limit: limit + 1, // +1 to account for the _meta row
       }).promise();
-      return (result.Items || []).filter((item: any) => item.leadId !== '_meta');
+      return (result.Items || []).filter((item: any) => item.leadId !== '_meta').slice(0, limit);
     } catch (error) {
       handleDynamoDbError(error, 'getEnrichmentSnapshotsByJobId');
       throw error;
@@ -6822,7 +7091,8 @@ export const accountMemoryDb = {
     userId: string,
     category: string,
     content: string,
-    sourceSessionId?: string
+    sourceSessionId?: string,
+    embedding?: number[]
   ) {
     if (!VALID_MEMORY_CATEGORIES.includes(category as MemoryCategory)) {
       throw new Error(`Invalid category: ${category}. Must be one of: ${VALID_MEMORY_CATEGORIES.join(', ')}`);
@@ -6846,6 +7116,10 @@ export const accountMemoryDb = {
     };
     if (sourceSessionId) {
       item.sourceSessionId = sourceSessionId;
+    }
+    // Persisted so memory can later be retrieved by semantic relevance, not just recency.
+    if (embedding && embedding.length > 0) {
+      item.embedding = embedding;
     }
 
     try {
@@ -6896,6 +7170,22 @@ export const accountMemoryDb = {
       return result.Items || [];
     } catch (error) {
       handleDynamoDbError(error, 'getRecentMemories');
+      throw error;
+    }
+  },
+
+  // Backfill an embedding onto an existing memory (e.g. one written before embeddings
+  // existed), so relevance retrieval pays the embedding cost at most once per memory.
+  async setMemoryEmbedding(userId: string, memoryId: string, embedding: number[]) {
+    try {
+      await dynamodb.update({
+        TableName: ACCOUNT_MEMORY_TABLE,
+        Key: { userId, memoryId },
+        UpdateExpression: 'SET embedding = :e',
+        ExpressionAttributeValues: { ':e': embedding },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'setMemoryEmbedding');
       throw error;
     }
   },
@@ -6966,7 +7256,8 @@ export const orgMemoryDb = {
     orgId: string,
     category: string,
     content: string,
-    sourceUserId?: string
+    sourceUserId?: string,
+    embedding?: number[]
   ) {
     if (!VALID_MEMORY_CATEGORIES.includes(category as MemoryCategory)) {
       throw new Error(`Invalid category: ${category}. Must be one of: ${VALID_MEMORY_CATEGORIES.join(', ')}`);
@@ -6990,6 +7281,10 @@ export const orgMemoryDb = {
     };
     if (sourceUserId) {
       item.sourceUserId = sourceUserId;
+    }
+    // Persisted so org memory can later be retrieved by semantic relevance, not just recency.
+    if (embedding && embedding.length > 0) {
+      item.embedding = embedding;
     }
 
     try {
@@ -7040,6 +7335,21 @@ export const orgMemoryDb = {
       return result.Items || [];
     } catch (error) {
       handleDynamoDbError(error, 'getRecentOrgMemories');
+      throw error;
+    }
+  },
+
+  // Backfill an embedding onto an existing org memory (see accountMemoryDb.setMemoryEmbedding).
+  async setMemoryEmbedding(orgId: string, memoryId: string, embedding: number[]) {
+    try {
+      await dynamodb.update({
+        TableName: ORG_MEMORY_TABLE,
+        Key: { orgId, memoryId },
+        UpdateExpression: 'SET embedding = :e',
+        ExpressionAttributeValues: { ':e': embedding },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'setMemoryEmbedding');
       throw error;
     }
   },

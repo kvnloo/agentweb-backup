@@ -1,9 +1,19 @@
-import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, _setBedrockClientForTest, _setVertexClientForTest, _setSleepFnForTest } from '../services/codingAgentService';
+import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest, _parseEventStreamFrames, _accumulateBedrockStream } from '../services/codingAgentService';
 import { agentModeService } from '../services/agentModeService';
 
 // Mock mcpFetch
 jest.mock('../mcp/server/httpClient', () => ({
   mcpFetch: jest.fn()
+}));
+
+// Mock v0Service so scope resolution doesn't hit DynamoDB. By default both lookups
+// return empty (page not found) → scope stays undefined → the agent runs
+// unrestricted, matching the pre-scope behavior the bulk of these tests assert.
+const mockGetLandingPageById = jest.fn();
+const mockGetLandingPagesByOwner = jest.fn();
+jest.mock('../services/v0Service', () => ({
+  getLandingPageById: (...a: any[]) => mockGetLandingPageById(...a),
+  getLandingPagesByOwner: (...a: any[]) => mockGetLandingPagesByOwner(...a),
 }));
 
 import { mcpFetch } from '../mcp/server/httpClient';
@@ -435,6 +445,111 @@ describe('runCodingAgent', () => {
 
     // Should still complete (agent handles the error message from the tool)
     expect(result.iterations).toBeGreaterThanOrEqual(1);
+  });
+
+  test('take_screenshot feeds the captured image back to the model as a vision block', async () => {
+    const mockExecuteMcpTool = jest.fn().mockResolvedValueOnce({
+      content: 'Screenshot taken',
+      raw: { content: [{ type: 'image', mimeType: 'image/jpeg', data: 'BASE64IMAGEDATA' }] }
+    });
+    const contextWithBrowser: CodingAgentContext = {
+      ...mockContext,
+      executeMcpTool: mockExecuteMcpTool,
+    };
+
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'take_screenshot', input: { full_page: true } }
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Looks good.', status: 'success' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    const result = await runCodingAgent('screenshot the page', contextWithBrowser);
+
+    expect(result.success).toBe(true);
+    expect(mockExecuteMcpTool).toHaveBeenCalledWith('playwright_browser_take_screenshot', { type: 'jpeg', fullPage: true });
+
+    // The second LLM call must receive the screenshot as an image content block,
+    // not just the string "Screenshot taken successfully." — otherwise the model is blind.
+    const secondCallMessages = mockCreate.mock.calls[1][0].messages;
+    const toolResultMsg = secondCallMessages.find(
+      (m: any) => m.role === 'user' && Array.isArray(m.content) && m.content.some((b: any) => b.type === 'tool_result')
+    );
+    expect(toolResultMsg).toBeDefined();
+    const trBlock = toolResultMsg.content.find((b: any) => b.type === 'tool_result');
+    expect(Array.isArray(trBlock.content)).toBe(true);
+    const imageBlock = trBlock.content.find((b: any) => b.type === 'image');
+    expect(imageBlock).toBeDefined();
+    expect(imageBlock.source).toMatchObject({ type: 'base64', media_type: 'image/jpeg', data: 'BASE64IMAGEDATA' });
+  });
+
+  test('take_screenshot returns a text error (no image block) when browser tools are unavailable', async () => {
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'take_screenshot', input: {} }
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Browser not available.', status: 'error' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    // No executeMcpTool on mockContext
+    await runCodingAgent('screenshot the page', mockContext);
+
+    const secondCallMessages = mockCreate.mock.calls[1][0].messages;
+    const toolResultMsg = secondCallMessages.find(
+      (m: any) => m.role === 'user' && Array.isArray(m.content) && m.content.some((b: any) => b.type === 'tool_result')
+    );
+    const trBlock = toolResultMsg.content.find((b: any) => b.type === 'tool_result');
+    expect(typeof trBlock.content).toBe('string');
+    expect(trBlock.content).toMatch(/not available/i);
+  });
+
+  test('take_screenshot falls back to text when MCP returns no image data', async () => {
+    const mockExecuteMcpTool = jest.fn().mockResolvedValueOnce({
+      content: 'no image here',
+      raw: { content: [] }
+    });
+    const contextWithBrowser: CodingAgentContext = {
+      ...mockContext,
+      executeMcpTool: mockExecuteMcpTool,
+    };
+
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'take_screenshot', input: {} }
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'done', status: 'success' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    const result = await runCodingAgent('screenshot the page', contextWithBrowser);
+
+    expect(result.success).toBe(true);
+    const secondCallMessages = mockCreate.mock.calls[1][0].messages;
+    const toolResultMsg = secondCallMessages.find(
+      (m: any) => m.role === 'user' && Array.isArray(m.content) && m.content.some((b: any) => b.type === 'tool_result')
+    );
+    const trBlock = toolResultMsg.content.find((b: any) => b.type === 'tool_result');
+    expect(typeof trBlock.content).toBe('string');
   });
 
   test('list_commits tool returns formatted commit history', async () => {
@@ -1073,19 +1188,21 @@ describe('applySearchReplace — new file creation', () => {
 });
 
 // ─── Model → provider routing ─────────────────────────────────────────────────
-// Regression for "400 The provided model identifier is invalid": switching the
-// coding-agent default model to a Vertex model (claude-opus-4-8) must route to
-// the Vertex client, not the Bedrock client (which rejects bare claude-* ids).
+// Routing must send each model id to the client that can actually serve it:
+// - anthropic.claude-opus-4-8 → Bedrock bearer-token client (separate AWS account)
+// - other bare claude-* → Vertex
+// - anthropic.* → Bedrock (default IAM credentials)
 describe('runCodingAgent — model provider routing', () => {
   const mockContext: CodingAgentContext = {
     pageId: 'test-page-123',
     userId: 'user-456',
     sessionId: 'session-789',
-    llmModel: 'claude-opus-4-8',
+    llmModel: 'anthropic.claude-opus-4-8',
   };
 
   const bedrockCreate = jest.fn();
   const vertexCreate = jest.fn();
+  const bearerCreate = jest.fn();
   let modelSpy: jest.SpyInstance;
 
   beforeEach(() => {
@@ -1093,8 +1210,10 @@ describe('runCodingAgent — model provider routing', () => {
     mockedMcpFetch.mockReset();
     bedrockCreate.mockReset();
     vertexCreate.mockReset();
+    bearerCreate.mockReset();
     _setBedrockClientForTest({ messages: { create: bedrockCreate } } as any);
     _setVertexClientForTest({ messages: { create: vertexCreate } } as any);
+    _setBedrockBearerClientForTest({ messages: { create: bearerCreate } } as any);
     _setSleepFnForTest(async () => {});
     // Pre-flight list_files succeeds so the loop reaches the LLM call.
     mockedMcpFetch.mockResolvedValue({ files: [{ path: 'app/page.tsx', size: 100 }] });
@@ -1108,10 +1227,29 @@ describe('runCodingAgent — model provider routing', () => {
   afterAll(() => {
     _setBedrockClientForTest(null);
     _setVertexClientForTest(null);
+    _setBedrockBearerClientForTest(null);
   });
 
-  test('routes a Vertex model (claude-opus-4-8) to the Vertex client, not Bedrock', async () => {
-    modelSpy.mockResolvedValue('claude-opus-4-8');
+  test('routes Opus 4.8 (anthropic.claude-opus-4-8) to the Bedrock bearer client, not Vertex or default Bedrock', async () => {
+    modelSpy.mockResolvedValue('anthropic.claude-opus-4-8');
+    bearerCreate.mockResolvedValueOnce({
+      content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Done.', status: 'success' } }],
+      stop_reason: 'tool_use',
+    });
+
+    const result = await runCodingAgent('change the heading', mockContext);
+
+    expect(result.success).toBe(true);
+    expect(bearerCreate).toHaveBeenCalledTimes(1);
+    expect(vertexCreate).not.toHaveBeenCalled();
+    expect(bedrockCreate).not.toHaveBeenCalled();
+    // The bare model id must be passed through to the bearer client unchanged;
+    // the client maps it to the inference profile internally.
+    expect(bearerCreate.mock.calls[0][0].model).toBe('anthropic.claude-opus-4-8');
+  });
+
+  test('routes a Vertex model (claude-sonnet-*) to the Vertex client, not Bedrock', async () => {
+    modelSpy.mockResolvedValue('claude-sonnet-4-6');
     vertexCreate.mockResolvedValueOnce({
       content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Done.', status: 'success' } }],
       stop_reason: 'tool_use',
@@ -1122,8 +1260,8 @@ describe('runCodingAgent — model provider routing', () => {
     expect(result.success).toBe(true);
     expect(vertexCreate).toHaveBeenCalledTimes(1);
     expect(bedrockCreate).not.toHaveBeenCalled();
-    // The model id must be passed through to the Vertex client unchanged.
-    expect(vertexCreate.mock.calls[0][0].model).toBe('claude-opus-4-8');
+    expect(bearerCreate).not.toHaveBeenCalled();
+    expect(vertexCreate.mock.calls[0][0].model).toBe('claude-sonnet-4-6');
   });
 
   test('routes a Bedrock model (anthropic.*) to the Bedrock client, not Vertex', async () => {
@@ -1138,13 +1276,14 @@ describe('runCodingAgent — model provider routing', () => {
     expect(result.success).toBe(true);
     expect(bedrockCreate).toHaveBeenCalledTimes(1);
     expect(vertexCreate).not.toHaveBeenCalled();
+    expect(bearerCreate).not.toHaveBeenCalled();
   });
 
-  test('retries a transient 5xx from the Vertex client, then succeeds', async () => {
-    modelSpy.mockResolvedValue('claude-opus-4-8');
-    const transient: any = new Error('Vertex AI error 503: overloaded');
+  test('retries a transient 5xx from the Opus 4.8 bearer client, then succeeds', async () => {
+    modelSpy.mockResolvedValue('anthropic.claude-opus-4-8');
+    const transient: any = new Error('Bedrock (Opus 4.8) error 503: overloaded');
     transient.status = 503;
-    vertexCreate
+    bearerCreate
       .mockRejectedValueOnce(transient)
       .mockResolvedValueOnce({
         content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Done.', status: 'success' } }],
@@ -1154,6 +1293,477 @@ describe('runCodingAgent — model provider routing', () => {
     const result = await runCodingAgent('change the heading', mockContext);
 
     expect(result.success).toBe(true);
-    expect(vertexCreate).toHaveBeenCalledTimes(2);
+    expect(bearerCreate).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ─── Bedrock streaming: frame parser + accumulator ────────────────────────────
+// The bearer-token Opus path streams `application/vnd.amazon.eventstream` frames.
+// These tests build real frames (matching AWS framing) and verify we reconstruct
+// the exact non-streaming Anthropic.Message shape the agent loop consumes.
+
+/** Encode one eventstream frame. Layout: [totalLen][headersLen][preludeCRC][headers][payload][msgCRC].
+ * The parser does not validate CRCs, so we zero them. Headers are string-typed (type 7). */
+function encodeFrame(headers: Record<string, string>, payload: Buffer): Buffer {
+  const headerParts: Buffer[] = [];
+  for (const [name, value] of Object.entries(headers)) {
+    const nameBuf = Buffer.from(name, 'utf8');
+    const valBuf = Buffer.from(value, 'utf8');
+    const h = Buffer.alloc(1 + nameBuf.length + 1 + 2 + valBuf.length);
+    let o = 0;
+    h.writeUInt8(nameBuf.length, o); o += 1;
+    nameBuf.copy(h, o); o += nameBuf.length;
+    h.writeUInt8(7, o); o += 1; // string type
+    h.writeUInt16BE(valBuf.length, o); o += 2;
+    valBuf.copy(h, o);
+    headerParts.push(h);
+  }
+  const headerBuf = Buffer.concat(headerParts);
+  const totalLen = 4 + 4 + 4 + headerBuf.length + payload.length + 4;
+  const frame = Buffer.alloc(totalLen);
+  let o = 0;
+  frame.writeUInt32BE(totalLen, o); o += 4;
+  frame.writeUInt32BE(headerBuf.length, o); o += 4;
+  frame.writeUInt32BE(0, o); o += 4; // prelude CRC (unchecked)
+  headerBuf.copy(frame, o); o += headerBuf.length;
+  payload.copy(frame, o); o += payload.length;
+  frame.writeUInt32BE(0, o); // message CRC (unchecked)
+  return frame;
+}
+
+/** Wrap a native Anthropic streaming event into a Bedrock "event/chunk" frame
+ * (payload is JSON with a base64 `bytes` field), exactly as the live endpoint does. */
+function chunkFrame(event: any): Buffer {
+  const payload = Buffer.from(JSON.stringify({ bytes: Buffer.from(JSON.stringify(event), 'utf8').toString('base64') }), 'utf8');
+  return encodeFrame({ ':message-type': 'event', ':event-type': 'chunk', ':content-type': 'application/json' }, payload);
+}
+
+function streamFromBuffers(buffers: Buffer[]): ReadableStream<Uint8Array> {
+  let i = 0;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (i < buffers.length) controller.enqueue(new Uint8Array(buffers[i++]));
+      else controller.close();
+    },
+  });
+}
+
+// A canonical text + tool_use event sequence, mirroring what the probe captured live.
+const TEXT_AND_TOOL_EVENTS = [
+  { type: 'message_start', message: { id: 'msg_1', type: 'message', role: 'assistant', model: 'claude-opus-4-8', content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 0 } } },
+  { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+  { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: "I'll edit " } },
+  { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'the file.' } },
+  { type: 'content_block_stop', index: 0 },
+  { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'toolu_1', name: 'edit_file', input: {} } },
+  { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"file_path":"app/' } },
+  { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: 'page.tsx"}' } },
+  { type: 'content_block_stop', index: 1 },
+  { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: { output_tokens: 42 } },
+  { type: 'message_stop', 'amazon-bedrock-invocationMetrics': { inputTokenCount: 10, outputTokenCount: 42 } },
+];
+
+describe('_parseEventStreamFrames', () => {
+  test('parses a single complete frame and exposes its headers and payload', () => {
+    const payload = Buffer.from('{"hello":"world"}', 'utf8');
+    const frame = encodeFrame({ ':message-type': 'event', ':event-type': 'chunk' }, payload);
+    const state = { buf: Buffer.alloc(0) };
+    const frames = [..._parseEventStreamFrames(state, new Uint8Array(frame))];
+    expect(frames).toHaveLength(1);
+    expect(frames[0].headers[':message-type']).toBe('event');
+    expect(frames[0].headers[':event-type']).toBe('chunk');
+    expect(frames[0].payload.toString('utf8')).toBe('{"hello":"world"}');
+    expect(state.buf.length).toBe(0);
+  });
+
+  test('buffers a partial frame split across chunks until complete', () => {
+    const payload = Buffer.from('{"a":1}', 'utf8');
+    const frame = encodeFrame({ ':message-type': 'event' }, payload);
+    const state = { buf: Buffer.alloc(0) };
+    const mid = Math.floor(frame.length / 2);
+    // First half yields nothing (incomplete)
+    expect([..._parseEventStreamFrames(state, new Uint8Array(frame.subarray(0, mid)))]).toHaveLength(0);
+    // Second half completes it
+    const frames = [..._parseEventStreamFrames(state, new Uint8Array(frame.subarray(mid)))];
+    expect(frames).toHaveLength(1);
+    expect(frames[0].payload.toString('utf8')).toBe('{"a":1}');
+  });
+
+  test('parses two frames delivered in one chunk', () => {
+    const f1 = encodeFrame({ ':message-type': 'event' }, Buffer.from('first', 'utf8'));
+    const f2 = encodeFrame({ ':message-type': 'event' }, Buffer.from('second', 'utf8'));
+    const state = { buf: Buffer.alloc(0) };
+    const frames = [..._parseEventStreamFrames(state, new Uint8Array(Buffer.concat([f1, f2])))];
+    expect(frames.map(f => f.payload.toString('utf8'))).toEqual(['first', 'second']);
+  });
+});
+
+describe('_accumulateBedrockStream', () => {
+  test('reconstructs a text + tool_use message from a streamed event sequence', async () => {
+    const frames = TEXT_AND_TOOL_EVENTS.map(chunkFrame);
+    const activity = jest.fn();
+    const msg = await _accumulateBedrockStream(streamFromBuffers(frames), 'us.anthropic.claude-opus-4-8', activity);
+
+    expect(msg.stop_reason).toBe('tool_use');
+    expect(msg.content).toHaveLength(2);
+    expect(msg.content[0]).toEqual({ type: 'text', text: "I'll edit the file." });
+    expect(msg.content[1]).toMatchObject({ type: 'tool_use', id: 'toolu_1', name: 'edit_file', input: { file_path: 'app/page.tsx' } });
+    // usage from message_start should be merged with message_delta's output_tokens
+    expect(msg.usage.output_tokens).toBe(42);
+    // onActivity fires at least once per chunk read
+    expect(activity).toHaveBeenCalled();
+  });
+
+  test('splitting frames mid-stream still reconstructs correctly (chunk boundaries are irrelevant)', async () => {
+    const all = Buffer.concat(TEXT_AND_TOOL_EVENTS.map(chunkFrame));
+    // Deliver the whole byte stream in 7-byte slices to stress the buffering path.
+    const slices: Buffer[] = [];
+    for (let i = 0; i < all.length; i += 7) slices.push(all.subarray(i, i + 7));
+    const msg = await _accumulateBedrockStream(streamFromBuffers(slices), 'p', () => {});
+    expect(msg.content[1]).toMatchObject({ name: 'edit_file', input: { file_path: 'app/page.tsx' } });
+  });
+
+  test('throws a retryable (5xx) error when the stream ends without message_start', async () => {
+    await expect(
+      _accumulateBedrockStream(streamFromBuffers([]), 'p', () => {})
+    ).rejects.toMatchObject({ status: 500 });
+  });
+
+  test('surfaces a Bedrock throttling exception frame as a retryable 429', async () => {
+    const start = chunkFrame(TEXT_AND_TOOL_EVENTS[0]);
+    const exceptionFrame = encodeFrame(
+      { ':message-type': 'exception', ':exception-type': 'ThrottlingException' },
+      Buffer.from('{"message":"Too many requests"}', 'utf8')
+    );
+    await expect(
+      _accumulateBedrockStream(streamFromBuffers([start, exceptionFrame]), 'p', () => {})
+    ).rejects.toMatchObject({ status: 429 });
+  });
+});
+
+// ─── Bearer client: abort surfaces as an honest timeout, not a generic error ──
+describe('runCodingAgent — bearer-token request timeout surfacing', () => {
+  const mockContext: CodingAgentContext = {
+    pageId: 'p', userId: 'u', sessionId: 's', llmModel: 'anthropic.claude-opus-4-8',
+  };
+  let modelSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedMcpFetch.mockReset();
+    mockedMcpFetch.mockResolvedValue({ files: [{ path: 'app/page.tsx', size: 100 }] });
+    _setSleepFnForTest(async () => {});
+    modelSpy = jest.spyOn(agentModeService, 'getCodingAgentDefaultModel').mockResolvedValue('anthropic.claude-opus-4-8');
+  });
+  afterEach(() => { modelSpy.mockRestore(); _setBedrockBearerClientForTest(null); });
+
+  test('a 408 timeout error from the client is reported (not retried into oblivion)', async () => {
+    const timeoutErr: any = new Error('Bedrock (us.anthropic.claude-opus-4-8) request timed out after 120s of inactivity');
+    timeoutErr.status = 408;
+    timeoutErr.isTimeout = true;
+    const bearerCreate = jest.fn().mockRejectedValue(timeoutErr);
+    _setBedrockBearerClientForTest({ messages: { create: bearerCreate } } as any);
+
+    const result = await runCodingAgent('edit the page', mockContext);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toMatch(/timed out|inactivity/i);
+    // 408 is not in callWithRetry's retry set (only 429/5xx), so exactly one attempt.
+    expect(bearerCreate).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── Page scope: pure helpers ─────────────────────────────────────────────────
+// Many landing pages share ONE repo: a root page owns top-level app/ files and
+// each other page is an app/<slug>/ route directory. The coding agent's file API
+// is already physically confined to the one repo behind its pageId, so the
+// editable boundary is the WHOLE repo (every route dir + shared files) — a run is
+// free to edit any sibling route, since they are all one multi-route project.
+describe('resolvePageScope', () => {
+  const repo = 'https://github.com/acme/lp-every-io';
+  const root = { id: 'root-1', isRootPage: true, githubRepoUrl: repo };
+  const subA = { id: 'sub-a', slug: 'every-io-day-zero-pre-seed-fou', githubRepoUrl: repo };
+  const subB = { id: 'sub-b', slug: 'every-io-seed-stage-founders', githubRepoUrl: repo };
+  const otherRepo = { id: 'other-1', slug: 'unrelated', githubRepoUrl: 'https://github.com/acme/lp-other' };
+
+  test('scope carries the page repo and the route slugs that live in it', () => {
+    const scope = resolvePageScope(subA, [root, subA, subB]);
+    expect(scope.repoUrl).toBe(repo);
+    expect(scope.routeSlugs.sort()).toEqual([subA.slug, subB.slug].sort());
+  });
+
+  test('only counts pages in the SAME repo as routes (ignores the owner\'s other repos)', () => {
+    const scope = resolvePageScope(subA, [root, subA, subB, otherRepo]);
+    expect(scope.routeSlugs).not.toContain('unrelated');
+    expect(scope.routeSlugs.sort()).toEqual([subA.slug, subB.slug].sort());
+  });
+
+  test('deduplicates route slugs and drops blanks', () => {
+    const scope = resolvePageScope(subA, [
+      subA,
+      subB,
+      { id: 'sub-c', slug: 'every-io-seed-stage-founders', githubRepoUrl: repo }, // dup slug
+      { id: 'sub-d', slug: '', githubRepoUrl: repo }, // blank (root-ish)
+    ]);
+    expect(scope.routeSlugs.sort()).toEqual([subA.slug, subB.slug].sort());
+  });
+});
+
+// A repo-wide scope: the agent may edit ANY file in its own repo (all route dirs
+// plus shared files). The only paths rejected are unsafe ones that escape the
+// repo (absolute paths, parent traversal).
+describe('isSafeRepoPath', () => {
+  test('allows this page\'s own route directory', () => {
+    expect(isSafeRepoPath('app/my-page/page.tsx')).toBe(true);
+    expect(isSafeRepoPath('app/my-page/_components/landing/TrustBar.tsx')).toBe(true);
+  });
+
+  test('allows OTHER route directories in the same multi-route project', () => {
+    // The exact case from the report: editing a sibling route's lead-capture form.
+    expect(isSafeRepoPath('app/every-io-series-a-scaling/_components/lead-capture-form.tsx')).toBe(true);
+    expect(isSafeRepoPath('app/other-page/page.tsx')).toBe(true);
+  });
+
+  test('allows shared components and root-level files', () => {
+    expect(isSafeRepoPath('components/landing/trust-bar.tsx')).toBe(true);
+    expect(isSafeRepoPath('app/layout.tsx')).toBe(true);
+    expect(isSafeRepoPath('app/globals.css')).toBe(true);
+    expect(isSafeRepoPath('app/page.tsx')).toBe(true);
+  });
+
+  test('normalizes leading ./ and / and backslashes', () => {
+    expect(isSafeRepoPath('./app/my-page/page.tsx')).toBe(true);
+    expect(isSafeRepoPath('/app/my-page/page.tsx')).toBe(true);
+    expect(isSafeRepoPath('app\\my-page\\page.tsx')).toBe(true);
+  });
+
+  test('rejects empty paths', () => {
+    expect(isSafeRepoPath('')).toBe(false);
+    expect(isSafeRepoPath('   ')).toBe(false);
+  });
+
+  test('rejects paths that escape the repo via parent traversal', () => {
+    expect(isSafeRepoPath('../secrets.txt')).toBe(false);
+    expect(isSafeRepoPath('app/../../etc/passwd')).toBe(false);
+    expect(isSafeRepoPath('app/my-page/../../../outside.tsx')).toBe(false);
+  });
+});
+
+describe('buildScopeSystemClause', () => {
+  const repo = 'https://github.com/acme/lp-every-io';
+
+  test('lists the project\'s routes and keeps the "only the change asked for" guidance', () => {
+    const clause = buildScopeSystemClause({
+      repoUrl: repo,
+      routeSlugs: ['every-io-day-zero-pre-seed-fou', 'every-io-series-a-scaling'],
+    });
+    // All routes named so the agent knows it may edit across them.
+    expect(clause).toContain('app/every-io-day-zero-pre-seed-fou/');
+    expect(clause).toContain('app/every-io-series-a-scaling/');
+    // Anti-overreach guidance from PR #1739 is preserved (soft, not a route lockout).
+    expect(clause).toMatch(/only the specific change/i);
+  });
+
+  test('handles a single-route / no-extra-routes project without crashing', () => {
+    const clause = buildScopeSystemClause({ repoUrl: repo, routeSlugs: [] });
+    expect(typeof clause).toBe('string');
+    expect(clause).toMatch(/only the specific change/i);
+  });
+});
+
+// ─── Page scope: enforcement in the agent loop ────────────────────────────────
+describe('runCodingAgent — scope enforcement', () => {
+  const scopedContext: CodingAgentContext = {
+    pageId: 'sub-a',
+    userId: 'user-456',
+    sessionId: 'session-789',
+    llmModel: 'anthropic.claude-sonnet-4-6',
+    draftBranch: 'draft/abc12345',
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedMcpFetch.mockReset();
+    mockCreate.mockReset();
+    mockGetLandingPageById.mockReset();
+    mockGetLandingPagesByOwner.mockReset();
+    _setBedrockClientForTest(mockClient);
+    _setSleepFnForTest(async () => {});
+    // The page under edit is one route of a multi-route project; a sibling route
+    // shares the SAME repo, so it is in-scope and editable.
+    const repo = 'https://github.com/acme/lp-every-io';
+    mockGetLandingPageById.mockResolvedValue({ id: 'sub-a', userId: 'user-456', slug: 'my-page', githubRepoUrl: repo });
+    mockGetLandingPagesByOwner.mockResolvedValue([
+      { id: 'sub-a', userId: 'user-456', slug: 'my-page', githubRepoUrl: repo },
+      { id: 'sub-b', userId: 'user-456', slug: 'other-page', githubRepoUrl: repo },
+    ]);
+  });
+
+  afterAll(() => {
+    _setBedrockClientForTest(null);
+  });
+
+  test('allows an edit to a SIBLING route in the same multi-route project', async () => {
+    // Regression for the report: editing another route's file in the same repo
+    // must go through (PR #1739 wrongly blocked this).
+    mockedMcpFetch.mockResolvedValueOnce({
+      files: [
+        { path: 'app/my-page/page.tsx', size: 1000 },
+        { path: 'app/other-page/_components/lead-capture-form.tsx', size: 1000 },
+      ],
+    });
+
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_file', input: {
+          file_path: 'app/other-page/_components/lead-capture-form.tsx',
+          edits: [{ search: '<button>', replace: '<button type="submit">' }],
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    // edit_file: GET current content, then PUT
+    mockedMcpFetch
+      .mockResolvedValueOnce({ content: '<button>' })
+      .mockResolvedValueOnce({ success: true, is_staging: true, commit_url: 'https://github.com/x/commit/abc' });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Aligned the submit button.', status: 'success' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    const result = await runCodingAgent('align the series A submit button', scopedContext);
+
+    expect(result.success).toBe(true);
+    const putCalls = mockedMcpFetch.mock.calls.filter(c => c[0]?.method === 'PUT');
+    expect(putCalls).toHaveLength(1);
+    expect((putCalls[0][0] as any).body.file_path).toBe('app/other-page/_components/lead-capture-form.tsx');
+  });
+
+  test('allows an edit inside the page\'s own directory', async () => {
+    // Pre-fetch list_files
+    mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/my-page/page.tsx', size: 1000 }] });
+
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_file', input: {
+          file_path: 'app/my-page/_components/landing/TrustBar.tsx',
+          edits: [{ search: '<img src="placeholder" />', replace: '<img src="https://logo" />' }],
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    // edit_file: GET current content, then PUT
+    mockedMcpFetch
+      .mockResolvedValueOnce({ content: '<img src="placeholder" />' })
+      .mockResolvedValueOnce({ success: true, is_staging: true, commit_url: 'https://github.com/x/commit/abc' });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Logo updated.', status: 'success' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    const result = await runCodingAgent('replace the placeholder logo', scopedContext);
+
+    expect(result.success).toBe(true);
+    const putCalls = mockedMcpFetch.mock.calls.filter(c => c[0]?.method === 'PUT');
+    expect(putCalls).toHaveLength(1);
+    expect((putCalls[0][0] as any).body.file_path).toBe('app/my-page/_components/landing/TrustBar.tsx');
+  });
+
+  test('blocks a write that escapes the repo via parent traversal', async () => {
+    mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/my-page/page.tsx', size: 1000 }] });
+
+    // LLM tries to write outside the repo entirely.
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_file', input: {
+          file_path: '../../etc/passwd',
+          edits: [{ search: 'a', replace: 'b' }],
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Cannot write there.', status: 'error' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    await runCodingAgent('write outside the repo', scopedContext);
+
+    // No PUT, and the file-content GET never happened either — only the pre-fetch.
+    const putCalls = mockedMcpFetch.mock.calls.filter(c => c[0]?.method === 'PUT');
+    expect(putCalls).toHaveLength(0);
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
+
+    const secondCallMessages = mockCreate.mock.calls[1][0].messages;
+    const toolResultMsg = secondCallMessages.find(
+      (m: any) => m.role === 'user' && Array.isArray(m.content) && m.content.some((b: any) => b.type === 'tool_result')
+    );
+    const trBlock = toolResultMsg.content.find((b: any) => b.type === 'tool_result');
+    expect(trBlock.content).toMatch(/outside the repository|cannot/i);
+  });
+
+  test('shows the full repo file listing and injects the scope clause into the system prompt', async () => {
+    mockedMcpFetch.mockResolvedValueOnce({
+      files: [
+        { path: 'app/my-page/page.tsx', size: 1000 },
+        { path: 'app/other-page/page.tsx', size: 1000 },
+        { path: 'components/landing/trust-bar.tsx', size: 500 },
+      ],
+    });
+    mockCreate.mockResolvedValueOnce({
+      content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'done', status: 'success' } }],
+      stop_reason: 'tool_use'
+    });
+
+    await runCodingAgent('do something', scopedContext);
+
+    const firstCall = mockCreate.mock.calls[0][0];
+    // System prompt names the project's routes and keeps the anti-overreach guidance.
+    expect(firstCall.system).toContain('app/my-page/');
+    expect(firstCall.system).toContain('app/other-page/');
+    expect(firstCall.system).toMatch(/only the specific change/i);
+    // The user message's file listing now shows the WHOLE repo — all routes + shared.
+    const userMsg = firstCall.messages.find((m: any) => m.role === 'user');
+    const userText = typeof userMsg.content === 'string'
+      ? userMsg.content
+      : userMsg.content.map((b: any) => b.text || '').join('');
+    expect(userText).toContain('app/my-page/page.tsx');
+    expect(userText).toContain('app/other-page/page.tsx');
+    expect(userText).toContain('components/landing/trust-bar.tsx');
+  });
+
+  test('still edits normally when the page record is not found (unrestricted fallback)', async () => {
+    // No page record → scope undefined → still unrestricted (safe-path guard only).
+    mockGetLandingPageById.mockResolvedValue(null);
+
+    mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/anything.tsx', size: 100 }] });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_file', input: {
+          file_path: 'app/other-page/page.tsx',
+          edits: [{ search: 'a', replace: 'b' }],
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    mockedMcpFetch
+      .mockResolvedValueOnce({ content: 'a' })
+      .mockResolvedValueOnce({ success: true, is_staging: true });
+    mockCreate.mockResolvedValueOnce({
+      content: [{ type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'done', status: 'success' } }],
+      stop_reason: 'tool_use'
+    });
+
+    const result = await runCodingAgent('edit anything', scopedContext);
+
+    expect(result.success).toBe(true);
+    const putCalls = mockedMcpFetch.mock.calls.filter(c => c[0]?.method === 'PUT');
+    expect(putCalls).toHaveLength(1);
   });
 });

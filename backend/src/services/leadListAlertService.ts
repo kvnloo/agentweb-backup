@@ -223,31 +223,14 @@ export const leadListAlertService = {
       </div>
     `;
 
+    // LinkedIn connection-accepted alerts are email-only by design — no Slack
+    // notification (unlike generic lead-list alerts in
+    // notifyLeadListOwnerIfConfigured).
     const ccEmails = Array.isArray(list.alertCcEmails) ? list.alertCcEmails.filter((e: string) => typeof e === 'string' && e.trim()) : undefined;
     if (Array.isArray(ccEmails) && ccEmails.length > 0) {
       await emailService.sendEmail(user.email, subject, text, html, ccEmails);
     } else {
       await emailService.sendEmail(user.email, subject, text, html);
-    }
-
-    if (user.slackChannel) {
-      try {
-        await sendLeadNotification(user.slackChannel, {
-          firstName: lead.firstName,
-          lastName: lead.lastName,
-          email: lead.email,
-          company: lead.company,
-          phone: lead.phone,
-          linkedin: lead.linkedin,
-          listName,
-          listId: list.listId,
-          crmUrl: leadEngagementUrl,
-          eventType: 'linkedin.connection_accepted',
-          timestamp: new Date().toISOString(),
-        });
-      } catch (slackError) {
-        console.error('Failed to send Slack LinkedIn connection notification:', slackError);
-      }
     }
   },
 

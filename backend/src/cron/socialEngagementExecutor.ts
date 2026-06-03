@@ -5,31 +5,97 @@ import { agentModeService } from '../services/agentModeService';
 import { v4 as uuidv4 } from 'uuid';
 
 const INSTANCE_ID = uuidv4();
-const COMMENT_MODEL = 'gemini-3.1-flash-lite';
+// gemini-3.5-flash follows the "no questions / no generic openers" instructions far more
+// reliably than the previous flash-lite model, which produced jargon-stuffed, templated comments.
+const COMMENT_MODEL = 'gemini-3.5-flash';
+// Lowered from 0.9 — high temperature on a weak prompt produced rambling, homogeneous output.
+const COMMENT_TEMPERATURE = 0.7;
+// Posts whose fetched text is shorter than this are treated as "no content": commenting on them
+// makes the model ask for the post text ("Please provide the post content…"), which then got
+// posted verbatim. Skip the comment instead.
+const MIN_POST_CONTENT_LENGTH = 20;
 
 const POST_COMMENT_SYSTEM_PROMPT = `You are writing a LinkedIn comment on behalf of a real person. Write exactly as a human would — natural, specific, and personal to the post content.
 
 Rules:
 - Reference something specific from the post (a number, an idea, a phrase) — do not comment on the post in general terms
-- Make a statement, share a reaction, or add a brief related thought — do NOT ask questions
-- Keep it 1-3 sentences — shorter is often better
-- Never start with "Great", "Love", "Wow", "Absolutely", "Totally", "Insightful", "Fascinating", or any generic opener
+- Make a statement, share a reaction, or add a brief related thought — do NOT ask questions. Never end with a question.
+- Keep it 1-2 sentences and under 50 words — shorter is almost always better
+- Never start with "Great", "Love", "Wow", "Absolutely", "Totally", "Insightful", "Fascinating", "The shift", "Moving beyond", "Transitioning from", "This shift", "The transition", "Scaling", or any generic or templated opener
+- Write in plain, conversational language. Do NOT stack corporate buzzwords (e.g. "agentic workflows", "operational debt", "data governance", "scalable infrastructure", "observability", "circuit breakers", "go-to-market", "enterprise ROI"). At most one such term, only if it's truly relevant.
 - No hashtags, no emojis unless the post itself is casual
 - Do not say "Thanks for sharing" or "This is so important" or anything a bot would say
 - Sound like you read the post, not like you scanned it
-Return ONLY the comment text, no quotes, no explanation.`;
+- NEVER ask for the post text, mention that content is missing, refer to "the post content", reference your persona, or explain what you are doing. If you cannot write a specific comment, the only allowed output is the single word: SKIP
+Return ONLY the comment text, no quotes, no preamble, no explanation.`;
 
 const COMMENT_REPLY_SYSTEM_PROMPT = `You are writing a LinkedIn reply on behalf of a real person. Write exactly as a human would — direct, warm, and specific to what was said.
 
 Rules:
 - Respond to something specific in the comment — a word, a claim, a question
 - Keep it 1-2 sentences, conversational in tone
-- Never start with "Absolutely", "Great point", "Totally agree", "So true", or any filler opener
-- No hashtags, no "Thanks for sharing"
+- Never start with "Absolutely", "Great point", "Totally agree", "So true", "The shift", "Moving beyond", or any filler opener
+- No hashtags, no "Thanks for sharing", no "Thank you for the kind words"
+- Write in plain language. Do NOT stack corporate buzzwords or sound like a press release.
 - It's fine to disagree gently, add nuance, or just connect briefly — whatever fits naturally
-- Make a statement or add a thought — do NOT ask questions back
+- Make a statement or add a thought — do NOT ask questions back. Never end with a question.
 - Sound like a colleague continuing a conversation, not an assistant acknowledging a ticket
-Return ONLY the reply text, no quotes, no explanation.`;
+- NEVER ask for the post or comment text, mention that content is missing, reference your persona, or explain what you are doing. If you cannot write a specific reply, the only allowed output is the single word: SKIP
+Return ONLY the reply text, no quotes, no preamble, no explanation.`;
+
+/**
+ * Phrases that indicate the LLM returned a refusal / meta-instruction / preamble instead of
+ * an actual comment. These were being posted verbatim to LinkedIn (e.g. "Please provide the
+ * text of the LinkedIn post so I can tailor the critique…"). Any match means the output is junk.
+ */
+const REFUSAL_PATTERNS: RegExp[] = [
+    /provide (the|your|me with the|specific|more) /i,
+    /please (share|provide|paste)/i,
+    /share (it|the post|the text|the content)/i,
+    /(i will|i'?ll|i can|i'?d) (craft|tailor|write|create|provide|be happy)/i,
+    /so (i|that i) can (tailor|craft|respond|write|provide)/i,
+    /here('?s| is) (a|my|the) (versatile|professional|generic|general|following)/i,
+    /since you (didn'?t|did not|haven'?t|have not) provide/i,
+    /you (didn'?t|did not|haven'?t|have not) provided?/i,
+    /\bas an? (ai|language model)\b/i,
+    /\blanguage model\b/i,
+    /\bmy persona\b/i,
+    /fits? (my|the) persona/i,
+    /aligns? with .{0,60}(perspective|persona)/i,
+    /no (post )?content (was )?(provided|available|given)/i,
+    /\[no content/i,
+    /^skip\.?$/i,
+];
+
+/**
+ * Cleans and validates an LLM-generated comment/reply before it is posted.
+ * - Strips wrapping quotes/backticks.
+ * - Salvages the real comment when the model prefixes a meta-preamble ending in a colon
+ *   (e.g. "…here is a versatile comment: <actual comment>").
+ * - Returns null if the result is empty or still looks like a refusal/meta response, so the
+ *   caller can skip posting rather than publish junk to LinkedIn.
+ */
+export function sanitizeGeneratedComment(raw?: string | null): string | null {
+    if (!raw) return null;
+    let text = raw.trim().replace(/^["'`“”]+|["'`“”]+$/g, '').trim();
+
+    // Salvage the comment when the model leads with a meta-preamble that introduces it via a colon.
+    const colonIdx = text.indexOf(':');
+    if (colonIdx > 0 && colonIdx < 240) {
+        const prefix = text.slice(0, colonIdx).toLowerCase();
+        if (/(provide|versatile|suitable|here is|here'?s|otherwise|professional comment|general comment|following comment)/.test(prefix)
+            && /(comment|response|reply|here)/.test(prefix)) {
+            const after = text.slice(colonIdx + 1).trim().replace(/^["'`“”]+|["'`“”]+$/g, '').trim();
+            if (after.length >= 15) text = after;
+        }
+    }
+
+    if (text.length < 3) return null;
+    for (const re of REFUSAL_PATTERNS) {
+        if (re.test(text)) return null;
+    }
+    return text;
+}
 
 const REACTION_SYSTEM_PROMPT = `You are a LinkedIn engagement assistant. Based on the content provided, choose the single most appropriate LinkedIn reaction.
 Reply with EXACTLY one of these values (no other text):
@@ -248,8 +314,10 @@ export class SocialEngagementExecutor {
         let reactionType: string | undefined;
 
         if (doComment) {
-            if (!postContent) {
-                console.warn(`[Executor] Skipping comment on ${postId}: post content could not be fetched.`);
+            // Treat whitespace-only or very short content as "no content" — commenting on it makes the
+            // model produce a refusal ("Please provide the post content…") that would be posted verbatim.
+            if (!postContent || postContent.trim().length < MIN_POST_CONTENT_LENGTH) {
+                console.warn(`[Executor] Skipping comment on ${postId}: post content unavailable or too short to comment meaningfully.`);
             } else {
                 // Real-time dedup: check if this account already commented on the post
                 const alreadyCommented = await this.hasAccountCommented(adapter, engagingConnection, engagingUserId, postId);
@@ -257,10 +325,15 @@ export class SocialEngagementExecutor {
                     console.log(`[Executor] Account ${engagingConnection.account_id} already commented on ${postId}, skipping comment.`);
                 } else {
                     const recentComments = await socialEngagementTrackingDb.getRecentGeneratedTexts(engagingConnection.account_id, 10);
-                    generatedText = await this.generatePostComment(postContent, engagerMemory, engagerPersonality, ownerContext, recentComments);
-                    console.log(`[Executor] Generated comment: "${generatedText.slice(0, 100)}..."`);
-                    await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId);
-                    console.log(`[Executor] Comment posted on post ${postId}`);
+                    const comment = await this.generatePostComment(postContent, engagerMemory, engagerPersonality, ownerContext, recentComments);
+                    if (!comment) {
+                        console.warn(`[Executor] No usable comment generated for ${postId}, skipping comment.`);
+                    } else {
+                        generatedText = comment;
+                        console.log(`[Executor] Generated comment: "${generatedText.slice(0, 100)}..."`);
+                        await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId);
+                        console.log(`[Executor] Comment posted on post ${postId}`);
+                    }
                 }
             }
         }
@@ -339,7 +412,7 @@ export class SocialEngagementExecutor {
         }
     }
 
-    private async generatePostComment(postContent: string, engagerMemory?: string, personality?: { presets: string[]; custom?: string }, ownerContext?: { name?: string; memory?: string }, recentComments?: string[]): Promise<string> {
+    private async generatePostComment(postContent: string, engagerMemory?: string, personality?: { presets: string[]; custom?: string }, ownerContext?: { name?: string; memory?: string }, recentComments?: string[]): Promise<string | null> {
         try {
             let systemPrompt = POST_COMMENT_SYSTEM_PROMPT;
             if (personality?.presets?.length || personality?.custom) {
@@ -367,21 +440,17 @@ export class SocialEngagementExecutor {
                     { role: 'system', content: systemPrompt },
                     { role: 'user', content: `Post content: ${postContent}` },
                 ],
-                temperature: 0.9,
+                temperature: COMMENT_TEMPERATURE,
             });
-            const text = completion.choices[0]?.message?.content?.trim();
-            if (text) return text;
+            const sanitized = sanitizeGeneratedComment(completion.choices[0]?.message?.content);
+            if (sanitized) return sanitized;
+            console.warn(`[Executor] Generated comment rejected by sanitizer (refusal/meta/empty), skipping comment.`);
         } catch (err) {
             console.warn(`[Executor] LLM comment generation failed:`, err);
         }
-        const fallbacks = [
-            'Hadn\'t considered it from this angle before. Makes sense though.',
-            'Worth bookmarking. A lot of people overlook this.',
-            'This resonates — the same pattern keeps showing up in a lot of places.',
-            'The numbers here tell a story that\'s easy to miss at first glance.',
-            'This is something more people should be paying attention to.',
-        ];
-        return fallbacks[Math.floor(Math.random() * fallbacks.length)];
+        // Return null rather than a canned fallback — a generic bot-like line is worse than no
+        // comment. The caller skips posting when generation fails or is rejected.
+        return null;
     }
 
     private async generateReactionType(content: string): Promise<LinkedInReaction> {
@@ -434,12 +503,20 @@ export class SocialEngagementExecutor {
             const alreadyReplied = await this.hasAccountCommented(adapter, engagingConnection, engagingUserId, commentId);
             if (alreadyReplied) {
                 console.log(`[Executor] Account ${engagingConnection.account_id} already replied to ${commentId}, skipping reply.`);
+            } else if (!commentText || commentText.trim().length < 3) {
+                // Without the comment text the model has nothing to reply to and produces a refusal.
+                console.warn(`[Executor] Skipping reply on ${commentId}: original comment text unavailable.`);
             } else {
                 const recentComments = await socialEngagementTrackingDb.getRecentGeneratedTexts(engagingConnection.account_id, 10);
-                generatedText = await this.generateCommentReply(commentText || '', engagerMemory, engagerPersonality, recentComments);
-                console.log(`[Executor] Generated reply: "${generatedText.slice(0, 100)}..."`);
-                await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId, commentId);
-                console.log(`[Executor] Reply posted on comment ${commentId}`);
+                const reply = await this.generateCommentReply(commentText, engagerMemory, engagerPersonality, recentComments);
+                if (!reply) {
+                    console.warn(`[Executor] No usable reply generated for ${commentId}, skipping reply.`);
+                } else {
+                    generatedText = reply;
+                    console.log(`[Executor] Generated reply: "${generatedText.slice(0, 100)}..."`);
+                    await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId, commentId);
+                    console.log(`[Executor] Reply posted on comment ${commentId}`);
+                }
             }
         }
 
@@ -464,7 +541,7 @@ export class SocialEngagementExecutor {
         return { generatedText, reactionType };
     }
 
-    private async generateCommentReply(commentText: string, engagerMemory?: string, personality?: { presets: string[]; custom?: string }, recentComments?: string[]): Promise<string> {
+    private async generateCommentReply(commentText: string, engagerMemory?: string, personality?: { presets: string[]; custom?: string }, recentComments?: string[]): Promise<string | null> {
         try {
             let systemPrompt = COMMENT_REPLY_SYSTEM_PROMPT;
             if (personality?.presets?.length || personality?.custom) {
@@ -486,20 +563,16 @@ export class SocialEngagementExecutor {
                     { role: 'system', content: systemPrompt },
                     { role: 'user', content: `Comment: ${commentText}` },
                 ],
-                temperature: 0.9,
+                temperature: COMMENT_TEMPERATURE,
             });
-            const text = completion.choices[0]?.message?.content?.trim();
-            if (text) return text;
+            const sanitized = sanitizeGeneratedComment(completion.choices[0]?.message?.content);
+            if (sanitized) return sanitized;
+            console.warn(`[Executor] Generated reply rejected by sanitizer (refusal/meta/empty), skipping reply.`);
         } catch (err) {
             console.warn(`[Executor] LLM reply generation failed:`, err);
         }
-        const fallbacks = [
-            'Interesting point — I hadn\'t thought about it that way.',
-            'Fair. That tracks with what I\'ve seen too.',
-            'Yeah, this keeps coming up. Worth paying attention to.',
-            'Good call. More people should be thinking about this.',
-        ];
-        return fallbacks[Math.floor(Math.random() * fallbacks.length)];
+        // Return null rather than a canned fallback — skip rather than post a generic bot-like reply.
+        return null;
     }
 
     // ────────────────────────────────────────────────────────────────────────────

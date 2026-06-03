@@ -3556,6 +3556,11 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5)
 // Function to search platform-wide knowledge base using Vertex AI Search
 export async function searchPlatformKnowledgeBase(query: string, maxResults: number = 10, userId?: string): Promise<ContextChunk[]> {
   try {
+    // An empty/whitespace query matches everything in Vertex — return nothing instead.
+    if (!query || !query.trim()) {
+      return [];
+    }
+
     // Initialize the Search Service clients
     const privateKey = await getGCSPPrivateKey();
 
@@ -3586,6 +3591,9 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
     // Create the search request with proper types
     const searchRequest: protos.google.cloud.discoveryengine.v1.ISearchRequest = {
       query,
+      // Bound the number of documents returned per bucket. Without this Vertex defaults to
+      // 10 docs, and with maxExtractiveSegmentCount segments each the result set balloons.
+      pageSize: maxResults,
       contentSearchSpec: {
         extractiveContentSpec: {
           maxExtractiveSegmentCount: maxResults

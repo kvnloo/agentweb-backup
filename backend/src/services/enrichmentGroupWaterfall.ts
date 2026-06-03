@@ -65,6 +65,8 @@ export interface ApolloFetchContext {
   personFetchAttempted: boolean;
   orgFetchFailed: boolean;
   personFetchFailed: boolean;
+  orgFromCache?: boolean;
+  personFromCache?: boolean;
 }
 
 export function createApolloFetchContext(): ApolloFetchContext {
@@ -77,7 +79,33 @@ export function createApolloFetchContext(): ApolloFetchContext {
     personFetchAttempted: false,
     orgFetchFailed: false,
     personFetchFailed: false,
+    orgFromCache: undefined,
+    personFromCache: undefined,
   };
+}
+
+// ─── EnrichSo fetch context (per-lead memoization) ───────────────────────────
+
+export interface EnrichSoFetchResult {
+  firstName?: string;
+  lastName?: string;
+  jobTitle?: string;
+  profileUrl?: string;
+  companyName?: string;
+  companyLocation?: string;
+  companyLinkedInUrl?: string;
+  pastCompanies?: string[];
+  education?: string[];
+  fromCache?: boolean;
+}
+
+export interface EnrichSoFetchContext {
+  result: EnrichSoFetchResult | null;
+  fetchAttempted: boolean;
+}
+
+export function createEnrichSoFetchContext(): EnrichSoFetchContext {
+  return { result: null, fetchAttempted: false };
 }
 
 // ─── Public types ─────────────────────────────────────────────────────────────
@@ -91,7 +119,7 @@ export interface FieldFill {
 export interface GroupResult {
   fields: FieldFill[];
   missing: string[];
-  tierFills: { crm: number; apollo: number; web: number; missing: number };
+  tierFills: { crm: number; apollo: number; enrichSo: number; unipile: number; web: number; missing: number };
 }
 
 export interface LLMExtractInput {
@@ -120,6 +148,7 @@ export interface LLMExtractResult {
 export interface ApolloFetchResult {
   mapped: Record<string, string>;
   raw: any;
+  fromCache?: boolean;
 }
 
 export interface WaterfallDeps {
@@ -140,17 +169,21 @@ export interface WaterfallDeps {
     last_name?: string;
     title?: string;
     linkedin_url?: string;
+    fromCache?: boolean;
   } | null>;
   /** Tier 5: company enrichment via Unipile (runs after Tier 4 web).
    *  Only fires when lead.linkedin is present. getProfile → company_id → getCompany.
    *  Returns companyRaw (full company profile) and company_name from work_experience. */
-  findUnipileCompany?(lead: LeadRecord): Promise<{ company_name?: string; companyRaw: any } | null>;
+  findUnipileCompany?(lead: LeadRecord): Promise<{ company_name?: string; companyRaw: any; fromCache?: boolean } | null>;
   /** Tier 3.5: Apollo broker chain (run_waterfall_email). Optional — only
    *  wired when the caller has a persisted lead to receive the webhook result. */
   apolloBrokerChain?: (
     input: { firstName: string; lastName: string; emailDomain?: string; company?: string; linkedin?: string },
     leadHint: { listId: string; leadId: string },
   ) => Promise<{ email: string; emailStatus?: string } | null>;
+  /** Tier 3.5b-enrich.so: reverse-lookup by email → person + company fields.
+   *  Memoized via EnrichSoFetchContext — called at most once per lead. */
+  findEnrichSoPerson?(email: string): Promise<EnrichSoFetchResult | null>;
 }
 
 export interface RunWaterfallInput {
@@ -160,6 +193,7 @@ export interface RunWaterfallInput {
   requestedFields: string[];
   configFieldsByName: Record<string, { instruction?: string } | undefined>;
   apolloCtx: ApolloFetchContext;
+  enrichSoCtx: EnrichSoFetchContext;
   refreshFields: Set<string>;   // entries shaped "<leadId>:<fieldName>"
   /** When set, enables Tier 3.5 Apollo broker chain for the person_identity
    *  group. The webhook writes the async result back to this lead. */
@@ -191,6 +225,7 @@ async function ensureApolloFetched(
       const result = await deps.fetchApolloOrg(lead);
       ctx.orgRaw = result?.mapped ?? null;
       ctx.orgRawJson = result?.raw ?? null;
+      ctx.orgFromCache = result?.fromCache;
       const mappedCount = ctx.orgRaw ? Object.keys(ctx.orgRaw).length : 0;
       const rawKeys = ctx.orgRawJson ? Object.keys(ctx.orgRawJson).length : 0;
       console.log(`${atag} ${ctx.orgRaw ? `HIT mapped_fields=${mappedCount} raw_keys=${rawKeys}` : 'MISS no org data'}`);
@@ -211,6 +246,7 @@ async function ensureApolloFetched(
     const result = await deps.fetchApolloPerson(lead);
     ctx.personRaw = result?.mapped ?? null;
     ctx.personRawJson = result?.raw ?? null;
+    ctx.personFromCache = result?.fromCache;
     const mappedCount = ctx.personRaw ? Object.keys(ctx.personRaw).length : 0;
     const rawKeys = ctx.personRawJson ? Object.keys(ctx.personRawJson).length : 0;
     console.log(`${atag} ${ctx.personRaw ? `HIT mapped_fields=${mappedCount} raw_keys=${rawKeys}` : 'MISS no person data'}`);
@@ -231,7 +267,10 @@ function getLeadFieldValue(lead: LeadRecord, field: string): string | undefined 
   return undefined;
 }
 
-function metaApollo(field: string, opts?: { llmExtracted?: boolean }): EnrichedFieldMeta {
+function metaApollo(
+  field: string,
+  opts?: { llmExtracted?: boolean; fromCache?: boolean },
+): EnrichedFieldMeta {
   // Tier 2 (deterministic direct-map) uses the raw registry confidence; Tier 3
   // (LLM extraction over Apollo raw JSON) passes { llmExtracted: true }, which
   // downgrades one notch — LLM extraction is less reliable than a direct map.
@@ -244,6 +283,7 @@ function metaApollo(field: string, opts?: { llmExtracted?: boolean }): EnrichedF
     provider: 'apollo',
     confidence,
     enrichedAt: new Date().toISOString(),
+    fromCache: opts?.fromCache,
   };
 }
 
@@ -255,16 +295,48 @@ function metaWeb(sourceUrl?: string, sourceQuote?: string): EnrichedFieldMeta {
     ...(sourceUrl ? { sourceUrl } : {}),
     ...(sourceQuote ? { sourceQuote } : {}),
     enrichedAt: new Date().toISOString(),
+    fromCache: false,
   };
 }
 
-function metaUnipile(): EnrichedFieldMeta {
+function metaUnipile(opts?: { fromCache?: boolean }): EnrichedFieldMeta {
   return {
     source: 'api',
     provider: 'unipile',
     confidence: 'medium',
     enrichedAt: new Date().toISOString(),
+    fromCache: opts?.fromCache,
   };
+}
+
+function metaEnrichSo(opts?: { fromCache?: boolean }): EnrichedFieldMeta {
+  return {
+    source: 'api',
+    provider: 'enrich.so',
+    confidence: 'medium',
+    enrichedAt: new Date().toISOString(),
+    fromCache: opts?.fromCache,
+  };
+}
+
+async function ensureEnrichSoFetched(
+  ctx: EnrichSoFetchContext,
+  email: string,
+  deps: WaterfallDeps,
+  tag: string,
+): Promise<EnrichSoFetchResult | null> {
+  if (ctx.fetchAttempted) return ctx.result;
+  ctx.fetchAttempted = true;
+  if (!deps.findEnrichSoPerson) return null;
+  try {
+    const result = await deps.findEnrichSoPerson(email);
+    ctx.result = result;
+    return result;
+  } catch (err) {
+    console.warn(`${tag} enrichSo fetch failed:`, (err as Error).message);
+    ctx.result = null;
+    return null;
+  }
 }
 
 /** True when an LLM-extracted entry carries a non-empty value — i.e. it
@@ -281,7 +353,7 @@ export async function runWaterfall(
   input: RunWaterfallInput,
   deps: WaterfallDeps,
 ): Promise<GroupResult> {
-  const { lead, groupName, requestedFields, apolloCtx, refreshFields } = input;
+  const { lead, groupName, requestedFields, apolloCtx, enrichSoCtx, refreshFields } = input;
   const groupConfig = FIELD_GROUPS[groupName];
 
   // Filter to fields actually in this group.
@@ -291,7 +363,7 @@ export async function runWaterfall(
     return {
       fields: [],
       missing: [],
-      tierFills: { crm: 0, apollo: 0, web: 0, missing: 0 },
+      tierFills: { crm: 0, apollo: 0, enrichSo: 0, unipile: 0, web: 0, missing: 0 },
     };
   }
 
@@ -320,7 +392,7 @@ export async function runWaterfall(
       continue;
     }
     console.log(`${tag} T1 HIT  field=${f} value="${String(value).slice(0, 60)}"`);
-    crmHits.push({ field: f, value, meta: meta! });
+    crmHits.push({ field: f, value, meta: { ...meta!, fromCache: true } });
   }
   filled.push(...crmHits);
   remaining = remaining.filter(f => !crmHits.find(c => c.field === f));
@@ -331,7 +403,7 @@ export async function runWaterfall(
     return {
       fields: filled,
       missing: [],
-      tierFills: { crm: crmHits.length, apollo: 0, web: 0, missing: 0 },
+      tierFills: { crm: crmHits.length, apollo: 0, enrichSo: 0, unipile: 0, web: 0, missing: 0 },
     };
   }
 
@@ -354,7 +426,11 @@ export async function runWaterfall(
       const value = apolloRaw[f];
       if (typeof value === 'string' && value.length > 0) {
         console.log(`${tag} T2 HIT  field=${f} value="${String(value).slice(0, 60)}"`);
-        apolloHits.push({ field: f, value, meta: metaApollo(f) });
+        apolloHits.push({
+          field: f,
+          value,
+          meta: metaApollo(f, { fromCache: apolloCtx.orgFromCache ?? apolloCtx.personFromCache }),
+        });
       } else {
         console.log(`${tag} T2 MISS field=${f} reason=not_in_apollo_mapped`);
       }
@@ -396,7 +472,14 @@ export async function runWaterfall(
       const entry = llmResult.filled[f];
       if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
         console.log(`${tag} T3 HIT  field=${f} value="${String(entry.value).slice(0, 60)}"`);
-        filled.push({ field: f, value: entry.value, meta: metaApollo(f, { llmExtracted: true }) });
+        filled.push({
+          field: f,
+          value: entry.value,
+          meta: metaApollo(f, {
+            llmExtracted: true,
+            fromCache: apolloCtx.orgFromCache ?? apolloCtx.personFromCache,
+          }),
+        });
         tier3Fills += 1;
       } else {
         console.log(`${tag} T3 MISS field=${f} reason=llm_returned_empty`);
@@ -418,6 +501,8 @@ export async function runWaterfall(
       tierFills: {
         crm: crmHits.length,
         apollo: apolloHits.length + tier3Fills,
+        enrichSo: 0,
+        unipile: 0,
         web: 0,
         missing: 0,
       },
@@ -473,6 +558,88 @@ export async function runWaterfall(
       tierFills: {
         crm: crmHits.length,
         apollo: apolloHits.length + tier3Fills,
+        enrichSo: 0,
+        unipile: 0,
+        web: 0,
+        missing: 0,
+      },
+    };
+  }
+
+  // ─ Tier 3.5b-enrich.so: reverse-lookup by email ────────────────────────────
+  // Fires for person AND company groups when lead has email and enrich.so dep is wired.
+  // Memoized via enrichSoCtx — at most one API call per lead across all groups.
+  // Person fields: first_name, last_name, title, linkedin_url
+  // Company fields: company_name, company_linkedin_url
+  //   hq_location intentionally NOT mapped: this tier (T3.5b) sits ABOVE Unipile and
+  //   web-search, and web-search yields a better HQ value. The waterfall only fills
+  //   empty fields, so letting enrich.so set hq_location would block the superior
+  //   web-search result. enrich.so DOES return one (EnrichSoFetchResult.companyLocation),
+  //   left unmapped on purpose. Revisit only if this tier moves to the very end.
+  // Career fields: prior_companies, education
+  const ENRICHSO_PERSON_FIELDS: Record<string, keyof EnrichSoFetchResult> = {
+    first_name: 'firstName',
+    last_name: 'lastName',
+    title: 'jobTitle',
+    linkedin_url: 'profileUrl',
+  };
+  const ENRICHSO_COMPANY_FIELDS: Record<string, keyof EnrichSoFetchResult> = {
+    company_name: 'companyName',
+    company_linkedin_url: 'companyLinkedInUrl',
+  };
+  const ENRICHSO_CAREER_FIELDS = new Set(['prior_companies', 'education']);
+  const allEnrichSoFields = [...Object.keys(ENRICHSO_PERSON_FIELDS), ...Object.keys(ENRICHSO_COMPANY_FIELDS), ...ENRICHSO_CAREER_FIELDS];
+  let enrichSoFills = 0;
+  if (deps.findEnrichSoPerson && remaining.some(f => allEnrichSoFields.includes(f))) {
+    const effectiveEmail = lead.email || filled.find(f => f.field === 'email')?.value;
+    if (effectiveEmail) {
+      console.log(`${tag} T3.5b-es attempt email=${effectiveEmail} attempted=${enrichSoCtx.fetchAttempted}`);
+      const esResult = await ensureEnrichSoFetched(enrichSoCtx, effectiveEmail, deps, tag);
+      if (esResult) {
+        for (const f of remaining) {
+          if (ENRICHSO_PERSON_FIELDS[f]) {
+            const value = esResult[ENRICHSO_PERSON_FIELDS[f]];
+            if (typeof value === 'string' && value.length > 0) {
+              console.log(`${tag} T3.5b-es HIT  field=${f} value="${value.slice(0, 60)}"`);
+              filled.push({ field: f, value, meta: metaEnrichSo({ fromCache: esResult.fromCache }) });
+              enrichSoFills++;
+            }
+          } else if (ENRICHSO_COMPANY_FIELDS[f]) {
+            const value = esResult[ENRICHSO_COMPANY_FIELDS[f]];
+            if (typeof value === 'string' && value.length > 0) {
+              console.log(`${tag} T3.5b-es HIT  field=${f} value="${value.slice(0, 60)}"`);
+              filled.push({ field: f, value, meta: metaEnrichSo({ fromCache: esResult.fromCache }) });
+              enrichSoFills++;
+            }
+          } else if (ENRICHSO_CAREER_FIELDS.has(f)) {
+            const raw = f === 'prior_companies' ? esResult.pastCompanies : esResult.education;
+            if (Array.isArray(raw) && raw.length > 0) {
+              const value = JSON.stringify(raw);
+              console.log(`${tag} T3.5b-es HIT  field=${f} value="${value.slice(0, 60)}"`);
+              filled.push({ field: f, value, meta: metaEnrichSo({ fromCache: esResult.fromCache }) });
+              enrichSoFills++;
+            }
+          }
+        }
+        remaining = remaining.filter(f => !filled.find(x => x.field === f));
+      } else {
+        console.log(`${tag} T3.5b-es MISS enrich.so returned null`);
+      }
+    } else {
+      console.log(`${tag} T3.5b-es SKIP no email available`);
+    }
+  }
+
+  if (remaining.length === 0) {
+    console.log(`${tag} DONE all filled by T1-T3.5b-es`);
+    return {
+      fields: filled,
+      missing: [],
+      tierFills: {
+        crm: crmHits.length,
+        apollo: apolloHits.length + tier3Fills,
+        enrichSo: enrichSoFills,
+        unipile: 0,
         web: 0,
         missing: 0,
       },
@@ -501,7 +668,7 @@ export async function runWaterfall(
           const value = result[f as keyof typeof result];
           if (typeof value === 'string' && value.length > 0) {
             console.log(`${tag} T3.5b HIT  field=${f} value="${value.slice(0, 60)}"`);
-            filled.push({ field: f, value, meta: metaUnipile() });
+            filled.push({ field: f, value, meta: metaUnipile({ fromCache: result.fromCache }) });
             unipileFills += 1;
           } else {
             console.log(`${tag} T3.5b MISS field=${f} reason=not_in_result`);
@@ -523,7 +690,9 @@ export async function runWaterfall(
       missing: [],
       tierFills: {
         crm: crmHits.length,
-        apollo: apolloHits.length + tier3Fills + unipileFills,
+        apollo: apolloHits.length + tier3Fills,
+        enrichSo: enrichSoFills,
+        unipile: unipileFills,
         web: 0,
         missing: 0,
       },
@@ -587,7 +756,7 @@ export async function runWaterfall(
           const entry = llmResult.filled[f];
           if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
             console.log(`${tag} T5 HIT  field=${f} value="${String(entry.value).slice(0, 60)}"`);
-            filled.push({ field: f, value: entry.value, meta: metaUnipile() });
+            filled.push({ field: f, value: entry.value, meta: metaUnipile({ fromCache: result.fromCache }) });
             unipileFills += 1;
           } else {
             console.log(`${tag} T5 MISS field=${f} reason=llm_returned_empty`);
@@ -597,7 +766,7 @@ export async function runWaterfall(
       } else if (result?.company_name && remaining.includes('company_name')) {
         // companyRaw unavailable but company_name from work_experience is enough
         console.log(`${tag} T5 HIT  field=company_name value="${result.company_name.slice(0, 60)}" (no companyRaw)`);
-        filled.push({ field: 'company_name', value: result.company_name, meta: metaUnipile() });
+        filled.push({ field: 'company_name', value: result.company_name, meta: metaUnipile({ fromCache: result.fromCache }) });
         unipileFills += 1;
         remaining = remaining.filter(f => f !== 'company_name');
       } else {
@@ -614,7 +783,9 @@ export async function runWaterfall(
     missing: remaining,
     tierFills: {
       crm: crmHits.length,
-      apollo: apolloHits.length + tier3Fills + unipileFills,
+      apollo: apolloHits.length + tier3Fills,
+      enrichSo: enrichSoFills,
+      unipile: unipileFills,
       web: webFills,
       missing: remaining.length,
     },

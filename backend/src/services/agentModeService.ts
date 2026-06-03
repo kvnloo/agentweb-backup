@@ -7,6 +7,8 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
+import { rankMemoriesByRelevance } from '../utils/memoryRanking';
+import { embedText } from '../utils/embeddings';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
@@ -21,6 +23,7 @@ import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
 import { skillService } from './skillService';
 import { extractVariables } from '../utils/templateParser';
+import { applyPrintLayoutFixes } from '../utils/pdfPrintLayout';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData } from '../utils/llmService';
@@ -185,6 +188,19 @@ const DIAGNOSIS_TIMEOUT_MS = 10_000;
 
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'avif', 'heic', 'heif']);
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wmv', 'm4v', 'ogv', '3gp', 'ts']);
+
+// Models served from the separate Bedrock account (231030591963) reached via a
+// long-term API key (bearer token) rather than the app's default SigV4 creds.
+const BEARER_TOKEN_MODELS = new Set(['anthropic.claude-opus-4-8']);
+
+// Legacy model ids persisted by sessions/schedules created before a model was
+// renamed. Maps the old id to its current registry key so old sessions keep
+// working instead of throwing "Invalid model". Opus 4.8 was renamed from the
+// bare Vertex id "claude-opus-4-8" to the Bedrock id "anthropic.claude-opus-4-8"
+// in commit c86c8ec1.
+const LEGACY_MODEL_ALIASES: Record<string, string> = {
+  'claude-opus-4-8': 'anthropic.claude-opus-4-8',
+};
 
 // Context passed to the diagnosis agent when the main agent fails
 export interface DiagnosisContext {
@@ -895,7 +911,7 @@ export class AgentModeService {
    * model without affecting chat. Falls back to a known vision-capable model.
    */
   async getVisionModel(): Promise<string> {
-    const fallbackModel = this.llmModels['claude-opus-4-8'] ? 'claude-opus-4-8' : this.default_model;
+    const fallbackModel = this.llmModels['anthropic.claude-opus-4-8'] ? 'anthropic.claude-opus-4-8' : this.default_model;
     try {
       const setting = await settingsService.getSetting(this.visionModelSettingName);
       const configuredModel = setting?.settingValue?.trim();
@@ -1196,17 +1212,44 @@ export class AgentModeService {
 
     const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
     const BEDROCK_REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes per request
-    const bedrockClient = new BedrockRuntimeClient({
-      region,
-      credentials: process.env.AWS_ACCESS_KEY_ID ? {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
-      } : undefined,
-      requestHandler: {
-        connectionTimeout: 10_000, // 10s to establish connection
-        requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS,
-      } as any,
-    });
+
+    // Opus 4.8 is served from a separate AWS account (231030591963) that the app's
+    // default IAM credentials (992382574572) cannot reach. Authenticate that model
+    // with a long-term Bedrock API key (bearer token) instead of SigV4, scoped to a
+    // dedicated client so all other models keep using the default credential chain.
+    const usesBearerToken = BEARER_TOKEN_MODELS.has(modelId);
+    let bedrockClient: any;
+    if (usesBearerToken) {
+      const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+      const bearerToken = (await getSecret(`${environment}/AgentWeb/Bedrock/ApiKey`)).trim();
+      bedrockClient = new BedrockRuntimeClient({
+        region,
+        token: { token: bearerToken },
+        authSchemePreference: ['httpBearerAuth'],
+        requestHandler: {
+          connectionTimeout: 10_000,
+          requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS,
+        } as any,
+      });
+    } else {
+      // Pin SigV4 explicitly. If AWS_BEARER_TOKEN_BEDROCK is present in the
+      // environment (e.g. cloud-dev boxes set it for the Claude Code CLI), the
+      // SDK would otherwise default to bearer-first auth and send that token —
+      // scoped to the Opus 4.8 account (231030591963) — for every Bedrock call,
+      // 403ing models like Sonnet/Opus 4.6 that live in the default account.
+      bedrockClient = new BedrockRuntimeClient({
+        region,
+        authSchemePreference: ['sigv4'],
+        credentials: process.env.AWS_ACCESS_KEY_ID ? {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
+        } : undefined,
+        requestHandler: {
+          connectionTimeout: 10_000, // 10s to establish connection
+          requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS,
+        } as any,
+      });
+    }
 
     // Map certain model IDs to their corresponding inference profile ARNs
     // Note: Newer Claude models require using inference profiles for cross-region access
@@ -1214,10 +1257,8 @@ export class AgentModeService {
       'anthropic.claude-sonnet-4-5-20250929-v1:0': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
       'anthropic.claude-sonnet-4-6': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
       'anthropic.claude-opus-4-6-v1': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
-      // NOTE: claude-opus-4-7 is registered but NOT available on this Bedrock account as of 2026-04-21.
-      // Kept in registry because: (1) admin-only so no user-facing risk, (2) may become available later.
-      // If a user hits it today they get a 400 from Bedrock which is now correctly handled by httpStatus check.
-      'anthropic.claude-opus-4-7': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-7',
+      // Opus 4.8 lives in account 231030591963 (reached via bearer token above).
+      'anthropic.claude-opus-4-8': 'us.anthropic.claude-opus-4-8',
     };
     const actualModelId = inferenceProfileMap[modelId] || modelId;
 
@@ -1684,12 +1725,9 @@ export class AgentModeService {
     'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
     'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true, supportsVision: true },
     'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true, adminOnly: true, supportsVision: true },
-    // NOTE: not available on this Bedrock account as of 2026-04-21 (admin-only, kept for future availability).
-    // Vision capable, but omitted from vision options until provisioned (selecting it returns 403). Add supportsVision: true when enabled.
-    'anthropic.claude-opus-4-7': { client: null, supportsTemperature: true, adminOnly: true },
-    // Claude Opus 4.8 via Google Vertex AI — available to all users
-    // temperature is deprecated for this model on Vertex AI
-    'claude-opus-4-8': { client: null, supportsTemperature: false, supportsVision: true },
+    // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
+    // temperature is deprecated for this model
+    'anthropic.claude-opus-4-8': { client: null, supportsTemperature: false, supportsVision: true },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
@@ -1703,7 +1741,7 @@ export class AgentModeService {
   }
 
   async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
-    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || !this.llmModels[m].adminOnly));
+    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || (!this.llmModels[m].adminOnly && !m.includes('opus'))));
   }
   /**
    * Make an LLM call with the specified model and parameters
@@ -1714,11 +1752,26 @@ export class AgentModeService {
    */
 
 
+  /**
+   * Resolve a possibly-legacy model id to its current registry key. Sessions and
+   * schedules created before a model rename persist the old id; this maps it
+   * forward so requests don't fail with "Invalid model". Unknown/canonical ids
+   * (and undefined) pass through unchanged.
+   */
+  public normalizeModelId<T extends string | undefined>(model: T): T {
+    if (model && LEGACY_MODEL_ALIASES[model]) {
+      return LEGACY_MODEL_ALIASES[model] as T;
+    }
+    return model;
+  }
+
   async callLLM(
     model: string,
     messages: any[],
     options?: LLMCallOptions
   ) {
+    // Map legacy/renamed model ids forward before validation or routing.
+    model = this.normalizeModelId(model);
 
     // Validate that the model exists
     if (!this.llmModels[model]) {
@@ -1848,7 +1901,7 @@ export class AgentModeService {
       'anthropic.claude-sonnet-4-5-20250929-v1:0': [3, 15],
       'anthropic.claude-sonnet-4-6': [3, 15],
       'anthropic.claude-opus-4-6-v1': [15, 75],
-      'claude-opus-4-8': [15, 75],
+      'anthropic.claude-opus-4-8': [15, 75],
       'gpt-5-chat-2': [2.5, 10],
       'gpt-5.2-chat': [3, 12],
       'gemini-3-pro-preview': [1.25, 10],
@@ -1928,6 +1981,10 @@ export class AgentModeService {
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
     try {
+      // Map legacy/renamed model ids forward (e.g. old sessions persisted the
+      // pre-rename "claude-opus-4-8") so metadata, pricing, and routing all use
+      // the canonical registry key.
+      llmModel = this.normalizeModelId(llmModel);
       // Track backup model usage
       const originalLlmModel = llmModel;
       let backupModelUsed = false;
@@ -2004,14 +2061,60 @@ export class AgentModeService {
         });
       }
 
-      // Inject account memory context (cross-session knowledge)
+      // Inject memory context (cross-session knowledge). Retrieve by *relevance* to the
+      // current message, not just recency — so a relevant older fact is surfaced even when
+      // the account has more than MEMORY_INJECTION_LIMIT stored memories. Small accounts
+      // (<= limit) inject everything, identical to the previous recency behavior.
       try {
         const { userDb, orgMemoryDb, orgDb } = await import('./db');
         const memoryUser = await userDb.getUserById(userId);
+
+        const MEMORY_INJECTION_LIMIT = 20;
+        // Embed the current message once, lazily, and reuse for both account + org memory.
+        // Only computed when a memory set actually exceeds the limit (no cost for small accounts).
+        let queryEmbedding: number[] | null | undefined;
+        const getQueryEmbedding = async (): Promise<number[] | null> => {
+          if (queryEmbedding === undefined) {
+            queryEmbedding = messageContent ? await embedText(messageContent) : null;
+          }
+          return queryEmbedding;
+        };
+
+        // Rank `all` memories by relevance to the message. Lazily embeds (and backfills)
+        // any legacy memory missing an embedding so ranking is fair and one-time.
+        const selectRelevantMemories = async (
+          all: any[],
+          backfill: (memoryId: string, embedding: number[]) => void
+        ): Promise<any[]> => {
+          if (all.length <= MEMORY_INJECTION_LIMIT) {
+            return rankMemoriesByRelevance(all, [], MEMORY_INJECTION_LIMIT);
+          }
+          const qEmbedding = await getQueryEmbedding();
+          if (!qEmbedding) {
+            // Embedding unavailable → degrade gracefully to recency.
+            return rankMemoriesByRelevance(all, [], MEMORY_INJECTION_LIMIT);
+          }
+          for (const m of all) {
+            if (!Array.isArray(m.embedding) || m.embedding.length === 0) {
+              const emb = await embedText(m.content);
+              if (emb) {
+                m.embedding = emb;
+                backfill(m.memoryId, emb);
+              }
+            }
+          }
+          return rankMemoriesByRelevance(all, qEmbedding, MEMORY_INJECTION_LIMIT);
+        };
+
         if (memoryUser?.memoryEnabled !== false) {
-          const recentMemories = await accountMemoryDb.getRecentMemories(userId, 20);
-          if (recentMemories.length > 0) {
-            const memoryLines = recentMemories.map(
+          const allMemories = await accountMemoryDb.getUserMemories(userId);
+          const relevantMemories = await selectRelevantMemories(allMemories, (memoryId, emb) => {
+            accountMemoryDb.setMemoryEmbedding(userId, memoryId, emb).catch((e) =>
+              console.error('Failed to backfill account memory embedding:', e)
+            );
+          });
+          if (relevantMemories.length > 0) {
+            const memoryLines = relevantMemories.map(
               (m: any) => `- [${m.category}] ${m.content}`
             );
             messages.push({
@@ -2025,9 +2128,14 @@ export class AgentModeService {
         if (memoryUser?.orgId) {
           const org = await orgDb.getOrgById(memoryUser.orgId);
           if (org && org.orgMemoryEnabled !== false) {
-            const recentOrgMemories = await orgMemoryDb.getRecentOrgMemories(memoryUser.orgId, 20);
-            if (recentOrgMemories.length > 0) {
-              const orgMemoryLines = recentOrgMemories.map(
+            const allOrgMemories = await orgMemoryDb.getOrgMemories(memoryUser.orgId);
+            const relevantOrgMemories = await selectRelevantMemories(allOrgMemories, (memoryId, emb) => {
+              orgMemoryDb.setMemoryEmbedding(memoryUser.orgId!, memoryId, emb).catch((e) =>
+                console.error('Failed to backfill org memory embedding:', e)
+              );
+            });
+            if (relevantOrgMemories.length > 0) {
+              const orgMemoryLines = relevantOrgMemories.map(
                 (m: any) => `- [${m.category}] ${m.content}`
               );
               messages.push({
@@ -4027,6 +4135,7 @@ export class AgentModeService {
         s3_url: actualResult.s3_url,
         filename: actualResult.filename,
         title: actualResult.title,
+        document_type: actualResult.document_type,
       };
     }
 
@@ -5036,6 +5145,7 @@ export class AgentModeService {
           s3_url: `https://mock-s3-bucket.s3.amazonaws.com/html_${Date.now()}_${args.title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`,
           filename: `html_${Date.now()}_${args.title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`,
           title: args.title,
+          document_type: args.document_type === 'email' ? 'email' : 'document',
           message: 'Mock HTML file created successfully'
         };
 
@@ -9468,7 +9578,15 @@ ${emailDraftFormat === 'text'
         });
       }
 
-      // Create message draft optimised for LinkedIn connection invites (max 300 chars)
+      // Create message draft optimised for LinkedIn connection invites. The char limit
+      // depends on the sending account tier: 300 for Premium, 200 for free. Resolve the
+      // account the same way the send-invite route does (list-assigned → user's own).
+      const { linkedInOutreachService } = await import('./linkedInOutreachService');
+      const inviteAccountId = (list as any)?.linkedInAccountId
+        || await linkedInOutreachService.resolveUserOwnedAccountId(userId);
+      const inviteCharLimit = inviteAccountId
+        ? await linkedInOutreachService.getInviteCharLimitForAccount(userId, inviteAccountId)
+        : 200;
       const leadName = [(lead as any).firstName, (lead as any).lastName].filter(Boolean).join(' ');
       const leadTitle = (lead as any).title || '';
       const leadCompany = (lead as any).company || '';
@@ -9484,7 +9602,7 @@ Write a note that:
 - Leads with something specific about THEIR work, role, or company — show you looked them up
 - Explains briefly WHY you want to connect, relevant to them
 - Sounds like one human writing to another — warm, direct, no corporate speak
-- Is under 280 characters total
+- Is under ${inviteCharLimit} characters total
 - Opens with their first name naturally (e.g. "John, saw your work on..." or "Sarah —")
 - Does NOT start with Hi or Hello
 - Does NOT have a call to action ("would love to chat", "let's connect")
@@ -9527,12 +9645,13 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         messageData = null;
       }
 
-      // Create message draft object if we got valid data — hard-cap at 300 chars (LinkedIn invite limit)
+      // Create message draft object if we got valid data — hard-cap at the account's
+      // LinkedIn invite limit (300 Premium / 200 free).
       let messageDraft = null;
       if (messageData && messageData.content) {
         const now = new Date().toISOString();
         messageDraft = {
-          content: String(messageData.content).slice(0, 300),
+          content: String(messageData.content).slice(0, inviteCharLimit),
           createdAt: now,
           updatedAt: now,
           sessionId: sessionId
@@ -11562,16 +11681,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         data: allData,
       };
 
-      const filename = `insights_${actualNodeId}_${Date.now()}.json`;
-
-      const s3Result = await uploadFileToS3(
-        JSON.stringify(envelope, null, 2),
-        filename,
-        userId,
-        "application/json"
-      );
-
-      return { success: true, s3_url: s3Result.url, totalRows: allData.length };
+      // Return the insights data inline rather than uploading to S3 ourselves.
+      // The agent-mode tool pipeline already offloads any oversized tool response
+      // to S3 under a readable `tool-responses/<sessionId>` key (retrievable via
+      // read_tool_response / search_tool_response) and keeps small responses inline.
+      // Doing our own upload produced an unreadable `s3_url` (no s3_key, wrong
+      // content path), which broke every file-reading tool and the daily digest.
+      return {
+        success: true,
+        totalRows: allData.length,
+        metadata: envelope.metadata,
+        data: allData,
+      };
 
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
@@ -12551,18 +12672,48 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       const image = await metaService.uploadImage(accountId, accessToken, filename, buffer);
+      // metaService.uploadImage returns a flat { hash, url, ... } object. Surface the hash
+      // at the top level as image_hash so callers (COPY_AD re-upload, the agent itself)
+      // never have to parse Meta's filename-keyed images map — that parsing is the source
+      // of distinct creatives colliding on the wrong hash during batch uploads.
+      const imageHash = image?.hash;
+      if (!imageHash) {
+        return {
+          success: false,
+          message: 'Image upload did not return a hash from Meta.',
+          error: 'NO_IMAGE_HASH',
+          image
+        };
+      }
       return {
         success: true,
         message: `Image uploaded successfully`,
-        image: image
+        image_hash: imageHash,
+        image_url: image?.url,
+        image
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error uploading Meta ad image:', error);
+      // metaService.handleError attaches a structuredError ({ code, error_subcode,
+      // error_user_msg, ... }) so callers see Meta's actual reason instead of the bare
+      // "Invalid parameter". Surface it so the agent knows e.g. an image is too large.
+      const structured = error.structuredError;
+      const detail = structured?.error_user_msg || structured?.error_user_title;
+      const baseMessage = error.message || 'Failed to upload Meta ad image.';
       return {
         success: false,
-        message: error.message || 'Failed to upload Meta ad image.',
-        error: error.message
+        message: detail ? `${baseMessage} (${detail})` : baseMessage,
+        error: baseMessage,
+        meta_error: structured
+          ? {
+              code: structured.code,
+              error_subcode: structured.error_subcode,
+              error_user_title: structured.error_user_title,
+              error_user_msg: structured.error_user_msg,
+              classification: structured.classification,
+            }
+          : undefined,
       };
     }
   }
@@ -14132,7 +14283,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
     // LinkedIn invite message too long — tell the LLM to shorten and retry, not report success
     if (toolName === 'linkedin_outreach' && safeMessage.toLowerCase().includes('too long')) {
-      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: The invitation message exceeded LinkedIn's 300-character limit. Do NOT report this as a success. Shorten the message to 300 characters or fewer (trim filler words, remove the sign-off line, keep only the core personalisation) and retry the send-invite call immediately.`;
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: The invitation message exceeded LinkedIn's per-account character limit (see the reason above for the exact limit — 200 for free accounts, 300 for Premium). Do NOT report this as a success. Shorten the message to within that limit (trim filler words, remove the sign-off line, keep only the core personalisation) and retry the send-invite call immediately.`;
     }
     // save_file / create_html_file parameter errors — guide LLM to use correct schema names
     if ((toolName === 'save_file' || toolName === 'create_html_file') &&
@@ -14183,6 +14334,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async searchKnowledgeBase(query: string, maxResults: number = 5, userId?: string): Promise<any> {
     try {
       console.log('AgentMode: Searching knowledge base for query:', query, 'maxResults:', maxResults);
+
+      // Guard: an empty/whitespace query matches everything in Vertex (returned the whole
+      // KB). Skip the search entirely and return nothing.
+      if (!query || !query.trim()) {
+        return {
+          success: true,
+          message: 'No search query provided.',
+          query: query || '',
+          results: [],
+          totalResults: 0,
+        };
+      }
 
       // Limit max results to 10
       const limitedMaxResults = Math.min(maxResults, 10);
@@ -14320,12 +14483,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
+      // Bound the merged results to what the caller asked for. Each source (Vertex, Drive,
+      // ClickUp docs/tasks) is collected up to limitedMaxResults independently, so the merged
+      // list can be several times larger than requested — cap it to avoid context bloat.
+      const boundedResults = results.slice(0, limitedMaxResults);
+
       return {
         success: true,
-        message: `Found ${results.length} knowledge base results for "${query}"`,
+        message: `Found ${boundedResults.length} knowledge base results for "${query}"`,
         query,
-        results,
-        totalResults: results.length
+        results: boundedResults,
+        totalResults: boundedResults.length
       };
     } catch (error) {
       console.error('AgentMode: Error searching knowledge base:', error);
@@ -16184,6 +16352,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         });
         const page = await browser.newPage();
         await page.goto(sourceUrl, { waitUntil: 'networkidle0', timeout: 30000 });
+        // Prevent sections/tables taller than a page from overflowing and
+        // overwriting adjacent sections (relax unsatisfiable break-inside:avoid).
+        await applyPrintLayoutFixes(page, 'A4', '20mm', '20mm');
         const pdfBuffer = await page.pdf({
           format: 'A4',
           printBackground: true,
@@ -19693,7 +19864,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
     contentDraft: string,
     formatRequirements: string,
     userId: string,
-    sessionId: string
+    sessionId: string,
+    documentType: 'document' | 'email' = 'document'
   ): Promise<any> {
     try {
       if (!title || typeof title !== 'string') {
@@ -19703,6 +19875,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         throw new Error('content_draft is required and must be a non-empty string');
       }
 
+      const isEmail = documentType === 'email';
+
       // Use Claude model by default (check for Claude in model name)
       const defaultClaudeModel = 'anthropic.claude-sonnet-4-6';
 
@@ -19711,8 +19885,39 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       // Use high token limit for HTML generation — reports like GTM audits can be large
       const llmService = createLLMService(defaultClaudeModel, 0.8, 64000);
 
+      // Email mode produces a one-off newsletter/marketing email rendered in
+      // HTML that is safe across email clients (Gmail, Outlook, Apple Mail).
+      // This is a finished email, NOT a reusable {{variable}} template.
+      const emailSystemPrompt = `You are an expert HTML email designer. Your task is to create a complete, polished, ready-to-send marketing/newsletter email in HTML from the provided subject/title and content draft.
+
+EMAIL-CLIENT COMPATIBILITY (CRITICAL — emails are not web pages):
+- Use a table-based layout (<table role="presentation" ...>) for ALL structure — do NOT rely on flexbox, grid, float, or position
+- Use INLINE styles on every element (style="..."). Email clients strip or ignore <style> blocks and external CSS
+- Center the email in a 600px-wide container table (max-width: 600px); use a full-width outer wrapper table with a light background color
+- Use only web-safe fonts (Arial, Helvetica, Georgia, sans-serif) with explicit font-family fallbacks
+- Use absolute https:// URLs for all images, and always include width, alt text, and display:block
+- Use VML-free, JavaScript-free markup — NO <script>, NO external <link>, NO web fonts, NO charts/canvas
+- Specify explicit colors as hex (e.g. #1a1a1a) and set bgcolor on table cells where relevant
+- Make buttons as bulletproof anchor "buttons": an <a> with inline padding, background-color, border-radius, and color
+- Add a viewport meta tag and set body { margin:0; padding:0; } for consistent rendering
+- Keep total width responsive: the container should gracefully shrink on mobile (use width:100% with max-width:600px)
+
+EMAIL STRUCTURE:
+- Begin with a clear header (brand name or logo area) and a strong headline derived from the subject/title
+- Organize the content draft into scannable sections with headings, short paragraphs, and bullet lists where helpful
+- Include a clear call-to-action button if the content implies one
+- End with a simple footer (sender/company line and an unsubscribe placeholder link)
+
+DATA ACCURACY RULES (CRITICAL):
+- NEVER invent, estimate, approximate, or round numeric values
+- Use ONLY the exact numbers, names, dates, and links provided in the content draft — copy them verbatim
+- If a value is not present in the content draft, omit it rather than guessing
+${formatRequirements ? `\nAdditional Format Requirements:\n${formatRequirements}` : ''}
+
+Return ONLY the complete HTML email document (DOCTYPE through </html>), production-ready and well-formatted. Do NOT use {{variable}} placeholders — fill in the actual content. This is a finished, one-off email, not a reusable template.`;
+
       // Build system prompt for HTML generation
-      const systemPrompt = `You are an expert web developer and HTML designer. Your task is to create a well-formatted, professional HTML document from the provided title and content draft.
+      const documentSystemPrompt = `You are an expert web developer and HTML designer. Your task is to create a well-formatted, professional HTML document from the provided title and content draft.
 
 Requirements:
 - Create a complete, valid HTML5 document with proper DOCTYPE, html, head, and body tags
@@ -19755,8 +19960,21 @@ Option B — Inline Chart.js (for interactive charts):
 
 The HTML should be production-ready and well-formatted.`;
 
+      const systemPrompt = isEmail ? emailSystemPrompt : documentSystemPrompt;
+
       // Build user prompt
-      const userPrompt = `Create a well-formatted HTML document with the following:
+      const userPrompt = isEmail
+        ? `Create a complete, ready-to-send HTML email with the following:
+
+Subject / Title: ${title}
+
+Content Draft:
+${contentDraft}
+
+${formatRequirements ? `\nFormat Requirements:\n${formatRequirements}` : ''}
+
+Please generate a complete, email-client-safe HTML email that presents this content as a polished newsletter/marketing email.`
+        : `Create a well-formatted HTML document with the following:
 
 Title: ${title}
 
@@ -19768,7 +19986,7 @@ ${formatRequirements ? `\nFormat Requirements:\n${formatRequirements}` : ''}
 Please generate a complete, professional HTML document that properly formats and presents this content.`;
 
       // Generate HTML using LLMService
-      console.log('AgentMode: Generating HTML file with LLMService (Claude model)');
+      console.log(`AgentMode: Generating HTML ${isEmail ? 'email' : 'file'} with LLMService (Claude model)`);
       const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'));
 
       if (!htmlContent || htmlContent.trim().length === 0) {
@@ -19792,7 +20010,8 @@ Please generate a complete, professional HTML document that properly formats and
         s3_url: s3Url,
         filename: filename,
         title: title,
-        message: 'HTML file created successfully'
+        document_type: documentType,
+        message: isEmail ? 'HTML email created successfully' : 'HTML file created successfully'
       };
     } catch (error) {
       console.error('Error creating HTML file:', error);
@@ -19816,6 +20035,17 @@ Please generate a complete, professional HTML document that properly formats and
     types?: string[]
   ): Promise<any> {
     try {
+      // Validate html_source up front so a missing/non-string value returns a
+      // clean error instead of throwing "Cannot read properties of undefined
+      // (reading 'startsWith')" below.
+      if (typeof htmlSource !== 'string' || htmlSource.trim().length === 0) {
+        return {
+          success: false,
+          message: 'Failed to create HTML template',
+          error: 'html_source is required and must be a non-empty string (raw HTML content or an S3/HTTPS URL).'
+        };
+      }
+
       // Org-level create gating: only org owner or listed htmlTemplates editor
       const { userDb, orgDb } = await import('./db');
       const { canManageOrgFeature } = await import('./orgShareService');
@@ -21984,7 +22214,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'send-invite': {
           if (!target) throw new Error('Either profile_url or provider_id is required for send-invite');
-          const inviteResult = await linkedInOutreachService.sendInvitation(account_id, target, isUrl, message);
+          // Premium accounts allow 300-char invites; free accounts 200.
+          const inviteCharLimit = await linkedInOutreachService.getInviteCharLimitForAccount(userId, account_id);
+          const inviteResult = await linkedInOutreachService.sendInvitation(account_id, target, isUrl, message, inviteCharLimit);
           return { success: true, data: inviteResult };
         }
 

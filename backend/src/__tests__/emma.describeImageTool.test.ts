@@ -50,8 +50,8 @@ describe('describe_image Emma tool', () => {
     (agentModeService.describeImage as jest.Mock).mockResolvedValue(mockResponse);
 
     const args = { image_url: 'https://example.com/chart.png', prompt: 'describe it' };
-    // The chat is on claude-opus-4-8 — this must NOT be forwarded to describeImage.
-    const context = { llmModel: 'claude-opus-4-8', userId: 'user-123', sessionId: 'sess-1' };
+    // The chat is on anthropic.claude-opus-4-8 — this must NOT be forwarded to describeImage.
+    const context = { llmModel: 'anthropic.claude-opus-4-8', userId: 'user-123', sessionId: 'sess-1' };
 
     const result = await tool.execute(args, context);
 
@@ -62,7 +62,7 @@ describe('describe_image Emma tool', () => {
     );
     // Guard against regressing to forwarding the chat model
     expect(agentModeService.describeImage).not.toHaveBeenCalledWith(
-      'claude-opus-4-8',
+      'anthropic.claude-opus-4-8',
       expect.anything(),
       expect.anything()
     );

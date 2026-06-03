@@ -244,5 +244,59 @@ describe('CRM Engagement Count - Sent vs Received Filtering', () => {
       expect(result.totalAllMessages).toBe(0);
       expect(result.last7Days).toBe(0);
     });
+
+    it('does not double-count a sent message present as both synthetic send + synced event', async () => {
+      getUserByIdSpy = jest.spyOn(userDb, 'getUserById').mockResolvedValue({ userId: 'user1' } as any);
+
+      // Same outbound message recorded twice: once at send time (synthetic
+      // linkedin_sent_*) and once when the sync re-imported it (linkedin_msg_*).
+      const linkedInEvents = [
+        { eventId: 'linkedin_sent_1780236070619_lead1', eventType: 'linkedin.message.sent', createdAt: '2026-05-31T14:01:10Z', data: { text: 'Thanks for connecting. would love to learn more about your work.' } },
+        { eventId: 'linkedin_msg_2-ABC', eventType: 'linkedin.message.sent', createdAt: '2026-05-31T14:01:10Z', data: { text: 'Thanks for connecting. would love to learn more about your work.' } },
+        { eventId: 'linkedin_msg_2-DEF', eventType: 'linkedin.message.sent', createdAt: '2026-05-31T13:41:54Z', data: { text: 'Hi Kfir — different intro message.' } },
+      ];
+      mockGetEventsByEmailDomainAndLeadEmail.mockResolvedValueOnce(linkedInEvents);
+
+      const result = await crmDb.getLeadEngagementCount('list1', 'lead1', 'user1');
+
+      // 2 distinct sent messages, not 3.
+      expect(result.total).toBe(2);
+      expect(result.totalAllMessages).toBe(2);
+    });
+  });
+
+  describe('getLeadEngagements - dedup', () => {
+    beforeEach(() => {
+      jest.spyOn(userDb, 'getUserById').mockResolvedValue({ userId: 'user1' } as any);
+    });
+
+    it('drops the synthetic send-time duplicate from the activity timeline', async () => {
+      const linkedInEvents = [
+        { eventId: 'linkedin_sent_1780236070619_lead1', eventType: 'linkedin.message.sent', createdAt: '2026-05-31T14:01:10Z', data: { text: 'Thanks for connecting. would love to learn more about your work.' } },
+        { eventId: 'linkedin_msg_2-ABC', eventType: 'linkedin.message.sent', createdAt: '2026-05-31T14:01:10Z', data: { text: 'Thanks for connecting. would love to learn more about your work.' } },
+      ];
+      mockGetEventsByEmailDomainAndLeadEmail.mockResolvedValueOnce(linkedInEvents);
+
+      const result = await crmDb.getLeadEngagements('list1', 'lead1', 'user1');
+      const linkedinEngagements = result.engagements.filter((e: any) =>
+        String(e.eventType || '').startsWith('linkedin'));
+
+      expect(linkedinEngagements).toHaveLength(1);
+      // The surviving event is the synced one (stable provider id).
+      expect(linkedinEngagements[0].eventData?.text).toContain('Thanks for connecting');
+    });
+
+    it('keeps a synthetic send event when the sync has not imported it yet', async () => {
+      const linkedInEvents = [
+        { eventId: 'linkedin_sent_1780236070619_lead1', eventType: 'linkedin.message.sent', createdAt: '2026-05-31T14:01:10Z', data: { text: 'Only sent, not yet synced.' } },
+      ];
+      mockGetEventsByEmailDomainAndLeadEmail.mockResolvedValueOnce(linkedInEvents);
+
+      const result = await crmDb.getLeadEngagements('list1', 'lead1', 'user1');
+      const linkedinEngagements = result.engagements.filter((e: any) =>
+        String(e.eventType || '').startsWith('linkedin'));
+
+      expect(linkedinEngagements).toHaveLength(1);
+    });
   });
 });

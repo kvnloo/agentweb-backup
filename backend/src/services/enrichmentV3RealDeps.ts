@@ -16,7 +16,7 @@ import { CrmEnrichmentService, type LeadRecord } from './crmEnrichmentService';
 import { sanitizePhone } from '../utils/phoneValidation';
 import type { IdentityResolverDeps } from './enrichmentIdentityResolver';
 import { resolveIdentity as pureResolveIdentity } from './enrichmentIdentityResolver';
-import { runWaterfall as pureRunWaterfall, type LLMFilledValue } from './enrichmentGroupWaterfall';
+import { runWaterfall as pureRunWaterfall, type LLMFilledValue, type EnrichSoFetchResult } from './enrichmentGroupWaterfall';
 import { apolloAsyncRequestCacheKey, APOLLO_SCHEMA_VERSION } from './apolloCacheKeys';
 import { FIELD_GROUPS } from './enrichmentGroups';
 import { trimQuote } from '../utils/enrichedFieldValue';
@@ -81,6 +81,7 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
           city: p.city,
           state: p.state,
           country: p.country,
+          fromCache: result.fromCache,
         };
       } catch (err) {
         console.warn('[v3 deps] apolloPeopleMatch failed:', (err as Error).message);
@@ -135,6 +136,7 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
           firstName: result.firstName,
           lastName: result.lastName,
           company: result.companyName,
+          fromCache: result.fromCache,
         };
       } catch (err) {
         console.warn('[v3 deps] enrichSoReverseLookup failed:', (err as Error).message);
@@ -776,6 +778,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
           return {
             mapped: mapApolloOrgToCrmFields(result.organization),
             raw: result.organizationRaw ?? null,
+            fromCache: result.fromCache,
           };
         } catch (err) {
           console.warn(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:org] ERROR ${(err as Error).message}`);
@@ -807,6 +810,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
           return {
             mapped: mapApolloPersonToCrmFields(result.match.person),
             raw: result.personRaw ?? null,
+            fromCache: result.fromCache,
           };
         } catch (err) {
           console.warn(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:person] ERROR ${(err as Error).message}`);
@@ -854,6 +858,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
                 last_name:    trimStr(raw.last_name),
                 linkedin_url: raw.public_identifier ? `https://www.linkedin.com/in/${raw.public_identifier}` : undefined,
                 title:        trimStr(current?.position),
+                fromCache:    profileResult.fromCache,
               };
               console.log(`${tag} Case A HIT name="${result.first_name ?? '∅'} ${result.last_name ?? '∅'}" title="${result.title ?? '∅'}" company="${current?.company ?? '∅'}"`);
               return result;
@@ -924,6 +929,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
               last_name:    picked.last_name    ?? (typeof chosen.last_name  === 'string' ? chosen.last_name  : undefined),
               linkedin_url: `https://www.linkedin.com/in/${chosen.public_identifier}`,
               title:        picked.title        ?? undefined,
+              fromCache:    false,
             };
             console.log(`${tag} Case B HIT candidate[${picked.chosenIndex}] linkedin=${result.linkedin_url} title="${result.title ?? '∅'}" company="${picked.company_name ?? '∅'}"`);
             return result;
@@ -977,18 +983,18 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
 
             if (!companyId) {
               console.log(`${tag} no company_id in work_experience → return company_name only`);
-              return { company_name, companyRaw: null };
+              return { company_name, companyRaw: null, fromCache: profileResult.fromCache };
             }
 
             console.log(`${tag} getCompany company_id=${companyId}`);
             const companyResult = await getUnipileCompanyService().getCompany(companyId, accountId);
             if (!companyResult.found || !companyResult.rawData) {
               console.warn(`${tag} getCompany MISS found=${companyResult.found} → return company_name only`);
-              return { company_name, companyRaw: null };
+              return { company_name, companyRaw: null, fromCache: profileResult.fromCache };
             }
             const cRaw = companyResult.rawData;
             console.log(`${tag} companyRaw HIT name="${cRaw.name ?? '∅'}" website="${cRaw.website ?? '∅'}" employees=${cRaw.employee_count ?? '∅'}`);
-            return { company_name: company_name ?? cRaw.name ?? undefined, companyRaw: cRaw };
+            return { company_name: company_name ?? cRaw.name ?? undefined, companyRaw: cRaw, fromCache: companyResult.fromCache };
           } catch (err) {
             if ((err as any)?.structuredError?.classification === 'RATE_LIMIT_ERROR') {
               console.warn(`${tag} 429 on account ${accountId} — rotating (attempt ${attempt + 1}/3)`);
@@ -1014,6 +1020,30 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
         if (result?.email) return { email: result.email, emailStatus: result.emailStatus };
         return null;
       },
+
+      // Tier 3.5b-enrich.so: reverse-lookup by email → person + company fields.
+      findEnrichSoPerson: async (email: string): Promise<EnrichSoFetchResult | null> => {
+        try {
+          const enrichSo = getEnrichSoService();
+          const result = await enrichSo.reverseLookup(email, { userId });
+          if (!result?.found) return null;
+          return {
+            firstName: result.firstName,
+            lastName: result.lastName,
+            jobTitle: result.jobTitle,
+            profileUrl: result.profileUrl,
+            companyName: result.companyName,
+            companyLocation: result.companyLocation,
+            companyLinkedInUrl: result.companyLinkedInUrl,
+            pastCompanies: result.pastCompanies,
+            education: result.education,
+            fromCache: result.fromCache,
+          };
+        } catch (err) {
+          console.warn('[v3 deps] findEnrichSoPerson failed:', (err as Error).message);
+          return null;
+        }
+      },
     }),
 
     // Ungrouped fields → synthetic web fetch using a generic "{{emailDomain}}"
@@ -1021,13 +1051,13 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
     // AW-EnrichmentRawCache reuse (one fetch per lead per run).
     extractUngroupedFieldsViaWeb: async ({ listId, lead, fields, configFieldsByName }) => {
       if (fields.length === 0) {
-        return { fields: [], missing: [], tierFills: { crm: 0, apollo: 0, web: 0, missing: 0 } };
+        return { fields: [], missing: [], tierFills: { crm: 0, apollo: 0, enrichSo: 0, unipile: 0, web: 0, missing: 0 } };
       }
       const domain = lead.emailDomain || extractDomain(lead.email) || extractDomain(lead.website);
       if (!domain) {
         return {
           fields: [], missing: fields,
-          tierFills: { crm: 0, apollo: 0, web: 0, missing: fields.length },
+          tierFills: { crm: 0, apollo: 0, enrichSo: 0, unipile: 0, web: 0, missing: fields.length },
         };
       }
       // Build search query from field INSTRUCTIONS, not field names — a custom
@@ -1050,7 +1080,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       if (!webContext) {
         return {
           fields: [], missing: fields,
-          tierFills: { crm: 0, apollo: 0, web: 0, missing: fields.length },
+          tierFills: { crm: 0, apollo: 0, enrichSo: 0, unipile: 0, web: 0, missing: fields.length },
         };
       }
       const llmResult = await extractFieldsViaLLMReal({
@@ -1078,7 +1108,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       return {
         fields: filled,
         missing: llmResult.missing,
-        tierFills: { crm: 0, apollo: 0, web: filled.length, missing: llmResult.missing.length },
+        tierFills: { crm: 0, apollo: 0, enrichSo: 0, unipile: 0, web: filled.length, missing: llmResult.missing.length },
       };
     },
 

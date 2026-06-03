@@ -135,6 +135,9 @@ import {
   ensurePageMetadataTitle,
   buildPageSlug,
   autoFixV0Files,
+  getDeploymentStatus,
+  isOrphanedFailedPage,
+  cleanupOrphanedFailedPages,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig } from "../services/v0Service";
@@ -309,6 +312,238 @@ describe("v0Service - generateLandingPage", () => {
     expect(mockChatsCreate).toHaveBeenCalledTimes(1);
     expect(result.id).toBe("test-uuid-1234");
   });
+
+  it("SUCCESS: recycles a prior failed record (no v0 chat) instead of orphaning it", async () => {
+    // Query #1 (findUserSiteRecord) → no site repo exists.
+    // Query #2 (listLandingPages) → one prior failed first-page record with no v0ChatId.
+    mockQuery
+      .mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) })
+      .mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Items: [
+              {
+                id: "failed-page-id",
+                userId: "user-1",
+                name: "Old",
+                prompt: "old",
+                status: "failed",
+                iterations: 0,
+                errorMessage: 'HTTP 500: {"error":{"code":"500"}}',
+                createdAt: "t",
+                updatedAt: "t",
+              },
+            ],
+          }),
+      });
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_recycled" });
+
+    const result = await generateLandingPage("user-1", "Retry page", "Retry", {});
+
+    // Reuses the failed record's id rather than minting "test-uuid-1234".
+    expect(result.id).toBe("failed-page-id");
+    // Re-puts the record (reset to generating) under the recycled id.
+    expect(mockPut).toHaveBeenCalledWith(
+      expect.objectContaining({
+        Item: expect.objectContaining({ id: "failed-page-id", status: "generating" }),
+      })
+    );
+  });
+
+  it("SUCCESS: does NOT recycle a failed record that already has a v0ChatId", async () => {
+    // A page that failed *after* v0 chat creation is recoverable via deploy — don't recycle it.
+    mockQuery
+      .mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) })
+      .mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Items: [
+              {
+                id: "has-chat-id",
+                userId: "user-1",
+                name: "Old",
+                prompt: "old",
+                status: "failed",
+                v0ChatId: "chat_existing",
+                iterations: 0,
+                createdAt: "t",
+                updatedAt: "t",
+              },
+            ],
+          }),
+      });
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_new" });
+
+    const result = await generateLandingPage("user-1", "Retry page", "Retry", {});
+
+    // New uuid is minted — the chat-bearing failed record is left alone.
+    expect(result.id).toBe("test-uuid-1234");
+  });
+
+  it("SUCCESS: recycles the newest orphan AND archives the older orphan backlog", async () => {
+    // Two prior orphaned failed records (no v0ChatId, no repo). One is recycled (its id
+    // reused); the OTHER must be archived so the backlog from a sustained outage doesn't linger.
+    const orphan = (id: string) => ({
+      id,
+      userId: "user-1",
+      name: "Old",
+      prompt: "old",
+      status: "failed",
+      iterations: 0,
+      createdAt: "t",
+      updatedAt: "t",
+    });
+    mockQuery
+      .mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) })
+      .mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({ Items: [orphan("orphan-a"), orphan("orphan-b")] }),
+      });
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_recycled" });
+
+    const result = await generateLandingPage("user-1", "Retry page", "Retry", {});
+
+    // The first matching orphan is recycled.
+    expect(result.id).toBe("orphan-a");
+    // The other orphan is archived via an update setting archived=true.
+    const archiveCall = mockUpdate.mock.calls.find(
+      (c: any) =>
+        c[0].Key?.id === "orphan-b" &&
+        c[0].ExpressionAttributeValues?.[":archived"] === true
+    );
+    expect(archiveCall).toBeDefined();
+    // The recycled orphan is NOT archived.
+    const recycledArchived = mockUpdate.mock.calls.find(
+      (c: any) =>
+        c[0].Key?.id === "orphan-a" &&
+        c[0].ExpressionAttributeValues?.[":archived"] === true
+    );
+    expect(recycledArchived).toBeUndefined();
+  });
+});
+
+// =============================================================================
+// Orphaned failed page helpers (v0 outage cleanup)
+// =============================================================================
+describe("v0Service - isOrphanedFailedPage", () => {
+  const base = {
+    id: "p",
+    userId: "user-1",
+    name: "n",
+    prompt: "p",
+    iterations: 0,
+    createdAt: "",
+    updatedAt: "",
+  };
+
+  it("FAIL: deployed page is not orphaned", () => {
+    expect(
+      isOrphanedFailedPage({
+        ...base,
+        status: "deployed",
+        v0ChatId: "chat_1",
+        githubRepoUrl: "https://github.com/x/y",
+      } as any)
+    ).toBe(false);
+  });
+
+  it("FAIL: failed page WITH a v0ChatId is recoverable, not orphaned", () => {
+    expect(
+      isOrphanedFailedPage({ ...base, status: "failed", v0ChatId: "chat_1" } as any)
+    ).toBe(false);
+  });
+
+  it("FAIL: failed page WITH a githubRepoUrl is a real site, not orphaned", () => {
+    expect(
+      isOrphanedFailedPage({
+        ...base,
+        status: "failed",
+        githubRepoUrl: "https://github.com/x/y",
+      } as any)
+    ).toBe(false);
+  });
+
+  it("FAIL: failed sub-page (has slug) is not treated as an orphan", () => {
+    expect(
+      isOrphanedFailedPage({ ...base, status: "failed", slug: "pricing" } as any)
+    ).toBe(false);
+  });
+
+  it("SUCCESS: failed page with no v0ChatId, no repo, no slug is orphaned", () => {
+    expect(isOrphanedFailedPage({ ...base, status: "failed" } as any)).toBe(true);
+  });
+});
+
+describe("v0Service - cleanupOrphanedFailedPages", () => {
+  const orphan = (id: string) =>
+    ({
+      id,
+      userId: "user-1",
+      name: "n",
+      prompt: "p",
+      status: "failed",
+      iterations: 0,
+      createdAt: "",
+      updatedAt: "",
+    } as any);
+
+  it("FAIL: no pages → archives nothing, returns 0", async () => {
+    const count = await cleanupOrphanedFailedPages("user-1", []);
+    expect(count).toBe(0);
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: only non-orphan pages → archives nothing", async () => {
+    const pages = [
+      { ...orphan("a"), status: "deployed", githubRepoUrl: "https://gh/x" },
+      { ...orphan("b"), v0ChatId: "chat_1" },
+    ];
+    const count = await cleanupOrphanedFailedPages("user-1", pages);
+    expect(count).toBe(0);
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: keepId is skipped so the recycled record is not archived", async () => {
+    const count = await cleanupOrphanedFailedPages(
+      "user-1",
+      [orphan("keep"), orphan("archive-me")],
+      "keep"
+    );
+    expect(count).toBe(1);
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+    expect(mockUpdate.mock.calls[0][0].Key.id).toBe("archive-me");
+  });
+
+  it("FAIL: a DynamoDB error on one orphan is swallowed, others still archived", async () => {
+    mockUpdate
+      .mockReturnValueOnce({
+        promise: () => Promise.reject(new Error("DDB throttled")),
+      })
+      .mockReturnValueOnce({ promise: () => Promise.resolve() });
+
+    const count = await cleanupOrphanedFailedPages("user-1", [
+      orphan("a"),
+      orphan("b"),
+    ]);
+
+    expect(mockUpdate).toHaveBeenCalledTimes(2);
+    expect(count).toBe(1);
+  });
+
+  it("SUCCESS: archives all orphaned failed pages and returns the count", async () => {
+    const count = await cleanupOrphanedFailedPages("user-1", [
+      orphan("a"),
+      { ...orphan("b"), status: "deployed", githubRepoUrl: "https://gh/x" }, // skipped
+      orphan("c"),
+    ]);
+
+    expect(count).toBe(2);
+    expect(mockUpdate).toHaveBeenCalledTimes(2);
+    const archivedFlags = mockUpdate.mock.calls.map(
+      (c: any) => c[0].ExpressionAttributeValues[":archived"]
+    );
+    expect(archivedFlags).toEqual([true, true]);
+  });
 });
 
 // =============================================================================
@@ -325,7 +560,7 @@ describe("v0Service - deployLandingPage", () => {
     );
   });
 
-  it("FAIL: no v0ChatId → throws generate first", async () => {
+  it("FAIL: no v0ChatId → throws no v0 chat", async () => {
     mockGet.mockReturnValueOnce({
       promise: () =>
         Promise.resolve({
@@ -334,7 +569,7 @@ describe("v0Service - deployLandingPage", () => {
     });
 
     await expect(deployLandingPage("page-1", "user-1")).rejects.toThrow(
-      "generate first"
+      "no v0 chat"
     );
   });
 
@@ -473,6 +708,55 @@ describe("v0Service - deployLandingPage", () => {
 });
 
 // =============================================================================
+// getDeploymentStatus — auto-heal must verify the page's own live URL
+// =============================================================================
+describe("v0Service - getDeploymentStatus (auto-heal URL verification)", () => {
+  // A failed sub-page whose project's latest Vercel deployment is READY, but
+  // whose own /slug route 404s (the build never contained the route). The
+  // empathiaai bug: project-level READY healed the record to "deployed" while
+  // the live URL stayed broken. Auto-heal must NOT promote it.
+  const failedSubPage = {
+    id: "sub-1",
+    userId: "user-1",
+    name: "PHSA Re-engagement",
+    status: "failed",
+    slug: "phsa-re-engagement",
+    vercelProjectId: "prj_test123",
+    deployedUrl: "https://lp-test.agentwebforms.com/phsa-re-engagement",
+  };
+
+  it("FAIL: project READY but sub-page URL 404s → record stays failed (not healed)", async () => {
+    mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: failedSubPage }) });
+    // Vercel: latest project deployment is READY
+    mockAxiosGet.mockResolvedValueOnce({
+      data: { deployments: [{ uid: "dpl_ready", readyState: "READY" }] },
+    });
+    // Live URL probe: the sub-page route 404s
+    mockAxiosGet.mockResolvedValueOnce({ status: 404, data: "" });
+
+    const result = await getDeploymentStatus("sub-1", "user-1");
+
+    expect(result.status).toBe("failed");
+    // Must NOT have written status=deployed to DynamoDB
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: project READY and sub-page URL resolves → record healed to deployed", async () => {
+    mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: failedSubPage }) });
+    mockAxiosGet.mockResolvedValueOnce({
+      data: { deployments: [{ uid: "dpl_ready", readyState: "READY" }] },
+    });
+    // Live URL probe: route resolves
+    mockAxiosGet.mockResolvedValueOnce({ status: 200, data: "<html>ok</html>" });
+
+    const result = await getDeploymentStatus("sub-1", "user-1");
+
+    expect(result.status).toBe("deployed");
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+  });
+});
+
+// =============================================================================
 // iterateLandingPage
 // =============================================================================
 describe("v0Service - iterateLandingPage", () => {
@@ -486,7 +770,7 @@ describe("v0Service - iterateLandingPage", () => {
     ).rejects.toThrow("not found");
   });
 
-  it("FAIL: no v0ChatId → throws generate first", async () => {
+  it("FAIL: no v0ChatId → throws no v0 chat", async () => {
     mockGet.mockReturnValueOnce({
       promise: () =>
         Promise.resolve({
@@ -496,7 +780,7 @@ describe("v0Service - iterateLandingPage", () => {
 
     await expect(
       iterateLandingPage("page-1", "user-1", "change color")
-    ).rejects.toThrow("generate first");
+    ).rejects.toThrow("no v0 chat");
   });
 
   it("FAIL: sendMessage throws → throws iteration error", async () => {
@@ -1193,11 +1477,15 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     mockAxiosPatch.mockResolvedValueOnce({ data: {} });
   };
 
-  // Setup: mock Vercel deployment polling (success)
+  // Setup: mock Vercel deployment polling (success).
+  // The deployment's githubCommitSha matches the commit pushed by setupGitHubMocks
+  // ("commit_sha") so the SHA-match guard in pollVercelDeployment accepts it.
   const setupVercelDeploySuccessMock = () => {
     mockAxiosGet.mockResolvedValueOnce({
       data: {
-        deployments: [{ uid: "dpl_123", readyState: "READY" }],
+        deployments: [
+          { uid: "dpl_123", readyState: "READY", meta: { githubCommitSha: "commit_sha" } },
+        ],
       },
     });
   };
@@ -1217,6 +1505,72 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       ],
     });
   };
+
+  // Setup: Vercel returns a READY deployment for a DIFFERENT commit (the stale
+  // root deployment), then never produces one for our commit. This reproduces the
+  // empathiaai.com bug: a sub-page was marked "deployed" against a build that did
+  // not contain its app/<slug>/ route, so the page permanently 404'd.
+  const setupVercelStaleDeploymentMock = () => {
+    for (let i = 0; i < 30; i++) {
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          deployments: [
+            { uid: "dpl_stale", readyState: "READY", meta: { githubCommitSha: "OLD_ROOT_SHA" } },
+          ],
+        },
+      });
+    }
+  };
+
+  it("FAIL: READY deployment for a different commit → not accepted, record set to failed (empathiaai 404 bug)", async () => {
+    setupSiteRecordMock();
+    await setupV0Mocks();
+    setupGitHubMocks(); // pushes commit "commit_sha"
+    setupVercelStaleDeploymentMock(); // Vercel only has READY for "OLD_ROOT_SHA"
+
+    const result = await generateLandingPage(
+      "user-1",
+      "Create re-engagement page",
+      "PHSA Re-engagement",
+      {}
+    );
+
+    // The build for our commit never went live, so the page must NOT be marked
+    // deployed — that false-positive is exactly what produced the 404.
+    expect(result.status).toBe("failed");
+    expect(result.errorMessage).toContain("timed out");
+  });
+
+  it("SUCCESS: ignores stale READY for old commit, accepts READY once our commit deploys", async () => {
+    setupSiteRecordMock();
+    await setupV0Mocks();
+    setupGitHubMocks(); // pushes commit "commit_sha"
+    // First poll: stale root deployment is newest & READY but for a different commit
+    mockAxiosGet.mockResolvedValueOnce({
+      data: {
+        deployments: [
+          { uid: "dpl_stale", readyState: "READY", meta: { githubCommitSha: "OLD_ROOT_SHA" } },
+        ],
+      },
+    });
+    // Second poll: our commit's build is now the newest and READY
+    mockAxiosGet.mockResolvedValueOnce({
+      data: {
+        deployments: [
+          { uid: "dpl_ours", readyState: "READY", meta: { githubCommitSha: "commit_sha" } },
+        ],
+      },
+    });
+
+    const result = await generateLandingPage(
+      "user-1",
+      "Create re-engagement page",
+      "Infoway Re-engagement",
+      {}
+    );
+
+    expect(result.status).toBe("deployed");
+  });
 
   it("FAIL: Vercel build fails → record status set to failed with build error", async () => {
     setupSiteRecordMock();
@@ -1288,10 +1642,12 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
         deployments: [{ uid: "dpl_123", readyState: "BUILDING" }],
       },
     });
-    // Second poll: READY
+    // Second poll: READY (matching the pushed commit_sha)
     mockAxiosGet.mockResolvedValueOnce({
       data: {
-        deployments: [{ uid: "dpl_123", readyState: "READY" }],
+        deployments: [
+          { uid: "dpl_123", readyState: "READY", meta: { githubCommitSha: "commit_sha" } },
+        ],
       },
     });
 
@@ -1370,7 +1726,7 @@ describe("v0Service - loadDefaultTemplateOutline fallback", () => {
     mockAxiosPost.mockResolvedValueOnce({ data: { sha: "tree_sha" } });           // tree
     mockAxiosPost.mockResolvedValueOnce({ data: { sha: "commit_sha" } });         // commit
     mockAxiosPatch.mockResolvedValueOnce({ data: {} });                           // patch ref
-    mockAxiosGet.mockResolvedValueOnce({ data: { deployments: [{ uid: "dpl_1", readyState: "READY" }] } }); // Vercel
+    mockAxiosGet.mockResolvedValueOnce({ data: { deployments: [{ uid: "dpl_1", readyState: "READY", meta: { githubCommitSha: "commit_sha" } }] } }); // Vercel
   };
 
   // FAIL tests — boundary/error cases

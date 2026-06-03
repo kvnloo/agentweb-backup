@@ -124,10 +124,12 @@ router.delete('/site-wide-unipile-accounts/:accountId', authenticateToken, requi
 router.get('/scoring-judges/default-prompt', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const setting = await settingsService.getSetting('default-scoring-prompt');
+    const modelSetting = await settingsService.getSetting('default-scoring-model');
     const { DEFAULT_SCORING_SYSTEM_PROMPT } = await import('../services/sessionScoringService');
     res.json({
       systemPrompt: setting?.settingValue || DEFAULT_SCORING_SYSTEM_PROMPT,
       isCustom: !!setting?.settingValue,
+      llmModel: modelSetting?.settingValue || '',
     });
   } catch (error) {
     console.error('Error getting default scoring prompt:', error);
@@ -138,12 +140,20 @@ router.get('/scoring-judges/default-prompt', authenticateToken, requireAdmin, as
 // Update default scoring prompt
 router.put('/scoring-judges/default-prompt', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { systemPrompt } = req.body;
+    const { systemPrompt, llmModel } = req.body;
     if (!systemPrompt) {
       return res.status(400).json({ error: 'systemPrompt is required' });
     }
     await settingsService.setSetting('default-scoring-prompt', systemPrompt.trim(), 'Default scoring judge system prompt', req.user?.email);
-    res.json({ systemPrompt: systemPrompt.trim() });
+    if (llmModel !== undefined) {
+      if (llmModel) {
+        await settingsService.setSetting('default-scoring-model', llmModel.trim(), 'Default scoring judge LLM model', req.user?.email);
+      } else {
+        await settingsService.deleteSetting('default-scoring-model');
+      }
+    }
+    const modelSetting = await settingsService.getSetting('default-scoring-model');
+    res.json({ systemPrompt: systemPrompt.trim(), llmModel: modelSetting?.settingValue || '' });
   } catch (error) {
     console.error('Error updating default scoring prompt:', error);
     res.status(500).json({ error: 'Failed to update default scoring prompt' });
@@ -154,8 +164,9 @@ router.put('/scoring-judges/default-prompt', authenticateToken, requireAdmin, as
 router.delete('/scoring-judges/default-prompt', authenticateToken, requireAdmin, async (req, res) => {
   try {
     await settingsService.deleteSetting('default-scoring-prompt');
+    await settingsService.deleteSetting('default-scoring-model');
     const { DEFAULT_SCORING_SYSTEM_PROMPT } = await import('../services/sessionScoringService');
-    res.json({ systemPrompt: DEFAULT_SCORING_SYSTEM_PROMPT });
+    res.json({ systemPrompt: DEFAULT_SCORING_SYSTEM_PROMPT, llmModel: '' });
   } catch (error) {
     console.error('Error resetting default scoring prompt:', error);
     res.status(500).json({ error: 'Failed to reset default scoring prompt' });
@@ -167,7 +178,11 @@ router.get('/scoring-judges', authenticateToken, requireAdmin, async (req, res) 
   try {
     const setting = await settingsService.getSetting('scoring-judges');
     const judges = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
-    res.json({ judges });
+    const { agentModeService } = await import('../services/agentModeService');
+    const availableModels = (await agentModeService.getSupportedModels(true)).filter(
+      m => !(agentModeService as any).llmModels?.[m]?.isLive
+    );
+    res.json({ judges, availableModels });
   } catch (error) {
     console.error('Error getting scoring judges:', error);
     res.status(500).json({ error: 'Failed to get scoring judges' });
@@ -177,7 +192,7 @@ router.get('/scoring-judges', authenticateToken, requireAdmin, async (req, res) 
 // Create a scoring judge
 router.post('/scoring-judges', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { name, systemPrompt } = req.body;
+    const { name, systemPrompt, llmModel } = req.body;
     if (!name || !systemPrompt) {
       return res.status(400).json({ error: 'name and systemPrompt are required' });
     }
@@ -186,13 +201,14 @@ router.post('/scoring-judges', authenticateToken, requireAdmin, async (req, res)
     const judges = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
 
     const now = new Date().toISOString();
-    const newJudge = {
+    const newJudge: any = {
       id: `judge_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       name: name.trim(),
       systemPrompt: systemPrompt.trim(),
       createdAt: now,
       updatedAt: now,
     };
+    if (llmModel) newJudge.llmModel = llmModel.trim();
 
     judges.push(newJudge);
     await settingsService.setSetting('scoring-judges', JSON.stringify(judges), 'Custom scoring judges', req.user?.email);
@@ -207,7 +223,7 @@ router.post('/scoring-judges', authenticateToken, requireAdmin, async (req, res)
 router.put('/scoring-judges/:judgeId', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { judgeId } = req.params;
-    const { name, systemPrompt } = req.body;
+    const { name, systemPrompt, llmModel } = req.body;
 
     const setting = await settingsService.getSetting('scoring-judges');
     if (!setting?.settingValue) {
@@ -219,9 +235,15 @@ router.put('/scoring-judges/:judgeId', authenticateToken, requireAdmin, async (r
     if (index === -1) {
       return res.status(404).json({ error: 'Judge not found' });
     }
-
     if (name) judges[index].name = name.trim();
     if (systemPrompt) judges[index].systemPrompt = systemPrompt.trim();
+    if (llmModel !== undefined) {
+      if (llmModel) {
+        judges[index].llmModel = llmModel.trim();
+      } else {
+        delete judges[index].llmModel;
+      }
+    }
     judges[index].updatedAt = new Date().toISOString();
 
     await settingsService.setSetting('scoring-judges', JSON.stringify(judges), 'Custom scoring judges', req.user?.email);
