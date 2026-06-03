@@ -61,6 +61,10 @@ export interface ReverseResult {
   pastCompanies?: string[];
   /** Education entries formatted as "School (Degree)" or just "School" when degree unknown. */
   education?: string[];
+  /** Current employer's city/region from positions[current].companyLocation. */
+  companyLocation?: string;
+  /** Current employer's LinkedIn URL from positions[current].linkedInUrl. */
+  companyLinkedInUrl?: string;
   fromCache: boolean;
   checkedAt: string;
 }
@@ -257,14 +261,18 @@ function rowToReverse(row: CacheRow, fromCache: boolean): ReverseResult {
   }
   const d = row.rawData ?? {};
   const positions = Array.isArray(d.positions?.positionHistory) ? d.positions.positionHistory : [];
-  const currentTitle = positions[0]?.title;
+  // Current position = entry where end is an empty object (no end date set).
+  const currentPos = positions.find((p: any) => p?.startEndDate?.end && Object.keys(p.startEndDate.end).length === 0) ?? positions[0];
+  const currentTitle = currentPos?.title;
+  const currentCompanyLocation = typeof currentPos?.companyLocation === 'string' ? currentPos.companyLocation.trim() : undefined;
+  const currentCompanyLinkedInUrl = typeof currentPos?.linkedInUrl === 'string' ? currentPos.linkedInUrl.trim() : undefined;
 
-  // Past companies = positionHistory[1..], deduped by name (case-insensitive),
+  // Past companies = all non-current positions, deduped by name (case-insensitive),
   // skipping anything matching the current company so we don't echo it back.
   const currentCompany = (d.companyName ?? '').trim().toLowerCase();
   const pastCompanies: string[] = [];
   const seen = new Set<string>();
-  for (const p of positions.slice(1)) {
+  for (const p of positions.filter((p: any) => p !== currentPos)) {
     const name = typeof p?.companyName === 'string' ? p.companyName.trim() : '';
     if (!name) continue;
     const key = name.toLowerCase();
@@ -304,6 +312,8 @@ function rowToReverse(row: CacheRow, fromCache: boolean): ReverseResult {
     connectionCount,
     pastCompanies: pastCompanies.length ? pastCompanies : undefined,
     education: education.length ? education : undefined,
+    companyLocation: currentCompanyLocation || undefined,
+    companyLinkedInUrl: currentCompanyLinkedInUrl || undefined,
     fromCache,
     checkedAt: row.fetchedAt,
   };

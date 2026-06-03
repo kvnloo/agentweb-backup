@@ -42,6 +42,7 @@ import {
   ButtonGroup,
   InputAdornment,
   Autocomplete,
+  Divider,
 } from "@mui/material";
 import { format } from "date-fns";
 import axios from "axios";
@@ -6229,6 +6230,7 @@ export default function AdminDashboard() {
         <TabPanel value={tabValue} index={22}>
           <ContractorsTab />
         </TabPanel>
+
       </Paper>
 
       {/* Satisfaction Score Override Popover */}

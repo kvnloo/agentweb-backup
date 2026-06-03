@@ -11,7 +11,7 @@
 import { buildOrchestratorDeps, buildIdentityDeps, buildFieldGuidanceV3, rejectHallucinatedLinkedInUrls } from '../services/enrichmentV3RealDeps';
 import * as apolloServiceModule from '../services/apolloService';
 import type { ApolloService } from '../services/apolloService';
-import { createApolloFetchContext } from '../services/enrichmentGroupWaterfall';
+import { createApolloFetchContext, createEnrichSoFetchContext } from '../services/enrichmentGroupWaterfall';
 import type { LeadRecord } from '../services/crmEnrichmentService';
 
 const PERSON_RAW = { id: 'p1', first_name: 'Jane', last_name: 'Doe', email: 'jane@acme.com' };
@@ -80,6 +80,7 @@ describe('fetchApolloPerson — no email, name+website path', () => {
       requestedFields: ['email'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -107,6 +108,7 @@ describe('fetchApolloPerson — no email, name+website path', () => {
       requestedFields: ['email'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -129,6 +131,7 @@ describe('fetchApolloPerson — no email, name+website path', () => {
       requestedFields: ['email'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -149,6 +152,7 @@ describe('fetchApolloPerson — no email, name+website path', () => {
       requestedFields: ['email'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -171,6 +175,7 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
       requestedFields: ['linkedin_url'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 
@@ -196,6 +201,7 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
       requestedFields: ['linkedin_url'],
       configFieldsByName: {},
       apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
       refreshFields: new Set(),
     });
 

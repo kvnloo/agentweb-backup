@@ -11,9 +11,11 @@
 import { randomUUID } from 'crypto';
 import {
   createApolloFetchContext,
+  createEnrichSoFetchContext,
   type GroupResult,
   type FieldFill,
   type ApolloFetchContext,
+  type EnrichSoFetchContext,
 } from './enrichmentGroupWaterfall';
 import { normalizeFills } from './enrichmentNormalizer';
 import { FIELD_GROUPS } from './enrichmentGroups';
@@ -27,6 +29,7 @@ import {
 } from './enrichmentSiblingConfigFields';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { STANDARD_ENRICHABLE_FIELDS } from './enrichmentConfigService';
+import { crmDb } from './db';
 
 // ─── Socket progress options ─────────────────────────────────────────────────
 //
@@ -111,6 +114,8 @@ export interface RunEnrichmentInput {
 interface TierCount {
   crm: number;
   apollo: number;
+  enrichSo: number;
+  unipile: number;
   web: number;
   missing: number;
 }
@@ -169,6 +174,7 @@ export interface OrchestratorDeps {
     requestedFields: string[];
     configFieldsByName: Record<string, { instruction?: string } | undefined>;
     apolloCtx: ApolloFetchContext;
+    enrichSoCtx: EnrichSoFetchContext;
     refreshFields: Set<string>;
     leadHint?: { listId: string; leadId: string };
   }): Promise<GroupResult>;
@@ -218,16 +224,73 @@ export interface OrchestratorDeps {
  *  AW-Leads column that is not part of the enrichable-fields list. */
 const STANDARD_LEAD_COLUMNS = new Set<string>([...STANDARD_ENRICHABLE_FIELDS, 'website']);
 
+type SourceKey = 'apollo' | 'unipile' | 'enrichSo' | 'webSearch' | 'sibling' | 'llm';
+
+function providerToSourceKey(meta: EnrichedFieldMeta): SourceKey | null {
+  if (meta.source === 'llm') return 'llm';
+  switch (meta.provider) {
+    case 'apollo': return 'apollo';
+    case 'unipile': return 'unipile';
+    case 'enrich.so': return 'enrichSo';
+    case 'llm_web_search': return 'webSearch';
+    case 'agentweb': return 'sibling';
+    default: return null;
+  }
+}
+
+function computeLeadSourceBreakdown(fills: FieldFill[]): Array<{ key: SourceKey; fromCache: boolean }> {
+  const seen = new Set<SourceKey>();
+  const result: Array<{ key: SourceKey; fromCache: boolean }> = [];
+  for (const f of fills) {
+    const key = providerToSourceKey(f.meta);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    result.push({ key, fromCache: f.meta.fromCache ?? false });
+  }
+  return result;
+}
+
+function buildSnapshotFields(
+  lead: LeadRecord,
+  fills: FieldFill[],
+): {
+  previousStandardFields: Record<string, string | null>;
+  previousCustomFields: Record<string, string | null>;
+  previousEnrichmentMetadata: Record<string, any>;
+  fieldsEnriched: Array<{ field: string; provider: string; fromCache: boolean }>;
+} {
+  const previousStandardFields: Record<string, string | null> = {};
+  const previousCustomFields: Record<string, string | null> = {};
+  const previousEnrichmentMetadata: Record<string, any> = {};
+  const fieldsEnriched: Array<{ field: string; provider: string; fromCache: boolean }> = [];
+  for (const { field, meta } of fills) {
+    if (STANDARD_LEAD_COLUMNS.has(field)) {
+      previousStandardFields[field] = (lead as any)[field] ?? null;
+    } else {
+      previousCustomFields[field] = lead.customFields?.[field] ?? null;
+    }
+    previousEnrichmentMetadata[field] = lead.enrichmentMetadata?.[field] ?? null;
+    fieldsEnriched.push({
+      field,
+      provider: meta.provider ?? meta.source ?? 'unknown',
+      fromCache: meta.fromCache ?? false,
+    });
+  }
+  return { previousStandardFields, previousCustomFields, previousEnrichmentMetadata, fieldsEnriched };
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function emptyTierCount(): TierCount {
-  return { crm: 0, apollo: 0, web: 0, missing: 0 };
+  return { crm: 0, apollo: 0, enrichSo: 0, unipile: 0, web: 0, missing: 0 };
 }
 
 function addTierCounts(a: TierCount, b: TierCount): TierCount {
   return {
     crm: a.crm + b.crm,
     apollo: a.apollo + b.apollo,
+    enrichSo: a.enrichSo + b.enrichSo,
+    unipile: a.unipile + b.unipile,
     web: a.web + b.web,
     missing: a.missing + b.missing,
   };
@@ -399,6 +462,7 @@ async function processLead(
   const perGroupTierFills = new Map<string, TierCount>();
   const allFills: FieldFill[] = [];
   const apolloCtx = createApolloFetchContext();
+  const enrichSoCtx = createEnrichSoFetchContext();
   const leadStart = Date.now();
   console.log(`[v3:${input.listId}:${lead.leadId}] start (email=${lead.email ?? '∅'}, company=${lead.company ?? '∅'})`);
 
@@ -461,7 +525,7 @@ async function processLead(
     allFills.push(...tier0bResult.fills.map(f => ({
       field: f.field,
       value: f.value,
-      meta: f.meta,
+      meta: { ...f.meta, fromCache: true },
     })));
     // Merge into enrichedLead so waterfall sees these fields as already filled
     for (const f of tier0bResult.fills) {
@@ -493,6 +557,7 @@ async function processLead(
         requestedFields: fields,
         configFieldsByName,
         apolloCtx,
+        enrichSoCtx,
         refreshFields: refreshSet,
         leadHint: { listId: input.listId, leadId: lead.leadId },
       });
@@ -658,6 +723,7 @@ async function processLead(
               confidence: 'medium',
               ...(evalResult.model ? { provider: evalResult.model } : {}),
               ...(evalResult.reasoning ? { sourceQuote: evalResult.reasoning } : {}),
+              fromCache: false,
             },
           });
         }
@@ -743,6 +809,7 @@ export async function runEnrichment(
   options?: RunEnrichmentOptions,
 ): Promise<RunEnrichmentResult> {
   const runId = randomUUID();
+  const jobExpiresAt = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
   const startedAt = Date.now();
 
   const progressEvent = options?.progressEvent || 'crm-enrichment-progress';
@@ -855,6 +922,15 @@ export async function runEnrichment(
   let llmOrParseFailed = 0;
   let updateFailed = 0;
 
+  const sourceBreakdown = {
+    apollo:    { live: 0, cached: 0 },
+    unipile:   { live: 0, cached: 0 },
+    enrichSo:  { live: 0, cached: 0 },
+    webSearch: { live: 0, cached: 0 },
+    sibling:   { live: 0, cached: 0 },
+    llm:       { live: 0, cached: 0 },
+  };
+
   emitToRooms(progressEvent, {
     runId,
     listId: input.listId,
@@ -953,14 +1029,44 @@ export async function runEnrichment(
       const writeResults = await Promise.all(
         pendingWrites.map(async ({ lead, outcome }) => {
           const wStart = Date.now();
-          const writeResult = await writeLeadOutcome(lead, outcome, input, deps, runId);
+          // Filter injected dep fills (synthetic fields added for smart-field resolution) from
+          // the snapshot — they were never in the user's config and should not be reverted.
+          const writableFills = outcome.fills.filter(f => !injectedDepNames.has(f.field));
+          // Apply the same overwrite policy as writeLeadOutcome so the snapshot and
+          // analytics only cover fills that will actually reach the DB (excludes
+          // existing_data fills and fill_if_empty fills where the lead already has a value).
+          const { fillIfEmpty: snapFillIfEmpty, alwaysOverwrite: snapOverwrite } = bucketByOverwritePolicy(lead, writableFills, input.config);
+          const actualFills = [...snapFillIfEmpty, ...snapOverwrite];
+          const { previousStandardFields, previousCustomFields, previousEnrichmentMetadata, fieldsEnriched } = buildSnapshotFields(lead, actualFills);
+          const leadBreakdown = computeLeadSourceBreakdown(actualFills);
+          try {
+            await crmDb.createEnrichmentSnapshotItem({
+              jobId: runId,
+              leadId: lead.leadId,
+              previousStandardFields,
+              previousCustomFields,
+              previousEnrichmentMetadata,
+              fieldsEnriched,
+              expiresAt: jobExpiresAt,
+            });
+          } catch (err: any) {
+            console.error(`[v3] Failed to write enrichment snapshot runId=${runId} leadId=${lead.leadId}:`, err);
+            return { writeResult: { ok: false as const }, leadBreakdown: [] };
+          }
+          // Pass writableFills (injected deps already stripped) so writeLeadOutcome
+          // only writes what is also snapshotted — keeps write and revert in sync.
+          const writeResult = await writeLeadOutcome(lead, { ...outcome, fills: writableFills }, input, deps, runId);
           console.log(`[v3:${input.listId}:${lead.leadId}] write in ${Date.now() - wStart}ms (ok=${writeResult.ok})`);
-          return writeResult;
+          return { writeResult, leadBreakdown };
         }),
       );
-      for (const writeResult of writeResults) {
+      for (const { writeResult, leadBreakdown } of writeResults) {
         if (writeResult.ok) {
           processed += 1;
+          for (const { key, fromCache } of leadBreakdown) {
+            if (fromCache) sourceBreakdown[key].cached++;
+            else sourceBreakdown[key].live++;
+          }
         } else {
           updateFailed += 1;
         }
@@ -1025,6 +1131,33 @@ export async function runEnrichment(
     tierFillBreakdown: result.tierFillBreakdown,
     durationMs: result.durationMs,
   });
+
+  const attemptedLeadIds = leads.map((l: LeadRecord) => l.leadId);
+
+  if (input.mode !== 'preview' && (processed > 0 || totalFailed > 0)) {
+    crmDb.createEnrichmentJobMeta({
+      jobId: runId,
+      listId: input.listId,
+      userId: input.userId,
+      outputFields: includedFieldNames,
+      createdAt: new Date().toISOString(),
+      status: 'completed',
+      expiresAt: jobExpiresAt,
+      processedCount: processed,
+      failedCount: totalFailed,
+      skippedCount: 0,
+      ...(attemptedLeadIds.length <= 5000
+        ? { attemptedLeadIds }
+        : { leadsDeduplicationUnavailable: true }),
+      failureBreakdown: {
+        searchWebFailed: 0,
+        linkedinFailed: apolloFailed,
+        llmOrParseFailed,
+        updateFailed,
+      },
+      sourceBreakdown,
+    }).catch((err: any) => console.error(`[v3] Failed to write enrichment job meta runId=${runId}:`, err));
+  }
 
   return result;
 }

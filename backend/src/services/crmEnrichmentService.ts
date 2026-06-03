@@ -1788,6 +1788,8 @@ export class CrmEnrichmentService {
     }
 
     const counters = { processed: 0, failed: 0, skipped: 0 };
+    const attemptedLeadIds: string[] = [];
+    const skippedLeadIds: string[] = [];
     const failureBreakdown = {
       searchWebFailed: 0,
       linkedinFailed: 0,
@@ -1805,6 +1807,7 @@ export class CrmEnrichmentService {
     const enrichedAt = new Date().toISOString();
     const chunkProcessors = chunks.map(async (chunk) => {
       for (const lead of chunk) {
+        if (lead?.leadId) attemptedLeadIds.push(lead.leadId);
         try {
           const { fields, metadata: citations, normalized } = await this.enrichLead(lead, spec, linkedInAccountId, enrichConfig);
           const { standardUpdates, customUpdates } = CrmEnrichmentService.splitFields(fields);
@@ -1813,10 +1816,33 @@ export class CrmEnrichmentService {
           // Snapshot previous values before overwriting
           const previousStandardFields = CrmEnrichmentService.pickMappedStandardFields(lead, standardUpdates);
           const previousCustomFields = CrmEnrichmentService.pickCustomFieldValues(lead.customFields, customUpdates);
+          // Use original field names (not mapped camelCase) for standard fields so they
+          // match the keys used in fieldMeta and lead.enrichmentMetadata (stored under
+          // original names like 'first_name', not mapped names like 'firstName').
+          const standardOriginalKeys: string[] = [];
+          for (const key of Object.keys(fields)) {
+            const mapped = CrmEnrichmentService.STANDARD_FIELD_MAP[key.toLowerCase()];
+            if (mapped && standardUpdates[mapped] !== undefined) standardOriginalKeys.push(key);
+          }
+          const allUpdatedFields = [...standardOriginalKeys, ...Object.keys(customUpdates)];
+          const previousEnrichmentMetadata: Record<string, any> = {};
+          const fieldsEnriched: Array<{ field: string; provider: string; fromCache: boolean }> = [];
+          for (const field of allUpdatedFields) {
+            previousEnrichmentMetadata[field] = lead.enrichmentMetadata?.[field] ?? null;
+            const meta = fieldMeta[field];
+            if (meta) {
+              fieldsEnriched.push({
+                field,
+                provider: meta.provider ?? meta.source ?? 'unknown',
+                fromCache: meta.fromCache ?? false,
+              });
+            }
+          }
           try {
             await crmDb.createEnrichmentSnapshotItem({
               jobId, leadId: lead.leadId,
-              previousStandardFields, previousCustomFields,
+              previousStandardFields, previousCustomFields, previousEnrichmentMetadata,
+              fieldsEnriched,
               expiresAt: jobExpiresAt,
             });
           } catch (err: any) {
@@ -1859,6 +1885,7 @@ export class CrmEnrichmentService {
           const step = error?.step || 'unknown';
           if (step === 'skipped_personal') {
             counters.skipped++;
+            if (lead?.leadId) skippedLeadIds.push(lead.leadId);
             console.log(`[CrmEnrichment] Skipped lead ${lead?.leadId}: ${error.message}`);
           } else {
             if (step === 'search') {
@@ -1908,6 +1935,16 @@ export class CrmEnrichmentService {
         status: 'completed',
         expiresAt: jobExpiresAt,
         processedCount: counters.processed,
+        failedCount: counters.failed,
+        skippedCount: counters.skipped,
+        ...(attemptedLeadIds.length <= 5000
+          ? { attemptedLeadIds }
+          : { leadsDeduplicationUnavailable: true }),
+        ...(skippedLeadIds.length > 0 && skippedLeadIds.length <= 5000
+          ? { skippedLeadIds }
+          : skippedLeadIds.length > 5000
+          ? { skippedDeduplicationUnavailable: true }
+          : {}),
         failureBreakdown,
         failures: failureRecords,
       })).catch((err: any) => console.error('[CrmEnrichment] Failed to write job meta:', err));
@@ -2191,9 +2228,19 @@ export class CrmEnrichmentService {
             }
           }
 
+          const restoredEnrichmentMetadata: Record<string, any> = { ...(currentLead.enrichmentMetadata || {}) };
+          for (const [key, prevMeta] of Object.entries(snapshot.previousEnrichmentMetadata || {})) {
+            if (prevMeta === null || prevMeta === undefined) {
+              delete restoredEnrichmentMetadata[key];
+            } else {
+              restoredEnrichmentMetadata[key] = prevMeta;
+            }
+          }
+
           await crmDb.updateLead(listId, snapshot.leadId, {
             ...(snapshot.previousStandardFields || {}),
             customFields: restoredCustomFields,
+            enrichmentMetadata: restoredEnrichmentMetadata,
           });
 
           revertedCount++;

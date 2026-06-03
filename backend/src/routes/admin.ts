@@ -5295,4 +5295,86 @@ router.delete("/skill-assignments/:assignmentId", async (req, res) => {
   }
 });
 
+// GET /api/admin/lead-lists?userId=xxx — all lists (optionally filtered by userId)
+router.get("/lead-lists", async (req, res) => {
+  try {
+    const { userId } = req.query as { userId?: string };
+    const lists = userId
+      ? await crmDb.getLeadListsByUserId(userId)
+      : await crmDb.getAllLeadLists();
+    res.json(lists.map((l: any) => ({ listId: l.listId, name: l.name, userId: l.userId })));
+  } catch (error: any) {
+    console.error("Error fetching lead lists:", error.message);
+    res.status(500).json({ message: "Failed to fetch lead lists" });
+  }
+});
+
+// GET /api/admin/lists/:listId/enrichment-jobs — enrichment job history for a list
+router.get("/lists/:listId/enrichment-jobs", async (req, res) => {
+  try {
+    const { listId } = req.params;
+    const startDate = req.query.startDate as string | undefined;
+    const endDate = req.query.endDate as string | undefined;
+    const pageSize = Math.min(parseInt(req.query.pageSize as string) || 20, 100);
+    const nextToken = req.query.nextToken as string | undefined;
+    const result = await crmDb.getEnrichmentJobsByListId(listId, startDate, endDate, pageSize, nextToken);
+    return res.json(result);
+  } catch (error: any) {
+    console.error("Error fetching enrichment jobs:", error.message);
+    return res.status(error.statusCode || 500).json({ message: error.statusCode === 400 ? error.message : "Failed to fetch enrichment jobs" });
+  }
+});
+
+// GET /api/admin/lists/:listId/enrichment-jobs/:jobId — single job with per-lead breakdown
+router.get("/lists/:listId/enrichment-jobs/:jobId", async (req, res) => {
+  try {
+    const { listId, jobId } = req.params;
+
+    const [meta, snapshots] = await Promise.all([
+      crmDb.getEnrichmentJobMeta(jobId),
+      crmDb.getEnrichmentSnapshotsByJobId(jobId),
+    ]);
+
+    if (!meta || meta.listId !== listId) {
+      return res.status(404).json({ message: "Enrichment job not found" });
+    }
+
+    return res.json({ job: meta, leads: snapshots });
+  } catch (error: any) {
+    console.error("Error fetching enrichment job detail:", error.message);
+    return res.status(500).json({ message: "Failed to fetch enrichment job detail" });
+  }
+});
+
+// GET /api/admin/enrichment-jobs?startDate=ISO&endDate=ISO&pageSize=N&nextToken=T
+router.get("/enrichment-jobs", async (req, res) => {
+  try {
+    const startDate = req.query.startDate as string | undefined;
+    const endDate = req.query.endDate as string | undefined;
+    const pageSize = Math.min(parseInt(req.query.pageSize as string) || 50, 200);
+    const nextToken = req.query.nextToken as string | undefined;
+    const result = await crmDb.getRecentEnrichmentJobs(startDate, endDate, pageSize, nextToken);
+    return res.json(result);
+  } catch (error: any) {
+    console.error("Error fetching recent enrichment jobs:", error.message);
+    return res.status(error.statusCode || 500).json({ message: error.statusCode === 400 ? error.message : "Failed to fetch enrichment jobs" });
+  }
+});
+
+// GET /api/admin/users/:userId/enrichment-jobs?startDate=ISO&endDate=ISO&pageSize=N&nextToken=T
+router.get("/users/:userId/enrichment-jobs", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const startDate = req.query.startDate as string | undefined;
+    const endDate = req.query.endDate as string | undefined;
+    const pageSize = Math.min(parseInt(req.query.pageSize as string) || 50, 200);
+    const nextToken = req.query.nextToken as string | undefined;
+    const result = await crmDb.getEnrichmentJobsByUserId(userId, startDate, endDate, pageSize, nextToken);
+    return res.json(result);
+  } catch (error: any) {
+    console.error("Error fetching user enrichment jobs:", error.message);
+    return res.status(error.statusCode || 500).json({ message: error.statusCode === 400 ? error.message : "Failed to fetch enrichment jobs" });
+  }
+});
+
 export default router;
