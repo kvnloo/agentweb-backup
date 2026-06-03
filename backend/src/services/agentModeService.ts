@@ -12672,10 +12672,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       const image = await metaService.uploadImage(accountId, accessToken, filename, buffer);
+      // metaService.uploadImage returns a flat { hash, url, ... } object. Surface the hash
+      // at the top level as image_hash so callers (COPY_AD re-upload, the agent itself)
+      // never have to parse Meta's filename-keyed images map — that parsing is the source
+      // of distinct creatives colliding on the wrong hash during batch uploads.
+      const imageHash = image?.hash;
+      if (!imageHash) {
+        return {
+          success: false,
+          message: 'Image upload did not return a hash from Meta.',
+          error: 'NO_IMAGE_HASH',
+          image
+        };
+      }
       return {
         success: true,
         message: `Image uploaded successfully`,
-        image: image
+        image_hash: imageHash,
+        image_url: image?.url,
+        image
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;

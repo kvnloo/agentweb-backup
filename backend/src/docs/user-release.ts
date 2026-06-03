@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-06-02
+// Last updated: 2026-06-03
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,14 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-06-03',
+    changes: [
+      'Fixed: Facebook/Meta Ad Images No Longer Get Swapped or Duplicated',
+      '- When uploading several ad images at once, distinct images could come back sharing the same image ID, so an ad could end up showing the wrong picture',
+      '- Each uploaded image now reliably returns its own correct ID, so the right creative is matched to the right ad',
+    ],
+  },
   {
     date: '2026-06-02',
     changes: [
