@@ -374,7 +374,23 @@ Respond with JSON: {"content": "the message text"}`;
   });
 }
 
+/**
+ * Operational kill-switch for "X accepted your LinkedIn invitation" emails.
+ * Default-MUTED hotfix for the 2026-06-03 outage: notifications stay OFF unless
+ * LINKEDIN_CONNECTION_NOTIFICATIONS_ENABLED is explicitly set to 'true'. This lets ops
+ * mute/unmute without a redeploy once the root-cause fix (backfill suppression) is verified.
+ */
+export function linkedInConnectionNotificationsEnabled(): boolean {
+  return process.env.LINKEDIN_CONNECTION_NOTIFICATIONS_ENABLED === 'true';
+}
+
 export async function notifyNewConnections(newConnections: UnipileConnection[]): Promise<void> {
+  if (!linkedInConnectionNotificationsEnabled()) {
+    if (newConnections.length > 0) {
+      console.log(`${TAG} LinkedIn connection-accepted notifications are MUTED (set LINKEDIN_CONNECTION_NOTIFICATIONS_ENABLED=true to enable) — skipping ${newConnections.length} connection(s)`);
+    }
+    return;
+  }
   for (const conn of newConnections) {
     try {
       const leads = await crmDb.findLeadsByLinkedin(conn.publicProfileUrl);
@@ -432,9 +448,27 @@ export async function runLinkedInConnectionSync(): Promise<void> {
 
     const allNewConnections: UnipileConnection[] = [];
     for (const accountId of accountIds) {
+      // A run that backfills the FULL connection history (the first sync for an
+      // account whose __fullsync__ marker is still absent) returns EVERY historical
+      // connection as "new". Those are long-standing connections, not freshly-accepted
+      // invitations — feeding them into notify/enroll would email the list owner about
+      // every past connection at once (the 2026-06-03 outage). So we only accumulate
+      // connections for notify/enroll when the account was ALREADY backfilled before
+      // this run (marker present → this run is a cheap incremental poll).
+      let alreadyBackfilled = false;
+      try {
+        alreadyBackfilled = (await getFullSyncCompletedAt(accountId)) !== null;
+      } catch {
+        // If we can't tell, assume not-yet-backfilled and suppress — never over-notify.
+        alreadyBackfilled = false;
+      }
       try {
         const newConns = await syncConnectionsForAccount(accountId);
-        allNewConnections.push(...newConns);
+        if (alreadyBackfilled) {
+          allNewConnections.push(...newConns);
+        } else if (newConns.length > 0) {
+          console.log(`${TAG} account=${accountId} initial backfill — suppressing ${newConns.length} historical connection(s) from notify/enroll`);
+        }
       } catch (err) {
         console.error(`${TAG} Sync failed for account ${accountId}:`, err);
       }
