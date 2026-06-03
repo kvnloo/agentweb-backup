@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-03',
     changes: [
+      'Fixed: No More Duplicate "Accepted Your LinkedIn Invitation" Emails',
+      '- A recent connection-syncing change could mistake your existing LinkedIn connections for brand-new acceptances, sending a burst of "accepted your invitation" emails for people you connected with long ago',
+      '- These notifications now fire only when a connection is genuinely newly accepted, never when we backfill your existing connection history',
+      '- As a safeguard we have temporarily paused these emails while the fix is verified; they will resume once confirmed working',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
       'Improved: Auto-Drafted LinkedIn Follow-Up Messages Are More Personal',
       '- When a lead accepts your connection request, the follow-up message we pre-draft for you now reflects your brand voice and your offer, instead of reading like generic filler',
       '- The draft also takes prior emails and LinkedIn messages into account: if the lead already replied to you, it picks up that thread rather than re-introducing yourself',
