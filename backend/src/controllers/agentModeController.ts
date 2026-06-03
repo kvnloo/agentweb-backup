@@ -934,6 +934,56 @@ export async function runScheduledChat(
   let generatedSummary: string | undefined;
 
   try {
+    // Guard against orphaned schedules whose owning user no longer exists.
+    // Without this, downstream calls (e.g. token-usage checks) throw
+    // "User not found: <userId>" on every run, repeatedly alerting oncall.
+    // Auto-pause the schedule so it stops firing, and return gracefully.
+    const scheduleOwner = await userDb.getUserById(userId);
+    if (!scheduleOwner) {
+      console.warn(
+        `Scheduled chat "${schedule.scheduleName}" (${schedule.scheduleId}) references a missing user ${userId}. Auto-pausing schedule.`
+      );
+
+      if (!isTest) {
+        try {
+          await scheduleDb.updateSchedule(schedule.scheduleId, {
+            status: 'paused',
+            updatedAt: new Date().toISOString(),
+          });
+        } catch (pauseError) {
+          console.error(
+            `Failed to auto-pause orphaned schedule ${schedule.scheduleId}:`,
+            pauseError
+          );
+        }
+      }
+
+      const orphanedUserResult = {
+        scheduleId: schedule.scheduleId,
+        runId: preGeneratedRunId || require('uuid').v4(),
+        status: 'failure' as const,
+        passed: false,
+        actualResponse: `Scheduled chat paused: the owning user (${userId}) no longer exists.`,
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: 0,
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString(),
+      };
+
+      try {
+        await scheduleDb.addRunResult(schedule.scheduleId, orphanedUserResult);
+      } catch (saveError) {
+        console.error('Error saving orphaned-user run result:', saveError);
+      }
+
+      return orphanedUserResult;
+    }
+
     const scheduleVariables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
     const scheduleVariableValues = (schedule.variableValues && typeof schedule.variableValues === 'object')
       ? schedule.variableValues as Record<string, string>
