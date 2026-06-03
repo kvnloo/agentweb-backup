@@ -1,3 +1,22 @@
+## Outage: flood of "X accepted your LinkedIn invitation" emails (2026-06-03)
+
+Reported: a huge number of "{lead} accepted your LinkedIn invitation" notification emails went out at once. Immediate ask: **mute these emails** and find the cause.
+
+### Root cause: backfill connections treated as freshly-accepted invitations
+
+The connection-sync cron (`backend/src/cron/linkedInConnectionSyncCron.ts`, runs every 10 min, wired in `server.ts:514`) calls `notifyNewConnections()` for **every** connection returned by `syncConnectionsForAccount()`. That function performs a **one-time full backfill** of an account's *entire* connection history when the per-account `__fullsync__` marker is absent, and returns **all** historical connections as its "new connections" result. For an account being backfilled for the first time, none of those long-standing connections had ever been notified (`lead.system.linkedInConnectionNotifiedAt` was unset), so the very next cron tick emailed the list owner "accepted your invitation" for **every** historical connection that matches a CRM lead. `enrollNewConnections` had the same blast radius (auto-enrolling history into drip sequences).
+
+Trigger: commit **`570dc302` (2026-06-03 15:40 UTC) "backfill partial LinkedIn connection caches"**, which extended the full backfill from empty-cache-only to *partially* populated caches. That pushed a population of established accounts (with large pre-existing connection histories and matching leads) through the backfill → notify path on their next poll.
+
+The notify path itself looks correct in isolation (dedup via `linkedInConnectionNotifiedAt`, set before send) — the defect is that **a backfill must not be a notification trigger at all**. A backfill is a cache-population operation; only an incremental poll observing a connection that crossed the watermark represents a genuinely *new* acceptance.
+
+### Fix (this branch)
+
+1. **Root cause** — in `runLinkedInConnectionSync`, read the account's `__fullsync__` marker *before* syncing; only push that account's results into the notify/enroll set when the marker was **already present** (i.e. this run is a cheap incremental poll, not the initial backfill). Backfill runs still populate the cache, but their historical connections are logged and dropped from notify/enroll.
+2. **Mute kill-switch (default OFF)** — `notifyNewConnections` now short-circuits unless `LINKEDIN_CONNECTION_NOTIFICATIONS_ENABLED === 'true'`. Shipping default-muted immediately stops the flood on deploy; ops flips the env var to `true` (no redeploy) to re-enable once verified. Helper exported as `linkedInConnectionNotificationsEnabled()`.
+
+Tests: `backend/src/__tests__/linkedInConnectionSync.muteAndBackfill.test.ts` (new) covers the mute switch and backfill suppression end-to-end; existing `notifyNewConnections.test.ts` now opts into the enabled path via `LINKEDIN_CONNECTION_NOTIFICATIONS_ENABLED=true`.
+
 ## LinkedIn Invite to Gundars Katlaps — "Sent Without Approval" Investigation (2026-06-03)
 
 Reported by user `yuan@carley.ai` (userId `5fed2022-2e0f-4534-b09f-86ae95afc035`): angry that a LinkedIn connection invite was sent to lead **Gundars Katlaps** (Chief of Thoracic & Cardiovascular Surgery, Tampa General Hospital) without his approval. Investigation only — no code changed.
