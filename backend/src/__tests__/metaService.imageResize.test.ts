@@ -123,6 +123,34 @@ describe('MetaService.resizeImageForMeta', () => {
     ]);
   });
 
+  it('stops dropping JPEG quality once it bottoms out, even if still over the cap', async () => {
+    const original = fakeBuffer(40 * 1024 * 1024);
+    const tooBig = fakeBuffer(MAX_BYTES + 1); // never fits, forcing the quality floor
+    const instance = makeSharpInstance({ width: 6000, height: 6000, format: 'jpeg' }, [tooBig]);
+    (sharp as jest.Mock).mockReturnValue(instance);
+
+    const result = await service.resizeImageForMeta(original, 'enormous.jpg');
+
+    // Loop exits via the quality>40 guard (90 -> 75 -> 60 -> 45 -> 30), not because it fit.
+    expect(result.resized).toBe(true);
+    expect(result.buffer).toBe(tooBig);
+    expect(instance.jpeg.mock.calls.map((c: any[]) => c[0].quality)).toEqual([90, 75, 60, 45, 30]);
+  });
+
+  it('handles a thrown non-error value without crashing', async () => {
+    const buf = fakeBuffer(6 * 1024 * 1024);
+    (sharp as jest.Mock).mockImplementation(() => {
+      throw null; // exercises the error?.message optional-chain branch
+    });
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const result = await service.resizeImageForMeta(buf, 'logo.png');
+
+    expect(result.resized).toBe(false);
+    expect(result.buffer).toBe(buf);
+    consoleSpy.mockRestore();
+  });
+
   it('returns the original buffer when sharp throws (never blocks the upload)', async () => {
     const buf = fakeBuffer(6 * 1024 * 1024);
     (sharp as jest.Mock).mockImplementation(() => {
