@@ -29,6 +29,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-03',
     changes: [
+      'Fixed: "LinkedIn Invitation Accepted" Email Notifications Are Sending Again (and No Longer Over-Send)',
+      '- These notifications had stopped firing because an accepted connection\'s profile URL never matched the stored lead, so no email went out',
+      '- The alert now fires only when the lead\'s list has a LinkedIn sender assigned and the invitation was accepted on that exact sender account',
+      '- Connecting a LinkedIn account no longer triggers a flood of "accepted" emails for connections you made long ago — the one-time backfill of your existing connections now runs silently',
+      '- These acceptance alerts are now email-only — they no longer post to Slack',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
       'Fixed: LinkedIn Invite Status Updates Instantly Without a Page Reload',
       '- After sending a LinkedIn connection invite from a lead, the lead\'s row didn\'t show the "invitation pending" marker until you reloaded the page',
       '- The pending status now appears immediately on the lead row the moment the invite is sent',
