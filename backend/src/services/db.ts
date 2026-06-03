@@ -3797,6 +3797,22 @@ export const crmDb = {
     }
   },
 
+  async getAllLeadLists() {
+    const items: any[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await dynamodb.scan({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        ProjectionExpression: 'listId, #n, userId',
+        ExpressionAttributeNames: { '#n': 'name' },
+        ExclusiveStartKey: lastEvaluatedKey,
+      }).promise();
+      items.push(...(result.Items || []));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+    return items;
+  },
+
   // Returns true if userId owns the list OR is an org member of the same org as the list owner.
   async canOrgMemberAccessList(userId: string, list: { userId?: string } | Record<string, any>): Promise<boolean> {
     if (list.userId === userId) return true;
@@ -6358,6 +6374,16 @@ export const crmDb = {
     status: 'completed' | 'undone';
     expiresAt: number;
     processedCount: number;
+    failedCount?: number;
+    skippedCount?: number;
+    /** Lead IDs attempted in this run. Used for cross-run unique-lead dedup. Omitted when run exceeds 5000 leads. */
+    attemptedLeadIds?: string[];
+    /** True when attemptedLeadIds was omitted due to run size — dedup stats unavailable for this job. */
+    leadsDeduplicationUnavailable?: boolean;
+    /** Lead IDs skipped in this run. Used for cross-run unique skipped dedup. Omitted when skipped count exceeds 5000. */
+    skippedLeadIds?: string[];
+    /** True when skippedLeadIds was omitted due to size. */
+    skippedDeduplicationUnavailable?: boolean;
     /** Aggregate counts per failure step (search/linkedin/llm/update). Item #11. */
     failureBreakdown?: { searchWebFailed: number; linkedinFailed: number; llmOrParseFailed: number; updateFailed: number };
     /** Per-lead failure records (capped to ~50 to keep row size bounded). Item #11. */
@@ -6385,6 +6411,12 @@ export const crmDb = {
         expiresAt: meta.expiresAt,
         processedCount: meta.processedCount,
       };
+      if (meta.failedCount !== undefined) item.failedCount = meta.failedCount;
+      if (meta.skippedCount !== undefined) item.skippedCount = meta.skippedCount;
+      if (meta.attemptedLeadIds && meta.attemptedLeadIds.length > 0) item.attemptedLeadIds = meta.attemptedLeadIds;
+      if (meta.leadsDeduplicationUnavailable) item.leadsDeduplicationUnavailable = true;
+      if (meta.skippedLeadIds && meta.skippedLeadIds.length > 0) item.skippedLeadIds = meta.skippedLeadIds;
+      if (meta.skippedDeduplicationUnavailable) item.skippedDeduplicationUnavailable = true;
       if (meta.failureBreakdown) item.failureBreakdown = meta.failureBreakdown;
       if (meta.failures && meta.failures.length > 0) {
         // Cap to 50 entries to stay well under DynamoDB's 400KB row limit
@@ -6416,34 +6448,91 @@ export const crmDb = {
     }
   },
 
-  async getEnrichmentJobsByUserId(userId: string, limit = 20): Promise<any[]> {
+  async batchGetListNames(listIds: string[]): Promise<Record<string, string>> {
+    const unique = [...new Set(listIds)].filter(Boolean);
+    if (!unique.length) return {};
+    const CHUNK = 100;
+    const chunks: string[][] = [];
+    for (let i = 0; i < unique.length; i += CHUNK) chunks.push(unique.slice(i, i + CHUNK));
+    const results = await Promise.all(chunks.map(chunk =>
+      dynamodb.batchGet({
+        RequestItems: {
+          [`${TABLE_PREFIX}AW-LeadLists`]: {
+            Keys: chunk.map(id => ({ listId: id })),
+            ProjectionExpression: 'listId, #n',
+            ExpressionAttributeNames: { '#n': 'name' },
+          },
+        },
+      }).promise().then(r => r.Responses?.[`${TABLE_PREFIX}AW-LeadLists`] || [])
+    ));
+    return Object.fromEntries(results.flat().map((item: any) => [item.listId, item.name]));
+  },
+
+  async getEnrichmentJobsByUserId(
+    userId: string,
+    startDate?: string,
+    endDate?: string,
+    pageSize = 50,
+    nextToken?: string,
+  ): Promise<{ jobs: any[]; nextToken?: string }> {
     try {
+      const keyExpr = startDate && endDate
+        ? 'userId = :userId AND createdAt BETWEEN :start AND :end'
+        : 'userId = :userId';
+      const exprValues: Record<string, string> = { ':userId': userId };
+      if (startDate) exprValues[':start'] = startDate;
+      if (endDate) exprValues[':end'] = endDate;
       const result = await dynamodb.query({
         TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
         IndexName: 'userId-createdAt-index',
-        KeyConditionExpression: 'userId = :userId',
-        ExpressionAttributeValues: { ':userId': userId },
+        KeyConditionExpression: keyExpr,
+        ExpressionAttributeValues: exprValues,
         ScanIndexForward: false,
-        Limit: limit,
+        Limit: pageSize,
+        ...(nextToken ? { ExclusiveStartKey: JSON.parse(Buffer.from(nextToken, 'base64').toString()) } : {}),
       }).promise();
-      return (result.Items || []).filter((item: any) => item.leadId === '_meta');
+      const jobs = (result.Items || []).filter((item: any) => item.leadId === '_meta');
+      const listNames = await this.batchGetListNames(jobs.map((j: any) => j.listId));
+      const filtered = jobs.filter((j: any) => listNames[j.listId]).map((j: any) => ({ ...j, listName: listNames[j.listId] }));
+      const newNextToken = result.LastEvaluatedKey
+        ? Buffer.from(JSON.stringify(result.LastEvaluatedKey)).toString('base64')
+        : undefined;
+      return { jobs: filtered, nextToken: newNextToken };
     } catch (error) {
       handleDynamoDbError(error, 'getEnrichmentJobsByUserId');
       throw error;
     }
   },
 
-  async getRecentEnrichmentJobs(limit = 20): Promise<any[]> {
+  async getRecentEnrichmentJobs(
+    startDate?: string,
+    endDate?: string,
+    pageSize = 50,
+    nextToken?: string,
+  ): Promise<{ jobs: any[]; nextToken?: string }> {
     try {
+      const keyExpr = startDate && endDate
+        ? 'jobType = :jobType AND createdAt BETWEEN :start AND :end'
+        : 'jobType = :jobType';
+      const exprValues: Record<string, string> = { ':jobType': 'meta' };
+      if (startDate) exprValues[':start'] = startDate;
+      if (endDate) exprValues[':end'] = endDate;
       const result = await dynamodb.query({
         TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
         IndexName: 'jobType-createdAt-index',
-        KeyConditionExpression: 'jobType = :jobType',
-        ExpressionAttributeValues: { ':jobType': 'meta' },
+        KeyConditionExpression: keyExpr,
+        ExpressionAttributeValues: exprValues,
         ScanIndexForward: false,
-        Limit: limit,
+        Limit: pageSize,
+        ...(nextToken ? { ExclusiveStartKey: JSON.parse(Buffer.from(nextToken, 'base64').toString()) } : {}),
       }).promise();
-      return result.Items || [];
+      const jobs = result.Items || [];
+      const listNames = await this.batchGetListNames(jobs.map((j: any) => j.listId));
+      const filtered = jobs.filter((j: any) => listNames[j.listId]).map((j: any) => ({ ...j, listName: listNames[j.listId] }));
+      const newNextToken = result.LastEvaluatedKey
+        ? Buffer.from(JSON.stringify(result.LastEvaluatedKey)).toString('base64')
+        : undefined;
+      return { jobs: filtered, nextToken: newNextToken };
     } catch (error) {
       handleDynamoDbError(error, 'getRecentEnrichmentJobs');
       throw error;

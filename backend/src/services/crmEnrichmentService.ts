@@ -1788,6 +1788,8 @@ export class CrmEnrichmentService {
     }
 
     const counters = { processed: 0, failed: 0, skipped: 0 };
+    const attemptedLeadIds: string[] = [];
+    const skippedLeadIds: string[] = [];
     const failureBreakdown = {
       searchWebFailed: 0,
       linkedinFailed: 0,
@@ -1805,6 +1807,7 @@ export class CrmEnrichmentService {
     const enrichedAt = new Date().toISOString();
     const chunkProcessors = chunks.map(async (chunk) => {
       for (const lead of chunk) {
+        if (lead?.leadId) attemptedLeadIds.push(lead.leadId);
         try {
           const { fields, metadata: citations, normalized } = await this.enrichLead(lead, spec, linkedInAccountId, enrichConfig);
           const { standardUpdates, customUpdates } = CrmEnrichmentService.splitFields(fields);
@@ -1874,6 +1877,7 @@ export class CrmEnrichmentService {
           const step = error?.step || 'unknown';
           if (step === 'skipped_personal') {
             counters.skipped++;
+            if (lead?.leadId) skippedLeadIds.push(lead.leadId);
             console.log(`[CrmEnrichment] Skipped lead ${lead?.leadId}: ${error.message}`);
           } else {
             if (step === 'search') {
@@ -1923,6 +1927,16 @@ export class CrmEnrichmentService {
         status: 'completed',
         expiresAt: jobExpiresAt,
         processedCount: counters.processed,
+        failedCount: counters.failed,
+        skippedCount: counters.skipped,
+        ...(attemptedLeadIds.length <= 5000
+          ? { attemptedLeadIds }
+          : { leadsDeduplicationUnavailable: true }),
+        ...(skippedLeadIds.length > 0 && skippedLeadIds.length <= 5000
+          ? { skippedLeadIds }
+          : skippedLeadIds.length > 5000
+          ? { skippedDeduplicationUnavailable: true }
+          : {}),
         failureBreakdown,
         failures: failureRecords,
       })).catch((err: any) => console.error('[CrmEnrichment] Failed to write job meta:', err));

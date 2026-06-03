@@ -5295,6 +5295,20 @@ router.delete("/skill-assignments/:assignmentId", async (req, res) => {
   }
 });
 
+// GET /api/admin/lead-lists?userId=xxx — all lists (optionally filtered by userId)
+router.get("/lead-lists", async (req, res) => {
+  try {
+    const { userId } = req.query as { userId?: string };
+    const lists = userId
+      ? await crmDb.getLeadListsByUserId(userId)
+      : await crmDb.getAllLeadLists();
+    res.json(lists.map((l: any) => ({ listId: l.listId, name: l.name, userId: l.userId })));
+  } catch (error: any) {
+    console.error("Error fetching lead lists:", error.message);
+    res.status(500).json({ message: "Failed to fetch lead lists" });
+  }
+});
+
 // GET /api/admin/lists/:listId/enrichment-jobs — enrichment job history for a list
 router.get("/lists/:listId/enrichment-jobs", async (req, res) => {
   try {
@@ -5331,25 +5345,31 @@ router.get("/lists/:listId/enrichment-jobs/:jobId", async (req, res) => {
   }
 });
 
-// GET /api/admin/enrichment-jobs?limit=N — system-wide recent enrichment jobs
+// GET /api/admin/enrichment-jobs?startDate=ISO&endDate=ISO&pageSize=N&nextToken=T
 router.get("/enrichment-jobs", async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
-    const jobs = await crmDb.getRecentEnrichmentJobs(limit);
-    return res.json({ jobs });
+    const startDate = req.query.startDate as string | undefined;
+    const endDate = req.query.endDate as string | undefined;
+    const pageSize = Math.min(parseInt(req.query.pageSize as string) || 50, 200);
+    const nextToken = req.query.nextToken as string | undefined;
+    const result = await crmDb.getRecentEnrichmentJobs(startDate, endDate, pageSize, nextToken);
+    return res.json(result);
   } catch (error: any) {
     console.error("Error fetching recent enrichment jobs:", error.message);
     return res.status(500).json({ message: "Failed to fetch enrichment jobs" });
   }
 });
 
-// GET /api/admin/users/:userId/enrichment-jobs — all jobs for a user
+// GET /api/admin/users/:userId/enrichment-jobs?startDate=ISO&endDate=ISO&pageSize=N&nextToken=T
 router.get("/users/:userId/enrichment-jobs", async (req, res) => {
   try {
     const { userId } = req.params;
-    const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
-    const jobs = await crmDb.getEnrichmentJobsByUserId(userId, limit);
-    return res.json({ jobs });
+    const startDate = req.query.startDate as string | undefined;
+    const endDate = req.query.endDate as string | undefined;
+    const pageSize = Math.min(parseInt(req.query.pageSize as string) || 50, 200);
+    const nextToken = req.query.nextToken as string | undefined;
+    const result = await crmDb.getEnrichmentJobsByUserId(userId, startDate, endDate, pageSize, nextToken);
+    return res.json(result);
   } catch (error: any) {
     console.error("Error fetching user enrichment jobs:", error.message);
     return res.status(500).json({ message: "Failed to fetch enrichment jobs" });

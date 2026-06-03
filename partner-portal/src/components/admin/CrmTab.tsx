@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import EnrichmentHistoryTab from './EnrichmentHistoryTab';
 import {
   Box,
   Button,
@@ -433,6 +434,9 @@ export default function CrmTab() {
           <Button onClick={() => setAddDialogOpen(false)}>Close</Button>
         </DialogActions>
       </Dialog>
+
+      <Divider sx={{ my: 3 }} />
+      <EnrichmentHistoryTab />
     </Box>
   );
 }
