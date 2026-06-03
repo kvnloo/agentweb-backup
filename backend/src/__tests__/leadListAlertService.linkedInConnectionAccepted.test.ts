@@ -5,6 +5,7 @@
 import { leadListAlertService } from '../services/leadListAlertService';
 import { userDb } from '../services/db';
 import { emailService } from '../services/emailService';
+import { sendLeadNotification } from '../services/slackService';
 
 jest.mock('../services/db', () => ({
   crmDb: {
@@ -27,6 +28,8 @@ jest.mock('../services/emailService', () => ({
 jest.mock('../services/slackService', () => ({
   sendLeadNotification: jest.fn(),
 }));
+
+const mockSendLeadNotification = sendLeadNotification as jest.Mock;
 
 const LIST = {
   listId: 'list-1',
@@ -132,5 +135,18 @@ describe('notifyLinkedInConnectionAccepted', () => {
 
     const [, , text] = (emailService.sendEmail as jest.Mock).mock.calls[0];
     expect(text).not.toMatch(/john@example\.com \(john@example\.com\)/);
+  });
+
+  it('never sends a Slack notification, even when the user has a slackChannel', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      email: 'owner@example.com',
+      userId: 'user-1',
+      slackChannel: 'C123456',
+    });
+
+    await leadListAlertService.notifyLinkedInConnectionAccepted(LIST, LEAD);
+
+    expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
+    expect(mockSendLeadNotification).not.toHaveBeenCalled();
   });
 });

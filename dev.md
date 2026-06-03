@@ -4648,3 +4648,45 @@ Rather than increasing upload limits or adding server-side zip extraction (which
 ### Recommendation for the product
 
 If large brand guideline uploads become a common need, consider adding a "Connect Google Drive folder" shortcut in the Brand Guidelines UI that guides users through sharing a folder with the service account — avoiding the upload flow entirely for large asset libraries.
+
+---
+
+# June 3, 2026: Investigation — LinkedIn "Invitation Accepted" Notifications Stopped Sending
+
+## Symptom
+
+The email notification a list owner should receive when a lead accepts their LinkedIn connection request stopped firing. Separately, when it *did* fire it also posted to Slack (which it should not), and it fired for lists that never sent the invite.
+
+## Root causes
+
+1. **Trailing-slash URL mismatch (the "stopped sending" bug).** `linkedInConnectionSyncCron.notifyNewConnections` looked up CRM leads via `crmDb.findLeadsByLinkedin(conn.publicProfileUrl)`. The connection URL is normalized by `unipileConnectionsDb.normalizeLinkedInUrl`, which **forces a trailing slash** (`.../in/john/`). But leads store their `linkedin` value **without** a trailing slash — CSV import (`crm.ts` normalizer) and enrichment (`enrichmentGroups.normalizeLinkedInUrl`) both strip it, and `db.createLead` only `.trim()`s. `findLeadsByLinkedin` does an **exact** GSI match on `LinkedinLookupIndex`, so the slash-terminated key never matched → zero leads → no email. The `__latest__` watermark had already advanced, so the connection was never reconsidered → permanent miss. (The sibling `enrollNewConnections` was unaffected because it normalizes *both* sides before comparing.)
+
+2. **Slack notification.** `leadListAlertService.notifyLinkedInConnectionAccepted` posted to Slack via `sendLeadNotification` whenever the owner had a `slackChannel`. These acceptance alerts should be email-only.
+
+3. **No sender gate.** The notification fired for any list containing the matching lead, regardless of whether the list had an assigned LinkedIn sender (`list.linkedInAccountId`).
+
+## Fixes
+
+- `notifyNewConnections` now queries both the slash and no-slash URL variants (deduping by `listId#leadId`) via a new `findLeadsForConnectionUrl` helper.
+- It now only notifies when `list.linkedInAccountId` is set **and** equals the connection's `accountId` (the sender that actually sent the invite).
+- Removed the Slack block from `notifyLinkedInConnectionAccepted`. Generic lead-list alerts in `notifyLeadListOwnerIfConfigured` still post to Slack.
+
+## Tests
+
+- `linkedInConnectionSync.notifyNewConnections.test.ts` — added slash-variant matching, variant dedup, and sender-gate cases; made the `normalizeLinkedInUrl` mock mirror the real (trailing-slash) behavior.
+- `leadListAlertService.linkedInConnectionAccepted.test.ts` — added a case asserting Slack is never called even when a `slackChannel` is set.
+
+## PRODUCTION INCIDENT — notification flood on initial backfill (2026-06-03 16:33–16:42 UTC)
+
+While PR #1752 (above) was in review (NOT deployed), a live flood of "invitation accepted" emails hit `murray.newlands@gmail.com`.
+
+### Diagnosis (from prod logs + DynamoDB)
+
+- User `9fde4157-e73f-4f0e-9d3a-ac8fe97b35ec`, list `list_1776558909356_4e0g4dxrt` ("Master Contact Data with Enrichment"): **132,363 leads, 32,298 with LinkedIn URLs**, freshly imported.
+- Unipile account `LIBGE2pYS1eckwgo7wUIGQ` (**3,447 cached connections**) ran a **one-time full backfill**. Commit `570dc302` (merged to `main` the same day) extended the forced full backfill from *empty* caches to *partial* caches too (gated on a new `__fullsync__` marker), so every pre-existing account backfills once. `notifyNewConnections` then treated every historical connection (e.g. `connectedAt` = Mar 22) as a freshly-accepted invitation → ~86 emails (+ Slack) in 9 minutes, all to one owner.
+- The list had **no `linkedInAccountId` assigned**, yet it still notified (the missing sender gate).
+- Dedup (`lead.system.linkedInConnectionNotifiedAt`) WAS working — each lead fired once — so it was a one-time burst, not a per-cron repeat. It self-terminated once the backfill completed (flat at 16:42; no growth across the 16:50 cron boundary).
+
+### Root-cause fix (added to PR #1752)
+
+`runLinkedInConnectionSync` now checks the `__fullsync__` marker (`getFullSyncCompletedAt`) BEFORE syncing each account. If absent, this run is the one-time full backfill — covering **both empty AND partial caches** (the partial-cache path is what actually flooded) — so it caches the connections silently and skips BOTH `notifyNewConnections` and `enrollNewConnections`. Keying off the fullsync marker (not the watermark) is essential: the flood account had a non-null watermark, so a watermark-based check would have missed it. Combined with the sender-gate fix, this list would have sent **zero** emails. Covered by `linkedInConnectionSync.initialBackfillNoNotify.test.ts` (includes a partial-cache case).

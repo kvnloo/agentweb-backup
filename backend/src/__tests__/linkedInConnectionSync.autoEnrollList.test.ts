@@ -79,6 +79,28 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockDripDb.getExistingEnrollment.mockResolvedValue(null);
   mockDripDb.enrollLead.mockResolvedValue({} as any);
+  // Auto-enroll kill-switch defaults to muted; enable it so these tests exercise
+  // the real enrollment logic. A dedicated test below covers muted-by-default.
+  process.env.LINKEDIN_CONNECTION_ENROLL = 'true';
+});
+
+afterAll(() => {
+  delete process.env.LINKEDIN_CONNECTION_ENROLL;
+});
+
+describe('enrollNewConnections - kill-switch', () => {
+  it('is muted by default: enrolls nothing when LINKEDIN_CONNECTION_ENROLL is unset', async () => {
+    delete process.env.LINKEDIN_CONNECTION_ENROLL;
+    mockDripDb.getAllSequencesByTriggerType.mockResolvedValue([SEQUENCE_WITH_FILTER] as any);
+    mockCrmDb.getLeadListsByUserId.mockResolvedValue([CORRECT_LIST] as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [MATCHING_LEAD], lastEvaluatedKey: null, hasMore: false } as any);
+
+    const enrolled = await enrollNewConnections([NEW_CONNECTION]);
+
+    expect(enrolled).toBe(0);
+    expect(mockDripDb.getAllSequencesByTriggerType).not.toHaveBeenCalled();
+    expect(mockDripDb.enrollLead).not.toHaveBeenCalled();
+  });
 });
 
 describe('enrollNewConnections - autoEnrollListIds filter', () => {

@@ -31,7 +31,12 @@ jest.mock('../services/linkedInOutreachService', () => ({
 jest.mock('../services/unipileConnectionsDb', () => ({
   upsertConnections: jest.fn(),
   getLatestConnectedAt: jest.fn().mockResolvedValue(null),
-  normalizeLinkedInUrl: jest.fn((url: string) => url.replace(/\/$/, '').toLowerCase()),
+  // Mirror the real normalizer: lowercase + force a trailing slash.
+  normalizeLinkedInUrl: jest.fn((url: string) => {
+    let u = url.trim().toLowerCase();
+    if (!u.endsWith('/')) u += '/';
+    return u;
+  }),
 }));
 
 jest.mock('../services/dripSequenceDb', () => ({
@@ -96,11 +101,43 @@ const MATCHING_LEAD = {
   linkedin: 'https://www.linkedin.com/in/john-prospect',
 };
 
-const LIST = { listId: 'list-1', name: 'Outreach List', userId: 'user-1' };
+// List has an assigned LinkedIn sender matching the connection's account, so
+// notifications fire (the sender-gate requirement).
+const LIST = { listId: 'list-1', name: 'Outreach List', userId: 'user-1', linkedInAccountId: 'account-1' };
 
 beforeEach(() => {
   jest.clearAllMocks();
   mockAlertService.notifyLinkedInConnectionAccepted.mockResolvedValue(undefined);
+  // The notification kill-switch defaults to muted; enable it so these tests
+  // exercise the real notification logic. A dedicated test below covers the
+  // muted-by-default behavior.
+  process.env.LINKEDIN_CONNECTION_NOTIFY = 'true';
+});
+
+afterAll(() => {
+  delete process.env.LINKEDIN_CONNECTION_NOTIFY;
+});
+
+describe('notifyNewConnections — kill-switch', () => {
+  it('is muted by default: sends nothing when LINKEDIN_CONNECTION_NOTIFY is unset', async () => {
+    delete process.env.LINKEDIN_CONNECTION_NOTIFY;
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([MATCHING_LEAD] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    expect(mockCrmDb.findLeadsByLinkedin).not.toHaveBeenCalled();
+    expect(mockAlertService.notifyLinkedInConnectionAccepted).not.toHaveBeenCalled();
+  });
+
+  it('stays muted even when set to a non-"true" value', async () => {
+    process.env.LINKEDIN_CONNECTION_NOTIFY = '1';
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([MATCHING_LEAD] as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    expect(mockAlertService.notifyLinkedInConnectionAccepted).not.toHaveBeenCalled();
+  });
 });
 
 describe('notifyNewConnections', () => {
@@ -191,6 +228,54 @@ describe('notifyNewConnections', () => {
     expect(mockCrmDb.getLeadListById).not.toHaveBeenCalled();
     expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
     expect(mockAlertService.notifyLinkedInConnectionAccepted).not.toHaveBeenCalled();
+  });
+
+  it('skips notification when the list has no assigned LinkedIn sender', async () => {
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([MATCHING_LEAD] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue({ ...LIST, linkedInAccountId: null } as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    expect(mockAlertService.notifyLinkedInConnectionAccepted).not.toHaveBeenCalled();
+  });
+
+  it('skips notification when the list sender differs from the connection account', async () => {
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([MATCHING_LEAD] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue({ ...LIST, linkedInAccountId: 'other-account' } as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    expect(mockAlertService.notifyLinkedInConnectionAccepted).not.toHaveBeenCalled();
+  });
+
+  it('matches leads stored without a trailing slash even though the connection URL has one', async () => {
+    // Connection URL is normalized with a trailing slash; the lead was stored
+    // WITHOUT one (CSV import / enrichment strip it). Both variants must be queried.
+    const connWithSlash = { ...NEW_CONNECTION, publicProfileUrl: 'https://www.linkedin.com/in/john-prospect/' };
+    const leadNoSlash = { ...MATCHING_LEAD, linkedin: 'https://www.linkedin.com/in/john-prospect' };
+
+    mockCrmDb.findLeadsByLinkedin.mockImplementation(async (url: string) =>
+      (url === 'https://www.linkedin.com/in/john-prospect' ? [leadNoSlash] : []) as any,
+    );
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+
+    await notifyNewConnections([connWithSlash]);
+
+    expect(mockCrmDb.findLeadsByLinkedin).toHaveBeenCalledWith('https://www.linkedin.com/in/john-prospect');
+    expect(mockAlertService.notifyLinkedInConnectionAccepted).toHaveBeenCalledWith(LIST, leadNoSlash);
+  });
+
+  it('does not notify twice when both URL variants return the same lead', async () => {
+    // findLeadsByLinkedin returns the same lead for both the slash and no-slash
+    // lookups — the helper must dedup so the owner is notified only once.
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([MATCHING_LEAD] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    expect(mockAlertService.notifyLinkedInConnectionAccepted).toHaveBeenCalledTimes(1);
   });
 
   it('marks lead with linkedInConnectionNotifiedAt before sending notification', async () => {
