@@ -410,6 +410,13 @@ export class LinkedInOutreachService {
 
       // Unipile may return 'FIRST_DEGREE' (validated format) or 'DISTANCE_1' (raw format)
       if (distance === 'FIRST_DEGREE' || distance === 'DISTANCE_1') {
+        // Self-heal: the live API says we're connected but the cache evidently didn't
+        // (or the CRM wouldn't have offered the invite). Upsert this connection so the
+        // CRM stops offering the invite immediately, without waiting for the next full
+        // sync. Non-fatal — never let a cache write block the already-connected guard.
+        await this.cacheLiveConnection(accountId, profile).catch((err) =>
+          this.log(`Self-heal connection cache write skipped`, { providerId, reason: err?.message }),
+        );
         throw new Error(
           `Cannot send invite: you are already connected with this person (network_distance: ${distance}). ` +
           `Use the send-message action to reach them directly.`
@@ -420,6 +427,41 @@ export class LinkedInOutreachService {
       // Profile lookup failed — log and proceed rather than blocking the invite
       this.log(`Connection status check skipped (profile fetch failed)`, { providerId, reason: error.message });
     }
+  }
+
+  /**
+   * Upsert a single live 1st-degree connection into AW-UnipileConnections. Used to
+   * self-heal a stale cache that was missing a genuinely-connected lead. Best-effort:
+   * skips silently if the profile lacks a usable public URL/member id.
+   */
+  private async cacheLiveConnection(accountId: string, profile: any): Promise<void> {
+    const publicId: string | undefined = profile?.public_identifier || profile?.provider_id;
+    const memberId: string | undefined = profile?.member_id || publicId;
+    if (!memberId) return;
+
+    const {
+      upsertConnections,
+      normalizeLinkedInUrl,
+    } = await import('./unipileConnectionsDb');
+
+    const profileUrl = normalizeLinkedInUrl(
+      profile?.public_profile_url ||
+      (publicId ? `https://www.linkedin.com/in/${publicId}/` : ''),
+    );
+    if (!profileUrl) return;
+
+    await upsertConnections([{
+      accountId,
+      memberId,
+      publicProfileUrl: profileUrl,
+      memberUrn: profile?.member_urn ?? '',
+      connectionUrn: profile?.connection_urn ?? '',
+      firstName: profile?.first_name ?? '',
+      lastName: profile?.last_name ?? '',
+      headline: profile?.headline ?? '',
+      connectedAt: profile?.created_at ?? 0,
+      syncedAt: new Date().toISOString(),
+    }]);
   }
 
   /**
