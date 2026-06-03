@@ -36,6 +36,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-03',
     changes: [
+      'Fixed: Emma Can Edit Every Page of a Multi-Page Landing Site Again',
+      '- When a site has several pages that share one project, Emma could refuse to edit a page other than the one you opened — even one she had just edited moments earlier in the same chat',
+      '- Emma can now edit any page or shared file within the same site/project, so cross-page tweaks (like aligning a form on another page) go through reliably',
+      '- She still makes only the change you asked for and won\'t touch unrelated pages or copy on her own',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
       'Fixed: Facebook/Meta Ad Images No Longer Get Swapped or Duplicated',
       '- When uploading several ad images at once, distinct images could come back sharing the same image ID, so an ad could end up showing the wrong picture',
       '- Each uploaded image now reliably returns its own correct ID, so the right creative is matched to the right ad',
