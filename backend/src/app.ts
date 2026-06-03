@@ -128,6 +128,8 @@ const corsOptions = {
       /^https:\/\/[a-zA-Z0-9\-]+\.agentweb\.pro$/, // Allow any subdomain of agentweb.pro
       /^https:\/\/[a-zA-Z0-9\-]+\.agentwebforms\.com$/, // Allow any subdomain of agentwebforms.com
       "https://agentweb.pro", // Main Production Partner URL
+      /^https:\/\/[a-zA-Z0-9\-]+\.hireemma\.ai$/, // Allow any subdomain of hireemma.ai (e.g. www)
+      "https://hireemma.ai", // hireemma.ai apex domain
       "https://agentweb-user-files.s3.us-west-2.amazonaws.com", // S3 bucket for user files
       process.env.FRONTEND_URL || "http://localhost:5173", // Partner Portal (Deployed or Local)
       process.env.CUSTOMER_FRONTEND_URL || "http://localhost:5174", // Customer Portal (Deployed or Local)
