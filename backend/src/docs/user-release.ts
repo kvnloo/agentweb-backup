@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-03',
     changes: [
+      'Fixed: Scheduled Chats Owned by Deleted Accounts Now Pause Themselves',
+      '- A scheduled chat whose owner account had been removed kept trying to run and failing every time, instead of stopping',
+      '- These orphaned schedules now pause automatically the next time they would run, and the run is recorded as a failure so it\'s visible in your history',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
       'Fixed: Large Facebook/Meta Ad Images Upload Instead of Failing',
       '- High-resolution creatives (for example 4096×4096 renders) were rejected by Meta with an unhelpful "Invalid parameter" error, blocking bulk ad creation',
       '- We now automatically scale oversized images down to a size Meta accepts (preserving the aspect ratio, and keeping logos crisp) before uploading, so you no longer have to manually resize and re-upload them',
