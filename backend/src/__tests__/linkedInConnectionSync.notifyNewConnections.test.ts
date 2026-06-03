@@ -66,9 +66,12 @@ jest.mock('../services/leadListAlertService', () => ({
 import { notifyNewConnections } from '../cron/linkedInConnectionSyncCron';
 import { crmDb } from '../services/db';
 import { leadListAlertService } from '../services/leadListAlertService';
+import { agentModeService } from '../services/agentModeService';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 const mockAlertService = leadListAlertService as jest.Mocked<typeof leadListAlertService>;
+const mockReadBrandGuidelines = agentModeService.readBrandGuidelines as jest.Mock;
+const mockReadMarketStrategy = agentModeService.readMarketStrategy as jest.Mock;
 const getOpenAICreate = () => (global as any).__linkedInCronOpenAICreate as jest.Mock;
 
 const NEW_CONNECTION = {
@@ -287,5 +290,119 @@ describe('generateConnectionFollowUpDraft — activity history', () => {
 
     // getLeadEngagements should NOT be called since we short-circuit early
     expect(mockCrmDb.getLeadEngagements).not.toHaveBeenCalled();
+  });
+});
+
+describe('generateConnectionFollowUpDraft — brand voice & market strategy context', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockAlertService.notifyLinkedInConnectionAccepted.mockResolvedValue(undefined);
+    getOpenAICreate().mockResolvedValue({
+      choices: [{ message: { content: '{"content":"Hi, thanks for connecting!"}' } }],
+    });
+    mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+  });
+
+  it('injects brand voice from readBrandGuidelines().formattedContent into the prompt', async () => {
+    const leadWithLinkedIn = { ...MATCHING_LEAD, linkedin: 'https://www.linkedin.com/in/john-prospect' };
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([leadWithLinkedIn] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+    mockReadBrandGuidelines.mockResolvedValue({
+      exists: true,
+      formattedContent: 'Tone of voice: warm, concise, founder-led. We never use buzzwords.',
+    });
+    mockReadMarketStrategy.mockResolvedValue(null);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    const userMessage = getOpenAICreate().mock.calls[0][0].messages.find((m: any) => m.role === 'user');
+    expect(userMessage.content).toContain('warm, concise, founder-led');
+  });
+
+  it('injects market strategy from readMarketStrategy().formattedContent into the prompt', async () => {
+    const leadWithLinkedIn = { ...MATCHING_LEAD, linkedin: 'https://www.linkedin.com/in/john-prospect' };
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([leadWithLinkedIn] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+    mockReadBrandGuidelines.mockResolvedValue(null);
+    mockReadMarketStrategy.mockResolvedValue({
+      exists: true,
+      formattedContent: 'We sell browser-isolation security to mid-market CISOs.',
+    });
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    const userMessage = getOpenAICreate().mock.calls[0][0].messages.find((m: any) => m.role === 'user');
+    expect(userMessage.content).toContain('browser-isolation security to mid-market CISOs');
+  });
+
+  it('omits brand/strategy lines when neither exists', async () => {
+    const leadWithLinkedIn = { ...MATCHING_LEAD, linkedin: 'https://www.linkedin.com/in/john-prospect' };
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([leadWithLinkedIn] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+    mockReadBrandGuidelines.mockResolvedValue({ exists: false });
+    mockReadMarketStrategy.mockResolvedValue({ exists: false });
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    const userMessage = getOpenAICreate().mock.calls[0][0].messages.find((m: any) => m.role === 'user');
+    expect(userMessage.content).not.toContain('Brand voice:');
+    expect(userMessage.content).not.toContain('Offer/market fit:');
+  });
+});
+
+describe('generateConnectionFollowUpDraft — message direction labelling', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockAlertService.notifyLinkedInConnectionAccepted.mockResolvedValue(undefined);
+    getOpenAICreate().mockResolvedValue({
+      choices: [{ message: { content: '{"content":"Hi, thanks for connecting!"}' } }],
+    });
+    mockReadBrandGuidelines.mockResolvedValue(null);
+    mockReadMarketStrategy.mockResolvedValue(null);
+  });
+
+  it('labels sent vs received messages so the model can tell direction', async () => {
+    const leadWithLinkedIn = { ...MATCHING_LEAD, linkedin: 'https://www.linkedin.com/in/john-prospect' };
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([leadWithLinkedIn] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+    mockCrmDb.getLeadEngagements.mockResolvedValue({
+      engagements: [
+        { eventType: 'linkedin.message.sent', createdAt: '2026-05-01T10:00:00.000Z', text: 'Saw your work on isolation' },
+        { eventType: 'linkedin.message.received', createdAt: '2026-05-02T08:00:00.000Z', text: 'Thanks, appreciate it!' },
+      ],
+    } as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    const userMessage = getOpenAICreate().mock.calls[0][0].messages.find((m: any) => m.role === 'user');
+    // Outbound (sent/opened) → "You", inbound (received/replied) → "Them"
+    expect(userMessage.content).toContain('You sent');
+    expect(userMessage.content).toContain('They sent');
+  });
+});
+
+describe('generateConnectionFollowUpDraft — prompt quality guardrails', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockAlertService.notifyLinkedInConnectionAccepted.mockResolvedValue(undefined);
+    getOpenAICreate().mockResolvedValue({
+      choices: [{ message: { content: '{"content":"Hi, thanks for connecting!"}' } }],
+    });
+    mockReadBrandGuidelines.mockResolvedValue(null);
+    mockReadMarketStrategy.mockResolvedValue(null);
+    mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+  });
+
+  it('includes a banned-words list and a good/bad example in the prompt', async () => {
+    const leadWithLinkedIn = { ...MATCHING_LEAD, linkedin: 'https://www.linkedin.com/in/john-prospect' };
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([leadWithLinkedIn] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    const userMessage = getOpenAICreate().mock.calls[0][0].messages.find((m: any) => m.role === 'user');
+    expect(userMessage.content).toContain('synergy');
+    expect(userMessage.content.toLowerCase()).toContain('good:');
+    expect(userMessage.content.toLowerCase()).toContain('bad:');
   });
 });
