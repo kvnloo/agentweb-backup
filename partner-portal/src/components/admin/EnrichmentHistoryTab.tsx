@@ -407,7 +407,11 @@ export default function EnrichmentHistoryTab() {
 
   const buildJobUrl = (days: number, paginationToken?: string, listId?: string, userId?: string) => {
     const params = buildParams(days, paginationToken);
-    if (listId) return buildApiUrl(`/api/admin/lists/${listId}/enrichment-jobs?${params}`);
+    // List view: no date filter — show all runs for the list
+    if (listId) {
+      const p = paginationToken ? `nextToken=${encodeURIComponent(paginationToken)}` : '';
+      return buildApiUrl(`/api/admin/lists/${listId}/enrichment-jobs${p ? `?${p}` : ''}`);
+    }
     if (userId) return buildApiUrl(`/api/admin/users/${userId}/enrichment-jobs?${params}`);
     return buildApiUrl(`/api/admin/enrichment-jobs?${params}`);
   };
@@ -529,14 +533,24 @@ export default function EnrichmentHistoryTab() {
             clearOnEscape
             noOptionsText={lists.length === 0 ? 'No lists found' : 'No match'}
           />
-          <FormControl size="small" sx={{ width: 160 }}>
-            <InputLabel>Time frame</InputLabel>
-            <Select value={timeframeDays} label="Time frame" onChange={e => setTimeframeDays(Number(e.target.value))}>
-              {TIMEFRAMES.map(tf => (
-                <MenuItem key={tf.days} value={tf.days}>{tf.label}</MenuItem>
-              ))}
-            </Select>
-          </FormControl>
+          <Tooltip title={selectedList ? 'Deselect the list to enable time filtering' : ''} placement="top">
+            <span>
+              <FormControl size="small" sx={{ width: 160 }} disabled={!!selectedList}>
+                <InputLabel>Time frame</InputLabel>
+                <Select
+                  value={selectedList ? '' : timeframeDays}
+                  label="Time frame"
+                  onChange={e => setTimeframeDays(Number(e.target.value))}
+                  displayEmpty={!!selectedList}
+                  renderValue={selectedList ? () => '—' : undefined}
+                >
+                  {TIMEFRAMES.map(tf => (
+                    <MenuItem key={tf.days} value={tf.days}>{tf.label}</MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+            </span>
+          </Tooltip>
         </Box>
       </Box>
       {(selectedUser || selectedList) && (
