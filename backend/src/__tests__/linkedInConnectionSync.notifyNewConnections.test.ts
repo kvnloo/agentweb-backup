@@ -108,6 +108,36 @@ const LIST = { listId: 'list-1', name: 'Outreach List', userId: 'user-1', linked
 beforeEach(() => {
   jest.clearAllMocks();
   mockAlertService.notifyLinkedInConnectionAccepted.mockResolvedValue(undefined);
+  // The notification kill-switch defaults to muted; enable it so these tests
+  // exercise the real notification logic. A dedicated test below covers the
+  // muted-by-default behavior.
+  process.env.LINKEDIN_CONNECTION_NOTIFY = 'true';
+});
+
+afterAll(() => {
+  delete process.env.LINKEDIN_CONNECTION_NOTIFY;
+});
+
+describe('notifyNewConnections — kill-switch', () => {
+  it('is muted by default: sends nothing when LINKEDIN_CONNECTION_NOTIFY is unset', async () => {
+    delete process.env.LINKEDIN_CONNECTION_NOTIFY;
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([MATCHING_LEAD] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    expect(mockCrmDb.findLeadsByLinkedin).not.toHaveBeenCalled();
+    expect(mockAlertService.notifyLinkedInConnectionAccepted).not.toHaveBeenCalled();
+  });
+
+  it('stays muted even when set to a non-"true" value', async () => {
+    process.env.LINKEDIN_CONNECTION_NOTIFY = '1';
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([MATCHING_LEAD] as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    expect(mockAlertService.notifyLinkedInConnectionAccepted).not.toHaveBeenCalled();
+  });
 });
 
 describe('notifyNewConnections', () => {

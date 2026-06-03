@@ -86,6 +86,15 @@ beforeEach(() => {
   // Single site-wide account to sync.
   mockGetSetting.mockResolvedValue({ settingValue: JSON.stringify([{ account_id: 'acct-1', enabled: true }]) });
   mockGetAllUsers.mockResolvedValue([]);
+  // Enable the notify/enroll kill-switches so the "processes normally" assertions
+  // reflect the backfill gate, not the global mute (which is covered elsewhere).
+  process.env.LINKEDIN_CONNECTION_NOTIFY = 'true';
+  process.env.LINKEDIN_CONNECTION_ENROLL = 'true';
+});
+
+afterAll(() => {
+  delete process.env.LINKEDIN_CONNECTION_NOTIFY;
+  delete process.env.LINKEDIN_CONNECTION_ENROLL;
 });
 
 describe('runLinkedInConnectionSync — one-time backfill suppression', () => {
