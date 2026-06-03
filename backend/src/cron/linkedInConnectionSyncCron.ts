@@ -309,18 +309,26 @@ async function generateConnectionFollowUpDraft(lead: any, list: any): Promise<vo
       agentModeService.readMarketStrategy(userId).catch(() => null),
       userId ? crmDb.getLeadEngagements(lead.listId, lead.leadId, userId).catch(() => ({ engagements: [] })) : Promise.resolve({ engagements: [] }),
     ]);
-    if (brand?.guidelines) brandContext += `\nBrand voice: ${String(brand.guidelines).slice(0, 300)}`;
-    if (strategy?.strategy) brandContext += `\nOffer/market fit: ${String(strategy.strategy).slice(0, 300)}`;
+    // readBrandGuidelines / readMarketStrategy return { exists, formattedContent }
+    // — there is no `.guidelines` / `.strategy` field, so the previous checks were
+    // always false and brand/offer context never reached the prompt.
+    if (brand?.exists && brand.formattedContent) brandContext += `\nBrand voice: ${String(brand.formattedContent).slice(0, 500)}`;
+    if (strategy?.exists && strategy.formattedContent) brandContext += `\nOffer/market fit: ${String(strategy.formattedContent).slice(0, 500)}`;
 
     const engagements: any[] = (engagementsResult as any).engagements || [];
     if (engagements.length > 0) {
       activityContext = '\n\nPast activity with this lead (most recent first):';
       engagements.slice(0, 10).forEach((eng: any, i: number) => {
-        activityContext += `\n${i + 1}. [${eng.eventType}] ${eng.createdAt}`;
+        // Label direction so the model knows what to acknowledge: outbound
+        // (we contacted them) vs inbound (they replied / engaged).
+        const type = String(eng.eventType || '');
+        const inbound = /received|replied|reply|opened|clicked/i.test(type);
+        const actor = inbound ? 'They' : 'You';
+        activityContext += `\n${i + 1}. ${actor} sent [${type}] ${eng.createdAt}`;
         if (eng.eventData?.subject) activityContext += ` — Subject: ${eng.eventData.subject}`;
         if (eng.text) activityContext += `\n   "${String(eng.text).slice(0, 300)}"`;
       });
-      activityContext += '\n\nUse this history to craft a relevant follow-up that references prior touchpoints where appropriate.';
+      activityContext += '\n\nUse this history to craft a relevant follow-up that references prior touchpoints where appropriate. If they already replied, acknowledge their reply rather than re-introducing yourself.';
     }
   } catch { /* non-fatal */ }
 
@@ -328,13 +336,17 @@ async function generateConnectionFollowUpDraft(lead: any, list: any): Promise<vo
 
 Lead: ${leadName}${company}${title}${brandContext}${activityContext}
 
-Requirements:
-- 1-3 short sentences, max 300 characters
-- Friendly and natural, not salesy
-- Reference that you just connected
-- If there is past activity, acknowledge it naturally (e.g. "following up on my earlier email")
-- Open-ended question or soft next step
-- No subject line, no signature
+Write a message that:
+- Is 1-3 short sentences, max 300 characters
+- Leads with something specific about THEIR work, role, or company, or builds on a prior touchpoint — show you actually know who they are
+- Sounds like one human writing to another — warm, direct, no corporate speak
+- References that you just connected, naturally (not "thanks for accepting my request")
+- Ends with one genuine, open-ended question or a soft next step
+- Does NOT use: synergy, opportunity, exciting, leverage, passionate, innovative, value-add, circle back, touch base
+- No emojis, no subject line, no signature
+
+Bad: "Hi John, thanks for connecting! I'd love to learn more about what you're working on. Would you be open to a quick chat sometime?"
+Good: "Glad we connected, John. Still think your take on isolating the browser instead of locking it down is the right call — are you finding that scales as the team grows?"
 
 Respond with JSON: {"content": "the message text"}`;
 
