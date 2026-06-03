@@ -1,4 +1,4 @@
-import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isPathInScope, filterFileListingToScope, buildScopeSystemClause, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest, _parseEventStreamFrames, _accumulateBedrockStream } from '../services/codingAgentService';
+import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest, _parseEventStreamFrames, _accumulateBedrockStream } from '../services/codingAgentService';
 import { agentModeService } from '../services/agentModeService';
 
 // Mock mcpFetch
@@ -1474,135 +1474,100 @@ describe('runCodingAgent — bearer-token request timeout surfacing', () => {
 });
 
 // ─── Page scope: pure helpers ─────────────────────────────────────────────────
-// Many pages share one repo; each is an app/<slug>/ dir (root page owns top-level
-// app/ files). These helpers compute and apply the editable boundary.
+// Many landing pages share ONE repo: a root page owns top-level app/ files and
+// each other page is an app/<slug>/ route directory. The coding agent's file API
+// is already physically confined to the one repo behind its pageId, so the
+// editable boundary is the WHOLE repo (every route dir + shared files) — a run is
+// free to edit any sibling route, since they are all one multi-route project.
 describe('resolvePageScope', () => {
-  const root = { id: 'root-1', isRootPage: true };
-  const subA = { id: 'sub-a', slug: 'every-io-day-zero-pre-seed-fou' };
-  const subB = { id: 'sub-b', slug: 'every-io-seed-stage-founders' };
+  const repo = 'https://github.com/acme/lp-every-io';
+  const root = { id: 'root-1', isRootPage: true, githubRepoUrl: repo };
+  const subA = { id: 'sub-a', slug: 'every-io-day-zero-pre-seed-fou', githubRepoUrl: repo };
+  const subB = { id: 'sub-b', slug: 'every-io-seed-stage-founders', githubRepoUrl: repo };
+  const otherRepo = { id: 'other-1', slug: 'unrelated', githubRepoUrl: 'https://github.com/acme/lp-other' };
 
-  test('sub-page scope lists its slug and excludes itself from siblings', () => {
+  test('scope carries the page repo and the route slugs that live in it', () => {
     const scope = resolvePageScope(subA, [root, subA, subB]);
-    expect(scope.isRootPage).toBe(false);
-    expect(scope.slug).toBe('every-io-day-zero-pre-seed-fou');
-    expect(scope.siblingSlugs).toEqual(['every-io-seed-stage-founders']);
+    expect(scope.repoUrl).toBe(repo);
+    expect(scope.routeSlugs.sort()).toEqual([subA.slug, subB.slug].sort());
   });
 
-  test('a page with no slug is treated as the root page', () => {
-    const scope = resolvePageScope({ id: 'root-1' }, [{ id: 'root-1' }, subA]);
-    expect(scope.isRootPage).toBe(true);
-    expect(scope.slug).toBe('');
-    expect(scope.siblingSlugs).toEqual([subA.slug]);
+  test('only counts pages in the SAME repo as routes (ignores the owner\'s other repos)', () => {
+    const scope = resolvePageScope(subA, [root, subA, subB, otherRepo]);
+    expect(scope.routeSlugs).not.toContain('unrelated');
+    expect(scope.routeSlugs.sort()).toEqual([subA.slug, subB.slug].sort());
   });
 
-  test('explicit isRootPage flag still collects sibling slugs to protect', () => {
-    const scope = resolvePageScope(root, [root, subA, subB]);
-    expect(scope.isRootPage).toBe(true);
-    expect(scope.siblingSlugs.sort()).toEqual([subA.slug, subB.slug].sort());
-  });
-
-  test('deduplicates sibling slugs and drops blanks', () => {
+  test('deduplicates route slugs and drops blanks', () => {
     const scope = resolvePageScope(subA, [
       subA,
       subB,
-      { id: 'sub-c', slug: 'every-io-seed-stage-founders' }, // dup slug
-      { id: 'sub-d', slug: '' }, // blank
+      { id: 'sub-c', slug: 'every-io-seed-stage-founders', githubRepoUrl: repo }, // dup slug
+      { id: 'sub-d', slug: '', githubRepoUrl: repo }, // blank (root-ish)
     ]);
-    expect(scope.siblingSlugs).toEqual(['every-io-seed-stage-founders']);
+    expect(scope.routeSlugs.sort()).toEqual([subA.slug, subB.slug].sort());
   });
 });
 
-describe('isPathInScope', () => {
-  const subScope = { slug: 'my-page', isRootPage: false, siblingSlugs: ['other-page'] };
-  const rootScope = { slug: '', isRootPage: true, siblingSlugs: ['my-page', 'other-page'] };
-
-  // --- sub-page: only its own directory ---
-  test('sub-page allows files inside its own app/<slug>/ directory', () => {
-    expect(isPathInScope('app/my-page/page.tsx', subScope)).toBe(true);
-    expect(isPathInScope('app/my-page/_components/landing/TrustBar.tsx', subScope)).toBe(true);
+// A repo-wide scope: the agent may edit ANY file in its own repo (all route dirs
+// plus shared files). The only paths rejected are unsafe ones that escape the
+// repo (absolute paths, parent traversal).
+describe('isSafeRepoPath', () => {
+  test('allows this page\'s own route directory', () => {
+    expect(isSafeRepoPath('app/my-page/page.tsx')).toBe(true);
+    expect(isSafeRepoPath('app/my-page/_components/landing/TrustBar.tsx')).toBe(true);
   });
 
-  test('sub-page rejects a sibling page directory', () => {
-    expect(isPathInScope('app/other-page/_components/trust-bar.tsx', subScope)).toBe(false);
+  test('allows OTHER route directories in the same multi-route project', () => {
+    // The exact case from the report: editing a sibling route's lead-capture form.
+    expect(isSafeRepoPath('app/every-io-series-a-scaling/_components/lead-capture-form.tsx')).toBe(true);
+    expect(isSafeRepoPath('app/other-page/page.tsx')).toBe(true);
   });
 
-  test('sub-page rejects shared components and root files', () => {
-    expect(isPathInScope('components/landing/trust-bar.tsx', subScope)).toBe(false);
-    expect(isPathInScope('app/layout.tsx', subScope)).toBe(false);
-    expect(isPathInScope('app/globals.css', subScope)).toBe(false);
-    expect(isPathInScope('app/page.tsx', subScope)).toBe(false);
+  test('allows shared components and root-level files', () => {
+    expect(isSafeRepoPath('components/landing/trust-bar.tsx')).toBe(true);
+    expect(isSafeRepoPath('app/layout.tsx')).toBe(true);
+    expect(isSafeRepoPath('app/globals.css')).toBe(true);
+    expect(isSafeRepoPath('app/page.tsx')).toBe(true);
   });
 
-  test('sub-page does not treat a prefix collision as in-scope', () => {
-    // "app/my-page-2/" must NOT match scope "my-page"
-    expect(isPathInScope('app/my-page-2/page.tsx', subScope)).toBe(false);
+  test('normalizes leading ./ and / and backslashes', () => {
+    expect(isSafeRepoPath('./app/my-page/page.tsx')).toBe(true);
+    expect(isSafeRepoPath('/app/my-page/page.tsx')).toBe(true);
+    expect(isSafeRepoPath('app\\my-page\\page.tsx')).toBe(true);
   });
 
-  test('normalizes leading ./ and / before matching', () => {
-    expect(isPathInScope('./app/my-page/page.tsx', subScope)).toBe(true);
-    expect(isPathInScope('/app/my-page/page.tsx', subScope)).toBe(true);
-    expect(isPathInScope('app\\my-page\\page.tsx', subScope)).toBe(true);
+  test('rejects empty paths', () => {
+    expect(isSafeRepoPath('')).toBe(false);
+    expect(isSafeRepoPath('   ')).toBe(false);
   });
 
-  // --- root page: everything except sibling dirs ---
-  test('root page allows top-level and shared files', () => {
-    expect(isPathInScope('app/page.tsx', rootScope)).toBe(true);
-    expect(isPathInScope('app/layout.tsx', rootScope)).toBe(true);
-    expect(isPathInScope('components/landing/trust-bar.tsx', rootScope)).toBe(true);
-    expect(isPathInScope('app/globals.css', rootScope)).toBe(true);
-  });
-
-  test('root page rejects any sub-page directory', () => {
-    expect(isPathInScope('app/my-page/page.tsx', rootScope)).toBe(false);
-    expect(isPathInScope('app/other-page/_components/x.tsx', rootScope)).toBe(false);
-  });
-
-  test('empty path is never in scope', () => {
-    expect(isPathInScope('', subScope)).toBe(false);
-    expect(isPathInScope('   ', rootScope)).toBe(false);
-  });
-});
-
-describe('filterFileListingToScope', () => {
-  test('keeps only in-scope lines from a formatted listing', () => {
-    const scope = { slug: 'my-page', isRootPage: false, siblingSlugs: ['other-page'] };
-    const listing = [
-      'app/my-page/page.tsx (1200 bytes)',
-      'app/my-page/_components/TrustBar.tsx (800 bytes)',
-      'app/other-page/page.tsx (1000 bytes)',
-      'components/landing/trust-bar.tsx (500 bytes)',
-      'app/layout.tsx (300 bytes)',
-    ].join('\n');
-
-    const filtered = filterFileListingToScope(listing, scope);
-
-    expect(filtered).toContain('app/my-page/page.tsx');
-    expect(filtered).toContain('app/my-page/_components/TrustBar.tsx');
-    expect(filtered).not.toContain('app/other-page/page.tsx');
-    expect(filtered).not.toContain('components/landing/trust-bar.tsx');
-    expect(filtered).not.toContain('app/layout.tsx');
-  });
-
-  test('returns a placeholder when nothing is in scope', () => {
-    const scope = { slug: 'my-page', isRootPage: false, siblingSlugs: [] };
-    const filtered = filterFileListingToScope('app/other/page.tsx (10 bytes)', scope);
-    expect(filtered).toMatch(/no files/i);
+  test('rejects paths that escape the repo via parent traversal', () => {
+    expect(isSafeRepoPath('../secrets.txt')).toBe(false);
+    expect(isSafeRepoPath('app/../../etc/passwd')).toBe(false);
+    expect(isSafeRepoPath('app/my-page/../../../outside.tsx')).toBe(false);
   });
 });
 
 describe('buildScopeSystemClause', () => {
-  test('sub-page clause names the allowed directory and forbids shared files', () => {
-    const clause = buildScopeSystemClause({ slug: 'my-page', isRootPage: false, siblingSlugs: ['other'] });
-    expect(clause).toContain('app/my-page/');
-    expect(clause).toMatch(/STRICT/);
+  const repo = 'https://github.com/acme/lp-every-io';
+
+  test('lists the project\'s routes and keeps the "only the change asked for" guidance', () => {
+    const clause = buildScopeSystemClause({
+      repoUrl: repo,
+      routeSlugs: ['every-io-day-zero-pre-seed-fou', 'every-io-series-a-scaling'],
+    });
+    // All routes named so the agent knows it may edit across them.
+    expect(clause).toContain('app/every-io-day-zero-pre-seed-fou/');
+    expect(clause).toContain('app/every-io-series-a-scaling/');
+    // Anti-overreach guidance from PR #1739 is preserved (soft, not a route lockout).
     expect(clause).toMatch(/only the specific change/i);
   });
 
-  test('root-page clause lists sibling dirs as off-limits', () => {
-    const clause = buildScopeSystemClause({ slug: '', isRootPage: true, siblingSlugs: ['a', 'b'] });
-    expect(clause).toContain('app/a/');
-    expect(clause).toContain('app/b/');
-    expect(clause).toMatch(/ROOT page/i);
+  test('handles a single-route / no-extra-routes project without crashing', () => {
+    const clause = buildScopeSystemClause({ repoUrl: repo, routeSlugs: [] });
+    expect(typeof clause).toBe('string');
+    expect(clause).toMatch(/only the specific change/i);
   });
 });
 
@@ -1624,11 +1589,13 @@ describe('runCodingAgent — scope enforcement', () => {
     mockGetLandingPagesByOwner.mockReset();
     _setBedrockClientForTest(mockClient);
     _setSleepFnForTest(async () => {});
-    // The page under edit is a sub-page; a sibling sub-page shares the repo.
-    mockGetLandingPageById.mockResolvedValue({ id: 'sub-a', userId: 'user-456', slug: 'my-page' });
+    // The page under edit is one route of a multi-route project; a sibling route
+    // shares the SAME repo, so it is in-scope and editable.
+    const repo = 'https://github.com/acme/lp-every-io';
+    mockGetLandingPageById.mockResolvedValue({ id: 'sub-a', userId: 'user-456', slug: 'my-page', githubRepoUrl: repo });
     mockGetLandingPagesByOwner.mockResolvedValue([
-      { id: 'sub-a', userId: 'user-456', slug: 'my-page' },
-      { id: 'sub-b', userId: 'user-456', slug: 'other-page' },
+      { id: 'sub-a', userId: 'user-456', slug: 'my-page', githubRepoUrl: repo },
+      { id: 'sub-b', userId: 'user-456', slug: 'other-page', githubRepoUrl: repo },
     ]);
   });
 
@@ -1636,48 +1603,42 @@ describe('runCodingAgent — scope enforcement', () => {
     _setBedrockClientForTest(null);
   });
 
-  test('blocks an edit to a sibling page directory without writing, and feeds back a corrective message', async () => {
-    // Pre-fetch list_files
+  test('allows an edit to a SIBLING route in the same multi-route project', async () => {
+    // Regression for the report: editing another route's file in the same repo
+    // must go through (PR #1739 wrongly blocked this).
     mockedMcpFetch.mockResolvedValueOnce({
       files: [
         { path: 'app/my-page/page.tsx', size: 1000 },
-        { path: 'app/other-page/page.tsx', size: 1000 },
+        { path: 'app/other-page/_components/lead-capture-form.tsx', size: 1000 },
       ],
     });
 
-    // LLM tries to edit the SIBLING page's file
     mockCreate.mockResolvedValueOnce({
       content: [
         { type: 'tool_use', id: 'tu_1', name: 'edit_file', input: {
-          file_path: 'app/other-page/_components/trust-bar.tsx',
-          edits: [{ search: 'As seen in', replace: 'Backed by' }],
+          file_path: 'app/other-page/_components/lead-capture-form.tsx',
+          edits: [{ search: '<button>', replace: '<button type="submit">' }],
         }}
       ],
       stop_reason: 'tool_use'
     });
-    // Then the LLM gives up / reports
+    // edit_file: GET current content, then PUT
+    mockedMcpFetch
+      .mockResolvedValueOnce({ content: '<button>' })
+      .mockResolvedValueOnce({ success: true, is_staging: true, commit_url: 'https://github.com/x/commit/abc' });
     mockCreate.mockResolvedValueOnce({
       content: [
-        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Cannot edit that file.', status: 'error' } }
+        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Aligned the submit button.', status: 'success' } }
       ],
       stop_reason: 'tool_use'
     });
 
-    await runCodingAgent('change the trust bar copy', scopedContext);
+    const result = await runCodingAgent('align the series A submit button', scopedContext);
 
-    // The only mcpFetch call should be the pre-fetch list_files — NO github-edit PUT,
-    // and NOT even the file-content GET that edit_file normally does first.
+    expect(result.success).toBe(true);
     const putCalls = mockedMcpFetch.mock.calls.filter(c => c[0]?.method === 'PUT');
-    expect(putCalls).toHaveLength(0);
-    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
-
-    // The agent must have received the corrective message as the tool result.
-    const secondCallMessages = mockCreate.mock.calls[1][0].messages;
-    const toolResultMsg = secondCallMessages.find(
-      (m: any) => m.role === 'user' && Array.isArray(m.content) && m.content.some((b: any) => b.type === 'tool_result')
-    );
-    const trBlock = toolResultMsg.content.find((b: any) => b.type === 'tool_result');
-    expect(trBlock.content).toMatch(/outside this page's directory|app\/my-page/i);
+    expect(putCalls).toHaveLength(1);
+    expect((putCalls[0][0] as any).body.file_path).toBe('app/other-page/_components/lead-capture-form.tsx');
   });
 
   test('allows an edit inside the page\'s own directory', async () => {
@@ -1712,7 +1673,42 @@ describe('runCodingAgent — scope enforcement', () => {
     expect((putCalls[0][0] as any).body.file_path).toBe('app/my-page/_components/landing/TrustBar.tsx');
   });
 
-  test('filters the pre-fetched file listing and injects the scope clause into the system prompt', async () => {
+  test('blocks a write that escapes the repo via parent traversal', async () => {
+    mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/my-page/page.tsx', size: 1000 }] });
+
+    // LLM tries to write outside the repo entirely.
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_file', input: {
+          file_path: '../../etc/passwd',
+          edits: [{ search: 'a', replace: 'b' }],
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Cannot write there.', status: 'error' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    await runCodingAgent('write outside the repo', scopedContext);
+
+    // No PUT, and the file-content GET never happened either — only the pre-fetch.
+    const putCalls = mockedMcpFetch.mock.calls.filter(c => c[0]?.method === 'PUT');
+    expect(putCalls).toHaveLength(0);
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
+
+    const secondCallMessages = mockCreate.mock.calls[1][0].messages;
+    const toolResultMsg = secondCallMessages.find(
+      (m: any) => m.role === 'user' && Array.isArray(m.content) && m.content.some((b: any) => b.type === 'tool_result')
+    );
+    const trBlock = toolResultMsg.content.find((b: any) => b.type === 'tool_result');
+    expect(trBlock.content).toMatch(/outside the repository|cannot/i);
+  });
+
+  test('shows the full repo file listing and injects the scope clause into the system prompt', async () => {
     mockedMcpFetch.mockResolvedValueOnce({
       files: [
         { path: 'app/my-page/page.tsx', size: 1000 },
@@ -1728,21 +1724,22 @@ describe('runCodingAgent — scope enforcement', () => {
     await runCodingAgent('do something', scopedContext);
 
     const firstCall = mockCreate.mock.calls[0][0];
-    // System prompt carries the strict scope clause for this page.
+    // System prompt names the project's routes and keeps the anti-overreach guidance.
     expect(firstCall.system).toContain('app/my-page/');
-    expect(firstCall.system).toMatch(/STRICT/);
-    // The user message's file listing is filtered to the page's scope.
+    expect(firstCall.system).toContain('app/other-page/');
+    expect(firstCall.system).toMatch(/only the specific change/i);
+    // The user message's file listing now shows the WHOLE repo — all routes + shared.
     const userMsg = firstCall.messages.find((m: any) => m.role === 'user');
     const userText = typeof userMsg.content === 'string'
       ? userMsg.content
       : userMsg.content.map((b: any) => b.text || '').join('');
     expect(userText).toContain('app/my-page/page.tsx');
-    expect(userText).not.toContain('app/other-page/page.tsx');
-    expect(userText).not.toContain('components/landing/trust-bar.tsx');
+    expect(userText).toContain('app/other-page/page.tsx');
+    expect(userText).toContain('components/landing/trust-bar.tsx');
   });
 
-  test('falls back to unrestricted editing when the page record is not found', async () => {
-    // No page record → scope undefined → no blocking, no listing filter.
+  test('still edits normally when the page record is not found (unrestricted fallback)', async () => {
+    // No page record → scope undefined → still unrestricted (safe-path guard only).
     mockGetLandingPageById.mockResolvedValue(null);
 
     mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/anything.tsx', size: 100 }] });
@@ -1766,7 +1763,6 @@ describe('runCodingAgent — scope enforcement', () => {
     const result = await runCodingAgent('edit anything', scopedContext);
 
     expect(result.success).toBe(true);
-    // The write went through because scope resolution found no page.
     const putCalls = mockedMcpFetch.mock.calls.filter(c => c[0]?.method === 'PUT');
     expect(putCalls).toHaveLength(1);
   });
