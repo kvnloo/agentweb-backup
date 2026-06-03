@@ -17,19 +17,20 @@ import { getLandingPageById, getLandingPagesByOwner, GeneratedLandingPage } from
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 /**
- * The set of files a coding-agent run is allowed to touch. Many landing pages share
- * ONE GitHub repo — each page is an `app/<slug>/` sub-route directory (plus the root
- * page, which owns the top-level `app/` files). A run scoped to one pageId must not
- * edit a sibling page's directory. This describes that boundary; `isPathInScope`
- * applies it.
+ * The repo a coding-agent run edits. Many landing pages share ONE GitHub repo —
+ * each page is an `app/<slug>/` route directory (plus the root page, which owns
+ * the top-level `app/` files). A run keyed on one pageId may be just one route of
+ * such a multi-route project, and the file API is already confined to that one
+ * repo, so the whole repo is editable. The safety guard `isSafeRepoPath` only
+ * blocks paths that escape the repo.
  */
 export interface PageScope {
-  /** This page's slug, e.g. "every-io-day-zero-pre-seed-fou". Empty for the root page. */
-  slug: string;
-  /** True if this is the site's root page (owns top-level app/ files, e.g. app/page.tsx). */
-  isRootPage: boolean;
-  /** Slugs of OTHER pages in the same repo — their app/<slug>/ dirs are off-limits. */
-  siblingSlugs: string[];
+  /** The GitHub repo this run edits. The coding agent's file API is already
+   * confined to this one repo, so the editable boundary is the whole repo. */
+  repoUrl: string;
+  /** Slugs of all route directories (app/<slug>/) in this repo — informational,
+   * surfaced to the agent so it knows which sibling routes share the project. */
+  routeSlugs: string[];
 }
 
 export interface CodingAgentContext {
@@ -139,11 +140,15 @@ The tool will create the file if it doesn't exist. No need to read it first.
 Skip steps that aren't needed. For a simple text change, you might just: read the file, edit it, check deployment, and report. Use your judgment.`;
 
 // ─── Page Scope ───────────────────────────────────────────────────────────────
-// Many landing pages live in ONE shared GitHub repo: the root page owns the
+// Many landing pages live in ONE shared GitHub repo: a root page owns the
 // top-level app/ files (app/page.tsx, app/layout.tsx, components/, …) and every
-// other page is an app/<slug>/ sub-route. A run scoped to one pageId must stay
-// inside that page's files, or it bleeds edits into sibling pages (the scope-creep
-// bug this guards against). These helpers compute and enforce that boundary.
+// other page is an app/<slug>/ route. A run is keyed on one pageId, but that
+// pageId may be just one route of a larger multi-route project — and the coding
+// agent's file API is ALREADY physically confined to that one repo. So the
+// editable boundary is the WHOLE repo: a run may freely edit any route directory
+// or shared file in its own project. The only writes rejected are unsafe paths
+// that escape the repo. (We keep soft "make only the change asked for" guidance
+// in the prompt to discourage over-reach without hard-blocking sibling routes.)
 
 /** Strip a leading "./" or "/" and collapse backslashes so comparisons are stable. */
 function normalizeRepoPath(filePath: string): string {
@@ -155,82 +160,59 @@ function normalizeRepoPath(filePath: string): string {
 }
 
 /**
- * Build the editable boundary for `page` given all pages in the same repo.
- * A page with no slug (or an explicit isRootPage flag) is the root page.
+ * Build the editable boundary for `page` given all of the owner's pages. The
+ * boundary is the page's repo; route slugs are collected from the OTHER pages
+ * that share the same githubRepoUrl (purely informational for the prompt).
  */
 export function resolvePageScope(
-  page: Pick<GeneratedLandingPage, 'id' | 'slug' | 'isRootPage'>,
-  repoPages: Pick<GeneratedLandingPage, 'id' | 'slug' | 'isRootPage'>[]
+  page: Pick<GeneratedLandingPage, 'id' | 'slug' | 'githubRepoUrl'>,
+  repoPages: Pick<GeneratedLandingPage, 'id' | 'slug' | 'githubRepoUrl'>[]
 ): PageScope {
-  const slug = (page.slug || '').trim();
-  const isRootPage = !!page.isRootPage || slug === '';
-  const siblingSlugs = Array.from(
+  const repoUrl = (page.githubRepoUrl || '').trim();
+  const routeSlugs = Array.from(
     new Set(
       repoPages
-        .filter((p) => p.id !== page.id && !!p.slug)
+        // Only pages in the SAME repo are routes of this project. The owner may
+        // have other landing pages in entirely separate repos — those are not
+        // reachable here and must not be counted.
+        .filter((p) => (p.githubRepoUrl || '').trim() === repoUrl && !!p.slug)
         .map((p) => (p.slug as string).trim())
-        .filter((s) => s !== '' && s !== slug)
+        .filter((s) => s !== '')
     )
   );
-  return { slug, isRootPage, siblingSlugs };
+  return { repoUrl, routeSlugs };
 }
 
-/** True if `filePath` is one the agent is allowed to edit under `scope`. */
-export function isPathInScope(filePath: string, scope: PageScope): boolean {
+/**
+ * True if `filePath` is a safe, repo-relative path the agent may write. Repo-wide
+ * scope means any in-repo file is editable; we only reject paths that escape the
+ * repo (empty, absolute, or parent-traversal). Scope-agnostic by design.
+ */
+export function isSafeRepoPath(filePath: string): boolean {
   const path = normalizeRepoPath(filePath);
   if (!path) return false;
-
-  if (scope.isRootPage) {
-    // Root page owns everything EXCEPT other pages' app/<slug>/ directories.
-    for (const sib of scope.siblingSlugs) {
-      if (path === `app/${sib}` || path.startsWith(`app/${sib}/`)) return false;
-    }
-    return true;
+  // Reject any parent-traversal segment — it could climb out of the repo root.
+  if (path === '..' || path.startsWith('../') || path.includes('/../') || path.endsWith('/..')) {
+    return false;
   }
-
-  // Sub-page: edits must live under this page's own directory.
-  if (!scope.slug) return true; // Unknown slug — don't block (defensive fallback).
-  return path === `app/${scope.slug}` || path.startsWith(`app/${scope.slug}/`);
+  return true;
 }
 
-/** Drop file-listing lines (formatted "path (N bytes)") that fall outside `scope`. */
-export function filterFileListingToScope(listing: string, scope: PageScope): string {
-  const kept = listing
-    .split('\n')
-    .filter((line) => {
-      const path = line.split(' (')[0].trim();
-      return path !== '' && isPathInScope(path, scope);
-    });
-  return kept.join('\n') || '(no files in your editable scope)';
-}
-
-/** The scope rules appended to the system prompt for a scoped run. */
+/** The scope guidance appended to the system prompt for a scoped run. */
 export function buildScopeSystemClause(scope: PageScope): string {
-  if (scope.isRootPage) {
-    const others = scope.siblingSlugs.length
-      ? scope.siblingSlugs.map((s) => `app/${s}/`).join(', ')
-      : '(none yet)';
-    return `
-
-## Edit scope (STRICT — enforced)
-You are editing the site's ROOT page. You MAY edit top-level files such as \`app/page.tsx\`, \`app/layout.tsx\`, \`app/globals.css\`, and shared \`components/\`.
-You may NOT edit other pages' directories: ${others}. Writes to those paths are rejected.
-Make ONLY the specific change the user asked for. Do not relabel copy, rename sections, or touch unrelated pages or components.`;
-  }
+  const routes = scope.routeSlugs.length
+    ? scope.routeSlugs.map((s) => `\`app/${s}/\``).join(', ')
+    : '(this project has a single route)';
   return `
 
-## Edit scope (STRICT — enforced)
-You are editing ONE page, which lives entirely under \`app/${scope.slug}/\`. You may ONLY create or modify files under \`app/${scope.slug}/\` (e.g. \`app/${scope.slug}/page.tsx\`, \`app/${scope.slug}/_components/...\`).
-Do NOT edit other pages' directories (other \`app/*/\` folders), shared files in \`components/\`, \`app/layout.tsx\`, \`app/globals.css\`, or config — those affect other pages and writes to them are rejected. If the change seems to need a shared component, copy/adjust it inside \`app/${scope.slug}/_components/\` instead.
-Make ONLY the specific change the user asked for. Do not relabel copy, rename sections, or touch other pages.`;
+## Edit scope
+You are editing ONE GitHub repository (one Vercel project). This project may contain MULTIPLE page routes that all live in the same repo — its route directories are: ${routes}. You MAY edit any file in this repo, including any of those route directories and shared files (\`components/\`, \`app/layout.tsx\`, \`app/globals.css\`, etc.) when the task calls for it.
+Make ONLY the specific change the user asked for. Do not relabel copy, rename sections, or touch routes, components, or files unrelated to the request — even though you are permitted to.`;
 }
 
-/** Corrective message returned to the agent when it tries to write outside scope. */
-function scopeViolationMessage(filePath: string, scope: PageScope): string {
-  if (scope.isRootPage) {
-    return `Refusing to edit "${filePath}": it belongs to another landing page, not the root page you are editing. You may only edit files outside the other pages' directories.`;
-  }
-  return `Refusing to edit "${filePath}": it is outside this page's directory "app/${scope.slug}/". You may ONLY edit files under "app/${scope.slug}/". To change shared UI for THIS page only, create or edit a component under "app/${scope.slug}/_components/" instead.`;
+/** Corrective message returned to the agent when it tries to write an unsafe path. */
+function scopeViolationMessage(filePath: string): string {
+  return `Refusing to edit "${filePath}": that path is outside the repository (it uses an absolute path or "../" traversal). Use a repo-relative path such as "app/<route>/page.tsx" or "components/...".`;
 }
 
 // ─── Search/Replace Engine ──────────────────────────────────────────────────
@@ -600,16 +582,15 @@ async function executeTool(
   const branch = context.draftBranch || "main";
   const branchQuery: Record<string, string> = branch !== "main" ? { branch } : {};
 
-  // Hard scope guard: block writes outside this page's editable boundary. Reads
-  // (read_file/search_in_file) stay unrestricted so the agent can still inspect
-  // shared code for context — only mutations are confined. No scope => no limit.
+  // Safety guard: block writes whose path escapes the repo (absolute or "../"
+  // traversal). Edits across route directories within the SAME repo are allowed —
+  // many routes share one repo and are one project. Reads stay unrestricted.
   if (
-    context.scope &&
     (toolName === 'edit_file' || toolName === 'revert_file') &&
     args.file_path &&
-    !isPathInScope(args.file_path, context.scope)
+    !isSafeRepoPath(args.file_path)
   ) {
-    return scopeViolationMessage(args.file_path, context.scope);
+    return scopeViolationMessage(args.file_path);
   }
 
   switch (toolName) {
@@ -1499,10 +1480,11 @@ function extractFailureSummary(
 }
 
 /**
- * Resolve the editable boundary for a run from the page record and its repo
- * siblings (the owner's other pages — sub-pages share one repo with the root).
- * Best-effort: any failure (missing record, DB error) returns undefined so the
- * agent runs unrestricted rather than blocking all edits on a lookup hiccup.
+ * Resolve the editable boundary for a run from the page record and the owner's
+ * other pages that share the same repo (a multi-route project = many page
+ * records, one repo). Best-effort: any failure (missing record, DB error)
+ * returns undefined so the agent runs unrestricted rather than blocking all
+ * edits on a lookup hiccup.
  */
 async function resolvePageScopeForContext(
   context: CodingAgentContext
@@ -1515,8 +1497,8 @@ async function resolvePageScopeForContext(
       const ownerPages = await getLandingPagesByOwner(page.userId);
       if (ownerPages.length > 0) repoPages = ownerPages;
     } catch (e) {
-      // Couldn't list siblings — scope to just this page (still blocks sub-pages
-      // for the root, since siblingSlugs is empty, but never over-blocks).
+      // Couldn't list the owner's pages — scope to just this page (still yields a
+      // valid repo-wide scope, only without the sibling route slugs for the prompt).
       console.warn('[CODING AGENT] Could not list owner pages for scope; using page alone:', e);
     }
     return resolvePageScope(page, repoPages);
@@ -1550,15 +1532,12 @@ async function runCodingAgentInternal(
 
   // Pre-fetch the file listing so the agent knows the repo structure from the first iteration.
   // This prevents it from blindly guessing file paths (e.g. editing index.html instead of app/page.tsx).
+  // The full repo is shown — all route directories and shared files — because a
+  // multi-route project lives in one repo and edits may legitimately span routes.
   let fileListingPreamble = '';
   try {
     const fileList = await executeTool('list_files', {}, scopedContext);
-    // Filter the listing to the page's scope so the agent never even sees sibling
-    // pages' files — removing the temptation to edit them.
-    const scopedList = scope
-      ? filterFileListingToScope(typeof fileList === 'string' ? fileList : '', scope)
-      : (fileList as string);
-    fileListingPreamble = `\n\n## Repository file listing (use this to orient yourself — do not call list_files again)\n\`\`\`\n${scopedList}\n\`\`\`\n\n`;
+    fileListingPreamble = `\n\n## Repository file listing (use this to orient yourself — do not call list_files again)\n\`\`\`\n${typeof fileList === 'string' ? fileList : ''}\n\`\`\`\n\n`;
   } catch (e) {
     if (is403Error(e)) throw e; // Authorization failure — propagate immediately
     // Non-fatal: agent can still call list_files itself
