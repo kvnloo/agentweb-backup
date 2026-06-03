@@ -19,6 +19,8 @@ import { leadListAlertService } from '../services/leadListAlertService';
 import {
   upsertConnections,
   getLatestConnectedAt,
+  getFullSyncCompletedAt,
+  markFullSyncCompleted,
   normalizeLinkedInUrl,
   UnipileConnection,
 } from '../services/unipileConnectionsDb';
@@ -85,17 +87,21 @@ export async function syncConnectionsForAccount(
   const lastKnownAt = await getLatestConnectedAt(accountId).catch(() => null);
   const newConnections: UnipileConnection[] = [];
 
-  // First-ever sync for this account (empty cache): paginate through ALL connections.
-  // The incremental 3-page poll only captures the newest ~150, so an account that
-  // already had more connections than that when caching began would never get its
-  // older connections backfilled — making genuinely-connected leads look
-  // "not connected". Treat an empty cache as a full sync.
-  const isInitialSync = lastKnownAt === null;
-  const fullSync = opts.fullSync || isInitialSync;
+  // Decide whether this run should backfill ALL connections instead of the incremental
+  // 3-page poll. The incremental poll only captures the newest ~60, so an account with
+  // more connections than that would never get its older connections cached — making
+  // genuinely-connected leads look "not connected" (the CRM then offers "Send Invite",
+  // which fails live as "already connected"). We force a one-time full backfill until a
+  // __fullsync__ marker is set, covering BOTH:
+  //   - empty caches (no watermark yet), and
+  //   - partial caches populated by incremental polls before this fix landed.
+  const fullSyncDoneAt = await getFullSyncCompletedAt(accountId).catch(() => null);
+  const needsBackfill = fullSyncDoneAt === null;
+  const fullSync = opts.fullSync || needsBackfill;
 
   let cursor: string | undefined;
   let page = 0;
-  const MAX_PAGES = fullSync ? 200 : 3; // 3 pages × 50 = 150 connections per 10-min poll
+  const MAX_PAGES = fullSync ? 200 : 3; // Unipile returns ~20 relations/page → ~60 newest per incremental 10-min poll
 
   do {
     const result = await linkedInOutreachService.listConnections(accountId, cursor);
@@ -144,7 +150,15 @@ export async function syncConnectionsForAccount(
     if (hitOldRecord) break;
   } while (cursor && page < MAX_PAGES);
 
-  console.log(`${TAG} account=${accountId} synced ${newConnections.length} new connections (pages=${page})`);
+  // After a successful full pagination, record the one-time backfill marker so
+  // subsequent polls revert to the cheap 3-page incremental path.
+  if (fullSync) {
+    await markFullSyncCompleted(accountId).catch((err) =>
+      console.error(`${TAG} Failed to mark full-sync complete for ${accountId}:`, err),
+    );
+  }
+
+  console.log(`${TAG} account=${accountId} synced ${newConnections.length} new connections (pages=${page}, fullSync=${fullSync})`);
   return newConnections;
 }
 
