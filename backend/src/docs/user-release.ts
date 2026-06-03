@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-03',
     changes: [
+      'Fixed: Updating a Facebook/Meta Ad\'s Creative Now Actually Changes the Ad',
+      '- When you asked to swap an existing ad onto a different creative (by creative ID), the update reported success but Meta kept showing the old image',
+      '- The new creative is now attached correctly, so the change is reflected on the same ad in Ads Manager — no need to delete and recreate the ad',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
       'Fixed: Scheduled Chats Owned by Deleted Accounts Now Pause Themselves',
       '- A scheduled chat whose owner account had been removed kept trying to run and failing every time, instead of stopping',
       '- These orphaned schedules now pause automatically the next time they would run, and the run is recorded as a failure so it\'s visible in your history',
