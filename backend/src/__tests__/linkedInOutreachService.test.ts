@@ -16,6 +16,13 @@ jest.mock('../services/db', () => ({
   }
 }));
 
+const mockUpsertConnections = jest.fn().mockResolvedValue(undefined);
+jest.mock('../services/unipileConnectionsDb', () => ({
+  upsertConnections: (...a: any[]) => mockUpsertConnections(...a),
+  normalizeLinkedInUrl: (url: string) =>
+    url ? url.trim().toLowerCase().replace(/\/?$/, '/') : '',
+}));
+
 const mockGetUnipileCredentials = getUnipileCredentials as jest.MockedFunction<typeof getUnipileCredentials>;
 
 describe('LinkedInOutreachService', () => {
@@ -141,6 +148,57 @@ describe('LinkedInOutreachService', () => {
       ).rejects.toThrow('already connected');
 
       expect(mockUnipileClient.users.sendInvitation).not.toHaveBeenCalled();
+    });
+
+    it('self-heals the connection cache when the live API reports an already-connected lead', async () => {
+      // Live profile lookup says FIRST_DEGREE but the cache was missing this lead
+      // (that's why the CRM offered the invite). The guard must upsert it into the cache.
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
+        network_distance: 'FIRST_DEGREE',
+        public_identifier: 'ramesh-lakshminarayanan-72657298',
+        member_id: 'ACoAABS6hI4',
+        public_profile_url: 'https://www.linkedin.com/in/ramesh-lakshminarayanan-72657298/',
+        first_name: 'Ramesh',
+        last_name: 'Lakshminarayanan',
+        created_at: 1776011706000,
+      });
+
+      await expect(
+        linkedInOutreachService.sendInvitation('account-id', 'provider-id', false)
+      ).rejects.toThrow('already connected');
+
+      expect(mockUpsertConnections).toHaveBeenCalledWith([
+        expect.objectContaining({
+          accountId: 'account-id',
+          memberId: 'ACoAABS6hI4',
+          publicProfileUrl: 'https://www.linkedin.com/in/ramesh-lakshminarayanan-72657298/',
+          firstName: 'Ramesh',
+          lastName: 'Lakshminarayanan',
+        }),
+      ]);
+      expect(mockUnipileClient.users.sendInvitation).not.toHaveBeenCalled();
+    });
+
+    it('still throws already-connected even if the self-heal cache write fails', async () => {
+      mockUpsertConnections.mockRejectedValueOnce(new Error('dynamo down'));
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
+        network_distance: 'FIRST_DEGREE',
+        public_identifier: 'someone',
+      });
+
+      await expect(
+        linkedInOutreachService.sendInvitation('account-id', 'provider-id', false)
+      ).rejects.toThrow('already connected');
+      expect(mockUnipileClient.users.sendInvitation).not.toHaveBeenCalled();
+    });
+
+    it('does NOT write to the cache when target is SECOND_DEGREE', async () => {
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
+        network_distance: 'SECOND_DEGREE',
+      });
+
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false);
+      expect(mockUpsertConnections).not.toHaveBeenCalled();
     });
 
     it('should send invitation when target is SECOND_DEGREE (not yet connected)', async () => {

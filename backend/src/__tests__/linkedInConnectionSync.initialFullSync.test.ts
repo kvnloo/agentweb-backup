@@ -23,9 +23,13 @@ jest.mock('../services/linkedInOutreachService', () => ({
 
 const mockUpsertConnections = jest.fn().mockResolvedValue(undefined);
 const mockGetLatestConnectedAt = jest.fn();
+const mockGetFullSyncCompletedAt = jest.fn();
+const mockMarkFullSyncCompleted = jest.fn().mockResolvedValue(undefined);
 jest.mock('../services/unipileConnectionsDb', () => ({
   upsertConnections: (...a: any[]) => mockUpsertConnections(...a),
   getLatestConnectedAt: (...a: any[]) => mockGetLatestConnectedAt(...a),
+  getFullSyncCompletedAt: (...a: any[]) => mockGetFullSyncCompletedAt(...a),
+  markFullSyncCompleted: (...a: any[]) => mockMarkFullSyncCompleted(...a),
   normalizeLinkedInUrl: (url: string) => url.replace(/\/$/, '').toLowerCase(),
 }));
 
@@ -60,6 +64,7 @@ describe('syncConnectionsForAccount pagination', () => {
 
   it('full-syncs (paginates past 3 pages) when the cache is empty', async () => {
     mockGetLatestConnectedAt.mockResolvedValue(null); // empty cache
+    mockGetFullSyncCompletedAt.mockResolvedValue(null); // never backfilled
     mockListConnections.mockImplementation(pagedListConnections(6, 1_700_000_000));
 
     const result = await syncConnectionsForAccount('acct-empty');
@@ -69,8 +74,9 @@ describe('syncConnectionsForAccount pagination', () => {
     expect(result.length).toBe(12);
   });
 
-  it('caps at 3 pages for an incremental poll when the cache is populated', async () => {
+  it('caps at 3 pages for an incremental poll once the backfill marker is set', async () => {
     mockGetLatestConnectedAt.mockResolvedValue(1_000); // existing cache
+    mockGetFullSyncCompletedAt.mockResolvedValue(1_780_000_000_000); // already backfilled
     // All connections are newer than lastKnownAt, so no early-stop; the 3-page
     // cap is what bounds the poll.
     mockListConnections.mockImplementation(pagedListConnections(10, 2_000_000_000));

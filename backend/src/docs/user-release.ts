@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-03',
     changes: [
+      'Fixed: CRM No Longer Offers "Send LinkedIn Invite" for People You\'re Already Connected To',
+      '- Some LinkedIn accounts only had a partial list of their connections cached, so leads you connected with a while ago still showed a "Send LinkedIn Invite" button — which then failed with "already connected"',
+      '- We now do a one-time full backfill of every connection for these accounts, so existing connections are correctly recognised',
+      '- As an extra safeguard, if a send attempt discovers you\'re already connected, that connection is added to the cache immediately so the button disappears right away',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
       'Fixed: LinkedIn Invite Status Updates Instantly Without a Page Reload',
       '- After sending a LinkedIn connection invite from a lead, the lead\'s row didn\'t show the "invitation pending" marker until you reloaded the page',
       '- The pending status now appears immediately on the lead row the moment the invite is sent',
