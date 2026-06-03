@@ -98,6 +98,16 @@ const MATCHING_LEAD = {
 
 const LIST = { listId: 'list-1', name: 'Outreach List', userId: 'user-1' };
 
+// Notifications are default-MUTED (2026-06-03 outage hotfix). These tests exercise the
+// ENABLED path, so opt in explicitly. The mute behaviour is covered separately in
+// linkedInConnectionSync.muteAndBackfill.test.ts.
+const ORIGINAL_NOTIFY_ENV = process.env.LINKEDIN_CONNECTION_NOTIFICATIONS_ENABLED;
+beforeAll(() => { process.env.LINKEDIN_CONNECTION_NOTIFICATIONS_ENABLED = 'true'; });
+afterAll(() => {
+  if (ORIGINAL_NOTIFY_ENV === undefined) delete process.env.LINKEDIN_CONNECTION_NOTIFICATIONS_ENABLED;
+  else process.env.LINKEDIN_CONNECTION_NOTIFICATIONS_ENABLED = ORIGINAL_NOTIFY_ENV;
+});
+
 beforeEach(() => {
   jest.clearAllMocks();
   mockAlertService.notifyLinkedInConnectionAccepted.mockResolvedValue(undefined);
