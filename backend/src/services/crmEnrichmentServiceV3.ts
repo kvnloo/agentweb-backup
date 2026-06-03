@@ -114,6 +114,8 @@ export interface RunEnrichmentInput {
 interface TierCount {
   crm: number;
   apollo: number;
+  enrichSo: number;
+  unipile: number;
   web: number;
   missing: number;
 }
@@ -280,13 +282,15 @@ function buildSnapshotFields(
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function emptyTierCount(): TierCount {
-  return { crm: 0, apollo: 0, web: 0, missing: 0 };
+  return { crm: 0, apollo: 0, enrichSo: 0, unipile: 0, web: 0, missing: 0 };
 }
 
 function addTierCounts(a: TierCount, b: TierCount): TierCount {
   return {
     crm: a.crm + b.crm,
     apollo: a.apollo + b.apollo,
+    enrichSo: a.enrichSo + b.enrichSo,
+    unipile: a.unipile + b.unipile,
     web: a.web + b.web,
     missing: a.missing + b.missing,
   };
@@ -1028,18 +1032,30 @@ export async function runEnrichment(
           // Filter injected dep fills (synthetic fields added for smart-field resolution) from
           // the snapshot — they were never in the user's config and should not be reverted.
           const writableFills = outcome.fills.filter(f => !injectedDepNames.has(f.field));
-          const { previousStandardFields, previousCustomFields, previousEnrichmentMetadata, fieldsEnriched } = buildSnapshotFields(lead, writableFills);
-          const leadBreakdown = computeLeadSourceBreakdown(writableFills);
-          crmDb.createEnrichmentSnapshotItem({
-            jobId: runId,
-            leadId: lead.leadId,
-            previousStandardFields,
-            previousCustomFields,
-            previousEnrichmentMetadata,
-            fieldsEnriched,
-            expiresAt: jobExpiresAt,
-          }).catch((err: any) => console.error(`[v3] Failed to write enrichment snapshot runId=${runId} leadId=${lead.leadId}:`, err));
-          const writeResult = await writeLeadOutcome(lead, outcome, input, deps, runId);
+          // Apply the same overwrite policy as writeLeadOutcome so the snapshot and
+          // analytics only cover fills that will actually reach the DB (excludes
+          // existing_data fills and fill_if_empty fills where the lead already has a value).
+          const { fillIfEmpty: snapFillIfEmpty, alwaysOverwrite: snapOverwrite } = bucketByOverwritePolicy(lead, writableFills, input.config);
+          const actualFills = [...snapFillIfEmpty, ...snapOverwrite];
+          const { previousStandardFields, previousCustomFields, previousEnrichmentMetadata, fieldsEnriched } = buildSnapshotFields(lead, actualFills);
+          const leadBreakdown = computeLeadSourceBreakdown(actualFills);
+          try {
+            await crmDb.createEnrichmentSnapshotItem({
+              jobId: runId,
+              leadId: lead.leadId,
+              previousStandardFields,
+              previousCustomFields,
+              previousEnrichmentMetadata,
+              fieldsEnriched,
+              expiresAt: jobExpiresAt,
+            });
+          } catch (err: any) {
+            console.error(`[v3] Failed to write enrichment snapshot runId=${runId} leadId=${lead.leadId}:`, err);
+            return { writeResult: { ok: false as const }, leadBreakdown: [] };
+          }
+          // Pass writableFills (injected deps already stripped) so writeLeadOutcome
+          // only writes what is also snapshotted — keeps write and revert in sync.
+          const writeResult = await writeLeadOutcome(lead, { ...outcome, fills: writableFills }, input, deps, runId);
           console.log(`[v3:${input.listId}:${lead.leadId}] write in ${Date.now() - wStart}ms (ok=${writeResult.ok})`);
           return { writeResult, leadBreakdown };
         }),
@@ -1116,7 +1132,9 @@ export async function runEnrichment(
     durationMs: result.durationMs,
   });
 
-  if (input.mode !== 'preview' && (processed > 0 || llmOrParseFailed > 0 || updateFailed > 0)) {
+  const attemptedLeadIds = leads.map((l: LeadRecord) => l.leadId);
+
+  if (input.mode !== 'preview' && (processed > 0 || totalFailed > 0)) {
     crmDb.createEnrichmentJobMeta({
       jobId: runId,
       listId: input.listId,
@@ -1126,6 +1144,11 @@ export async function runEnrichment(
       status: 'completed',
       expiresAt: jobExpiresAt,
       processedCount: processed,
+      failedCount: totalFailed,
+      skippedCount: 0,
+      ...(attemptedLeadIds.length <= 5000
+        ? { attemptedLeadIds }
+        : { leadsDeduplicationUnavailable: true }),
       failureBreakdown: {
         searchWebFailed: 0,
         linkedinFailed: apolloFailed,

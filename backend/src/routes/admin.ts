@@ -5313,13 +5313,15 @@ router.get("/lead-lists", async (req, res) => {
 router.get("/lists/:listId/enrichment-jobs", async (req, res) => {
   try {
     const { listId } = req.params;
-    const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
-
-    const jobs = await crmDb.getEnrichmentJobsByListId(listId, limit);
-    return res.json({ jobs });
+    const startDate = req.query.startDate as string | undefined;
+    const endDate = req.query.endDate as string | undefined;
+    const pageSize = Math.min(parseInt(req.query.pageSize as string) || 20, 100);
+    const nextToken = req.query.nextToken as string | undefined;
+    const result = await crmDb.getEnrichmentJobsByListId(listId, startDate, endDate, pageSize, nextToken);
+    return res.json(result);
   } catch (error: any) {
     console.error("Error fetching enrichment jobs:", error.message);
-    return res.status(500).json({ message: "Failed to fetch enrichment jobs" });
+    return res.status(error.statusCode || 500).json({ message: error.statusCode === 400 ? error.message : "Failed to fetch enrichment jobs" });
   }
 });
 
@@ -5328,13 +5330,12 @@ router.get("/lists/:listId/enrichment-jobs/:jobId", async (req, res) => {
   try {
     const { listId, jobId } = req.params;
 
-    const [metaRows, snapshots] = await Promise.all([
-      crmDb.getEnrichmentJobsByListId(listId, 100),
+    const [meta, snapshots] = await Promise.all([
+      crmDb.getEnrichmentJobMeta(jobId),
       crmDb.getEnrichmentSnapshotsByJobId(jobId),
     ]);
 
-    const meta = metaRows.find((r: any) => r.jobId === jobId);
-    if (!meta) {
+    if (!meta || meta.listId !== listId) {
       return res.status(404).json({ message: "Enrichment job not found" });
     }
 
@@ -5356,7 +5357,7 @@ router.get("/enrichment-jobs", async (req, res) => {
     return res.json(result);
   } catch (error: any) {
     console.error("Error fetching recent enrichment jobs:", error.message);
-    return res.status(500).json({ message: "Failed to fetch enrichment jobs" });
+    return res.status(error.statusCode || 500).json({ message: error.statusCode === 400 ? error.message : "Failed to fetch enrichment jobs" });
   }
 });
 
@@ -5372,7 +5373,7 @@ router.get("/users/:userId/enrichment-jobs", async (req, res) => {
     return res.json(result);
   } catch (error: any) {
     console.error("Error fetching user enrichment jobs:", error.message);
-    return res.status(500).json({ message: "Failed to fetch enrichment jobs" });
+    return res.status(error.statusCode || 500).json({ message: error.statusCode === 400 ? error.message : "Failed to fetch enrichment jobs" });
   }
 });
 

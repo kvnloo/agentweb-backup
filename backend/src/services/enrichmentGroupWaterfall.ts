@@ -119,7 +119,7 @@ export interface FieldFill {
 export interface GroupResult {
   fields: FieldFill[];
   missing: string[];
-  tierFills: { crm: number; apollo: number; web: number; missing: number };
+  tierFills: { crm: number; apollo: number; enrichSo: number; unipile: number; web: number; missing: number };
 }
 
 export interface LLMExtractInput {
@@ -363,7 +363,7 @@ export async function runWaterfall(
     return {
       fields: [],
       missing: [],
-      tierFills: { crm: 0, apollo: 0, web: 0, missing: 0 },
+      tierFills: { crm: 0, apollo: 0, enrichSo: 0, unipile: 0, web: 0, missing: 0 },
     };
   }
 
@@ -403,7 +403,7 @@ export async function runWaterfall(
     return {
       fields: filled,
       missing: [],
-      tierFills: { crm: crmHits.length, apollo: 0, web: 0, missing: 0 },
+      tierFills: { crm: crmHits.length, apollo: 0, enrichSo: 0, unipile: 0, web: 0, missing: 0 },
     };
   }
 
@@ -501,6 +501,8 @@ export async function runWaterfall(
       tierFills: {
         crm: crmHits.length,
         apollo: apolloHits.length + tier3Fills,
+        enrichSo: 0,
+        unipile: 0,
         web: 0,
         missing: 0,
       },
@@ -556,6 +558,8 @@ export async function runWaterfall(
       tierFills: {
         crm: crmHits.length,
         apollo: apolloHits.length + tier3Fills,
+        enrichSo: 0,
+        unipile: 0,
         web: 0,
         missing: 0,
       },
@@ -566,7 +570,12 @@ export async function runWaterfall(
   // Fires for person AND company groups when lead has email and enrich.so dep is wired.
   // Memoized via enrichSoCtx — at most one API call per lead across all groups.
   // Person fields: first_name, last_name, title, linkedin_url
-  // Company fields: company_name, hq_location, company_linkedin_url
+  // Company fields: company_name, company_linkedin_url
+  //   hq_location intentionally NOT mapped: this tier (T3.5b) sits ABOVE Unipile and
+  //   web-search, and web-search yields a better HQ value. The waterfall only fills
+  //   empty fields, so letting enrich.so set hq_location would block the superior
+  //   web-search result. enrich.so DOES return one (EnrichSoFetchResult.companyLocation),
+  //   left unmapped on purpose. Revisit only if this tier moves to the very end.
   // Career fields: prior_companies, education
   const ENRICHSO_PERSON_FIELDS: Record<string, keyof EnrichSoFetchResult> = {
     first_name: 'firstName',
@@ -629,6 +638,8 @@ export async function runWaterfall(
       tierFills: {
         crm: crmHits.length,
         apollo: apolloHits.length + tier3Fills,
+        enrichSo: enrichSoFills,
+        unipile: 0,
         web: 0,
         missing: 0,
       },
@@ -679,7 +690,9 @@ export async function runWaterfall(
       missing: [],
       tierFills: {
         crm: crmHits.length,
-        apollo: apolloHits.length + tier3Fills + unipileFills,
+        apollo: apolloHits.length + tier3Fills,
+        enrichSo: enrichSoFills,
+        unipile: unipileFills,
         web: 0,
         missing: 0,
       },
@@ -770,7 +783,9 @@ export async function runWaterfall(
     missing: remaining,
     tierFills: {
       crm: crmHits.length,
-      apollo: apolloHits.length + tier3Fills + unipileFills,
+      apollo: apolloHits.length + tier3Fills,
+      enrichSo: enrichSoFills,
+      unipile: unipileFills,
       web: webFills,
       missing: remaining.length,
     },

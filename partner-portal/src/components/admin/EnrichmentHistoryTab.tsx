@@ -223,6 +223,7 @@ function JobRow({ job, token }: { job: EnrichmentJob; token: string }) {
   const [open, setOpen] = useState(false);
   const [leads, setLeads] = useState<LeadSnapshot[]>([]);
   const [loading, setLoading] = useState(false);
+  const [expandError, setExpandError] = useState('');
   const failed = totalFailed(job);
   const attempted = job.leadsDeduplicationUnavailable ? 0 : (job.attemptedLeadIds?.length ?? 0);
   const successRate = attempted > 0 ? Math.round((Math.min(job.processedCount, attempted) / attempted) * 100) : null;
@@ -230,14 +231,16 @@ function JobRow({ job, token }: { job: EnrichmentJob; token: string }) {
   const handleExpand = async () => {
     if (!open && leads.length === 0) {
       setLoading(true);
+      setExpandError('');
       try {
         const res = await axios.get(
           buildApiUrl(`/api/admin/lists/${job.listId}/enrichment-jobs/${job.jobId}`),
           { headers: { Authorization: `Bearer ${token}` } },
         );
         setLeads(res.data.leads || []);
-      } catch { /* leave empty */ }
-      finally { setLoading(false); }
+      } catch (err: any) {
+        setExpandError(err.response?.data?.message || 'Failed to load lead breakdown');
+      } finally { setLoading(false); }
     }
     setOpen(o => !o);
   };
@@ -299,7 +302,9 @@ function JobRow({ job, token }: { job: EnrichmentJob; token: string }) {
           <Collapse in={open} timeout="auto" unmountOnExit>
             <Box sx={{ m: 2 }}>
               <Typography variant="subtitle2" gutterBottom>Per-lead breakdown</Typography>
-              {loading ? <CircularProgress size={20} /> : leads.length === 0 ? (
+              {loading ? <CircularProgress size={20} /> : expandError ? (
+                <Typography variant="body2" color="error.main">{expandError}</Typography>
+              ) : leads.length === 0 ? (
                 <Typography variant="body2" color="text.secondary">No per-lead data (run predates this feature).</Typography>
               ) : (
                 <TableContainer component={Paper} variant="outlined">
@@ -360,6 +365,7 @@ export default function EnrichmentHistoryTab() {
   const [lists, setLists] = useState<LeadList[]>([]);
 
   useEffect(() => {
+    if (!token) return;
     axios.get(buildApiUrl('/api/admin/users?hideBotLike=false'), {
       headers: { Authorization: `Bearer ${token}` },
     }).then(res => setUsers(res.data || [])).catch(() => {});
@@ -391,6 +397,7 @@ export default function EnrichmentHistoryTab() {
   };
 
   useEffect(() => {
+    if (!token) return;
     const q = selectedUser ? `?userId=${selectedUser.userId}` : '';
     axios.get(buildApiUrl(`/api/admin/lead-lists${q}`), {
       headers: { Authorization: `Bearer ${token}` },
@@ -405,18 +412,25 @@ export default function EnrichmentHistoryTab() {
     return buildApiUrl(`/api/admin/enrichment-jobs?${params}`);
   };
 
+  const fetchSeqRef = useRef(0);
+
   const fetchJobs = useCallback(async (days: number, userId?: string, listId?: string) => {
+    if (!token) return;
+    const seq = ++fetchSeqRef.current;
     setLoading(true);
+    setNextToken(undefined);
     setError('');
     try {
       const url = buildJobUrl(days, undefined, listId, userId);
       const res = await axios.get(url, { headers: { Authorization: `Bearer ${token}` } });
+      if (seq !== fetchSeqRef.current) return;
       setJobs(res.data.jobs || []);
       setNextToken(res.data.nextToken);
     } catch (err: any) {
+      if (seq !== fetchSeqRef.current) return;
       setError(err.response?.data?.message || 'Failed to fetch enrichment jobs');
     } finally {
-      setLoading(false);
+      if (seq === fetchSeqRef.current) setLoading(false);
     }
   }, [token]);
 
@@ -433,7 +447,7 @@ export default function EnrichmentHistoryTab() {
     } finally {
       setLoadingMore(false);
     }
-  }, [nextToken, timeframeDays, selectedUser, token]);
+  }, [nextToken, timeframeDays, selectedUser, selectedList, token]);
 
   const sentinelRef = useRef<HTMLDivElement>(null);
 
@@ -452,6 +466,9 @@ export default function EnrichmentHistoryTab() {
   const agg = aggregateBreakdown(jobs);
   const hitRate = cacheHitRate(agg);
   const dedupableJobs = jobs.filter(j => !j.leadsDeduplicationUnavailable && j.attemptedLeadIds);
+  // Jobs where backend explicitly flagged the run as too large to store lead IDs
+  const explicitlyTooLargeCount = jobs.filter(j => j.leadsDeduplicationUnavailable).length;
+  // Jobs without dedup data but not because they're too large (old runs, pre-feature)
   const nonDedupableCount = jobs.length - dedupableJobs.length;
   const uniqueLeadsAttempted = new Set(dedupableJobs.flatMap(j => j.attemptedLeadIds ?? [])).size;
   const dedupProcessed = dedupableJobs.reduce((a, j) => a + j.processedCount, 0);
@@ -505,6 +522,7 @@ export default function EnrichmentHistoryTab() {
             sx={{ width: 260 }}
             options={lists}
             getOptionLabel={l => l.name || l.listId}
+            getOptionKey={l => l.listId}
             value={selectedList}
             onChange={(_, val) => setSelectedList(val)}
             renderInput={params => <TextField {...params} label="Filter by list" placeholder="All lists" />}
@@ -545,8 +563,16 @@ export default function EnrichmentHistoryTab() {
             <Grid item xs={6} sm={4} md={2}>
               <StatCard
                 label="Leads enriched"
-                value={uniqueLeadsAttempted > 0 ? `${dedupProcessed} / ${uniqueLeadsAttempted}` : '—'}
-                sub={enrichmentSuccessRate !== null ? `${enrichmentSuccessRate}% success rate${nonDedupableCount > 0 ? ` (${nonDedupableCount} run${nonDedupableCount > 1 ? 's' : ''} excluded)` : ''}` : nonDedupableCount > 0 ? 'unavailable — runs too large' : undefined}
+                value={uniqueLeadsAttempted > 0 ? `${dedupProcessed} / ${uniqueLeadsAttempted}` : totalProcessed > 0 ? String(totalProcessed) : '—'}
+                sub={
+                  enrichmentSuccessRate !== null
+                    ? `${enrichmentSuccessRate}% success rate${explicitlyTooLargeCount > 0 ? ` (${explicitlyTooLargeCount} large run${explicitlyTooLargeCount > 1 ? 's' : ''} excluded)` : ''}`
+                    : explicitlyTooLargeCount > 0
+                      ? 'dedup unavailable — runs too large'
+                      : uniqueLeadsAttempted === 0 && totalProcessed > 0
+                        ? 'no dedup data for these runs'
+                        : undefined
+                }
                 color={enrichmentSuccessRate !== null && enrichmentSuccessRate >= 50 ? 'success.main' : enrichmentSuccessRate !== null ? 'warning.main' : undefined}
               />
             </Grid>

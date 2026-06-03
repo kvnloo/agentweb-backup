@@ -6468,6 +6468,16 @@ export const crmDb = {
     return Object.fromEntries(results.flat().map((item: any) => [item.listId, item.name]));
   },
 
+  parseEnrichmentNextToken(token: string): AWS.DynamoDB.DocumentClient.Key {
+    try {
+      return JSON.parse(Buffer.from(token, 'base64').toString());
+    } catch {
+      const err: any = new Error('Invalid pagination token');
+      err.statusCode = 400;
+      throw err;
+    }
+  },
+
   async getEnrichmentJobsByUserId(
     userId: string,
     startDate?: string,
@@ -6480,8 +6490,10 @@ export const crmDb = {
         ? 'userId = :userId AND createdAt BETWEEN :start AND :end'
         : 'userId = :userId';
       const exprValues: Record<string, string> = { ':userId': userId };
-      if (startDate) exprValues[':start'] = startDate;
-      if (endDate) exprValues[':end'] = endDate;
+      if (startDate && endDate) {
+        exprValues[':start'] = startDate;
+        exprValues[':end'] = endDate;
+      }
       const result = await dynamodb.query({
         TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
         IndexName: 'userId-createdAt-index',
@@ -6489,7 +6501,7 @@ export const crmDb = {
         ExpressionAttributeValues: exprValues,
         ScanIndexForward: false,
         Limit: pageSize,
-        ...(nextToken ? { ExclusiveStartKey: JSON.parse(Buffer.from(nextToken, 'base64').toString()) } : {}),
+        ...(nextToken ? { ExclusiveStartKey: this.parseEnrichmentNextToken(nextToken) } : {}),
       }).promise();
       const jobs = (result.Items || []).filter((item: any) => item.leadId === '_meta');
       const listNames = await this.batchGetListNames(jobs.map((j: any) => j.listId));
@@ -6504,6 +6516,10 @@ export const crmDb = {
     }
   },
 
+  // NOTE: forward-only — jobType='meta' is only written on rows created after this
+  // attribute was introduced. The jobType-createdAt-index GSI is sparse, so pre-deploy
+  // _meta rows are invisible to this query. No backfill was done because old rows lack
+  // sourceBreakdown/processedCount aggregates and would show empty stats anyway.
   async getRecentEnrichmentJobs(
     startDate?: string,
     endDate?: string,
@@ -6515,8 +6531,10 @@ export const crmDb = {
         ? 'jobType = :jobType AND createdAt BETWEEN :start AND :end'
         : 'jobType = :jobType';
       const exprValues: Record<string, string> = { ':jobType': 'meta' };
-      if (startDate) exprValues[':start'] = startDate;
-      if (endDate) exprValues[':end'] = endDate;
+      if (startDate && endDate) {
+        exprValues[':start'] = startDate;
+        exprValues[':end'] = endDate;
+      }
       const result = await dynamodb.query({
         TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
         IndexName: 'jobType-createdAt-index',
@@ -6524,7 +6542,7 @@ export const crmDb = {
         ExpressionAttributeValues: exprValues,
         ScanIndexForward: false,
         Limit: pageSize,
-        ...(nextToken ? { ExclusiveStartKey: JSON.parse(Buffer.from(nextToken, 'base64').toString()) } : {}),
+        ...(nextToken ? { ExclusiveStartKey: this.parseEnrichmentNextToken(nextToken) } : {}),
       }).promise();
       const jobs = result.Items || [];
       const listNames = await this.batchGetListNames(jobs.map((j: any) => j.listId));
@@ -6539,31 +6557,64 @@ export const crmDb = {
     }
   },
 
-  async getEnrichmentJobsByListId(listId: string, limit = 10): Promise<any[]> {
+  async getEnrichmentJobsByListId(
+    listId: string,
+    startDate?: string,
+    endDate?: string,
+    pageSize = 20,
+    nextToken?: string,
+  ): Promise<{ jobs: any[]; nextToken?: string }> {
     try {
+      const keyExpr = startDate && endDate
+        ? 'listId = :listId AND createdAt BETWEEN :start AND :end'
+        : 'listId = :listId';
+      const exprValues: Record<string, string> = { ':listId': listId };
+      if (startDate && endDate) {
+        exprValues[':start'] = startDate;
+        exprValues[':end'] = endDate;
+      }
       const result = await dynamodb.query({
         TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
         IndexName: 'listId-createdAt-index',
-        KeyConditionExpression: 'listId = :listId',
-        ExpressionAttributeValues: { ':listId': listId },
+        KeyConditionExpression: keyExpr,
+        ExpressionAttributeValues: exprValues,
         ScanIndexForward: false,
-        Limit: limit,
+        Limit: pageSize,
+        ...(nextToken ? { ExclusiveStartKey: this.parseEnrichmentNextToken(nextToken) } : {}),
       }).promise();
-      return (result.Items || []).filter((item: any) => item.leadId === '_meta');
+      const jobs = (result.Items || []).filter((item: any) => item.leadId === '_meta');
+      const newNextToken = result.LastEvaluatedKey
+        ? Buffer.from(JSON.stringify(result.LastEvaluatedKey)).toString('base64')
+        : undefined;
+      return { jobs, nextToken: newNextToken };
     } catch (error) {
       handleDynamoDbError(error, 'getEnrichmentJobsByListId');
       throw error;
     }
   },
 
-  async getEnrichmentSnapshotsByJobId(jobId: string): Promise<any[]> {
+  async getEnrichmentJobMeta(jobId: string): Promise<any | null> {
+    try {
+      const result = await dynamodb.get({
+        TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
+        Key: { jobId, leadId: '_meta' },
+      }).promise();
+      return result.Item ?? null;
+    } catch (error) {
+      handleDynamoDbError(error, 'getEnrichmentJobMeta');
+      throw error;
+    }
+  },
+
+  async getEnrichmentSnapshotsByJobId(jobId: string, limit = 200): Promise<any[]> {
     try {
       const result = await dynamodb.query({
         TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
         KeyConditionExpression: 'jobId = :jobId',
         ExpressionAttributeValues: { ':jobId': jobId },
+        Limit: limit + 1, // +1 to account for the _meta row
       }).promise();
-      return (result.Items || []).filter((item: any) => item.leadId !== '_meta');
+      return (result.Items || []).filter((item: any) => item.leadId !== '_meta').slice(0, limit);
     } catch (error) {
       handleDynamoDbError(error, 'getEnrichmentSnapshotsByJobId');
       throw error;

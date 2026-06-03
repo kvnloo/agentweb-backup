@@ -1816,7 +1816,15 @@ export class CrmEnrichmentService {
           // Snapshot previous values before overwriting
           const previousStandardFields = CrmEnrichmentService.pickMappedStandardFields(lead, standardUpdates);
           const previousCustomFields = CrmEnrichmentService.pickCustomFieldValues(lead.customFields, customUpdates);
-          const allUpdatedFields = [...Object.keys(standardUpdates), ...Object.keys(customUpdates)];
+          // Use original field names (not mapped camelCase) for standard fields so they
+          // match the keys used in fieldMeta and lead.enrichmentMetadata (stored under
+          // original names like 'first_name', not mapped names like 'firstName').
+          const standardOriginalKeys: string[] = [];
+          for (const key of Object.keys(fields)) {
+            const mapped = CrmEnrichmentService.STANDARD_FIELD_MAP[key.toLowerCase()];
+            if (mapped && standardUpdates[mapped] !== undefined) standardOriginalKeys.push(key);
+          }
+          const allUpdatedFields = [...standardOriginalKeys, ...Object.keys(customUpdates)];
           const previousEnrichmentMetadata: Record<string, any> = {};
           const fieldsEnriched: Array<{ field: string; provider: string; fromCache: boolean }> = [];
           for (const field of allUpdatedFields) {

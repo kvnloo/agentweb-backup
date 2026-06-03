@@ -1051,13 +1051,13 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
     // AW-EnrichmentRawCache reuse (one fetch per lead per run).
     extractUngroupedFieldsViaWeb: async ({ listId, lead, fields, configFieldsByName }) => {
       if (fields.length === 0) {
-        return { fields: [], missing: [], tierFills: { crm: 0, apollo: 0, web: 0, missing: 0 } };
+        return { fields: [], missing: [], tierFills: { crm: 0, apollo: 0, enrichSo: 0, unipile: 0, web: 0, missing: 0 } };
       }
       const domain = lead.emailDomain || extractDomain(lead.email) || extractDomain(lead.website);
       if (!domain) {
         return {
           fields: [], missing: fields,
-          tierFills: { crm: 0, apollo: 0, web: 0, missing: fields.length },
+          tierFills: { crm: 0, apollo: 0, enrichSo: 0, unipile: 0, web: 0, missing: fields.length },
         };
       }
       // Build search query from field INSTRUCTIONS, not field names — a custom
@@ -1080,7 +1080,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       if (!webContext) {
         return {
           fields: [], missing: fields,
-          tierFills: { crm: 0, apollo: 0, web: 0, missing: fields.length },
+          tierFills: { crm: 0, apollo: 0, enrichSo: 0, unipile: 0, web: 0, missing: fields.length },
         };
       }
       const llmResult = await extractFieldsViaLLMReal({
@@ -1108,7 +1108,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       return {
         fields: filled,
         missing: llmResult.missing,
-        tierFills: { crm: 0, apollo: 0, web: filled.length, missing: llmResult.missing.length },
+        tierFills: { crm: 0, apollo: 0, enrichSo: 0, unipile: 0, web: filled.length, missing: llmResult.missing.length },
       };
     },
 

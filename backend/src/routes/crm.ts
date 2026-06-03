@@ -6244,7 +6244,7 @@ router.get('/lists/:listId/enrichment-history', async (req: Request, res: Respon
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    const jobs = await crmDb.getEnrichmentJobsByListId(listId, 10);
+    const { jobs } = await crmDb.getEnrichmentJobsByListId(listId, undefined, undefined, 10);
     return res.json({ jobs });
   } catch (error: any) {
     console.error('[CRM] enrichment-history error:', error);

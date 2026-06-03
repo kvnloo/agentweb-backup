@@ -265,3 +265,68 @@ describe('crmDb.updateLead — null standard fields → REMOVE', () => {
     ).resolves.not.toThrow();
   });
 });
+
+// ─── Empty-string REMOVE branch ──────────────────────────────────────────────
+// An empty string is falsy → same code branch as null → must produce REMOVE.
+// This is distinct from the GSI self-heal tests above (which detect legacy
+// empty-string values already persisted in DynamoDB). Here the caller is
+// actively setting a field to '' and the service must REMOVE it, not SET ''.
+
+describe('crmDb.updateLead — empty-string fields → REMOVE', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    updatePromiseMock.mockResolvedValue({ Attributes: {} });
+    getPromiseMock.mockResolvedValue({
+      Item: {
+        listId: 'list-1',
+        leadId: 'lead-1',
+        email: 'jane@acme.com',
+        firstName: 'Jane',
+        company: 'Acme',
+        phone: '555-1234',
+      },
+    });
+  });
+
+  // FAIL: firstName: '' → REMOVE firstName (not SET firstName = '')
+  it('REMOVEs firstName when passed as empty string', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { firstName: '' });
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toMatch(/REMOVE\b.*\bfirstName\b/);
+    expect(params.ExpressionAttributeValues).not.toHaveProperty(':firstName');
+  });
+
+  // FAIL: company: '' → REMOVE company
+  it('REMOVEs company when passed as empty string', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { company: '' });
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toMatch(/REMOVE\b.*\bcompany\b/);
+    expect(params.ExpressionAttributeValues).not.toHaveProperty(':company');
+  });
+
+  // FAIL: phone: '' → REMOVE phone
+  it('REMOVEs phone when passed as empty string', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { phone: '' });
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toMatch(/REMOVE\b.*\bphone\b/);
+    expect(params.ExpressionAttributeValues).not.toHaveProperty(':phone');
+  });
+
+  // SUCCESS: firstName: 'John' → SET firstName = 'John' (non-empty still sets)
+  it('SETs firstName when passed as a non-empty string', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { firstName: 'John' });
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toMatch(/SET\b.*\bfirstName\b/);
+    expect(params.ExpressionAttributeValues[':firstName']).toBe('John');
+    // Must NOT also REMOVE it
+    expect(params.UpdateExpression).not.toMatch(/REMOVE\b[^]*\bfirstName\b/);
+  });
+
+  // SUCCESS: email: '' → REMOVE email (GSI key also removed on empty string)
+  it('REMOVEs email when passed as empty string', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { email: '' });
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toMatch(/REMOVE\b.*\bemail\b/);
+    expect(params.ExpressionAttributeValues).not.toHaveProperty(':email');
+  });
+});
