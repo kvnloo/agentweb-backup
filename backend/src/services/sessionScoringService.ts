@@ -99,6 +99,26 @@ Respond with ONLY valid JSON:
 
 const MAX_MESSAGES_FOR_SCORING = 50;
 const MIN_USER_MESSAGES = 1;
+
+/**
+ * Whether the session has produced at least one real assistant turn — i.e. the
+ * model actually responded with text or invoked a tool.
+ *
+ * Scheduled/agent runs persist the user (or system-injected) prompt immediately
+ * at session creation, but the assistant response is only saved once the run
+ * completes. A sync-scoring pass (e.g. the "Daily Satisfaction Score Report"
+ * job itself) can therefore observe a session that is still in-flight — just
+ * [system, user] with no reply yet — and wrongly score it 1/5. Skipping these
+ * lets the next scoring pass evaluate the session once it has actually run.
+ */
+function hasAssistantTurn(messages: ChatMessage[] = []): boolean {
+  return messages.some((m: any) => {
+    if (m.role !== "assistant") return false;
+    const text = (typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "")).trim();
+    const toolCalls = m.metadata?.toolCalls;
+    return text.length > 0 || (Array.isArray(toolCalls) && toolCalls.length > 0);
+  });
+}
 const SCORING_TIMEOUT_MS = 20000; // 20 seconds per session
 
 async function getDefaultScoringPrompt(): Promise<string> {
@@ -280,6 +300,11 @@ export async function scoreSessionWithJudgeIfNeeded(
     return null;
   }
 
+  // Skip sessions still in-flight (no assistant response persisted yet)
+  if (!hasAssistantTurn(session.messages)) {
+    return null;
+  }
+
   const result = await scoreSessionWithJudge(session.messages || [], messageCount, judge, session.sessionType);
 
   const judgeScore = {
@@ -320,6 +345,11 @@ export async function scoreSessionIfNeeded(
     (m: any) => m.role === "user"
   );
   if (userMessages.length < MIN_USER_MESSAGES) {
+    return null;
+  }
+
+  // Skip sessions still in-flight (no assistant response persisted yet)
+  if (!hasAssistantTurn(session.messages)) {
     return null;
   }
 
