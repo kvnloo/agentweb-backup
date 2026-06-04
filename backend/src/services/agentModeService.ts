@@ -64,6 +64,7 @@ const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import * as linkedInAdsService from './linkedInAdsService';
+import { googleAdsService } from './googleAdsService';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 
@@ -997,7 +998,7 @@ export class AgentModeService {
 
         this.gemini_client = new OpenAI({
           apiKey: geminiApiKey.trim(),
-          baseURL: 'https://generativelanguage.googleapis.com/v1beta',
+          baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
         });
 
         return this.gemini_client;
@@ -21513,7 +21514,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           platform: acc.platform,
           account_name: acc.account_name,
           account_type: acc.config.account_type,
-          is_active: await isTokenValid(acc)
+          is_active: await isTokenValid(acc),
+          ...(acc.platform === 'google_ads' && (acc.config as { customer_id?: string })?.customer_id
+            ? {
+                customer_id: (acc.config as { customer_id: string }).customer_id,
+                currency: (acc.config as { currency?: string }).currency || 'USD',
+              }
+            : {}),
         })))
       };
     } catch (error) {
@@ -23235,6 +23242,296 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
 
     return response;
+  }
+
+  public async handleCallGoogleAdsApi(userId: string, args: {
+    customer_id: string;
+    entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION';
+    action: string;
+    [key: string]: any;
+  }): Promise<any> {
+    try {
+      const { customer_id, entity_type, action } = args;
+
+      if (entity_type === 'CAMPAIGN') {
+        if (action === 'LIST') {
+          const campaigns = await googleAdsService.listCampaigns(userId, customer_id);
+          return { success: true, campaigns };
+        }
+        if (action === 'PAUSE') {
+          if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for PAUSE action' };
+          await googleAdsService.pauseCampaign(userId, customer_id, args.campaign_resource_name);
+          return { success: true, message: 'Campaign paused' };
+        }
+        if (action === 'RESUME') {
+          if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for RESUME action' };
+          await googleAdsService.resumeCampaign(userId, customer_id, args.campaign_resource_name);
+          return { success: true, message: 'Campaign resumed' };
+        }
+        if (action === 'REMOVE') {
+          if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for REMOVE action' };
+          await googleAdsService.removeCampaign(userId, customer_id, args.campaign_resource_name);
+          return { success: true, message: 'Campaign removed' };
+        }
+        if (action === 'CREATE') {
+          if (!args.budget_resource_name || !args.name || !args.type || !args.bidding_strategy) {
+            return { success: false, error: 'name, type, budget_resource_name, and bidding_strategy are required to create a campaign' };
+          }
+          if (args.bidding_strategy === 'TARGET_CPA' && !args.bidding_strategy_target) {
+            return { success: false, error: 'TARGET_CPA requires bidding_strategy_target (CPA value in account currency, e.g. 20 for $20). Ask the user for their target CPA before proceeding.' };
+          }
+          if (args.bidding_strategy === 'TARGET_ROAS' && !args.bidding_strategy_target) {
+            return { success: false, error: 'TARGET_ROAS requires bidding_strategy_target (ROAS as a decimal, e.g. 3.0 for 300%). Ask the user for their target ROAS before proceeding.' };
+          }
+          const campaign = await googleAdsService.createCampaign(userId, customer_id, {
+            name: args.name,
+            type: args.type,
+            budgetResourceName: args.budget_resource_name,
+            biddingStrategy: args.bidding_strategy,
+            biddingStrategyTarget: args.bidding_strategy_target,
+            cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
+            locationTargetIds: args.location_target_ids || [],
+            status: args.status || 'PAUSED',
+            brandBusinessName: args.brand_business_name,
+            brandLogoAssetResourceName: args.brand_logo_asset_resource_name,
+          });
+          return { success: true, campaignResourceName: campaign.resourceName };
+        }
+        if (action === 'UPDATE') {
+          if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for UPDATE action' };
+          await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
+            name: args.name,
+            status: args.status,
+            biddingStrategy: args.bidding_strategy,
+            biddingStrategyTarget: args.bidding_strategy_target,
+            cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
+            budgetResourceName: args.budget_resource_name,
+          });
+          return { success: true, message: 'Campaign updated' };
+        }
+      }
+
+      if (entity_type === 'BUDGET' && action === 'LIST') {
+        const budgets = await googleAdsService.listBudgets(userId, customer_id);
+        return { success: true, budgets };
+      }
+      if (entity_type === 'BUDGET' && action === 'CREATE') {
+        if (!args.name || args.amount_micros === undefined) return { success: false, error: 'name and amount_micros are required to create a budget' };
+        const budget = await googleAdsService.createBudget(userId, customer_id, { name: args.name, amountMicros: args.amount_micros, explicitlyShared: args.explicitly_shared });
+        return { success: true, budgetResourceName: budget.resourceName };
+      }
+      if (entity_type === 'BUDGET' && action === 'UPDATE') {
+        if (!args.budget_resource_name || args.amount_micros === undefined) return { success: false, error: 'budget_resource_name and amount_micros are required for BUDGET UPDATE' };
+        await googleAdsService.updateBudget(userId, customer_id, args.budget_resource_name, args.amount_micros);
+        return { success: true, message: 'Budget updated' };
+      }
+      if (entity_type === 'BUDGET' && action === 'REMOVE') {
+        if (!args.budget_resource_name) return { success: false, error: 'budget_resource_name is required for BUDGET REMOVE. Note: budget must not be attached to any campaign (reference_count must be 0).' };
+        await googleAdsService.removeBudget(userId, customer_id, args.budget_resource_name);
+        return { success: true, message: 'Budget removed' };
+      }
+
+      if (entity_type === 'AD_GROUP') {
+        if (action === 'LIST') {
+          if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for AD_GROUP LIST' };
+          const adGroups = await googleAdsService.listAdGroups(userId, customer_id, args.campaign_resource_name);
+          return { success: true, adGroups };
+        }
+        if (action === 'CREATE') {
+          if (!args.name || !args.campaign_resource_name || !args.type) return { success: false, error: 'name, campaign_resource_name, and type are required' };
+          const adGroup = await googleAdsService.createAdGroup(userId, customer_id, {
+            name: args.name,
+            campaignResourceName: args.campaign_resource_name,
+            type: args.type,
+            cpcBidMicros: args.cpc_bid_micros,
+          });
+          return { success: true, adGroupResourceName: adGroup.resourceName };
+        }
+        if (action === 'UPDATE') {
+          if (!args.ad_group_resource_name) return { success: false, error: 'ad_group_resource_name is required for UPDATE action' };
+          await googleAdsService.updateAdGroup(userId, customer_id, args.ad_group_resource_name, {
+            name: args.name,
+            status: args.status,
+            cpcBidMicros: args.cpc_bid_micros,
+            adRotationMode: args.ad_rotation_mode,
+            targetCpaMicros: args.target_cpa_micros,
+            targetRoas: args.target_roas,
+          });
+          return { success: true, message: 'Ad group updated' };
+        }
+        if (action === 'REMOVE') {
+          if (!args.ad_group_resource_name) return { success: false, error: 'ad_group_resource_name is required for REMOVE action' };
+          await googleAdsService.removeAdGroup(userId, customer_id, args.ad_group_resource_name);
+          return { success: true, message: 'Ad group removed' };
+        }
+      }
+
+      if (entity_type === 'KEYWORD') {
+        if (action === 'LIST') {
+          if (!args.ad_group_resource_name) return { success: false, error: 'ad_group_resource_name is required for KEYWORD LIST' };
+          const keywords = await googleAdsService.listKeywords(userId, customer_id, args.ad_group_resource_name);
+          return { success: true, keywords };
+        }
+        if (action === 'ADD') {
+          if (!args.ad_group_resource_name || !args.keywords) return { success: false, error: 'ad_group_resource_name and keywords array are required' };
+          await googleAdsService.addKeywords(userId, customer_id, args.ad_group_resource_name, args.keywords);
+          return { success: true, message: `Added ${args.keywords.length} keyword(s)` };
+        }
+        if (action === 'ADD_NEGATIVE') {
+          if ((!args.campaign_resource_name && !args.ad_group_resource_name) || !args.keywords) {
+            return { success: false, error: 'keywords and either campaign_resource_name or ad_group_resource_name are required' };
+          }
+          await googleAdsService.addNegativeKeywords(userId, customer_id, {
+            campaignResourceName: args.campaign_resource_name,
+            adGroupResourceName: args.ad_group_resource_name,
+          }, args.keywords);
+          return { success: true, message: `Added ${args.keywords.length} negative keyword(s)` };
+        }
+        if (action === 'UPDATE') {
+          if (!args.criterion_resource_name) return { success: false, error: 'criterion_resource_name is required for KEYWORD UPDATE' };
+          await googleAdsService.updateKeyword(userId, customer_id, args.criterion_resource_name, {
+            status: args.status,
+            cpcBidMicros: args.cpc_bid_micros,
+          });
+          return { success: true, message: 'Keyword updated' };
+        }
+        if (action === 'REMOVE') {
+          if (!args.criterion_resource_name) return { success: false, error: 'criterion_resource_name is required for KEYWORD REMOVE' };
+          await googleAdsService.removeKeyword(userId, customer_id, args.criterion_resource_name);
+          return { success: true, message: 'Keyword removed' };
+        }
+      }
+
+      if (entity_type === 'LOCATION' && action === 'SEARCH') {
+        if (!args.query) return { success: false, error: 'query is required for LOCATION SEARCH' };
+        const locations = await googleAdsService.searchLocations(userId, customer_id, args.query, args.locale || 'en');
+        return { success: true, locations };
+      }
+
+      if (entity_type === 'AD') {
+        if (action === 'LIST') {
+          if (!args.ad_group_resource_name) return { success: false, error: 'ad_group_resource_name is required for AD LIST' };
+          const ads = await googleAdsService.listAds(userId, customer_id, args.ad_group_resource_name);
+          return { success: true, ads };
+        }
+        if (action === 'CREATE') {
+          if (!args.ad_group_resource_name || !args.type || !args.headlines || !args.descriptions || !args.final_url) {
+            return { success: false, error: 'ad_group_resource_name, type, headlines, descriptions, and final_url are required to create an ad' };
+          }
+          let adType = args.type as string;
+          if (adType === 'SEARCH') adType = 'RESPONSIVE_SEARCH_AD';
+          else if (adType === 'DISPLAY') adType = 'RESPONSIVE_DISPLAY_AD';
+          const ad = await googleAdsService.createAd(userId, customer_id, {
+            adGroupResourceName: args.ad_group_resource_name,
+            type: adType as 'RESPONSIVE_SEARCH_AD' | 'RESPONSIVE_DISPLAY_AD',
+            headlines: args.headlines,
+            descriptions: args.descriptions,
+            finalUrl: args.final_url,
+            imageAssetResourceNames: args.image_asset_resource_names,
+          });
+          return { success: true, adResourceName: ad.resourceName };
+        }
+        if (action === 'UPDATE') {
+          if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD UPDATE' };
+          await googleAdsService.updateAd(userId, customer_id, args.ad_resource_name, {
+            status: args.status,
+          });
+          return { success: true, message: 'Ad updated' };
+        }
+        if (action === 'REMOVE') {
+          if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD REMOVE' };
+          await googleAdsService.removeAd(userId, customer_id, args.ad_resource_name);
+          return { success: true, message: 'Ad removed' };
+        }
+      }
+
+      if (entity_type === 'CAMPAIGN_ASSET' && action === 'ATTACH') {
+        if (!args.campaign_resource_name || !args.assets) return { success: false, error: 'campaign_resource_name and assets array are required for CAMPAIGN_ASSET ATTACH' };
+        await googleAdsService.attachCampaignAssets(userId, customer_id, args.campaign_resource_name, args.assets);
+        return { success: true, message: `Attached ${args.assets.length} asset(s) to campaign` };
+      }
+
+      if (entity_type === 'ASSET' && action === 'UPLOAD') {
+        if (!args.asset_type || !args.name || !args.data) return { success: false, error: 'asset_type, name, and data are required for ASSET UPLOAD' };
+        const resourceName = await googleAdsService.uploadAsset(userId, customer_id, {
+          type: args.asset_type,
+          name: args.name,
+          data: args.data,
+        });
+        return { success: true, assetResourceName: resourceName };
+      }
+
+      if (entity_type === 'ASSET_GROUP' && action === 'CREATE') {
+        if (!args.name || !args.campaign_resource_name || !args.headlines || !args.long_headlines ||
+            !args.descriptions || !args.square_image_assets || !args.landscape_image_assets ||
+            !args.logo_assets || !args.final_url) {
+          return { success: false, error: 'name, campaign_resource_name, headlines, long_headlines, descriptions, square_image_assets, landscape_image_assets, logo_assets, and final_url are required' };
+        }
+        const assetGroup = await googleAdsService.createAssetGroup(userId, customer_id, {
+          name: args.name,
+          campaignResourceName: args.campaign_resource_name,
+          headlines: args.headlines,
+          longHeadlines: args.long_headlines,
+          descriptions: args.descriptions,
+          squareImageAssets: args.square_image_assets,
+          landscapeImageAssets: args.landscape_image_assets,
+          logoAssets: args.logo_assets,
+          videoAssets: args.video_assets,
+          finalUrl: args.final_url,
+        });
+        return { success: true, assetGroupResourceName: assetGroup.resourceName };
+      }
+
+      return { success: false, error: `Unsupported entity_type=${entity_type} action=${action}` };
+    } catch (error: any) {
+      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true };
+      console.error('[AgentMode] handleCallGoogleAdsApi error:', error);
+      const gadsErrors: any[] = error?.response?.data?.error?.details?.[0]?.errors || [];
+      const gadsError = gadsErrors.length
+        ? gadsErrors.map((e: any) => {
+            const code = Object.values(e.errorCode || {})[0];
+            return code ? `${code}: ${e.message}` : e.message;
+          }).join('; ')
+        : undefined;
+      return { success: false, error: gadsError || error.message || 'Unknown error' };
+    }
+  }
+
+  public async handleCallGoogleAdsReportingApi(userId: string, args: {
+    customer_id: string;
+    mode: 'raw' | 'dashboard';
+    query?: string;
+    campaign_ids?: string[];
+    date_preset?: string;
+  }): Promise<any> {
+    try {
+      if (args.mode === 'dashboard') {
+        const summary = await googleAdsService.getQuickMetrics(userId, args.customer_id, {
+          campaignIds: args.campaign_ids,
+          datePreset: args.date_preset || 'LAST_30_DAYS',
+        });
+        const { campaigns, totals, currency } = summary;
+        const rows = campaigns.map((c: any) =>
+          `| ${c.name} | ${c.status} | ${c.impressions.toLocaleString()} | ${c.clicks.toLocaleString()} | ${c.ctr.toFixed(2)}% | ${currency} ${c.spendFormatted} | ${c.conversions} | ${c.avgCpc} |`
+        ).join('\n');
+        const formattedMarkdown = `## Google Ads Performance\n\n| Campaign | Status | Impressions | Clicks | CTR | Spend | Conversions | Avg CPC |\n|---|---|---|---|---|---|---|---|\n${rows}\n\n**Totals:** ${totals.impressions.toLocaleString()} impressions · ${totals.clicks.toLocaleString()} clicks · ${currency} ${totals.spend.toFixed(2)} spend · ${totals.conversions} conversions`;
+        return { success: true, formattedMarkdown, summary };
+      }
+
+      if (args.mode === 'raw') {
+        if (!args.query) return { success: false, error: 'query is required for raw mode' };
+        const results = await googleAdsService.queryReporting(userId, args.customer_id, args.query);
+        return { success: true, results, totalRows: results.length };
+      }
+
+      return { success: false, error: 'mode must be "raw" or "dashboard"' };
+    } catch (error: any) {
+      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true };
+      console.error('[AgentMode] handleCallGoogleAdsReportingApi error:', error);
+      const gadsErrors: any[] = error?.response?.data?.error?.details?.[0]?.errors || [];
+      const gadsError = gadsErrors.length ? gadsErrors.map((e: any) => e.message).join('; ') : undefined;
+      return { success: false, error: gadsError || error.message || 'Unknown error' };
+    }
   }
 }
 

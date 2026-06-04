@@ -1,0 +1,982 @@
+const mockAxiosPost = jest.fn();
+const mockAxiosGet = jest.fn();
+jest.mock('axios', () => ({
+  post: (...args: any[]) => mockAxiosPost(...args),
+  get: (...args: any[]) => mockAxiosGet(...args),
+}));
+
+jest.mock('../utils/secretsManager', () => ({
+  getGoogleAdsCredentials: jest.fn().mockResolvedValue({
+    clientId: 'test-client-id',
+    clientSecret: 'test-secret',
+    developerToken: 'test-dev-token',
+  }),
+}));
+
+jest.mock('../services/db', () => ({
+  userDb: {
+    getUserById: jest.fn().mockResolvedValue({
+      userId: 'user-123',
+      connected_accounts: [
+        {
+          platform: 'google_ads',
+          account_id: '1234567890',
+          account_name: 'Test Account',
+          config: {
+            customer_id: '1234567890',
+            currency: 'USD',
+            access_token: 'valid-token',
+            refresh_token: 'refresh-token',
+            token_expires_at: Date.now() + 3600 * 1000,
+          },
+        },
+      ],
+    }),
+  },
+}));
+
+jest.mock('../services/connectedAccountsDb', () => ({
+  updateAccountTokens: jest.fn().mockResolvedValue(undefined),
+  // normalizeAccounts is NOT exported — do not mock it here
+}));
+
+const mockAssertPublicHostname = jest.fn();
+jest.mock('../utils/ssrfGuard', () => ({
+  assertPublicHostname: (...args: any[]) => mockAssertPublicHostname(...args),
+  SsrfBlockedError: class SsrfBlockedError extends Error {
+    constructor(message = 'URL resolves to a private/internal address') {
+      super(message);
+      this.name = 'SsrfBlockedError';
+    }
+  },
+}));
+import { SsrfBlockedError } from '../utils/ssrfGuard';
+
+import { GoogleAdsService } from '../services/googleAdsService';
+
+let service: GoogleAdsService;
+beforeEach(() => {
+  jest.clearAllMocks();
+  mockAssertPublicHostname.mockResolvedValue(undefined);
+  service = new GoogleAdsService();
+});
+
+describe('API version', () => {
+  it('uses Google Ads API v24 base URL', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: [] } });
+    await service.listAccessibleAccounts('test-access-token');
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      expect.stringContaining('googleads.googleapis.com/v24'),
+      expect.anything()
+    );
+  });
+
+  it('uses path customer ID as login-customer-id for direct account access', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
+    await service.search('1234567890', 'test-access-token', 'SELECT campaign.id FROM campaign');
+    const headers = mockAxiosPost.mock.calls[0][2].headers;
+    expect(headers['login-customer-id']).toBe('1234567890');
+  });
+});
+
+describe('search — pagination', () => {
+  it('follows nextPageToken and concatenates all pages', async () => {
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [{ id: '1' }, { id: '2' }], nextPageToken: 'tok-2' } })
+      .mockResolvedValueOnce({ data: { results: [{ id: '3' }] } });
+
+    const results = await service.search('1234567890', 'test-access-token', 'SELECT campaign.id FROM campaign');
+
+    expect(results).toEqual([{ id: '1' }, { id: '2' }, { id: '3' }]);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(2);
+    // first page request carries no pageToken; second page sends the token
+    expect(mockAxiosPost.mock.calls[0][1].pageToken).toBeUndefined();
+    expect(mockAxiosPost.mock.calls[1][1].pageToken).toBe('tok-2');
+  });
+
+  it('returns a single page when there is no nextPageToken', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ id: '1' }] } });
+    const results = await service.search('1234567890', 'test-access-token', 'SELECT campaign.id FROM campaign');
+    expect(results).toEqual([{ id: '1' }]);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('listAccessibleAccounts', () => {
+  it('calls listAccessibleCustomers and returns parsed accounts', async () => {
+    mockAxiosGet.mockResolvedValueOnce({
+      data: { resourceNames: ['customers/1234567890'] },
+    });
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          customer: { id: '1234567890', descriptiveName: 'Test Account', currencyCode: 'USD' },
+        }],
+      },
+    });
+
+    const accounts = await service.listAccessibleAccounts('test-access-token');
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0]).toEqual({ customerId: '1234567890', name: 'Test Account', currency: 'USD' });
+  });
+
+  it('returns empty array if no accessible customers', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: [] } });
+    const accounts = await service.listAccessibleAccounts('test-access-token');
+    expect(accounts).toHaveLength(0);
+  });
+
+  it('skips manager accounts', async () => {
+    mockAxiosGet.mockResolvedValueOnce({
+      data: { resourceNames: ['customers/9999999999'] },
+    });
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          customer: { id: '9999999999', descriptiveName: 'MCC Account', currencyCode: 'USD', manager: true },
+        }],
+      },
+    });
+
+    const accounts = await service.listAccessibleAccounts('test-access-token');
+    expect(accounts).toHaveLength(0);
+  });
+});
+
+describe('getAccountCredentials', () => {
+  it('returns credentials for a connected account', async () => {
+    const creds = await service.getAccountCredentials('user-123', '1234567890');
+    expect(creds.accessToken).toBe('valid-token');
+    expect(creds.customerId).toBe('1234567890');
+    expect(creds.currency).toBe('USD');
+  });
+
+  it('throws if customerId not in connected accounts', async () => {
+    await expect(service.getAccountCredentials('user-123', 'wrong-id'))
+      .rejects.toThrow('Google Ads account not found in your connected accounts');
+  });
+});
+
+describe('getAccountCredentials — token refresh', () => {
+  it('refreshes expired token and returns new access token', async () => {
+    const { userDb } = require('../services/db');
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: 'user-123',
+      connected_accounts: [{
+        platform: 'google_ads',
+        account_id: 'acc-abc',
+        account_name: 'Test',
+        config: {
+          customer_id: '1234567890',
+          currency: 'USD',
+          access_token: 'old-token',
+          refresh_token: 'refresh-token',
+          token_expires_at: Date.now() - 1000, // expired
+        },
+      }],
+    });
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { access_token: 'new-token', expires_in: 3600 },
+    });
+    const { updateAccountTokens } = require('../services/connectedAccountsDb');
+
+    const creds = await service.getAccountCredentials('user-123', '1234567890');
+
+    expect(creds.accessToken).toBe('new-token');
+    expect(mockAxiosPost).toHaveBeenCalledWith(
+      'https://oauth2.googleapis.com/token',
+      expect.stringContaining('grant_type=refresh_token'),
+      expect.any(Object)
+    );
+    expect(updateAccountTokens).toHaveBeenCalledWith(
+      'user-123', 'google_ads',
+      expect.objectContaining({ access_token: 'new-token' }),
+      'acc-abc'  // account_id, NOT customer_id
+    );
+  });
+
+  it('throws if user not found', async () => {
+    const { userDb } = require('../services/db');
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce(null);
+    await expect(service.getAccountCredentials('user-123', '1234567890'))
+      .rejects.toThrow('User not found');
+  });
+
+  it('throws if no access token after refresh attempt', async () => {
+    const { userDb } = require('../services/db');
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: 'user-123',
+      connected_accounts: [{
+        platform: 'google_ads',
+        account_id: 'acc-abc',
+        config: {
+          customer_id: '1234567890',
+          currency: 'USD',
+          access_token: null,
+          refresh_token: null,
+          token_expires_at: null,
+        },
+      }],
+    });
+    await expect(service.getAccountCredentials('user-123', '1234567890'))
+      .rejects.toThrow('No access token available');
+  });
+});
+
+describe('createBudget', () => {
+  it('sends mutate request and returns resource name', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/campaignBudgets/456' }] },
+    });
+    const budget = await service.createBudget('user-123', '1234567890', {
+      amountMicros: 10_000_000,
+      name: 'Test Budget',
+    });
+    expect(budget.resourceName).toBe('customers/123/campaignBudgets/456');
+    const callBody = mockAxiosPost.mock.calls[0][1];
+    expect(callBody.operations[0].create.amountMicros).toBe('10000000');
+    expect(callBody.operations[0].create.deliveryMethod).toBe('STANDARD');
+  });
+});
+
+describe('listBudgets', () => {
+  it('returns mapped budgets from GAQL search', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          campaignBudget: {
+            resourceName: 'customers/123/campaignBudgets/1',
+            name: 'My Budget',
+            amountMicros: '50000000',
+            explicitlyShared: false,
+            referenceCount: 2,
+          },
+        }],
+      },
+    });
+    const budgets = await service.listBudgets('user-123', '1234567890');
+    expect(budgets).toHaveLength(1);
+    expect(budgets[0].resourceName).toBe('customers/123/campaignBudgets/1');
+    expect(budgets[0].name).toBe('My Budget');
+    expect(budgets[0].amountMicros).toBe('50000000');
+    expect(budgets[0].explicitlyShared).toBe(false);
+    expect(budgets[0].referenceCount).toBe(2);
+  });
+
+  it('sends correct GAQL fields in the search query', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
+    await service.listBudgets('user-123', '1234567890');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.query).toContain('campaign_budget.resource_name');
+    expect(body.query).toContain('campaign_budget.amount_micros');
+  });
+});
+
+describe('listCampaigns', () => {
+  it('returns campaigns from GAQL search', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          campaign: { resourceName: 'customers/123/campaigns/1', id: '1', name: 'Search Campaign', status: 'ENABLED', advertisingChannelType: 'SEARCH' },
+        }],
+      },
+    });
+    const campaigns = await service.listCampaigns('user-123', '1234567890');
+    expect(campaigns).toHaveLength(1);
+    expect(campaigns[0].name).toBe('Search Campaign');
+    expect(campaigns[0].type).toBe('SEARCH');
+  });
+});
+
+describe('createCampaign', () => {
+  it('creates a SEARCH campaign with MAXIMIZE_CONVERSIONS bidding', async () => {
+    // First call = campaign mutate, second call = location targeting mutate
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/campaigns/2' }] } })
+      .mockResolvedValueOnce({ data: { results: [{}] } });
+    const campaign = await service.createCampaign('user-123', '1234567890', {
+      name: 'Test Search',
+      type: 'SEARCH',
+      budgetResourceName: 'customers/123/campaignBudgets/456',
+      biddingStrategy: 'MAXIMIZE_CONVERSIONS',
+      locationTargetIds: [2840],
+      status: 'PAUSED',
+    });
+    expect(campaign.resourceName).toBe('customers/123/campaigns/2');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.advertisingChannelType).toBe('SEARCH');
+    expect(body.operations[0].create.maximizeConversions).toBeDefined();
+    expect(body.operations[0].create.status).toBe('PAUSED');
+  });
+
+  it('creates a PERFORMANCE_MAX campaign', async () => {
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/campaigns/3' }] } })
+      .mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.createCampaign('user-123', '1234567890', {
+      name: 'PMax Campaign',
+      type: 'PERFORMANCE_MAX',
+      budgetResourceName: 'customers/123/campaignBudgets/456',
+      biddingStrategy: 'MAXIMIZE_CONVERSION_VALUE',
+      locationTargetIds: [2840],
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.advertisingChannelType).toBe('PERFORMANCE_MAX');
+  });
+});
+
+describe('pauseCampaign / resumeCampaign', () => {
+  it('pauses a campaign', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.pauseCampaign('user-123', '1234567890', 'customers/123/campaigns/1');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.status).toBe('PAUSED');
+  });
+
+  it('resumes a campaign', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.resumeCampaign('user-123', '1234567890', 'customers/123/campaigns/1');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.status).toBe('ENABLED');
+  });
+});
+
+describe('searchLocations', () => {
+  it('returns location suggestions', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        geoTargetConstantSuggestions: [{
+          geoTargetConstant: { id: '2840', name: 'United States', countryCode: 'US', targetType: 'Country' },
+        }],
+      },
+    });
+    const locations = await service.searchLocations('user-123', '1234567890', 'United States', 'en');
+    expect(locations).toHaveLength(1);
+    expect(locations[0].id).toBe('2840');
+    expect(locations[0].name).toBe('United States');
+  });
+});
+
+describe('createAdGroup', () => {
+  it('creates an ad group for Search campaign', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/adGroups/789' }] },
+    });
+    const ag = await service.createAdGroup('user-123', '1234567890', {
+      name: 'Test Ad Group',
+      campaignResourceName: 'customers/123/campaigns/1',
+      type: 'SEARCH_STANDARD',
+    });
+    expect(ag.resourceName).toBe('customers/123/adGroups/789');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.type).toBe('SEARCH_STANDARD');
+  });
+});
+
+describe('addKeywords', () => {
+  it('adds keywords with correct match types', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}, {}] } });
+    await service.addKeywords('user-123', '1234567890', 'customers/123/adGroups/789', [
+      { text: 'buy shoes', matchType: 'BROAD' },
+      { text: 'running shoes', matchType: 'PHRASE' },
+    ]);
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations).toHaveLength(2);
+    expect(body.operations[0].create.keyword.matchType).toBe('BROAD');
+    expect(body.operations[1].create.keyword.matchType).toBe('PHRASE');
+  });
+});
+
+describe('addNegativeKeywords', () => {
+  it('adds campaign-level negative keywords', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.addNegativeKeywords('user-123', '1234567890',
+      { campaignResourceName: 'customers/123/campaigns/1' },
+      [{ text: 'free', matchType: 'BROAD' }]
+    );
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.campaign).toBe('customers/123/campaigns/1');
+    expect(body.operations[0].create.negative).toBe(true);
+    expect(body.operations[0].create.keyword.text).toBe('free');
+  });
+});
+
+describe('createAd (Responsive Search Ad)', () => {
+  it('creates RSA with headlines and descriptions', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/adGroupAds/1' }] },
+    });
+    await service.createAd('user-123', '1234567890', {
+      adGroupResourceName: 'customers/123/adGroups/789',
+      type: 'RESPONSIVE_SEARCH_AD',
+      headlines: ['Headline 1', 'Headline 2', 'Headline 3'],
+      descriptions: ['Description 1', 'Description 2'],
+      finalUrl: 'https://example.com',
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.ad.responsiveSearchAd.headlines).toHaveLength(3);
+    expect(body.operations[0].create.ad.finalUrls[0]).toBe('https://example.com');
+  });
+});
+
+describe('addNegativeKeywords — adGroup level', () => {
+  it('adds adGroup-level negative keywords', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.addNegativeKeywords('user-123', '1234567890',
+      { adGroupResourceName: 'customers/123/adGroups/789' },
+      [{ text: 'cheap', matchType: 'EXACT' }]
+    );
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.adGroup).toBe('customers/123/adGroups/789');
+    expect(body.operations[0].create.negative).toBe(true);
+  });
+});
+
+describe('createAd — Responsive Display Ad', () => {
+  it('creates RDA with image assets', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/adGroupAds/2' }] },
+    });
+    await service.createAd('user-123', '1234567890', {
+      adGroupResourceName: 'customers/123/adGroups/789',
+      type: 'RESPONSIVE_DISPLAY_AD',
+      headlines: ['Headline 1'],
+      descriptions: ['Description 1'],
+      finalUrl: 'https://example.com',
+      imageAssetResourceNames: ['customers/123/assets/1'],
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.ad.responsiveDisplayAd).toBeDefined();
+    expect(body.operations[0].create.ad.responsiveDisplayAd.marketingImages).toHaveLength(1);
+  });
+
+  it('rejects an unknown ad type instead of silently building a display ad', async () => {
+    await expect(service.createAd('user-123', '1234567890', {
+      adGroupResourceName: 'customers/123/adGroups/789',
+      type: 'SEARCH' as any,
+      headlines: ['Headline 1'],
+      descriptions: ['Description 1'],
+      finalUrl: 'https://example.com',
+    })).rejects.toThrow(/Unsupported ad type/);
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+});
+
+describe('uploadAsset', () => {
+  it('uploads an image and returns resource name', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/assets/1' }] },
+    });
+    const result = await service.uploadAsset('user-123', '1234567890', {
+      type: 'IMAGE',
+      name: 'hero.jpg',
+      data: Buffer.from('fake-image-data'),
+    });
+    expect(result).toBe('customers/123/assets/1');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.type).toBe('IMAGE');
+    expect(body.operations[0].create.imageAsset.data).toBeDefined();
+  });
+});
+
+describe('queryReporting', () => {
+  it('runs GAQL and returns results', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{ campaign: { id: '1', name: 'Test' }, metrics: { impressions: '1000' } }],
+      },
+    });
+    const results = await service.queryReporting('user-123', '1234567890',
+      'SELECT campaign.id, campaign.name, metrics.impressions FROM campaign WHERE segments.date DURING LAST_30_DAYS',
+    );
+    expect(results).toHaveLength(1);
+    expect(results[0].metrics.impressions).toBe('1000');
+  });
+});
+
+describe('getQuickMetrics', () => {
+  it('returns formatted metrics summary', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          campaign: { id: '1', name: 'Test Campaign', status: 'ENABLED' },
+          metrics: { impressions: '5000', clicks: '200', costMicros: '1000000000', conversions: '10' },
+        }],
+      },
+    });
+    const summary = await service.getQuickMetrics('user-123', '1234567890', { datePreset: 'LAST_30_DAYS' });
+    expect(summary.campaigns).toHaveLength(1);
+    expect(summary.campaigns[0].name).toBe('Test Campaign');
+    expect(summary.campaigns[0].spendFormatted).toBe('1000.00');
+    expect(summary.campaigns[0].ctr).toBeCloseTo(4.0);
+    expect(summary.currency).toBe('USD');
+  });
+});
+
+describe('getQuickMetrics — with campaignIds filter', () => {
+  it('builds WHERE clause with campaign ID filter', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [] },
+    });
+    await service.getQuickMetrics('user-123', '1234567890', {
+      campaignIds: ['1', '2'],
+      datePreset: 'LAST_7_DAYS',
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.query).toContain('campaign.id IN (1,2)');
+    expect(body.query).toContain('DURING LAST_7_DAYS');
+  });
+});
+
+describe('getQuickMetrics — spend totals use raw micros not toFixed strings', () => {
+  it('totals.spend is sum of raw spend, not sum of toFixed(2) strings', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [
+          { campaign: { id: '1', name: 'A', status: 'ENABLED' }, metrics: { costMicros: '1', clicks: '0', impressions: '0', conversions: '0' } },
+          { campaign: { id: '2', name: 'B', status: 'ENABLED' }, metrics: { costMicros: '1', clicks: '0', impressions: '0', conversions: '0' } },
+        ],
+      },
+    });
+    const summary = await service.getQuickMetrics('user-123', '1234567890', { datePreset: 'LAST_30_DAYS' });
+    // 1 micro + 1 micro = 0.000002, not 0.00 + 0.00 = 0.00
+    expect(summary.totals.spend).toBeCloseTo(0.000002, 9);
+  });
+});
+
+describe('updateCampaign — TARGET_IMPRESSION_SHARE', () => {
+  it('sends correct fields when switching to TARGET_IMPRESSION_SHARE', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+      biddingStrategy: 'TARGET_IMPRESSION_SHARE',
+      biddingStrategyTarget: 0.7,
+      cpcBidCeilingMicros: 5_000_000,
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    const update = body.operations[0].update;
+    expect(update.targetImpressionShare.locationFractionMicros).toBe('700000');
+    expect(update.targetImpressionShare.cpcBidCeilingMicros).toBe('5000000');
+    expect(body.operations[0].updateMask).toContain('target_impression_share.cpc_bid_ceiling_micros');
+  });
+
+  it('uses 100_000_000 as default cpcBidCeilingMicros', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+      biddingStrategy: 'TARGET_IMPRESSION_SHARE',
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.targetImpressionShare.cpcBidCeilingMicros).toBe('100000000');
+  });
+});
+
+describe('updateCampaign', () => {
+  it('sends mutate request with update and updateMask for name change', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', { name: 'New Name' });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.resourceName).toBe('customers/123/campaigns/1');
+    expect(body.operations[0].update.name).toBe('New Name');
+    expect(body.operations[0].updateMask).toContain('name');
+  });
+
+  it('sends mutate request with update and updateMask for status change', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', { status: 'PAUSED' });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.status).toBe('PAUSED');
+    expect(body.operations[0].updateMask).toContain('status');
+  });
+});
+
+describe('updateAdGroup', () => {
+  it('sends mutate request with update and updateMask for name change', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateAdGroup('user-123', '1234567890', 'customers/123/adGroups/789', { name: 'Updated Group' });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.resourceName).toBe('customers/123/adGroups/789');
+    expect(body.operations[0].update.name).toBe('Updated Group');
+    expect(body.operations[0].updateMask).toContain('name');
+  });
+
+  it('sends mutate request with cpcBidMicros update', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateAdGroup('user-123', '1234567890', 'customers/123/adGroups/789', { cpcBidMicros: 500000 });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.cpcBidMicros).toBe('500000');
+    expect(body.operations[0].updateMask).toContain('cpc_bid_micros');
+  });
+});
+
+describe('listAds', () => {
+  it('calls search and returns mapped ad results', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          adGroupAd: {
+            resourceName: 'customers/123/adGroupAds/1',
+            status: 'ENABLED',
+            ad: { id: '1', type: 'RESPONSIVE_SEARCH_AD' },
+          },
+        }],
+      },
+    });
+    const ads = await service.listAds('user-123', '1234567890', 'customers/123/adGroups/789');
+    expect(ads).toHaveLength(1);
+    expect(ads[0].resourceName).toBe('customers/123/adGroupAds/1');
+    expect(ads[0].status).toBe('ENABLED');
+    expect(ads[0].type).toBe('RESPONSIVE_SEARCH_AD');
+  });
+
+  it('returns empty array when no ads found', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
+    const ads = await service.listAds('user-123', '1234567890', 'customers/123/adGroups/789');
+    expect(ads).toHaveLength(0);
+  });
+});
+
+describe('createAssetGroup', () => {
+  it('sends single batchMutate and returns resource name', async () => {
+    // New impl: single googleAds:mutate call with all ops (text assets + asset group + links)
+    // Input: 1 headline, 1 long headline, 1 description = 3 text asset ops; asset group at index 3
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        mutateOperationResponses: [
+          { assetResult: { resourceName: 'customers/123/assets/-2' } },
+          { assetResult: { resourceName: 'customers/123/assets/-3' } },
+          { assetResult: { resourceName: 'customers/123/assets/-4' } },
+          { assetGroupResult: { resourceName: 'customers/123/assetGroups/1' } },
+          { assetGroupAssetResult: { resourceName: 'customers/123/assetGroupAssets/1' } },
+          { assetGroupAssetResult: { resourceName: 'customers/123/assetGroupAssets/2' } },
+          { assetGroupAssetResult: { resourceName: 'customers/123/assetGroupAssets/3' } },
+          { assetGroupAssetResult: { resourceName: 'customers/123/assetGroupAssets/4' } },
+          { assetGroupAssetResult: { resourceName: 'customers/123/assetGroupAssets/5' } },
+        ],
+      },
+    });
+
+    const result = await service.createAssetGroup('user-123', '1234567890', {
+      name: 'My Asset Group',
+      campaignResourceName: 'customers/123/campaigns/1',
+      headlines: ['Headline 1'],
+      longHeadlines: ['Long Headline 1'],
+      descriptions: ['Description 1'],
+      squareImageAssets: ['customers/123/assets/sq1'],
+      landscapeImageAssets: ['customers/123/assets/ls1'],
+      logoAssets: ['customers/123/assets/logo1'],
+      finalUrl: 'https://example.com',
+    });
+
+    expect(result.resourceName).toBe('customers/123/assetGroups/1');
+    // Single batchMutate call to googleAds:mutate
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.mutateOperations).toBeDefined();
+    // Text assets come first
+    expect(body.mutateOperations[0].assetOperation.create.textAsset.text).toBe('Headline 1');
+    // Asset group is after text assets (index 3)
+    expect(body.mutateOperations[3].assetGroupOperation.create.name).toBe('My Asset Group');
+    expect(body.mutateOperations[3].assetGroupOperation.create.campaign).toBe('customers/123/campaigns/1');
+    expect(body.mutateOperations[3].assetGroupOperation.create.finalUrls[0]).toBe('https://example.com');
+  });
+
+  it('retries without LOGO links on BRAND_ASSETS_NOT_LINKED_AT_CAMPAIGN_LEVEL error', async () => {
+    const brandError = {
+      response: {
+        data: {
+          error: { message: 'BRAND_ASSETS_NOT_LINKED_AT_CAMPAIGN_LEVEL LOGO field not allowed' },
+        },
+      },
+      message: 'BRAND_ASSETS_NOT_LINKED_AT_CAMPAIGN_LEVEL LOGO',
+    };
+    mockAxiosPost
+      .mockRejectedValueOnce(brandError)
+      .mockResolvedValueOnce({
+        data: {
+          mutateOperationResponses: [
+            { assetResult: { resourceName: 'customers/123/assets/-2' } },
+            { assetResult: { resourceName: 'customers/123/assets/-3' } },
+            { assetResult: { resourceName: 'customers/123/assets/-4' } },
+            { assetGroupResult: { resourceName: 'customers/123/assetGroups/1' } },
+            { assetGroupAssetResult: {} },
+            { assetGroupAssetResult: {} },
+            { assetGroupAssetResult: {} },
+            { assetGroupAssetResult: {} },
+          ],
+        },
+      });
+
+    const result = await service.createAssetGroup('user-123', '1234567890', {
+      name: 'Brand Group',
+      campaignResourceName: 'customers/123/campaigns/1',
+      headlines: ['H1'],
+      longHeadlines: ['LH1'],
+      descriptions: ['D1'],
+      squareImageAssets: ['customers/123/assets/sq1'],
+      landscapeImageAssets: ['customers/123/assets/ls1'],
+      logoAssets: ['customers/123/assets/logo1'],
+      finalUrl: 'https://example.com',
+    });
+
+    expect(result.resourceName).toBe('customers/123/assetGroups/1');
+    expect(mockAxiosPost).toHaveBeenCalledTimes(2);
+    // Second call should not contain LOGO link ops
+    const retryBody = mockAxiosPost.mock.calls[1][1];
+    const logoLinks = retryBody.mutateOperations.filter(
+      (op: any) => op.assetGroupAssetOperation?.create?.fieldType === 'LOGO',
+    );
+    expect(logoLinks).toHaveLength(0);
+  });
+});
+
+describe('listKeywords', () => {
+  it('returns keyword list for ad group', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          adGroupCriterion: {
+            resourceName: 'customers/123/adGroupCriteria/789~1',
+            keyword: { text: 'running shoes', matchType: 'BROAD' },
+            status: 'ENABLED',
+            negative: false,
+          },
+        }],
+      },
+    });
+    const keywords = await service.listKeywords('user-123', '1234567890', 'customers/123/adGroups/789');
+    expect(keywords).toHaveLength(1);
+    expect(keywords[0].text).toBe('running shoes');
+    expect(keywords[0].matchType).toBe('BROAD');
+    expect(keywords[0].status).toBe('ENABLED');
+    expect(keywords[0].negative).toBe(false);
+  });
+
+  it('returns empty array when no keywords', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
+    const keywords = await service.listKeywords('user-123', '1234567890', 'customers/123/adGroups/789');
+    expect(keywords).toHaveLength(0);
+  });
+});
+
+describe('updateKeyword', () => {
+  it('sends status update with correct updateMask', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateKeyword('user-123', '1234567890', 'customers/123/adGroupCriteria/789~1', { status: 'PAUSED' });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.resourceName).toBe('customers/123/adGroupCriteria/789~1');
+    expect(body.operations[0].update.status).toBe('PAUSED');
+    expect(body.operations[0].updateMask).toContain('status');
+  });
+
+  it('sends cpcBidMicros update with correct updateMask', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateKeyword('user-123', '1234567890', 'customers/123/adGroupCriteria/789~1', { cpcBidMicros: 1000000 });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.cpcBidMicros).toBe('1000000');
+    expect(body.operations[0].updateMask).toContain('cpc_bid_micros');
+  });
+
+  it('does nothing when no params provided', async () => {
+    await service.updateKeyword('user-123', '1234567890', 'customers/123/adGroupCriteria/789~1', {});
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+});
+
+describe('removeKeyword', () => {
+  it('sends remove operation for criterion', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.removeKeyword('user-123', '1234567890', 'customers/123/adGroupCriteria/789~1');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].remove).toBe('customers/123/adGroupCriteria/789~1');
+  });
+});
+
+describe('updateAd', () => {
+  it('sends status update with correct updateMask', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateAd('user-123', '1234567890', 'customers/123/adGroupAds/1', { status: 'PAUSED' });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.resourceName).toBe('customers/123/adGroupAds/1');
+    expect(body.operations[0].update.status).toBe('PAUSED');
+    expect(body.operations[0].updateMask).toContain('status');
+  });
+
+  it('does nothing when no params provided', async () => {
+    await service.updateAd('user-123', '1234567890', 'customers/123/adGroupAds/1', {});
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+});
+
+describe('removeAd', () => {
+  it('sends remove operation for adGroupAd', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.removeAd('user-123', '1234567890', 'customers/123/adGroupAds/1');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].remove).toBe('customers/123/adGroupAds/1');
+  });
+});
+
+describe('uploadAsset — URL input', () => {
+  it('fetches image from URL and uploads as base64', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: Buffer.from('fake-image-bytes') });
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/assets/2' }] },
+    });
+    const result = await service.uploadAsset('user-123', '1234567890', {
+      type: 'IMAGE',
+      name: 'logo.jpg',
+      data: 'https://example.com/logo.jpg',
+    });
+    expect(result).toBe('customers/123/assets/2');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.imageAsset.data).toBeDefined();
+    expect(body.operations[0].create.type).toBe('IMAGE');
+  });
+
+  it('maps LOGO type to IMAGE for upload', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: Buffer.from('logo-bytes') });
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/assets/3' }] },
+    });
+    await service.uploadAsset('user-123', '1234567890', {
+      type: 'LOGO',
+      name: 'brand-logo.jpg',
+      data: 'https://example.com/brand-logo.jpg',
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.type).toBe('IMAGE');
+  });
+
+  it('throws for IMAGE with non-URL non-Buffer data', async () => {
+    await expect(service.uploadAsset('user-123', '1234567890', {
+      type: 'IMAGE',
+      name: 'test.jpg',
+      data: 'not-a-url' as any,
+    })).rejects.toThrow('IMAGE/LOGO asset data must be a Buffer or an https:// URL string');
+  });
+});
+
+describe('uploadAsset — SSRF protection', () => {
+  it('runs the SSRF guard before fetching and hardens the request', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: Buffer.from('img') });
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/assets/9' }] },
+    });
+    await service.uploadAsset('user-123', '1234567890', {
+      type: 'IMAGE',
+      name: 'hero.jpg',
+      data: 'https://example.com/hero.jpg',
+    });
+    expect(mockAssertPublicHostname).toHaveBeenCalledWith('https://example.com/hero.jpg');
+    // guard must run before the outbound fetch
+    expect(mockAssertPublicHostname.mock.invocationCallOrder[0])
+      .toBeLessThan(mockAxiosGet.mock.invocationCallOrder[0]);
+    const opts = mockAxiosGet.mock.calls[0][1];
+    expect(opts.maxRedirects).toBe(0);
+    expect(opts.maxContentLength).toBeGreaterThan(0);
+    expect(opts.maxBodyLength).toBeGreaterThan(0);
+  });
+
+  it('rejects when the SSRF guard blocks the URL and never fetches', async () => {
+    mockAssertPublicHostname.mockRejectedValueOnce(new SsrfBlockedError());
+    await expect(service.uploadAsset('user-123', '1234567890', {
+      type: 'IMAGE',
+      name: 'evil.jpg',
+      data: 'https://169.254.169.254/latest/meta-data/',
+    })).rejects.toBeInstanceOf(SsrfBlockedError);
+    expect(mockAxiosGet).not.toHaveBeenCalled();
+  });
+
+  it('rejects http:// URLs without invoking the guard or fetching', async () => {
+    await expect(service.uploadAsset('user-123', '1234567890', {
+      type: 'IMAGE',
+      name: 'plain.jpg',
+      data: 'http://example.com/plain.jpg',
+    })).rejects.toThrow('IMAGE/LOGO asset data must be a Buffer or an https:// URL string');
+    expect(mockAssertPublicHostname).not.toHaveBeenCalled();
+    expect(mockAxiosGet).not.toHaveBeenCalled();
+  });
+});
+
+describe('attachCampaignAssets', () => {
+  it('creates text asset and attaches as BUSINESS_NAME', async () => {
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/assets/text-1' }] } }) // text asset creation
+      .mockResolvedValueOnce({ data: { results: [{}] } }); // campaignAssets mutate
+    await service.attachCampaignAssets('user-123', '1234567890', 'customers/123/campaigns/1', [
+      { fieldType: 'BUSINESS_NAME', text: 'My Brand' },
+    ]);
+    const firstBody = mockAxiosPost.mock.calls[0][1];
+    expect(firstBody.operations[0].create.textAsset.text).toBe('My Brand');
+    const secondBody = mockAxiosPost.mock.calls[1][1];
+    expect(secondBody.operations[0].create.campaign).toBe('customers/123/campaigns/1');
+    expect(secondBody.operations[0].create.fieldType).toBe('BUSINESS_NAME');
+    expect(secondBody.operations[0].create.asset).toBe('customers/123/assets/text-1');
+  });
+
+  it('attaches existing asset by resource name without creating text asset', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.attachCampaignAssets('user-123', '1234567890', 'customers/123/campaigns/1', [
+      { fieldType: 'LOGO', assetResourceName: 'customers/123/assets/logo-1' },
+    ]);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.fieldType).toBe('LOGO');
+    expect(body.operations[0].create.asset).toBe('customers/123/assets/logo-1');
+  });
+});
+
+describe('updateAdGroup — adRotationMode and status', () => {
+  it('sends adRotationMode update', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateAdGroup('user-123', '1234567890', 'customers/123/adGroups/789', { adRotationMode: 'OPTIMIZE' });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.adRotationMode).toBe('OPTIMIZE');
+    expect(body.operations[0].updateMask).toContain('ad_rotation_mode');
+  });
+
+  it('sends status update', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.updateAdGroup('user-123', '1234567890', 'customers/123/adGroups/789', { status: 'PAUSED' });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.status).toBe('PAUSED');
+    expect(body.operations[0].updateMask).toContain('status');
+  });
+});
+
+describe('createCampaign — PMax with brand guidelines', () => {
+  it('sends batchMutate with text asset + campaign + campaignAsset ops', async () => {
+    // mutateOperationResponses: [0]=assetResult, [1]=campaignResult, [2]=campaignAssetResult, [3]=campaignAssetResult
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        mutateOperationResponses: [
+          { assetResult: { resourceName: 'customers/123/assets/-2' } },
+          { campaignResult: { resourceName: 'customers/123/campaigns/1' } },
+          { campaignAssetResult: { resourceName: 'customers/123/campaignAssets/1' } },
+          { campaignAssetResult: { resourceName: 'customers/123/campaignAssets/2' } },
+        ],
+      },
+    });
+    const result = await service.createCampaign('user-123', '1234567890', {
+      name: 'PMax Brand Campaign',
+      type: 'PERFORMANCE_MAX',
+      budgetResourceName: 'customers/123/campaignBudgets/1',
+      biddingStrategy: 'MAXIMIZE_CONVERSION_VALUE',
+      locationTargetIds: [],
+      brandBusinessName: 'My Brand',
+      brandLogoAssetResourceName: 'customers/123/assets/logo-1',
+    });
+    expect(result.resourceName).toBe('customers/123/campaigns/1');
+    const body = mockAxiosPost.mock.calls[0][1];
+    // First op: text asset for business name
+    expect(body.mutateOperations[0].assetOperation.create.textAsset.text).toBe('My Brand');
+    // Second op: campaign
+    expect(body.mutateOperations[1].campaignOperation.create.name).toBe('PMax Brand Campaign');
+    // Third op: BUSINESS_NAME campaign asset
+    expect(body.mutateOperations[2].campaignAssetOperation.create.fieldType).toBe('BUSINESS_NAME');
+    // Fourth op: LOGO campaign asset
+    expect(body.mutateOperations[3].campaignAssetOperation.create.fieldType).toBe('LOGO');
+    expect(body.mutateOperations[3].campaignAssetOperation.create.asset).toBe('customers/123/assets/logo-1');
+  });
+});
+
+
