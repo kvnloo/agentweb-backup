@@ -337,6 +337,8 @@ describe('MetaService', () => {
             expect(callArgs.asset_feed_spec.link_urls).toEqual([{ website_url: 'http://example.com' }]);
             expect(callArgs.asset_feed_spec.ad_formats).toEqual(['SINGLE_IMAGE']);
             expect(callArgs.asset_feed_spec.call_to_action_types).toEqual(['LEARN_MORE']);
+            // Placement-customization creatives must be marked optimization_type=PLACEMENT
+            expect(callArgs.asset_feed_spec.optimization_type).toBe('PLACEMENT');
 
             // The vertical asset is scoped to story + reels placements (FB + IG positions unioned)
             const rules = callArgs.asset_feed_spec.asset_customization_rules;
@@ -347,13 +349,19 @@ describe('MetaService', () => {
             expect(verticalRule.customization_spec.instagram_positions).toEqual(
                 expect.arrayContaining(['story', 'reels'])
             );
+            // Scoped rules must NOT carry an is_default flag
+            expect(verticalRule.customization_spec.is_default).toBeUndefined();
+            // Rule shape per Meta docs: no `priority` field
+            expect(verticalRule.priority).toBeUndefined();
 
-            // The square asset is the default/fallback rule
+            // The square asset is the fallback rule — an EMPTY customization_spec ({}), per Meta docs
+            // (NOT { is_default: true }, which Meta rejects).
             const defaultRule = rules.find((r: any) => r.image_label.name === 'asset_0');
-            expect(defaultRule.customization_spec.is_default).toBe(true);
+            expect(defaultRule.customization_spec).toEqual({});
 
-            // Still includes object_story_spec so the creative renders on the Page
+            // object_story_spec carries only the Page; all copy/link lives in asset_feed_spec
             expect(callArgs.object_story_spec.page_id).toBe('page_123');
+            expect(callArgs.object_story_spec.link_data).toBeUndefined();
         });
     });
 

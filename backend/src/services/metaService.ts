@@ -875,13 +875,17 @@ export class MetaService {
    * asset is the default/fallback (is_default or no placements); the rest are scoped to placement
    * groups (feed, story, reels, …) which expand to Meta customization_spec objects.
    *
-   * Resulting shape (link/image ad):
-   *   object_story_spec: { page_id, link_data: { link, message, name, call_to_action } }
+   * Shape matches Meta's Placement Asset Customization docs:
+   *   object_story_spec: { page_id }
    *   asset_feed_spec: {
    *     images: [{ hash, adlabels: [{ name }] }, ...],
    *     bodies / titles / link_urls / call_to_action_types: [...],
    *     ad_formats: ['SINGLE_IMAGE'],
-   *     asset_customization_rules: [{ customization_spec, image_label: { name }, priority }, ...],
+   *     optimization_type: 'PLACEMENT',
+   *     asset_customization_rules: [
+   *       { customization_spec: { publisher_platforms, *_positions }, image_label: { name } },  // scoped
+   *       { customization_spec: {}, image_label: { name } },                                     // fallback
+   *     ],
    *   }
    */
   private async createPlacementCustomizedCreative(
@@ -893,7 +897,6 @@ export class MetaService {
 
     const images: any[] = [];
     const rules: any[] = [];
-    let priority = 0;
 
     for (let i = 0; i < assets.length; i++) {
       const asset = assets[i];
@@ -910,7 +913,15 @@ export class MetaService {
       images.push({ hash, adlabels: [{ name: label }] });
 
       const isDefault = asset.is_default || !asset.placements || asset.placements.length === 0;
-      if (isDefault) continue; // the default image needs no rule — it fills unmatched placements
+      if (isDefault) {
+        // Per Meta docs, the fallback rule uses an EMPTY customization_spec ({}); it catches
+        // every placement not matched by a scoped rule. (NOT { is_default: true } — that is invalid.)
+        rules.push({
+          customization_spec: {},
+          image_label: { name: label },
+        });
+        continue;
+      }
 
       const customizationSpec = asset.customization_spec || MetaService.buildCustomizationSpec(asset.placements!);
       if (!customizationSpec) {
@@ -919,17 +930,8 @@ export class MetaService {
       rules.push({
         customization_spec: customizationSpec,
         image_label: { name: label },
-        priority: priority++,
       });
     }
-
-    // The default image is matched by an is_default rule that catches every other placement.
-    const defaultIdx = assets.findIndex(a => a.is_default || !a.placements || a.placements.length === 0);
-    rules.push({
-      customization_spec: { is_default: true } as any,
-      image_label: { name: `asset_${defaultIdx}` },
-      priority: priority++,
-    });
 
     const assetFeedSpec: any = {
       images,
@@ -937,23 +939,17 @@ export class MetaService {
       titles: [{ text: params.title }],
       link_urls: [{ website_url: params.link_url }],
       ad_formats: ['SINGLE_IMAGE'],
+      optimization_type: 'PLACEMENT',
       asset_customization_rules: rules,
     };
     if (params.call_to_action_type) {
       assetFeedSpec.call_to_action_types = [params.call_to_action_type];
     }
 
+    // For asset_feed_spec creatives, all copy/link/format live in asset_feed_spec; object_story_spec
+    // carries only the Page (and optionally instagram_user_id). Keep it minimal to match Meta's examples.
     const objectStorySpec: any = {
       page_id: params.page_id,
-      link_data: {
-        link: params.link_url,
-        message: params.body,
-        name: params.title,
-        call_to_action: params.call_to_action_type ? {
-          type: params.call_to_action_type,
-          value: { link: params.link_url },
-        } : undefined,
-      },
     };
 
     const creativeParams: any = {
