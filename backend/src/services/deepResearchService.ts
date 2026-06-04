@@ -1,6 +1,6 @@
 import { GoogleGenAI } from '@google/genai';
 import { getSecret } from "../utils/secretsManager";
-import { DEEP_RESEARCH_AGENT } from '../config';
+import { DEEP_RESEARCH_AGENT_SPEED, DEEP_RESEARCH_AGENT_MAX } from '../config';
 
 /**
  * Result from deep research operation
@@ -146,11 +146,19 @@ export class DeepResearchService {
       }
 
       console.log(`Deep Research Prompt: ${researchInput}`);
-      
+
+      // Select the agent tier by requested depth: the most thorough requests use
+      // the "max" agent for maximum comprehensiveness; everything else uses the
+      // faster "speed" agent.
+      const agent = params.depth === 'comprehensive'
+        ? DEEP_RESEARCH_AGENT_MAX
+        : DEEP_RESEARCH_AGENT_SPEED;
+      console.log(`Deep Research agent: ${agent} (depth: ${params.depth || 'default'})`);
+
       // Start the Deep Research Agent with background=true for async execution
       const initialInteraction = await ai.interactions.create({
         input: researchInput,
-        agent: DEEP_RESEARCH_AGENT,
+        agent,
         background: true,
       });
 
