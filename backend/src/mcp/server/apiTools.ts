@@ -1327,8 +1327,8 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'PUT', path: `/api/crm/lists/${args.list_id}`, context: ctx(context),
-      body: { publicAccessEnabled: true }
+      method: 'PUT', path: `/api/crm/lists/${args.list_id}/public-access`, context: ctx(context),
+      body: { enabled: true }
     });
     return jsonResult(data);
   }
