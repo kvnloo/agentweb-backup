@@ -13,6 +13,7 @@ import { getHubSpotConfig } from '../config/integrations';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
 import { agentModeService } from '../services/agentModeService';
 import { resendService } from '../services/resendService';
+import { sendRoadmapDeliveryEmail } from '../services/roadmapDelivery';
 import { emmaEmailService } from '../services/emmaEmailService';
 import { TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
 import { isDoNotContact } from '../utils/leadContactStatus';
@@ -452,6 +453,20 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         event: 'lead.unchanged',
         leadId: lead.leadId,
         listId: leadList.listId
+      });
+    }
+
+    // WORKAROUND (2026-06-04): deliver the AI Readiness roadmap PDF directly.
+    // The proper path (list-bound drip sequence) is not usable yet — the
+    // sequence feature is not production ready and this webhook does not
+    // auto-enroll (AGW-37509247-c951-8108-9545-fb47c0914bdc). Send only on new
+    // leads to avoid re-sending on repeat submits. Fire-and-forget; never blocks.
+    if (isNew) {
+      void sendRoadmapDeliveryEmail({
+        to: lead.email,
+        stage: mergedCustomFields.stage,
+        source: mergedCustomFields.source,
+        firstName: lead.firstName,
       });
     }
 
