@@ -12301,10 +12301,39 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
+  /**
+   * Ensure every placement_assets entry has an image_hash. asset_feed_spec.images only accepts
+   * hashes (not CDN URLs), so any asset given as image_url is uploaded here and replaced with the
+   * returned hash. Returns a shallow copy with placement_assets resolved; non-placement params
+   * are passed through untouched.
+   */
+  private async resolvePlacementAssetHashes<T extends { placement_assets?: any[] }>(
+    userId: string,
+    params: T,
+    account_id?: string
+  ): Promise<T> {
+    if (!params.placement_assets || params.placement_assets.length === 0) {
+      return params;
+    }
+    const resolved = await Promise.all(params.placement_assets.map(async (asset: any) => {
+      if (asset.image_hash || !asset.image_url) return asset;
+      const uploaded = await this.uploadMetaAdsImage(userId, asset.image_url, account_id);
+      if (!uploaded?.image_hash) {
+        throw new Error(`Failed to upload placement asset image from ${asset.image_url}: ${uploaded?.message || 'no hash returned'}`);
+      }
+      // Drop image_url once hashed so the builder uses the hash.
+      const { image_url, ...rest } = asset;
+      return { ...rest, image_hash: uploaded.image_hash };
+    }));
+    return { ...params, placement_assets: resolved };
+  }
+
   public async createMetaAdsAdCreative(userId: string, params: MetaAdsAdCreativeParams & { account_id?: string }): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, params.account_id);
-      const creative = await metaService.createAdCreative(accountId, accessToken, params);
+      // asset_feed_spec.images only accepts image hashes — resolve any placement_assets URLs to hashes first.
+      const resolvedParams = await this.resolvePlacementAssetHashes(userId, params, params.account_id);
+      const creative = await metaService.createAdCreative(accountId, accessToken, resolvedParams);
 
       return {
         success: true,
@@ -12460,7 +12489,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * Keys that indicate a destination/creative content change rather than an ad-level change.
    * When these are present in params, we need to create a new creative and swap it.
    */
-  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type'];
+  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets'];
 
   public async updateMetaAdsAd(userId: string, adId: string, params: any, account_id?: string): Promise<any> {
     try {
@@ -12495,7 +12524,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
 
       if (creativeKeys.length > 0) {
-        return await this.updateAdViaCreativeSwap(accessToken, accountId, adId, params, creativeKeys);
+        return await this.updateAdViaCreativeSwap(userId, accessToken, accountId, adId, params, creativeKeys);
       }
 
       // Standard ad-level update (status, name, etc.)
@@ -12523,6 +12552,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * 4. Updating the ad to reference the new creative
    */
   private async updateAdViaCreativeSwap(
+    userId: string,
     accessToken: string,
     accountId: string,
     adId: string,
@@ -12563,7 +12593,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // Determine current creative type and extract existing fields
     let newCreativeParams: any;
 
-    if (existingSpec.video_data) {
+    if (params.placement_assets) {
+      // Placement-customized image creative (asset_feed_spec): map different images to different
+      // placements (e.g. keep the square Feed image, add a 9:16 asset for Stories/Reels) in one
+      // creative. Copy/link/CTA carry over from the existing creative unless overridden.
+      const ld = existingSpec.link_data || {};
+      const vd = existingSpec.video_data || {};
+      newCreativeParams = {
+        name: params.name || `${creativeData.name || 'Creative'} (placement-customized)`,
+        page_id: pageId,
+        placement_assets: params.placement_assets,
+        body: params.body || ld.message || vd.message || creativeData.body || '',
+        title: params.title || ld.name || vd.title || creativeData.title || '',
+        link_url: newLinkUrl || ld.link || vd.call_to_action?.value?.link || '',
+        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || vd.call_to_action?.type,
+      };
+    } else if (existingSpec.video_data) {
       // Video creative
       const vd = existingSpec.video_data;
       newCreativeParams = {
@@ -12619,6 +12664,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     console.log(`AgentMode: Creating new creative with updated fields for ad ${adId}:`, newCreativeParams);
+
+    // asset_feed_spec.images only accepts image hashes — resolve any placement_assets URLs first.
+    newCreativeParams = await this.resolvePlacementAssetHashes(userId, newCreativeParams, accountId);
 
     // Create the new creative
     const newCreative = await metaService.createAdCreative(accountId, accessToken, newCreativeParams);
