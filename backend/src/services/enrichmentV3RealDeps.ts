@@ -394,7 +394,7 @@ async function fetchWebForGroupReal(
   }
   console.log(`${wtag} query="${query.slice(0, 120)}"`);
 
-  // 3. Google CSE
+  // 3. Google CSE — for company_technographic also run a job-postings query
   let webResults: any[] = [];
   try {
     const search = await agentModeService.searchWeb(query, 10);
@@ -405,6 +405,25 @@ async function fetchWebForGroupReal(
     console.warn(`${wtag} searchWeb ERROR ${(err as Error).message}`);
     return null;
   }
+
+  if (groupName === 'company_technographic') {
+    const jobsQuery = CrmEnrichmentService.applySearchTemplate(
+      '{{emailDomain}} job posting required tools technologies software',
+      lead,
+    );
+    try {
+      const jobsSearch = await agentModeService.searchWeb(jobsQuery, 5);
+      if (jobsSearch?.success && Array.isArray(jobsSearch.results)) {
+        const existingUrls = new Set(webResults.map((r: any) => r.url || r.link));
+        for (const r of jobsSearch.results) {
+          if (!existingUrls.has(r.url || r.link)) webResults.push(r);
+        }
+      }
+    } catch (err) {
+      console.warn(`${wtag} jobsSearch ERROR ${(err as Error).message}`);
+    }
+  }
+
   if (webResults.length === 0) {
     console.log(`${wtag} MISS searchWeb returned 0 results`);
     return null;
@@ -462,6 +481,8 @@ export function buildFieldGuidanceV3(fields: string[], configFieldsByName: Recor
       guidance = `ONLY copy a LinkedIn company page URL that appears verbatim in the source data above. The URL must start with "https://www.linkedin.com/company/". Do NOT construct, guess, or complete a URL. Return null if no exact /company/ URL is present in the data.`;
     } else if (/linkedin/.test(fl)) {
       guidance = `ONLY copy a linkedin.com/in/ URL that appears verbatim in the provided data. Do NOT construct, guess, or complete a URL — even if you think you know the person's LinkedIn handle. Do NOT use /pub/dir/ or /search/ URLs. Return null if no exact /in/ URL is present in the data.`;
+    } else if (name === 'tech_stack') {
+      guidance = instr || `Extract all software tools, SaaS products, platforms, and technical services this company uses — including analytics, CMS, marketing automation, cloud infrastructure, payment processors, and other integrations. Look in job postings (required tools), integration/app pages, and tech profile data. Return as a comma-separated list. Return null if nothing found.`;
     } else if (instr) {
       guidance = instr;
     } else {
