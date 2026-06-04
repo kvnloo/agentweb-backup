@@ -3175,6 +3175,79 @@ export class AgentModeService {
     }
   }
 
+  /**
+   * Render a session work plan into LLM context message(s).
+   *
+   * Shared by agent mode (buildMarketingContext) and Emma (chatbotService.generateChatResponse)
+   * so that whichever assistant the user is chatting with sees and follows the same active plan.
+   *
+   * - When every step is terminal (completed/skipped): emits a single user-role [SYSTEM] message
+   *   instructing the LLM not to re-execute finished work.
+   * - Otherwise: emits an assistant-role message listing each step with its status, description,
+   *   required functions, and auto-installed skills, plus autocomplete guidance when enabled.
+   *
+   * Returns an empty array when there is no work plan or it has no steps.
+   */
+  public static buildWorkPlanContextMessages(workPlan?: any): any[] {
+    if (!workPlan || !Array.isArray(workPlan.steps) || workPlan.steps.length === 0) {
+      return [];
+    }
+
+    const statusIcons = {
+      completed: '✓',
+      pending: '○',
+      skipped: '⊘'
+    };
+
+    // Check if all steps are terminal (completed or skipped) — no pending work remains
+    const allStepsDone = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+
+    let workPlanContent = `⚠️ IMPORTANT: A WORK PLAN ALREADY EXISTS FOR THIS SESSION ⚠️\n\n`;
+    workPlanContent += `[Current Active Work Plan: "${workPlan.title}"]\n\n`;
+
+    if (allStepsDone) {
+      // When all steps are done, skip listing step details to avoid the LLM trying to "finish" them.
+      // Use a user-role message so it appears as a direct instruction right before the assistant responds.
+      const completedCount = workPlan.steps.filter((s: any) => s.status === 'completed').length;
+      const skippedCount = workPlan.steps.filter((s: any) => s.status === 'skipped').length;
+      workPlanContent += `✅ ALL ${workPlan.steps.length} STEPS ARE DONE (${completedCount} completed, ${skippedCount} skipped). `;
+      workPlanContent += `DO NOT retry or re-execute any work plan steps. DO NOT call generate_image or other tools to redo completed work. `;
+      workPlanContent += `If the user is asking about the completed work, respond with a plain-text summary. If the user is asking for something new and unrelated to the work plan, help them with that new request normally.`;
+      return [{ role: 'user', content: `[SYSTEM] ${workPlanContent.trim()}` }];
+    }
+
+    workPlanContent += `You MUST continue working with this existing plan. DO NOT create a new work plan. Use modify_work_plan if you need to add or change steps.\n\n`;
+
+    // If autocomplete is enabled, add instruction to auto-complete steps
+    if (workPlan.autocomplete) {
+      workPlanContent += `⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.\n\n`;
+    }
+
+    workPlan.steps.forEach((step: any) => {
+      const icon = statusIcons[step.status as keyof typeof statusIcons];
+      workPlanContent += `${step.stepCount}. ${icon} ${step.title} (${step.status})\n`;
+
+      // Include step description if available
+      if (step.description) {
+        workPlanContent += `   Description: ${step.description}\n`;
+      }
+
+      // Include required function calls if available
+      if (step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
+        workPlanContent += `   Required Functions: ${step.requiredFunctionCalls.join(', ')}\n`;
+      }
+
+      // Include skill IDs if available (for awareness)
+      if (step.skillIds && step.skillIds.length > 0) {
+        workPlanContent += `   Skills (auto-installed when this step becomes active): ${step.skillIds.join(', ')}\n`;
+      }
+
+      workPlanContent += '\n';
+    });
+
+    return [{ role: 'assistant', content: workPlanContent.trim() }];
+  }
+
   private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
@@ -3333,62 +3406,7 @@ export class AgentModeService {
 
     // Insert work plan status as an assistant message if exists
     if (workPlan) {
-      const statusIcons = {
-        completed: '✓',
-        pending: '○',
-        skipped: '⊘'
-      };
-
-      // Check if all steps are terminal (completed or skipped) — no pending work remains
-      const allStepsDone = workPlan.steps.length > 0 &&
-        workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
-
-      let workPlanContent = `⚠️ IMPORTANT: A WORK PLAN ALREADY EXISTS FOR THIS SESSION ⚠️\n\n`;
-      workPlanContent += `[Current Active Work Plan: "${workPlan.title}"]\n\n`;
-
-      if (allStepsDone) {
-        // When all steps are done, skip listing step details to avoid the LLM trying to "finish" them.
-        // Use a user-role message so it appears as a direct instruction right before the assistant responds.
-        const completedCount = workPlan.steps.filter((s: any) => s.status === 'completed').length;
-        const skippedCount = workPlan.steps.filter((s: any) => s.status === 'skipped').length;
-        workPlanContent += `✅ ALL ${workPlan.steps.length} STEPS ARE DONE (${completedCount} completed, ${skippedCount} skipped). `;
-        workPlanContent += `DO NOT retry or re-execute any work plan steps. DO NOT call generate_image or other tools to redo completed work. `;
-        workPlanContent += `If the user is asking about the completed work, respond with a plain-text summary. If the user is asking for something new and unrelated to the work plan, help them with that new request normally.`;
-        console.log('workPlanContent', workPlanContent);
-        messages.push({ role: 'user', content: `[SYSTEM] ${workPlanContent.trim()}` });
-      } else {
-        workPlanContent += `You MUST continue working with this existing plan. DO NOT create a new work plan. Use modify_work_plan if you need to add or change steps.\n\n`;
-
-        // If autocomplete is enabled, add instruction to auto-complete steps
-        if (workPlan.autocomplete) {
-          workPlanContent += `⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.\n\n`;
-        }
-
-        workPlan.steps.forEach((step: any) => {
-          const icon = statusIcons[step.status as keyof typeof statusIcons];
-          workPlanContent += `${step.stepCount}. ${icon} ${step.title} (${step.status})\n`;
-
-          // Include step description if available
-          if (step.description) {
-            workPlanContent += `   Description: ${step.description}\n`;
-          }
-
-          // Include required function calls if available
-          if (step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
-            workPlanContent += `   Required Functions: ${step.requiredFunctionCalls.join(', ')}\n`;
-          }
-
-          // Include skill IDs if available (for awareness)
-          if (step.skillIds && step.skillIds.length > 0) {
-            workPlanContent += `   Skills (auto-installed when this step becomes active): ${step.skillIds.join(', ')}\n`;
-          }
-
-          workPlanContent += '\n';
-        });
-
-        console.log('workPlanContent', workPlanContent);
-        messages.push({ role: 'assistant', content: workPlanContent.trim() });
-      }
+      messages.push(...AgentModeService.buildWorkPlanContextMessages(workPlan));
     }
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)

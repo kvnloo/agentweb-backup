@@ -3926,6 +3926,22 @@ export async function generateChatResponse(
       retrievalErrorOccurred = true;
     }
 
+    // Inject the session's active work plan so Emma sees and follows it while chatting,
+    // mirroring agent mode. Without this, Emma can create/modify a plan but is blind to an
+    // existing one — she won't continue it or update step statuses. Insert right before the
+    // final user message so it reads as the most recent context.
+    if (session.workPlan) {
+      const workPlanMessages = AgentModeService.buildWorkPlanContextMessages(session.workPlan);
+      if (workPlanMessages.length > 0) {
+        const lastUserMsgIndex = messages.map((m) => m.role).lastIndexOf("user");
+        const insertAt = lastUserMsgIndex >= 0 ? lastUserMsgIndex : messages.length;
+        messages.splice(insertAt, 0, ...workPlanMessages.map((m) => ({
+          ...m,
+          metadata: { timestamp },
+        })));
+      }
+    }
+
     // Initialize tool support for Emma (customer portal, or admin users on any portal)
     let agentModeService: AgentModeService | null = null;
     let toolDefinitions: any[] = [];
