@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-04',
     changes: [
+      'Fixed: Leads From Landing-Page Forms Now Start Your Drip Sequence Automatically',
+      '- When a lead came in through a public landing-page form, they were saved to your list but never enrolled in a drip sequence set to auto-enroll that list — so the first email (for example the "here\'s your PDF" message) never went out',
+      '- Leads captured through a form now enroll in any sequence watching that list, exactly like leads you add manually or quick-add',
+      '- This applies to both brand-new leads and existing leads that get updated by a new form submission',
+    ],
+  },
+  {
+    date: '2026-06-04',
+    changes: [
       'Fixed: Data Analysis Now Reads Large Files Reliably Instead of Guessing From Truncated Data',
       '- When you asked Emma to analyze large data files (for example usage or billing totals across many sessions), the files were not actually reaching the analysis sandbox, so it fell back to working from a shortened, inline copy of the data',
       '- This produced inconsistent and untrustworthy numbers — the same question could return a different grand total each time, and category breakdowns would not add up',
