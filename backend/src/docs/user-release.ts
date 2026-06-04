@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-06-03
+// Last updated: 2026-06-04
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,16 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-06-04',
+    changes: [
+      'New: Scheduled Chats Can Now Improve Their Own Prompt Over Time',
+      '- Turn on the new "Self-improve prompt" switch when creating or editing a scheduled chat (it\'s off by default)',
+      '- After each run — including test runs, so you can try it out — Emma reflects on how it went and on anything else it can see in your account to spot ways the schedule could do better next time',
+      '- When it finds a clear improvement, it refines the schedule\'s prompt for you, so future runs get better on their own',
+      '- Every prompt change (whether from self-improve, an edit you make, or one you ask Emma for) now saves the previous version, keeping the last 10 so you can always revert',
+    ],
+  },
   {
     date: '2026-06-03',
     changes: [
