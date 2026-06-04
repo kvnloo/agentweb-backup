@@ -1,6 +1,6 @@
 import { GoogleGenAI } from '@google/genai';
 import { getSecret } from "../utils/secretsManager";
-import { DEEP_RESEARCH_AGENT } from '../config';
+import { DEEP_RESEARCH_AGENT_SPEED, DEEP_RESEARCH_AGENT_MAX } from '../config';
 
 /**
  * Result from deep research operation
@@ -26,8 +26,51 @@ interface DeepResearchParams {
 }
 
 /**
+ * Extract the full markdown report from a completed Deep Research interaction.
+ *
+ * The April 2026 agents (deep-research-preview-04-2026 /
+ * deep-research-max-preview-04-2026) return the report under `steps`: the user
+ * turn is a `user_input` step, and the report is emitted across one or more
+ * `model_output` steps, each whose `content` array holds text chunks (and
+ * optionally `image` chunks for charts). The complete report is the
+ * concatenation of every model_output text chunk, in order.
+ *
+ * Older agents returned the report in a flat `outputs` array, so we fall back to
+ * that shape when no `steps` are present.
+ */
+export function extractReportText(interaction: any): string {
+  const steps = interaction?.steps;
+  if (Array.isArray(steps) && steps.length > 0) {
+    const chunks: string[] = [];
+    for (const step of steps) {
+      if (step?.type !== 'model_output') continue;
+      const content = Array.isArray(step.content) ? step.content : [];
+      for (const item of content) {
+        if (item?.type === 'text' && typeof item.text === 'string' && item.text) {
+          chunks.push(item.text);
+        }
+      }
+    }
+    if (chunks.length > 0) {
+      return chunks.join('\n\n').trim();
+    }
+  }
+
+  // Legacy fallback: flat outputs array, take the last text output.
+  const outputs = interaction?.outputs;
+  if (Array.isArray(outputs) && outputs.length > 0) {
+    const finalOutput = outputs[outputs.length - 1];
+    if (finalOutput && typeof finalOutput.text === 'string') {
+      return finalOutput.text.trim();
+    }
+  }
+
+  return '';
+}
+
+/**
  * Simplified Deep Research Service
- * 
+ *
  * This service handles only the Gemini Deep Research API calls.
  * All content processing (restyling, image placeholders, HTML generation)
  * is handled by blog.ts.
@@ -146,11 +189,19 @@ export class DeepResearchService {
       }
 
       console.log(`Deep Research Prompt: ${researchInput}`);
-      
+
+      // Select the agent tier by requested depth: the most thorough requests use
+      // the "max" agent for maximum comprehensiveness; everything else uses the
+      // faster "speed" agent.
+      const agent = params.depth === 'comprehensive'
+        ? DEEP_RESEARCH_AGENT_MAX
+        : DEEP_RESEARCH_AGENT_SPEED;
+      console.log(`Deep Research agent: ${agent} (depth: ${params.depth || 'default'})`);
+
       // Start the Deep Research Agent with background=true for async execution
       const initialInteraction = await ai.interactions.create({
         input: researchInput,
-        agent: DEEP_RESEARCH_AGENT,
+        agent,
         background: true,
       });
 
@@ -229,23 +280,17 @@ export class DeepResearchService {
 
       console.log('Deep research completed successfully');
 
-      // Extract the research report from the interaction outputs
-      const outputs = (interaction as any).outputs || [];
-      if (outputs.length === 0) {
-        return {
-          success: false,
-          error: 'Deep research completed but no output was returned.'
-        };
-      }
-
-      // Get the final text output (usually the last one)
-      const finalOutput = outputs[outputs.length - 1];
-      const researchText = 'text' in finalOutput ? (finalOutput.text as string) || '' : '';
+      // Extract the research report. The April 2026 Deep Research agents return
+      // the report under `steps` (each model_output step holds a chunk of the
+      // report, streamed across multiple steps), not the legacy `outputs` array.
+      // The full report is the concatenation of every model_output text chunk in
+      // order. We still fall back to `outputs` for backward compatibility.
+      const researchText = extractReportText(interaction);
 
       if (!researchText) {
         return {
           success: false,
-          error: 'Deep research completed but the research report is empty.'
+          error: 'Deep research completed but no report content was returned.'
         };
       }
 

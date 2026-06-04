@@ -1,8 +1,8 @@
 // Unit tests for deepResearchService
 
-import { DeepResearchService } from '../services/deepResearchService';
+import { DeepResearchService, extractReportText } from '../services/deepResearchService';
 import * as secretsManager from '../utils/secretsManager';
-import { DEEP_RESEARCH_AGENT } from '../config';
+import { DEEP_RESEARCH_AGENT, DEEP_RESEARCH_AGENT_SPEED, DEEP_RESEARCH_AGENT_MAX } from '../config';
 
 // Mock dependencies
 jest.mock('../utils/secretsManager');
@@ -79,9 +79,86 @@ describe('DeepResearchService', () => {
   });
 
   describe('Config Constants', () => {
-    it('should use the correct deep research agent from config', () => {
-      // Verify the agent name matches our config constant
-      expect(DEEP_RESEARCH_AGENT).toBe('deep-research-pro-preview-12-2025');
+    it('should use the April 2026 speed and max deep research agents', () => {
+      // Verify the agent names match Google's April 2026 Deep Research agents.
+      expect(DEEP_RESEARCH_AGENT_SPEED).toBe('deep-research-preview-04-2026');
+      expect(DEEP_RESEARCH_AGENT_MAX).toBe('deep-research-max-preview-04-2026');
+    });
+
+    it('should default to the speed agent', () => {
+      expect(DEEP_RESEARCH_AGENT).toBe(DEEP_RESEARCH_AGENT_SPEED);
+    });
+  });
+
+  describe('extractReportText', () => {
+    it('should concatenate text from all model_output steps in order', () => {
+      const interaction = {
+        steps: [
+          { type: 'user_input', content: [{ type: 'text', text: 'the prompt' }] },
+          { type: 'model_output', content: [{ type: 'text', text: '# Title\n\nIntro.' }] },
+          {
+            type: 'model_output',
+            content: [
+              { type: 'image', mime_type: 'image/png', data: 'base64==' },
+              { type: 'text', text: 'Second chunk continues the report.' },
+            ],
+          },
+        ],
+      };
+
+      const result = extractReportText(interaction);
+
+      expect(result).toBe('# Title\n\nIntro.\n\nSecond chunk continues the report.');
+    });
+
+    it('should ignore user_input steps and image content', () => {
+      const interaction = {
+        steps: [
+          { type: 'user_input', content: [{ type: 'text', text: 'should not appear' }] },
+          { type: 'model_output', content: [{ type: 'image', mime_type: 'image/png', data: 'x' }] },
+          { type: 'model_output', content: [{ type: 'text', text: 'Only this.' }] },
+        ],
+      };
+
+      const result = extractReportText(interaction);
+
+      expect(result).toBe('Only this.');
+      expect(result).not.toContain('should not appear');
+    });
+
+    it('should fall back to the legacy outputs array when no steps are present', () => {
+      const interaction = {
+        outputs: [
+          { type: 'text', text: 'first' },
+          { type: 'text', text: 'final report text' },
+        ],
+      };
+
+      const result = extractReportText(interaction);
+
+      // Legacy behavior: take the last text output.
+      expect(result).toBe('final report text');
+    });
+
+    it('should return empty string when there is no usable content', () => {
+      expect(extractReportText({ steps: [] })).toBe('');
+      expect(extractReportText({ outputs: [] })).toBe('');
+      expect(extractReportText({})).toBe('');
+      expect(extractReportText(null)).toBe('');
+      expect(
+        extractReportText({ steps: [{ type: 'model_output', content: [] }] })
+      ).toBe('');
+    });
+
+    it('should prefer steps over a legacy outputs array when both exist', () => {
+      const interaction = {
+        steps: [
+          { type: 'model_output', content: [{ type: 'text', text: 'from steps' }] },
+        ],
+        outputs: [{ type: 'text', text: 'from outputs' }],
+      };
+
+      expect(extractReportText(interaction)).toBe('from steps');
     });
   });
 
@@ -146,9 +223,64 @@ describe('DeepResearchService', () => {
         topic: 'Tech trends',
         style: 'substack'
       };
-      
+
       // Verify substack style is accepted
       expect(params.style).toBe('substack');
+    });
+  });
+
+  describe('Agent Tier Selection by Depth', () => {
+    const mockGoogleGenAI = require('@google/genai').GoogleGenAI;
+    let createMock: jest.Mock;
+
+    beforeEach(() => {
+      mockGetSecret.mockResolvedValue('test-api-key');
+
+      // Resolve immediately as completed so performDeepResearch returns without polling.
+      const completedInteraction = {
+        id: 'interaction-1',
+        status: 'completed',
+        outputs: [{ text: '# Title\n\nReport body content.' }],
+      };
+      createMock = jest.fn().mockResolvedValue(completedInteraction);
+      mockGoogleGenAI.mockImplementation(() => ({
+        interactions: {
+          create: createMock,
+          get: jest.fn().mockResolvedValue(completedInteraction),
+        },
+      }));
+    });
+
+    it('should use the max agent for comprehensive depth', async () => {
+      await deepResearchService.performDeepResearch({
+        topic: 'Quantum computing',
+        depth: 'comprehensive',
+      });
+
+      expect(createMock).toHaveBeenCalledWith(
+        expect.objectContaining({ agent: DEEP_RESEARCH_AGENT_MAX })
+      );
+    });
+
+    it('should use the speed agent for detailed depth', async () => {
+      await deepResearchService.performDeepResearch({
+        topic: 'Quantum computing',
+        depth: 'detailed',
+      });
+
+      expect(createMock).toHaveBeenCalledWith(
+        expect.objectContaining({ agent: DEEP_RESEARCH_AGENT_SPEED })
+      );
+    });
+
+    it('should use the speed agent when depth is not provided', async () => {
+      await deepResearchService.performDeepResearch({
+        topic: 'Quantum computing',
+      });
+
+      expect(createMock).toHaveBeenCalledWith(
+        expect.objectContaining({ agent: DEEP_RESEARCH_AGENT_SPEED })
+      );
     });
   });
 
