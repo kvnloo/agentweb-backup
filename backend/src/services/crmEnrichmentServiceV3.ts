@@ -1032,7 +1032,7 @@ export async function runEnrichment(
           // Filter injected dep fills (synthetic fields added for smart-field resolution) from
           // the snapshot — they were never in the user's config and should not be reverted.
           // (Value shape validation — e.g. dropping malformed LinkedIn URLs — happens earlier
-          // in normalizeFills, keyed on canonical name so all sources + aliases are covered.)
+          // in normalizeFills, keyed on canonical name so all enrichment sources are covered.)
           const writableFills = outcome.fills.filter(f => !injectedDepNames.has(f.field));
           // Apply the same overwrite policy as writeLeadOutcome so the snapshot and
           // analytics only cover fills that will actually reach the DB (excludes

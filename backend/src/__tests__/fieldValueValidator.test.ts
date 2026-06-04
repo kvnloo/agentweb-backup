@@ -17,9 +17,34 @@ describe('isValidFieldValue', () => {
       expect(isValidFieldValue('company_linkedin_url', 'https://www.linkedin.com/in/janedoe')).toBe(false);
     });
 
+    it('rejects lookalike domains (host anchor)', () => {
+      expect(isValidFieldValue('company_linkedin_url', 'https://notlinkedin.com/company/acme')).toBe(false);
+      expect(isValidFieldValue('linkedin_url', 'https://notlinkedin.com/in/janedoe')).toBe(false);
+    });
+
+    it('rejects subdomain spoofing', () => {
+      expect(isValidFieldValue('company_linkedin_url', 'https://evil.linkedin.com/company/acme')).toBe(false);
+      expect(isValidFieldValue('linkedin_url', 'https://evil.linkedin.com/in/janedoe')).toBe(false);
+    });
+
+    it('rejects open-redirect embedding', () => {
+      expect(isValidFieldValue('company_linkedin_url', 'https://attacker.com/?url=linkedin.com/company/acme')).toBe(false);
+      expect(isValidFieldValue('linkedin_url', 'https://attacker.com/?url=linkedin.com/in/janedoe')).toBe(false);
+    });
+
     it('rejects a company /company/ URL placed in a personal linkedin field', () => {
       expect(isValidFieldValue('linkedin', 'https://www.linkedin.com/company/acme')).toBe(false);
       expect(isValidFieldValue('linkedin_url', 'https://www.linkedin.com/search/results/people/?keywords=cto')).toBe(false);
+    });
+
+    it('rejects /pub/dir/ legacy profile URLs', () => {
+      expect(isValidFieldValue('linkedin_url', 'https://www.linkedin.com/pub/dir/jane/doe')).toBe(false);
+      expect(isValidFieldValue('company_linkedin_url', 'https://www.linkedin.com/pub/dir/acme/corp')).toBe(false);
+    });
+
+    it('rejects malformed / non-URL strings', () => {
+      expect(isValidFieldValue('linkedin_url', 'linkedin.com/in/janedoe')).toBe(false);
+      expect(isValidFieldValue('company_linkedin_url', 'not-a-url')).toBe(false);
     });
 
     it('rejects empty / non-string values for the linkedin URL fields only', () => {

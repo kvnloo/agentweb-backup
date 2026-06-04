@@ -20,8 +20,8 @@
 //   /showcase/ — sub-brand / product showcase pages
 // All are valid company-linkedin values; only non-org paths (/search/, /in/,
 // /pub/dir/, bare text) are rejected.
-const VALID_COMPANY_LINKEDIN_RE = /linkedin\.com\/(company|school|showcase)\//i;
-const VALID_PERSON_LINKEDIN_RE = /linkedin\.com\/in\//i;
+const VALID_COMPANY_LINKEDIN_RE = /^\/(company|school|showcase)\//i;
+const VALID_PERSON_LINKEDIN_RE = /^\/in\//i;
 
 // Only the fields that are supposed to hold a LinkedIn *profile URL* are
 // shape-validated. Crucially this is an explicit allowlist, NOT a substring
@@ -61,9 +61,17 @@ export function isValidFieldValue(field: string, value: string): boolean {
 
   if (typeof value !== 'string' || value.length === 0) return false;
 
-  return isCompanyLinkedin
-    ? VALID_COMPANY_LINKEDIN_RE.test(value)
-    : VALID_PERSON_LINKEDIN_RE.test(value);
+  try {
+    const u = new URL(value);
+    const host = u.hostname.toLowerCase();
+    const ALLOWED_HOSTS = new Set(['linkedin.com', 'www.linkedin.com', 'm.linkedin.com']);
+    if (!ALLOWED_HOSTS.has(host)) return false;
+    return isCompanyLinkedin
+      ? VALID_COMPANY_LINKEDIN_RE.test(u.pathname)
+      : VALID_PERSON_LINKEDIN_RE.test(u.pathname);
+  } catch {
+    return false;
+  }
 }
 
 /**

@@ -414,9 +414,10 @@ async function fetchWebForGroupReal(
     try {
       const jobsSearch = await agentModeService.searchWeb(jobsQuery, 5);
       if (jobsSearch?.success && Array.isArray(jobsSearch.results)) {
-        const existingUrls = new Set(webResults.map((r: any) => r.url || r.link));
+        const existingUrls = new Set(webResults.map((r: any) => r.url || r.link).filter(Boolean));
         for (const r of jobsSearch.results) {
-          if (!existingUrls.has(r.url || r.link)) webResults.push(r);
+          const key = r.url || r.link;
+          if (key && !existingUrls.has(key)) { existingUrls.add(key); webResults.push(r); }
         }
       }
     } catch (err) {
