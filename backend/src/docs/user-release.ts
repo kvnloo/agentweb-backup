@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-04',
     changes: [
+      'Improved: Deep Research Reports Are Back and More Comprehensive',
+      '- Deep research now runs on Google\'s latest research agents, which plan, search, and synthesize more thoroughly across your topic',
+      '- When you ask for a "comprehensive" report, we automatically use the most in-depth research agent; lighter requests use a faster one',
+      '- Fixed an issue where a research run could finish but come back empty — reports now reliably return their full content, so you get the complete write-up every time',
+    ],
+  },
+  {
+    date: '2026-06-04',
+    changes: [
       'Fixed: Leads From Landing-Page Forms Now Start Your Drip Sequence Automatically',
       '- When a lead came in through a public landing-page form, they were saved to your list but never enrolled in a drip sequence set to auto-enroll that list — so the first email (for example the "here\'s your PDF" message) never went out',
       '- Leads captured through a form now enroll in any sequence watching that list, exactly like leads you add manually or quick-add',
