@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-04',
     changes: [
+      'Fixed: Data Analysis Now Reads Large Files Reliably Instead of Guessing From Truncated Data',
+      '- When you asked Emma to analyze large data files (for example usage or billing totals across many sessions), the files were not actually reaching the analysis sandbox, so it fell back to working from a shortened, inline copy of the data',
+      '- This produced inconsistent and untrustworthy numbers — the same question could return a different grand total each time, and category breakdowns would not add up',
+      '- Files you provide are now written into the analysis environment correctly and read directly from there, so totals are computed over the complete dataset and stay consistent across runs',
+      '- The analysis also now runs on a faster, more reliable model, reducing timeouts on big datasets',
+    ],
+  },
+  {
+    date: '2026-06-04',
+    changes: [
       'New: Scheduled Chats Can Now Improve Their Own Prompt Over Time',
       '- Turn on the new "Self-improve prompt" switch when creating or editing a scheduled chat (it\'s off by default)',
       '- After each run — including test runs, so you can try it out — Emma reflects on how it went and on anything else it can see in your account to spot ways the schedule could do better next time',
