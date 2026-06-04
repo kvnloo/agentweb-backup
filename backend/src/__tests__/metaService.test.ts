@@ -299,6 +299,62 @@ describe('MetaService', () => {
             }));
             expect(result).toEqual(mockCreativeData);
         });
+
+        it('should build asset_feed_spec for a placement-customized creative', async () => {
+            const mockCreativeData = { id: 'creative_pc', name: 'Placement Creative' };
+            const mockCreateCreative = jest.fn().mockResolvedValue({ _data: mockCreativeData });
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                createAdCreative: mockCreateCreative,
+            }));
+
+            const params = {
+                name: 'Placement Creative',
+                page_id: 'page_123',
+                body: 'Ad Body',
+                title: 'Ad Title',
+                link_url: 'http://example.com',
+                call_to_action_type: 'LEARN_MORE',
+                placement_assets: [
+                    { image_hash: 'square_hash', is_default: true },
+                    { image_hash: 'vertical_hash', placements: ['story', 'reels'] },
+                ],
+            };
+
+            const result = await service.createAdCreative(mockAdAccountId, mockAccessToken, params);
+
+            expect(result).toEqual(mockCreativeData);
+            const callArgs = mockCreateCreative.mock.calls[0][1];
+
+            // asset_feed_spec must carry both images (each tagged with an adlabel)
+            expect(callArgs.asset_feed_spec.images).toEqual([
+                { hash: 'square_hash', adlabels: [{ name: 'asset_0' }] },
+                { hash: 'vertical_hash', adlabels: [{ name: 'asset_1' }] },
+            ]);
+
+            // Copy/link/format carry across to asset_feed_spec
+            expect(callArgs.asset_feed_spec.bodies).toEqual([{ text: 'Ad Body' }]);
+            expect(callArgs.asset_feed_spec.titles).toEqual([{ text: 'Ad Title' }]);
+            expect(callArgs.asset_feed_spec.link_urls).toEqual([{ website_url: 'http://example.com' }]);
+            expect(callArgs.asset_feed_spec.ad_formats).toEqual(['SINGLE_IMAGE']);
+            expect(callArgs.asset_feed_spec.call_to_action_types).toEqual(['LEARN_MORE']);
+
+            // The vertical asset is scoped to story + reels placements (FB + IG positions unioned)
+            const rules = callArgs.asset_feed_spec.asset_customization_rules;
+            const verticalRule = rules.find((r: any) => r.image_label.name === 'asset_1');
+            expect(verticalRule.customization_spec.facebook_positions).toEqual(
+                expect.arrayContaining(['story', 'facebook_reels'])
+            );
+            expect(verticalRule.customization_spec.instagram_positions).toEqual(
+                expect.arrayContaining(['story', 'reels'])
+            );
+
+            // The square asset is the default/fallback rule
+            const defaultRule = rules.find((r: any) => r.image_label.name === 'asset_0');
+            expect(defaultRule.customization_spec.is_default).toBe(true);
+
+            // Still includes object_story_spec so the creative renders on the Page
+            expect(callArgs.object_story_spec.page_id).toBe('page_123');
+        });
     });
 
     describe('Ad Operations', () => {

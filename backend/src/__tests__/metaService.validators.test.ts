@@ -294,6 +294,152 @@ describe('MetaService static validators', () => {
         })
       ).toThrow('carousel_cards[0] must have at least one of image_hash, image_url, or video_id');
     });
+
+    // --- Placement-customized creative (asset_feed_spec) ---
+    it('passes for a valid placement_assets creative (square default + 9:16 stories/reels)', () => {
+      expect(() =>
+        MetaService.validateCreativeParams('CREATE', {
+          name: 'Creative',
+          page_id: 'p1',
+          body: 'body',
+          title: 'title',
+          link_url: 'https://example.com',
+          placement_assets: [
+            { image_hash: 'square_hash', is_default: true },
+            { image_hash: 'vertical_hash', placements: ['story', 'reels'] }
+          ]
+        })
+      ).not.toThrow();
+    });
+
+    it('treats an asset with no placements as the default', () => {
+      expect(() =>
+        MetaService.validateCreativeParams('CREATE', {
+          name: 'Creative',
+          page_id: 'p1',
+          body: 'body',
+          title: 'title',
+          link_url: 'https://example.com',
+          placement_assets: [
+            { image_hash: 'square_hash' }, // implicit default
+            { image_hash: 'vertical_hash', placements: ['stories'] }
+          ]
+        })
+      ).not.toThrow();
+    });
+
+    it('throws when placement_assets has fewer than 2 items', () => {
+      expect(() =>
+        MetaService.validateCreativeParams('CREATE', {
+          name: 'Creative',
+          page_id: 'p1',
+          body: 'body',
+          title: 'title',
+          link_url: 'https://example.com',
+          placement_assets: [{ image_hash: 'square_hash', is_default: true }]
+        })
+      ).toThrow('must be an array of at least 2 items');
+    });
+
+    it('throws when a placement asset has no image', () => {
+      expect(() =>
+        MetaService.validateCreativeParams('CREATE', {
+          name: 'Creative',
+          page_id: 'p1',
+          body: 'body',
+          title: 'title',
+          link_url: 'https://example.com',
+          placement_assets: [
+            { is_default: true } as any,
+            { image_hash: 'vertical_hash', placements: ['reels'] }
+          ]
+        })
+      ).toThrow('placement_assets[0] must have image_hash or image_url');
+    });
+
+    it('throws when no default placement asset is designated', () => {
+      expect(() =>
+        MetaService.validateCreativeParams('CREATE', {
+          name: 'Creative',
+          page_id: 'p1',
+          body: 'body',
+          title: 'title',
+          link_url: 'https://example.com',
+          placement_assets: [
+            { image_hash: 'feed_hash', placements: ['feed'] },
+            { image_hash: 'vertical_hash', placements: ['reels'] }
+          ]
+        })
+      ).toThrow('exactly one default/fallback image');
+    });
+
+    it('throws when more than one default placement asset is designated', () => {
+      expect(() =>
+        MetaService.validateCreativeParams('CREATE', {
+          name: 'Creative',
+          page_id: 'p1',
+          body: 'body',
+          title: 'title',
+          link_url: 'https://example.com',
+          placement_assets: [
+            { image_hash: 'a', is_default: true },
+            { image_hash: 'b', is_default: true }
+          ]
+        })
+      ).toThrow('exactly one default/fallback image');
+    });
+
+    it('throws for an unknown placement token', () => {
+      expect(() =>
+        MetaService.validateCreativeParams('CREATE', {
+          name: 'Creative',
+          page_id: 'p1',
+          body: 'body',
+          title: 'title',
+          link_url: 'https://example.com',
+          placement_assets: [
+            { image_hash: 'square_hash', is_default: true },
+            { image_hash: 'vertical_hash', placements: ['banner_ad'] }
+          ]
+        })
+      ).toThrow('unknown placement "banner_ad"');
+    });
+
+    it('throws when placement_assets is combined with video_id (mutually exclusive)', () => {
+      expect(() =>
+        MetaService.validateCreativeParams('CREATE', {
+          name: 'Creative',
+          page_id: 'p1',
+          body: 'body',
+          title: 'title',
+          link_url: 'https://example.com',
+          video_id: 'vid_123',
+          image_hash: 'thumb',
+          placement_assets: [
+            { image_hash: 'square_hash', is_default: true },
+            { image_hash: 'vertical_hash', placements: ['reels'] }
+          ]
+        })
+      ).toThrow('mutually exclusive');
+    });
+  });
+
+  // ===================== validatePlacementAssets (direct) =====================
+  describe('validatePlacementAssets', () => {
+    it('exposes the supported placement tokens', () => {
+      expect(MetaService.supportedPlacementTokens).toEqual(
+        expect.arrayContaining(['feed', 'story', 'stories', 'reels', 'instagram_reels'])
+      );
+    });
+
+    it('accepts a raw customization_spec escape hatch without a known token', () => {
+      expect(() =>
+        MetaService.validatePlacementAssets([
+          { image_hash: 'square', is_default: true },
+          { image_hash: 'vertical', placements: ['anything'], customization_spec: { publisher_platforms: ['instagram'] } }
+        ])
+      ).not.toThrow();
+    });
   });
 
   // ===================== validateAdParams =====================
