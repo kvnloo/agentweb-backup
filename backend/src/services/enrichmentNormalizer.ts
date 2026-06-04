@@ -4,13 +4,16 @@
  * Applied before persistFills() so all tiers (Apollo direct, LLM/Apollo,
  * LLM/web) produce consistent formats regardless of source.
  *
- * Money  → $X.XXB / $X.XXM / $X.XXK (human-readable, US format)
- * Dates  → MM/DD/YYYY (American format)
- * Phone  → E.164 international format, invalid/vanity numbers dropped
+ * Money    → $X.XXB / $X.XXM / $X.XXK (human-readable, US format)
+ * Dates    → MM/DD/YYYY (American format)
+ * Phone    → E.164 international format, invalid/vanity numbers dropped
+ * LinkedIn → person /in/ and company /company,school,showcase/ URLs only;
+ *            malformed values (e.g. /search/ URLs) dropped
  */
 
 import type { FieldFill } from './enrichmentGroupWaterfall';
 import { sanitizePhone } from '../utils/phoneValidation';
+import { isValidFieldValue } from './fieldValueValidator';
 
 // ─── Field sets ───────────────────────────────────────────────────────────────
 
@@ -165,6 +168,19 @@ export function normalizeFills(
     if (isDateField(canonical)) {
       const normalized = normalizeDate(value);
       out.push(normalized !== value ? { ...fill, value: normalized } : fill);
+      continue;
+    }
+
+    // LinkedIn URL fields: drop values that aren't a real profile URL of the
+    // right kind (person /in/ vs company /company,/school,/showcase). Keyed on
+    // `canonical` so a custom-named field aliased to linkedin_url /
+    // company_linkedin_url is still covered. isValidFieldValue returns true for
+    // every non-linkedin field, so this is a no-op for everything else.
+    if (!isValidFieldValue(canonical, value)) {
+      console.warn(
+        `[normalizeFills] dropped fill field="${field}" canonical="${canonical}" ` +
+        `— invalid LinkedIn URL: "${String(value).slice(0, 100)}"`,
+      );
       continue;
     }
 
