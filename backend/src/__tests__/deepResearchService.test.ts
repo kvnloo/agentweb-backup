@@ -2,7 +2,7 @@
 
 import { DeepResearchService } from '../services/deepResearchService';
 import * as secretsManager from '../utils/secretsManager';
-import { DEEP_RESEARCH_AGENT } from '../config';
+import { DEEP_RESEARCH_AGENT, DEEP_RESEARCH_AGENT_SPEED, DEEP_RESEARCH_AGENT_MAX } from '../config';
 
 // Mock dependencies
 jest.mock('../utils/secretsManager');
@@ -79,9 +79,14 @@ describe('DeepResearchService', () => {
   });
 
   describe('Config Constants', () => {
-    it('should use the correct deep research agent from config', () => {
-      // Verify the agent name matches our config constant
-      expect(DEEP_RESEARCH_AGENT).toBe('deep-research-pro-preview-12-2025');
+    it('should use the April 2026 speed and max deep research agents', () => {
+      // Verify the agent names match Google's April 2026 Deep Research agents.
+      expect(DEEP_RESEARCH_AGENT_SPEED).toBe('deep-research-preview-04-2026');
+      expect(DEEP_RESEARCH_AGENT_MAX).toBe('deep-research-max-preview-04-2026');
+    });
+
+    it('should default to the speed agent', () => {
+      expect(DEEP_RESEARCH_AGENT).toBe(DEEP_RESEARCH_AGENT_SPEED);
     });
   });
 
@@ -146,9 +151,64 @@ describe('DeepResearchService', () => {
         topic: 'Tech trends',
         style: 'substack'
       };
-      
+
       // Verify substack style is accepted
       expect(params.style).toBe('substack');
+    });
+  });
+
+  describe('Agent Tier Selection by Depth', () => {
+    const mockGoogleGenAI = require('@google/genai').GoogleGenAI;
+    let createMock: jest.Mock;
+
+    beforeEach(() => {
+      mockGetSecret.mockResolvedValue('test-api-key');
+
+      // Resolve immediately as completed so performDeepResearch returns without polling.
+      const completedInteraction = {
+        id: 'interaction-1',
+        status: 'completed',
+        outputs: [{ text: '# Title\n\nReport body content.' }],
+      };
+      createMock = jest.fn().mockResolvedValue(completedInteraction);
+      mockGoogleGenAI.mockImplementation(() => ({
+        interactions: {
+          create: createMock,
+          get: jest.fn().mockResolvedValue(completedInteraction),
+        },
+      }));
+    });
+
+    it('should use the max agent for comprehensive depth', async () => {
+      await deepResearchService.performDeepResearch({
+        topic: 'Quantum computing',
+        depth: 'comprehensive',
+      });
+
+      expect(createMock).toHaveBeenCalledWith(
+        expect.objectContaining({ agent: DEEP_RESEARCH_AGENT_MAX })
+      );
+    });
+
+    it('should use the speed agent for detailed depth', async () => {
+      await deepResearchService.performDeepResearch({
+        topic: 'Quantum computing',
+        depth: 'detailed',
+      });
+
+      expect(createMock).toHaveBeenCalledWith(
+        expect.objectContaining({ agent: DEEP_RESEARCH_AGENT_SPEED })
+      );
+    });
+
+    it('should use the speed agent when depth is not provided', async () => {
+      await deepResearchService.performDeepResearch({
+        topic: 'Quantum computing',
+      });
+
+      expect(createMock).toHaveBeenCalledWith(
+        expect.objectContaining({ agent: DEEP_RESEARCH_AGENT_SPEED })
+      );
     });
   });
 
