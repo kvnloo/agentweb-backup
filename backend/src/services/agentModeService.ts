@@ -5820,14 +5820,27 @@ export class AgentModeService {
       // Initialize Google Generative AI client
       const genAI = new GoogleGenerativeAI(geminiApiKey);
 
-      // Get the model name from environment or use default
-      const modelName = process.env.DATA_ANALYSIS_LLM_NAME || 'gemini-2.5-flash';
+      // Get the model name from environment or use default. gemini-3.5-flash is
+      // Google's documented code-execution model and reliably materializes input
+      // files on the sandbox filesystem; the older gemini-2.5-flash intermittently
+      // returns HTTP 500 on the same payloads.
+      const modelName = process.env.DATA_ANALYSIS_LLM_NAME || 'gemini-3.5-flash';
 
       // Get file size limit from environment or use default (50MB)
       const maxTotalSize = parseInt(process.env.DATA_ANALYSIS_FILE_SIZE || '52428800'); // 50MB in bytes
 
-      // Prepare file data for analysis
+      // Prepare file data for analysis.
+      // IMPORTANT: Gemini code_execution only writes a file part to the sandbox
+      // filesystem when its mimeType is text/csv. application/json is rejected
+      // (HTTP 400) and text/plain is silently NOT written to disk. So every file
+      // is sent as text/csv regardless of its real content type, and the model is
+      // told the exact on-disk filenames (input_file_<n>.csv in /root) so it reads
+      // from disk instead of re-inlining and truncating large payloads.
+      const SANDBOX_FILE_MIME = 'text/csv';
       const fileParts: any[] = [];
+      // Human-readable source description per file, parallel to fileParts, used to
+      // build the filename manifest in the prompt.
+      const fileSources: string[] = [];
       let totalSize = 0;
 
       for (const fileUrl of urlsToProcess) {
@@ -5864,15 +5877,13 @@ export class AgentModeService {
                 message: `Total file size (${totalSize} bytes) exceeds the ${maxTotalSize} bytes limit. Please reduce the number or size of files.`
               };
             }
-            const mimeTypeForS3 = fileUrl.endsWith('.json') ? 'application/json'
-              : fileUrl.endsWith('.csv') ? 'text/csv'
-              : 'text/plain';
             fileParts.push({
               inlineData: {
-                mimeType: mimeTypeForS3,
+                mimeType: SANDBOX_FILE_MIME,
                 data: contentBuffer.toString('base64'),
               }
             });
+            fileSources.push(fileUrl);
             continue;
           }
 
@@ -5906,10 +5917,11 @@ export class AgentModeService {
             }
             fileParts.push({
               inlineData: {
-                mimeType: fileUrl.endsWith('.json') ? 'application/json' : 'text/plain',
+                mimeType: SANDBOX_FILE_MIME,
                 data: contentBuffer.toString('base64'),
               }
             });
+            fileSources.push(fileUrl);
             continue;
           }
 
@@ -5929,44 +5941,18 @@ export class AgentModeService {
             };
           }
 
-          // Determine MIME type from URL or response headers
-          const contentType = response.headers['content-type'];
-          const url = fileUrl.toLowerCase();
-
-          let mimeType = 'text/plain';
-          if (contentType) {
-            mimeType = contentType;
-          } else if (url.includes('.csv')) {
-            mimeType = 'text/csv';
-          } else if (url.includes('.json')) {
-            mimeType = 'application/json';
-          } else if (url.includes('.jsonl')) {
-            mimeType = 'application/jsonl';
-          } else if (url.includes('.xml')) {
-            mimeType = 'application/xml';
-          } else if (url.includes('.yaml') || url.includes('.yml')) {
-            mimeType = 'application/x-yaml';
-          } else if (url.includes('.html') || url.includes('.htm')) {
-            mimeType = 'text/html';
-          } else if (url.includes('.md')) {
-            mimeType = 'text/markdown';
-          } else if (url.includes('.py')) {
-            mimeType = 'text/x-python';
-          } else if (url.includes('.js')) {
-            mimeType = 'text/javascript';
-          } else if (url.includes('.ts')) {
-            mimeType = 'text/typescript';
-          }
-
-          // Upload file to Gemini
+          // Send to Gemini as text/csv so the file materializes on the sandbox
+          // filesystem (see SANDBOX_FILE_MIME note above). The actual content may
+          // be CSV, JSON, or plain text — the model is told this in the prompt.
           const base64Content = Buffer.from(fileData).toString('base64');
 
           fileParts.push({
-            inline_data: {
+            inlineData: {
+              mimeType: SANDBOX_FILE_MIME,
               data: base64Content,
-              mime_type: mimeType
             }
           });
+          fileSources.push(fileUrl);
 
         } catch (error) {
           console.error(`Error processing file ${fileUrl}:`, error);
@@ -5984,9 +5970,23 @@ export class AgentModeService {
       // Add file parts
       fileParts.forEach(part => parts.push(part));
 
+      // Build a manifest mapping each attached file to its exact on-disk filename.
+      // Gemini writes the Nth file part to <SANDBOX_INPUT_OUTPUT_DIRECTORY>/input_file_<N>.csv
+      // (SANDBOX_INPUT_OUTPUT_DIRECTORY is the sandbox working directory). The model
+      // MUST read these files from disk — they are the complete, untruncated dataset.
+      let fileGuidance: string;
+      if (fileParts.length > 0) {
+        const manifest = fileSources
+          .map((src, i) => `- input_file_${i}.csv (from ${src})`)
+          .join('\n');
+        fileGuidance = `The following data files have been written to the code-execution sandbox filesystem in the working directory (also available via the SANDBOX_INPUT_OUTPUT_DIRECTORY environment variable):\n${manifest}\n\nIMPORTANT: Read these files FROM DISK with Python (e.g. open('input_file_0.csv').read()). They contain the COMPLETE dataset — do NOT rely on any data pasted inline in this instruction, which may be truncated. Although the filenames end in .csv, the contents may be CSV, JSON, JSONL, or plain text; detect the format and parse accordingly (e.g. json.loads for JSON). Also incorporate any small structured data included in the instruction text below.`;
+      } else {
+        fileGuidance = 'No external files are attached; treat the information in the instruction as the complete dataset for this task.';
+      }
+
       // Add text part with analysis instruction so the model knows how to proceed with or without files
       parts.push({
-        text: `Please perform the following analysis task. ${urlsToProcess.length > 0 ? 'Use the attached files as primary data sources and incorporate any structured data included in the instruction text.' : 'No external files are attached; treat the information in the instruction as the complete dataset for this task.'}\n\n${analysisInstruction}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present.\n\nIMPORTANT: When generating charts or visualizations, you MUST use matplotlib or seaborn to produce rasterized PNG images. Do NOT use altair, vega, vega-lite, or any library that produces JSON specs instead of rendered images. Always call plt.savefig() or equivalent to emit the image as inline output, then call plt.close() to free memory.`
+        text: `Please perform the following analysis task. ${fileGuidance}\n\n${analysisInstruction}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present.\n\nIMPORTANT: When generating charts or visualizations, you MUST use matplotlib or seaborn to produce rasterized PNG images. Do NOT use altair, vega, vega-lite, or any library that produces JSON specs instead of rendered images. Always call plt.savefig() or equivalent to emit the image as inline output, then call plt.close() to free memory.`
       });
 
       // Call Gemini API directly via REST to enable code execution
