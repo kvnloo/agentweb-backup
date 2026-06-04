@@ -108,8 +108,7 @@ const MIN_USER_MESSAGES = 1;
  * at session creation, but the assistant response is only saved once the run
  * completes. A sync-scoring pass (e.g. the "Daily Satisfaction Score Report"
  * job itself) can therefore observe a session that is still in-flight — just
- * [system, user] with no reply yet — and wrongly score it 1/5. Skipping these
- * lets the next scoring pass evaluate the session once it has actually run.
+ * [system, user] with no reply yet — and wrongly score it 1/5.
  */
 function hasAssistantTurn(messages: ChatMessage[] = []): boolean {
   return messages.some((m: any) => {
@@ -118,6 +117,47 @@ function hasAssistantTurn(messages: ChatMessage[] = []): boolean {
     const toolCalls = m.metadata?.toolCalls;
     return text.length > 0 || (Array.isArray(toolCalls) && toolCalls.length > 0);
   });
+}
+
+// A session with no assistant turn is either still running or it crashed before
+// producing output. We can't tell from the message shape alone, so we use time:
+// a turn-less session updated within this window is assumed in-flight and is
+// skipped (scored on a later pass once it has run); one older than this window
+// has stalled and is treated as a failed run. Set comfortably above the longest
+// plausible scheduled-run duration so a slow-but-healthy run is never misread
+// as a crash.
+const IN_FLIGHT_GRACE_MS = 60 * 60 * 1000; // 60 minutes
+
+/**
+ * Classify a session that has produced NO assistant turn yet, using how long
+ * ago it was last updated. Returns "in-flight" if it is still within the grace
+ * window (skip, score later) or "failed" if it has gone stale (crashed/timed
+ * out before producing any output — score as a failure rather than silently
+ * dropping it from satisfaction reporting). A missing/invalid timestamp is
+ * treated as "failed" so such a session is never skipped forever.
+ */
+function classifyTurnlessSession(session: ChatSession): "in-flight" | "failed" {
+  const updatedAtMs = session.updatedAt ? new Date(session.updatedAt).getTime() : NaN;
+  if (Number.isNaN(updatedAtMs)) return "failed";
+  const age = Date.now() - updatedAtMs;
+  return age <= IN_FLIGHT_GRACE_MS ? "in-flight" : "failed";
+}
+
+const FAILED_RUN_REASON =
+  "Session produced no assistant response — it appears to have crashed or timed out before completing. Flagged as a failed run.";
+
+/**
+ * Deterministic failure score for a session that stalled before producing any
+ * assistant output. There is nothing to send to the LLM judge, so we score it
+ * 1/5 across all dimensions directly with an explanatory reason.
+ */
+function buildFailedRunResult(messageCount: number): ScoringResult {
+  return {
+    score: 1,
+    reason: FAILED_RUN_REASON,
+    evaluatedMessageIndex: messageCount,
+    dimensions: { goalCompletion: 1, dataAccuracy: 1, outputQuality: 1 },
+  };
 }
 const SCORING_TIMEOUT_MS = 20000; // 20 seconds per session
 
@@ -300,12 +340,16 @@ export async function scoreSessionWithJudgeIfNeeded(
     return null;
   }
 
-  // Skip sessions still in-flight (no assistant response persisted yet)
+  // No assistant turn yet: skip if still in-flight, flag as failed if stale.
+  let result: ScoringResult;
   if (!hasAssistantTurn(session.messages)) {
-    return null;
+    if (classifyTurnlessSession(session) === "in-flight") {
+      return null;
+    }
+    result = buildFailedRunResult(messageCount);
+  } else {
+    result = await scoreSessionWithJudge(session.messages || [], messageCount, judge, session.sessionType);
   }
-
-  const result = await scoreSessionWithJudge(session.messages || [], messageCount, judge, session.sessionType);
 
   const judgeScore = {
     score: result.score,
@@ -348,12 +392,16 @@ export async function scoreSessionIfNeeded(
     return null;
   }
 
-  // Skip sessions still in-flight (no assistant response persisted yet)
+  // No assistant turn yet: skip if still in-flight, flag as failed if stale.
+  let result: ScoringResult;
   if (!hasAssistantTurn(session.messages)) {
-    return null;
+    if (classifyTurnlessSession(session) === "in-flight") {
+      return null;
+    }
+    result = buildFailedRunResult(messageCount);
+  } else {
+    result = await scoreSession(session.messages || [], messageCount, session.pageIdentifier, session.sessionType);
   }
-
-  const result = await scoreSession(session.messages || [], messageCount, session.pageIdentifier, session.sessionType);
 
   const satisfactionScore: ChatSession["satisfactionScore"] = {
     score: result.score,
