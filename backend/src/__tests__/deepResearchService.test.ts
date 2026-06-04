@@ -1,6 +1,6 @@
 // Unit tests for deepResearchService
 
-import { DeepResearchService } from '../services/deepResearchService';
+import { DeepResearchService, extractReportText } from '../services/deepResearchService';
 import * as secretsManager from '../utils/secretsManager';
 import { DEEP_RESEARCH_AGENT, DEEP_RESEARCH_AGENT_SPEED, DEEP_RESEARCH_AGENT_MAX } from '../config';
 
@@ -87,6 +87,78 @@ describe('DeepResearchService', () => {
 
     it('should default to the speed agent', () => {
       expect(DEEP_RESEARCH_AGENT).toBe(DEEP_RESEARCH_AGENT_SPEED);
+    });
+  });
+
+  describe('extractReportText', () => {
+    it('should concatenate text from all model_output steps in order', () => {
+      const interaction = {
+        steps: [
+          { type: 'user_input', content: [{ type: 'text', text: 'the prompt' }] },
+          { type: 'model_output', content: [{ type: 'text', text: '# Title\n\nIntro.' }] },
+          {
+            type: 'model_output',
+            content: [
+              { type: 'image', mime_type: 'image/png', data: 'base64==' },
+              { type: 'text', text: 'Second chunk continues the report.' },
+            ],
+          },
+        ],
+      };
+
+      const result = extractReportText(interaction);
+
+      expect(result).toBe('# Title\n\nIntro.\n\nSecond chunk continues the report.');
+    });
+
+    it('should ignore user_input steps and image content', () => {
+      const interaction = {
+        steps: [
+          { type: 'user_input', content: [{ type: 'text', text: 'should not appear' }] },
+          { type: 'model_output', content: [{ type: 'image', mime_type: 'image/png', data: 'x' }] },
+          { type: 'model_output', content: [{ type: 'text', text: 'Only this.' }] },
+        ],
+      };
+
+      const result = extractReportText(interaction);
+
+      expect(result).toBe('Only this.');
+      expect(result).not.toContain('should not appear');
+    });
+
+    it('should fall back to the legacy outputs array when no steps are present', () => {
+      const interaction = {
+        outputs: [
+          { type: 'text', text: 'first' },
+          { type: 'text', text: 'final report text' },
+        ],
+      };
+
+      const result = extractReportText(interaction);
+
+      // Legacy behavior: take the last text output.
+      expect(result).toBe('final report text');
+    });
+
+    it('should return empty string when there is no usable content', () => {
+      expect(extractReportText({ steps: [] })).toBe('');
+      expect(extractReportText({ outputs: [] })).toBe('');
+      expect(extractReportText({})).toBe('');
+      expect(extractReportText(null)).toBe('');
+      expect(
+        extractReportText({ steps: [{ type: 'model_output', content: [] }] })
+      ).toBe('');
+    });
+
+    it('should prefer steps over a legacy outputs array when both exist', () => {
+      const interaction = {
+        steps: [
+          { type: 'model_output', content: [{ type: 'text', text: 'from steps' }] },
+        ],
+        outputs: [{ type: 'text', text: 'from outputs' }],
+      };
+
+      expect(extractReportText(interaction)).toBe('from steps');
     });
   });
 
