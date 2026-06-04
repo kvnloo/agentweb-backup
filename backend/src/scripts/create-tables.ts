@@ -1926,6 +1926,8 @@ const createEnrichmentHistoryTable = async () => {
       { AttributeName: 'leadId', AttributeType: 'S' },
       { AttributeName: 'listId', AttributeType: 'S' },
       { AttributeName: 'createdAt', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'jobType', AttributeType: 'S' },
     ],
     KeySchema: [
       { AttributeName: 'jobId', KeyType: 'HASH' },
@@ -1936,6 +1938,22 @@ const createEnrichmentHistoryTable = async () => {
         IndexName: 'listId-createdAt-index',
         KeySchema: [
           { AttributeName: 'listId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        IndexName: 'userId-createdAt-index',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        IndexName: 'jobType-createdAt-index',
+        KeySchema: [
+          { AttributeName: 'jobType', KeyType: 'HASH' },
           { AttributeName: 'createdAt', KeyType: 'RANGE' },
         ],
         Projection: { ProjectionType: 'ALL' },

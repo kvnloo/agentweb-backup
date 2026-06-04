@@ -823,6 +823,77 @@ export class MetaService {
     }
   }
 
+  // Meta's image-ad upload rejects oversized assets with a generic "Invalid parameter".
+  // Downscale the longest side to this many pixels (Meta's recommended ad image max) and
+  // keep the encoded file under the byte cap before uploading.
+  private static readonly META_MAX_IMAGE_DIMENSION = 1936;
+  private static readonly META_MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+
+  /**
+   * Downscale/re-encode an image so it fits within Meta's ad-image dimension and size
+   * limits. Oversized images (e.g. 4096x4096 renders) are otherwise rejected by the
+   * Marketing API with an unhelpful generic "Invalid parameter" error.
+   *
+   * Behaviour:
+   * - If the image is already within both limits, the original buffer/filename is returned.
+   * - Otherwise the longest side is fit inside META_MAX_IMAGE_DIMENSION (aspect ratio
+   *   preserved, never enlarged). PNGs stay PNG (preserving transparency for logo creatives);
+   *   only if a re-encoded PNG is still over the byte cap do we fall back to JPEG.
+   * - If sharp is unavailable or fails, the original buffer is used so upload still attempts.
+   */
+  public async resizeImageForMeta(
+    fileBuffer: Buffer,
+    filename: string
+  ): Promise<{ buffer: Buffer; filename: string; resized: boolean }> {
+    const MAX_DIM = MetaService.META_MAX_IMAGE_DIMENSION;
+    const MAX_BYTES = MetaService.META_MAX_IMAGE_BYTES;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const sharp = require('sharp');
+      const metadata = await sharp(fileBuffer).metadata();
+      const width = metadata.width || 0;
+      const height = metadata.height || 0;
+      const longestSide = Math.max(width, height);
+      const tooLarge = longestSide > MAX_DIM;
+      const tooHeavy = fileBuffer.length > MAX_BYTES;
+
+      if (!tooLarge && !tooHeavy) {
+        return { buffer: fileBuffer, filename, resized: false };
+      }
+
+      const resizeOpts = { width: MAX_DIM, height: MAX_DIM, fit: 'inside' as const, withoutEnlargement: true };
+      const isPng = metadata.format === 'png';
+
+      let out: Buffer;
+      let outFilename = filename;
+      if (isPng) {
+        out = await sharp(fileBuffer).resize(resizeOpts).png({ compressionLevel: 9 }).toBuffer();
+        // Transparency-preserving PNG is still too heavy — fall back to JPEG.
+        if (out.length > MAX_BYTES) {
+          out = await sharp(fileBuffer).resize(resizeOpts).jpeg({ quality: 85 }).toBuffer();
+          outFilename = filename.replace(/\.[^/.]+$/, '') + '.jpg';
+        }
+      } else {
+        let quality = 90;
+        out = await sharp(fileBuffer).resize(resizeOpts).jpeg({ quality }).toBuffer();
+        while (out.length > MAX_BYTES && quality > 40) {
+          quality -= 15;
+          out = await sharp(fileBuffer).resize(resizeOpts).jpeg({ quality }).toBuffer();
+        }
+        outFilename = filename.replace(/\.[^/.]+$/, '') + '.jpg';
+      }
+
+      this.log(`Resized image for Meta limits`, {
+        from: { width, height, bytes: fileBuffer.length },
+        to: { bytes: out.length, filename: outFilename },
+      });
+      return { buffer: out, filename: outFilename, resized: true };
+    } catch (error: any) {
+      console.error('[MetaService] resizeImageForMeta failed, uploading original buffer:', error?.message);
+      return { buffer: fileBuffer, filename, resized: false };
+    }
+  }
+
   /**
    * Upload image to ad account
    */
@@ -830,12 +901,35 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const account = new AdAccount(`act_${adAccountId}`);
-      this.log(`Uploading image to account: ${adAccountId}, filename: ${filename}`);
-      const adImage = await account.createAdImage([], {
-        filename: filename,
-        bytes: fileBuffer.toString('base64'),
+      // Downscale oversized images up front — Meta rejects them with a generic error.
+      const prepared = await this.resizeImageForMeta(fileBuffer, filename);
+      const uploadFilename = prepared.filename;
+      const uploadBuffer = prepared.buffer;
+      this.log(`Uploading image to account: ${adAccountId}, filename: ${uploadFilename}`, {
+        resized: prepared.resized,
+        bytes: uploadBuffer.length,
       });
-      return adImage._data;
+      const adImage = await account.createAdImage([], {
+        filename: uploadFilename,
+        bytes: uploadBuffer.toString('base64'),
+      });
+      // Meta's /adimages endpoint returns the result keyed by the uploaded filename,
+      // e.g. { images: { "<filename>": { hash, url, ... } } }. The SDK stores this raw
+      // payload on `_data`, so we must unwrap the (single) entry to expose a flat
+      // { hash, url, ... } object. Returning the raw map forces every caller to dig the
+      // hash out of a filename-keyed object, which is where distinct creatives end up
+      // mapped to the wrong hash under batch uploads.
+      const data = adImage._data || {};
+      if (data.images && typeof data.images === 'object') {
+        const keys = Object.keys(data.images);
+        if (keys.length > 0) {
+          const entry = data.images[keys[0]];
+          this.log(`Image uploaded`, { filename: uploadFilename, hash: entry?.hash });
+          return entry;
+        }
+      }
+      // Fallback: response was already flat (e.g. { hash, url }).
+      return data;
     } catch (error) {
       return this.handleError(error, 'uploadImage');
     }

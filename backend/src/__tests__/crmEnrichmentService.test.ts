@@ -1924,6 +1924,39 @@ describe('CrmEnrichmentService - enrichment history snapshot', () => {
     expect(mockCrmDb.createEnrichmentJobMeta).not.toHaveBeenCalled();
   });
 
+  // B1/B4 — snapshot previousEnrichmentMetadata keyed by original snake_case (not mapped camelCase)
+  it('snapshots previousEnrichmentMetadata under original field name (first_name not firstName)', async () => {
+    const existingMeta = { source: 'web_search', enrichedAt: '2025-01-01T00:00:00Z' };
+    const lead = createLead({
+      leadId: 'lead-b1',
+      firstName: 'OldFirst',
+      enrichmentMetadata: { first_name: existingMeta },
+      customFields: {},
+    });
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+    mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [lead], lastEvaluatedKey: null, hasMore: false });
+    mockAgentModeService.searchWeb.mockResolvedValue({
+      success: true, results: [{ title: 'John Doe', snippet: 'Person profile' }],
+    });
+    // LLM returns first_name (original key) — STANDARD_FIELD_MAP maps it to firstName
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ first_name: 'NewFirst' }));
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Find first name',
+      outputFields: ['first_name'],
+      sources: ['web_search'],
+      forceOverwrite: true,
+    };
+
+    await service.execute(spec);
+
+    const snapshotCall = mockCrmDb.createEnrichmentSnapshotItem.mock.calls[0][0];
+    // Key must be 'first_name' (original) not 'firstName' (mapped) so revert delete is not a no-op
+    expect(snapshotCall.previousEnrichmentMetadata).toHaveProperty('first_name', existingMeta);
+    expect(snapshotCall.previousEnrichmentMetadata).not.toHaveProperty('firstName');
+  });
+
   // SUCCESS test: snapshot captures correct previous value before updateLead overwrites it
   it('should snapshot the existing field value before it is overwritten by enrichment', async () => {
     const lead = createLead({
@@ -2086,6 +2119,122 @@ describe('CrmEnrichmentService - revertJob', () => {
     expect(updatedCustomFields).not.toHaveProperty('tech_stack');
     // New column added after enrichment must be preserved
     expect(updatedCustomFields['phone']).toBe('123-456');
+  });
+});
+
+// ─── Revert metadata restoration tests ──────────────────────────────────────
+//
+// The revert logic at crmEnrichmentService.ts:2223-2230 merges
+// snapshot.previousEnrichmentMetadata back into the current lead's
+// enrichmentMetadata. Null entries mean "this key didn't exist before
+// enrichment" and must be DELETED; non-null entries must be restored.
+
+describe('CrmEnrichmentService - revertJob enrichmentMetadata restoration', () => {
+  let service: CrmEnrichmentService;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new CrmEnrichmentService();
+    mockCrmDb.updateEnrichmentJobStatus.mockResolvedValue(undefined);
+    mockCrmDb.updateLead.mockResolvedValue({} as any);
+    mockSettingsService.getSetting.mockResolvedValue(null);
+  });
+
+  // FAIL: snapshot has previousEnrichmentMetadata with a non-null entry —
+  // updateLead must be called with that metadata restored.
+  it('restores non-null previousEnrichmentMetadata entry in updateLead call', async () => {
+    const prevMeta = { provider: 'apollo', enrichedAt: '2026-01-01T00:00:00Z' };
+    mockCrmDb.getEnrichmentSnapshotsByJobId.mockResolvedValue([
+      {
+        jobId: 'job-meta-1',
+        leadId: 'lead-meta-1',
+        previousCustomFields: {},
+        previousStandardFields: {},
+        previousEnrichmentMetadata: { company_name: prevMeta },
+      },
+    ]);
+    mockCrmDb.getLeadById.mockResolvedValue({
+      leadId: 'lead-meta-1',
+      listId: 'list1',
+      customFields: {},
+      enrichmentMetadata: { company_name: { provider: 'enrich.so', enrichedAt: '2026-06-01T00:00:00Z' } },
+    });
+
+    const result = await service.revertJob('job-meta-1', 'list1');
+
+    expect(result.revertedCount).toBe(1);
+    const updateCall = mockCrmDb.updateLead.mock.calls[0];
+    const updatedMeta = (updateCall[2] as any).enrichmentMetadata as Record<string, any>;
+    expect(updatedMeta['company_name']).toEqual(prevMeta);
+  });
+
+  // FAIL: snapshot has previousEnrichmentMetadata = { company_name: null } —
+  // that key must be removed (not present) in the updateLead call.
+  it('removes enrichmentMetadata key when previousEnrichmentMetadata entry is null', async () => {
+    mockCrmDb.getEnrichmentSnapshotsByJobId.mockResolvedValue([
+      {
+        jobId: 'job-meta-2',
+        leadId: 'lead-meta-2',
+        previousCustomFields: {},
+        previousStandardFields: {},
+        previousEnrichmentMetadata: { company_name: null },
+      },
+    ]);
+    mockCrmDb.getLeadById.mockResolvedValue({
+      leadId: 'lead-meta-2',
+      listId: 'list1',
+      customFields: {},
+      enrichmentMetadata: { company_name: { provider: 'apollo', enrichedAt: '2026-06-01T00:00:00Z' } },
+    });
+
+    const result = await service.revertJob('job-meta-2', 'list1');
+
+    expect(result.revertedCount).toBe(1);
+    const updateCall = mockCrmDb.updateLead.mock.calls[0];
+    const updatedMeta = (updateCall[2] as any).enrichmentMetadata as Record<string, any>;
+    expect(updatedMeta).not.toHaveProperty('company_name');
+  });
+
+  // SUCCESS: full round-trip — snapshot has both null and non-null entries —
+  // verify correct merge (null → remove, non-null → restore).
+  it('correctly merges mixed null/non-null previousEnrichmentMetadata in one revert', async () => {
+    const titlePrevMeta = { provider: 'apollo', enrichedAt: '2026-01-15T00:00:00Z' };
+    mockCrmDb.getEnrichmentSnapshotsByJobId.mockResolvedValue([
+      {
+        jobId: 'job-meta-3',
+        leadId: 'lead-meta-3',
+        previousCustomFields: {},
+        previousStandardFields: {},
+        previousEnrichmentMetadata: {
+          title: titlePrevMeta,       // non-null → restore
+          company_name: null,         // null → remove
+        },
+      },
+    ]);
+    mockCrmDb.getLeadById.mockResolvedValue({
+      leadId: 'lead-meta-3',
+      listId: 'list1',
+      customFields: {},
+      enrichmentMetadata: {
+        title: { provider: 'enrich.so', enrichedAt: '2026-06-01T00:00:00Z' },
+        company_name: { provider: 'apollo', enrichedAt: '2026-06-01T00:00:00Z' },
+        // hq_location was NOT in the snapshot → must remain untouched
+        hq_location: { provider: 'web_search', enrichedAt: '2026-06-01T00:00:00Z' },
+      },
+    });
+
+    const result = await service.revertJob('job-meta-3', 'list1');
+
+    expect(result.revertedCount).toBe(1);
+    expect(result.failedCount).toBe(0);
+    const updateCall = mockCrmDb.updateLead.mock.calls[0];
+    const updatedMeta = (updateCall[2] as any).enrichmentMetadata as Record<string, any>;
+    // restored
+    expect(updatedMeta['title']).toEqual(titlePrevMeta);
+    // removed
+    expect(updatedMeta).not.toHaveProperty('company_name');
+    // untouched (not in snapshot)
+    expect(updatedMeta['hq_location']).toBeDefined();
   });
 });
 

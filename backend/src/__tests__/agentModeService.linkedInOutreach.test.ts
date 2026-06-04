@@ -30,6 +30,7 @@ const mockGetMessagesWithContact = jest.fn();
 const mockResolveProviderId = jest.fn();
 const mockSearchPeople = jest.fn();
 const mockResolveAccountId = jest.fn();
+const mockGetInviteCharLimitForAccount = jest.fn().mockResolvedValue(200);
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     sendMessage: (...args: any[]) => mockSendMessage(...args),
@@ -39,6 +40,7 @@ jest.mock('../services/linkedInOutreachService', () => ({
     resolveProviderId: (...args: any[]) => mockResolveProviderId(...args),
     searchPeople: (...args: any[]) => mockSearchPeople(...args),
     resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
+    getInviteCharLimitForAccount: (...args: any[]) => mockGetInviteCharLimitForAccount(...args),
   },
 }));
 
@@ -746,6 +748,7 @@ describe('AgentModeService - LinkedIn Outreach', () => {
   describe('send-invite', () => {
     it('returns success when sendInvitation resolves', async () => {
       mockSendInvitation.mockResolvedValue({ id: 'invite-123' });
+      mockGetInviteCharLimitForAccount.mockResolvedValue(200);
 
       const result = await service.linkedinOutreach('user-1', {
         action: 'send-invite',
@@ -755,17 +758,21 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       });
 
       expect(result.success).toBe(true);
+      // The per-account invite char limit is resolved and passed through to sendInvitation.
+      expect(mockGetInviteCharLimitForAccount).toHaveBeenCalledWith('user-1', 'test-account-id');
       expect(mockSendInvitation).toHaveBeenCalledWith(
         'test-account-id',
         'provider-abc',
         false,
-        'Hi, let us connect!'
+        'Hi, let us connect!',
+        200
       );
     });
 
     it('returns success:false with error message when sendInvitation rejects', async () => {
+      mockGetInviteCharLimitForAccount.mockResolvedValue(200);
       mockSendInvitation.mockRejectedValue(
-        new Error('Invitation message is too long (350 characters). LinkedIn limits invitation notes to 300 characters. Please shorten the message and retry.')
+        new Error('Invitation message is too long (350 characters). LinkedIn limits invitation notes to 200 characters for this account. Please shorten the message and retry.')
       );
 
       const result = await service.linkedinOutreach('user-1', {

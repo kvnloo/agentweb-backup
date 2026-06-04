@@ -1,9 +1,19 @@
-import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest, _parseEventStreamFrames, _accumulateBedrockStream } from '../services/codingAgentService';
+import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest, _parseEventStreamFrames, _accumulateBedrockStream } from '../services/codingAgentService';
 import { agentModeService } from '../services/agentModeService';
 
 // Mock mcpFetch
 jest.mock('../mcp/server/httpClient', () => ({
   mcpFetch: jest.fn()
+}));
+
+// Mock v0Service so scope resolution doesn't hit DynamoDB. By default both lookups
+// return empty (page not found) → scope stays undefined → the agent runs
+// unrestricted, matching the pre-scope behavior the bulk of these tests assert.
+const mockGetLandingPageById = jest.fn();
+const mockGetLandingPagesByOwner = jest.fn();
+jest.mock('../services/v0Service', () => ({
+  getLandingPageById: (...a: any[]) => mockGetLandingPageById(...a),
+  getLandingPagesByOwner: (...a: any[]) => mockGetLandingPagesByOwner(...a),
 }));
 
 import { mcpFetch } from '../mcp/server/httpClient';
@@ -1460,5 +1470,300 @@ describe('runCodingAgent — bearer-token request timeout surfacing', () => {
     expect(result.message).toMatch(/timed out|inactivity/i);
     // 408 is not in callWithRetry's retry set (only 429/5xx), so exactly one attempt.
     expect(bearerCreate).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── Page scope: pure helpers ─────────────────────────────────────────────────
+// Many landing pages share ONE repo: a root page owns top-level app/ files and
+// each other page is an app/<slug>/ route directory. The coding agent's file API
+// is already physically confined to the one repo behind its pageId, so the
+// editable boundary is the WHOLE repo (every route dir + shared files) — a run is
+// free to edit any sibling route, since they are all one multi-route project.
+describe('resolvePageScope', () => {
+  const repo = 'https://github.com/acme/lp-every-io';
+  const root = { id: 'root-1', isRootPage: true, githubRepoUrl: repo };
+  const subA = { id: 'sub-a', slug: 'every-io-day-zero-pre-seed-fou', githubRepoUrl: repo };
+  const subB = { id: 'sub-b', slug: 'every-io-seed-stage-founders', githubRepoUrl: repo };
+  const otherRepo = { id: 'other-1', slug: 'unrelated', githubRepoUrl: 'https://github.com/acme/lp-other' };
+
+  test('scope carries the page repo and the route slugs that live in it', () => {
+    const scope = resolvePageScope(subA, [root, subA, subB]);
+    expect(scope.repoUrl).toBe(repo);
+    expect(scope.routeSlugs.sort()).toEqual([subA.slug, subB.slug].sort());
+  });
+
+  test('only counts pages in the SAME repo as routes (ignores the owner\'s other repos)', () => {
+    const scope = resolvePageScope(subA, [root, subA, subB, otherRepo]);
+    expect(scope.routeSlugs).not.toContain('unrelated');
+    expect(scope.routeSlugs.sort()).toEqual([subA.slug, subB.slug].sort());
+  });
+
+  test('deduplicates route slugs and drops blanks', () => {
+    const scope = resolvePageScope(subA, [
+      subA,
+      subB,
+      { id: 'sub-c', slug: 'every-io-seed-stage-founders', githubRepoUrl: repo }, // dup slug
+      { id: 'sub-d', slug: '', githubRepoUrl: repo }, // blank (root-ish)
+    ]);
+    expect(scope.routeSlugs.sort()).toEqual([subA.slug, subB.slug].sort());
+  });
+});
+
+// A repo-wide scope: the agent may edit ANY file in its own repo (all route dirs
+// plus shared files). The only paths rejected are unsafe ones that escape the
+// repo (absolute paths, parent traversal).
+describe('isSafeRepoPath', () => {
+  test('allows this page\'s own route directory', () => {
+    expect(isSafeRepoPath('app/my-page/page.tsx')).toBe(true);
+    expect(isSafeRepoPath('app/my-page/_components/landing/TrustBar.tsx')).toBe(true);
+  });
+
+  test('allows OTHER route directories in the same multi-route project', () => {
+    // The exact case from the report: editing a sibling route's lead-capture form.
+    expect(isSafeRepoPath('app/every-io-series-a-scaling/_components/lead-capture-form.tsx')).toBe(true);
+    expect(isSafeRepoPath('app/other-page/page.tsx')).toBe(true);
+  });
+
+  test('allows shared components and root-level files', () => {
+    expect(isSafeRepoPath('components/landing/trust-bar.tsx')).toBe(true);
+    expect(isSafeRepoPath('app/layout.tsx')).toBe(true);
+    expect(isSafeRepoPath('app/globals.css')).toBe(true);
+    expect(isSafeRepoPath('app/page.tsx')).toBe(true);
+  });
+
+  test('normalizes leading ./ and / and backslashes', () => {
+    expect(isSafeRepoPath('./app/my-page/page.tsx')).toBe(true);
+    expect(isSafeRepoPath('/app/my-page/page.tsx')).toBe(true);
+    expect(isSafeRepoPath('app\\my-page\\page.tsx')).toBe(true);
+  });
+
+  test('rejects empty paths', () => {
+    expect(isSafeRepoPath('')).toBe(false);
+    expect(isSafeRepoPath('   ')).toBe(false);
+  });
+
+  test('rejects paths that escape the repo via parent traversal', () => {
+    expect(isSafeRepoPath('../secrets.txt')).toBe(false);
+    expect(isSafeRepoPath('app/../../etc/passwd')).toBe(false);
+    expect(isSafeRepoPath('app/my-page/../../../outside.tsx')).toBe(false);
+  });
+});
+
+describe('buildScopeSystemClause', () => {
+  const repo = 'https://github.com/acme/lp-every-io';
+
+  test('lists the project\'s routes and keeps the "only the change asked for" guidance', () => {
+    const clause = buildScopeSystemClause({
+      repoUrl: repo,
+      routeSlugs: ['every-io-day-zero-pre-seed-fou', 'every-io-series-a-scaling'],
+    });
+    // All routes named so the agent knows it may edit across them.
+    expect(clause).toContain('app/every-io-day-zero-pre-seed-fou/');
+    expect(clause).toContain('app/every-io-series-a-scaling/');
+    // Anti-overreach guidance from PR #1739 is preserved (soft, not a route lockout).
+    expect(clause).toMatch(/only the specific change/i);
+  });
+
+  test('handles a single-route / no-extra-routes project without crashing', () => {
+    const clause = buildScopeSystemClause({ repoUrl: repo, routeSlugs: [] });
+    expect(typeof clause).toBe('string');
+    expect(clause).toMatch(/only the specific change/i);
+  });
+});
+
+// ─── Page scope: enforcement in the agent loop ────────────────────────────────
+describe('runCodingAgent — scope enforcement', () => {
+  const scopedContext: CodingAgentContext = {
+    pageId: 'sub-a',
+    userId: 'user-456',
+    sessionId: 'session-789',
+    llmModel: 'anthropic.claude-sonnet-4-6',
+    draftBranch: 'draft/abc12345',
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedMcpFetch.mockReset();
+    mockCreate.mockReset();
+    mockGetLandingPageById.mockReset();
+    mockGetLandingPagesByOwner.mockReset();
+    _setBedrockClientForTest(mockClient);
+    _setSleepFnForTest(async () => {});
+    // The page under edit is one route of a multi-route project; a sibling route
+    // shares the SAME repo, so it is in-scope and editable.
+    const repo = 'https://github.com/acme/lp-every-io';
+    mockGetLandingPageById.mockResolvedValue({ id: 'sub-a', userId: 'user-456', slug: 'my-page', githubRepoUrl: repo });
+    mockGetLandingPagesByOwner.mockResolvedValue([
+      { id: 'sub-a', userId: 'user-456', slug: 'my-page', githubRepoUrl: repo },
+      { id: 'sub-b', userId: 'user-456', slug: 'other-page', githubRepoUrl: repo },
+    ]);
+  });
+
+  afterAll(() => {
+    _setBedrockClientForTest(null);
+  });
+
+  test('allows an edit to a SIBLING route in the same multi-route project', async () => {
+    // Regression for the report: editing another route's file in the same repo
+    // must go through (PR #1739 wrongly blocked this).
+    mockedMcpFetch.mockResolvedValueOnce({
+      files: [
+        { path: 'app/my-page/page.tsx', size: 1000 },
+        { path: 'app/other-page/_components/lead-capture-form.tsx', size: 1000 },
+      ],
+    });
+
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_file', input: {
+          file_path: 'app/other-page/_components/lead-capture-form.tsx',
+          edits: [{ search: '<button>', replace: '<button type="submit">' }],
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    // edit_file: GET current content, then PUT
+    mockedMcpFetch
+      .mockResolvedValueOnce({ content: '<button>' })
+      .mockResolvedValueOnce({ success: true, is_staging: true, commit_url: 'https://github.com/x/commit/abc' });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Aligned the submit button.', status: 'success' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    const result = await runCodingAgent('align the series A submit button', scopedContext);
+
+    expect(result.success).toBe(true);
+    const putCalls = mockedMcpFetch.mock.calls.filter(c => c[0]?.method === 'PUT');
+    expect(putCalls).toHaveLength(1);
+    expect((putCalls[0][0] as any).body.file_path).toBe('app/other-page/_components/lead-capture-form.tsx');
+  });
+
+  test('allows an edit inside the page\'s own directory', async () => {
+    // Pre-fetch list_files
+    mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/my-page/page.tsx', size: 1000 }] });
+
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_file', input: {
+          file_path: 'app/my-page/_components/landing/TrustBar.tsx',
+          edits: [{ search: '<img src="placeholder" />', replace: '<img src="https://logo" />' }],
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    // edit_file: GET current content, then PUT
+    mockedMcpFetch
+      .mockResolvedValueOnce({ content: '<img src="placeholder" />' })
+      .mockResolvedValueOnce({ success: true, is_staging: true, commit_url: 'https://github.com/x/commit/abc' });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Logo updated.', status: 'success' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    const result = await runCodingAgent('replace the placeholder logo', scopedContext);
+
+    expect(result.success).toBe(true);
+    const putCalls = mockedMcpFetch.mock.calls.filter(c => c[0]?.method === 'PUT');
+    expect(putCalls).toHaveLength(1);
+    expect((putCalls[0][0] as any).body.file_path).toBe('app/my-page/_components/landing/TrustBar.tsx');
+  });
+
+  test('blocks a write that escapes the repo via parent traversal', async () => {
+    mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/my-page/page.tsx', size: 1000 }] });
+
+    // LLM tries to write outside the repo entirely.
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_file', input: {
+          file_path: '../../etc/passwd',
+          edits: [{ search: 'a', replace: 'b' }],
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Cannot write there.', status: 'error' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    await runCodingAgent('write outside the repo', scopedContext);
+
+    // No PUT, and the file-content GET never happened either — only the pre-fetch.
+    const putCalls = mockedMcpFetch.mock.calls.filter(c => c[0]?.method === 'PUT');
+    expect(putCalls).toHaveLength(0);
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
+
+    const secondCallMessages = mockCreate.mock.calls[1][0].messages;
+    const toolResultMsg = secondCallMessages.find(
+      (m: any) => m.role === 'user' && Array.isArray(m.content) && m.content.some((b: any) => b.type === 'tool_result')
+    );
+    const trBlock = toolResultMsg.content.find((b: any) => b.type === 'tool_result');
+    expect(trBlock.content).toMatch(/outside the repository|cannot/i);
+  });
+
+  test('shows the full repo file listing and injects the scope clause into the system prompt', async () => {
+    mockedMcpFetch.mockResolvedValueOnce({
+      files: [
+        { path: 'app/my-page/page.tsx', size: 1000 },
+        { path: 'app/other-page/page.tsx', size: 1000 },
+        { path: 'components/landing/trust-bar.tsx', size: 500 },
+      ],
+    });
+    mockCreate.mockResolvedValueOnce({
+      content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'done', status: 'success' } }],
+      stop_reason: 'tool_use'
+    });
+
+    await runCodingAgent('do something', scopedContext);
+
+    const firstCall = mockCreate.mock.calls[0][0];
+    // System prompt names the project's routes and keeps the anti-overreach guidance.
+    expect(firstCall.system).toContain('app/my-page/');
+    expect(firstCall.system).toContain('app/other-page/');
+    expect(firstCall.system).toMatch(/only the specific change/i);
+    // The user message's file listing now shows the WHOLE repo — all routes + shared.
+    const userMsg = firstCall.messages.find((m: any) => m.role === 'user');
+    const userText = typeof userMsg.content === 'string'
+      ? userMsg.content
+      : userMsg.content.map((b: any) => b.text || '').join('');
+    expect(userText).toContain('app/my-page/page.tsx');
+    expect(userText).toContain('app/other-page/page.tsx');
+    expect(userText).toContain('components/landing/trust-bar.tsx');
+  });
+
+  test('still edits normally when the page record is not found (unrestricted fallback)', async () => {
+    // No page record → scope undefined → still unrestricted (safe-path guard only).
+    mockGetLandingPageById.mockResolvedValue(null);
+
+    mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/anything.tsx', size: 100 }] });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_file', input: {
+          file_path: 'app/other-page/page.tsx',
+          edits: [{ search: 'a', replace: 'b' }],
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    mockedMcpFetch
+      .mockResolvedValueOnce({ content: 'a' })
+      .mockResolvedValueOnce({ success: true, is_staging: true });
+    mockCreate.mockResolvedValueOnce({
+      content: [{ type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'done', status: 'success' } }],
+      stop_reason: 'tool_use'
+    });
+
+    const result = await runCodingAgent('edit anything', scopedContext);
+
+    expect(result.success).toBe(true);
+    const putCalls = mockedMcpFetch.mock.calls.filter(c => c[0]?.method === 'PUT');
+    expect(putCalls).toHaveLength(1);
   });
 });

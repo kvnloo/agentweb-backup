@@ -31,7 +31,12 @@ jest.mock('../services/linkedInOutreachService', () => ({
 jest.mock('../services/unipileConnectionsDb', () => ({
   upsertConnections: jest.fn(),
   getLatestConnectedAt: jest.fn().mockResolvedValue(null),
-  normalizeLinkedInUrl: jest.fn((url: string) => url.replace(/\/$/, '').toLowerCase()),
+  // Mirror the real normalizer: lowercase + force a trailing slash.
+  normalizeLinkedInUrl: jest.fn((url: string) => {
+    let u = url.trim().toLowerCase();
+    if (!u.endsWith('/')) u += '/';
+    return u;
+  }),
 }));
 
 jest.mock('../services/dripSequenceDb', () => ({
@@ -66,9 +71,12 @@ jest.mock('../services/leadListAlertService', () => ({
 import { notifyNewConnections } from '../cron/linkedInConnectionSyncCron';
 import { crmDb } from '../services/db';
 import { leadListAlertService } from '../services/leadListAlertService';
+import { agentModeService } from '../services/agentModeService';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 const mockAlertService = leadListAlertService as jest.Mocked<typeof leadListAlertService>;
+const mockReadBrandGuidelines = agentModeService.readBrandGuidelines as jest.Mock;
+const mockReadMarketStrategy = agentModeService.readMarketStrategy as jest.Mock;
 const getOpenAICreate = () => (global as any).__linkedInCronOpenAICreate as jest.Mock;
 
 const NEW_CONNECTION = {
@@ -93,11 +101,43 @@ const MATCHING_LEAD = {
   linkedin: 'https://www.linkedin.com/in/john-prospect',
 };
 
-const LIST = { listId: 'list-1', name: 'Outreach List', userId: 'user-1' };
+// List has an assigned LinkedIn sender matching the connection's account, so
+// notifications fire (the sender-gate requirement).
+const LIST = { listId: 'list-1', name: 'Outreach List', userId: 'user-1', linkedInAccountId: 'account-1' };
 
 beforeEach(() => {
   jest.clearAllMocks();
   mockAlertService.notifyLinkedInConnectionAccepted.mockResolvedValue(undefined);
+  // The notification kill-switch defaults to muted; enable it so these tests
+  // exercise the real notification logic. A dedicated test below covers the
+  // muted-by-default behavior.
+  process.env.LINKEDIN_CONNECTION_NOTIFY = 'true';
+});
+
+afterAll(() => {
+  delete process.env.LINKEDIN_CONNECTION_NOTIFY;
+});
+
+describe('notifyNewConnections — kill-switch', () => {
+  it('is muted by default: sends nothing when LINKEDIN_CONNECTION_NOTIFY is unset', async () => {
+    delete process.env.LINKEDIN_CONNECTION_NOTIFY;
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([MATCHING_LEAD] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    expect(mockCrmDb.findLeadsByLinkedin).not.toHaveBeenCalled();
+    expect(mockAlertService.notifyLinkedInConnectionAccepted).not.toHaveBeenCalled();
+  });
+
+  it('stays muted even when set to a non-"true" value', async () => {
+    process.env.LINKEDIN_CONNECTION_NOTIFY = '1';
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([MATCHING_LEAD] as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    expect(mockAlertService.notifyLinkedInConnectionAccepted).not.toHaveBeenCalled();
+  });
 });
 
 describe('notifyNewConnections', () => {
@@ -188,6 +228,54 @@ describe('notifyNewConnections', () => {
     expect(mockCrmDb.getLeadListById).not.toHaveBeenCalled();
     expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
     expect(mockAlertService.notifyLinkedInConnectionAccepted).not.toHaveBeenCalled();
+  });
+
+  it('skips notification when the list has no assigned LinkedIn sender', async () => {
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([MATCHING_LEAD] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue({ ...LIST, linkedInAccountId: null } as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    expect(mockAlertService.notifyLinkedInConnectionAccepted).not.toHaveBeenCalled();
+  });
+
+  it('skips notification when the list sender differs from the connection account', async () => {
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([MATCHING_LEAD] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue({ ...LIST, linkedInAccountId: 'other-account' } as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+    expect(mockAlertService.notifyLinkedInConnectionAccepted).not.toHaveBeenCalled();
+  });
+
+  it('matches leads stored without a trailing slash even though the connection URL has one', async () => {
+    // Connection URL is normalized with a trailing slash; the lead was stored
+    // WITHOUT one (CSV import / enrichment strip it). Both variants must be queried.
+    const connWithSlash = { ...NEW_CONNECTION, publicProfileUrl: 'https://www.linkedin.com/in/john-prospect/' };
+    const leadNoSlash = { ...MATCHING_LEAD, linkedin: 'https://www.linkedin.com/in/john-prospect' };
+
+    mockCrmDb.findLeadsByLinkedin.mockImplementation(async (url: string) =>
+      (url === 'https://www.linkedin.com/in/john-prospect' ? [leadNoSlash] : []) as any,
+    );
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+
+    await notifyNewConnections([connWithSlash]);
+
+    expect(mockCrmDb.findLeadsByLinkedin).toHaveBeenCalledWith('https://www.linkedin.com/in/john-prospect');
+    expect(mockAlertService.notifyLinkedInConnectionAccepted).toHaveBeenCalledWith(LIST, leadNoSlash);
+  });
+
+  it('does not notify twice when both URL variants return the same lead', async () => {
+    // findLeadsByLinkedin returns the same lead for both the slash and no-slash
+    // lookups — the helper must dedup so the owner is notified only once.
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([MATCHING_LEAD] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    expect(mockAlertService.notifyLinkedInConnectionAccepted).toHaveBeenCalledTimes(1);
   });
 
   it('marks lead with linkedInConnectionNotifiedAt before sending notification', async () => {
@@ -287,5 +375,119 @@ describe('generateConnectionFollowUpDraft — activity history', () => {
 
     // getLeadEngagements should NOT be called since we short-circuit early
     expect(mockCrmDb.getLeadEngagements).not.toHaveBeenCalled();
+  });
+});
+
+describe('generateConnectionFollowUpDraft — brand voice & market strategy context', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockAlertService.notifyLinkedInConnectionAccepted.mockResolvedValue(undefined);
+    getOpenAICreate().mockResolvedValue({
+      choices: [{ message: { content: '{"content":"Hi, thanks for connecting!"}' } }],
+    });
+    mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+  });
+
+  it('injects brand voice from readBrandGuidelines().formattedContent into the prompt', async () => {
+    const leadWithLinkedIn = { ...MATCHING_LEAD, linkedin: 'https://www.linkedin.com/in/john-prospect' };
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([leadWithLinkedIn] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+    mockReadBrandGuidelines.mockResolvedValue({
+      exists: true,
+      formattedContent: 'Tone of voice: warm, concise, founder-led. We never use buzzwords.',
+    });
+    mockReadMarketStrategy.mockResolvedValue(null);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    const userMessage = getOpenAICreate().mock.calls[0][0].messages.find((m: any) => m.role === 'user');
+    expect(userMessage.content).toContain('warm, concise, founder-led');
+  });
+
+  it('injects market strategy from readMarketStrategy().formattedContent into the prompt', async () => {
+    const leadWithLinkedIn = { ...MATCHING_LEAD, linkedin: 'https://www.linkedin.com/in/john-prospect' };
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([leadWithLinkedIn] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+    mockReadBrandGuidelines.mockResolvedValue(null);
+    mockReadMarketStrategy.mockResolvedValue({
+      exists: true,
+      formattedContent: 'We sell browser-isolation security to mid-market CISOs.',
+    });
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    const userMessage = getOpenAICreate().mock.calls[0][0].messages.find((m: any) => m.role === 'user');
+    expect(userMessage.content).toContain('browser-isolation security to mid-market CISOs');
+  });
+
+  it('omits brand/strategy lines when neither exists', async () => {
+    const leadWithLinkedIn = { ...MATCHING_LEAD, linkedin: 'https://www.linkedin.com/in/john-prospect' };
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([leadWithLinkedIn] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+    mockReadBrandGuidelines.mockResolvedValue({ exists: false });
+    mockReadMarketStrategy.mockResolvedValue({ exists: false });
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    const userMessage = getOpenAICreate().mock.calls[0][0].messages.find((m: any) => m.role === 'user');
+    expect(userMessage.content).not.toContain('Brand voice:');
+    expect(userMessage.content).not.toContain('Offer/market fit:');
+  });
+});
+
+describe('generateConnectionFollowUpDraft — message direction labelling', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockAlertService.notifyLinkedInConnectionAccepted.mockResolvedValue(undefined);
+    getOpenAICreate().mockResolvedValue({
+      choices: [{ message: { content: '{"content":"Hi, thanks for connecting!"}' } }],
+    });
+    mockReadBrandGuidelines.mockResolvedValue(null);
+    mockReadMarketStrategy.mockResolvedValue(null);
+  });
+
+  it('labels sent vs received messages so the model can tell direction', async () => {
+    const leadWithLinkedIn = { ...MATCHING_LEAD, linkedin: 'https://www.linkedin.com/in/john-prospect' };
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([leadWithLinkedIn] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+    mockCrmDb.getLeadEngagements.mockResolvedValue({
+      engagements: [
+        { eventType: 'linkedin.message.sent', createdAt: '2026-05-01T10:00:00.000Z', text: 'Saw your work on isolation' },
+        { eventType: 'linkedin.message.received', createdAt: '2026-05-02T08:00:00.000Z', text: 'Thanks, appreciate it!' },
+      ],
+    } as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    const userMessage = getOpenAICreate().mock.calls[0][0].messages.find((m: any) => m.role === 'user');
+    // Outbound (sent/opened) → "You", inbound (received/replied) → "Them"
+    expect(userMessage.content).toContain('You sent');
+    expect(userMessage.content).toContain('They sent');
+  });
+});
+
+describe('generateConnectionFollowUpDraft — prompt quality guardrails', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockAlertService.notifyLinkedInConnectionAccepted.mockResolvedValue(undefined);
+    getOpenAICreate().mockResolvedValue({
+      choices: [{ message: { content: '{"content":"Hi, thanks for connecting!"}' } }],
+    });
+    mockReadBrandGuidelines.mockResolvedValue(null);
+    mockReadMarketStrategy.mockResolvedValue(null);
+    mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+  });
+
+  it('includes a banned-words list and a good/bad example in the prompt', async () => {
+    const leadWithLinkedIn = { ...MATCHING_LEAD, linkedin: 'https://www.linkedin.com/in/john-prospect' };
+    mockCrmDb.findLeadsByLinkedin.mockResolvedValue([leadWithLinkedIn] as any);
+    mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+
+    await notifyNewConnections([NEW_CONNECTION]);
+
+    const userMessage = getOpenAICreate().mock.calls[0][0].messages.find((m: any) => m.role === 'user');
+    expect(userMessage.content).toContain('synergy');
+    expect(userMessage.content.toLowerCase()).toContain('good:');
+    expect(userMessage.content.toLowerCase()).toContain('bad:');
   });
 });

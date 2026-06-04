@@ -228,7 +228,10 @@ export class ExternalCrmSyncService {
       userId,
       accountId: updates.accountId ?? existing?.accountId,
       apiKeyEncrypted: existing?.apiKeyEncrypted,
-      autoSyncEnabled: updates.autoSyncEnabled ?? existing?.autoSyncEnabled ?? false,
+      // Default ON: a configured sync should push new/edited leads automatically.
+      // Matches the UI toggle default. A partial save (e.g. from Test Connection)
+      // therefore won't silently disable auto-sync on a brand-new config.
+      autoSyncEnabled: updates.autoSyncEnabled ?? existing?.autoSyncEnabled ?? true,
       contactFieldMapping: updates.contactFieldMapping ?? existing?.contactFieldMapping
         ?? (isHubspot ? DEFAULT_HUBSPOT_CONTACT_MAPPING : DEFAULT_ATTIO_CONTACT_MAPPING),
       dealFieldMapping: nextDealFieldMapping,

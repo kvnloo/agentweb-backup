@@ -53,12 +53,14 @@ jest.mock('../services/emailEventsDb', () => ({
 }));
 
 const mockResolveAccountId = jest.fn();
+const mockResolveUserOwnedAccountId = jest.fn();
 const mockGetMessagesWithContact = jest.fn();
 const mockResolveProviderId = jest.fn();
 
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
+    resolveUserOwnedAccountId: (...args: any[]) => mockResolveUserOwnedAccountId(...args),
     getMessagesWithContact: (...args: any[]) => mockGetMessagesWithContact(...args),
     resolveProviderId: (...args: any[]) => mockResolveProviderId(...args),
   },
@@ -128,6 +130,7 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/sync-linkedin-messages', () 
     mockGetLeadListById.mockResolvedValue(OWNED_LIST);
     mockGetLeadById.mockResolvedValue(LEAD_WITH_LINKEDIN);
     mockResolveAccountId.mockResolvedValue('unipile-acct-1');
+    mockResolveUserOwnedAccountId.mockResolvedValue('unipile-acct-1');
     mockResolveProviderId.mockResolvedValue('provider-id-1');
     mockGetMessagesWithContact.mockResolvedValue([]);
     mockAddLinkedInMessageEvent.mockResolvedValue(undefined);
@@ -216,7 +219,7 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/sync-linkedin-messages', () 
   });
 
   it('returns 400 when no Unipile account is connected', async () => {
-    mockResolveAccountId.mockResolvedValue(null);
+    mockResolveUserOwnedAccountId.mockResolvedValue(null);
     const req: any = {
       user: { userId: 'test-user-id' },
       params: { listId: 'list-123', leadId: 'lead-456' },
@@ -224,6 +227,23 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/sync-linkedin-messages', () 
     const res = makeRes();
     await handler!(req, res);
     expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  it('does NOT borrow a site-wide shared account when the user has no own account and the list has none assigned', async () => {
+    // resolveUserOwnedAccountId returns null (no own account); the route must NOT
+    // fall through to resolveAccountId (which would borrow a site-wide shared account).
+    mockResolveUserOwnedAccountId.mockResolvedValue(null);
+    mockResolveAccountId.mockResolvedValue('site-wide-shared-acct');
+    const req: any = {
+      user: { userId: 'test-user-id' },
+      params: { listId: 'list-123', leadId: 'lead-456' },
+    };
+    const res = makeRes();
+    await handler!(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(mockResolveAccountId).not.toHaveBeenCalled();
+    expect(mockGetMessagesWithContact).not.toHaveBeenCalled();
   });
 
   it('syncs messages and returns count on happy path', async () => {

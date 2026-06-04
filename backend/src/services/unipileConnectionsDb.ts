@@ -130,12 +130,42 @@ export async function getAllConnectionsByAccount(accountId: string): Promise<Uni
       ExpressionAttributeValues: { ':aid': accountId },
       ExclusiveStartKey: lastEvaluatedKey,
     }).promise();
-    // Skip the __latest__ watermark row (sort key is a sentinel, not a real connection)
-    const batch = (result.Items ?? []).filter((item: any) => item.memberId !== '__latest__') as UnipileConnection[];
+    // Skip sentinel rows (__latest__ watermark, __fullsync__ marker) — not real connections.
+    const batch = (result.Items ?? []).filter(
+      (item: any) => item.memberId !== '__latest__' && item.memberId !== FULLSYNC_SK,
+    ) as UnipileConnection[];
     items.push(...batch);
     lastEvaluatedKey = result.LastEvaluatedKey as AWS.DynamoDB.DocumentClient.Key | undefined;
   } while (lastEvaluatedKey);
   return items;
+}
+
+/**
+ * One-time full-backfill marker. A partial cache (populated by incremental polls
+ * before the empty-cache full-sync fix landed) has a __latest__ watermark set, so it
+ * would otherwise never get its older connections backfilled. We store a __fullsync__
+ * sentinel row the first time an account is fully paginated; its absence means the
+ * account still needs a one-time backfill.
+ */
+const FULLSYNC_SK = '__fullsync__';
+
+/** Returns the timestamp a full backfill completed for this account, or null if it never has. */
+export async function getFullSyncCompletedAt(accountId: string): Promise<number | null> {
+  const result = await dynamodb.get({
+    TableName: TABLE,
+    Key: { accountId, memberId: FULLSYNC_SK },
+    ProjectionExpression: 'connectedAt',
+  }).promise();
+  const item = result.Item as Pick<UnipileConnection, 'connectedAt'> | undefined;
+  return item?.connectedAt ?? null;
+}
+
+/** Mark that a full backfill has completed for this account (idempotent). */
+export async function markFullSyncCompleted(accountId: string): Promise<void> {
+  await dynamodb.put({
+    TableName: TABLE,
+    Item: { accountId, memberId: FULLSYNC_SK, connectedAt: Date.now() },
+  }).promise();
 }
 
 /** Get the timestamp of the most recently synced connection for an account. */

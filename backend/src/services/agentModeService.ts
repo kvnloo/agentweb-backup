@@ -9579,7 +9579,15 @@ ${emailDraftFormat === 'text'
         });
       }
 
-      // Create message draft optimised for LinkedIn connection invites (max 300 chars)
+      // Create message draft optimised for LinkedIn connection invites. The char limit
+      // depends on the sending account tier: 300 for Premium, 200 for free. Resolve the
+      // account the same way the send-invite route does (list-assigned → user's own).
+      const { linkedInOutreachService } = await import('./linkedInOutreachService');
+      const inviteAccountId = (list as any)?.linkedInAccountId
+        || await linkedInOutreachService.resolveUserOwnedAccountId(userId);
+      const inviteCharLimit = inviteAccountId
+        ? await linkedInOutreachService.getInviteCharLimitForAccount(userId, inviteAccountId)
+        : 200;
       const leadName = [(lead as any).firstName, (lead as any).lastName].filter(Boolean).join(' ');
       const leadTitle = (lead as any).title || '';
       const leadCompany = (lead as any).company || '';
@@ -9595,7 +9603,7 @@ Write a note that:
 - Leads with something specific about THEIR work, role, or company — show you looked them up
 - Explains briefly WHY you want to connect, relevant to them
 - Sounds like one human writing to another — warm, direct, no corporate speak
-- Is under 280 characters total
+- Is under ${inviteCharLimit} characters total
 - Opens with their first name naturally (e.g. "John, saw your work on..." or "Sarah —")
 - Does NOT start with Hi or Hello
 - Does NOT have a call to action ("would love to chat", "let's connect")
@@ -9638,12 +9646,13 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         messageData = null;
       }
 
-      // Create message draft object if we got valid data — hard-cap at 300 chars (LinkedIn invite limit)
+      // Create message draft object if we got valid data — hard-cap at the account's
+      // LinkedIn invite limit (300 Premium / 200 free).
       let messageDraft = null;
       if (messageData && messageData.content) {
         const now = new Date().toISOString();
         messageDraft = {
-          content: String(messageData.content).slice(0, 300),
+          content: String(messageData.content).slice(0, inviteCharLimit),
           createdAt: now,
           updatedAt: now,
           sessionId: sessionId
@@ -12458,6 +12467,29 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
 
+      // A pre-built creative_id passed directly must be nested as { creative: { creative_id } }.
+      // Meta's POST /{ad-id} endpoint silently ignores a top-level creative_id (returns success
+      // but the ad keeps its old creative), so handle it explicitly before any other branch.
+      if (params.creative_id) {
+        const newCreativeId = params.creative_id;
+        await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } });
+
+        // Apply any other ad-level params (status, name, etc.) in a separate update
+        const adLevelParams: any = {};
+        for (const key of Object.keys(params)) {
+          if (key !== 'creative_id') adLevelParams[key] = params[key];
+        }
+        if (Object.keys(adLevelParams).length > 0) {
+          await metaService.updateAd(accessToken, adId, adLevelParams);
+        }
+
+        return {
+          success: true,
+          message: `Ad updated successfully. Swapped in creative ${newCreativeId}.`,
+          new_creative_id: newCreativeId
+        };
+      }
+
       // Detect if params contain creative content keys that require a creative swap
       const creativeKeys = Object.keys(params).filter(k =>
         AgentModeService.CREATIVE_CONTENT_KEYS.includes(k)
@@ -12664,18 +12696,48 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       const image = await metaService.uploadImage(accountId, accessToken, filename, buffer);
+      // metaService.uploadImage returns a flat { hash, url, ... } object. Surface the hash
+      // at the top level as image_hash so callers (COPY_AD re-upload, the agent itself)
+      // never have to parse Meta's filename-keyed images map — that parsing is the source
+      // of distinct creatives colliding on the wrong hash during batch uploads.
+      const imageHash = image?.hash;
+      if (!imageHash) {
+        return {
+          success: false,
+          message: 'Image upload did not return a hash from Meta.',
+          error: 'NO_IMAGE_HASH',
+          image
+        };
+      }
       return {
         success: true,
         message: `Image uploaded successfully`,
-        image: image
+        image_hash: imageHash,
+        image_url: image?.url,
+        image
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error uploading Meta ad image:', error);
+      // metaService.handleError attaches a structuredError ({ code, error_subcode,
+      // error_user_msg, ... }) so callers see Meta's actual reason instead of the bare
+      // "Invalid parameter". Surface it so the agent knows e.g. an image is too large.
+      const structured = error.structuredError;
+      const detail = structured?.error_user_msg || structured?.error_user_title;
+      const baseMessage = error.message || 'Failed to upload Meta ad image.';
       return {
         success: false,
-        message: error.message || 'Failed to upload Meta ad image.',
-        error: error.message
+        message: detail ? `${baseMessage} (${detail})` : baseMessage,
+        error: baseMessage,
+        meta_error: structured
+          ? {
+              code: structured.code,
+              error_subcode: structured.error_subcode,
+              error_user_title: structured.error_user_title,
+              error_user_msg: structured.error_user_msg,
+              classification: structured.classification,
+            }
+          : undefined,
       };
     }
   }
@@ -14245,7 +14307,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
     // LinkedIn invite message too long — tell the LLM to shorten and retry, not report success
     if (toolName === 'linkedin_outreach' && safeMessage.toLowerCase().includes('too long')) {
-      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: The invitation message exceeded LinkedIn's 300-character limit. Do NOT report this as a success. Shorten the message to 300 characters or fewer (trim filler words, remove the sign-off line, keep only the core personalisation) and retry the send-invite call immediately.`;
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: The invitation message exceeded LinkedIn's per-account character limit (see the reason above for the exact limit — 200 for free accounts, 300 for Premium). Do NOT report this as a success. Shorten the message to within that limit (trim filler words, remove the sign-off line, keep only the core personalisation) and retry the send-invite call immediately.`;
     }
     // save_file / create_html_file parameter errors — guide LLM to use correct schema names
     if ((toolName === 'save_file' || toolName === 'create_html_file') &&
@@ -22182,7 +22244,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'send-invite': {
           if (!target) throw new Error('Either profile_url or provider_id is required for send-invite');
-          const inviteResult = await linkedInOutreachService.sendInvitation(account_id, target, isUrl, message);
+          // Premium accounts allow 300-char invites; free accounts 200.
+          const inviteCharLimit = await linkedInOutreachService.getInviteCharLimitForAccount(userId, account_id);
+          const inviteResult = await linkedInOutreachService.sendInvitation(account_id, target, isUrl, message, inviteCharLimit);
           return { success: true, data: inviteResult };
         }
 

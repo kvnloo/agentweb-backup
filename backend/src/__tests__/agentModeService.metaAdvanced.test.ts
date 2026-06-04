@@ -61,8 +61,9 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
   // ==================== UPLOAD OPERATIONS ====================
   describe('Upload Operations', () => {
     describe('uploadMetaAdsImage', () => {
-      it('should successfully upload an image', async () => {
-        const mockImageData = { hash: 'image_hash_123' };
+      it('should successfully upload an image and surface a top-level image_hash', async () => {
+        // metaService.uploadImage now returns a flat { hash, url } object.
+        const mockImageData = { hash: 'image_hash_123', url: 'https://scontent.example/img.jpg' };
         const imageUrl = 'https://example.com/image.jpg';
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
@@ -73,7 +74,38 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
 
         expect(result.success).toBe(true);
         expect(result.message).toBe('Image uploaded successfully');
+        expect(result.image_hash).toBe('image_hash_123');
+        expect(result.image_url).toBe('https://scontent.example/img.jpg');
         expect(result.image).toEqual(mockImageData);
+      });
+
+      it('should fail clearly when Meta returns no hash', async () => {
+        const imageUrl = 'https://example.com/image.jpg';
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.uploadImage as jest.Mock).mockResolvedValue({ url: 'https://no-hash.example' });
+        (axios.get as jest.Mock).mockResolvedValue({ data: Buffer.from('mock image data') });
+
+        const result = await agentModeService.uploadMetaAdsImage('user123', imageUrl);
+
+        expect(result.success).toBe(false);
+        expect(result.error).toBe('NO_IMAGE_HASH');
+      });
+
+      it('should return distinct hashes for distinct images (no scrambling)', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (axios.get as jest.Mock).mockResolvedValue({ data: Buffer.from('mock image data') });
+        (metaService.uploadImage as jest.Mock)
+          .mockResolvedValueOnce({ hash: 'hash_A' })
+          .mockResolvedValueOnce({ hash: 'hash_B' })
+          .mockResolvedValueOnce({ hash: 'hash_C' });
+
+        const a = await agentModeService.uploadMetaAdsImage('user123', 'https://example.com/a.png');
+        const b = await agentModeService.uploadMetaAdsImage('user123', 'https://example.com/b.png');
+        const c = await agentModeService.uploadMetaAdsImage('user123', 'https://example.com/c.png');
+
+        expect([a.image_hash, b.image_hash, c.image_hash]).toEqual(['hash_A', 'hash_B', 'hash_C']);
+        expect(new Set([a.image_hash, b.image_hash, c.image_hash]).size).toBe(3);
       });
 
       it('should handle download errors', async () => {
@@ -99,6 +131,37 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
 
         expect(result.success).toBe(false);
         expect(result.message).toContain('Invalid image format');
+      });
+
+      it('should surface Meta structured error details instead of a bare message', async () => {
+        const imageUrl = 'https://example.com/oversized.png';
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (axios.get as jest.Mock).mockResolvedValue({ data: Buffer.from('image data') });
+
+        // Simulate metaService.handleError attaching a structuredError to the thrown error.
+        const err: any = new Error('Invalid parameter');
+        err.structuredError = {
+          code: 100,
+          error_subcode: 1487837,
+          error_user_title: 'Image too large',
+          error_user_msg: 'The image dimensions exceed the maximum allowed.',
+          classification: 'VALIDATION_ERROR',
+        };
+        (metaService.uploadImage as jest.Mock).mockRejectedValue(err);
+
+        const result = await agentModeService.uploadMetaAdsImage('user123', imageUrl);
+
+        expect(result.success).toBe(false);
+        // The user-facing reason should be appended to the generic message.
+        expect(result.message).toContain('The image dimensions exceed the maximum allowed.');
+        expect(result.meta_error).toEqual({
+          code: 100,
+          error_subcode: 1487837,
+          error_user_title: 'Image too large',
+          error_user_msg: 'The image dimensions exceed the maximum allowed.',
+          classification: 'VALIDATION_ERROR',
+        });
       });
     });
 

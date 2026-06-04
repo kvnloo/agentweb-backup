@@ -489,6 +489,53 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(mockScheduleDb.addRunResult).toHaveBeenCalled();
     });
 
+    it('should auto-pause and return failure when the owning user no longer exists', async () => {
+      mockUserDb.getUserById.mockResolvedValue(null as any);
+
+      const result = await runScheduledChat(baseSchedule, mockUserId, false);
+
+      // Returns a graceful failure result instead of throwing
+      expect(result).toEqual(
+        expect.objectContaining({
+          scheduleId: mockScheduleId,
+          status: 'failure',
+          passed: false,
+          attempt: 0,
+          sessionId: '',
+          actualResponse: expect.stringContaining(mockUserId),
+        })
+      );
+
+      // Auto-pauses the schedule so it stops firing
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        mockScheduleId,
+        expect.objectContaining({ status: 'paused' })
+      );
+
+      // Records the failure for visibility in the UI
+      expect(mockScheduleDb.addRunResult).toHaveBeenCalledWith(
+        mockScheduleId,
+        expect.objectContaining({ status: 'failure', sessionId: '' })
+      );
+
+      // Never starts the actual agent run
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+    });
+
+    it('should not auto-pause on a test run when the user is missing', async () => {
+      mockUserDb.getUserById.mockResolvedValue(null as any);
+
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
+
+      expect(result).toEqual(
+        expect.objectContaining({ status: 'failure', passed: false })
+      );
+
+      // Test runs must not mutate the schedule's status
+      expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+    });
+
     it('should create correct session title for test vs production', async () => {
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(mockResponse);
 

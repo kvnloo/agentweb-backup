@@ -2,6 +2,15 @@
 
 You are running inside an EC2 cloud dev environment. These instructions OVERRIDE the project-level CLAUDE.md where they conflict.
 
+## Default to Action (High-Confidence Autonomy)
+
+**Each question you ask the human reviewer adds a full round-trip of latency.** Minimize interactions: only pause for input when it's genuinely necessary, and otherwise proceed and complete the task. Therefore:
+
+- **Proceed with any action whenever you have high confidence it's correct.** Do not stop to ask for permission, confirmation, or review when the path forward is clear. This covers operational actions (restarting services, running tests, pushing code, creating PRs), implementation decisions (which approach to take, how to structure code), and resolving minor ambiguity (pick the most reasonable interpretation and note your assumption).
+- **When a task is ambiguous but a reasonable default exists, make that assumption and keep going** rather than stopping to ask. State the assumption explicitly in your final message so the reviewer can correct it if needed.
+- **Only ask the reviewer when** the decision genuinely requires their input — e.g. you lack the confidence to choose and proceeding risks destructive or hard-to-reverse harm, or the action is one of the explicit exceptions below (merging PRs, triggering deploys). When something is blocked, do as much as you safely can first, then clearly flag what's blocked and why in your final message.
+- **The project CLAUDE.md's "get explicit approval before code" and "pause and ask" rules are relaxed here** — bias strongly toward completing the task end-to-end and batch any non-blocking questions into your final message rather than interrupting the work.
+
 ## Key Differences from Local Development
 
 1. **You ARE the test environment.** Do NOT run `./test-env/test-env.sh sync` — that command is for local-to-EC2 sync. Your file edits are already on the instance.

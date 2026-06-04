@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-06-02
+// Last updated: 2026-06-04
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,171 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-06-04',
+    changes: [
+      'New: Scheduled Chats Can Now Improve Their Own Prompt Over Time',
+      '- Turn on the new "Self-improve prompt" switch when creating or editing a scheduled chat (it\'s off by default)',
+      '- After each run — including test runs, so you can try it out — Emma reflects on how it went and on anything else it can see in your account to spot ways the schedule could do better next time',
+      '- When it finds a clear improvement, it refines the schedule\'s prompt for you, so future runs get better on their own',
+      '- Every prompt change (whether from self-improve, an edit you make, or one you ask Emma for) now saves the previous version, keeping the last 10 so you can always revert',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
+      'Fixed: Updating a Facebook/Meta Ad\'s Creative Now Actually Changes the Ad',
+      '- When you asked to swap an existing ad onto a different creative (by creative ID), the update reported success but Meta kept showing the old image',
+      '- The new creative is now attached correctly, so the change is reflected on the same ad in Ads Manager — no need to delete and recreate the ad',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
+      'Fixed: Scheduled Chats Owned by Deleted Accounts Now Pause Themselves',
+      '- A scheduled chat whose owner account had been removed kept trying to run and failing every time, instead of stopping',
+      '- These orphaned schedules now pause automatically the next time they would run, and the run is recorded as a failure so it\'s visible in your history',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
+      'Fixed: Large Facebook/Meta Ad Images Upload Instead of Failing',
+      '- High-resolution creatives (for example 4096×4096 renders) were rejected by Meta with an unhelpful "Invalid parameter" error, blocking bulk ad creation',
+      '- We now automatically scale oversized images down to a size Meta accepts (preserving the aspect ratio, and keeping logos crisp) before uploading, so you no longer have to manually resize and re-upload them',
+      '- If an upload still fails, we now show Meta\'s actual reason instead of a generic error, so it\'s clear what to fix',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
+      'Improved: Auto-Drafted LinkedIn Follow-Up Messages Are More Personal',
+      '- When a lead accepts your connection request, the follow-up message we pre-draft for you now reflects your brand voice and your offer, instead of reading like generic filler',
+      '- The draft also takes prior emails and LinkedIn messages into account: if the lead already replied to you, it picks up that thread rather than re-introducing yourself',
+      '- The wording now matches the quality of the connection-invite notes — leading with something specific to the person and avoiding corporate buzzwords',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
+      'Fixed: CRM No Longer Offers "Send LinkedIn Invite" for People You\'re Already Connected To',
+      '- Some LinkedIn accounts only had a partial list of their connections cached, so leads you connected with a while ago still showed a "Send LinkedIn Invite" button — which then failed with "already connected"',
+      '- We now do a one-time full backfill of every connection for these accounts, so existing connections are correctly recognised',
+      '- As an extra safeguard, if a send attempt discovers you\'re already connected, that connection is added to the cache immediately so the button disappears right away',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
+      'Fixed: "LinkedIn Invitation Accepted" Email Notifications Are Sending Again (and No Longer Over-Send)',
+      '- These notifications had stopped firing because an accepted connection\'s profile URL never matched the stored lead, so no email went out',
+      '- The alert now fires only when the lead\'s list has a LinkedIn sender assigned and the invitation was accepted on that exact sender account',
+      '- Connecting a LinkedIn account no longer triggers a flood of "accepted" emails for connections you made long ago — the one-time backfill of your existing connections now runs silently',
+      '- These acceptance alerts are now email-only — they no longer post to Slack',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
+      'Fixed: LinkedIn Invite Status Updates Instantly Without a Page Reload',
+      '- After sending a LinkedIn connection invite from a lead, the lead\'s row didn\'t show the "invitation pending" marker until you reloaded the page',
+      '- The pending status now appears immediately on the lead row the moment the invite is sent',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
+      'Fixed: Analytics Tracking on the hireemma.ai Site',
+      '- Event tracking calls from the hireemma.ai website were being blocked by the browser because the domain was not on the API\'s allowed list',
+      '- hireemma.ai is now allowed, so its analytics events are recorded successfully instead of failing in the browser',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
+      'Fixed: Emma Can Edit Every Page of a Multi-Page Landing Site Again',
+      '- When a site has several pages that share one project, Emma could refuse to edit a page other than the one you opened — even one she had just edited moments earlier in the same chat',
+      '- Emma can now edit any page or shared file within the same site/project, so cross-page tweaks (like aligning a form on another page) go through reliably',
+      '- She still makes only the change you asked for and won\'t touch unrelated pages or copy on her own',
+    ],
+  },
+  {
+    date: '2026-06-03',
+    changes: [
+      'Fixed: Facebook/Meta Ad Images No Longer Get Swapped or Duplicated',
+      '- When uploading several ad images at once, distinct images could come back sharing the same image ID, so an ad could end up showing the wrong picture',
+      '- Each uploaded image now reliably returns its own correct ID, so the right creative is matched to the right ad',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'Fixed: Editing One Landing Page No Longer Changes Your Other Pages',
+      '- When you asked Emma to update a single landing page, she could occasionally edit files belonging to your other pages that share the same site, causing unintended changes',
+      '- Edits are now confined to the page you asked about: a single page can only touch its own files, and edits to other pages\' sections are rejected',
+      '- Emma also stays focused on exactly what you asked for and won\'t relabel or rewrite copy you didn\'t mention',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'Fixed: New Landing Pages No Longer Get Marked "Live" While Showing a 404',
+      '- When adding an extra page to an existing site, the page could be reported as deployed even though its build never went live, so visiting the link returned a "page not found" error',
+      '- We now confirm the deployment for the exact version we just published is the one that goes live before marking the page deployed — a stale, earlier build is never mistaken for success',
+      '- If that build does not come up in time, the page is now clearly marked failed (so you can retry) instead of silently showing a broken link',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'New: Mark a LinkedIn Account as Premium for Longer Connection Notes',
+      '- LinkedIn limits connection-invite notes to 200 characters on free accounts and 300 on Premium; invite notes now default to a 200-character limit so they\'re never silently rejected',
+      '- In Settings → Connected accounts, you can mark a LinkedIn Outreach account as Premium (or back to Free) from its menu — Premium accounts show a Premium badge and allow notes up to 300 characters',
+      '- The CRM compose panel\'s character counter, the "Send LinkedIn Invite" button, and the AI note drafting all follow the connected account\'s actual limit',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'Improved: AI-Drafted LinkedIn Invite Notes Are Saved Automatically',
+      '- When you generate or redraft a connection-invite note with AI, it\'s now saved to the lead automatically — it no longer disappears if you navigate away before clicking Save',
+      '- If you edit the note yourself, click Save draft to keep your changes, as before',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'Fixed: LinkedIn Sync and Invites Require a Connected LinkedIn Account',
+      '- Syncing LinkedIn messages and sending a LinkedIn connection invite now require a LinkedIn Outreach account that you\'ve connected (or one assigned to the list)',
+      '- Previously these could run without a sender configured; if no LinkedIn account is connected, you\'ll now see a clear prompt to connect one in Settings first',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'Fixed: Landing Page Generation No Longer Fails on Temporary v0 Outages',
+      '- A temporary error from the page-generation service (HTTP 500) would immediately fail the whole request, leaving a dead "failed" page and forcing you to start over; these transient errors (and rate limits) are now retried automatically with backoff',
+      '- Retrying a generation that failed before any content was created now reuses the existing failed page record instead of leaving behind a pile of orphaned empty pages',
+      '- Any leftover empty "failed" pages from earlier retries are now cleaned up automatically on your next generation, so your landing pages list stays tidy after an outage',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'Fixed: HubSpot Sync Now Reliably Pushes Leads (Including Notes) and Auto-Syncs New Ones',
+      '- Lists whose mapping included a "Notes" field could fail to push every contact ("Property \\"notes\\" does not exist"); the missing field is now created automatically before syncing, regardless of how it was mapped',
+      '- New and edited leads added to a synced list now push to HubSpot automatically by default — previously auto-sync could be left off after setup, so new leads silently never appeared in HubSpot',
+      '- Saving a connection without a pasted access token is now blocked with a clear prompt, instead of saving an unusable configuration that you had to set up a second time',
+    ],
+  },
+  {
+    date: '2026-06-02',
+    changes: [
+      'Fixed: Shared Plan Links No Longer Get Stuck on a Login Page',
+      '- Opening a shared plan link for a plan that requires sign-in sent recipients to the login screen and dropped the share access, so the link looked broken',
+      '- Shared plan links now open the conversation directly using the link itself as the access pass — no forced login for the people you share with',
+    ],
+  },
   {
     date: '2026-06-02',
     changes: [

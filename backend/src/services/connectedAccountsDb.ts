@@ -59,6 +59,9 @@ export interface LinkedInOutreachConfig {
   refresh_token?: undefined;
   token_expires_at: number;
   scopes?: string[];
+  // Premium LinkedIn accounts allow 300-char invitation notes (free accounts: 200).
+  // User-set in Settings → Connected accounts. Absent/false = free tier.
+  is_premium?: boolean;
 }
 
 /**

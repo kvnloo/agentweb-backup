@@ -19,6 +19,8 @@ import { leadListAlertService } from '../services/leadListAlertService';
 import {
   upsertConnections,
   getLatestConnectedAt,
+  getFullSyncCompletedAt,
+  markFullSyncCompleted,
   normalizeLinkedInUrl,
   UnipileConnection,
 } from '../services/unipileConnectionsDb';
@@ -37,6 +39,28 @@ const openai = new OpenAI({
 });
 
 const TAG = '[linkedInConnectionSync]';
+
+/**
+ * Kill-switches for the side effects of detecting a newly-accepted LinkedIn
+ * connection. Both default to DISABLED (muted) and must be explicitly turned on
+ * by setting the env var to "true". This is a deliberate fail-safe added after
+ * the 2026-06-03 notification flood (see docs/postmortem-2026-06-03-linkedin-connection-notification-flood.md):
+ * a one-time connection backfill caused thousands of "invitation accepted"
+ * emails/Slack messages and auto-enrollments to fire for historical, already-old
+ * connections — at a scale that risked spamming clients' prospects.
+ *
+ *  - LINKEDIN_CONNECTION_NOTIFY:  owner email/Slack alerts ("X accepted your invite")
+ *  - LINKEDIN_CONNECTION_ENROLL:  auto-enroll accepted leads into drip sequences
+ *                                 (this is what triggers OUTBOUND messages to leads)
+ *
+ * Connection caching itself is unaffected — the "already connected" detection
+ * other CRM features rely on keeps working.
+ *
+ * Read at call time (not module load) so the flag can be flipped via the EB
+ * environment without import-order concerns.
+ */
+const isNotifyEnabled = (): boolean => process.env.LINKEDIN_CONNECTION_NOTIFY === 'true';
+const isEnrollEnabled = (): boolean => process.env.LINKEDIN_CONNECTION_ENROLL === 'true';
 
 /** Returns all Unipile account IDs to sync: site-wide settings + all per-user connected accounts. */
 async function getAllUnipileAccountIds(): Promise<string[]> {
@@ -85,17 +109,21 @@ export async function syncConnectionsForAccount(
   const lastKnownAt = await getLatestConnectedAt(accountId).catch(() => null);
   const newConnections: UnipileConnection[] = [];
 
-  // First-ever sync for this account (empty cache): paginate through ALL connections.
-  // The incremental 3-page poll only captures the newest ~150, so an account that
-  // already had more connections than that when caching began would never get its
-  // older connections backfilled — making genuinely-connected leads look
-  // "not connected". Treat an empty cache as a full sync.
-  const isInitialSync = lastKnownAt === null;
-  const fullSync = opts.fullSync || isInitialSync;
+  // Decide whether this run should backfill ALL connections instead of the incremental
+  // 3-page poll. The incremental poll only captures the newest ~60, so an account with
+  // more connections than that would never get its older connections cached — making
+  // genuinely-connected leads look "not connected" (the CRM then offers "Send Invite",
+  // which fails live as "already connected"). We force a one-time full backfill until a
+  // __fullsync__ marker is set, covering BOTH:
+  //   - empty caches (no watermark yet), and
+  //   - partial caches populated by incremental polls before this fix landed.
+  const fullSyncDoneAt = await getFullSyncCompletedAt(accountId).catch(() => null);
+  const needsBackfill = fullSyncDoneAt === null;
+  const fullSync = opts.fullSync || needsBackfill;
 
   let cursor: string | undefined;
   let page = 0;
-  const MAX_PAGES = fullSync ? 200 : 3; // 3 pages × 50 = 150 connections per 10-min poll
+  const MAX_PAGES = fullSync ? 200 : 3; // Unipile returns ~20 relations/page → ~60 newest per incremental 10-min poll
 
   do {
     const result = await linkedInOutreachService.listConnections(accountId, cursor);
@@ -144,7 +172,15 @@ export async function syncConnectionsForAccount(
     if (hitOldRecord) break;
   } while (cursor && page < MAX_PAGES);
 
-  console.log(`${TAG} account=${accountId} synced ${newConnections.length} new connections (pages=${page})`);
+  // After a successful full pagination, record the one-time backfill marker so
+  // subsequent polls revert to the cheap 3-page incremental path.
+  if (fullSync) {
+    await markFullSyncCompleted(accountId).catch((err) =>
+      console.error(`${TAG} Failed to mark full-sync complete for ${accountId}:`, err),
+    );
+  }
+
+  console.log(`${TAG} account=${accountId} synced ${newConnections.length} new connections (pages=${page}, fullSync=${fullSync})`);
   return newConnections;
 }
 
@@ -213,6 +249,13 @@ export async function syncSentInvitationsForAccount(accountId: string): Promise<
  */
 export async function enrollNewConnections(newConnections: UnipileConnection[]): Promise<number> {
   if (newConnections.length === 0) return 0;
+
+  // Kill-switch: auto-enrollment is what sends OUTBOUND messages to leads, so it
+  // is muted by default. Set LINKEDIN_CONNECTION_ENROLL=true to re-enable.
+  if (!isEnrollEnabled()) {
+    console.log(`${TAG} Auto-enrollment muted (LINKEDIN_CONNECTION_ENROLL not 'true') — skipping ${newConnections.length} connection(s)`);
+    return 0;
+  }
 
   const sequences = await dripSequenceDb.getAllSequencesByTriggerType('linkedin_connection_accepted');
   if (sequences.length === 0) return 0;
@@ -295,18 +338,26 @@ async function generateConnectionFollowUpDraft(lead: any, list: any): Promise<vo
       agentModeService.readMarketStrategy(userId).catch(() => null),
       userId ? crmDb.getLeadEngagements(lead.listId, lead.leadId, userId).catch(() => ({ engagements: [] })) : Promise.resolve({ engagements: [] }),
     ]);
-    if (brand?.guidelines) brandContext += `\nBrand voice: ${String(brand.guidelines).slice(0, 300)}`;
-    if (strategy?.strategy) brandContext += `\nOffer/market fit: ${String(strategy.strategy).slice(0, 300)}`;
+    // readBrandGuidelines / readMarketStrategy return { exists, formattedContent }
+    // — there is no `.guidelines` / `.strategy` field, so the previous checks were
+    // always false and brand/offer context never reached the prompt.
+    if (brand?.exists && brand.formattedContent) brandContext += `\nBrand voice: ${String(brand.formattedContent).slice(0, 500)}`;
+    if (strategy?.exists && strategy.formattedContent) brandContext += `\nOffer/market fit: ${String(strategy.formattedContent).slice(0, 500)}`;
 
     const engagements: any[] = (engagementsResult as any).engagements || [];
     if (engagements.length > 0) {
       activityContext = '\n\nPast activity with this lead (most recent first):';
       engagements.slice(0, 10).forEach((eng: any, i: number) => {
-        activityContext += `\n${i + 1}. [${eng.eventType}] ${eng.createdAt}`;
+        // Label direction so the model knows what to acknowledge: outbound
+        // (we contacted them) vs inbound (they replied / engaged).
+        const type = String(eng.eventType || '');
+        const inbound = /received|replied|reply|opened|clicked/i.test(type);
+        const actor = inbound ? 'They' : 'You';
+        activityContext += `\n${i + 1}. ${actor} sent [${type}] ${eng.createdAt}`;
         if (eng.eventData?.subject) activityContext += ` — Subject: ${eng.eventData.subject}`;
         if (eng.text) activityContext += `\n   "${String(eng.text).slice(0, 300)}"`;
       });
-      activityContext += '\n\nUse this history to craft a relevant follow-up that references prior touchpoints where appropriate.';
+      activityContext += '\n\nUse this history to craft a relevant follow-up that references prior touchpoints where appropriate. If they already replied, acknowledge their reply rather than re-introducing yourself.';
     }
   } catch { /* non-fatal */ }
 
@@ -314,13 +365,17 @@ async function generateConnectionFollowUpDraft(lead: any, list: any): Promise<vo
 
 Lead: ${leadName}${company}${title}${brandContext}${activityContext}
 
-Requirements:
-- 1-3 short sentences, max 300 characters
-- Friendly and natural, not salesy
-- Reference that you just connected
-- If there is past activity, acknowledge it naturally (e.g. "following up on my earlier email")
-- Open-ended question or soft next step
-- No subject line, no signature
+Write a message that:
+- Is 1-3 short sentences, max 300 characters
+- Leads with something specific about THEIR work, role, or company, or builds on a prior touchpoint — show you actually know who they are
+- Sounds like one human writing to another — warm, direct, no corporate speak
+- References that you just connected, naturally (not "thanks for accepting my request")
+- Ends with one genuine, open-ended question or a soft next step
+- Does NOT use: synergy, opportunity, exciting, leverage, passionate, innovative, value-add, circle back, touch base
+- No emojis, no subject line, no signature
+
+Bad: "Hi John, thanks for connecting! I'd love to learn more about what you're working on. Would you be open to a quick chat sometime?"
+Good: "Glad we connected, John. Still think your take on isolating the browser instead of locking it down is the right call — are you finding that scales as the team grows?"
 
 Respond with JSON: {"content": "the message text"}`;
 
@@ -348,10 +403,46 @@ Respond with JSON: {"content": "the message text"}`;
   });
 }
 
+/**
+ * Look up CRM leads matching a connection's LinkedIn profile URL.
+ *
+ * The connection URL is normalized with a trailing slash (e.g. ".../in/john/"),
+ * but leads store their LinkedIn URL WITHOUT a trailing slash (CSV import and
+ * enrichment both strip it). findLeadsByLinkedin does an exact GSI match, so a
+ * single slash-terminated lookup silently misses every lead — which is why
+ * acceptance notifications stopped firing. Query both variants and dedup.
+ */
+async function findLeadsForConnectionUrl(profileUrl: string): Promise<any[]> {
+  const withSlash = normalizeLinkedInUrl(profileUrl); // lowercase + trailing slash
+  const withoutSlash = withSlash.replace(/\/+$/, '');
+  const variants = withSlash === withoutSlash ? [withSlash] : [withoutSlash, withSlash];
+
+  const seen = new Set<string>();
+  const out: any[] = [];
+  for (const variant of variants) {
+    const leads = (await crmDb.findLeadsByLinkedin(variant)) || [];
+    for (const lead of leads as any[]) {
+      const key = `${lead.listId}#${lead.leadId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(lead);
+    }
+  }
+  return out;
+}
+
 export async function notifyNewConnections(newConnections: UnipileConnection[]): Promise<void> {
+  // Kill-switch: owner email/Slack alerts are muted by default after the
+  // 2026-06-03 flood. Set LINKEDIN_CONNECTION_NOTIFY=true to re-enable.
+  if (!isNotifyEnabled()) {
+    if (newConnections.length > 0) {
+      console.log(`${TAG} Acceptance notifications muted (LINKEDIN_CONNECTION_NOTIFY not 'true') — skipping ${newConnections.length} connection(s)`);
+    }
+    return;
+  }
   for (const conn of newConnections) {
     try {
-      const leads = await crmDb.findLeadsByLinkedin(conn.publicProfileUrl);
+      const leads = await findLeadsForConnectionUrl(conn.publicProfileUrl);
       for (const lead of leads as any[]) {
         if (!lead.listId) continue;
         // Dedup: skip if we already sent a notification for this lead's connection event.
@@ -362,6 +453,16 @@ export async function notifyNewConnections(newConnections: UnipileConnection[]):
         try {
           const list = await crmDb.getLeadListById(lead.listId);
           if (!list) continue;
+          // Only notify at the lead-list level when the list has an assigned
+          // LinkedIn sender, AND this connection was synced from that exact
+          // sender account. Otherwise a connection accepted on an unrelated
+          // account (e.g. the shared site-wide pool) would wrongly notify the
+          // owner of a list that never sent the invite.
+          const listSenderAccountId: string | null = (list as any).linkedInAccountId ?? null;
+          if (!listSenderAccountId || listSenderAccountId !== conn.accountId) {
+            console.log(`${TAG} Skipping notification for lead ${lead.leadId} — list ${lead.listId} has no matching assigned LinkedIn sender (list sender=${listSenderAccountId ?? 'none'}, connection account=${conn.accountId})`);
+            continue;
+          }
           // Mark as notified before sending — prevents duplicate sends if this throws.
           await crmDb.updateLead(lead.listId, lead.leadId, {
             system: { ...((lead.system as Record<string, any>) ?? {}), linkedInConnectionNotifiedAt: new Date().toISOString() },
@@ -407,8 +508,23 @@ export async function runLinkedInConnectionSync(): Promise<void> {
     const allNewConnections: UnipileConnection[] = [];
     for (const accountId of accountIds) {
       try {
+        // Detect a one-time full backfill BEFORE syncing. syncConnectionsForAccount
+        // forces a full backfill (then sets the __fullsync__ marker) whenever that
+        // marker is absent — covering BOTH empty caches and partial caches populated
+        // by incremental polls before the backfill fix landed. That backfill pulls
+        // ALL historical connections into the cache; those are old accepted
+        // invitations, NOT freshly accepted ones. Treating them as new would
+        // email/enroll the list owner for every pre-existing connection at once
+        // (observed: a one-time burst of acceptance emails). Cache them silently and
+        // only process genuinely-new connections on subsequent incremental runs.
+        const wasBackfill = (await getFullSyncCompletedAt(accountId).catch(() => null)) === null;
+
         const newConns = await syncConnectionsForAccount(accountId);
-        allNewConnections.push(...newConns);
+        if (wasBackfill) {
+          console.log(`${TAG} account=${accountId} one-time backfill cached ${newConns.length} connection(s) — skipping accepted-notifications and enrollment`);
+        } else {
+          allNewConnections.push(...newConns);
+        }
       } catch (err) {
         console.error(`${TAG} Sync failed for account ${accountId}:`, err);
       }

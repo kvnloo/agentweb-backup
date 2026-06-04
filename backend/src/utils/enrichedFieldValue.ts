@@ -38,6 +38,9 @@ export interface EnrichedFieldMeta {
   confidence?: 'high' | 'medium' | 'low';
   enrichedAt: string;          // ISO
   enrichedJobId?: string;
+  /** Whether this value was served from a provider cache rather than a live API call.
+   *  Absent on legacy records written before this field was added. */
+  fromCache?: boolean;
   /** Set when a user has manually verified the value. */
   verifiedBy?: { userId: string; at: string };
   /** Set when a user has rejected the value. */

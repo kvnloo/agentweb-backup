@@ -11,6 +11,7 @@
 import {
   runWaterfall,
   createApolloFetchContext,
+  createEnrichSoFetchContext,
   APOLLO_GROUP_COVERAGE,
   type WaterfallDeps,
   type RunWaterfallInput,
@@ -64,6 +65,7 @@ function makeInput(overrides: Partial<RunWaterfallInput> = {}): RunWaterfallInpu
     requestedFields: ['company_name'],
     configFieldsByName: {},
     apolloCtx: createApolloFetchContext(),
+    enrichSoCtx: createEnrichSoFetchContext(),
     refreshFields: new Set<string>(),
     ...overrides,
   };
@@ -127,7 +129,7 @@ describe('runWaterfall — empty / no-op paths', () => {
 
     expect(result.fields).toEqual([]);
     expect(result.missing).toEqual([]);
-    expect(result.tierFills).toEqual({ crm: 0, apollo: 0, web: 0, missing: 0 });
+    expect(result.tierFills).toEqual({ crm: 0, apollo: 0, enrichSo: 0, unipile: 0, web: 0, missing: 0 });
     expect(deps.fetchApolloOrg).not.toHaveBeenCalled();
     expect(deps.fetchWebForGroup).not.toHaveBeenCalled();
   });
@@ -155,7 +157,7 @@ describe('runWaterfall — Tier 1 (CRM)', () => {
 
     expect(result.fields).toHaveLength(2);
     expect(result.fields.every(f => f.meta.source === 'existing_data')).toBe(true);
-    expect(result.tierFills).toEqual({ crm: 2, apollo: 0, web: 0, missing: 0 });
+    expect(result.tierFills).toEqual({ crm: 2, apollo: 0, enrichSo: 0, unipile: 0, web: 0, missing: 0 });
     expect(deps.fetchApolloOrg).not.toHaveBeenCalled();
     expect(deps.fetchWebForGroup).not.toHaveBeenCalled();
     expect(deps.extractFieldsViaLLM).not.toHaveBeenCalled();
@@ -391,7 +393,7 @@ describe('runWaterfall — Tier 4 (Web)', () => {
 
     expect(result.fields.map(f => f.field)).toEqual(['company_name']);
     expect(result.missing).toEqual(['industry']);
-    expect(result.tierFills).toEqual({ crm: 0, apollo: 0, web: 1, missing: 1 });
+    expect(result.tierFills).toEqual({ crm: 0, apollo: 0, enrichSo: 0, unipile: 0, web: 1, missing: 1 });
   });
 
   it('skips web when web fetch returns null (e.g. all upstream caches expired AND fetch failed)', async () => {
@@ -651,7 +653,7 @@ describe('runWaterfall — Tier 5 (Unipile company enrichment after web)', () =>
     expect(deps.findUnipileCompany).toHaveBeenCalledTimes(1);
     expect(result.fields).toHaveLength(2);
     expect(result.fields.every(f => f.meta.source === 'api' && f.meta.provider === 'unipile')).toBe(true);
-    expect(result.tierFills.apollo).toBe(2);
+    expect(result.tierFills.unipile).toBe(2);
     expect(result.tierFills.web).toBe(0);
   });
 
@@ -672,7 +674,7 @@ describe('runWaterfall — Tier 5 (Unipile company enrichment after web)', () =>
     expect(result.fields.find(f => f.field === 'company_description')?.meta.source).toBe('web_search');
     expect(result.fields.find(f => f.field === 'employee_count')?.meta.source).toBe('api');
     expect(result.tierFills.web).toBe(1);
-    expect(result.tierFills.apollo).toBe(1);
+    expect(result.tierFills.unipile).toBe(1);
   });
 
   it('skips when lead.linkedin is absent', async () => {
@@ -774,7 +776,7 @@ describe('runWaterfall — Tier 5 (Unipile company enrichment after web)', () =>
     expect(llmCall.fields).toContain('company_description');
   });
 
-  it('accounts for company fills under apollo in tierFills', async () => {
+  it('accounts for company fills under unipile in tierFills', async () => {
     const lead = makeLead({ linkedin: 'https://www.linkedin.com/in/jane-doe' });
     const deps = makeDeps({
       findUnipileCompany: jest.fn().mockResolvedValue({ companyRaw: { name: 'Acme' } }),
@@ -788,7 +790,7 @@ describe('runWaterfall — Tier 5 (Unipile company enrichment after web)', () =>
       deps,
     );
 
-    expect(result.tierFills).toEqual({ crm: 0, apollo: 1, web: 0, missing: 0 });
+    expect(result.tierFills).toEqual({ crm: 0, apollo: 0, enrichSo: 0, unipile: 1, web: 0, missing: 0 });
     expect(result.missing).toEqual([]);
   });
 });
@@ -1089,6 +1091,160 @@ describe('runWaterfall — Tier 3.5b (Unipile person enrichment)', () => {
     delete (deps as any).findUnipilePerson;
     const result = await runWaterfall(
       makeInput({ groupName: 'person_identity', requestedFields: ['first_name'] }),
+      deps,
+    );
+
+    expect(result.missing).toContain('first_name');
+  });
+});
+
+// ─── Tier 3.5b-enrich.so ────────────────────────────────────────────────────
+
+describe('runWaterfall — T3.5b-enrich.so (reverse lookup)', () => {
+  it('fills person fields from enrich.so when email present and fields remaining', async () => {
+    const findEnrichSoPerson = jest.fn().mockResolvedValue({
+      firstName: 'Jane',
+      lastName: 'Doe',
+      jobTitle: 'VP Engineering',
+      profileUrl: 'https://www.linkedin.com/in/janedoe',
+      fromCache: false,
+    });
+    const deps = makeDeps({ findEnrichSoPerson });
+
+    const result = await runWaterfall(
+      makeInput({
+        groupName: 'person_identity',
+        requestedFields: ['first_name', 'last_name', 'title', 'linkedin_url'],
+        lead: makeLead({ email: 'jane@acme.com' }),
+      }),
+      deps,
+    );
+
+    expect(findEnrichSoPerson).toHaveBeenCalledWith('jane@acme.com');
+    expect(result.fields.find(f => f.field === 'first_name')?.value).toBe('Jane');
+    expect(result.fields.find(f => f.field === 'last_name')?.value).toBe('Doe');
+    expect(result.fields.find(f => f.field === 'title')?.value).toBe('VP Engineering');
+    expect(result.fields.find(f => f.field === 'linkedin_url')?.value).toBe('https://www.linkedin.com/in/janedoe');
+  });
+
+  it('sets fromCache correctly on enrich.so fills', async () => {
+    const findEnrichSoPerson = jest.fn().mockResolvedValue({
+      firstName: 'Jane',
+      fromCache: true,
+    });
+    const deps = makeDeps({ findEnrichSoPerson });
+
+    const result = await runWaterfall(
+      makeInput({
+        groupName: 'person_identity',
+        requestedFields: ['first_name'],
+        lead: makeLead({ email: 'jane@acme.com' }),
+      }),
+      deps,
+    );
+
+    expect(result.fields.find(f => f.field === 'first_name')?.meta.fromCache).toBe(true);
+    expect(result.fields.find(f => f.field === 'first_name')?.meta.provider).toBe('enrich.so');
+  });
+
+  it('fills company fields from enrich.so', async () => {
+    const findEnrichSoPerson = jest.fn().mockResolvedValue({
+      companyName: 'Acme Corp',
+      companyLinkedInUrl: 'https://www.linkedin.com/company/acme',
+      fromCache: false,
+    });
+    const deps = makeDeps({ findEnrichSoPerson });
+
+    const result = await runWaterfall(
+      makeInput({
+        groupName: 'company_firmographic',
+        requestedFields: ['company_name', 'company_linkedin_url'],
+        lead: makeLead({ email: 'jane@acme.com' }),
+      }),
+      deps,
+    );
+
+    expect(result.fields.find(f => f.field === 'company_name')?.value).toBe('Acme Corp');
+    expect(result.fields.find(f => f.field === 'company_linkedin_url')?.value).toBe('https://www.linkedin.com/company/acme');
+  });
+
+  it('fills career fields as JSON stringified arrays', async () => {
+    const findEnrichSoPerson = jest.fn().mockResolvedValue({
+      pastCompanies: ['OldCo', 'StartupX'],
+      education: ['MIT (BS Computer Science)'],
+      fromCache: false,
+    });
+    const deps = makeDeps({ findEnrichSoPerson });
+
+    const result = await runWaterfall(
+      makeInput({
+        groupName: 'person_career',
+        requestedFields: ['prior_companies', 'education'],
+        lead: makeLead({ email: 'jane@acme.com' }),
+      }),
+      deps,
+    );
+
+    expect(result.fields.find(f => f.field === 'prior_companies')?.value).toBe(JSON.stringify(['OldCo', 'StartupX']));
+    expect(result.fields.find(f => f.field === 'education')?.value).toBe(JSON.stringify(['MIT (BS Computer Science)']));
+  });
+
+  it('skips when no email available', async () => {
+    const findEnrichSoPerson = jest.fn().mockResolvedValue({ firstName: 'Jane' });
+    const deps = makeDeps({ findEnrichSoPerson });
+
+    const result = await runWaterfall(
+      makeInput({
+        groupName: 'person_identity',
+        requestedFields: ['first_name'],
+        lead: makeLead({ email: undefined }),
+      }),
+      deps,
+    );
+
+    expect(findEnrichSoPerson).not.toHaveBeenCalled();
+    expect(result.missing).toContain('first_name');
+  });
+
+  it('memoizes — calls findEnrichSoPerson only once across multiple uses', async () => {
+    const findEnrichSoPerson = jest.fn().mockResolvedValue({
+      firstName: 'Jane',
+      fromCache: false,
+    });
+    const deps = makeDeps({ findEnrichSoPerson });
+    const enrichSoCtx = createEnrichSoFetchContext();
+
+    await runWaterfall(
+      makeInput({ groupName: 'person_identity', requestedFields: ['first_name'], enrichSoCtx }),
+      deps,
+    );
+    await runWaterfall(
+      makeInput({ groupName: 'person_career', requestedFields: ['prior_companies'], enrichSoCtx }),
+      deps,
+    );
+
+    expect(findEnrichSoPerson).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips when findEnrichSoPerson dep absent', async () => {
+    const deps = makeDeps();
+    const result = await runWaterfall(
+      makeInput({ groupName: 'person_identity', requestedFields: ['first_name'] }),
+      deps,
+    );
+    expect(result.missing).toContain('first_name');
+  });
+
+  it('handles enrich.so returning null gracefully', async () => {
+    const findEnrichSoPerson = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({ findEnrichSoPerson });
+
+    const result = await runWaterfall(
+      makeInput({
+        groupName: 'person_identity',
+        requestedFields: ['first_name'],
+        lead: makeLead({ email: 'jane@acme.com' }),
+      }),
       deps,
     );
 

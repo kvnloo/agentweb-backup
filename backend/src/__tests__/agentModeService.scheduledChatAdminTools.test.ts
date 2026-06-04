@@ -108,7 +108,7 @@ jest.mock('../services/skillService', () => ({
 // Import mocked services
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
-import { scheduleDb } from '../services/db';
+import { scheduleDb, userDb } from '../services/db';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { getAllowedSkills } from '../services/subscriptionService';
 import { skillService } from '../services/skillService';
@@ -150,6 +150,12 @@ describe('Scheduled Chat - Admin Tool Auto-Install', () => {
     mockScheduleDb.addRunResult.mockResolvedValue(undefined);
     mockedGetAllowedSkills.mockResolvedValue(['*']);
     mockedSkillService.getPublishedSkills.mockResolvedValue([]);
+    // Schedule owner must exist (and be admin, since these tests exercise admin tools)
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: mockUserId,
+      email: 'owner@example.com',
+      isAdmin: true,
+    });
   });
 
   // ─── FAIL tests: non-admin tools should NOT install __admin_tools__ ───

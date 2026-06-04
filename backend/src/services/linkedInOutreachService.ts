@@ -338,13 +338,41 @@ export class LinkedInOutreachService {
    * @param isUrl          - true if profileUrlOrId is a profile URL, false if it is already a provider_id.
    * @param message        - Optional personalised note to attach to the invitation.
    */
-  // LinkedIn (via Unipile) rejects invitation notes longer than 300 characters.
+  // LinkedIn invitation-note limits depend on the account tier:
+  //  - Free accounts: 200 characters
+  //  - Premium accounts: 300 characters (also LinkedIn's absolute maximum)
   static readonly INVITE_MESSAGE_MAX_CHARS = 300;
+  static readonly INVITE_MESSAGE_MAX_CHARS_FREE = 200;
 
-  async sendInvitation(account_id: string, profileUrlOrId: string, isUrl: boolean, message?: string): Promise<any> {
-    if (message !== undefined && message.length > LinkedInOutreachService.INVITE_MESSAGE_MAX_CHARS) {
+  /**
+   * Resolve the invitation-note character limit for a given account: 300 for a
+   * Premium account (config.is_premium === true), 200 otherwise. Falls back to the
+   * free limit if the account can't be read, so we never over-promise capacity.
+   */
+  async getInviteCharLimitForAccount(userId: string, accountId: string): Promise<number> {
+    try {
+      const { getAccountsByUserIdIncludingOrgShared } = await import('./connectedAccountsDb');
+      const accounts = await getAccountsByUserIdIncludingOrgShared(userId);
+      const account = (accounts as any[]).find(
+        (a) => a.platform === 'unipile' && a.account_id === accountId
+      );
+      if (account?.config?.is_premium === true) {
+        return LinkedInOutreachService.INVITE_MESSAGE_MAX_CHARS;
+      }
+    } catch { /* ignore — fall through to the free limit */ }
+    return LinkedInOutreachService.INVITE_MESSAGE_MAX_CHARS_FREE;
+  }
+
+  async sendInvitation(
+    account_id: string,
+    profileUrlOrId: string,
+    isUrl: boolean,
+    message?: string,
+    maxChars: number = LinkedInOutreachService.INVITE_MESSAGE_MAX_CHARS
+  ): Promise<any> {
+    if (message !== undefined && message.length > maxChars) {
       throw new Error(
-        `Invitation message is too long (${message.length} characters). LinkedIn limits invitation notes to ${LinkedInOutreachService.INVITE_MESSAGE_MAX_CHARS} characters. Please shorten the message and retry.`
+        `Invitation message is too long (${message.length} characters). LinkedIn limits invitation notes to ${maxChars} characters for this account. Please shorten the message and retry.`
       );
     }
     try {
@@ -382,6 +410,13 @@ export class LinkedInOutreachService {
 
       // Unipile may return 'FIRST_DEGREE' (validated format) or 'DISTANCE_1' (raw format)
       if (distance === 'FIRST_DEGREE' || distance === 'DISTANCE_1') {
+        // Self-heal: the live API says we're connected but the cache evidently didn't
+        // (or the CRM wouldn't have offered the invite). Upsert this connection so the
+        // CRM stops offering the invite immediately, without waiting for the next full
+        // sync. Non-fatal — never let a cache write block the already-connected guard.
+        await this.cacheLiveConnection(accountId, profile).catch((err) =>
+          this.log(`Self-heal connection cache write skipped`, { providerId, reason: err?.message }),
+        );
         throw new Error(
           `Cannot send invite: you are already connected with this person (network_distance: ${distance}). ` +
           `Use the send-message action to reach them directly.`
@@ -392,6 +427,41 @@ export class LinkedInOutreachService {
       // Profile lookup failed — log and proceed rather than blocking the invite
       this.log(`Connection status check skipped (profile fetch failed)`, { providerId, reason: error.message });
     }
+  }
+
+  /**
+   * Upsert a single live 1st-degree connection into AW-UnipileConnections. Used to
+   * self-heal a stale cache that was missing a genuinely-connected lead. Best-effort:
+   * skips silently if the profile lacks a usable public URL/member id.
+   */
+  private async cacheLiveConnection(accountId: string, profile: any): Promise<void> {
+    const publicId: string | undefined = profile?.public_identifier || profile?.provider_id;
+    const memberId: string | undefined = profile?.member_id || publicId;
+    if (!memberId) return;
+
+    const {
+      upsertConnections,
+      normalizeLinkedInUrl,
+    } = await import('./unipileConnectionsDb');
+
+    const profileUrl = normalizeLinkedInUrl(
+      profile?.public_profile_url ||
+      (publicId ? `https://www.linkedin.com/in/${publicId}/` : ''),
+    );
+    if (!profileUrl) return;
+
+    await upsertConnections([{
+      accountId,
+      memberId,
+      publicProfileUrl: profileUrl,
+      memberUrn: profile?.member_urn ?? '',
+      connectionUrn: profile?.connection_urn ?? '',
+      firstName: profile?.first_name ?? '',
+      lastName: profile?.last_name ?? '',
+      headline: profile?.headline ?? '',
+      connectedAt: profile?.created_at ?? 0,
+      syncedAt: new Date().toISOString(),
+    }]);
   }
 
   /**
@@ -961,6 +1031,27 @@ export class LinkedInOutreachService {
       }
     } catch { /* ignore parse errors or settings fetch failures */ }
 
+    return null;
+  }
+
+  /**
+   * Resolve ONLY the user's own connected Unipile account_id — no site-wide
+   * shared-account fallback.
+   *
+   * Use this for user-initiated CRM actions (LinkedIn message sync, sending a
+   * connection invite) that must run from a LinkedIn sender the user has actually
+   * configured. The site-wide shared pool used by `resolveAccountId` is for
+   * background/system features (enrichment, drip sequences); borrowing one of
+   * those accounts for a user's manual outreach would send from an account the
+   * user never connected. Returns null when the user has no own Unipile account.
+   */
+  async resolveUserOwnedAccountId(userId: string): Promise<string | null> {
+    try {
+      const { getAccountsByUserId } = await import('./connectedAccountsDb');
+      const accounts = await getAccountsByUserId(userId);
+      const userAccount = (accounts as any[]).find((a) => a.platform === 'unipile');
+      if (userAccount?.account_id) return userAccount.account_id;
+    } catch { /* ignore */ }
     return null;
   }
 

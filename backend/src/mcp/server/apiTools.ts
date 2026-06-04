@@ -310,6 +310,7 @@ mcpToolRegistry.register({
         function_call_min_calls: { type: 'object', description: 'Minimum call counts per function (create/update)' },
         email_notifications: { type: 'array', items: { type: 'string' }, description: 'Email addresses for notifications (REQUIRED for create — must include at least one; optional for update but must be non-empty if provided)' },
         daily_digest: { type: 'boolean', description: 'Send daily digest instead of per-run emails (create/update, hourly only)' },
+        self_improve: { type: 'boolean', description: 'When true, after each run a reflection turn reviews the result and may automatically refine starting_message so future runs do better. Off by default (create/update).' },
         run_count: { type: 'number', description: 'Number of runs (-1 for unlimited, create/update)' },
         variables: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' } }, required: ['name'] }, description: 'Variable definitions for the starting message (create/update)' },
         variable_values: { type: 'object', description: 'Initial variable values (create/update)' },
@@ -337,6 +338,7 @@ mcpToolRegistry.register({
         if (args.function_call_min_calls !== undefined) body.functionCallMinCalls = args.function_call_min_calls;
         if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
         if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
+        if (args.self_improve !== undefined) body.selfImprove = args.self_improve;
         if (args.run_count !== undefined) body.runCount = args.run_count;
         if (args.variables !== undefined) body.variables = args.variables;
         if (args.variable_values !== undefined) body.variableValues = args.variable_values;
@@ -359,6 +361,7 @@ mcpToolRegistry.register({
         if (args.function_call_min_calls !== undefined) body.functionCallMinCalls = args.function_call_min_calls;
         if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
         if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
+        if (args.self_improve !== undefined) body.selfImprove = args.self_improve;
         if (args.run_count !== undefined) body.runCount = args.run_count;
         if (args.variables !== undefined) body.variables = args.variables;
         if (args.variable_values !== undefined) body.variableValues = args.variable_values;
