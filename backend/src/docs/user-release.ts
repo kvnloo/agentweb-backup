@@ -20,6 +20,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-04',
     changes: [
+      'Fixed: Enabling Public Access on a Landing Page Lead List Now Works',
+      '- When Emma set up a landing page, the step that opens its lead list for public form submissions reported success but did not actually take effect, so the form could be left unable to capture leads',
+      '- That step now reliably flips the list to public, so landing page forms can submit leads without anyone having to sign in',
+    ],
+  },
+  {
+    date: '2026-06-04',
+    changes: [
       'Fixed: Data Analysis Now Reads Large Files Reliably Instead of Guessing From Truncated Data',
       '- When you asked Emma to analyze large data files (for example usage or billing totals across many sessions), the files were not actually reaching the analysis sandbox, so it fell back to working from a shortened, inline copy of the data',
       '- This produced inconsistent and untrustworthy numbers — the same question could return a different grand total each time, and category breakdowns would not add up',
