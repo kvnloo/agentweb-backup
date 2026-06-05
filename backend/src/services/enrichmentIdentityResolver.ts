@@ -86,6 +86,19 @@ export interface IdentityResolverDeps {
   /** Step 2 — Unipile LinkedIn people search. Finds linkedin_url from name+company.
    *  Returns null when no connected LinkedIn account or no confident match. */
   findLinkedInUrl(input: { firstName: string; lastName: string; company: string }): Promise<string | null>;
+  /** Step 3.5 — Unipile profile lookup BY LinkedIn URL. Resolves
+   *  name/title/company directly from a /in/ URL — the one identity source
+   *  that works for a LinkedIn-only lead Apollo doesn't cover. Without it such
+   *  leads fail the person-completeness gate and are skipped before the
+   *  waterfall's own Unipile tier (3.5b) ever runs. Returns null when there is
+   *  no connected LinkedIn account or the profile cannot be fetched. */
+  findUnipileProfileByUrl?(input: { linkedinUrl: string }): Promise<{
+    firstName?: string;
+    lastName?: string;
+    title?: string;
+    company?: string;
+    fromCache?: boolean;
+  } | null>;
   /**
    * Cross-tenant lookup. Returns ALL non-self leads matching by email,
    * linkedin, or exact name+company across ALL users — deduped by leadId,
@@ -445,6 +458,41 @@ export async function resolveIdentity(
       }
     } catch (err) {
       console.warn(`${logTag} unified Apollo match failed:`, (err as Error).message);
+    }
+  }
+
+  // 3.5. Unipile profile-by-URL — fires when a LinkedIn /in/ URL is present but
+  // first/last name is STILL missing after Apollo. getProfile(url) resolves
+  // name/title/company directly from the URL: the one identity source that
+  // works for a LinkedIn-only lead Apollo doesn't cover. Without this, such
+  // leads fail the person-completeness gate below and are skipped entirely —
+  // before the waterfall's own Unipile tier (3.5b) ever runs.
+  const linkedinForProfile = linkedinUrl || resolved.linkedin;
+  const stillMissingName =
+    !(lead.firstName || resolved.firstName) || !(lead.lastName || resolved.lastName);
+  if (deps.findUnipileProfileByUrl && needsPersonFields && linkedinForProfile && stillMissingName) {
+    try {
+      const profile = await deps.findUnipileProfileByUrl({ linkedinUrl: linkedinForProfile });
+      if (profile) {
+        if (profile.firstName && !lead.firstName && !resolved.firstName) {
+          resolved.firstName = profile.firstName;
+          meta.firstName = makeApiMeta('unipile', 'firstName', profile.fromCache);
+        }
+        if (profile.lastName && !lead.lastName && !resolved.lastName) {
+          resolved.lastName = profile.lastName;
+          meta.lastName = makeApiMeta('unipile', 'lastName', profile.fromCache);
+        }
+        if (profile.title && !lead.title && !resolved.title) {
+          resolved.title = profile.title;
+          meta.title = makeApiMeta('unipile', 'title', profile.fromCache);
+        }
+        if (profile.company && !lead.company && !resolved.company) {
+          resolved.company = profile.company;
+          meta.company = makeApiMeta('unipile', 'company', profile.fromCache);
+        }
+      }
+    } catch (err) {
+      console.warn(`${logTag} step 3.5 findUnipileProfileByUrl failed:`, (err as Error).message);
     }
   }
 

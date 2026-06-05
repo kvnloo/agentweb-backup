@@ -160,6 +160,9 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
     findLinkedInUrl: ({ firstName, lastName, company }) =>
       findLinkedInUrlImpl(userId, firstName, lastName, company),
 
+    findUnipileProfileByUrl: ({ linkedinUrl }) =>
+      findUnipileProfileByUrlImpl(userId, linkedinUrl),
+
     resolveCompanyDomainViaWebSearch: async ({ company, domain, linkedin, title, firstName, lastName }) => {
       try {
         const llm = createLLMService(WEB_SEARCH_MODEL, 0.2);
@@ -710,6 +713,69 @@ export async function findLinkedInUrlImpl(
     console.warn('[v3 deps] findLinkedInUrl failed:', (err as Error).message);
     return null;
   }
+}
+
+/**
+ * Identity-resolution Tier 3.5: resolve name/title/company directly from a
+ * LinkedIn /in/ URL via Unipile getProfile. Mirrors findUnipilePerson Case A
+ * (account resolution + 429 rotation across connected accounts) but is callable
+ * from the identity resolver, BEFORE the person-completeness gate — so a
+ * LinkedIn-only lead Apollo can't match still gets a name and isn't skipped.
+ */
+export async function findUnipileProfileByUrlImpl(
+  userId: string,
+  linkedinUrl: string,
+): Promise<{ firstName?: string; lastName?: string; title?: string; company?: string; fromCache?: boolean } | null> {
+  if (!linkedinUrl || !linkedinUrl.includes('/in/')) return null;
+  const tag = `[v3 deps:findUnipileProfileByUrl]`;
+  const { linkedInOutreachService } = await import('./linkedInOutreachService');
+  const triedAccounts = new Set<string>();
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let accountId: string | null = null;
+    try {
+      accountId = await linkedInOutreachService.resolveAccountIdForEnrichment(
+        userId,
+        triedAccounts.size > 0 ? triedAccounts : undefined,
+      );
+      if (!accountId) { console.warn(`${tag} no accountId → skip`); return null; }
+
+      console.log(`${tag} getProfile url=${linkedinUrl}`);
+      const profileResult = await getUnipileProfileService().getProfile(linkedinUrl, accountId);
+      if (!profileResult?.found || !profileResult.rawData) {
+        console.log(`${tag} MISS profile not found`);
+        return null;
+      }
+      const raw = profileResult.rawData;
+      const current = (raw.work_experience as any[] | undefined)?.find((e: any) => !e.end);
+      const trimStr = (v: unknown): string | undefined => {
+        const s = typeof v === 'string' ? v.trim() : '';
+        return s || undefined;
+      };
+      const result = {
+        firstName: trimStr(raw.first_name),
+        lastName:  trimStr(raw.last_name),
+        title:     trimStr(current?.position),
+        company:   trimStr(current?.company),
+        fromCache: profileResult.fromCache,
+      };
+      console.log(`${tag} HIT name="${result.firstName ?? '∅'} ${result.lastName ?? '∅'}" title="${result.title ?? '∅'}" company="${result.company ?? '∅'}"`);
+      return result;
+    } catch (err) {
+      if ((err as any)?.structuredError?.classification === 'RATE_LIMIT_ERROR') {
+        console.warn(`${tag} 429 on account ${accountId} — rotating (attempt ${attempt + 1}/3)`);
+        if (accountId) triedAccounts.add(accountId);
+        linkedInOutreachService.invalidateResolvedAccount(userId);
+        continue;
+      }
+      linkedInOutreachService.invalidateResolvedAccount(userId);
+      if (accountId) linkedInOutreachService.clearStatusCache(accountId);
+      console.warn(`${tag} ERROR ${(err as Error).message}`);
+      return null;
+    }
+  }
+  console.warn(`${tag} all accounts rate-limited (tried ${triedAccounts.size})`);
+  return null;
 }
 
 // ─── Orchestrator deps ────────────────────────────────────────────────────────
