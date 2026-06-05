@@ -86,6 +86,19 @@ export interface IdentityResolverDeps {
   /** Step 2 — Unipile LinkedIn people search. Finds linkedin_url from name+company.
    *  Returns null when no connected LinkedIn account or no confident match. */
   findLinkedInUrl(input: { firstName: string; lastName: string; company: string }): Promise<string | null>;
+  /** Step 3.5 — Unipile profile lookup BY LinkedIn URL. Resolves
+   *  name/title/company directly from a /in/ URL — the one identity source
+   *  that works for a LinkedIn-only lead Apollo doesn't cover. Without it such
+   *  leads fail the person-completeness gate and are skipped before the
+   *  waterfall's own Unipile tier (3.5b) ever runs. Returns null when there is
+   *  no connected LinkedIn account or the profile cannot be fetched. */
+  findUnipileProfileByUrl?(input: { linkedinUrl: string }): Promise<{
+    firstName?: string;
+    lastName?: string;
+    title?: string;
+    company?: string;
+    fromCache?: boolean;
+  } | null>;
   /**
    * Cross-tenant lookup. Returns ALL non-self leads matching by email,
    * linkedin, or exact name+company across ALL users — deduped by leadId,
@@ -448,6 +461,79 @@ export async function resolveIdentity(
     }
   }
 
+  // 3.5. Unipile profile-by-URL — fires when a LinkedIn /in/ URL is present but
+  // first/last name is STILL missing after Apollo. getProfile(url) resolves
+  // name/title/company directly from the URL: the one identity source that
+  // works for a LinkedIn-only lead Apollo doesn't cover. Without this, such
+  // leads fail the person-completeness gate below and are skipped entirely —
+  // before the waterfall's own Unipile tier (3.5b) ever runs.
+  const linkedinForProfile = linkedinUrl || resolved.linkedin;
+  const stillMissingName =
+    !(lead.firstName || resolved.firstName) || !(lead.lastName || resolved.lastName);
+  if (deps.findUnipileProfileByUrl && needsPersonFields && linkedinForProfile && stillMissingName) {
+    try {
+      const profile = await deps.findUnipileProfileByUrl({ linkedinUrl: linkedinForProfile });
+      if (profile) {
+        if (profile.firstName && !lead.firstName && !resolved.firstName) {
+          resolved.firstName = profile.firstName;
+          meta.firstName = makeApiMeta('unipile', 'firstName', profile.fromCache);
+        }
+        if (profile.lastName && !lead.lastName && !resolved.lastName) {
+          resolved.lastName = profile.lastName;
+          meta.lastName = makeApiMeta('unipile', 'lastName', profile.fromCache);
+        }
+        if (profile.title && !lead.title && !resolved.title) {
+          resolved.title = profile.title;
+          meta.title = makeApiMeta('unipile', 'title', profile.fromCache);
+        }
+        if (profile.company && !lead.company && !resolved.company) {
+          resolved.company = profile.company;
+          meta.company = makeApiMeta('unipile', 'company', profile.fromCache);
+        }
+      }
+    } catch (err) {
+      console.warn(`${logTag} step 3.5 findUnipileProfileByUrl failed:`, (err as Error).message);
+    }
+  }
+
+  // 3.6. If a company was resolved above (step 3.5 Unipile or Apollo) but the
+  // lead still has no email domain, resolve the company's website/domain now —
+  // the SAME web-search lookup Tier 0.5 does. Tier 0.5 already ran (step 2.5),
+  // before the company was known for a LinkedIn-only lead, so it skipped. Doing
+  // it here lets the email finders below (5.5/6.5/7) run in THIS pass; without
+  // it the domain is only discovered later in the waterfall, so email
+  // resolution would otherwise need a second enrichment run.
+  const domainKnown = !!(
+    lead.emailDomain || resolved.emailDomain ||
+    (rawEmailDomain && hasBusinessEmailDomain) ||
+    lead.website || resolved.website
+  );
+  if (!email && needsPersonFields && resolved.company && !lead.company && !domainKnown) {
+    try {
+      const dr = await deps.resolveCompanyDomainViaWebSearch({
+        company: resolved.company,
+        linkedin: lead.linkedin || resolved.linkedin || undefined,
+        title: resolved.title || lead.title || undefined,
+        firstName: lead.firstName || resolved.firstName || undefined,
+        lastName: lead.lastName || resolved.lastName || undefined,
+      });
+      if (dr?.website) {
+        const derived = deriveDomainFromWebsite(dr.website);
+        if (derived) {
+          if (!lead.website && !resolved.website) {
+            resolved.website = dr.website;
+            meta.website = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
+          }
+          resolved.emailDomain = derived;
+          meta.emailDomain = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
+          console.log(`${logTag} step 3.6 domain-from-company website=${dr.website} emailDomain=${derived}`);
+        }
+      }
+    } catch (err) {
+      console.warn(`${logTag} step 3.6 resolveCompanyDomainViaWebSearch failed:`, (err as Error).message);
+    }
+  }
+
   // 4. Derive emailDomain from email if present. Pure local op, no API call.
   if (email && !lead.emailDomain) {
     const derived = extractDomainFromEmail(email);
@@ -630,10 +716,14 @@ export async function resolveIdentity(
     if (!personOk) return { ok: false, reason: 'identity_unresolvable' };
   }
   if (needsCompanyFields) {
-    // Business email domain is sufficient — T2/T5 waterfall tiers can discover
-    // company from domain alone (Unipile company search, Apollo org match).
-    // Only block when we have neither company name nor a resolvable domain.
-    const companyOk = lead.company || resolved.company || hasBusinessEmailDomain;
+    // Business email domain OR a LinkedIn URL is sufficient — the T2/T5 waterfall
+    // tiers can discover company from either. A domain feeds Apollo org match /
+    // Unipile company search; a LinkedIn URL feeds Tier 5 findUnipileCompany,
+    // which resolves company directly from lead.linkedin via Unipile getProfile
+    // (no company name or domain needed). Only block when we have none of
+    // company name, a resolvable domain, or a LinkedIn URL.
+    const hasLinkedin = !!(linkedinUrl || resolved.linkedin);
+    const companyOk = lead.company || resolved.company || hasBusinessEmailDomain || hasLinkedin;
     if (!companyOk) return { ok: false, reason: 'identity_unresolvable' };
   }
 

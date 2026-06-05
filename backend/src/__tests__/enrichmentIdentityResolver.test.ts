@@ -88,6 +88,87 @@ describe('resolveIdentity — name-based path (no email / no linkedin)', () => {
   });
 });
 
+// ─── LinkedIn-URL-only identity (Unipile getProfile path) ────────────────────
+
+describe('resolveIdentity — LinkedIn-URL-only path (Unipile getProfile)', () => {
+  it('resolves first/last name from a LinkedIn URL via Unipile getProfile when Apollo misses', async () => {
+    // Repro of the EveryIO bug: lead imported with ONLY a LinkedIn URL (no
+    // name/email/company). Apollo has no record for the profile, so the only
+    // source that can establish identity is Unipile getProfile(url). Without
+    // it the lead fails the person-completeness gate and is skipped before the
+    // waterfall's own Unipile tier (3.5b) ever runs.
+    const findUnipileProfileByUrl = jest.fn().mockResolvedValue({
+      firstName: 'Uday',
+      lastName: 'Ayyagari',
+      title: 'Founder',
+      company: 'Acme',
+    });
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue(null),
+      findUnipileProfileByUrl,
+    });
+
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, linkedin: 'https://www.linkedin.com/in/uday2' },
+        needsPersonFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(findUnipileProfileByUrl).toHaveBeenCalledWith({
+      linkedinUrl: 'https://www.linkedin.com/in/uday2',
+    });
+    if (result.ok) {
+      expect(result.resolved.firstName).toBe('Uday');
+      expect(result.resolved.lastName).toBe('Ayyagari');
+    }
+  });
+
+  it('still returns identity_unresolvable when Unipile getProfile also cannot fetch the profile', async () => {
+    // Private / deleted profile: Apollo misses AND Unipile getProfile returns
+    // null. Lead remains unresolvable — but we proved we tried Unipile.
+    const findUnipileProfileByUrl = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue(null),
+      findUnipileProfileByUrl,
+    });
+
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, linkedin: 'https://www.linkedin.com/in/muhammadymalik' },
+        needsPersonFields: true,
+      }),
+      deps,
+    );
+
+    expect(findUnipileProfileByUrl).toHaveBeenCalled();
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('identity_unresolvable');
+  });
+
+  it('does not call Unipile getProfile when first and last name are already present', async () => {
+    const findUnipileProfileByUrl = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({ findUnipileProfileByUrl });
+
+    await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          firstName: 'Jane',
+          lastName: 'Doe',
+          linkedin: 'https://www.linkedin.com/in/jane-doe',
+        },
+        needsPersonFields: true,
+      }),
+      deps,
+    );
+
+    expect(findUnipileProfileByUrl).not.toHaveBeenCalled();
+  });
+});
+
 // ─── Failure paths (TDD: cover the unhappy branches first) ────────────────────
 
 describe('resolveIdentity — failure paths', () => {
@@ -403,10 +484,11 @@ describe('resolveIdentity — write semantics', () => {
     expect(call.fields).toEqual({ firstName: 'Jane' });
     expect(call.fields.lastName).toBeUndefined();
   });
-  it('writes person fields (linkedin, title) before completeness gate fires — no data loss on skip', async () => {
+  it('writes person fields (linkedin, title) and passes the company gate when a LinkedIn URL is resolved', async () => {
     // Apollo returns person+linkedin+title but no org (personal email).
-    // Completeness gate fires (needsCompanyFields=true, no company).
-    // Write must still happen so linkedin/title land in the DB.
+    // A resolved LinkedIn URL now satisfies the company completeness gate —
+    // Tier 5 findUnipileCompany can resolve company directly from it — so the
+    // lead is no longer skipped, and the person fields are persisted regardless.
     const deps = makeDeps({
       apolloPeopleMatch: jest.fn().mockResolvedValue({
         firstName: 'Nels',
@@ -424,8 +506,8 @@ describe('resolveIdentity — write semantics', () => {
       deps,
     );
 
-    expect(result.ok).toBe(false); // company missing → gate fires
-    // But write must have happened with the person fields Apollo returned
+    expect(result.ok).toBe(true); // LinkedIn URL present → company gate passes
+    // Write must have happened with the person fields Apollo returned
     expect(deps.writeLeadFields).toHaveBeenCalledTimes(1);
     const call = (deps.writeLeadFields as jest.Mock).mock.calls[0][0];
     expect(call.fields).toMatchObject({

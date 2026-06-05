@@ -716,6 +716,28 @@ describe('POST /api/crm/lists/:listId/leads/lookup-emails (bulk)', () => {
     expect(mockCrmDb.mergeFieldNames).toHaveBeenCalledWith('L1', expect.any(Set));
   });
 
+  it('drops garbage /search/ LinkedIn URL from enrich.so — does not write linkedin field', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'u1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [{ leadId: '1', email: 'a@b.com' }],
+      lastEvaluatedKey: undefined,
+    } as any);
+    mockEnrichSo.reverseLookup.mockResolvedValue({
+      found: true,
+      firstName: 'Alice',
+      lastName: 'Smith',
+      companyName: 'Acme',
+      jobTitle: 'CEO',
+      profileUrl: 'https://www.linkedin.com/search/results/people/?keywords=alice+smith',
+      fromCache: false, checkedAt: 'x',
+    });
+    await request(app).post('/api/crm/lists/L1/leads/lookup-emails').send({});
+    await new Promise((r) => setImmediate(r));
+    const payload = mockCrmDb.updateLead.mock.calls[0][2] as any;
+    expect(payload.firstName).toBe('Alice');
+    expect(payload.linkedin).toBeUndefined();
+  });
+
   it('returns 200 (not 202) when no leads are applicable — all 5 standard fields already filled', async () => {
     mockCrmDb.getLeadListById.mockResolvedValue({
       userId: 'u1',

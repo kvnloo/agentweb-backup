@@ -44,6 +44,7 @@ const CANONICAL_SYNONYMS: Record<string, string> = {
   tech: 'tech_stack',
   technology: 'tech_stack',
   tools: 'tech_stack',
+  techStack: 'tech_stack',
 
   // Firmographics
   employees: 'employee_count',
