@@ -19,6 +19,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-05',
     changes: [
+      'Improved: Logos Now Blend Cleanly Into Newsletter Headers and Colored Sections',
+      '- When a logo needs to sit on a colored or gradient background (like a newsletter header), Emma now recreates the logo on that exact background so there\'s no leftover box or mismatched edge behind it',
+      '- If the same logo appears on two different backgrounds — for example a purple header and a dark footer — Emma makes a matching version for each spot',
+      '- This avoids the earlier problem where a logo could show an ugly solid box on a colored background, without needing you to re-export a transparent file',
+    ],
+  },
+  {
+    date: '2026-06-05',
+    changes: [
       'Improved: Your CRM Now Updates Itself While Emma Works — No More Manual Refresh',
       '- When Emma changes a lead\'s status, sends an email, logs activity, imports leads, or edits a list, those changes now appear in your CRM automatically — you no longer have to reload the page to see them',
       '- The update happens right where you are: if you\'re on page 2 (or any later page) of a long list, it refreshes in place instead of jumping you back to the first page',
