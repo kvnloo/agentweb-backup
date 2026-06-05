@@ -1,6 +1,6 @@
 import { LLMService } from './llmService';
 
-const STANDARD_FIELDS = ['firstName', 'lastName', 'email', 'company', 'title'] as const;
+const STANDARD_FIELDS = ['firstName', 'lastName', 'email', 'company', 'title', 'senderName', 'senderEmail'] as const;
 
 /**
  * Returns true if the HTML contains a <style> block with class-based CSS rules that

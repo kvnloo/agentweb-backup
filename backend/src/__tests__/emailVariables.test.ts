@@ -72,6 +72,24 @@ describe('substituteVariables', () => {
     const lead = { firstName: 'Alice' };
     expect(substituteVariables(template, lead)).toBe('Alice - Dear Alice');
   });
+
+  it('should substitute senderName', () => {
+    const template = 'From {{senderName}}';
+    const lead = { senderName: 'John Doe' };
+    expect(substituteVariables(template, lead)).toBe('From John Doe');
+  });
+
+  it('should substitute senderEmail', () => {
+    const template = 'Reply to {{senderEmail}}';
+    const lead = { senderEmail: 'john@company.com' };
+    expect(substituteVariables(template, lead)).toBe('Reply to john@company.com');
+  });
+
+  it('should substitute senderName and senderEmail together in a template', () => {
+    const template = 'Hi {{firstName}}, this is {{senderName}} ({{senderEmail}})';
+    const lead = { firstName: 'Alice', senderName: 'Bob Smith', senderEmail: 'bob@acme.com' };
+    expect(substituteVariables(template, lead)).toBe('Hi Alice, this is Bob Smith (bob@acme.com)');
+  });
 });
 
 describe('extractVariables', () => {
