@@ -15,6 +15,9 @@ jest.mock('../services/db', () => ({
     setLeadListCrmSyncConfig: jest.fn().mockResolvedValue(undefined),
     getLeadsByListId: jest.fn().mockResolvedValue({ items: [], lastEvaluatedKey: undefined }),
   },
+  userDb: {
+    getUserById: jest.fn().mockResolvedValue({ userId: 'user-1' }),
+  },
 }));
 
 jest.mock('../services/externalCrmSyncService', () => ({
@@ -223,5 +226,73 @@ describe('POST /api/crm-sync/test/:listId/:provider — persist on success', () 
       .expect(403);
 
     expect(externalCrmSyncService.saveConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe('Org-aware access control on CRM sync routes', () => {
+  const { crmDb, userDb } = require('../services/db');
+  const { externalCrmSyncService } = require('../services/externalCrmSyncService');
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    externalCrmSyncService.getConfig.mockResolvedValue(null);
+    externalCrmSyncService.getDefaultMappings.mockResolvedValue({ contactFieldMapping: [], dealFieldMapping: [], customFieldMapping: [] });
+  });
+
+  it('allows an org member to load config for a list owned by another member of the same org', async () => {
+    // List owned by a different user...
+    crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'owner-2' });
+    // ...but both users belong to the same org.
+    userDb.getUserById.mockImplementation((id: string) =>
+      Promise.resolve(id === 'owner-2' ? { userId: 'owner-2', orgId: 'org-A' } : { userId: 'user-1', orgId: 'org-A' })
+    );
+
+    const res = await request(app)
+      .get('/api/crm-sync/config/list-1/hubspot')
+      .expect(200);
+
+    expect(res.body.configured).toBe(false);
+  });
+
+  it('denies a user who is not the owner and not in the same org', async () => {
+    crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'owner-2' });
+    userDb.getUserById.mockImplementation((id: string) =>
+      Promise.resolve(id === 'owner-2' ? { userId: 'owner-2', orgId: 'org-B' } : { userId: 'user-1', orgId: 'org-A' })
+    );
+
+    await request(app)
+      .get('/api/crm-sync/config/list-1/hubspot')
+      .expect(403);
+  });
+
+  it('denies access when the owner has no org (private list of another user)', async () => {
+    crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'owner-2' });
+    userDb.getUserById.mockImplementation((id: string) =>
+      Promise.resolve(id === 'owner-2' ? { userId: 'owner-2' } : { userId: 'user-1', orgId: 'org-A' })
+    );
+
+    await request(app)
+      .get('/api/crm-sync/config/list-1/hubspot')
+      .expect(403);
+  });
+
+  it('allows an org member to save config for a list owned by another member', async () => {
+    crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'owner-2' });
+    userDb.getUserById.mockImplementation((id: string) =>
+      Promise.resolve(id === 'owner-2' ? { userId: 'owner-2', orgId: 'org-A' } : { userId: 'user-1', orgId: 'org-A' })
+    );
+    externalCrmSyncService.saveConfig.mockResolvedValue({
+      provider: 'hubspot', listId: 'list-1', userId: 'user-1',
+      autoSyncEnabled: false, contactFieldMapping: [], dealFieldMapping: [], customFieldMapping: [],
+      deleteOnPush: false, deleteOnPull: false, webhookEnabled: true, webhookSecret: 'abc',
+      createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot')
+      .send({ autoSyncEnabled: false })
+      .expect(200);
+
+    expect(res.body.configured).toBe(true);
   });
 });
