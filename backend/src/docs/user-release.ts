@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-05',
     changes: [
+      'Improved: Your CRM Now Updates Itself While Emma Works — No More Manual Refresh',
+      '- When Emma changes a lead\'s status, sends an email, logs activity, imports leads, or edits a list, those changes now appear in your CRM automatically — you no longer have to reload the page to see them',
+      '- The update happens right where you are: if you\'re on page 2 (or any later page) of a long list, it refreshes in place instead of jumping you back to the first page',
+      '- If you have a lead\'s detail panel open, its activity timeline refreshes too, so a freshly sent email or logged note shows up immediately',
+    ],
+  },
+  {
+    date: '2026-06-05',
+    changes: [
       'Fixed: Team Members Can Now Set Up External CRM Sync on Shared Lead Lists',
       '- When a teammate opened "External CRM sync" on a lead list owned by someone else in your organization and picked HubSpot or Attio, it failed with "Failed to load your sync configuration"',
       '- Any member of your organization can now view, configure, and run HubSpot/Attio sync on shared lead lists, matching how the rest of your shared CRM already works',
