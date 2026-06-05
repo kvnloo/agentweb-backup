@@ -410,6 +410,114 @@ describe('AgentModeService.performDataAnalysis', () => {
     expect(result.success).toBe(false);
     expect(result.message).toContain('timed out');
   });
+
+  // ─── sandbox file materialization (text/csv mime + on-disk filenames) ───────
+  // Gemini code_execution only writes a file part to the sandbox filesystem when
+  // its mimeType is text/csv. application/json is rejected (HTTP 400) and
+  // text/plain is silently NOT written to disk. So every file MUST be sent as
+  // text/csv regardless of its real content type, and the model must be told the
+  // exact on-disk filenames so it reads from disk instead of inlining/truncating.
+
+  const onlyFileParts = (postBody: any): any[] =>
+    (postBody.contents[0].parts as any[]).filter(p => p.inlineData || p.inline_data);
+  const promptTextOf = (postBody: any): string => {
+    const parts = postBody.contents[0].parts as any[];
+    return parts[parts.length - 1].text as string;
+  };
+
+  test('sends a .json tool-response file to Gemini as text/csv so it materializes on disk', async () => {
+    const sessionId = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
+    const s3Key = `tool-responses/${sessionId}/get_chat_history.json`;
+    mockedGetS3ObjectAsString.mockResolvedValueOnce('{"sessions":[{"cost":1.5}],"total":1.5}');
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [{ text: 'Done.' }] } }] }
+    });
+
+    const result = await (service as any).performDataAnalysis([s3Key], 'Total the cost.', 'user-1');
+
+    expect(result.success).toBe(true);
+    const fileParts = onlyFileParts(mockedAxiosPost.mock.calls[0][1]);
+    expect(fileParts).toHaveLength(1);
+    const part = fileParts[0];
+    const mime = part.inlineData?.mimeType ?? part.inline_data?.mime_type;
+    expect(mime).toBe('text/csv');
+  });
+
+  test('sends an https .txt file to Gemini as text/csv (text/plain would not materialize)', async () => {
+    mockedAxiosGet.mockResolvedValueOnce({
+      data: Buffer.from('plain text tool response payload'),
+      headers: { 'content-type': 'text/plain' }
+    });
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [{ text: 'Done.' }] } }] }
+    });
+
+    await (service as any).performDataAnalysis(['https://files.test/data.txt'], 'Summarize.', 'user-1');
+
+    const fileParts = onlyFileParts(mockedAxiosPost.mock.calls[0][1]);
+    const mime = fileParts[0].inlineData?.mimeType ?? fileParts[0].inline_data?.mime_type;
+    expect(mime).toBe('text/csv');
+  });
+
+  test('tells the model the exact on-disk filename (input_file_0.csv) for a provided file', async () => {
+    mockedAxiosGet.mockResolvedValueOnce({
+      data: Buffer.from('col1,col2\na,b'),
+      headers: { 'content-type': 'text/csv' }
+    });
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [{ text: 'Done.' }] } }] }
+    });
+
+    await (service as any).performDataAnalysis(['https://files.test/data.csv'], 'Summarize.', 'user-1');
+
+    const prompt = promptTextOf(mockedAxiosPost.mock.calls[0][1]);
+    expect(prompt).toContain('input_file_0.csv');
+    // Must instruct reading from disk, not relying on inline data
+    expect(prompt.toLowerCase()).toContain('read');
+  });
+
+  test('numbers multiple files input_file_0.csv and input_file_1.csv in the prompt', async () => {
+    const s3Url = 's3://agentweb-user-files/users/user-1/files/1234/abc/data.csv';
+    mockedGetS3ObjectAsString.mockResolvedValueOnce('name,value\nfoo,1');
+    mockedAxiosGet.mockResolvedValueOnce({
+      data: Buffer.from('col1,col2\na,b'),
+      headers: { 'content-type': 'text/csv' }
+    });
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [{ text: 'Done.' }] } }] }
+    });
+
+    await (service as any).performDataAnalysis([s3Url, 'https://files.test/extra.csv'], 'Summarize both.', 'user-1');
+
+    const prompt = promptTextOf(mockedAxiosPost.mock.calls[0][1]);
+    expect(prompt).toContain('input_file_0.csv');
+    expect(prompt).toContain('input_file_1.csv');
+  });
+
+  test('defaults to the gemini-3.5-flash model for code execution', async () => {
+    delete process.env.DATA_ANALYSIS_LLM_NAME;
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [{ text: 'Done.' }] } }] }
+    });
+
+    await (service as any).performDataAnalysis([], 'Summarize.', 'user-1');
+
+    const apiUrl = mockedAxiosPost.mock.calls[0][0] as string;
+    expect(apiUrl).toContain('gemini-3.5-flash');
+  });
+
+  test('honors DATA_ANALYSIS_LLM_NAME override when set', async () => {
+    process.env.DATA_ANALYSIS_LLM_NAME = 'gemini-3-flash-preview';
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [{ text: 'Done.' }] } }] }
+    });
+
+    await (service as any).performDataAnalysis([], 'Summarize.', 'user-1');
+
+    const apiUrl = mockedAxiosPost.mock.calls[0][0] as string;
+    expect(apiUrl).toContain('gemini-3-flash-preview');
+    delete process.env.DATA_ANALYSIS_LLM_NAME;
+  });
 });
 
 describe('perform_data_analysis in DEFAULT_FOUNDATION_TOOLS', () => {

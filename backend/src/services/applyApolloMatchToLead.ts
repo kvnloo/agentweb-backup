@@ -20,6 +20,7 @@
 
 import type { MappedMatch } from './apolloFieldMapper';
 import { getFieldConfidence } from './fieldConfidenceRegistry';
+import { isValidFieldValue } from './fieldValueValidator';
 
 interface ApplyResult {
   updates: Record<string, any>;
@@ -106,7 +107,7 @@ export function applyApolloMatchToLead(
       newMeta.title = tag(p.fieldConfidence.title);
       changed.add('title');
     }
-    if (!lead.linkedin && p.linkedin) {
+    if (!lead.linkedin && p.linkedin && isValidFieldValue('linkedin', p.linkedin)) {
       updates.linkedin = p.linkedin;
       newMeta.linkedin = tag(p.fieldConfidence.linkedin);
       changed.add('linkedin');
@@ -151,7 +152,7 @@ export function applyApolloMatchToLead(
       newMeta.company = tag('medium');
       changed.add('company');
     }
-    if (!lead.companyLinkedin && o.linkedinUrl) {
+    if (!lead.companyLinkedin && o.linkedinUrl && isValidFieldValue('companyLinkedin', o.linkedinUrl)) {
       updates.companyLinkedin = o.linkedinUrl;
       newMeta.companyLinkedin = tag('medium');
       changed.add('companyLinkedin');

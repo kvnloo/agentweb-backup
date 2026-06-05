@@ -5,6 +5,7 @@ import { crmDb } from '../services/db';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { agentModeService } from '../services/agentModeService';
 import { resendService } from '../services/resendService';
+import { dripSequenceDb } from '../services/dripSequenceDb';
 
 // Mock dependencies
 jest.mock('../services/db', () => ({
@@ -14,6 +15,13 @@ jest.mock('../services/db', () => ({
     createLead: jest.fn(),
     updateLead: jest.fn(),
     getLeadById: jest.fn(),
+  },
+}));
+
+jest.mock('../services/dripSequenceDb', () => ({
+  dripSequenceDb: {
+    getSequencesByAutoEnrollList: jest.fn(),
+    bulkEnroll: jest.fn(),
   },
 }));
 
@@ -65,6 +73,8 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       success: true,
       message: 'Email and message drafts created successfully',
     });
+    (dripSequenceDb.getSequencesByAutoEnrollList as jest.Mock).mockResolvedValue([]);
+    (dripSequenceDb.bulkEnroll as jest.Mock).mockResolvedValue(undefined);
   });
 
   describe('POST /api/webhooks/forward-lead', () => {
@@ -745,6 +755,148 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
         const call = (crmDb.createLead as jest.Mock).mock.calls[0][1];
         expect(call.firstTouch).toBeUndefined();
         expect(call.lastTouch).toBeUndefined();
+      });
+    });
+
+    describe('Auto-enroll into list-bound drip sequences', () => {
+      const mockLeadList = {
+        listId: 'list_123',
+        userId: 'owner_123',
+        name: 'Test List',
+        publicAccessEnabled: true,
+        autoDraftEnabled: false,
+      };
+
+      const mockSequence = {
+        sequenceId: 'seq_123',
+        userId: 'owner_123',
+        name: 'AI Readiness Drip',
+      };
+
+      beforeEach(() => {
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+        (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+      });
+
+      it('enrolls a newly created public-form lead into a list-bound sequence', async () => {
+        (crmDb.createLead as jest.Mock).mockResolvedValue({
+          leadId: 'lead_enroll',
+          listId: 'list_123',
+          email: 'enroll@example.com',
+        });
+        (dripSequenceDb.getSequencesByAutoEnrollList as jest.Mock).mockResolvedValue([mockSequence]);
+
+        const response = await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({ listId: 'list_123', email: 'enroll@example.com' });
+
+        expect(response.status).toBe(201);
+
+        // Wait for fire-and-forget
+        await new Promise((r) => setTimeout(r, 200));
+
+        expect(dripSequenceDb.getSequencesByAutoEnrollList).toHaveBeenCalledWith('owner_123', 'list_123');
+        expect(dripSequenceDb.bulkEnroll).toHaveBeenCalledWith([
+          expect.objectContaining({
+            sequenceId: 'seq_123',
+            userId: 'owner_123',
+            listId: 'list_123',
+            leadId: 'lead_enroll',
+            leadEmail: 'enroll@example.com',
+          }),
+        ]);
+      });
+
+      it('enrolls an updated existing lead into a list-bound sequence', async () => {
+        (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+          leadId: 'lead_existing',
+          listId: 'list_123',
+          email: 'existing@example.com',
+          firstName: '',
+        });
+        (dripSequenceDb.getSequencesByAutoEnrollList as jest.Mock).mockResolvedValue([mockSequence]);
+
+        const response = await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({ listId: 'list_123', email: 'existing@example.com', firstName: 'Updated' });
+
+        expect(response.status).toBe(200);
+
+        // Wait for fire-and-forget
+        await new Promise((r) => setTimeout(r, 200));
+
+        expect(dripSequenceDb.bulkEnroll).toHaveBeenCalledWith([
+          expect.objectContaining({
+            sequenceId: 'seq_123',
+            leadId: 'lead_existing',
+            leadEmail: 'existing@example.com',
+          }),
+        ]);
+      });
+
+      it('does not call bulkEnroll when no sequences watch the list', async () => {
+        (crmDb.createLead as jest.Mock).mockResolvedValue({
+          leadId: 'lead_none',
+          listId: 'list_123',
+          email: 'none@example.com',
+        });
+        (dripSequenceDb.getSequencesByAutoEnrollList as jest.Mock).mockResolvedValue([]);
+
+        await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({ listId: 'list_123', email: 'none@example.com' });
+
+        // Wait for fire-and-forget
+        await new Promise((r) => setTimeout(r, 200));
+
+        expect(dripSequenceDb.getSequencesByAutoEnrollList).toHaveBeenCalledWith('owner_123', 'list_123');
+        expect(dripSequenceDb.bulkEnroll).not.toHaveBeenCalled();
+      });
+
+      it('does not enroll when the lead exists with no changes', async () => {
+        (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+          leadId: 'lead_same',
+          listId: 'list_123',
+          email: 'same@example.com',
+          firstName: 'Same',
+          customFields: { source: 'api' },
+        });
+        (dripSequenceDb.getSequencesByAutoEnrollList as jest.Mock).mockResolvedValue([mockSequence]);
+
+        const response = await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({ listId: 'list_123', email: 'same@example.com', firstName: 'Same' });
+
+        expect(response.status).toBe(200);
+        expect(response.body.event).toBe('lead.unchanged');
+
+        // Wait for fire-and-forget
+        await new Promise((r) => setTimeout(r, 200));
+
+        expect(dripSequenceDb.getSequencesByAutoEnrollList).not.toHaveBeenCalled();
+        expect(dripSequenceDb.bulkEnroll).not.toHaveBeenCalled();
+      });
+
+      it('does not fail the request when enrollment throws', async () => {
+        (crmDb.createLead as jest.Mock).mockResolvedValue({
+          leadId: 'lead_err',
+          listId: 'list_123',
+          email: 'err@example.com',
+        });
+        (dripSequenceDb.getSequencesByAutoEnrollList as jest.Mock).mockRejectedValue(
+          new Error('drip db down')
+        );
+
+        const response = await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({ listId: 'list_123', email: 'err@example.com' });
+
+        expect(response.status).toBe(201);
+        expect(response.body.success).toBe(true);
+
+        // Wait for fire-and-forget; should not throw
+        await new Promise((r) => setTimeout(r, 200));
+        expect(dripSequenceDb.bulkEnroll).not.toHaveBeenCalled();
       });
     });
   });

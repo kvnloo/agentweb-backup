@@ -2523,6 +2523,8 @@ export const scheduleDb = {
       functionCallMinCalls: { [functionName: string]: number };
       emailNotifications: string[];
       dailyDigest: boolean;
+      selfImprove: boolean;
+      promptRevisions: Array<{ startingMessage: string; updatedAt: string }>;
       updatedAt: string;
       emailCampaignTaskId: string;
       runCount: number;

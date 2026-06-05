@@ -153,6 +153,28 @@ describe('Scheduled Chat MCP Tools', () => {
       expect(callBody.variables).toEqual([{ name: 'data', description: 'Input data' }]);
       expect(callBody.variableValues).toEqual({ data: 'test-value' });
     });
+
+    it('maps self_improve to selfImprove on create and update', async () => {
+      mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-si' });
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'create',
+        schedule_name: 'Self Improving',
+        starting_message: 'Do the thing',
+        schedule_frequency: 'daily',
+        email_notifications: ['user@example.com'],
+        self_improve: true,
+      }, context);
+      expect((mockMcpFetch.mock.calls[0][0] as any).body.selfImprove).toBe(true);
+
+      mockMcpFetch.mockClear();
+      mockMcpFetch.mockResolvedValue({ message: 'Updated' });
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'update',
+        schedule_id: 'sc-si',
+        self_improve: false,
+      }, context);
+      expect((mockMcpFetch.mock.calls[0][0] as any).body.selfImprove).toBe(false);
+    });
   });
 
   describe('manage_scheduled_chat - create with every_n_days', () => {

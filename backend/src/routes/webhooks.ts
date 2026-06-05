@@ -6,12 +6,14 @@ import { webhookService, ResendWebhookEvent } from '../services/webhookService';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { crmDb, userDb, tempEmailDb } from '../services/db';
+import { dripSequenceDb } from '../services/dripSequenceDb';
 import { getUserIdByHubSpotPortalId } from '../services/connectedAccountsDb';
 import { HubSpotService } from '../services/hubspotService';
 import { getHubSpotConfig } from '../config/integrations';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
 import { agentModeService } from '../services/agentModeService';
 import { resendService } from '../services/resendService';
+import { sendRoadmapDeliveryEmail } from '../services/roadmapDelivery';
 import { emmaEmailService } from '../services/emmaEmailService';
 import { TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
 import { isDoNotContact } from '../utils/leadContactStatus';
@@ -40,6 +42,35 @@ function verifyHubSpotSignature(clientSecret: string, body: any, signature: stri
 }
 
 const router = express.Router();
+
+/**
+ * Fire-and-forget: enroll a single lead into any sequences that have
+ * autoEnrollListIds containing this list. Mirrors the authenticated CRM path
+ * (routes/crm.ts) so leads captured via the public forward-lead webhook also
+ * land in list-bound drip sequences. Errors are logged but never surfaced.
+ */
+async function autoEnrollLeadInSequences(
+  userId: string,
+  listId: string,
+  leadId: string,
+  leadEmail: string,
+): Promise<void> {
+  if (!leadEmail) return;
+  try {
+    const sequences = await dripSequenceDb.getSequencesByAutoEnrollList(userId, listId);
+    for (const seq of sequences) {
+      await dripSequenceDb.bulkEnroll([{
+        sequenceId: seq.sequenceId,
+        userId,
+        listId,
+        leadId,
+        leadEmail,
+      }]);
+    }
+  } catch (err) {
+    console.error('[webhooks] autoEnrollLeadInSequences error:', err);
+  }
+}
 
 // Resend webhook endpoint
 router.post('/resend', async (req: express.Request, res: express.Response) => {
@@ -425,8 +456,26 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       });
     }
 
+    // WORKAROUND (2026-06-04): deliver the AI Readiness roadmap PDF directly.
+    // The proper path (list-bound drip sequence) is not usable yet — the
+    // sequence feature is not production ready and this webhook does not
+    // auto-enroll (AGW-37509247-c951-8108-9545-fb47c0914bdc). Send only on new
+    // leads to avoid re-sending on repeat submits. Fire-and-forget; never blocks.
+    if (isNew) {
+      void sendRoadmapDeliveryEmail({
+        to: lead.email,
+        stage: mergedCustomFields.stage,
+        source: mergedCustomFields.source,
+        firstName: lead.firstName,
+      });
+    }
+
     // After response is sent: auto-draft, auto-send, and alert (fire-and-forget, fully awaited internally)
     if (isNew || isUpdated) {
+      // Enroll the lead into any list-bound drip sequences (uses the list
+      // owner's userId since the public webhook request is unauthenticated).
+      void autoEnrollLeadInSequences(leadList.userId, leadList.listId, lead.leadId, lead.email);
+
       void (async () => {
         try {
           let autoDraftStatus: string | undefined;
