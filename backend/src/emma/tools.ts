@@ -445,6 +445,11 @@ PLACEMENT ASSET CUSTOMIZATION (placement_assets) — fixes "invalid format / lac
   instagram_feed, story/stories, facebook_story, instagram_story, reels, facebook_reels, instagram_reels, explore.
   TO FIX AN EXISTING AD: AD UPDATE with ad_id + params.placement_assets — the system builds the new
   multi-placement creative and points the SAME ad at it (no Ads Manager UI, same ad_id).
+  NOTES:
+  - Instagram placements (story/reels/etc.) need an Instagram actor; the system auto-resolves it from the
+    Page, or pass params.instagram_user_id explicitly. (Meta error 1772103 = "Instagram Account Is Missing".)
+  - CTA must be allowed for the campaign objective on asset-feed creatives. e.g. BOOK_NOW is rejected under
+    OUTCOME_SALES (Meta error 1885396) — use a supported CTA like LEARN_MORE / SIGN_UP / SHOP_NOW.
 
 VIDEO CREATIVE WORKFLOW (3 steps, all required):
   Step 1: UPLOAD_VIDEO → returns video_id
@@ -535,6 +540,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
 
             // --- Creative ---
             page_id: { type: "string", description: "Facebook Page ID (from list_meta_pages or PAGE LIST)." },
+            instagram_user_id: { type: "string", description: "Instagram actor ID for the creative. Required when serving Instagram placements (e.g. placement_assets targeting story/reels); auto-resolved from the Page if omitted." },
             image_hash: { type: "string", description: "Image hash from UPLOAD_IMAGE." },
             image_url: { type: "string", description: "Image URL (for UPLOAD_IMAGE action or direct creative use)." },
             video_id: { type: "string", description: "Video ID from UPLOAD_VIDEO." },

@@ -12328,11 +12328,40 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return { ...params, placement_assets: resolved };
   }
 
+  /** True if any placement asset targets an Instagram placement (story/reels/explore/etc.). */
+  private placementAssetsTargetInstagram(assets?: any[]): boolean {
+    if (!assets) return false;
+    return assets.some((a: any) =>
+      Array.isArray(a.placements) && a.placements.some((p: string) => MetaService.placementTokenTargetsInstagram(p))
+    );
+  }
+
+  /**
+   * When a placement_assets creative serves Instagram placements, Meta requires
+   * object_story_spec.instagram_user_id (else attaching it to an ad fails with subcode 1772103).
+   * Resolve it from the Page if the caller didn't supply one.
+   */
+  private async resolvePlacementInstagramActor<T extends { placement_assets?: any[]; page_id?: string; instagram_user_id?: string }>(
+    params: T,
+    accessToken: string
+  ): Promise<T> {
+    if (!params.placement_assets || params.instagram_user_id || !params.page_id) return params;
+    if (!this.placementAssetsTargetInstagram(params.placement_assets)) return params;
+    const igActor = await metaService.getPageInstagramActor(accessToken, params.page_id);
+    if (igActor) {
+      console.log(`AgentMode: Resolved Instagram actor ${igActor} for page ${params.page_id} (placement assets target IG).`);
+      return { ...params, instagram_user_id: igActor };
+    }
+    return params;
+  }
+
   public async createMetaAdsAdCreative(userId: string, params: MetaAdsAdCreativeParams & { account_id?: string }): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, params.account_id);
       // asset_feed_spec.images only accepts image hashes — resolve any placement_assets URLs to hashes first.
-      const resolvedParams = await this.resolvePlacementAssetHashes(userId, params, params.account_id);
+      let resolvedParams = await this.resolvePlacementAssetHashes(userId, params, params.account_id);
+      // IG placements require an instagram_user_id in object_story_spec — auto-resolve from the Page.
+      resolvedParams = await this.resolvePlacementInstagramActor(resolvedParams, accessToken);
       const creative = await metaService.createAdCreative(accountId, accessToken, resolvedParams);
 
       return {
@@ -12667,6 +12696,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     // asset_feed_spec.images only accepts image hashes — resolve any placement_assets URLs first.
     newCreativeParams = await this.resolvePlacementAssetHashes(userId, newCreativeParams, accountId);
+    // IG placements require object_story_spec.instagram_user_id — auto-resolve from the Page.
+    newCreativeParams = await this.resolvePlacementInstagramActor(newCreativeParams, accessToken);
 
     // Create the new creative
     const newCreative = await metaService.createAdCreative(accountId, accessToken, newCreativeParams);

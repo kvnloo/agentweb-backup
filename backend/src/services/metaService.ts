@@ -39,6 +39,11 @@ export interface MetaPlacementAsset {
 export interface MetaAdsAdCreativeParams {
   name: string;
   page_id: string;
+  // Instagram actor for the creative. Required by Meta when the creative serves Instagram
+  // placements (e.g. placement_assets targeting story/reels) — without it, attaching the creative
+  // to an ad fails with error_subcode 1772103 "Instagram Account Is Missing". For placement_assets
+  // creatives the agentMode layer auto-resolves this from the Page when omitted.
+  instagram_user_id?: string;
   image_hash?: string;
   image_url?: string;
   video_id?: string;
@@ -340,6 +345,12 @@ export class MetaService {
     return Object.keys(MetaService.PLACEMENT_SPEC_MAP);
   }
 
+  /** True if the given placement token serves an Instagram placement. */
+  public static placementTokenTargetsInstagram(token: string): boolean {
+    const spec = MetaService.PLACEMENT_SPEC_MAP[String(token).toLowerCase()];
+    return !!spec?.publisher_platforms?.includes('instagram');
+  }
+
   /**
    * Validate the placement_assets array used for placement-level image customization.
    * Throws a descriptive Error if validation fails.
@@ -480,6 +491,29 @@ export class MetaService {
     } catch (error: any) {
       this.handleError(error);
       return []; // Unreachable
+    }
+  }
+
+  /**
+   * Resolve the Instagram actor ID linked to a Facebook Page. Needed when building creatives that
+   * serve Instagram placements (asset_feed_spec with story/reels rules), where Meta requires
+   * object_story_spec.instagram_user_id or the ad fails with error_subcode 1772103
+   * ("Instagram Account Is Missing"). Returns null if no IG account is linked or on error.
+   */
+  public async getPageInstagramActor(accessToken: string, pageId: string): Promise<string | null> {
+    try {
+      const api = this.initApi(accessToken);
+      // Use the generic Graph call — the SDK's Page object is not exported in its TS types.
+      const result: any = await api.call('GET', [pageId], {
+        fields: 'instagram_business_account,connected_instagram_account',
+      });
+      const data = result?._data || result || {};
+      const igId = data.instagram_business_account?.id || data.connected_instagram_account?.id;
+      return igId || null;
+    } catch (error: any) {
+      // Non-fatal: callers proceed without an IG actor (Facebook-only placements still work).
+      console.warn(`[MetaService] getPageInstagramActor failed for page ${pageId}: ${error?.message}`);
+      return null;
     }
   }
 
@@ -947,10 +981,15 @@ export class MetaService {
     }
 
     // For asset_feed_spec creatives, all copy/link/format live in asset_feed_spec; object_story_spec
-    // carries only the Page (and optionally instagram_user_id). Keep it minimal to match Meta's examples.
+    // carries only the Page (and instagram_user_id). The IG actor is REQUIRED when the rules target
+    // Instagram placements (story/reels) — Meta rejects the ad with error_subcode 1772103
+    // "Instagram Account Is Missing" otherwise.
     const objectStorySpec: any = {
       page_id: params.page_id,
     };
+    if (params.instagram_user_id) {
+      objectStorySpec.instagram_user_id = params.instagram_user_id;
+    }
 
     const creativeParams: any = {
       [AdCreative.Fields.name]: params.name,
