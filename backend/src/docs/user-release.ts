@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-06-04',
+    changes: [
+      'New: Facebook/Meta Ads Can Now Use a Different Image per Placement (Fixes "Needs a 9:16 for Stories/Reels")',
+      '- When an ad set uses manual placements that include Stories and Reels, an ad with only a square/Feed image was rejected by Meta for "lacking a 9:16 format" and got paused automatically',
+      '- You can now attach a vertical 9:16 image for Stories/Reels while keeping the square image for the Feed — all in the same ad — without touching Ads Manager',
+      '- Just ask to update the ad with the extra placement image; we build the combined creative and point your existing ad at it, so the same ad keeps running with the right image in every placement',
+    ],
+  },
+  {
     date: '2026-06-05',
     changes: [
       'Fixed: One Bad Email No Longer Blocks Your HubSpot Sync',

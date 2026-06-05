@@ -24,9 +24,26 @@ export interface MetaAdsAdSetParams {
   promoted_object?: any;
 }
 
+export interface MetaPlacementAsset {
+  image_hash?: string;
+  image_url?: string;
+  // Friendly placement group tokens (e.g. ["story", "reels"]) that this image should serve to.
+  // Omit (or set is_default) on exactly one asset to designate the fallback image (typically the
+  // square/4:5 Feed image) that serves every placement not matched by another rule.
+  placements?: string[];
+  is_default?: boolean;
+  // Power-user escape hatch: a raw Meta customization_spec to use verbatim instead of `placements`.
+  customization_spec?: any;
+}
+
 export interface MetaAdsAdCreativeParams {
   name: string;
   page_id: string;
+  // Instagram actor for the creative. Required by Meta when the creative serves Instagram
+  // placements (e.g. placement_assets targeting story/reels) — without it, attaching the creative
+  // to an ad fails with error_subcode 1772103 "Instagram Account Is Missing". For placement_assets
+  // creatives the agentMode layer auto-resolves this from the Page when omitted.
+  instagram_user_id?: string;
   image_hash?: string;
   image_url?: string;
   video_id?: string;
@@ -38,6 +55,10 @@ export interface MetaAdsAdCreativeParams {
     link_url?: string;
     video_id?: string;
   }>;
+  // Placement-level asset customization: map different images to different placements within a
+  // single creative (e.g. square → Feed, 9:16 → Stories/Reels) via Meta's asset_feed_spec /
+  // asset_customization_rules. Mutually exclusive with video_id and carousel_cards.
+  placement_assets?: MetaPlacementAsset[];
   body: string;
   title: string;
   link_url: string;
@@ -200,6 +221,7 @@ export class MetaService {
 
     const hasVideo = !!params.video_id;
     const hasCarousel = !!params.carousel_cards;
+    const hasPlacementAssets = !!params.placement_assets;
     const hasImage = !!(params.image_hash || params.image_url);
 
     // title and link_url are only required for non-carousel creatives (for carousel they live per-card)
@@ -211,11 +233,19 @@ export class MetaService {
       }
     }
 
-    if (hasVideo && hasCarousel) {
+    // The four creative types are mutually exclusive — exactly one shape per creative.
+    const typeCount = [hasVideo, hasCarousel, hasPlacementAssets].filter(Boolean).length;
+    if (typeCount > 1) {
       throw new Error(
-        'Ad Creative CREATE: "video_id" and "carousel_cards" are mutually exclusive. ' +
-        'For a video creative provide video_id; for carousel provide carousel_cards (2–10 items); for image provide image_hash or image_url.'
+        'Ad Creative CREATE: "video_id", "carousel_cards", and "placement_assets" are mutually exclusive. ' +
+        'For a video creative provide video_id; for carousel provide carousel_cards (2–10 items); ' +
+        'for placement-customized images provide placement_assets; for a single image provide image_hash or image_url.'
       );
+    }
+
+    if (hasPlacementAssets) {
+      MetaService.validatePlacementAssets(params.placement_assets!);
+      return; // placement assets validated
     }
 
     if (hasCarousel) {
@@ -248,9 +278,142 @@ export class MetaService {
         'Ad Creative CREATE: must specify a creative type. ' +
         'For a video creative provide video_id + image_hash/image_url (thumbnail); ' +
         'for carousel provide carousel_cards (2–10 items); ' +
+        'for placement-customized images provide placement_assets; ' +
         'for image provide image_hash or image_url.'
       );
     }
+  }
+
+  /**
+   * Friendly placement-group tokens → the Meta customization_spec they expand to.
+   * Each spec scopes a rule to specific publisher platforms + positions so a given image
+   * only serves the placements it was designed for (e.g. a 9:16 asset for Stories/Reels).
+   */
+  private static readonly PLACEMENT_SPEC_MAP: Record<string, any> = {
+    feed: {
+      publisher_platforms: ['facebook', 'instagram'],
+      facebook_positions: ['feed'],
+      instagram_positions: ['stream'],
+    },
+    facebook_feed: {
+      publisher_platforms: ['facebook'],
+      facebook_positions: ['feed'],
+    },
+    instagram_feed: {
+      publisher_platforms: ['instagram'],
+      instagram_positions: ['stream'],
+    },
+    story: {
+      publisher_platforms: ['facebook', 'instagram'],
+      facebook_positions: ['story'],
+      instagram_positions: ['story'],
+    },
+    stories: {
+      publisher_platforms: ['facebook', 'instagram'],
+      facebook_positions: ['story'],
+      instagram_positions: ['story'],
+    },
+    facebook_story: {
+      publisher_platforms: ['facebook'],
+      facebook_positions: ['story'],
+    },
+    instagram_story: {
+      publisher_platforms: ['instagram'],
+      instagram_positions: ['story'],
+    },
+    reels: {
+      publisher_platforms: ['facebook', 'instagram'],
+      facebook_positions: ['facebook_reels'],
+      instagram_positions: ['reels'],
+    },
+    facebook_reels: {
+      publisher_platforms: ['facebook'],
+      facebook_positions: ['facebook_reels'],
+    },
+    instagram_reels: {
+      publisher_platforms: ['instagram'],
+      instagram_positions: ['reels'],
+    },
+    explore: {
+      publisher_platforms: ['instagram'],
+      instagram_positions: ['explore'],
+    },
+  };
+
+  /** Placement tokens accepted in placement_assets[].placements. */
+  public static get supportedPlacementTokens(): string[] {
+    return Object.keys(MetaService.PLACEMENT_SPEC_MAP);
+  }
+
+  /** True if the given placement token serves an Instagram placement. */
+  public static placementTokenTargetsInstagram(token: string): boolean {
+    const spec = MetaService.PLACEMENT_SPEC_MAP[String(token).toLowerCase()];
+    return !!spec?.publisher_platforms?.includes('instagram');
+  }
+
+  /**
+   * Validate the placement_assets array used for placement-level image customization.
+   * Throws a descriptive Error if validation fails.
+   */
+  public static validatePlacementAssets(assets: MetaPlacementAsset[]): void {
+    if (!Array.isArray(assets) || assets.length < 2) {
+      throw new Error(
+        'Ad Creative CREATE: "placement_assets" must be an array of at least 2 items ' +
+        '(e.g. a square image for Feed and a 9:16 image for Stories/Reels). ' +
+        'For a single image use image_hash/image_url instead.'
+      );
+    }
+
+    let defaultCount = 0;
+    for (let i = 0; i < assets.length; i++) {
+      const asset = assets[i];
+      if (!asset.image_hash && !asset.image_url) {
+        throw new Error(`Ad Creative CREATE: placement_assets[${i}] must have image_hash or image_url.`);
+      }
+
+      const isDefault = asset.is_default || !asset.placements || asset.placements.length === 0;
+      if (isDefault) {
+        defaultCount++;
+      } else {
+        for (const token of asset.placements!) {
+          if (!asset.customization_spec && !MetaService.PLACEMENT_SPEC_MAP[String(token).toLowerCase()]) {
+            throw new Error(
+              `Ad Creative CREATE: placement_assets[${i}] has unknown placement "${token}". ` +
+              `Supported: ${MetaService.supportedPlacementTokens.join(', ')}.`
+            );
+          }
+        }
+      }
+    }
+
+    if (defaultCount !== 1) {
+      throw new Error(
+        `Ad Creative CREATE: placement_assets must designate exactly one default/fallback image ` +
+        `(via is_default: true or by omitting placements), found ${defaultCount}. ` +
+        `The default serves every placement not matched by another asset.`
+      );
+    }
+  }
+
+  /**
+   * Expand a list of friendly placement tokens into a single Meta customization_spec by
+   * unioning their publisher_platforms / *_positions. Returns null if no tokens map.
+   */
+  private static buildCustomizationSpec(placements: string[]): any | null {
+    const spec: Record<string, Set<string>> = {};
+    for (const token of placements) {
+      const mapped = MetaService.PLACEMENT_SPEC_MAP[String(token).toLowerCase()];
+      if (!mapped) continue;
+      for (const key of Object.keys(mapped)) {
+        if (!spec[key]) spec[key] = new Set();
+        for (const val of mapped[key]) spec[key].add(val);
+      }
+    }
+    const keys = Object.keys(spec);
+    if (keys.length === 0) return null;
+    const out: Record<string, string[]> = {};
+    for (const key of keys) out[key] = Array.from(spec[key]);
+    return out;
   }
 
   /**
@@ -328,6 +491,29 @@ export class MetaService {
     } catch (error: any) {
       this.handleError(error);
       return []; // Unreachable
+    }
+  }
+
+  /**
+   * Resolve the Instagram actor ID linked to a Facebook Page. Needed when building creatives that
+   * serve Instagram placements (asset_feed_spec with story/reels rules), where Meta requires
+   * object_story_spec.instagram_user_id or the ad fails with error_subcode 1772103
+   * ("Instagram Account Is Missing"). Returns null if no IG account is linked or on error.
+   */
+  public async getPageInstagramActor(accessToken: string, pageId: string): Promise<string | null> {
+    try {
+      const api = this.initApi(accessToken);
+      // Use the generic Graph call — the SDK's Page object is not exported in its TS types.
+      const result: any = await api.call('GET', [pageId], {
+        fields: 'instagram_business_account,connected_instagram_account',
+      });
+      const data = result?._data || result || {};
+      const igId = data.instagram_business_account?.id || data.connected_instagram_account?.id;
+      return igId || null;
+    } catch (error: any) {
+      // Non-fatal: callers proceed without an IG actor (Facebook-only placements still work).
+      console.warn(`[MetaService] getPageInstagramActor failed for page ${pageId}: ${error?.message}`);
+      return null;
     }
   }
 
@@ -602,9 +788,18 @@ export class MetaService {
 
       // Media source: at least one must be provided
       const hasMedia = params.image_hash || params.image_url || params.video_id ||
-        (params.carousel_cards && params.carousel_cards.length > 0);
+        (params.carousel_cards && params.carousel_cards.length > 0) ||
+        (params.placement_assets && params.placement_assets.length > 0);
       if (!hasMedia) {
-        throw new Error('Creative requires at least one media source: image_hash, image_url, video_id, or carousel_cards.');
+        throw new Error('Creative requires at least one media source: image_hash, image_url, video_id, carousel_cards, or placement_assets.');
+      }
+
+      // PLACEMENT-CUSTOMIZED IMAGE CREATIVE (asset_feed_spec) — different image per placement
+      // (e.g. square → Feed, 9:16 → Stories/Reels) in a single creative. Handled separately
+      // because it uses asset_feed_spec rather than object_story_spec.{link_data,video_data}.
+      if (params.placement_assets && params.placement_assets.length > 0) {
+        MetaService.validatePlacementAssets(params.placement_assets);
+        return await this.createPlacementCustomizedCreative(account, adAccountId, params);
       }
 
       // Carousel card count: Meta requires 2-10
@@ -703,6 +898,108 @@ export class MetaService {
     } catch (error) {
       return this.handleError(error, 'createAdCreative');
     }
+  }
+
+  /**
+   * Build and create an AdCreative that maps different images to different placements within a
+   * single creative, via Meta's asset_feed_spec + asset_customization_rules.
+   *
+   * Each placement_assets entry must already carry an image_hash (asset_feed_spec.images only
+   * accepts hashes, not URLs — the caller resolves URLs to hashes before this point). Exactly one
+   * asset is the default/fallback (is_default or no placements); the rest are scoped to placement
+   * groups (feed, story, reels, …) which expand to Meta customization_spec objects.
+   *
+   * Shape matches Meta's Placement Asset Customization docs:
+   *   object_story_spec: { page_id }
+   *   asset_feed_spec: {
+   *     images: [{ hash, adlabels: [{ name }] }, ...],
+   *     bodies / titles / link_urls / call_to_action_types: [...],
+   *     ad_formats: ['SINGLE_IMAGE'],
+   *     optimization_type: 'PLACEMENT',
+   *     asset_customization_rules: [
+   *       { customization_spec: { publisher_platforms, *_positions }, image_label: { name } },  // scoped
+   *       { customization_spec: {}, image_label: { name } },                                     // fallback
+   *     ],
+   *   }
+   */
+  private async createPlacementCustomizedCreative(
+    account: InstanceType<typeof AdAccount>,
+    adAccountId: string,
+    params: MetaAdsAdCreativeParams
+  ) {
+    const assets = params.placement_assets!;
+
+    const images: any[] = [];
+    const rules: any[] = [];
+
+    for (let i = 0; i < assets.length; i++) {
+      const asset = assets[i];
+      const hash = asset.image_hash;
+      if (!hash) {
+        // Defensive: the agentMode layer resolves URLs → hashes before calling us.
+        throw new Error(
+          `placement_assets[${i}] is missing image_hash. Upload the image via AD_CREATIVE UPLOAD_IMAGE first ` +
+          `(asset_feed_spec requires image hashes, not URLs).`
+        );
+      }
+
+      const label = `asset_${i}`;
+      images.push({ hash, adlabels: [{ name: label }] });
+
+      const isDefault = asset.is_default || !asset.placements || asset.placements.length === 0;
+      if (isDefault) {
+        // Per Meta docs, the fallback rule uses an EMPTY customization_spec ({}); it catches
+        // every placement not matched by a scoped rule. (NOT { is_default: true } — that is invalid.)
+        rules.push({
+          customization_spec: {},
+          image_label: { name: label },
+        });
+        continue;
+      }
+
+      const customizationSpec = asset.customization_spec || MetaService.buildCustomizationSpec(asset.placements!);
+      if (!customizationSpec) {
+        throw new Error(`placement_assets[${i}] resolved to an empty customization_spec.`);
+      }
+      rules.push({
+        customization_spec: customizationSpec,
+        image_label: { name: label },
+      });
+    }
+
+    const assetFeedSpec: any = {
+      images,
+      bodies: [{ text: params.body }],
+      titles: [{ text: params.title }],
+      link_urls: [{ website_url: params.link_url }],
+      ad_formats: ['SINGLE_IMAGE'],
+      optimization_type: 'PLACEMENT',
+      asset_customization_rules: rules,
+    };
+    if (params.call_to_action_type) {
+      assetFeedSpec.call_to_action_types = [params.call_to_action_type];
+    }
+
+    // For asset_feed_spec creatives, all copy/link/format live in asset_feed_spec; object_story_spec
+    // carries only the Page (and instagram_user_id). The IG actor is REQUIRED when the rules target
+    // Instagram placements (story/reels) — Meta rejects the ad with error_subcode 1772103
+    // "Instagram Account Is Missing" otherwise.
+    const objectStorySpec: any = {
+      page_id: params.page_id,
+    };
+    if (params.instagram_user_id) {
+      objectStorySpec.instagram_user_id = params.instagram_user_id;
+    }
+
+    const creativeParams: any = {
+      [AdCreative.Fields.name]: params.name,
+      [AdCreative.Fields.object_story_spec]: objectStorySpec,
+      asset_feed_spec: assetFeedSpec,
+    };
+
+    this.log(`Creating placement-customized ad creative in account: ${adAccountId}`, creativeParams);
+    const creative = await account.createAdCreative([], creativeParams);
+    return creative._data;
   }
 
   /**
