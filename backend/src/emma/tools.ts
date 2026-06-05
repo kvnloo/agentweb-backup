@@ -2951,6 +2951,38 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
+  name: 'get_leads_needing_followup',
+  definition: {
+    name: 'get_leads_needing_followup',
+    description: 'For a LinkedIn-outreach lead list, return the cohort of leads who ACCEPTED your connection invite but still need a follow-up — in a single list-level call (no per-lead get_lead_details fan-out). A lead qualifies when they are a 1st-degree connection AND the most recent message is not an outbound touch sent after they connected (i.e. you never followed up after they accepted, or they replied and you owe a response). Each returned lead includes linkedInConnectionStatus (isConnected, connectedAt), lastEngagementType, lastEngagementDirection (inbound/outbound), lastEngagementAt, and awaitingReply. Requires the list to have a LinkedIn account assigned. Use this to answer "which leads accepted my invite but haven\'t been followed up?".',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The ID of the LinkedIn-outreach lead list to scan'
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of leads to return (default 25, max 100)'
+        },
+        scan_limit: {
+          type: 'number',
+          description: 'Maximum number of leads to scan in the list (default 2000, max 5000). Raise only for very large lists; the response reports scannedAllLeads so you know whether the whole list was covered.'
+        }
+      },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.getLeadsNeedingFollowup(args.list_id, context?.userId, {
+      limit: args.limit,
+      scanLimit: args.scan_limit,
+    });
+  }
+});
+
+emmaToolRegistry.register({
   name: 'update_lead',
   definition: {
     name: 'update_lead',
