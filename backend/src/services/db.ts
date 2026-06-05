@@ -6386,6 +6386,10 @@ export const crmDb = {
     skippedLeadIds?: string[];
     /** True when skippedLeadIds was omitted due to size. */
     skippedDeduplicationUnavailable?: boolean;
+    /** Lead IDs successfully enriched in this run. Used for cross-run unique enriched-lead count. Omitted when run exceeds 5000 leads. */
+    successfulLeadIds?: string[];
+    /** True when successfulLeadIds was omitted due to run size. */
+    successLeadsDeduplicationUnavailable?: boolean;
     /** Aggregate counts per failure step (search/linkedin/llm/update). Item #11. */
     failureBreakdown?: { searchWebFailed: number; linkedinFailed: number; llmOrParseFailed: number; updateFailed: number };
     /** Per-lead failure records (capped to ~50 to keep row size bounded). Item #11. */
@@ -6419,6 +6423,8 @@ export const crmDb = {
       if (meta.leadsDeduplicationUnavailable) item.leadsDeduplicationUnavailable = true;
       if (meta.skippedLeadIds && meta.skippedLeadIds.length > 0) item.skippedLeadIds = meta.skippedLeadIds;
       if (meta.skippedDeduplicationUnavailable) item.skippedDeduplicationUnavailable = true;
+      if (meta.successfulLeadIds && meta.successfulLeadIds.length > 0) item.successfulLeadIds = meta.successfulLeadIds;
+      if (meta.successLeadsDeduplicationUnavailable) item.successLeadsDeduplicationUnavailable = true;
       if (meta.failureBreakdown) item.failureBreakdown = meta.failureBreakdown;
       if (meta.failures && meta.failures.length > 0) {
         // Cap to 50 entries to stay well under DynamoDB's 400KB row limit

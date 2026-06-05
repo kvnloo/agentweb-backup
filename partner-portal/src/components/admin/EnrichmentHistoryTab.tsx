@@ -65,6 +65,8 @@ interface EnrichmentJob {
   leadsDeduplicationUnavailable?: boolean;
   skippedLeadIds?: string[];
   skippedDeduplicationUnavailable?: boolean;
+  successfulLeadIds?: string[];
+  successLeadsDeduplicationUnavailable?: boolean;
   outputFields?: string[];
   failureBreakdown?: { searchWebFailed: number; linkedinFailed: number; llmOrParseFailed: number; updateFailed: number };
   sourceBreakdown?: SourceBreakdown;
@@ -225,8 +227,9 @@ function JobRow({ job, token }: { job: EnrichmentJob; token: string }) {
   const [loading, setLoading] = useState(false);
   const [expandError, setExpandError] = useState('');
   const failed = totalFailed(job);
-  const attempted = job.leadsDeduplicationUnavailable ? 0 : (job.attemptedLeadIds?.length ?? 0);
-  const successRate = attempted > 0 ? Math.round((Math.min(job.processedCount, attempted) / attempted) * 100) : null;
+  const jobSuccessful = (!job.successLeadsDeduplicationUnavailable && job.successfulLeadIds && !job.leadsDeduplicationUnavailable && job.attemptedLeadIds)
+    ? { enriched: job.successfulLeadIds!.length, attempted: job.attemptedLeadIds!.length }
+    : null;
 
   const handleExpand = async () => {
     if (!open && leads.length === 0) {
@@ -254,15 +257,15 @@ function JobRow({ job, token }: { job: EnrichmentJob; token: string }) {
           </IconButton>
         </TableCell>
         <TableCell>
-          <Typography variant="body2">{new Date(job.createdAt).toLocaleString()}</Typography>
-          <Typography variant="caption" color="text.secondary">
-            {job.listName || job.listId}
-          </Typography>
+          <Typography variant="body2">{job.listName || job.listId}</Typography>
           {job.listName && (
             <Typography variant="caption" color="text.disabled" sx={{ fontFamily: 'monospace', display: 'block' }}>
               {job.listId}
             </Typography>
           )}
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+            {new Date(job.createdAt).toLocaleString()}
+          </Typography>
         </TableCell>
         <TableCell>
           <Chip
@@ -273,11 +276,8 @@ function JobRow({ job, token }: { job: EnrichmentJob; token: string }) {
           />
         </TableCell>
         <TableCell align="right">
-          <Typography variant="body2" fontWeight={600}>{job.processedCount}</Typography>
-        </TableCell>
-        <TableCell align="right">
-          <Typography variant="body2" color={successRate === null ? 'text.secondary' : successRate >= 50 ? 'success.main' : 'warning.main'}>
-            {successRate !== null ? `${successRate}%` : '—'}
+          <Typography variant="body2" fontWeight={600} color={jobSuccessful ? 'success.main' : 'text.secondary'}>
+            {jobSuccessful ? `${jobSuccessful.enriched} / ${jobSuccessful.attempted}` : '—'}
           </Typography>
         </TableCell>
         <TableCell align="right">
@@ -298,7 +298,7 @@ function JobRow({ job, token }: { job: EnrichmentJob; token: string }) {
       </TableRow>
 
       <TableRow>
-        <TableCell colSpan={8} sx={{ py: 0 }}>
+        <TableCell colSpan={7} sx={{ py: 0 }}>
           <Collapse in={open} timeout="auto" unmountOnExit>
             <Box sx={{ m: 2 }}>
               <Typography variant="subtitle2" gutterBottom>Per-lead breakdown</Typography>
@@ -467,22 +467,15 @@ export default function EnrichmentHistoryTab() {
     return () => observer.disconnect();
   }, [nextToken, loadingMore, loadMore]);
 
-  const agg = aggregateBreakdown(jobs);
+  const completedJobs = jobs.filter(j => j.status === 'completed');
+  const agg = aggregateBreakdown(completedJobs);
   const hitRate = cacheHitRate(agg);
-  const dedupableJobs = jobs.filter(j => !j.leadsDeduplicationUnavailable && j.attemptedLeadIds);
-  // Jobs where backend explicitly flagged the run as too large to store lead IDs
-  const explicitlyTooLargeCount = jobs.filter(j => j.leadsDeduplicationUnavailable).length;
-  // Jobs without dedup data but not because they're too large (old runs, pre-feature)
-  const nonDedupableCount = jobs.length - dedupableJobs.length;
-  const uniqueLeadsAttempted = new Set(dedupableJobs.flatMap(j => j.attemptedLeadIds ?? [])).size;
-  const dedupProcessed = dedupableJobs.reduce((a, j) => a + j.processedCount, 0);
-  const totalProcessed = jobs.reduce((a, j) => a + j.processedCount, 0);
-  const skippedDedupable = jobs.filter(j => !j.skippedDeduplicationUnavailable && j.skippedLeadIds);
+  const skippedDedupable = completedJobs.filter(j => !j.skippedDeduplicationUnavailable && j.skippedLeadIds);
   const uniqueSkipped = new Set(skippedDedupable.flatMap(j => j.skippedLeadIds ?? [])).size;
-  const totalSkipped = uniqueSkipped > 0 ? uniqueSkipped : jobs.reduce((a, j) => a + (j.skippedCount ?? 0), 0);
+  const totalSkipped = uniqueSkipped > 0 ? uniqueSkipped : completedJobs.reduce((a, j) => a + (j.skippedCount ?? 0), 0);
   const skippedIsDeduped = uniqueSkipped > 0;
-  const totalFailures = jobs.reduce((a, j) => a + totalFailed(j), 0);
-  const completedRuns = jobs.filter(j => j.status === 'completed').length;
+  const totalFailures = completedJobs.reduce((a, j) => a + totalFailed(j), 0);
+  const completedRuns = completedJobs.length;
   const perProviderRates = ALL_PROVIDERS.map(k => {
     const v = agg[k];
     if (!v) return null;
@@ -502,8 +495,15 @@ export default function EnrichmentHistoryTab() {
     </Box>
   ) : undefined;
 
-  const enrichmentSuccessRate = uniqueLeadsAttempted > 0
-    ? Math.round((Math.min(dedupProcessed, uniqueLeadsAttempted) / uniqueLeadsAttempted) * 100)
+  const successDedupableJobs = completedJobs.filter(j =>
+    !j.successLeadsDeduplicationUnavailable && j.successfulLeadIds &&
+    !j.leadsDeduplicationUnavailable && j.attemptedLeadIds
+  );
+  const uniqueSuccessfulLeads = successDedupableJobs.length > 0
+    ? new Set(successDedupableJobs.flatMap(j => j.successfulLeadIds ?? [])).size
+    : null;
+  const uniqueAttemptedLeads = successDedupableJobs.length > 0
+    ? new Set(successDedupableJobs.flatMap(j => j.attemptedLeadIds ?? [])).size
     : null;
 
   return (
@@ -570,29 +570,36 @@ export default function EnrichmentHistoryTab() {
       ) : (
         <>
           {/* ── Summary cards ── */}
+          {nextToken && (
+            <Alert severity="info" sx={{ mb: 2 }}>
+              Stats cover loaded runs only — scroll down to load more runs and update totals.
+            </Alert>
+          )}
           <Grid container spacing={2} sx={{ mb: 3 }}>
             <Grid item xs={6} sm={4} md={2}>
               <StatCard label="Runs shown" value={jobs.length} sub={`${completedRuns} completed`} />
             </Grid>
             <Grid item xs={6} sm={4} md={2}>
               <StatCard
-                label="Leads enriched"
-                value={uniqueLeadsAttempted > 0 ? `${dedupProcessed} / ${uniqueLeadsAttempted}` : totalProcessed > 0 ? String(totalProcessed) : '—'}
-                sub={
-                  enrichmentSuccessRate !== null
-                    ? `${enrichmentSuccessRate}% success rate${explicitlyTooLargeCount > 0 ? ` (${explicitlyTooLargeCount} large run${explicitlyTooLargeCount > 1 ? 's' : ''} excluded)` : ''}`
-                    : explicitlyTooLargeCount > 0
-                      ? 'dedup unavailable — runs too large'
-                      : uniqueLeadsAttempted === 0 && totalProcessed > 0
-                        ? 'no dedup data for these runs'
-                        : undefined
-                }
-                color={enrichmentSuccessRate !== null && enrichmentSuccessRate >= 50 ? 'success.main' : enrichmentSuccessRate !== null ? 'warning.main' : undefined}
+                label="Unique leads enriched"
+                value={uniqueSuccessfulLeads !== null && uniqueAttemptedLeads !== null && uniqueAttemptedLeads > 0
+                  ? `${uniqueSuccessfulLeads} / ${uniqueAttemptedLeads}`
+                  : uniqueSuccessfulLeads !== null
+                  ? String(uniqueSuccessfulLeads)
+                  : '—'}
+                sub={uniqueSuccessfulLeads !== null && uniqueAttemptedLeads !== null && uniqueAttemptedLeads > 0
+                  ? 'unique leads'
+                  : uniqueSuccessfulLeads !== null
+                  ? 'attempted count unavailable'
+                  : 'available on new runs'}
+                color={uniqueSuccessfulLeads !== null && uniqueAttemptedLeads !== null && uniqueAttemptedLeads > 0
+                  ? (uniqueSuccessfulLeads / uniqueAttemptedLeads >= 0.5 ? 'success.main' : 'warning.main')
+                  : undefined}
               />
             </Grid>
             <Grid item xs={6} sm={4} md={2}>
               <StatCard
-                label="Skipped"
+                label="Unresolvable"
                 value={totalSkipped}
                 sub={skippedIsDeduped ? 'unique leads' : undefined}
                 color={totalSkipped > 0 ? 'warning.main' : undefined}
@@ -638,9 +645,8 @@ export default function EnrichmentHistoryTab() {
                     <TableCell padding="checkbox" />
                     <TableCell>Run / List</TableCell>
                     <TableCell>Status</TableCell>
-                    <TableCell align="right">Leads</TableCell>
-                    <TableCell align="right">Success</TableCell>
-                    <TableCell align="right">Skipped</TableCell>
+                    <TableCell align="right">Enriched</TableCell>
+                    <TableCell align="right">Unresolvable</TableCell>
                     <TableCell align="right">Failures</TableCell>
                     <TableCell>Source Breakdown</TableCell>
                   </TableRow>

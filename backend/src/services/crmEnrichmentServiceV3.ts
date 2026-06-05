@@ -917,6 +917,7 @@ export async function runEnrichment(
   const tierBreakdown: Record<string, TierCount> = {};
   const previewSamples: NonNullable<RunEnrichmentResult['preview']> = [];
   let processed = 0;
+  const successfulLeadIds: string[] = [];
   let identityResolutionFailed = 0;
   let apolloFailed = 0;
   let llmOrParseFailed = 0;
@@ -1051,18 +1052,19 @@ export async function runEnrichment(
             });
           } catch (err: any) {
             console.error(`[v3] Failed to write enrichment snapshot runId=${runId} leadId=${lead.leadId}:`, err);
-            return { writeResult: { ok: false as const }, leadBreakdown: [] };
+            return { writeResult: { ok: false as const }, leadBreakdown: [], leadId: lead.leadId };
           }
           // Pass writableFills (injected deps already stripped) so writeLeadOutcome
           // only writes what is also snapshotted — keeps write and revert in sync.
           const writeResult = await writeLeadOutcome(lead, { ...outcome, fills: writableFills }, input, deps, runId);
           console.log(`[v3:${input.listId}:${lead.leadId}] write in ${Date.now() - wStart}ms (ok=${writeResult.ok})`);
-          return { writeResult, leadBreakdown };
+          return { writeResult, leadBreakdown, leadId: lead.leadId };
         }),
       );
-      for (const { writeResult, leadBreakdown } of writeResults) {
+      for (const { writeResult, leadBreakdown, leadId } of writeResults) {
         if (writeResult.ok) {
           processed += 1;
+          successfulLeadIds.push(leadId);
           for (const { key, fromCache } of leadBreakdown) {
             if (fromCache) sourceBreakdown[key].cached++;
             else sourceBreakdown[key].live++;
@@ -1118,14 +1120,14 @@ export async function runEnrichment(
     result.preview = previewSamples;
   }
 
-  const totalFailed =
-    identityResolutionFailed + llmOrParseFailed + updateFailed;
-  console.log(`[v3] runEnrichment DONE runId=${runId} processed=${processed} failed=${totalFailed} durationMs=${result.durationMs}`);
+  const totalFailed = llmOrParseFailed + updateFailed;
+  console.log(`[v3] runEnrichment DONE runId=${runId} processed=${processed} failed=${totalFailed} skipped=${identityResolutionFailed} durationMs=${result.durationMs}`);
   emitToRooms(completeEvent, {
     runId,
     listId: input.listId,
     processedCount: processed,
     failedCount: totalFailed,
+    skippedCount: identityResolutionFailed,
     outputFields: includedFieldNames,
     failureBreakdown: result.failed,
     tierFillBreakdown: result.tierFillBreakdown,
@@ -1134,7 +1136,7 @@ export async function runEnrichment(
 
   const attemptedLeadIds = leads.map((l: LeadRecord) => l.leadId);
 
-  if (input.mode !== 'preview' && (processed > 0 || totalFailed > 0)) {
+  if (input.mode !== 'preview' && (processed > 0 || totalFailed > 0 || identityResolutionFailed > 0)) {
     crmDb.createEnrichmentJobMeta({
       jobId: runId,
       listId: input.listId,
@@ -1145,10 +1147,13 @@ export async function runEnrichment(
       expiresAt: jobExpiresAt,
       processedCount: processed,
       failedCount: totalFailed,
-      skippedCount: 0,
+      skippedCount: identityResolutionFailed,
       ...(attemptedLeadIds.length <= 5000
         ? { attemptedLeadIds }
         : { leadsDeduplicationUnavailable: true }),
+      ...(successfulLeadIds.length <= 5000
+        ? { successfulLeadIds }
+        : { successLeadsDeduplicationUnavailable: true }),
       failureBreakdown: {
         searchWebFailed: 0,
         linkedinFailed: apolloFailed,

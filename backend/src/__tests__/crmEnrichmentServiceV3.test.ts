@@ -1801,6 +1801,36 @@ describe('runEnrichment — snapshot and job-meta persistence', () => {
     expect(meta.leadsDeduplicationUnavailable).toBeUndefined();
   });
 
+  it('writes identity resolution failures to skippedCount, not failedCount', async () => {
+    const lead = makeLead({ leadId: 'lead-id-fail', customFields: {} });
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([lead]),
+      resolveIdentity: jest.fn().mockResolvedValue({ ok: false, reason: 'no_email' }),
+    });
+
+    await runEnrichment(makeInput(), deps);
+
+    const meta = (mockCrmDb.createEnrichmentJobMeta as jest.Mock).mock.calls[0][0];
+    expect(meta.skippedCount).toBe(1);
+    expect(meta.failedCount).toBe(0);
+  });
+
+  it('writes job meta when all leads are unresolvable (processed=0, failedCount=0)', async () => {
+    const lead = makeLead({ leadId: 'lead-unresolvable', customFields: {} });
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([lead]),
+      resolveIdentity: jest.fn().mockResolvedValue({ ok: false, reason: 'no_email' }),
+    });
+
+    await runEnrichment(makeInput(), deps);
+
+    expect(mockCrmDb.createEnrichmentJobMeta).toHaveBeenCalledTimes(1);
+    const meta = (mockCrmDb.createEnrichmentJobMeta as jest.Mock).mock.calls[0][0];
+    expect(meta.processedCount).toBe(0);
+    expect(meta.failedCount).toBe(0);
+    expect(meta.skippedCount).toBe(1);
+  });
+
   it('sets leadsDeduplicationUnavailable instead of attemptedLeadIds when >5000 leads', async () => {
     const manyLeads = Array.from({ length: 5001 }, (_, i) =>
       makeLead({ leadId: `lead-big-${i}`, customFields: {} }),
@@ -1841,6 +1871,69 @@ describe('runEnrichment — snapshot and job-meta persistence', () => {
     // A lead that cannot be snapshotted cannot be reverted — do not count as success.
     expect(result.processed).toBe(0);
     expect(deps.setLeadFields).not.toHaveBeenCalled();
+  });
+
+  it('writes successfulLeadIds containing the enriched lead ID', async () => {
+    (mockCrmDb.createEnrichmentSnapshotItem as jest.Mock).mockResolvedValue(undefined);
+    const lead = makeLead({ leadId: 'lead-success-1', customFields: {} });
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([lead]),
+      resolveIdentity: jest.fn().mockResolvedValue({ ok: true, resolved: {}, siblings: [] }),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [{ field: 'company_name', value: 'Acme', meta: { source: 'apollo' } }],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, enrichSo: 0, unipile: 0, web: 0, missing: 0 },
+      }),
+    });
+
+    await runEnrichment(makeInput(), deps);
+
+    const meta = (mockCrmDb.createEnrichmentJobMeta as jest.Mock).mock.calls[0][0];
+    expect(Array.isArray(meta.successfulLeadIds)).toBe(true);
+    expect(meta.successfulLeadIds).toContain('lead-success-1');
+    expect(meta.successLeadsDeduplicationUnavailable).toBeUndefined();
+  });
+
+  it('does not include failed lead in successfulLeadIds', async () => {
+    const lead = makeLead({ leadId: 'lead-fail-1', customFields: {} });
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([lead]),
+      resolveIdentity: jest.fn().mockResolvedValue({ ok: false, reason: 'no_email' }),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [],
+        missing: [],
+        tierFills: { crm: 0, apollo: 0, enrichSo: 0, unipile: 0, web: 0, missing: 0 },
+      }),
+    });
+
+    await runEnrichment(makeInput(), deps);
+
+    const meta = (mockCrmDb.createEnrichmentJobMeta as jest.Mock).mock.calls[0]?.[0];
+    if (meta) {
+      expect((meta.successfulLeadIds ?? []).includes('lead-fail-1')).toBe(false);
+    }
+  });
+
+  it('sets successLeadsDeduplicationUnavailable instead of successfulLeadIds when >5000 leads succeed', async () => {
+    (mockCrmDb.createEnrichmentSnapshotItem as jest.Mock).mockResolvedValue(undefined);
+    const manyLeads = Array.from({ length: 5001 }, (_, i) =>
+      makeLead({ leadId: `lead-succ-big-${i}`, customFields: {} }),
+    );
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue(manyLeads),
+      resolveIdentity: jest.fn().mockResolvedValue({ ok: true, resolved: {}, siblings: [] }),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [{ field: 'company_name', value: 'Acme', meta: { source: 'apollo' } }],
+        missing: [],
+        tierFills: { crm: 0, apollo: 1, enrichSo: 0, unipile: 0, web: 0, missing: 0 },
+      }),
+    });
+
+    await runEnrichment(makeInput(), deps);
+
+    const meta = (mockCrmDb.createEnrichmentJobMeta as jest.Mock).mock.calls[0][0];
+    expect(meta.successLeadsDeduplicationUnavailable).toBe(true);
+    expect(meta.successfulLeadIds).toBeUndefined();
   });
 });
 

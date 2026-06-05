@@ -3279,3 +3279,40 @@ describe('enrichLead — apolloTechStack waterfall', () => {
     expect(mockAgentModeService.searchWeb).toHaveBeenCalled();
   });
 });
+
+// ─── successfulLeadIds in job meta ───────────────────────────────────────────
+
+describe('CrmEnrichmentService — successfulLeadIds in job meta', () => {
+  let service: CrmEnrichmentService;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new CrmEnrichmentService();
+    mockCrmDb.createEnrichmentJobMeta.mockResolvedValue(undefined);
+    mockCrmDb.createEnrichmentSnapshotItem.mockResolvedValue(undefined);
+    mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+    mockAgentModeService.searchWeb.mockResolvedValue({
+      success: true, results: [{ title: 'Acme', snippet: 'Company' }],
+    });
+    mockGeminiCreate.mockResolvedValue(geminiResponse({ company_name: 'Acme' }));
+  });
+
+  it('writes successfulLeadIds containing the successfully enriched lead ID', async () => {
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [createLead({ leadId: 'lead-succ-v1', customFields: {} })],
+      lastEvaluatedKey: null, hasMore: false,
+    });
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Find company', outputFields: ['company_name'],
+      sources: ['web_search'], forceOverwrite: true,
+    };
+    await service.execute(spec);
+
+    const meta = mockCrmDb.createEnrichmentJobMeta.mock.calls[0][0];
+    expect(Array.isArray(meta.successfulLeadIds)).toBe(true);
+    expect(meta.successfulLeadIds).toContain('lead-succ-v1');
+    expect(meta.successLeadsDeduplicationUnavailable).toBeUndefined();
+  });
+});

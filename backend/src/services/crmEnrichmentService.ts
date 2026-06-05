@@ -1790,6 +1790,7 @@ export class CrmEnrichmentService {
     const counters = { processed: 0, failed: 0, skipped: 0 };
     const attemptedLeadIds: string[] = [];
     const skippedLeadIds: string[] = [];
+    const successfulLeadIds: string[] = [];
     const failureBreakdown = {
       searchWebFailed: 0,
       linkedinFailed: 0,
@@ -1881,6 +1882,7 @@ export class CrmEnrichmentService {
           });
 
           counters.processed++;
+          if (lead?.leadId) successfulLeadIds.push(lead.leadId);
         } catch (error: any) {
           const step = error?.step || 'unknown';
           if (step === 'skipped_personal') {
@@ -1945,6 +1947,9 @@ export class CrmEnrichmentService {
           : skippedLeadIds.length > 5000
           ? { skippedDeduplicationUnavailable: true }
           : {}),
+        ...(successfulLeadIds.length <= 5000
+          ? { successfulLeadIds }
+          : { successLeadsDeduplicationUnavailable: true }),
         failureBreakdown,
         failures: failureRecords,
       })).catch((err: any) => console.error('[CrmEnrichment] Failed to write job meta:', err));
