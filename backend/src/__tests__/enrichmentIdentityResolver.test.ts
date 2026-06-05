@@ -484,10 +484,11 @@ describe('resolveIdentity — write semantics', () => {
     expect(call.fields).toEqual({ firstName: 'Jane' });
     expect(call.fields.lastName).toBeUndefined();
   });
-  it('writes person fields (linkedin, title) before completeness gate fires — no data loss on skip', async () => {
+  it('writes person fields (linkedin, title) and passes the company gate when a LinkedIn URL is resolved', async () => {
     // Apollo returns person+linkedin+title but no org (personal email).
-    // Completeness gate fires (needsCompanyFields=true, no company).
-    // Write must still happen so linkedin/title land in the DB.
+    // A resolved LinkedIn URL now satisfies the company completeness gate —
+    // Tier 5 findUnipileCompany can resolve company directly from it — so the
+    // lead is no longer skipped, and the person fields are persisted regardless.
     const deps = makeDeps({
       apolloPeopleMatch: jest.fn().mockResolvedValue({
         firstName: 'Nels',
@@ -505,8 +506,8 @@ describe('resolveIdentity — write semantics', () => {
       deps,
     );
 
-    expect(result.ok).toBe(false); // company missing → gate fires
-    // But write must have happened with the person fields Apollo returned
+    expect(result.ok).toBe(true); // LinkedIn URL present → company gate passes
+    // Write must have happened with the person fields Apollo returned
     expect(deps.writeLeadFields).toHaveBeenCalledTimes(1);
     const call = (deps.writeLeadFields as jest.Mock).mock.calls[0][0];
     expect(call.fields).toMatchObject({

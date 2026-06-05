@@ -678,10 +678,14 @@ export async function resolveIdentity(
     if (!personOk) return { ok: false, reason: 'identity_unresolvable' };
   }
   if (needsCompanyFields) {
-    // Business email domain is sufficient — T2/T5 waterfall tiers can discover
-    // company from domain alone (Unipile company search, Apollo org match).
-    // Only block when we have neither company name nor a resolvable domain.
-    const companyOk = lead.company || resolved.company || hasBusinessEmailDomain;
+    // Business email domain OR a LinkedIn URL is sufficient — the T2/T5 waterfall
+    // tiers can discover company from either. A domain feeds Apollo org match /
+    // Unipile company search; a LinkedIn URL feeds Tier 5 findUnipileCompany,
+    // which resolves company directly from lead.linkedin via Unipile getProfile
+    // (no company name or domain needed). Only block when we have none of
+    // company name, a resolvable domain, or a LinkedIn URL.
+    const hasLinkedin = !!(linkedinUrl || resolved.linkedin);
+    const companyOk = lead.company || resolved.company || hasBusinessEmailDomain || hasLinkedin;
     if (!companyOk) return { ok: false, reason: 'identity_unresolvable' };
   }
 
