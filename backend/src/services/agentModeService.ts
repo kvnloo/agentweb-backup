@@ -28,6 +28,7 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData } from '../utils/llmService';
 import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
+import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmMutationEvents';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 
 // Constant for the virtual "other skills" identifier
@@ -2716,6 +2717,21 @@ export class AgentModeService {
               result: minimalResult,
               duration
             });
+
+            // Notify the CRM page to refresh after a successful CRM-mutating tool.
+            // Enrichment / tech-stack tools broadcast their own completion events,
+            // so this covers the rest (update/status/email/delete/import/…). Emitted
+            // to the user's room so it reaches the CRM page regardless of which agent
+            // surface (full agent mode or Emma sidebar) ran the tool. Guard on a
+            // success flag so a tool that returned { success: false } doesn't trigger
+            // a spurious refresh.
+            if (socketEmit) {
+              const crmPayload = buildCrmDataChangedPayload(toolCall.function.name, functionArgs);
+              const toolSucceeded = !(processedResult && (processedResult as any).success === false);
+              if (crmPayload && toolSucceeded) {
+                socketEmit(`user:${userId}`, CRM_DATA_CHANGED_EVENT, crmPayload);
+              }
+            }
 
             // For create_social_media_posts, count actual posts in the array (not function calls)
             const counterIncrement = toolCall.function.name === 'create_social_media_posts'
