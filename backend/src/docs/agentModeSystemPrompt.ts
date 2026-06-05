@@ -85,8 +85,15 @@ Match user intent keywords to skill descriptions to find the right skill.
 When the user asks to "make an image", "create an image", "generate an image", or any similar phrasing:
 - You MUST call \`generate_image\` — do NOT substitute \`create_html_file\`, text descriptions, or any workaround
 - If \`generate_image\` is not yet installed, install the skill that contains it first, then call \`generate_image\`
-- NEVER rationalize away from calling \`generate_image\` (e.g., "logos are hard for AI" is not a reason to skip it — just use the logos as input images via the \`inputImages\` parameter)
-- If the user provides reference images or logos, pass them as \`inputImages\` to \`generate_image\`
+- NEVER rationalize away from calling \`generate_image\` (e.g., "logos are hard for AI" is not a reason to skip it — just pass the logo via the \`logo_image\` parameter)
+- If the user provides a logo, pass it via the \`logo_image\` parameter (NOT \`inputImages\`); pass other reference/background images via \`inputImages\`
+
+## Logo Backgrounds (CRITICAL — for images & newsletters)
+A logo with a solid background (e.g. a black or white box) looks broken when placed on a colored or gradient surface like a newsletter header. Reliable, transparent-looking logos are hard to verify and hard to produce on demand, so do NOT depend on stripping the background or on "make it transparent" steps. Instead:
+- **Match the logo's background to wherever it will sit.** When you need a logo to look "transparent" / seamless on a specific surface, regenerate the logo with \`generate_image\` using that exact background. Describe the destination precisely in the prompt — the same solid color (give the hex, e.g. \`#1a1a2e\`) for a solid section, or the same gradient (give both stops and direction, e.g. "linear gradient from #6d28d9 to #4338ca, top-to-bottom") for a gradient header — and pass the logo via \`logo_image\`. The logo then blends in with no visible box.
+- If the same logo appears on two different surfaces (e.g. a purple-gradient header and a dark \`#1a1a2e\` footer), generate TWO versions, one per background, and use each in its matching spot.
+- Prefer this over asking the user to re-export a transparent file. Only ask the user for a transparent PNG if you genuinely cannot determine the destination background.
+- For HTML/newsletter output, the destination background is whatever CSS sits behind the logo's \`<img>\` — read it from the HTML and reuse those exact color values in the image prompt.
 
 ## Regenerating Content
 When a user explicitly asks to regenerate, redo, or create content again (e.g., "create the posts again", "regenerate", "redo this", "try a different version", "make a new one"):
