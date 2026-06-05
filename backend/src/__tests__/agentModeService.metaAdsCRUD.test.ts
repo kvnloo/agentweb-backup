@@ -22,7 +22,13 @@ jest.mock('../services/metaService', () => ({
     getAd: jest.fn(),
     getAdCreative: jest.fn(),
     updateAd: jest.fn(),
-    deleteAd: jest.fn()
+    deleteAd: jest.fn(),
+    getPageInstagramActor: jest.fn()
+  },
+  // Static helper used by the agent layer to decide whether IG actor resolution is needed.
+  MetaService: {
+    placementTokenTargetsInstagram: (token: string) =>
+      ['feed', 'story', 'stories', 'reels', 'instagram_feed', 'instagram_story', 'instagram_reels', 'explore'].includes(String(token).toLowerCase())
   }
 }));
 
@@ -294,6 +300,85 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
               { image_hash: 'vertical_hash', placements: ['story', 'reels'] }
             ]
           })
+        );
+      });
+
+      it('auto-resolves instagram_user_id from the page when placement_assets target Instagram', async () => {
+        const params = {
+          name: 'Placement Creative',
+          page_id: 'page_123',
+          body: 'Ad Body',
+          title: 'Ad Title',
+          link_url: 'https://example.com',
+          placement_assets: [
+            { image_hash: 'square_hash', is_default: true },
+            { image_hash: 'vertical_hash', placements: ['story', 'reels'] }
+          ]
+        };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getPageInstagramActor as jest.Mock).mockResolvedValue('17841469032554858');
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative_pc' });
+
+        const result = await agentModeService.createMetaAdsAdCreative('user123', params);
+
+        expect(result.success).toBe(true);
+        expect(metaService.getPageInstagramActor).toHaveBeenCalledWith('mock-access-token', 'page_123');
+        // The resolved IG actor is passed to the builder so the creative can serve IG placements
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({ instagram_user_id: '17841469032554858' })
+        );
+      });
+
+      it('does NOT resolve instagram_user_id when placements are Facebook-only', async () => {
+        const params = {
+          name: 'Placement Creative',
+          page_id: 'page_123',
+          body: 'Ad Body',
+          title: 'Ad Title',
+          link_url: 'https://example.com',
+          placement_assets: [
+            { image_hash: 'square_hash', is_default: true },
+            { image_hash: 'vertical_hash', placements: ['facebook_reels'] }
+          ]
+        };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative_pc' });
+
+        const result = await agentModeService.createMetaAdsAdCreative('user123', params);
+
+        expect(result.success).toBe(true);
+        expect(metaService.getPageInstagramActor).not.toHaveBeenCalled();
+      });
+
+      it('respects an explicitly-supplied instagram_user_id (no auto-resolution)', async () => {
+        const params = {
+          name: 'Placement Creative',
+          page_id: 'page_123',
+          instagram_user_id: 'explicit_ig',
+          body: 'Ad Body',
+          title: 'Ad Title',
+          link_url: 'https://example.com',
+          placement_assets: [
+            { image_hash: 'square_hash', is_default: true },
+            { image_hash: 'vertical_hash', placements: ['reels'] }
+          ]
+        };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative_pc' });
+
+        const result = await agentModeService.createMetaAdsAdCreative('user123', params);
+
+        expect(result.success).toBe(true);
+        expect(metaService.getPageInstagramActor).not.toHaveBeenCalled();
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({ instagram_user_id: 'explicit_ig' })
         );
       });
 
@@ -700,6 +785,42 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
           'mock-access-token',
           'ad_123',
           { creative: { creative_id: 'new_placement_creative' } }
+        );
+      });
+
+      it('auto-resolves instagram_user_id during a placement-asset AD UPDATE swap (IG placements)', async () => {
+        const params = {
+          placement_assets: [
+            { image_hash: 'square_hash', is_default: true },
+            { image_hash: 'vertical_9x16_hash', placements: ['story', 'reels'] }
+          ]
+        };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock).mockResolvedValue({
+          id: 'ad_123',
+          creative: { creative_id: 'old_square_creative' }
+        });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'old_square_creative',
+          name: 'Maint-05',
+          object_story_spec: {
+            page_id: 'page_123',
+            link_data: { message: 'Hi', link: 'https://usehaven.ai', name: 'T', image_hash: 'square_hash' }
+          }
+        });
+        (metaService.getPageInstagramActor as jest.Mock).mockResolvedValue('17841469032554858');
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'new_placement_creative' });
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(true);
+        expect(metaService.getPageInstagramActor).toHaveBeenCalledWith('mock-access-token', 'page_123');
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({ instagram_user_id: '17841469032554858' })
         );
       });
 

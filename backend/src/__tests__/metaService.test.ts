@@ -1055,4 +1055,57 @@ describe('MetaService', () => {
             expect(result).toEqual([]);
         });
     });
+
+    describe('getPageInstagramActor', () => {
+        it('returns the instagram_business_account id linked to the page', async () => {
+            const mockCall = jest.fn().mockResolvedValue({
+                _data: { instagram_business_account: { id: '17841469032554858' } }
+            });
+            (FacebookAdsApi.init as jest.Mock).mockReturnValue({ call: mockCall });
+
+            const result = await service.getPageInstagramActor(mockAccessToken, '383736054827460');
+
+            expect(result).toBe('17841469032554858');
+            expect(mockCall).toHaveBeenCalledWith('GET', ['383736054827460'], expect.objectContaining({
+                fields: expect.stringContaining('instagram_business_account')
+            }));
+        });
+
+        it('falls back to connected_instagram_account when no business account', async () => {
+            const mockCall = jest.fn().mockResolvedValue({
+                _data: { connected_instagram_account: { id: '999' } }
+            });
+            (FacebookAdsApi.init as jest.Mock).mockReturnValue({ call: mockCall });
+
+            const result = await service.getPageInstagramActor(mockAccessToken, 'page_1');
+            expect(result).toBe('999');
+        });
+
+        it('returns null when the page has no linked Instagram account', async () => {
+            const mockCall = jest.fn().mockResolvedValue({ _data: {} });
+            (FacebookAdsApi.init as jest.Mock).mockReturnValue({ call: mockCall });
+
+            const result = await service.getPageInstagramActor(mockAccessToken, 'page_1');
+            expect(result).toBeNull();
+        });
+
+        it('returns null (non-fatal) when the Graph call throws', async () => {
+            const mockCall = jest.fn().mockRejectedValue(new Error('boom'));
+            (FacebookAdsApi.init as jest.Mock).mockReturnValue({ call: mockCall });
+
+            const result = await service.getPageInstagramActor(mockAccessToken, 'page_1');
+            expect(result).toBeNull();
+        });
+    });
+
+    describe('placementTokenTargetsInstagram', () => {
+        it('is true for IG-serving tokens and false for FB-only tokens', () => {
+            expect(MetaService.placementTokenTargetsInstagram('reels')).toBe(true);
+            expect(MetaService.placementTokenTargetsInstagram('story')).toBe(true);
+            expect(MetaService.placementTokenTargetsInstagram('instagram_reels')).toBe(true);
+            expect(MetaService.placementTokenTargetsInstagram('facebook_reels')).toBe(false);
+            expect(MetaService.placementTokenTargetsInstagram('facebook_feed')).toBe(false);
+            expect(MetaService.placementTokenTargetsInstagram('unknown')).toBe(false);
+        });
+    });
 });
