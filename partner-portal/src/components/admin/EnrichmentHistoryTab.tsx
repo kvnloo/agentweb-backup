@@ -67,6 +67,8 @@ interface EnrichmentJob {
   skippedDeduplicationUnavailable?: boolean;
   successfulLeadIds?: string[];
   successLeadsDeduplicationUnavailable?: boolean;
+  totalFieldsFilled?: number;
+  totalFieldsAttempted?: number;
   outputFields?: string[];
   failureBreakdown?: { searchWebFailed: number; linkedinFailed: number; llmOrParseFailed: number; updateFailed: number };
   sourceBreakdown?: SourceBreakdown;
@@ -276,9 +278,18 @@ function JobRow({ job, token }: { job: EnrichmentJob; token: string }) {
           />
         </TableCell>
         <TableCell align="right">
-          <Typography variant="body2" fontWeight={600} color={jobSuccessful ? 'success.main' : 'text.secondary'}>
-            {jobSuccessful ? `${jobSuccessful.enriched} / ${jobSuccessful.attempted}` : '—'}
-          </Typography>
+          <Tooltip title="Total leads enriched">
+            <Typography variant="body2" fontWeight={600} color={jobSuccessful ? 'success.main' : 'text.secondary'} sx={{ cursor: 'default', display: 'inline-block' }}>
+              {jobSuccessful ? `${jobSuccessful.enriched} / ${jobSuccessful.attempted}` : '—'}
+            </Typography>
+          </Tooltip>
+          {(job.totalFieldsFilled !== undefined && job.totalFieldsAttempted) && (
+            <Tooltip title="Total fields enriched">
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block', cursor: 'default' }}>
+                {job.totalFieldsFilled} / {job.totalFieldsAttempted}
+              </Typography>
+            </Tooltip>
+          )}
         </TableCell>
         <TableCell align="right">
           <Typography variant="body2" color={job.skippedCount ? 'warning.main' : 'text.secondary'}>

@@ -6403,6 +6403,10 @@ export const crmDb = {
       sibling:   { live: number; cached: number };
       llm:       { live: number; cached: number };
     };
+    /** Total fields provider had data for across all successfully written leads (before overwrite policy). */
+    totalFieldsFilled?: number;
+    /** Total field slots attempted: config.fields.length × leads.length. */
+    totalFieldsAttempted?: number;
   }): Promise<void> {
     try {
       const item: any = {
@@ -6431,6 +6435,8 @@ export const crmDb = {
         item.failures = meta.failures.slice(0, 50);
       }
       if (meta.sourceBreakdown) item.sourceBreakdown = meta.sourceBreakdown;
+      if (meta.totalFieldsFilled !== undefined) item.totalFieldsFilled = meta.totalFieldsFilled;
+      if (meta.totalFieldsAttempted !== undefined) item.totalFieldsAttempted = meta.totalFieldsAttempted;
       await dynamodb.put({
         TableName: `${TABLE_PREFIX}AW-EnrichmentHistory`,
         Item: item,
