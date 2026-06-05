@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-06-05',
+    changes: [
+      'New: Instantly Find LinkedIn Leads Who Accepted Your Invite But Need a Follow-Up',
+      '- Ask Emma "which leads accepted my invite but haven\'t been followed up?" and get the answer for the whole list in one step, instead of Emma checking leads one at a time (which used to be slow and unreliable on big lists)',
+      '- Each surfaced lead shows when they connected, what the last message was, whether it came from you or them, and whether you\'re the one who owes the next reply',
+      '- Works on lead lists that have a LinkedIn account connected, and scales to lists with hundreds or thousands of leads',
+    ],
+  },
+  {
     date: '2026-06-04',
     changes: [
       'Improved: Deep Research Reports Are Back and More Comprehensive',
