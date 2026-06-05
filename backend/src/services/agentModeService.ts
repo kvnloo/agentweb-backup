@@ -28,6 +28,7 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData } from '../utils/llmService';
 import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
+import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmMutationEvents';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 
 // Constant for the virtual "other skills" identifier
@@ -2716,6 +2717,21 @@ export class AgentModeService {
               result: minimalResult,
               duration
             });
+
+            // Notify the CRM page to refresh after a successful CRM-mutating tool.
+            // Enrichment / tech-stack tools broadcast their own completion events,
+            // so this covers the rest (update/status/email/delete/import/…). Emitted
+            // to the user's room so it reaches the CRM page regardless of which agent
+            // surface (full agent mode or Emma sidebar) ran the tool. Guard on a
+            // success flag so a tool that returned { success: false } doesn't trigger
+            // a spurious refresh.
+            if (socketEmit) {
+              const crmPayload = buildCrmDataChangedPayload(toolCall.function.name, functionArgs);
+              const toolSucceeded = !(processedResult && (processedResult as any).success === false);
+              if (crmPayload && toolSucceeded) {
+                socketEmit(`user:${userId}`, CRM_DATA_CHANGED_EVENT, crmPayload);
+              }
+            }
 
             // For create_social_media_posts, count actual posts in the array (not function calls)
             const counterIncrement = toolCall.function.name === 'create_social_media_posts'
@@ -8335,6 +8351,184 @@ export class AgentModeService {
     } catch (error) {
       console.error('AgentMode: Error getting lead details:', error);
       return { success: false, message: 'Failed to get lead details', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * List-level "accepted-but-not-followed-up" query for LinkedIn outreach lists.
+   *
+   * Answers "which leads accepted my invite but still need a follow-up?" WITHOUT
+   * the N+1 get_lead_details fan-out the old path required. All the cross-lead
+   * signal is loaded in a constant number of queries:
+   *   - one getAllConnectionsByAccount(accountId) -> who is connected + connectedAt
+   *   - one getEventsByEmailDomain(`linkedin-{listId}`) -> LinkedIn message direction/timestamps
+   *   - one getEventsByEmailDomain(userEmailDomain) -> email message direction/timestamps
+   *   - a bounded scan of getLeadsByListId pages for the leads themselves
+   *
+   * A lead is "needs follow-up" when it is a 1st-degree connection (the invite
+   * was accepted) and there is no OUTBOUND touch after connectedAt — i.e. either
+   * we never messaged them post-accept, or they replied and we owe a response
+   * (awaitingReply=true).
+   */
+  public async getLeadsNeedingFollowup(listId: string, userId: string, options: {
+    limit?: number;
+    scanLimit?: number;
+  } = {}): Promise<any> {
+    try {
+      const { crmDb, userDb } = await import('./db');
+      const limit = Math.min(Math.max(options.limit || 25, 1), 100);
+      const scanLimit = Math.min(Math.max(options.scanLimit || 2000, 1), 5000);
+
+      // Verify list access (org-aware).
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
+      }
+
+      const accountId: string | null = (list as any).linkedInAccountId ?? null;
+      if (!accountId) {
+        return {
+          success: false,
+          message: 'This list has no LinkedIn account assigned',
+          error: 'Follow-up detection requires a LinkedIn account (list.linkedInAccountId) so connection status can be resolved. Assign one in the list settings.',
+        };
+      }
+
+      // --- Constant-query signal loading (NO per-lead fan-out) ---
+      const { emailEventsDb } = await import('./emailEventsDb');
+      const { getAllConnectionsByAccount, normalizeLinkedInUrl } = await import('./unipileConnectionsDb');
+      const user = await userDb.getUserById(userId);
+      const emailDomain = user?.emailDomain?.trim();
+
+      const [connections, linkedInEvents, emailEvents] = await Promise.all([
+        getAllConnectionsByAccount(accountId).catch(() => []),
+        emailEventsDb.getEventsByEmailDomain(`linkedin-${listId}`).catch(() => []),
+        emailDomain ? emailEventsDb.getEventsByEmailDomain(emailDomain).catch(() => []) : Promise.resolve([]),
+      ]);
+
+      // connectedAt (UNIX seconds) keyed by normalized profile URL.
+      const connectedAtByUrl = new Map<string, number>();
+      for (const c of connections as any[]) {
+        const url = String(c?.publicProfileUrl || '').trim().toLowerCase();
+        if (!url) continue;
+        const ts = typeof c?.connectedAt === 'number' ? c.connectedAt : 0;
+        const existing = connectedAtByUrl.get(url);
+        if (existing === undefined || ts < existing) connectedAtByUrl.set(url, ts); // earliest connect wins
+      }
+
+      // Build last-engagement signal keyed by lead identity. LinkedIn events are
+      // keyed by normalized profile URL; email events by lead email.
+      type Signal = { at: number; type: string; direction: 'inbound' | 'outbound' };
+      const directionOf = (eventType: string): 'inbound' | 'outbound' =>
+        /received|replied/i.test(eventType) ? 'inbound' : 'outbound';
+
+      const linkedInSignalByUrl = new Map<string, Signal>();
+      for (const e of linkedInEvents as any[]) {
+        const url = String(e?.leadEmail || '').trim().toLowerCase();
+        if (!url) continue;
+        this.foldEngagementSignal(linkedInSignalByUrl, url, e, directionOf);
+      }
+      const emailSignalByEmail = new Map<string, Signal>();
+      for (const e of emailEvents as any[]) {
+        const email = String(e?.leadEmail || '').trim().toLowerCase();
+        if (!email) continue;
+        this.foldEngagementSignal(emailSignalByEmail, email, e, directionOf);
+      }
+
+      // --- Scan leads (bounded) and segment in memory ---
+      const matches: any[] = [];
+      let scanned = 0;
+      let cursor: any = undefined;
+      let scannedAll = true;
+      while (scanned < scanLimit) {
+        const page = await crmDb.getLeadsByListId(listId, 200, cursor);
+        const items: any[] = page.items || [];
+        for (const lead of items) {
+          scanned++;
+          if (!lead.linkedin) continue;
+          const url = normalizeLinkedInUrl(String(lead.linkedin)).toLowerCase();
+          const connectedAt = connectedAtByUrl.get(url);
+          if (connectedAt === undefined) continue; // not connected -> invite not accepted yet
+
+          // Merge LinkedIn + email signals for this lead; the most recent wins.
+          const leadEmail = String(lead.email || '').trim().toLowerCase();
+          const candidates: Signal[] = [];
+          const liSig = linkedInSignalByUrl.get(url);
+          if (liSig) candidates.push(liSig);
+          const emSig = leadEmail ? emailSignalByEmail.get(leadEmail) : undefined;
+          if (emSig) candidates.push(emSig);
+
+          const last = candidates.sort((a, b) => b.at - a.at)[0];
+
+          // The ball is in THEIR court (already followed up, waiting on them)
+          // when the most-recent engagement is an outbound touch sent after the
+          // connection was accepted. A later inbound reply flips it back to
+          // "needs follow-up" (awaitingReply) since we now owe the response.
+          const connectedAtMs = connectedAt * 1000;
+          if (last && last.direction === 'outbound' && last.at > connectedAtMs) continue;
+
+          const awaitingReply = !!last && last.direction === 'inbound';
+          matches.push({
+            leadId: lead.leadId,
+            email: lead.email || '',
+            firstName: lead.firstName || '',
+            lastName: lead.lastName || '',
+            company: lead.company || '',
+            title: lead.title || '',
+            linkedin: lead.linkedin || '',
+            linkedInConnectionStatus: {
+              isConnected: true,
+              connectedAt: new Date(connectedAtMs).toISOString(),
+              connectedAtTimestamp: connectedAt,
+            },
+            lastEngagementType: last?.type ?? null,
+            lastEngagementDirection: last?.direction ?? null,
+            lastEngagementAt: last ? new Date(last.at).toISOString() : null,
+            awaitingReply,
+          });
+          if (matches.length >= limit) break;
+        }
+        cursor = page.lastEvaluatedKey;
+        if (matches.length >= limit) { scannedAll = !cursor; break; }
+        if (!cursor) break;
+        if (scanned >= scanLimit) { scannedAll = false; break; }
+      }
+
+      return {
+        success: true,
+        message: `Found ${matches.length} lead(s) that accepted your invite and need a follow-up`,
+        leads: matches,
+        matchCount: matches.length,
+        listName: list.name,
+        scannedLeads: scanned,
+        scannedAllLeads: scannedAll,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error getting leads needing follow-up:', error);
+      return { success: false, message: 'Failed to get leads needing follow-up', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Fold a single engagement event into a per-key "last engagement" signal map,
+   * keeping only the most-recent engagement per key. Shared by the
+   * LinkedIn-URL-keyed and email-keyed signal builders.
+   */
+  private foldEngagementSignal(
+    map: Map<string, { at: number; type: string; direction: 'inbound' | 'outbound' }>,
+    key: string,
+    event: any,
+    directionOf: (eventType: string) => 'inbound' | 'outbound',
+  ): void {
+    const at = new Date(event?.createdAt || 0).getTime();
+    if (!at || isNaN(at)) return;
+    const existing = map.get(key);
+    if (!existing || at > existing.at) {
+      map.set(key, { at, type: String(event?.eventType || ''), direction: directionOf(String(event?.eventType || '')) });
     }
   }
 

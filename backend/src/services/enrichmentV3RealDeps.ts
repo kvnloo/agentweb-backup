@@ -160,6 +160,9 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
     findLinkedInUrl: ({ firstName, lastName, company }) =>
       findLinkedInUrlImpl(userId, firstName, lastName, company),
 
+    findUnipileProfileByUrl: ({ linkedinUrl }) =>
+      findUnipileProfileByUrlImpl(userId, linkedinUrl),
+
     resolveCompanyDomainViaWebSearch: async ({ company, domain, linkedin, title, firstName, lastName }) => {
       try {
         const llm = createLLMService(WEB_SEARCH_MODEL, 0.2);
@@ -394,7 +397,7 @@ async function fetchWebForGroupReal(
   }
   console.log(`${wtag} query="${query.slice(0, 120)}"`);
 
-  // 3. Google CSE
+  // 3. Google CSE — for company_technographic also run a job-postings query
   let webResults: any[] = [];
   try {
     const search = await agentModeService.searchWeb(query, 10);
@@ -405,6 +408,26 @@ async function fetchWebForGroupReal(
     console.warn(`${wtag} searchWeb ERROR ${(err as Error).message}`);
     return null;
   }
+
+  if (groupName === 'company_technographic') {
+    const jobsQuery = CrmEnrichmentService.applySearchTemplate(
+      '{{emailDomain}} job posting required tools technologies software',
+      lead,
+    );
+    try {
+      const jobsSearch = await agentModeService.searchWeb(jobsQuery, 5);
+      if (jobsSearch?.success && Array.isArray(jobsSearch.results)) {
+        const existingUrls = new Set(webResults.map((r: any) => r.url || r.link).filter(Boolean));
+        for (const r of jobsSearch.results) {
+          const key = r.url || r.link;
+          if (key && !existingUrls.has(key)) { existingUrls.add(key); webResults.push(r); }
+        }
+      }
+    } catch (err) {
+      console.warn(`${wtag} jobsSearch ERROR ${(err as Error).message}`);
+    }
+  }
+
   if (webResults.length === 0) {
     console.log(`${wtag} MISS searchWeb returned 0 results`);
     return null;
@@ -462,6 +485,8 @@ export function buildFieldGuidanceV3(fields: string[], configFieldsByName: Recor
       guidance = `ONLY copy a LinkedIn company page URL that appears verbatim in the source data above. The URL must start with "https://www.linkedin.com/company/". Do NOT construct, guess, or complete a URL. Return null if no exact /company/ URL is present in the data.`;
     } else if (/linkedin/.test(fl)) {
       guidance = `ONLY copy a linkedin.com/in/ URL that appears verbatim in the provided data. Do NOT construct, guess, or complete a URL — even if you think you know the person's LinkedIn handle. Do NOT use /pub/dir/ or /search/ URLs. Return null if no exact /in/ URL is present in the data.`;
+    } else if (name === 'tech_stack') {
+      guidance = instr || `Extract all software tools, SaaS products, platforms, and technical services this company uses — including analytics, CMS, marketing automation, cloud infrastructure, payment processors, and other integrations. Look in job postings (required tools), integration/app pages, and tech profile data. Return as a comma-separated list. Return null if nothing found.`;
     } else if (instr) {
       guidance = instr;
     } else {
@@ -688,6 +713,69 @@ export async function findLinkedInUrlImpl(
     console.warn('[v3 deps] findLinkedInUrl failed:', (err as Error).message);
     return null;
   }
+}
+
+/**
+ * Identity-resolution Tier 3.5: resolve name/title/company directly from a
+ * LinkedIn /in/ URL via Unipile getProfile. Mirrors findUnipilePerson Case A
+ * (account resolution + 429 rotation across connected accounts) but is callable
+ * from the identity resolver, BEFORE the person-completeness gate — so a
+ * LinkedIn-only lead Apollo can't match still gets a name and isn't skipped.
+ */
+export async function findUnipileProfileByUrlImpl(
+  userId: string,
+  linkedinUrl: string,
+): Promise<{ firstName?: string; lastName?: string; title?: string; company?: string; fromCache?: boolean } | null> {
+  if (!linkedinUrl || !linkedinUrl.includes('/in/')) return null;
+  const tag = `[v3 deps:findUnipileProfileByUrl]`;
+  const { linkedInOutreachService } = await import('./linkedInOutreachService');
+  const triedAccounts = new Set<string>();
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let accountId: string | null = null;
+    try {
+      accountId = await linkedInOutreachService.resolveAccountIdForEnrichment(
+        userId,
+        triedAccounts.size > 0 ? triedAccounts : undefined,
+      );
+      if (!accountId) { console.warn(`${tag} no accountId → skip`); return null; }
+
+      console.log(`${tag} getProfile url=${linkedinUrl}`);
+      const profileResult = await getUnipileProfileService().getProfile(linkedinUrl, accountId);
+      if (!profileResult?.found || !profileResult.rawData) {
+        console.log(`${tag} MISS profile not found`);
+        return null;
+      }
+      const raw = profileResult.rawData;
+      const current = (raw.work_experience as any[] | undefined)?.find((e: any) => !e.end);
+      const trimStr = (v: unknown): string | undefined => {
+        const s = typeof v === 'string' ? v.trim() : '';
+        return s || undefined;
+      };
+      const result = {
+        firstName: trimStr(raw.first_name),
+        lastName:  trimStr(raw.last_name),
+        title:     trimStr(current?.position),
+        company:   trimStr(current?.company),
+        fromCache: profileResult.fromCache,
+      };
+      console.log(`${tag} HIT name="${result.firstName ?? '∅'} ${result.lastName ?? '∅'}" title="${result.title ?? '∅'}" company="${result.company ?? '∅'}"`);
+      return result;
+    } catch (err) {
+      if ((err as any)?.structuredError?.classification === 'RATE_LIMIT_ERROR') {
+        console.warn(`${tag} 429 on account ${accountId} — rotating (attempt ${attempt + 1}/3)`);
+        if (accountId) triedAccounts.add(accountId);
+        linkedInOutreachService.invalidateResolvedAccount(userId);
+        continue;
+      }
+      linkedInOutreachService.invalidateResolvedAccount(userId);
+      if (accountId) linkedInOutreachService.clearStatusCache(accountId);
+      console.warn(`${tag} ERROR ${(err as Error).message}`);
+      return null;
+    }
+  }
+  console.warn(`${tag} all accounts rate-limited (tried ${triedAccounts.size})`);
+  return null;
 }
 
 // ─── Orchestrator deps ────────────────────────────────────────────────────────

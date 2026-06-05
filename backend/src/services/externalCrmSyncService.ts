@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { crmDb } from './db';
+import { crmDb, userDb } from './db';
 import { decryptPassword, encryptPassword } from '../utils/crypto';
 import { CrmAuth, CrmAdapter } from './adapters/crmAdapterTypes';
 import { AttioAdapter } from './adapters/attioAdapter';
@@ -147,8 +147,19 @@ export class ExternalCrmSyncService {
     if (!configs?.[provider]) return null;
 
     const config = configs[provider];
-    if (config.userId !== userId) return null;
+    if (!(await this.canAccessConfig(userId, config.userId))) return null;
     return config;
+  }
+
+  // A config is accessible to its creator or to any member of the creator's org,
+  // matching the org-aware list sharing enforced in the crm/crmSync routes.
+  private async canAccessConfig(userId: string, configUserId: string): Promise<boolean> {
+    if (configUserId === userId) return true;
+    const [user, owner] = await Promise.all([
+      userDb.getUserById(userId),
+      userDb.getUserById(configUserId),
+    ]);
+    return !!(user?.orgId && owner?.orgId && user.orgId === owner.orgId);
   }
 
   /**

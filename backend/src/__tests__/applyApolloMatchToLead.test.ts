@@ -228,4 +228,34 @@ describe('applyApolloMatchToLead', () => {
       expect(r.updates.firstName).toBe('A');
     });
   });
+
+  describe('LinkedIn URL validation', () => {
+    it('does NOT write a malformed company LinkedIn URL (search URL)', () => {
+      const m = match({}, { name: 'Acme', linkedinUrl: 'https://www.linkedin.com/search/results/companies/?keywords=x' });
+      const r = applyApolloMatchToLead({}, m);
+      expect(r.updates.companyLinkedin).toBeUndefined();
+      expect(r.changed.has('companyLinkedin')).toBe(false);
+    });
+
+    it('writes a valid /company/ URL', () => {
+      const m = match({}, { name: 'Acme', linkedinUrl: 'https://www.linkedin.com/company/acme' });
+      const r = applyApolloMatchToLead({}, m);
+      expect(r.updates.companyLinkedin).toBe('https://www.linkedin.com/company/acme');
+      expect(r.changed.has('companyLinkedin')).toBe(true);
+    });
+
+    it('does NOT write a malformed personal LinkedIn URL', () => {
+      const m = match({ firstName: 'A', linkedin: 'https://www.linkedin.com/pub/dir/foo' });
+      const r = applyApolloMatchToLead({}, m);
+      expect(r.updates.linkedin).toBeUndefined();
+      expect(r.changed.has('linkedin')).toBe(false);
+    });
+
+    it('writes a valid /in/ personal URL', () => {
+      const m = match({ firstName: 'A', linkedin: 'https://www.linkedin.com/in/janedoe' });
+      const r = applyApolloMatchToLead({}, m);
+      expect(r.updates.linkedin).toBe('https://www.linkedin.com/in/janedoe');
+      expect(r.changed.has('linkedin')).toBe(true);
+    });
+  });
 });

@@ -10,6 +10,10 @@ jest.mock('../services/db', () => ({
     batchCreateLeads: jest.fn(),
     setLeadListCrmSyncConfig: jest.fn().mockResolvedValue(undefined),
   },
+  userDb: {
+    // Default: users have no org, so only the config owner can access it.
+    getUserById: jest.fn().mockResolvedValue(null),
+  },
 }));
 
 jest.mock('../utils/crypto', () => ({
@@ -184,6 +188,28 @@ describe('ExternalCrmSyncService', () => {
       mockListWithConfig(config);
       const result = await service.getConfig('user1', 'list1', 'hubspot');
       expect(result).toMatchObject({ provider: 'hubspot', listId: 'list1', userId: 'user1' });
+    });
+
+    it('returns config for an org member when the config owner is in the same org', async () => {
+      const { userDb } = require('../services/db');
+      userDb.getUserById.mockImplementation((id: string) =>
+        Promise.resolve(id === 'other-user' ? { userId: 'other-user', orgId: 'org-A' } : { userId: 'user1', orgId: 'org-A' })
+      );
+      const config = makeConfig({ userId: 'other-user' });
+      mockListWithConfig(config);
+      const result = await service.getConfig('user1', 'list1', 'hubspot');
+      expect(result).toMatchObject({ userId: 'other-user' });
+    });
+
+    it('returns null when the requester and config owner are in different orgs', async () => {
+      const { userDb } = require('../services/db');
+      userDb.getUserById.mockImplementation((id: string) =>
+        Promise.resolve(id === 'other-user' ? { userId: 'other-user', orgId: 'org-B' } : { userId: 'user1', orgId: 'org-A' })
+      );
+      const config = makeConfig({ userId: 'other-user' });
+      mockListWithConfig(config);
+      const result = await service.getConfig('user1', 'list1', 'hubspot');
+      expect(result).toBeNull();
     });
 
   });

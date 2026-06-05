@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-06-04
+// Last updated: 2026-06-05
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,58 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-06-05',
+    changes: [
+      'Fixed: One Bad Email No Longer Blocks Your HubSpot Sync',
+      '- When a lead\'s email field actually held something else (like a profile URL such as https://superdm.me/chessbaseindia), HubSpot rejected it as an invalid email and the lead showed up as a sync error',
+      '- These leads are now skipped cleanly with a clear note in the Sync Result, so the rest of your list still syncs without interruption',
+    ],
+  },
+  {
+    date: '2026-06-05',
+    changes: [
+      'Improved: Logos Now Blend Cleanly Into Newsletter Headers and Colored Sections',
+      '- When a logo needs to sit on a colored or gradient background (like a newsletter header), Emma now recreates the logo on that exact background so there\'s no leftover box or mismatched edge behind it',
+      '- If the same logo appears on two different backgrounds — for example a purple header and a dark footer — Emma makes a matching version for each spot',
+      '- This avoids the earlier problem where a logo could show an ugly solid box on a colored background, without needing you to re-export a transparent file',
+    ],
+  },
+  {
+    date: '2026-06-05',
+    changes: [
+      'Improved: Your CRM Now Updates Itself While Emma Works — No More Manual Refresh',
+      '- When Emma changes a lead\'s status, sends an email, logs activity, imports leads, or edits a list, those changes now appear in your CRM automatically — you no longer have to reload the page to see them',
+      '- The update happens right where you are: if you\'re on page 2 (or any later page) of a long list, it refreshes in place instead of jumping you back to the first page',
+      '- If you have a lead\'s detail panel open, its activity timeline refreshes too, so a freshly sent email or logged note shows up immediately',
+    ],
+  },
+  {
+    date: '2026-06-05',
+    changes: [
+      'Fixed: Team Members Can Now Set Up External CRM Sync on Shared Lead Lists',
+      '- When a teammate opened "External CRM sync" on a lead list owned by someone else in your organization and picked HubSpot or Attio, it failed with "Failed to load your sync configuration"',
+      '- Any member of your organization can now view, configure, and run HubSpot/Attio sync on shared lead lists, matching how the rest of your shared CRM already works',
+    ],
+  },
+  {
+    date: '2026-06-05',
+    changes: [
+      'New: Instantly Find LinkedIn Leads Who Accepted Your Invite But Need a Follow-Up',
+      '- Ask Emma "which leads accepted my invite but haven\'t been followed up?" and get the answer for the whole list in one step, instead of Emma checking leads one at a time (which used to be slow and unreliable on big lists)',
+      '- Each surfaced lead shows when they connected, what the last message was, whether it came from you or them, and whether you\'re the one who owes the next reply',
+      '- Works on lead lists that have a LinkedIn account connected, and scales to lists with hundreds or thousands of leads',
+    ],
+  },
+  {
+    date: '2026-06-04',
+    changes: [
+      'Improved: Deep Research Reports Are Back and More Comprehensive',
+      '- Deep research now runs on Google\'s latest research agents, which plan, search, and synthesize more thoroughly across your topic',
+      '- When you ask for a "comprehensive" report, we automatically use the most in-depth research agent; lighter requests use a faster one',
+      '- Fixed an issue where a research run could finish but come back empty — reports now reliably return their full content, so you get the complete write-up every time',
+    ],
+  },
   {
     date: '2026-06-04',
     changes: [

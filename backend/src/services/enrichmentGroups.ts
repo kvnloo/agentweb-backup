@@ -102,7 +102,7 @@ export const FIELD_GROUPS: Record<string, FieldGroupConfig> = {
 
   company_technographic: {
     entityType: 'company',
-    version: 1,
+    version: 5,
     fields: [
       'tech_stack', 'crm_used', 'marketing_tools',
       'cloud_provider', 'analytics_tools', 'engineering_stack',

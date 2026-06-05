@@ -18,6 +18,7 @@ import {
   type ApolloFetchContext,
   type ApolloFetchResult,
 } from '../services/enrichmentGroupWaterfall';
+import { buildFieldGuidanceV3 } from '../services/enrichmentV3RealDeps';
 import type { LeadRecord } from '../services/crmEnrichmentService';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
 
@@ -1233,6 +1234,29 @@ describe('runWaterfall — T3.5b-enrich.so (reverse lookup)', () => {
       deps,
     );
     expect(result.missing).toContain('first_name');
+  });
+
+  describe('buildFieldGuidanceV3 — tech_stack default instruction', () => {
+    it('injects default tech_stack guidance when no user instruction set', () => {
+      const guidance = buildFieldGuidanceV3(['tech_stack'], {});
+      expect(guidance).toContain('tech_stack');
+      expect(guidance).toContain('comma-separated');
+      expect(guidance).not.toContain('Return only what is explicitly stated');
+    });
+
+    it('uses user instruction over default when set', () => {
+      const guidance = buildFieldGuidanceV3(
+        ['tech_stack'],
+        { tech_stack: { instruction: 'List only CRM tools.' } },
+      );
+      expect(guidance).toContain('List only CRM tools.');
+      expect(guidance).not.toContain('comma-separated');
+    });
+
+    it('other fields still get generic guidance', () => {
+      const guidance = buildFieldGuidanceV3(['industry'], {});
+      expect(guidance).toContain('Return only what is explicitly stated');
+    });
   });
 
   it('handles enrich.so returning null gracefully', async () => {

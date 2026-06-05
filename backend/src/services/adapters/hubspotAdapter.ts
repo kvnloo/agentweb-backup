@@ -2,6 +2,7 @@ import { CrmAdapter, CrmAuth } from './crmAdapterTypes';
 import { ExternalCrmSyncConfig, FieldMapping, SyncResult } from '../externalCrmSyncService';
 import { HubSpotService } from '../hubspotService';
 import { crmDb } from '../db';
+import { validateEmail } from '../../utils/validation';
 
 
 /**
@@ -108,7 +109,20 @@ export class HubspotAdapter implements CrmAdapter {
         // ── 3. Sync each lead ────────────────────────────────────────────────────
         for (const lead of leads) {
             try {
-                if (!lead.email) continue; // HubSpot requires email to upsert
+                const email = typeof lead.email === 'string' ? lead.email.trim() : '';
+                if (!email) continue; // HubSpot requires email to upsert
+
+                // Guard against non-email values (e.g. a social/profile URL landing
+                // in the email field). HubSpot rejects these with INVALID_EMAIL and
+                // aborts the whole upsert; skip them with a clear per-lead error so
+                // the rest of the batch still syncs.
+                if (!validateEmail(email)) {
+                    result.errorCount++;
+                    const msg = `Invalid email "${email}" — skipped (not a valid email address)`;
+                    console.warn(`[HubspotAdapter] ${msg} for lead=${lead.leadId}`);
+                    result.errors.push(`${email}: ${msg}`);
+                    continue;
+                }
 
                 // Build contact properties from contact + custom mappings
                 const contactProps = this.buildHubSpotProps(lead, config.contactFieldMapping);
@@ -119,7 +133,7 @@ export class HubspotAdapter implements CrmAdapter {
 
                 // Upsert contact — service handles find-or-create
                 const { contactId, isNew } = await svc.upsertContact({
-                    email: lead.email,
+                    email,
                     ...this.propsToContactData(allContactProps),
                     customFields: this.extractCustomFields(allContactProps),
                 });
