@@ -318,6 +318,44 @@ describe('apiTools', () => {
     });
   });
 
+  describe('enable_lead_list_public_access', () => {
+    it('should call the dedicated public-access endpoint with { enabled: true }', async () => {
+      mockMcpFetch.mockResolvedValue({ success: true, publicAccessEnabled: true });
+
+      await mcpToolRegistry.execute('enable_lead_list_public_access', {
+        list_id: 'list_123',
+      }, context);
+
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+        method: 'PUT',
+        path: '/api/crm/lists/list_123/public-access',
+        body: { enabled: true },
+      }));
+    });
+
+    it('should NOT post publicAccessEnabled to the generic list-update endpoint', async () => {
+      mockMcpFetch.mockResolvedValue({ success: true });
+
+      await mcpToolRegistry.execute('enable_lead_list_public_access', {
+        list_id: 'list_456',
+      }, context);
+
+      const call = mockMcpFetch.mock.calls[0][0];
+      // The generic PUT /api/crm/lists/:id route silently ignores
+      // publicAccessEnabled, so the tool must not use it.
+      expect(call.path).not.toBe('/api/crm/lists/list_456');
+      expect((call.body as any)?.publicAccessEnabled).toBeUndefined();
+    });
+
+    it('should propagate a 403 from the access check', async () => {
+      mockMcpFetch.mockRejectedValue(new Error('API error (403): Access denied'));
+
+      await expect(
+        mcpToolRegistry.execute('enable_lead_list_public_access', { list_id: 'list_789' }, context)
+      ).rejects.toThrow('API error (403): Access denied');
+    });
+  });
+
   describe('manage_gtm_items - add_phase', () => {
     it('should call POST /api/gtm-plan/:id/phases', async () => {
       mockMcpFetch.mockResolvedValue({ phaseId: 'phase-1' });

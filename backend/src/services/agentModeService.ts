@@ -64,6 +64,7 @@ const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import * as linkedInAdsService from './linkedInAdsService';
+import { googleAdsService } from './googleAdsService';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 
@@ -997,7 +998,7 @@ export class AgentModeService {
 
         this.gemini_client = new OpenAI({
           apiKey: geminiApiKey.trim(),
-          baseURL: 'https://generativelanguage.googleapis.com/v1beta',
+          baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
         });
 
         return this.gemini_client;
@@ -5819,14 +5820,27 @@ export class AgentModeService {
       // Initialize Google Generative AI client
       const genAI = new GoogleGenerativeAI(geminiApiKey);
 
-      // Get the model name from environment or use default
-      const modelName = process.env.DATA_ANALYSIS_LLM_NAME || 'gemini-2.5-flash';
+      // Get the model name from environment or use default. gemini-3.5-flash is
+      // Google's documented code-execution model and reliably materializes input
+      // files on the sandbox filesystem; the older gemini-2.5-flash intermittently
+      // returns HTTP 500 on the same payloads.
+      const modelName = process.env.DATA_ANALYSIS_LLM_NAME || 'gemini-3.5-flash';
 
       // Get file size limit from environment or use default (50MB)
       const maxTotalSize = parseInt(process.env.DATA_ANALYSIS_FILE_SIZE || '52428800'); // 50MB in bytes
 
-      // Prepare file data for analysis
+      // Prepare file data for analysis.
+      // IMPORTANT: Gemini code_execution only writes a file part to the sandbox
+      // filesystem when its mimeType is text/csv. application/json is rejected
+      // (HTTP 400) and text/plain is silently NOT written to disk. So every file
+      // is sent as text/csv regardless of its real content type, and the model is
+      // told the exact on-disk filenames (input_file_<n>.csv in /root) so it reads
+      // from disk instead of re-inlining and truncating large payloads.
+      const SANDBOX_FILE_MIME = 'text/csv';
       const fileParts: any[] = [];
+      // Human-readable source description per file, parallel to fileParts, used to
+      // build the filename manifest in the prompt.
+      const fileSources: string[] = [];
       let totalSize = 0;
 
       for (const fileUrl of urlsToProcess) {
@@ -5863,15 +5877,13 @@ export class AgentModeService {
                 message: `Total file size (${totalSize} bytes) exceeds the ${maxTotalSize} bytes limit. Please reduce the number or size of files.`
               };
             }
-            const mimeTypeForS3 = fileUrl.endsWith('.json') ? 'application/json'
-              : fileUrl.endsWith('.csv') ? 'text/csv'
-              : 'text/plain';
             fileParts.push({
               inlineData: {
-                mimeType: mimeTypeForS3,
+                mimeType: SANDBOX_FILE_MIME,
                 data: contentBuffer.toString('base64'),
               }
             });
+            fileSources.push(fileUrl);
             continue;
           }
 
@@ -5905,10 +5917,11 @@ export class AgentModeService {
             }
             fileParts.push({
               inlineData: {
-                mimeType: fileUrl.endsWith('.json') ? 'application/json' : 'text/plain',
+                mimeType: SANDBOX_FILE_MIME,
                 data: contentBuffer.toString('base64'),
               }
             });
+            fileSources.push(fileUrl);
             continue;
           }
 
@@ -5928,44 +5941,18 @@ export class AgentModeService {
             };
           }
 
-          // Determine MIME type from URL or response headers
-          const contentType = response.headers['content-type'];
-          const url = fileUrl.toLowerCase();
-
-          let mimeType = 'text/plain';
-          if (contentType) {
-            mimeType = contentType;
-          } else if (url.includes('.csv')) {
-            mimeType = 'text/csv';
-          } else if (url.includes('.json')) {
-            mimeType = 'application/json';
-          } else if (url.includes('.jsonl')) {
-            mimeType = 'application/jsonl';
-          } else if (url.includes('.xml')) {
-            mimeType = 'application/xml';
-          } else if (url.includes('.yaml') || url.includes('.yml')) {
-            mimeType = 'application/x-yaml';
-          } else if (url.includes('.html') || url.includes('.htm')) {
-            mimeType = 'text/html';
-          } else if (url.includes('.md')) {
-            mimeType = 'text/markdown';
-          } else if (url.includes('.py')) {
-            mimeType = 'text/x-python';
-          } else if (url.includes('.js')) {
-            mimeType = 'text/javascript';
-          } else if (url.includes('.ts')) {
-            mimeType = 'text/typescript';
-          }
-
-          // Upload file to Gemini
+          // Send to Gemini as text/csv so the file materializes on the sandbox
+          // filesystem (see SANDBOX_FILE_MIME note above). The actual content may
+          // be CSV, JSON, or plain text — the model is told this in the prompt.
           const base64Content = Buffer.from(fileData).toString('base64');
 
           fileParts.push({
-            inline_data: {
+            inlineData: {
+              mimeType: SANDBOX_FILE_MIME,
               data: base64Content,
-              mime_type: mimeType
             }
           });
+          fileSources.push(fileUrl);
 
         } catch (error) {
           console.error(`Error processing file ${fileUrl}:`, error);
@@ -5983,9 +5970,23 @@ export class AgentModeService {
       // Add file parts
       fileParts.forEach(part => parts.push(part));
 
+      // Build a manifest mapping each attached file to its exact on-disk filename.
+      // Gemini writes the Nth file part to <SANDBOX_INPUT_OUTPUT_DIRECTORY>/input_file_<N>.csv
+      // (SANDBOX_INPUT_OUTPUT_DIRECTORY is the sandbox working directory). The model
+      // MUST read these files from disk — they are the complete, untruncated dataset.
+      let fileGuidance: string;
+      if (fileParts.length > 0) {
+        const manifest = fileSources
+          .map((src, i) => `- input_file_${i}.csv (from ${src})`)
+          .join('\n');
+        fileGuidance = `The following data files have been written to the code-execution sandbox filesystem in the working directory (also available via the SANDBOX_INPUT_OUTPUT_DIRECTORY environment variable):\n${manifest}\n\nIMPORTANT: Read these files FROM DISK with Python (e.g. open('input_file_0.csv').read()). They contain the COMPLETE dataset — do NOT rely on any data pasted inline in this instruction, which may be truncated. Although the filenames end in .csv, the contents may be CSV, JSON, JSONL, or plain text; detect the format and parse accordingly (e.g. json.loads for JSON). Also incorporate any small structured data included in the instruction text below.`;
+      } else {
+        fileGuidance = 'No external files are attached; treat the information in the instruction as the complete dataset for this task.';
+      }
+
       // Add text part with analysis instruction so the model knows how to proceed with or without files
       parts.push({
-        text: `Please perform the following analysis task. ${urlsToProcess.length > 0 ? 'Use the attached files as primary data sources and incorporate any structured data included in the instruction text.' : 'No external files are attached; treat the information in the instruction as the complete dataset for this task.'}\n\n${analysisInstruction}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present.\n\nIMPORTANT: When generating charts or visualizations, you MUST use matplotlib or seaborn to produce rasterized PNG images. Do NOT use altair, vega, vega-lite, or any library that produces JSON specs instead of rendered images. Always call plt.savefig() or equivalent to emit the image as inline output, then call plt.close() to free memory.`
+        text: `Please perform the following analysis task. ${fileGuidance}\n\n${analysisInstruction}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present.\n\nIMPORTANT: When generating charts or visualizations, you MUST use matplotlib or seaborn to produce rasterized PNG images. Do NOT use altair, vega, vega-lite, or any library that produces JSON specs instead of rendered images. Always call plt.savefig() or equivalent to emit the image as inline output, then call plt.close() to free memory.`
       });
 
       // Call Gemini API directly via REST to enable code execution
@@ -8334,6 +8335,184 @@ export class AgentModeService {
     } catch (error) {
       console.error('AgentMode: Error getting lead details:', error);
       return { success: false, message: 'Failed to get lead details', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * List-level "accepted-but-not-followed-up" query for LinkedIn outreach lists.
+   *
+   * Answers "which leads accepted my invite but still need a follow-up?" WITHOUT
+   * the N+1 get_lead_details fan-out the old path required. All the cross-lead
+   * signal is loaded in a constant number of queries:
+   *   - one getAllConnectionsByAccount(accountId) -> who is connected + connectedAt
+   *   - one getEventsByEmailDomain(`linkedin-{listId}`) -> LinkedIn message direction/timestamps
+   *   - one getEventsByEmailDomain(userEmailDomain) -> email message direction/timestamps
+   *   - a bounded scan of getLeadsByListId pages for the leads themselves
+   *
+   * A lead is "needs follow-up" when it is a 1st-degree connection (the invite
+   * was accepted) and there is no OUTBOUND touch after connectedAt — i.e. either
+   * we never messaged them post-accept, or they replied and we owe a response
+   * (awaitingReply=true).
+   */
+  public async getLeadsNeedingFollowup(listId: string, userId: string, options: {
+    limit?: number;
+    scanLimit?: number;
+  } = {}): Promise<any> {
+    try {
+      const { crmDb, userDb } = await import('./db');
+      const limit = Math.min(Math.max(options.limit || 25, 1), 100);
+      const scanLimit = Math.min(Math.max(options.scanLimit || 2000, 1), 5000);
+
+      // Verify list access (org-aware).
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
+      }
+
+      const accountId: string | null = (list as any).linkedInAccountId ?? null;
+      if (!accountId) {
+        return {
+          success: false,
+          message: 'This list has no LinkedIn account assigned',
+          error: 'Follow-up detection requires a LinkedIn account (list.linkedInAccountId) so connection status can be resolved. Assign one in the list settings.',
+        };
+      }
+
+      // --- Constant-query signal loading (NO per-lead fan-out) ---
+      const { emailEventsDb } = await import('./emailEventsDb');
+      const { getAllConnectionsByAccount, normalizeLinkedInUrl } = await import('./unipileConnectionsDb');
+      const user = await userDb.getUserById(userId);
+      const emailDomain = user?.emailDomain?.trim();
+
+      const [connections, linkedInEvents, emailEvents] = await Promise.all([
+        getAllConnectionsByAccount(accountId).catch(() => []),
+        emailEventsDb.getEventsByEmailDomain(`linkedin-${listId}`).catch(() => []),
+        emailDomain ? emailEventsDb.getEventsByEmailDomain(emailDomain).catch(() => []) : Promise.resolve([]),
+      ]);
+
+      // connectedAt (UNIX seconds) keyed by normalized profile URL.
+      const connectedAtByUrl = new Map<string, number>();
+      for (const c of connections as any[]) {
+        const url = String(c?.publicProfileUrl || '').trim().toLowerCase();
+        if (!url) continue;
+        const ts = typeof c?.connectedAt === 'number' ? c.connectedAt : 0;
+        const existing = connectedAtByUrl.get(url);
+        if (existing === undefined || ts < existing) connectedAtByUrl.set(url, ts); // earliest connect wins
+      }
+
+      // Build last-engagement signal keyed by lead identity. LinkedIn events are
+      // keyed by normalized profile URL; email events by lead email.
+      type Signal = { at: number; type: string; direction: 'inbound' | 'outbound' };
+      const directionOf = (eventType: string): 'inbound' | 'outbound' =>
+        /received|replied/i.test(eventType) ? 'inbound' : 'outbound';
+
+      const linkedInSignalByUrl = new Map<string, Signal>();
+      for (const e of linkedInEvents as any[]) {
+        const url = String(e?.leadEmail || '').trim().toLowerCase();
+        if (!url) continue;
+        this.foldEngagementSignal(linkedInSignalByUrl, url, e, directionOf);
+      }
+      const emailSignalByEmail = new Map<string, Signal>();
+      for (const e of emailEvents as any[]) {
+        const email = String(e?.leadEmail || '').trim().toLowerCase();
+        if (!email) continue;
+        this.foldEngagementSignal(emailSignalByEmail, email, e, directionOf);
+      }
+
+      // --- Scan leads (bounded) and segment in memory ---
+      const matches: any[] = [];
+      let scanned = 0;
+      let cursor: any = undefined;
+      let scannedAll = true;
+      while (scanned < scanLimit) {
+        const page = await crmDb.getLeadsByListId(listId, 200, cursor);
+        const items: any[] = page.items || [];
+        for (const lead of items) {
+          scanned++;
+          if (!lead.linkedin) continue;
+          const url = normalizeLinkedInUrl(String(lead.linkedin)).toLowerCase();
+          const connectedAt = connectedAtByUrl.get(url);
+          if (connectedAt === undefined) continue; // not connected -> invite not accepted yet
+
+          // Merge LinkedIn + email signals for this lead; the most recent wins.
+          const leadEmail = String(lead.email || '').trim().toLowerCase();
+          const candidates: Signal[] = [];
+          const liSig = linkedInSignalByUrl.get(url);
+          if (liSig) candidates.push(liSig);
+          const emSig = leadEmail ? emailSignalByEmail.get(leadEmail) : undefined;
+          if (emSig) candidates.push(emSig);
+
+          const last = candidates.sort((a, b) => b.at - a.at)[0];
+
+          // The ball is in THEIR court (already followed up, waiting on them)
+          // when the most-recent engagement is an outbound touch sent after the
+          // connection was accepted. A later inbound reply flips it back to
+          // "needs follow-up" (awaitingReply) since we now owe the response.
+          const connectedAtMs = connectedAt * 1000;
+          if (last && last.direction === 'outbound' && last.at > connectedAtMs) continue;
+
+          const awaitingReply = !!last && last.direction === 'inbound';
+          matches.push({
+            leadId: lead.leadId,
+            email: lead.email || '',
+            firstName: lead.firstName || '',
+            lastName: lead.lastName || '',
+            company: lead.company || '',
+            title: lead.title || '',
+            linkedin: lead.linkedin || '',
+            linkedInConnectionStatus: {
+              isConnected: true,
+              connectedAt: new Date(connectedAtMs).toISOString(),
+              connectedAtTimestamp: connectedAt,
+            },
+            lastEngagementType: last?.type ?? null,
+            lastEngagementDirection: last?.direction ?? null,
+            lastEngagementAt: last ? new Date(last.at).toISOString() : null,
+            awaitingReply,
+          });
+          if (matches.length >= limit) break;
+        }
+        cursor = page.lastEvaluatedKey;
+        if (matches.length >= limit) { scannedAll = !cursor; break; }
+        if (!cursor) break;
+        if (scanned >= scanLimit) { scannedAll = false; break; }
+      }
+
+      return {
+        success: true,
+        message: `Found ${matches.length} lead(s) that accepted your invite and need a follow-up`,
+        leads: matches,
+        matchCount: matches.length,
+        listName: list.name,
+        scannedLeads: scanned,
+        scannedAllLeads: scannedAll,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error getting leads needing follow-up:', error);
+      return { success: false, message: 'Failed to get leads needing follow-up', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Fold a single engagement event into a per-key "last engagement" signal map,
+   * keeping only the most-recent engagement per key. Shared by the
+   * LinkedIn-URL-keyed and email-keyed signal builders.
+   */
+  private foldEngagementSignal(
+    map: Map<string, { at: number; type: string; direction: 'inbound' | 'outbound' }>,
+    key: string,
+    event: any,
+    directionOf: (eventType: string) => 'inbound' | 'outbound',
+  ): void {
+    const at = new Date(event?.createdAt || 0).getTime();
+    if (!at || isNaN(at)) return;
+    const existing = map.get(key);
+    if (!existing || at > existing.at) {
+      map.set(key, { at, type: String(event?.eventType || ''), direction: directionOf(String(event?.eventType || '')) });
     }
   }
 
@@ -21513,7 +21692,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           platform: acc.platform,
           account_name: acc.account_name,
           account_type: acc.config.account_type,
-          is_active: await isTokenValid(acc)
+          is_active: await isTokenValid(acc),
+          ...(acc.platform === 'google_ads' && (acc.config as { customer_id?: string })?.customer_id
+            ? {
+                customer_id: (acc.config as { customer_id: string }).customer_id,
+                currency: (acc.config as { currency?: string }).currency || 'USD',
+              }
+            : {}),
         })))
       };
     } catch (error) {
@@ -23235,6 +23420,296 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
 
     return response;
+  }
+
+  public async handleCallGoogleAdsApi(userId: string, args: {
+    customer_id: string;
+    entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION';
+    action: string;
+    [key: string]: any;
+  }): Promise<any> {
+    try {
+      const { customer_id, entity_type, action } = args;
+
+      if (entity_type === 'CAMPAIGN') {
+        if (action === 'LIST') {
+          const campaigns = await googleAdsService.listCampaigns(userId, customer_id);
+          return { success: true, campaigns };
+        }
+        if (action === 'PAUSE') {
+          if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for PAUSE action' };
+          await googleAdsService.pauseCampaign(userId, customer_id, args.campaign_resource_name);
+          return { success: true, message: 'Campaign paused' };
+        }
+        if (action === 'RESUME') {
+          if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for RESUME action' };
+          await googleAdsService.resumeCampaign(userId, customer_id, args.campaign_resource_name);
+          return { success: true, message: 'Campaign resumed' };
+        }
+        if (action === 'REMOVE') {
+          if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for REMOVE action' };
+          await googleAdsService.removeCampaign(userId, customer_id, args.campaign_resource_name);
+          return { success: true, message: 'Campaign removed' };
+        }
+        if (action === 'CREATE') {
+          if (!args.budget_resource_name || !args.name || !args.type || !args.bidding_strategy) {
+            return { success: false, error: 'name, type, budget_resource_name, and bidding_strategy are required to create a campaign' };
+          }
+          if (args.bidding_strategy === 'TARGET_CPA' && !args.bidding_strategy_target) {
+            return { success: false, error: 'TARGET_CPA requires bidding_strategy_target (CPA value in account currency, e.g. 20 for $20). Ask the user for their target CPA before proceeding.' };
+          }
+          if (args.bidding_strategy === 'TARGET_ROAS' && !args.bidding_strategy_target) {
+            return { success: false, error: 'TARGET_ROAS requires bidding_strategy_target (ROAS as a decimal, e.g. 3.0 for 300%). Ask the user for their target ROAS before proceeding.' };
+          }
+          const campaign = await googleAdsService.createCampaign(userId, customer_id, {
+            name: args.name,
+            type: args.type,
+            budgetResourceName: args.budget_resource_name,
+            biddingStrategy: args.bidding_strategy,
+            biddingStrategyTarget: args.bidding_strategy_target,
+            cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
+            locationTargetIds: args.location_target_ids || [],
+            status: args.status || 'PAUSED',
+            brandBusinessName: args.brand_business_name,
+            brandLogoAssetResourceName: args.brand_logo_asset_resource_name,
+          });
+          return { success: true, campaignResourceName: campaign.resourceName };
+        }
+        if (action === 'UPDATE') {
+          if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for UPDATE action' };
+          await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
+            name: args.name,
+            status: args.status,
+            biddingStrategy: args.bidding_strategy,
+            biddingStrategyTarget: args.bidding_strategy_target,
+            cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
+            budgetResourceName: args.budget_resource_name,
+          });
+          return { success: true, message: 'Campaign updated' };
+        }
+      }
+
+      if (entity_type === 'BUDGET' && action === 'LIST') {
+        const budgets = await googleAdsService.listBudgets(userId, customer_id);
+        return { success: true, budgets };
+      }
+      if (entity_type === 'BUDGET' && action === 'CREATE') {
+        if (!args.name || args.amount_micros === undefined) return { success: false, error: 'name and amount_micros are required to create a budget' };
+        const budget = await googleAdsService.createBudget(userId, customer_id, { name: args.name, amountMicros: args.amount_micros, explicitlyShared: args.explicitly_shared });
+        return { success: true, budgetResourceName: budget.resourceName };
+      }
+      if (entity_type === 'BUDGET' && action === 'UPDATE') {
+        if (!args.budget_resource_name || args.amount_micros === undefined) return { success: false, error: 'budget_resource_name and amount_micros are required for BUDGET UPDATE' };
+        await googleAdsService.updateBudget(userId, customer_id, args.budget_resource_name, args.amount_micros);
+        return { success: true, message: 'Budget updated' };
+      }
+      if (entity_type === 'BUDGET' && action === 'REMOVE') {
+        if (!args.budget_resource_name) return { success: false, error: 'budget_resource_name is required for BUDGET REMOVE. Note: budget must not be attached to any campaign (reference_count must be 0).' };
+        await googleAdsService.removeBudget(userId, customer_id, args.budget_resource_name);
+        return { success: true, message: 'Budget removed' };
+      }
+
+      if (entity_type === 'AD_GROUP') {
+        if (action === 'LIST') {
+          if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for AD_GROUP LIST' };
+          const adGroups = await googleAdsService.listAdGroups(userId, customer_id, args.campaign_resource_name);
+          return { success: true, adGroups };
+        }
+        if (action === 'CREATE') {
+          if (!args.name || !args.campaign_resource_name || !args.type) return { success: false, error: 'name, campaign_resource_name, and type are required' };
+          const adGroup = await googleAdsService.createAdGroup(userId, customer_id, {
+            name: args.name,
+            campaignResourceName: args.campaign_resource_name,
+            type: args.type,
+            cpcBidMicros: args.cpc_bid_micros,
+          });
+          return { success: true, adGroupResourceName: adGroup.resourceName };
+        }
+        if (action === 'UPDATE') {
+          if (!args.ad_group_resource_name) return { success: false, error: 'ad_group_resource_name is required for UPDATE action' };
+          await googleAdsService.updateAdGroup(userId, customer_id, args.ad_group_resource_name, {
+            name: args.name,
+            status: args.status,
+            cpcBidMicros: args.cpc_bid_micros,
+            adRotationMode: args.ad_rotation_mode,
+            targetCpaMicros: args.target_cpa_micros,
+            targetRoas: args.target_roas,
+          });
+          return { success: true, message: 'Ad group updated' };
+        }
+        if (action === 'REMOVE') {
+          if (!args.ad_group_resource_name) return { success: false, error: 'ad_group_resource_name is required for REMOVE action' };
+          await googleAdsService.removeAdGroup(userId, customer_id, args.ad_group_resource_name);
+          return { success: true, message: 'Ad group removed' };
+        }
+      }
+
+      if (entity_type === 'KEYWORD') {
+        if (action === 'LIST') {
+          if (!args.ad_group_resource_name) return { success: false, error: 'ad_group_resource_name is required for KEYWORD LIST' };
+          const keywords = await googleAdsService.listKeywords(userId, customer_id, args.ad_group_resource_name);
+          return { success: true, keywords };
+        }
+        if (action === 'ADD') {
+          if (!args.ad_group_resource_name || !args.keywords) return { success: false, error: 'ad_group_resource_name and keywords array are required' };
+          await googleAdsService.addKeywords(userId, customer_id, args.ad_group_resource_name, args.keywords);
+          return { success: true, message: `Added ${args.keywords.length} keyword(s)` };
+        }
+        if (action === 'ADD_NEGATIVE') {
+          if ((!args.campaign_resource_name && !args.ad_group_resource_name) || !args.keywords) {
+            return { success: false, error: 'keywords and either campaign_resource_name or ad_group_resource_name are required' };
+          }
+          await googleAdsService.addNegativeKeywords(userId, customer_id, {
+            campaignResourceName: args.campaign_resource_name,
+            adGroupResourceName: args.ad_group_resource_name,
+          }, args.keywords);
+          return { success: true, message: `Added ${args.keywords.length} negative keyword(s)` };
+        }
+        if (action === 'UPDATE') {
+          if (!args.criterion_resource_name) return { success: false, error: 'criterion_resource_name is required for KEYWORD UPDATE' };
+          await googleAdsService.updateKeyword(userId, customer_id, args.criterion_resource_name, {
+            status: args.status,
+            cpcBidMicros: args.cpc_bid_micros,
+          });
+          return { success: true, message: 'Keyword updated' };
+        }
+        if (action === 'REMOVE') {
+          if (!args.criterion_resource_name) return { success: false, error: 'criterion_resource_name is required for KEYWORD REMOVE' };
+          await googleAdsService.removeKeyword(userId, customer_id, args.criterion_resource_name);
+          return { success: true, message: 'Keyword removed' };
+        }
+      }
+
+      if (entity_type === 'LOCATION' && action === 'SEARCH') {
+        if (!args.query) return { success: false, error: 'query is required for LOCATION SEARCH' };
+        const locations = await googleAdsService.searchLocations(userId, customer_id, args.query, args.locale || 'en');
+        return { success: true, locations };
+      }
+
+      if (entity_type === 'AD') {
+        if (action === 'LIST') {
+          if (!args.ad_group_resource_name) return { success: false, error: 'ad_group_resource_name is required for AD LIST' };
+          const ads = await googleAdsService.listAds(userId, customer_id, args.ad_group_resource_name);
+          return { success: true, ads };
+        }
+        if (action === 'CREATE') {
+          if (!args.ad_group_resource_name || !args.type || !args.headlines || !args.descriptions || !args.final_url) {
+            return { success: false, error: 'ad_group_resource_name, type, headlines, descriptions, and final_url are required to create an ad' };
+          }
+          let adType = args.type as string;
+          if (adType === 'SEARCH') adType = 'RESPONSIVE_SEARCH_AD';
+          else if (adType === 'DISPLAY') adType = 'RESPONSIVE_DISPLAY_AD';
+          const ad = await googleAdsService.createAd(userId, customer_id, {
+            adGroupResourceName: args.ad_group_resource_name,
+            type: adType as 'RESPONSIVE_SEARCH_AD' | 'RESPONSIVE_DISPLAY_AD',
+            headlines: args.headlines,
+            descriptions: args.descriptions,
+            finalUrl: args.final_url,
+            imageAssetResourceNames: args.image_asset_resource_names,
+          });
+          return { success: true, adResourceName: ad.resourceName };
+        }
+        if (action === 'UPDATE') {
+          if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD UPDATE' };
+          await googleAdsService.updateAd(userId, customer_id, args.ad_resource_name, {
+            status: args.status,
+          });
+          return { success: true, message: 'Ad updated' };
+        }
+        if (action === 'REMOVE') {
+          if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD REMOVE' };
+          await googleAdsService.removeAd(userId, customer_id, args.ad_resource_name);
+          return { success: true, message: 'Ad removed' };
+        }
+      }
+
+      if (entity_type === 'CAMPAIGN_ASSET' && action === 'ATTACH') {
+        if (!args.campaign_resource_name || !args.assets) return { success: false, error: 'campaign_resource_name and assets array are required for CAMPAIGN_ASSET ATTACH' };
+        await googleAdsService.attachCampaignAssets(userId, customer_id, args.campaign_resource_name, args.assets);
+        return { success: true, message: `Attached ${args.assets.length} asset(s) to campaign` };
+      }
+
+      if (entity_type === 'ASSET' && action === 'UPLOAD') {
+        if (!args.asset_type || !args.name || !args.data) return { success: false, error: 'asset_type, name, and data are required for ASSET UPLOAD' };
+        const resourceName = await googleAdsService.uploadAsset(userId, customer_id, {
+          type: args.asset_type,
+          name: args.name,
+          data: args.data,
+        });
+        return { success: true, assetResourceName: resourceName };
+      }
+
+      if (entity_type === 'ASSET_GROUP' && action === 'CREATE') {
+        if (!args.name || !args.campaign_resource_name || !args.headlines || !args.long_headlines ||
+            !args.descriptions || !args.square_image_assets || !args.landscape_image_assets ||
+            !args.logo_assets || !args.final_url) {
+          return { success: false, error: 'name, campaign_resource_name, headlines, long_headlines, descriptions, square_image_assets, landscape_image_assets, logo_assets, and final_url are required' };
+        }
+        const assetGroup = await googleAdsService.createAssetGroup(userId, customer_id, {
+          name: args.name,
+          campaignResourceName: args.campaign_resource_name,
+          headlines: args.headlines,
+          longHeadlines: args.long_headlines,
+          descriptions: args.descriptions,
+          squareImageAssets: args.square_image_assets,
+          landscapeImageAssets: args.landscape_image_assets,
+          logoAssets: args.logo_assets,
+          videoAssets: args.video_assets,
+          finalUrl: args.final_url,
+        });
+        return { success: true, assetGroupResourceName: assetGroup.resourceName };
+      }
+
+      return { success: false, error: `Unsupported entity_type=${entity_type} action=${action}` };
+    } catch (error: any) {
+      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true };
+      console.error('[AgentMode] handleCallGoogleAdsApi error:', error);
+      const gadsErrors: any[] = error?.response?.data?.error?.details?.[0]?.errors || [];
+      const gadsError = gadsErrors.length
+        ? gadsErrors.map((e: any) => {
+            const code = Object.values(e.errorCode || {})[0];
+            return code ? `${code}: ${e.message}` : e.message;
+          }).join('; ')
+        : undefined;
+      return { success: false, error: gadsError || error.message || 'Unknown error' };
+    }
+  }
+
+  public async handleCallGoogleAdsReportingApi(userId: string, args: {
+    customer_id: string;
+    mode: 'raw' | 'dashboard';
+    query?: string;
+    campaign_ids?: string[];
+    date_preset?: string;
+  }): Promise<any> {
+    try {
+      if (args.mode === 'dashboard') {
+        const summary = await googleAdsService.getQuickMetrics(userId, args.customer_id, {
+          campaignIds: args.campaign_ids,
+          datePreset: args.date_preset || 'LAST_30_DAYS',
+        });
+        const { campaigns, totals, currency } = summary;
+        const rows = campaigns.map((c: any) =>
+          `| ${c.name} | ${c.status} | ${c.impressions.toLocaleString()} | ${c.clicks.toLocaleString()} | ${c.ctr.toFixed(2)}% | ${currency} ${c.spendFormatted} | ${c.conversions} | ${c.avgCpc} |`
+        ).join('\n');
+        const formattedMarkdown = `## Google Ads Performance\n\n| Campaign | Status | Impressions | Clicks | CTR | Spend | Conversions | Avg CPC |\n|---|---|---|---|---|---|---|---|\n${rows}\n\n**Totals:** ${totals.impressions.toLocaleString()} impressions · ${totals.clicks.toLocaleString()} clicks · ${currency} ${totals.spend.toFixed(2)} spend · ${totals.conversions} conversions`;
+        return { success: true, formattedMarkdown, summary };
+      }
+
+      if (args.mode === 'raw') {
+        if (!args.query) return { success: false, error: 'query is required for raw mode' };
+        const results = await googleAdsService.queryReporting(userId, args.customer_id, args.query);
+        return { success: true, results, totalRows: results.length };
+      }
+
+      return { success: false, error: 'mode must be "raw" or "dashboard"' };
+    } catch (error: any) {
+      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true };
+      console.error('[AgentMode] handleCallGoogleAdsReportingApi error:', error);
+      const gadsErrors: any[] = error?.response?.data?.error?.details?.[0]?.errors || [];
+      const gadsError = gadsErrors.length ? gadsErrors.map((e: any) => e.message).join('; ') : undefined;
+      return { success: false, error: gadsError || error.message || 'Unknown error' };
+    }
   }
 }
 

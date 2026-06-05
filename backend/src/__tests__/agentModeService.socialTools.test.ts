@@ -114,6 +114,62 @@ describe('AgentModeService - Social Media Tools', () => {
       expect(result.message).toBe('Found 0 connected account(s)');
     });
 
+    it('should include customer_id and currency for google_ads accounts', async () => {
+      const mockGoogleAdsAccount = {
+        account_id: 'ga-account-1',
+        account_name: 'My Google Ads',
+        platform: 'google_ads',
+        config: {
+          account_type: 'ad_account',
+          customer_id: '1234567890',
+          currency: 'INR',
+          access_token: 'token',
+          token_expires_at: Date.now() + 3600000,
+        },
+      };
+      mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([mockGoogleAdsAccount] as any);
+      mockIsTokenValid.mockResolvedValue(true);
+
+      const result = await service.listConnectedAccounts('user-123');
+
+      expect(result.success).toBe(true);
+      expect(result.accounts[0].customer_id).toBe('1234567890');
+      expect(result.accounts[0].currency).toBe('INR');
+    });
+
+    it('should default currency to USD for google_ads accounts missing currency in config', async () => {
+      const mockGoogleAdsAccountNoCurrency = {
+        account_id: 'ga-account-2',
+        account_name: 'No Currency Account',
+        platform: 'google_ads',
+        config: {
+          account_type: 'ad_account',
+          customer_id: '9876543210',
+          access_token: 'token',
+          token_expires_at: Date.now() + 3600000,
+        },
+      };
+      mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([mockGoogleAdsAccountNoCurrency] as any);
+      mockIsTokenValid.mockResolvedValue(true);
+
+      const result = await service.listConnectedAccounts('user-123');
+
+      expect(result.success).toBe(true);
+      expect(result.accounts[0].customer_id).toBe('9876543210');
+      expect(result.accounts[0].currency).toBe('USD');
+    });
+
+    it('should not include customer_id for non-google_ads accounts', async () => {
+      mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockIsTokenValid.mockResolvedValue(true);
+
+      const result = await service.listConnectedAccounts('user-123');
+
+      expect(result.success).toBe(true);
+      expect(result.accounts[0].customer_id).toBeUndefined();
+      expect(result.accounts[0].currency).toBeUndefined();
+    });
+
     it('should handle errors gracefully', async () => {
       mockGetAccountsByUserIdIncludingOrgShared.mockRejectedValue(new Error('Database error'));
 

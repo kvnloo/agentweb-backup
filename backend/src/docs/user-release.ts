@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-06-03
+// Last updated: 2026-06-04
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,69 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-06-05',
+    changes: [
+      'Fixed: Team Members Can Now Set Up External CRM Sync on Shared Lead Lists',
+      '- When a teammate opened "External CRM sync" on a lead list owned by someone else in your organization and picked HubSpot or Attio, it failed with "Failed to load your sync configuration"',
+      '- Any member of your organization can now view, configure, and run HubSpot/Attio sync on shared lead lists, matching how the rest of your shared CRM already works',
+    ],
+  },
+  {
+    date: '2026-06-05',
+    changes: [
+      'New: Instantly Find LinkedIn Leads Who Accepted Your Invite But Need a Follow-Up',
+      '- Ask Emma "which leads accepted my invite but haven\'t been followed up?" and get the answer for the whole list in one step, instead of Emma checking leads one at a time (which used to be slow and unreliable on big lists)',
+      '- Each surfaced lead shows when they connected, what the last message was, whether it came from you or them, and whether you\'re the one who owes the next reply',
+      '- Works on lead lists that have a LinkedIn account connected, and scales to lists with hundreds or thousands of leads',
+    ],
+  },
+  {
+    date: '2026-06-04',
+    changes: [
+      'Improved: Deep Research Reports Are Back and More Comprehensive',
+      '- Deep research now runs on Google\'s latest research agents, which plan, search, and synthesize more thoroughly across your topic',
+      '- When you ask for a "comprehensive" report, we automatically use the most in-depth research agent; lighter requests use a faster one',
+      '- Fixed an issue where a research run could finish but come back empty — reports now reliably return their full content, so you get the complete write-up every time',
+    ],
+  },
+  {
+    date: '2026-06-04',
+    changes: [
+      'Fixed: Leads From Landing-Page Forms Now Start Your Drip Sequence Automatically',
+      '- When a lead came in through a public landing-page form, they were saved to your list but never enrolled in a drip sequence set to auto-enroll that list — so the first email (for example the "here\'s your PDF" message) never went out',
+      '- Leads captured through a form now enroll in any sequence watching that list, exactly like leads you add manually or quick-add',
+      '- This applies to both brand-new leads and existing leads that get updated by a new form submission',
+    ],
+  },
+  {
+    date: '2026-06-04',
+    changes: [
+      'Fixed: Enabling Public Access on a Landing Page Lead List Now Works',
+      '- When Emma set up a landing page, the step that opens its lead list for public form submissions reported success but did not actually take effect, so the form could be left unable to capture leads',
+      '- That step now reliably flips the list to public, so landing page forms can submit leads without anyone having to sign in',
+    ],
+  },
+  {
+    date: '2026-06-04',
+    changes: [
+      'Fixed: Data Analysis Now Reads Large Files Reliably Instead of Guessing From Truncated Data',
+      '- When you asked Emma to analyze large data files (for example usage or billing totals across many sessions), the files were not actually reaching the analysis sandbox, so it fell back to working from a shortened, inline copy of the data',
+      '- This produced inconsistent and untrustworthy numbers — the same question could return a different grand total each time, and category breakdowns would not add up',
+      '- Files you provide are now written into the analysis environment correctly and read directly from there, so totals are computed over the complete dataset and stay consistent across runs',
+      '- The analysis also now runs on a faster, more reliable model, reducing timeouts on big datasets',
+    ],
+  },
+  {
+    date: '2026-06-04',
+    changes: [
+      'New: Scheduled Chats Can Now Improve Their Own Prompt Over Time',
+      '- Turn on the new "Self-improve prompt" switch when creating or editing a scheduled chat (it\'s off by default)',
+      '- After each run — including test runs, so you can try it out — Emma reflects on how it went and on anything else it can see in your account to spot ways the schedule could do better next time',
+      '- When it finds a clear improvement, it refines the schedule\'s prompt for you, so future runs get better on their own',
+      '- Every prompt change (whether from self-improve, an edit you make, or one you ask Emma for) now saves the previous version, keeping the last 10 so you can always revert',
+    ],
+  },
   {
     date: '2026-06-03',
     changes: [

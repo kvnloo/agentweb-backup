@@ -6,6 +6,7 @@ import { webhookService, ResendWebhookEvent } from '../services/webhookService';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { crmDb, userDb, tempEmailDb } from '../services/db';
+import { dripSequenceDb } from '../services/dripSequenceDb';
 import { getUserIdByHubSpotPortalId } from '../services/connectedAccountsDb';
 import { HubSpotService } from '../services/hubspotService';
 import { getHubSpotConfig } from '../config/integrations';
@@ -40,6 +41,35 @@ function verifyHubSpotSignature(clientSecret: string, body: any, signature: stri
 }
 
 const router = express.Router();
+
+/**
+ * Fire-and-forget: enroll a single lead into any sequences that have
+ * autoEnrollListIds containing this list. Mirrors the authenticated CRM path
+ * (routes/crm.ts) so leads captured via the public forward-lead webhook also
+ * land in list-bound drip sequences. Errors are logged but never surfaced.
+ */
+async function autoEnrollLeadInSequences(
+  userId: string,
+  listId: string,
+  leadId: string,
+  leadEmail: string,
+): Promise<void> {
+  if (!leadEmail) return;
+  try {
+    const sequences = await dripSequenceDb.getSequencesByAutoEnrollList(userId, listId);
+    for (const seq of sequences) {
+      await dripSequenceDb.bulkEnroll([{
+        sequenceId: seq.sequenceId,
+        userId,
+        listId,
+        leadId,
+        leadEmail,
+      }]);
+    }
+  } catch (err) {
+    console.error('[webhooks] autoEnrollLeadInSequences error:', err);
+  }
+}
 
 // Resend webhook endpoint
 router.post('/resend', async (req: express.Request, res: express.Response) => {
@@ -427,6 +457,10 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
     // After response is sent: auto-draft, auto-send, and alert (fire-and-forget, fully awaited internally)
     if (isNew || isUpdated) {
+      // Enroll the lead into any list-bound drip sequences (uses the list
+      // owner's userId since the public webhook request is unauthenticated).
+      void autoEnrollLeadInSequences(leadList.userId, leadList.listId, lead.leadId, lead.email);
+
       void (async () => {
         try {
           let autoDraftStatus: string | undefined;

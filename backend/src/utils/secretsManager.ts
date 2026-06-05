@@ -346,6 +346,49 @@ export async function getYouTubeCredentials(): Promise<GmailCredentials> {
 }
 
 /**
+ * Interface for Google Ads API credentials returned from Secrets Manager
+ */
+export interface GoogleAdsCredentials {
+  clientId: string;
+  clientSecret: string;
+  developerToken: string;
+}
+
+/**
+ * Get Google Ads API credentials from AWS Secrets Manager.
+ *
+ * Secret location: dev/AgentWeb/Google/Ads (or prod/... for production)
+ * Secret format: { "clientId": "...", "clientSecret": "...", "developerToken": "..." }
+ *
+ * @returns Google Ads API credentials
+ */
+export async function getGoogleAdsCredentials(): Promise<GoogleAdsCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/Google/Ads'
+      : 'dev/AgentWeb/Google/Ads';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('Google Ads credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as GoogleAdsCredentials;
+
+    if (!credentials.clientId || !credentials.clientSecret || !credentials.developerToken) {
+      throw new Error('Google Ads credentials missing one or more required fields: clientId, clientSecret, developerToken');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching Google Ads credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch Google Ads credentials from Secrets Manager');
+  }
+}
+
+/**
  * Interface for V0 credentials returned from Secrets Manager
  */
 export interface V0Credentials {

@@ -64,6 +64,7 @@ const AVAILABLE_CONNECTED_ACCOUNTS = [
   { id: 'fathom', label: 'Fathom' },
   { id: 'hubspot', label: 'HubSpot' },
   { id: 'attio', label: 'Attio' },
+  { id: 'google_ads', label: 'Google Ads' },
 ];
 
 interface AvailableSkill {
