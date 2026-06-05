@@ -110,13 +110,13 @@ export class HubspotAdapter implements CrmAdapter {
         for (const lead of leads) {
             try {
                 const email = typeof lead.email === 'string' ? lead.email.trim() : '';
-                if (!email) continue; // HubSpot requires email to upsert
 
                 // Guard against non-email values (e.g. a social/profile URL landing
                 // in the email field). HubSpot rejects these with INVALID_EMAIL and
                 // aborts the whole upsert; skip them with a clear per-lead error so
-                // the rest of the batch still syncs.
-                if (!validateEmail(email)) {
+                // the rest of the batch still syncs. An empty email is allowed — we
+                // push those via create/update-by-id below.
+                if (email && !validateEmail(email)) {
                     result.errorCount++;
                     const msg = `Invalid email "${email}" — skipped (not a valid email address)`;
                     console.warn(`[HubspotAdapter] ${msg} for lead=${lead.leadId}`);
@@ -131,14 +131,34 @@ export class HubspotAdapter implements CrmAdapter {
 
                 if (Object.keys(allContactProps).length === 0) continue;
 
-                // Upsert contact — service handles find-or-create
-                const { contactId, isNew } = await svc.upsertContact({
-                    email,
+                const contactData = {
+                    ...(email ? { email } : {}),
                     ...this.propsToContactData(allContactProps),
                     customFields: this.extractCustomFields(allContactProps),
-                });
+                };
 
-                if (isNew) result.newCount++; else result.updatedCount++;
+                let contactId: string;
+                if (email) {
+                    // Email present — find-or-create by email (dedup).
+                    const upserted = await svc.upsertContact(contactData);
+                    contactId = upserted.contactId;
+                    if (upserted.isNew) result.newCount++; else result.updatedCount++;
+                } else {
+                    // No email to dedup on. If we synced this lead before, update the
+                    // known contact by id; otherwise create a fresh email-less contact.
+                    const existingContactId: string | undefined =
+                        lead.syncMetadata?.hubspot_contact_id || lead.customFields?.hubspot_contact_id;
+                    if (existingContactId) {
+                        const updated = await svc.updateContact(existingContactId, contactData);
+                        contactId = updated.contactId;
+                        result.updatedCount++;
+                    } else {
+                        const created = await svc.createContact(contactData);
+                        contactId = created.contactId;
+                        result.newCount++;
+                    }
+                }
+
                 result.successCount++;
 
                 // Persist HubSpot contact ID back to our DB
