@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-05',
     changes: [
+      'Fixed: Team Members Can Now Set Up External CRM Sync on Shared Lead Lists',
+      '- When a teammate opened "External CRM sync" on a lead list owned by someone else in your organization and picked HubSpot or Attio, it failed with "Failed to load your sync configuration"',
+      '- Any member of your organization can now view, configure, and run HubSpot/Attio sync on shared lead lists, matching how the rest of your shared CRM already works',
+    ],
+  },
+  {
+    date: '2026-06-05',
+    changes: [
       'New: Instantly Find LinkedIn Leads Who Accepted Your Invite But Need a Follow-Up',
       '- Ask Emma "which leads accepted my invite but haven\'t been followed up?" and get the answer for the whole list in one step, instead of Emma checking leads one at a time (which used to be slow and unreliable on big lists)',
       '- Each surfaced lead shows when they connected, what the last message was, whether it came from you or them, and whether you\'re the one who owes the next reply',
