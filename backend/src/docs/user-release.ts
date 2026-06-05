@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-05',
     changes: [
+      'Improved: Paste a Message You Received and Emma Drafts the Reply',
+      '- When you paste in a Slack or chat message someone sent you, Emma now drafts a reply for you to send back, instead of assuming it should send that exact text to a channel',
+      '- Emma no longer mistakes itself for a person named in the message — if a message says "Hey Walter…", it understands Walter is you and writes the reply on your behalf',
+      '- You always see the draft (plus a couple of alternative tones) before anything is sent, and nothing goes out until you say so',
+    ],
+  },
+  {
+    date: '2026-06-05',
+    changes: [
       'Fixed: Team Members Can Now Set Up External CRM Sync on Shared Lead Lists',
       '- When a teammate opened "External CRM sync" on a lead list owned by someone else in your organization and picked HubSpot or Attio, it failed with "Failed to load your sync configuration"',
       '- Any member of your organization can now view, configure, and run HubSpot/Attio sync on shared lead lists, matching how the rest of your shared CRM already works',
