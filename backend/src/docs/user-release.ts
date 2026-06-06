@@ -11,10 +11,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-05',
     changes: [
-      'Improved: Paste a Message You Received and Emma Drafts the Reply',
-      '- When you paste in a Slack or chat message someone sent you, Emma now drafts a reply for you to send back, instead of assuming it should send that exact text to a channel',
-      '- Emma no longer mistakes itself for a person named in the message — if a message says "Hey Walter…", it understands Walter is you and writes the reply on your behalf',
-      '- You always see the draft (plus a couple of alternative tones) before anything is sent, and nothing goes out until you say so',
+      'Improved: Emma Suggests a Reply When a New Slack Message Comes In',
+      '- When a message from an outside contact lands in your connected Slack channel, Emma now suggests a ready-to-send reply (plus a couple of alternative tones), instead of saying "that\'s not a marketing task" or asking what you want first',
+      '- Emma no longer mistakes itself for a person named in the message — if the note says "Hey Walter…", it understands Walter is you and writes the reply on your behalf, in your voice',
+      '- The suggested reply is just text for you to review and send — nothing is sent automatically',
     ],
   },
   {
