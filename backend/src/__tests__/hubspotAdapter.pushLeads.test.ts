@@ -16,10 +16,14 @@ jest.mock('../services/db', () => ({
 
 // Mock HubSpotService — fromToken returns a stub service we can assert on
 const mockUpsertContact = jest.fn();
+const mockCreateContact = jest.fn();
+const mockUpdateContact = jest.fn();
 const mockEnsureContactProperty = jest.fn().mockResolvedValue('prop');
 const mockEnsureDealProperty = jest.fn().mockResolvedValue('prop');
 const mockSvc = {
   upsertContact: mockUpsertContact,
+  createContact: mockCreateContact,
+  updateContact: mockUpdateContact,
   ensureContactProperty: mockEnsureContactProperty,
   ensureDealProperty: mockEnsureDealProperty,
 };
@@ -62,6 +66,8 @@ describe('HubspotAdapter.pushLeads — email validation', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockUpsertContact.mockResolvedValue({ contactId: 'c1', isNew: true });
+    mockCreateContact.mockResolvedValue({ contactId: 'c1' });
+    mockUpdateContact.mockResolvedValue({ contactId: 'c1' });
     adapter = new HubspotAdapter();
   });
 
@@ -90,14 +96,65 @@ describe('HubspotAdapter.pushLeads — email validation', () => {
     expect(result.errors[0]).toMatch(/invalid email/i);
   });
 
-  it('skips a lead whose email is only whitespace (treated as missing, no error)', async () => {
+  it('creates a contact (no upsert) for a lead with no email and no prior HubSpot id', async () => {
+    const leads = [{ leadId: 'l1', listId: 'list_1', firstName: 'Foo' }];
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    // Cannot upsert (no email to dedup on) — must create directly.
+    expect(mockUpsertContact).not.toHaveBeenCalled();
+    expect(mockCreateContact).toHaveBeenCalledTimes(1);
+    expect(mockCreateContact).toHaveBeenCalledWith(
+      expect.objectContaining({ firstName: 'Foo' })
+    );
+    expect(result.successCount).toBe(1);
+    expect(result.newCount).toBe(1);
+    expect(result.errorCount).toBe(0);
+  });
+
+  it('creates a contact for a lead whose email is only whitespace (treated as missing)', async () => {
     const leads = [{ leadId: 'l1', listId: 'list_1', email: '   ', firstName: 'Foo' }];
 
     const result = await adapter.pushLeads(auth, leads, makeConfig());
 
     expect(mockUpsertContact).not.toHaveBeenCalled();
+    expect(mockCreateContact).toHaveBeenCalledTimes(1);
+    expect(result.successCount).toBe(1);
+    expect(result.newCount).toBe(1);
     expect(result.errorCount).toBe(0);
+  });
+
+  it('updates by stored hubspot_contact_id for an email-less lead synced before', async () => {
+    const leads = [
+      { leadId: 'l1', listId: 'list_1', firstName: 'Foo', syncMetadata: { hubspot_contact_id: 'c99' } },
+    ];
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    expect(mockUpsertContact).not.toHaveBeenCalled();
+    expect(mockCreateContact).not.toHaveBeenCalled();
+    expect(mockUpdateContact).toHaveBeenCalledTimes(1);
+    expect(mockUpdateContact).toHaveBeenCalledWith(
+      'c99',
+      expect.objectContaining({ firstName: 'Foo' })
+    );
+    expect(result.successCount).toBe(1);
+    expect(result.updatedCount).toBe(1);
+    expect(result.newCount).toBe(0);
+    expect(result.errorCount).toBe(0);
+  });
+
+  it('skips an email-less lead that has no mappable properties (nothing to push)', async () => {
+    // Only an email mapping is configured, and the lead has no email → no props.
+    const leads = [{ leadId: 'l1', listId: 'list_1' }];
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    expect(mockUpsertContact).not.toHaveBeenCalled();
+    expect(mockCreateContact).not.toHaveBeenCalled();
+    expect(mockUpdateContact).not.toHaveBeenCalled();
     expect(result.successCount).toBe(0);
+    expect(result.errorCount).toBe(0);
   });
 
   it('still pushes a lead with a valid email', async () => {

@@ -20,6 +20,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-05',
     changes: [
+      'Improved: Leads Without an Email Now Sync to HubSpot Too',
+      '- Previously a lead with no email address was silently left out of your HubSpot sync, because HubSpot normally matches contacts by email',
+      '- These leads are now pushed to HubSpot using their other details (name, company, phone, and any mapped fields), so your whole list makes it over',
+      '- If a lead was already synced before losing its email, we update that same HubSpot contact instead of creating a duplicate',
+    ],
+  },
+  {
+    date: '2026-06-05',
+    changes: [
       'Fixed: One Bad Email No Longer Blocks Your HubSpot Sync',
       '- When a lead\'s email field actually held something else (like a profile URL such as https://superdm.me/chessbaseindia), HubSpot rejected it as an invalid email and the lead showed up as a sync error',
       '- These leads are now skipped cleanly with a clear note in the Sync Result, so the rest of your list still syncs without interruption',
