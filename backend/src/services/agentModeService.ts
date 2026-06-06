@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
+import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride, SLACK_SUGGEST_REPLY_GUIDANCE } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
 import { google } from 'googleapis';
 import { createHash, randomUUID } from 'crypto';
@@ -2048,8 +2048,16 @@ export class AgentModeService {
 
       const today = new Date().toISOString().split('T')[0];
       const sessionTypeLabel = getScheduledSessionOverride(currentSession?.sessionType);
+      // "Slack suggest" flow only (pageIdentifier === 'slack-triggered'): an outside contact's
+      // message landed in a connected channel with no instruction, and Emma should suggest a reply
+      // to send back. Fold the guidance into the base system message (messages[0]) — buildMarketingContext
+      // slices off any stored system message (startIdx=1), so this is the only system text the LLM
+      // reliably sees. Scoped to this one flow so regular chat/task/other-Slack sessions are unaffected.
+      const slackSuggestGuidance = currentSession?.pageIdentifier === 'slack-triggered'
+        ? `\n\n${SLACK_SUGGEST_REPLY_GUIDANCE}`
+        : '';
       const messages: any[] = [
-        { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
+        { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}${slackSuggestGuidance}` }
       ];
       // Use helper to inject installed skills and templates
       this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
