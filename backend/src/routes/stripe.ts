@@ -857,6 +857,23 @@ router.post(
 
       const subscription = subscriptions.data[0];
 
+      // If the subscription is attached to a subscription_schedule (e.g. a
+      // discount/coupon or a tier change applied via Stripe Subscription
+      // Schedules), Stripe REJECTS a direct cancel_at_period_end update with
+      // "The subscription is managed by the subscription schedule ..., and
+      // updating any cancelation behavior directly is not allowed." That bug
+      // made "Switch to Free" return 500 for any customer who had a scheduled
+      // change or sales-applied coupon. Release the schedule first so the
+      // subscription becomes independently updatable — releasing preserves the
+      // subscription's current price/discount, it just detaches the schedule.
+      const scheduleId =
+        typeof (subscription as any).schedule === "string"
+          ? (subscription as any).schedule
+          : (subscription as any).schedule?.id;
+      if (scheduleId) {
+        await stripe.subscriptionSchedules.release(scheduleId);
+      }
+
       // Cancel at period end (graceful cancellation)
       const updated: Stripe.Subscription = await stripe.subscriptions.update(subscription.id, {
         cancel_at_period_end: true,
@@ -883,6 +900,10 @@ router.post(
         subscription_status: "canceling",
       };
       if (periodEnd) updateData.current_period_end = periodEnd;
+      // If we just released a schedule, any cached pending change is now void.
+      // Clear it optimistically (the subscription_schedule.released webhook
+      // also clears it) so /auth/me doesn't surface a stale scheduledChange.
+      if (scheduleId) updateData.scheduledChange = null;
       await userDb.updateUser(userId, updateData);
 
       res.json({
