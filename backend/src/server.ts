@@ -601,6 +601,40 @@ createTestAccount().then(async () => {
         console.log('[AiEvalLoop] Disabled (set AI_EVAL_LOOP_ENABLED=true to enable)');
       }
 
+      // AI Readiness Funnel closed-loop — daily at 16:30 UTC, offset 30 min from
+      // ai-eval (16:00) so they don't race for Slack/Bedrock. Default ON (the
+      // loop is the value); kill with AI_READINESS_LOOP_ENABLED=false. The loop
+      // itself is always REGISTERED in app.ts so event ingestion works
+      // regardless of this schedule flag.
+      if (process.env.AI_READINESS_LOOP_ENABLED !== 'false') {
+        try {
+          const AI_READINESS_LOOP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+          const { runAiReadinessLoopOnce } = await import('./loops/instances/ai-readiness-funnel');
+
+          const nowForReadiness = new Date();
+          const nextReadinessRun = new Date(nowForReadiness);
+          nextReadinessRun.setUTCHours(16, 30, 0, 0);
+          if (nextReadinessRun <= nowForReadiness) {
+            nextReadinessRun.setUTCDate(nextReadinessRun.getUTCDate() + 1);
+          }
+          const msUntilReadiness = nextReadinessRun.getTime() - nowForReadiness.getTime();
+
+          console.log(
+            `[AiReadinessLoop] Initialized — first run at 16:30 UTC (in ${Math.round(msUntilReadiness / 60000)} min)`,
+          );
+          setTimeout(() => {
+            runAiReadinessLoopOnce().catch(e => console.error('[AiReadinessLoop] Error:', e));
+            setInterval(() => {
+              runAiReadinessLoopOnce().catch(e => console.error('[AiReadinessLoop] Error:', e));
+            }, AI_READINESS_LOOP_INTERVAL_MS);
+          }, msUntilReadiness);
+        } catch (error) {
+          console.error('[AiReadinessLoop] Failed to initialize:', error);
+        }
+      } else {
+        console.log('[AiReadinessLoop] Disabled (AI_READINESS_LOOP_ENABLED=false)');
+      }
+
       // Onboarding loop V2 (framework port, REVAMP) — daily at 17:00 UTC (9am
       // PT), offset from the legacy onboarding loop (15:00) + ai-eval (16:00) so
       // they don't race for Slack/Bedrock. Gated by ONBOARDING_LOOP_V2=true; runs
