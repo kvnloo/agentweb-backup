@@ -32,6 +32,7 @@ import {
   BULK_ENRICH_CONCURRENCY,
 } from '../services/crmEnrichmentConcurrency';
 import { findEmailsForLeadsInBackground } from '../services/crmFindEmailRunner';
+import { linkedinUrlOrUndef } from '../services/fieldValueValidator';
 
 // Conservative RFC-5322-ish check — sufficient to reject obvious garbage and
 // catch typos. Real deliverability is what enrich.so checks; this is just a
@@ -379,7 +380,8 @@ async function lookupProfilesForLeadsInBackground(
         if (!lead.lastName  && r.lastName)   topLevel.lastName  = r.lastName;
         if (!lead.company   && r.companyName) topLevel.company  = r.companyName;
         if (!lead.title     && r.jobTitle)   topLevel.title     = r.jobTitle;
-        if (!lead.linkedin  && r.profileUrl?.startsWith('http')) topLevel.linkedin  = r.profileUrl;
+        const validLinkedin = linkedinUrlOrUndef('linkedin', r.profileUrl);
+        if (!lead.linkedin  && validLinkedin) topLevel.linkedin  = validLinkedin;
 
         if (Object.keys(topLevel).length === 0) {
           if (jobId) recordResult(jobId, { found: false });
@@ -723,7 +725,7 @@ router.post('/leads/lookup-by-email', async (req: Request, res: Response) => {
         lastName: result.lastName,
         company: result.companyName,
         title: result.jobTitle,
-        linkedin: result.profileUrl?.startsWith('http') ? result.profileUrl : undefined,
+        linkedin: linkedinUrlOrUndef('linkedin', result.profileUrl),
         location: result.location,
         headline: result.headline,
       },

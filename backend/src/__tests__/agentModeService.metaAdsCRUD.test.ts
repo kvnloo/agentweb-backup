@@ -22,7 +22,13 @@ jest.mock('../services/metaService', () => ({
     getAd: jest.fn(),
     getAdCreative: jest.fn(),
     updateAd: jest.fn(),
-    deleteAd: jest.fn()
+    deleteAd: jest.fn(),
+    getPageInstagramActor: jest.fn()
+  },
+  // Static helper used by the agent layer to decide whether IG actor resolution is needed.
+  MetaService: {
+    placementTokenTargetsInstagram: (token: string) =>
+      ['feed', 'story', 'stories', 'reels', 'instagram_feed', 'instagram_story', 'instagram_reels', 'explore'].includes(String(token).toLowerCase())
   }
 }));
 
@@ -262,6 +268,154 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(result.message).toBe('Ad creative "New Creative" created successfully');
         expect(result.creative).toEqual(mockCreativeData);
       });
+
+      it('should pass placement_assets through with hashes untouched', async () => {
+        const params = {
+          name: 'Placement Creative',
+          page_id: 'page_123',
+          body: 'Ad Body',
+          title: 'Ad Title',
+          link_url: 'https://example.com',
+          placement_assets: [
+            { image_hash: 'square_hash', is_default: true },
+            { image_hash: 'vertical_hash', placements: ['story', 'reels'] }
+          ]
+        };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        const uploadSpy = jest.spyOn(agentModeService, 'uploadMetaAdsImage');
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative_pc', name: 'Placement Creative' });
+
+        const result = await agentModeService.createMetaAdsAdCreative('user123', params);
+
+        expect(result.success).toBe(true);
+        // No upload needed when hashes are already supplied
+        expect(uploadSpy).not.toHaveBeenCalled();
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({
+            placement_assets: [
+              { image_hash: 'square_hash', is_default: true },
+              { image_hash: 'vertical_hash', placements: ['story', 'reels'] }
+            ]
+          })
+        );
+      });
+
+      it('auto-resolves instagram_user_id from the page when placement_assets target Instagram', async () => {
+        const params = {
+          name: 'Placement Creative',
+          page_id: 'page_123',
+          body: 'Ad Body',
+          title: 'Ad Title',
+          link_url: 'https://example.com',
+          placement_assets: [
+            { image_hash: 'square_hash', is_default: true },
+            { image_hash: 'vertical_hash', placements: ['story', 'reels'] }
+          ]
+        };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getPageInstagramActor as jest.Mock).mockResolvedValue('17841469032554858');
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative_pc' });
+
+        const result = await agentModeService.createMetaAdsAdCreative('user123', params);
+
+        expect(result.success).toBe(true);
+        expect(metaService.getPageInstagramActor).toHaveBeenCalledWith('mock-access-token', 'page_123');
+        // The resolved IG actor is passed to the builder so the creative can serve IG placements
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({ instagram_user_id: '17841469032554858' })
+        );
+      });
+
+      it('does NOT resolve instagram_user_id when placements are Facebook-only', async () => {
+        const params = {
+          name: 'Placement Creative',
+          page_id: 'page_123',
+          body: 'Ad Body',
+          title: 'Ad Title',
+          link_url: 'https://example.com',
+          placement_assets: [
+            { image_hash: 'square_hash', is_default: true },
+            { image_hash: 'vertical_hash', placements: ['facebook_reels'] }
+          ]
+        };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative_pc' });
+
+        const result = await agentModeService.createMetaAdsAdCreative('user123', params);
+
+        expect(result.success).toBe(true);
+        expect(metaService.getPageInstagramActor).not.toHaveBeenCalled();
+      });
+
+      it('respects an explicitly-supplied instagram_user_id (no auto-resolution)', async () => {
+        const params = {
+          name: 'Placement Creative',
+          page_id: 'page_123',
+          instagram_user_id: 'explicit_ig',
+          body: 'Ad Body',
+          title: 'Ad Title',
+          link_url: 'https://example.com',
+          placement_assets: [
+            { image_hash: 'square_hash', is_default: true },
+            { image_hash: 'vertical_hash', placements: ['reels'] }
+          ]
+        };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative_pc' });
+
+        const result = await agentModeService.createMetaAdsAdCreative('user123', params);
+
+        expect(result.success).toBe(true);
+        expect(metaService.getPageInstagramActor).not.toHaveBeenCalled();
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({ instagram_user_id: 'explicit_ig' })
+        );
+      });
+
+      it('should upload placement_assets given as image_url and resolve them to hashes', async () => {
+        const params = {
+          name: 'Placement Creative',
+          page_id: 'page_123',
+          body: 'Ad Body',
+          title: 'Ad Title',
+          link_url: 'https://example.com',
+          placement_assets: [
+            { image_hash: 'square_hash', is_default: true },
+            { image_url: 'https://cdn.example.com/vertical.jpg', placements: ['reels'] }
+          ]
+        };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        const uploadSpy = jest.spyOn(agentModeService, 'uploadMetaAdsImage')
+          .mockResolvedValue({ success: true, image_hash: 'uploaded_vertical_hash', image_url: 'https://cdn/x' });
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative_pc' });
+
+        const result = await agentModeService.createMetaAdsAdCreative('user123', params);
+
+        expect(result.success).toBe(true);
+        expect(uploadSpy).toHaveBeenCalledTimes(1);
+        // The URL asset is replaced with the uploaded hash and image_url is dropped
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({
+            placement_assets: [
+              { image_hash: 'square_hash', is_default: true },
+              { placements: ['reels'], image_hash: 'uploaded_vertical_hash' }
+            ]
+          })
+        );
+      });
     });
   });
 
@@ -333,6 +487,59 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         // Should NOT call getAd or getAdCreative for ad-level updates
         expect(metaService.getAd).not.toHaveBeenCalled();
         expect(metaService.getAdCreative).not.toHaveBeenCalled();
+      });
+
+      it('should nest a directly-supplied creative_id (Meta ignores a top-level creative_id)', async () => {
+        const params = { creative_id: 'new_creative_B' };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(true);
+        expect(result.new_creative_id).toBe('new_creative_B');
+        // Must nest as { creative: { creative_id } } — a top-level creative_id is silently
+        // dropped by Meta (the API returns success but the ad keeps its old creative).
+        expect(metaService.updateAd).toHaveBeenCalledWith(
+          'mock-access-token',
+          'ad_123',
+          { creative: { creative_id: 'new_creative_B' } }
+        );
+        // Must NOT pass a bare top-level creative_id to Meta
+        expect(metaService.updateAd).not.toHaveBeenCalledWith(
+          'mock-access-token',
+          'ad_123',
+          { creative_id: 'new_creative_B' }
+        );
+        // A pre-built creative_id needs no rebuild from the old creative
+        expect(metaService.getAd).not.toHaveBeenCalled();
+        expect(metaService.getAdCreative).not.toHaveBeenCalled();
+        expect(metaService.createAdCreative).not.toHaveBeenCalled();
+      });
+
+      it('should apply ad-level params (status) alongside a direct creative_id swap', async () => {
+        const params = { creative_id: 'new_creative_B', status: 'ACTIVE' };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(true);
+        expect(result.new_creative_id).toBe('new_creative_B');
+        // The creative swap is issued as a nested creative param
+        expect(metaService.updateAd).toHaveBeenCalledWith(
+          'mock-access-token',
+          'ad_123',
+          { creative: { creative_id: 'new_creative_B' } }
+        );
+        // The ad-level status change is issued separately, without the creative_id
+        expect(metaService.updateAd).toHaveBeenCalledWith(
+          'mock-access-token',
+          'ad_123',
+          { status: 'ACTIVE' }
+        );
       });
 
       it('should use creative swap when link_url is in params', async () => {
@@ -516,6 +723,147 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
 
         expect(result.success).toBe(false);
         expect(result.error).toBe('CREATIVE_CREATE_FAILED');
+      });
+
+      it('should swap to a placement-customized creative, carrying over copy from the old creative', async () => {
+        // Repro: an ad with a single square Feed image is rejected on Stories/Reels placements.
+        // Fix: AD UPDATE with placement_assets builds a multi-placement creative and swaps it in.
+        const params = {
+          placement_assets: [
+            { image_hash: 'square_hash', is_default: true },
+            { image_hash: 'vertical_9x16_hash', placements: ['story', 'reels'] }
+          ]
+        };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock).mockResolvedValue({
+          id: 'ad_123',
+          creative: { creative_id: 'old_square_creative' }
+        });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'old_square_creative',
+          name: 'Maint-05 - 24/7 Coverage',
+          object_story_spec: {
+            page_id: 'page_123',
+            link_data: {
+              message: '24/7 coverage you can count on',
+              link: 'https://usehaven.ai',
+              name: 'Always-on Maintenance',
+              image_hash: 'square_hash',
+              call_to_action: { type: 'LEARN_MORE', value: { link: 'https://usehaven.ai' } }
+            }
+          }
+        });
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'new_placement_creative' });
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(true);
+        expect(result.old_creative_id).toBe('old_square_creative');
+        expect(result.new_creative_id).toBe('new_placement_creative');
+
+        // New creative carries over body/title/link/CTA from the old creative + the placement assets
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({
+            page_id: 'page_123',
+            body: '24/7 coverage you can count on',
+            title: 'Always-on Maintenance',
+            link_url: 'https://usehaven.ai',
+            call_to_action_type: 'LEARN_MORE',
+            placement_assets: [
+              { image_hash: 'square_hash', is_default: true },
+              { image_hash: 'vertical_9x16_hash', placements: ['story', 'reels'] }
+            ]
+          })
+        );
+
+        // Same ad_id is pointed at the new creative (nested) — no UI, no recreate
+        expect(metaService.updateAd).toHaveBeenCalledWith(
+          'mock-access-token',
+          'ad_123',
+          { creative: { creative_id: 'new_placement_creative' } }
+        );
+      });
+
+      it('auto-resolves instagram_user_id during a placement-asset AD UPDATE swap (IG placements)', async () => {
+        const params = {
+          placement_assets: [
+            { image_hash: 'square_hash', is_default: true },
+            { image_hash: 'vertical_9x16_hash', placements: ['story', 'reels'] }
+          ]
+        };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock).mockResolvedValue({
+          id: 'ad_123',
+          creative: { creative_id: 'old_square_creative' }
+        });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'old_square_creative',
+          name: 'Maint-05',
+          object_story_spec: {
+            page_id: 'page_123',
+            link_data: { message: 'Hi', link: 'https://usehaven.ai', name: 'T', image_hash: 'square_hash' }
+          }
+        });
+        (metaService.getPageInstagramActor as jest.Mock).mockResolvedValue('17841469032554858');
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'new_placement_creative' });
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(true);
+        expect(metaService.getPageInstagramActor).toHaveBeenCalledWith('mock-access-token', 'page_123');
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({ instagram_user_id: '17841469032554858' })
+        );
+      });
+
+      it('should upload placement_assets URLs to hashes during an AD UPDATE swap', async () => {
+        const params = {
+          placement_assets: [
+            { image_hash: 'square_hash', is_default: true },
+            { image_url: 'https://cdn.example.com/vertical.jpg', placements: ['reels'] }
+          ]
+        };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock).mockResolvedValue({
+          id: 'ad_123',
+          creative: { creative_id: 'old_creative' }
+        });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'old_creative',
+          name: 'My Creative',
+          object_story_spec: {
+            page_id: 'page_123',
+            link_data: { message: 'Hi', link: 'https://old.com', name: 'T', image_hash: 'square_hash' }
+          }
+        });
+        const uploadSpy = jest.spyOn(agentModeService, 'uploadMetaAdsImage')
+          .mockResolvedValue({ success: true, image_hash: 'uploaded_hash', image_url: 'https://cdn/x' });
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'new_creative' });
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(true);
+        expect(uploadSpy).toHaveBeenCalledTimes(1);
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({
+            placement_assets: [
+              { image_hash: 'square_hash', is_default: true },
+              { placements: ['reels'], image_hash: 'uploaded_hash' }
+            ]
+          })
+        );
       });
     });
 

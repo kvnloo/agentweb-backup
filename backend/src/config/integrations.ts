@@ -1,4 +1,4 @@
-import { getLinkedInCredentials, getLinkedInAdsSecrets, getMetaCredentials, getGmailCredentials, getYouTubeCredentials, getFathomCredentials, getClickUpCredentials, getHubSpotCredentials, getAttioCredentials } from '../utils/secretsManager';
+import { getLinkedInCredentials, getLinkedInAdsSecrets, getMetaCredentials, getGmailCredentials, getYouTubeCredentials, getFathomCredentials, getClickUpCredentials, getHubSpotCredentials, getAttioCredentials, getGoogleAdsCredentials } from '../utils/secretsManager';
 import { MetaConfig } from '../types/meta';
 
 // Graph API version for Auth/Token exchange - decoupled from SDK version
@@ -90,6 +90,17 @@ export const INTEGRATION_CONFIG = {
     scopes: [
       'https://www.googleapis.com/auth/youtube',
       'https://www.googleapis.com/auth/youtube.readonly',
+      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/userinfo.profile',
+    ],
+  },
+
+  google_ads: {
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/google-ads/callback`,
+    authorizationUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
+    tokenUrl: 'https://oauth2.googleapis.com/token',
+    scopes: [
+      'https://www.googleapis.com/auth/adwords',
       'https://www.googleapis.com/auth/userinfo.email',
       'https://www.googleapis.com/auth/userinfo.profile',
     ],
@@ -336,6 +347,36 @@ export async function getYouTubeConfig(): Promise<YouTubeOAuthConfig> {
   };
   youtubeConfigCacheExpiresAt = Date.now() + YOUTUBE_CONFIG_CACHE_TTL_MS;
   return cachedYouTubeConfig;
+}
+
+export interface GoogleAdsOAuthConfig {
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+  scopes: string[];
+  authorizationUrl: string;
+  tokenUrl: string;
+}
+
+let cachedGoogleAdsConfig: GoogleAdsOAuthConfig | null = null;
+let googleAdsConfigCacheExpiresAt = 0;
+const GOOGLE_ADS_CONFIG_CACHE_TTL_MS = 5 * 60 * 1000;
+
+export async function getGoogleAdsConfig(): Promise<GoogleAdsOAuthConfig> {
+  if (cachedGoogleAdsConfig && Date.now() < googleAdsConfigCacheExpiresAt) {
+    return cachedGoogleAdsConfig;
+  }
+  const credentials = await getGoogleAdsCredentials();
+  cachedGoogleAdsConfig = {
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+    redirectUri: INTEGRATION_CONFIG.google_ads.redirectUri,
+    scopes: INTEGRATION_CONFIG.google_ads.scopes,
+    authorizationUrl: INTEGRATION_CONFIG.google_ads.authorizationUrl,
+    tokenUrl: INTEGRATION_CONFIG.google_ads.tokenUrl,
+  };
+  googleAdsConfigCacheExpiresAt = Date.now() + GOOGLE_ADS_CONFIG_CACHE_TTL_MS;
+  return cachedGoogleAdsConfig;
 }
 
 /**

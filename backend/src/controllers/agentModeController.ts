@@ -269,6 +269,9 @@ interface ScheduledChatVariable {
 
 const SCHEDULED_CHAT_VARIABLE_REGEX = /\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}/g;
 
+// How many previous scheduled-chat prompts to retain for revert. Oldest are dropped.
+export const SCHEDULE_PROMPT_REVISION_LIMIT = 10;
+
 function extractScheduledChatVariableNames(startingMessage: string): string[] {
   const seen = new Set<string>();
   let match: RegExpExecArray | null;
@@ -934,6 +937,56 @@ export async function runScheduledChat(
   let generatedSummary: string | undefined;
 
   try {
+    // Guard against orphaned schedules whose owning user no longer exists.
+    // Without this, downstream calls (e.g. token-usage checks) throw
+    // "User not found: <userId>" on every run, repeatedly alerting oncall.
+    // Auto-pause the schedule so it stops firing, and return gracefully.
+    const scheduleOwner = await userDb.getUserById(userId);
+    if (!scheduleOwner) {
+      console.warn(
+        `Scheduled chat "${schedule.scheduleName}" (${schedule.scheduleId}) references a missing user ${userId}. Auto-pausing schedule.`
+      );
+
+      if (!isTest) {
+        try {
+          await scheduleDb.updateSchedule(schedule.scheduleId, {
+            status: 'paused',
+            updatedAt: new Date().toISOString(),
+          });
+        } catch (pauseError) {
+          console.error(
+            `Failed to auto-pause orphaned schedule ${schedule.scheduleId}:`,
+            pauseError
+          );
+        }
+      }
+
+      const orphanedUserResult = {
+        scheduleId: schedule.scheduleId,
+        runId: preGeneratedRunId || require('uuid').v4(),
+        status: 'failure' as const,
+        passed: false,
+        actualResponse: `Scheduled chat paused: the owning user (${userId}) no longer exists.`,
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: 0,
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString(),
+      };
+
+      try {
+        await scheduleDb.addRunResult(schedule.scheduleId, orphanedUserResult);
+      } catch (saveError) {
+        console.error('Error saving orphaned-user run result:', saveError);
+      }
+
+      return orphanedUserResult;
+    }
+
     const scheduleVariables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
     const scheduleVariableValues = (schedule.variableValues && typeof schedule.variableValues === 'object')
       ? schedule.variableValues as Record<string, string>
@@ -1188,6 +1241,22 @@ export async function runScheduledChat(
       // Continue even if saving fails - we still want to return the result
     }
 
+    // Self-improve: when enabled, run a reflection turn in the same session that may
+    // rewrite the schedule's prompt so future runs do better. Runs on test runs too so
+    // it's easy to try out. Best-effort — never fails the run.
+    if (schedule.selfImprove === true) {
+      try {
+        await runScheduleSelfImprovement({
+          schedule,
+          sessionId,
+          userId,
+          llmModel: modelToUse,
+        });
+      } catch (err) {
+        console.error('AgentMode: Self-improve reflection failed:', err);
+      }
+    }
+
     // Send oncall alert and Notion ticket if scheduled chat failed validation (not for test runs)
     if (!finalResult.passed && !isTest) {
       sendAgentModeOncallAlert({
@@ -1326,6 +1395,32 @@ export async function runScheduledChat(
     // Return error result for error reporting
     return errorResult;
   }
+}
+
+// Run one reflection turn (a real Emma turn in the same session, with full tool access)
+// after a scheduled chat completes. Emma reviews how the run went, and using anything it
+// can access, decides whether the schedule's prompt could be improved for future runs.
+// This is just another message to Emma — if it decides to improve the prompt, it calls
+// the same manage_scheduled_chat tool a user would, which records a revision automatically.
+export async function runScheduleSelfImprovement(params: {
+  schedule: any;
+  sessionId: string;
+  userId: string;
+  llmModel: string;
+}): Promise<void> {
+  const { schedule, sessionId, userId, llmModel } = params;
+
+  const reflectionPrompt = [
+    'This was an automated scheduled run. Now reflect on it to help FUTURE runs of this same schedule do better.',
+    '',
+    'Review how this run went. You may use any tools or data you can access (the results of this run, past runs, the account\'s current state, etc.) to find concrete, actionable opportunities to improve.',
+    '',
+    `Then decide whether this schedule's instruction prompt (its starting_message) should be improved so future runs produce better results. If — and only if — you find a clear improvement, update it now by calling the manage_scheduled_chat tool with action "update" and schedule_id "${schedule.scheduleId}", passing the full improved starting_message.`,
+    '',
+    'Rules for any improved prompt: keep the same overall goal and any {{variables}} exactly as they are; only refine the wording/instructions to make future runs more reliable. Do not invent new variables. If the current prompt is already good, make no change and simply explain why.',
+  ].join('\n');
+
+  await generateSessionResponse(sessionId, reflectionPrompt, userId, llmModel);
 }
 
 // Helper function to set up SSE connection
@@ -3802,7 +3897,8 @@ export const agentModeController = {
         runCount,
         variables,
         variableValues,
-        frequencyIntervalDays
+        frequencyIntervalDays,
+        selfImprove
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -3869,6 +3965,7 @@ export const agentModeController = {
         functionCallMinCalls: functionCallMinCalls || {},
         emailNotifications: [] as string[],
         dailyDigest: scheduleFrequency === 'hourly' ? (req.body.dailyDigest || false) : false, // Only allow daily digest for hourly schedules
+        selfImprove: selfImprove === true, // When on, a reflection turn after each run may improve the prompt
         status: 'active',
         nextRunTime: scheduledNextRunTime,
         createdAt: now.toISOString(),
@@ -3983,7 +4080,8 @@ export const agentModeController = {
         runCount,
         variables,
         variableValues,
-        frequencyIntervalDays
+        frequencyIntervalDays,
+        selfImprove
       } = req.body;
 
       // Verify schedule exists and belongs to user (before validation so we can merge)
@@ -4042,10 +4140,27 @@ export const agentModeController = {
         functionCallMinCalls: functionCallMinCalls !== undefined ? functionCallMinCalls : (existingSchedule.functionCallMinCalls || {}),
         emailNotifications: normalizeEmailList(emailNotifications !== undefined ? emailNotifications : (existingSchedule.emailNotifications || [])),
         dailyDigest: effectiveScheduleFrequency === 'hourly' ? (dailyDigest !== undefined ? dailyDigest : (existingSchedule.dailyDigest || false)) : false,
+        selfImprove: selfImprove !== undefined ? (selfImprove === true) : ((existingSchedule as any).selfImprove || false),
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
       };
+
+      // Whenever the prompt actually changes, snapshot the PREVIOUS prompt into the
+      // revision history so it can be reverted. This applies to every update path —
+      // manual edits, Emma's manage_scheduled_chat tool, and self-improve. Keep the
+      // most recent SCHEDULE_PROMPT_REVISION_LIMIT revisions only.
+      const previousStartingMessage = existingSchedule.startingMessage || '';
+      if (effectiveStartingMessage !== previousStartingMessage) {
+        const existingRevisions = Array.isArray((existingSchedule as any).promptRevisions)
+          ? (existingSchedule as any).promptRevisions as Array<{ startingMessage: string; updatedAt: string }>
+          : [];
+        const nextRevisions = [
+          ...existingRevisions,
+          { startingMessage: previousStartingMessage, updatedAt: now.toISOString() },
+        ];
+        updates.promptRevisions = nextRevisions.slice(-SCHEDULE_PROMPT_REVISION_LIMIT);
+      }
 
       const { variables: normalizedVariables, error: variableError } =
         validateAndBuildScheduledChatVariables(effectiveStartingMessage, variables, existingSchedule.variables || []);

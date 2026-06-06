@@ -410,6 +410,12 @@ COPY_AD WORKFLOW (clone an existing ad with optional overrides):
   4. Returns new_ad_id and new_creative_id
   NOTE: AD LIST now includes creative.object_story_spec so you can inspect image/video/URL details before copying.
 
+CHANGING AN AD'S CREATIVE/IMAGE (AD UPDATE):
+  Meta ads cannot mutate a creative in place — you must point the ad at a different creative.
+  - To swap to a creative you already built: AD UPDATE with params.creative_id (the system nests it correctly; a top-level creative_id is silently dropped by Meta and the old image keeps showing).
+  - To change copy/destination/image content: AD UPDATE with link_url / body / title / image_hash / image_url — the system auto-builds a new creative from the old one and swaps it in.
+  Either way the change is reflected on the SAME ad_id; deleting and recreating the ad is NOT required.
+
 CAMPAIGN OBJECTIVES (valid values for 'objective'):
   OUTCOME_TRAFFIC, OUTCOME_AWARENESS, OUTCOME_ENGAGEMENT, OUTCOME_SALES, OUTCOME_LEADS, OUTCOME_APP_PROMOTION
 
@@ -423,7 +429,27 @@ CREATIVE SUB-TYPES (mutually exclusive — pick exactly one):
   VIDEO creative:    provide video_id (from UPLOAD_VIDEO) + REQUIRED thumbnail: image_hash or image_url
                      (Meta API error 1443226 if thumbnail is missing — always upload thumbnail first)
   CAROUSEL creative: provide carousel_cards array with 2–10 items; each card needs at least one of image_hash, image_url, or video_id; plus title, link_url per card
-  RULE: Cannot pass both video_id and carousel_cards — they are mutually exclusive.
+  PLACEMENT-CUSTOMIZED creative: provide placement_assets — different image per placement in ONE creative (e.g. square for Feed, 9:16 for Stories/Reels). See below.
+  RULE: video_id, carousel_cards, and placement_assets are mutually exclusive — pick one.
+
+PLACEMENT ASSET CUSTOMIZATION (placement_assets) — fixes "invalid format / lacking 9:16 for story and reel":
+  When an ad set uses manual placements that include Stories/Reels, a creative with only a square/4:5
+  Feed image is rejected (missing 9:16) and the ad is auto-paused. Attach a vertical 9:16 asset for
+  Stories/Reels while keeping the square image for Feed — in the SAME creative — via placement_assets.
+  Shape: placement_assets = [
+    { image_hash OR image_url, is_default: true },                 // fallback (square/Feed image) — exactly one
+    { image_hash OR image_url, placements: ["story", "reels"] }     // 9:16 vertical asset for Stories/Reels
+  ]
+  Rules: at least 2 assets; EXACTLY ONE default (is_default:true or omit placements); body/title/link_url
+  apply to all placements. image_url is auto-uploaded to a hash. Placement tokens: feed, facebook_feed,
+  instagram_feed, story/stories, facebook_story, instagram_story, reels, facebook_reels, instagram_reels, explore.
+  TO FIX AN EXISTING AD: AD UPDATE with ad_id + params.placement_assets — the system builds the new
+  multi-placement creative and points the SAME ad at it (no Ads Manager UI, same ad_id).
+  NOTES:
+  - Instagram placements (story/reels/etc.) need an Instagram actor; the system auto-resolves it from the
+    Page, or pass params.instagram_user_id explicitly. (Meta error 1772103 = "Instagram Account Is Missing".)
+  - CTA must be allowed for the campaign objective on asset-feed creatives. e.g. BOOK_NOW is rejected under
+    OUTCOME_SALES (Meta error 1885396) — use a supported CTA like LEARN_MORE / SIGN_UP / SHOP_NOW.
 
 VIDEO CREATIVE WORKFLOW (3 steps, all required):
   Step 1: UPLOAD_VIDEO → returns video_id
@@ -514,6 +540,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
 
             // --- Creative ---
             page_id: { type: "string", description: "Facebook Page ID (from list_meta_pages or PAGE LIST)." },
+            instagram_user_id: { type: "string", description: "Instagram actor ID for the creative. Required when serving Instagram placements (e.g. placement_assets targeting story/reels); auto-resolved from the Page if omitted." },
             image_hash: { type: "string", description: "Image hash from UPLOAD_IMAGE." },
             image_url: { type: "string", description: "Image URL (for UPLOAD_IMAGE action or direct creative use)." },
             video_id: { type: "string", description: "Video ID from UPLOAD_VIDEO." },
@@ -529,11 +556,28 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
               },
               description: "Carousel card array for multi-card creatives."
             },
+            placement_assets: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  image_hash: { type: "string", description: "Image hash from UPLOAD_IMAGE." },
+                  image_url: { type: "string", description: "Image URL (auto-uploaded to a hash)." },
+                  placements: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "Placement tokens this image serves (e.g. ['story','reels']). Omit for the default/fallback asset."
+                  },
+                  is_default: { type: "boolean", description: "Marks the fallback image that serves every unmatched placement (e.g. the square Feed image). Exactly one asset must be the default." }
+                }
+              },
+              description: "Placement-level image customization (asset_feed_spec). Map different images to different placements in ONE creative (square→Feed, 9:16→Stories/Reels). Requires ≥2 assets and exactly one default. Mutually exclusive with video_id and carousel_cards."
+            },
             body: { type: "string", description: "Ad body / primary text." },
             title: { type: "string", description: "Ad headline." },
             link_url: { type: "string", description: "Destination URL." },
             call_to_action_type: { type: "string", description: "CTA button (e.g., LEARN_MORE, SHOP_NOW, SIGN_UP)." },
-            creative_id: { type: "string", description: "Creative ID for AD CREATE." },
+            creative_id: { type: "string", description: "Creative ID. For AD CREATE: the creative to attach. For AD UPDATE: swap the ad onto this existing creative (nested as { creative: { creative_id } } — a top-level creative_id is silently ignored by Meta)." },
 
             // --- Custom Audience ---
             subtype: { type: "string", enum: ["CUSTOM", "LOOKALIKE"], description: "Audience subtype." },
@@ -2941,6 +2985,38 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     return await agentModeService.getLeadDetails(args.list_id, args.lead_id, context?.userId);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'get_leads_needing_followup',
+  definition: {
+    name: 'get_leads_needing_followup',
+    description: 'For a LinkedIn-outreach lead list, return the cohort of leads who ACCEPTED your connection invite but still need a follow-up — in a single list-level call (no per-lead get_lead_details fan-out). A lead qualifies when they are a 1st-degree connection AND the most recent message is not an outbound touch sent after they connected (i.e. you never followed up after they accepted, or they replied and you owe a response). Each returned lead includes linkedInConnectionStatus (isConnected, connectedAt), lastEngagementType, lastEngagementDirection (inbound/outbound), lastEngagementAt, and awaitingReply. Requires the list to have a LinkedIn account assigned. Use this to answer "which leads accepted my invite but haven\'t been followed up?".',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The ID of the LinkedIn-outreach lead list to scan'
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of leads to return (default 25, max 100)'
+        },
+        scan_limit: {
+          type: 'number',
+          description: 'Maximum number of leads to scan in the list (default 2000, max 5000). Raise only for very large lists; the response reports scannedAllLeads so you know whether the whole list was covered.'
+        }
+      },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.getLeadsNeedingFollowup(args.list_id, context?.userId, {
+      limit: args.limit,
+      scanLimit: args.scan_limit,
+    });
   }
 });
 
@@ -7131,4 +7207,111 @@ Response keys:
       auto_enrich: args.auto_enrich,
     });
   }
+});
+
+// ── Google Ads Tools ────────────────────────────────────────────────────────
+
+emmaToolRegistry.register({
+  name: 'call_google_ads_api',
+  definition: {
+    name: 'call_google_ads_api',
+    description: `Manage Google Ads entities via the Google Ads API.
+
+ACTION MATRIX:
+  BUDGET      → LIST, CREATE (name, amount_micros, explicitly_shared?), UPDATE (budget_resource_name, amount_micros), REMOVE (budget_resource_name; must not be attached to any campaign)
+  CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy?, bidding_strategy_target?, budget_resource_name?), REMOVE (campaign_resource_name)
+              For PERFORMANCE_MAX: pass brand_business_name and brand_logo_asset_resource_name — backend batches campaign creation + brand asset attachment atomically
+  AD_GROUP    → LIST (campaign_resource_name)
+               CREATE (name, campaign_resource_name, type [SEARCH_STANDARD|DISPLAY_STANDARD], cpc_bid_micros?)
+               UPDATE (ad_group_resource_name, name?, status?, cpc_bid_micros?, ad_rotation_mode?, target_cpa_micros?, target_roas?)
+               REMOVE (ad_group_resource_name)
+  KEYWORD     → LIST (ad_group_resource_name), ADD (ad_group_resource_name, keywords[]), ADD_NEGATIVE (keywords[], campaign_resource_name OR ad_group_resource_name), UPDATE (criterion_resource_name, status?, cpc_bid_micros?), REMOVE (criterion_resource_name)
+  AD          → LIST (ad_group_resource_name), CREATE (ad_group_resource_name, type [RESPONSIVE_SEARCH_AD|RESPONSIVE_DISPLAY_AD], headlines[], descriptions[], final_url), UPDATE (ad_resource_name, status?), REMOVE (ad_resource_name)
+              NOTE: final_url, headlines, descriptions are ALL immutable after creation — to change any of these, REMOVE and recreate the ad
+  ASSET       → UPLOAD
+  CAMPAIGN_ASSET → ATTACH (campaign_resource_name, assets[{fieldType, assetResourceName?, text?}])
+              fieldType values: BUSINESS_NAME (use text), LOGO, SQUARE_MARKETING_IMAGE, MARKETING_IMAGE (use assetResourceName)
+              Note: brand guidelines are handled automatically in CAMPAIGN CREATE — use ATTACH only for adding additional campaign-level assets after campaign creation
+  ASSET_GROUP → CREATE
+  LOCATION    → SEARCH`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        customer_id: { type: 'string', description: 'Google Ads customer ID (numeric, no dashes). Call list_connected_accounts(platform="google_ads") and use the "customer_id" field from the result (NOT the "id" field).' },
+        entity_type: { type: 'string', enum: ['BUDGET', 'CAMPAIGN', 'AD_GROUP', 'KEYWORD', 'AD', 'ASSET', 'CAMPAIGN_ASSET', 'ASSET_GROUP', 'LOCATION'] },
+        action: { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
+        name: { type: 'string' },
+        type: { type: 'string', description: 'Campaign type (SEARCH|DISPLAY|PERFORMANCE_MAX), ad group type (SEARCH_STANDARD|DISPLAY_STANDARD), or ad type for AD CREATE (RESPONSIVE_SEARCH_AD|RESPONSIVE_DISPLAY_AD).' },
+        budget_resource_name: { type: 'string', description: 'From BUDGET CREATE. Required for CAMPAIGN CREATE.' },
+        amount_micros: { type: 'number', description: 'Budget in micros. $10/day = 10000000.' },
+        explicitly_shared: { type: 'boolean', description: 'Whether the budget is explicitly shared across campaigns. Optional for BUDGET CREATE.' },
+        bidding_strategy: { type: 'string', enum: ['MAXIMIZE_CONVERSIONS', 'TARGET_CPA', 'TARGET_ROAS', 'MAXIMIZE_CONVERSION_VALUE', 'TARGET_IMPRESSION_SHARE', 'MANUAL_CPC'] },
+        bidding_strategy_target: { type: 'number' },
+        cpc_bid_ceiling_micros: { type: 'number', description: 'Max CPC bid ceiling in micros for TARGET_IMPRESSION_SHARE campaigns. Default 100000000 (≈100 currency units). Pass a lower value to cap spend per click.' },
+        location_target_ids: { type: 'array', items: { type: 'number' }, description: 'From LOCATION SEARCH.' },
+        campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME/UPDATE/REMOVE and AD_GROUP LIST.' },
+        ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD LIST/ADD/ADD_NEGATIVE/REMOVE, AD LIST/CREATE, AD_GROUP UPDATE.' },
+        ad_resource_name: { type: 'string', description: 'AdGroupAd resource name. Required for AD UPDATE/REMOVE. Obtain from AD LIST.' },
+        brand_business_name: { type: 'string', description: 'Business name for PMax brand guidelines. Required for PERFORMANCE_MAX CAMPAIGN CREATE when brand guidelines are enforced.' },
+        brand_logo_asset_resource_name: { type: 'string', description: 'Logo image asset resource name for PMax brand guidelines. Upload via ASSET UPLOAD first.' },
+        criterion_resource_name: { type: 'string', description: 'Ad group criterion resource name. Required for KEYWORD REMOVE. Obtain from KEYWORD LIST.' },
+        assets: { type: 'array', items: { type: 'object', properties: { fieldType: { type: 'string', enum: ['BUSINESS_NAME', 'LOGO', 'SQUARE_MARKETING_IMAGE', 'MARKETING_IMAGE', 'HEADLINE', 'DESCRIPTION'] }, assetResourceName: { type: 'string' }, text: { type: 'string' } }, required: ['fieldType'] }, description: 'Assets to attach for CAMPAIGN_ASSET ATTACH. Use text for BUSINESS_NAME, assetResourceName for image/logo types.' },
+        keywords: { type: 'array', items: { type: 'object', properties: { text: { type: 'string' }, matchType: { type: 'string', enum: ['BROAD', 'PHRASE', 'EXACT'] } }, required: ['text', 'matchType'] }, description: 'Keywords for ADD or ADD_NEGATIVE action.' },
+        query: { type: 'string', description: 'Location search query.' },
+        status: { type: 'string', enum: ['ENABLED', 'PAUSED'], description: 'Entity status for CREATE or UPDATE.' },
+        cpc_bid_micros: { type: 'number', description: 'CPC bid in micros for AD_GROUP CREATE or UPDATE.' },
+        ad_rotation_mode: { type: 'string', enum: ['OPTIMIZE', 'ROTATE_FOREVER'], description: 'Ad rotation mode for AD_GROUP UPDATE.' },
+        target_cpa_micros: { type: 'number', description: 'Ad-group-level target CPA in micros for AD_GROUP UPDATE. Overrides campaign-level target.' },
+        target_roas: { type: 'number', description: 'Ad-group-level target ROAS for AD_GROUP UPDATE. Overrides campaign-level target.' },
+        headlines: { type: 'array', items: { type: 'string' }, description: 'Ad headlines. Required for AD CREATE. Min 3 for RSA.' },
+        descriptions: { type: 'array', items: { type: 'string' }, description: 'Ad descriptions. Required for AD CREATE. Min 2 for RSA.' },
+        final_url: { type: 'string', description: 'Landing page URL. Required for AD CREATE and ASSET_GROUP CREATE.' },
+        image_asset_resource_names: { type: 'array', items: { type: 'string' }, description: 'Image asset resource names. Optional, Display ads only.' },
+        asset_type: { type: 'string', enum: ['IMAGE', 'LOGO', 'VIDEO'], description: 'Asset type for ASSET UPLOAD. Use LOGO for square logo images (internally uploaded as IMAGE). Use IMAGE for marketing images. Use VIDEO for YouTube videos.' },
+        data: { type: 'string', description: 'Asset data. For IMAGE/LOGO: a public URL (https://...) — backend will fetch and upload. For VIDEO: YouTube video ID string. for VIDEO.' },
+        long_headlines: { type: 'array', items: { type: 'string' }, description: 'Long headlines for ASSET_GROUP CREATE (PMax).' },
+        square_image_assets: { type: 'array', items: { type: 'string' }, description: 'Square image asset resource names for ASSET_GROUP CREATE.' },
+        landscape_image_assets: { type: 'array', items: { type: 'string' }, description: 'Landscape image asset resource names for ASSET_GROUP CREATE.' },
+        logo_assets: { type: 'array', items: { type: 'string' }, description: 'Logo asset resource names for ASSET_GROUP CREATE.' },
+        video_assets: { type: 'array', items: { type: 'string' }, description: 'Video asset resource names for ASSET_GROUP CREATE. Optional.' },
+      },
+      required: ['customer_id', 'entity_type', 'action'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    return await agentModeService.handleCallGoogleAdsApi(context?.userId || context?.agentUserId, args);
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'call_google_ads_reporting_api',
+  definition: {
+    name: 'call_google_ads_reporting_api',
+    description: `Fetch Google Ads performance data.
+
+TWO MODES:
+- mode="dashboard": Pre-formatted markdown table (spend, impressions, clicks, CTR, conversions, avg CPC). Use for "how are my campaigns doing?" questions.
+- mode="raw": Custom GAQL query, returns structured results. Use for keyword-level data, custom breakdowns, or specific fields.
+
+COST: cost_micros from API ÷ 1,000,000 = spend in account currency. Check the currency field in response.
+NEVER fabricate metrics — only report what tools return.
+
+GAQL EXAMPLES:
+  Campaign: SELECT campaign.id, campaign.name, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions FROM campaign WHERE segments.date DURING LAST_30_DAYS
+  Keywords: SELECT ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, metrics.clicks, metrics.cost_micros, metrics.average_cpc FROM keyword_view WHERE segments.date DURING LAST_30_DAYS`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        customer_id: { type: 'string', description: 'Google Ads customer ID (numeric, no dashes). Call list_connected_accounts(platform="google_ads") and use the "customer_id" field (NOT the "id" field).' },
+        mode: { type: 'string', enum: ['raw', 'dashboard'], description: '"dashboard" for formatted summary. "raw" for custom GAQL.' },
+        query: { type: 'string', description: 'GAQL query. Required for mode="raw".' },
+        campaign_ids: { type: 'array', items: { type: 'string' }, description: 'Filter to specific campaigns (dashboard mode only). Omit for all.' },
+        date_preset: { type: 'string', enum: ['TODAY', 'YESTERDAY', 'LAST_7_DAYS', 'LAST_30_DAYS', 'LAST_90_DAYS', 'THIS_MONTH', 'LAST_MONTH', 'THIS_YEAR'], description: 'Defaults to LAST_30_DAYS.' },
+      },
+      required: ['customer_id', 'mode'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    return await agentModeService.handleCallGoogleAdsReportingApi(context?.userId || context?.agentUserId, args);
+  },
 });
