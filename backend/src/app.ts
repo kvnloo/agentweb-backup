@@ -85,6 +85,7 @@ import onboardingEventsRoutes from "./routes/onboardingEvents";
 import onboardingVariantsRoutes from "./routes/onboardingVariants";
 import loopEventsRoutes from "./routes/loopEvents";
 import { registerAiEvalFunnelForProduction } from "./loops/instances/ai-eval-funnel/cron";
+import { registerAiReadinessFunnel } from "./loops/instances/ai-readiness-funnel";
 import brandBuildRoutes from "./routes/brandBuild";
 import adGenRoutes from "./routes/adGen";
 import onboardingStepsRoutes from "./routes/onboardingSteps";
@@ -321,6 +322,16 @@ try {
   // Idempotent registration may throw on hot-reload; safe to swallow during
   // dev-server restarts. Production should never hit this path twice.
   console.warn("[loops] registerAiEvalFunnelForProduction skipped:", String(err));
+}
+// Register the /ai-readiness lander loop AFTER ai-eval (the legacy ai-eval
+// registrar resets the registry only when called on a non-empty one, so it
+// must run first on an empty registry). Always registered so /api/loop-events
+// accepts + stores the lander's events; the daily analysis run is scheduled
+// separately in server.ts.
+try {
+  registerAiReadinessFunnel();
+} catch (err) {
+  console.warn("[loops] registerAiReadinessFunnel skipped:", String(err));
 }
 app.use("/api/onboarding", brandBuildRoutes);
 app.use("/api/onboarding", adGenRoutes);
