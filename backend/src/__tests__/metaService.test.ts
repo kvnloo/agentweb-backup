@@ -1081,6 +1081,37 @@ describe('MetaService', () => {
             expect(result).toBe('999');
         });
 
+        it('falls back to the matching Page access token when the user token has no linked Instagram actor', async () => {
+            const mockUserTokenCall = jest.fn().mockResolvedValue({ _data: {} });
+            const mockPageTokenCall = jest.fn().mockResolvedValue({
+                _data: { instagram_business_account: { id: '17841469032554858' } }
+            });
+            (FacebookAdsApi.init as jest.Mock).mockImplementation((token: string) => ({
+                call: token === 'page_token_123' ? mockPageTokenCall : mockUserTokenCall,
+            }));
+            (User as unknown as jest.Mock).mockImplementation(() => ({
+                getAccounts: jest.fn().mockResolvedValue([
+                    {
+                        id: 'page_1',
+                        _data: {
+                            id: 'page_1',
+                            name: 'Test Page',
+                            access_token: 'page_token_123',
+                        }
+                    }
+                ]),
+            }));
+
+            const result = await service.getPageInstagramActor(mockAccessToken, 'page_1');
+
+            expect(result).toBe('17841469032554858');
+            expect(FacebookAdsApi.init).toHaveBeenCalledWith(mockAccessToken);
+            expect(FacebookAdsApi.init).toHaveBeenCalledWith('page_token_123');
+            expect(mockPageTokenCall).toHaveBeenCalledWith('GET', ['page_1'], expect.objectContaining({
+                fields: expect.stringContaining('instagram_business_account')
+            }));
+        });
+
         it('returns null when the page has no linked Instagram account', async () => {
             const mockCall = jest.fn().mockResolvedValue({ _data: {} });
             (FacebookAdsApi.init as jest.Mock).mockReturnValue({ call: mockCall });

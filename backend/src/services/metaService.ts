@@ -501,18 +501,37 @@ export class MetaService {
    * ("Instagram Account Is Missing"). Returns null if no IG account is linked or on error.
    */
   public async getPageInstagramActor(accessToken: string, pageId: string): Promise<string | null> {
+    const extractInstagramActor = (result: any): string | null => {
+      const data = result?._data || result || {};
+      return data.instagram_business_account?.id || data.connected_instagram_account?.id || null;
+    };
+
     try {
       const api = this.initApi(accessToken);
       // Use the generic Graph call — the SDK's Page object is not exported in its TS types.
       const result: any = await api.call('GET', [pageId], {
         fields: 'instagram_business_account,connected_instagram_account',
       });
-      const data = result?._data || result || {};
-      const igId = data.instagram_business_account?.id || data.connected_instagram_account?.id;
-      return igId || null;
+      const igId = extractInstagramActor(result);
+      if (igId) return igId;
+    } catch (error: any) {
+      console.warn(`[MetaService] getPageInstagramActor user-token lookup failed for page ${pageId}: ${error?.message}`);
+    }
+
+    try {
+      const pages = await this.getPages(accessToken);
+      const page = pages.find((p: any) => String(p.id) === String(pageId));
+      const pageAccessToken = page?.access_token;
+      if (!pageAccessToken || pageAccessToken === accessToken) return null;
+
+      const pageApi = this.initApi(pageAccessToken);
+      const pageResult: any = await pageApi.call('GET', [pageId], {
+        fields: 'instagram_business_account,connected_instagram_account',
+      });
+      return extractInstagramActor(pageResult);
     } catch (error: any) {
       // Non-fatal: callers proceed without an IG actor (Facebook-only placements still work).
-      console.warn(`[MetaService] getPageInstagramActor failed for page ${pageId}: ${error?.message}`);
+      console.warn(`[MetaService] getPageInstagramActor page-token lookup failed for page ${pageId}: ${error?.message}`);
       return null;
     }
   }
