@@ -23,7 +23,7 @@ import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
 import { skillService } from './skillService';
 import { extractVariables } from '../utils/templateParser';
-import { applyPrintLayoutFixes } from '../utils/pdfPrintLayout';
+import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData } from '../utils/llmService';
@@ -16628,7 +16628,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async convertToPdf(sourceUrl: string, outputFilename: string, userId: string): Promise<any> {
+  public async convertToPdf(
+    sourceUrl: string,
+    outputFilename: string,
+    userId: string,
+    options?: { orientation?: 'portrait' | 'landscape' | 'auto'; format?: string }
+  ): Promise<any> {
     try {
       console.log('AgentMode: Converting to PDF:', sourceUrl, 'for user:', userId);
 
@@ -16639,48 +16644,35 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         throw new Error('source_url must be an HTTP or HTTPS URL');
       }
 
-      const puppeteer = await import('puppeteer-core');
-      let browser: any = null;
-      try {
-        browser = await puppeteer.default.launch({
-          executablePath: '/usr/bin/google-chrome',
-          args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-          headless: true,
-        });
-        const page = await browser.newPage();
-        await page.goto(sourceUrl, { waitUntil: 'networkidle0', timeout: 30000 });
-        // Prevent sections/tables taller than a page from overflowing and
-        // overwriting adjacent sections (relax unsatisfiable break-inside:avoid).
-        await applyPrintLayoutFixes(page, 'A4', '20mm', '20mm');
-        const pdfBuffer = await page.pdf({
-          format: 'A4',
-          printBackground: true,
-          margin: { top: '20mm', bottom: '20mm', left: '15mm', right: '15mm' },
-        });
-        await browser.close();
-        browser = null;
+      // Shared render path: orientation is auto-detected (16:9 decks print
+      // landscape) unless the caller forces it, and wide content is scaled to
+      // fit so the right side is never clipped.
+      const { buffer, orientation, scale } = await renderHtmlToPdf({
+        url: sourceUrl,
+        orientation: options?.orientation ?? 'auto',
+        format: options?.format,
+      });
+      console.log(
+        `AgentMode: PDF rendered (orientation=${orientation}, scale=${scale.toFixed(2)})`
+      );
 
-        const pdfFilename = (outputFilename || 'export')
-          .replace(/\.html?$/i, '')
-          .replace(/[^a-zA-Z0-9_\-]/g, '_') + '.pdf';
+      const pdfFilename = (outputFilename || 'export')
+        .replace(/\.html?$/i, '')
+        .replace(/[^a-zA-Z0-9_\-]/g, '_') + '.pdf';
 
-        const uploadResult = await uploadFileToS3(Buffer.from(pdfBuffer), pdfFilename, userId, 'application/pdf');
+      const uploadResult = await uploadFileToS3(buffer, pdfFilename, userId, 'application/pdf');
 
-        if (!uploadResult.success || !uploadResult.url) {
-          throw new Error(uploadResult.error || 'Failed to upload PDF to S3');
-        }
-
-        return {
-          success: true,
-          pdf_url: uploadResult.url,
-          filename: pdfFilename,
-          message: `PDF created and saved. Download: ${uploadResult.url}`,
-        };
-      } finally {
-        if (browser) {
-          try { await browser.close(); } catch {}
-        }
+      if (!uploadResult.success || !uploadResult.url) {
+        throw new Error(uploadResult.error || 'Failed to upload PDF to S3');
       }
+
+      return {
+        success: true,
+        pdf_url: uploadResult.url,
+        filename: pdfFilename,
+        orientation,
+        message: `PDF created and saved. Download: ${uploadResult.url}`,
+      };
     } catch (error) {
       console.error('AgentMode: Error converting to PDF:', error);
       return {

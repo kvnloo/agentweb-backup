@@ -24,15 +24,22 @@
 
 const PX_PER_MM = 96 / 25.4; // CSS reference pixel is 1/96in; 1in = 25.4mm
 
-/** Page heights in millimeters for supported Puppeteer paper formats. */
-const FORMAT_HEIGHT_MM: Record<string, number> = {
-  a4: 297,
-  letter: 279.4,
-  legal: 355.6,
-  a3: 420,
-  a5: 210,
-  tabloid: 431.8,
+/**
+ * Portrait dimensions (width × height, in mm) for supported Puppeteer paper
+ * formats. In landscape the two are swapped.
+ */
+const FORMAT_DIMENSIONS_MM: Record<string, { width: number; height: number }> = {
+  a4: { width: 210, height: 297 },
+  letter: { width: 215.9, height: 279.4 },
+  legal: { width: 215.9, height: 355.6 },
+  a3: { width: 297, height: 420 },
+  a5: { width: 148, height: 210 },
+  tabloid: { width: 279.4, height: 431.8 },
 };
+
+function formatDimensions(format: string): { width: number; height: number } {
+  return FORMAT_DIMENSIONS_MM[(format || "a4").toLowerCase()] ?? FORMAT_DIMENSIONS_MM.a4;
+}
 
 /** Convert a millimeter measurement to CSS pixels at 96dpi. */
 export function mmToPx(mm: number): number {
@@ -64,19 +71,89 @@ function marginToMm(margin: string | undefined): number {
   }
 }
 
+export type Orientation = "portrait" | "landscape";
+
 /**
  * Compute the printable content height (in CSS px) for a paper format and
  * top/bottom margins — i.e. how tall an element can be before it can no longer
- * fit on a single page.
+ * fit on a single page. In landscape the format's width becomes the height.
  */
 export function computePageContentHeightPx(
   format: string,
   marginTop: string | undefined,
-  marginBottom: string | undefined
+  marginBottom: string | undefined,
+  orientation: Orientation = "portrait"
 ): number {
-  const heightMm = FORMAT_HEIGHT_MM[(format || "a4").toLowerCase()] ?? 297;
+  const dims = formatDimensions(format);
+  const heightMm = orientation === "landscape" ? dims.width : dims.height;
   const usableMm = heightMm - marginToMm(marginTop) - marginToMm(marginBottom);
   return mmToPx(usableMm);
+}
+
+/**
+ * Compute the printable content WIDTH (in CSS px) for a paper format and
+ * left/right margins — how wide content can be before it is clipped off the
+ * right edge of the page. In landscape the format's height becomes the width.
+ */
+export function computePageContentWidthPx(
+  format: string,
+  marginLeft: string | undefined,
+  marginRight: string | undefined,
+  orientation: Orientation = "portrait"
+): number {
+  const dims = formatDimensions(format);
+  const widthMm = orientation === "landscape" ? dims.height : dims.width;
+  const usableMm = widthMm - marginToMm(marginLeft) - marginToMm(marginRight);
+  return mmToPx(usableMm);
+}
+
+/** Uncapped fit ratio: how much content must shrink to fit a page width (≤ 1). */
+function fitRatio(contentWidthPx: number, pageWidthPx: number): number {
+  if (!(contentWidthPx > 0) || !(pageWidthPx > 0)) return 1;
+  return Math.min(1, pageWidthPx / contentWidthPx);
+}
+
+/**
+ * Decide a sensible page orientation from the rendered content's WIDTH.
+ *
+ * Width — not aspect ratio — is the right signal: a slide deck is many 16:9
+ * slides stacked vertically, so the document as a whole is tall (portrait-ish
+ * by aspect ratio) even though each slide is wide. What actually matters is
+ * whether the content is too wide to fit a portrait page without shrinking.
+ *
+ * Rule: if the content fits a portrait page comfortably (needs little or no
+ * downscaling), stay portrait — this keeps ordinary reports portrait. Only when
+ * portrait would require meaningful shrinking AND landscape fits better do we
+ * switch to landscape.
+ */
+export function chooseOrientation(
+  contentWidthPx: number,
+  portraitContentWidthPx: number,
+  landscapeContentWidthPx: number,
+  portraitFitThreshold = 0.85
+): Orientation {
+  if (!(contentWidthPx > 0)) return "portrait";
+  const portraitFit = fitRatio(contentWidthPx, portraitContentWidthPx);
+  if (portraitFit >= portraitFitThreshold) return "portrait";
+  const landscapeFit = fitRatio(contentWidthPx, landscapeContentWidthPx);
+  return landscapeFit > portraitFit ? "landscape" : "portrait";
+}
+
+/**
+ * Compute a scale factor (≤ 1) that shrinks content to fit within the printable
+ * page width, preventing the right side from being clipped. Returns 1 when the
+ * content already fits or when inputs are invalid. Never scales below `minScale`
+ * so text stays legible — clipping a little is better than an unreadable page.
+ */
+export function computeFitScale(
+  contentWidthPx: number,
+  pageContentWidthPx: number,
+  minScale = 0.5
+): number {
+  if (!(contentWidthPx > 0) || !(pageContentWidthPx > 0)) return 1;
+  if (contentWidthPx <= pageContentWidthPx) return 1;
+  const scale = pageContentWidthPx / contentWidthPx;
+  return Math.max(minScale, scale);
 }
 
 /**
@@ -137,12 +214,14 @@ export async function applyPrintLayoutFixes(
   },
   format: string,
   marginTop: string | undefined,
-  marginBottom: string | undefined
+  marginBottom: string | undefined,
+  orientation: Orientation = "portrait"
 ): Promise<number> {
   const pageContentHeightPx = computePageContentHeightPx(
     format,
     marginTop,
-    marginBottom
+    marginBottom,
+    orientation
   );
 
   await page.addStyleTag({ content: PRINT_SAFETY_CSS });
@@ -167,4 +246,36 @@ export async function applyPrintLayoutFixes(
     });
     return relaxed;
   }, pageContentHeightPx)) as number;
+}
+
+/**
+ * Measure the rendered content's natural size (CSS px) inside a Puppeteer page.
+ * Used to auto-detect orientation and to decide whether content overflows the
+ * page width and must be scaled to avoid right-edge clipping.
+ *
+ * `width` is the widest of scroll/offset/client width so absolutely-positioned
+ * or overflowing children (a wide slide canvas, a fixed-width deck) are counted.
+ */
+export async function measureContentSize(page: {
+  evaluate: (fn: (...args: any[]) => any, ...args: any[]) => Promise<any>;
+}): Promise<{ width: number; height: number }> {
+  return (await page.evaluate(() => {
+    const b = document.body;
+    const e = document.documentElement;
+    const width = Math.max(
+      b ? b.scrollWidth : 0,
+      b ? b.offsetWidth : 0,
+      e ? e.scrollWidth : 0,
+      e ? e.offsetWidth : 0,
+      e ? e.clientWidth : 0
+    );
+    const height = Math.max(
+      b ? b.scrollHeight : 0,
+      b ? b.offsetHeight : 0,
+      e ? e.scrollHeight : 0,
+      e ? e.offsetHeight : 0,
+      e ? e.clientHeight : 0
+    );
+    return { width, height };
+  })) as { width: number; height: number };
 }
