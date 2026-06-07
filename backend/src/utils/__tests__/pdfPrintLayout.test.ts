@@ -14,6 +14,10 @@
 import {
   mmToPx,
   computePageContentHeightPx,
+  computePageContentWidthPx,
+  chooseOrientation,
+  computeFitScale,
+  measureContentSize,
   shouldRelaxBreakInside,
   applyPrintLayoutFixes,
   PRINT_SAFETY_CSS,
@@ -258,6 +262,180 @@ describe("applyPrintLayoutFixes", () => {
       expect(relaxed).toBe(0);
       expect(setCalls).toEqual([]);
     });
+  });
+});
+
+describe("computePageContentHeightPx — orientation", () => {
+  it("uses the format width as the height in landscape", () => {
+    // A4 landscape height = portrait width (210mm), minus 20+20mm margins => 170mm.
+    const h = computePageContentHeightPx("A4", "20mm", "20mm", "landscape");
+    expect(Math.round(h)).toBe(Math.round(mmToPx(170)));
+  });
+
+  it("defaults to portrait when orientation is omitted", () => {
+    const portrait = computePageContentHeightPx("A4", "0mm", "0mm");
+    expect(Math.round(portrait)).toBe(Math.round(mmToPx(297)));
+  });
+});
+
+describe("computePageContentWidthPx", () => {
+  it("returns A4 portrait printable width minus left/right margins", () => {
+    // A4 width = 210mm. With 15mm left + 15mm right => 180mm.
+    const w = computePageContentWidthPx("A4", "15mm", "15mm");
+    expect(Math.round(w)).toBe(Math.round(mmToPx(180)));
+  });
+
+  it("uses the format height as the width in landscape", () => {
+    // A4 landscape width = portrait height (297mm) minus 15+15mm => 267mm.
+    const w = computePageContentWidthPx("A4", "15mm", "15mm", "landscape");
+    expect(Math.round(w)).toBe(Math.round(mmToPx(267)));
+  });
+
+  it("falls back to A4 for an unknown format", () => {
+    const w = computePageContentWidthPx("nope", "0mm", "0mm");
+    expect(Math.round(w)).toBe(Math.round(mmToPx(210)));
+  });
+
+  it("treats missing margins as zero", () => {
+    const w = computePageContentWidthPx("Letter", undefined, undefined);
+    expect(Math.round(w)).toBe(Math.round(mmToPx(215.9)));
+  });
+});
+
+describe("chooseOrientation", () => {
+  // A4 printable widths at 15mm side margins.
+  const portraitW = computePageContentWidthPx("A4", "15mm", "15mm"); // ~680px
+  const landscapeW = computePageContentWidthPx("A4", "15mm", "15mm", "landscape"); // ~1008px
+
+  it("keeps a report that fits portrait in portrait", () => {
+    // 600px easily fits the ~680px portrait width.
+    expect(chooseOrientation(600, portraitW, landscapeW)).toBe("portrait");
+  });
+
+  it("switches a wide slide (1280px) to landscape", () => {
+    // 1280px would need heavy shrink in portrait but fits landscape better —
+    // this is the stacked-16:9-deck case that aspect ratio got wrong.
+    expect(chooseOrientation(1280, portraitW, landscapeW)).toBe("landscape");
+  });
+
+  it("stays portrait when content is just slightly over the portrait width", () => {
+    // Within the 0.85 comfort threshold (fit ~0.94) — not worth rotating.
+    expect(chooseOrientation(720, portraitW, landscapeW)).toBe("portrait");
+  });
+
+  it("rotates very wide content to landscape (landscape fits less badly)", () => {
+    // Neither orientation fits a 5000px element, but landscape shrinks less,
+    // so it is the better choice.
+    expect(chooseOrientation(5000, portraitW, landscapeW)).toBe("landscape");
+  });
+
+  it("defaults to portrait for invalid width", () => {
+    expect(chooseOrientation(0, portraitW, landscapeW)).toBe("portrait");
+    expect(chooseOrientation(-10, portraitW, landscapeW)).toBe("portrait");
+  });
+
+  it("honors a custom portrait fit threshold", () => {
+    // With a strict threshold of 0.99, content needing any shrink rotates.
+    expect(chooseOrientation(720, portraitW, landscapeW, 0.99)).toBe("landscape");
+  });
+});
+
+describe("computeFitScale", () => {
+  const pageWidth = computePageContentWidthPx("A4", "15mm", "15mm"); // ~680px
+
+  it("returns 1 when content already fits", () => {
+    expect(computeFitScale(500, pageWidth)).toBe(1);
+  });
+
+  it("returns 1 when content is exactly the page width", () => {
+    expect(computeFitScale(pageWidth, pageWidth)).toBe(1);
+  });
+
+  it("scales down proportionally when content overflows", () => {
+    expect(computeFitScale(pageWidth * 2, pageWidth)).toBeCloseTo(0.5, 5);
+  });
+
+  it("never scales below the minimum so text stays legible", () => {
+    // 10x too wide would imply 0.1; clamp to default min 0.5.
+    expect(computeFitScale(pageWidth * 10, pageWidth)).toBe(0.5);
+  });
+
+  it("honors a custom minimum scale", () => {
+    expect(computeFitScale(pageWidth * 4, pageWidth, 0.3)).toBeCloseTo(0.3, 5);
+  });
+
+  it("returns 1 for invalid inputs", () => {
+    expect(computeFitScale(0, pageWidth)).toBe(1);
+    expect(computeFitScale(500, 0)).toBe(1);
+  });
+});
+
+describe("measureContentSize", () => {
+  it("returns the widest/tallest of the body/doc element box metrics", async () => {
+    const page = {
+      evaluate: async (fn: (...a: any[]) => any) => {
+        (global as any).document = {
+          body: {
+            scrollWidth: 1200,
+            offsetWidth: 1180,
+            scrollHeight: 800,
+            offsetHeight: 790,
+          },
+          documentElement: {
+            scrollWidth: 1000,
+            offsetWidth: 1000,
+            clientWidth: 990,
+            scrollHeight: 900,
+            offsetHeight: 880,
+            clientHeight: 870,
+          },
+        };
+        try {
+          return fn();
+        } finally {
+          delete (global as any).document;
+        }
+      },
+    };
+
+    const size = await measureContentSize(page);
+    expect(size).toEqual({ width: 1200, height: 900 });
+  });
+
+  it("handles a missing body/documentElement gracefully", async () => {
+    const page = {
+      evaluate: async (fn: (...a: any[]) => any) => {
+        (global as any).document = { body: null, documentElement: null };
+        try {
+          return fn();
+        } finally {
+          delete (global as any).document;
+        }
+      },
+    };
+
+    const size = await measureContentSize(page);
+    expect(size).toEqual({ width: 0, height: 0 });
+  });
+});
+
+describe("applyPrintLayoutFixes — orientation", () => {
+  it("passes the landscape page-content height to the in-browser pass", async () => {
+    let maxHeight = 0;
+    const page = {
+      addStyleTag: async () => {},
+      emulateMediaType: async () => {},
+      evaluate: async (_fn: (...a: any[]) => any, max: number) => {
+        maxHeight = max;
+        return 0;
+      },
+    };
+
+    await applyPrintLayoutFixes(page, "A4", "20mm", "20mm", "landscape");
+
+    expect(Math.round(maxHeight)).toBe(
+      Math.round(computePageContentHeightPx("A4", "20mm", "20mm", "landscape"))
+    );
   });
 });
 
