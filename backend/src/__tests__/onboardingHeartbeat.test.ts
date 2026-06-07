@@ -11,8 +11,13 @@
  *   item the put receives includes `ts`.
  */
 
-import { computeHeartbeatMetrics, HeartbeatUser } from '../cron/onboardingLoop';
+import {
+  computeHeartbeatMetrics,
+  computeReliabilitySummary,
+  HeartbeatUser,
+} from '../cron/onboardingLoop';
 import { formatHeartbeat, postHeartbeatSlackDM, HeartbeatMetrics } from '../services/onboardingLoopApproval';
+import type { OnboardingStepMetricInput } from '../services/onboardingMetricsService';
 
 // Fixed clock for deterministic windowing
 const NOW = new Date('2026-05-25T16:00:00.000Z');
@@ -32,6 +37,19 @@ const user = (overrides: Partial<HeartbeatUser> = {}): HeartbeatUser => ({
   userId: 'u-' + Math.random().toString(36).slice(2, 8),
   createdAt: new Date(NOW_MS - 60 * DAY).toISOString(),
   ...overrides,
+});
+
+const metric = (
+  step: OnboardingStepMetricInput['step'],
+  durationMs: number,
+  status: OnboardingStepMetricInput['status'] = 'ready',
+): OnboardingStepMetricInput => ({
+  userId: `u-${step}-${durationMs}`,
+  step,
+  startedAt: new Date(NOW_MS - durationMs).toISOString(),
+  completedAt: NOW.toISOString(),
+  durationMs,
+  status,
 });
 
 describe('computeHeartbeatMetrics', () => {
@@ -153,6 +171,84 @@ describe('computeHeartbeatMetrics', () => {
   });
 });
 
+describe('computeReliabilitySummary', () => {
+  it('summarises step p50/p95/max and failure rate from onboarding metrics rows', () => {
+    const summary = computeReliabilitySummary(
+      [],
+      {
+        'brand-build': [
+          metric('brand-build', 10_000),
+          metric('brand-build', 30_000),
+          metric('brand-build', 90_000, 'timeout'),
+        ],
+        'ad-image': [
+          metric('ad-image', 220_000),
+          metric('ad-image', 240_000, 'failed'),
+        ],
+      },
+      NOW,
+    );
+
+    const brand = summary.stepSummaries.find((s) => s.step === 'brand-build');
+    expect(brand).toEqual(
+      expect.objectContaining({
+        count: 3,
+        p50DurationMs: 30_000,
+        p95DurationMs: 90_000,
+        maxDurationMs: 90_000,
+        failureRate: 1 / 3,
+      }),
+    );
+    expect(summary.slowestStep?.step).toBe('ad-image');
+    expect(summary.highestFailureStep?.step).toBe('ad-image');
+  });
+
+  it('extracts paid-ads friction from user events and current step state', () => {
+    const users: HeartbeatUser[] = [
+      user({
+        userId: 'paid-1',
+        onboardingEvents: [
+          { event: 'goal_selected', ts: new Date(NOW_MS - HOUR).toISOString(), data: { goal: 'paid_ads' } },
+          { event: 'deviation', ts: new Date(NOW_MS - 30 * 60 * 1000).toISOString(), data: { step: 'paidAdsQuestions', message: 'confusing paid ads screen' } },
+        ],
+        adImageStatus: 'failed',
+      } as any),
+      user({
+        userId: 'paid-2',
+        goal: 'paid_ads',
+        onboardingEvents: [
+          { event: 'ads_generated', ts: new Date(NOW_MS - 20 * 60 * 1000).toISOString() },
+          { event: 'onboarding_completed', ts: new Date(NOW_MS - 10 * 60 * 1000).toISOString() },
+        ],
+        adCopyStatus: 'ready',
+      } as any),
+    ];
+
+    const summary = computeReliabilitySummary(users, {}, NOW);
+
+    expect(summary.paidAds).toEqual(
+      expect.objectContaining({
+        users: 2,
+        completed: 1,
+        reachedAds: 1,
+        deviations: 1,
+      }),
+    );
+    expect(summary.recentComplaintSignals[0]).toEqual(
+      expect.objectContaining({
+        userId: 'paid-1',
+        step: 'paidAdsQuestions',
+      }),
+    );
+    expect(summary.stuckByStage['(unknown)']?.count ?? 0).toBeGreaterThanOrEqual(1);
+  });
+
+  it('returns an explicit no-data recommendation when metrics have not landed yet', () => {
+    const summary = computeReliabilitySummary([], {}, NOW);
+    expect(summary.recommendedAction).toMatch(/No step timing data/);
+  });
+});
+
 describe('formatHeartbeat', () => {
   const baseMetrics: HeartbeatMetrics = {
     todayStr: '2026-05-25',
@@ -163,6 +259,53 @@ describe('formatHeartbeat', () => {
     completions: { last24h: 0, last7d: 0 },
     selfActive: { last24h: 14, last7d: 28, last30d: 46 },
     pilotRatio: 0.33,
+    reliability: {
+      stepSummaries: [
+        {
+          step: 'ad-image',
+          count: 3,
+          p50DurationMs: 95_000,
+          p95DurationMs: 240_000,
+          maxDurationMs: 240_000,
+          failureRate: 1 / 3,
+        },
+      ],
+      slowestStep: {
+        step: 'ad-image',
+        count: 3,
+        p50DurationMs: 95_000,
+        p95DurationMs: 240_000,
+        maxDurationMs: 240_000,
+        failureRate: 1 / 3,
+      },
+      highestFailureStep: {
+        step: 'ad-image',
+        count: 3,
+        p50DurationMs: 95_000,
+        p95DurationMs: 240_000,
+        maxDurationMs: 240_000,
+        failureRate: 1 / 3,
+      },
+      stuckByStage: {
+        brand_submitted: { count: 2, oldestHours: 4 },
+      },
+      paidAds: {
+        users: 5,
+        completed: 1,
+        reachedAds: 2,
+        deviations: 1,
+        failedAdStepUsers: 1,
+      },
+      recentComplaintSignals: [
+        {
+          userId: 'u-complaint',
+          ts: '2026-05-25T15:30:00.000Z',
+          step: 'paidAdsQuestions',
+          message: 'paid ads screen is confusing',
+        },
+      ],
+      recommendedAction: 'Fix ad-image reliability before copy variants.',
+    },
   };
 
   it('includes the date in the header', () => {
@@ -194,6 +337,16 @@ describe('formatHeartbeat', () => {
     expect(formatHeartbeat(baseMetrics)).toMatch(/Pilot ratio:/);
     expect(formatHeartbeat({ ...baseMetrics, pilotRatio: null })).not.toMatch(/Pilot ratio:/);
   });
+
+  it('surfaces reliability before copy-loop reassurance', () => {
+    const out = formatHeartbeat(baseMetrics);
+    expect(out).toMatch(/Reliability/);
+    expect(out).toMatch(/Slowest step: ad-image/);
+    expect(out).toMatch(/p95 4m 0s/);
+    expect(out).toMatch(/Paid ads/);
+    expect(out).toMatch(/Recent complaint signals/);
+    expect(out).toMatch(/Fix ad-image reliability before copy variants/);
+  });
 });
 
 describe('postHeartbeatSlackDM', () => {
@@ -206,6 +359,7 @@ describe('postHeartbeatSlackDM', () => {
     completions: { last24h: 0, last7d: 0 },
     selfActive: { last24h: 0, last7d: 0, last30d: 0 },
     pilotRatio: null,
+    reliability: undefined,
   };
 
   it('posts to the user ID directly (avoids im:write scope requirement)', async () => {
