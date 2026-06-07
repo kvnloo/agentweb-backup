@@ -15,7 +15,19 @@ import { WebClient } from '@slack/web-api';
 import { readConfig, writeConfig, invalidateConfigCache } from '../services/onboardingLoopConfig';
 import { LLMService } from '../utils/llmService';
 import { LLMServiceInterface, StepStats, sensorScan, diagnoseUnderperforming, generateMutations, validateBusinessRules, critiqueMutations } from '../services/onboardingLoopAgents';
-import { postDailySlackDM, postHeartbeatSlackDM, HeartbeatMetrics } from '../services/onboardingLoopApproval';
+import {
+  OnboardingReliabilitySummary,
+  ReliabilityStepSummary,
+  postDailySlackDM,
+  postHeartbeatSlackDM,
+  HeartbeatMetrics,
+} from '../services/onboardingLoopApproval';
+import {
+  getRecentStepMetrics,
+  OnboardingStep,
+  OnboardingStepMetricInput,
+  summariseStepMetrics,
+} from '../services/onboardingMetricsService';
 import { userDb } from '../services/db';
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
@@ -26,6 +38,14 @@ const RUNS_TABLE = `${TABLE_PREFIX}AW-OnboardingLoopRuns`;
 // max_tokens_per_cycle_usd * 1000 compared against estimated call count.
 const ESTIMATED_USD_PER_LLM_CALL = 0.015;
 const MAX_LLM_CALLS_PER_CYCLE = 6;
+const RELIABILITY_STEPS: OnboardingStep[] = [
+  'brand-build',
+  'icp',
+  'competitor',
+  'creative-dir',
+  'ad-image',
+  'ad-copy',
+];
 
 function buildDynamoDB(): AWS.DynamoDB.DocumentClient {
   return new AWS.DynamoDB.DocumentClient({
@@ -123,6 +143,10 @@ export async function runOnboardingLoop(): Promise<void> {
 
     const stats: StepStats[] = await sensorScan(users, config);
     console.log(`[OnboardingLoop] sensorScan: ${stats.length} step-variant data points`);
+    const reliability = computeReliabilitySummary(
+      users as HeartbeatUser[],
+      await readReliabilityMetricRows(),
+    );
 
     const allowlist = (process.env.ONBOARDING_LOOP_ALLOWLIST ?? '')
       .split(',')
@@ -186,6 +210,7 @@ export async function runOnboardingLoop(): Promise<void> {
       if (slackUserId && process.env.SLACK_BOT_TOKEN) {
         try {
           const metrics = computeHeartbeatMetrics(users, config);
+          metrics.reliability = reliability;
           const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
           const dm = await postHeartbeatSlackDM(metrics, slackUserId, slackClient);
           console.log(`[OnboardingLoop] Heartbeat DM posted — channel=${dm.channel} ts=${dm.ts}`);
@@ -221,7 +246,13 @@ export async function runOnboardingLoop(): Promise<void> {
     if (slackUserId && process.env.SLACK_BOT_TOKEN) {
       try {
         const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-        const dm = await postDailySlackDM(proposedMutations, stats, slackUserId, slackClient);
+        const dm = await postDailySlackDM(
+          proposedMutations,
+          stats,
+          slackUserId,
+          slackClient,
+          reliability,
+        );
         slackChannel = dm.channel;
         slackTs = dm.ts;
         console.log(`[OnboardingLoop] Slack DM posted — channel=${slackChannel} ts=${slackTs}`);
@@ -299,10 +330,26 @@ export async function runOnboardingLoop(): Promise<void> {
 export interface HeartbeatUser {
   userId?: string;
   createdAt?: string;
+  goal?: string;
+  emmaHelpInterests?: string[];
   onboardingStage?: string;
   onboardingEvents?: unknown;
   lastLoginTime?: string;
   lastActiveAt?: string;
+  brandBuildStatus?: string;
+  icpStatus?: string;
+  competitorStatus?: string;
+  creativeDirStatus?: string;
+  adImageStatus?: string;
+  adCopyStatus?: string;
+  adGenStatus?: string;
+  brandBuildStartedAt?: string;
+  icpStartedAt?: string;
+  competitorStartedAt?: string;
+  creativeDirStartedAt?: string;
+  adImageStartedAt?: string;
+  adCopyStartedAt?: string;
+  adGenStartedAt?: string;
 }
 
 export function computeHeartbeatMetrics(
@@ -379,4 +426,235 @@ export function computeHeartbeatMetrics(
     selfActive: { last24h: selfActive24.size, last7d: selfActive7d.size, last30d: selfActive30d.size },
     pilotRatio: pilotEligible > 0 ? pilotOnly / pilotEligible : null,
   };
+}
+
+type MetricRowsByStep = Partial<Record<OnboardingStep, OnboardingStepMetricInput[]>>;
+
+async function readReliabilityMetricRows(): Promise<MetricRowsByStep> {
+  const entries = await Promise.all(
+    RELIABILITY_STEPS.map(async (step): Promise<[OnboardingStep, OnboardingStepMetricInput[]]> => {
+      try {
+        return [step, await getRecentStepMetrics({ step, limit: 100 })];
+      } catch (err) {
+        console.warn('[OnboardingLoop] Failed to read onboarding reliability metrics', {
+          step,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return [step, []];
+      }
+    }),
+  );
+  return Object.fromEntries(entries) as MetricRowsByStep;
+}
+
+export function computeReliabilitySummary(
+  users: ReadonlyArray<HeartbeatUser>,
+  rowsByStep: MetricRowsByStep,
+  now: Date = new Date(),
+): OnboardingReliabilitySummary {
+  const stepSummaries = RELIABILITY_STEPS
+    .map((step): ReliabilityStepSummary | null => {
+      const rows = rowsByStep[step] ?? [];
+      if (rows.length === 0) return null;
+      const summary = summariseStepMetrics(rows);
+      const durations = rows
+        .map((r) => Number(r.durationMs))
+        .filter((n) => Number.isFinite(n) && n >= 0);
+      return {
+        step,
+        count: summary.count,
+        p50DurationMs: summary.p50DurationMs,
+        p95DurationMs: summary.p95DurationMs,
+        maxDurationMs: durations.length > 0 ? Math.max(...durations) : null,
+        failureRate: summary.failureRate,
+      };
+    })
+    .filter((s): s is ReliabilityStepSummary => Boolean(s));
+
+  const slowestStep = [...stepSummaries].sort(
+    (a, b) => (b.p95DurationMs ?? -1) - (a.p95DurationMs ?? -1),
+  )[0] ?? null;
+  const highestFailureStep = [...stepSummaries].sort(
+    (a, b) => b.failureRate - a.failureRate || (b.count - a.count),
+  )[0] ?? null;
+
+  const nowMs = now.getTime();
+  const stuckByStage: OnboardingReliabilitySummary['stuckByStage'] = {};
+  const complaintSignals: OnboardingReliabilitySummary['recentComplaintSignals'] = [];
+  const paidAds = {
+    users: 0,
+    completed: 0,
+    reachedAds: 0,
+    deviations: 0,
+    failedAdStepUsers: 0,
+  };
+
+  for (const user of users) {
+    const events = normalizeEvents(user.onboardingEvents);
+    const paidAdsUser = isPaidAdsUser(user, events);
+    const completed = events.some((e) => e.event === 'onboarding_completed');
+    const reachedAds =
+      events.some((e) => e.event === 'ads_generated') ||
+      user.adGenStatus === 'ready' ||
+      user.adImageStatus === 'ready' ||
+      user.adCopyStatus === 'ready';
+    const adStepFailed =
+      user.adGenStatus === 'failed' ||
+      user.adImageStatus === 'failed' ||
+      user.adCopyStatus === 'failed';
+
+    let userDeviationCount = 0;
+    for (const event of events) {
+      if (event.event !== 'deviation') continue;
+      const message = stringify(event.data?.message);
+      const step = stringify(event.data?.step) || '(unknown)';
+      const relevant =
+        paidAdsUser ||
+        /paid|ads?|campaign|meta/i.test(`${step} ${message}`);
+      if (!relevant) continue;
+      userDeviationCount++;
+      if (message) {
+        complaintSignals.push({
+          userId: user.userId ?? '(unknown-user)',
+          ts: event.ts,
+          step,
+          message,
+        });
+      }
+    }
+
+    if (paidAdsUser) {
+      paidAds.users++;
+      if (completed) paidAds.completed++;
+      if (reachedAds) paidAds.reachedAds++;
+      if (adStepFailed) paidAds.failedAdStepUsers++;
+      paidAds.deviations += userDeviationCount;
+    }
+
+    const stuck = classifyStuckUser(user, events, nowMs);
+    if (stuck) {
+      const existing = stuckByStage[stuck.stage] ?? { count: 0, oldestHours: 0 };
+      existing.count++;
+      existing.oldestHours = Math.max(existing.oldestHours, stuck.hours);
+      stuckByStage[stuck.stage] = existing;
+    }
+  }
+
+  complaintSignals.sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
+
+  return {
+    stepSummaries,
+    slowestStep,
+    highestFailureStep,
+    stuckByStage,
+    paidAds,
+    recentComplaintSignals: complaintSignals.slice(0, 5),
+    recommendedAction: buildReliabilityRecommendation({
+      stepSummaries,
+      slowestStep,
+      highestFailureStep,
+      paidAds,
+      complaintCount: complaintSignals.length,
+    }),
+  };
+}
+
+function normalizeEvents(raw: unknown): Array<{ event?: string; ts: string; data?: Record<string, unknown> }> {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((e): e is { event?: string; ts?: string; data?: Record<string, unknown> } => Boolean(e && typeof e === 'object'))
+    .map((e) => ({
+      event: e.event,
+      ts: typeof e.ts === 'string' ? e.ts : '',
+      data: e.data && typeof e.data === 'object' ? e.data : undefined,
+    }))
+    .filter((e) => e.ts.length > 0);
+}
+
+function isPaidAdsUser(
+  user: HeartbeatUser,
+  events: Array<{ event?: string; data?: Record<string, unknown> }>,
+): boolean {
+  if (user.goal === 'paid_ads') return true;
+  if (Array.isArray(user.emmaHelpInterests) && user.emmaHelpInterests.includes('paid_ads')) {
+    return true;
+  }
+  return events.some((e) => e.event === 'goal_selected' && e.data?.goal === 'paid_ads');
+}
+
+function classifyStuckUser(
+  user: HeartbeatUser,
+  events: Array<{ event?: string; ts: string }>,
+  nowMs: number,
+): { stage: string; hours: number } | null {
+  if (user.onboardingStage === 'onboarding_completed' || user.onboardingStage === 'active') {
+    return null;
+  }
+
+  const statuses = [
+    user.brandBuildStatus,
+    user.icpStatus,
+    user.competitorStatus,
+    user.creativeDirStatus,
+    user.adImageStatus,
+    user.adCopyStatus,
+    user.adGenStatus,
+  ].filter(Boolean);
+  const hasProblemStatus = statuses.some((s) => s === 'running' || s === 'building' || s === 'generating' || s === 'failed');
+  if (!hasProblemStatus && !user.onboardingStage) return null;
+
+  const lastTs = latestTimestamp([
+    ...events.map((e) => e.ts),
+    user.brandBuildStartedAt,
+    user.icpStartedAt,
+    user.competitorStartedAt,
+    user.creativeDirStartedAt,
+    user.adImageStartedAt,
+    user.adCopyStartedAt,
+    user.adGenStartedAt,
+    user.createdAt,
+  ]);
+  const hours = lastTs ? Math.max(0, (nowMs - Date.parse(lastTs)) / (60 * 60 * 1000)) : 0;
+  return { stage: user.onboardingStage || '(unknown)', hours };
+}
+
+function latestTimestamp(values: Array<string | undefined>): string | null {
+  let best: string | null = null;
+  let bestMs = -Infinity;
+  for (const value of values) {
+    if (!value) continue;
+    const ms = Date.parse(value);
+    if (!Number.isFinite(ms)) continue;
+    if (ms > bestMs) {
+      bestMs = ms;
+      best = value;
+    }
+  }
+  return best;
+}
+
+function stringify(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+function buildReliabilityRecommendation(input: {
+  stepSummaries: ReliabilityStepSummary[];
+  slowestStep: ReliabilityStepSummary | null;
+  highestFailureStep: ReliabilityStepSummary | null;
+  paidAds: OnboardingReliabilitySummary['paidAds'];
+  complaintCount: number;
+}): string {
+  if (input.stepSummaries.length === 0) {
+    return 'No step timing data found yet; verify AW-OnboardingMetrics writes before trusting copy-loop output.';
+  }
+  if (input.paidAds.deviations > 0 || input.complaintCount > 0) {
+    return 'Investigate paid-ads onboarding friction and recent deviation complaints before copy variants.';
+  }
+  if (input.highestFailureStep && input.highestFailureStep.failureRate > 0) {
+    return `Fix ${input.highestFailureStep.step} failure/timeout rate before copy variants.`;
+  }
+  if (input.slowestStep && (input.slowestStep.p95DurationMs ?? 0) >= 120_000) {
+    return `Reduce ${input.slowestStep.step} wait time before copy variants.`;
+  }
+  return 'Reliability looks stable from recent metrics; copy variants can be considered after reviewing qualitative complaints.';
 }
