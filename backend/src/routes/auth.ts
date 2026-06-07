@@ -395,6 +395,7 @@ const ALLOWED_EMMA_HELP_INTERESTS = new Set<string>([
   'outreach_smartlead',
   'paid_plus_organic',
   'not_sure',
+  'outreach',
 ]);
 
 // Persist the user's onboarding interests. Called from the onboarding flow;
