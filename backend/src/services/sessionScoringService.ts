@@ -95,6 +95,11 @@ IMPORTANT: Brand / topic mismatch:
 - Only lower the score for a mismatch if the assistant repeatedly refuses to produce ANY usable output after the user has clearly pushed back and asked it to proceed anyway. Flagging once (or flagging and then delivering a best-effort draft) should score as satisfied (score ≥ 4)
 - A brief flag followed by a usable deliverable is ideal; a flag with a clarifying question is acceptable and should not be treated as the user "having to repeat themselves"
 
+IMPORTANT: Draft/reply direction:
+- For drafting tasks involving multiple named parties, evaluate whether the assistant preserved the intended sender and recipient.
+- If the user explicitly asked for a reply TO one person FROM/on behalf of another person or team, drafting in the opposite direction is a goal-completion failure even if the wording is polished.
+- If sender/recipient direction was genuinely ambiguous, a single concise clarification such as "I'll draft this FROM X TO Y - correct?" is correct behavior and should not be penalized as excessive clarification.
+
 In addition to the overall score, rate three specific dimensions (1-5 each):
 - goalCompletion: Did the assistant fully accomplish what the user asked? Did the user get what they came for?
 - dataAccuracy: Did the output contain plausible, consistent, and factually coherent data? Penalize hallucinated facts, made-up numbers, or self-contradictions.
