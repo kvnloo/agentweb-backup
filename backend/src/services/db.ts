@@ -2651,6 +2651,9 @@ export const scheduleDb = {
       variableRequestAccessTokenHash: string;
       variableRequestAccessTokenExpiresAt: string;
       variableRequestAccessTokenConsumedAt: string;
+      zeroAssistantRetryCount: number;
+      lastZeroAssistantOutputAt: string;
+      lastZeroAssistantOutputSessionId: string;
     }>
   ) {
     try {
