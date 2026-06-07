@@ -23,7 +23,11 @@ import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
 import { skillService } from './skillService';
 import { extractVariables } from '../utils/templateParser';
-import { applyPrintLayoutFixes } from '../utils/pdfPrintLayout';
+import {
+  applyPrintLayoutFixes,
+  normalizePdfOrientation,
+  type PdfOrientation,
+} from '../utils/pdfPrintLayout';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData } from '../utils/llmService';
@@ -16628,7 +16632,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async convertToPdf(sourceUrl: string, outputFilename: string, userId: string): Promise<any> {
+  public async convertToPdf(
+    sourceUrl: string,
+    outputFilename: string,
+    userId: string,
+    orientation?: PdfOrientation
+  ): Promise<any> {
     try {
       console.log('AgentMode: Converting to PDF:', sourceUrl, 'for user:', userId);
 
@@ -16639,6 +16648,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         throw new Error('source_url must be an HTTP or HTTPS URL');
       }
 
+      const pdfOrientation = normalizePdfOrientation(orientation);
       const puppeteer = await import('puppeteer-core');
       let browser: any = null;
       try {
@@ -16651,9 +16661,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         await page.goto(sourceUrl, { waitUntil: 'networkidle0', timeout: 30000 });
         // Prevent sections/tables taller than a page from overflowing and
         // overwriting adjacent sections (relax unsatisfiable break-inside:avoid).
-        await applyPrintLayoutFixes(page, 'A4', '20mm', '20mm');
+        await applyPrintLayoutFixes(page, 'A4', '20mm', '20mm', pdfOrientation);
         const pdfBuffer = await page.pdf({
           format: 'A4',
+          landscape: pdfOrientation === 'landscape',
           printBackground: true,
           margin: { top: '20mm', bottom: '20mm', left: '15mm', right: '15mm' },
         });

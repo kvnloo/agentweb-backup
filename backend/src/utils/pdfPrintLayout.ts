@@ -24,19 +24,27 @@
 
 const PX_PER_MM = 96 / 25.4; // CSS reference pixel is 1/96in; 1in = 25.4mm
 
-/** Page heights in millimeters for supported Puppeteer paper formats. */
-const FORMAT_HEIGHT_MM: Record<string, number> = {
-  a4: 297,
-  letter: 279.4,
-  legal: 355.6,
-  a3: 420,
-  a5: 210,
-  tabloid: 431.8,
+export type PdfOrientation = "portrait" | "landscape";
+
+/** Page dimensions in millimeters for supported Puppeteer paper formats. */
+const FORMAT_SIZE_MM: Record<string, { width: number; height: number }> = {
+  a4: { width: 210, height: 297 },
+  letter: { width: 215.9, height: 279.4 },
+  legal: { width: 215.9, height: 355.6 },
+  a3: { width: 297, height: 420 },
+  a5: { width: 148, height: 210 },
+  tabloid: { width: 279.4, height: 431.8 },
 };
 
 /** Convert a millimeter measurement to CSS pixels at 96dpi. */
 export function mmToPx(mm: number): number {
   return mm * PX_PER_MM;
+}
+
+export function normalizePdfOrientation(
+  orientation: unknown
+): PdfOrientation {
+  return orientation === "landscape" ? "landscape" : "portrait";
 }
 
 /**
@@ -72,9 +80,13 @@ function marginToMm(margin: string | undefined): number {
 export function computePageContentHeightPx(
   format: string,
   marginTop: string | undefined,
-  marginBottom: string | undefined
+  marginBottom: string | undefined,
+  orientation: PdfOrientation = "portrait"
 ): number {
-  const heightMm = FORMAT_HEIGHT_MM[(format || "a4").toLowerCase()] ?? 297;
+  const size = FORMAT_SIZE_MM[(format || "a4").toLowerCase()] ?? FORMAT_SIZE_MM.a4;
+  const heightMm = normalizePdfOrientation(orientation) === "landscape"
+    ? size.width
+    : size.height;
   const usableMm = heightMm - marginToMm(marginTop) - marginToMm(marginBottom);
   return mmToPx(usableMm);
 }
@@ -137,12 +149,14 @@ export async function applyPrintLayoutFixes(
   },
   format: string,
   marginTop: string | undefined,
-  marginBottom: string | undefined
+  marginBottom: string | undefined,
+  orientation: PdfOrientation = "portrait"
 ): Promise<number> {
   const pageContentHeightPx = computePageContentHeightPx(
     format,
     marginTop,
-    marginBottom
+    marginBottom,
+    orientation
   );
 
   await page.addStyleTag({ content: PRINT_SAFETY_CSS });

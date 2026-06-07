@@ -49,6 +49,16 @@ describe("computePageContentHeightPx", () => {
     expect(Math.round(h)).toBe(Math.round(mmToPx(279.4)));
   });
 
+  it("uses the short side as printable height for A4 landscape PDFs", () => {
+    const h = computePageContentHeightPx(
+      "A4",
+      "0mm",
+      "0mm",
+      "landscape"
+    );
+    expect(Math.round(h)).toBe(Math.round(mmToPx(210)));
+  });
+
   it("treats missing margins as zero", () => {
     const h = computePageContentHeightPx("A4", undefined, undefined);
     expect(Math.round(h)).toBe(Math.round(mmToPx(297)));
@@ -146,6 +156,28 @@ describe("applyPrintLayoutFixes", () => {
     expect(Math.round(calls.maxHeight!)).toBe(
       Math.round(computePageContentHeightPx("A4", "20mm", "20mm"))
     );
+  });
+
+  it("passes landscape page content height into the in-browser relaxation pass", async () => {
+    let maxHeight: number | undefined;
+    const page = {
+      addStyleTag: async () => {},
+      emulateMediaType: async () => {},
+      evaluate: async (_fn: (...a: any[]) => any, max: number) => {
+        maxHeight = max;
+        return 0;
+      },
+    };
+
+    await applyPrintLayoutFixes(
+      page,
+      "A4",
+      "20mm",
+      "20mm",
+      "landscape"
+    );
+
+    expect(Math.round(maxHeight!)).toBe(Math.round(mmToPx(170)));
   });
 
   it("works when the page has no emulateMediaType (still injects CSS and evaluates)", async () => {

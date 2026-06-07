@@ -5087,12 +5087,17 @@ emmaToolRegistry.register({
           type: 'string',
           description: 'Desired filename for the PDF (without extension, e.g. "sentriq-readiness-checklist-v5")',
         },
+        orientation: {
+          type: 'string',
+          enum: ['portrait', 'landscape'],
+          description: 'Optional PDF orientation. Use "landscape" for 16:9 presentations or other wide HTML layouts. Defaults to "portrait".',
+        },
       },
       required: ['source_url', 'output_filename'],
     },
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.convertToPdf(args.source_url, args.output_filename, context?.userId);
+    return await agentModeService.convertToPdf(args.source_url, args.output_filename, context?.userId, args.orientation);
   },
 });
 
