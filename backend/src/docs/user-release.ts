@@ -18,6 +18,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-06-07',
+    changes: [
+      'Fixed: Wide Presentations Now Export to PDF in Landscape — No More Cut-Off Slides',
+      '- When you turned a landscape HTML presentation (like a 16:9 pitch deck) into a PDF, it defaulted to a tall portrait page and chopped off the right side of every slide',
+      '- PDFs now detect a wide layout automatically and lay it out in landscape, and any content that is still slightly too wide is scaled to fit so nothing is clipped off the edge',
+      '- You can also tell Emma the orientation explicitly ("export this as a landscape PDF") when you want to force portrait or landscape',
+    ],
+  },
+  {
     date: '2026-06-04',
     changes: [
       'New: Facebook/Meta Ads Can Now Use a Different Image per Placement (Fixes "Needs a 9:16 for Stories/Reels")',
