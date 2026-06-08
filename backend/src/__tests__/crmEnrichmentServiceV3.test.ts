@@ -1123,7 +1123,8 @@ describe('runEnrichment — smart fields', () => {
     expect(setCallArgs.enrichmentMetadata?.isQualified?.source).toBe('llm');
   });
 
-  it('skips evaluateSmartField when all deps could not be enriched', async () => {
+  it('evaluates smart field via LLM even when no deps could be enriched (lets the LLM decide)', async () => {
+    const evaluateSmartField = jest.fn().mockResolvedValue({ value: 'false', reasoning: 'tiny company' });
     const deps = makeDeps({
       loadLeads: jest.fn().mockResolvedValue([makeLead()]),
       runWaterfall: jest.fn().mockResolvedValue({
@@ -1131,13 +1132,37 @@ describe('runEnrichment — smart fields', () => {
         missing: ['funding_stage', 'total_funding'],
         tierFills: { crm: 0, apollo: 0, web: 0, missing: 2 },
       }),
-      evaluateSmartField: jest.fn().mockResolvedValue({ value: 'true', reasoning: '' }),
+      evaluateSmartField,
     });
 
     await runEnrichment(makeInput({ config: makeSmartConfig() }), deps);
 
-    // No dep data available → evaluateSmartField must NOT be called (save LLM tokens)
-    expect(deps.evaluateSmartField).not.toHaveBeenCalled();
+    // No dep data → still ask the LLM (it has native lead context); pass through the empty dep values.
+    expect(evaluateSmartField).toHaveBeenCalledWith(
+      expect.objectContaining({
+        fieldName: 'isQualified',
+        condition: 'true when series A or later and total funding > $1M',
+        depValues: {},
+      }),
+    );
+  });
+
+  it('writes the LLM-decided value when no dep data was available', async () => {
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead()]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: [],
+        missing: ['funding_stage', 'total_funding'],
+        tierFills: { crm: 0, apollo: 0, web: 0, missing: 2 },
+      }),
+      evaluateSmartField: jest.fn().mockResolvedValue({ value: 'false', reasoning: 'tiny company' }),
+    });
+
+    await runEnrichment(makeInput({ config: makeSmartConfig() }), deps);
+
+    const setCallArgs = (deps.setLeadFields as jest.Mock).mock.calls[0][0];
+    expect(setCallArgs.customFields).toMatchObject({ isQualified: 'false' });
+    expect(setCallArgs.enrichmentMetadata?.isQualified?.source).toBe('llm');
   });
 
   it('succeeds overall when evaluateSmartField throws — smart field just missing', async () => {
