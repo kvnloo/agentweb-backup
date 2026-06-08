@@ -602,11 +602,11 @@ createTestAccount().then(async () => {
       }
 
       // AI Readiness Funnel closed-loop — daily at 16:30 UTC, offset 30 min from
-      // ai-eval (16:00) so they don't race for Slack/Bedrock. Default ON (the
-      // loop is the value); kill with AI_READINESS_LOOP_ENABLED=false. The loop
-      // itself is always REGISTERED in app.ts so event ingestion works
-      // regardless of this schedule flag.
-      if (process.env.AI_READINESS_LOOP_ENABLED !== 'false') {
+      // ai-eval (16:00) so they don't race for Slack/Bedrock. Explicit opt-in so
+      // staging/dev environments with Emma Dev tokens cannot start DMing by
+      // accident. The loop itself is always REGISTERED in app.ts so event
+      // ingestion works regardless of this schedule flag.
+      if (process.env.AI_READINESS_LOOP_ENABLED === 'true') {
         try {
           const AI_READINESS_LOOP_INTERVAL_MS = 24 * 60 * 60 * 1000;
           const { runAiReadinessLoopOnce } = await import('./loops/instances/ai-readiness-funnel');
@@ -632,7 +632,7 @@ createTestAccount().then(async () => {
           console.error('[AiReadinessLoop] Failed to initialize:', error);
         }
       } else {
-        console.log('[AiReadinessLoop] Disabled (AI_READINESS_LOOP_ENABLED=false)');
+        console.log('[AiReadinessLoop] Disabled (set AI_READINESS_LOOP_ENABLED=true to enable)');
       }
 
       // Onboarding loop V2 (framework port, REVAMP) — daily at 17:00 UTC (9am
@@ -670,4 +670,4 @@ createTestAccount().then(async () => {
 
     }, 30000); // Delay 30s after startup to allow Agent Mode to boot first
   });
-}); 
+});

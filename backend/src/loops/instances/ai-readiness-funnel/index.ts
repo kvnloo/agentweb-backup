@@ -16,9 +16,10 @@
  *
  * Registration is ALWAYS performed (so /api/loop-events accepts + stores the
  * lander's events). The daily analysis run is scheduled separately in
- * server.ts and is killable via AI_READINESS_LOOP_ENABLED=false.
+ * server.ts and must be explicitly enabled via AI_READINESS_LOOP_ENABLED=true.
  */
 
+import AWS from 'aws-sdk';
 import {
   getLoopManifest,
   getRegisteredLoopIds,
@@ -32,7 +33,7 @@ import {
 import { CaptureGate } from '../../core/gates/captureGate';
 import { InMemoryLearningStore } from '../../core/learning/inMemoryLearningStore';
 import { LlmAnalystRuleSet } from '../../core/policy/llmAnalystRuleSet';
-import { EventTableEventSource } from '../../core/sensors/eventTableEventSource';
+import { EventTableEventSource, LOOP_EVENTS_TABLE } from '../../core/sensors/eventTableEventSource';
 import { SpecOutputTool } from '../../core/tools/specOutputTool';
 import { runLoop } from '../../core/orchestrator';
 import { productionLoopPorts } from '../../adapters/awsAdapters';
@@ -49,9 +50,11 @@ const READINESS_SCOPE = {
   dimensionKey: 'landerPath',
   dimensionValue: '/ai-readiness',
 } as const;
+const DAILY_DIGEST_CLAIM_LOOP_ID = `${AI_READINESS_LOOP_ID}#daily-digest`;
 
 // Held so the tick can drain the gate after the orchestrator returns.
 let aiReadinessGate: CaptureGate | null = null;
+let digestDynamo: AWS.DynamoDB.DocumentClient | null = null;
 
 /**
  * Register the loop. Idempotent. Does NOT reset the registry, so it coexists
@@ -159,6 +162,75 @@ function constraintLine(s: FunnelShape): string {
   return `_No disproportionate leak this window. Watch the shape above; the next push is whichever stage is thinnest._`;
 }
 
+interface DailyDigestClaimItem {
+  loopId: string;
+  tsSession: string;
+  eventType: 'digest_posted';
+  subjectId: string;
+  ts: string;
+  dimensions: {
+    digestDate: string;
+    loopId: string;
+    runId: string;
+    slackUserId: string;
+  };
+}
+
+function dailyDigestDynamo(): AWS.DynamoDB.DocumentClient {
+  if (!digestDynamo) {
+    digestDynamo = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || 'us-west-2' });
+  }
+  return digestDynamo;
+}
+
+function buildDailyDigestClaimItem(
+  digestDate: string,
+  slackUserId: string,
+  runId: string,
+  now = new Date(),
+): DailyDigestClaimItem {
+  return {
+    loopId: DAILY_DIGEST_CLAIM_LOOP_ID,
+    tsSession: digestDate,
+    eventType: 'digest_posted',
+    subjectId: slackUserId,
+    ts: now.toISOString(),
+    dimensions: {
+      digestDate,
+      loopId: AI_READINESS_LOOP_ID,
+      runId,
+      slackUserId,
+    },
+  };
+}
+
+function isConditionalCheckFailed(err: unknown): boolean {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    'code' in err &&
+    (err as { code?: unknown }).code === 'ConditionalCheckFailedException'
+  );
+}
+
+async function claimDailyDigestPost(digestDate: string, slackUserId: string, runId: string): Promise<boolean> {
+  try {
+    await dailyDigestDynamo()
+      .put({
+        TableName: LOOP_EVENTS_TABLE,
+        Item: buildDailyDigestClaimItem(digestDate, slackUserId, runId),
+        ConditionExpression: 'attribute_not_exists(loopId) AND attribute_not_exists(tsSession)',
+      })
+      .promise();
+    return true;
+  } catch (err) {
+    if (isConditionalCheckFailed(err)) return false;
+    throw err;
+  }
+}
+
+type DailyDigestClaim = (digestDate: string, slackUserId: string, runId: string) => Promise<boolean>;
+
 /** Build the digest DM lines. Pure (no I/O) so it can be unit-tested across
  * the three branches: empty window, no-finding (constraint), and findings.
  * Never emits "healthy". */
@@ -193,11 +265,27 @@ async function postDigest(
   shape: FunnelShape | null,
   slack: { postMessage: (channelOrUserId: string, markdown: string) => Promise<unknown> },
   slackUserId: string | undefined,
+  claimDigest: DailyDigestClaim = claimDailyDigestPost,
 ): Promise<void> {
   if (!slackUserId) {
     console.warn('[ai-readiness-funnel] no approval.slackUserId — skipping DM');
     return;
   }
+
+  const digestDate = new Date().toISOString().slice(0, 10);
+  let claimed = false;
+  try {
+    claimed = await claimDigest(digestDate, slackUserId, result.runId);
+  } catch (err) {
+    console.error('[ai-readiness-funnel] daily digest claim failed; skipping Slack DM:', err);
+    return;
+  }
+
+  if (!claimed) {
+    console.log(`[ai-readiness-funnel] daily digest already posted for ${digestDate}; skipping duplicate DM`);
+    return;
+  }
+
   try {
     await slack.postMessage(slackUserId, buildDigestLines(result, shape).join('\n'));
   } catch (err) {
@@ -207,4 +295,4 @@ async function postDigest(
 
 /** Test seam. */
 export const _internal = { get aiReadinessGate() { return aiReadinessGate; } };
-export const _testing = { summarizeFunnel, buildDigestLines };
+export const _testing = { summarizeFunnel, buildDigestLines, buildDailyDigestClaimItem, postDigest };

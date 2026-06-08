@@ -12,7 +12,7 @@ import { _testing } from '../loops/instances/ai-readiness-funnel';
 import type { DynamoPort, DynamoAttributeMap } from '../loops/core/ports';
 import type { LoopRunResult } from '../loops/core/types';
 
-const { summarizeFunnel, buildDigestLines } = _testing;
+const { summarizeFunnel, buildDigestLines, buildDailyDigestClaimItem, postDigest } = _testing;
 
 function dynamoReturning(items: DynamoAttributeMap[]): DynamoPort {
   return {
@@ -99,5 +99,35 @@ describe('ai-readiness-funnel buildDigestLines — never reports "healthy"', () 
     expect(lines).toContain('What I found');
     expect(lines).toContain('Quiz step drops 40%');
     expect(lines).toContain('shorten the quiz to one question');
+  });
+});
+
+describe('ai-readiness-funnel daily digest posting', () => {
+  it('builds a deterministic daily claim row keyed by loop + date', () => {
+    const claim = buildDailyDigestClaimItem('2026-06-08', 'U08TM4QFQ1L', 'run_test', new Date('2026-06-08T16:30:00.000Z'));
+    expect(claim.loopId).toBe('ai-readiness-funnel#daily-digest');
+    expect(claim.tsSession).toBe('2026-06-08');
+    expect(claim.subjectId).toBe('U08TM4QFQ1L');
+    expect(claim.dimensions.runId).toBe('run_test');
+  });
+
+  it('posts the Slack digest when the daily claim succeeds', async () => {
+    const slack = { postMessage: jest.fn().mockResolvedValue({ ok: true }) };
+    const claimDigest = jest.fn().mockResolvedValue(true);
+
+    await postDigest(result({ eventsScanned: 0 }), null, slack, 'U08TM4QFQ1L', claimDigest);
+
+    expect(claimDigest).toHaveBeenCalledWith(expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/), 'U08TM4QFQ1L', 'run_test');
+    expect(slack.postMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips Slack when another scheduler already claimed the daily digest', async () => {
+    const slack = { postMessage: jest.fn().mockResolvedValue({ ok: true }) };
+    const claimDigest = jest.fn().mockResolvedValue(false);
+
+    await postDigest(result({ eventsScanned: 0 }), null, slack, 'U08TM4QFQ1L', claimDigest);
+
+    expect(claimDigest).toHaveBeenCalledTimes(1);
+    expect(slack.postMessage).not.toHaveBeenCalled();
   });
 });
