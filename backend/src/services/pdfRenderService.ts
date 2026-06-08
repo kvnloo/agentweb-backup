@@ -22,6 +22,8 @@ import {
   chooseOrientation,
   computePageContentWidthPx,
   computeFitScale,
+  readAuthoredPageRule,
+  parsePageSize,
   Orientation,
 } from "../utils/pdfPrintLayout";
 
@@ -59,6 +61,12 @@ export interface RenderHtmlToPdfResult {
   orientation: Orientation;
   /** The scale applied to fit content to the page width (1 = no scaling). */
   scale: number;
+  /**
+   * True when the document declared its own `@page { size }` and we rendered at
+   * exactly that page size + margin (e.g. a slide deck authored at 11in×8.5in),
+   * rather than forcing a paper format. Lets callers/tests assert edge-to-edge.
+   */
+  honoredAuthoredPageSize: boolean;
 }
 
 /**
@@ -99,9 +107,45 @@ export async function renderHtmlToPdf(
       });
     }
 
-    // Decide orientation: explicit wins, otherwise infer from how well the
-    // content's width fits a portrait vs landscape page (width is the right
-    // signal — a deck is wide slides stacked tall, so aspect ratio misleads).
+    // ── Path 1: the document declares its own @page size (e.g. a slide deck
+    // authored at "11in 8.5in; margin: 0"). Honor it exactly — render at that
+    // page size with the CSS margins and no fit-shrink — so the slide prints
+    // edge-to-edge. Forcing a paper format here is what left a band at the
+    // bottom and clipped the right edge. Only used when the caller did not
+    // explicitly override orientation/format.
+    const callerOverrodeLayout =
+      requestedOrientation !== "auto" || opts.format !== undefined;
+    if (!callerOverrodeLayout) {
+      const authored = parsePageSize(
+        (await readAuthoredPageRule(page))?.size
+      );
+      if (authored) {
+        // The document owns its layout (fixed-size slides paginated with
+        // break-after: page). Don't inject the report break-inside relaxation —
+        // just render at the authored size with preferCSSPageSize so Chrome uses
+        // the @page box and its margin. No fit-shrink: scale stays 1.
+        const pdfBuffer = await page.pdf({
+          width: `${authored.widthMm}mm`,
+          height: `${authored.heightMm}mm`,
+          printBackground: true,
+          preferCSSPageSize: true,
+          scale: 1,
+          // Authored @page declares its own margin; do not inject ours.
+          margin: { top: "0", bottom: "0", left: "0", right: "0" },
+        });
+        return {
+          buffer: Buffer.from(pdfBuffer),
+          orientation: authored.orientation,
+          scale: 1,
+          honoredAuthoredPageSize: true,
+        };
+      }
+    }
+
+    // ── Path 2 (fallback): no authored @page size. Decide orientation from how
+    // well the content's width fits a portrait vs landscape page (width is the
+    // right signal — a deck is wide slides stacked tall, so aspect ratio
+    // misleads), then scale to fit so the right edge is never clipped.
     const content = await measureContentSize(page);
     const portraitWidthPx = computePageContentWidthPx(
       format,
@@ -145,7 +189,12 @@ export async function renderHtmlToPdf(
       margin,
     });
 
-    return { buffer: Buffer.from(pdfBuffer), orientation, scale };
+    return {
+      buffer: Buffer.from(pdfBuffer),
+      orientation,
+      scale,
+      honoredAuthoredPageSize: false,
+    };
   } finally {
     if (browser) {
       try {

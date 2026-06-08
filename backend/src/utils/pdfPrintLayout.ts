@@ -73,6 +73,100 @@ function marginToMm(margin: string | undefined): number {
 
 export type Orientation = "portrait" | "landscape";
 
+/** Parse a single CSS length token (e.g. "11in", "210mm") into mm, else null. */
+function lengthToMm(token: string): number | null {
+  const match = /^([\d.]+)(mm|cm|in|px|pt)?$/.exec(token.trim());
+  if (!match) return null;
+  const value = parseFloat(match[1]);
+  if (!isFinite(value)) return null;
+  switch (match[2]) {
+    case "cm":
+      return value * 10;
+    case "in":
+      return value * 25.4;
+    case "px":
+      return value / PX_PER_MM;
+    case "pt":
+      return (value / 72) * 25.4;
+    case "mm":
+      return value;
+    default:
+      // A unitless length is invalid for @page size; treat as unresolved.
+      return null;
+  }
+}
+
+/**
+ * A page size resolved from a CSS `@page { size: ... }` declaration, in mm.
+ * `orientation` is reported for logging/wiring; the width/height are already
+ * swapped so width is the page's horizontal extent.
+ */
+export interface AuthoredPageSize {
+  widthMm: number;
+  heightMm: number;
+  orientation: Orientation;
+}
+
+/**
+ * Parse a CSS `@page` `size` value into concrete page dimensions.
+ *
+ * Honoring a document's own `@page` size is what makes a slide deck print
+ * edge-to-edge: the deck declares e.g. `size: 11in 8.5in; margin: 0`, and we
+ * render at exactly that instead of forcing A4 + margins (which clips the right
+ * and leaves a band at the bottom).
+ *
+ * Supported forms:
+ *   - two lengths:  "11in 8.5in"      → 279.4 × 215.9 mm
+ *   - one length:   "8.5in"           → square 215.9 × 215.9 mm
+ *   - named:        "A4", "Letter"    → format dimensions (portrait)
+ *   - named + kw:   "A4 landscape"    → format dimensions, swapped
+ *   - keyword only: "landscape"       → null (no concrete size; caller decides)
+ *   - "auto"/empty/unparseable        → null
+ */
+export function parsePageSize(size: string | undefined): AuthoredPageSize | null {
+  if (!size) return null;
+  const tokens = size.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return null;
+  if (tokens.length === 1 && (tokens[0] === "auto" || tokens[0] === "")) {
+    return null;
+  }
+
+  // Explicit length(s): one or two CSS lengths.
+  const lengths = tokens.map(lengthToMm);
+  if (lengths.every((l) => l !== null)) {
+    if (lengths.length === 1) {
+      const s = lengths[0] as number;
+      return { widthMm: s, heightMm: s, orientation: "portrait" };
+    }
+    if (lengths.length === 2) {
+      const w = lengths[0] as number;
+      const h = lengths[1] as number;
+      return {
+        widthMm: w,
+        heightMm: h,
+        orientation: w >= h ? "landscape" : "portrait",
+      };
+    }
+    return null;
+  }
+
+  // Named format, optionally with a portrait/landscape keyword.
+  const orientationKw = tokens.find(
+    (t) => t === "portrait" || t === "landscape"
+  ) as Orientation | undefined;
+  const formatKw = tokens.find((t) => t in FORMAT_DIMENSIONS_MM);
+  if (formatKw) {
+    const dims = FORMAT_DIMENSIONS_MM[formatKw];
+    const orientation = orientationKw ?? "portrait";
+    const widthMm = orientation === "landscape" ? dims.height : dims.width;
+    const heightMm = orientation === "landscape" ? dims.width : dims.height;
+    return { widthMm, heightMm, orientation };
+  }
+
+  // Keyword-only (e.g. "landscape") has no concrete size — let the caller decide.
+  return null;
+}
+
 /**
  * Compute the printable content height (in CSS px) for a paper format and
  * top/bottom margins — i.e. how tall an element can be before it can no longer
@@ -278,4 +372,41 @@ export async function measureContentSize(page: {
     );
     return { width, height };
   })) as { width: number; height: number };
+}
+
+/** Raw `size`/`margin` strings read from a document's first `@page` rule. */
+export interface AuthoredPageRule {
+  size?: string;
+  margin?: string;
+}
+
+/**
+ * Read the first `@page` rule's `size`/`margin` from the document's stylesheets
+ * inside a Puppeteer page. Returns null when no `@page` rule is declared.
+ *
+ * Cross-origin stylesheets throw on `.cssRules` access; those are skipped so a
+ * remote font/CSS import can't break detection.
+ */
+export async function readAuthoredPageRule(page: {
+  evaluate: (fn: (...args: any[]) => any, ...args: any[]) => Promise<any>;
+}): Promise<AuthoredPageRule | null> {
+  return (await page.evaluate(() => {
+    for (const sheet of Array.from(document.styleSheets)) {
+      let rules: any;
+      try {
+        rules = (sheet as CSSStyleSheet).cssRules;
+      } catch {
+        continue; // cross-origin sheet — not readable
+      }
+      for (const rule of Array.from(rules || [])) {
+        if (rule && rule.constructor && rule.constructor.name === "CSSPageRule") {
+          const style = (rule as any).style || {};
+          const size = style.size || undefined;
+          const margin = style.margin || undefined;
+          if (size || margin) return { size, margin };
+        }
+      }
+    }
+    return null;
+  })) as AuthoredPageRule | null;
 }
