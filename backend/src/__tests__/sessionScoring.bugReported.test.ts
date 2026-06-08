@@ -86,6 +86,24 @@ describe('SessionScoring - bug reported during session', () => {
     expect(DEFAULT_SCORING_SYSTEM_PROMPT).toContain('dimension scores');
   });
 
+  // Brand / topic mismatch clause: flagging a mismatch is correct behavior, not a failure
+
+  it('DEFAULT_SCORING_SYSTEM_PROMPT includes a brand/topic mismatch clause', () => {
+    expect(DEFAULT_SCORING_SYSTEM_PROMPT).toContain('Brand / topic mismatch');
+  });
+
+  it('DEFAULT_SCORING_SYSTEM_PROMPT instructs judge not to penalize flagging a mismatch', () => {
+    expect(DEFAULT_SCORING_SYSTEM_PROMPT).toContain('Do NOT penalize the assistant for surfacing a brand/topic mismatch');
+  });
+
+  it('DEFAULT_SCORING_SYSTEM_PROMPT mentions placeholders as acceptable output', () => {
+    expect(DEFAULT_SCORING_SYSTEM_PROMPT).toContain('[Brand Name]');
+  });
+
+  it('DEFAULT_SCORING_SYSTEM_PROMPT only lowers mismatch score on repeated refusal after pushback', () => {
+    expect(DEFAULT_SCORING_SYSTEM_PROMPT).toContain('repeatedly refuses to produce ANY usable output');
+  });
+
   // SUCCESS: verify the tool call appears in the serialized conversation and prompt passes through
 
   it('serialized conversation text includes report_product_issues in called tools line', async () => {

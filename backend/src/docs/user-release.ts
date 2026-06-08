@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-06-04
+// Last updated: 2026-06-05
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,67 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-06-07',
+    changes: [
+      'Fixed: Emma\'s Local Browser Agent No Longer Times Out on Slow Pages',
+      '- When Emma fell back to your local browser agent to read a site that blocks the cloud browser, long-running scans would fail partway through with a connection error and return nothing',
+      '- The connection now stays alive during multi-minute scans, so results come back reliably instead of dropping',
+      '- The maximum time Emma will wait for one of these browser tasks has also been raised, so heavier pages have room to finish',
+    ],
+  },
+  {
+    date: '2026-06-04',
+    changes: [
+      'New: Facebook/Meta Ads Can Now Use a Different Image per Placement (Fixes "Needs a 9:16 for Stories/Reels")',
+      '- When an ad set uses manual placements that include Stories and Reels, an ad with only a square/Feed image was rejected by Meta for "lacking a 9:16 format" and got paused automatically',
+      '- You can now attach a vertical 9:16 image for Stories/Reels while keeping the square image for the Feed — all in the same ad — without touching Ads Manager',
+      '- Just ask to update the ad with the extra placement image; we build the combined creative and point your existing ad at it, so the same ad keeps running with the right image in every placement',
+    ],
+  },
+  {
+    date: '2026-06-05',
+    changes: [
+      'Improved: Leads Without an Email Now Sync to HubSpot Too',
+      '- Previously a lead with no email address was silently left out of your HubSpot sync, because HubSpot normally matches contacts by email',
+      '- These leads are now pushed to HubSpot using their other details (name, company, phone, and any mapped fields), so your whole list makes it over',
+      '- If a lead was already synced before losing its email, we update that same HubSpot contact instead of creating a duplicate',
+    ],
+  },
+  {
+    date: '2026-06-05',
+    changes: [
+      'Fixed: One Bad Email No Longer Blocks Your HubSpot Sync',
+      '- When a lead\'s email field actually held something else (like a profile URL such as https://superdm.me/chessbaseindia), HubSpot rejected it as an invalid email and the lead showed up as a sync error',
+      '- These leads are now skipped cleanly with a clear note in the Sync Result, so the rest of your list still syncs without interruption',
+    ],
+  },
+  {
+    date: '2026-06-05',
+    changes: [
+      'Improved: Logos Now Blend Cleanly Into Newsletter Headers and Colored Sections',
+      '- When a logo needs to sit on a colored or gradient background (like a newsletter header), Emma now recreates the logo on that exact background so there\'s no leftover box or mismatched edge behind it',
+      '- If the same logo appears on two different backgrounds — for example a purple header and a dark footer — Emma makes a matching version for each spot',
+      '- This avoids the earlier problem where a logo could show an ugly solid box on a colored background, without needing you to re-export a transparent file',
+    ],
+  },
+  {
+    date: '2026-06-05',
+    changes: [
+      'Improved: Your CRM Now Updates Itself While Emma Works — No More Manual Refresh',
+      '- When Emma changes a lead\'s status, sends an email, logs activity, imports leads, or edits a list, those changes now appear in your CRM automatically — you no longer have to reload the page to see them',
+      '- The update happens right where you are: if you\'re on page 2 (or any later page) of a long list, it refreshes in place instead of jumping you back to the first page',
+      '- If you have a lead\'s detail panel open, its activity timeline refreshes too, so a freshly sent email or logged note shows up immediately',
+    ],
+  },
+  {
+    date: '2026-06-05',
+    changes: [
+      'Fixed: Team Members Can Now Set Up External CRM Sync on Shared Lead Lists',
+      '- When a teammate opened "External CRM sync" on a lead list owned by someone else in your organization and picked HubSpot or Attio, it failed with "Failed to load your sync configuration"',
+      '- Any member of your organization can now view, configure, and run HubSpot/Attio sync on shared lead lists, matching how the rest of your shared CRM already works',
+    ],
+  },
   {
     date: '2026-06-05',
     changes: [

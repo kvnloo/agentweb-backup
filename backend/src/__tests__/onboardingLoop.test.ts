@@ -16,6 +16,8 @@
 // ---------------------------------------------------------------------------
 const mockGetObject = jest.fn();
 const mockPutObject = jest.fn();
+const mockDynamoDBPut = jest.fn();
+const mockDynamoDBQuery = jest.fn();
 jest.mock('aws-sdk', () => ({
   __esModule: true,
   default: {
@@ -26,12 +28,11 @@ jest.mock('aws-sdk', () => ({
     DynamoDB: {
       DocumentClient: jest.fn().mockImplementation(() => ({
         put: mockDynamoDBPut,
+        query: mockDynamoDBQuery,
       })),
     },
   },
 }));
-
-const mockDynamoDBPut = jest.fn();
 
 // ---------------------------------------------------------------------------
 // Mock LLMService
@@ -894,6 +895,7 @@ describe('runOnboardingLoop', () => {
     mockGetObject.mockReset();
     mockPutObject.mockReset();
     mockDynamoDBPut.mockReturnValue({ promise: () => Promise.resolve() });
+    mockDynamoDBQuery.mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) });
     mockGetAllUsers.mockResolvedValue([]);
     mockConversationsOpen.mockResolvedValue({ channel: { id: 'C123' } });
     mockChatPostMessage.mockResolvedValue({ ok: true, ts: '123.456' });

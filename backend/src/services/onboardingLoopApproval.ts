@@ -71,15 +71,56 @@ export interface HeartbeatMetrics {
   completions: { last24h: number; last7d: number };
   selfActive: { last24h: number; last7d: number; last30d: number }; // distinct users with non-delegated activity in window
   pilotRatio: number | null; // fraction of users where lastLoginTime exists but lastActiveAt doesn't (0..1), null if no data
+  reliability?: OnboardingReliabilitySummary;
+}
+
+export interface ReliabilityStepSummary {
+  step: string;
+  count: number;
+  p50DurationMs: number | null;
+  p95DurationMs: number | null;
+  maxDurationMs: number | null;
+  failureRate: number;
+}
+
+export interface OnboardingComplaintSignal {
+  userId: string;
+  ts: string;
+  step: string;
+  message: string;
+}
+
+export interface OnboardingReliabilitySummary {
+  stepSummaries: ReliabilityStepSummary[];
+  slowestStep: ReliabilityStepSummary | null;
+  highestFailureStep: ReliabilityStepSummary | null;
+  stuckByStage: Record<string, { count: number; oldestHours: number }>;
+  paidAds: {
+    users: number;
+    completed: number;
+    reachedAds: number;
+    deviations: number;
+    failedAdStepUsers: number;
+  };
+  recentComplaintSignals: OnboardingComplaintSignal[];
+  recommendedAction: string;
 }
 
 export function formatHeartbeat(m: HeartbeatMetrics): string {
   const lines: string[] = [];
   lines.push(`🟢 *Onboarding Loop — Heartbeat (${m.todayStr})*`);
   lines.push('');
-  lines.push(`*Status:* Healthy. No mutations to propose today.`);
+  lines.push(
+    m.reliability
+      ? `*Status:* Reliability check complete. Copy mutations are secondary.`
+      : `*Status:* Healthy. No mutations to propose today.`,
+  );
   lines.push(`_Why:_ ${m.reason}`);
   lines.push('');
+  if (m.reliability) {
+    lines.push(...formatReliabilityBlock(m.reliability));
+    lines.push('');
+  }
   lines.push(`*Last 24h*`);
   lines.push(`  • New signups: ${m.signups.last24h}`);
   lines.push(`  • Completed onboarding: ${m.completions.last24h}`);
@@ -119,6 +160,70 @@ export function formatHeartbeat(m: HeartbeatMetrics): string {
   return lines.join('\n');
 }
 
+function formatReliabilityBlock(r: OnboardingReliabilitySummary): string[] {
+  const lines: string[] = [];
+  lines.push('*Reliability*');
+  if (r.slowestStep) {
+    lines.push(
+      `  • Slowest step: ${r.slowestStep.step} — p50 ${formatDuration(r.slowestStep.p50DurationMs)}, p95 ${formatDuration(r.slowestStep.p95DurationMs)}, max ${formatDuration(r.slowestStep.maxDurationMs)} (n=${r.slowestStep.count})`,
+    );
+  } else {
+    lines.push('  • Step timings: no completed step metrics yet');
+  }
+  if (r.highestFailureStep && r.highestFailureStep.failureRate > 0) {
+    lines.push(
+      `  • Highest failure/timeout: ${r.highestFailureStep.step} — ${formatPercent(r.highestFailureStep.failureRate)} (n=${r.highestFailureStep.count})`,
+    );
+  } else {
+    lines.push('  • Highest failure/timeout: none in recent step metrics');
+  }
+
+  const stuckEntries = Object.entries(r.stuckByStage)
+    .sort((a, b) => b[1].count - a[1].count || b[1].oldestHours - a[1].oldestHours)
+    .slice(0, 3);
+  if (stuckEntries.length > 0) {
+    lines.push(
+      `  • Stuck users: ${stuckEntries
+        .map(([stage, info]) => `${stage}=${info.count} (oldest ${info.oldestHours.toFixed(1)}h)`)
+        .join(', ')}`,
+    );
+  } else {
+    lines.push('  • Stuck users: none detected from current statuses/events');
+  }
+
+  const paidAdsCompletion =
+    r.paidAds.users > 0 ? `${r.paidAds.completed}/${r.paidAds.users}` : '0/0';
+  lines.push(
+    `  • Paid ads: users=${r.paidAds.users}, completed=${paidAdsCompletion}, reached ads=${r.paidAds.reachedAds}, deviations=${r.paidAds.deviations}, failed ad steps=${r.paidAds.failedAdStepUsers}`,
+  );
+
+  if (r.recentComplaintSignals.length > 0) {
+    lines.push('  • Recent complaint signals:');
+    for (const signal of r.recentComplaintSignals.slice(0, 3)) {
+      lines.push(
+        `    - ${signal.step}: ${signal.message.slice(0, 120)} (${signal.userId})`,
+      );
+    }
+  }
+
+  lines.push(`  • Recommended action: ${r.recommendedAction}`);
+  return lines;
+}
+
+function formatDuration(ms: number | null): string {
+  if (ms === null || !Number.isFinite(ms)) return '—';
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes <= 0) return `${seconds}s`;
+  return `${minutes}m ${seconds}s`;
+}
+
+function formatPercent(value: number): string {
+  if (!Number.isFinite(value)) return '—';
+  return `${(value * 100).toFixed(0)}%`;
+}
+
 // ---------------------------------------------------------------------------
 // postDailySlackDM
 // ---------------------------------------------------------------------------
@@ -132,6 +237,7 @@ export async function postDailySlackDM(
   stats: StepStats[],
   slackUserId: string,
   slackClient: WebClient,
+  reliability?: OnboardingReliabilitySummary,
 ): Promise<{ channel: string; ts: string }> {
   const today = new Date().toISOString().slice(0, 10);
 
@@ -147,6 +253,13 @@ export async function postDailySlackDM(
     `North star: ${northStarRate}% completion (7d) | Δ vs last week: (not tracked yet)`,
     '',
   ];
+
+  if (reliability) {
+    lines.push(...formatReliabilityBlock(reliability));
+    lines.push('');
+    lines.push('_Copy variants below are secondary to the reliability findings above._');
+    lines.push('');
+  }
 
   for (const { step, variants } of proposedMutations) {
     const controlStat = stats.find(

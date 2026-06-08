@@ -28,6 +28,7 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData } from '../utils/llmService';
 import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
+import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmMutationEvents';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 
 // Constant for the virtual "other skills" identifier
@@ -2716,6 +2717,21 @@ export class AgentModeService {
               result: minimalResult,
               duration
             });
+
+            // Notify the CRM page to refresh after a successful CRM-mutating tool.
+            // Enrichment / tech-stack tools broadcast their own completion events,
+            // so this covers the rest (update/status/email/delete/import/…). Emitted
+            // to the user's room so it reaches the CRM page regardless of which agent
+            // surface (full agent mode or Emma sidebar) ran the tool. Guard on a
+            // success flag so a tool that returned { success: false } doesn't trigger
+            // a spurious refresh.
+            if (socketEmit) {
+              const crmPayload = buildCrmDataChangedPayload(toolCall.function.name, functionArgs);
+              const toolSucceeded = !(processedResult && (processedResult as any).success === false);
+              if (crmPayload && toolSucceeded) {
+                socketEmit(`user:${userId}`, CRM_DATA_CHANGED_EVENT, crmPayload);
+              }
+            }
 
             // For create_social_media_posts, count actual posts in the array (not function calls)
             const counterIncrement = toolCall.function.name === 'create_social_media_posts'
@@ -12480,10 +12496,68 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
+  /**
+   * Ensure every placement_assets entry has an image_hash. asset_feed_spec.images only accepts
+   * hashes (not CDN URLs), so any asset given as image_url is uploaded here and replaced with the
+   * returned hash. Returns a shallow copy with placement_assets resolved; non-placement params
+   * are passed through untouched.
+   */
+  private async resolvePlacementAssetHashes<T extends { placement_assets?: any[] }>(
+    userId: string,
+    params: T,
+    account_id?: string
+  ): Promise<T> {
+    if (!params.placement_assets || params.placement_assets.length === 0) {
+      return params;
+    }
+    const resolved = await Promise.all(params.placement_assets.map(async (asset: any) => {
+      if (asset.image_hash || !asset.image_url) return asset;
+      const uploaded = await this.uploadMetaAdsImage(userId, asset.image_url, account_id);
+      if (!uploaded?.image_hash) {
+        throw new Error(`Failed to upload placement asset image from ${asset.image_url}: ${uploaded?.message || 'no hash returned'}`);
+      }
+      // Drop image_url once hashed so the builder uses the hash.
+      const { image_url, ...rest } = asset;
+      return { ...rest, image_hash: uploaded.image_hash };
+    }));
+    return { ...params, placement_assets: resolved };
+  }
+
+  /** True if any placement asset targets an Instagram placement (story/reels/explore/etc.). */
+  private placementAssetsTargetInstagram(assets?: any[]): boolean {
+    if (!assets) return false;
+    return assets.some((a: any) =>
+      Array.isArray(a.placements) && a.placements.some((p: string) => MetaService.placementTokenTargetsInstagram(p))
+    );
+  }
+
+  /**
+   * When a placement_assets creative serves Instagram placements, Meta requires
+   * object_story_spec.instagram_user_id (else attaching it to an ad fails with subcode 1772103).
+   * Resolve it from the Page if the caller didn't supply one.
+   */
+  private async resolvePlacementInstagramActor<T extends { placement_assets?: any[]; page_id?: string; instagram_user_id?: string }>(
+    params: T,
+    accessToken: string
+  ): Promise<T> {
+    if (!params.placement_assets || params.instagram_user_id || !params.page_id) return params;
+    if (!this.placementAssetsTargetInstagram(params.placement_assets)) return params;
+    const igActor = await metaService.getPageInstagramActor(accessToken, params.page_id);
+    if (igActor) {
+      console.log(`AgentMode: Resolved Instagram actor ${igActor} for page ${params.page_id} (placement assets target IG).`);
+      return { ...params, instagram_user_id: igActor };
+    }
+    return params;
+  }
+
   public async createMetaAdsAdCreative(userId: string, params: MetaAdsAdCreativeParams & { account_id?: string }): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, params.account_id);
-      const creative = await metaService.createAdCreative(accountId, accessToken, params);
+      // asset_feed_spec.images only accepts image hashes — resolve any placement_assets URLs to hashes first.
+      let resolvedParams = await this.resolvePlacementAssetHashes(userId, params, params.account_id);
+      // IG placements require an instagram_user_id in object_story_spec — auto-resolve from the Page.
+      resolvedParams = await this.resolvePlacementInstagramActor(resolvedParams, accessToken);
+      const creative = await metaService.createAdCreative(accountId, accessToken, resolvedParams);
 
       return {
         success: true,
@@ -12639,7 +12713,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * Keys that indicate a destination/creative content change rather than an ad-level change.
    * When these are present in params, we need to create a new creative and swap it.
    */
-  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type'];
+  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets'];
 
   public async updateMetaAdsAd(userId: string, adId: string, params: any, account_id?: string): Promise<any> {
     try {
@@ -12674,7 +12748,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
 
       if (creativeKeys.length > 0) {
-        return await this.updateAdViaCreativeSwap(accessToken, accountId, adId, params, creativeKeys);
+        return await this.updateAdViaCreativeSwap(userId, accessToken, accountId, adId, params, creativeKeys);
       }
 
       // Standard ad-level update (status, name, etc.)
@@ -12702,6 +12776,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * 4. Updating the ad to reference the new creative
    */
   private async updateAdViaCreativeSwap(
+    userId: string,
     accessToken: string,
     accountId: string,
     adId: string,
@@ -12742,7 +12817,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // Determine current creative type and extract existing fields
     let newCreativeParams: any;
 
-    if (existingSpec.video_data) {
+    if (params.placement_assets) {
+      // Placement-customized image creative (asset_feed_spec): map different images to different
+      // placements (e.g. keep the square Feed image, add a 9:16 asset for Stories/Reels) in one
+      // creative. Copy/link/CTA carry over from the existing creative unless overridden.
+      const ld = existingSpec.link_data || {};
+      const vd = existingSpec.video_data || {};
+      newCreativeParams = {
+        name: params.name || `${creativeData.name || 'Creative'} (placement-customized)`,
+        page_id: pageId,
+        placement_assets: params.placement_assets,
+        body: params.body || ld.message || vd.message || creativeData.body || '',
+        title: params.title || ld.name || vd.title || creativeData.title || '',
+        link_url: newLinkUrl || ld.link || vd.call_to_action?.value?.link || '',
+        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || vd.call_to_action?.type,
+      };
+    } else if (existingSpec.video_data) {
       // Video creative
       const vd = existingSpec.video_data;
       newCreativeParams = {
@@ -12798,6 +12888,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     console.log(`AgentMode: Creating new creative with updated fields for ad ${adId}:`, newCreativeParams);
+
+    // asset_feed_spec.images only accepts image hashes — resolve any placement_assets URLs first.
+    newCreativeParams = await this.resolvePlacementAssetHashes(userId, newCreativeParams, accountId);
+    // IG placements require object_story_spec.instagram_user_id — auto-resolve from the Page.
+    newCreativeParams = await this.resolvePlacementInstagramActor(newCreativeParams, accessToken);
 
     // Create the new creative
     const newCreative = await metaService.createAdCreative(accountId, accessToken, newCreativeParams);

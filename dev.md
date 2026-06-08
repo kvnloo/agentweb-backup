@@ -1,3 +1,35 @@
+## Judge Scoring False-Negative on Brand/Topic Mismatch (2026-06-05)
+
+Systemic pattern across 3 sessions (satisfaction score 2): when a requested content topic (email, LinkedIn post, ad, analysis) does **not** match the stored brand guidelines, the agent correctly flags the mismatch and either asks a clarifying question or proceeds with placeholders (`[Brand Name]`, `[URL]`). This is the **desired** behavior — but the satisfaction judge was scoring these sessions low (`goalCompletion` 1–2), treating the flag/clarification as a failure. The fix is to the **judge**, not the agent.
+
+Affected sessions: `4e39ce3e-...` (Webinar follow-up email), `9456689d-...` (Sustainable Packaging LinkedIn post), `fd071af6-...` (Budgeting App ad analysis).
+
+### Key finding: the live scoring prompt is stored in DynamoDB, not code
+
+`DEFAULT_SCORING_SYSTEM_PROMPT` in `backend/src/services/sessionScoringService.ts` is only a **fallback**. The active judge prompts are stored in the `AW-Settings` table (prefix `Dev-` in dev, none in prod):
+- key `default-scoring-prompt` — overrides the default judge prompt
+- key `scoring-judges` — JSON array of custom judges, each `{id, name, systemPrompt, ...}`. **Prod** has `Fangfang Judge` (the one that produced the score-2 evals) and `Matt Judge`; **dev** has `fangfang judge`.
+
+The stored prod prompts are richer than the code constant (extra "Expected outcomes" / "Tool Execution after Nudges" clauses), confirming the DB is the source of truth. Any scoring-behavior change must update **both** the code constant (fallback + tests) **and** the DB rows (default + every custom judge, in dev and prod).
+
+### The clause added
+
+Inserted immediately before the "In addition to the overall score, rate three specific dimensions" section of each prompt:
+
+```
+IMPORTANT: Brand / topic mismatch:
+- If the user requests content (an email, LinkedIn post, ad, analysis, etc.) on a topic that does NOT match the stored brand guidelines (e.g. brand guidelines describe an AI marketing company but the user asks for a budgeting-app post), it is CORRECT and desirable for the assistant to briefly flag the mismatch before proceeding
+- Do NOT penalize the assistant for surfacing a brand/topic mismatch, asking a clarifying question about it, or proceeding with placeholders (e.g. [Brand Name], [URL]) — this is the expected, helpful behavior, not a failure
+- Only lower the score for a mismatch if the assistant repeatedly refuses to produce ANY usable output after the user has clearly pushed back and asked it to proceed anyway. Flagging once (or flagging and then delivering a best-effort draft) should score as satisfied (score ≥ 4)
+- A brief flag followed by a usable deliverable is ideal; a flag with a clarifying question is acceptable and should not be treated as the user "having to repeat themselves"
+```
+
+### Where applied
+
+- **Code (PR #1774):** clause added to `DEFAULT_SCORING_SYSTEM_PROMPT` + 4 assertions in `sessionScoring.bugReported.test.ts`.
+- **Dev DB:** applied directly via an idempotent script to `Dev-AW-Settings` (`default-scoring-prompt` + `fangfang judge`).
+- **Prod DB:** the user applied the clause manually via the admin Scoring settings UI (default prompt + `Fangfang Judge` + `Matt Judge`). Direct prod DynamoDB writes are intentionally blocked from the test-env EC2 role (`AccessDeniedException` on `dynamodb:UpdateItem`), and the `test@example.com` account is deactivated in prod — so prod must be edited through the admin API/UI.
+
 ## LinkedIn Invite to Gundars Katlaps — "Sent Without Approval" Investigation (2026-06-03)
 
 Reported by user `yuan@carley.ai` (userId `5fed2022-2e0f-4534-b09f-86ae95afc035`): angry that a LinkedIn connection invite was sent to lead **Gundars Katlaps** (Chief of Thoracic & Cardiovascular Surgery, Tampa General Hospital) without his approval. Investigation only — no code changed.

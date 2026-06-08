@@ -317,7 +317,7 @@ function FunnelBarChart({
               label: (ctx) => {
                 const stage = stages[ctx.dataIndex];
                 if (stage.status === 'unavailable') return 'Data not connected';
-                return `Count: ${formatNumber(ctx.parsed.x)}`;
+                return `Count: ${formatNumber(ctx.parsed.x ?? 0)}`;
               },
               afterLabel: (ctx) => {
                 const stage = stages[ctx.dataIndex];

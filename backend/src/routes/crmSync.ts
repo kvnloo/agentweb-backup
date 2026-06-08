@@ -1,6 +1,6 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
-import { crmDb } from '../services/db';
+import { crmDb, userDb } from '../services/db';
 import {
   externalCrmSyncService,
 } from '../services/externalCrmSyncService';
@@ -10,14 +10,26 @@ router.use(authenticateToken);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+// Grants access when the user owns the list OR belongs to the same org as the
+// list owner. Mirrors `canAccessCrmList` in crm.ts so org members share lead
+// lists (and their CRM sync configs) consistently across every CRM surface.
 async function verifyListOwnership(
   userId: string,
   listId: string
 ): Promise<{ ok: boolean; status?: number; error?: string }> {
   const list = await crmDb.getLeadListById(listId);
   if (!list) return { ok: false, status: 404, error: 'Lead list not found' };
-  if ((list as any).userId !== userId) return { ok: false, status: 403, error: 'Access denied' };
-  return { ok: true };
+
+  const ownerId = (list as any).userId;
+  if (ownerId === userId) return { ok: true };
+
+  const [user, owner] = await Promise.all([
+    userDb.getUserById(userId),
+    userDb.getUserById(ownerId),
+  ]);
+  if (user?.orgId && owner?.orgId && user.orgId === owner.orgId) return { ok: true };
+
+  return { ok: false, status: 403, error: 'Access denied' };
 }
 
 // ─── Default field mappings ───────────────────────────────────────────────────

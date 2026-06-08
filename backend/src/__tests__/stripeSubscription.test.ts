@@ -8,6 +8,9 @@ const mockStripe = {
     list: jest.fn(),
     update: jest.fn(),
   },
+  subscriptionSchedules: {
+    release: jest.fn(),
+  },
   webhooks: {
     constructEvent: jest.fn(),
   },
@@ -134,6 +137,111 @@ describe('Stripe subscription management', () => {
       expect(mockUpdateUser).toHaveBeenCalledWith('user-123', expect.objectContaining({
         subscription_status: 'canceling',
       }));
+    });
+
+    it('should NOT call subscriptionSchedules.release when the sub has no schedule', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: 'user-123',
+        stripe_customer_id: 'cus_abc123',
+      });
+      mockStripe.subscriptions.list.mockResolvedValue({
+        data: [{ id: 'sub_abc', status: 'active', schedule: null, current_period_end: 1700000000 }],
+      });
+      mockStripe.subscriptions.update.mockResolvedValue({
+        id: 'sub_abc',
+        cancel_at_period_end: true,
+        current_period_end: 1700000000,
+      });
+      mockUpdateUser.mockResolvedValue({});
+
+      const app = createApp();
+      const res = await request(app)
+        .post('/api/stripe/cancel-subscription')
+        .set('Authorization', 'Bearer valid-token');
+
+      expect(res.status).toBe(200);
+      expect(mockStripe.subscriptionSchedules.release).not.toHaveBeenCalled();
+    });
+
+    // Regression — Jerry Shan / Insightful-Tech (2026-06-05): a sales-applied
+    // 90% coupon attached his subscription to a Stripe subscription_schedule.
+    // The old handler called subscriptions.update({cancel_at_period_end}) directly,
+    // which Stripe rejects for schedule-managed subs ("...updating any cancelation
+    // behavior directly is not allowed. Please update the schedule instead."),
+    // so "Switch to Free" returned 500 "Failed to cancel subscription." on every
+    // attempt. The handler must release the schedule first, then cancel.
+    it('releases an attached subscription_schedule before canceling (schedule as id string)', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: 'user-123',
+        stripe_customer_id: 'cus_abc123',
+        scheduledChange: { stripeScheduleId: 'sub_sched_xyz', toTier: 'Starter' },
+      });
+      mockStripe.subscriptions.list.mockResolvedValue({
+        data: [{
+          id: 'sub_abc',
+          status: 'active',
+          schedule: 'sub_sched_xyz',
+          items: { data: [{ current_period_end: 1700000000 }] },
+        }],
+      });
+      mockStripe.subscriptionSchedules.release.mockResolvedValue({ id: 'sub_sched_xyz', status: 'released' });
+      mockStripe.subscriptions.update.mockResolvedValue({
+        id: 'sub_abc',
+        cancel_at_period_end: true,
+        items: { data: [{ current_period_end: 1700000000 }] },
+      });
+      mockUpdateUser.mockResolvedValue({});
+
+      const app = createApp();
+      const res = await request(app)
+        .post('/api/stripe/cancel-subscription')
+        .set('Authorization', 'Bearer valid-token');
+
+      expect(res.status).toBe(200);
+      expect(res.body.cancel_at_period_end).toBe(true);
+      // Schedule released FIRST, then the cancel update applied.
+      expect(mockStripe.subscriptionSchedules.release).toHaveBeenCalledWith('sub_sched_xyz');
+      expect(mockStripe.subscriptions.update).toHaveBeenCalledWith('sub_abc', {
+        cancel_at_period_end: true,
+      });
+      const releaseOrder = mockStripe.subscriptionSchedules.release.mock.invocationCallOrder[0];
+      const updateOrder = mockStripe.subscriptions.update.mock.invocationCallOrder[0];
+      expect(releaseOrder).toBeLessThan(updateOrder);
+      // Stale pending change cleared so /auth/me doesn't show a phantom schedule.
+      expect(mockUpdateUser).toHaveBeenCalledWith('user-123', expect.objectContaining({
+        subscription_status: 'canceling',
+        scheduledChange: null,
+      }));
+    });
+
+    it('releases an attached schedule when it is expanded to an object (schedule.id)', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: 'user-123',
+        stripe_customer_id: 'cus_abc123',
+      });
+      mockStripe.subscriptions.list.mockResolvedValue({
+        data: [{
+          id: 'sub_abc',
+          status: 'active',
+          schedule: { id: 'sub_sched_obj', object: 'subscription_schedule' },
+          items: { data: [{ current_period_end: 1700000000 }] },
+        }],
+      });
+      mockStripe.subscriptionSchedules.release.mockResolvedValue({ id: 'sub_sched_obj', status: 'released' });
+      mockStripe.subscriptions.update.mockResolvedValue({
+        id: 'sub_abc',
+        cancel_at_period_end: true,
+        items: { data: [{ current_period_end: 1700000000 }] },
+      });
+      mockUpdateUser.mockResolvedValue({});
+
+      const app = createApp();
+      const res = await request(app)
+        .post('/api/stripe/cancel-subscription')
+        .set('Authorization', 'Bearer valid-token');
+
+      expect(res.status).toBe(200);
+      expect(mockStripe.subscriptionSchedules.release).toHaveBeenCalledWith('sub_sched_obj');
     });
   });
 

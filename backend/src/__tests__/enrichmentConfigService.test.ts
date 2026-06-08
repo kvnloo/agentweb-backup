@@ -512,6 +512,17 @@ describe('setEnrichmentConfig — validation', () => {
     expect(saved.config.fields[0].aliasFor).toBe('funding_stage');
   });
 
+  it('auto-infers aliasFor via synonym map for "techStack" → tech_stack', async () => {
+    const deps = makeDeps();
+    const config = validConfig({
+      fields: [
+        { name: 'techStack', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+    const saved = await setEnrichmentConfig({ listId: LIST_ID, userId: USER_ID, config }, deps);
+    expect(saved.config.fields[0].aliasFor).toBe('tech_stack');
+  });
+
   it('auto-infers aliasFor via synonym map for "tech" → tech_stack', async () => {
     const deps = makeDeps();
     const config = validConfig({

@@ -204,7 +204,7 @@ This tool is read-only, browser-only. If the user asks for anything outside web 
         },
         timeout_seconds: {
           type: 'number',
-          description: 'Timeout in seconds. Defaults to 120. Max 600.',
+          description: 'Timeout in seconds. Defaults to 120. Max 900.',
         },
       },
       required: ['task'],
@@ -228,7 +228,7 @@ This tool is read-only, browser-only. If the user asks for anything outside web 
       };
     }
 
-    const timeoutSeconds = Math.min(args.timeout_seconds ?? 120, 600);
+    const timeoutSeconds = Math.min(args.timeout_seconds ?? 120, 900);
 
     // Prepend a hard privacy instruction to every task so Codex never returns
     // the account owner's personal data (name, email, phone, address, etc.).
