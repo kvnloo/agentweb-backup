@@ -18,6 +18,8 @@ import {
   chooseOrientation,
   computeFitScale,
   measureContentSize,
+  parsePageSize,
+  readAuthoredPageRule,
   shouldRelaxBreakInside,
   applyPrintLayoutFixes,
   PRINT_SAFETY_CSS,
@@ -334,6 +336,18 @@ describe("chooseOrientation", () => {
     expect(chooseOrientation(-10, portraitW, landscapeW)).toBe("portrait");
   });
 
+  it("stays portrait when landscape is not strictly better (equal widths)", () => {
+    // portrait doesn't fit comfortably, but landscapeFit == portraitFit, so the
+    // tie resolves to portrait (landscapeFit must strictly exceed portraitFit).
+    expect(chooseOrientation(2000, portraitW, portraitW)).toBe("portrait");
+  });
+
+  it("treats a non-positive landscape width as not fitting (guard)", () => {
+    // landscapeContentWidthPx <= 0 -> fitRatio returns 1 for it; with a tiny
+    // portrait width the content doesn't fit portrait, and landscapeFit (1) wins.
+    expect(chooseOrientation(2000, 100, 0)).toBe("landscape");
+  });
+
   it("honors a custom portrait fit threshold", () => {
     // With a strict threshold of 0.99, content needing any shrink rotates.
     expect(chooseOrientation(720, portraitW, landscapeW, 0.99)).toBe("landscape");
@@ -436,6 +450,207 @@ describe("applyPrintLayoutFixes — orientation", () => {
     expect(Math.round(maxHeight)).toBe(
       Math.round(computePageContentHeightPx("A4", "20mm", "20mm", "landscape"))
     );
+  });
+});
+
+describe("parsePageSize", () => {
+  it("parses two explicit lengths as landscape when width >= height", () => {
+    // The HomeReq deck: @page { size: 11in 8.5in }
+    expect(parsePageSize("11in 8.5in")).toEqual({
+      widthMm: 11 * 25.4,
+      heightMm: 8.5 * 25.4,
+      orientation: "landscape",
+    });
+  });
+
+  it("parses two explicit lengths as portrait when height > width", () => {
+    expect(parsePageSize("210mm 297mm")).toEqual({
+      widthMm: 210,
+      heightMm: 297,
+      orientation: "portrait",
+    });
+  });
+
+  it("parses a single length as a square page", () => {
+    expect(parsePageSize("8.5in")).toEqual({
+      widthMm: 8.5 * 25.4,
+      heightMm: 8.5 * 25.4,
+      orientation: "portrait",
+    });
+  });
+
+  it("parses a named format (portrait by default)", () => {
+    expect(parsePageSize("A4")).toEqual({
+      widthMm: 210,
+      heightMm: 297,
+      orientation: "portrait",
+    });
+  });
+
+  it("parses a named format with a landscape keyword (swapped)", () => {
+    expect(parsePageSize("A4 landscape")).toEqual({
+      widthMm: 297,
+      heightMm: 210,
+      orientation: "landscape",
+    });
+  });
+
+  it("parses keyword-before-format order too", () => {
+    expect(parsePageSize("landscape Letter")).toEqual({
+      widthMm: 279.4,
+      heightMm: 215.9,
+      orientation: "landscape",
+    });
+  });
+
+  it("returns null for a keyword-only size (no concrete dimensions)", () => {
+    expect(parsePageSize("landscape")).toBeNull();
+  });
+
+  it("returns null for auto / empty / undefined", () => {
+    expect(parsePageSize("auto")).toBeNull();
+    expect(parsePageSize("")).toBeNull();
+    expect(parsePageSize(undefined)).toBeNull();
+    expect(parsePageSize("   ")).toBeNull();
+  });
+
+  it("returns null for unparseable or unitless lengths", () => {
+    expect(parsePageSize("100 200")).toBeNull(); // unitless
+    expect(parsePageSize("banana")).toBeNull();
+    expect(parsePageSize("11in 8.5in 5in")).toBeNull(); // too many tokens
+  });
+
+  it("converts cm lengths", () => {
+    const r = parsePageSize("21cm 29.7cm");
+    expect(r).not.toBeNull();
+    expect(r!.widthMm).toBeCloseTo(210, 5);
+    expect(r!.heightMm).toBeCloseTo(297, 5);
+    expect(r!.orientation).toBe("portrait");
+  });
+
+  it("converts pt lengths", () => {
+    // 792pt x 612pt == 11in x 8.5in.
+    const r = parsePageSize("792pt 612pt");
+    expect(r).not.toBeNull();
+    expect(r!.widthMm).toBeCloseTo(11 * 25.4, 4);
+    expect(r!.heightMm).toBeCloseTo(8.5 * 25.4, 4);
+    expect(r!.orientation).toBe("landscape");
+  });
+
+  it("converts px lengths", () => {
+    // 96px == 1in == 25.4mm.
+    const r = parsePageSize("96px");
+    expect(r).not.toBeNull();
+    expect(r!.widthMm).toBeCloseTo(25.4, 4);
+  });
+
+  it("returns null when a numeric value is non-finite", () => {
+    // "." matches the digit pattern but parseFloat(".") is NaN.
+    expect(parsePageSize(".in .in")).toBeNull();
+  });
+});
+
+describe("readAuthoredPageRule", () => {
+  function fakePage(rules: any[]) {
+    return {
+      evaluate: async (fn: (...a: any[]) => any) => {
+        (global as any).document = {
+          styleSheets: [{ cssRules: rules }],
+        };
+        try {
+          return fn();
+        } finally {
+          delete (global as any).document;
+        }
+      },
+    };
+  }
+
+  // Mimic a CSSPageRule: constructor.name must be "CSSPageRule".
+  class CSSPageRule {
+    style: any;
+    constructor(style: any) {
+      this.style = style;
+    }
+  }
+  class CSSStyleRule {
+    style: any = {};
+  }
+
+  it("returns the size/margin from the first @page rule", async () => {
+    const page = fakePage([
+      new CSSStyleRule(),
+      new CSSPageRule({ size: "11in 8.5in", margin: "0px" }),
+    ]);
+    expect(await readAuthoredPageRule(page)).toEqual({
+      size: "11in 8.5in",
+      margin: "0px",
+    });
+  });
+
+  it("returns null when there is no @page rule", async () => {
+    const page = fakePage([new CSSStyleRule(), new CSSStyleRule()]);
+    expect(await readAuthoredPageRule(page)).toBeNull();
+  });
+
+  it("returns a margin-only @page rule (size undefined)", async () => {
+    const page = fakePage([new CSSPageRule({ margin: "1in" })]);
+    expect(await readAuthoredPageRule(page)).toEqual({
+      size: undefined,
+      margin: "1in",
+    });
+  });
+
+  it("skips an empty @page rule (no size and no margin)", async () => {
+    const page = fakePage([new CSSPageRule({}), new CSSPageRule({ size: "A4" })]);
+    expect(await readAuthoredPageRule(page)).toEqual({
+      size: "A4",
+      margin: undefined,
+    });
+  });
+
+  it("handles a stylesheet whose cssRules is null", async () => {
+    const page = {
+      evaluate: async (fn: (...a: any[]) => any) => {
+        (global as any).document = { styleSheets: [{ cssRules: null }] };
+        try {
+          return fn();
+        } finally {
+          delete (global as any).document;
+        }
+      },
+    };
+    expect(await readAuthoredPageRule(page)).toBeNull();
+  });
+
+  it("handles a CSSPageRule that has no style object", async () => {
+    // constructor.name matches but .style is undefined -> falls back to {}.
+    const noStyle = new CSSPageRule(undefined);
+    const page = fakePage([noStyle, new CSSPageRule({ size: "A4" })]);
+    expect(await readAuthoredPageRule(page)).toEqual({
+      size: "A4",
+      margin: undefined,
+    });
+  });
+
+  it("skips cross-origin stylesheets that throw on cssRules access", async () => {
+    const page = {
+      evaluate: async (fn: (...a: any[]) => any) => {
+        const crossOrigin = {
+          get cssRules(): any {
+            throw new Error("SecurityError");
+          },
+        };
+        const local = { cssRules: [new CSSPageRule({ size: "A4", margin: "" })] };
+        (global as any).document = { styleSheets: [crossOrigin, local] };
+        try {
+          return fn();
+        } finally {
+          delete (global as any).document;
+        }
+      },
+    };
+    expect(await readAuthoredPageRule(page)).toEqual({ size: "A4", margin: undefined });
   });
 });
 
