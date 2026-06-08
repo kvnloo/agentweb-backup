@@ -27,9 +27,27 @@ from .runner import CodexRunner, SCREENSHOTS_BASE_DIR
 
 logger = logging.getLogger(__name__)
 
+# ngrok (and most reverse proxies) drop a connection after 300s with no bytes
+# flowing from the upstream. Long browser scans buffer their whole result until
+# the end, so we emit a whitespace keep-alive on this interval to reset that
+# idle clock. Leading whitespace is valid JSON, so the final body still parses.
+HEARTBEAT_INTERVAL_SECONDS = 30
+
+
+def _encode_chunk(data: bytes) -> bytes:
+    """Frame a byte string as a single HTTP/1.1 transfer-encoding chunk."""
+    return f"{len(data):X}\r\n".encode("ascii") + data + b"\r\n"
+
+
+CHUNKED_TERMINATOR = b"0\r\n\r\n"
+
 
 class RelayRequestHandler(BaseHTTPRequestHandler):
     """Minimal HTTP handler — avoids FastAPI/Flask dependency."""
+
+    # Chunked transfer-encoding (used for the /task heartbeat) is only valid over
+    # HTTP/1.1; under the default HTTP/1.0 clients read the chunk framing literally.
+    protocol_version = "HTTP/1.1"
 
     server: "RelayHTTPServer"  # type annotation for IDE
 
@@ -138,25 +156,65 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
 
         logger.info("Running task (len=%d): %s…", len(task), task[:120])
         runner = CodexRunner(config)
+        self._run_task_with_heartbeat(runner, task)
+
+    def _run_task_with_heartbeat(self, runner: "CodexRunner", task: str) -> None:
+        """Run the (possibly multi-minute) task while keeping the connection alive.
+
+        Codex buffers its whole result until the end, which can exceed the proxy's
+        300s idle timeout. We send chunked-encoding keep-alive whitespace every
+        HEARTBEAT_INTERVAL_SECONDS so the tunnel never sees an idle connection,
+        then deliver the real JSON body as the final chunk.
+        """
+        result_box: dict[str, object] = {}
+
+        def _worker() -> None:
+            try:
+                result_box["result"] = runner.run(task)
+            except Exception as exc:  # noqa: BLE001 — surfaced to client below
+                logger.exception("Runner error")
+                result_box["error"] = str(exc)
+
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
         try:
-            result = runner.run(task)
-        except Exception as exc:
-            logger.exception("Runner error")
-            self._send_json(500, {"ok": False, "error": str(exc)})
+            while worker.is_alive():
+                worker.join(timeout=HEARTBEAT_INTERVAL_SECONDS)
+                if worker.is_alive():
+                    self.wfile.write(_encode_chunk(b" "))
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            logger.warning("Client disconnected during task; finishing run in background")
             return
 
-        # Derive the run_id from the screenshot_dir path (last path component)
-        run_id = Path(result.screenshot_dir).name if result.screenshot_dir else ""
-        self._send_json(200, {
-            "ok": result.ok,
-            "result": result.final_message,
-            "session_id": result.session_id,
-            "returncode": result.returncode,
-            "screenshots": [
-                {"name": name, "url": f"/files/{run_id}/{name}"}
-                for name in result.screenshots
-            ],
-        })
+        if "error" in result_box:
+            body = json.dumps({"ok": False, "error": result_box["error"]})
+        else:
+            result = result_box["result"]
+            run_id = Path(result.screenshot_dir).name if result.screenshot_dir else ""
+            body = json.dumps({
+                "ok": result.ok,
+                "result": result.final_message,
+                "session_id": result.session_id,
+                "returncode": result.returncode,
+                "screenshots": [
+                    {"name": name, "url": f"/files/{run_id}/{name}"}
+                    for name in result.screenshots
+                ],
+            })
+
+        try:
+            self.wfile.write(_encode_chunk(body.encode("utf-8")))
+            self.wfile.write(CHUNKED_TERMINATOR)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            logger.warning("Client disconnected before final body could be sent")
 
 
 class RelayHTTPServer(ThreadingMixIn, HTTPServer):
