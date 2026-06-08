@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-06-08',
+    changes: [
+      'New: Emma Can Now Lay Out an Exact Number of Images Reliably (e.g. "9 avatars in a hexagon")',
+      '- AI image generation often couldn\'t hit an exact count — ask for 9 hexagons or 9 community photos and you\'d get 7 or 8, no matter how many times you tried',
+      '- Emma can now assemble a specific set of images into an exact layout — a grid, a single row or column, or a packed honeycomb/hexagon arrangement — placing every image exactly once so the count is always right',
+      '- Avatars and headshots can be cropped to circles, and the layout is built directly (no more failed workarounds), so these requests finish quickly instead of looping',
+    ],
+  },
+  {
     date: '2026-06-07',
     changes: [
       'Fixed: Emma\'s Local Browser Agent No Longer Times Out on Slow Pages',
