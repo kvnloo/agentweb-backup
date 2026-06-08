@@ -696,12 +696,11 @@ async function processLead(
       for (const dep of sf.smartDependencies ?? []) {
         if (fillValueMap[dep]) depValues[dep] = fillValueMap[dep];
       }
-      // Skip eval when no dep data is available — LLM would return null anyway.
-      const hasDeps = (sf.smartDependencies ?? []).length > 0;
-      if (hasDeps && Object.keys(depValues).length === 0) {
-        console.log(`[v3:${input.listId}:${lead.leadId}] smart-eval SKIP field=${sf.name} (no dep data)`);
-        continue;
-      }
+      // Even when no dependency data could be enriched, still ask the LLM: it
+      // receives the lead's native context (company, title, website, etc.) and
+      // can often infer the value from domain knowledge, or fall through to the
+      // condition's "else" branch. It returns null only when genuinely
+      // indeterminate, so we never fabricate a value.
       const smartStart = Date.now();
       console.log(`[v3:${input.listId}:${lead.leadId}] smart-eval START field=${sf.name} deps=${JSON.stringify(Object.keys(depValues))}`);
       await smartEvalSemaphore.acquire();

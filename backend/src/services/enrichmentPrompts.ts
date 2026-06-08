@@ -262,12 +262,14 @@ export function buildSmartFieldEvalSystemPrompt(): string {
   return `You evaluate a derived CRM field condition using enriched lead data.
 
 Rules:
+- The Condition is the authoritative instruction — follow exactly what it says, including any default it specifies.
+- If the Condition specifies an explicit default or "else" outcome (e.g. "... else No"), you MUST apply that outcome whenever the positive criteria are not met or cannot be confirmed from the data. In that case do NOT return null — the condition already told you what to do.
 - Base your answer on the provided enriched data plus standard domain knowledge (e.g. funding stage terminology, industry classifications, common abbreviations).
 - For boolean conditions: return "true" or "false" as a string value.
 - For categorical conditions: return the matching category string.
 - For numeric or scored conditions: return the computed value as a string.
 - If the condition has multiple criteria (AND/OR), evaluate accordingly — partial data can satisfy OR conditions.
-- Return null ONLY when the available data is genuinely insufficient to make any determination.
+- Return null ONLY when the data is genuinely insufficient to make any determination AND the Condition provides no explicit default/else outcome.
 
 Return ONLY valid JSON (no markdown, no backticks):
 { "value": "<string>" | null, "reasoning": "<≤20-word explanation>" }`;
