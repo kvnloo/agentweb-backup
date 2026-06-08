@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-06-07',
+    changes: [
+      'Fixed: Emma\'s Local Browser Agent No Longer Times Out on Slow Pages',
+      '- When Emma fell back to your local browser agent to read a site that blocks the cloud browser, long-running scans would fail partway through with a connection error and return nothing',
+      '- The connection now stays alive during multi-minute scans, so results come back reliably instead of dropping',
+      '- The maximum time Emma will wait for one of these browser tasks has also been raised, so heavier pages have room to finish',
+    ],
+  },
+  {
     date: '2026-06-04',
     changes: [
       'New: Facebook/Meta Ads Can Now Use a Different Image per Placement (Fixes "Needs a 9:16 for Stories/Reels")',
