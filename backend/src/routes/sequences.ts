@@ -16,7 +16,7 @@ import {
 import { crmDb } from '../services/db';
 import { resendService } from '../services/resendService';
 import axios from 'axios';
-import { extractVariables, leadHasVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
+import { extractVariables, leadHasVariable, isSupportedVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
 
 const router = express.Router();
@@ -193,7 +193,7 @@ router.post(
   authenticateToken,
   async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
-    const { listId, lifecycle, startAt } = req.body;
+    const { listId, lifecycle, startAt, confirm } = req.body;
     if (!listId) return res.status(400).json({ error: 'listId is required' });
 
     try {
@@ -204,12 +204,52 @@ router.post(
         return res.status(400).json({ error: 'Sequence has no steps' });
       }
 
-      const leadsResult = lifecycle
-        ? await crmDb.getLeadsByStatus(listId, lifecycle)
-        : await crmDb.getLeadsByListId(listId);
-      const leads = Array.isArray(leadsResult)
-        ? leadsResult
-        : ((leadsResult as any).items ?? (leadsResult as any).leads ?? []);
+      // Verify the caller owns (or org-shares) the list before reading its leads.
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) return res.status(404).json({ error: 'List not found' });
+      if (!(await crmDb.canOrgMemberAccessList(authReq.user!.userId, list))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+
+      // Load ALL leads. Lifecycle-filtered enroll keeps its existing path; the
+      // default list enroll uses the paginated loader so counts/enrollment are complete.
+      let leads: any[];
+      if (lifecycle) {
+        const r = await crmDb.getLeadsByStatus(listId, lifecycle);
+        leads = Array.isArray(r) ? r : ((r as any).items ?? (r as any).leads ?? []);
+      } else {
+        leads = await crmDb.getAllLeadsByListId(listId);
+      }
+
+      // Variable coverage across all steps + channels (email subject/body + LinkedIn
+      // messageText). Warn — but allow override via `confirm` — when a supported
+      // variable is missing for any lead, or an unsupported token is referenced.
+      const templateText = sequence.steps
+        .map((s: any) => `${s.subject ?? ''} ${s.bodyHtml ?? ''} ${s.messageText ?? ''}`)
+        .join(' ');
+      const vars = extractVariables(templateText)
+        .filter((v) => v !== 'senderName' && v !== 'senderEmail');
+      const unsupported = vars.filter((v) => !isSupportedVariable(v));
+      const supported = vars.filter((v) => isSupportedVariable(v));
+      const missing: { variable: string; missing: number; present: number }[] = [];
+      for (const v of supported) {
+        let miss = 0;
+        let pres = 0;
+        for (const lead of leads) {
+          if (leadHasVariable(lead, v)) pres++;
+          else miss++;
+        }
+        if (miss > 0) missing.push({ variable: v, missing: miss, present: pres });
+      }
+
+      if ((unsupported.length > 0 || missing.length > 0) && !confirm) {
+        return res.json({
+          enrolled: false,
+          needsConfirmation: true,
+          leadCount: leads.length,
+          warnings: { unsupported, missing },
+        });
+      }
 
       const inputs = leads.map((l: any) => ({
         sequenceId: req.params.sequenceId,
