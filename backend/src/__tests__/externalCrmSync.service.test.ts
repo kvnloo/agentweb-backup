@@ -10,6 +10,10 @@ jest.mock('../services/db', () => ({
     batchCreateLeads: jest.fn(),
     setLeadListCrmSyncConfig: jest.fn().mockResolvedValue(undefined),
   },
+  userDb: {
+    // Default: users have no org, so only the config owner can access it.
+    getUserById: jest.fn().mockResolvedValue(null),
+  },
 }));
 
 jest.mock('../utils/crypto', () => ({
@@ -22,6 +26,8 @@ const mockHubSpotServiceInstance = {
   ensureContactProperty: jest.fn().mockResolvedValue('aw_notes'),
   ensureDealProperty: jest.fn().mockResolvedValue('amount'),
   upsertContact: jest.fn().mockResolvedValue({ contactId: 'c1', isNew: true }),
+  createContact: jest.fn().mockResolvedValue({ contactId: 'c1' }),
+  updateContact: jest.fn().mockResolvedValue({ contactId: 'c1' }),
   createDeal: jest.fn().mockResolvedValue('d1'),
   updateDeal: jest.fn().mockResolvedValue(undefined),
   associateContactToDeal: jest.fn().mockResolvedValue(undefined),
@@ -145,6 +151,8 @@ describe('ExternalCrmSyncService', () => {
     mockHubSpotServiceInstance.ensureContactProperty.mockResolvedValue('aw_notes');
     mockHubSpotServiceInstance.ensureDealProperty.mockResolvedValue('amount');
     mockHubSpotServiceInstance.upsertContact.mockResolvedValue({ contactId: 'c1', isNew: true });
+    mockHubSpotServiceInstance.createContact.mockResolvedValue({ contactId: 'c1' });
+    mockHubSpotServiceInstance.updateContact.mockResolvedValue({ contactId: 'c1' });
     mockHubSpotServiceInstance.createDeal.mockResolvedValue('d1');
     mockHubSpotServiceInstance.updateDeal.mockResolvedValue(undefined);
     mockHubSpotServiceInstance.associateContactToDeal.mockResolvedValue(undefined);
@@ -184,6 +192,28 @@ describe('ExternalCrmSyncService', () => {
       mockListWithConfig(config);
       const result = await service.getConfig('user1', 'list1', 'hubspot');
       expect(result).toMatchObject({ provider: 'hubspot', listId: 'list1', userId: 'user1' });
+    });
+
+    it('returns config for an org member when the config owner is in the same org', async () => {
+      const { userDb } = require('../services/db');
+      userDb.getUserById.mockImplementation((id: string) =>
+        Promise.resolve(id === 'other-user' ? { userId: 'other-user', orgId: 'org-A' } : { userId: 'user1', orgId: 'org-A' })
+      );
+      const config = makeConfig({ userId: 'other-user' });
+      mockListWithConfig(config);
+      const result = await service.getConfig('user1', 'list1', 'hubspot');
+      expect(result).toMatchObject({ userId: 'other-user' });
+    });
+
+    it('returns null when the requester and config owner are in different orgs', async () => {
+      const { userDb } = require('../services/db');
+      userDb.getUserById.mockImplementation((id: string) =>
+        Promise.resolve(id === 'other-user' ? { userId: 'other-user', orgId: 'org-B' } : { userId: 'user1', orgId: 'org-A' })
+      );
+      const config = makeConfig({ userId: 'other-user' });
+      mockListWithConfig(config);
+      const result = await service.getConfig('user1', 'list1', 'hubspot');
+      expect(result).toBeNull();
     });
 
   });
@@ -509,22 +539,23 @@ describe('ExternalCrmSyncService', () => {
       expect(result.successCount).toBe(0);
     });
 
-    it('skips leads without email when pushing to HubSpot (no upsert possible)', async () => {
+    it('creates (not upserts) a contact for leads without email when pushing to HubSpot', async () => {
       const config = makeConfig();
       mockListWithConfig(config);
       mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+      mockHubSpotServiceInstance.createContact.mockResolvedValue({ contactId: 'c1' });
       mockCrmDb.getLeadsByListId.mockResolvedValue({
         items: [{ leadId: 'l1', firstName: 'John' }], // no email
         lastEvaluatedKey: null,
         hasMore: false,
       });
 
-      const mockClient = { post: jest.fn(), patch: jest.fn(), get: jest.fn(), put: jest.fn() };
-      axios.create.mockReturnValue(mockClient);
-
       const result = await service.pushAllLeads('user1', 'list1', 'hubspot');
-      expect(result.successCount).toBe(0);
-      expect(mockClient.post).not.toHaveBeenCalled();
+      // No email means no dedup search — create directly instead of upsert.
+      expect(mockHubSpotServiceInstance.upsertContact).not.toHaveBeenCalled();
+      expect(mockHubSpotServiceInstance.createContact).toHaveBeenCalledTimes(1);
+      expect(result.successCount).toBe(1);
+      expect(result.newCount).toBe(1);
     });
 
     it('only syncs enabled field mappings', async () => {

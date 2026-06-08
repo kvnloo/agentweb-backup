@@ -299,6 +299,70 @@ describe('MetaService', () => {
             }));
             expect(result).toEqual(mockCreativeData);
         });
+
+        it('should build asset_feed_spec for a placement-customized creative', async () => {
+            const mockCreativeData = { id: 'creative_pc', name: 'Placement Creative' };
+            const mockCreateCreative = jest.fn().mockResolvedValue({ _data: mockCreativeData });
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                createAdCreative: mockCreateCreative,
+            }));
+
+            const params = {
+                name: 'Placement Creative',
+                page_id: 'page_123',
+                body: 'Ad Body',
+                title: 'Ad Title',
+                link_url: 'http://example.com',
+                call_to_action_type: 'LEARN_MORE',
+                placement_assets: [
+                    { image_hash: 'square_hash', is_default: true },
+                    { image_hash: 'vertical_hash', placements: ['story', 'reels'] },
+                ],
+            };
+
+            const result = await service.createAdCreative(mockAdAccountId, mockAccessToken, params);
+
+            expect(result).toEqual(mockCreativeData);
+            const callArgs = mockCreateCreative.mock.calls[0][1];
+
+            // asset_feed_spec must carry both images (each tagged with an adlabel)
+            expect(callArgs.asset_feed_spec.images).toEqual([
+                { hash: 'square_hash', adlabels: [{ name: 'asset_0' }] },
+                { hash: 'vertical_hash', adlabels: [{ name: 'asset_1' }] },
+            ]);
+
+            // Copy/link/format carry across to asset_feed_spec
+            expect(callArgs.asset_feed_spec.bodies).toEqual([{ text: 'Ad Body' }]);
+            expect(callArgs.asset_feed_spec.titles).toEqual([{ text: 'Ad Title' }]);
+            expect(callArgs.asset_feed_spec.link_urls).toEqual([{ website_url: 'http://example.com' }]);
+            expect(callArgs.asset_feed_spec.ad_formats).toEqual(['SINGLE_IMAGE']);
+            expect(callArgs.asset_feed_spec.call_to_action_types).toEqual(['LEARN_MORE']);
+            // Placement-customization creatives must be marked optimization_type=PLACEMENT
+            expect(callArgs.asset_feed_spec.optimization_type).toBe('PLACEMENT');
+
+            // The vertical asset is scoped to story + reels placements (FB + IG positions unioned)
+            const rules = callArgs.asset_feed_spec.asset_customization_rules;
+            const verticalRule = rules.find((r: any) => r.image_label.name === 'asset_1');
+            expect(verticalRule.customization_spec.facebook_positions).toEqual(
+                expect.arrayContaining(['story', 'facebook_reels'])
+            );
+            expect(verticalRule.customization_spec.instagram_positions).toEqual(
+                expect.arrayContaining(['story', 'reels'])
+            );
+            // Scoped rules must NOT carry an is_default flag
+            expect(verticalRule.customization_spec.is_default).toBeUndefined();
+            // Rule shape per Meta docs: no `priority` field
+            expect(verticalRule.priority).toBeUndefined();
+
+            // The square asset is the fallback rule — an EMPTY customization_spec ({}), per Meta docs
+            // (NOT { is_default: true }, which Meta rejects).
+            const defaultRule = rules.find((r: any) => r.image_label.name === 'asset_0');
+            expect(defaultRule.customization_spec).toEqual({});
+
+            // object_story_spec carries only the Page; all copy/link lives in asset_feed_spec
+            expect(callArgs.object_story_spec.page_id).toBe('page_123');
+            expect(callArgs.object_story_spec.link_data).toBeUndefined();
+        });
     });
 
     describe('Ad Operations', () => {
@@ -989,6 +1053,90 @@ describe('MetaService', () => {
 
             const result = await service.listPixels(mockAdAccountId, mockAccessToken);
             expect(result).toEqual([]);
+        });
+    });
+
+    describe('getPageInstagramActor', () => {
+        it('returns the instagram_business_account id linked to the page', async () => {
+            const mockCall = jest.fn().mockResolvedValue({
+                _data: { instagram_business_account: { id: '17841469032554858' } }
+            });
+            (FacebookAdsApi.init as jest.Mock).mockReturnValue({ call: mockCall });
+
+            const result = await service.getPageInstagramActor(mockAccessToken, '383736054827460');
+
+            expect(result).toBe('17841469032554858');
+            expect(mockCall).toHaveBeenCalledWith('GET', ['383736054827460'], expect.objectContaining({
+                fields: expect.stringContaining('instagram_business_account')
+            }));
+        });
+
+        it('falls back to connected_instagram_account when no business account', async () => {
+            const mockCall = jest.fn().mockResolvedValue({
+                _data: { connected_instagram_account: { id: '999' } }
+            });
+            (FacebookAdsApi.init as jest.Mock).mockReturnValue({ call: mockCall });
+
+            const result = await service.getPageInstagramActor(mockAccessToken, 'page_1');
+            expect(result).toBe('999');
+        });
+
+        it('falls back to the matching Page access token when the user token has no linked Instagram actor', async () => {
+            const mockUserTokenCall = jest.fn().mockResolvedValue({ _data: {} });
+            const mockPageTokenCall = jest.fn().mockResolvedValue({
+                _data: { instagram_business_account: { id: '17841469032554858' } }
+            });
+            (FacebookAdsApi.init as jest.Mock).mockImplementation((token: string) => ({
+                call: token === 'page_token_123' ? mockPageTokenCall : mockUserTokenCall,
+            }));
+            (User as unknown as jest.Mock).mockImplementation(() => ({
+                getAccounts: jest.fn().mockResolvedValue([
+                    {
+                        id: 'page_1',
+                        _data: {
+                            id: 'page_1',
+                            name: 'Test Page',
+                            access_token: 'page_token_123',
+                        }
+                    }
+                ]),
+            }));
+
+            const result = await service.getPageInstagramActor(mockAccessToken, 'page_1');
+
+            expect(result).toBe('17841469032554858');
+            expect(FacebookAdsApi.init).toHaveBeenCalledWith(mockAccessToken);
+            expect(FacebookAdsApi.init).toHaveBeenCalledWith('page_token_123');
+            expect(mockPageTokenCall).toHaveBeenCalledWith('GET', ['page_1'], expect.objectContaining({
+                fields: expect.stringContaining('instagram_business_account')
+            }));
+        });
+
+        it('returns null when the page has no linked Instagram account', async () => {
+            const mockCall = jest.fn().mockResolvedValue({ _data: {} });
+            (FacebookAdsApi.init as jest.Mock).mockReturnValue({ call: mockCall });
+
+            const result = await service.getPageInstagramActor(mockAccessToken, 'page_1');
+            expect(result).toBeNull();
+        });
+
+        it('returns null (non-fatal) when the Graph call throws', async () => {
+            const mockCall = jest.fn().mockRejectedValue(new Error('boom'));
+            (FacebookAdsApi.init as jest.Mock).mockReturnValue({ call: mockCall });
+
+            const result = await service.getPageInstagramActor(mockAccessToken, 'page_1');
+            expect(result).toBeNull();
+        });
+    });
+
+    describe('placementTokenTargetsInstagram', () => {
+        it('is true for IG-serving tokens and false for FB-only tokens', () => {
+            expect(MetaService.placementTokenTargetsInstagram('reels')).toBe(true);
+            expect(MetaService.placementTokenTargetsInstagram('story')).toBe(true);
+            expect(MetaService.placementTokenTargetsInstagram('instagram_reels')).toBe(true);
+            expect(MetaService.placementTokenTargetsInstagram('facebook_reels')).toBe(false);
+            expect(MetaService.placementTokenTargetsInstagram('facebook_feed')).toBe(false);
+            expect(MetaService.placementTokenTargetsInstagram('unknown')).toBe(false);
         });
     });
 });

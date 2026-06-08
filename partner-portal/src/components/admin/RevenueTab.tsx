@@ -173,7 +173,7 @@ function MrrTrendChart({ snapshots }: { snapshots: RevenueSnapshot[] }) {
           tooltip: {
             callbacks: {
               label: (ctx) => {
-                const val = ctx.parsed.y;
+                const val = ctx.parsed.y ?? 0;
                 return `${ctx.dataset.label}: $${Math.abs(val).toLocaleString()}`;
               },
             },

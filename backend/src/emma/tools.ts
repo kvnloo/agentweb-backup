@@ -429,7 +429,27 @@ CREATIVE SUB-TYPES (mutually exclusive — pick exactly one):
   VIDEO creative:    provide video_id (from UPLOAD_VIDEO) + REQUIRED thumbnail: image_hash or image_url
                      (Meta API error 1443226 if thumbnail is missing — always upload thumbnail first)
   CAROUSEL creative: provide carousel_cards array with 2–10 items; each card needs at least one of image_hash, image_url, or video_id; plus title, link_url per card
-  RULE: Cannot pass both video_id and carousel_cards — they are mutually exclusive.
+  PLACEMENT-CUSTOMIZED creative: provide placement_assets — different image per placement in ONE creative (e.g. square for Feed, 9:16 for Stories/Reels). See below.
+  RULE: video_id, carousel_cards, and placement_assets are mutually exclusive — pick one.
+
+PLACEMENT ASSET CUSTOMIZATION (placement_assets) — fixes "invalid format / lacking 9:16 for story and reel":
+  When an ad set uses manual placements that include Stories/Reels, a creative with only a square/4:5
+  Feed image is rejected (missing 9:16) and the ad is auto-paused. Attach a vertical 9:16 asset for
+  Stories/Reels while keeping the square image for Feed — in the SAME creative — via placement_assets.
+  Shape: placement_assets = [
+    { image_hash OR image_url, is_default: true },                 // fallback (square/Feed image) — exactly one
+    { image_hash OR image_url, placements: ["story", "reels"] }     // 9:16 vertical asset for Stories/Reels
+  ]
+  Rules: at least 2 assets; EXACTLY ONE default (is_default:true or omit placements); body/title/link_url
+  apply to all placements. image_url is auto-uploaded to a hash. Placement tokens: feed, facebook_feed,
+  instagram_feed, story/stories, facebook_story, instagram_story, reels, facebook_reels, instagram_reels, explore.
+  TO FIX AN EXISTING AD: AD UPDATE with ad_id + params.placement_assets — the system builds the new
+  multi-placement creative and points the SAME ad at it (no Ads Manager UI, same ad_id).
+  NOTES:
+  - Instagram placements (story/reels/etc.) need an Instagram actor; the system auto-resolves it from the
+    Page, or pass params.instagram_user_id explicitly. (Meta error 1772103 = "Instagram Account Is Missing".)
+  - CTA must be allowed for the campaign objective on asset-feed creatives. e.g. BOOK_NOW is rejected under
+    OUTCOME_SALES (Meta error 1885396) — use a supported CTA like LEARN_MORE / SIGN_UP / SHOP_NOW.
 
 VIDEO CREATIVE WORKFLOW (3 steps, all required):
   Step 1: UPLOAD_VIDEO → returns video_id
@@ -520,6 +540,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
 
             // --- Creative ---
             page_id: { type: "string", description: "Facebook Page ID (from list_meta_pages or PAGE LIST)." },
+            instagram_user_id: { type: "string", description: "Instagram actor ID for the creative. Required when serving Instagram placements (e.g. placement_assets targeting story/reels); auto-resolved from the Page if omitted." },
             image_hash: { type: "string", description: "Image hash from UPLOAD_IMAGE." },
             image_url: { type: "string", description: "Image URL (for UPLOAD_IMAGE action or direct creative use)." },
             video_id: { type: "string", description: "Video ID from UPLOAD_VIDEO." },
@@ -534,6 +555,23 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
                 }
               },
               description: "Carousel card array for multi-card creatives."
+            },
+            placement_assets: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  image_hash: { type: "string", description: "Image hash from UPLOAD_IMAGE." },
+                  image_url: { type: "string", description: "Image URL (auto-uploaded to a hash)." },
+                  placements: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "Placement tokens this image serves (e.g. ['story','reels']). Omit for the default/fallback asset."
+                  },
+                  is_default: { type: "boolean", description: "Marks the fallback image that serves every unmatched placement (e.g. the square Feed image). Exactly one asset must be the default." }
+                }
+              },
+              description: "Placement-level image customization (asset_feed_spec). Map different images to different placements in ONE creative (square→Feed, 9:16→Stories/Reels). Requires ≥2 assets and exactly one default. Mutually exclusive with video_id and carousel_cards."
             },
             body: { type: "string", description: "Ad body / primary text." },
             title: { type: "string", description: "Ad headline." },
@@ -2947,6 +2985,38 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     return await agentModeService.getLeadDetails(args.list_id, args.lead_id, context?.userId);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'get_leads_needing_followup',
+  definition: {
+    name: 'get_leads_needing_followup',
+    description: 'For a LinkedIn-outreach lead list, return the cohort of leads who ACCEPTED your connection invite but still need a follow-up — in a single list-level call (no per-lead get_lead_details fan-out). A lead qualifies when they are a 1st-degree connection AND the most recent message is not an outbound touch sent after they connected (i.e. you never followed up after they accepted, or they replied and you owe a response). Each returned lead includes linkedInConnectionStatus (isConnected, connectedAt), lastEngagementType, lastEngagementDirection (inbound/outbound), lastEngagementAt, and awaitingReply. Requires the list to have a LinkedIn account assigned. Use this to answer "which leads accepted my invite but haven\'t been followed up?".',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The ID of the LinkedIn-outreach lead list to scan'
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of leads to return (default 25, max 100)'
+        },
+        scan_limit: {
+          type: 'number',
+          description: 'Maximum number of leads to scan in the list (default 2000, max 5000). Raise only for very large lists; the response reports scannedAllLeads so you know whether the whole list was covered.'
+        }
+      },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.getLeadsNeedingFollowup(args.list_id, context?.userId, {
+      limit: args.limit,
+      scanLimit: args.scan_limit,
+    });
   }
 });
 

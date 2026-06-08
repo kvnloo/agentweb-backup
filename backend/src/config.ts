@@ -8,7 +8,14 @@ export const MAX_MESSAGE_SIZE_PER_SESSION = 1000;
 export const MAX_FILE_SIZE = 100 * 1024 * 1024;
 
 // AI Model Configuration
-export const DEEP_RESEARCH_AGENT = 'deep-research-pro-preview-12-2025';
+// Google Deep Research agents (April 2026). Two tiers replace the prior single
+// "pro" preview agent. See https://aistudio.google.com/learn/deep-research-developer-guide
+// - speed: fast, ideal for streaming back to a client UI
+// - max: maximum comprehensiveness for synthesis-heavy reports
+export const DEEP_RESEARCH_AGENT_SPEED = 'deep-research-preview-04-2026';
+export const DEEP_RESEARCH_AGENT_MAX = 'deep-research-max-preview-04-2026';
+// Default agent (used when a caller does not select a tier by depth).
+export const DEEP_RESEARCH_AGENT = DEEP_RESEARCH_AGENT_SPEED;
 export const CONTENT_RESTYLE_MODEL = 'gemini-3-flash-preview';
 
 // Resend System Email Configuration
