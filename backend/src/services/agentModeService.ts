@@ -3514,6 +3514,12 @@ export class AgentModeService {
     // ad-hoc analysis tasks. Must be available even when no skill is installed
     // so that scheduled chats with empty requiredFunctionCalls can still call it.
     'perform_data_analysis',
+
+    // Deterministic image compositing — the reliable, in-process fallback for
+    // "exact element count" requests (e.g. "9 avatars in a hexagon layout")
+    // that generative image models cannot satisfy. Safe, side-effect-free
+    // primitive, so it is always available regardless of installed skills.
+    'composite_images',
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
@@ -16969,6 +16975,77 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: 'Failed to generate image',
         error: error.message
+      };
+    }
+  }
+
+  /**
+   * Deterministically composite a specific set of images into an exact layout
+   * (grid / row / column / honeycomb). Unlike generate_image, this places every
+   * supplied image exactly once, so it reliably hits exact element counts
+   * (e.g. "9 community avatars in a hexagon layout") that generative models
+   * cannot guarantee.
+   */
+  public async compositeImages(
+    images: string[],
+    filename: string,
+    userId: string,
+    sessionId: string,
+    options?: {
+      layout?: 'grid' | 'row' | 'column' | 'honeycomb';
+      shape?: 'square' | 'circle';
+      columns?: number;
+      cellSize?: number;
+      gap?: number;
+      background?: string;
+    }
+  ): Promise<any> {
+    try {
+      const { imageService } = await import('./imageGeneration');
+
+      const result = await imageService.compositeImages({
+        images: images || [],
+        filename,
+        userId,
+        layout: options?.layout,
+        shape: options?.shape,
+        columns: options?.columns,
+        cellSize: options?.cellSize,
+        gap: options?.gap,
+        background: options?.background,
+      });
+
+      if (result.success && result.imageUrl) {
+        try {
+          await chatbotDb.addMessageToSession(sessionId, {
+            role: 'system',
+            content: `Composite image created: ${result.filename} (${(images || []).length} images)`,
+            metadata: { timestamp: new Date().toISOString() },
+          });
+        } catch (error) {
+          console.warn('Failed to store composite image metadata:', error);
+        }
+
+        return {
+          success: true,
+          message: `✅ Composite image "${result.filename}" created from ${(images || []).length} images.`,
+          imageUrl: result.imageUrl,
+          filename: result.filename,
+          imageCount: (images || []).length,
+        };
+      }
+
+      return {
+        success: false,
+        message: result.error || 'Failed to composite images',
+        error: result.error,
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error compositing images:', error);
+      return {
+        success: false,
+        message: 'Failed to composite images',
+        error: error.message,
       };
     }
   }

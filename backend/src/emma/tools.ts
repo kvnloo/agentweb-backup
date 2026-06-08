@@ -4043,6 +4043,73 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
+  name: 'composite_images',
+  definition: {
+    name: 'composite_images',
+    description: 'Deterministically arrange a SPECIFIC SET of existing images into an EXACT layout (grid, row, column, or honeycomb/hexagon). Unlike generate_image, this places every image you provide exactly once — so the output always has the exact number of elements requested.\n\nWHEN TO USE THIS INSTEAD OF generate_image:\n- The user wants an EXACT COUNT of distinct elements (e.g. "9 community avatars", "a row of 5 product photos", "a 3x3 grid of headshots"). Generative models (generate_image) CANNOT reliably produce an exact number of elements — they routinely render one or two too many or too few. composite_images is the correct, deterministic tool for exact counts.\n- You already have the individual image URLs (avatars, logos, product shots, screenshots) and just need them assembled into a layout.\n\nThe images are placed in the order given. Each tile is resized to cover its cell. Set shape="circle" for avatar montages. Use layout="honeycomb" for the packed hexagon look. The result is a single PNG uploaded to storage; its URL is returned.\n\nIf you do NOT yet have the individual images (e.g. you need to first create 9 avatars), generate each one with generate_image, then pass their URLs here to assemble the exact layout.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        images: {
+          type: 'array',
+          description: 'Ordered list of image URLs to place. Each is resized to fill one cell. The number of URLs is exactly the number of elements in the output.',
+          items: { type: 'string' }
+        },
+        filename: {
+          type: 'string',
+          description: 'Name for the composite image file (should include .png extension)'
+        },
+        layout: {
+          type: 'string',
+          description: 'How to arrange the images. "grid" = near-square grid (or use columns). "row" = single horizontal line. "column" = single vertical line. "honeycomb" = offset rows for a packed hexagon look (best for avatar clusters).',
+          enum: ['grid', 'row', 'column', 'honeycomb'],
+          default: 'grid'
+        },
+        shape: {
+          type: 'string',
+          description: 'Clip each tile into a circle (e.g. for avatar/headshot montages) or leave it square. Defaults to square.',
+          enum: ['square', 'circle'],
+          default: 'square'
+        },
+        columns: {
+          type: 'number',
+          description: 'Optional explicit number of columns for grid/honeycomb layouts. Omit for an automatic near-square arrangement.'
+        },
+        cellSize: {
+          type: 'number',
+          description: 'Optional pixel size of each square cell. Defaults to 256.'
+        },
+        gap: {
+          type: 'number',
+          description: 'Optional pixel gap between cells. Defaults to 16.'
+        },
+        background: {
+          type: 'string',
+          description: 'Optional CSS color for the canvas background (e.g. "#ffffff"). Defaults to transparent.'
+        }
+      },
+      required: ['images', 'filename']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.compositeImages(
+      args.images || [],
+      args.filename,
+      context?.userId,
+      context?.sessionId,
+      {
+        layout: args.layout,
+        shape: args.shape,
+        columns: args.columns,
+        cellSize: args.cellSize,
+        gap: args.gap,
+        background: args.background,
+      }
+    );
+  }
+});
+
+emmaToolRegistry.register({
   name: 'generate_video',
   definition: {
     name: 'generate_video',

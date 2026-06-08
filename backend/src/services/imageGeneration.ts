@@ -35,6 +35,44 @@ interface ImageGenerationParams {
   removeC2PA?: boolean; // Optional parameter to remove C2PA metadata, defaults to true
 }
 
+// Deterministic compositing (sharp, in-process) — the exact-count fallback for
+// requests that generative models cannot reliably satisfy (e.g. "9 avatars in a
+// hexagon layout"). N input images always produce exactly N placed cells.
+export type CompositeLayout = "grid" | "row" | "column" | "honeycomb";
+export type CompositeShape = "square" | "circle";
+
+interface CompositeLayoutOptions {
+  layout?: CompositeLayout;
+  columns?: number; // explicit column count (grid/honeycomb); auto near-square when omitted
+  cellSize?: number; // px per cell (square); default 256
+  gap?: number; // px between cells; default 16
+}
+
+interface CompositeCell {
+  x: number;
+  y: number;
+  size: number;
+}
+
+interface CompositeLayoutResult {
+  cells: CompositeCell[];
+  width: number;
+  height: number;
+}
+
+interface CompositeImagesParams extends CompositeLayoutOptions {
+  images: string[]; // URLs of the exact images to place, in order
+  filename: string;
+  userId: string;
+  shape?: CompositeShape; // mask each cell into a circle (e.g. avatars) or leave square
+  background?: string; // CSS color for the canvas; default transparent
+}
+
+// Upper bound on images per composite — guards memory and keeps layouts sane.
+const MAX_COMPOSITE_IMAGES = 50;
+const DEFAULT_CELL_SIZE = 256;
+const DEFAULT_CELL_GAP = 16;
+
 export class ImageService {
   // Default timeout for a single image generation API call (10 minutes).
   // Prevents sessions from hanging indefinitely when a provider is unresponsive.
@@ -502,6 +540,176 @@ export class ImageService {
     }
     
     return { buffer: imageBuffer, mimeType };
+  }
+
+  /**
+   * Compute a deterministic layout for placing exactly `count` cells.
+   *
+   * This is the heart of the exact-count guarantee: the returned `cells` array
+   * always has exactly `count` entries, so N input images map 1:1 to N placed
+   * positions — something generative image models cannot promise.
+   *
+   * Layouts:
+   *  - grid (default): near-square arrangement, or `columns` if provided
+   *  - row / column: single line of cells
+   *  - honeycomb: grid with alternating rows offset by half a cell and a
+   *    compressed vertical pitch, giving the packed "hexagon" look
+   */
+  public computeCompositeLayout(
+    count: number,
+    options: CompositeLayoutOptions
+  ): CompositeLayoutResult {
+    const cellSize = options.cellSize && options.cellSize > 0 ? options.cellSize : DEFAULT_CELL_SIZE;
+    const gap = options.gap !== undefined && options.gap >= 0 ? options.gap : DEFAULT_CELL_GAP;
+    const layout = options.layout || "grid";
+
+    const cells: CompositeCell[] = [];
+
+    if (layout === "row") {
+      for (let i = 0; i < count; i++) {
+        cells.push({ x: i * (cellSize + gap), y: 0, size: cellSize });
+      }
+      const width = count * cellSize + Math.max(0, count - 1) * gap;
+      return { cells, width, height: cellSize };
+    }
+
+    if (layout === "column") {
+      for (let i = 0; i < count; i++) {
+        cells.push({ x: 0, y: i * (cellSize + gap), size: cellSize });
+      }
+      const height = count * cellSize + Math.max(0, count - 1) * gap;
+      return { cells, width: cellSize, height };
+    }
+
+    // grid / honeycomb share column math
+    const columns = options.columns && options.columns > 0
+      ? Math.floor(options.columns)
+      : Math.max(1, Math.ceil(Math.sqrt(count)));
+    const rows = Math.max(1, Math.ceil(count / columns));
+
+    if (layout === "honeycomb") {
+      // Half-cell horizontal offset on odd rows; vertical pitch compressed to
+      // ~86.6% (sin 60°) of the cell so rows nest like a honeycomb.
+      const rowPitch = Math.round(cellSize * 0.866) + gap;
+      const halfStep = (cellSize + gap) / 2;
+      for (let i = 0; i < count; i++) {
+        const r = Math.floor(i / columns);
+        const c = i % columns;
+        const xOffset = r % 2 === 1 ? halfStep : 0;
+        cells.push({
+          x: c * (cellSize + gap) + xOffset,
+          y: r * rowPitch,
+          size: cellSize,
+        });
+      }
+      // Widest row spans `columns` cells plus a possible half-step offset.
+      const width = columns * cellSize + Math.max(0, columns - 1) * gap + halfStep;
+      const height = (rows - 1) * rowPitch + cellSize;
+      return { cells, width, height };
+    }
+
+    // grid
+    for (let i = 0; i < count; i++) {
+      const r = Math.floor(i / columns);
+      const c = i % columns;
+      cells.push({
+        x: c * (cellSize + gap),
+        y: r * (cellSize + gap),
+        size: cellSize,
+      });
+    }
+    const width = columns * cellSize + Math.max(0, columns - 1) * gap;
+    const height = rows * cellSize + Math.max(0, rows - 1) * gap;
+    return { cells, width, height };
+  }
+
+  /**
+   * Build a circular-mask SVG buffer for the given cell size.
+   * Used to clip each tile into a circle (e.g. for avatar montages).
+   */
+  private circleMaskSvg(size: number): Buffer {
+    const r = size / 2;
+    return Buffer.from(
+      `<svg width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">` +
+        `<circle cx="${r}" cy="${r}" r="${r}" fill="#fff"/></svg>`
+    );
+  }
+
+  /**
+   * Deterministically composite N specific images into an exact layout using
+   * sharp (in-process — no network sandbox, no generative model). Guarantees
+   * every supplied image is placed exactly once.
+   *
+   * This is the reliable path for "exact element count" requests (e.g. "9
+   * community avatars in a hexagon layout") that generative models fail at.
+   */
+  async compositeImages(params: CompositeImagesParams): Promise<ImageGenerationResult> {
+    try {
+      const { images, filename, userId } = params;
+
+      if (!images || images.length === 0) {
+        return { success: false, error: "compositeImages requires at least one image URL." };
+      }
+      if (images.length > MAX_COMPOSITE_IMAGES) {
+        return {
+          success: false,
+          error: `Too many images: ${images.length}. Maximum is ${MAX_COMPOSITE_IMAGES}.`,
+        };
+      }
+      if (!filename || !filename.trim()) {
+        return { success: false, error: "compositeImages requires a filename." };
+      }
+
+      const sharp = require("sharp");
+
+      const cellSize = params.cellSize && params.cellSize > 0 ? params.cellSize : DEFAULT_CELL_SIZE;
+      const layout = this.computeCompositeLayout(images.length, {
+        layout: params.layout,
+        columns: params.columns,
+        cellSize,
+        gap: params.gap,
+      });
+
+      // Download, resize-to-cover, and (optionally) circle-mask each tile.
+      const circleMask = params.shape === "circle" ? this.circleMaskSvg(cellSize) : null;
+      const overlays = await Promise.all(
+        images.map(async (url, i) => {
+          const { buffer } = await this.processInputImage(url);
+          let tile = sharp(buffer).resize(cellSize, cellSize, { fit: "cover", position: "center" });
+          if (circleMask) {
+            tile = tile.composite([{ input: circleMask, blend: "dest-in" }]);
+          }
+          const tileBuffer = await tile.png().toBuffer();
+          return {
+            input: tileBuffer,
+            left: Math.round(layout.cells[i].x),
+            top: Math.round(layout.cells[i].y),
+          };
+        })
+      );
+
+      const canvasBuffer = await sharp({
+        create: {
+          width: Math.round(layout.width),
+          height: Math.round(layout.height),
+          channels: 4,
+          background: params.background || { r: 0, g: 0, b: 0, alpha: 0 },
+        },
+      })
+        .composite(overlays)
+        .png()
+        .toBuffer();
+
+      const uploadResult = await uploadFileToS3(canvasBuffer, filename, userId, "image/png");
+      if (!uploadResult.success) {
+        return { success: false, error: uploadResult.error || "Failed to upload composite to S3." };
+      }
+
+      return { success: true, imageUrl: uploadResult.url, filename };
+    } catch (error: any) {
+      console.error("Error compositing images:", error);
+      return { success: false, error: `Failed to composite images: ${error.message}` };
+    }
   }
 
   /**
