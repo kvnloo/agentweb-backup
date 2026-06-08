@@ -4711,6 +4711,20 @@ export const crmDb = {
     }
   },
 
+  // Loads ALL leads for a list, following DynamoDB pagination. Use this anywhere a
+  // complete list is required (enrollment, coverage counts) — getLeadsByListId
+  // returns only a single ~1MB page.
+  async getAllLeadsByListId(listId: string) {
+    const all: any[] = [];
+    let lastKey: any = undefined;
+    do {
+      const result = await this.getLeadsByListId(listId, 100, lastKey);
+      all.push(...result.items);
+      lastKey = result.lastEvaluatedKey;
+    } while (lastKey);
+    return all;
+  },
+
   async getLeadsByICPFlag(listId: string, isICP: 0 | 1, limit?: number, lastEvaluatedKey?: any) {
     try {
       const params: any = {
