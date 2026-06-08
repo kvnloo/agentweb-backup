@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-06-08',
+    changes: [
+      'Improved: Presentation PDFs Now Fill the Whole Page — No More Margins or Cut-Off Edges',
+      '- When a presentation or document sets its own page size (like a slide deck designed at 11"×8.5"), the PDF now uses that exact size with no extra margins, so each slide fills the page edge to edge',
+      '- This fixes the leftover white band along the bottom and the slightly cut-off right side that could appear even after the landscape fix',
+      '- Regular documents that don\'t specify a page size are unaffected — they still auto-pick portrait or landscape and scale to fit',
+    ],
+  },
+  {
     date: '2026-06-07',
     changes: [
       'Fixed: Emma\'s Local Browser Agent No Longer Times Out on Slow Pages',
