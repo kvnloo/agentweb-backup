@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-08
 **Branch:** harshit/crm-sequence-bug-fixes
-**Status:** Approved design — ready for implementation plan
+**Status:** Approved design (revised post-CTO review) — ready for implementation plan
 
 ## Problem
 
@@ -13,157 +13,211 @@ on the leads in that list. Today enrollment happens immediately with no feedback
 so those leads silently receive messages with blank variables.
 
 We want to **check the sequence's template variables against the selected list's
-leads at enroll time, warn the user about any gaps, and let them proceed anyway**.
+leads at enroll time, warn the user about any gaps, and let them proceed anyway.**
 
 ## Scope
 
 **In scope:** the by-list "Enroll Leads from a list" dialog in
-`customer-portal/src/components/crm/SequencesTab.tsx` (the `EnrollmentDetail`
-enroll flow → `handleEnrollFromList` → `POST /enrollments/by-list`).
+`customer-portal/src/components/crm/SequencesTab.tsx` (`EnrollmentDetail` →
+`handleEnrollFromList` → `POST /enrollments/by-list`).
 
-**Out of scope:**
-- Background **auto-enroll** (no human present to see a warning).
-- The per-lead **"Add to Sequence"** flow from the CRM list view.
-- Changing how variables are substituted at send time (already fixed separately —
-  `customFields` now flow through `msgVars` in `dripSequenceWorker.ts`).
+**Coupled fixes pulled in (see CTO review below):**
+- Worker variable forwarding (`dripSequenceWorker.ts`) — so the check reflects what
+  actually gets substituted.
+- Paginated lead loading (`db.ts`) — so counts are correct and the existing enroll
+  stops silently truncating large lists.
 
-## Confirmed Decisions
+**Out of scope:** background **auto-enroll** (no human present — see Known Gaps),
+the per-lead **"Add to Sequence"** flow, and supporting arbitrary lead fields beyond
+the substitution engine's known set.
 
-1. **Trigger:** a variable is "missing" if it is empty/absent for **any** lead in
-   the list. Warn with **per-variable counts** ("missing for N of M leads").
-2. **Timing:** **gate on click.** When the user clicks "Enroll All Leads", run the
-   check first. If anything is missing, **hold** enrollment and show the warning;
-   the button becomes **"Enroll Anyway"**. A second click performs the real enroll.
-   If nothing is missing, enroll immediately (no added friction).
-3. **Channels:** check email `subject` + `bodyHtml` **and** LinkedIn `messageText`
-   across **all** steps of the sequence.
-4. **Excluded variables:** sender-sourced vars (`senderName`, `senderEmail`) are
-   excluded from the coverage check — they come from the user, not the lead, so
-   checking them against leads would be a false positive. `unsubscribeUrl` /
-   `unsubscribe_url` are already excluded by `extractVariables`.
+## CTO Review Findings (validated against code, now folded in)
 
-## Existing Building Blocks (reused, not rebuilt)
+1. **The check must validate what is actually substituted, not raw lead fields.**
+   `STANDARD_FIELDS` (`emailVariables.ts:3`) =
+   `['firstName','lastName','email','company','title','senderName','senderEmail']`,
+   but the worker's `msgVars` (`dripSequenceWorker.ts:111`) only forwards
+   `firstName,lastName,email,company,senderName,senderEmail,customFields` — **`title`
+   is missing**, so `{{title}}` always renders blank even when the lead has a title.
+   Validating with `leadHasVariable` against raw lead fields would therefore give a
+   false "all clear." **Fix:** forward all engine-supported standard fields in the
+   worker (add `title`), and scope the check to the engine's known variable set.
+2. **Lead loading truncates large lists.** `getLeadsByListId` (`db.ts:4683`) is a
+   single ~1MB-capped DynamoDB query returning `LastEvaluatedKey`; the enroll path
+   (`sequences.ts:208`) consumes `.items` with no pagination loop, so large lists are
+   silently under-enrolled today, and any "N of M" count would be wrong. **Fix:**
+   paginate (pattern already exists at `db.ts:4254`).
+3. **One round-trip, one lead read.** Rather than a separate check endpoint that
+   re-loads all leads, fold the check into the existing enroll endpoint via a
+   `confirm` flag (details below). Avoids double DynamoDB cost and time-of-check/
+   time-of-use drift.
+4. **List ownership is unchecked.** Enroll verifies `sequence.userId`
+   (`sequences.ts:202`) but not that the list belongs to the caller. **Fix:** verify
+   via `getLeadListById` + `list.userId === userId` (helper near `db.ts:3819`).
+5. **Auto-enroll gap** is accepted for v1 and documented under Known Gaps.
 
-In `backend/src/utils/emailVariables.ts`:
-- `extractVariables(template: string): string[]` — pulls `{{...}}` tokens; already
-  skips `unsubscribeUrl`/`unsubscribe_url`.
-- `leadHasVariable(lead, varName): boolean` — true if the lead has a non-empty value
-  for the variable; understands `customFields.*` dot-paths.
+## Confirmed Product Decisions
 
-There is also an existing single-step endpoint
-`POST /:sequenceId/steps/verify-variables` used during step editing. We will **not**
-overload it — it is wired to single email subject/body editing. A dedicated
-enrollment-check endpoint keeps responsibilities clean and independently testable.
+1. **Trigger:** a *supported* variable is "missing" if it is empty/absent for **any**
+   lead in the list. Warn with per-variable counts ("missing for N of M leads").
+2. **Severity split (added):** distinguish two cases so the warning stays honest and
+   doesn't cry wolf with a single bucket:
+   - **Unsupported variable** — a token the engine cannot fill for *anyone*
+     (not a standard field and not `customFields.*`). Always blank/literal. Strong
+     warning.
+   - **Missing data** — a supported variable empty on some leads. Counted warning.
+3. **Timing:** **gate on click.** Clicking "Enroll All Leads" runs the check; if
+   anything is flagged, **hold** enrollment and show the warning; the button becomes
+   **"Enroll Anyway."** A second click performs the real enroll. Clean lists enroll
+   on first click (no friction).
+4. **Channels:** check email `subject` + `bodyHtml` **and** LinkedIn `messageText`
+   across **all** steps.
+5. **Excluded from the lead check:** `senderName`, `senderEmail` (user-sourced) and
+   `unsubscribeUrl`/`unsubscribe_url` (already excluded by `extractVariables`).
+
+## Existing Building Blocks (reused)
+
+`backend/src/utils/emailVariables.ts`:
+- `extractVariables(template)` — pulls `{{...}}` tokens; already skips unsubscribe vars.
+- `leadHasVariable(lead, varName)` — non-empty check, understands `customFields.*`.
+- `STANDARD_FIELDS` — the engine's known standard variable set.
+
+We will export/derive a **supported-variable set** = `STANDARD_FIELDS` minus
+`senderName`/`senderEmail`, plus any `customFields.*`. A token not in this set is
+classified "unsupported."
 
 ## Design
 
-### Backend — new endpoint
+### A. Worker fix — forward `title` (and align with `STANDARD_FIELDS`)
 
-`POST /api/crm/sequences/:sequenceId/enrollments/by-list/check-variables`
+In `dripSequenceWorker.ts`, add the engine-supported standard fields that are
+currently dropped so substitution is truthful:
 
-Request body: `{ listId: string }`
+```js
+const msgVars: Record<string, any> = {
+  firstName: lead?.firstName ?? '',
+  lastName:  lead?.lastName ?? '',
+  email:     enrollment.leadEmail,
+  company:   lead?.company ?? '',
+  title:     lead?.title ?? '',        // ← was missing; {{title}} rendered blank
+  senderName: user?.displayName ?? user?.name ?? '',
+  senderEmail: user?.email ?? '',
+  customFields: lead?.customFields ?? {},
+};
+```
 
-Logic:
-1. Auth (same `authenticateToken` as siblings); 401 if no user.
-2. Load the sequence (`dripSequenceDb.getSequence`); 404 if missing.
-3. Gather templates from every step across channels:
-   - email steps: `step.subject` + `step.bodyHtml`
-   - LinkedIn steps: `step.messageText`
-   - (A step that is email-only won't have `messageText`, and vice-versa — just
-     concatenate whatever string fields are present.)
-4. `extractVariables()` over the concatenated template text → unique variable list.
-5. Remove sender-sourced vars: filter out anything in
-   `SENDER_VARS = new Set(['senderName', 'senderEmail'])`.
-6. Load the list's leads (`crmDb.getLeadsByListId`, handling the array/`items`/`leads`
-   shapes the existing verify-variables endpoint already handles).
-7. For each remaining variable, count `present` / `missing` across leads via
-   `leadHasVariable`.
-8. Respond:
+This is a real bug fix in its own right and makes the enroll check meaningful.
+Supporting arbitrary non-standard fields (e.g. `{{phone}}`) would require changing
+`substituteVariables` itself and is explicitly out of scope.
+
+### B. Paginated lead loading
+
+Add `getAllLeadsByListId(listId)` to `db.ts` (or an inline loop) that pages until
+`lastEvaluatedKey` is null, reusing the pattern at `db.ts:4254`. Use it in the
+enroll endpoint in place of the single-page `getLeadsByListId` call, fixing the
+existing truncation. The same loaded array feeds both coverage and enrollment.
+
+### C. Enroll endpoint — `confirm` flag (no separate endpoint)
+
+Extend `POST /api/crm/sequences/:sequenceId/enrollments/by-list`.
+Request body adds: `confirm?: boolean`.
+
+Flow:
+1. Existing auth + `sequence.userId` check (unchanged).
+2. **New:** verify list ownership (`getLeadListById` + `list.userId === userId`) → 403 otherwise.
+3. Load **all** leads (paginated, B).
+4. Gather templates across all steps and channels (email `subject`+`bodyHtml`,
+   LinkedIn `messageText`); `extractVariables` over the combined text.
+5. Partition variables into **supported** vs **unsupported** (per the supported set).
+   For supported vars, compute `present`/`missing` over the leads via `leadHasVariable`.
+6. Build `warnings = { unsupported: string[], missing: [{variable, missing, present}] }`.
+7. **If** (`unsupported.length || missing.length`) **and not** `confirm` → return
+   **without enrolling**:
    ```json
-   {
-     "leadCount": 40,
-     "variables": ["firstName", "customFields.region"],
-     "missing": [
-       { "variable": "customFields.region", "missing": 12, "present": 28 }
-     ]
-   }
+   { "enrolled": false, "needsConfirmation": true,
+     "leadCount": 40, "warnings": { "unsupported": ["phone"],
+       "missing": [{ "variable": "customFields.region", "missing": 12, "present": 28 }] } }
    ```
-   `missing` contains only variables with `missing > 0` (the warning list). An empty
-   `missing` array means "all clear".
+8. **Else** (clean, or `confirm: true`) → proceed with the existing `bulkEnroll`
+   + auto-enroll-list update, and return the normal result (optionally echoing
+   `warnings` for display).
 
-Response shape note: we return a pre-filtered `missing` array (only vars with gaps)
-so the frontend can treat "warn?" as simply `missing.length > 0`, while still
-exposing full `variables` for completeness.
+This keeps a single code path and a single lead read per click.
 
-### Frontend — `EnrollmentDetail` enroll dialog
+### D. Frontend — `EnrollmentDetail` enroll dialog
 
-State additions:
-- `checking: boolean` — check request in flight.
-- `varWarning: { variable: string; missing: number; present: number }[] | null` —
-  populated when the check finds gaps; drives the warning panel.
-- `leadCount: number | null` — for "N of M leads" phrasing.
+State additions: `checking`, `warnings` (`{ unsupported, missing } | null`), `leadCount`.
 
-Flow change in the dialog footer button:
-- **First click ("Enroll All Leads")** → call `check-variables`.
-  - On `missing.length === 0` → proceed straight to the existing `handleEnrollFromList`.
-  - On `missing.length > 0` → set `varWarning`, render the warning panel, change the
-    button label to **"Enroll Anyway"**. Do **not** enroll yet.
-- **Second click ("Enroll Anyway")** → call the existing `handleEnrollFromList`
-  (real `POST /enrollments/by-list`), then show the existing success summary.
-- Selecting a different list resets `varWarning` (back to first-click behavior).
-- Cancel/close resets all the new state.
+Footer button behavior:
+- **First click** → POST enroll **without** `confirm`.
+  - `needsConfirmation` true → store `warnings`/`leadCount`, render warning panel,
+    relabel button **"Enroll Anyway."** No enrollment yet.
+  - Otherwise (normal result) → show existing success summary.
+- **Second click ("Enroll Anyway")** → POST enroll with `confirm: true` → success summary.
+- Changing the selected list or closing the dialog resets `warnings`.
 
-Warning panel content (inside the existing dialog, above the footer):
-- A short heading, e.g. "Some message variables aren't filled in for this list."
-- A list of rows: `{{customFields.region}}` — "missing for 12 of 40 leads".
-- A one-line note that those leads will receive blank values for those variables.
+Warning panel (inside the dialog, above the footer), two sections when present:
+- **"These variables can't be filled"** (unsupported) — list tokens; note they will
+  appear blank/literal for every lead.
+- **"Missing for some leads"** — rows like `{{customFields.region}}` — "missing for
+  12 of 40 leads."
 
-No new design-system components are needed — reuse existing alert/border styling
-already present in the file.
+Reuse existing alert/border styling in the file; no new design-system components.
 
-### Error handling
+### E. Error handling
 
-- Check endpoint failure (network/500): don't block the user. Log it and fall back
-  to the current behavior (allow enroll). Rationale: the warning is advisory; a
-  check outage shouldn't prevent enrollment.
-- Empty list (0 leads): `leadCount = 0`, `missing = []` → no warning, normal enroll.
+- Enroll/check failure (network/500): surface the existing error path; do not
+  invent a blocking state. (The check now lives inside enroll, so there is no
+  separate advisory call to fail open on.)
+- Empty list (0 leads): `leadCount = 0`, no missing-data warnings; unsupported-token
+  warnings still apply (they're list-independent) — enroll proceeds on confirm.
 
 ## Testing
 
-### Backend (TDD — write failing tests first)
-New file `backend/src/__tests__/sequences.checkVariables.test.ts` (or extend
-`sequences.test.ts` following its existing style):
-1. **Custom field missing** → a `{{customFields.region}}` referenced in a step is
-   absent on some leads → response `missing` includes it with correct counts. (FAIL)
-2. **LinkedIn messageText variable** → a var only present in a LinkedIn step's
-   `messageText` is included in the check. (FAIL)
-3. **Sender vars excluded** → `{{senderName}}`/`{{senderEmail}}` in a template never
-   appear in `missing` even though no lead has them. (FAIL)
-4. **All present** → every referenced var populated on all leads → `missing` empty. (SUCCESS)
-5. **Empty list** → 0 leads → `missing` empty, `leadCount` 0, 200 response.
-6. **Sequence not found** → 404.
+### Backend (TDD — failing tests first)
+Extend `backend/src/__tests__/sequences.test.ts` (or a new
+`sequences.enrollByListConfirm.test.ts`):
+1. Supported custom field missing on some leads, no `confirm` →
+   `needsConfirmation:true`, correct `missing` counts, **no enrollment performed**. (FAIL)
+2. Variable only in a LinkedIn `messageText` step is included in the check. (FAIL)
+3. Unsupported token (`{{phone}}`) → appears in `warnings.unsupported`, not in
+   `missing`. (FAIL)
+4. `senderName`/`senderEmail` never flagged. (FAIL)
+5. `confirm:true` with gaps → enrolls and returns normal result. (SUCCESS)
+6. Clean list (all supported vars populated) → enrolls on first call, no confirmation. (SUCCESS)
+7. Pagination: a list spanning multiple pages is fully loaded (counts use total, not
+   first page). (FAIL→fix in B)
+8. List not owned by caller → 403.
+
+Worker fix gets its own test (extends `dripSequenceWorker.customFields.test.ts` or a
+sibling): `{{title}}` is substituted from the lead. (FAIL→fix in A)
 
 ### Frontend
-Follow existing component-test conventions in `customer-portal`:
-- Clicking "Enroll All Leads" with missing vars shows the warning and does **not**
-  call the enroll endpoint; button becomes "Enroll Anyway".
-- Clicking "Enroll Anyway" calls the enroll endpoint.
-- Clean list (no missing vars) enrolls on first click without a warning.
+Per existing customer-portal conventions:
+- First click with gaps shows the warning and does **not** enroll; button →
+  "Enroll Anyway"; second click enrolls.
+- Clean list enrolls on first click with no warning.
 
-## Known Limitations (acceptable for v1)
+## Known Gaps (accepted for v1, documented)
 
-- **Aliased variables** (e.g. `{{first name}}` resolved via `VARIABLE_ALIASES` at
-  send time) are returned verbatim by `extractVariables` and won't be resolved by
-  `leadHasVariable`, so they could show as false-positive "missing". Standard
-  canonical tokens (`{{firstName}}`) and `{{customFields.*}}` — the common cases —
-  work correctly. Alias resolution can be a follow-up if needed.
-- The check counts a variable as "present" when the lead field is a non-empty value;
-  it does not validate format/content.
+- **Auto-enroll is unguarded.** The by-list dialog enables auto-enroll by default
+  (`sequences.ts:228`), so leads added to the list *later* are enrolled in the
+  background with no variable check. v1 only gates the manual batch. Follow-up:
+  surface the same coverage summary on the auto-enroll toggle, or run the check at
+  auto-enroll time and skip/flag offending leads.
+- **Aliased variables** (`{{first name}}`) returned verbatim by `extractVariables`
+  are not resolved by `leadHasVariable` and may classify as unsupported/missing.
+  Canonical tokens and `customFields.*` work correctly. Alias resolution is a follow-up.
+- **Arbitrary non-standard fields** (`{{phone}}`) aren't substituted by the engine at
+  all; they're reported as unsupported rather than newly supported.
 
 ## Files Touched
 
-- `backend/src/routes/sequences.ts` — new `check-variables` endpoint.
-- `backend/src/__tests__/sequences.checkVariables.test.ts` — new tests.
-- `customer-portal/src/components/crm/SequencesTab.tsx` — gate-on-click flow + warning panel.
-- (Frontend test file per existing conventions.)
-- Reuses `backend/src/utils/emailVariables.ts` (`extractVariables`, `leadHasVariable`) unchanged.
+- `backend/src/services/dripSequenceWorker.ts` — forward `title` (worker fix A).
+- `backend/src/services/db.ts` — paginated `getAllLeadsByListId` (B).
+- `backend/src/routes/sequences.ts` — `confirm` flag, list-ownership check, coverage
+  partitioning on the existing by-list enroll endpoint (C).
+- `backend/src/__tests__/…` — backend tests above.
+- `customer-portal/src/components/crm/SequencesTab.tsx` — gate-on-click + warning panel (D).
+- Reuses `backend/src/utils/emailVariables.ts` (`extractVariables`, `leadHasVariable`,
+  `STANDARD_FIELDS`); a small supported-variable-set helper may live here.
