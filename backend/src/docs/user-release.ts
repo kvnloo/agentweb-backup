@@ -18,6 +18,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-06-08',
+    changes: [
+      'Fixed: "Push Failed" When Sending a Large List to HubSpot or Attio',
+      '- Pushing a long lead list could show "Push failed" even though the contacts actually made it to your CRM — the page gave up waiting before the sync finished',
+      '- The push now runs in the background: you can keep working, and the result (or any error) appears when it completes, even if you close and reopen the sync window',
+      '- If a push is already running, clicking Push again won\'t start a duplicate, and the real reason for any failure is now shown instead of a generic message',
+    ],
+  },
+  {
     date: '2026-06-07',
     changes: [
       'Fixed: Emma\'s Local Browser Agent No Longer Times Out on Slow Pages',
