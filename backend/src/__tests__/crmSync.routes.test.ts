@@ -44,6 +44,8 @@ jest.mock('../services/externalCrmSyncService', () => ({
     getDistinctCustomFieldKeys: jest.fn().mockResolvedValue([]),
     testConnection: jest.fn().mockResolvedValue({ valid: true }),
     pushAllLeads: jest.fn().mockResolvedValue({ successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] }),
+    startPushJob: jest.fn().mockResolvedValue({ job: { jobId: 'job-1', status: 'running', startedAt: '2026-01-01T00:00:00.000Z' }, completion: Promise.resolve() }),
+    getPushJob: jest.fn().mockResolvedValue({ jobId: 'job-1', status: 'running', startedAt: '2026-01-01T00:00:00.000Z' }),
     pullAllContacts: jest.fn().mockResolvedValue({ successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] }),
     getExternalProperties: jest.fn().mockResolvedValue({ properties: [] }),
     getExternalPipelines: jest.fn().mockResolvedValue([]),
@@ -226,6 +228,108 @@ describe('POST /api/crm-sync/test/:listId/:provider — persist on success', () 
       .expect(403);
 
     expect(externalCrmSyncService.saveConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/crm-sync/push/:listId/:provider — async job', () => {
+  const { externalCrmSyncService } = require('../services/externalCrmSyncService');
+  const { crmDb, userDb } = require('../services/db');
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' });
+    userDb.getUserById.mockResolvedValue({ userId: 'user-1' });
+  });
+
+  it('returns 202 with a running job and does NOT block on completion', async () => {
+    let resolveCompletion: () => void = () => {};
+    const completion = new Promise<void>((r) => { resolveCompletion = r; });
+    externalCrmSyncService.startPushJob.mockResolvedValueOnce({
+      job: { jobId: 'job-async', status: 'running', startedAt: '2026-01-01T00:00:00.000Z' },
+      completion,
+    });
+
+    const res = await request(app)
+      .post('/api/crm-sync/push/list-1/hubspot')
+      .send({})
+      .expect(202);
+
+    expect(res.body.jobId).toBe('job-async');
+    expect(res.body.status).toBe('running');
+    // The route must not have awaited completion (still pending here).
+    resolveCompletion();
+  });
+
+  it('returns 403 when the user cannot access the list', async () => {
+    crmDb.getLeadListById.mockResolvedValueOnce({ listId: 'list-1', userId: 'other' });
+    userDb.getUserById.mockImplementation((id: string) =>
+      Promise.resolve(id === 'other' ? { userId: 'other', orgId: 'B' } : { userId: 'user-1', orgId: 'A' })
+    );
+
+    await request(app)
+      .post('/api/crm-sync/push/list-1/hubspot')
+      .send({})
+      .expect(403);
+
+    expect(externalCrmSyncService.startPushJob).not.toHaveBeenCalled();
+  });
+
+  it('returns 500 with the error message when startPushJob throws (e.g. no config)', async () => {
+    externalCrmSyncService.startPushJob.mockRejectedValueOnce(new Error('No sync configuration found'));
+
+    const res = await request(app)
+      .post('/api/crm-sync/push/list-1/hubspot')
+      .send({})
+      .expect(500);
+
+    expect(res.body.error).toMatch(/No sync configuration found/);
+  });
+});
+
+describe('GET /api/crm-sync/push/:listId/:provider/status — job status', () => {
+  const { externalCrmSyncService } = require('../services/externalCrmSyncService');
+  const { crmDb, userDb } = require('../services/db');
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' });
+    userDb.getUserById.mockResolvedValue({ userId: 'user-1' });
+  });
+
+  it('returns the job status when a job exists', async () => {
+    externalCrmSyncService.getPushJob.mockResolvedValueOnce({
+      jobId: 'job-1', status: 'completed', startedAt: '2026-01-01T00:00:00.000Z',
+      finishedAt: '2026-01-01T00:01:00.000Z',
+      result: { successCount: 5, newCount: 5, updatedCount: 0, errorCount: 0, errors: [] },
+    });
+
+    const res = await request(app)
+      .get('/api/crm-sync/push/list-1/hubspot/status')
+      .expect(200);
+
+    expect(res.body.status).toBe('completed');
+    expect(res.body.result.successCount).toBe(5);
+  });
+
+  it('returns status idle (200) when no job has run', async () => {
+    externalCrmSyncService.getPushJob.mockResolvedValueOnce(null);
+
+    const res = await request(app)
+      .get('/api/crm-sync/push/list-1/hubspot/status')
+      .expect(200);
+
+    expect(res.body.status).toBe('idle');
+  });
+
+  it('returns 403 when the user cannot access the list', async () => {
+    crmDb.getLeadListById.mockResolvedValueOnce({ listId: 'list-1', userId: 'other' });
+    userDb.getUserById.mockImplementation((id: string) =>
+      Promise.resolve(id === 'other' ? { userId: 'other', orgId: 'B' } : { userId: 'user-1', orgId: 'A' })
+    );
+
+    await request(app)
+      .get('/api/crm-sync/push/list-1/hubspot/status')
+      .expect(403);
   });
 });
 
