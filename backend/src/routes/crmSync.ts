@@ -299,6 +299,11 @@ router.post('/test/:listId/:provider', async (req: any, res) => {
 // ─── Sync operations ──────────────────────────────────────────────────────────
 
 // POST /api/crm-sync/push/:listId/:provider
+// Starts the push in the background and returns 202 immediately. A full-list
+// push can take minutes (sequential per-lead CRM API calls); holding the HTTP
+// connection open caused upstream proxies to sever it at ~40s and surface a
+// spurious "Push failed" even though the backend kept running and succeeded.
+// The client polls GET .../status for progress and the final result.
 router.post('/push/:listId/:provider', async (req: any, res) => {
   try {
     const userId = req.user?.userId;
@@ -308,10 +313,31 @@ router.post('/push/:listId/:provider', async (req: any, res) => {
     const ownership = await verifyListOwnership(userId, listId);
     if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
 
-    const result = await externalCrmSyncService.pushAllLeads(userId, listId, provider);
-    res.json(result);
+    // Validation (config + auth) happens synchronously inside startPushJob and
+    // throws here; the actual push runs detached (completion is not awaited).
+    const { job } = await externalCrmSyncService.startPushJob(userId, listId, provider);
+    res.status(202).json(job);
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to push leads' });
+  }
+});
+
+// GET /api/crm-sync/push/:listId/:provider/status
+// Returns the latest push job (running/completed/error) for the polling UI.
+router.get('/push/:listId/:provider/status', async (req: any, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { listId, provider } = req.params;
+    const ownership = await verifyListOwnership(userId, listId);
+    if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
+
+    const job = await externalCrmSyncService.getPushJob(userId, listId, provider);
+    if (!job) return res.json({ status: 'idle' });
+    res.json(job);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to get push status' });
   }
 });
 

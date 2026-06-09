@@ -602,11 +602,11 @@ createTestAccount().then(async () => {
       }
 
       // AI Readiness Funnel closed-loop — daily at 16:30 UTC, offset 30 min from
-      // ai-eval (16:00) so they don't race for Slack/Bedrock. Default ON (the
-      // loop is the value); kill with AI_READINESS_LOOP_ENABLED=false. The loop
-      // itself is always REGISTERED in app.ts so event ingestion works
-      // regardless of this schedule flag.
-      if (process.env.AI_READINESS_LOOP_ENABLED !== 'false') {
+      // ai-eval (16:00) so they don't race for Slack/Bedrock. Explicit opt-in so
+      // staging/dev environments with Emma Dev tokens cannot start DMing by
+      // accident. The loop itself is always REGISTERED in app.ts so event
+      // ingestion works regardless of this schedule flag.
+      if (process.env.AI_READINESS_LOOP_ENABLED === 'true') {
         try {
           const AI_READINESS_LOOP_INTERVAL_MS = 24 * 60 * 60 * 1000;
           const { runAiReadinessLoopOnce } = await import('./loops/instances/ai-readiness-funnel');
@@ -632,7 +632,7 @@ createTestAccount().then(async () => {
           console.error('[AiReadinessLoop] Failed to initialize:', error);
         }
       } else {
-        console.log('[AiReadinessLoop] Disabled (AI_READINESS_LOOP_ENABLED=false)');
+        console.log('[AiReadinessLoop] Disabled (set AI_READINESS_LOOP_ENABLED=true to enable)');
       }
 
       // Onboarding loop V2 (framework port, REVAMP) — daily at 17:00 UTC (9am
@@ -668,6 +668,39 @@ createTestAccount().then(async () => {
         console.log('[OnboardingLoopV2] Disabled (set ONBOARDING_LOOP_V2=true to enable)');
       }
 
+      // Generic Layer-5 attribution — daily at 18:00 UTC, after the product
+      // proposal loops. This measures shipped mutations for every registered
+      // loop and writes verdicts back to the durable learning store so future
+      // policy runs can read what worked or failed.
+      if (process.env.LOOP_ATTRIBUTION_ENABLED !== 'false') {
+        try {
+          const LOOP_ATTRIBUTION_INTERVAL_MS = 24 * 60 * 60 * 1000;
+          const { runLoopAttributionOnce } = await import('./loops/cron/loopAttributionCron');
+
+          const nowForAttribution = new Date();
+          const nextAttributionRun = new Date(nowForAttribution);
+          nextAttributionRun.setUTCHours(18, 0, 0, 0);
+          if (nextAttributionRun <= nowForAttribution) {
+            nextAttributionRun.setUTCDate(nextAttributionRun.getUTCDate() + 1);
+          }
+          const msUntilAttribution = nextAttributionRun.getTime() - nowForAttribution.getTime();
+
+          console.log(
+            `[LoopAttribution] Initialized — first run at 18:00 UTC (in ${Math.round(msUntilAttribution / 60000)} min)`,
+          );
+          setTimeout(() => {
+            runLoopAttributionOnce().catch(e => console.error('[LoopAttribution] Error:', e));
+            setInterval(() => {
+              runLoopAttributionOnce().catch(e => console.error('[LoopAttribution] Error:', e));
+            }, LOOP_ATTRIBUTION_INTERVAL_MS);
+          }, msUntilAttribution);
+        } catch (error) {
+          console.error('[LoopAttribution] Failed to initialize:', error);
+        }
+      } else {
+        console.log('[LoopAttribution] Disabled (LOOP_ATTRIBUTION_ENABLED=false)');
+      }
+
     }, 30000); // Delay 30s after startup to allow Agent Mode to boot first
   });
-}); 
+});

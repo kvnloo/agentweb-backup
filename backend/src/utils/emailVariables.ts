@@ -1,6 +1,22 @@
 import { LLMService } from './llmService';
 
-const STANDARD_FIELDS = ['firstName', 'lastName', 'email', 'company', 'title'] as const;
+const STANDARD_FIELDS = ['firstName', 'lastName', 'email', 'company', 'title', 'senderName', 'senderEmail'] as const;
+
+// Standard fields that come from the LEAD (excludes sender-sourced vars, which are
+// supplied from the user at send time and must not be checked against leads).
+const LEAD_STANDARD_FIELDS = STANDARD_FIELDS.filter(
+  (f) => f !== 'senderName' && f !== 'senderEmail',
+) as readonly string[];
+
+/**
+ * True if a {{variable}} can actually be filled from a lead by substituteVariables:
+ * a lead-sourced standard field, or any customFields.* path. Sender vars and
+ * arbitrary unknown tokens return false.
+ */
+export function isSupportedVariable(varName: string): boolean {
+  if (varName.startsWith('customFields.')) return true;
+  return LEAD_STANDARD_FIELDS.includes(varName);
+}
 
 /**
  * Returns true if the HTML contains a <style> block with class-based CSS rules that

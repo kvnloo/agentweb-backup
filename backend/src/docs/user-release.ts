@@ -9,12 +9,39 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-06-08',
+    changes: [
+      'Improved: Presentation PDFs Now Fill the Whole Page — No More Margins or Cut-Off Edges',
+      '- When a presentation or document sets its own page size (like a slide deck designed at 11"×8.5"), the PDF now uses that exact size with no extra margins, so each slide fills the page edge to edge',
+      '- This fixes the leftover white band along the bottom and the slightly cut-off right side that could appear even after the landscape fix',
+      '- Regular documents that don\'t specify a page size are unaffected — they still auto-pick portrait or landscape and scale to fit',
+    ],
+  },
+  {
+    date: '2026-06-08',
+    changes: [
+      'Fixed: "Push Failed" When Sending a Large List to HubSpot or Attio',
+      '- Pushing a long lead list could show "Push failed" even though the contacts actually made it to your CRM — the page gave up waiting before the sync finished',
+      '- The push now runs in the background: you can keep working, and the result (or any error) appears when it completes, even if you close and reopen the sync window',
+      '- If a push is already running, clicking Push again won\'t start a duplicate, and the real reason for any failure is now shown instead of a generic message',
+    ],
+  },
+  {
     date: '2026-06-07',
     changes: [
       'Fixed: Emma\'s Local Browser Agent No Longer Times Out on Slow Pages',
       '- When Emma fell back to your local browser agent to read a site that blocks the cloud browser, long-running scans would fail partway through with a connection error and return nothing',
       '- The connection now stays alive during multi-minute scans, so results come back reliably instead of dropping',
       '- The maximum time Emma will wait for one of these browser tasks has also been raised, so heavier pages have room to finish',
+    ],
+  },
+  {
+    date: '2026-06-07',
+    changes: [
+      'Fixed: Wide Presentations Now Export to PDF in Landscape — No More Cut-Off Slides',
+      '- When you turned a landscape HTML presentation (like a 16:9 pitch deck) into a PDF, it defaulted to a tall portrait page and chopped off the right side of every slide',
+      '- PDFs now detect a wide layout automatically and lay it out in landscape, and any content that is still slightly too wide is scaled to fit so nothing is clipped off the edge',
+      '- You can also tell Emma the orientation explicitly ("export this as a landscape PDF") when you want to force portrait or landscape',
     ],
   },
   {

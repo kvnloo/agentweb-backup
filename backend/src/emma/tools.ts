@@ -5075,7 +5075,7 @@ emmaToolRegistry.register({
   name: 'convert_to_pdf',
   definition: {
     name: 'convert_to_pdf',
-    description: 'Convert an HTML file (or any URL) to a PDF and upload it to S3. Use this when the user wants a PDF version of a previously generated HTML file or checklist. Pass the direct S3 URL of the HTML file as source_url.',
+    description: 'Convert an HTML file (or any URL) to a PDF and upload it to S3. Use this when the user wants a PDF version of a previously generated HTML file or checklist. Pass the direct S3 URL of the HTML file as source_url. Orientation is auto-detected (a wide 16:9 slide deck prints landscape, a report prints portrait); only set orientation explicitly to override.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -5087,12 +5087,25 @@ emmaToolRegistry.register({
           type: 'string',
           description: 'Desired filename for the PDF (without extension, e.g. "sentriq-readiness-checklist-v5")',
         },
+        orientation: {
+          type: 'string',
+          enum: ['auto', 'portrait', 'landscape'],
+          description: 'Page orientation. "auto" (default) detects landscape vs portrait from the content; use "landscape" to force it for a slide deck/presentation, "portrait" for a document.',
+        },
+        format: {
+          type: 'string',
+          enum: ['A4', 'Letter', 'Legal', 'A3', 'A5', 'Tabloid'],
+          description: 'Paper size. Defaults to A4.',
+        },
       },
       required: ['source_url', 'output_filename'],
     },
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.convertToPdf(args.source_url, args.output_filename, context?.userId);
+    return await agentModeService.convertToPdf(args.source_url, args.output_filename, context?.userId, {
+      orientation: args.orientation,
+      format: args.format,
+    });
   },
 });
 

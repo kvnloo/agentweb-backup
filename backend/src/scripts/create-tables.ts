@@ -2011,6 +2011,32 @@ const createEnrichmentRawCacheTable = async () => {
   }
 };
 
+const createLoopLearningTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: 'Dev-AW-LoopLearning',
+    AttributeDefinitions: [
+      { AttributeName: 'loopId', AttributeType: 'S' },
+      { AttributeName: 'sortKey', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'loopId', KeyType: 'HASH' },
+      { AttributeName: 'sortKey', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const main = async () => {
   try {
     console.log(`Creating tables for environment: ${process.env.NODE_ENV || 'production'}`);
@@ -2065,6 +2091,7 @@ const main = async () => {
     await createDripSendsTable();
     await createEnrichmentHistoryTable();
     await createEnrichmentRawCacheTable();
+    await createLoopLearningTable();
     await createCharactersTable();
     await createCRMCompaniesTable();
     console.log('All tables created successfully');

@@ -29,7 +29,13 @@ jest.mock('../services/db', () => ({
       { leadId: 'lead-1', email: 'a@example.com' },
       { leadId: 'lead-2', email: 'b@example.com' },
     ]),
+    getAllLeadsByListId: jest.fn().mockResolvedValue([
+      { leadId: 'lead-1', email: 'a@example.com' },
+      { leadId: 'lead-2', email: 'b@example.com' },
+    ]),
     getLeadsByStatus: jest.fn().mockResolvedValue([]),
+    getLeadListById: jest.fn().mockResolvedValue({ listId: 'list-1', userId: 'user-123' }),
+    canOrgMemberAccessList: jest.fn().mockResolvedValue(true),
   },
   userDb: {
     getUserById: jest.fn().mockResolvedValue({ userId: 'user-123', email: 'test@example.com' }),
@@ -293,7 +299,7 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     dripSequenceDb.getSequence.mockResolvedValueOnce({ ...mockSequence, autoEnrollListIds: undefined });
 
     const crmDbMock = require('../services/db').crmDb;
-    crmDbMock.getLeadsByListId = jest.fn().mockResolvedValue([
+    crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
       { leadId: 'lead-1', email: 'a@example.com' },
     ]);
 
@@ -322,7 +328,7 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     dripSequenceDb.updateSequence.mockClear();
 
     const crmDbMock = require('../services/db').crmDb;
-    crmDbMock.getLeadsByListId = jest.fn().mockResolvedValue([]);
+    crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([]);
 
     await request(app).post('/seq_1/enrollments/by-list').send({ listId: 'list-1' });
     await new Promise((r) => setTimeout(r, 10));

@@ -41,6 +41,7 @@ jest.mock('../services/agentModeService', () => ({
 jest.mock('../services/resendService', () => ({
   resendService: {
     sendEmail: jest.fn(),
+    sendSystemEmail: jest.fn(),
   },
 }));
 
@@ -64,11 +65,17 @@ const app = express();
 app.use(express.json());
 app.use('/api/webhooks', webhookRouter);
 
+const flushAsyncWork = async () => {
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+};
+
 describe('Lead Forwarding API (List ID Authentication)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
     (crmDb.updateLead as jest.Mock).mockResolvedValue(undefined);
+    (resendService.sendSystemEmail as jest.Mock).mockResolvedValue({ id: 'email_123' });
     (agentModeService.updateEmailDraftForLead as jest.Mock).mockResolvedValue({
       success: true,
       message: 'Email and message drafts created successfully',
@@ -220,6 +227,152 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
         'user_123',
         'text'
       );
+    });
+
+    it('should send the AI Readiness roadmap for a new final roadmap lead', async () => {
+      const mockLead = {
+        leadId: 'lead_roadmap_new',
+        listId: 'list_123',
+        email: 'roadmap@example.com',
+        firstName: 'Road',
+        lastName: 'Map',
+        customFields: {
+          source: 'ai-readiness-popup',
+          stage: 4,
+          partial: false,
+        },
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+        ...mockLeadList,
+        autoDraftEnabled: false,
+      });
+      (crmDb.createLead as jest.Mock).mockResolvedValue(mockLead);
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({
+          listId: 'list_123',
+          email: 'roadmap@example.com',
+          firstName: 'Road',
+          source: 'ai-readiness-popup',
+          customFields: {
+            stage: 4,
+            partial: false,
+          },
+        });
+
+      expect(response.status).toBe(201);
+      await flushAsyncWork();
+
+      expect(resendService.sendSystemEmail).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: 'roadmap@example.com',
+          subject: 'Your AI Marketing Readiness Roadmap (Stage 4)',
+        })
+      );
+      expect(crmDb.updateLead).toHaveBeenCalledWith(
+        'list_123',
+        'lead_roadmap_new',
+        expect.objectContaining({
+          customFields: expect.objectContaining({
+            roadmapEmailSentAt: expect.any(String),
+            roadmapEmailStage: 4,
+          }),
+        })
+      );
+    });
+
+    it('should send the roadmap when an existing AI Eval lead is later updated with a stage', async () => {
+      const existingLead = {
+        leadId: 'lead_existing_eval',
+        listId: 'list_123',
+        email: 'existing@example.com',
+        firstName: 'Existing',
+        customFields: {
+          source: 'ai-readiness-popup-ai-eval-started',
+          ai_eval_auto_triggered: true,
+        },
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+        ...mockLeadList,
+        autoDraftEnabled: false,
+      });
+      (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(existingLead);
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({
+          listId: 'list_123',
+          email: 'existing@example.com',
+          source: 'ai-readiness-popup',
+          customFields: {
+            stage: 5,
+            partial: false,
+          },
+        });
+
+      expect(response.status).toBe(200);
+      expect(response.body.event).toBe('lead.updated');
+      await flushAsyncWork();
+
+      expect(resendService.sendSystemEmail).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: 'existing@example.com',
+          subject: 'Your AI Marketing Readiness Roadmap (Stage 5)',
+        })
+      );
+      expect(crmDb.updateLead).toHaveBeenLastCalledWith(
+        'list_123',
+        'lead_existing_eval',
+        expect.objectContaining({
+          customFields: expect.objectContaining({
+            stage: 5,
+            roadmapEmailSentAt: expect.any(String),
+            roadmapEmailStage: 5,
+          }),
+        })
+      );
+    });
+
+    it('should not resend the roadmap after it has been marked delivered', async () => {
+      const existingLead = {
+        leadId: 'lead_already_sent',
+        listId: 'list_123',
+        email: 'sent@example.com',
+        firstName: 'Already',
+        customFields: {
+          source: 'ai-readiness-popup',
+          stage: 3,
+          partial: false,
+          roadmapEmailSentAt: '2026-06-08T19:00:00.000Z',
+          roadmapEmailStage: 3,
+        },
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+        ...mockLeadList,
+        autoDraftEnabled: false,
+      });
+      (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(existingLead);
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({
+          listId: 'list_123',
+          email: 'sent@example.com',
+          source: 'ai-readiness-popup',
+          customFields: {
+            stage: 3,
+            partial: false,
+          },
+        });
+
+      expect(response.status).toBe(200);
+      await flushAsyncWork();
+
+      expect(resendService.sendSystemEmail).not.toHaveBeenCalled();
     });
 
     it('should successfully forward a lead with full data', async () => {

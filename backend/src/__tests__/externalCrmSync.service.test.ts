@@ -736,6 +736,127 @@ describe('ExternalCrmSyncService', () => {
     });
   });
 
+  // ─── startPushJob / getPushJob (async push) ───────────────────────────────
+
+  describe('startPushJob / getPushJob', () => {
+    it('throws when no config found (validated synchronously)', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(null);
+      await expect(service.startPushJob('user1', 'list1', 'hubspot'))
+        .rejects.toThrow(/no.*config/i);
+    });
+
+    it('throws when no token or accountId configured (validated synchronously)', async () => {
+      mockListWithConfig(makeConfig({ accountId: undefined, apiKeyEncrypted: undefined }));
+      await expect(service.startPushJob('user1', 'list1', 'hubspot'))
+        .rejects.toThrow(/no.*auth/i);
+    });
+
+    it('returns a running job immediately and marks it completed in the background', async () => {
+      mockListWithConfig(makeConfig());
+      mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false });
+
+      const { job, completion } = await service.startPushJob('user1', 'list1', 'hubspot');
+      expect(job.status).toBe('running');
+      expect(typeof job.jobId).toBe('string');
+      expect(job.jobId.length).toBeGreaterThan(0);
+
+      await completion;
+
+      const pushJobStates = mockCrmDb.setLeadListCrmSyncConfig.mock.calls
+        .map(c => (c[2] as any)?.pushJob)
+        .filter(Boolean);
+      const finalState = pushJobStates[pushJobStates.length - 1];
+      expect(finalState.status).toBe('completed');
+      expect(finalState.jobId).toBe(job.jobId);
+      expect(finalState.result).toMatchObject({ errorCount: 0 });
+      expect(finalState.finishedAt).toBeDefined();
+    });
+
+    it('marks the job as error when the push throws', async () => {
+      mockListWithConfig(makeConfig());
+      mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+      mockCrmDb.getLeadsByListId.mockRejectedValue(new Error('boom'));
+
+      const { completion } = await service.startPushJob('user1', 'list1', 'hubspot');
+      await completion;
+
+      const pushJobStates = mockCrmDb.setLeadListCrmSyncConfig.mock.calls
+        .map(c => (c[2] as any)?.pushJob)
+        .filter(Boolean);
+      const finalState = pushJobStates[pushJobStates.length - 1];
+      expect(finalState.status).toBe('error');
+      expect(finalState.error).toMatch(/boom/);
+    });
+
+    it('reuses an in-flight fresh job instead of starting a second push', async () => {
+      const running = { jobId: 'job-existing', status: 'running', startedAt: new Date().toISOString() };
+      mockListWithConfig(makeConfig({ pushJob: running as any }));
+
+      const { job, completion } = await service.startPushJob('user1', 'list1', 'hubspot');
+      await completion;
+
+      expect(job.jobId).toBe('job-existing');
+      expect(job.status).toBe('running');
+      // No new push should have been kicked off.
+      expect(mockCrmDb.getLeadsByListId).not.toHaveBeenCalled();
+    });
+
+    it('starts a fresh push when the existing running job is stale', async () => {
+      const stale = {
+        jobId: 'job-stale',
+        status: 'running',
+        startedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(), // 1h ago
+      };
+      mockListWithConfig(makeConfig({ pushJob: stale as any }));
+      mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false });
+
+      const { job, completion } = await service.startPushJob('user1', 'list1', 'hubspot');
+      await completion;
+
+      expect(job.jobId).not.toBe('job-stale');
+      expect(mockCrmDb.getLeadsByListId).toHaveBeenCalled();
+    });
+
+    it('does not throw when persisting the job state fails (non-critical)', async () => {
+      mockListWithConfig(makeConfig());
+      mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false });
+      mockCrmDb.setLeadListCrmSyncConfig.mockRejectedValue(new Error('ddb down'));
+
+      const { completion } = await service.startPushJob('user1', 'list1', 'hubspot');
+      await expect(completion).resolves.toBeUndefined();
+    });
+
+    it('getPushJob returns the persisted job state', async () => {
+      const running = { jobId: 'job-x', status: 'running', startedAt: new Date().toISOString() };
+      mockListWithConfig(makeConfig({ pushJob: running as any }));
+
+      const job = await service.getPushJob('user1', 'list1', 'hubspot');
+      expect(job?.jobId).toBe('job-x');
+      expect(job?.status).toBe('running');
+    });
+
+    it('getPushJob returns null when no job has run', async () => {
+      mockListWithConfig(makeConfig());
+      const job = await service.getPushJob('user1', 'list1', 'hubspot');
+      expect(job).toBeNull();
+    });
+
+    it('getPushJob returns null when the requester cannot access the config', async () => {
+      const { userDb } = require('../services/db');
+      userDb.getUserById.mockImplementation((id: string) =>
+        Promise.resolve(id === 'other-user' ? { userId: 'other-user', orgId: 'org-B' } : { userId: 'user1', orgId: 'org-A' })
+      );
+      const running = { jobId: 'job-x', status: 'running', startedAt: new Date().toISOString() };
+      mockListWithConfig(makeConfig({ userId: 'other-user', pushJob: running as any }));
+
+      const job = await service.getPushJob('user1', 'list1', 'hubspot');
+      expect(job).toBeNull();
+    });
+  });
+
   // ─── pushAllLeads (Attio) ─────────────────────────────────────────────────
 
   describe('pushAllLeads - Attio', () => {
