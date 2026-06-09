@@ -355,8 +355,9 @@ try {
   console.warn("[loops] registerAiReadinessFunnel skipped:", String(err));
 }
 // Always registered so the agent-mode loop is visible to /api/admin/loops/health
-// and the attribution cron; the recorder hot-path hook + daily analysis run are
-// gated by AGENT_MODE_LOOP_ENABLED.
+// and the attribution cron; the recorder hot-path hook is gated separately by
+// AGENT_RUNTIME_SPINE_ENABLED, while the daily analysis run is gated by
+// AGENT_MODE_LOOP_ENABLED.
 try {
   registerAgentModeLoop();
 } catch (err) {

@@ -3,8 +3,9 @@
  * Dev-AW-LoopEvents table (Layer-1 writer for the agent-mode loop).
  *
  * Each method maps one lifecycle point to one NormalizedEvent, keyed by
- * subjectId = sessionId so all events for a chat turn form a single run
- * timeline (the AgentRun / AgentRunEvent debugging timeline Rui named):
+ * subjectId = runId so all events for one response attempt form a single run
+ * timeline (the AgentRun / AgentRunEvent debugging timeline Rui named). Include
+ * sessionId in dimensions when the caller wants to join a run back to a chat:
  *
  *   runStarted    → agent_run_started        (run begins)
  *   decision      → agent_decision           (why Emma chose tools — AgentDecision)
@@ -48,63 +49,74 @@ export class AgentRunRecorder {
   ) {}
 
   async runStarted(
-    sessionId: string,
-    info: { llmModel?: string; sessionType?: string; userId?: string } = {},
+    runId: string,
+    info: { llmModel?: string; sessionType?: string; userId?: string; sessionId?: string } = {},
   ): Promise<void> {
-    await this.emit(sessionId, EVT_RUN_STARTED, cleanDims(info));
+    await this.emit(runId, EVT_RUN_STARTED, cleanDims(info));
   }
 
   async decision(
-    sessionId: string,
-    info: { iteration: number; toolNames: readonly string[] },
+    runId: string,
+    info: {
+      iteration: number;
+      toolNames: readonly string[];
+      sessionId?: string;
+      toolArgKeys?: string;
+      toolArgsPreview?: string;
+    },
   ): Promise<void> {
-    await this.emit(sessionId, EVT_DECISION, {
+    await this.emit(runId, EVT_DECISION, {
       iteration: info.iteration,
       toolNames: info.toolNames.join(','),
       toolCount: info.toolNames.length,
+      ...(info.sessionId ? { sessionId: info.sessionId } : {}),
+      ...(info.toolArgKeys ? { toolArgKeys: info.toolArgKeys } : {}),
+      ...(info.toolArgsPreview ? { toolArgsPreview: info.toolArgsPreview } : {}),
     });
   }
 
   async toolInvoked(
-    sessionId: string,
-    info: { toolName: string; iteration?: number },
+    runId: string,
+    info: { toolName: string; iteration?: number; sessionId?: string },
   ): Promise<void> {
-    await this.emit(sessionId, EVT_TOOL_INVOKED, cleanDims(info));
+    await this.emit(runId, EVT_TOOL_INVOKED, cleanDims(info));
   }
 
   async toolSucceeded(
-    sessionId: string,
-    info: { toolName: string; durationMs?: number },
+    runId: string,
+    info: { toolName: string; durationMs?: number; sessionId?: string },
   ): Promise<void> {
-    await this.emit(sessionId, EVT_TOOL_SUCCEEDED, cleanDims(info));
+    await this.emit(runId, EVT_TOOL_SUCCEEDED, cleanDims(info));
   }
 
   async toolFailed(
-    sessionId: string,
-    info: { toolName: string; error: unknown; durationMs?: number },
+    runId: string,
+    info: { toolName: string; error: unknown; durationMs?: number; sessionId?: string },
   ): Promise<void> {
-    await this.emit(sessionId, EVT_TOOL_FAILED, {
+    await this.emit(runId, EVT_TOOL_FAILED, {
       toolName: info.toolName,
       ...(info.durationMs != null ? { durationMs: info.durationMs } : {}),
+      ...(info.sessionId ? { sessionId: info.sessionId } : {}),
       errorClass: errorClassOf(info.error),
       errorMessage: errorMessageOf(info.error),
     });
   }
 
   async runCompleted(
-    sessionId: string,
-    info: { toolCalls?: number; failedToolCalls?: number } = {},
+    runId: string,
+    info: { toolCalls?: number; failedToolCalls?: number; sessionId?: string } = {},
   ): Promise<void> {
-    await this.emit(sessionId, EVT_RUN_COMPLETED, cleanDims(info));
+    await this.emit(runId, EVT_RUN_COMPLETED, cleanDims(info));
   }
 
   async runFailed(
-    sessionId: string,
-    info: { error: unknown; toolCalls?: number; failedToolCalls?: number },
+    runId: string,
+    info: { error: unknown; toolCalls?: number; failedToolCalls?: number; sessionId?: string },
   ): Promise<void> {
-    await this.emit(sessionId, EVT_RUN_FAILED, {
+    await this.emit(runId, EVT_RUN_FAILED, {
       ...(info.toolCalls != null ? { toolCalls: info.toolCalls } : {}),
       ...(info.failedToolCalls != null ? { failedToolCalls: info.failedToolCalls } : {}),
+      ...(info.sessionId ? { sessionId: info.sessionId } : {}),
       errorClass: errorClassOf(info.error),
       errorMessage: errorMessageOf(info.error),
     });
@@ -112,11 +124,11 @@ export class AgentRunRecorder {
 
   /** Build + put one event row. Swallows errors — telemetry must never break
    * the caller's hot path. */
-  private async emit(sessionId: string, eventType: string, dimensions: EventDimensions): Promise<void> {
+  private async emit(runId: string, eventType: string, dimensions: EventDimensions): Promise<void> {
     try {
       recorderSeq++;
       const event: NormalizedEvent = {
-        subjectId: asSubjectId(sessionId),
+        subjectId: asSubjectId(runId),
         eventType,
         ts: this.clock.now(),
         dimensions,

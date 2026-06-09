@@ -10,8 +10,10 @@
  * Mapping to the record types Rui named:
  *
  *   AgentRun / AgentRunEvent  — the debugging timeline. Every event below,
- *                               keyed by subjectId = sessionId, IS the run's
- *                               timeline (run_started … tool events … run_*).
+ *                               keyed by subjectId = runId, IS one response
+ *                               attempt's timeline (run_started … tool
+ *                               events … run_*). sessionId is stored as a join
+ *                               dimension.
  *   AgentDecision             — `agent_decision`: why Emma chose an action
  *                               (which tools, which iteration).
  *   AgentOutcome              — `agent_tool_succeeded` / `agent_tool_failed`
