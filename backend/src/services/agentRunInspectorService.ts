@@ -21,6 +21,8 @@ export interface AgentRunDecisionSummary {
   toolNames: string[];
   toolArgKeys?: string;
   toolArgsPreview?: string;
+  decisionExplanation?: string;
+  explanationSource?: string;
 }
 
 export interface AgentRunToolOutcomeSummary {
@@ -79,6 +81,8 @@ function buildOneRunSummary(runId: string, events: AgentRunEventRow[]): AgentRun
       toolNames: splitToolNames(e.dimensions?.toolNames),
       toolArgKeys: asString(e.dimensions?.toolArgKeys),
       toolArgsPreview: asString(e.dimensions?.toolArgsPreview),
+      decisionExplanation: asString(e.dimensions?.decisionExplanation),
+      explanationSource: asString(e.dimensions?.explanationSource),
     }));
 
   const outcomes: AgentRunToolOutcomeSummary[] = sorted

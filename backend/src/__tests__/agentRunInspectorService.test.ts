@@ -39,6 +39,8 @@ describe('agentRunInspectorService', () => {
           toolNames: 'save_memory',
           toolArgKeys: 'save_memory:category|content',
           toolArgsPreview: '[{"tool":"save_memory","args":{"content":"hello"}}]',
+          decisionExplanation: 'Chose save_memory to persist user-provided information for future context.',
+          explanationSource: 'deterministic_tool_summary',
           toolCount: 1,
         },
       },
@@ -72,6 +74,8 @@ describe('agentRunInspectorService', () => {
         toolNames: ['save_memory'],
         toolArgKeys: 'save_memory:category|content',
         toolArgsPreview: '[{"tool":"save_memory","args":{"content":"hello"}}]',
+        decisionExplanation: 'Chose save_memory to persist user-provided information for future context.',
+        explanationSource: 'deterministic_tool_summary',
       },
     ]);
     expect(run.outcomes).toHaveLength(2);
