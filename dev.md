@@ -1,3 +1,45 @@
+## Self-Learning Loop Adoption — Health Endpoint + AgentMode as a Loop (2026-06-09)
+
+Follow-up to the YC-style learning-loop audit + retro. PR #1799 (branch `rui/self-learning-loop-adoption`). The retro's framing: a *bug-feedback* loop (user/Emma notices → Slack/Notion → eng fixes → next bug) is useful but is **not self-learning**. A *self-learning* loop must **store the decision, ship or reject the change, measure the outcome, and feed that result back into future policy** — the five layers Sensor → Policy → Tools → Quality gate → Learning, with Layer 5 writing back into Layer 2.
+
+### Key finding: the audit predates Harsha's hardening commit
+
+The audit was written **before** `6665655f feat(loops): harden product learning loop` (already on `main`). That commit closed most of the *product-loop* gaps, so they did **not** need redoing:
+- Prod loops (`ai-eval-funnel`, `ai-readiness-funnel`, `onboarding` v2) switched `InMemoryLearningStore` → `DynamoLearningStore` (`Dev-AW-LoopLearning`). Without durable storage the loop forgot every proposal/outcome on redeploy and could never read its own history back.
+- `loops/cron/loopAttributionCron.ts` → `runLoopAttributionOnce()` wired into `server.ts` at 18:00 UTC (gated `LOOP_ATTRIBUTION_ENABLED`). For each shipped mutation whose settle window elapsed, it computes the target metric before-vs-after and writes a verdict (`improved / no_change / regressed / inconclusive`) back to the store.
+- `CooldownRuleSet` wraps every live policy — reads the learning store and suppresses re-proposing a fix that is still in flight or recently regressed/did-nothing (`improved` is not suppressed).
+- Registry boot-order fragility removed via idempotent `registerOrReplace*` + `getRegisteredLoopManifests()` + dedup guards in each instance; `app.ts` registration wrapped in try/catch so one failing loop can't take down the rest.
+
+So only audit items **#6 (loop health endpoints)** and **#7 (AgentMode wired into the apparatus)** were genuinely open. PR #1799 builds exactly those.
+
+### What was built (#6 — operator visibility)
+
+`GET /api/admin/loops/health` (admin-only). Per registered loop it reports one of **empty / blocked / pending_approval / in_flight / learned / regressed / idle**, plus counts and the last graded outcome.
+- `loops/core/health.ts` — pure `computeLoopHealth` (no I/O, exhaustively unit-tested, most-urgent-state-wins precedence).
+- `loops/health/loopHealthService.ts` — reads each loop's **own** learning store; a single failing loop degrades to an `error` entry instead of failing the whole report.
+- `routes/loopHealth.ts` — mounted admin-only.
+
+### What was built (#7 — AgentMode as a first-class loop, not a parallel system)
+
+AgentMode reuses the **same** registry, `DynamoLearningStore`, attribution cron, and health endpoint as the funnel loops. In `loops/instances/agent-mode/`:
+- `eventTypes.ts` — run/decision/tool/outcome vocabulary (`agent_run_started`, `agent_decision`, `agent_tool_invoked`/`_succeeded`/`_failed`, `agent_run_completed`/`_failed`).
+- Hot-path hook in `agentModeService.ts` fires these into the shared `Dev-AW-LoopEvents` table keyed by `sessionId` (the debugging timeline). Best-effort + gated, so it never slows a live chat.
+- Policy `AgentFailureRuleSet` clusters failures **per tool** over a 7d window; a tool past the count+rate threshold yields a cloud-dev fix-spec proposal (wrapped in `CooldownRuleSet`).
+- Target metric `tool_success_rate = agent_tool_succeeded / agent_tool_invoked`. Risky changes (code, prompts) never auto-ship.
+- Daily analysis cron at 17:30 UTC.
+
+### Known remaining gap — why no loop reaches a verdict yet
+
+The production `ApprovalGate` is still `CaptureGate`, whose `pollDecision()` always returns `pending` — so **`shippedAt` is never stamped by a gate**, and attribution only grades mutations that have `shippedAt`. Net effect: every loop runs Sensor → Policy → Tools → Gate (DM sent) then **stalls at `pending_approval`**; it never reaches `learned`/`regressed`. The new health endpoint makes that stall visible per loop. Building a real Slack-reaction gate that sets `shippedAt` + approval status is the single remaining piece that turns the apparatus from "wired" to "actually closing the loop" — the next highest-leverage work.
+
+### Watch plan (next ~1–2 weeks)
+
+Letting the loops run and observing before building the gate. What to watch:
+- `GET /api/admin/loops/health` — confirm `agent-mode` + the funnel loops show up and accumulate events (state should move `empty` → `pending_approval` as proposals fire). If everything stays `empty`, telemetry/ingestion isn't landing.
+- Whether the AgentMode policy surfaces *real* repeatedly-failing tools (signal) vs. noise — tune the count/rate thresholds in `AgentFailureRuleSet` from what we see.
+- The 17:30 UTC Slack digest: are the proposed fix-specs actionable as-is?
+- Once enough loops are stuck at `pending_approval`, that's the cue to prioritize the real approval gate.
+
 ## Judge Scoring False-Negative on Brand/Topic Mismatch (2026-06-05)
 
 Systemic pattern across 3 sessions (satisfaction score 2): when a requested content topic (email, LinkedIn post, ad, analysis) does **not** match the stored brand guidelines, the agent correctly flags the mismatch and either asks a clarifying question or proceeds with placeholders (`[Brand Name]`, `[URL]`). This is the **desired** behavior — but the satisfaction judge was scoring these sessions low (`goalCompletion` 1–2), treating the flag/clarification as a failure. The fix is to the **judge**, not the agent.
