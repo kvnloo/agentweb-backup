@@ -525,6 +525,17 @@ export class HubSpotService {
   }
 
   /**
+   * Get the IDs of all contacts associated with a deal.
+   */
+  async getDealContactAssociations(dealId: string): Promise<string[]> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/crm/v3/objects/deals/${dealId}/associations/contacts`,
+      { headers: await this.authHeaders() }
+    );
+    return ((res.data as any)?.results ?? []).map((r: any) => r.id as string);
+  }
+
+  /**
    * Fetch a raw deal record by ID.
    * Returns the full HubSpot response object, or null on 404.
    */

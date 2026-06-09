@@ -18,7 +18,7 @@ const mockGetCreds = getHubSpotCredentials as jest.Mock;
 
 const DEV_KEY = 'test-dev-key-abc123';
 
-function makeSubsResponse(subs: Array<{ eventType: string; propertyName: string }>) {
+function makeSubsResponse(subs: Array<{ eventType: string; propertyName?: string }>) {
   return {
     data: {
       results: subs.map((s, i) => ({ id: i + 1, eventType: s.eventType, propertyName: s.propertyName, active: true })),
@@ -68,9 +68,18 @@ describe('ensureWebhookSubscriptions', () => {
     }
   });
 
-  it('makes exactly 10 POST calls on a clean slate (7 contact + 3 deal)', async () => {
+  it('registers contact.creation and contact.deletion (no propertyName)', async () => {
     await ensureWebhookSubscriptions([], []);
-    expect(mockAxiosPost).toHaveBeenCalledTimes(10);
+    const bodies = mockAxiosPost.mock.calls.map((c: any[]) => c[1]);
+    expect(bodies).toContainEqual(expect.objectContaining({ eventType: 'contact.creation' }));
+    expect(bodies).toContainEqual(expect.objectContaining({ eventType: 'contact.deletion' }));
+    expect(bodies.find((b: any) => b.eventType === 'contact.creation').propertyName).toBeUndefined();
+    expect(bodies.find((b: any) => b.eventType === 'contact.deletion').propertyName).toBeUndefined();
+  });
+
+  it('makes exactly 12 POST calls on a clean slate (2 lifecycle + 7 contact + 3 deal)', async () => {
+    await ensureWebhookSubscriptions([], []);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(12);
   });
 
   // ── Idempotency ──────────────────────────────────────────────────────────────
@@ -92,6 +101,8 @@ describe('ensureWebhookSubscriptions', () => {
 
   it('does nothing when all standard props already subscribed', async () => {
     const allSubs = [
+      { eventType: 'contact.creation' },
+      { eventType: 'contact.deletion' },
       ...ALL_CONTACT_PROPS.map(p => ({ eventType: 'contact.propertyChange', propertyName: p })),
       ...ALL_DEAL_PROPS.map(p => ({ eventType: 'deal.propertyChange', propertyName: p })),
     ];
@@ -207,7 +218,7 @@ describe('ensureWebhookSubscriptions', () => {
 
     await ensureWebhookSubscriptions([], []);
 
-    expect(mockAxiosPost).toHaveBeenCalledTimes(10);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(12);
   });
 
   // ── Error resilience ─────────────────────────────────────────────────────────
@@ -218,8 +229,8 @@ describe('ensureWebhookSubscriptions', () => {
       .mockResolvedValue({ data: { id: 99 } });
 
     await expect(ensureWebhookSubscriptions([], [])).resolves.not.toThrow();
-    // 10 total attempted despite first failure
-    expect(mockAxiosPost).toHaveBeenCalledTimes(10);
+    // 12 total attempted despite first failure
+    expect(mockAxiosPost).toHaveBeenCalledTimes(12);
   });
 
   it('swallows outer error gracefully when GET subscriptions fails', async () => {

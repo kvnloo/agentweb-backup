@@ -34,18 +34,23 @@ async function getExistingSubscriptions(developerApiKey: string): Promise<Set<st
     if (sub.propertyName &&
         (sub.eventType === 'contact.propertyChange' || sub.eventType === 'deal.propertyChange')) {
       subscribed.add(`${sub.eventType}:${sub.propertyName.toLowerCase()}`);
+    } else if (!sub.propertyName &&
+        (sub.eventType === 'contact.creation' || sub.eventType === 'contact.deletion')) {
+      subscribed.add(sub.eventType);
     }
   }
   return subscribed;
 }
 
-async function registerSubscription(developerApiKey: string, eventType: string, propertyName: string): Promise<void> {
+async function registerSubscription(developerApiKey: string, eventType: string, propertyName?: string): Promise<void> {
+  const payload: Record<string, any> = { eventType, active: true };
+  if (propertyName) payload.propertyName = propertyName;
   await axios.post(
     `${HUBSPOT_WEBHOOKS_BASE}/${HUBSPOT_APP_ID}/subscriptions`,
-    { eventType, propertyName, active: true },
+    payload,
     { params: { hapikey: developerApiKey } }
   );
-  console.log(`[HubSpotWebhook] Registered ${eventType} for "${propertyName}"`);
+  console.log(`[HubSpotWebhook] Registered ${eventType}${propertyName ? ` for "${propertyName}"` : ''}`);
 }
 
 /**
@@ -68,6 +73,10 @@ export async function ensureWebhookSubscriptions(
     }
 
     const candidateProps = new Set<string>();
+
+    // Contact: lifecycle events (no propertyName)
+    candidateProps.add('contact.creation');
+    candidateProps.add('contact.deletion');
 
     // Contact: standard props
     for (const prop of STANDARD_CONTACT_PROPS_TO_SUBSCRIBE) {
@@ -98,14 +107,14 @@ export async function ensureWebhookSubscriptions(
 
     // HubSpot enforces a 1,000 subscription limit per app. Warn early.
     const totalAfter = existingSubscriptions.size + toRegister.length;
-    if (totalAfter > 900) {
+    if (totalAfter >= 900) {
       console.warn(`[HubSpotWebhook] Approaching subscription limit: ${totalAfter}/1000 after this batch`);
     }
 
     for (const key of toRegister) {
       const colonIdx = key.indexOf(':');
-      const eventType = key.slice(0, colonIdx);
-      const propertyName = key.slice(colonIdx + 1);
+      const eventType = colonIdx >= 0 ? key.slice(0, colonIdx) : key;
+      const propertyName = colonIdx >= 0 ? key.slice(colonIdx + 1) : undefined;
       try {
         await registerSubscription(developerApiKey, eventType, propertyName);
       } catch (err: any) {
