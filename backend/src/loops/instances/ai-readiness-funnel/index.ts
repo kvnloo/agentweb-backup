@@ -121,6 +121,16 @@ interface FunnelShape {
   signup_clicked: number;
 }
 
+type LowDataConfidence = 'low' | 'medium';
+
+interface LowDataDecision {
+  id: string;
+  confidence: LowDataConfidence;
+  evidence: string;
+  action: string;
+  requiresApproval: true;
+}
+
 /** Tally the 7d funnel shape directly from the event table (scoped to
  * /ai-readiness) so the digest always shows where people drop, not just a
  * total. */
@@ -160,6 +170,71 @@ function constraintLine(s: FunnelShape): string {
     );
   }
   return `_No disproportionate leak this window. Watch the shape above; the next push is whichever stage is thinnest._`;
+}
+
+function pct(numerator: number, denominator: number): number {
+  if (denominator <= 0) return 0;
+  return Math.round((numerator / denominator) * 100);
+}
+
+/**
+ * Startup fallback: make reversible, permission-gated decisions from weak
+ * signal. This is intentionally not statistical significance testing. It is a
+ * founder-operator heuristic layer for the early period where waiting for
+ * hundreds of samples means the loop never helps.
+ */
+function buildLowDataDecisions(s: FunnelShape): LowDataDecision[] {
+  if (s.landed === 0) {
+    return [
+      {
+        id: 'low-data-no-traffic',
+        confidence: 'low',
+        evidence: '0 /ai-readiness landings in the 7d window.',
+        action:
+          'Verify telemetry and route at least one owned surface into /ai-readiness today before changing page copy.',
+        requiresApproval: true,
+      },
+    ];
+  }
+
+  const decisions: LowDataDecision[] = [];
+  const nextStepClicks = s.book_clicked + s.signup_clicked;
+  const quizStartRate = pct(s.quiz_started, s.landed);
+
+  if (s.form_submitted < 10) {
+    decisions.push({
+      id: 'low-data-awareness-routing',
+      confidence: s.landed >= 10 ? 'medium' : 'low',
+      evidence: `${s.form_submitted} captures from ${s.landed} landings in 7d.`,
+      action:
+        'Treat awareness as the binding constraint: add one homepage/blog route into /ai-readiness and one external distribution push before optimizing form copy.',
+      requiresApproval: true,
+    });
+  }
+
+  if (s.landed >= 10 && quizStartRate < 25) {
+    decisions.push({
+      id: 'low-data-quiz-start-leak',
+      confidence: 'medium',
+      evidence: `${s.quiz_started}/${s.landed} visitors started the quiz (${quizStartRate}%).`,
+      action:
+        'Try one above-the-fold change: make the first screen promise the delivered roadmap and reduce the perceived quiz commitment.',
+      requiresApproval: true,
+    });
+  }
+
+  if (s.form_submitted >= 5 && nextStepClicks === 0) {
+    decisions.push({
+      id: 'low-data-post-capture-cta',
+      confidence: 'medium',
+      evidence: `${s.form_submitted} captured leads and 0 next-step clicks after capture.`,
+      action:
+        'Tighten the thank-you step so qualified leads get one obvious stack-review CTA and everyone else gets one obvious self-serve CTA.',
+      requiresApproval: true,
+    });
+  }
+
+  return decisions.slice(0, 3);
 }
 
 interface DailyDigestClaimItem {
@@ -236,6 +311,7 @@ type DailyDigestClaim = (digestDate: string, slackUserId: string, runId: string)
  * Never emits "healthy". */
 export function buildDigestLines(result: LoopRunResult, shape: FunnelShape | null): string[] {
   const lines: string[] = [];
+  const lowDataDecisions = shape && result.proposals.length === 0 ? buildLowDataDecisions(shape) : [];
   lines.push(`*🧭 AI Readiness Funnel — daily run ${new Date().toISOString().slice(0, 10)}*`);
   lines.push(`Run ID: \`${result.runId}\``);
   lines.push(`Events scanned: ${result.eventsScanned}  |  Findings: ${result.proposals.length}`);
@@ -253,6 +329,15 @@ export function buildDigestLines(result: LoopRunResult, shape: FunnelShape | nul
       const directive = (p.payload as { directive?: string } | undefined)?.directive ?? '';
       lines.push(`${i + 1}. ${p.hypothesis}`);
       lines.push(`   Kind: \`${p.kind}\`${directive ? `  |  Fix: ${directive}` : ''}`);
+    }
+  }
+  if (lowDataDecisions.length > 0) {
+    lines.push('');
+    lines.push('*Startup decisions (low-data, permission-gated)*');
+    for (let i = 0; i < lowDataDecisions.length; i++) {
+      const d = lowDataDecisions[i];
+      lines.push(`${i + 1}. \`${d.id}\` — ${d.action}`);
+      lines.push(`   Evidence: ${d.evidence}  |  Confidence: ${d.confidence}  |  Needs approval: yes`);
     }
   }
   lines.push('');
@@ -295,4 +380,10 @@ async function postDigest(
 
 /** Test seam. */
 export const _internal = { get aiReadinessGate() { return aiReadinessGate; } };
-export const _testing = { summarizeFunnel, buildDigestLines, buildDailyDigestClaimItem, postDigest };
+export const _testing = {
+  summarizeFunnel,
+  buildDigestLines,
+  buildDailyDigestClaimItem,
+  buildLowDataDecisions,
+  postDigest,
+};
