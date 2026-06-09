@@ -34,7 +34,11 @@ import { mergeCustomFields } from '../utils/customFieldsGuard';
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
-const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'manage_user_guide', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage'];
+// Note: list_predefined_work_plans is intentionally NOT admin-gated — it is a
+// foundation tool that returns published/launchable templates for non-admins and
+// the full management list for admins (role-aware in apiTools.ts). The admin-only
+// mutation tool remains manage_predefined_work_plan.
+const ADMIN_SKILL_TOOL_NAMES = ['manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'manage_user_guide', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -3518,6 +3522,8 @@ export class AgentModeService {
     'modify_work_plan',
     'set_work_plan_status',
     'save_work_plan',
+    'list_predefined_work_plans',
+    'launch_predefined_work_plan',
 
     // Skill Creation (users can define custom skill bundles)
     'create_skill',
@@ -20653,6 +20659,148 @@ Please:
         success: false,
         message: 'Failed to create work plan',
         error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Instantiate a predefined work plan template into an existing chat session.
+   *
+   * This is the programmatic equivalent of Agent Mode's createSessionWithPlan, but
+   * applied to a session that already exists (e.g. an Emma conversation). It:
+   *   - resolves the template by title (case-insensitive) or planId, honoring the
+   *     same system/public/private visibility rules as the listing tool;
+   *   - copies the template's steps into session.workPlan with status 'pending';
+   *   - carries welcomeMessage / autocomplete / userInstructions through;
+   *   - auto-installs ALL skills referenced by the plan's steps so the required
+   *     tools are available from the next message (tool filtering is computed per
+   *     message, so skills must be installed upfront);
+   *   - applies the plan's defaultModel when supported.
+   *
+   * Refuses to overwrite an existing active (non-empty) work plan unless force=true.
+   */
+  public async applyPredefinedWorkPlan(planTitleOrId: string, sessionId: string, userId?: string, options?: { force?: boolean }): Promise<any> {
+    try {
+      const { workPlanService } = await import('./workPlanService');
+
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return { success: false, message: 'Session not found' };
+      }
+
+      // Guard: don't clobber an in-progress plan unless explicitly forced.
+      const existing = session.workPlan;
+      if (existing && Array.isArray(existing.steps) && existing.steps.length > 0 && !options?.force) {
+        return {
+          success: false,
+          message: `A work plan "${existing.title}" is already active in this session. Ask the user to confirm, then call launch_predefined_work_plan again with force=true to replace it.`,
+          requiresConfirmation: true,
+        };
+      }
+
+      // Resolve candidate plans with private (user/org) taking priority over system/public.
+      const candidates: any[] = [];
+      if (userId && !userId.startsWith('anon_')) {
+        try {
+          const { userDb } = await import('./db');
+          const user = await userDb.getUserById(userId);
+          const [ownPlans, orgPlans] = await Promise.all([
+            workPlanService.getWorkPlansByOwner(userId),
+            user?.orgId ? workPlanService.getWorkPlansByOrg(user.orgId) : Promise.resolve([]),
+          ]);
+          const seen = new Set<string>();
+          for (const p of [...ownPlans, ...orgPlans]) {
+            if (p.visibility === 'private' && !seen.has(p.planId)) {
+              seen.add(p.planId);
+              candidates.push(p);
+            }
+          }
+        } catch (err) {
+          console.warn('[applyPredefinedWorkPlan] Error loading private plans:', (err as Error).message);
+        }
+      }
+      const [systemPlans, publicPlans] = await Promise.all([
+        workPlanService.getWorkPlansByVisibility('system'),
+        workPlanService.getWorkPlansByVisibility('public'),
+      ]);
+      candidates.push(...systemPlans, ...publicPlans);
+
+      const needle = planTitleOrId.toLowerCase();
+      const predefinedPlan = candidates.find(
+        (p) => p.planId === planTitleOrId || (p.title && p.title.toLowerCase() === needle)
+      );
+
+      if (!predefinedPlan) {
+        return { success: false, message: `Work plan template "${planTitleOrId}" not found` };
+      }
+      if (predefinedPlan.visibility === 'private' && (!userId || userId.startsWith('anon_'))) {
+        return { success: false, message: 'Not authorized to use this private work plan' };
+      }
+
+      // Convert template steps -> session work plan (all steps start pending).
+      const workPlan = {
+        title: predefinedPlan.title,
+        steps: (predefinedPlan.steps || []).map((step: any) => ({
+          stepCount: step.stepCount,
+          title: step.title,
+          description: step.description,
+          ...(step.userInstructions !== undefined && { userInstructions: step.userInstructions }),
+          status: 'pending' as const,
+          completedAt: undefined,
+          notes: undefined,
+          requiredFunctionCalls: step.requiredFunctionCalls,
+          skillIds: step.skillIds,
+        })),
+        welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
+        autocomplete: predefinedPlan.autocomplete || false,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+
+      // Auto-install ALL skills from ALL steps upfront so their tools are available
+      // from the next message (tool filtering is computed at the start of each message).
+      const allSkillIds = new Set<string>();
+      for (const step of predefinedPlan.steps || []) {
+        if (step.skillIds?.length) {
+          step.skillIds.forEach((id: string) => allSkillIds.add(id));
+        }
+      }
+      if (allSkillIds.size > 0) {
+        try {
+          await chatbotDb.addAssociatedSkills(sessionId, Array.from(allSkillIds));
+        } catch (skillErr) {
+          console.error('[applyPredefinedWorkPlan] Error auto-installing plan skills:', skillErr);
+        }
+      }
+
+      // Apply the plan's default model when it is supported.
+      if (predefinedPlan.defaultModel) {
+        try {
+          const supportedModels = await this.getSupportedModels();
+          if (supportedModels.includes(predefinedPlan.defaultModel)) {
+            await chatbotDb.updateSessionLlmModel(sessionId, predefinedPlan.defaultModel);
+          } else {
+            console.warn(`[applyPredefinedWorkPlan] Plan model "${predefinedPlan.defaultModel}" not supported; leaving session model unchanged`);
+          }
+        } catch (modelErr) {
+          console.warn('[applyPredefinedWorkPlan] Error applying plan model:', (modelErr as Error).message);
+        }
+      }
+
+      return {
+        success: true,
+        message: `Started work plan "${predefinedPlan.title}" with ${workPlan.steps.length} steps`,
+        workPlan,
+        welcomeMessage: workPlan.welcomeMessage,
+        formattedContent: `Started work plan "${predefinedPlan.title}":\n${workPlan.steps.map((s: any) => `${s.stepCount}. ${s.title}`).join('\n')}`,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error applying predefined work plan:', error);
+      return {
+        success: false,
+        message: 'Failed to start work plan',
+        error: error instanceof Error ? error.message : 'Unknown error',
       };
     }
   }

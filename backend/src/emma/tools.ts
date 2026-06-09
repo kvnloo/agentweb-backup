@@ -5164,6 +5164,35 @@ emmaToolRegistry.register({
   }
 });
 
+// Note: the listing tool for templates is `list_predefined_work_plans`, registered
+// in mcp/server/apiTools.ts. It is role-aware — non-admins get published/launchable
+// templates (system/public + their private), admins get the full management list.
+
+emmaToolRegistry.register({
+  name: 'launch_predefined_work_plan',
+  definition: {
+    name: 'launch_predefined_work_plan',
+    description: 'Launch (instantiate) a predefined work plan template into the current chat session. Use this when the user picks a template returned by list_predefined_work_plans. This copies the template\'s steps into the session as a fresh work plan (all pending), installs any skills the plan needs, and applies its settings, so you can then guide the user through the steps. If a work plan is already active in this session, the call returns requiresConfirmation — confirm with the user, then call again with force=true to replace it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        planTitle: {
+          type: 'string',
+          description: 'The exact title (or planId) of the work plan template to launch, as returned by list_predefined_work_plans.'
+        },
+        force: {
+          type: 'boolean',
+          description: 'Set to true to replace an existing active work plan in this session. Only do this after the user confirms.'
+        }
+      },
+      required: ['planTitle']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.applyPredefinedWorkPlan(args.planTitle, context?.sessionId, context?.userId, { force: args.force === true });
+  }
+});
+
 emmaToolRegistry.register({
   name: 'modify_work_plan',
   definition: {
