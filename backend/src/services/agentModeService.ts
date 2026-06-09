@@ -114,7 +114,7 @@ function recordAgentModeToolTelemetry(
   runId: string,
   sessionId: string,
   iteration: number,
-  toolResults: Array<{ status: 'success' | 'error'; toolCall: any; error?: any; duration: number }>,
+  toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs?: any; error?: any; duration: number }>,
 ): void {
   const recorder = getAgentRunRecorderSafe();
   if (!recorder || toolResults.length === 0) return;
@@ -122,7 +122,13 @@ function recordAgentModeToolTelemetry(
   void (async () => {
     try {
       const toolNames = toolResults.map(r => r.toolCall?.function?.name ?? 'unknown');
-      await recorder.decision(runId, { iteration, toolNames, sessionId });
+      await recorder.decision(runId, {
+        iteration,
+        toolNames,
+        sessionId,
+        toolArgKeys: summarizeToolArgKeys(toolResults),
+        toolArgsPreview: summarizeToolArgs(toolResults),
+      });
       for (const r of toolResults) {
         const toolName = r.toolCall?.function?.name ?? 'unknown';
         await recorder.toolInvoked(runId, { toolName, iteration, sessionId });
@@ -167,6 +173,58 @@ function recordAgentModeRunFailed(
 
 function countFailedToolCalls(toolCalls: any[]): number {
   return toolCalls.filter((toolCall) => toolCall && 'error' in toolCall).length;
+}
+
+const AGENT_RUNTIME_ARG_PREVIEW_MAX_CHARS = 1200;
+const AGENT_RUNTIME_REDACTED_ARG_KEYS = /token|secret|password|credential|authorization|api[_-]?key|cookie/i;
+
+function summarizeToolArgKeys(
+  toolResults: Array<{ toolCall: any; functionArgs?: any }>,
+): string {
+  return toolResults
+    .map((r) => {
+      const toolName = r.toolCall?.function?.name ?? 'unknown';
+      const keys = r.functionArgs && typeof r.functionArgs === 'object' && !Array.isArray(r.functionArgs)
+        ? Object.keys(r.functionArgs).sort().join('|')
+        : '';
+      return keys ? `${toolName}:${keys}` : `${toolName}:`;
+    })
+    .join(',');
+}
+
+function summarizeToolArgs(
+  toolResults: Array<{ toolCall: any; functionArgs?: any }>,
+): string {
+  const safe = toolResults.map((r) => ({
+    tool: r.toolCall?.function?.name ?? 'unknown',
+    args: redactTelemetryValue(r.functionArgs),
+  }));
+  const json = JSON.stringify(safe);
+  return json.length > AGENT_RUNTIME_ARG_PREVIEW_MAX_CHARS
+    ? `${json.slice(0, AGENT_RUNTIME_ARG_PREVIEW_MAX_CHARS - 3)}...`
+    : json;
+}
+
+function redactTelemetryValue(value: unknown, depth = 0): unknown {
+  if (depth > 3) return '[truncated]';
+  if (value === null || value === undefined) return value ?? null;
+  if (typeof value === 'string') {
+    return value.length > 240 ? `${value.slice(0, 237)}...` : value;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+  if (Array.isArray(value)) {
+    return value.slice(0, 8).map((item) => redactTelemetryValue(item, depth + 1));
+  }
+  if (typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value as Record<string, unknown>).slice(0, 24)) {
+      out[key] = AGENT_RUNTIME_REDACTED_ARG_KEYS.test(key)
+        ? '[redacted]'
+        : redactTelemetryValue(child, depth + 1);
+    }
+    return out;
+  }
+  return String(value);
 }
 
 function getAgentRunRecorderSafe() {

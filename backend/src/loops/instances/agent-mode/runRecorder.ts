@@ -57,13 +57,21 @@ export class AgentRunRecorder {
 
   async decision(
     runId: string,
-    info: { iteration: number; toolNames: readonly string[]; sessionId?: string },
+    info: {
+      iteration: number;
+      toolNames: readonly string[];
+      sessionId?: string;
+      toolArgKeys?: string;
+      toolArgsPreview?: string;
+    },
   ): Promise<void> {
     await this.emit(runId, EVT_DECISION, {
       iteration: info.iteration,
       toolNames: info.toolNames.join(','),
       toolCount: info.toolNames.length,
       ...(info.sessionId ? { sessionId: info.sessionId } : {}),
+      ...(info.toolArgKeys ? { toolArgKeys: info.toolArgKeys } : {}),
+      ...(info.toolArgsPreview ? { toolArgsPreview: info.toolArgsPreview } : {}),
     });
   }
 

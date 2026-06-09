@@ -61,13 +61,20 @@ describe('AgentRunRecorder', () => {
     const { port, puts } = fakeDynamo();
     const rec = new AgentRunRecorder(port, clock);
 
-    await rec.decision('sess-1', { iteration: 2, toolNames: ['generate_image', 'send_email'] });
+    await rec.decision('sess-1', {
+      iteration: 2,
+      toolNames: ['generate_image', 'send_email'],
+      toolArgKeys: 'generate_image:prompt,send_email:subject|to',
+      toolArgsPreview: '[{"tool":"generate_image","args":{"prompt":"hero image"}}]',
+    });
 
     const item = puts[0].item as any;
     expect(item.eventType).toBe(EVT_DECISION);
     expect(item.dimensions.toolNames).toBe('generate_image,send_email');
     expect(item.dimensions.toolCount).toBe(2);
     expect(item.dimensions.iteration).toBe(2);
+    expect(item.dimensions.toolArgKeys).toBe('generate_image:prompt,send_email:subject|to');
+    expect(item.dimensions.toolArgsPreview).toContain('hero image');
   });
 
   it('records tool invoked + succeeded with toolName + duration', async () => {
