@@ -166,6 +166,19 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
 
   // ── Boundary cases ──────────────────────────────────────────────────────────
 
+  it('rejects unsigned request in production (NODE_ENV=production)', async () => {
+    const original = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      const body = [{ subscriptionType: 'contact.propertyChange', portalId: PORTAL_ID, objectId: '1', propertyName: 'phone', propertyValue: '555' }];
+      await request(app).post('/api/webhooks/hubspot').send(body);
+      await new Promise(r => setTimeout(r, 50));
+      expect(mockUpdateLead).not.toHaveBeenCalled();
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+
   it('accepts request without signature header (dev/test mode)', async () => {
     const body = [{ subscriptionType: 'contact.propertyChange', portalId: PORTAL_ID, objectId: '2', propertyName: 'email', propertyValue: 'alice@example.com' }];
     const res = await request(app).post('/api/webhooks/hubspot').send(body);
