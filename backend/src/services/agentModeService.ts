@@ -132,6 +132,8 @@ function recordAgentModeToolTelemetry(
         sessionId,
         toolArgKeys: summarizeToolArgKeys(toolResults),
         toolArgsPreview: summarizeToolArgs(toolResults),
+        decisionExplanation: summarizeToolDecision(toolResults),
+        explanationSource: 'deterministic_tool_summary',
       });
       for (const r of toolResults) {
         const toolName = r.toolCall?.function?.name ?? 'unknown';
@@ -207,6 +209,45 @@ function summarizeToolArgs(
   return json.length > AGENT_RUNTIME_ARG_PREVIEW_MAX_CHARS
     ? `${json.slice(0, AGENT_RUNTIME_ARG_PREVIEW_MAX_CHARS - 3)}...`
     : json;
+}
+
+function summarizeToolDecision(
+  toolResults: Array<{ toolCall: any; functionArgs?: any }>,
+): string {
+  const toolNames = toolResults.map((r) => r.toolCall?.function?.name ?? 'unknown');
+  const uniqueTools = [...new Set(toolNames)];
+  if (uniqueTools.length === 0) return 'No tool decision was recorded.';
+  if (uniqueTools.every((name) => name === 'search_web')) {
+    const queries = toolResults
+      .map((r) => typeof r.functionArgs?.query === 'string' ? r.functionArgs.query : '')
+      .filter(Boolean)
+      .slice(0, 3);
+    return queries.length > 0
+      ? `Chose web search to gather external or current information for: ${queries.join(' | ')}.`
+      : 'Chose web search to gather external or current information.';
+  }
+  if (uniqueTools.includes('save_memory')) {
+    return 'Chose save_memory to persist user-provided information for future context.';
+  }
+  if (uniqueTools.includes('read_file_content')) {
+    return 'Chose read_file_content to inspect a file artifact before answering.';
+  }
+  if (uniqueTools.includes('save_file')) {
+    return 'Chose save_file to create or update a durable file artifact.';
+  }
+  if (uniqueTools.includes('install_skills')) {
+    return 'Chose install_skills to make a required skill or work-plan capability available before continuing.';
+  }
+  if (uniqueTools.some((name) => name.startsWith('playwright_browser_'))) {
+    return `Chose browser automation to inspect or interact with a webpage using: ${uniqueTools.join(', ')}.`;
+  }
+  if (uniqueTools.includes('create_task_from_prompt')) {
+    return 'Chose create_task_from_prompt because the request appears to require creating a tracked task.';
+  }
+  if (uniqueTools.length === 1) {
+    return `Chose ${uniqueTools[0]} based on the requested action and available tool schema.`;
+  }
+  return `Chose multiple tools in one iteration: ${uniqueTools.join(', ')}.`;
 }
 
 function redactTelemetryValue(value: unknown, depth = 0): unknown {
