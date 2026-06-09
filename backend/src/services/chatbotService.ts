@@ -4014,6 +4014,44 @@ export async function generateChatResponse(
         const { mcpToolRegistry } = await import('../mcp/server/registry');
         const { emmaToolRegistry } = await import('../emma/registry');
 
+        // Expand the tool set with any skills installed on this session
+        // (session.associatedSkills). Without this, skills installed via Emma's
+        // install_skills tool — or auto-installed when a work plan template is
+        // launched (launch_predefined_work_plan) — would have no effect on Emma's tool list,
+        // so the plan's required tools would never become available. This mirrors
+        // Agent Mode, which resolves a session's installed skills into tool names.
+        const sessionSkillIds = Array.isArray(session.associatedSkills) ? session.associatedSkills : [];
+        if (sessionSkillIds.length > 0) {
+          try {
+            const { resolveSkillsToToolNames } = await import('./subscriptionService');
+            const skillToolNames = await resolveSkillsToToolNames(sessionSkillIds);
+            if (skillToolNames.includes('*')) {
+              // Wildcard: every registered Emma/MCP tool becomes available.
+              emmaToolRegistry.getToolNames().forEach(t => toolsToInclude.add(t));
+              mcpToolRegistry.getToolNames().forEach(t => toolsToInclude.add(t));
+            } else {
+              skillToolNames.forEach(t => toolsToInclude.add(t));
+            }
+          } catch (skillErr) {
+            console.error('[generateChatResponse] Error resolving session skills to tools:', skillErr);
+          }
+        }
+
+        // Expand the tool set with the active work plan's required function calls.
+        // Predefined templates declare the tools each step needs via
+        // requiredFunctionCalls (not skillIds), and Agent Mode runs them as legacy
+        // sessions where every tool is available. Emma has no such fallback, so
+        // without this a plan step whose required tool isn't a foundation/page tool
+        // (e.g. generate_landing_page, create_html_file) could never be completed.
+        // Scope: only sessions actually running a plan, and only that plan's tools.
+        if (Array.isArray(session.workPlan?.steps)) {
+          for (const step of session.workPlan!.steps) {
+            if (Array.isArray(step.requiredFunctionCalls)) {
+              step.requiredFunctionCalls.forEach((fn: string) => toolsToInclude.add(fn));
+            }
+          }
+        }
+
         for (const toolName of toolsToInclude) {
           // First try emmaToolRegistry (Emma-specific tools), then fall back to mcpToolRegistry
           const emmaHandler = emmaToolRegistry.getTool(toolName);
