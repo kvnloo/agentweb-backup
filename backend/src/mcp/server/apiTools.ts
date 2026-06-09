@@ -1680,11 +1680,24 @@ mcpToolRegistry.register({
   name: 'list_predefined_work_plans',
   definition: {
     name: 'list_predefined_work_plans',
-    description: 'List all predefined work plans. Returns the full list of plans with their IDs, titles, steps, and settings. CAUTION: Admin-only tool — changes to work plans affect the production environment.',
+    description: 'List the predefined work plan templates available to start. Non-admin users see published templates (system/public) plus their own and org-shared private plans. Admins (or admin-delegated sessions) get the full management list including unpublished and pending-review plans. To begin one, call launch_predefined_work_plan with the chosen title.',
     inputSchema: { type: 'object', properties: {}, required: [] }
   },
   execute: async (_args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: '/api/admin/work-plans', context: ctx(context) });
+    // Role-aware: admins (or admin-delegated sessions) get the full management
+    // list via the admin route; everyone else gets the published/launchable set
+    // via the public agent-mode route. Both go through authenticateToken.
+    const c = ctx(context);
+    let isAdmin = c.isDelegatedAccess === true;
+    if (!isAdmin && c.userId) {
+      try {
+        const { userDb } = await import('../../services/db');
+        const user = await userDb.getUserById(c.userId);
+        isAdmin = user?.isAdmin === true;
+      } catch { /* default to non-admin on lookup failure */ }
+    }
+    const path = isAdmin ? '/api/admin/work-plans' : '/api/agent-mode/public/plans';
+    const data = await mcpFetch({ method: 'GET', path, context: c });
     return jsonResult(data);
   }
 });
