@@ -312,22 +312,16 @@ app.use("/api/onboarding", onboardingEventsRoutes);
 app.use("/api/onboarding", onboardingVariantsRoutes);
 app.use("/api/loop-events", loopEventsRoutes);
 
-// Register closed-loop instances with production impls (real DDB sensor +
-// NotionDigestTool + Slack DM gate via the cron wrapper). The route handlers
-// look up the loop manifest from LOOP_REGISTRY; the cron in server.ts
-// invokes runAiEvalLoopOnce() on a daily schedule.
+// Register closed-loop instances with production impls. The route handlers
+// look up loop manifests from LOOP_REGISTRY; the cron in server.ts invokes
+// each loop and the generic attribution pass on schedules.
 try {
   registerAiEvalFunnelForProduction();
 } catch (err) {
-  // Idempotent registration may throw on hot-reload; safe to swallow during
-  // dev-server restarts. Production should never hit this path twice.
   console.warn("[loops] registerAiEvalFunnelForProduction skipped:", String(err));
 }
-// Register the /ai-readiness lander loop AFTER ai-eval (the legacy ai-eval
-// registrar resets the registry only when called on a non-empty one, so it
-// must run first on an empty registry). Always registered so /api/loop-events
-// accepts + stores the lander's events; the daily analysis run is scheduled
-// separately in server.ts.
+// Always registered so /api/loop-events accepts + stores the lander's events;
+// the daily analysis run is scheduled separately in server.ts.
 try {
   registerAiReadinessFunnel();
 } catch (err) {

@@ -22,10 +22,17 @@ import {
   getGate,
   getLearningStore,
   getLoopManifest,
+  getRegisteredLoopManifests,
   getRegisteredLoopIds,
   getRuleSet,
   getSensor,
   getTools,
+  registerOrReplaceGate,
+  registerOrReplaceLearningStore,
+  registerOrReplaceLoop,
+  registerOrReplaceRuleSet,
+  registerOrReplaceSensor,
+  registerOrReplaceTools,
   registerGate,
   registerLearningStore,
   registerLoop,
@@ -197,11 +204,62 @@ describe('loops registry — happy paths', () => {
     expect(getRegisteredLoopIds()).toContain(asLoopId('test-loop-2'));
   });
 
+  it('getRegisteredLoopManifests returns every manifest for generic cron runners', () => {
+    registerLoop(stubManifest);
+    const second: LoopManifest = {
+      ...stubManifest,
+      loopId: asLoopId('test-loop-2'),
+      displayName: 'Second Loop',
+    };
+    registerLoop(second);
+
+    expect(getRegisteredLoopManifests().map((m) => m.loopId)).toEqual([
+      asLoopId('test-loop'),
+      asLoopId('test-loop-2'),
+    ]);
+  });
+
   it('different implementations can register under different names', () => {
     registerSensor('userArray', stubSensor);
     registerSensor('eventTable', stubSensor);
     expect(getSensor('userArray')).toBe(stubSensor);
     expect(getSensor('eventTable')).toBe(stubSensor);
+  });
+
+  it('registerOrReplace swaps one implementation without clearing unrelated registrations', () => {
+    const replacementSensor: EventSource<NormalizedEvent> = { fetchEvents: jest.fn().mockResolvedValue([]) };
+    const replacementRuleSet: RuleSet<NormalizedEvent, unknown> = { evaluate: jest.fn().mockResolvedValue([]) };
+    const replacementTools: MutationTools<unknown> = { apply: jest.fn() };
+    const replacementGate: ApprovalGate = { requestApproval: jest.fn(), pollDecision: jest.fn() };
+    const replacementLearning: LearningStore = {
+      record: jest.fn().mockResolvedValue(undefined),
+      queryHistory: jest.fn().mockResolvedValue([]),
+      lastOutcomeForRule: jest.fn().mockResolvedValue(null),
+    };
+    const unrelatedSensor: EventSource<NormalizedEvent> = { fetchEvents: jest.fn().mockResolvedValue([]) };
+
+    registerSensor('shared', stubSensor);
+    registerSensor('unrelated', unrelatedSensor);
+    registerRuleSet('shared', stubRuleSet);
+    registerTools('shared', stubTools);
+    registerGate('shared', stubGate);
+    registerLearningStore('shared', stubLearning);
+    registerLoop(stubManifest);
+
+    registerOrReplaceSensor('shared', replacementSensor);
+    registerOrReplaceRuleSet('shared', replacementRuleSet);
+    registerOrReplaceTools('shared', replacementTools);
+    registerOrReplaceGate('shared', replacementGate);
+    registerOrReplaceLearningStore('shared', replacementLearning);
+    registerOrReplaceLoop({ ...stubManifest, displayName: 'Updated Test Loop' });
+
+    expect(getSensor('shared')).toBe(replacementSensor);
+    expect(getSensor('unrelated')).toBe(unrelatedSensor);
+    expect(getRuleSet('shared')).toBe(replacementRuleSet);
+    expect(getTools('shared')).toBe(replacementTools);
+    expect(getGate('shared')).toBe(replacementGate);
+    expect(getLearningStore('shared')).toBe(replacementLearning);
+    expect(getLoopManifest(asLoopId('test-loop')).displayName).toBe('Updated Test Loop');
   });
 
   it('_resetRegistryForTesting clears every registry slot', () => {

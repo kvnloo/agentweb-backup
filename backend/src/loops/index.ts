@@ -55,10 +55,18 @@ export function registerSensor(name: string, impl: EventSource<NormalizedEvent>)
   impls.sensors.set(name, impl);
 }
 
+export function registerOrReplaceSensor(name: string, impl: EventSource<NormalizedEvent>): void {
+  impls.sensors.set(name, impl);
+}
+
 export function registerRuleSet(name: string, impl: RuleSet<NormalizedEvent, unknown>): void {
   if (impls.rulesets.has(name)) {
     throw new Error(`[loops] ruleset impl already registered: ${name}`);
   }
+  impls.rulesets.set(name, impl);
+}
+
+export function registerOrReplaceRuleSet(name: string, impl: RuleSet<NormalizedEvent, unknown>): void {
   impls.rulesets.set(name, impl);
 }
 
@@ -69,6 +77,10 @@ export function registerTools(name: string, impl: MutationTools<unknown>): void 
   impls.tools.set(name, impl);
 }
 
+export function registerOrReplaceTools(name: string, impl: MutationTools<unknown>): void {
+  impls.tools.set(name, impl);
+}
+
 export function registerGate(name: string, impl: ApprovalGate): void {
   if (impls.gates.has(name)) {
     throw new Error(`[loops] gate impl already registered: ${name}`);
@@ -76,10 +88,18 @@ export function registerGate(name: string, impl: ApprovalGate): void {
   impls.gates.set(name, impl);
 }
 
+export function registerOrReplaceGate(name: string, impl: ApprovalGate): void {
+  impls.gates.set(name, impl);
+}
+
 export function registerLearningStore(name: string, impl: LearningStore): void {
   if (impls.learning.has(name)) {
     throw new Error(`[loops] learning impl already registered: ${name}`);
   }
+  impls.learning.set(name, impl);
+}
+
+export function registerOrReplaceLearningStore(name: string, impl: LearningStore): void {
   impls.learning.set(name, impl);
 }
 
@@ -126,6 +146,10 @@ export function registerLoop(manifest: LoopManifest): void {
   loops.set(manifest.loopId, manifest);
 }
 
+export function registerOrReplaceLoop(manifest: LoopManifest): void {
+  loops.set(manifest.loopId, manifest);
+}
+
 export function getLoopManifest(loopId: LoopId): LoopManifest {
   const manifest = loops.get(loopId);
   if (!manifest) throw new Error(`[loops] loop not registered: ${loopId}`);
@@ -134,6 +158,10 @@ export function getLoopManifest(loopId: LoopId): LoopManifest {
 
 export function getRegisteredLoopIds(): readonly LoopId[] {
   return Array.from(loops.keys());
+}
+
+export function getRegisteredLoopManifests(): readonly LoopManifest[] {
+  return Array.from(loops.values());
 }
 
 /** Reset everything. Used only by tests + the smoke harness. */

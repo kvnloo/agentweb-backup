@@ -12,7 +12,7 @@
  *   policy   = LlmAnalystRuleSet (binding-constraint lens via flowDescription)
  *   tools    = SpecOutputTool (records the proposal spec; the DM is the value)
  *   gate     = CaptureGate (Slack DM + reactions)
- *   learning = InMemoryLearningStore
+ *   learning = DynamoLearningStore + CooldownRuleSet read-back
  *
  * Registration is ALWAYS performed (so /api/loop-events accepts + stores the
  * lander's events). The daily analysis run is scheduled separately in
@@ -23,15 +23,16 @@ import AWS from 'aws-sdk';
 import {
   getLoopManifest,
   getRegisteredLoopIds,
-  registerGate,
-  registerLearningStore,
-  registerLoop,
-  registerRuleSet,
-  registerSensor,
-  registerTools,
+  registerOrReplaceGate,
+  registerOrReplaceLearningStore,
+  registerOrReplaceLoop,
+  registerOrReplaceRuleSet,
+  registerOrReplaceSensor,
+  registerOrReplaceTools,
 } from '../../index';
 import { CaptureGate } from '../../core/gates/captureGate';
-import { InMemoryLearningStore } from '../../core/learning/inMemoryLearningStore';
+import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
+import { CooldownRuleSet } from '../../core/policy/cooldownRuleSet';
 import { LlmAnalystRuleSet } from '../../core/policy/llmAnalystRuleSet';
 import { EventTableEventSource, LOOP_EVENTS_TABLE } from '../../core/sensors/eventTableEventSource';
 import { SpecOutputTool } from '../../core/tools/specOutputTool';
@@ -58,9 +59,7 @@ let digestDynamo: AWS.DynamoDB.DocumentClient | null = null;
 
 /**
  * Register the loop. Idempotent. Does NOT reset the registry, so it coexists
- * with the ai-eval + onboarding loops. Must be called AFTER
- * registerAiEvalFunnelForProduction() in app.ts (that legacy function resets
- * the registry only when called on a non-empty registry).
+ * with ai-eval + onboarding regardless of boot order.
  */
 export function registerAiReadinessFunnel(): void {
   if ((getRegisteredLoopIds() as readonly string[]).includes(AI_READINESS_LOOP_ID)) return;
@@ -70,25 +69,26 @@ export function registerAiReadinessFunnel(): void {
   const sensor = new EventTableEventSource(ports.dynamo, AI_READINESS_LOOP_ID, {
     scope: { ...READINESS_SCOPE },
   });
-  const ruleSet = new LlmAnalystRuleSet(AI_READINESS_LOOP_ID, ports.bedrock, {
+  const learning = new DynamoLearningStore(ports.dynamo);
+  const analyst = new LlmAnalystRuleSet(AI_READINESS_LOOP_ID, ports.bedrock, {
     model: aiReadinessManifest.generator.model,
     targetMetricName: aiReadinessManifest.targetMetric.name,
     flowDescription: AI_READINESS_FLOW_DESCRIPTION,
     maxProposals: 3,
     chapterDimension: 'landerPath',
   });
+  const ruleSet = new CooldownRuleSet(analyst, learning, AI_READINESS_LOOP_ID);
   const tools = new SpecOutputTool(AI_READINESS_LOOP_ID);
   const gate = new CaptureGate();
-  const learning = new InMemoryLearningStore();
 
-  registerSensor('aiReadinessSensor', sensor);
+  registerOrReplaceSensor('aiReadinessSensor', sensor);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  registerRuleSet('aiReadinessAnalyst', ruleSet as any);
+  registerOrReplaceRuleSet('aiReadinessAnalyst', ruleSet as any);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  registerTools('aiReadinessSpecTool', tools as any);
-  registerGate('aiReadinessGate', gate);
-  registerLearningStore('aiReadinessLearning', learning);
-  registerLoop(aiReadinessManifest);
+  registerOrReplaceTools('aiReadinessSpecTool', tools as any);
+  registerOrReplaceGate('aiReadinessGate', gate);
+  registerOrReplaceLearningStore('aiReadinessLearning', learning);
+  registerOrReplaceLoop(aiReadinessManifest);
 
   aiReadinessGate = gate;
 }
