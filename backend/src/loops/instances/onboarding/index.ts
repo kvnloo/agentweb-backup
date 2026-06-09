@@ -13,22 +13,22 @@
  *   tools    = SpecOutputTool (records the proposal spec; the DM is the value
  *              during verification — swap to a cloud-dev dispatch tool at cutover)
  *   gate     = CaptureGate (Slack DM + reactions)
- *   learning = InMemoryLearningStore (swap to the durable store + attribution
- *              engine at cutover)
+ *   learning = DynamoLearningStore + CooldownRuleSet read-back
  */
 
 import {
   getLoopManifest,
   getRegisteredLoopIds,
-  registerGate,
-  registerLearningStore,
-  registerLoop,
-  registerRuleSet,
-  registerSensor,
-  registerTools,
+  registerOrReplaceGate,
+  registerOrReplaceLearningStore,
+  registerOrReplaceLoop,
+  registerOrReplaceRuleSet,
+  registerOrReplaceSensor,
+  registerOrReplaceTools,
 } from '../../index';
 import { CaptureGate } from '../../core/gates/captureGate';
-import { InMemoryLearningStore } from '../../core/learning/inMemoryLearningStore';
+import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
+import { CooldownRuleSet } from '../../core/policy/cooldownRuleSet';
 import { LlmAnalystRuleSet } from '../../core/policy/llmAnalystRuleSet';
 import {
   UserArrayEventSource,
@@ -58,24 +58,25 @@ export function registerOnboardingLoopV2(): boolean {
   const sensor = new UserArrayEventSource(
     async () => (await userDb.getAllUsers(true)) as UserArrayRecord[],
   );
-  const ruleSet = new LlmAnalystRuleSet(ONBOARDING_LOOP_ID, ports.bedrock, {
+  const learning = new DynamoLearningStore(ports.dynamo);
+  const analyst = new LlmAnalystRuleSet(ONBOARDING_LOOP_ID, ports.bedrock, {
     model: onboardingManifest.generator.model,
     targetMetricName: onboardingManifest.targetMetric.name,
     flowDescription: ONBOARDING_FLOW_DESCRIPTION,
     maxProposals: 3,
   });
+  const ruleSet = new CooldownRuleSet(analyst, learning, ONBOARDING_LOOP_ID);
   const tools = new SpecOutputTool(ONBOARDING_LOOP_ID);
   const gate = new CaptureGate();
-  const learning = new InMemoryLearningStore();
 
-  registerSensor('onboardingUserSensor', sensor);
+  registerOrReplaceSensor('onboardingUserSensor', sensor);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  registerRuleSet('onboardingAnalyst', ruleSet as any);
+  registerOrReplaceRuleSet('onboardingAnalyst', ruleSet as any);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  registerTools('onboardingSpecTool', tools as any);
-  registerGate('onboardingGate', gate);
-  registerLearningStore('onboardingLearning', learning);
-  registerLoop(onboardingManifest);
+  registerOrReplaceTools('onboardingSpecTool', tools as any);
+  registerOrReplaceGate('onboardingGate', gate);
+  registerOrReplaceLearningStore('onboardingLearning', learning);
+  registerOrReplaceLoop(onboardingManifest);
 
   onboardingGate = gate;
   return true;
