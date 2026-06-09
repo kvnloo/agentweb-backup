@@ -9,6 +9,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-06-09',
+    changes: [
+      'Improved: Emma Now Remembers Your Preferences and Lessons Across Sessions',
+      '- When you tell Emma something worth keeping — a preferred tone or format, a recurring workflow, or a hard-won lesson about your business — she now saves it to your account memory so it carries into every future chat',
+      '- You no longer have to repeat the same context each session; Emma recalls what she learned and applies it automatically',
+      '- Learnings that apply to your whole team can be saved to your organization\'s shared memory, so teammates benefit too',
+      '- You stay in control: ask Emma to forget or update anything she\'s remembered, and account memory can be turned off in settings',
+    ],
+  },
+  {
     date: '2026-06-08',
     changes: [
       'Improved: Presentation PDFs Now Fill the Whole Page — No More Margins or Cut-Off Edges',
