@@ -979,31 +979,17 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
         }
       }
 
-      // Handle top-level message events in user-connected Slack channels (slack triggered session)
-      // Filter: plain message, NOT a thread reply, NOT a bot message, NOT a message_changed/deleted event
-      // Skip messages that @mention Emma — those trigger an app_mention event that Emma handles
-      // directly, so generating a "suggest" email would be redundant. Other @mentions (e.g.
-      // @john) should still go through the suggest flow.
+      // Do not passively capture top-level Slack messages. Emma sessions should only
+      // start from explicit app_mention events so customer Slack conversations are
+      // not documented or billed unless Emma is invoked.
       if (event.type === 'message' && !event.thread_ts && !event.bot_id && !event.subtype) {
-        const { text, user: slackUserId, channel, ts } = event;
-        if (text) {
-          const botId = await getEmmaBotUserId();
-          const mentionsEmma = !!(botId && text.includes(`<@${botId}>`));
-          if (mentionsEmma) {
-            console.log('📨 Skipping slack suggest for Emma @mention (already handled by app_mention handler):', { channel, user: slackUserId });
-          } else {
-            console.log('📨 Top-level Slack message received:', { channel, user: slackUserId });
-            // Fire-and-forget: triage + session + email
-            handleSlackTriggeredSession({ text, slackUserId, channel, ts });
-          }
-        }
+        const { channel, user: slackUserId } = event;
+        console.log('📨 Ignoring passive top-level Slack message without Emma mention:', { channel, user: slackUserId });
       }
 
-      // Handle message events in threads (follow-up messages to Emma sessions, or non-Emma threads)
+      // Handle message events in threads that are already associated with Emma sessions.
       // Filter: must be a plain message in a thread, not a bot message or message_changed/deleted event
-      // Allow file_share subtype so that Slack file uploads are also processed
-      // Skip messages that @mention Emma — those trigger an app_mention event that Emma handles
-      // directly, so processing them here too would cause Emma to answer twice.
+      // Allow file_share subtype so that Slack file uploads are also processed.
       if (event.type === 'message' && event.thread_ts && !event.bot_id && (!event.subtype || event.subtype === 'file_share')) {
         const { text, user: slackUserId, channel, thread_ts: threadTs, files } = event;
 
@@ -1026,58 +1012,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             const isTriggered = parsed.type === 'triggered';
 
             if (isTriggered) {
-              // Monitored (email-only) session — continue it and send email, do NOT post to Slack
-              if (text) {
-                // Skip replies from AgentWeb team members — no suggest needed for our own team's comments
-                const replySenderEmail = await getSlackUserEmail(slackUserId);
-                if (replySenderEmail && replySenderEmail.endsWith('@agentweb.pro')) {
-                  console.log(`📨 [slack-triggered] skipping thread reply from AgentWeb team member (${replySenderEmail})`);
-                  return;
-                }
-
-                console.log('📨 Thread reply in monitored session (email-only):', { channel, threadTs, slackUserId });
-                const { chatbotDb } = await import('../services/chatbotService');
-                const { generateSessionResponse } = await import('../controllers/agentModeController');
-                const { agentModeService } = await import('../services/agentModeService');
-                const { userDb } = await import('../services/db');
-
-                const session = await chatbotDb.getChatSession(sessionId);
-                if (!session) {
-                  console.log('❌ Session not found for monitored Slack thread:', sessionId);
-                  return;
-                }
-
-                const displayName = await getSlackUserDisplayName(slackUserId);
-                const formattedMessage = `${displayName}: ${text}`.trim();
-
-                const llmModel = session.llmModel || await agentModeService.getDefaultModel();
-                let emmaResponse = '';
-                try {
-                  const result = await generateSessionResponse(sessionId, formattedMessage, userId, llmModel);
-                  emmaResponse = result.content;
-                } catch (genError) {
-                  console.error('❌ Error generating response for monitored thread:', genError);
-                  emmaResponse = '(Emma was unable to generate a response for this message.)';
-                }
-
-                let channelName = channel;
-                try {
-                  const { WebClient } = await import('@slack/web-api');
-                  const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-                  const info = await slackClient.conversations.info({ channel });
-                  channelName = (info.channel as any)?.name || channel;
-                } catch { /* non-blocking */ }
-
-                const user = await userDb.getUserById(userId);
-                await emailService.sendSlackTriggeredSessionEmail('founders@agentweb.pro', {
-                  sessionId,
-                  userEmail: user?.email || userId,
-                  channelName,
-                  originalMessage: text,
-                  emmaResponse,
-                  receivedAt: new Date().toISOString(),
-                });
-              }
+              console.log('📨 Ignoring legacy monitored Slack thread reply without Emma mention:', { channel, threadTs, slackUserId });
             } else {
               // Emma @mention session — existing behavior: post response directly to Slack
               console.log('💬 Thread reply in Emma session:', { channel, threadTs, slackUserId });
@@ -1153,10 +1088,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             console.error('❌ Error processing thread reply:', parseError);
           }
         } else if (text) {
-          // Thread not mapped to anything — treat as a new monitored conversation.
-          // Pass thread_ts as ts so subsequent replies in this thread continue the same session.
-          console.log('📨 Thread reply in untracked thread, triggering monitoring:', { channel, threadTs, slackUserId });
-          handleSlackTriggeredSession({ text, slackUserId, channel, ts: threadTs });
+          console.log('📨 Ignoring untracked Slack thread reply without Emma mention:', { channel, threadTs, slackUserId });
         }
       }
 

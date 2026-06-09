@@ -23,6 +23,8 @@ jest.mock('../services/chatbotService', () => ({
     updateSessionTitle: jest.fn(),
     updateSessionSlackThread: jest.fn(),
     getChatSession: jest.fn(),
+    updateSessionGtmWorkItem: jest.fn(),
+    updateSessionLlmModel: jest.fn(),
     createOrReuseInteractiveShare: jest.fn().mockResolvedValue('http://localhost:5174/ishare/session-123?conversable=abc123'),
   },
 }));
@@ -35,6 +37,13 @@ jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     default_model: 'gpt-4o',
     getDefaultModel: jest.fn().mockResolvedValue('gpt-4o'),
+    triageSlackMessage: jest.fn().mockResolvedValue(true),
+  },
+}));
+
+jest.mock('../services/emailService', () => ({
+  emailService: {
+    sendSlackTriggeredSessionEmail: jest.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -63,9 +72,15 @@ jest.mock('../utils/s3Utils', () => ({
 
 jest.mock('@slack/web-api', () => ({
   WebClient: jest.fn().mockImplementation(() => ({
+    auth: {
+      test: jest.fn().mockResolvedValue({ user_id: 'UEMMA123' }),
+    },
     chat: {
       postMessage: mockPostMessage,
       delete: mockChatDelete,
+    },
+    conversations: {
+      info: jest.fn().mockResolvedValue({ channel: { name: 'customer-channel' } }),
     },
   })),
 }));
@@ -74,6 +89,8 @@ const { userDb } = require('../services/db');
 const { settingsService } = require('../services/settingsService');
 const { chatbotDb } = require('../services/chatbotService');
 const { generateSessionResponse } = require('../controllers/agentModeController');
+const { agentModeService } = require('../services/agentModeService');
+const { emailService } = require('../services/emailService');
 const { postThreadResponse, postThinkingMessage, deleteSlackMessage, getSlackUserDisplayName } = require('../services/slackService');
 
 describe('Slack Events API', () => {
@@ -383,6 +400,139 @@ describe('Slack Events API', () => {
           text: expect.stringContaining('couldn\'t find a user account linked'),
         })
       );
+    });
+
+    describe('passive Slack messages', () => {
+      it('does not triage or create a session for top-level messages that do not mention Emma', async () => {
+        settingsService.getSetting.mockReset();
+        settingsService.getSetting.mockResolvedValue({
+          settingValue: 'user-123',
+        });
+
+        userDb.getUserById.mockResolvedValue({
+          userId: 'user-123',
+          email: 'client@example.com',
+          slackChannel: 'C12345',
+        });
+
+        chatbotDb.createChatSession.mockResolvedValue({
+          sessionId: 'session-passive',
+          userId: 'user-123',
+          messages: [],
+          llmModel: 'gpt-4o',
+        });
+
+        generateSessionResponse.mockResolvedValue({
+          content: 'Draft response',
+          toolCalls: [],
+        });
+
+        const response = await request(app)
+          .post('/api/slack/events')
+          .send({
+            type: 'event_callback',
+            event: {
+              type: 'message',
+              user: 'UCLIENT',
+              text: 'Can someone look into the data enrichment case?',
+              channel: 'C12345',
+              ts: '1234567890.123456',
+            },
+          });
+
+        expect(response.status).toBe(200);
+
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        expect(agentModeService.triageSlackMessage).not.toHaveBeenCalled();
+        expect(chatbotDb.createChatSession).not.toHaveBeenCalled();
+        expect(generateSessionResponse).not.toHaveBeenCalled();
+        expect(emailService.sendSlackTriggeredSessionEmail).not.toHaveBeenCalled();
+      });
+
+      it('does not create a monitored session for replies in untracked threads', async () => {
+        settingsService.getSetting.mockReset();
+        settingsService.getSetting
+          .mockResolvedValueOnce(null)
+          .mockResolvedValueOnce({ settingValue: 'user-123' });
+
+        userDb.getUserById.mockResolvedValue({
+          userId: 'user-123',
+          email: 'client@example.com',
+          slackChannel: 'C12345',
+        });
+
+        chatbotDb.createChatSession.mockResolvedValue({
+          sessionId: 'session-untracked-thread',
+          userId: 'user-123',
+          messages: [],
+          llmModel: 'gpt-4o',
+        });
+
+        generateSessionResponse.mockResolvedValue({
+          content: 'Draft response',
+          toolCalls: [],
+        });
+
+        const response = await request(app)
+          .post('/api/slack/events')
+          .send({
+            type: 'event_callback',
+            event: {
+              type: 'message',
+              user: 'UCLIENT',
+              text: 'Following up here without mentioning Emma.',
+              channel: 'C12345',
+              ts: '1234567891.000000',
+              thread_ts: '1234567890.123456',
+            },
+          });
+
+        expect(response.status).toBe(200);
+
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        expect(agentModeService.triageSlackMessage).not.toHaveBeenCalled();
+        expect(chatbotDb.createChatSession).not.toHaveBeenCalled();
+        expect(generateSessionResponse).not.toHaveBeenCalled();
+        expect(emailService.sendSlackTriggeredSessionEmail).not.toHaveBeenCalled();
+      });
+
+      it('does not continue legacy monitored sessions when a thread mapping is marked triggered', async () => {
+        settingsService.getSetting.mockReset();
+        settingsService.getSetting.mockResolvedValue({
+          settingValue: JSON.stringify({ sessionId: 'session-triggered', userId: 'user-123', type: 'triggered' }),
+        });
+
+        chatbotDb.getChatSession.mockResolvedValue({
+          sessionId: 'session-triggered',
+          userId: 'user-123',
+          messages: [],
+          llmModel: 'gpt-4o',
+        });
+
+        const response = await request(app)
+          .post('/api/slack/events')
+          .send({
+            type: 'event_callback',
+            event: {
+              type: 'message',
+              user: 'UCLIENT',
+              text: 'Adding detail without invoking Emma.',
+              channel: 'C12345',
+              ts: '1234567891.000000',
+              thread_ts: '1234567890.123456',
+            },
+          });
+
+        expect(response.status).toBe(200);
+
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
+        expect(generateSessionResponse).not.toHaveBeenCalled();
+        expect(emailService.sendSlackTriggeredSessionEmail).not.toHaveBeenCalled();
+      });
     });
 
     describe('Thread message handling', () => {
