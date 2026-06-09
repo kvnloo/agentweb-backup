@@ -38,11 +38,11 @@ router.get('/', async (req: Request, res: Response) => {
 
     const rows = ((result.Items ?? []) as AgentRunEventRow[])
       .filter((row) => row.eventType && row.subjectId && row.ts)
-      .filter((row) => !runId || row.subjectId === runId)
-      .filter((row) => !sessionId || row.dimensions?.sessionId === sessionId)
-      .filter((row) => !userId || row.dimensions?.userId === userId);
+      .filter((row) => !runId || row.subjectId === runId);
 
-    const runs = buildAgentRunSummaries(rows);
+    const runs = buildAgentRunSummaries(rows)
+      .filter((run) => !sessionId || run.sessionId === sessionId)
+      .filter((run) => !userId || run.userId === userId);
     return res.status(200).json({
       runs,
       count: runs.length,
