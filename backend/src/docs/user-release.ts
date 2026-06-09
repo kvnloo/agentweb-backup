@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-06-05
+// Last updated: 2026-06-09
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,16 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-06-09',
+    changes: [
+      'New: Start and Run Guided Work Plans Right From Emma Chat',
+      '- You can now ask Emma "what work plans can I start?" to see the available step-by-step templates (onboarding, landing page builder, AI news to LinkedIn post, and more), then say "start the …" to launch one without leaving the chat',
+      '- Once a plan is active, Emma follows it: she walks you through each step, marks steps complete as you go, and picks up where you left off in later messages',
+      '- Launching a plan automatically turns on the tools and skills that plan needs, so each step just works',
+      '- If a plan is already in progress, Emma checks with you before replacing it so you don\'t lose your place',
+    ],
+  },
   {
     date: '2026-06-09',
     changes: [
