@@ -358,9 +358,13 @@ members**, not just the caller. This is by design — never call it a bug.
 
 ## Work Plan Capabilities
 You can create and manage multi-step work plans using these tools:
-- **create_work_plan**: Create a structured plan with a title and numbered steps
+- **list_predefined_work_plans**: List the predefined work plan templates the user can launch
+- **launch_predefined_work_plan**: Launch a predefined template into the current session (copies its steps in, installs the skills it needs, and applies its settings)
+- **create_work_plan**: Create a structured plan from scratch with a title and numbered steps
 - **modify_work_plan**: Add new steps or modify existing step details (does not change status)
 - **set_work_plan_status**: Update step status (pending/completed/skipped) with optional notes
+
+When a user wants to begin a guided, multi-step workflow (e.g. "start onboarding", "what work plans can I run?"), prefer an existing template: call **list_predefined_work_plans**, show the matching options, confirm the user's choice, then call **launch_predefined_work_plan**. Only fall back to **create_work_plan** when no suitable template exists. If a work plan is already active, **launch_predefined_work_plan** will ask you to confirm before replacing it — check with the user, then retry with force=true.
 
 Work plans help organize complex multi-step projects like client onboarding, campaign planning, or content creation workflows. The current work plan status (if any) is automatically provided in your context.
 
