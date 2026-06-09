@@ -722,6 +722,7 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
       // Verify X-HubSpot-Signature when present. If the header is missing we
       // log a warning and continue (supports local dev / test environments).
       const signature = req.headers['x-hubspot-signature'] as string | undefined;
+      const isProd = process.env.NODE_ENV === 'production';
       if (signature) {
         const hubspotConfig = await getHubSpotConfig().catch(() => null);
         if (hubspotConfig?.clientSecret) {
@@ -730,8 +731,11 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
             return;
           }
         }
+      } else if (isProd) {
+        console.warn('[HubSpot Webhook] Missing X-HubSpot-Signature in production — request rejected');
+        return;
       } else {
-        console.warn('[HubSpot Webhook] No X-HubSpot-Signature header — proceeding without verification');
+        console.warn('[HubSpot Webhook] No X-HubSpot-Signature header — proceeding without verification (dev only)');
       }
 
       // ── Aggregate events by objectId ────────────────────────────────────────

@@ -785,7 +785,7 @@ export class ExternalCrmSyncService {
         const externalId = lead.syncMetadata?.[idField];
         if (!externalId) continue;                          // never synced — skip
         if (seenSet.has(externalId)) continue;              // still exists in CRM — skip
-        if (lead.syncMetadata?.crmRemovedAt) continue;      // already marked — skip
+        if (lead.syncMetadata?.crmRemovedAt || lead.syncMetadata?.crmRemoved) continue; // already marked — skip
 
         await crmDb.updateLead(listId, lead.leadId, {
           syncMetadata: {

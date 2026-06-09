@@ -682,35 +682,38 @@ describe('HubSpotService — addContactToList chunking', () => {
     mockAxiosPut.mockResolvedValue({ data: {} });
   });
 
-  it('makes 1 PUT call for ≤100 contacts', async () => {
+  it('makes 1 PUT call for ≤100 contacts and returns correct addedCount', async () => {
     const ids = Array.from({ length: 50 }, (_, i) => `c${i}`);
-    await svc.addContactToList('list-1', ids);
+    const result = await svc.addContactToList('list-1', ids);
     expect(mockAxiosPut).toHaveBeenCalledTimes(1);
     expect(mockAxiosPut.mock.calls[0][1]).toEqual(ids);
+    expect(result.addedCount).toBe(50);
+    expect(result.failedChunks).toEqual([]);
   });
 
   it('makes 1 PUT call for exactly 100 contacts', async () => {
     const ids = Array.from({ length: 100 }, (_, i) => `c${i}`);
-    await svc.addContactToList('list-1', ids);
+    const result = await svc.addContactToList('list-1', ids);
     expect(mockAxiosPut).toHaveBeenCalledTimes(1);
-    expect(mockAxiosPut.mock.calls[0][1]).toHaveLength(100);
+    expect(result.addedCount).toBe(100);
+    expect(result.failedChunks).toEqual([]);
   });
 
   it('splits 101 contacts into 2 PUT calls (100 + 1)', async () => {
     const ids = Array.from({ length: 101 }, (_, i) => `c${i}`);
-    await svc.addContactToList('list-1', ids);
+    const result = await svc.addContactToList('list-1', ids);
     expect(mockAxiosPut).toHaveBeenCalledTimes(2);
     expect(mockAxiosPut.mock.calls[0][1]).toHaveLength(100);
     expect(mockAxiosPut.mock.calls[1][1]).toHaveLength(1);
+    expect(result.addedCount).toBe(101);
+    expect(result.failedChunks).toEqual([]);
   });
 
   it('splits 250 contacts into 3 PUT calls (100 + 100 + 50)', async () => {
     const ids = Array.from({ length: 250 }, (_, i) => `c${i}`);
-    await svc.addContactToList('list-1', ids);
+    const result = await svc.addContactToList('list-1', ids);
     expect(mockAxiosPut).toHaveBeenCalledTimes(3);
-    expect(mockAxiosPut.mock.calls[0][1]).toHaveLength(100);
-    expect(mockAxiosPut.mock.calls[1][1]).toHaveLength(100);
-    expect(mockAxiosPut.mock.calls[2][1]).toHaveLength(50);
+    expect(result.addedCount).toBe(250);
   });
 
   it('preserves contact ID ordering across chunks', async () => {
@@ -718,5 +721,19 @@ describe('HubSpotService — addContactToList chunking', () => {
     await svc.addContactToList('list-1', ids);
     const allSent = [...mockAxiosPut.mock.calls[0][1], ...mockAxiosPut.mock.calls[1][1]];
     expect(allSent).toEqual(ids);
+  });
+
+  it('continues remaining chunks when one fails and reports partial success', async () => {
+    mockAxiosPut
+      .mockResolvedValueOnce({ data: {} })       // chunk 0 (0–99): success
+      .mockRejectedValueOnce({ response: { status: 429, data: 'rate limited' } }) // chunk 1 (100–199): fail
+      .mockResolvedValueOnce({ data: {} });       // chunk 2 (200–249): success
+
+    const ids = Array.from({ length: 250 }, (_, i) => `c${i}`);
+    const result = await svc.addContactToList('list-1', ids);
+
+    expect(mockAxiosPut).toHaveBeenCalledTimes(3);
+    expect(result.addedCount).toBe(150);        // chunk 0 (100) + chunk 2 (50) succeeded
+    expect(result.failedChunks).toEqual([100]); // chunk starting at index 100 failed
   });
 });

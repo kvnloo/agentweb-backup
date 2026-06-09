@@ -792,15 +792,27 @@ export class HubSpotService {
     return this.createList(name);
   }
 
-  async addContactToList(listId: string, contactIds: string[]): Promise<void> {
+  async addContactToList(listId: string, contactIds: string[]): Promise<{ addedCount: number; failedChunks: number[] }> {
     const CHUNK_SIZE = 100;
+    let addedCount = 0;
+    const failedChunks: number[] = [];
+
     for (let i = 0; i < contactIds.length; i += CHUNK_SIZE) {
-      await axiosInstance.put(
-        `${HUBSPOT_API_BASE}/crm/v3/lists/${listId}/memberships/add`,
-        contactIds.slice(i, i + CHUNK_SIZE),
-        { headers: await this.authHeaders() }
-      );
+      const chunk = contactIds.slice(i, i + CHUNK_SIZE);
+      try {
+        await axiosInstance.put(
+          `${HUBSPOT_API_BASE}/crm/v3/lists/${listId}/memberships/add`,
+          chunk,
+          { headers: await this.authHeaders() }
+        );
+        addedCount += chunk.length;
+      } catch (err: any) {
+        console.error(`[HubSpotService] addContactToList chunk ${i}–${i + chunk.length - 1} failed:`, err?.response?.data ?? err?.message);
+        failedChunks.push(i);
+      }
     }
+
+    return { addedCount, failedChunks };
   }
 
   async getAllLists(query?: string): Promise<Array<{ id: string; name: string }>> {
