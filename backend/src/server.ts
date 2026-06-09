@@ -668,6 +668,40 @@ createTestAccount().then(async () => {
         console.log('[OnboardingLoopV2] Disabled (set ONBOARDING_LOOP_V2=true to enable)');
       }
 
+      // Agent-mode tool-reliability loop — daily at 17:30 UTC, offset from the
+      // funnel loops so they don't race for Slack/Bedrock. Reads agent_tool_*
+      // events the recorder wrote to Dev-AW-LoopEvents, clusters failures per
+      // tool, and DMs Harsha a cloud-dev fix spec per failing tool. Gated by
+      // AGENT_MODE_LOOP_ENABLED=true (same flag as the hot-path recorder).
+      if (process.env.AGENT_MODE_LOOP_ENABLED === 'true') {
+        try {
+          const AGENT_MODE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+          const { runAgentModeLoopOnce } = await import('./loops/instances/agent-mode');
+
+          const nowForAgentMode = new Date();
+          const nextAgentModeRun = new Date(nowForAgentMode);
+          nextAgentModeRun.setUTCHours(17, 30, 0, 0);
+          if (nextAgentModeRun <= nowForAgentMode) {
+            nextAgentModeRun.setUTCDate(nextAgentModeRun.getUTCDate() + 1);
+          }
+          const msUntilAgentMode = nextAgentModeRun.getTime() - nowForAgentMode.getTime();
+
+          console.log(
+            `[AgentModeLoop] Initialized — first run at 17:30 UTC (in ${Math.round(msUntilAgentMode / 60000)} min)`,
+          );
+          setTimeout(() => {
+            runAgentModeLoopOnce().catch(e => console.error('[AgentModeLoop] Error:', e));
+            setInterval(() => {
+              runAgentModeLoopOnce().catch(e => console.error('[AgentModeLoop] Error:', e));
+            }, AGENT_MODE_INTERVAL_MS);
+          }, msUntilAgentMode);
+        } catch (error) {
+          console.error('[AgentModeLoop] Failed to initialize:', error);
+        }
+      } else {
+        console.log('[AgentModeLoop] Disabled (set AGENT_MODE_LOOP_ENABLED=true to enable)');
+      }
+
       // Generic Layer-5 attribution — daily at 18:00 UTC, after the product
       // proposal loops. This measures shipped mutations for every registered
       // loop and writes verdicts back to the durable learning store so future
