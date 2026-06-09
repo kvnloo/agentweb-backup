@@ -5,7 +5,8 @@
  * The recorder must:
  *   - write the right NormalizedEvent for each lifecycle point (run start,
  *     decision, tool invoked/succeeded/failed, run end)
- *   - key every event by subjectId = sessionId so they form one run timeline
+ *   - key every event by subjectId = runId so they form one run timeline
+ *     while allowing sessionId to be stored as a join dimension
  *   - put the toolName + errorClass on dimensions (the policy groups on these)
  *   - NEVER throw into the caller's hot path (telemetry failures are swallowed)
  */
@@ -42,17 +43,18 @@ describe('AgentRunRecorder', () => {
     const { port, puts } = fakeDynamo();
     const rec = new AgentRunRecorder(port, clock);
 
-    await rec.runStarted('sess-1', { llmModel: 'claude-opus-4-8', sessionType: 'regular' });
+    await rec.runStarted('sess-1:run:abc', { llmModel: 'claude-opus-4-8', sessionType: 'regular', sessionId: 'sess-1' });
 
     expect(puts).toHaveLength(1);
     const item = puts[0].item as any;
     expect(item.loopId).toBe('agent-mode');
     expect(item.eventType).toBe(EVT_RUN_STARTED);
-    expect(item.subjectId).toBe('sess-1');
+    expect(item.subjectId).toBe('sess-1:run:abc');
+    expect(item.dimensions.sessionId).toBe('sess-1');
     expect(item.dimensions.llmModel).toBe('claude-opus-4-8');
     expect(item.dimensions.sessionType).toBe('regular');
-    // tsSession is the SK and must include sessionId + eventType for uniqueness
-    expect(String(item.tsSession)).toContain('sess-1');
+    // tsSession is the SK and must include runId + eventType for uniqueness
+    expect(String(item.tsSession)).toContain('sess-1:run:abc');
   });
 
   it('records a decision with the chosen tool names', async () => {
