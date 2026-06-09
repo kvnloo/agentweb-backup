@@ -4,6 +4,7 @@ import { crmDb, userDb } from '../services/db';
 import {
   externalCrmSyncService,
 } from '../services/externalCrmSyncService';
+import { ensureWebhookSubscriptions } from '../utils/hubspotWebhookSubscriptions';
 
 const router = express.Router();
 router.use(authenticateToken);
@@ -165,6 +166,16 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       deleteOnPush, deleteOnPull, webhookEnabled,
       externalPipelineId, listName,
     });
+
+    // Fire-and-forget: register webhook subscriptions for any custom HubSpot
+    // properties in the mapping that aren't already subscribed in the public app.
+    // Only for HubSpot OAuth connections — manual token users use per-list webhooks.
+    if (provider === 'hubspot' && (accountId || config.accountId)) {
+      void ensureWebhookSubscriptions(
+        contactFieldMapping ?? config.contactFieldMapping ?? [],
+        customFieldMapping ?? config.customFieldMapping ?? [],
+      );
+    }
 
     res.json({
       configured: true,
@@ -356,6 +367,40 @@ router.post('/pull/:listId/:provider', async (req: any, res) => {
   } catch (err: any) {
     console.error(`[crmSync] Pull error for provider ${req.params?.provider}:`, err.response?.data || err);
     res.status(500).json({ error: err.response?.data?.message || err.message || 'Failed to pull contacts' });
+  }
+});
+
+// ─── Used accounts ────────────────────────────────────────────────────────────
+
+// GET /api/crm-sync/used-accounts
+// Returns all connected account IDs that are already linked to a lead list for
+// this user, so the UI can disable those accounts in the selector.
+router.get('/used-accounts', async (req: any, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const lists = await crmDb.getLeadListsByUserId(userId);
+    const used: Array<{ accountId: string; listId: string; listName: string; provider: string }> = [];
+
+    for (const list of (lists || [])) {
+      const configs = (list as any).externalCrmSyncConfigs as Record<string, any> | undefined;
+      if (!configs) continue;
+      for (const [provider, config] of Object.entries(configs)) {
+        if (config?.accountId) {
+          used.push({
+            accountId: config.accountId,
+            listId: list.listId,
+            listName: (list as any).name || list.listId,
+            provider,
+          });
+        }
+      }
+    }
+
+    res.json({ used });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to fetch used accounts' });
   }
 });
 

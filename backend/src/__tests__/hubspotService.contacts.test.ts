@@ -672,3 +672,51 @@ describe('HubSpotService — getContactById', () => {
     await expect(svc.getContactById('contact-err')).rejects.toMatchObject({ response: { status: 500 } });
   });
 });
+
+describe('HubSpotService — addContactToList chunking', () => {
+  let svc: InstanceType<typeof HubSpotService>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    svc = HubSpotService.fromToken('pat-test');
+    mockAxiosPut.mockResolvedValue({ data: {} });
+  });
+
+  it('makes 1 PUT call for ≤100 contacts', async () => {
+    const ids = Array.from({ length: 50 }, (_, i) => `c${i}`);
+    await svc.addContactToList('list-1', ids);
+    expect(mockAxiosPut).toHaveBeenCalledTimes(1);
+    expect(mockAxiosPut.mock.calls[0][1]).toEqual(ids);
+  });
+
+  it('makes 1 PUT call for exactly 100 contacts', async () => {
+    const ids = Array.from({ length: 100 }, (_, i) => `c${i}`);
+    await svc.addContactToList('list-1', ids);
+    expect(mockAxiosPut).toHaveBeenCalledTimes(1);
+    expect(mockAxiosPut.mock.calls[0][1]).toHaveLength(100);
+  });
+
+  it('splits 101 contacts into 2 PUT calls (100 + 1)', async () => {
+    const ids = Array.from({ length: 101 }, (_, i) => `c${i}`);
+    await svc.addContactToList('list-1', ids);
+    expect(mockAxiosPut).toHaveBeenCalledTimes(2);
+    expect(mockAxiosPut.mock.calls[0][1]).toHaveLength(100);
+    expect(mockAxiosPut.mock.calls[1][1]).toHaveLength(1);
+  });
+
+  it('splits 250 contacts into 3 PUT calls (100 + 100 + 50)', async () => {
+    const ids = Array.from({ length: 250 }, (_, i) => `c${i}`);
+    await svc.addContactToList('list-1', ids);
+    expect(mockAxiosPut).toHaveBeenCalledTimes(3);
+    expect(mockAxiosPut.mock.calls[0][1]).toHaveLength(100);
+    expect(mockAxiosPut.mock.calls[1][1]).toHaveLength(100);
+    expect(mockAxiosPut.mock.calls[2][1]).toHaveLength(50);
+  });
+
+  it('preserves contact ID ordering across chunks', async () => {
+    const ids = Array.from({ length: 150 }, (_, i) => `contact-${i}`);
+    await svc.addContactToList('list-1', ids);
+    const allSent = [...mockAxiosPut.mock.calls[0][1], ...mockAxiosPut.mock.calls[1][1]];
+    expect(allSent).toEqual(ids);
+  });
+});

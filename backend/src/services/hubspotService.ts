@@ -793,11 +793,14 @@ export class HubSpotService {
   }
 
   async addContactToList(listId: string, contactIds: string[]): Promise<void> {
-    await axiosInstance.put(
-      `${HUBSPOT_API_BASE}/crm/v3/lists/${listId}/memberships/add`,
-      contactIds,
-      { headers: await this.authHeaders() }
-    );
+    const CHUNK_SIZE = 100;
+    for (let i = 0; i < contactIds.length; i += CHUNK_SIZE) {
+      await axiosInstance.put(
+        `${HUBSPOT_API_BASE}/crm/v3/lists/${listId}/memberships/add`,
+        contactIds.slice(i, i + CHUNK_SIZE),
+        { headers: await this.authHeaders() }
+      );
+    }
   }
 
   async getAllLists(query?: string): Promise<Array<{ id: string; name: string }>> {

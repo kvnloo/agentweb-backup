@@ -636,6 +636,7 @@ export async function getStripeCredentials(): Promise<StripeCredentials> {
 export interface HubSpotCredentials {
   clientId: string;
   clientSecret: string;
+  developerApiKey?: string;
 }
 
 export async function getHubSpotCredentials(): Promise<HubSpotCredentials> {
