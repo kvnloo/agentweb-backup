@@ -26,6 +26,11 @@ jest.mock('../services/agentModeService', () => ({
   },
 }));
 
+const mockGetUserById = jest.fn();
+jest.mock('../services/db', () => ({
+  userDb: { getUserById: (...args: any[]) => mockGetUserById(...args) },
+}));
+
 import { mcpFetch } from '../mcp/server/httpClient';
 import { mcpToolRegistry } from '../mcp/server/registry';
 import '../mcp/server/apiTools';
@@ -63,6 +68,7 @@ describe('Predefined Work Plan MCP Tools', () => {
     });
 
     it('should propagate HTTP errors from mcpFetch', async () => {
+      mockGetUserById.mockResolvedValue({ userId: 'user-123', isAdmin: false });
       mockMcpFetch.mockRejectedValue(new Error('API error (403): Forbidden'));
       await expect(
         mcpToolRegistry.execute('list_predefined_work_plans', {}, context)
@@ -83,19 +89,55 @@ describe('Predefined Work Plan MCP Tools', () => {
 
   // ─── SUCCESS tests ─────────────────────────────────────────────────────
 
-  describe('list_predefined_work_plans', () => {
-    it('should call GET /api/admin/work-plans', async () => {
-      mockMcpFetch.mockResolvedValue({ settingValue: '[{"id":"wp-1","title":"Onboarding"}]' });
+  describe('list_predefined_work_plans (role-aware)', () => {
+    it('non-admin users get the public/launchable list via /api/agent-mode/public/plans', async () => {
+      mockGetUserById.mockResolvedValue({ userId: 'user-123', isAdmin: false });
+      mockMcpFetch.mockResolvedValue([{ id: 'wp-1', title: 'Onboarding' }]);
 
       const result = await mcpToolRegistry.execute('list_predefined_work_plans', {}, context);
 
-      expect(mockMcpFetch).toHaveBeenCalledWith({
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+        method: 'GET',
+        path: '/api/agent-mode/public/plans',
+      }));
+      expect(result.content[0].text).toContain('Onboarding');
+    });
+
+    it('admin users get the full management list via /api/admin/work-plans', async () => {
+      mockGetUserById.mockResolvedValue({ userId: 'admin-1', isAdmin: true });
+      mockMcpFetch.mockResolvedValue([{ id: 'wp-1', title: 'Onboarding', visibility: 'pending_review' }]);
+
+      const result = await mcpToolRegistry.execute('list_predefined_work_plans', {}, { userId: 'admin-1' });
+
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
         method: 'GET',
         path: '/api/admin/work-plans',
-        context: { userId: 'user-123', agentUserId: 'user-123' },
-      });
-      expect(result.content[0].text).toContain('wp-1');
-      expect(result.content[0].text).toContain('Onboarding');
+      }));
+      expect(result.content[0].text).toContain('pending_review');
+    });
+
+    it('admin-delegated sessions get the admin list without a user lookup', async () => {
+      mockMcpFetch.mockResolvedValue([{ id: 'wp-1', title: 'Onboarding' }]);
+
+      await mcpToolRegistry.execute('list_predefined_work_plans', {}, { userId: 'user-123', isDelegatedAccess: true });
+
+      expect(mockGetUserById).not.toHaveBeenCalled();
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+        method: 'GET',
+        path: '/api/admin/work-plans',
+      }));
+    });
+
+    it('falls back to the non-admin path when the user lookup fails', async () => {
+      mockGetUserById.mockRejectedValue(new Error('lookup failed'));
+      mockMcpFetch.mockResolvedValue([{ id: 'wp-1', title: 'Onboarding' }]);
+
+      await mcpToolRegistry.execute('list_predefined_work_plans', {}, context);
+
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+        method: 'GET',
+        path: '/api/agent-mode/public/plans',
+      }));
     });
   });
 
