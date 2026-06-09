@@ -670,9 +670,11 @@ createTestAccount().then(async () => {
 
       // Agent-mode tool-reliability loop — daily at 17:30 UTC, offset from the
       // funnel loops so they don't race for Slack/Bedrock. Reads agent_tool_*
-      // events the recorder wrote to Dev-AW-LoopEvents, clusters failures per
-      // tool, and DMs Harsha a cloud-dev fix spec per failing tool. Gated by
-      // AGENT_MODE_LOOP_ENABLED=true (same flag as the hot-path recorder).
+      // events the runtime-spine recorder wrote to Dev-AW-LoopEvents, clusters
+      // failures per tool, and DMs Harsha a cloud-dev fix spec per failing
+      // tool. This learning/dispatch loop is gated by AGENT_MODE_LOOP_ENABLED.
+      // Shadow-mode telemetry can be tested separately with
+      // AGENT_RUNTIME_SPINE_ENABLED=true.
       if (process.env.AGENT_MODE_LOOP_ENABLED === 'true') {
         try {
           const AGENT_MODE_INTERVAL_MS = 24 * 60 * 60 * 1000;

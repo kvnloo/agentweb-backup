@@ -11,7 +11,9 @@
  *
  * Registration is ALWAYS performed (so the loop is visible to health + the
  * ingestion route accepts agent-mode events). The recorder hook on the chat hot
- * path and the daily analysis run are gated separately by AGENT_MODE_LOOP_ENABLED.
+ * path is gated by AGENT_RUNTIME_SPINE_ENABLED so staging can test shadow-mode
+ * telemetry without enabling the daily learning loop. The daily analysis run is
+ * gated separately by AGENT_MODE_LOOP_ENABLED.
  */
 
 import {
@@ -70,15 +72,23 @@ export function registerAgentModeLoop(): void {
 
 /**
  * Lazily build the singleton recorder used by the agent-mode hot path. Returns
- * null when the loop is disabled, so the hook is a cheap no-op in that case.
+ * null when the runtime spine is disabled, so the hook is a cheap no-op in that
+ * case. AGENT_MODE_LOOP_ENABLED also enables the recorder for backwards
+ * compatibility, but staging should prefer AGENT_RUNTIME_SPINE_ENABLED=true
+ * when testing observability-only telemetry.
  */
 export function getAgentRunRecorder(): AgentRunRecorder | null {
-  if (process.env.AGENT_MODE_LOOP_ENABLED !== 'true') return null;
+  if (!isAgentRuntimeSpineEnabled()) return null;
   if (!recorderSingleton) {
     const ports = productionLoopPorts();
     recorderSingleton = new AgentRunRecorder(ports.dynamo, ports.clock);
   }
   return recorderSingleton;
+}
+
+export function isAgentRuntimeSpineEnabled(): boolean {
+  return process.env.AGENT_RUNTIME_SPINE_ENABLED === 'true'
+    || process.env.AGENT_MODE_LOOP_ENABLED === 'true';
 }
 
 /**

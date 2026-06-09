@@ -107,35 +107,142 @@ const openai = new OpenAI({
  * Self-learning loop telemetry for agent-mode tool calls.
  *
  * Emits one decision event + per-tool invoked/succeeded/failed events into the
- * shared LoopEvents table so the agent-mode loop can cluster failures per tool
- * and propose fixes. Fire-and-forget: never awaited on the chat hot path, and a
- * no-op unless AGENT_MODE_LOOP_ENABLED=true (getAgentRunRecorder returns null).
+ * shared LoopEvents table. Fire-and-forget: never awaited on the chat hot path,
+ * and a no-op unless AGENT_RUNTIME_SPINE_ENABLED=true (or the legacy
+ * AGENT_MODE_LOOP_ENABLED=true) because getAgentRunRecorder returns null.
+ *
+ * Keep V0 observability-only: this must not change tool execution, retries,
+ * prompts, streaming, or user-facing responses.
  */
 function recordAgentModeToolTelemetry(
+  runId: string,
   sessionId: string,
   iteration: number,
-  toolResults: Array<{ status: 'success' | 'error'; toolCall: any; error?: any; duration: number }>,
+  toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs?: any; error?: any; duration: number }>,
 ): void {
-  const recorder = getAgentRunRecorder();
+  const recorder = getAgentRunRecorderSafe();
   if (!recorder || toolResults.length === 0) return;
 
   void (async () => {
     try {
       const toolNames = toolResults.map(r => r.toolCall?.function?.name ?? 'unknown');
-      await recorder.decision(sessionId, { iteration, toolNames });
+      await recorder.decision(runId, {
+        iteration,
+        toolNames,
+        sessionId,
+        toolArgKeys: summarizeToolArgKeys(toolResults),
+        toolArgsPreview: summarizeToolArgs(toolResults),
+      });
       for (const r of toolResults) {
         const toolName = r.toolCall?.function?.name ?? 'unknown';
-        await recorder.toolInvoked(sessionId, { toolName, iteration });
+        await recorder.toolInvoked(runId, { toolName, iteration, sessionId });
         if (r.status === 'success') {
-          await recorder.toolSucceeded(sessionId, { toolName, durationMs: r.duration });
+          await recorder.toolSucceeded(runId, { toolName, durationMs: r.duration, sessionId });
         } else {
-          await recorder.toolFailed(sessionId, { toolName, error: r.error, durationMs: r.duration });
+          await recorder.toolFailed(runId, { toolName, error: r.error, durationMs: r.duration, sessionId });
         }
       }
     } catch (err) {
       console.error('[agent-mode] tool telemetry failed (swallowed):', err);
     }
   })();
+}
+
+function recordAgentModeRunStarted(
+  runId: string,
+  info: { llmModel?: string; sessionType?: string; userId?: string; sessionId?: string },
+): void {
+  const recorder = getAgentRunRecorderSafe();
+  if (!recorder) return;
+  void recorder.runStarted(runId, info);
+}
+
+function recordAgentModeRunCompleted(
+  runId: string,
+  info: { toolCalls?: number; failedToolCalls?: number; sessionId?: string },
+): void {
+  const recorder = getAgentRunRecorderSafe();
+  if (!recorder) return;
+  void recorder.runCompleted(runId, info);
+}
+
+function recordAgentModeRunFailed(
+  runId: string,
+  info: { error: unknown; toolCalls?: number; failedToolCalls?: number; sessionId?: string },
+): void {
+  const recorder = getAgentRunRecorderSafe();
+  if (!recorder) return;
+  void recorder.runFailed(runId, info);
+}
+
+function countFailedToolCalls(toolCalls: any[]): number {
+  return toolCalls.filter((toolCall) => toolCall && 'error' in toolCall).length;
+}
+
+const AGENT_RUNTIME_ARG_PREVIEW_MAX_CHARS = 1200;
+const AGENT_RUNTIME_REDACTED_ARG_KEYS = /token|secret|password|credential|authorization|api[_-]?key|cookie/i;
+
+function summarizeToolArgKeys(
+  toolResults: Array<{ toolCall: any; functionArgs?: any }>,
+): string {
+  return toolResults
+    .map((r) => {
+      const toolName = r.toolCall?.function?.name ?? 'unknown';
+      const keys = r.functionArgs && typeof r.functionArgs === 'object' && !Array.isArray(r.functionArgs)
+        ? Object.keys(r.functionArgs).sort().join('|')
+        : '';
+      return keys ? `${toolName}:${keys}` : `${toolName}:`;
+    })
+    .join(',');
+}
+
+function summarizeToolArgs(
+  toolResults: Array<{ toolCall: any; functionArgs?: any }>,
+): string {
+  const safe = toolResults.map((r) => ({
+    tool: r.toolCall?.function?.name ?? 'unknown',
+    args: redactTelemetryValue(r.functionArgs),
+  }));
+  const json = JSON.stringify(safe);
+  return json.length > AGENT_RUNTIME_ARG_PREVIEW_MAX_CHARS
+    ? `${json.slice(0, AGENT_RUNTIME_ARG_PREVIEW_MAX_CHARS - 3)}...`
+    : json;
+}
+
+function redactTelemetryValue(value: unknown, depth = 0): unknown {
+  if (depth > 3) return '[truncated]';
+  if (value === null || value === undefined) return value ?? null;
+  if (typeof value === 'string') {
+    return value.length > 240 ? `${value.slice(0, 237)}...` : value;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+  if (Array.isArray(value)) {
+    return value.slice(0, 8).map((item) => redactTelemetryValue(item, depth + 1));
+  }
+  if (typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value as Record<string, unknown>).slice(0, 24)) {
+      out[key] = AGENT_RUNTIME_REDACTED_ARG_KEYS.test(key)
+        ? '[redacted]'
+        : redactTelemetryValue(child, depth + 1);
+    }
+    return out;
+  }
+  return String(value);
+}
+
+function getAgentRunRecorderSafe() {
+  try {
+    return getAgentRunRecorder();
+  } catch (err) {
+    console.error('[agent-mode] runtime spine recorder unavailable (swallowed):', err);
+    return null;
+  }
+}
+
+function buildAgentRuntimeRunId(sessionId: string): string {
+  const randomSuffix = Math.random().toString(36).slice(2, 8);
+  return `${sessionId}:run:${Date.now().toString(36)}:${randomSuffix}`;
 }
 
 // Type declaration for pdf-parse module
@@ -2022,6 +2129,14 @@ export class AgentModeService {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
+    let _toolCallsForTelemetry: any[] = [];
+    const agentRuntimeRunId = buildAgentRuntimeRunId(sessionId);
+    recordAgentModeRunStarted(agentRuntimeRunId, {
+      llmModel,
+      userId,
+      sessionId,
+      sessionType: isInteractiveShare ? 'interactive_share' : 'regular',
+    });
     try {
       // Map legacy/renamed model ids forward (e.g. old sessions persisted the
       // pre-rename "claude-opus-4-8") so metadata, pricing, and routing all use
@@ -2228,6 +2343,7 @@ export class AgentModeService {
 
       let content = '';
       const toolCalls: any[] = [];
+      _toolCallsForTelemetry = toolCalls;
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
       const iterationTimings: { iteration: number; llmDurationMs: number; toolNames: string[] }[] = [];
@@ -2723,13 +2839,13 @@ export class AgentModeService {
           toolResults = await Promise.all(toolPromises);
         }
 
-        // Self-learning loop telemetry: record this iteration's decision + each
+        // Runtime spine V0 telemetry: record this iteration's decision + each
         // tool's invoked/succeeded/failed outcome into the shared LoopEvents
         // table. Best-effort and non-blocking — the recorder swallows its own
-        // errors and is a no-op unless AGENT_MODE_LOOP_ENABLED=true. The
-        // agent-mode loop's policy clusters these failures per tool and proposes
-        // a cloud-dev fix; attribution later grades whether the fix worked.
-        recordAgentModeToolTelemetry(sessionId, iteration, toolResults);
+        // errors and is a no-op unless AGENT_RUNTIME_SPINE_ENABLED=true (or the
+        // legacy AGENT_MODE_LOOP_ENABLED=true). This is observability-only and
+        // must not affect tool execution, retries, streaming, or responses.
+        recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, toolResults);
 
         // Phase 3: Process results in original order — append to messages, toolCalls, counters
         for (const toolResult of toolResults) {
@@ -2986,6 +3102,11 @@ export class AgentModeService {
         (msg: any) => msg.role !== 'user'
       );
 
+      recordAgentModeRunCompleted(agentRuntimeRunId, {
+        sessionId,
+        toolCalls: toolCalls.length,
+        failedToolCalls: countFailedToolCalls(toolCalls),
+      });
       return {
         content,
         toolCalls,
@@ -3044,6 +3165,12 @@ export class AgentModeService {
       if (partialResponseMessages.length > 0) {
         wrappedError.partialUsageMessages = partialResponseMessages;
       }
+      recordAgentModeRunFailed(agentRuntimeRunId, {
+        error: wrappedError,
+        sessionId,
+        toolCalls: _toolCallsForTelemetry.length,
+        failedToolCalls: countFailedToolCalls(_toolCallsForTelemetry),
+      });
       throw wrappedError;
     }
   }
