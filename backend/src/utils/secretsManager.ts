@@ -637,6 +637,7 @@ export interface HubSpotCredentials {
   clientId: string;
   clientSecret: string;
   developerApiKey?: string;
+  hubspotAppId?: string;
 }
 
 export async function getHubSpotCredentials(): Promise<HubSpotCredentials> {

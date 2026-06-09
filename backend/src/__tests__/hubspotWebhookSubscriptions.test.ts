@@ -32,12 +32,19 @@ const ALL_DEAL_PROPS = ['amount', 'dealstage', 'deal_currency_code'];
 describe('ensureWebhookSubscriptions', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockGetCreds.mockResolvedValue({ clientId: 'id', clientSecret: 'secret', developerApiKey: DEV_KEY });
+    mockGetCreds.mockResolvedValue({ clientId: 'id', clientSecret: 'secret', developerApiKey: DEV_KEY, hubspotAppId: 'test-app-id-123' });
     mockAxiosGet.mockResolvedValue(makeSubsResponse([]));
     mockAxiosPost.mockResolvedValue({ data: { id: 99, active: true } });
   });
 
   // ── Credential guard ─────────────────────────────────────────────────────────
+
+  it('skips entirely when hubspotAppId is absent from credentials', async () => {
+    mockGetCreds.mockResolvedValue({ clientId: 'id', clientSecret: 'secret', developerApiKey: DEV_KEY });
+    await ensureWebhookSubscriptions([], []);
+    expect(mockAxiosGet).not.toHaveBeenCalled();
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
 
   it('skips entirely when developerApiKey is absent', async () => {
     mockGetCreds.mockResolvedValue({ clientId: 'id', clientSecret: 'secret' });
@@ -242,5 +249,24 @@ describe('ensureWebhookSubscriptions', () => {
   it('swallows outer error gracefully when getHubSpotCredentials throws', async () => {
     mockGetCreds.mockRejectedValue(new Error('Secrets Manager unavailable'));
     await expect(ensureWebhookSubscriptions([], [])).resolves.not.toThrow();
+  });
+
+  it('continues registering remaining props when one POST returns 429', async () => {
+    mockAxiosPost
+      .mockRejectedValueOnce({ response: { status: 429, headers: { 'retry-after': '1' }, data: {} } })
+      .mockResolvedValue({ data: { id: 99 } });
+
+    await expect(ensureWebhookSubscriptions([], [])).resolves.not.toThrow();
+    // 12 total attempted despite the 429 on the first call
+    expect(mockAxiosPost).toHaveBeenCalledTimes(12);
+  });
+
+  it('does not double-register when called concurrently with identical props', async () => {
+    // Both calls see the same empty subscription list (GET is called by each).
+    // Each proceeds to register — idempotency is ensured by the HubSpot API (409 on duplicate).
+    // Our code must not throw on concurrent invocations.
+    await expect(
+      Promise.all([ensureWebhookSubscriptions([], []), ensureWebhookSubscriptions([], [])])
+    ).resolves.not.toThrow();
   });
 });

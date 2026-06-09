@@ -814,9 +814,9 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
               })
             )).filter(Boolean) as Array<{ list: any; syncConfig: any }>;
 
-            for (const contactId of contactIds) {
+            await Promise.all(contactIds.map(async (contactId) => {
               const contactEmail = await svc.getContactEmailById(contactId).catch(() => null);
-              if (!contactEmail) continue;
+              if (!contactEmail) return;
 
               for (const { list, syncConfig } of activeDealLists) {
                 const lead = await crmDb.getLeadByEmail(list.listId, contactEmail.toLowerCase());
@@ -835,7 +835,7 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
                   console.log(`[HubSpot Webhook] Deal update synced to lead ${lead.leadId} in list ${list.listId}`);
                 }
               }
-            }
+            }));
           } catch (err: any) {
             console.error(`[HubSpot Webhook] deal.propertyChange error for deal ${objectId}:`, err.message);
           }
