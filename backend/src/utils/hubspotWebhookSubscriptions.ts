@@ -1,7 +1,6 @@
 import axios from 'axios';
 import { getHubSpotCredentials } from './secretsManager';
 
-const HUBSPOT_APP_ID = '42057552';
 const HUBSPOT_WEBHOOKS_BASE = 'https://api.hubapi.com/webhooks/v3';
 
 const STANDARD_CONTACT_PROPS_TO_SUBSCRIBE = new Set([
@@ -19,9 +18,9 @@ interface HubSpotWebhookSubscription {
   active: boolean;
 }
 
-async function getExistingSubscriptions(developerApiKey: string): Promise<Set<string>> {
+async function getExistingSubscriptions(appId: string, developerApiKey: string): Promise<Set<string>> {
   const res = await axios.get<{ results: HubSpotWebhookSubscription[] } | HubSpotWebhookSubscription[]>(
-    `${HUBSPOT_WEBHOOKS_BASE}/${HUBSPOT_APP_ID}/subscriptions`,
+    `${HUBSPOT_WEBHOOKS_BASE}/${appId}/subscriptions`,
     { params: { hapikey: developerApiKey } }
   );
   const subscribed = new Set<string>();
@@ -42,11 +41,11 @@ async function getExistingSubscriptions(developerApiKey: string): Promise<Set<st
   return subscribed;
 }
 
-async function registerSubscription(developerApiKey: string, eventType: string, propertyName?: string): Promise<void> {
+async function registerSubscription(appId: string, developerApiKey: string, eventType: string, propertyName?: string): Promise<void> {
   const payload: Record<string, any> = { eventType, active: true };
   if (propertyName) payload.propertyName = propertyName;
   await axios.post(
-    `${HUBSPOT_WEBHOOKS_BASE}/${HUBSPOT_APP_ID}/subscriptions`,
+    `${HUBSPOT_WEBHOOKS_BASE}/${appId}/subscriptions`,
     payload,
     { params: { hapikey: developerApiKey } }
   );
@@ -66,7 +65,11 @@ export async function ensureWebhookSubscriptions(
 ): Promise<void> {
   try {
     const credentials = await getHubSpotCredentials();
-    const developerApiKey = credentials.developerApiKey;
+    const { developerApiKey, hubspotAppId: appId } = credentials;
+    if (!appId) {
+      console.warn('[HubSpotWebhook] No hubspotAppId in credentials — skipping subscription sync');
+      return;
+    }
     if (!developerApiKey) {
       console.warn('[HubSpotWebhook] No developerApiKey in credentials — skipping subscription sync');
       return;
@@ -97,7 +100,7 @@ export async function ensureWebhookSubscriptions(
 
     if (candidateProps.size === 0) return;
 
-    const existingSubscriptions = await getExistingSubscriptions(developerApiKey);
+    const existingSubscriptions = await getExistingSubscriptions(appId, developerApiKey);
 
     const toRegister = Array.from(candidateProps).filter(p => !existingSubscriptions.has(p));
     if (toRegister.length === 0) {
@@ -116,7 +119,7 @@ export async function ensureWebhookSubscriptions(
       const eventType = colonIdx >= 0 ? key.slice(0, colonIdx) : key;
       const propertyName = colonIdx >= 0 ? key.slice(colonIdx + 1) : undefined;
       try {
-        await registerSubscription(developerApiKey, eventType, propertyName);
+        await registerSubscription(appId, developerApiKey, eventType, propertyName);
       } catch (err: any) {
         const detail = err?.response?.data ?? err?.message;
         const status = err?.response?.status;

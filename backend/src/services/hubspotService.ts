@@ -7,6 +7,23 @@ import { getAccountsByUserId, getAccountById, updateAccountTokens } from './conn
 const _created = axios.create?.({ timeout: 15000 });
 const axiosInstance: typeof axios = (_created ?? axios) as typeof axios;
 
+// Retry once on 429 — respect Retry-After header, default 10s.
+if (_created) {
+  _created.interceptors.response.use(
+    (res) => res,
+    async (err) => {
+      const config = err?.config as any;
+      if (err?.response?.status === 429 && config && !config.__hubspotRetried) {
+        config.__hubspotRetried = true;
+        const retryAfter = Math.min(parseInt(err.response.headers?.['retry-after'] ?? '10', 10), 10);
+        await new Promise(r => setTimeout(r, retryAfter * 1000));
+        return _created.request(config);
+      }
+      throw err;
+    }
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // HUBSPOT WEBHOOK EVENTS
 //
@@ -526,13 +543,23 @@ export class HubSpotService {
 
   /**
    * Get the IDs of all contacts associated with a deal.
+   * Follows pagination cursors to return all contacts, not just the first 100.
    */
   async getDealContactAssociations(dealId: string): Promise<string[]> {
-    const res = await axiosInstance.get(
-      `${HUBSPOT_API_BASE}/crm/v3/objects/deals/${dealId}/associations/contacts`,
-      { headers: await this.authHeaders() }
-    );
-    return ((res.data as any)?.results ?? []).map((r: any) => r.id as string);
+    const allIds: string[] = [];
+    let after: string | undefined;
+    do {
+      const params: Record<string, string> = {};
+      if (after) params.after = after;
+      const res = await axiosInstance.get(
+        `${HUBSPOT_API_BASE}/crm/v3/objects/deals/${dealId}/associations/contacts`,
+        { headers: await this.authHeaders(), params }
+      );
+      const data = res.data as any;
+      allIds.push(...((data?.results ?? []).map((r: any) => r.id as string)));
+      after = data?.paging?.next?.after;
+    } while (after);
+    return allIds;
   }
 
   /**

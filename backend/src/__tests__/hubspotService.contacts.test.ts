@@ -586,6 +586,48 @@ describe('HubSpotService — getContactDealAssociations', () => {
   });
 });
 
+// ─── getDealContactAssociations ───────────────────────────────────────────────
+
+describe('HubSpotService — getDealContactAssociations', () => {
+  let svc: HubSpotService;
+  beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); jest.clearAllMocks(); });
+
+  it('returns all contact ids from a single page', async () => {
+    mockAxiosGet.mockResolvedValue({
+      data: { results: [{ id: 'c-1' }, { id: 'c-2' }] },
+    });
+    const ids = await svc.getDealContactAssociations('deal-99');
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      expect.stringContaining('deals/deal-99/associations/contacts'),
+      expect.any(Object)
+    );
+    expect(ids).toEqual(['c-1', 'c-2']);
+  });
+
+  it('follows pagination cursor to return all contacts across multiple pages', async () => {
+    mockAxiosGet
+      .mockResolvedValueOnce({
+        data: { results: [{ id: 'c-1' }], paging: { next: { after: 'cursor-abc' } } },
+      })
+      .mockResolvedValueOnce({
+        data: { results: [{ id: 'c-2' }, { id: 'c-3' }] },
+      });
+    const ids = await svc.getDealContactAssociations('deal-99');
+    expect(mockAxiosGet).toHaveBeenCalledTimes(2);
+    expect(mockAxiosGet).toHaveBeenNthCalledWith(2,
+      expect.stringContaining('deals/deal-99/associations/contacts'),
+      expect.objectContaining({ params: { after: 'cursor-abc' } })
+    );
+    expect(ids).toEqual(['c-1', 'c-2', 'c-3']);
+  });
+
+  it('returns empty array when deal has no contact associations', async () => {
+    mockAxiosGet.mockResolvedValue({ data: { results: [] } });
+    const ids = await svc.getDealContactAssociations('deal-99');
+    expect(ids).toEqual([]);
+  });
+});
+
 // ─── getDeal ──────────────────────────────────────────────────────────────────
 
 describe('HubSpotService — getDeal', () => {
