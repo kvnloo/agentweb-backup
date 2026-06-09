@@ -68,6 +68,7 @@ import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
+import { getAgentRunRecorder } from '../loops/instances/agent-mode';
 
 type MetaApiResult = {
   success: boolean;
@@ -97,6 +98,41 @@ const openai = new OpenAI({
   defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION },
   defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
 });
+
+/**
+ * Self-learning loop telemetry for agent-mode tool calls.
+ *
+ * Emits one decision event + per-tool invoked/succeeded/failed events into the
+ * shared LoopEvents table so the agent-mode loop can cluster failures per tool
+ * and propose fixes. Fire-and-forget: never awaited on the chat hot path, and a
+ * no-op unless AGENT_MODE_LOOP_ENABLED=true (getAgentRunRecorder returns null).
+ */
+function recordAgentModeToolTelemetry(
+  sessionId: string,
+  iteration: number,
+  toolResults: Array<{ status: 'success' | 'error'; toolCall: any; error?: any; duration: number }>,
+): void {
+  const recorder = getAgentRunRecorder();
+  if (!recorder || toolResults.length === 0) return;
+
+  void (async () => {
+    try {
+      const toolNames = toolResults.map(r => r.toolCall?.function?.name ?? 'unknown');
+      await recorder.decision(sessionId, { iteration, toolNames });
+      for (const r of toolResults) {
+        const toolName = r.toolCall?.function?.name ?? 'unknown';
+        await recorder.toolInvoked(sessionId, { toolName, iteration });
+        if (r.status === 'success') {
+          await recorder.toolSucceeded(sessionId, { toolName, durationMs: r.duration });
+        } else {
+          await recorder.toolFailed(sessionId, { toolName, error: r.error, durationMs: r.duration });
+        }
+      }
+    } catch (err) {
+      console.error('[agent-mode] tool telemetry failed (swallowed):', err);
+    }
+  })();
+}
 
 // Type declaration for pdf-parse module
 interface PDFData {
@@ -2682,6 +2718,14 @@ export class AgentModeService {
           });
           toolResults = await Promise.all(toolPromises);
         }
+
+        // Self-learning loop telemetry: record this iteration's decision + each
+        // tool's invoked/succeeded/failed outcome into the shared LoopEvents
+        // table. Best-effort and non-blocking — the recorder swallows its own
+        // errors and is a no-op unless AGENT_MODE_LOOP_ENABLED=true. The
+        // agent-mode loop's policy clusters these failures per tool and proposes
+        // a cloud-dev fix; attribution later grades whether the fix worked.
+        recordAgentModeToolTelemetry(sessionId, iteration, toolResults);
 
         // Phase 3: Process results in original order — append to messages, toolCalls, counters
         for (const toolResult of toolResults) {

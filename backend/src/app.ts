@@ -86,6 +86,7 @@ import onboardingVariantsRoutes from "./routes/onboardingVariants";
 import loopEventsRoutes from "./routes/loopEvents";
 import { registerAiEvalFunnelForProduction } from "./loops/instances/ai-eval-funnel/cron";
 import { registerAiReadinessFunnel } from "./loops/instances/ai-readiness-funnel";
+import { registerAgentModeLoop } from "./loops/instances/agent-mode";
 import loopHealthRoutes from "./routes/loopHealth";
 import brandBuildRoutes from "./routes/brandBuild";
 import adGenRoutes from "./routes/adGen";
@@ -328,6 +329,14 @@ try {
   registerAiReadinessFunnel();
 } catch (err) {
   console.warn("[loops] registerAiReadinessFunnel skipped:", String(err));
+}
+// Always registered so the agent-mode loop is visible to /api/admin/loops/health
+// and the attribution cron; the recorder hot-path hook + daily analysis run are
+// gated by AGENT_MODE_LOOP_ENABLED.
+try {
+  registerAgentModeLoop();
+} catch (err) {
+  console.warn("[loops] registerAgentModeLoop skipped:", String(err));
 }
 app.use("/api/onboarding", brandBuildRoutes);
 app.use("/api/onboarding", adGenRoutes);
