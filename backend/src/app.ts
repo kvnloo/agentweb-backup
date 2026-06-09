@@ -111,6 +111,30 @@ import { serveAsset, getAssetStats } from "./controllers/assetController";
 
 const app = express();
 
+// Security hardening (TAC Security report — Low findings):
+//   1. Remove the default "X-Powered-By: Express" header so the framework is not
+//      disclosed to unauthenticated clients (fingerprinting aid).
+//   2. Add standard security response headers on every response. We set these
+//      manually rather than pulling in helmet to avoid a new dependency and to
+//      keep full control over values (helmet's CSP/defaults can break the
+//      existing CORS + cross-origin asset flows).
+app.disable("x-powered-by");
+app.use((req, res, next) => {
+  // Prevent MIME-type sniffing.
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  // Disallow framing to mitigate clickjacking. The API is not meant to be framed.
+  res.setHeader("X-Frame-Options", "DENY");
+  // Do not leak the full URL (which may contain tokens/ids) in the Referer header.
+  res.setHeader("Referrer-Policy", "no-referrer");
+  // Enforce HTTPS for one year, including subdomains. Safe because all production
+  // traffic is served over TLS via nginx/Elastic Beanstalk.
+  res.setHeader(
+    "Strict-Transport-Security",
+    "max-age=31536000; includeSubDomains"
+  );
+  next();
+});
+
 // Initialize MCP Server routes BEFORE global body parsers
 setupMcpServer(app);
 
