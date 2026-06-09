@@ -25,15 +25,14 @@ import { mergeCustomFields } from '../utils/customFieldsGuard';
 /**
  * Verifies a HubSpot v1 webhook signature.
  * HubSpot computes: SHA-256(clientSecret + rawBody) and sends it as hex in
- * the X-HubSpot-Signature header.
- * We re-stringify req.body (already JSON-parsed) which matches HubSpot's
- * canonical JSON in practice.
+ * the X-HubSpot-Signature header. Must use the original raw bytes, not a
+ * re-serialized JSON object (key order / whitespace would differ).
  */
-function verifyHubSpotSignature(clientSecret: string, body: any, signature: string): boolean {
+function verifyHubSpotSignature(clientSecret: string, rawBody: Buffer, signature: string): boolean {
   try {
     const expected = crypto
       .createHash('sha256')
-      .update(clientSecret + JSON.stringify(body))
+      .update(clientSecret + rawBody.toString('utf8'))
       .digest('hex');
     return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
   } catch {
@@ -718,6 +717,10 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
 
   void (async () => {
     try {
+      // Raw body captured by express.raw() — parse once for processing.
+      const rawBody = req.body as Buffer;
+      const parsedBody: any = JSON.parse(rawBody.toString('utf8'));
+
       // ── Signature verification ──────────────────────────────────────────────
       // Verify X-HubSpot-Signature when present. If the header is missing we
       // log a warning and continue (supports local dev / test environments).
@@ -725,11 +728,13 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
       const isProd = process.env.NODE_ENV === 'production';
       if (signature) {
         const hubspotConfig = await getHubSpotConfig().catch(() => null);
-        if (hubspotConfig?.clientSecret) {
-          if (!verifyHubSpotSignature(hubspotConfig.clientSecret, req.body, signature)) {
-            console.warn('[HubSpot Webhook] Signature mismatch — request ignored');
-            return;
-          }
+        if (!hubspotConfig?.clientSecret) {
+          console.warn('[HubSpot Webhook] Signature present but client secret unavailable — request rejected');
+          return;
+        }
+        if (!verifyHubSpotSignature(hubspotConfig.clientSecret, rawBody, signature)) {
+          console.warn('[HubSpot Webhook] Signature mismatch — request ignored');
+          return;
         }
       } else if (isProd) {
         console.warn('[HubSpot Webhook] Missing X-HubSpot-Signature in production — request rejected');
@@ -739,7 +744,7 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
       }
 
       // ── Aggregate events by objectId ────────────────────────────────────────
-      const events: any[] = Array.isArray(req.body) ? req.body : [req.body];
+      const events: any[] = Array.isArray(parsedBody) ? parsedBody : [parsedBody];
       type ContactChange = {
         portalId: number;
         properties: Record<string, string>;
@@ -788,7 +793,7 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
         // ── Deal.propertyChange: resolve contacts via deal associations ──────────
         if (data.isDealChange && svc) {
           try {
-            const contactIds = await svc.getContactDealAssociations(objectId).catch(() => [] as string[]);
+            const contactIds = await svc.getDealContactAssociations(objectId).catch(() => [] as string[]);
             if (contactIds.length === 0) {
               console.log(`[HubSpot Webhook] deal ${objectId} has no contact association, skipping`);
               continue;
@@ -798,7 +803,7 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
             if (!allLists) continue;
             const dealLists = allLists.filter(l => {
               const cfgs = (l as any).externalCrmSyncConfigs as Record<string, any> | undefined;
-              return cfgs?.hubspot?.accountId === portalIdStr;
+              return String(cfgs?.hubspot?.accountId) === portalIdStr;
             });
 
             // Fetch syncConfig per list once — doesn't vary per contact
@@ -871,7 +876,7 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
         // when the same email happens to exist in both.
         const contactLists = allLists.filter(l => {
           const cfgs = (l as any).externalCrmSyncConfigs as Record<string, any> | undefined;
-          return cfgs?.hubspot?.accountId === portalIdStr;
+          return String(cfgs?.hubspot?.accountId) === portalIdStr;
         });
         if (contactLists.length === 0) {
           console.log(`[HubSpot Webhook] No lists linked to portal ${portalIdStr} for user ${userId}, skipping`);

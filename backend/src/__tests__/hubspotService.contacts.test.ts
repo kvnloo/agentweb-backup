@@ -674,7 +674,7 @@ describe('HubSpotService — getContactById', () => {
 });
 
 describe('HubSpotService — addContactToList chunking', () => {
-  let svc: InstanceType<typeof HubSpotService>;
+  let svc: HubSpotService;
 
   beforeEach(() => {
     jest.clearAllMocks();
