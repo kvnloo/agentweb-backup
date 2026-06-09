@@ -70,11 +70,13 @@ jest.mock('../services/externalCrmSyncService', () => ({
 
 const mockGetContactById = jest.fn();
 const mockGetContactEmailById = jest.fn();
+const mockGetContactDealAssociations = jest.fn();
 jest.mock('../services/hubspotService', () => ({
   HubSpotService: {
     create: jest.fn().mockResolvedValue({
       getContactById: (...a: any[]) => mockGetContactById(...a),
       getContactEmailById: (...a: any[]) => mockGetContactEmailById(...a),
+      getContactDealAssociations: (...a: any[]) => mockGetContactDealAssociations(...a),
     }),
   },
 }));
@@ -104,7 +106,12 @@ const USER_ID = 'user-abc';
 const LIST_ID = 'list-xyz';
 
 const mockLead = { leadId: 'lead-1', email: 'alice@example.com', firstName: 'Alice', customFields: {} };
-const mockList = { listId: LIST_ID, userId: USER_ID };
+const mockList = {
+  listId: LIST_ID,
+  userId: USER_ID,
+  // Portal ID scoping: only process this list for events from portal 12345
+  externalCrmSyncConfigs: { hubspot: { accountId: String(PORTAL_ID) } },
+};
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
@@ -117,6 +124,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
     mockUpdateLead.mockResolvedValue(undefined);
     mockGetContactById.mockResolvedValue({});
     mockGetContactEmailById.mockResolvedValue(null);
+    mockGetContactDealAssociations.mockResolvedValue([]);
     // Default: webhookEnabled not set (treated as true)
     mockGetSyncConfig.mockResolvedValue(null);
   });
@@ -250,7 +258,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
     expect(mockUpdateLead).toHaveBeenCalledWith(
       LIST_ID, 'lead-1',
       expect.objectContaining({
-        syncMetadata: expect.objectContaining({ crmRemoved: true }),
+        syncMetadata: expect.objectContaining({ crmRemovedAt: expect.any(String) }),
       })
     );
   });
@@ -319,5 +327,290 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
     expect(mockUpdateLead).toHaveBeenCalledWith(
       LIST_ID, 'lead-1', expect.objectContaining({ company: 'NewCorp' })
     );
+  });
+
+  // ── Portal ID scoping ────────────────────────────────────────────────────────
+
+  it('only updates lists linked to the event portal — ignores lists on other portals', async () => {
+    const OTHER_PORTAL = 99999;
+    const listForOtherPortal = {
+      listId: 'list-other',
+      userId: USER_ID,
+      externalCrmSyncConfigs: { hubspot: { accountId: String(OTHER_PORTAL) } },
+    };
+
+    mockGetLeadListsByUserId.mockResolvedValue([mockList, listForOtherPortal]);
+
+    const body = [
+      { subscriptionType: 'contact.propertyChange', portalId: PORTAL_ID, objectId: '90', propertyName: 'email', propertyValue: 'alice@example.com' },
+      { subscriptionType: 'contact.propertyChange', portalId: PORTAL_ID, objectId: '90', propertyName: 'company', propertyValue: 'Acme' },
+    ];
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .set('x-hubspot-signature', makeSignature(body))
+      .send(body);
+
+    await new Promise(r => setTimeout(r, 50));
+    // Only the list linked to PORTAL_ID (LIST_ID) is updated — not list-other
+    expect(mockUpdateLead).toHaveBeenCalledTimes(1);
+    expect(mockUpdateLead).toHaveBeenCalledWith(LIST_ID, 'lead-1', expect.any(Object));
+  });
+
+  it('skips contact event entirely when no lists are linked to that portal', async () => {
+    // All lists belong to a different portal
+    mockGetLeadListsByUserId.mockResolvedValue([
+      { listId: 'list-other', userId: USER_ID, externalCrmSyncConfigs: { hubspot: { accountId: '99999' } } },
+    ]);
+
+    const body = [
+      { subscriptionType: 'contact.propertyChange', portalId: PORTAL_ID, objectId: '91', propertyName: 'email', propertyValue: 'alice@example.com' },
+    ];
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .set('x-hubspot-signature', makeSignature(body))
+      .send(body);
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
+  // ── contact.deletion: crmRemovedAt ──────────────────────────────────────────
+
+  it('contact.deletion: sets crmRemovedAt as ISO timestamp (not crmRemoved boolean)', async () => {
+    const body = [
+      { subscriptionType: 'contact.propertyChange', portalId: PORTAL_ID, objectId: '95', propertyName: 'email', propertyValue: 'alice@example.com' },
+      { subscriptionType: 'contact.deletion', portalId: PORTAL_ID, objectId: '95' },
+    ];
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .set('x-hubspot-signature', makeSignature(body))
+      .send(body);
+
+    await new Promise(r => setTimeout(r, 50));
+    const call = mockUpdateLead.mock.calls[0];
+    const syncMetadata = call[2]?.syncMetadata;
+    expect(syncMetadata?.crmRemovedAt).toBeDefined();
+    expect(new Date(syncMetadata.crmRemovedAt).toISOString()).toBe(syncMetadata.crmRemovedAt);
+    expect(syncMetadata?.crmRemoved).toBeUndefined();
+  });
+});
+
+describe('POST /api/webhooks/hubspot — deal.propertyChange', () => {
+  const DEAL_ID = 'deal-999';
+  const CONTACT_ID = 'contact-555';
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetUserIdByHubSpotPortalId.mockResolvedValue(USER_ID);
+    mockGetLeadListsByUserId.mockResolvedValue([mockList]);
+    mockGetLeadByEmail.mockResolvedValue(mockLead);
+    mockUpdateLead.mockResolvedValue(undefined);
+    mockGetContactDealAssociations.mockResolvedValue([CONTACT_ID]);
+    mockGetContactEmailById.mockResolvedValue('alice@example.com');
+    mockGetContactById.mockResolvedValue({});
+    // Deal handler requires non-null syncConfig (checks !syncConfig) for processing
+    mockGetSyncConfig.mockResolvedValue({ webhookEnabled: true });
+  });
+
+  it('deal.propertyChange: syncs amount → dealValue to the associated contact lead', async () => {
+    const body = [
+      { subscriptionType: 'deal.propertyChange', portalId: PORTAL_ID, objectId: DEAL_ID, propertyName: 'amount', propertyValue: '50000' },
+    ];
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .set('x-hubspot-signature', makeSignature(body))
+      .send(body);
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockGetContactDealAssociations).toHaveBeenCalledWith(DEAL_ID);
+    expect(mockGetContactEmailById).toHaveBeenCalledWith(CONTACT_ID);
+    expect(mockUpdateLead).toHaveBeenCalledWith(
+      LIST_ID, 'lead-1', expect.objectContaining({ dealValue: '50000' })
+    );
+  });
+
+  it('deal.propertyChange: syncs dealstage → status using raw stage id when no stageMap', async () => {
+    const body = [
+      { subscriptionType: 'deal.propertyChange', portalId: PORTAL_ID, objectId: DEAL_ID, propertyName: 'dealstage', propertyValue: 'appointmentscheduled' },
+    ];
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .set('x-hubspot-signature', makeSignature(body))
+      .send(body);
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockUpdateLead).toHaveBeenCalledWith(
+      LIST_ID, 'lead-1', expect.objectContaining({ status: 'appointmentscheduled' })
+    );
+  });
+
+  it('deal.propertyChange: maps dealstage using hubspotDealStageMap when configured', async () => {
+    mockGetSyncConfig.mockResolvedValue({
+      webhookEnabled: true,
+      hubspotDealStageMap: { Qualified: 'appointmentscheduled' },
+    });
+
+    const body = [
+      { subscriptionType: 'deal.propertyChange', portalId: PORTAL_ID, objectId: DEAL_ID, propertyName: 'dealstage', propertyValue: 'appointmentscheduled' },
+    ];
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .set('x-hubspot-signature', makeSignature(body))
+      .send(body);
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockUpdateLead).toHaveBeenCalledWith(
+      LIST_ID, 'lead-1', expect.objectContaining({ status: 'Qualified' })
+    );
+  });
+
+  it('deal.propertyChange: syncs deal_currency_code → dealCurrency', async () => {
+    const body = [
+      { subscriptionType: 'deal.propertyChange', portalId: PORTAL_ID, objectId: DEAL_ID, propertyName: 'deal_currency_code', propertyValue: 'EUR' },
+    ];
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .set('x-hubspot-signature', makeSignature(body))
+      .send(body);
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockUpdateLead).toHaveBeenCalledWith(
+      LIST_ID, 'lead-1', expect.objectContaining({ dealCurrency: 'EUR' })
+    );
+  });
+
+  it('deal.propertyChange: syncs to all contacts when deal has multiple associations', async () => {
+    const CONTACT_ID_2 = 'contact-556';
+    const mockLead2 = { leadId: 'lead-2', email: 'bob@example.com', customFields: {} };
+    mockGetContactDealAssociations.mockResolvedValue([CONTACT_ID, CONTACT_ID_2]);
+    mockGetContactEmailById
+      .mockResolvedValueOnce('alice@example.com')
+      .mockResolvedValueOnce('bob@example.com');
+    mockGetLeadByEmail
+      .mockResolvedValueOnce(mockLead)
+      .mockResolvedValueOnce(mockLead2);
+
+    const body = [
+      { subscriptionType: 'deal.propertyChange', portalId: PORTAL_ID, objectId: DEAL_ID, propertyName: 'amount', propertyValue: '75000' },
+    ];
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .set('x-hubspot-signature', makeSignature(body))
+      .send(body);
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockUpdateLead).toHaveBeenCalledTimes(2);
+    expect(mockUpdateLead).toHaveBeenCalledWith(LIST_ID, 'lead-1', expect.objectContaining({ dealValue: '75000' }));
+    expect(mockUpdateLead).toHaveBeenCalledWith(LIST_ID, 'lead-2', expect.objectContaining({ dealValue: '75000' }));
+  });
+
+  it('deal.propertyChange: skips when deal has no contact association', async () => {
+    mockGetContactDealAssociations.mockResolvedValue([]);
+
+    const body = [
+      { subscriptionType: 'deal.propertyChange', portalId: PORTAL_ID, objectId: DEAL_ID, propertyName: 'amount', propertyValue: '1000' },
+    ];
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .set('x-hubspot-signature', makeSignature(body))
+      .send(body);
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
+  it('deal.propertyChange: skips when contact email cannot be resolved', async () => {
+    mockGetContactEmailById.mockResolvedValue(null);
+
+    const body = [
+      { subscriptionType: 'deal.propertyChange', portalId: PORTAL_ID, objectId: DEAL_ID, propertyName: 'amount', propertyValue: '1000' },
+    ];
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .set('x-hubspot-signature', makeSignature(body))
+      .send(body);
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
+  it('deal.propertyChange: skips list when syncConfig is null (no config = no deal sync)', async () => {
+    mockGetSyncConfig.mockResolvedValue(null);
+
+    const body = [
+      { subscriptionType: 'deal.propertyChange', portalId: PORTAL_ID, objectId: DEAL_ID, propertyName: 'amount', propertyValue: '1000' },
+    ];
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .set('x-hubspot-signature', makeSignature(body))
+      .send(body);
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
+  it('deal.propertyChange: skips list when webhookEnabled is false', async () => {
+    mockGetSyncConfig.mockResolvedValue({ webhookEnabled: false });
+
+    const body = [
+      { subscriptionType: 'deal.propertyChange', portalId: PORTAL_ID, objectId: DEAL_ID, propertyName: 'amount', propertyValue: '1000' },
+    ];
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .set('x-hubspot-signature', makeSignature(body))
+      .send(body);
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
+  it('deal.propertyChange: skips when lead not found in list', async () => {
+    mockGetLeadByEmail.mockResolvedValue(null);
+
+    const body = [
+      { subscriptionType: 'deal.propertyChange', portalId: PORTAL_ID, objectId: DEAL_ID, propertyName: 'amount', propertyValue: '1000' },
+    ];
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .set('x-hubspot-signature', makeSignature(body))
+      .send(body);
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
+  it('deal.propertyChange: only updates lists linked to that portal', async () => {
+    const otherList = {
+      listId: 'list-other',
+      userId: USER_ID,
+      externalCrmSyncConfigs: { hubspot: { accountId: '99999' } },
+    };
+    mockGetLeadListsByUserId.mockResolvedValue([mockList, otherList]);
+
+    const body = [
+      { subscriptionType: 'deal.propertyChange', portalId: PORTAL_ID, objectId: DEAL_ID, propertyName: 'amount', propertyValue: '2000' },
+    ];
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .set('x-hubspot-signature', makeSignature(body))
+      .send(body);
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockUpdateLead).toHaveBeenCalledTimes(1);
+    expect(mockUpdateLead).toHaveBeenCalledWith(LIST_ID, 'lead-1', expect.any(Object));
+  });
+
+  it('deal.propertyChange: does not call updateLead when no mapped deal properties change', async () => {
+    // The event property is not amount/dealstage/deal_currency_code
+    const body = [
+      { subscriptionType: 'deal.propertyChange', portalId: PORTAL_ID, objectId: DEAL_ID, propertyName: 'dealname', propertyValue: 'New Name' },
+    ];
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .set('x-hubspot-signature', makeSignature(body))
+      .send(body);
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 });

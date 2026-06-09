@@ -278,7 +278,7 @@ export class HubspotAdapter implements CrmAdapter {
                     }
                 }
 
-                if (Object.keys(customFields).length > 0) leadData.customFields = customFields;
+                leadData.customFields = customFields;
                 if (Object.keys(syncMetadata).length > 0) leadData.syncMetadata = syncMetadata;
                 pageLeadData.push(leadData);
             }
