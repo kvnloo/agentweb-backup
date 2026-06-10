@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-10',
     changes: [
+      'New: Send Us Any Kind of Feedback, Not Just Bugs',
+      '- The "Report a bug" button is now a "Send feedback" button — use it to report a bug, request a feature, suggest an improvement, or share general feedback',
+      '- Just pick the kind of feedback you\'re sending, type a quick note, and hit send — we still automatically attach a screenshot of the page you were looking at for extra context',
+      '- Each type goes straight to our team, clearly labeled and tracked, and we follow up at your account email if we need more detail',
+    ],
+  },
+  {
+    date: '2026-06-10',
+    changes: [
       'New: Report a Bug in One Click, Screenshot Included',
       '- A new "Report a bug" button is always within reach in the bottom-right corner of every page',
       '- Click it and we automatically grab a screenshot of the page you were just looking at — no need to capture or attach anything yourself',
