@@ -1520,6 +1520,29 @@ mcpToolRegistry.register({
   }
 });
 
+mcpToolRegistry.register({
+  name: 'revert_landing_page_publish',
+  definition: {
+    name: 'revert_landing_page_publish',
+    description: 'Undo the most recent publish of a landing page, rolling the live site back to exactly how it was before that publish. Use this when the user wants to revert or undo published landing page changes. This restores the previous state and triggers a production redeploy. Only the most recent publish can be reverted, and only once. If nothing has been published, or main has changed since (newer changes were published), the revert is refused with an explanation.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID' }
+      },
+      required: ['page_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST',
+      path: `/api/landing-pages/v0/generated/${args.page_id}/revert-publish`,
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
 // ─── Internal-only tools (hidden from external MCP clients) ─────────────────
 // These tools are registered with internal: true so Emma can use them in chat,
 // but they are NOT listed to external MCP clients.

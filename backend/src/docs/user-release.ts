@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-10',
     changes: [
+      'New: Undo a Landing Page Publish in One Click',
+      '- Published a landing page change and want it back the way it was? Each landing page card now has a "Revert last publish" button that rolls the live site back to exactly how it looked before your most recent publish, then redeploys automatically',
+      '- The button only appears when there is a publish to undo, and a confirmation dialog explains what will happen before anything changes',
+      '- You can also just ask Emma to "revert the last publish" on a page and she will do the same thing',
+      '- Only the most recent publish can be reverted, and only once — so it is safe and predictable',
+    ],
+  },
+  {
+    date: '2026-06-10',
+    changes: [
       'Fixed: LinkedIn Ads Audience Size Check Now Works Before Launching a Campaign',
       '- Asking Emma to estimate the reach of a LinkedIn Ads audience used to fail with confusing, contradictory errors and never returned a number',
       '- The audience-size check now accepts the same targeting you use to build a campaign (locations, job titles, skills, seniorities, industries, and more) and returns the estimated audience size',
