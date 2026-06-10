@@ -4074,6 +4074,10 @@ export class AgentModeService {
 
   public async installSkills(skillIds: string[], userId: string, sessionId: string, isDelegatedAccess: boolean = false): Promise<any> {
     try {
+      if (!Array.isArray(skillIds) || skillIds.length === 0 || skillIds.some((id) => typeof id !== 'string')) {
+        return { message: "skillIds must be a non-empty array of skill IDs." };
+      }
+
       let installUserOrgId: string | undefined;
       try {
         const { userDb: uDb } = await import('./db');

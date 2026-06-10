@@ -86,6 +86,32 @@ describe('HTML Emma tools contract cleanup', () => {
     jest.clearAllMocks();
   });
 
+  it('install_skills declares non-empty skillIds at the schema layer', () => {
+    const tool = emmaToolRegistry.getTool('install_skills');
+    const skillIdsSchema = (tool?.definition.inputSchema as any)?.properties?.skillIds;
+
+    expect(skillIdsSchema).toMatchObject({
+      type: 'array',
+      minItems: 1,
+      items: { type: 'string' },
+    });
+  });
+
+  it('update_html_file declares replacement_json as a gateway-owned alias', () => {
+    const tool = emmaToolRegistry.getTool('update_html_file');
+    const operationsSchema = (tool?.definition.inputSchema as any)?.properties?.operations_json;
+
+    expect(operationsSchema?.['x-aliases']).toContain('replacement_json');
+  });
+
+  it('coding_agent declares common argument drift as gateway-owned aliases', () => {
+    const tool = emmaToolRegistry.getTool('coding_agent');
+    const props = (tool?.definition.inputSchema as any)?.properties || {};
+
+    expect(props.page_id?.['x-aliases']).toContain('landing_page_id');
+    expect(props.task_description?.['x-aliases']).toContain('instructions');
+  });
+
   it('create_html_file delegates canonical required args to the service', async () => {
     const tool = emmaToolRegistry.getTool('create_html_file');
     if (!tool) throw new Error('Tool create_html_file not found');

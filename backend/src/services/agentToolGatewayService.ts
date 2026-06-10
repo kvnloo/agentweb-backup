@@ -248,6 +248,7 @@ export function validateAndRepairToolArgs(
       properties,
       required,
       existingArgs: repairedArgs,
+      allowExplicitAliasRepair: true,
       allowSemanticUrlRepair: lowRiskRepairAllowed,
     });
 
@@ -278,6 +279,7 @@ export function validateAndRepairToolArgs(
       target: name,
       properties,
       existingArgs: repairedArgs,
+      allowExplicitAliasRepair: true,
       allowSemanticUrlRepair: lowRiskRepairAllowed && (
         !(name === 'url' || name.endsWith('_url') || name.endsWith('Url')) ||
         missingRequiredUrlTargetCount === 1
@@ -305,6 +307,7 @@ export function validateAndRepairToolArgs(
     if (repairedArgs[name] === undefined || repairedArgs[name] === null) continue;
     const typeIssue = validateJsonSchemaType(name, repairedArgs[name], propSchema);
     if (typeIssue) issues.push(typeIssue);
+    issues.push(...validateJsonSchemaConstraints(name, repairedArgs[name], propSchema));
   }
 
   if (issues.length > 0) {
@@ -436,6 +439,7 @@ function findAliasTarget(input: {
   properties: Record<string, any>;
   required: string[];
   existingArgs: Record<string, unknown>;
+  allowExplicitAliasRepair: boolean;
   allowSemanticUrlRepair: boolean;
 }): string | null {
   const propertyNames = Object.keys(input.properties);
@@ -443,6 +447,13 @@ function findAliasTarget(input: {
   const normalizedMatch = propertyNames.find((name) => normalizeArgName(name) === normalizedKey);
   if (normalizedMatch && input.existingArgs[normalizedMatch] === undefined) {
     return normalizedMatch;
+  }
+
+  if (input.allowExplicitAliasRepair) {
+    const explicitMatch = propertyNames.find((name) =>
+      getSchemaAliases(input.properties[name]).some((alias) => normalizeArgName(alias) === normalizedKey)
+    );
+    if (explicitMatch && input.existingArgs[explicitMatch] === undefined) return explicitMatch;
   }
 
   if (!input.allowSemanticUrlRepair || typeof input.value !== 'string') return null;
@@ -464,6 +475,7 @@ function findKnownAliasSource(input: {
   target: string;
   properties: Record<string, any>;
   existingArgs: Record<string, unknown>;
+  allowExplicitAliasRepair: boolean;
   allowSemanticUrlRepair: boolean;
 }): string | null {
   const targetNormalized = normalizeArgName(input.target);
@@ -471,6 +483,14 @@ function findKnownAliasSource(input: {
     if (key === input.target) continue;
     if (!input.properties[key]) continue;
     if (normalizeArgName(key) === targetNormalized) return key;
+  }
+
+  if (input.allowExplicitAliasRepair) {
+    const targetAliases = getSchemaAliases(input.properties[input.target]).map(normalizeArgName);
+    for (const key of Object.keys(input.existingArgs)) {
+      if (key === input.target) continue;
+      if (targetAliases.includes(normalizeArgName(key))) return key;
+    }
   }
 
   if (!input.allowSemanticUrlRepair) return null;
@@ -509,6 +529,29 @@ function validateJsonSchemaType(name: string, value: unknown, schema: any): Agen
   };
 }
 
+function validateJsonSchemaConstraints(name: string, value: unknown, schema: any): AgentToolContractIssue[] {
+  const issues: AgentToolContractIssue[] = [];
+
+  if (Array.isArray(value)) {
+    if (typeof schema?.minItems === 'number' && value.length < schema.minItems) {
+      issues.push({
+        code: 'invalid_args',
+        path: `$.${name}`,
+        message: `Argument "${name}" must contain at least ${schema.minItems} item(s).`,
+      });
+    }
+
+    if (schema?.items) {
+      value.forEach((item, index) => {
+        const typeIssue = validateJsonSchemaType(`${name}[${index}]`, item, schema.items);
+        if (typeIssue) issues.push(typeIssue);
+      });
+    }
+  }
+
+  return issues;
+}
+
 function isMissingRequiredValue(value: unknown, schema: any): boolean {
   if (value === undefined) return true;
   if (value === null) return !schemaAllowsType(schema, 'null');
@@ -520,6 +563,11 @@ function schemaAllowsType(schema: any, type: string): boolean {
   if (!expected) return false;
   const expectedTypes = Array.isArray(expected) ? expected : [expected];
   return expectedTypes.includes(type);
+}
+
+function getSchemaAliases(schema: any): string[] {
+  const aliases = schema?.['x-aliases'] ?? schema?.aliases;
+  return Array.isArray(aliases) ? aliases.filter((alias): alias is string => typeof alias === 'string') : [];
 }
 
 function normalizeArgName(value: string): string {

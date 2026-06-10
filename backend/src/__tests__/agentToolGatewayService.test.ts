@@ -440,5 +440,83 @@ describe('agentToolGatewayService', () => {
         ]));
       }
     });
+
+    it('repairs explicit schema aliases even for side-effecting tools', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'coding_agent',
+        args: {
+          landing_page_id: 'lp_123',
+          instructions: 'Make the hero headline clearer'
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            page_id: { type: 'string', 'x-aliases': ['landing_page_id'] },
+            task_description: { type: 'string', 'x-aliases': ['instructions'] },
+          },
+          required: ['page_id', 'task_description'],
+          additionalProperties: false
+        },
+        effect: 'internal_write',
+      });
+
+      expect(result.status).toBe('repaired');
+      expect(result.args).toEqual({
+        page_id: 'lp_123',
+        task_description: 'Make the hero headline clearer'
+      });
+      expect(result.repairs).toEqual([
+        'landing_page_id->page_id',
+        'instructions->task_description',
+      ]);
+    });
+
+    it('enforces array minItems and item types from schema', () => {
+      const emptyResult = validateAndRepairToolArgs({
+        toolName: 'install_skills',
+        args: { skillIds: [] },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            skillIds: { type: 'array', minItems: 1, items: { type: 'string' } },
+          },
+          required: ['skillIds'],
+          additionalProperties: false
+        },
+        effect: 'session_state',
+      });
+
+      expect(emptyResult.status).toBe('invalid');
+      if (emptyResult.status === 'invalid') {
+        expect(emptyResult.issues).toEqual(expect.arrayContaining([
+          expect.objectContaining({
+            code: 'invalid_args',
+            path: '$.skillIds',
+            message: 'Argument "skillIds" must contain at least 1 item(s).',
+          }),
+        ]));
+      }
+
+      const wrongItemResult = validateAndRepairToolArgs({
+        toolName: 'install_skills',
+        args: { skillIds: ['__other_skills__', 123] },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            skillIds: { type: 'array', minItems: 1, items: { type: 'string' } },
+          },
+          required: ['skillIds'],
+          additionalProperties: false
+        },
+        effect: 'session_state',
+      });
+
+      expect(wrongItemResult.status).toBe('invalid');
+      if (wrongItemResult.status === 'invalid') {
+        expect(wrongItemResult.issues).toEqual(expect.arrayContaining([
+          expect.objectContaining({ code: 'type_mismatch', path: '$.skillIds[1]' }),
+        ]));
+      }
+    });
   });
 });
