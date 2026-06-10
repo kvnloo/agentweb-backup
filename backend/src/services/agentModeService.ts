@@ -5410,7 +5410,7 @@ export class AgentModeService {
       case 'update_html_file':
         // Mock validation for update_html_file
         try {
-          const instructions = JSON.parse(args.replacement_json);
+          const instructions = JSON.parse(args.operations_json || args.replacement_json);
 
           // Validate that it's an array
           if (!Array.isArray(instructions)) {
@@ -5502,7 +5502,7 @@ export class AgentModeService {
         } catch (error) {
           return {
             success: false,
-            message: 'Invalid JSON in replacement_json',
+            message: 'Invalid JSON in operations_json',
             error: error instanceof Error ? error.message : 'Unknown error'
           };
         }
@@ -5567,15 +5567,58 @@ export class AgentModeService {
   }
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
+    const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
+    const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
+    const initialPolicyDecision = evaluateAgentToolPolicy({
+      toolName,
+      args,
+      isAdmin: extraContext?.isDelegatedAdmin === true,
+      enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
+    });
+    const contractResult = validateAndRepairToolArgs({
+      toolName,
+      args,
+      inputSchema,
+      effect: initialPolicyDecision.effect,
+    });
+
+    if (contractResult.status === 'invalid') {
+      return {
+        success: false,
+        error: contractResult.modelMessage,
+        validation: {
+          status: contractResult.status,
+          issues: contractResult.issues,
+          repairs: contractResult.repairs,
+        },
+      };
+    }
+
+    const preparedArgs = contractResult.args;
+    const policyDecision = evaluateAgentToolPolicy({
+      toolName,
+      args: preparedArgs,
+      isAdmin: extraContext?.isDelegatedAdmin === true,
+      enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
+    });
+
+    if (!policyDecision.allowed) {
+      return {
+        success: false,
+        error: `Tool "${toolName}" was blocked by Agent Tool Gateway policy: ${policyDecision.flags.map((flag) => flag.message).join(' ')}`,
+        policy: policyDecision,
+      };
+    }
+
     // In mock mode, only session-state tools (install_skills) execute for real
     // because they modify DynamoDB session state with no external side effects
     // and are required for the skill-gated tool flow to work during benchmark tests.
     if (mockMode && !AgentModeService.MOCK_BYPASS_TOOLS.has(toolName)) {
-      return this.getMockToolResult(toolName, args);
+      return this.getMockToolResult(toolName, preparedArgs);
     }
 
     try {
-      return await this.toolRegistry.execute(toolName, args, {
+      return await this.toolRegistry.execute(toolName, preparedArgs, {
         userId,
         sessionId,
         llmModel,
