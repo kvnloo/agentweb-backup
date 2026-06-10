@@ -137,6 +137,9 @@ export const INTEGRATION_CONFIG = {
       'crm.schemas.contacts.write',
       'crm.schemas.deals.read',
       'crm.schemas.deals.write',
+      'marketing.campaigns.read',
+      'marketing.campaigns.revenue.read',
+      'marketing.campaigns.write',
     ],
   },
 

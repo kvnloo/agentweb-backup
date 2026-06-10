@@ -7362,3 +7362,44 @@ GAQL EXAMPLES:
     return await agentModeService.handleCallGoogleAdsReportingApi(context?.userId || context?.agentUserId, args);
   },
 });
+
+// ─── HubSpot Campaigns (Marketing Hub Professional+) ─────────────────────────
+
+emmaToolRegistry.register({
+  name: 'call_hubspot_campaigns_api',
+  definition: {
+    name: 'call_hubspot_campaigns_api',
+    description: `Manage HubSpot campaigns. Requires Marketing Hub Professional or higher.
+
+ACTION MATRIX:
+  LIST        → List all campaigns. Optional: cursor (pagination).
+  GET         → Get campaign details + performance metrics. Requires: guid.
+  CREATE      → Create a new campaign (reporting/attribution container). Requires: name. Optional: start_date (YYYY-MM-DD), notes, utm.
+  UPDATE      → Update campaign fields. Requires: guid. Optional: name, start_date, notes, utm.
+  DELETE      → Permanently delete a campaign. Requires: guid.
+  GET_METRICS → Get performance metrics only (sessions, contacts, revenue). Requires: guid.
+
+WORKFLOW:
+  1. LIST to discover campaign guids and names.
+  2. GET or GET_METRICS with guid to view details/stats.
+  3. CREATE to start a new campaign, then associate emails/ads to it in HubSpot.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action:     { type: 'string', enum: ['LIST', 'GET', 'CREATE', 'UPDATE', 'DELETE', 'GET_METRICS'], description: 'Action to perform.' },
+        guid:       { type: 'string', description: 'Campaign guid. Required for GET, UPDATE, DELETE, GET_METRICS.' },
+        name:       { type: 'string', description: 'Campaign name. Required for CREATE.' },
+        start_date: { type: 'string', description: 'Campaign start date in YYYY-MM-DD format.' },
+        notes:      { type: 'string', description: 'Internal notes about the campaign.' },
+        utm:        { type: 'string', description: 'UTM campaign value for tracking.' },
+        cursor:     { type: 'string', description: 'Pagination cursor for LIST (from previous nextCursor).' },
+      },
+      required: ['action'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId;
+    if (!userId) return { success: false, error: 'Authentication required: no user context.' };
+    return agentModeService.handleHubspotCampaignsApi(userId, args);
+  },
+});

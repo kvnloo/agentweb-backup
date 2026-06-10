@@ -70,6 +70,7 @@ import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, Me
 import { linkedInOutreachService } from './linkedInOutreachService';
 import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
+import { HubSpotService } from './hubspotService';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
@@ -24495,6 +24496,93 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       const gadsErrors: any[] = error?.response?.data?.error?.details?.[0]?.errors || [];
       const gadsError = gadsErrors.length ? gadsErrors.map((e: any) => e.message).join('; ') : undefined;
       return { success: false, error: gadsError || error.message || 'Unknown error' };
+    }
+  }
+
+  // ─── HubSpot Campaigns ──────────────────────────────────────────────────────
+
+  private async resolveHubSpotService(userId: string): Promise<HubSpotService> {
+    try {
+      return await HubSpotService.create(userId);
+    } catch {
+      // Fall back to token-paste: scan lead lists for HubSpot apiKeyEncrypted
+    }
+    const { crmDb } = await import('./db');
+    const lists = await crmDb.getLeadListsByUserId(userId);
+    for (const list of lists as any[]) {
+      const hubspotConfig = list?.externalCrmSyncConfigs?.hubspot;
+      if (hubspotConfig?.apiKeyEncrypted) {
+        const { decryptPassword } = await import('../utils/crypto');
+        const { password } = decryptPassword(hubspotConfig.apiKeyEncrypted);
+        return HubSpotService.fromToken(password);
+      }
+    }
+    throw new Error('No HubSpot account connected. Please connect HubSpot in Settings → External CRM Sync or via OAuth in Connected Accounts.');
+  }
+
+  public async handleHubspotCampaignsApi(userId: string, args: any): Promise<any> {
+    const action: string = (args?.action ?? '').toUpperCase();
+    const guid: string | undefined = args?.guid;
+    try {
+      const svc = await this.resolveHubSpotService(userId);
+      switch (action) {
+        case 'LIST': {
+          const data = await svc.listCampaigns(args?.cursor);
+          return { success: true, ...data };
+        }
+        case 'GET': {
+          if (!guid) return { success: false, error: 'guid is required for GET.' };
+          const [campaign, metrics] = await Promise.allSettled([
+            svc.getCampaign(guid),
+            svc.getCampaignMetrics(guid),
+          ]);
+          return {
+            success: true,
+            campaign: campaign.status === 'fulfilled' ? campaign.value : null,
+            metrics: metrics.status === 'fulfilled' ? metrics.value : null,
+          };
+        }
+        case 'CREATE': {
+          const name: string = args?.name ?? '';
+          if (!name.trim()) return { success: false, error: 'name is required for CREATE.' };
+          const data = await svc.createCampaign(name, {
+            startDate: args?.start_date,
+            notes: args?.notes,
+            utm: args?.utm,
+          });
+          return { success: true, ...data };
+        }
+        case 'UPDATE': {
+          if (!guid) return { success: false, error: 'guid is required for UPDATE.' };
+          const data = await svc.updateCampaign(guid, {
+            name: args?.name,
+            startDate: args?.start_date,
+            notes: args?.notes,
+            utm: args?.utm,
+          });
+          return { success: true, ...data };
+        }
+        case 'DELETE': {
+          if (!guid) return { success: false, error: 'guid is required for DELETE.' };
+          await svc.deleteCampaign(guid);
+          return { success: true, deleted: guid };
+        }
+        case 'GET_METRICS': {
+          if (!guid) return { success: false, error: 'guid is required for GET_METRICS.' };
+          const data = await svc.getCampaignMetrics(guid);
+          return { success: true, ...data };
+        }
+        default:
+          return { success: false, error: `Unknown action "${action}". Valid: LIST, GET, CREATE, UPDATE, DELETE, GET_METRICS.` };
+      }
+    } catch (err: any) {
+      if (err?.response?.status === 403) return { success: false, error: 'HubSpot Campaigns API requires Marketing Hub Professional or higher.' };
+      return {
+        success: false,
+        error: err?.message ?? 'HubSpot campaigns API call failed.',
+        hubspotError: err?.response?.data ?? null,
+        status: err?.response?.status ?? null,
+      };
     }
   }
 }

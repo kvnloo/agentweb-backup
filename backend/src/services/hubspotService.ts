@@ -56,6 +56,7 @@ if (_created) {
 
 const HUBSPOT_API_BASE = 'https://api.hubapi.com';
 
+
 export interface HubSpotContact {
   contactId: string;
   email?: string;
@@ -851,6 +852,80 @@ export class HubSpotService {
     }
 
     return { addedCount, failedChunks };
+  }
+
+  // ─── Campaigns ───────────────────────────────────────────────────────────────
+  // Requires Marketing Hub Professional+
+  // Scopes: marketing.campaigns.read, marketing.campaigns.write
+
+  async listCampaigns(cursor?: string): Promise<any> {
+    const CAMPAIGN_PROPS = 'hs_name,hs_start_date,hs_end_date,hs_notes,hs_utm,hs_campaign_status';
+    let url = `${HUBSPOT_API_BASE}/marketing/v3/campaigns?properties=${CAMPAIGN_PROPS}`;
+    if (cursor) url += `&after=${encodeURIComponent(cursor)}`;
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
+    return res.data;
+  }
+
+  async getCampaign(guid: string): Promise<any> {
+    const CAMPAIGN_PROPS = 'hs_name,hs_start_date,hs_end_date,hs_notes,hs_utm,hs_campaign_status';
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/marketing/v3/campaigns/${guid}?properties=${CAMPAIGN_PROPS}`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async createCampaign(
+    name: string,
+    opts?: { startDate?: string; notes?: string; utm?: string }
+  ): Promise<any> {
+    if (!name || !name.trim()) throw new Error('Campaign name is required');
+
+    const properties: Record<string, string> = { hs_name: name.trim() };
+    if (opts?.startDate) properties.hs_start_date = opts.startDate;
+    if (opts?.notes) properties.hs_notes = opts.notes;
+    if (opts?.utm) properties.hs_utm = opts.utm;
+
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/marketing/v3/campaigns`,
+      { properties },
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async updateCampaign(
+    guid: string,
+    props: { name?: string; startDate?: string; notes?: string; utm?: string }
+  ): Promise<any> {
+    const properties: Record<string, string> = {};
+    if (props.name !== undefined) properties.hs_name = props.name;
+    if (props.startDate !== undefined) properties.hs_start_date = props.startDate;
+    if (props.notes !== undefined) properties.hs_notes = props.notes;
+    if (props.utm !== undefined) properties.hs_utm = props.utm;
+
+    const res = await axiosInstance.patch(
+      `${HUBSPOT_API_BASE}/marketing/v3/campaigns/${guid}`,
+      { properties },
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async deleteCampaign(guid: string): Promise<void> {
+    await axiosInstance.request({
+      method: 'DELETE',
+      url: `${HUBSPOT_API_BASE}/marketing/v3/campaigns/${guid}`,
+      headers: await this.authHeaders(),
+    });
+  }
+
+  async getCampaignMetrics(guid: string): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/marketing/v3/campaigns/${guid}/reports/metrics`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
   }
 
   async getAllLists(query?: string): Promise<Array<{ id: string; name: string }>> {
