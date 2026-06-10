@@ -40,6 +40,40 @@ export interface AgentToolGatewayExecutionInput extends AgentToolPolicyInput {
   now?: () => number;
 }
 
+export interface AgentToolContractValidationInput {
+  toolName: string;
+  args: unknown;
+  inputSchema?: any;
+  effect?: AgentToolEffect;
+}
+
+export interface AgentToolContractIssue {
+  code: 'missing_required' | 'unknown_property' | 'type_mismatch' | 'invalid_args';
+  path: string;
+  message: string;
+}
+
+export type AgentToolContractValidationResult =
+  | {
+      status: 'valid';
+      args: unknown;
+      issues: AgentToolContractIssue[];
+      repairs: string[];
+    }
+  | {
+      status: 'repaired';
+      args: unknown;
+      issues: AgentToolContractIssue[];
+      repairs: string[];
+    }
+  | {
+      status: 'invalid';
+      args: unknown;
+      issues: AgentToolContractIssue[];
+      repairs: string[];
+      modelMessage: string;
+    };
+
 export type AgentToolGatewayExecutionOutcome =
   | {
       status: 'success';
@@ -58,6 +92,13 @@ export class AgentToolPolicyBlockedError extends Error {
   constructor(readonly policyDecision: AgentToolPolicyDecision) {
     super(`Tool "${policyDecision.toolName}" was blocked by Agent Tool Gateway policy.`);
     this.name = 'AgentToolPolicyBlockedError';
+  }
+}
+
+export class AgentToolContractValidationError extends Error {
+  constructor(readonly validation: Extract<AgentToolContractValidationResult, { status: 'invalid' }>) {
+    super(validation.modelMessage);
+    this.name = 'AgentToolContractValidationError';
   }
 }
 
@@ -158,6 +199,132 @@ export function evaluateAgentToolPolicy(input: AgentToolPolicyInput): AgentToolP
   };
 }
 
+export function validateAndRepairToolArgs(
+  input: AgentToolContractValidationInput,
+): AgentToolContractValidationResult {
+  const schema = input.inputSchema;
+  const issues: AgentToolContractIssue[] = [];
+  const repairs: string[] = [];
+
+  if (!schema || schema.type !== 'object') {
+    return { status: 'valid', args: input.args, issues, repairs };
+  }
+
+  if (!input.args || typeof input.args !== 'object' || Array.isArray(input.args)) {
+    return {
+      status: 'invalid',
+      args: input.args,
+      issues: [{
+        code: 'invalid_args',
+        path: '$',
+        message: `Tool "${input.toolName}" arguments must be a JSON object.`,
+      }],
+      repairs,
+      modelMessage: buildSchemaRetryMessage(input.toolName, [{
+        code: 'invalid_args',
+        path: '$',
+        message: `Tool "${input.toolName}" arguments must be a JSON object.`,
+      }]),
+    };
+  }
+
+  const properties = schema.properties && typeof schema.properties === 'object'
+    ? schema.properties as Record<string, any>
+    : {};
+  const required = Array.isArray(schema.required)
+    ? schema.required.filter((name: unknown): name is string => typeof name === 'string')
+    : [];
+  const allowAdditional = schema.additionalProperties !== false;
+  const repairedArgs: Record<string, unknown> = { ...(input.args as Record<string, unknown>) };
+  const propertyNames = Object.keys(properties);
+  const lowRiskRepairAllowed = (input.effect ?? classifyToolEffect(input.toolName, input.args)) === 'read';
+
+  for (const key of Object.keys(repairedArgs)) {
+    if (properties[key]) continue;
+
+    const aliasTarget = findAliasTarget({
+      key,
+      value: repairedArgs[key],
+      properties,
+      required,
+      existingArgs: repairedArgs,
+      allowSemanticUrlRepair: lowRiskRepairAllowed,
+    });
+
+    if (aliasTarget) {
+      repairedArgs[aliasTarget] = repairedArgs[key];
+      delete repairedArgs[key];
+      repairs.push(`${key}->${aliasTarget}`);
+      continue;
+    }
+
+    if (!allowAdditional) {
+      issues.push({
+        code: 'unknown_property',
+        path: `$.${key}`,
+        message: `Unknown argument "${key}". Allowed arguments: ${propertyNames.join(', ') || '(none)'}.`,
+      });
+    }
+  }
+
+  const missingRequiredUrlTargetCount = required.filter((name: string) =>
+    isMissingRequiredValue(repairedArgs[name], properties[name]) &&
+    (name === 'url' || name.endsWith('_url') || name.endsWith('Url'))
+  ).length;
+
+  for (const name of required) {
+    if (!isMissingRequiredValue(repairedArgs[name], properties[name])) continue;
+    const aliasSource = findKnownAliasSource({
+      target: name,
+      properties,
+      existingArgs: repairedArgs,
+      allowSemanticUrlRepair: lowRiskRepairAllowed && (
+        !(name === 'url' || name.endsWith('_url') || name.endsWith('Url')) ||
+        missingRequiredUrlTargetCount === 1
+      ),
+    });
+
+    if (aliasSource) {
+      repairedArgs[name] = repairedArgs[aliasSource];
+      delete repairedArgs[aliasSource];
+      repairs.push(`${aliasSource}->${name}`);
+    }
+  }
+
+  for (const name of required) {
+    if (isMissingRequiredValue(repairedArgs[name], properties[name])) {
+      issues.push({
+        code: 'missing_required',
+        path: `$.${name}`,
+        message: `Missing required argument "${name}".`,
+      });
+    }
+  }
+
+  for (const [name, propSchema] of Object.entries(properties)) {
+    if (repairedArgs[name] === undefined || repairedArgs[name] === null) continue;
+    const typeIssue = validateJsonSchemaType(name, repairedArgs[name], propSchema);
+    if (typeIssue) issues.push(typeIssue);
+  }
+
+  if (issues.length > 0) {
+    return {
+      status: 'invalid',
+      args: repairedArgs,
+      issues,
+      repairs,
+      modelMessage: buildSchemaRetryMessage(input.toolName, issues),
+    };
+  }
+
+  return {
+    status: repairs.length > 0 ? 'repaired' : 'valid',
+    args: repairedArgs,
+    issues,
+    repairs,
+  };
+}
+
 export function summarizeAgentToolPolicyFlags(
   decisions: Array<AgentToolPolicyDecision | undefined>,
 ): string | undefined {
@@ -178,6 +345,11 @@ export function summarizeAgentToolPolicyModes(
     .map((decision) => `${decision.toolName}:${decision.effect}:${decision.risk}:${decision.mode}`);
 
   return entries.length > 0 ? entries.join(',') : undefined;
+}
+
+export function buildSchemaRetryMessage(toolName: string, issues: AgentToolContractIssue[]): string {
+  const details = issues.map((issue) => issue.message).join(' ');
+  return `Tool "${toolName}" arguments failed schema validation before execution. ${details} Retry the same tool with arguments that exactly match the tool schema.`;
 }
 
 export async function executeAgentToolThroughGateway(
@@ -256,6 +428,106 @@ function stringField(value: unknown, field: string): string {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
   const raw = (value as Record<string, unknown>)[field];
   return typeof raw === 'string' ? raw : '';
+}
+
+function findAliasTarget(input: {
+  key: string;
+  value: unknown;
+  properties: Record<string, any>;
+  required: string[];
+  existingArgs: Record<string, unknown>;
+  allowSemanticUrlRepair: boolean;
+}): string | null {
+  const propertyNames = Object.keys(input.properties);
+  const normalizedKey = normalizeArgName(input.key);
+  const normalizedMatch = propertyNames.find((name) => normalizeArgName(name) === normalizedKey);
+  if (normalizedMatch && input.existingArgs[normalizedMatch] === undefined) {
+    return normalizedMatch;
+  }
+
+  if (!input.allowSemanticUrlRepair || typeof input.value !== 'string') return null;
+  if (!looksLikeUrl(input.value)) return null;
+
+  const urlLikeKeys = new Set(['url', 'link', 'href', 'uri']);
+  if (!urlLikeKeys.has(normalizedKey)) return null;
+
+  const missingRequiredUrlFields = input.required.filter((name) =>
+    input.existingArgs[name] === undefined &&
+    (name === 'url' || name.endsWith('_url') || name.endsWith('Url'))
+  );
+
+  if (missingRequiredUrlFields.length === 1) return missingRequiredUrlFields[0];
+  return null;
+}
+
+function findKnownAliasSource(input: {
+  target: string;
+  properties: Record<string, any>;
+  existingArgs: Record<string, unknown>;
+  allowSemanticUrlRepair: boolean;
+}): string | null {
+  const targetNormalized = normalizeArgName(input.target);
+  for (const key of Object.keys(input.existingArgs)) {
+    if (key === input.target) continue;
+    if (!input.properties[key]) continue;
+    if (normalizeArgName(key) === targetNormalized) return key;
+  }
+
+  if (!input.allowSemanticUrlRepair) return null;
+  if (!(input.target === 'url' || input.target.endsWith('_url') || input.target.endsWith('Url'))) return null;
+
+  const urlLikeKeys = new Set(['url', 'link', 'href', 'uri']);
+  for (const key of Object.keys(input.existingArgs)) {
+    if (!urlLikeKeys.has(normalizeArgName(key))) continue;
+    const value = input.existingArgs[key];
+    if (typeof value === 'string' && looksLikeUrl(value)) return key;
+  }
+
+  return null;
+}
+
+function validateJsonSchemaType(name: string, value: unknown, schema: any): AgentToolContractIssue | null {
+  const expected = schema?.type;
+  if (!expected) return null;
+  const expectedTypes = Array.isArray(expected) ? expected : [expected];
+  const valid = expectedTypes.some((type) => {
+    if (type === 'string') return typeof value === 'string';
+    if (type === 'number') return typeof value === 'number' && Number.isFinite(value);
+    if (type === 'integer') return Number.isInteger(value);
+    if (type === 'boolean') return typeof value === 'boolean';
+    if (type === 'array') return Array.isArray(value);
+    if (type === 'object') return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+    if (type === 'null') return value === null;
+    return true;
+  });
+
+  if (valid) return null;
+  return {
+    code: 'type_mismatch',
+    path: `$.${name}`,
+    message: `Argument "${name}" has the wrong type. Expected ${expectedTypes.join(' or ')}.`,
+  };
+}
+
+function isMissingRequiredValue(value: unknown, schema: any): boolean {
+  if (value === undefined) return true;
+  if (value === null) return !schemaAllowsType(schema, 'null');
+  return value === '';
+}
+
+function schemaAllowsType(schema: any, type: string): boolean {
+  const expected = schema?.type;
+  if (!expected) return false;
+  const expectedTypes = Array.isArray(expected) ? expected : [expected];
+  return expectedTypes.includes(type);
+}
+
+function normalizeArgName(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function looksLikeUrl(value: string): boolean {
+  return /^https?:\/\/\S+$/i.test(value.trim());
 }
 
 function safeStringify(value: unknown): string {

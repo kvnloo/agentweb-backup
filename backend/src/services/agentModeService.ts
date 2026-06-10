@@ -79,6 +79,7 @@ import {
   evaluateAgentToolPolicy,
   summarizeAgentToolPolicyFlags,
   summarizeAgentToolPolicyModes,
+  validateAndRepairToolArgs,
 } from './agentToolGatewayService';
 
 type MetaApiResult = {
@@ -2849,13 +2850,51 @@ export class AgentModeService {
               skillsUpdated = true;
             }
 
-            const policyDecision = evaluateAgentToolPolicy({
+            const initialPolicyDecision = evaluateAgentToolPolicy({
               toolName: toolCall.function.name,
               args: functionArgs,
               isAdmin: hasAdminAccess,
               isSharedSession: isInteractiveShare,
               enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
             });
+
+            const toolDefinition = this.toolRegistry.getTool(toolCall.function.name)?.definition;
+            const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.inputSchema;
+            const contractResult = validateAndRepairToolArgs({
+              toolName: toolCall.function.name,
+              args: functionArgs,
+              inputSchema,
+              effect: initialPolicyDecision.effect,
+            });
+
+            if (contractResult.status === 'invalid') {
+              const errorContent = this.formatToolError(toolCall.function.name, contractResult.modelMessage);
+              (messages as any[]).push({
+                tool_call_id: toolCall.id,
+                role: 'tool',
+                name: toolCall.function.name,
+                content: errorContent,
+                metadata: { timestamp: new Date().toISOString() }
+              });
+              continue;
+            }
+
+            const preparedFunctionArgs = contractResult.args;
+            const policyDecision = evaluateAgentToolPolicy({
+              toolName: toolCall.function.name,
+              args: preparedFunctionArgs,
+              isAdmin: hasAdminAccess,
+              isSharedSession: isInteractiveShare,
+              enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
+            });
+
+            if (contractResult.status === 'repaired') {
+              policyDecision.flags.push({
+                code: 'args_repaired',
+                severity: 'info',
+                message: `Tool arguments were repaired before execution: ${contractResult.repairs.join(', ')}`,
+              });
+            }
 
             if (!policyDecision.allowed) {
               const errorMsg = `Tool "${toolCall.function.name}" was blocked by Agent Tool Gateway policy: ${policyDecision.flags.map((flag) => flag.message).join(' ')}`;
@@ -2869,7 +2908,7 @@ export class AgentModeService {
               continue;
             }
 
-            preparedCalls.push({ toolCall, functionArgs, policyDecision });
+            preparedCalls.push({ toolCall, functionArgs: preparedFunctionArgs, policyDecision });
           } catch (error) {
             // JSON parse failure — append error message for LLM
             console.error(`AgentMode: Tool argument parse error for ${toolCall.function.name}:`, error);

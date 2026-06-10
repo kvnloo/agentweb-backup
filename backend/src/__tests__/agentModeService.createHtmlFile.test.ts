@@ -484,37 +484,55 @@ describe('AgentModeService - createHtmlFile', () => {
     });
 
     it('should return error when title is missing', async () => {
-      await expect(
-        (agentModeService as any).executeTool(
-          'gpt-4',
-          'create_html_file',
-          {
-            content_draft: 'Test content'
-          },
-          'user123',
-          'session123',
-          false
-        )
-      ).rejects.toThrow('title is required and must be a string');
+      const result = await (agentModeService as any).executeTool(
+        'gpt-4',
+        'create_html_file',
+        {
+          content_draft: 'Test content'
+        },
+        'user123',
+        'session123',
+        false
+      );
 
-      expect((singletonAgentService as any).createHtmlFile).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        success: false,
+        message: 'title is required'
+      });
+      expect((singletonAgentService as any).createHtmlFile).toHaveBeenCalledWith(
+        undefined,
+        'Test content',
+        '',
+        'user123',
+        'session123',
+        'document'
+      );
     });
 
     it('should return error when content_draft is missing', async () => {
-      await expect(
-        (agentModeService as any).executeTool(
-          'gpt-4',
-          'create_html_file',
-          {
-            title: 'Test Title'
-          },
-          'user123',
-          'session123',
-          false
-        )
-      ).rejects.toThrow('content_draft is required and must be a string');
+      const result = await (agentModeService as any).executeTool(
+        'gpt-4',
+        'create_html_file',
+        {
+          title: 'Test Title'
+        },
+        'user123',
+        'session123',
+        false
+      );
 
-      expect((singletonAgentService as any).createHtmlFile).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        success: false,
+        message: 'content_draft is required'
+      });
+      expect((singletonAgentService as any).createHtmlFile).toHaveBeenCalledWith(
+        'Test Title',
+        undefined,
+        '',
+        'user123',
+        'session123',
+        'document'
+      );
     });
 
     it('should handle mock mode for create_html_file', async () => {
@@ -571,4 +589,3 @@ describe('AgentModeService - createHtmlFile', () => {
     });
   });
 });
-

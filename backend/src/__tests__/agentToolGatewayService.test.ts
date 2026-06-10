@@ -4,6 +4,7 @@ import {
   evaluateAgentToolPolicy,
   summarizeAgentToolPolicyFlags,
   summarizeAgentToolPolicyModes,
+  validateAndRepairToolArgs,
 } from '../services/agentToolGatewayService';
 
 describe('agentToolGatewayService', () => {
@@ -59,6 +60,33 @@ describe('agentToolGatewayService', () => {
 
     expect(decision.flags).toEqual(expect.arrayContaining([
       expect.objectContaining({ code: 'possible_task_tool_mismatch', severity: 'warning' }),
+    ]));
+  });
+
+  it('marks session-state tools as low-risk side effects', () => {
+    const decision = evaluateAgentToolPolicy({
+      toolName: 'save_memory',
+      args: { content: 'User prefers concise status updates' },
+    });
+
+    expect(decision.effect).toBe('session_state');
+    expect(decision.risk).toBe('low');
+    expect(decision.flags).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'side_effecting_tool', severity: 'info' }),
+    ]));
+  });
+
+  it('raises shared-session side effects to high risk', () => {
+    const decision = evaluateAgentToolPolicy({
+      toolName: 'update_html_file',
+      args: { file_url: 'https://example.com/page.html' },
+      isSharedSession: true,
+    });
+
+    expect(decision.effect).toBe('internal_write');
+    expect(decision.risk).toBe('high');
+    expect(decision.flags).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'shared_session_side_effect', severity: 'critical' }),
     ]));
   });
 
@@ -127,5 +155,290 @@ describe('agentToolGatewayService', () => {
       expect(outcome.error).toBeInstanceOf(AgentToolPolicyBlockedError);
       expect(outcome.policyDecision.allowed).toBe(false);
     }
+  });
+
+  describe('tool contract validation', () => {
+    const readFileSchema = {
+      type: 'object',
+      properties: {
+        file_url: { type: 'string' }
+      },
+      required: ['file_url'],
+      additionalProperties: false
+    };
+
+    it('passes args through when no object schema exists', () => {
+      const args = { anything: ['goes'] };
+
+      expect(validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args,
+      })).toEqual({
+        status: 'valid',
+        args,
+        issues: [],
+        repairs: [],
+      });
+
+      expect(validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args,
+        inputSchema: { type: 'string' },
+      })).toEqual({
+        status: 'valid',
+        args,
+        issues: [],
+        repairs: [],
+      });
+    });
+
+    it('rejects non-object args before tool code runs', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args: ['https://example.com/pasted-text.txt'],
+        inputSchema: readFileSchema,
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('invalid');
+      if (result.status === 'invalid') {
+        expect(result.issues).toEqual([
+          expect.objectContaining({ code: 'invalid_args', path: '$' }),
+        ]);
+      }
+    });
+
+    it('passes valid args unchanged', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args: { file_url: 'https://example.com/pasted-text.txt' },
+        inputSchema: readFileSchema,
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('valid');
+      expect(result.args).toEqual({ file_url: 'https://example.com/pasted-text.txt' });
+      expect(result.repairs).toEqual([]);
+    });
+
+    it('repairs low-risk url alias drift before execution', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args: { url: 'https://example.com/pasted-text.txt' },
+        inputSchema: readFileSchema,
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('repaired');
+      expect(result.args).toEqual({ file_url: 'https://example.com/pasted-text.txt' });
+      expect(result.repairs).toEqual(['url->file_url']);
+    });
+
+    it('repairs known optional alias fields when the canonical required field is missing', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args: { url: 'https://example.com/pasted-text.txt' },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            file_url: { type: 'string' },
+            url: { type: 'string' }
+          },
+          required: ['file_url']
+        },
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('repaired');
+      expect(result.args).toEqual({ file_url: 'https://example.com/pasted-text.txt' });
+      expect(result.repairs).toEqual(['url->file_url']);
+    });
+
+    it('repairs camelCase property drift when the target field is known', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args: { fileUrl: 'https://example.com/pasted-text.txt' },
+        inputSchema: readFileSchema,
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('repaired');
+      expect(result.args).toEqual({ file_url: 'https://example.com/pasted-text.txt' });
+      expect(result.repairs).toEqual(['fileUrl->file_url']);
+    });
+
+    it('does not guess when URL alias repair is ambiguous', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'compare_pages',
+        args: { url: 'https://example.com/page-a.html' },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            source_url: { type: 'string' },
+            target_url: { type: 'string' },
+          },
+          required: ['source_url', 'target_url'],
+          additionalProperties: false
+        },
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('invalid');
+      expect(result.repairs).toEqual([]);
+      if (result.status === 'invalid') {
+        expect(result.issues.map((issue) => issue.code)).toEqual(expect.arrayContaining([
+          'unknown_property',
+          'missing_required',
+        ]));
+      }
+    });
+
+    it('rejects missing required args with a model-visible retry message', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args: {},
+        inputSchema: readFileSchema,
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('invalid');
+      if (result.status === 'invalid') {
+        expect(result.modelMessage).toContain('failed schema validation before execution');
+        expect(result.modelMessage).toContain('Missing required argument "file_url"');
+      }
+    });
+
+    it('does not semantically repair URL aliases for side-effecting tools', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'send_email',
+        args: { url: 'https://example.com' },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            body_url: { type: 'string' }
+          },
+          required: ['body_url'],
+          additionalProperties: false
+        },
+        effect: 'external_send',
+      });
+
+      expect(result.status).toBe('invalid');
+      expect(result.args).toEqual({ url: 'https://example.com' });
+      expect(result.repairs).toEqual([]);
+    });
+
+    it('rejects unknown fields when schema is strict', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args: {
+          file_url: 'https://example.com/pasted-text.txt',
+          unexpected: true
+        },
+        inputSchema: readFileSchema,
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('invalid');
+      if (result.status === 'invalid') {
+        expect(result.issues.map((issue) => issue.code)).toContain('unknown_property');
+      }
+    });
+
+    it('allows extra fields when the schema permits additional properties', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args: {
+          file_url: 'https://example.com/pasted-text.txt',
+          metadata: { source: 'upload' }
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            file_url: { type: 'string' }
+          },
+          required: ['file_url']
+        },
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('valid');
+      expect(result.args).toEqual({
+        file_url: 'https://example.com/pasted-text.txt',
+        metadata: { source: 'upload' }
+      });
+    });
+
+    it('rejects wrong primitive types before tool code runs', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args: { file_url: 123 },
+        inputSchema: readFileSchema,
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('invalid');
+      if (result.status === 'invalid') {
+        expect(result.issues).toEqual(expect.arrayContaining([
+          expect.objectContaining({ code: 'type_mismatch', path: '$.file_url' }),
+        ]));
+      }
+    });
+
+    it('validates common JSON schema primitive types', () => {
+      const schema = {
+        type: 'object',
+        properties: {
+          count: { type: 'integer' },
+          ratio: { type: 'number' },
+          enabled: { type: 'boolean' },
+          tags: { type: 'array' },
+          options: { type: 'object' },
+          maybe: { type: ['string', 'null'] },
+        },
+        required: ['count', 'ratio', 'enabled', 'tags', 'options', 'maybe'],
+        additionalProperties: false
+      };
+
+      expect(validateAndRepairToolArgs({
+        toolName: 'read_metrics',
+        args: {
+          count: 2,
+          ratio: 0.5,
+          enabled: true,
+          tags: ['a'],
+          options: { compact: true },
+          maybe: null,
+        },
+        inputSchema: schema,
+        effect: 'read',
+      }).status).toBe('valid');
+
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_metrics',
+        args: {
+          count: 2.5,
+          ratio: Number.POSITIVE_INFINITY,
+          enabled: 'true',
+          tags: 'a',
+          options: ['compact'],
+          maybe: false,
+        },
+        inputSchema: schema,
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('invalid');
+      if (result.status === 'invalid') {
+        expect(result.issues.map((issue) => issue.path)).toEqual(expect.arrayContaining([
+          '$.count',
+          '$.ratio',
+          '$.enabled',
+          '$.tags',
+          '$.options',
+          '$.maybe',
+        ]));
+      }
+    });
   });
 });

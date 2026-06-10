@@ -1973,13 +1973,6 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    if (!args.template_id) {
-      return {
-        success: false,
-        message: 'template_id is required'
-      };
-    }
-
     // Parse JSON strings
     let variableValues = {};
     let arrayVariableValues = {};
@@ -2054,13 +2047,6 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    if (!args.file_url) {
-      return { success: false, message: 'file_url is required' };
-    }
-    if (!args.update_type) {
-      return { success: false, message: 'update_type is required' };
-    }
-
     // Accept both operations_json (new) and replacement_json (legacy) parameter names
     const jsonStr = args.operations_json || args.replacement_json;
     if (!jsonStr) {
@@ -4814,30 +4800,13 @@ emmaToolRegistry.register({
         file_url: {
           type: 'string',
           description: 'The URL of the file to read and extract content from'
-        },
-        url: {
-          type: 'string',
-          description: 'Deprecated alias for file_url. Prefer file_url.'
         }
       },
       required: ["file_url"]
     }
   },
   execute: async (args: any, context?: any) => {
-    const fileUrl = args.file_url || args.url;
-    if (!fileUrl || typeof fileUrl !== 'string') {
-      return {
-        content: [
-          {
-            type: "text",
-            text: 'Error: file_url is required. Pass the attached file URL as file_url, not url.'
-          }
-        ],
-        isError: true
-      };
-    }
-
-    const result = await agentModeService.readFileContent(fileUrl);
+    const result = await agentModeService.readFileContent(args.file_url);
     if (result.success === false) {
       return {
         content: [
@@ -4992,12 +4961,6 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    if (!args.title || typeof args.title !== 'string') {
-      throw new Error('title is required and must be a string');
-    }
-    if (!args.content_draft || typeof args.content_draft !== 'string') {
-      throw new Error('content_draft is required and must be a string');
-    }
     const documentType = args.document_type === 'email' ? 'email' : 'document';
     return await agentModeService.createHtmlFile(args.title, args.content_draft, args.format_requirements || '', context?.userId, context?.sessionId, documentType);
   }
