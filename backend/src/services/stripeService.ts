@@ -1242,17 +1242,27 @@ export async function reconcileAllStripeUsers(): Promise<{
 // ─── Subscription Amount Resync ───────────────────────────────────────────────
 
 /**
- * Sync subscription_amount for all paying users by fetching their latest
- * paid invoice from Stripe. Can be triggered on demand from the admin UI.
+ * Resync all paying users against Stripe. For each user this:
+ *   1. Authoritatively reconciles subscription_status / has_payment_method /
+ *      tier / period_end / offer via reconcileStripeUser (Stripe wins), so a
+ *      stale "past_due"/overdue account whose recovery webhook never landed
+ *      gets unstuck.
+ *   2. Refreshes subscription_amount from the latest paid invoice.
+ *
+ * Can be triggered on demand from the admin UI ("Resync Payments").
+ *
+ * `updated` counts amount changes; `reconciled` counts users whose
+ * status/payment-method/etc. drift was corrected.
  */
 export async function resyncAllSubscriptionAmounts(): Promise<{
   checked: number;
   updated: number;
+  reconciled: number;
   skipped: number;
   errors: number;
 }> {
   const stripe = getStripeOrThrow();
-  const summary = { checked: 0, updated: 0, skipped: 0, errors: 0 };
+  const summary = { checked: 0, updated: 0, reconciled: 0, skipped: 0, errors: 0 };
 
   // Exclude empty strings — attribute_exists matches "" which causes Stripe errors
   const users = await userDb.scanWithFilter(
@@ -1270,6 +1280,15 @@ export async function resyncAllSubscriptionAmounts(): Promise<{
     }
 
     try {
+      // 1. Authoritative status/payment-method/tier reconcile (Stripe wins).
+      //    This is what unsticks an overdue account, not the amount sync below.
+      const reconcileUpdates = await reconcileStripeUser(user);
+      if (reconcileUpdates && Object.keys(reconcileUpdates).length > 0) {
+        summary.reconciled++;
+        console.log(`[STRIPE RESYNC] ${user.email}: reconciled ${Object.keys(reconcileUpdates).join(', ')}`);
+      }
+
+      // 2. Refresh subscription_amount from the latest paid invoice.
       const invoices = await stripe.invoices.list({
         customer: user.stripe_customer_id,
         status: 'paid',
@@ -1278,12 +1297,12 @@ export async function resyncAllSubscriptionAmounts(): Promise<{
 
       const latestPaid = invoices.data[0];
       if (!latestPaid || typeof latestPaid.amount_paid !== 'number' || latestPaid.amount_paid <= 0) {
-        summary.skipped++;
+        if (!reconcileUpdates) summary.skipped++;
         continue;
       }
 
       if (user.subscription_amount === latestPaid.amount_paid) {
-        summary.skipped++;
+        if (!reconcileUpdates) summary.skipped++;
         continue;
       }
 
@@ -1296,6 +1315,6 @@ export async function resyncAllSubscriptionAmounts(): Promise<{
     }
   }
 
-  console.log(`[STRIPE RESYNC] Done: checked=${summary.checked}, updated=${summary.updated}, skipped=${summary.skipped}, errors=${summary.errors}`);
+  console.log(`[STRIPE RESYNC] Done: checked=${summary.checked}, updated=${summary.updated}, reconciled=${summary.reconciled}, skipped=${summary.skipped}, errors=${summary.errors}`);
   return summary;
 }
