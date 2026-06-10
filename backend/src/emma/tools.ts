@@ -4248,8 +4248,8 @@ emmaToolRegistry.register({
         },
         videoModel: {
           type: 'string',
-          description: 'Optional: Specific video generation model to use. Currently supports: veo-3.1-generate-preview (by Google). Defaults to veo-3.1-generate-preview if not specified.',
-          enum: ['veo-3.1-generate-preview']
+          description: 'Optional: Specific video generation model to use. Supports: veo-3.1-generate-preview (Google Veo, text-to-video, supports multi-clip composition) and seedance-2.0 (ByteDance Seedance 2.0 via Higgsfield, image-to-video — if no startFrame is given, a first frame is auto-generated from the prompt). Defaults to veo-3.1-generate-preview if not specified.',
+          enum: ['veo-3.1-generate-preview', 'seedance-2.0']
         },
         durationSeconds: {
           type: 'number',
