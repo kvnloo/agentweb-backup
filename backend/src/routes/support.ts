@@ -206,19 +206,69 @@ router.post("/report-error", async (req, res) => {
   }
 });
 
-// Report a UI bug from the in-app "Report a bug" button.
-// Auto-captures a screenshot on the client; here we upload it, create a tracked
-// item on the engineering sprint board, and notify the product team — the same
-// pipeline used by Emma's report_product_issues tool.
+// Report types the in-app feedback button can submit. The pipeline (screenshot
+// → S3 → sprint board item → product-team email) is identical across types;
+// only the label, Notion tag, email subject, and accent color differ.
+type ReportTypeConfig = {
+  tag: string;          // Notion tag (in addition to "Customer Reported")
+  titlePrefix: string;  // sprint item / email title prefix
+  subjectLabel: string; // email subject bracket label
+  headerLabel: string;  // email header heading
+  accent: { border: string; bg: string; heading: string };
+};
+
+const REPORT_TYPES: Record<string, ReportTypeConfig> = {
+  // Default. The button lives in the UI, so a bug is reported with a page
+  // screenshot — hence the "UI Bug" title — but the tag is the broader "Bug".
+  bug: {
+    tag: "Bug",
+    titlePrefix: "UI Bug",
+    subjectLabel: "Bug",
+    headerLabel: "Bug Report",
+    accent: { border: "#ef4444", bg: "#fef2f2", heading: "#b91c1c" },
+  },
+  feature_request: {
+    tag: "Feature Request",
+    titlePrefix: "Feature Request",
+    subjectLabel: "Feature Request",
+    headerLabel: "Feature Request",
+    accent: { border: "#6366f1", bg: "#eef2ff", heading: "#4338ca" },
+  },
+  improvement: {
+    tag: "Improvement",
+    titlePrefix: "Improvement",
+    subjectLabel: "Improvement",
+    headerLabel: "Improvement Suggestion",
+    accent: { border: "#3b82f6", bg: "#eff6ff", heading: "#1d4ed8" },
+  },
+  feedback: {
+    tag: "Feedback",
+    titlePrefix: "Feedback",
+    subjectLabel: "Feedback",
+    headerLabel: "General Feedback",
+    accent: { border: "#64748b", bg: "#f8fafc", heading: "#334155" },
+  },
+};
+
+// Report a product issue from the in-app feedback button. Supports bugs,
+// feature requests, improvement suggestions, and general feedback. The client
+// auto-captures a screenshot; here we upload it, create a tracked item on the
+// engineering sprint board, and notify the product team — the same pipeline
+// used by Emma's report_product_issues tool.
 router.post("/report-ui-bug", async (req, res) => {
   try {
     const authenticatedReq = req as any;
     const userId = authenticatedReq.user.userId;
-    const { description, pageUrl, screenshot } = req.body;
+    const { description, pageUrl, screenshot, reportType } = req.body;
 
     if (!description || !description.trim()) {
       return res.status(400).json({ message: "Description is required" });
     }
+
+    // Resolve the report type, defaulting to "bug" for backward compatibility
+    // (older clients omit reportType).
+    const typeKey = typeof reportType === "string" && REPORT_TYPES[reportType] ? reportType : "bug";
+    const config = REPORT_TYPES[typeKey];
 
     const user = await userDb.getUserById(userId);
     if (!user) {
@@ -226,7 +276,7 @@ router.post("/report-ui-bug", async (req, res) => {
     }
 
     // Upload the screenshot (if provided) to S3. Degrade gracefully — a failed
-    // upload should never block the bug report itself.
+    // upload should never block the report itself.
     let screenshotUrl: string | null = null;
     if (typeof screenshot === "string" && screenshot.startsWith("data:image")) {
       const uploaded = await uploadScreenshotToS3(screenshot, userId);
@@ -239,7 +289,7 @@ router.post("/report-ui-bug", async (req, res) => {
     const isDelegated = authenticatedReq.delegateInfo?.isDelegated === true;
     const adminEmail: string | undefined = authenticatedReq.delegateInfo?.adminEmail;
 
-    const title = `UI Bug: ${description.trim().slice(0, 80)}`;
+    const title = `${config.titlePrefix}: ${description.trim().slice(0, 80)}`;
 
     const issueContext: Record<string, any> = {
       "User Name": user.displayName || user.email,
@@ -256,7 +306,7 @@ router.post("/report-ui-bug", async (req, res) => {
     const item = await createOncallItem({
       title,
       description: description.trim(),
-      additionalTags: ["Customer Reported", "UI Bug"],
+      additionalTags: ["Customer Reported", config.tag],
       context: issueContext,
     });
     const issueId = item.pageId ? `AGW-${item.pageId}` : undefined;
@@ -277,8 +327,8 @@ router.post("/report-ui-bug", async (req, res) => {
 <head><meta charset="utf-8"></head>
 <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; line-height: 1.6; color: #333;">
   <div style="max-width: 640px; margin: 0 auto; padding: 20px;">
-    <div style="background-color: #fef2f2; padding: 16px 20px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #ef4444;">
-      <h2 style="margin: 0; color: #b91c1c; font-size: 18px;">UI Bug Report</h2>
+    <div style="background-color: ${config.accent.bg}; padding: 16px 20px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid ${config.accent.border};">
+      <h2 style="margin: 0; color: ${config.accent.heading}; font-size: 18px;">${config.headerLabel}</h2>
     </div>
 
     ${delegationNote}
@@ -290,7 +340,7 @@ router.post("/report-ui-bug", async (req, res) => {
       ${pageUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Page URL</strong></td><td style="padding: 6px 0;"><a href="${pageUrl}" style="color: #4F46E5;">${pageUrl}</a></td></tr>` : ""}
     </table>
 
-    <div style="background-color: #fff; border-left: 4px solid #ef4444; padding: 15px; border-radius: 0 4px 4px 0;">
+    <div style="background-color: #fff; border-left: 4px solid ${config.accent.border}; padding: 15px; border-radius: 0 4px 4px 0;">
       <div style="font-weight: 600; margin-bottom: 8px; color: #333;">What the user reported</div>
       <div style="color: #444; line-height: 1.6;">${description.trim().replace(/\n/g, "<br>")}</div>
     </div>
@@ -313,15 +363,15 @@ router.post("/report-ui-bug", async (req, res) => {
     await resendService.sendEmail({
       from: `${RESEND_SYSTEM_NAME} Support <${RESEND_SYSTEM_EMAIL}>`,
       to: recipients,
-      subject: `[UI Bug] ${title} — reported by ${user.email}`,
+      subject: `[${config.subjectLabel}] ${title} — reported by ${user.email}`,
       html: emailHtml,
       replyTo: user.email,
     });
 
-    res.json({ success: true, message: "Bug reported successfully", issueId });
+    res.json({ success: true, message: "Report submitted successfully", issueId });
   } catch (error) {
-    console.error("Error reporting UI bug:", error);
-    res.status(500).json({ message: "Failed to report bug" });
+    console.error("Error submitting product report:", error);
+    res.status(500).json({ message: "Failed to submit report" });
   }
 });
 
