@@ -139,6 +139,8 @@ import {
   isOrphanedFailedPage,
   cleanupOrphanedFailedPages,
   getLandingPageLiveUrl,
+  recordLandingPagePublish,
+  markLandingPagePublishReverted,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig } from "../services/v0Service";
@@ -1866,5 +1868,51 @@ describe("v0Service - buildPageSlug", () => {
     const result = buildPageSlug("a".repeat(40));
     expect(result.length).toBeLessThanOrEqual(30);
     expect(result).not.toMatch(/^-|-$/);
+  });
+});
+
+// =============================================================================
+// recordLandingPagePublish / markLandingPagePublishReverted
+// =============================================================================
+describe("v0Service - publish history (record + mark reverted)", () => {
+  const PUBLISH_RECORD = {
+    preMergeSha: "pre-sha",
+    mergeSha: "merge-sha",
+    branch: "draft/session-12345678",
+    publishedAt: "2026-06-01T00:00:00.000Z",
+  };
+
+  it("SUCCESS: recordLandingPagePublish writes lastPublish via update", async () => {
+    await expect(
+      recordLandingPagePublish("page-1", PUBLISH_RECORD)
+    ).resolves.toBeUndefined();
+
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+    const params = mockUpdate.mock.calls[0][0];
+    expect(params.Key).toEqual({ id: "page-1" });
+    expect(params.UpdateExpression).toContain("lastPublish");
+    expect(params.ExpressionAttributeValues[":lp"]).toEqual(PUBLISH_RECORD);
+  });
+
+  it("SUCCESS: markLandingPagePublishReverted sets nested revertedAt via update", async () => {
+    await expect(
+      markLandingPagePublishReverted("page-1", "2026-06-02T00:00:00.000Z")
+    ).resolves.toBeUndefined();
+
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+    const params = mockUpdate.mock.calls[0][0];
+    expect(params.Key).toEqual({ id: "page-1" });
+    expect(params.UpdateExpression).toContain("lastPublish.revertedAt");
+    expect(params.ExpressionAttributeValues[":ra"]).toBe("2026-06-02T00:00:00.000Z");
+  });
+
+  it("FAIL: propagates DynamoDB update errors", async () => {
+    mockUpdate.mockReturnValueOnce({
+      promise: () => Promise.reject(new Error("dynamo down")),
+    });
+
+    await expect(
+      recordLandingPagePublish("page-1", PUBLISH_RECORD)
+    ).rejects.toThrow("dynamo down");
   });
 });
