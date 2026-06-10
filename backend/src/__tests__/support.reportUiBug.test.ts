@@ -96,7 +96,7 @@ describe('POST /api/support/report-ui-bug', () => {
       .send({ description: 'The button overlaps the header' });
 
     expect(res.status).toBe(500);
-    expect(res.body.message).toBe('Failed to report bug');
+    expect(res.body.message).toBe('Failed to submit report');
   });
 
   // SUCCESS tests — happy path
@@ -121,7 +121,8 @@ describe('POST /api/support/report-ui-bug', () => {
     // Tracked item created on the sprint board with the right tags + context
     expect(createOncallItem).toHaveBeenCalledTimes(1);
     const itemArg = createOncallItem.mock.calls[0][0];
-    expect(itemArg.additionalTags).toEqual(expect.arrayContaining(['Customer Reported', 'UI Bug']));
+    expect(itemArg.additionalTags).toEqual(expect.arrayContaining(['Customer Reported', 'Bug']));
+    expect(itemArg.title).toMatch(/^UI Bug:/);
     expect(itemArg.description).toContain('The save button is cut off');
     expect(itemArg.context['Page URL']).toBe('https://app.agentweb.pro/settings');
     expect(itemArg.context['Screenshot']).toContain('s3.amazonaws.com');
@@ -165,5 +166,71 @@ describe('POST /api/support/report-ui-bug', () => {
     expect(createOncallItem).toHaveBeenCalledTimes(1);
     const itemArg = createOncallItem.mock.calls[0][0];
     expect(itemArg.context['Screenshot']).toBe('Upload failed');
+  });
+
+  // Report types — bugs, feature requests, improvements, general feedback
+  it('defaults to a bug report (tag "Bug", "UI Bug" title) when reportType is omitted', async () => {
+    const app = buildApp();
+    const res = await request(app)
+      .post('/api/support/report-ui-bug')
+      .send({ description: 'The layout is broken' });
+
+    expect(res.status).toBe(200);
+    const itemArg = createOncallItem.mock.calls[0][0];
+    expect(itemArg.additionalTags).toEqual(expect.arrayContaining(['Customer Reported', 'Bug']));
+    expect(itemArg.title).toMatch(/^UI Bug:/);
+    expect(resendService.sendEmail.mock.calls[0][0].subject).toContain('[Bug]');
+  });
+
+  it('falls back to a bug report when reportType is unrecognized', async () => {
+    const app = buildApp();
+    const res = await request(app)
+      .post('/api/support/report-ui-bug')
+      .send({ description: 'Weird thing', reportType: 'not-a-real-type' });
+
+    expect(res.status).toBe(200);
+    const itemArg = createOncallItem.mock.calls[0][0];
+    expect(itemArg.additionalTags).toEqual(expect.arrayContaining(['Customer Reported', 'Bug']));
+  });
+
+  it('tags and labels a feature request', async () => {
+    const app = buildApp();
+    const res = await request(app)
+      .post('/api/support/report-ui-bug')
+      .send({ description: 'Please add dark mode', reportType: 'feature_request' });
+
+    expect(res.status).toBe(200);
+    const itemArg = createOncallItem.mock.calls[0][0];
+    expect(itemArg.additionalTags).toEqual(expect.arrayContaining(['Customer Reported', 'Feature Request']));
+    expect(itemArg.title).toMatch(/^Feature Request:/);
+    const emailCall = resendService.sendEmail.mock.calls[0][0];
+    expect(emailCall.subject).toContain('[Feature Request]');
+    expect(emailCall.html).toContain('Feature Request');
+  });
+
+  it('tags and labels an improvement suggestion', async () => {
+    const app = buildApp();
+    const res = await request(app)
+      .post('/api/support/report-ui-bug')
+      .send({ description: 'Make the dashboard faster', reportType: 'improvement' });
+
+    expect(res.status).toBe(200);
+    const itemArg = createOncallItem.mock.calls[0][0];
+    expect(itemArg.additionalTags).toEqual(expect.arrayContaining(['Customer Reported', 'Improvement']));
+    expect(itemArg.title).toMatch(/^Improvement:/);
+    expect(resendService.sendEmail.mock.calls[0][0].subject).toContain('[Improvement]');
+  });
+
+  it('tags and labels general feedback', async () => {
+    const app = buildApp();
+    const res = await request(app)
+      .post('/api/support/report-ui-bug')
+      .send({ description: 'Love the product!', reportType: 'feedback' });
+
+    expect(res.status).toBe(200);
+    const itemArg = createOncallItem.mock.calls[0][0];
+    expect(itemArg.additionalTags).toEqual(expect.arrayContaining(['Customer Reported', 'Feedback']));
+    expect(itemArg.title).toMatch(/^Feedback:/);
+    expect(resendService.sendEmail.mock.calls[0][0].subject).toContain('[Feedback]');
   });
 });
