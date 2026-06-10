@@ -1,4 +1,8 @@
-import { buildAgentRunSummaries, AgentRunEventRow } from '../services/agentRunInspectorService';
+import {
+  buildAgentRunChatContext,
+  buildAgentRunSummaries,
+  AgentRunEventRow,
+} from '../services/agentRunInspectorService';
 import {
   EVT_DECISION,
   EVT_RUN_COMPLETED,
@@ -186,5 +190,72 @@ describe('agentRunInspectorService', () => {
       expect.objectContaining({ code: 'repeated_tool', severity: 'warning', evidence: 'search_web' }),
       expect.objectContaining({ code: 'possible_task_tool_mismatch', severity: 'warning', evidence: 'create_gtm_plan' }),
     ]));
+  });
+
+  it('builds chat context from the matching ChatSession and ChatMessages rows', () => {
+    const chat = buildAgentRunChatContext({
+      sessionId: 'sess-chat-1',
+      customerPortalBaseUrl: 'https://app.agentweb.pro/',
+      session: {
+        sessionId: 'sess-chat-1',
+        title: 'Tool-heavy reliability smoke test',
+        portalType: 'agent',
+        sessionType: 'regular',
+        createdAt: '2026-06-10T10:00:00.000Z',
+        updatedAt: '2026-06-10T10:02:00.000Z',
+        messageCount: 4,
+      },
+      messages: [
+        {
+          messageIndex: 3,
+          message: {
+            role: 'assistant',
+            content: 'I created the requested HTML file and checked the tool results.',
+          },
+        },
+        {
+          messageIndex: 1,
+          message: {
+            role: 'user',
+            content: 'Read this pasted text and create an HTML report.',
+          },
+        },
+        {
+          messageIndex: 2,
+          message: {
+            role: 'user',
+            content: [{ type: 'text', text: 'Also make sure telemetry captures why tools were used.' }],
+          },
+        },
+      ],
+    });
+
+    expect(chat).toEqual(expect.objectContaining({
+      found: true,
+      sessionId: 'sess-chat-1',
+      title: 'Tool-heavy reliability smoke test',
+      portalType: 'agent',
+      sessionType: 'regular',
+      messageCount: 4,
+      firstUserMessage: 'Read this pasted text and create an HTML report.',
+      lastUserMessage: 'Also make sure telemetry captures why tools were used.',
+      lastAssistantMessage: 'I created the requested HTML file and checked the tool results.',
+      customerPortalUrl: 'https://app.agentweb.pro/agent-mode/sess-chat-1',
+    }));
+  });
+
+  it('returns a clear not-found chat context when only spine telemetry exists', () => {
+    const chat = buildAgentRunChatContext({
+      sessionId: 'missing-session',
+      customerPortalBaseUrl: 'https://app.agentweb.pro',
+      messages: [],
+    });
+
+    expect(chat).toEqual({
+      found: false,
+      sessionId: 'missing-session',
+      messageCount: 0,
+      customerPortalUrl: 'https://app.agentweb.pro/agent-mode/missing-session',
+    });
   });
 });

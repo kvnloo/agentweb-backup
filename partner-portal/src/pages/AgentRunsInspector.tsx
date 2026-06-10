@@ -30,6 +30,7 @@ import BugReportIcon from '@mui/icons-material/BugReport';
 import WarningAmberIcon from '@mui/icons-material/WarningAmber';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import ErrorOutlineIcon from '@mui/icons-material/ErrorOutline';
+import OpenInNewIcon from '@mui/icons-material/OpenInNew';
 
 type RunStatus = 'running' | 'completed' | 'failed' | 'unknown';
 type FlagSeverity = 'info' | 'warning' | 'critical';
@@ -63,6 +64,22 @@ interface AgentRunOutcome {
   errorMessage?: string;
 }
 
+interface AgentRunChatContext {
+  found: boolean;
+  sessionId: string;
+  title?: string;
+  portalType?: string;
+  pageIdentifier?: string;
+  sessionType?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  messageCount: number;
+  firstUserMessage?: string;
+  lastUserMessage?: string;
+  lastAssistantMessage?: string;
+  customerPortalUrl?: string;
+}
+
 interface AgentRun {
   runId: string;
   sessionId?: string;
@@ -78,6 +95,7 @@ interface AgentRun {
   flags: AgentRunFlag[];
   decisions: AgentRunDecision[];
   outcomes: AgentRunOutcome[];
+  chat?: AgentRunChatContext;
 }
 
 interface AgentRunsResponse {
@@ -127,6 +145,18 @@ function shortId(value?: string, head = 12): string {
 function parsePolicySummary(summary?: string): string[] {
   if (!summary) return [];
   return summary.split(',').map((entry) => entry.trim()).filter(Boolean);
+}
+
+function runChatLabel(run: AgentRun): string {
+  return run.chat?.title || run.chat?.firstUserMessage || run.chat?.lastUserMessage || shortId(run.sessionId, 16);
+}
+
+function runChatMeta(run: AgentRun): string {
+  const parts = [
+    run.chat?.found ? `${run.chat.messageCount} messages` : 'No chat history',
+    formatDate(run.startedAt),
+  ];
+  return parts.filter(Boolean).join(' · ');
 }
 
 export default function AgentRunsInspector() {
@@ -301,7 +331,7 @@ export default function AgentRunsInspector() {
               <Table stickyHeader size="small">
                 <TableHead>
                   <TableRow>
-                    <TableCell>Run</TableCell>
+                    <TableCell>Chat</TableCell>
                     <TableCell>Status</TableCell>
                     <TableCell align="right">Tools</TableCell>
                     <TableCell align="right">Flags</TableCell>
@@ -317,13 +347,16 @@ export default function AgentRunsInspector() {
                       sx={{ cursor: 'pointer' }}
                     >
                       <TableCell>
-                        <Tooltip title={run.runId}>
-                          <Typography variant="body2" fontWeight={600}>
-                            {shortId(run.runId)}
+                        <Tooltip title={run.chat?.firstUserMessage || run.runId}>
+                          <Typography variant="body2" fontWeight={600} sx={{ maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {runChatLabel(run)}
                           </Typography>
                         </Tooltip>
-                        <Typography variant="caption" color="text.secondary">
-                          {formatDate(run.startedAt)}
+                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                          {runChatMeta(run)}
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                          Run {shortId(run.runId, 10)}
                         </Typography>
                       </TableCell>
                       <TableCell>
@@ -388,11 +421,14 @@ function RunDetail({ run }: { run: AgentRun | null }) {
             <Box sx={{ flex: 1, minWidth: 260 }}>
               <Tooltip title={run.runId}>
                 <Typography variant="h6" fontWeight={700}>
-                  {shortId(run.runId, 24)}
+                  {runChatLabel(run)}
                 </Typography>
               </Tooltip>
               <Typography variant="body2" color="text.secondary">
                 User {shortId(run.userId, 18)} · Session {shortId(run.sessionId, 18)}
+              </Typography>
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
+                Run {shortId(run.runId, 24)}
               </Typography>
             </Box>
             <Chip label={statusConfig[run.status].label} color={statusConfig[run.status].color} />
@@ -408,6 +444,8 @@ function RunDetail({ run }: { run: AgentRun | null }) {
           </Grid>
         </CardContent>
       </Card>
+
+      <ChatHistorySummary run={run} />
 
       <Card>
         <CardContent>
@@ -543,6 +581,62 @@ function RunDetail({ run }: { run: AgentRun | null }) {
         </CardContent>
       </Card>
     </Stack>
+  );
+}
+
+function ChatHistorySummary({ run }: { run: AgentRun }) {
+  const chat = run.chat;
+  return (
+    <Card>
+      <CardContent>
+        <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 2, flexWrap: 'wrap', mb: 2 }}>
+          <Box sx={{ flex: 1, minWidth: 260 }}>
+            <Typography variant="subtitle1" fontWeight={700}>
+              Chat History
+            </Typography>
+            <Typography variant="body2" color="text.secondary">
+              {chat?.found
+                ? `${chat.messageCount} message(s) linked to this AgentRun session.`
+                : 'No chat history found for this AgentRun session.'}
+            </Typography>
+          </Box>
+          {chat?.customerPortalUrl && (
+            <Button
+              component="a"
+              href={chat.customerPortalUrl}
+              target="_blank"
+              rel="noreferrer"
+              size="small"
+              variant="outlined"
+              endIcon={<OpenInNewIcon fontSize="small" />}
+            >
+              Open chat
+            </Button>
+          )}
+        </Box>
+
+        {chat?.found ? (
+          <Grid container spacing={2}>
+            <Metric label="Session title" value={chat.title || '-'} />
+            <Metric label="Updated" value={formatDate(chat.updatedAt)} />
+            <Metric label="First user ask" value={chat.firstUserMessage || '-'} />
+            <Metric label="Latest user ask" value={chat.lastUserMessage || '-'} />
+            <Grid item xs={12}>
+              <Typography variant="caption" color="text.secondary">
+                Latest assistant response
+              </Typography>
+              <Typography variant="body2" fontWeight={600} sx={{ wordBreak: 'break-word' }}>
+                {chat.lastAssistantMessage || '-'}
+              </Typography>
+            </Grid>
+          </Grid>
+        ) : (
+          <Typography variant="body2" color="text.secondary">
+            The spine has a session ID, but the inspector could not find matching chat messages. That usually means the run came from an older trace, another environment, or a deleted session.
+          </Typography>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 
