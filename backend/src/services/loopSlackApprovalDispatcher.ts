@@ -51,6 +51,10 @@ interface DispatchResult {
 // Cached Emma bot user ID (fetched lazily via auth.test on first use).
 let emmaBotUserId: string | null = null;
 
+export function _resetLoopApprovalForTesting(): void {
+  emmaBotUserId = null;
+}
+
 export async function getEmmaBotUserId(): Promise<string | null> {
   if (emmaBotUserId) return emmaBotUserId;
   try {

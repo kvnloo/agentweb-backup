@@ -90,6 +90,7 @@ jest.mock('../services/slackService', () => ({
 
 // Tracker — use real impl, just reset between tests.
 import { _resetForTesting as resetTracker, isDispatched } from '../services/loopDispatchTracker';
+import { _resetLoopApprovalForTesting } from '../services/loopSlackApprovalDispatcher';
 
 // Import router AFTER all mocks declared.
 import slackRouter from '../routes/slack';
@@ -155,6 +156,18 @@ function buildFutureLoopDmMessage() {
   ].join('\n');
 }
 
+function buildUnparseableLoopDmMessage() {
+  return [
+    '*🧪 Revenue Loop — daily run 2026-06-10*',
+    'Run ID: `loop-revenue-empty`',
+    'Events scanned: 17  |  Findings: 1',
+    '',
+    'I found something, but this digest forgot to include numbered items.',
+    '',
+    'React ✅ to dispatch all to cloud-dev  |  ❌ to skip  |  🛑 to pause loop',
+  ].join('\n');
+}
+
 function buildApp(): express.Application {
   const app = express();
   app.use(express.json());
@@ -170,6 +183,7 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
   beforeEach(() => {
     jest.clearAllMocks();
     resetTracker();
+    _resetLoopApprovalForTesting();
 
     mockAuthTest.mockResolvedValue({ ok: true, user_id: EMMA_BOT });
     mockChatPostMessage.mockResolvedValue({ ok: true, ts: 'reply-ts' });
@@ -309,6 +323,13 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
   });
 
   it('lets a new loop use the shared ✅ footer without adding a bespoke Slack handler', async () => {
+    (global.fetch as jest.Mock).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        id: 'future-loop-page-id',
+      }),
+    } as Response);
+
     mockConversationsHistory.mockResolvedValue({
       ok: true,
       messages: [
@@ -350,7 +371,7 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
       }),
     );
     expect(mockLaunchEnvironment).toHaveBeenCalledWith(
-      'notion-ai-readiness-page-id',
+      'future-loop-page-id',
       expect.stringContaining('fix(revenue-loop)'),
       expect.stringContaining('tighten the pricing CTA'),
       SPRINT_TASKS_DATA_SOURCE,
@@ -361,6 +382,86 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
     );
     expect(replies[0][0].text).toMatch(/Creating 1 cloud-dev task for Revenue Loop/i);
     expect(replies[replies.length - 1][0].text).toMatch(/Launched 1\/1 cloud-dev run for Revenue Loop/i);
+    expect(replies[replies.length - 1][0].text).toMatch(/futurelooppageid/i);
+    expect(isDispatched(FUTURE_LOOP_MESSAGE_TS)).toBe(true);
+  });
+
+  it('reports a parse warning for new loop digests that have the shared footer but no dispatchable items', async () => {
+    mockConversationsHistory.mockResolvedValue({
+      ok: true,
+      messages: [
+        {
+          ts: FUTURE_LOOP_MESSAGE_TS,
+          user: EMMA_BOT,
+          bot_id: 'B_EMMA',
+          text: buildUnparseableLoopDmMessage(),
+        },
+      ],
+    });
+
+    const res = await request(buildApp())
+      .post('/api/slack/events')
+      .send({
+        type: 'event_callback',
+        event: {
+          type: 'reaction_added',
+          reaction: 'white_check_mark',
+          user: HARSHA,
+          item: { type: 'message', channel: DM_CHANNEL, ts: FUTURE_LOOP_MESSAGE_TS },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    await wait();
+
+    expect(mockLaunchEnvironment).not.toHaveBeenCalled();
+    const replies = mockChatPostMessage.mock.calls.filter(
+      ([arg]) => arg.thread_ts === FUTURE_LOOP_MESSAGE_TS,
+    );
+    expect(replies[0][0].text).toMatch(/could not parse any dispatchable tasks/i);
+  });
+
+  it('reports failed generated-task dispatch without hiding the rest of the reaction handler', async () => {
+    (global.fetch as jest.Mock).mockResolvedValueOnce({
+      ok: false,
+      json: async () => ({
+        object: 'error',
+        message: 'Notion write denied',
+      }),
+    } as Response);
+    mockConversationsHistory.mockResolvedValue({
+      ok: true,
+      messages: [
+        {
+          ts: FUTURE_LOOP_MESSAGE_TS,
+          user: EMMA_BOT,
+          bot_id: 'B_EMMA',
+          text: buildFutureLoopDmMessage(),
+        },
+      ],
+    });
+
+    const res = await request(buildApp())
+      .post('/api/slack/events')
+      .send({
+        type: 'event_callback',
+        event: {
+          type: 'reaction_added',
+          reaction: 'white_check_mark',
+          user: HARSHA,
+          item: { type: 'message', channel: DM_CHANNEL, ts: FUTURE_LOOP_MESSAGE_TS },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    await wait();
+
+    expect(mockLaunchEnvironment).not.toHaveBeenCalled();
+    const replies = mockChatPostMessage.mock.calls.filter(
+      ([arg]) => arg.thread_ts === FUTURE_LOOP_MESSAGE_TS,
+    );
+    expect(replies[replies.length - 1][0].text).toMatch(/Launched 0\/1 cloud-dev run/i);
+    expect(replies[replies.length - 1][0].text).toMatch(/Notion write denied/i);
     expect(isDispatched(FUTURE_LOOP_MESSAGE_TS)).toBe(true);
   });
 
@@ -517,6 +618,30 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
     consoleSpy.mockRestore();
   });
 
+  it('logs generic Slack history errors and returns 200 without dispatching', async () => {
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    mockConversationsHistory.mockRejectedValue(new Error('slack api unavailable'));
+
+    const res = await request(buildApp())
+      .post('/api/slack/events')
+      .send({
+        type: 'event_callback',
+        event: {
+          type: 'reaction_added',
+          reaction: 'white_check_mark',
+          user: HARSHA,
+          item: { type: 'message', channel: DM_CHANNEL, ts: MESSAGE_TS },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    await wait();
+
+    expect(mockLaunchEnvironment).not.toHaveBeenCalled();
+    expect(consoleSpy.mock.calls.flat().join(' ')).toMatch(/conversations\.history failed/);
+    consoleSpy.mockRestore();
+  });
+
   it('reports partial-success when one launchEnvironment throws', async () => {
     mockConversationsHistory.mockResolvedValue({
       ok: true,
@@ -616,5 +741,39 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
     expect(res.status).toBe(200);
     await wait();
     expect(mockLaunchEnvironment).not.toHaveBeenCalled();
+  });
+
+  it('ignores no-bot_id messages when Emma bot identity lookup fails', async () => {
+    const consoleSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    mockAuthTest.mockRejectedValue(new Error('auth.test failed'));
+    mockConversationsHistory.mockResolvedValue({
+      ok: true,
+      messages: [
+        {
+          ts: MESSAGE_TS,
+          user: EMMA_BOT,
+          text: buildLoopDmMessage(),
+        },
+      ],
+    });
+
+    const res = await request(buildApp())
+      .post('/api/slack/events')
+      .send({
+        type: 'event_callback',
+        event: {
+          type: 'reaction_added',
+          reaction: 'white_check_mark',
+          user: HARSHA,
+          item: { type: 'message', channel: DM_CHANNEL, ts: MESSAGE_TS },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    await wait();
+
+    expect(mockLaunchEnvironment).not.toHaveBeenCalled();
+    expect(consoleSpy.mock.calls.flat().join(' ')).toMatch(/Could not fetch Emma bot user ID/);
+    consoleSpy.mockRestore();
   });
 });
