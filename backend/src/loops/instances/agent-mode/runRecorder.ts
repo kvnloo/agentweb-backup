@@ -63,6 +63,10 @@ export class AgentRunRecorder {
       sessionId?: string;
       toolArgKeys?: string;
       toolArgsPreview?: string;
+      decisionExplanation?: string;
+      explanationSource?: string;
+      toolPolicyFlags?: string;
+      toolPolicySummary?: string;
     },
   ): Promise<void> {
     await this.emit(runId, EVT_DECISION, {
@@ -72,6 +76,10 @@ export class AgentRunRecorder {
       ...(info.sessionId ? { sessionId: info.sessionId } : {}),
       ...(info.toolArgKeys ? { toolArgKeys: info.toolArgKeys } : {}),
       ...(info.toolArgsPreview ? { toolArgsPreview: info.toolArgsPreview } : {}),
+      ...(info.decisionExplanation ? { decisionExplanation: info.decisionExplanation } : {}),
+      ...(info.explanationSource ? { explanationSource: info.explanationSource } : {}),
+      ...(info.toolPolicyFlags ? { toolPolicyFlags: info.toolPolicyFlags } : {}),
+      ...(info.toolPolicySummary ? { toolPolicySummary: info.toolPolicySummary } : {}),
     });
   }
 

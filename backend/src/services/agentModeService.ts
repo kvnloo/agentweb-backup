@@ -73,6 +73,12 @@ import { googleAdsService } from './googleAdsService';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
+import {
+  AgentToolPolicyDecision,
+  evaluateAgentToolPolicy,
+  summarizeAgentToolPolicyFlags,
+  summarizeAgentToolPolicyModes,
+} from './agentToolGatewayService';
 
 type MetaApiResult = {
   success: boolean;
@@ -118,7 +124,7 @@ function recordAgentModeToolTelemetry(
   runId: string,
   sessionId: string,
   iteration: number,
-  toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs?: any; error?: any; duration: number }>,
+  toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>,
 ): void {
   const recorder = getAgentRunRecorderSafe();
   if (!recorder || toolResults.length === 0) return;
@@ -132,6 +138,10 @@ function recordAgentModeToolTelemetry(
         sessionId,
         toolArgKeys: summarizeToolArgKeys(toolResults),
         toolArgsPreview: summarizeToolArgs(toolResults),
+        decisionExplanation: summarizeToolDecision(toolResults),
+        explanationSource: 'deterministic_tool_summary',
+        toolPolicyFlags: summarizeAgentToolPolicyFlags(toolResults.map((r) => r.policyDecision)),
+        toolPolicySummary: summarizeAgentToolPolicyModes(toolResults.map((r) => r.policyDecision)),
       });
       for (const r of toolResults) {
         const toolName = r.toolCall?.function?.name ?? 'unknown';
@@ -207,6 +217,40 @@ function summarizeToolArgs(
   return json.length > AGENT_RUNTIME_ARG_PREVIEW_MAX_CHARS
     ? `${json.slice(0, AGENT_RUNTIME_ARG_PREVIEW_MAX_CHARS - 3)}...`
     : json;
+}
+
+function summarizeToolDecision(
+  toolResults: Array<{ toolCall: any; functionArgs?: any }>,
+): string {
+  const toolNames = toolResults.map((r) => r.toolCall?.function?.name ?? 'unknown');
+  const uniqueTools = [...new Set(toolNames)];
+  if (uniqueTools.length === 0) return 'No tool decision was recorded.';
+  if (uniqueTools.every((name) => name === 'search_web')) {
+    const queries = toolResults
+      .map((r) => typeof r.functionArgs?.query === 'string' ? r.functionArgs.query : '')
+      .filter(Boolean)
+      .slice(0, 3);
+    return queries.length > 0
+      ? `Chose web search to gather external or current information for: ${queries.join(' | ')}.`
+      : 'Chose web search to gather external or current information.';
+  }
+  const reasons: string[] = [];
+  if (uniqueTools.includes('save_memory')) reasons.push('save_memory to persist user-provided information for future context');
+  if (uniqueTools.includes('read_file_content')) reasons.push('read_file_content to inspect a file artifact before answering');
+  if (uniqueTools.includes('save_file')) reasons.push('save_file to create or update a durable file artifact');
+  if (uniqueTools.includes('install_skills')) reasons.push('install_skills to make a required skill or work-plan capability available before continuing');
+  if (reasons.length === 1 && uniqueTools.length === 1) return `Chose ${reasons[0]}.`;
+  if (reasons.length > 0) return `Chose multiple tools: ${reasons.join('; ')}.`;
+  if (uniqueTools.some((name) => name.startsWith('playwright_browser_'))) {
+    return `Chose browser automation to inspect or interact with a webpage using: ${uniqueTools.join(', ')}.`;
+  }
+  if (uniqueTools.includes('create_task_from_prompt')) {
+    return 'Chose create_task_from_prompt because the request appears to require creating a tracked task.';
+  }
+  if (uniqueTools.length === 1) {
+    return `Chose ${uniqueTools[0]} based on the requested action and available tool schema.`;
+  }
+  return `Chose multiple tools in one iteration: ${uniqueTools.join(', ')}.`;
 }
 
 function redactTelemetryValue(value: unknown, depth = 0): unknown {
@@ -2702,7 +2746,7 @@ export class AgentModeService {
         const failedCounterUpdates: Record<string, number> = {};
 
         // Phase 1: Validate and prepare tool calls (synchronous)
-        const preparedCalls: Array<{ toolCall: any; functionArgs: any }> = [];
+        const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision }> = [];
 
         for (const toolCall of responseMessage.tool_calls) {
           try {
@@ -2772,7 +2816,27 @@ export class AgentModeService {
               skillsUpdated = true;
             }
 
-            preparedCalls.push({ toolCall, functionArgs });
+            const policyDecision = evaluateAgentToolPolicy({
+              toolName: toolCall.function.name,
+              args: functionArgs,
+              isAdmin: hasAdminAccess,
+              isSharedSession: isInteractiveShare,
+              enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
+            });
+
+            if (!policyDecision.allowed) {
+              const errorMsg = `Tool "${toolCall.function.name}" was blocked by Agent Tool Gateway policy: ${policyDecision.flags.map((flag) => flag.message).join(' ')}`;
+              (messages as any[]).push({
+                tool_call_id: toolCall.id,
+                role: 'tool',
+                name: toolCall.function.name,
+                content: JSON.stringify({ error: errorMsg, policy: policyDecision }),
+                metadata: { timestamp: new Date().toISOString() }
+              });
+              continue;
+            }
+
+            preparedCalls.push({ toolCall, functionArgs, policyDecision });
           } catch (error) {
             // JSON parse failure — append error message for LLM
             console.error(`AgentMode: Tool argument parse error for ${toolCall.function.name}:`, error);
@@ -2798,13 +2862,13 @@ export class AgentModeService {
           toolCall.function.name === 'generate_image' || toolCall.function.name === 'generate_video' || toolCall.function.name === 'generate_voiceover'
         );
 
-        let toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs: any; result?: any; error?: any; duration: number }>;
+        let toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs: any; result?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>;
 
         if (hasWaitTool || hasMultipleMediaGenTools) {
           // Sequential execution — preserves ordering so wait_seconds acts as a pause between tools,
           // and prevents rate-limit throttling when batching multiple image/video generation calls
           toolResults = [];
-          for (const { toolCall, functionArgs } of preparedCalls) {
+          for (const { toolCall, functionArgs, policyDecision } of preparedCalls) {
             const toolStart = Date.now();
             try {
               const toolOptions: Record<string, any> = {};
@@ -2813,15 +2877,15 @@ export class AgentModeService {
               if (isDelegatedAccess) toolOptions.isDelegatedAccess = true;
               const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, Object.keys(toolOptions).length > 0 ? toolOptions : undefined);
               const toolDuration = Date.now() - toolStart;
-              toolResults.push({ status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration });
+              toolResults.push({ status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration, policyDecision });
             } catch (error) {
               const toolDuration = Date.now() - toolStart;
-              toolResults.push({ status: 'error' as const, toolCall, functionArgs, error, duration: toolDuration });
+              toolResults.push({ status: 'error' as const, toolCall, functionArgs, error, duration: toolDuration, policyDecision });
             }
           }
         } else {
           // Parallel execution (default)
-          const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs }) => {
+          const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs, policyDecision }) => {
             const toolStart = Date.now();
             try {
               const toolOptions: Record<string, any> = {};
@@ -2830,10 +2894,10 @@ export class AgentModeService {
               if (isDelegatedAccess) toolOptions.isDelegatedAccess = true;
               const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, Object.keys(toolOptions).length > 0 ? toolOptions : undefined);
               const toolDuration = Date.now() - toolStart;
-              return { status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration };
+              return { status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration, policyDecision };
             } catch (error) {
               const toolDuration = Date.now() - toolStart;
-              return { status: 'error' as const, toolCall, functionArgs, error, duration: toolDuration };
+              return { status: 'error' as const, toolCall, functionArgs, error, duration: toolDuration, policyDecision };
             }
           });
           toolResults = await Promise.all(toolPromises);
