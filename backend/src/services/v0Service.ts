@@ -132,8 +132,27 @@ export interface GeneratedLandingPage {
   archivedAt?: string;
   gtmContainerId?: string;
   context?: string;
+  /**
+   * State captured at the most recent publish, used to revert it. The pre-merge
+   * `main` SHA is the exact byte-perfect rollback target — reverting simply
+   * force-resets `main` back to it. Marked with `revertedAt` once consumed.
+   */
+  lastPublish?: LandingPagePublishRecord;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface LandingPagePublishRecord {
+  /** The `main` SHA immediately before the publish merge — the revert target. */
+  preMergeSha: string;
+  /** The merge (or force-advanced) commit SHA that became the new `main`. */
+  mergeSha: string;
+  /** The draft branch that was published. */
+  branch: string;
+  /** ISO timestamp of the publish. */
+  publishedAt: string;
+  /** ISO timestamp set when a revert consumes this record (undefined = revertable). */
+  revertedAt?: string;
 }
 
 /**
@@ -2616,6 +2635,47 @@ export async function updateLandingPageGtm(
       })
       .promise();
   }
+}
+
+/**
+ * Persist the state needed to revert the most recent publish. Overwrites any
+ * prior `lastPublish` — only the latest publish is revertable (single-step).
+ */
+export async function recordLandingPagePublish(
+  id: string,
+  publishRecord: LandingPagePublishRecord
+): Promise<void> {
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      UpdateExpression: "SET lastPublish = :lp, updatedAt = :now",
+      ExpressionAttributeValues: {
+        ":lp": publishRecord,
+        ":now": new Date().toISOString(),
+      },
+    })
+    .promise();
+}
+
+/**
+ * Mark the recorded publish as reverted so it cannot be reverted twice.
+ */
+export async function markLandingPagePublishReverted(
+  id: string,
+  revertedAt: string
+): Promise<void> {
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      UpdateExpression: "SET lastPublish.revertedAt = :ra, updatedAt = :now",
+      ExpressionAttributeValues: {
+        ":ra": revertedAt,
+        ":now": new Date().toISOString(),
+      },
+    })
+    .promise();
 }
 
 export async function updateLandingPageContext(
