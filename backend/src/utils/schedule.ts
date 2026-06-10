@@ -30,10 +30,5 @@ export function calculateNextRunTime(frequency: string, timezone: string = 'UTC'
   nextRun = setHours(nextRun, defaultHour);
   nextRun = setMinutes(nextRun, defaultMinute);
 
-  // If the calculated next run time is in the past, add one more day
-  if (nextRun < zonedNow) {
-    nextRun = addDays(nextRun, 1);
-  }
-
   return format(nextRun, "yyyy-MM-dd'T'HH:mm:ssXXX");
-} 
+}
