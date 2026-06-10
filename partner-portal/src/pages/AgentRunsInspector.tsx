@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import axios from 'axios';
-import { buildApiUrl } from '../config';
+import { buildApiUrl, CUSTOMER_FRONTEND_URL } from '../config';
 import { useAuth } from '../contexts/AuthContext';
 import {
   Alert,
@@ -157,6 +157,12 @@ function runChatMeta(run: AgentRun): string {
     formatDate(run.startedAt),
   ];
   return parts.filter(Boolean).join(' · ');
+}
+
+function buildCustomerChatUrl(chat?: AgentRunChatContext): string | undefined {
+  if (!chat?.sessionId) return chat?.customerPortalUrl;
+  const baseUrl = CUSTOMER_FRONTEND_URL.replace(/\/+$/, '');
+  return `${baseUrl}/agent-mode/${encodeURIComponent(chat.sessionId)}`;
 }
 
 export default function AgentRunsInspector() {
@@ -586,6 +592,7 @@ function RunDetail({ run }: { run: AgentRun | null }) {
 
 function ChatHistorySummary({ run }: { run: AgentRun }) {
   const chat = run.chat;
+  const customerChatUrl = buildCustomerChatUrl(chat);
   return (
     <Card>
       <CardContent>
@@ -600,10 +607,10 @@ function ChatHistorySummary({ run }: { run: AgentRun }) {
                 : 'No chat history found for this AgentRun session.'}
             </Typography>
           </Box>
-          {chat?.customerPortalUrl && (
+          {customerChatUrl && (
             <Button
               component="a"
-              href={chat.customerPortalUrl}
+              href={customerChatUrl}
               target="_blank"
               rel="noreferrer"
               size="small"
