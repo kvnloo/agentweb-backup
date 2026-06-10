@@ -141,6 +141,7 @@ import {
   getLandingPageLiveUrl,
   recordLandingPagePublish,
   markLandingPagePublishReverted,
+  triggerVercelDeployment,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig } from "../services/v0Service";
@@ -1914,5 +1915,43 @@ describe("v0Service - publish history (record + mark reverted)", () => {
     await expect(
       recordLandingPagePublish("page-1", PUBLISH_RECORD)
     ).rejects.toThrow("dynamo down");
+  });
+});
+
+// =============================================================================
+// triggerVercelDeployment — production target for main
+// =============================================================================
+describe("v0Service - triggerVercelDeployment", () => {
+  beforeEach(() => {
+    // repo info lookup (for repoId)
+    mockAxiosGet.mockResolvedValue({ data: { id: 12345 } });
+    mockAxiosPost.mockResolvedValue({ data: { id: "dpl_1" } });
+  });
+
+  it("sets target=production when deploying main (so the production alias updates)", async () => {
+    await triggerVercelDeployment("prj_1", "Org/repo", "main");
+
+    expect(mockAxiosPost).toHaveBeenCalledWith(
+      "https://api.vercel.com/v13/deployments",
+      expect.objectContaining({
+        target: "production",
+        gitSource: expect.objectContaining({ ref: "main", repo: "Org/repo", repoId: 12345 }),
+      }),
+      expect.any(Object)
+    );
+  });
+
+  it("defaults ref to main and targets production", async () => {
+    await triggerVercelDeployment("prj_1", "Org/repo");
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.target).toBe("production");
+    expect(body.gitSource.ref).toBe("main");
+  });
+
+  it("does NOT set production target for a non-main (preview) ref", async () => {
+    await triggerVercelDeployment("prj_1", "Org/repo", "draft/session-12345678");
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.target).toBeUndefined();
+    expect(body.gitSource.ref).toBe("draft/session-12345678");
   });
 });
