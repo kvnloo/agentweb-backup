@@ -68,6 +68,8 @@ describe('AgentRunRecorder', () => {
       toolArgsPreview: '[{"tool":"generate_image","args":{"prompt":"hero image"}}]',
       decisionExplanation: 'Chose multiple tools in one iteration.',
       explanationSource: 'deterministic_tool_summary',
+      toolPolicyFlags: 'send_email:confirmation_recommended:critical',
+      toolPolicySummary: 'send_email:external_send:high:observe',
     });
 
     const item = puts[0].item as any;
@@ -79,6 +81,8 @@ describe('AgentRunRecorder', () => {
     expect(item.dimensions.toolArgsPreview).toContain('hero image');
     expect(item.dimensions.decisionExplanation).toBe('Chose multiple tools in one iteration.');
     expect(item.dimensions.explanationSource).toBe('deterministic_tool_summary');
+    expect(item.dimensions.toolPolicyFlags).toBe('send_email:confirmation_recommended:critical');
+    expect(item.dimensions.toolPolicySummary).toBe('send_email:external_send:high:observe');
   });
 
   it('records tool invoked + succeeded with toolName + duration', async () => {

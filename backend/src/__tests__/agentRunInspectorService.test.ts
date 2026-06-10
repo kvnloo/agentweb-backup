@@ -41,6 +41,8 @@ describe('agentRunInspectorService', () => {
           toolArgsPreview: '[{"tool":"save_memory","args":{"content":"hello"}}]',
           decisionExplanation: 'Chose save_memory to persist user-provided information for future context.',
           explanationSource: 'deterministic_tool_summary',
+          toolPolicyFlags: 'save_memory:side_effecting_tool:info',
+          toolPolicySummary: 'save_memory:session_state:low:observe',
           toolCount: 1,
         },
       },
@@ -67,6 +69,8 @@ describe('agentRunInspectorService', () => {
     expect(run.llmModel).toBe('anthropic.claude-opus-4-8');
     expect(run.toolCalls).toBe(1);
     expect(run.failedToolCalls).toBe(0);
+    expect(run.durationMs).toBe(3000);
+    expect(run.flags).toEqual([]);
     expect(run.decisions).toEqual([
       {
         ts: '2026-06-09T22:00:01.000Z',
@@ -76,6 +80,8 @@ describe('agentRunInspectorService', () => {
         toolArgsPreview: '[{"tool":"save_memory","args":{"content":"hello"}}]',
         decisionExplanation: 'Chose save_memory to persist user-provided information for future context.',
         explanationSource: 'deterministic_tool_summary',
+        toolPolicyFlags: 'save_memory:side_effecting_tool:info',
+        toolPolicySummary: 'save_memory:session_state:low:observe',
       },
     ]);
     expect(run.outcomes).toHaveLength(2);
@@ -127,6 +133,7 @@ describe('agentRunInspectorService', () => {
     expect(run.status).toBe('failed');
     expect(run.toolCalls).toBe(1);
     expect(run.failedToolCalls).toBe(1);
+    expect(run.flags.map((flag) => flag.code)).toEqual(['run_failed', 'failed_tool_calls']);
     expect(run.outcomes[0]).toMatchObject({
       eventType: EVT_TOOL_FAILED,
       toolName: 'search_web',
@@ -134,5 +141,50 @@ describe('agentRunInspectorService', () => {
       errorClass: 'TimeoutError',
       errorMessage: 'tool timed out',
     });
+  });
+
+  it('flags high-volume runs, repeated tools, and gateway policy warnings', () => {
+    const rows: AgentRunEventRow[] = [
+      {
+        eventType: EVT_RUN_STARTED,
+        subjectId: 'sess-3:run:c',
+        ts: '2026-06-09T22:02:00.000Z',
+        dimensions: { sessionId: 'sess-3', userId: 'user-3' },
+      },
+      {
+        eventType: EVT_DECISION,
+        subjectId: 'sess-3:run:c',
+        ts: '2026-06-09T22:02:01.000Z',
+        dimensions: {
+          sessionId: 'sess-3',
+          iteration: 1,
+          toolNames: 'search_web,search_web,search_web,search_web,search_web,create_gtm_plan',
+          toolPolicyFlags: 'create_gtm_plan:possible_task_tool_mismatch:warning',
+          toolPolicySummary: 'create_gtm_plan:internal_write:medium:observe',
+        },
+      },
+      ...Array.from({ length: 5 }, (_, idx) => ({
+        eventType: EVT_TOOL_INVOKED,
+        subjectId: 'sess-3:run:c',
+        ts: `2026-06-09T22:02:0${idx + 2}.000Z`,
+        dimensions: { sessionId: 'sess-3', iteration: 1, toolName: 'search_web' },
+      })),
+      {
+        eventType: EVT_RUN_COMPLETED,
+        subjectId: 'sess-3:run:c',
+        ts: '2026-06-09T22:03:35.000Z',
+        dimensions: { sessionId: 'sess-3', toolCalls: 13, failedToolCalls: 0 },
+      },
+    ];
+
+    const [run] = buildAgentRunSummaries(rows);
+
+    expect(run.durationMs).toBe(95_000);
+    expect(run.flags).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'high_tool_volume', severity: 'warning' }),
+      expect.objectContaining({ code: 'long_run', severity: 'info' }),
+      expect.objectContaining({ code: 'repeated_tool', severity: 'warning', evidence: 'search_web' }),
+      expect.objectContaining({ code: 'possible_task_tool_mismatch', severity: 'warning', evidence: 'create_gtm_plan' }),
+    ]));
   });
 });
