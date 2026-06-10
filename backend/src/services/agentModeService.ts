@@ -7960,7 +7960,7 @@ export class AgentModeService {
   public async getLeadLists(userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const { listLandingPages } = await import('./v0Service');
+      const { listLandingPages, getLandingPageLiveUrl } = await import('./v0Service');
 
       const [lists, landingPages] = await Promise.all([
         crmDb.getLeadListsForUser(userId),
@@ -7974,7 +7974,7 @@ export class AgentModeService {
           pageByListId.set(page.leadListId, {
             pageId: page.id,
             name: page.name || '',
-            url: page.deployedUrl || page.customDomainUrl || ''
+            url: getLandingPageLiveUrl(page)
           });
         }
       }

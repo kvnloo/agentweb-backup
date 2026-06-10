@@ -29,6 +29,7 @@ import {
   updateLandingPageLeadList,
   INTEGRATIONS,
   resolveSiteForCaller,
+  getLandingPageLiveUrl,
 } from "../services/v0Service";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/customDomainService";
@@ -895,17 +896,19 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
     }
 
     const isStaging = branch !== "main";
+    const liveUrl = getLandingPageLiveUrl(page);
     res.json({
       success: true,
       commit_url: commitRes.data.commit?.html_url || commitRes.data.html_url,
       file_path,
       page_id: page.id,
+      live_url: liveUrl,
       deployed_url: page.deployedUrl,
       branch,
       is_staging: isStaging,
       message: isStaging
         ? `File "${file_path}" updated on branch ${branch}. A Vercel preview deployment will be created. Use get_preview_url to check the preview, then publish_landing_page_changes when ready to go live.`
-        : `File "${file_path}" updated. Changes will auto-deploy to ${page.deployedUrl} within ~30 seconds.`,
+        : `File "${file_path}" updated. Changes will auto-deploy to ${liveUrl} within ~30 seconds.`,
     });
   } catch (error: any) {
     const ghStatus = error.response?.status;
@@ -1311,11 +1314,13 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
       }
     }
 
+    const liveUrl = getLandingPageLiveUrl(page);
     res.json({
       success: true,
       merge_commit_sha: mergeCommitSha,
+      live_url: liveUrl,
       deployed_url: page.deployedUrl,
-      message: `Changes from ${branch} have been published to main. Your site at ${page.deployedUrl} will update shortly.`,
+      message: `Changes from ${branch} have been published to main. Your site at ${liveUrl} will update shortly.`,
     });
   } catch (error: any) {
     const ghStatus = error.response?.status;
