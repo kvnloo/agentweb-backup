@@ -99,6 +99,7 @@ const EMMA_BOT = 'UEMMA_BOT';
 const DM_CHANNEL = 'D12345';
 const MESSAGE_TS = '1700000000.000100';
 const AI_READINESS_MESSAGE_TS = '1700000000.000200';
+const FUTURE_LOOP_MESSAGE_TS = '1700000000.000300';
 const SPRINT_TASKS_DATA_SOURCE = '2bf09247-c951-812a-bd0a-000bd4c05bbf';
 
 // One real Notion task URL from the daily DM (32-hex page id at end of slug).
@@ -135,6 +136,20 @@ function buildAiReadinessDmMessage() {
     '*Startup decisions (low-data, permission-gated)*',
     '1. `low-data-quiz-start-leak` — Try one above-the-fold change: make the first screen promise the delivered roadmap and reduce the perceived quiz commitment.',
     '   Evidence: 3/42 visitors started the quiz (7%).  |  Confidence: medium  |  Needs approval: yes',
+    '',
+    'React ✅ to dispatch all to cloud-dev  |  ❌ to skip  |  🛑 to pause loop',
+  ].join('\n');
+}
+
+function buildFutureLoopDmMessage() {
+  return [
+    '*🧪 Revenue Loop — daily run 2026-06-10*',
+    'Run ID: `loop-revenue-2026-06-10T16:45:00.000Z-123456`',
+    'Events scanned: 17  |  Findings: 1',
+    '',
+    '*What I found*',
+    '1. Trial signup drop-off spiked after pricing click',
+    '   Kind: `code_change`  |  Fix: tighten the pricing CTA and preserve measurement.',
     '',
     'React ✅ to dispatch all to cloud-dev  |  ❌ to skip  |  🛑 to pause loop',
   ].join('\n');
@@ -288,9 +303,65 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
       ([arg]) => arg.thread_ts === AI_READINESS_MESSAGE_TS,
     );
     expect(replies.length).toBeGreaterThanOrEqual(2);
-    expect(replies[0][0].text).toMatch(/Creating 1 AI Readiness cloud-dev task/i);
-    expect(replies[replies.length - 1][0].text).toMatch(/Launched 1\/1 AI Readiness/i);
+    expect(replies[0][0].text).toMatch(/Creating 1 cloud-dev task for AI Readiness/i);
+    expect(replies[replies.length - 1][0].text).toMatch(/Launched 1\/1 cloud-dev run for AI Readiness/i);
     expect(isDispatched(AI_READINESS_MESSAGE_TS)).toBe(true);
+  });
+
+  it('lets a new loop use the shared ✅ footer without adding a bespoke Slack handler', async () => {
+    mockConversationsHistory.mockResolvedValue({
+      ok: true,
+      messages: [
+        {
+          ts: FUTURE_LOOP_MESSAGE_TS,
+          user: EMMA_BOT,
+          bot_id: 'B_EMMA',
+          text: buildFutureLoopDmMessage(),
+        },
+      ],
+    });
+
+    const res = await request(buildApp())
+      .post('/api/slack/events')
+      .send({
+        type: 'event_callback',
+        event: {
+          type: 'reaction_added',
+          reaction: 'white_check_mark',
+          user: HARSHA,
+          item: { type: 'message', channel: DM_CHANNEL, ts: FUTURE_LOOP_MESSAGE_TS },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    await wait();
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      'https://api.notion.com/v1/pages',
+      expect.objectContaining({
+        method: 'POST',
+        body: expect.stringContaining('Trial signup drop-off spiked after pricing click'),
+      }),
+    );
+    expect(global.fetch).toHaveBeenCalledWith(
+      'https://api.notion.com/v1/pages',
+      expect.objectContaining({
+        body: expect.stringContaining('startup-sized decision'),
+      }),
+    );
+    expect(mockLaunchEnvironment).toHaveBeenCalledWith(
+      'notion-ai-readiness-page-id',
+      expect.stringContaining('fix(revenue-loop)'),
+      expect.stringContaining('tighten the pricing CTA'),
+      SPRINT_TASKS_DATA_SOURCE,
+    );
+
+    const replies = mockChatPostMessage.mock.calls.filter(
+      ([arg]) => arg.thread_ts === FUTURE_LOOP_MESSAGE_TS,
+    );
+    expect(replies[0][0].text).toMatch(/Creating 1 cloud-dev task for Revenue Loop/i);
+    expect(replies[replies.length - 1][0].text).toMatch(/Launched 1\/1 cloud-dev run for Revenue Loop/i);
+    expect(isDispatched(FUTURE_LOOP_MESSAGE_TS)).toBe(true);
   });
 
   it('ignores reactions from users other than Harsha', async () => {
