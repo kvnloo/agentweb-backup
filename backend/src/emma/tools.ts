@@ -4814,13 +4814,30 @@ emmaToolRegistry.register({
         file_url: {
           type: 'string',
           description: 'The URL of the file to read and extract content from'
+        },
+        url: {
+          type: 'string',
+          description: 'Deprecated alias for file_url. Prefer file_url.'
         }
       },
       required: ["file_url"]
     }
   },
   execute: async (args: any, context?: any) => {
-    const result = await agentModeService.readFileContent(args.file_url);
+    const fileUrl = args.file_url || args.url;
+    if (!fileUrl || typeof fileUrl !== 'string') {
+      return {
+        content: [
+          {
+            type: "text",
+            text: 'Error: file_url is required. Pass the attached file URL as file_url, not url.'
+          }
+        ],
+        isError: true
+      };
+    }
+
+    const result = await agentModeService.readFileContent(fileUrl);
     if (result.success === false) {
       return {
         content: [
