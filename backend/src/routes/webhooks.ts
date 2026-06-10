@@ -790,6 +790,14 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
         const portalIdStr = String(data.portalId);
         const svc = await HubSpotService.create(userId, portalIdStr).catch(() => null);
 
+        // Discard all events when the OAuth account is unavailable (expired token,
+        // revoked refresh, or account removed). Prevents webhook updates from landing
+        // on lists whose connection is broken (Type 1 disconnect — expired or manual).
+        if (!svc) {
+          console.log(`[HubSpot Webhook] OAuth token unavailable for portal ${portalIdStr} (user ${userId}) — discarding events`);
+          continue;
+        }
+
         // ── Deal.propertyChange: resolve contacts via deal associations ──────────
         if (data.isDealChange && svc) {
           try {

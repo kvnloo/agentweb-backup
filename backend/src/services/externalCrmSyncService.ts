@@ -307,6 +307,27 @@ export class ExternalCrmSyncService {
     await crmDb.setLeadListCrmSyncConfig(listId, provider, null);
   }
 
+  /**
+   * Disconnect the OAuth account from a list without wiping field mappings.
+   * Clears accountId, apiKeyEncrypted, and webhookSecret so the account is no
+   * longer "used" (drops out of used-accounts) and can be linked to another list.
+   * All other settings (mappings, autoSyncEnabled, webhookEnabled) are preserved.
+   */
+  async disconnectAccount(userId: string, listId: string, provider: string): Promise<void> {
+    const config = await this.getConfig(userId, listId, provider);
+    if (!config) return;
+    const now = new Date().toISOString();
+    const disconnected: ExternalCrmSyncConfig = {
+      ...config,
+      accountId: undefined,
+      apiKeyEncrypted: undefined,
+      webhookSecret: undefined,
+      // Mark as not configured so the UI returns to account-selection state
+      updatedAt: now,
+    };
+    await crmDb.setLeadListCrmSyncConfig(listId, provider, disconnected as any);
+  }
+
   async getDefaultMappings(provider: string): Promise<{
     contactFieldMapping: FieldMapping[];
     dealFieldMapping: FieldMapping[];
