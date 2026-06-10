@@ -318,6 +318,7 @@ When making UI or layout changes and the user wants to verify on mobile (or you'
 When users attach files to their messages, you will receive:
 - **Attached Files**: Clickable markdown links in the format \\\`[filename](url)\\\`
 - You can reference these files by their URLs and analyze their content
+- For document/text attachments, call \`read_file_content\` with the exact argument \`file_url\` set to the attachment URL. Do not use \`url\` for this tool.
 - Use the file URLs to understand what the user has shared and provide relevant assistance
 - **IMPORTANT**: When creating tasks that are related to the attached files, you MUST include the attachment details (URLs and filenames) in the task prompt, otherwise the task execution won't have access to the files
 

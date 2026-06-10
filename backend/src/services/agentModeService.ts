@@ -159,6 +159,38 @@ function recordAgentModeToolTelemetry(
   })();
 }
 
+function toolResultError(result: unknown): Error | null {
+  if (!result || typeof result !== 'object') return null;
+  const obj = result as Record<string, any>;
+
+  if (obj.isError === true) {
+    return new Error(extractToolResultMessage(obj) || 'Tool returned isError=true');
+  }
+
+  if (obj.success === false) {
+    return new Error(extractToolResultMessage(obj) || 'Tool returned success=false');
+  }
+
+  return null;
+}
+
+function extractToolResultMessage(obj: Record<string, any>): string {
+  if (typeof obj.error === 'string' && obj.error.trim()) return obj.error.trim();
+  if (typeof obj.message === 'string' && obj.message.trim()) return obj.message.trim();
+  if (typeof obj.content === 'string' && obj.content.trim()) return obj.content.trim();
+
+  if (Array.isArray(obj.content)) {
+    const text = obj.content
+      .map((part: any) => typeof part?.text === 'string' ? part.text : '')
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+    if (text) return text;
+  }
+
+  return '';
+}
+
 function recordAgentModeRunStarted(
   runId: string,
   info: { llmModel?: string; sessionType?: string; userId?: string; sessionId?: string },
@@ -2918,6 +2950,20 @@ export class AgentModeService {
           });
           toolResults = await Promise.all(toolPromises);
         }
+
+        toolResults = toolResults.map((toolResult) => {
+          if (toolResult.status !== 'success') return toolResult;
+          const error = toolResultError(toolResult.result);
+          if (!error) return toolResult;
+          return {
+            status: 'error' as const,
+            toolCall: toolResult.toolCall,
+            functionArgs: toolResult.functionArgs,
+            error,
+            duration: toolResult.duration,
+            policyDecision: toolResult.policyDecision,
+          };
+        });
 
         // Runtime spine V0 telemetry: record this iteration's decision + each
         // tool's invoked/succeeded/failed outcome into the shared LoopEvents
@@ -16990,8 +17036,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     try {
       console.log('AgentMode: Reading file content from URL:', fileUrl);
 
+      if (typeof fileUrl !== 'string' || fileUrl.trim().length === 0) {
+        return {
+          success: false,
+          message: 'file_url is required and must be a non-empty HTTP or HTTPS URL.',
+          error: 'Missing file_url'
+        };
+      }
+
+      const normalizedFileUrl = fileUrl.trim();
+
       // Validate URL format
-      if (!fileUrl.startsWith('http://') && !fileUrl.startsWith('https://')) {
+      if (!normalizedFileUrl.startsWith('http://') && !normalizedFileUrl.startsWith('https://')) {
         return {
           success: false,
           message: 'Invalid URL format. Must be HTTP or HTTPS.',
@@ -17000,7 +17056,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       // Determine file type from URL
-      const urlPath = new URL(fileUrl).pathname;
+      const urlPath = new URL(normalizedFileUrl).pathname;
       const extension = urlPath.split('.').pop()?.toLowerCase() || '';
 
       if (IMAGE_EXTENSIONS.has(extension)) {
@@ -17020,7 +17076,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       // Fetch the file content
-      const response = await axios.get(fileUrl, {
+      const response = await axios.get(normalizedFileUrl, {
         timeout: 30000,
         responseType: 'arraybuffer',
         headers: {
@@ -17137,7 +17193,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         file_type: fileType,
         file_size: buffer.length,
         content_length: extractedContent.length,
-        file_url: fileUrl,
+        file_url: normalizedFileUrl,
         message: `Successfully read ${fileType} file content (${extractedContent.length} characters)`
       };
 
@@ -17162,7 +17218,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: errorMessage,
         error: error.message,
-        file_url: fileUrl
+        file_url: typeof fileUrl === 'string' ? fileUrl : undefined
       };
     }
   }
