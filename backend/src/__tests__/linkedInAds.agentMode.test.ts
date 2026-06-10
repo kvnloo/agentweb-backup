@@ -10,6 +10,9 @@ jest.mock('../mcp/client/mcpClientService', () => ({
 }));
 
 jest.mock('../services/linkedInAdsService', () => ({
+  // resolveTargetingCriteria is a pure param-shaping helper — use the real implementation
+  // so the dispatcher's targeting resolution is exercised end-to-end.
+  resolveTargetingCriteria: jest.requireActual('../services/linkedInAdsService').resolveTargetingCriteria,
   refreshAccessToken: jest.fn(),
   listAdAccounts: jest.fn(),
   listCampaignGroups: jest.fn(),
@@ -44,6 +47,10 @@ jest.mock('../services/linkedInAdsService', () => ({
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() } }));
 
 jest.mock('../config/integrations', () => ({
+  // INTEGRATION_CONFIG is read at module-load time by linkedInAdsService (via requireActual below)
+  INTEGRATION_CONFIG: {
+    linkedinAds: { apiVersion: '202603', tokenUrl: 'https://www.linkedin.com/oauth/v2/accessToken' },
+  },
   getLinkedInAdsConfig: jest.fn().mockResolvedValue({
     clientId: 'test-client-id',
     clientSecret: 'test-client-secret',
@@ -410,20 +417,49 @@ describe('callLinkedInMarketingApi — TARGETING', () => {
     ).rejects.toThrow('facet');
   });
 
-  it('ESTIMATE_REACH calls getAudienceCount', async () => {
+  it('ESTIMATE_REACH calls getAudienceCount with a raw targeting_criteria object', async () => {
     await service.callLinkedInMarketingApi(USER_ID, 'TARGETING', 'ESTIMATE_REACH', ACCOUNT_ID, {
-      targeting_criteria: { include: { and: [] } },
+      targeting_criteria: { include: { and: [{ or: { 'urn:li:adTargetingFacet:locations': ['urn:li:geo:1'] } }] } },
     });
     expect(linkedInAdsService.getAudienceCount).toHaveBeenCalledWith(
       ACCESS_TOKEN,
-      { include: { and: [] } }
+      { include: { and: [{ or: { 'urn:li:adTargetingFacet:locations': ['urn:li:geo:1'] } }] } }
     );
   });
 
-  it('ESTIMATE_REACH throws when targeting_criteria missing', async () => {
+  it('ESTIMATE_REACH accepts the same targeting_include array shape as CAMPAIGN CREATE', async () => {
+    await service.callLinkedInMarketingApi(USER_ID, 'TARGETING', 'ESTIMATE_REACH', ACCOUNT_ID, {
+      targeting_include: [
+        { facet_urn: 'urn:li:adTargetingFacet:locations', values: ['urn:li:geo:103644278'] },
+        { facet_urn: 'urn:li:adTargetingFacet:titles', values: ['urn:li:title:68'] },
+      ],
+    });
+    expect(linkedInAdsService.getAudienceCount).toHaveBeenCalledWith(
+      ACCESS_TOKEN,
+      {
+        include: {
+          and: [
+            { or: { 'urn:li:adTargetingFacet:locations': ['urn:li:geo:103644278'] } },
+            { or: { 'urn:li:adTargetingFacet:titles': ['urn:li:title:68'] } },
+          ],
+        },
+      }
+    );
+  });
+
+  it('ESTIMATE_REACH applies targeting_exclude alongside targeting_include', async () => {
+    await service.callLinkedInMarketingApi(USER_ID, 'TARGETING', 'ESTIMATE_REACH', ACCOUNT_ID, {
+      targeting_include: [{ facet_urn: 'urn:li:adTargetingFacet:locations', values: ['urn:li:geo:103644278'] }],
+      targeting_exclude: [{ facet_urn: 'urn:li:adTargetingFacet:seniorities', values: ['urn:li:seniority:1'] }],
+    });
+    const passed = (linkedInAdsService.getAudienceCount as jest.Mock).mock.calls[0][1];
+    expect(passed.exclude).toEqual({ or: { 'urn:li:adTargetingFacet:seniorities': ['urn:li:seniority:1'] } });
+  });
+
+  it('ESTIMATE_REACH throws when no targeting is provided', async () => {
     await expect(
       service.callLinkedInMarketingApi(USER_ID, 'TARGETING', 'ESTIMATE_REACH', ACCOUNT_ID, {})
-    ).rejects.toThrow('targeting_criteria');
+    ).rejects.toThrow(/targeting/i);
   });
 });
 
