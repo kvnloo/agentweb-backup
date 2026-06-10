@@ -34,6 +34,33 @@ export interface AgentToolPolicyInput {
   enforce?: boolean;
 }
 
+export interface AgentToolGatewayExecutionInput extends AgentToolPolicyInput {
+  policyDecision?: AgentToolPolicyDecision;
+  execute: () => Promise<unknown>;
+  now?: () => number;
+}
+
+export type AgentToolGatewayExecutionOutcome =
+  | {
+      status: 'success';
+      result: unknown;
+      policyDecision: AgentToolPolicyDecision;
+      durationMs: number;
+    }
+  | {
+      status: 'error';
+      error: unknown;
+      policyDecision: AgentToolPolicyDecision;
+      durationMs: number;
+    };
+
+export class AgentToolPolicyBlockedError extends Error {
+  constructor(readonly policyDecision: AgentToolPolicyDecision) {
+    super(`Tool "${policyDecision.toolName}" was blocked by Agent Tool Gateway policy.`);
+    this.name = 'AgentToolPolicyBlockedError';
+  }
+}
+
 const SIDE_EFFECTING_PREFIXES = [
   'add_',
   'create_',
@@ -151,6 +178,40 @@ export function summarizeAgentToolPolicyModes(
     .map((decision) => `${decision.toolName}:${decision.effect}:${decision.risk}:${decision.mode}`);
 
   return entries.length > 0 ? entries.join(',') : undefined;
+}
+
+export async function executeAgentToolThroughGateway(
+  input: AgentToolGatewayExecutionInput,
+): Promise<AgentToolGatewayExecutionOutcome> {
+  const now = input.now ?? Date.now;
+  const startedAt = now();
+  const policyDecision = input.policyDecision ?? evaluateAgentToolPolicy(input);
+
+  if (!policyDecision.allowed) {
+    return {
+      status: 'error',
+      error: new AgentToolPolicyBlockedError(policyDecision),
+      policyDecision,
+      durationMs: Math.max(0, now() - startedAt),
+    };
+  }
+
+  try {
+    const result = await input.execute();
+    return {
+      status: 'success',
+      result,
+      policyDecision,
+      durationMs: Math.max(0, now() - startedAt),
+    };
+  } catch (error) {
+    return {
+      status: 'error',
+      error,
+      policyDecision,
+      durationMs: Math.max(0, now() - startedAt),
+    };
+  }
 }
 
 function classifyToolEffect(toolName: string, args: unknown): AgentToolEffect {

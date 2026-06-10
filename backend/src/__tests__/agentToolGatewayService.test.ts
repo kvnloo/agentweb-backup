@@ -1,4 +1,6 @@
 import {
+  AgentToolPolicyBlockedError,
+  executeAgentToolThroughGateway,
   evaluateAgentToolPolicy,
   summarizeAgentToolPolicyFlags,
   summarizeAgentToolPolicyModes,
@@ -68,5 +70,62 @@ describe('agentToolGatewayService', () => {
 
     expect(summarizeAgentToolPolicyFlags(decisions)).toContain('send_email:confirmation_recommended:critical');
     expect(summarizeAgentToolPolicyModes(decisions)).toContain('search_web:read:low:observe');
+  });
+
+  it('executes allowed tools and returns the exact result object', async () => {
+    const result = { ok: true, nested: { id: 'same-reference' } };
+    let now = 100;
+
+    const outcome = await executeAgentToolThroughGateway({
+      toolName: 'search_web',
+      args: { query: 'agent runtime' },
+      now: () => {
+        now += 25;
+        return now;
+      },
+      execute: async () => result,
+    });
+
+    expect(outcome.status).toBe('success');
+    if (outcome.status === 'success') {
+      expect(outcome.result).toBe(result);
+      expect(outcome.durationMs).toBe(25);
+      expect(outcome.policyDecision.effect).toBe('read');
+    }
+  });
+
+  it('preserves the exact error object when the tool throws', async () => {
+    const error = new Error('tool failed');
+
+    const outcome = await executeAgentToolThroughGateway({
+      toolName: 'search_web',
+      execute: async () => {
+        throw error;
+      },
+    });
+
+    expect(outcome.status).toBe('error');
+    if (outcome.status === 'error') {
+      expect(outcome.error).toBe(error);
+      expect(outcome.policyDecision.allowed).toBe(true);
+    }
+  });
+
+  it('blocks before execution only when policy is already enforcing', async () => {
+    const execute = jest.fn(async () => ({ shouldNotRun: true }));
+
+    const outcome = await executeAgentToolThroughGateway({
+      toolName: 'publish_blog_article',
+      args: { status: 'published' },
+      enforce: true,
+      execute,
+    });
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(outcome.status).toBe('error');
+    if (outcome.status === 'error') {
+      expect(outcome.error).toBeInstanceOf(AgentToolPolicyBlockedError);
+      expect(outcome.policyDecision.allowed).toBe(false);
+    }
   });
 });
