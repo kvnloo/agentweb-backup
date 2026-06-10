@@ -82,6 +82,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-10',
     changes: [
+      'Fixed: Updating a Meta Ad\'s Destination URL Now Reliably Takes Effect',
+      '- When you asked Emma to change a Meta ad\'s destination link, she would build a new ad creative and report success — but in some cases the ad kept pointing at the old URL, so the change never showed up in Ads Manager',
+      '- Emma now double-checks her own work after every destination-URL change: she re-reads the ad to confirm the new creative actually attached and that the live URL matches what you asked for. If it didn\'t take (usually a temporary Meta delay), she tells you instead of falsely reporting success, so you can retry',
+      '- Your existing tracking parameters (UTM tags) are now carried over automatically when the destination changes, instead of being silently dropped',
+    ],
+  },
+  {
+    date: '2026-06-10',
+    changes: [
       'New: Send Us Any Kind of Feedback, Not Just Bugs',
       '- The "Report a bug" button is now a "Send feedback" button — use it to report a bug, request a feature, suggest an improvement, or share general feedback',
       '- Just pick the kind of feedback you\'re sending, type a quick note, and hit send — we still automatically attach a screenshot of the page you were looking at for extra context',
