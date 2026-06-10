@@ -876,7 +876,7 @@ REQUIRED PARAMS PER ENTITY + ACTION:
   CREATIVE CREATE_DYNAMIC: campaign_id, format (JOBS|SPOTLIGHT|FOLLOW_COMPANY). JOBS needs headline+button_label. SPOTLIGHT needs headline+call_to_action+landing_page+logo_urn (logo_urn is REQUIRED — upload logo with MEDIA/UPLOAD_IMAGE first). FOLLOW_COMPANY needs headline.
   TARGETING SEARCH: facet (URN like urn:li:adTargetingFacet:locations), query (optional — omit for facets without typeahead like seniorities/industries)
     Common facets: locations, titles (job titles — NOT jobTitles), seniorities, industries, functions, staffCountRanges, memberInterests, skills
-  TARGETING ESTIMATE_REACH: targeting_criteria (object)
+  TARGETING ESTIMATE_REACH: targeting_include (array of { facet_urn, values } — SAME shape as CAMPAIGN CREATE; resolve value URNs via TARGETING SEARCH first). Optional targeting_exclude. Returns { active, total }; total is 0 when the audience is under the 300-member minimum. ALWAYS run this before CAMPAIGN CREATE to confirm reach ≥ 300.
   MEDIA UPLOAD_IMAGE: image_url (public URL). Returns image_urn.
   MEDIA UPLOAD_VIDEO: video_url (public URL). Auto-downloads, measures size, handles multipart upload. Returns video_urn. NEVER ask the user for file size.
   MEDIA UPLOAD_DOCUMENT: document_url (public URL to PDF/PPT/DOC). Returns document_urn.
@@ -926,7 +926,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
             runSchedule: { type: 'object', description: '{ start: <epoch_ms>, end?: <epoch_ms> }' },
             targeting_include: {
               type: 'array',
-              description: 'CAMPAIGN CREATE targeting (include). Each item: { facet_urn: string, values: string[] }. Use TARGETING SEARCH first to get value URNs.',
+              description: 'Targeting facets to include — used by both CAMPAIGN CREATE and TARGETING ESTIMATE_REACH. Each item: { facet_urn: string, values: string[] }. Use TARGETING SEARCH first to get value URNs.',
               items: {
                 type: 'object',
                 properties: {
@@ -937,7 +937,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
             },
             targeting_exclude: {
               type: 'array',
-              description: 'CAMPAIGN CREATE targeting (exclude). Same format as targeting_include.',
+              description: 'Targeting facets to exclude (CAMPAIGN CREATE and TARGETING ESTIMATE_REACH). Same format as targeting_include.',
               items: {
                 type: 'object',
                 properties: {

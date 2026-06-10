@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-10',
     changes: [
+      'Fixed: LinkedIn Ads Audience Size Check Now Works Before Launching a Campaign',
+      '- Asking Emma to estimate the reach of a LinkedIn Ads audience used to fail with confusing, contradictory errors and never returned a number',
+      '- The audience-size check now accepts the same targeting you use to build a campaign (locations, job titles, skills, seniorities, industries, and more) and returns the estimated audience size',
+      '- This lets Emma confirm your audience meets LinkedIn\'s 300-member minimum before creating the campaign, so you don\'t set up a campaign that can\'t run',
+    ],
+  },
+  {
+    date: '2026-06-10',
+    changes: [
       'Fixed: Account Wrongly Showing "Overdue" Despite an Active Subscription',
       '- Some accounts kept showing a past-due/overdue banner even though their subscription was active and paid in Stripe — caused by a stale billing status that a payment-recovery event failed to clear',
       '- Our team can now re-sync an account directly against Stripe to correct the status immediately, and the sync is authoritative so it no longer leaves a stuck status in place',

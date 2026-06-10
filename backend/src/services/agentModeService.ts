@@ -23422,8 +23422,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, entities: result.data?.elements || [] };
         }
         if (action === 'ESTIMATE_REACH') {
-          if (!params.targeting_criteria) throw new Error('ESTIMATE_REACH requires targeting_criteria');
-          const result = await linkedInAdsService.getAudienceCount(accessToken, params.targeting_criteria);
+          // Accept the same targeting shapes as CAMPAIGN CREATE: the flat
+          // targeting_include/targeting_exclude arrays (preferred) or a raw targeting_criteria object.
+          const targetingCriteria = linkedInAdsService.resolveTargetingCriteria(params);
+          if (!targetingCriteria) {
+            throw new Error('ESTIMATE_REACH requires targeting: pass targeting_include (array of { facet_urn, values }) or targeting_criteria.');
+          }
+          const result = await linkedInAdsService.getAudienceCount(accessToken, targetingCriteria);
           if (!result.success) throw new Error(result.error || 'Failed to estimate audience reach');
           return { success: true, audienceCount: result.data };
         }
