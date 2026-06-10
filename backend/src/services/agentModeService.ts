@@ -413,6 +413,15 @@ interface LLMCallOptions {
 const DIAGNOSIS_MODEL = 'gemini-3.1-flash-lite';
 const DIAGNOSIS_TIMEOUT_MS = 10_000;
 
+// Markers used by perform_data_analysis to capture files the Gemini code-execution
+// sandbox produces. The sandbox filesystem is discarded after execution and Gemini
+// never returns arbitrary on-disk files (only inline images), so the model is told
+// to print a file's full contents to stdout between these markers. The backend then
+// extracts the content and uploads it to real, downloadable S3 storage.
+const DATA_ANALYSIS_FILE_START_PREFIX = '<<<AGENTWEB_FILE:';
+const DATA_ANALYSIS_FILE_MARKER_SUFFIX = '>>>';
+const DATA_ANALYSIS_FILE_END_MARKER = '<<<AGENTWEB_FILE_END>>>';
+
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'avif', 'heic', 'heif']);
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wmv', 'm4v', 'ogv', '3gp', 'ts']);
 
@@ -6179,6 +6188,79 @@ export class AgentModeService {
     }
   }
 
+  // Infer a sensible Content-Type for a file the analysis sandbox produced, based
+  // on its extension. Defaults to text/plain so downloads are always served as a
+  // viewable/saveable file rather than an opaque octet-stream.
+  private static contentTypeForFilename(filename: string): string {
+    const ext = (filename.split('.').pop() || '').toLowerCase();
+    switch (ext) {
+      case 'csv': return 'text/csv';
+      case 'json': return 'application/json';
+      case 'tsv': return 'text/tab-separated-values';
+      case 'md': return 'text/markdown';
+      case 'html': case 'htm': return 'text/html';
+      case 'xml': return 'application/xml';
+      case 'txt': return 'text/plain';
+      default: return 'text/plain';
+    }
+  }
+
+  // Scan code-execution stdout/text for files the model emitted between the
+  // AGENTWEB_FILE markers, upload each to S3, and return real download links plus
+  // the text with the marker blocks stripped out (so the raw file contents are not
+  // dumped into the chat). Gemini's sandbox discards on-disk files, so this
+  // print-between-markers protocol is the only reliable way to deliver a generated
+  // file to the user.
+  private async extractAndUploadAnalysisFiles(
+    text: string,
+    userId: string
+  ): Promise<{ cleanedText: string; links: string[] }> {
+    const links: string[] = [];
+    if (!text || !text.includes(DATA_ANALYSIS_FILE_START_PREFIX)) {
+      return { cleanedText: text, links };
+    }
+
+    // Match a start marker (capturing the filename), the body, and the end marker.
+    // [\s\S] so the body can span newlines; non-greedy so adjacent files don't merge.
+    const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(
+      `${escapeRegExp(DATA_ANALYSIS_FILE_START_PREFIX)}([^\\r\\n>]*?)${escapeRegExp(DATA_ANALYSIS_FILE_MARKER_SUFFIX)}\\r?\\n([\\s\\S]*?)\\r?\\n?${escapeRegExp(DATA_ANALYSIS_FILE_END_MARKER)}`,
+      'g'
+    );
+
+    const { uploadFileToS3 } = await import('../utils/s3Utils');
+    let cleanedText = text;
+    const matches = [...text.matchAll(pattern)];
+    let fallbackIndex = 0;
+    for (const match of matches) {
+      const rawName = (match[1] || '').trim();
+      const body = match[2] ?? '';
+      // Sanitize/default the filename so we never produce an unusable S3 key.
+      const safeName = rawName.replace(/[\r\n]/g, '').trim() || `analysis_output_${fallbackIndex++}.csv`;
+      try {
+        const uploadResult = await uploadFileToS3(
+          Buffer.from(body, 'utf-8'),
+          safeName,
+          userId,
+          AgentModeService.contentTypeForFilename(safeName)
+        );
+        if (uploadResult.success && uploadResult.url) {
+          links.push(`**File saved:** [${safeName}](${uploadResult.url})`);
+          // Replace the whole marker block with a concise reference instead of the raw contents.
+          cleanedText = cleanedText.replace(match[0], `[Generated file: ${safeName} — download link below]`);
+        } else {
+          console.error(`AgentMode: performDataAnalysis failed to upload generated file "${safeName}":`, uploadResult.error);
+          cleanedText = cleanedText.replace(match[0], `[Generated file: ${safeName} — upload failed]`);
+        }
+      } catch (error) {
+        console.error(`AgentMode: performDataAnalysis error uploading generated file "${safeName}":`, error);
+        cleanedText = cleanedText.replace(match[0], `[Generated file: ${safeName} — upload failed]`);
+      }
+    }
+
+    return { cleanedText, links };
+  }
+
   public async performDataAnalysis(fileUrls: string[], analysisInstruction: string, userId: string): Promise<any> {
     try {
       const urlsToProcess = Array.isArray(fileUrls) ? fileUrls.filter(url => !!url) : [];
@@ -6442,7 +6524,7 @@ export class AgentModeService {
 
       // Add text part with analysis instruction so the model knows how to proceed with or without files
       parts.push({
-        text: `Please perform the following analysis task. ${fileGuidance}\n\n${analysisInstruction}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present.\n\nIMPORTANT: When generating charts or visualizations, you MUST use matplotlib or seaborn to produce rasterized PNG images. Do NOT use altair, vega, vega-lite, or any library that produces JSON specs instead of rendered images. Always call plt.savefig() or equivalent to emit the image as inline output, then call plt.close() to free memory.`
+        text: `Please perform the following analysis task. ${fileGuidance}\n\n${analysisInstruction}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present.\n\nIMPORTANT: When generating charts or visualizations, you MUST use matplotlib or seaborn to produce rasterized PNG images. Do NOT use altair, vega, vega-lite, or any library that produces JSON specs instead of rendered images. Always call plt.savefig() or equivalent to emit the image as inline output, then call plt.close() to free memory.\n\nSAVING FILES FOR DOWNLOAD: If the task asks you to save, export, or otherwise produce a file the user should download (e.g. a CSV, JSON, or text file), you MUST print its COMPLETE contents to stdout with print(), wrapped EXACTLY in these markers, each on its own line:\n${DATA_ANALYSIS_FILE_START_PREFIX}<filename>${DATA_ANALYSIS_FILE_MARKER_SUFFIX}\n<full file contents>\n${DATA_ANALYSIS_FILE_END_MARKER}\nUse a short, descriptive filename with the correct extension (e.g. seed_audience.csv). The platform captures everything between these markers and saves it to real, downloadable storage, then returns a working download link to the user. Do NOT invent, guess, fabricate, or report any download URL, S3 key, or file path yourself (e.g. a bare filename, an "https://...s3..." URL, or a "sandbox:/..." path) — the sandbox filesystem is discarded after execution and ANY such path will fail to download. Printing the contents between the markers above is the ONLY way to deliver a file to the user.`
       });
 
       // Call Gemini API directly via REST to enable code execution
@@ -6481,9 +6563,23 @@ export class AgentModeService {
       // Extract parts from response
       const responseParts = candidates[0].content.parts || [];
 
+      // Generated-file download links collected from marked stdout/text blocks.
+      const fileLinks: string[] = [];
+
       for (const part of responseParts) {
         if (part.text) {
-          resultParts.push(`**Analysis:** ${part.text}`);
+          const { cleanedText, links } = await this.extractAndUploadAnalysisFiles(part.text, userId);
+          fileLinks.push(...links);
+          resultParts.push(`**Analysis:** ${cleanedText}`);
+        }
+        // Capture files the model printed to stdout via code execution. Gemini returns
+        // executed-code output in a codeExecutionResult / code_execution_result part;
+        // the marker protocol means generated file contents arrive here, not on disk.
+        const execResult = (part as any).codeExecutionResult || (part as any).code_execution_result;
+        if (execResult && typeof execResult.output === 'string') {
+          codeExecuted = true;
+          const { links } = await this.extractAndUploadAnalysisFiles(execResult.output, userId);
+          fileLinks.push(...links);
         }
         // Handle inline data (images/charts from code execution) (handle both camelCase and snake_case)
         if ((part as any).inlineData && (part as any).inlineData.data) {
@@ -6550,6 +6646,11 @@ export class AgentModeService {
         }
       }
 
+      // Surface real, downloadable links for any files the model generated.
+      if (fileLinks.length > 0) {
+        resultParts.push(`**Generated Files:**\n${fileLinks.join('\n')}`);
+      }
+
       if (resultParts.length === 0) {
         return {
           success: false,
@@ -6565,7 +6666,8 @@ export class AgentModeService {
         message: 'Data analysis completed successfully',
         analysis: analysisResult,
         codeExecuted: codeExecuted,
-        formattedContent: analysisResult
+        formattedContent: analysisResult,
+        fileUrls: fileLinks.length > 0 ? fileLinks : undefined
       };
 
     } catch (error) {
