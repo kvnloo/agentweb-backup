@@ -1,5 +1,4 @@
 import { WebClient } from '@slack/web-api';
-import { launchEnvironment, getNotionPage, getNotionPageContent } from './devEnvService';
 import { isDispatched, markDispatched } from './loopDispatchTracker';
 import { getNotionCredentials, getSprintTasksDatabaseId } from './notionService';
 
@@ -290,6 +289,7 @@ async function createLoopNotionTask(task: LoopDispatchTask): Promise<{ pageId: s
 }
 
 async function dispatchExistingNotionPages(pageIds: string[]): Promise<DispatchResult[]> {
+  const { launchEnvironment, getNotionPage, getNotionPageContent } = await import('./devEnvService');
   const results: DispatchResult[] = [];
 
   for (const pageId of pageIds) {
@@ -311,6 +311,7 @@ async function dispatchExistingNotionPages(pageIds: string[]): Promise<DispatchR
 }
 
 async function dispatchCreatedTasks(tasks: LoopDispatchTask[]): Promise<DispatchResult[]> {
+  const { launchEnvironment } = await import('./devEnvService');
   const results: DispatchResult[] = [];
   const dataSourceId = await getSprintTasksDatabaseId();
 
