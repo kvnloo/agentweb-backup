@@ -49,6 +49,7 @@ import { format } from "date-fns";
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl, CUSTOMER_FRONTEND_URL } from "../config";
+import { buildAgentRunInspectorUrl } from "../utils/agentRunLinks";
 import DOMPurify from "dompurify";
 import ImageModelsSettings from "../components/admin/ImageModelsSettings";
 import DefaultPromptsSettings from "../components/admin/DefaultPromptsSettings";
@@ -5952,7 +5953,8 @@ export default function AdminDashboard() {
                             <Button
                               variant="outlined"
                               size="small"
-                              onClick={() => handleViewChat(session)}
+                              component={RouterLink}
+                              to={buildAgentRunInspectorUrl({ sessionId: session.sessionId })}
                             >
                               Debug Chat
                             </Button>
@@ -9761,4 +9763,3 @@ const AgentModeSettings = () => {
     </Box>
   );
 };
-
