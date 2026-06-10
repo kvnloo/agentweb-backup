@@ -1,6 +1,7 @@
 import { Router, Request, Response } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb, orgDb, Organization } from "../services/db";
+import { defaultShareSettings } from "../services/orgShareService";
 import { v4 as uuidv4 } from "uuid";
 import crypto from "crypto";
 
@@ -35,6 +36,11 @@ router.post("/", async (req: Request, res: Response) => {
       ownerUserId: userId,
       maxMembers: orgDb.ORG_MAX_MEMBERS,
       pendingInvites: [],
+      // Seed sharing defaults at creation so the toggle UI and member-fanout
+      // gating agree from day one (skills + work plans shared org-wide by
+      // default). Without this, new orgs had no shareSettings and default-on
+      // features silently fell through to "off" for plain members.
+      shareSettings: defaultShareSettings(),
       createdAt: now,
       updatedAt: now,
     };
