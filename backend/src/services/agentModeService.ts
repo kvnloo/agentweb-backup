@@ -1059,7 +1059,7 @@ export class AgentModeService {
   }
 
   // Supported video API models
-  static readonly VIDEO_API_MODELS = ['veo-3.1-generate-preview', 'veo-3-generate-preview'];
+  static readonly VIDEO_API_MODELS = ['veo-3.1-generate-preview', 'veo-3-generate-preview', 'seedance-2.0'];
 
   async getVideoApiDefaultModel(): Promise<string | undefined> {
     try {
@@ -2163,6 +2163,8 @@ export class AgentModeService {
     const pricePerClip: Record<string, number> = {
       'veo-3.1-generate-preview': 2.80,
       'veo-3.1-fast-generate-preview': 1.40,
+      // Higgsfield Seedance — approximate per-clip cost; adjust to match billed Higgsfield rates.
+      'seedance-2.0': 0.50,
     };
     const clipPrice = pricePerClip[model] ?? 2.80;
     const VEO_MAX_SECONDS = 8;

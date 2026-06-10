@@ -17,9 +17,27 @@ interface VideoGenerationResult {
 const SUPPORTED_MODELS = [
   "veo-3.1-generate-preview",
   "veo-3.1-fast-generate-preview",
+  "seedance-2.0",
 ] as const;
 
 type SupportedModel = typeof SUPPORTED_MODELS[number];
+
+// Higgsfield platform base URL for video generation
+const HIGGSFIELD_BASE_URL = "https://platform.higgsfield.ai";
+
+/**
+ * Maps our internal video model identifiers to Higgsfield platform model paths.
+ * Higgsfield's path convention is `bytedance/seedance/v{N}/pro/image-to-video`.
+ * NOTE: The exact path for Seedance 2.0 is unverified against a live API key (Higgsfield
+ * auth runs before routing, so endpoint probing can't confirm it). Update this single
+ * constant if Higgsfield exposes a different identifier.
+ */
+const HIGGSFIELD_MODEL_PATHS: Record<string, string> = {
+  "seedance-2.0": "bytedance/seedance/v2/pro/image-to-video",
+};
+
+const isHiggsfieldModel = (model: string): boolean =>
+  Object.prototype.hasOwnProperty.call(HIGGSFIELD_MODEL_PATHS, model);
 
 interface VideoGenerationParams {
   prompt: string;
@@ -54,10 +72,16 @@ export class VideoService {
     try {
       let secretName: string;
       
-      if (model === "veo-3.1-generate-preview" || model === "veo-3.1-fast-generate-preview") {
+      if (isHiggsfieldModel(model)) {
+        // Higgsfield platform (Seedance, etc.). The secret stores the credential pair
+        // in Higgsfield's "key:secret" format used directly in the Authorization header.
+        secretName = process.env.NODE_ENV === "development"
+          ? "dev/AgentWeb/Higgsfield/Video"
+          : "prod/AgentWeb/Higgsfield/Video";
+      } else if (model === "veo-3.1-generate-preview" || model === "veo-3.1-fast-generate-preview") {
         // Google Veo (both standard and fast models use the same API key)
-        secretName = process.env.NODE_ENV === "development" 
-          ? "dev/AgentWeb/Google/Video" 
+        secretName = process.env.NODE_ENV === "development"
+          ? "dev/AgentWeb/Google/Video"
           : "prod/AgentWeb/Google/Video";
       } else {
         // Default to Google Video
@@ -447,6 +471,163 @@ export class VideoService {
   }
 
   /**
+   * Download a video from an HTTP(S) URL and upload it to S3.
+   * Used by providers (e.g. Higgsfield) that return a hosted video URL rather than
+   * an SDK file handle.
+   */
+  private async downloadUrlAndUploadVideo(
+    videoUrl: string,
+    filename: string,
+    userId: string
+  ): Promise<{ success: boolean; url?: string; error?: string }> {
+    try {
+      const downloadResponse = await axios.get(videoUrl, {
+        responseType: "arraybuffer",
+        timeout: 300000, // 5 minutes for large video downloads
+      });
+      const buffer = Buffer.from(downloadResponse.data as ArrayBuffer);
+      const uploadResult = await uploadFileToS3(buffer, filename, userId, "video/mp4");
+      if (uploadResult.success && uploadResult.url) {
+        return { success: true, url: uploadResult.url };
+      }
+      return { success: false, error: uploadResult.error || "Failed to upload video to S3" };
+    } catch (error: any) {
+      console.error("❌ Failed to download and upload video from URL:", error.message);
+      return { success: false, error: `Failed to download video: ${error.message}` };
+    }
+  }
+
+  /**
+   * Generate a video using Higgsfield (e.g. ByteDance Seedance 2.0).
+   *
+   * Higgsfield models are image-to-video, so an input image is required. When no
+   * startFrame is supplied we generate a first frame from the prompt using the image
+   * service, mirroring the keyframe approach used elsewhere in this service.
+   *
+   * The Higgsfield API is an async queue: POST returns a request_id + status_url, which
+   * we poll until the job reaches a terminal state (completed/failed/nsfw).
+   */
+  private async generateWithHiggsfield(
+    params: VideoGenerationParams
+  ): Promise<VideoGenerationResult> {
+    try {
+      const model = params.videoModel || "seedance-2.0";
+      const modelPath = HIGGSFIELD_MODEL_PATHS[model];
+      if (!modelPath) {
+        return { success: false, error: `No Higgsfield model path configured for '${model}'` };
+      }
+
+      // Credential is stored as Higgsfield's "key:secret" pair, used directly in the header.
+      const apiCredential = await this.getApiKey(model);
+      const authHeader = `Key ${apiCredential}`;
+
+      // Seedance is image-to-video — ensure we have a source image.
+      let imageUrl = params.startFrame;
+      if (!imageUrl) {
+        console.log("VideoService: No startFrame for Higgsfield model; generating a first frame from the prompt");
+        const filenameBase = params.filename.replace(/\.mp4$/i, "");
+        const frameResult = await imageService.generateImage({
+          prompt: `Opening frame of a video scene: ${params.prompt}. Cinematic still frame, 16:9 aspect ratio, photorealistic.`,
+          filename: `${filenameBase}_frame.png`,
+          size: "16:9",
+          userId: params.userId,
+        });
+        if (!frameResult.success || !frameResult.imageUrl) {
+          return {
+            success: false,
+            error: `Failed to generate a source frame for Higgsfield video: ${frameResult.error || "unknown error"}`,
+          };
+        }
+        imageUrl = frameResult.imageUrl;
+      }
+
+      // Submit the generation request.
+      const requestBody: Record<string, any> = {
+        image_url: imageUrl,
+        prompt: params.prompt,
+      };
+      if (params.durationSeconds) {
+        requestBody.duration = Math.round(params.durationSeconds);
+      }
+
+      const submitResponse = await axios.post(
+        `${HIGGSFIELD_BASE_URL}/${modelPath}`,
+        requestBody,
+        {
+          headers: {
+            Authorization: authHeader,
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+          timeout: 60000,
+        }
+      );
+
+      const submitData: any = submitResponse.data;
+      let statusUrl: string | undefined = submitData?.status_url;
+      let status: string | undefined = submitData?.status;
+      let videoNode: any = submitData?.video;
+
+      if (!statusUrl && !videoNode) {
+        return {
+          success: false,
+          error: `Higgsfield did not return a status_url or video (status: ${status ?? "unknown"})`,
+        };
+      }
+
+      // Poll the status endpoint until a terminal state is reached.
+      const maxPollAttempts = 120; // 20 minutes max (120 * 10s)
+      let pollAttempts = 0;
+      const terminalStates = new Set(["completed", "failed", "nsfw"]);
+
+      while (statusUrl && !terminalStates.has(status || "") && pollAttempts < maxPollAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, 10000)); // 10s
+        console.log(`Waiting for Higgsfield video... (attempt ${pollAttempts + 1}/${maxPollAttempts})`);
+
+        const statusResponse = await axios.get(statusUrl, {
+          headers: { Authorization: authHeader, Accept: "application/json" },
+          timeout: 60000,
+        });
+        const statusData: any = statusResponse.data;
+        status = statusData?.status;
+        videoNode = statusData?.video ?? videoNode;
+        pollAttempts++;
+      }
+
+      if (status === "failed") {
+        return { success: false, error: `Higgsfield video generation failed` };
+      }
+      if (status === "nsfw") {
+        return { success: false, error: `Video generation was blocked by content policies (NSFW)` };
+      }
+      if (status !== "completed" && !videoNode?.url) {
+        return { success: false, error: "Higgsfield video generation timed out after 20 minutes" };
+      }
+
+      const resultVideoUrl: string | undefined = videoNode?.url;
+      if (!resultVideoUrl) {
+        return { success: false, error: "Higgsfield reported completion but returned no video URL" };
+      }
+
+      // Download the hosted video and re-upload to our S3 bucket.
+      const uploadResult = await this.downloadUrlAndUploadVideo(
+        resultVideoUrl,
+        params.filename,
+        params.userId
+      );
+      if (!uploadResult.success || !uploadResult.url) {
+        return { success: false, error: uploadResult.error || "Failed to upload video to S3" };
+      }
+
+      return { success: true, videoUrl: uploadResult.url, filename: params.filename };
+    } catch (error: any) {
+      const detail = error.response?.data?.detail || error.response?.data || error.message;
+      console.error("❌ Error generating video with Higgsfield:", detail);
+      return { success: false, error: `Higgsfield video generation failed: ${typeof detail === "string" ? detail : JSON.stringify(detail)}` };
+    }
+  }
+
+  /**
    * Generate N+1 keyframe images for a multi-clip video sequence.
    * Frame i is the start of clip i; frame i+1 is its end, which is also the start of clip i+1.
    * All frames are generated in parallel using the image service.
@@ -575,7 +756,14 @@ export class VideoService {
       try {
         let clipUrls: string[] = [];
 
-        if (modelToUse === "veo-3.1-generate-preview") {
+        if (isHiggsfieldModel(modelToUse)) {
+          // Higgsfield (Seedance) generates a single clip per request and handles its own
+          // duration; multi-clip Veo composition does not apply here.
+          result = await this.generateWithHiggsfield({ ...params, durationSeconds: requestedDuration });
+          if (result.success && result.videoUrl) {
+            clipUrls = [result.videoUrl];
+          }
+        } else if (modelToUse === "veo-3.1-generate-preview") {
           if (clipCount === 1) {
             result = await this.generateWithVeo31({ ...params, durationSeconds: veoGenerateDuration });
             if (result.success && result.videoUrl) {
