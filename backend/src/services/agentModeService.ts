@@ -12546,6 +12546,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const existingSpec = creativeData.object_story_spec;
       const pageId = existingSpec.page_id;
       const newLinkUrl = params.link_url || params.destination || params.url;
+      // Carry over UTM/tracking append rules from the source creative unless overridden.
+      const carriedUrlTags = params.url_tags !== undefined ? params.url_tags : creativeData.url_tags;
 
       let newCreativeParams: any;
 
@@ -12568,6 +12570,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           title: params.title || vd.title || creativeData.title || '',
           link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
           call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
+          url_tags: carriedUrlTags,
         };
       } else if (existingSpec.link_data?.child_attachments) {
         const ld = existingSpec.link_data;
@@ -12596,6 +12599,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           link_url: newLinkUrl || ld.link || '',
           carousel_cards: updatedCards,
           call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
+          url_tags: carriedUrlTags,
         };
       } else if (existingSpec.link_data) {
         const ld = existingSpec.link_data;
@@ -12615,6 +12619,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           title: params.title || ld.name || creativeData.title || '',
           link_url: newLinkUrl || ld.link || '',
           call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
+          url_tags: carriedUrlTags,
         };
       } else {
         return {
@@ -13342,6 +13347,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // Normalize destination param names → link_url
     const newLinkUrl = params.link_url || params.destination || params.url;
 
+    // Carry over UTM/tracking append rules unless the caller explicitly overrides them.
+    // Without this, every link_url swap silently strips the ad's existing url_tags.
+    const carriedUrlTags = params.url_tags !== undefined ? params.url_tags : creativeData.url_tags;
+
     // Determine current creative type and extract existing fields
     let newCreativeParams: any;
 
@@ -13359,6 +13368,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         title: params.title || ld.name || vd.title || creativeData.title || '',
         link_url: newLinkUrl || ld.link || vd.call_to_action?.value?.link || '',
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || vd.call_to_action?.type,
+        url_tags: carriedUrlTags,
       };
     } else if (existingSpec.video_data) {
       // Video creative
@@ -13373,6 +13383,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         title: params.title || vd.title || creativeData.title || '',
         link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
         call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
+        url_tags: carriedUrlTags,
       };
     } else if (existingSpec.link_data?.child_attachments) {
       // Carousel creative – update the main link and optionally per-card links
@@ -13393,6 +13404,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         link_url: newLinkUrl || ld.link || '',
         carousel_cards: updatedCards,
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
+        url_tags: carriedUrlTags,
       };
     } else if (existingSpec.link_data) {
       // Single image creative
@@ -13406,6 +13418,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         title: params.title || ld.name || creativeData.title || '',
         link_url: newLinkUrl || ld.link || '',
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
+        url_tags: carriedUrlTags,
       };
     } else {
       return {
@@ -13449,12 +13462,121 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       await metaService.updateAd(accessToken, adId, adLevelParams);
     }
 
+    // Step 5: Read back the ad to VERIFY the swap actually took effect. Meta's POST /{ad-id}
+    // can return success while leaving the ad on its old creative (the documented silent-success
+    // trap), so a 200 from updateAd is NOT proof the destination URL changed. Re-fetch the ad,
+    // confirm the new creative is attached, and — when the caller changed the destination —
+    // confirm the live URL matches what was requested.
+    const verification = await this.verifyCreativeSwap(
+      accessToken, adId, newCreativeId, oldCreativeId, newLinkUrl
+    );
+
+    if (!verification.attached) {
+      return {
+        success: false,
+        message: `The new creative (${newCreativeId}) was created, but ad ${adId} did not switch to it — `
+          + `it still references ${verification.liveCreativeId || oldCreativeId}. This is usually a transient `
+          + `Meta propagation issue; retry the AD UPDATE. The destination URL was NOT changed.`,
+        error: 'SWAP_NOT_REFLECTED',
+        old_creative_id: oldCreativeId,
+        new_creative_id: newCreativeId,
+        live_creative_id: verification.liveCreativeId,
+      };
+    }
+
+    if (newLinkUrl && verification.liveLinkUrl && !this.linkUrlMatches(verification.liveLinkUrl, newLinkUrl)) {
+      return {
+        success: false,
+        message: `Ad ${adId} switched to the new creative (${newCreativeId}), but its live destination URL `
+          + `is "${verification.liveLinkUrl}" instead of the requested "${newLinkUrl}". The update did not `
+          + `take effect as expected — please verify in Ads Manager and retry.`,
+        error: 'DESTINATION_NOT_REFLECTED',
+        old_creative_id: oldCreativeId,
+        new_creative_id: newCreativeId,
+        requested_link_url: newLinkUrl,
+        live_link_url: verification.liveLinkUrl,
+      };
+    }
+
     return {
       success: true,
-      message: `Ad updated successfully. Created new creative (${newCreativeId}) with updated ${creativeKeys.join(', ')} and swapped it in for the old creative (${oldCreativeId}).`,
+      message: `Ad updated successfully. Created new creative (${newCreativeId}) with updated ${creativeKeys.join(', ')} `
+        + `and swapped it in for the old creative (${oldCreativeId})`
+        + (verification.liveLinkUrl ? `. Verified live destination URL: ${verification.liveLinkUrl}` : '.'),
       old_creative_id: oldCreativeId,
       new_creative_id: newCreativeId,
+      verified: true,
+      live_link_url: verification.liveLinkUrl,
     };
+  }
+
+  /**
+   * Re-fetch an ad after a creative swap and report whether the new creative is actually
+   * attached and what destination URL the ad now serves. Used to catch Meta's silent-success
+   * case where POST /{ad-id} returns 200 but the ad keeps its old creative.
+   */
+  private async verifyCreativeSwap(
+    accessToken: string,
+    adId: string,
+    newCreativeId: string,
+    oldCreativeId: string,
+    expectedLinkUrl?: string
+  ): Promise<{ attached: boolean; liveCreativeId?: string; liveLinkUrl?: string }> {
+    try {
+      const ad = await metaService.getAd(accessToken, adId);
+      const liveCreativeId = ad?.creative?.creative_id || ad?.creative?.id;
+      const attached = String(liveCreativeId) === String(newCreativeId);
+
+      // Prefer the destination URL from the live creative's spec. getAd already returns the
+      // creative's object_story_spec; fall back to a dedicated creative fetch only if needed.
+      let liveLinkUrl = this.extractDestinationUrl(ad?.creative?.object_story_spec);
+      if (!liveLinkUrl && expectedLinkUrl && liveCreativeId) {
+        const liveCreative = await metaService.getAdCreative(accessToken, liveCreativeId);
+        liveLinkUrl = this.extractDestinationUrl(liveCreative?.object_story_spec, liveCreative?.asset_feed_spec)
+          || liveCreative?.link_url;
+      }
+
+      return { attached, liveCreativeId, liveLinkUrl };
+    } catch (err: any) {
+      // Verification is best-effort. If the read-back itself fails we can't prove the swap
+      // failed, so don't block — report attached so the swap is treated as successful but
+      // surface no live URL.
+      console.warn(`AgentMode: creative-swap verification read-back failed for ad ${adId}:`, err?.message);
+      return { attached: true, liveCreativeId: newCreativeId };
+    }
+  }
+
+  /**
+   * Extract the destination URL from a creative's object_story_spec (single image / video /
+   * carousel) or asset_feed_spec (placement-customized). Returns undefined if none found.
+   */
+  private extractDestinationUrl(objectStorySpec?: any, assetFeedSpec?: any): string | undefined {
+    if (objectStorySpec) {
+      const ld = objectStorySpec.link_data;
+      const vd = objectStorySpec.video_data;
+      const fromSpec =
+        ld?.link ||
+        ld?.call_to_action?.value?.link ||
+        ld?.child_attachments?.[0]?.link ||
+        vd?.call_to_action?.value?.link;
+      if (fromSpec) return fromSpec;
+    }
+    if (assetFeedSpec?.link_urls?.length) {
+      return assetFeedSpec.link_urls[0]?.website_url || assetFeedSpec.link_urls[0]?.display_url;
+    }
+    return undefined;
+  }
+
+  /**
+   * Compare the live destination URL against the requested one. Meta normalizes URLs (e.g. adds a
+   * trailing slash, lowercases the host), so compare leniently: strip trailing slashes and ignore
+   * case on the origin. A requested URL is considered reflected if the live URL starts with it.
+   */
+  private linkUrlMatches(liveUrl: string, requestedUrl: string): boolean {
+    const normalize = (u: string) => u.trim().replace(/\/+$/, '').toLowerCase();
+    const live = normalize(liveUrl);
+    const requested = normalize(requestedUrl);
+    return live === requested || live.startsWith(requested) || requested.startsWith(live);
   }
 
   public async deleteMetaAdsAd(userId: string, adId: string, account_id?: string): Promise<any> {

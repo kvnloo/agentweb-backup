@@ -430,8 +430,9 @@ COPY_AD WORKFLOW (clone an existing ad with optional overrides):
 CHANGING AN AD'S CREATIVE/IMAGE (AD UPDATE):
   Meta ads cannot mutate a creative in place — you must point the ad at a different creative.
   - To swap to a creative you already built: AD UPDATE with params.creative_id (the system nests it correctly; a top-level creative_id is silently dropped by Meta and the old image keeps showing).
-  - To change copy/destination/image content: AD UPDATE with link_url / body / title / image_hash / image_url — the system auto-builds a new creative from the old one and swaps it in.
+  - To change copy/destination/image content: AD UPDATE with link_url / body / title / image_hash / image_url — the system auto-builds a new creative from the old one (preserving existing UTM/url_tags unless you override them) and swaps it in.
   Either way the change is reflected on the SAME ad_id; deleting and recreating the ad is NOT required.
+  VERIFICATION: after a link_url/destination swap the system re-fetches the ad to confirm the new creative actually attached AND the live destination URL matches what you requested. If it returns error SWAP_NOT_REFLECTED or DESTINATION_NOT_REFLECTED, the change did NOT take effect (usually transient Meta propagation) — retry the AD UPDATE. Only a result with verified:true means the user will see the new URL in Ads Manager.
 
 CAMPAIGN OBJECTIVES (valid values for 'objective'):
   OUTCOME_TRAFFIC, OUTCOME_AWARENESS, OUTCOME_ENGAGEMENT, OUTCOME_SALES, OUTCOME_LEADS, OUTCOME_APP_PROMOTION
