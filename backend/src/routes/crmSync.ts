@@ -102,8 +102,10 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
     }
 
     const backendUrl = process.env.BACKEND_URL || 'http://localhost:3001';
+    // Post-disconnect: config record exists but credential cleared → not configured.
+    const hasCredential = !!(config.accountId || config.apiKeyEncrypted);
     res.json({
-      configured: true,
+      configured: hasCredential,
       provider: config.provider,
       accountId: config.accountId,
       hasManualToken: !!config.apiKeyEncrypted,
@@ -160,6 +162,21 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       });
     }
 
+    // Enforce one-account-per-list: reject if another list already uses this accountId.
+    if (accountId) {
+      const allLists = await crmDb.getLeadListsByUserId(userId);
+      const conflict = (allLists || []).find((l: any) => {
+        if (l.listId === listId) return false;
+        const cfg = l.externalCrmSyncConfigs?.[provider];
+        return cfg?.accountId === accountId;
+      });
+      if (conflict) {
+        return res.status(409).json({
+          error: `This account is already linked to another list ("${(conflict as any).name || conflict.listId}"). Disconnect it there first.`,
+        });
+      }
+    }
+
     const config = await externalCrmSyncService.saveConfig(userId, listId, provider, {
       accountId, apiKey, autoSyncEnabled,
       contactFieldMapping, dealFieldMapping, customFieldMapping,
@@ -200,6 +217,28 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to save config' });
+  }
+});
+
+// DELETE /api/crm-sync/config/:listId/:provider/account
+// Disconnects the OAuth account from this list (clears accountId + credentials)
+// while preserving field mappings and other settings.
+// Only the user's explicit action in the CRM sync dialog triggers this — OAuth
+// revocation from the settings page does NOT call this route, so the account
+// remains "used" and blocked from linking to other lists unless manually disconnected.
+router.delete('/config/:listId/:provider/account', async (req: any, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { listId, provider } = req.params;
+    const ownership = await verifyListOwnership(userId, listId);
+    if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
+
+    await externalCrmSyncService.disconnectAccount(userId, listId, provider);
+    res.json({ message: 'Account disconnected' });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to disconnect account' });
   }
 });
 
@@ -268,6 +307,12 @@ router.get('/external-pipelines/:listId/:provider', async (req: any, res) => {
     const pipelines = await externalCrmSyncService.getExternalPipelines(userId, listId, provider, { accountId, apiKey });
     res.json({ pipelines });
   } catch (err: any) {
+    const axiosData = err.response?.data;
+    console.error('[external-pipelines] error', {
+      message: err.message,
+      status: err.response?.status,
+      data: axiosData,
+    });
     res.status(500).json({ error: err.message || 'Failed to fetch external pipelines' });
   }
 });
@@ -293,6 +338,19 @@ router.post('/test/:listId/:provider', async (req: any, res) => {
     // webhookSecret is generated immediately and the webhook URL can be copied without
     // requiring a separate Save step.
     if (result.valid && (apiKey || accountId)) {
+      if (accountId) {
+        const allLists = await crmDb.getLeadListsByUserId(userId);
+        const conflict = (allLists || []).find((l: any) => {
+          if (l.listId === listId) return false;
+          const cfg = l.externalCrmSyncConfigs?.[provider];
+          return cfg?.accountId === accountId;
+        });
+        if (conflict) {
+          return res.status(409).json({
+            error: `This account is already linked to another list ("${(conflict as any).name || conflict.listId}"). Disconnect it there first.`,
+          });
+        }
+      }
       const saved = await externalCrmSyncService.saveConfig(userId, listId, provider, { apiKey, accountId });
       const backendUrl = process.env.BACKEND_URL || 'http://localhost:3001';
       const webhookUrl = saved.webhookSecret

@@ -396,6 +396,63 @@ describe('ExternalCrmSyncService', () => {
     });
   });
 
+  // ─── disconnectAccount ────────────────────────────────────────────────────
+
+  describe('disconnectAccount', () => {
+    it('does nothing when no config exists', async () => {
+      mockNoConfig();
+      await service.disconnectAccount('user1', 'list1', 'hubspot');
+      expect(mockCrmDb.setLeadListCrmSyncConfig).not.toHaveBeenCalled();
+    });
+
+    it('clears accountId, apiKeyEncrypted, and webhookSecret', async () => {
+      mockListWithConfig(makeConfig({ accountId: 'acct1', apiKeyEncrypted: 'enc:key', webhookSecret: 'secret123' }));
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.disconnectAccount('user1', 'list1', 'hubspot');
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as ExternalCrmSyncConfig;
+      expect(saved.accountId).toBeUndefined();
+      expect(saved.apiKeyEncrypted).toBeUndefined();
+      expect(saved.webhookSecret).toBeUndefined();
+    });
+
+    it('preserves field mappings', async () => {
+      const config = makeConfig({ accountId: 'acct1' });
+      mockListWithConfig(config);
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.disconnectAccount('user1', 'list1', 'hubspot');
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as ExternalCrmSyncConfig;
+      expect(saved.contactFieldMapping).toEqual(config.contactFieldMapping);
+      expect(saved.dealFieldMapping).toEqual(config.dealFieldMapping);
+      expect(saved.customFieldMapping).toEqual(config.customFieldMapping);
+    });
+
+    it('preserves autoSyncEnabled and webhookEnabled', async () => {
+      mockListWithConfig(makeConfig({ accountId: 'acct1', autoSyncEnabled: true, webhookEnabled: true }));
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.disconnectAccount('user1', 'list1', 'hubspot');
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as ExternalCrmSyncConfig;
+      expect(saved.autoSyncEnabled).toBe(true);
+      expect(saved.webhookEnabled).toBe(true);
+    });
+
+    it('does NOT set config to null (unlike deleteConfig)', async () => {
+      mockListWithConfig(makeConfig({ accountId: 'acct1' }));
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.disconnectAccount('user1', 'list1', 'hubspot');
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2];
+      expect(saved).not.toBeNull();
+    });
+  });
+
   // ─── testConnection ───────────────────────────────────────────────────────
 
   describe('testConnection', () => {
