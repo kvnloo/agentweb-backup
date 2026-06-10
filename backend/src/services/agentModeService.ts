@@ -75,6 +75,7 @@ import { isTransientLLMError } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
 import {
   AgentToolPolicyDecision,
+  executeAgentToolThroughGateway,
   evaluateAgentToolPolicy,
   summarizeAgentToolPolicyFlags,
   summarizeAgentToolPolicyModes,
@@ -2869,36 +2870,51 @@ export class AgentModeService {
           // and prevents rate-limit throttling when batching multiple image/video generation calls
           toolResults = [];
           for (const { toolCall, functionArgs, policyDecision } of preparedCalls) {
-            const toolStart = Date.now();
-            try {
-              const toolOptions: Record<string, any> = {};
-              if (socketEmit) toolOptions.socketEmit = socketEmit;
-              if (screenshotUrl) toolOptions.screenshotUrl = screenshotUrl;
-              if (isDelegatedAccess) toolOptions.isDelegatedAccess = true;
-              const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, Object.keys(toolOptions).length > 0 ? toolOptions : undefined);
-              const toolDuration = Date.now() - toolStart;
-              toolResults.push({ status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration, policyDecision });
-            } catch (error) {
-              const toolDuration = Date.now() - toolStart;
-              toolResults.push({ status: 'error' as const, toolCall, functionArgs, error, duration: toolDuration, policyDecision });
+            const outcome = await executeAgentToolThroughGateway({
+              toolName: toolCall.function.name,
+              args: functionArgs,
+              policyDecision,
+              execute: () => this.executePreparedAgentTool({
+                llmModel,
+                toolName: toolCall.function.name,
+                functionArgs,
+                userId,
+                sessionId,
+                mockMode,
+                socketEmit,
+                screenshotUrl,
+                isDelegatedAccess,
+              }),
+            });
+            if (outcome.status === 'success') {
+              toolResults.push({ status: 'success' as const, toolCall, functionArgs, result: outcome.result, duration: outcome.durationMs, policyDecision: outcome.policyDecision });
+            } else {
+              toolResults.push({ status: 'error' as const, toolCall, functionArgs, error: outcome.error, duration: outcome.durationMs, policyDecision: outcome.policyDecision });
             }
           }
         } else {
           // Parallel execution (default)
           const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs, policyDecision }) => {
-            const toolStart = Date.now();
-            try {
-              const toolOptions: Record<string, any> = {};
-              if (socketEmit) toolOptions.socketEmit = socketEmit;
-              if (screenshotUrl) toolOptions.screenshotUrl = screenshotUrl;
-              if (isDelegatedAccess) toolOptions.isDelegatedAccess = true;
-              const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, Object.keys(toolOptions).length > 0 ? toolOptions : undefined);
-              const toolDuration = Date.now() - toolStart;
-              return { status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration, policyDecision };
-            } catch (error) {
-              const toolDuration = Date.now() - toolStart;
-              return { status: 'error' as const, toolCall, functionArgs, error, duration: toolDuration, policyDecision };
+            const outcome = await executeAgentToolThroughGateway({
+              toolName: toolCall.function.name,
+              args: functionArgs,
+              policyDecision,
+              execute: () => this.executePreparedAgentTool({
+                llmModel,
+                toolName: toolCall.function.name,
+                functionArgs,
+                userId,
+                sessionId,
+                mockMode,
+                socketEmit,
+                screenshotUrl,
+                isDelegatedAccess,
+              }),
+            });
+            if (outcome.status === 'success') {
+              return { status: 'success' as const, toolCall, functionArgs, result: outcome.result, duration: outcome.durationMs, policyDecision: outcome.policyDecision };
             }
+            return { status: 'error' as const, toolCall, functionArgs, error: outcome.error, duration: outcome.durationMs, policyDecision: outcome.policyDecision };
           });
           toolResults = await Promise.all(toolPromises);
         }
@@ -5432,6 +5448,33 @@ export class AgentModeService {
           data: args
         };
     }
+  }
+
+  private async executePreparedAgentTool(input: {
+    llmModel: string;
+    toolName: string;
+    functionArgs: any;
+    userId: string;
+    sessionId: string;
+    mockMode: boolean;
+    socketEmit?: any;
+    screenshotUrl?: string;
+    isDelegatedAccess?: boolean;
+  }): Promise<any> {
+    const toolOptions: Record<string, any> = {};
+    if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
+    if (input.screenshotUrl) toolOptions.screenshotUrl = input.screenshotUrl;
+    if (input.isDelegatedAccess) toolOptions.isDelegatedAccess = true;
+
+    return this.executeTool(
+      input.llmModel,
+      input.toolName,
+      input.functionArgs,
+      input.userId,
+      input.sessionId,
+      input.mockMode,
+      Object.keys(toolOptions).length > 0 ? toolOptions : undefined,
+    );
   }
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
