@@ -76,6 +76,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When Emma listed or published a landing page, she sometimes gave you the raw internal hosting address instead of the custom domain you actually use and share with customers',
       '- Emma now always reports the live custom-domain URL for a page when one is set, so the links she gives you are the ones your visitors see',
       '- This applies everywhere Emma surfaces a page link — listing your pages, confirming a publish, and verification or QA instructions',
+      'Fixed: Files From Data Analysis Now Come With Working Download Links',
+      '- When you asked Emma to run a data analysis and save the result as a file (for example a CSV audience or export), the link she gave back sometimes did not actually open — it was just a filename or an address pointing to nothing',
+      '- Generated files are now saved to real, secure storage and Emma returns a download link that genuinely opens the file',
+      '- This works for CSV, JSON, and other text-based exports produced during analysis',
     ],
   },
   {
