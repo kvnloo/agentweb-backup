@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-10',
     changes: [
+      'New: Report a Bug in One Click, Screenshot Included',
+      '- A new "Report a bug" button is always within reach in the bottom-right corner of every page',
+      '- Click it and we automatically grab a screenshot of the page you were just looking at — no need to capture or attach anything yourself',
+      '- Just type a quick note about what went wrong and hit send; your report (with the screenshot) goes straight to our team and is tracked like any other issue',
+      '- We follow up at your account email if we need more detail',
+    ],
+  },
+  {
+    date: '2026-06-10',
+    changes: [
       'New: Undo a Landing Page Publish in One Click',
       '- Published a landing page change and want it back the way it was? Each landing page card now has a "Revert last publish" button that rolls the live site back to exactly how it looked before your most recent publish, then redeploys automatically',
       '- The button only appears when there is a publish to undo, and a confirmation dialog explains what will happen before anything changes',
