@@ -3,6 +3,8 @@ import { authenticateToken } from "../middleware/auth";
 import { resendService } from "../services/resendService";
 import { userDb } from "../services/db";
 import { settingsService } from "../services/settingsService";
+import { createOncallItem } from "../services/notionService";
+import { uploadScreenshotToS3, presignS3Url } from "../utils/s3Utils";
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from "../config";
 
 const router = express.Router();
@@ -201,6 +203,125 @@ router.post("/report-error", async (req, res) => {
   } catch (error) {
     console.error("Error sending error report:", error);
     res.status(500).json({ message: "Failed to send error report" });
+  }
+});
+
+// Report a UI bug from the in-app "Report a bug" button.
+// Auto-captures a screenshot on the client; here we upload it, create a tracked
+// item on the engineering sprint board, and notify the product team — the same
+// pipeline used by Emma's report_product_issues tool.
+router.post("/report-ui-bug", async (req, res) => {
+  try {
+    const authenticatedReq = req as any;
+    const userId = authenticatedReq.user.userId;
+    const { description, pageUrl, screenshot } = req.body;
+
+    if (!description || !description.trim()) {
+      return res.status(400).json({ message: "Description is required" });
+    }
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Upload the screenshot (if provided) to S3. Degrade gracefully — a failed
+    // upload should never block the bug report itself.
+    let screenshotUrl: string | null = null;
+    if (typeof screenshot === "string" && screenshot.startsWith("data:image")) {
+      const uploaded = await uploadScreenshotToS3(screenshot, userId);
+      screenshotUrl = uploaded?.url ?? null;
+    }
+    const screenshotContext = screenshot
+      ? (screenshotUrl || "Upload failed")
+      : "Not provided";
+
+    const isDelegated = authenticatedReq.delegateInfo?.isDelegated === true;
+    const adminEmail: string | undefined = authenticatedReq.delegateInfo?.adminEmail;
+
+    const title = `UI Bug: ${description.trim().slice(0, 80)}`;
+
+    const issueContext: Record<string, any> = {
+      "User Name": user.displayName || user.email,
+      "User Email": user.email,
+      "User ID": userId,
+      "Page URL": pageUrl || "N/A",
+      "Screenshot": screenshotContext,
+    };
+    if (isDelegated && adminEmail) {
+      issueContext["Reported By (Admin)"] = adminEmail;
+    }
+
+    // Create a tracked item on the sprint board (no-op in non-prod).
+    const item = await createOncallItem({
+      title,
+      description: description.trim(),
+      additionalTags: ["Customer Reported", "UI Bug"],
+      context: issueContext,
+    });
+    const issueId = item.pageId ? `AGW-${item.pageId}` : undefined;
+
+    // Presign the screenshot so the email can render an inline preview that the
+    // recipient can actually load (the bucket is private).
+    const previewUrl = screenshotUrl ? presignS3Url(screenshotUrl) : null;
+
+    const delegationNote = isDelegated && adminEmail
+      ? `<div style="background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 10px; margin-bottom: 15px;">
+           <strong>⚠️ Note:</strong> Submitted via admin delegation by ${adminEmail}
+         </div>`
+      : "";
+
+    const emailHtml = `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; line-height: 1.6; color: #333;">
+  <div style="max-width: 640px; margin: 0 auto; padding: 20px;">
+    <div style="background-color: #fef2f2; padding: 16px 20px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #ef4444;">
+      <h2 style="margin: 0; color: #b91c1c; font-size: 18px;">UI Bug Report</h2>
+    </div>
+
+    ${delegationNote}
+
+    <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+      <tr><td style="padding: 6px 0; color: #666; width: 140px; vertical-align: top;"><strong>Reported by</strong></td><td style="padding: 6px 0;"><a href="mailto:${user.email}" style="color: #4F46E5;">${user.displayName || user.email}</a> (${user.email})</td></tr>
+      ${issueId ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Issue ID</strong></td><td style="padding: 6px 0; font-family: monospace;">${issueId}</td></tr>` : ""}
+      ${item.notionUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Notion</strong></td><td style="padding: 6px 0;"><a href="${item.notionUrl}" style="color: #4F46E5; font-weight: 600;">→ Open in Notion</a></td></tr>` : ""}
+      ${pageUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Page URL</strong></td><td style="padding: 6px 0;"><a href="${pageUrl}" style="color: #4F46E5;">${pageUrl}</a></td></tr>` : ""}
+    </table>
+
+    <div style="background-color: #fff; border-left: 4px solid #ef4444; padding: 15px; border-radius: 0 4px 4px 0;">
+      <div style="font-weight: 600; margin-bottom: 8px; color: #333;">What the user reported</div>
+      <div style="color: #444; line-height: 1.6;">${description.trim().replace(/\n/g, "<br>")}</div>
+    </div>
+
+    ${previewUrl ? `<div style="margin-top: 20px;"><div style="font-weight: 600; margin-bottom: 8px; color: #333;">Screenshot</div><a href="${previewUrl}"><img src="${previewUrl}" alt="Screenshot" style="max-width: 100%; border: 1px solid #e5e7eb; border-radius: 6px;"></a><div style="font-size: 12px; color: #9ca3af; margin-top: 4px;">This preview link expires in ~1 hour.</div></div>` : ""}
+
+    <div style="margin-top: 20px; padding-top: 16px; border-top: 1px solid #e5e7eb; font-size: 12px; color: #9ca3af;">
+      Reply to this email to respond directly to the customer.
+    </div>
+  </div>
+</body>
+</html>
+    `;
+
+    const productIssueEmails = await settingsService.getJsonArraySetting("product_issue_emails", ["founders@agentweb.pro"]);
+    const recipients = isDelegated && adminEmail
+      ? [...productIssueEmails, adminEmail]
+      : productIssueEmails;
+
+    await resendService.sendEmail({
+      from: `${RESEND_SYSTEM_NAME} Support <${RESEND_SYSTEM_EMAIL}>`,
+      to: recipients,
+      subject: `[UI Bug] ${title} — reported by ${user.email}`,
+      html: emailHtml,
+      replyTo: user.email,
+    });
+
+    res.json({ success: true, message: "Bug reported successfully", issueId });
+  } catch (error) {
+    console.error("Error reporting UI bug:", error);
+    res.status(500).json({ message: "Failed to report bug" });
   }
 });
 
