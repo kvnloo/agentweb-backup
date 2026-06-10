@@ -22,6 +22,82 @@ function jsonResult(data: unknown) {
   return { content: [{ type: 'text' as const, text: typeof data === 'string' ? data : JSON.stringify(data, null, 2) }] };
 }
 
+function normalizeSkillQuery(value: unknown): string {
+  return String(value ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function skillTokens(value: unknown): string[] {
+  return normalizeSkillQuery(value)
+    .split(' ')
+    .filter((token) => token && token !== 'skill' && token !== 'engine' && token !== 'workflow');
+}
+
+function scoreSkillMatch(skill: any, query: string): number {
+  const normalizedQuery = normalizeSkillQuery(query);
+  if (!normalizedQuery) return 0;
+
+  const name = normalizeSkillQuery(skill?.name);
+  const description = normalizeSkillQuery(skill?.description);
+  const haystack = `${name} ${description}`;
+  const tokens = skillTokens(query);
+
+  let score = 0;
+  if (name === normalizedQuery) score += 100;
+  if (name.startsWith(normalizedQuery)) score += 70;
+  if (name.includes(normalizedQuery)) score += 55;
+  if (description.includes(normalizedQuery)) score += 25;
+
+  for (const token of tokens) {
+    if (name.split(' ').includes(token)) score += 12;
+    else if (name.includes(token)) score += 8;
+    else if (description.includes(token)) score += 4;
+  }
+
+  const matchedTokens = tokens.filter((token) => haystack.includes(token)).length;
+  if (tokens.length > 0) score += Math.round((matchedTokens / tokens.length) * 20);
+
+  return score;
+}
+
+function compactSkillMatch(skill: any, query: string) {
+  return {
+    skill_id: skill.skillId,
+    name: skill.name,
+    description: skill.description,
+    ownerEmail: skill.ownerEmail,
+    visibility: skill.visibility,
+    isPublished: skill.isPublished,
+    matchScore: scoreSkillMatch(skill, query),
+  };
+}
+
+function resolveSkillInstruction(action: string) {
+  return `skill_id is required for ${action}. Call resolve_skill with the user's skill name first, then retry manage_skill with the returned skill_id. Do not claim a skill is missing without resolve_skill evidence.`;
+}
+
+function skillResolution(matches: Array<{ matchScore: number }>) {
+  if (matches.length === 0) return 'no_match';
+  const [top, runnerUp] = matches;
+  if (top.matchScore >= 100 || (top.matchScore >= 60 && (!runnerUp || top.matchScore >= runnerUp.matchScore + 25))) {
+    return 'single_strong_match';
+  }
+  return 'multiple_matches';
+}
+
+function skillResolutionNextStep(resolution: string) {
+  if (resolution === 'single_strong_match') {
+    return 'Use manage_skill with this skill_id after user confirmation for mutations.';
+  }
+  if (resolution === 'multiple_matches') {
+    return 'Ask the user which skill_id to use before calling manage_skill.';
+  }
+  return 'Tell the user no matching skill was found and ask for a more specific skill name.';
+}
+
 // ─── Emma Chat Sessions ─────────────────────────────────────────────────────
 
 mcpToolRegistry.register({
@@ -1817,10 +1893,52 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
+  name: 'resolve_skill',
+  definition: {
+    name: 'resolve_skill',
+    description: 'Resolve a user-provided skill, engine, or workflow-skill name to compact skill metadata before using manage_skill. Admin-only. ALWAYS use this before update/delete/get when the user gave a skill name rather than an exact skill_id. Returns compact matches only and never returns the full systemPrompt.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Skill name or partial phrase to resolve, such as "Event skill" or "Luma Event Lead Engagement Engine".' },
+        limit: { type: 'number', description: 'Maximum matches to return, 1-10. Defaults to 5.' }
+      },
+      required: ['query']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const query = typeof args.query === 'string' ? args.query.trim() : '';
+    if (!query) {
+      return jsonResult({ error: 'query is required' });
+    }
+
+    const rawLimit = typeof args.limit === 'number' ? args.limit : 5;
+    const limit = Math.max(1, Math.min(10, Math.floor(rawLimit) || 5));
+    const skills = await mcpFetch({ method: 'GET', path: '/api/skills', context: ctx(context) });
+    const skillList = Array.isArray(skills) ? skills : [];
+    const matches = skillList
+      .map((skill: any) => compactSkillMatch(skill, query))
+      .filter((skill: any) => skill.skill_id && skill.name && skill.matchScore > 0)
+      .sort((a: any, b: any) => b.matchScore - a.matchScore || String(a.name).localeCompare(String(b.name)))
+      .slice(0, limit);
+    const resolution = skillResolution(matches);
+
+    return jsonResult({
+      success: true,
+      query,
+      totalMatches: matches.length,
+      matches,
+      resolution,
+      nextStep: skillResolutionNextStep(resolution),
+    });
+  }
+});
+
+mcpToolRegistry.register({
   name: 'manage_skill',
   definition: {
     name: 'manage_skill',
-    description: 'Create, update, delete, or get a skill definition. Admin only. CAUTION: These operations modify production skill configuration — changes affect which tools are available to users. Always confirm with the user before making changes.',
+    description: 'Create, update, delete, or get a skill definition. Admin only. CAUTION: These operations modify production skill configuration — changes affect which tools are available to users. For update/delete/get, skill_id is required; if the user gave a skill name, call resolve_skill first and then use the returned skill_id. Always confirm with the user before making changes.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1846,7 +1964,7 @@ mcpToolRegistry.register({
         return jsonResult(data);
       }
       case 'update': {
-        if (!args.skill_id) return jsonResult({ error: 'skill_id is required for update' });
+        if (!args.skill_id) return jsonResult({ error: resolveSkillInstruction('update') });
         const body: any = {};
         if (args.name !== undefined) body.name = args.name;
         if (args.description !== undefined) body.description = args.description;
@@ -1857,12 +1975,12 @@ mcpToolRegistry.register({
         return jsonResult(data);
       }
       case 'delete': {
-        if (!args.skill_id) return jsonResult({ error: 'skill_id is required for delete' });
+        if (!args.skill_id) return jsonResult({ error: resolveSkillInstruction('delete') });
         const data = await mcpFetch({ method: 'DELETE', path: `/api/skills/${args.skill_id}`, context: c });
         return jsonResult(data);
       }
       case 'get': {
-        if (!args.skill_id) return jsonResult({ error: 'skill_id is required for get' });
+        if (!args.skill_id) return jsonResult({ error: resolveSkillInstruction('get') });
         const data = await mcpFetch({ method: 'GET', path: `/api/skills/${args.skill_id}`, context: c });
         return jsonResult(data);
       }
