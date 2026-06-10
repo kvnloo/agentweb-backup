@@ -33,11 +33,18 @@ jest.mock('@slack/web-api', () => ({
 const mockLaunchEnvironment = jest.fn();
 const mockGetNotionPage = jest.fn();
 const mockGetNotionPageContent = jest.fn();
+const mockGetNotionCredentials = jest.fn();
+const mockGetSprintTasksDatabaseId = jest.fn();
 
 jest.mock('../services/devEnvService', () => ({
   launchEnvironment: (...args: unknown[]) => mockLaunchEnvironment(...args),
   getNotionPage: (...args: unknown[]) => mockGetNotionPage(...args),
   getNotionPageContent: (...args: unknown[]) => mockGetNotionPageContent(...args),
+}));
+
+jest.mock('../services/notionService', () => ({
+  getNotionCredentials: (...args: unknown[]) => mockGetNotionCredentials(...args),
+  getSprintTasksDatabaseId: (...args: unknown[]) => mockGetSprintTasksDatabaseId(...args),
 }));
 
 // Generic mocks so unrelated handlers in the same file don't blow up.
@@ -91,6 +98,8 @@ const HARSHA = 'U08TM4QFQ1L';
 const EMMA_BOT = 'UEMMA_BOT';
 const DM_CHANNEL = 'D12345';
 const MESSAGE_TS = '1700000000.000100';
+const AI_READINESS_MESSAGE_TS = '1700000000.000200';
+const SPRINT_TASKS_DATA_SOURCE = '2bf09247-c951-812a-bd0a-000bd4c05bbf';
 
 // One real Notion task URL from the daily DM (32-hex page id at end of slug).
 const PAGE_URL_1 =
@@ -114,6 +123,23 @@ function buildLoopDmMessage(urls: string[] = [PAGE_URL_1]) {
   ].join('\n');
 }
 
+function buildAiReadinessDmMessage() {
+  return [
+    '*🧭 AI Readiness Funnel — daily run 2026-06-10*',
+    'Run ID: `loop-ai-readiness-funnel-2026-06-10T16:30:00.087Z-523167`',
+    'Events scanned: 58  |  Findings: 0',
+    'Funnel (7d): landed 42 → quiz 3 → captured 11 → book 0 / signup 2',
+    '',
+    'No disproportionate leak this window. Watch the shape above; the next push is whichever stage is thinnest.',
+    '',
+    '*Startup decisions (low-data, permission-gated)*',
+    '1. `low-data-quiz-start-leak` — Try one above-the-fold change: make the first screen promise the delivered roadmap and reduce the perceived quiz commitment.',
+    '   Evidence: 3/42 visitors started the quiz (7%).  |  Confidence: medium  |  Needs approval: yes',
+    '',
+    'React ✅ to dispatch all to cloud-dev  |  ❌ to skip  |  🛑 to pause loop',
+  ].join('\n');
+}
+
 function buildApp(): express.Application {
   const app = express();
   app.use(express.json());
@@ -132,6 +158,15 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
 
     mockAuthTest.mockResolvedValue({ ok: true, user_id: EMMA_BOT });
     mockChatPostMessage.mockResolvedValue({ ok: true, ts: 'reply-ts' });
+    mockGetNotionCredentials.mockResolvedValue({ apiToken: 'notion-token', userGuidePageId: 'guide' });
+    mockGetSprintTasksDatabaseId.mockResolvedValue(SPRINT_TASKS_DATA_SOURCE);
+    jest.spyOn(global, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        id: 'notion-ai-readiness-page-id',
+        url: 'https://notion.so/notionaireadinesspageid',
+      }),
+    } as Response);
     mockGetNotionPage.mockResolvedValue({
       title: 'fix(ai-eval-funnel): capture-broken',
       status: 'To-do',
@@ -146,6 +181,10 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
       attachments: [],
     });
     mockLaunchEnvironment.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
   });
 
   it('dispatches cloud-dev runs when Harsha reacts ✅ on the daily Emma DM', async () => {
@@ -201,6 +240,57 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
 
     // Idempotency: marked dispatched.
     expect(isDispatched(MESSAGE_TS)).toBe(true);
+  });
+
+  it('creates and launches cloud-dev task when Harsha reacts ✅ on AI Readiness low-data digest', async () => {
+    mockConversationsHistory.mockResolvedValue({
+      ok: true,
+      messages: [
+        {
+          ts: AI_READINESS_MESSAGE_TS,
+          user: EMMA_BOT,
+          bot_id: 'B_EMMA',
+          text: buildAiReadinessDmMessage(),
+        },
+      ],
+    });
+
+    const res = await request(buildApp())
+      .post('/api/slack/events')
+      .send({
+        type: 'event_callback',
+        event: {
+          type: 'reaction_added',
+          reaction: 'white_check_mark',
+          user: HARSHA,
+          item: { type: 'message', channel: DM_CHANNEL, ts: AI_READINESS_MESSAGE_TS },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    await wait();
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      'https://api.notion.com/v1/pages',
+      expect.objectContaining({
+        method: 'POST',
+        body: expect.stringContaining('low-data-quiz-start-leak'),
+      }),
+    );
+    expect(mockLaunchEnvironment).toHaveBeenCalledWith(
+      'notion-ai-readiness-page-id',
+      'fix(ai-readiness-funnel): low-data-quiz-start-leak',
+      expect.stringContaining('3/42 visitors started the quiz'),
+      SPRINT_TASKS_DATA_SOURCE,
+    );
+
+    const replies = mockChatPostMessage.mock.calls.filter(
+      ([arg]) => arg.thread_ts === AI_READINESS_MESSAGE_TS,
+    );
+    expect(replies.length).toBeGreaterThanOrEqual(2);
+    expect(replies[0][0].text).toMatch(/Creating 1 AI Readiness cloud-dev task/i);
+    expect(replies[replies.length - 1][0].text).toMatch(/Launched 1\/1 AI Readiness/i);
+    expect(isDispatched(AI_READINESS_MESSAGE_TS)).toBe(true);
   });
 
   it('ignores reactions from users other than Harsha', async () => {
