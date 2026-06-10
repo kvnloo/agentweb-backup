@@ -136,6 +136,20 @@ export interface GeneratedLandingPage {
   updatedAt: string;
 }
 
+/**
+ * Resolve the canonical live URL to report to the user for a landing page.
+ *
+ * `customDomainUrl` (the user's custom domain or the managed *.agentwebforms.com
+ * subdomain) is the public-facing address the user knows their page by, so it
+ * takes priority over the raw Vercel `deployedUrl`. Falls back to `deployedUrl`
+ * when no custom domain is set, and to an empty string when neither exists.
+ */
+export function getLandingPageLiveUrl(
+  page: Pick<GeneratedLandingPage, "deployedUrl" | "customDomainUrl">
+): string {
+  return page.customDomainUrl || page.deployedUrl || "";
+}
+
 export interface BrandContext {
   brandName?: string;
   primaryColor?: string;

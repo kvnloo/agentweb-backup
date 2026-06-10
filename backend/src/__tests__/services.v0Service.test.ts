@@ -138,6 +138,7 @@ import {
   getDeploymentStatus,
   isOrphanedFailedPage,
   cleanupOrphanedFailedPages,
+  getLandingPageLiveUrl,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig } from "../services/v0Service";
@@ -905,6 +906,41 @@ describe("v0Service - listLandingPages", () => {
     const result = await listLandingPages("user-1");
     expect(result).toHaveLength(2);
     expect(result[0].name).toBe("Page 1");
+  });
+});
+
+// =============================================================================
+// getLandingPageLiveUrl — prefer customDomainUrl over deployedUrl
+// =============================================================================
+describe("v0Service - getLandingPageLiveUrl", () => {
+  it("prefers customDomainUrl when both are set", () => {
+    expect(
+      getLandingPageLiveUrl({
+        deployedUrl: "https://everyio-day-zero-founders.agentwebforms.com/every-io-day-zero-pre-seed-fou",
+        customDomainUrl: "https://everyio.agentwebforms.com/every-io-day-zero-pre-seed-fou",
+      })
+    ).toBe("https://everyio.agentwebforms.com/every-io-day-zero-pre-seed-fou");
+  });
+
+  it("falls back to deployedUrl when customDomainUrl is missing", () => {
+    expect(
+      getLandingPageLiveUrl({
+        deployedUrl: "https://my-project.vercel.app",
+      })
+    ).toBe("https://my-project.vercel.app");
+  });
+
+  it("falls back to deployedUrl when customDomainUrl is an empty string", () => {
+    expect(
+      getLandingPageLiveUrl({
+        deployedUrl: "https://my-project.vercel.app",
+        customDomainUrl: "",
+      })
+    ).toBe("https://my-project.vercel.app");
+  });
+
+  it("returns empty string when neither URL is set", () => {
+    expect(getLandingPageLiveUrl({})).toBe("");
   });
 });
 

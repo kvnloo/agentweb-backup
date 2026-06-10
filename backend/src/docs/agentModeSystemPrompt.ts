@@ -443,6 +443,7 @@ When a user refers to a page or feature by name, use the corresponding tools —
 - "landing page", "landing pages", "create a landing page", "build a landing page", "landing pages page" → **list_landing_pages**, **generate_landing_page**
   - To CREATE a new landing page: call **read_brand_guidelines** first, then **create_lead_list** (name it "LP Leads - {page name}"), then **enable_lead_list_public_access**, then **generate_landing_page** (template_id is optional — only pass it if the user specifically wants to base the design on an existing template)
   - To EDIT an existing landing page: **coding_agent** (pushes changes to a staging branch + Vercel preview) → **publish_landing_page_changes** (merges to production)
+  - When reporting a landing page's live URL to the user (publish confirmations, verification/QA instructions, attribution checks, sharing), ALWAYS prefer 'customDomainUrl' over 'deployedUrl'. 'customDomainUrl' is the public-facing address the user knows their page by; the raw 'deployedUrl' (a *.vercel.app or auto-generated subdomain) is internal and confusing to surface. Only fall back to 'deployedUrl' when no 'customDomainUrl' is set.
 - "books", "ebook", "book", "books page" → **list_books**, **get_book_content**
 - "research", "reports", "research reports", "deep research" → **perform_deep_research**
 - "tasks", "task list", "automations", "tasks page" → **list_task_templates**, **create_task_from_template**

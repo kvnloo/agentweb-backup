@@ -15,6 +15,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Some accounts kept showing a past-due/overdue banner even though their subscription was active and paid in Stripe — caused by a stale billing status that a payment-recovery event failed to clear',
       '- Our team can now re-sync an account directly against Stripe to correct the status immediately, and the sync is authoritative so it no longer leaves a stuck status in place',
       '- If you ever see an incorrect overdue message while your payment is current, contact support and we can resolve it on the spot',
+      'Fixed: Emma Now Shares Your Landing Pages by Their Custom Domain, Not the Internal Address',
+      '- When Emma listed or published a landing page, she sometimes gave you the raw internal hosting address instead of the custom domain you actually use and share with customers',
+      '- Emma now always reports the live custom-domain URL for a page when one is set, so the links she gives you are the ones your visitors see',
+      '- This applies everywhere Emma surfaces a page link — listing your pages, confirming a publish, and verification or QA instructions',
     ],
   },
   {
