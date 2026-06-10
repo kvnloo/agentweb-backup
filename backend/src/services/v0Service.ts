@@ -2206,16 +2206,30 @@ export async function triggerVercelDeployment(
   });
   const repoId = repoInfoRes.data.id;
 
+  // Deployments created via the REST API default to the "preview" environment.
+  // For the production branch (main) we must explicitly set target=production,
+  // otherwise the production alias is never updated and the live site keeps
+  // serving the previous deployment. This normally goes unnoticed because a
+  // git PUSH to main fires Vercel's native git integration (which marks main
+  // builds as production) — but a force-update of the main ref (used by
+  // publish's 409 fallback and by revert-publish) often does NOT fire a fresh
+  // push webhook, so this API deployment is the only one — and it must target
+  // production itself.
+  const body: Record<string, unknown> = {
+    name: vercelProjectId,
+    project: vercelProjectId,
+    gitSource: { type: "github", repo: repoFullName, ref, repoId },
+  };
+  if (ref === "main") {
+    body.target = "production";
+  }
+
   await axios.post<any>(
     "https://api.vercel.com/v13/deployments",
-    {
-      name: vercelProjectId,
-      project: vercelProjectId,
-      gitSource: { type: "github", repo: repoFullName, ref, repoId },
-    },
+    body,
     { headers }
   );
-  console.log(`[V0 SERVICE] Triggered deployment for ${repoFullName} on ${ref}`);
+  console.log(`[V0 SERVICE] Triggered ${ref === "main" ? "production " : ""}deployment for ${repoFullName} on ${ref}`);
 }
 
 // ---------------------------------------------------------------------------
