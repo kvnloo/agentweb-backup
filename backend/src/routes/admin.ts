@@ -22,7 +22,7 @@ import { encryptPassword } from "../utils/crypto";
 import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
 import { getRevenueMetrics } from "../services/revenueService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
-import { resyncAllSubscriptionAmounts, syncSubscriptionFromStripe } from "../services/stripeService";
+import { resyncAllSubscriptionAmounts, reconcileStripeUserById } from "../services/stripeService";
 import { syncNewUserToLeadList, syncUserUpdateToLeadList } from "../services/crmAutoSyncService";
 import { DEFAULT_PAGES, getTierConfig } from "../services/subscriptionService";
 import { getActivationFields } from "../cron/activationAnalysisCron";
@@ -5152,7 +5152,11 @@ router.post("/users/:userId/sync-stripe", async (req, res) => {
     if (!user.stripe_customer_id) {
       return res.status(400).json({ message: "User has no Stripe Customer ID" });
     }
-    const updates = await syncSubscriptionFromStripe(userId, user.stripe_customer_id);
+    // Authoritative reconcile (Stripe wins) — overwrites a stale local
+    // subscription_status (e.g. an account stuck on "past_due" whose recovery
+    // webhook never landed). The additive-only syncSubscriptionFromStripe only
+    // fills NULL fields and cannot unstick such an account.
+    const updates = await reconcileStripeUserById(userId);
     const updatedUser = await userDb.getUserById(userId);
     res.json({ updates, user: updatedUser });
   } catch (error: any) {

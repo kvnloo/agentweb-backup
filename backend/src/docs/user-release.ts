@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-06-10',
+    changes: [
+      'Fixed: Account Wrongly Showing "Overdue" Despite an Active Subscription',
+      '- Some accounts kept showing a past-due/overdue banner even though their subscription was active and paid in Stripe — caused by a stale billing status that a payment-recovery event failed to clear',
+      '- Our team can now re-sync an account directly against Stripe to correct the status immediately, and the sync is authoritative so it no longer leaves a stuck status in place',
+      '- If you ever see an incorrect overdue message while your payment is current, contact support and we can resolve it on the spot',
+    ],
+  },
+  {
     date: '2026-06-09',
     changes: [
       'New: Start and Run Guided Work Plans Right From Emma Chat',
