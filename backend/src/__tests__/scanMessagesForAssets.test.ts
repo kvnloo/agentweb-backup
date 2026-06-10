@@ -261,6 +261,52 @@ describe('scanMessagesForAssets', () => {
     expect(result.images[0].generatedAt).toBe('2026-02-01T00:00:00Z');
   });
 
+  it('should use metadata timestamp before session timestamp', () => {
+    const messages = [
+      {
+        role: 'assistant',
+        content: '',
+        metadata: {
+          timestamp: '2026-01-03T10:00:00Z',
+          toolCalls: [{
+            name: 'generate_image',
+            result: { success: true, imageUrl: 'https://s3.amazonaws.com/img.png', filename: 'img.png' },
+          }],
+        },
+      },
+    ];
+
+    const result = scanMessagesForAssets(messages, makeSession());
+
+    expect(result.images[0].generatedAt).toBe('2026-01-03T10:00:00Z');
+  });
+
+  it('should fall back to createdAt when updatedAt is missing', () => {
+    const messages = [
+      {
+        role: 'assistant',
+        content: '',
+        metadata: {
+          toolCalls: [{
+            name: 'generate_video',
+            result: { success: true, videoUrl: 'https://s3.amazonaws.com/generated.mp4' },
+          }],
+        },
+      },
+    ];
+
+    const result = scanMessagesForAssets(messages, makeSession({
+      updatedAt: undefined,
+      createdAt: '2026-03-01T00:00:00Z',
+    }));
+
+    expect(result.videos[0]).toEqual({
+      url: 'https://s3.amazonaws.com/generated.mp4',
+      filename: 'generated-video.mp4',
+      generatedAt: '2026-03-01T00:00:00Z',
+    });
+  });
+
   it('should use default filename when not provided', () => {
     const messages = [
       {
@@ -320,6 +366,80 @@ describe('scanMessagesForAssets', () => {
     const result = scanMessagesForAssets(messages, makeSession());
 
     expect(result.videos).toHaveLength(1);
+  });
+
+  it('should collect HTML reports from every supported result field', () => {
+    const messages = [
+      {
+        role: 'assistant',
+        content: '',
+        timestamp: '2026-01-01T12:00:00Z',
+        metadata: {
+          toolCalls: [
+            {
+              name: 'write_file',
+              result: { file_url: 'https://s3.amazonaws.com/report-from-file.htm', file_name: 'file-report.htm' },
+            },
+            {
+              name: 'publish_report',
+              result: { htmlUrl: 'https://s3.amazonaws.com/report-from-html-url.HTML', versioned_filename: 'versioned.HTML' },
+            },
+            {
+              name: 'publish_blog',
+              result: { blog_html_url: 'https://s3.amazonaws.com/blog-report.html' },
+            },
+          ],
+        },
+      },
+    ];
+
+    const result = scanMessagesForAssets(messages, makeSession());
+
+    expect(result.htmlReports).toEqual([
+      {
+        url: 'https://s3.amazonaws.com/report-from-file.htm',
+        filename: 'file-report.htm',
+        generatedAt: '2026-01-01T12:00:00Z',
+      },
+      {
+        url: 'https://s3.amazonaws.com/report-from-html-url.HTML',
+        filename: 'versioned.HTML',
+        generatedAt: '2026-01-01T12:00:00Z',
+      },
+      {
+        url: 'https://s3.amazonaws.com/blog-report.html',
+        filename: 'blog-report.html',
+        generatedAt: '2026-01-01T12:00:00Z',
+      },
+    ]);
+  });
+
+  it('should skip non-HTML result URLs and duplicate content URLs', () => {
+    const htmlUrl = 'https://s3.amazonaws.com/report.html';
+    const messages = [
+      {
+        role: 'assistant',
+        content: `Duplicate report: ${htmlUrl}`,
+        timestamp: '2026-01-01T12:00:00Z',
+        metadata: {
+          toolCalls: [
+            {
+              name: 'write_file',
+              result: { s3_url: htmlUrl, filename: 'report.html' },
+            },
+            {
+              name: 'write_file',
+              result: { file_url: 'https://s3.amazonaws.com/raw.json', filename: 'raw.json' },
+            },
+          ],
+        },
+      },
+    ];
+
+    const result = scanMessagesForAssets(messages, makeSession());
+
+    expect(result.htmlReports).toHaveLength(1);
+    expect(result.htmlReports[0].url).toBe(htmlUrl);
   });
 
   it('should return empty arrays for messages with no assets', () => {
