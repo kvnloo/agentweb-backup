@@ -1,6 +1,7 @@
 import {
   canViewItem, canEditItem, canManageOrgFeature, isAlwaysOnFeature,
   isFeatureEffectivelyEnabled,
+  defaultEnabledFor, defaultShareSettings,
   Feature,
   listOrgVisibleItems, MEMBER_FANOUT_CAP,
 } from "../services/orgShareService";
@@ -131,6 +132,71 @@ describe("canEditItem", () => {
   });
   it("different-org user blocked", () => {
     expect(canEditItem(item, other, orgA, ownerOrgId, "htmlTemplates")).toBe(false);
+  });
+});
+
+describe("feature defaults (single source of truth)", () => {
+  it("skills and workPlans default to enabled; others default to disabled", () => {
+    expect(defaultEnabledFor("skills")).toBe(true);
+    expect(defaultEnabledFor("workPlans")).toBe(true);
+    expect(defaultEnabledFor("knowledgeBase")).toBe(false);
+    expect(defaultEnabledFor("htmlTemplates")).toBe(false);
+    expect(defaultEnabledFor("landingPages")).toBe(false);
+    expect(defaultEnabledFor("analytics")).toBe(false);
+  });
+
+  it("always-on features report enabled by default", () => {
+    expect(defaultEnabledFor("brandGuidelines")).toBe(true);
+    expect(defaultEnabledFor("marketingStrategy")).toBe(true);
+  });
+
+  it("defaultShareSettings matches per-feature defaults with empty editors", () => {
+    const s = defaultShareSettings();
+    expect(s.skills).toEqual({ enabled: true, editors: [] });
+    expect(s.workPlans).toEqual({ enabled: true, editors: [] });
+    expect(s.knowledgeBase).toEqual({ enabled: false, editors: [] });
+    expect(s.htmlTemplates).toEqual({ enabled: false, editors: [] });
+    expect(s.landingPages).toEqual({ enabled: false, editors: [] });
+    expect(s.analytics).toEqual({ enabled: false, editors: [] });
+    expect(s.brandGuidelines).toEqual({ editors: [] });
+    expect(s.marketingStrategy).toEqual({ editors: [] });
+  });
+});
+
+describe("absent-config fallback (org never had shareSettings written)", () => {
+  // Org created without shareSettings at all — the real-world bug case.
+  const orgNoSettings = { orgId: "org-A", ownerUserId: "u-admin", name: "A" } as unknown as Organization;
+  // Org with shareSettings present but missing the `skills` key entirely.
+  const orgPartial = {
+    orgId: "org-A", ownerUserId: "u-admin", name: "A",
+    shareSettings: { knowledgeBase: { enabled: false, editors: [] } },
+  } as unknown as Organization;
+
+  it("plain member sees skills (default-on) when org has no shareSettings", () => {
+    expect(isFeatureEffectivelyEnabled(member, orgNoSettings, "skills")).toBe(true);
+    expect(canViewItem(item, member, orgNoSettings, ownerOrgId, "skills")).toBe(true);
+  });
+
+  it("plain member sees workPlans (default-on) when org has no shareSettings", () => {
+    expect(isFeatureEffectivelyEnabled(member, orgNoSettings, "workPlans")).toBe(true);
+  });
+
+  it("plain member does NOT see default-off features when org has no shareSettings", () => {
+    expect(isFeatureEffectivelyEnabled(member, orgNoSettings, "knowledgeBase")).toBe(false);
+    expect(canViewItem(item, member, orgNoSettings, ownerOrgId, "landingPages")).toBe(false);
+  });
+
+  it("falls back to the skills default when shareSettings exists but omits skills", () => {
+    expect(isFeatureEffectivelyEnabled(member, orgPartial, "skills")).toBe(true);
+  });
+
+  it("an explicit skills.enabled=false still overrides the default", () => {
+    const orgOff = {
+      orgId: "org-A", ownerUserId: "u-admin", name: "A",
+      shareSettings: { skills: { enabled: false, editors: [] } },
+    } as unknown as Organization;
+    expect(isFeatureEffectivelyEnabled(member, orgOff, "skills")).toBe(false);
+    expect(canViewItem(item, member, orgOff, ownerOrgId, "skills")).toBe(false);
   });
 });
 

@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-06-09
+// Last updated: 2026-06-10
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,15 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-06-10',
+    changes: [
+      'Fixed: Skills Built by a Teammate Are Now Shared Across Your Organization',
+      '- A skill created by one member of your organization is now visible to every other member in their skills catalog (Settings > Skills and when Emma lists available skills), so teammates can reuse each other\'s skills',
+      '- Previously a new skill was only visible to the person who created it, even though work plans and other org resources were already shared org-wide',
+      '- Skills and work plans are shared with your whole org by default; an org owner can still turn sharing off for either from Settings > Organization',
+    ],
+  },
   {
     date: '2026-06-10',
     changes: [

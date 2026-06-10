@@ -137,6 +137,22 @@ describe('Organization routes', () => {
       expect(mockUsers['user-1'].orgId).toBe(res.body.data.orgId);
       expect(mockUsers['user-1'].orgRole).toBe('owner');
     });
+
+    it('should seed shareSettings with skills + work plans shared by default', async () => {
+      const res = await request(app).post('/api/org').send({ name: 'My Org' });
+      expect(res.status).toBe(201);
+      const settings = res.body.data.shareSettings;
+      expect(settings).toBeDefined();
+      // Default-on features
+      expect(settings.skills).toEqual({ enabled: true, editors: [] });
+      expect(settings.workPlans).toEqual({ enabled: true, editors: [] });
+      // Default-off features
+      expect(settings.knowledgeBase.enabled).toBe(false);
+      expect(settings.landingPages.enabled).toBe(false);
+      // Always-on features carry only editors
+      expect(settings.brandGuidelines).toEqual({ editors: [] });
+      expect(settings.marketingStrategy).toEqual({ editors: [] });
+    });
   });
 
   describe('GET /api/org/me - get current org', () => {
