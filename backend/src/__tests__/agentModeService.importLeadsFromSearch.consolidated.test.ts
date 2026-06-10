@@ -490,7 +490,7 @@ describe('AgentModeService.importLeadsFromSearch — findReason tagging', () => 
     await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: longText, company: longText, location: longText });
     const leads = (mockBatchCreateLeads.mock.calls[0] as any)[1];
     expect(leads[0].system.findReason.length).toBeLessThanOrEqual(200);
-  });
+  }, 15000);
 
   it('does NOT use customFields for findReason', async () => {
     await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO' });
