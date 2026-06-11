@@ -61,8 +61,8 @@ describe('HubSpotService — 429 retry interceptor', () => {
     const err = { response: { status: 429, headers: { 'retry-after': '60' } }, config };
 
     const promise = capturedRejectedHandler!(err);
-    // 60s uncapped would not resolve here — 10s cap means it fires at 10000ms
-    jest.advanceTimersByTime(10000);
+    // 60s cap means it fires at 60000ms, not the full value
+    jest.advanceTimersByTime(60000);
     await Promise.resolve();
     await Promise.resolve();
     const result = await promise;

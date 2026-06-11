@@ -822,8 +822,9 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
               })
             )).filter(Boolean) as Array<{ list: any; syncConfig: any }>;
 
+            const emailMap = await svc.getContactEmailsByIds(contactIds).catch(() => new Map<string, string>());
             await Promise.all(contactIds.map(async (contactId) => {
-              const contactEmail = await svc.getContactEmailById(contactId).catch(() => null);
+              const contactEmail = emailMap.get(contactId) ?? null;
               if (!contactEmail) return;
 
               for (const { list, syncConfig } of activeDealLists) {

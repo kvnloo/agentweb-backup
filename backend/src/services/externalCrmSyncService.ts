@@ -322,6 +322,7 @@ export class ExternalCrmSyncService {
       accountId: undefined,
       apiKeyEncrypted: undefined,
       webhookSecret: undefined,
+      autoSyncEnabled: false,
       // Mark as not configured so the UI returns to account-selection state
       updatedAt: now,
     };

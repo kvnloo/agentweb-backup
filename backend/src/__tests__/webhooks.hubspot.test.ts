@@ -70,12 +70,14 @@ jest.mock('../services/externalCrmSyncService', () => ({
 
 const mockGetContactById = jest.fn();
 const mockGetContactEmailById = jest.fn();
+const mockGetContactEmailsByIds = jest.fn();
 const mockGetDealContactAssociations = jest.fn();
 jest.mock('../services/hubspotService', () => ({
   HubSpotService: {
     create: jest.fn().mockResolvedValue({
       getContactById: (...a: any[]) => mockGetContactById(...a),
       getContactEmailById: (...a: any[]) => mockGetContactEmailById(...a),
+      getContactEmailsByIds: (...a: any[]) => mockGetContactEmailsByIds(...a),
       getDealContactAssociations: (...a: any[]) => mockGetDealContactAssociations(...a),
     }),
   },
@@ -100,6 +102,11 @@ app.use('/api/webhooks', webhookRouter);
 
 function makeSignature(body: any): string {
   return crypto.createHash('sha256').update(CLIENT_SECRET + JSON.stringify(body)).digest('hex');
+}
+
+/** Drains the microtask queue so fire-and-forget async handlers complete before assertions. */
+function flushPromises(): Promise<void> {
+  return new Promise(setImmediate as unknown as (resolve: () => void) => void);
 }
 
 const PORTAL_ID = 12345;
@@ -149,7 +156,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
       .set('x-hubspot-signature', 'bad-signature')
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 
@@ -161,7 +168,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 
@@ -178,7 +185,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 
@@ -190,7 +197,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
     try {
       const body = [{ subscriptionType: 'contact.propertyChange', portalId: PORTAL_ID, objectId: '1', propertyName: 'phone', propertyValue: '555' }];
       await request(app).post('/api/webhooks/hubspot').send(body);
-      await new Promise(r => setTimeout(r, 200));
+      await flushPromises();
       expect(mockUpdateLead).not.toHaveBeenCalled();
     } finally {
       process.env.NODE_ENV = original;
@@ -210,7 +217,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 
@@ -231,7 +238,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockGetContactById).toHaveBeenCalledWith('10');
     expect(mockUpdateLead).toHaveBeenCalledWith(
       LIST_ID,
@@ -250,7 +257,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).toHaveBeenCalledWith(
       LIST_ID, 'lead-1', expect.objectContaining({ phone: '+1-555-1234' })
     );
@@ -266,7 +273,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).toHaveBeenCalledWith(
       LIST_ID, 'lead-1',
       expect.objectContaining({
@@ -285,7 +292,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).toHaveBeenCalledWith(
       LIST_ID, 'lead-1',
       expect.objectContaining({
@@ -304,7 +311,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockGetContactEmailById).toHaveBeenCalledWith('50');
     expect(mockUpdateLead).toHaveBeenCalledWith(LIST_ID, 'lead-1', expect.objectContaining({ phone: '555-9999' }));
   });
@@ -322,7 +329,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 
@@ -337,7 +344,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).toHaveBeenCalledWith(
       LIST_ID, 'lead-1', expect.objectContaining({ title: 'Director' })
     );
@@ -354,7 +361,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).toHaveBeenCalledWith(
       LIST_ID, 'lead-1', expect.objectContaining({ company: 'NewCorp' })
     );
@@ -381,7 +388,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     // Only the list linked to PORTAL_ID (LIST_ID) is updated — not list-other
     expect(mockUpdateLead).toHaveBeenCalledTimes(1);
     expect(mockUpdateLead).toHaveBeenCalledWith(LIST_ID, 'lead-1', expect.any(Object));
@@ -401,7 +408,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 
@@ -417,12 +424,57 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     const call = mockUpdateLead.mock.calls[0];
     const syncMetadata = call[2]?.syncMetadata;
     expect(syncMetadata?.crmRemovedAt).toBeDefined();
     expect(new Date(syncMetadata.crmRemovedAt).toISOString()).toBe(syncMetadata.crmRemovedAt);
     expect(syncMetadata?.crmRemoved).toBeUndefined();
+  });
+
+  // ── Signature: raw bytes (item 17) ──────────────────────────────────────────
+
+  it('accepts signature computed from raw body bytes, not re-serialized JSON', async () => {
+    // Simulate exactly what HubSpot sends: a compact JSON string with a specific byte layout.
+    // The route verifies SHA-256(clientSecret + rawBody.toString('utf8')) against the header.
+    // If the test re-serialized via JSON.stringify(obj) and key order differed, the sig would mismatch.
+    const rawJson = '[{"subscriptionType":"contact.creation","portalId":12345,"objectId":"42"}]';
+    const sig = crypto.createHash('sha256').update(CLIENT_SECRET + rawJson).digest('hex');
+
+    // Send the raw JSON string (not a JS object) so supertest does not re-serialize it.
+    // express.raw() captures this as a Buffer whose .toString('utf8') equals rawJson exactly.
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .type('application/json')
+      .set('x-hubspot-signature', sig)
+      .send(rawJson);
+
+    await flushPromises();
+    // Route accepted the request and attempted portal lookup (not rejected as bad signature)
+    expect(mockGetUserIdByHubSpotPortalId).toHaveBeenCalledWith(12345);
+  });
+
+  it('rejects signature computed from re-serialized JSON when byte layout differs', async () => {
+    // Raw payload has extra whitespace — re-serializing with JSON.stringify produces different bytes.
+    const rawJsonWithWhitespace = '[{ "subscriptionType": "contact.creation", "portalId": 12345, "objectId": "42" }]';
+    const correctSig = crypto.createHash('sha256').update(CLIENT_SECRET + rawJsonWithWhitespace).digest('hex');
+
+    // Compute wrong sig as the old makeSignature(obj) pattern would: JSON.stringify of a parsed obj
+    const parsedObj = JSON.parse(rawJsonWithWhitespace);
+    const wrongSig = crypto.createHash('sha256').update(CLIENT_SECRET + JSON.stringify(parsedObj)).digest('hex');
+
+    // Sanity: the two signatures differ when byte layout differs
+    expect(correctSig).not.toBe(wrongSig);
+
+    // Wrong sig → rejected
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .type('application/json')
+      .set('x-hubspot-signature', wrongSig)
+      .send(rawJsonWithWhitespace);
+
+    await flushPromises();
+    expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 });
 
@@ -437,6 +489,7 @@ describe('POST /api/webhooks/hubspot — deal.propertyChange', () => {
     mockGetLeadByEmail.mockResolvedValue(mockLead);
     mockUpdateLead.mockResolvedValue(undefined);
     mockGetDealContactAssociations.mockResolvedValue([CONTACT_ID]);
+    mockGetContactEmailsByIds.mockResolvedValue(new Map([[CONTACT_ID, 'alice@example.com']]));
     mockGetContactEmailById.mockResolvedValue('alice@example.com');
     mockGetContactById.mockResolvedValue({});
     // Deal handler requires non-null syncConfig (checks !syncConfig) for processing
@@ -452,9 +505,9 @@ describe('POST /api/webhooks/hubspot — deal.propertyChange', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockGetDealContactAssociations).toHaveBeenCalledWith(DEAL_ID);
-    expect(mockGetContactEmailById).toHaveBeenCalledWith(CONTACT_ID);
+    expect(mockGetContactEmailsByIds).toHaveBeenCalledWith([CONTACT_ID]);
     expect(mockUpdateLead).toHaveBeenCalledWith(
       LIST_ID, 'lead-1', expect.objectContaining({ dealValue: '50000' })
     );
@@ -469,7 +522,7 @@ describe('POST /api/webhooks/hubspot — deal.propertyChange', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).toHaveBeenCalledWith(
       LIST_ID, 'lead-1', expect.objectContaining({ status: 'appointmentscheduled' })
     );
@@ -489,7 +542,7 @@ describe('POST /api/webhooks/hubspot — deal.propertyChange', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).toHaveBeenCalledWith(
       LIST_ID, 'lead-1', expect.objectContaining({ status: 'Qualified' })
     );
@@ -504,7 +557,7 @@ describe('POST /api/webhooks/hubspot — deal.propertyChange', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).toHaveBeenCalledWith(
       LIST_ID, 'lead-1', expect.objectContaining({ dealCurrency: 'EUR' })
     );
@@ -514,9 +567,10 @@ describe('POST /api/webhooks/hubspot — deal.propertyChange', () => {
     const CONTACT_ID_2 = 'contact-556';
     const mockLead2 = { leadId: 'lead-2', email: 'bob@example.com', customFields: {} };
     mockGetDealContactAssociations.mockResolvedValue([CONTACT_ID, CONTACT_ID_2]);
-    mockGetContactEmailById
-      .mockResolvedValueOnce('alice@example.com')
-      .mockResolvedValueOnce('bob@example.com');
+    mockGetContactEmailsByIds.mockResolvedValue(new Map([
+      [CONTACT_ID, 'alice@example.com'],
+      [CONTACT_ID_2, 'bob@example.com'],
+    ]));
     mockGetLeadByEmail
       .mockResolvedValueOnce(mockLead)
       .mockResolvedValueOnce(mockLead2);
@@ -529,7 +583,7 @@ describe('POST /api/webhooks/hubspot — deal.propertyChange', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).toHaveBeenCalledTimes(2);
     expect(mockUpdateLead).toHaveBeenCalledWith(LIST_ID, 'lead-1', expect.objectContaining({ dealValue: '75000' }));
     expect(mockUpdateLead).toHaveBeenCalledWith(LIST_ID, 'lead-2', expect.objectContaining({ dealValue: '75000' }));
@@ -546,12 +600,12 @@ describe('POST /api/webhooks/hubspot — deal.propertyChange', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 
   it('deal.propertyChange: skips when contact email cannot be resolved', async () => {
-    mockGetContactEmailById.mockResolvedValue(null);
+    mockGetContactEmailsByIds.mockResolvedValue(new Map());
 
     const body = [
       { subscriptionType: 'deal.propertyChange', portalId: PORTAL_ID, objectId: DEAL_ID, propertyName: 'amount', propertyValue: '1000' },
@@ -561,7 +615,7 @@ describe('POST /api/webhooks/hubspot — deal.propertyChange', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 
@@ -576,7 +630,7 @@ describe('POST /api/webhooks/hubspot — deal.propertyChange', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 
@@ -591,7 +645,7 @@ describe('POST /api/webhooks/hubspot — deal.propertyChange', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 
@@ -606,7 +660,7 @@ describe('POST /api/webhooks/hubspot — deal.propertyChange', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 
@@ -626,7 +680,7 @@ describe('POST /api/webhooks/hubspot — deal.propertyChange', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).toHaveBeenCalledTimes(1);
     expect(mockUpdateLead).toHaveBeenCalledWith(LIST_ID, 'lead-1', expect.any(Object));
   });
@@ -641,7 +695,7 @@ describe('POST /api/webhooks/hubspot — deal.propertyChange', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 });

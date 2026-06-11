@@ -19,6 +19,7 @@ jest.mock('../services/db', () => ({
     setLeadListCrmSyncConfig: jest.fn().mockResolvedValue(undefined),
     getLeadsByListId: jest.fn().mockResolvedValue({ items: [], lastEvaluatedKey: undefined }),
     getLeadListsByUserId: jest.fn().mockResolvedValue([]),
+    getLeadListsForUser: jest.fn().mockResolvedValue([]),
   },
   userDb: {
     getUserById: jest.fn().mockResolvedValue({ userId: 'user-1' }),
@@ -422,7 +423,7 @@ describe('PUT /api/crm-sync/config/:listId/:provider — one-account-per-list en
   });
 
   it('returns 409 when accountId is already linked to a different list', async () => {
-    crmDb.getLeadListsByUserId.mockResolvedValue([
+    crmDb.getLeadListsForUser.mockResolvedValue([
       { listId: 'list-other', name: 'Other List', externalCrmSyncConfigs: { hubspot: { accountId: 'portal-123' } } },
     ]);
 
@@ -437,7 +438,7 @@ describe('PUT /api/crm-sync/config/:listId/:provider — one-account-per-list en
   });
 
   it('allows save when the same list already owns the accountId (update scenario)', async () => {
-    crmDb.getLeadListsByUserId.mockResolvedValue([
+    crmDb.getLeadListsForUser.mockResolvedValue([
       { listId: 'list-1', name: 'My List', externalCrmSyncConfigs: { hubspot: { accountId: 'portal-123' } } },
     ]);
 
@@ -450,7 +451,7 @@ describe('PUT /api/crm-sync/config/:listId/:provider — one-account-per-list en
   });
 
   it('allows save when accountId is absent (mapping-only update)', async () => {
-    crmDb.getLeadListsByUserId.mockResolvedValue([
+    crmDb.getLeadListsForUser.mockResolvedValue([
       { listId: 'list-other', name: 'Other', externalCrmSyncConfigs: { hubspot: { accountId: 'portal-123' } } },
     ]);
 
@@ -460,6 +461,21 @@ describe('PUT /api/crm-sync/config/:listId/:provider — one-account-per-list en
       .expect(200);
 
     expect(externalCrmSyncService.saveConfig).toHaveBeenCalled();
+  });
+
+  it('returns 409 when an org member already has the accountId linked (org-scoped check)', async () => {
+    // Simulate a different org member's list owning the same portal
+    crmDb.getLeadListsForUser.mockResolvedValue([
+      { listId: 'list-org-member', name: 'Team List', externalCrmSyncConfigs: { hubspot: { accountId: 'portal-123' } } },
+    ]);
+
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot')
+      .send({ accountId: 'portal-123' })
+      .expect(409);
+
+    expect(res.body.error).toMatch(/already linked/);
+    expect(externalCrmSyncService.saveConfig).not.toHaveBeenCalled();
   });
 });
 
@@ -480,7 +496,7 @@ describe('POST /api/crm-sync/test/:listId/:provider — one-account-per-list enf
   });
 
   it('returns 409 when accountId being tested is already linked to a different list', async () => {
-    crmDb.getLeadListsByUserId.mockResolvedValue([
+    crmDb.getLeadListsForUser.mockResolvedValue([
       { listId: 'list-other', name: 'Taken List', externalCrmSyncConfigs: { hubspot: { accountId: 'portal-123' } } },
     ]);
 
@@ -494,7 +510,7 @@ describe('POST /api/crm-sync/test/:listId/:provider — one-account-per-list enf
   });
 
   it('saves config after successful test when no conflict exists', async () => {
-    crmDb.getLeadListsByUserId.mockResolvedValue([]);
+    crmDb.getLeadListsForUser.mockResolvedValue([]);
 
     const res = await request(app)
       .post('/api/crm-sync/test/list-1/hubspot')

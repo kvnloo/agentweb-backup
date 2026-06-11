@@ -626,6 +626,21 @@ describe('HubSpotService — getDealContactAssociations', () => {
     const ids = await svc.getDealContactAssociations('deal-99');
     expect(ids).toEqual([]);
   });
+
+  it('stops at MAX_PAGES (20) when cursor never terminates', async () => {
+    // Every page returns a cursor — simulates an infinite loop without the cap.
+    mockAxiosGet.mockResolvedValue({
+      data: { results: [{ id: 'c-1' }], paging: { next: { after: 'cursor-infinite' } } },
+    });
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const ids = await svc.getDealContactAssociations('deal-99');
+
+    expect(mockAxiosGet).toHaveBeenCalledTimes(20);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('20-page cap'));
+    expect(ids).toHaveLength(20); // 1 result per page × 20 pages
+    warnSpy.mockRestore();
+  });
 });
 
 // ─── getDeal ──────────────────────────────────────────────────────────────────

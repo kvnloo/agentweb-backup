@@ -431,14 +431,14 @@ describe('ExternalCrmSyncService', () => {
       expect(saved.customFieldMapping).toEqual(config.customFieldMapping);
     });
 
-    it('preserves autoSyncEnabled and webhookEnabled', async () => {
+    it('disables autoSyncEnabled on disconnect but preserves webhookEnabled', async () => {
       mockListWithConfig(makeConfig({ accountId: 'acct1', autoSyncEnabled: true, webhookEnabled: true }));
       mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
 
       await service.disconnectAccount('user1', 'list1', 'hubspot');
 
       const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as ExternalCrmSyncConfig;
-      expect(saved.autoSyncEnabled).toBe(true);
+      expect(saved.autoSyncEnabled).toBe(false);
       expect(saved.webhookEnabled).toBe(true);
     });
 

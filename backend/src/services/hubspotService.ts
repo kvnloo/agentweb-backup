@@ -15,7 +15,8 @@ if (_created) {
       const config = err?.config as any;
       if (err?.response?.status === 429 && config && !config.__hubspotRetried) {
         config.__hubspotRetried = true;
-        const retryAfter = Math.min(parseInt(err.response.headers?.['retry-after'] ?? '10', 10), 10);
+        const parsed = parseInt(err.response.headers?.['retry-after'] ?? '10', 10);
+        const retryAfter = Math.min(isNaN(parsed) ? 10 : parsed, 60);
         await new Promise(r => setTimeout(r, retryAfter * 1000));
         return _created.request(config);
       }
@@ -432,6 +433,34 @@ export class HubSpotService {
   }
 
   /**
+   * Batch-fetch emails for up to 100 contact IDs per request.
+   * Returns a Map of contactId → email; contacts with no email are omitted.
+   * Chunk size is 100 (HubSpot batch/read limit). Partial chunk failures are
+   * logged and skipped so the rest of the batch still resolves.
+   */
+  async getContactEmailsByIds(contactIds: string[]): Promise<Map<string, string>> {
+    const CHUNK_SIZE = 100;
+    const emailMap = new Map<string, string>();
+    for (let i = 0; i < contactIds.length; i += CHUNK_SIZE) {
+      const chunk = contactIds.slice(i, i + CHUNK_SIZE);
+      try {
+        const res = await axiosInstance.post(
+          `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/batch/read`,
+          { properties: ['email'], inputs: chunk.map((id) => ({ id })) },
+          { headers: await this.authHeaders() },
+        );
+        for (const contact of (res.data as any)?.results ?? []) {
+          const email: string | undefined = contact?.properties?.email;
+          if (email) emailMap.set(String(contact.id), email);
+        }
+      } catch (e: any) {
+        console.warn(`[HubSpot] getContactEmailsByIds batch failed for chunk starting at ${i}:`, e?.message);
+      }
+    }
+    return emailMap;
+  }
+
+  /**
    * Fetches a contact by ID and returns all its property values as a flat map.
    * Pass specific propertyNames to request only those fields; omit to fetch
    * the standard set (email, name, phone, jobtitle, company, linkedin).
@@ -549,7 +578,13 @@ export class HubSpotService {
   async getDealContactAssociations(dealId: string): Promise<string[]> {
     const allIds: string[] = [];
     let after: string | undefined;
+    let pages = 0;
+    const MAX_PAGES = 20;
     do {
+      if (pages++ >= MAX_PAGES) {
+        console.warn(`[HubSpot] getDealContactAssociations hit ${MAX_PAGES}-page cap for deal ${dealId}`);
+        break;
+      }
       const params: Record<string, string> = {};
       if (after) params.after = after;
       const res = await axiosInstance.get(
@@ -1413,8 +1448,14 @@ export class HubSpotService {
   async getAllLists(query?: string): Promise<Array<{ id: string; name: string }>> {
     const results: Array<{ id: string; name: string }> = [];
     let after: string | undefined;
+    let pages = 0;
+    const MAX_PAGES = 50;
 
     do {
+      if (pages++ >= MAX_PAGES) {
+        console.warn(`[HubSpot] getAllLists hit ${MAX_PAGES}-page cap`);
+        break;
+      }
       const body: Record<string, any> = {
         processingTypes: ['MANUAL', 'SNAPSHOT', 'DYNAMIC'],
         count: 200,

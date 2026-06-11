@@ -163,8 +163,9 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
     }
 
     // Enforce one-account-per-list: reject if another list already uses this accountId.
+    // Uses org-aware query so two team members can't independently bind the same portal.
     if (accountId) {
-      const allLists = await crmDb.getLeadListsByUserId(userId);
+      const allLists = await crmDb.getLeadListsForUser(userId);
       const conflict = (allLists || []).find((l: any) => {
         if (l.listId === listId) return false;
         const cfg = l.externalCrmSyncConfigs?.[provider];
@@ -339,7 +340,7 @@ router.post('/test/:listId/:provider', async (req: any, res) => {
     // requiring a separate Save step.
     if (result.valid && (apiKey || accountId)) {
       if (accountId) {
-        const allLists = await crmDb.getLeadListsByUserId(userId);
+        const allLists = await crmDb.getLeadListsForUser(userId);
         const conflict = (allLists || []).find((l: any) => {
           if (l.listId === listId) return false;
           const cfg = l.externalCrmSyncConfigs?.[provider];

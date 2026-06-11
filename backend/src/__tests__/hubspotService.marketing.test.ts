@@ -750,3 +750,23 @@ describe('deleteSocialBroadcast', () => {
     await expect(svc.deleteSocialBroadcast('sb-missing')).rejects.toThrow();
   });
 });
+
+describe('getAllLists — pagination cap', () => {
+  it('stops at MAX_PAGES (50) when cursor never terminates', async () => {
+    mockPost.mockResolvedValue({
+      data: {
+        lists: [{ listId: 'list-1', name: 'Test List' }],
+        paging: { next: { after: 'cursor-infinite' } },
+      },
+    });
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const svc = makeSvc();
+    const results = await svc.getAllLists();
+
+    expect(mockPost).toHaveBeenCalledTimes(50);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('50-page cap'));
+    expect(results).toHaveLength(50);
+    warnSpy.mockRestore();
+  });
+});

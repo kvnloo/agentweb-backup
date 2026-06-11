@@ -434,6 +434,27 @@ function classifyToolEffect(toolName: string, args: unknown): AgentToolEffect {
     return 'read';
   }
 
+  if (toolName === 'call_hubspot_api') {
+    const action = stringField(args, 'action').toUpperCase();
+    if (action === 'CREATE_BROADCAST') return 'external_publish';
+    if (
+      action === 'DELETE' ||
+      action === 'DELETE_BROADCAST' ||
+      action === 'REMOVE_CONTACTS' ||
+      action === 'PUBLISH'
+    )
+      return 'destructive';
+    if (
+      action === 'CREATE' ||
+      action === 'UPDATE' ||
+      action === 'CLONE' ||
+      action === 'ADD_CONTACTS' ||
+      action === 'ARCHIVE'
+    )
+      return 'internal_write';
+    return 'read';
+  }
+
   if (READ_PREFIXES.some((prefix) => toolName.startsWith(prefix))) return 'read';
   if (SIDE_EFFECTING_PREFIXES.some((prefix) => toolName.startsWith(prefix))) return 'internal_write';
   return 'unknown';
