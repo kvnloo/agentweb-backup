@@ -18336,6 +18336,83 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         imageFilename = urlParts[urlParts.length - 1];
       }
 
+      const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+
+      // Prefer AgentWeb's Payload CMS for the owned landing-page blog. This must
+      // happen before legacy per-user CMS checks: landing-page publishing should
+      // not fail just because a user has no Webflow/BaseHub configuration.
+      let payloadEndpoint = 'https://www.agentweb.pro/api/publish-post';
+      let payloadSecret: string | undefined;
+
+      try {
+        const env = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+        const payloadSecretJson = await getSecret(`${env}/AgentWeb/PayloadCMS`);
+        if (payloadSecretJson) {
+          const parsed = JSON.parse(payloadSecretJson);
+          payloadEndpoint = parsed.PAYLOAD_PUBLISH_ENDPOINT || payloadEndpoint;
+          payloadSecret = parsed.PAYLOAD_PUBLISH_SECRET;
+        }
+      } catch (secretErr) {
+        console.warn('AgentMode: Could not load PayloadCMS secret, falling back to configured user CMS:', secretErr);
+      }
+
+      if (payloadSecret) {
+        const categoryMap: Record<string, string> = {
+          'AI in Marketing': 'AI in Marketing',
+          'Founder Playbooks': 'Founder Playbooks',
+          'Growth Tips': 'Growth Tips',
+          'Thought Leadership': 'Thought Leadership',
+          'Other': 'Other',
+          'Alternatives': 'Alternatives',
+          'Listicles': 'Listicles',
+          'User Guide': 'User Guide',
+          'Case Studies': 'Case Studies',
+        };
+        const payloadCategory = categories.length > 0
+          ? (categoryMap[categories[0]] || 'Other')
+          : 'Other';
+
+        const authorSlug = author?.toLowerCase().includes('rui') ? 'rui'
+          : author?.toLowerCase().includes('harsha') ? 'harsha'
+          : author?.toLowerCase().includes('fangfang') ? 'fangfang'
+          : author?.toLowerCase().includes('matthew') ? 'matthew'
+          : 'emma';
+
+        const payloadResponse = await axios.post(
+          payloadEndpoint,
+          {
+            title,
+            slug,
+            summary: description,
+            bodyHtml,
+            category: payloadCategory,
+            author: authorSlug,
+            featuredImageUrl: heroImageUrl,
+            publishedAt: new Date().toISOString(),
+            status,
+          },
+          {
+            headers: { 'Authorization': `Bearer ${payloadSecret}` },
+            timeout: 30000,
+          }
+        );
+
+        console.log(`AgentMode: Blog article published successfully to Payload CMS as ${status}`);
+
+        return {
+          success: true,
+          message: `Blog article published successfully to Payload CMS as ${status}`,
+          data: {
+            title,
+            slug,
+            status,
+            cmsType: 'Payload',
+            url: `/blog/${slug}`,
+            cmsResponse: payloadResponse.data,
+          }
+        };
+      }
+
       // Step 3: Get user's CMS type
       const { userDb } = await import('./db');
       const user = await userDb.getUserById(userId);
@@ -18364,7 +18441,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
         // Call Webflow publishing
         const axios = (await import('axios')).default;
-        const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
 
         // Use different field names based on whether we're using live endpoint or draft endpoint
         const cmsItemData: any = {
@@ -18527,94 +18603,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
         console.log(`AgentMode: Publishing to Webflow ${status === 'published' ? 'live' : 'draft'} endpoint: ${endpoint}`);
 
-        // Publish to Payload CMS instead of Webflow
-        let payloadEndpoint = 'https://www.agentweb.pro/api/publish-post';
-        let payloadSecret: string | undefined;
-
         try {
-          const env = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-          const payloadSecretJson = await getSecret(`${env}/AgentWeb/PayloadCMS`);
-          if (payloadSecretJson) {
-            const parsed = JSON.parse(payloadSecretJson);
-            payloadEndpoint = parsed.PAYLOAD_PUBLISH_ENDPOINT || payloadEndpoint;
-            payloadSecret = parsed.PAYLOAD_PUBLISH_SECRET;
-          }
-        } catch (secretErr) {
-          console.warn('AgentMode: Could not load PayloadCMS secret, falling back to Webflow:', secretErr);
-        }
-
-        if (!payloadSecret) {
-          console.warn('AgentMode: PAYLOAD_PUBLISH_SECRET not available, falling back to Webflow');
-        }
-
-        try {
-          if (payloadSecret) {
-            // Map Webflow categories to Payload categories
-            const categoryMap: Record<string, string> = {
-              'AI in Marketing': 'AI in Marketing',
-              'Founder Playbooks': 'Founder Playbooks',
-              'Growth Tips': 'Growth Tips',
-              'Thought Leadership': 'Thought Leadership',
-              'Other': 'Other',
-              'Alternatives': 'Alternatives',
-              'Listicles': 'Listicles',
-              'User Guide': 'User Guide',
-              'Case Studies': 'Case Studies',
-            };
-            const payloadCategory = categories.length > 0
-              ? (categoryMap[categories[0]] || 'Other')
-              : 'Other';
-
-            // Map author to Payload author slug
-            const authorSlug = author?.toLowerCase().includes('rui') ? 'rui'
-              : author?.toLowerCase().includes('harsha') ? 'harsha'
-              : author?.toLowerCase().includes('fangfang') ? 'fangfang'
-              : author?.toLowerCase().includes('matthew') ? 'matthew'
-              : 'emma';
-
-            const payloadResponse = await axios.post(
-              payloadEndpoint,
-              {
-                title,
-                slug,
-                summary: description,
-                bodyHtml: cleanBodyHtml,
-                category: payloadCategory,
-                author: authorSlug,
-                featuredImageUrl: heroImageUrl,
-                publishedAt: new Date().toISOString(),
-                status,
-              },
-              {
-                headers: { 'Authorization': `Bearer ${payloadSecret}` },
-                timeout: 30000,
-              }
-            );
-
-            console.log(`AgentMode: Blog article published successfully to Payload CMS as ${status}`);
-
-            return {
-              success: true,
-              message: `Blog article published successfully to Payload CMS as ${status}`,
-              data: {
-                title,
-                slug,
-                status,
-                cmsType: 'Payload',
-                url: `/blog/${slug}`,
-                cmsResponse: payloadResponse.data,
-              }
-            };
-          }
-
-          // Fallback to Webflow if no Payload secret
           const response = await axios.post(
             endpoint,
             cmsItemData,
             { headers }
           );
 
-          console.log(`AgentMode: Blog article published successfully to Webflow as ${status} (fallback)`);
+          console.log(`AgentMode: Blog article published successfully to Webflow as ${status}`);
 
           // Sanitize response to remove large content fields before sending to LLM
           const responseData = response.data as any;

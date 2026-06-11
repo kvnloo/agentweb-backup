@@ -872,13 +872,14 @@ describe('AgentModeService - publish_blog_article function', () => {
     };
 
     beforeEach(() => {
-      // Mock user with Webflow cmsType (Payload intercepts before Webflow)
+      // Mock user with Webflow cmsType. Payload should publish before any
+      // legacy Webflow/BaseHub configuration is required.
       mockGetUserById.mockResolvedValue({
         userId: mockUserId,
         cmsType: 'Webflow',
       });
 
-      // Mock Webflow config (still needed since publishBlogArticle loads it first)
+      // Mock Webflow config for the legacy fallback path when Payload is absent.
       mockGetWebflowConfig.mockResolvedValue({
         apiToken: 'test-api-token',
         siteId: 'test-site-id',
@@ -913,6 +914,39 @@ describe('AgentModeService - publish_blog_article function', () => {
       expect(result.success).toBe(true);
       expect(result.data.cmsType).toBe('Payload');
       expect(result.message).toContain('Payload CMS');
+      expect(mockGetWebflowConfig).not.toHaveBeenCalled();
+      expect(mockGetUserById).not.toHaveBeenCalled();
+    });
+
+    it('should publish to Payload CMS even when the user has no CMS configured', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: mockUserId,
+        cmsType: null,
+      });
+      mockAxiosGet.mockResolvedValueOnce({ data: mockHtmlContent });
+      mockAxiosPost.mockResolvedValueOnce(mockPayloadResponse);
+
+      const result = await (agentModeService as any).publishBlogArticle(
+        'Landing Page Blog',
+        'Payload should not depend on user CMS config',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId,
+        'published',
+        'Fangfang',
+        ['Thought Leadership']
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.data.cmsType).toBe('Payload');
+      expect(mockGetUserById).not.toHaveBeenCalled();
+      expect(mockGetWebflowConfig).not.toHaveBeenCalled();
+
+      const body = mockAxiosPost.mock.calls[0][1];
+      expect(body.status).toBe('published');
+      expect(body.author).toBe('fangfang');
+      expect(body.category).toBe('Thought Leadership');
     });
 
     it('should send correct payload to Payload CMS endpoint', async () => {
@@ -1013,4 +1047,3 @@ describe('AgentModeService - publish_blog_article function', () => {
 
   });
 });
-
