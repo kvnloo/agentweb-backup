@@ -42,7 +42,7 @@ jest.mock('../services/agentModeService', () => ({
     ])),
     getAdminToolNames: jest.fn().mockReturnValue([
       'list_predefined_work_plans', 'manage_predefined_work_plan',
-      'list_skills', 'resolve_skill', 'manage_skill', 'get_chat_history',
+      'list_skills', 'manage_skill', 'get_chat_history',
     ]),
   },
 }));

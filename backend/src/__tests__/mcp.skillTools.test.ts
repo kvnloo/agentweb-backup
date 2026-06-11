@@ -12,7 +12,22 @@ jest.mock('../mcp/server/httpClient', () => ({
 jest.mock('../services/skillService', () => ({
   skillService: {
     getPublishedSkills: jest.fn().mockResolvedValue([]),
+    getSkillsAvailableToUser: jest.fn(),
+    getAllSkills: jest.fn(),
   },
+}));
+
+jest.mock('../services/db', () => ({
+  userDb: {
+    getUserById: jest.fn(),
+  },
+  orgDb: {
+    getOrgById: jest.fn(),
+  },
+}));
+
+jest.mock('../services/orgShareService', () => ({
+  isFeatureEffectivelyEnabled: jest.fn().mockReturnValue(true),
 }));
 
 jest.mock('../services/subscriptionService', () => ({
@@ -28,16 +43,28 @@ jest.mock('../services/agentModeService', () => ({
 
 import { mcpFetch } from '../mcp/server/httpClient';
 import { mcpToolRegistry } from '../mcp/server/registry';
+import { skillService } from '../services/skillService';
+import { userDb, orgDb } from '../services/db';
 import '../mcp/server/apiTools';
 
 const mockMcpFetch = mcpFetch as jest.MockedFunction<typeof mcpFetch>;
+const mockSkillService = skillService as jest.Mocked<typeof skillService>;
+const mockUserDb = userDb as jest.Mocked<typeof userDb>;
+const mockOrgDb = orgDb as jest.Mocked<typeof orgDb>;
 
 describe('Skill Management MCP Tools', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockUserDb.getUserById.mockImplementation(async (userId: string) => {
+      if (userId === 'admin-123') return { userId, email: 'admin@agentweb.pro', isAdmin: true } as any;
+      if (userId === 'owner-123') return { userId, email: 'teammate@agentweb.pro', isAdmin: false } as any;
+      return { userId, email: 'user@agentweb.pro', isAdmin: false } as any;
+    });
+    mockOrgDb.getOrgById.mockResolvedValue({ orgId: 'org-123', shareSettings: { skills: { enabled: true } } } as any);
   });
 
   const context = { userId: 'user-123', agentUserId: 'user-123' };
+  const adminContext = { userId: 'admin-123', agentUserId: 'admin-123' };
 
   // ─── FAIL tests: invalid inputs, boundary conditions, error paths ────
 
@@ -149,18 +176,16 @@ describe('Skill Management MCP Tools', () => {
     ];
 
     it('should resolve an exact skill name without returning systemPrompt', async () => {
-      mockMcpFetch.mockResolvedValue(skills);
+      mockSkillService.getSkillsAvailableToUser.mockResolvedValue(skills as any);
 
       const result = await mcpToolRegistry.execute('resolve_skill', {
         query: 'Luma Event Lead Engagement Engine',
       }, context);
       const parsed = JSON.parse(result.content[0].text);
 
-      expect(mockMcpFetch).toHaveBeenCalledWith({
-        method: 'GET',
-        path: '/api/skills',
-        context: { userId: 'user-123', agentUserId: 'user-123' },
-      });
+      expect(mockSkillService.getSkillsAvailableToUser).toHaveBeenCalledWith('user-123', undefined);
+      expect(parsed.scope).toBe('user_accessible');
+      expect(parsed.canManageSkills).toBe(false);
       expect(parsed.resolution).toBe('single_strong_match');
       expect(parsed.matches[0]).toMatchObject({
         skill_id: 'luma-1',
@@ -174,7 +199,7 @@ describe('Skill Management MCP Tools', () => {
     });
 
     it('should resolve partial event skill queries in ranked order', async () => {
-      mockMcpFetch.mockResolvedValue(skills);
+      mockSkillService.getSkillsAvailableToUser.mockResolvedValue(skills as any);
 
       const result = await mcpToolRegistry.execute('resolve_skill', {
         query: 'Event skill',
@@ -188,7 +213,7 @@ describe('Skill Management MCP Tools', () => {
     });
 
     it('should return no_match when no skills match the query', async () => {
-      mockMcpFetch.mockResolvedValue(skills);
+      mockSkillService.getSkillsAvailableToUser.mockResolvedValue(skills as any);
 
       const result = await mcpToolRegistry.execute('resolve_skill', {
         query: 'Healthcare RFP Assistant',
@@ -201,24 +226,31 @@ describe('Skill Management MCP Tools', () => {
     });
 
     it('should preserve private and org-visible metadata in compact matches', async () => {
-      mockMcpFetch.mockResolvedValue([
+      mockUserDb.getUserById.mockImplementation(async (userId: string) => {
+        if (userId === 'user-123') return { userId, email: 'user@agentweb.pro', isAdmin: false, orgId: 'org-123', orgRole: 'member' } as any;
+        if (userId === 'owner-123') return { userId, email: 'teammate@agentweb.pro', isAdmin: false } as any;
+        return null;
+      });
+      mockSkillService.getSkillsAvailableToUser.mockResolvedValue([
         {
           skillId: 'org-1',
           name: 'Org Shared Event Skill',
           description: 'Shared inside the org',
-          ownerEmail: 'teammate@agentweb.pro',
+          ownerId: 'owner-123',
           visibility: 'private',
           isPublished: false,
           orgId: 'org-123',
           systemPrompt: 'ORG SECRET',
         },
-      ]);
+      ] as any);
 
       const result = await mcpToolRegistry.execute('resolve_skill', {
         query: 'shared event',
       }, context);
       const parsed = JSON.parse(result.content[0].text);
 
+      expect(mockSkillService.getSkillsAvailableToUser).toHaveBeenCalledWith('user-123', 'org-123');
+      expect(parsed.scope).toBe('user_accessible_with_org');
       expect(parsed.matches[0]).toEqual(expect.objectContaining({
         skill_id: 'org-1',
         name: 'Org Shared Event Skill',
@@ -227,6 +259,20 @@ describe('Skill Management MCP Tools', () => {
         isPublished: false,
       }));
       expect(JSON.stringify(parsed)).not.toContain('ORG SECRET');
+    });
+
+    it('should use admin-visible scope for admin users', async () => {
+      mockSkillService.getAllSkills.mockResolvedValue(skills as any);
+
+      const result = await mcpToolRegistry.execute('resolve_skill', {
+        query: 'Event skill',
+      }, adminContext);
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(mockSkillService.getAllSkills).toHaveBeenCalled();
+      expect(mockSkillService.getSkillsAvailableToUser).not.toHaveBeenCalled();
+      expect(parsed.scope).toBe('admin_visible');
+      expect(parsed.canManageSkills).toBe(true);
     });
   });
 

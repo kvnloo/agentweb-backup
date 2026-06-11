@@ -8,7 +8,7 @@
 describe('AgentModeService - Admin Tool Blocking', () => {
   // Note: list_predefined_work_plans is intentionally NOT admin-gated — it is a
   // role-aware foundation tool (published list for non-admins, full list for admins).
-  const ADMIN_TOOL_NAMES = ['manage_predefined_work_plan', 'list_skills', 'resolve_skill', 'manage_skill'];
+  const ADMIN_TOOL_NAMES = ['manage_predefined_work_plan', 'list_skills', 'manage_skill'];
 
   beforeEach(() => {
     jest.clearAllMocks();

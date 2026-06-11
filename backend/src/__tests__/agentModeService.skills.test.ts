@@ -449,14 +449,14 @@ describe('AgentModeService - Skills', () => {
       expect(result[0].description).toBe('tool_no_desc');
     });
 
-    it('should exclude admin-only tools from unassociated tools', () => {
+    it('should exclude foundation and admin-only tools from unassociated tools', () => {
       const publishedSkills: any[] = [];
       const mockTools = [
         { name: 'regular_tool', definition: { function: { description: 'regular' } } },
         { name: 'list_predefined_work_plans', definition: { function: { description: 'admin tool' } } },
         { name: 'manage_predefined_work_plan', definition: { function: { description: 'admin tool 2' } } },
         { name: 'list_skills', definition: { function: { description: 'admin tool 3' } } },
-        { name: 'resolve_skill', definition: { function: { description: 'admin tool 4' } } },
+        { name: 'resolve_skill', definition: { function: { description: 'foundation resolver' } } },
         { name: 'manage_skill', definition: { function: { description: 'admin tool 5' } } },
       ];
       jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
@@ -848,6 +848,7 @@ describe('AgentModeService - Skills', () => {
       expect(foundationTools).toBeInstanceOf(Set);
       expect(foundationTools.has('install_skills')).toBe(true);
       expect(foundationTools.has('list_available_skills')).toBe(true);
+      expect(foundationTools.has('resolve_skill')).toBe(true);
       expect(foundationTools.has('read_brand_guidelines')).toBe(true);
       expect(foundationTools.has('update_brand_guidelines')).toBe(true);
       expect(foundationTools.has('search_knowledge_base')).toBe(true);
@@ -888,11 +889,13 @@ describe('AgentModeService - Skills', () => {
       await agentModeService.loadFoundationTools();
 
       const tools = agentModeService.getFoundationToolNames();
-      expect(tools.size).toBe(3);
+      expect(tools.size).toBe(6);
       expect(tools.has('tool_a')).toBe(true);
       expect(tools.has('tool_b')).toBe(true);
       expect(tools.has('tool_c')).toBe(true);
-      expect(tools.has('install_skills')).toBe(false);
+      expect(tools.has('install_skills')).toBe(true);
+      expect(tools.has('list_available_skills')).toBe(true);
+      expect(tools.has('resolve_skill')).toBe(true);
     });
 
     it('should fall back to defaults when no DB setting exists', async () => {
@@ -942,17 +945,18 @@ describe('AgentModeService - Skills', () => {
 
       const result = await agentModeService.updateFoundationTools(['tool_x', 'tool_y'], 'admin@test.com');
 
-      expect(result).toEqual(['tool_x', 'tool_y']);
+      expect(result).toEqual(['tool_x', 'tool_y', 'install_skills', 'list_available_skills', 'resolve_skill']);
       expect(settingsService.setSetting).toHaveBeenCalledWith(
         'foundation_tools',
-        JSON.stringify(['tool_x', 'tool_y']),
+        JSON.stringify(['tool_x', 'tool_y', 'install_skills', 'list_available_skills', 'resolve_skill']),
         expect.any(String),
         'admin@test.com'
       );
       const tools = agentModeService.getFoundationToolNames();
-      expect(tools.size).toBe(2);
+      expect(tools.size).toBe(5);
       expect(tools.has('tool_x')).toBe(true);
       expect(tools.has('tool_y')).toBe(true);
+      expect(tools.has('resolve_skill')).toBe(true);
     });
 
     it('should deduplicate tool names', async () => {
@@ -961,7 +965,7 @@ describe('AgentModeService - Skills', () => {
 
       const result = await agentModeService.updateFoundationTools(['tool_a', 'tool_a', 'tool_b'], 'admin@test.com');
 
-      expect(result).toEqual(['tool_a', 'tool_b']);
+      expect(result).toEqual(['tool_a', 'tool_b', 'install_skills', 'list_available_skills', 'resolve_skill']);
     });
   });
 

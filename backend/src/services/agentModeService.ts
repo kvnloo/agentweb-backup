@@ -38,7 +38,7 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['manage_predefined_work_plan', 'list_skills', 'resolve_skill', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'manage_user_guide', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage'];
+const ADMIN_SKILL_TOOL_NAMES = ['manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'manage_user_guide', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -3792,6 +3792,7 @@ export class AgentModeService {
     // Discovery
     'install_skills',
     'list_available_skills',
+    'resolve_skill',
 
     // GTM Context (Read/Write)
     'update_brand_guidelines',
@@ -3875,6 +3876,11 @@ export class AgentModeService {
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
   // Made public for use in MCP server skill gating.
   public static FOUNDATION_TOOLS: Set<string> = new Set(AgentModeService.DEFAULT_FOUNDATION_TOOLS);
+  private static readonly MANDATORY_FOUNDATION_TOOLS: ReadonlyArray<string> = [
+    'install_skills',
+    'list_available_skills',
+    'resolve_skill',
+  ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
 
@@ -3938,8 +3944,9 @@ export class AgentModeService {
       if (setting?.settingValue) {
         const toolNames: string[] = JSON.parse(setting.settingValue);
         if (Array.isArray(toolNames) && toolNames.length > 0) {
-          AgentModeService.FOUNDATION_TOOLS = new Set(toolNames);
-          console.log(`AgentMode: Loaded ${toolNames.length} foundation tools from DB`);
+          const merged = [...new Set([...toolNames, ...AgentModeService.MANDATORY_FOUNDATION_TOOLS])];
+          AgentModeService.FOUNDATION_TOOLS = new Set(merged);
+          console.log(`AgentMode: Loaded ${merged.length} foundation tools from DB`);
           return;
         }
       }
@@ -3953,7 +3960,7 @@ export class AgentModeService {
    * Update foundation tools in DB and refresh the in-memory set.
    */
   public async updateFoundationTools(toolNames: string[], updatedBy: string): Promise<string[]> {
-    const unique = [...new Set(toolNames)];
+    const unique = [...new Set([...toolNames, ...AgentModeService.MANDATORY_FOUNDATION_TOOLS])];
     await settingsService.setSetting(
       AgentModeService.FOUNDATION_TOOLS_SETTING,
       JSON.stringify(unique),

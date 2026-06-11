@@ -88,14 +88,75 @@ function skillResolution(matches: Array<{ matchScore: number }>) {
   return 'multiple_matches';
 }
 
-function skillResolutionNextStep(resolution: string) {
+function skillResolutionNextStep(resolution: string, canManageSkills: boolean) {
   if (resolution === 'single_strong_match') {
-    return 'Use manage_skill with this skill_id after user confirmation for mutations.';
+    return canManageSkills
+      ? 'Use manage_skill with this skill_id after user confirmation for mutations.'
+      : 'Use this compact match to answer lookup questions. Skill mutations require admin access.';
   }
   if (resolution === 'multiple_matches') {
     return 'Ask the user which skill_id to use before calling manage_skill.';
   }
   return 'Tell the user no matching skill was found and ask for a more specific skill name.';
+}
+
+async function getSkillResolverScope(context: any) {
+  const userId = context?.userId;
+  const isDelegatedAccess = context?.isDelegatedAccess === true;
+  if (!userId) {
+    return { scope: 'unauthenticated' as const, canManageSkills: false, skills: [] as any[] };
+  }
+
+  const { skillService } = await import('../../services/skillService');
+  const { userDb, orgDb } = await import('../../services/db');
+  const currentUser = await userDb.getUserById(userId);
+  const canManageSkills = currentUser?.isAdmin === true || isDelegatedAccess;
+
+  const enrichOwnerEmails = async (skills: any[]) => {
+    const ownerIds = [...new Set(skills.map((s) => s.ownerId).filter(Boolean))];
+    const ownerEntries = await Promise.all(ownerIds.map(async (ownerId) => {
+      const owner = await userDb.getUserById(ownerId).catch(() => null);
+      return [ownerId, owner?.email] as const;
+    }));
+    const ownerEmailById = new Map(ownerEntries.filter(([, email]) => Boolean(email)) as Array<[string, string]>);
+    return skills.map((skill) => skill.ownerId && ownerEmailById.has(skill.ownerId)
+      ? { ...skill, ownerEmail: ownerEmailById.get(skill.ownerId) }
+      : skill
+    );
+  };
+
+  if (canManageSkills) {
+    const skills = await skillService.getAllSkills();
+    return {
+      scope: 'admin_visible' as const,
+      canManageSkills: true,
+      skills: await enrichOwnerEmails(skills),
+    };
+  }
+
+  let accessibleOrgId: string | undefined;
+  try {
+    const { isFeatureEffectivelyEnabled } = await import('../../services/orgShareService');
+    const candidateOrgId = currentUser?.orgId;
+    if (candidateOrgId) {
+      const org = await orgDb.getOrgById(candidateOrgId);
+      const enabled = isFeatureEffectivelyEnabled(
+        { userId, orgId: candidateOrgId, orgRole: currentUser?.orgRole },
+        org,
+        'skills',
+      );
+      if (enabled) accessibleOrgId = candidateOrgId;
+    }
+  } catch {
+    accessibleOrgId = undefined;
+  }
+
+  const skills = await skillService.getSkillsAvailableToUser(userId, accessibleOrgId);
+  return {
+    scope: accessibleOrgId ? 'user_accessible_with_org' as const : 'user_accessible' as const,
+    canManageSkills: false,
+    skills: await enrichOwnerEmails(skills),
+  };
 }
 
 // ─── Emma Chat Sessions ─────────────────────────────────────────────────────
@@ -1896,7 +1957,7 @@ mcpToolRegistry.register({
   name: 'resolve_skill',
   definition: {
     name: 'resolve_skill',
-    description: 'Resolve a user-provided skill, engine, or workflow-skill name to compact skill metadata before using manage_skill. Admin-only. ALWAYS use this before update/delete/get when the user gave a skill name rather than an exact skill_id. Returns compact matches only and never returns the full systemPrompt.',
+    description: 'Resolve a user-provided skill, engine, or workflow-skill name to compact skill metadata. Normal users search only skills they can access: published, own private, and org-shared private skills. Admin/delegated sessions search admin-visible skills. ALWAYS use this before saying a skill does not exist, and before manage_skill when the user gave a skill name rather than an exact skill_id. Returns compact matches only and never returns the full systemPrompt.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1914,7 +1975,7 @@ mcpToolRegistry.register({
 
     const rawLimit = typeof args.limit === 'number' ? args.limit : 5;
     const limit = Math.max(1, Math.min(10, Math.floor(rawLimit) || 5));
-    const skills = await mcpFetch({ method: 'GET', path: '/api/skills', context: ctx(context) });
+    const { scope, canManageSkills, skills } = await getSkillResolverScope(context);
     const skillList = Array.isArray(skills) ? skills : [];
     const matches = skillList
       .map((skill: any) => compactSkillMatch(skill, query))
@@ -1926,10 +1987,12 @@ mcpToolRegistry.register({
     return jsonResult({
       success: true,
       query,
+      scope,
+      canManageSkills,
       totalMatches: matches.length,
       matches,
       resolution,
-      nextStep: skillResolutionNextStep(resolution),
+      nextStep: skillResolutionNextStep(resolution, canManageSkills),
     });
   }
 });
