@@ -19,6 +19,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-11',
     changes: [
+      'Fixed: Clearer Message When You Cannot Edit a Shared Landing Page',
+      '- If you asked Emma to edit a teammate\'s landing page that you can see but are not allowed to change, Emma would keep trying and then report it as a platform error',
+      '- Emma now checks up front whether you have edit access to a page and, if not, tells you right away to ask your org owner to add you as a landing-page editor (Settings > Organization > Org-wide Sharing > Landing Pages) — no more wasted attempts or confusing error messages',
+      '- Your landing page list also now marks which pages you can edit versus only view',
       'Fixed: Skills You Create by Chatting with Emma Are Now Shared with Your Organization',
       '- When you asked Emma to create a skill, it was saved without linking it to your organization, so teammates could not see it and it did not behave like other shared skills',
       '- Skills created through Emma are now shared across your whole organization by default, just like skills created from Settings > Skills',
