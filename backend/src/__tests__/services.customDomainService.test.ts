@@ -204,6 +204,68 @@ describe("customDomainService", () => {
         /invalid domain/i
       );
     });
+
+    it("should treat a 409 (domain already on THIS project) as success", async () => {
+      // Vercel rejects the add because the domain already exists...
+      mockAxiosPost.mockRejectedValueOnce({ response: { status: 409 } });
+      // ...but a GET confirms it's on this project (pending DNS).
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          name: "landing.example.com",
+          verified: false,
+          verification: [{ type: "TXT", domain: "_vercel.landing.example.com", value: "vc=abc" }],
+        },
+      });
+
+      const result = await addCustomDomain("user-123", "proj-id", "landing.example.com");
+      expect(result.status).toBe("pending_verification");
+      expect(result.verificationRecords!.length).toBeGreaterThan(0);
+      // Confirmed via the project-scoped domain GET.
+      expect(mockAxiosGet).toHaveBeenCalledWith(
+        expect.stringContaining("/projects/proj-id/domains/landing.example.com"),
+        expect.any(Object)
+      );
+    });
+
+    it("should reuse the existing DynamoDB record id on a re-add (no duplicate)", async () => {
+      mockAxiosPost.mockRejectedValueOnce({ response: { status: 409 } });
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { name: "landing.example.com", verified: false, verification: [] },
+      });
+      // An existing record for this user+domain is already stored.
+      mockQuery.mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Items: [
+              {
+                id: "existing-dom-id",
+                userId: "user-123",
+                domain: "landing.example.com",
+                type: "custom",
+                status: "pending_verification",
+                vercelProjectId: "proj-id",
+                createdAt: "2024-01-01T00:00:00.000Z",
+                updatedAt: "2024-01-01T00:00:00.000Z",
+              },
+            ],
+          }),
+      });
+
+      const result = await addCustomDomain("user-123", "proj-id", "landing.example.com");
+      expect(result.id).toBe("existing-dom-id");
+      expect(result.createdAt).toBe("2024-01-01T00:00:00.000Z");
+    });
+
+    it("should propagate the original 409 when the domain is on a DIFFERENT project", async () => {
+      mockAxiosPost.mockRejectedValueOnce({ response: { status: 409 } });
+      // GET fails (domain not on this project) — the original 409 must surface
+      // so the route returns "already in use on another project".
+      mockAxiosGet.mockRejectedValueOnce({ response: { status: 404 } });
+
+      await expect(
+        addCustomDomain("user-123", "proj-id", "landing.example.com")
+      ).rejects.toMatchObject({ response: { status: 409 } });
+    });
   });
 
   describe("removeDomain", () => {
