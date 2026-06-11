@@ -217,14 +217,35 @@ export async function addCustomDomain(
 
   const headers = await getVercelHeaders();
 
-  // Add domain to Vercel project
-  const response = await axios.post(
-    `${VERCEL_API_BASE}/v10/projects/${vercelProjectId}/domains`,
-    { name: cleanDomain },
-    { headers }
-  );
+  // Add domain to Vercel project. A 409 means the domain already exists on
+  // Vercel — if it's already on THIS project (e.g. a prior add, or a disconnect
+  // whose Vercel delete silently failed) we treat that as success and read its
+  // current state instead of erroring. If it's on a different project, the 409
+  // propagates so the user sees "already in use on another project".
+  let vercelData: any;
+  try {
+    const response = await axios.post(
+      `${VERCEL_API_BASE}/v10/projects/${vercelProjectId}/domains`,
+      { name: cleanDomain },
+      { headers }
+    );
+    vercelData = response.data;
+  } catch (err: any) {
+    if (err.response?.status !== 409) throw err;
+    // Already exists — confirm it's on this project by fetching it. If the GET
+    // fails, the domain is on a different project (or otherwise unavailable):
+    // re-throw the original 409 so the caller still sees the conflict.
+    try {
+      const existing = await axios.get(
+        `${VERCEL_API_BASE}/v9/projects/${vercelProjectId}/domains/${cleanDomain}`,
+        { headers }
+      );
+      vercelData = existing.data;
+    } catch {
+      throw err;
+    }
+  }
 
-  const vercelData = response.data as any;
   const isVerified = vercelData.verified === true;
 
   // `verified` alone only proves domain ownership — Vercel returns it `true`
@@ -237,9 +258,17 @@ export async function addCustomDomain(
     : true;
   const isActive = isVerified && !misconfigured;
 
+  // Reuse an existing record for this user+domain if one is already stored, so
+  // a re-add (e.g. after a 409) updates in place rather than creating a
+  // duplicate row in DynamoDB.
+  const existingRecords = await listDomains(userId, vercelProjectId);
+  const existing = existingRecords.find(
+    (d) => d.type === "custom" && d.domain === cleanDomain
+  );
+
   const now = new Date().toISOString();
   const record: CustomDomainRecord = {
-    id: uuidv4(),
+    id: existing?.id ?? uuidv4(),
     userId,
     domain: cleanDomain,
     type: "custom",
@@ -252,7 +281,7 @@ export async function addCustomDomain(
           domain: v.domain,
           value: v.value,
         })),
-    createdAt: now,
+    createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   };
 
