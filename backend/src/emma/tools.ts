@@ -26,6 +26,7 @@ emmaToolRegistry.register({
       properties: {
         skillIds: {
           type: 'array',
+          minItems: 1,
           items: { type: 'string' },
           description: 'Array of ALL skill IDs to install. Include every skill you need in one call.'
         }
@@ -40,12 +41,15 @@ emmaToolRegistry.register({
       throw new Error("Authentication required: no user context");
     }
 
-    if (!Array.isArray(args.skillIds) || args.skillIds.length === 0) {
-      return { message: "skillIds must be a non-empty array of skill IDs." };
-    }
-
     // For external MCP clients: validate and update session state
     if (context?.updateInstalledSkills) {
+      const requestedSkillIds = Array.isArray(args.skillIds)
+        ? args.skillIds.filter((id: unknown): id is string => typeof id === 'string')
+        : [];
+      if (requestedSkillIds.length === 0) {
+        return { message: "skillIds must be a non-empty array of skill IDs." };
+      }
+
       const { skillService } = await import('../services/skillService');
       const { getAllowedSkills } = await import('../services/subscriptionService');
 
@@ -57,7 +61,7 @@ emmaToolRegistry.register({
       const isWildcard = userAllowedSkillIds.includes("*");
       const allowedSkillSet = new Set(userAllowedSkillIds);
 
-      const validSkillIds = args.skillIds.filter((id: string) => {
+      const validSkillIds = requestedSkillIds.filter((id: string) => {
         const skill = publishedSkills.find(s => s.skillId === id);
         const isOwnSkill = skill && (skill as any).ownerId === userId;
         return (id === '__other_skills__' || skill) &&
@@ -1706,10 +1710,12 @@ emmaToolRegistry.register({
       properties: {
         title_draft: {
           type: 'string',
+          'x-aliases': ['title', 'headline', 'subject'],
           description: 'A draft title for the blog article. The final title will be generated and optimized from this draft.'
         },
         content_draft: {
           type: 'string',
+          'x-aliases': ['content', 'body', 'text', 'markdown', 'article_content'],
           description: 'The blog article content in markdown format'
         },
         length: {
@@ -1973,13 +1979,6 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    if (!args.template_id) {
-      return {
-        success: false,
-        message: 'template_id is required'
-      };
-    }
-
     // Parse JSON strings
     let variableValues = {};
     let arrayVariableValues = {};
@@ -2037,6 +2036,7 @@ emmaToolRegistry.register({
         },
         operations_json: {
           type: 'string',
+          'x-aliases': ['replacement_json'],
           description: 'JSON string containing operations. ' +
             'For CSS mode: [{"action": "remove", "selector": ".card[data-id=\\"123\\"]"}, ' +
             '{"action": "replace", "selector": "h1.title", "html": "<h1 class=\\"title\\">New Title</h1>"}, ' +
@@ -2054,22 +2054,9 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    if (!args.file_url) {
-      return { success: false, message: 'file_url is required' };
-    }
-    if (!args.update_type) {
-      return { success: false, message: 'update_type is required' };
-    }
-
-    // Accept both operations_json (new) and replacement_json (legacy) parameter names
-    const jsonStr = args.operations_json || args.replacement_json;
-    if (!jsonStr) {
-      return { success: false, message: 'operations_json is required' };
-    }
-
     let operations;
     try {
-      operations = JSON.parse(jsonStr);
+      operations = JSON.parse(args.operations_json);
     } catch (error) {
       return {
         success: false,
@@ -4814,30 +4801,13 @@ emmaToolRegistry.register({
         file_url: {
           type: 'string',
           description: 'The URL of the file to read and extract content from'
-        },
-        url: {
-          type: 'string',
-          description: 'Deprecated alias for file_url. Prefer file_url.'
         }
       },
       required: ["file_url"]
     }
   },
   execute: async (args: any, context?: any) => {
-    const fileUrl = args.file_url || args.url;
-    if (!fileUrl || typeof fileUrl !== 'string') {
-      return {
-        content: [
-          {
-            type: "text",
-            text: 'Error: file_url is required. Pass the attached file URL as file_url, not url.'
-          }
-        ],
-        isError: true
-      };
-    }
-
-    const result = await agentModeService.readFileContent(fileUrl);
+    const result = await agentModeService.readFileContent(args.file_url);
     if (result.success === false) {
       return {
         content: [
@@ -4983,8 +4953,16 @@ emmaToolRegistry.register({
     inputSchema: {
       type: "object",
       properties: {
-        title: { type: "string", description: "Title of the HTML document, or the subject/headline for an email (e.g. 'Aquila May 2026 Newsletter'). Required." },
-        content_draft: { type: "string", description: "The full content to include. Include all data, scores, analysis, and text sections. Required." },
+        title: {
+          type: "string",
+          'x-aliases': ['file_name', 'filename', 'name', 'headline', 'subject'],
+          description: "Title of the HTML document, or the subject/headline for an email (e.g. 'Aquila May 2026 Newsletter'). Required."
+        },
+        content_draft: {
+          type: "string",
+          'x-aliases': ['html_content', 'content', 'body', 'text', 'markdown', 'document_content'],
+          description: "The full content to include. Include all data, scores, analysis, and text sections. Required."
+        },
         format_requirements: { type: "string", description: "Optional additional formatting instructions (e.g. 'use dark theme', 'include charts', 'brand color #1a73e8', 'add a CTA button to book a demo')." },
         document_type: { type: "string", enum: ["document", "email"], description: "Optional. Use 'email' for a one-off newsletter/marketing email so the HTML is email-client-safe (table-based layout, inline CSS, 600px container, no JS). Use 'document' (default) for reports, summaries, audits, and other web-style documents." }
       },
@@ -4992,12 +4970,6 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    if (!args.title || typeof args.title !== 'string') {
-      throw new Error('title is required and must be a string');
-    }
-    if (!args.content_draft || typeof args.content_draft !== 'string') {
-      throw new Error('content_draft is required and must be a string');
-    }
     const documentType = args.document_type === 'email' ? 'email' : 'document';
     return await agentModeService.createHtmlFile(args.title, args.content_draft, args.format_requirements || '', context?.userId, context?.sessionId, documentType);
   }
@@ -6025,6 +5997,7 @@ const bridgedToolNames = [
   'publish_landing_page_changes',
   'revert_landing_page_publish',
   'update_landing_page_context',
+  'resolve_skill',
 ];
 
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
@@ -6068,10 +6041,12 @@ emmaToolRegistry.register({
       properties: {
         page_id: {
           type: 'string',
+          'x-aliases': ['landing_page_id'],
           description: 'The landing page ID to edit'
         },
         task_description: {
           type: 'string',
+          'x-aliases': ['instructions'],
           description: 'Detailed description of what code changes to make. Include specific requirements, file paths if known, and any context about the desired outcome. Be as specific as possible.'
         }
       },
@@ -6079,20 +6054,6 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    // Auto-map common param name mistakes
-    if (!args.page_id && args.landing_page_id) {
-      args.page_id = args.landing_page_id;
-    }
-    if (!args.task_description && args.instructions) {
-      args.task_description = args.instructions;
-    }
-    if (!args.page_id) {
-      return { success: false, error: 'page_id is required. Provide the landing page ID to edit.' };
-    }
-    if (!args.task_description) {
-      return { success: false, error: 'task_description is required. Provide a detailed description of the code changes to make.' };
-    }
-
     const { runCodingAgent } = await import('../services/codingAgentService');
     const executeMcpTool = context?.service
       ? async (toolName: string, toolArgs: any) => {

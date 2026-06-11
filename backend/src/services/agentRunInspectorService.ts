@@ -37,6 +37,43 @@ export interface AgentRunToolOutcomeSummary {
   errorMessage?: string;
 }
 
+export interface AgentRunChatContext {
+  found: boolean;
+  sessionId: string;
+  title?: string;
+  portalType?: string;
+  pageIdentifier?: string;
+  sessionType?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  messageCount: number;
+  firstUserMessage?: string;
+  lastUserMessage?: string;
+  lastAssistantMessage?: string;
+  customerPortalUrl?: string;
+}
+
+export interface AgentRunChatSessionRow {
+  sessionId?: string;
+  title?: string;
+  portalType?: string;
+  pageIdentifier?: string;
+  sessionType?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  messageCount?: number;
+}
+
+export interface AgentRunChatMessageRow {
+  messageIndex?: number;
+  message?: {
+    role?: string;
+    content?: unknown;
+  };
+  role?: string;
+  content?: unknown;
+}
+
 export interface AgentRunSummary {
   runId: string;
   sessionId?: string;
@@ -53,6 +90,7 @@ export interface AgentRunSummary {
   decisions: AgentRunDecisionSummary[];
   outcomes: AgentRunToolOutcomeSummary[];
   events: AgentRunEventRow[];
+  chat?: AgentRunChatContext;
 }
 
 export interface AgentRunFlagSummary {
@@ -74,6 +112,45 @@ export function buildAgentRunSummaries(rows: AgentRunEventRow[]): AgentRunSummar
   return [...byRun.entries()]
     .map(([runId, events]) => buildOneRunSummary(runId, events))
     .sort((a, b) => String(b.startedAt ?? '').localeCompare(String(a.startedAt ?? '')));
+}
+
+export function buildAgentRunChatContext(input: {
+  sessionId: string;
+  session?: AgentRunChatSessionRow | null;
+  messages?: AgentRunChatMessageRow[];
+  customerPortalBaseUrl?: string;
+}): AgentRunChatContext {
+  const messages = [...(input.messages ?? [])].sort((a, b) => (a.messageIndex ?? 0) - (b.messageIndex ?? 0));
+  const normalized = messages
+    .map((row) => {
+      const message = row.message ?? row;
+      return {
+        role: typeof message.role === 'string' ? message.role : undefined,
+        content: summarizeMessageContent(message.content),
+      };
+    })
+    .filter((message) => message.role && message.content);
+
+  const userMessages = normalized.filter((message) => message.role === 'user');
+  const assistantMessages = normalized.filter((message) => message.role === 'assistant');
+  const messageCount = input.session?.messageCount ?? messages.length;
+  const baseUrl = trimTrailingSlash(input.customerPortalBaseUrl);
+
+  return {
+    found: Boolean(input.session || messages.length),
+    sessionId: input.sessionId,
+    title: cleanSessionTitle(input.session?.title),
+    portalType: input.session?.portalType,
+    pageIdentifier: input.session?.pageIdentifier,
+    sessionType: input.session?.sessionType,
+    createdAt: input.session?.createdAt,
+    updatedAt: input.session?.updatedAt,
+    messageCount,
+    firstUserMessage: userMessages[0]?.content,
+    lastUserMessage: userMessages[userMessages.length - 1]?.content,
+    lastAssistantMessage: assistantMessages[assistantMessages.length - 1]?.content,
+    customerPortalUrl: baseUrl ? `${baseUrl}/agent-mode/${encodeURIComponent(input.sessionId)}` : undefined,
+  };
 }
 
 function buildOneRunSummary(runId: string, events: AgentRunEventRow[]): AgentRunSummary {
@@ -261,4 +338,46 @@ function asString(value: unknown): string | undefined {
 
 function asNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function cleanSessionTitle(value: string | undefined): string | undefined {
+  const title = compactWhitespace(value);
+  if (!title || title === 'New Chat Session') return undefined;
+  return truncate(title, 140);
+}
+
+function summarizeMessageContent(value: unknown): string | undefined {
+  if (typeof value === 'string') return truncate(compactWhitespace(value), 360);
+  if (Array.isArray(value)) {
+    const text = value
+      .map((block) => {
+        if (typeof block === 'string') return block;
+        if (!block || typeof block !== 'object') return '';
+        const record = block as Record<string, unknown>;
+        if (typeof record.text === 'string') return record.text;
+        if (typeof record.content === 'string') return record.content;
+        if (typeof record.input === 'string') return record.input;
+        return '';
+      })
+      .filter(Boolean)
+      .join(' ');
+    return truncate(compactWhitespace(text), 360);
+  }
+  return undefined;
+}
+
+function compactWhitespace(value: string | undefined): string | undefined {
+  const compacted = value?.replace(/\s+/g, ' ').trim();
+  return compacted || undefined;
+}
+
+function truncate(value: string | undefined, maxLength: number): string | undefined {
+  if (!value) return undefined;
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function trimTrailingSlash(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed.replace(/\/+$/, '') : undefined;
 }

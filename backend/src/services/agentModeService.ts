@@ -79,6 +79,7 @@ import {
   evaluateAgentToolPolicy,
   summarizeAgentToolPolicyFlags,
   summarizeAgentToolPolicyModes,
+  validateAndRepairToolArgs,
 } from './agentToolGatewayService';
 
 type MetaApiResult = {
@@ -813,10 +814,12 @@ export class AgentModeService {
             properties: {
               s3_key: {
                 type: 'string',
+                'x-aliases': ['s3Key', 'key', 'file_key', 'storage_key', 'object_key'],
                 description: 'The S3 key from the "[Full response stored at S3 key: ...]" reference in the tool result'
               },
               query: {
                 type: 'string',
+                'x-aliases': ['search_query', 'search', 'q', 'term'],
                 description: 'The text or field name to search for (e.g. "link_url", "destination_url", "sessionId")'
               },
               match_offset: {
@@ -853,6 +856,7 @@ export class AgentModeService {
             properties: {
               s3_key: {
                 type: 'string',
+                'x-aliases': ['s3Key', 'key', 'file_key', 'storage_key', 'object_key'],
                 description: 'The S3 key from the "[Full response stored at S3 key: ...]" reference in the tool result'
               },
               char_offset: {
@@ -2780,6 +2784,41 @@ export class AgentModeService {
 
         // Phase 1: Validate and prepare tool calls (synchronous)
         const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision }> = [];
+        const preflightToolResults: Array<{ status: 'error'; toolCall: any; functionArgs: any; error: Error; duration: number; policyDecision?: AgentToolPolicyDecision }> = [];
+
+        const appendPreflightToolFailure = (
+          toolCall: any,
+          functionArgs: any,
+          errorMessage: string,
+          content: any,
+          policyDecision?: AgentToolPolicyDecision,
+        ) => {
+          const error = new Error(errorMessage);
+          (messages as any[]).push({
+            tool_call_id: toolCall.id,
+            role: 'tool',
+            name: toolCall.function.name,
+            content,
+            metadata: { timestamp: new Date().toISOString() }
+          });
+          toolCalls.push({
+            id: toolCall.id,
+            name: toolCall.function.name,
+            arguments: functionArgs ?? toolCall.function.arguments,
+            error: error.message,
+            duration: 0
+          });
+          failedCounterUpdates[toolCall.function.name] =
+            (failedCounterUpdates[toolCall.function.name] || 0) + 1;
+          preflightToolResults.push({
+            status: 'error',
+            toolCall,
+            functionArgs,
+            error,
+            duration: 0,
+            policyDecision,
+          });
+        };
 
         for (const toolCall of responseMessage.tool_calls) {
           try {
@@ -2799,48 +2838,26 @@ export class AgentModeService {
               const errorMsg = isInteractiveShare
                 ? `Tool "${toolCall.function.name}" is not available in shared sessions. You can continue to use it in Agent Mode in your own session.`
                 : `Tool "${toolCall.function.name}" requires admin access. This session does not have admin privileges.`;
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: JSON.stringify({ error: errorMsg }),
-                metadata: { timestamp: new Date().toISOString() }
-              });
+              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
               continue;
             }
 
             if (isInteractiveShare && toolCall.function.name === 'connect_account') {
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: JSON.stringify({ error: 'Account connections are not available in shared sessions. Tell the user they need to open Agent Mode in their own account to connect this account, then come back here.' }),
-                metadata: { timestamp: new Date().toISOString() }
-              });
+              const errorMsg = 'Account connections are not available in shared sessions. Tell the user they need to open Agent Mode in their own account to connect this account, then come back here.';
+              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
               continue;
             }
 
             // Block context-restricted tools even if LLM hallucinates the call from history
             if (excludeTools?.includes(toolCall.function.name)) {
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: JSON.stringify({ error: `Tool "${toolCall.function.name}" is not available in this context.` }),
-                metadata: { timestamp: new Date().toISOString() }
-              });
+              const errorMsg = `Tool "${toolCall.function.name}" is not available in this context.`;
+              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
               continue;
             }
 
             if (publishedSkills.length > 0 && sessionAssociatedSkillIds.length > 0 && !allowedToolNames.has(toolCall.function.name)) {
               const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: JSON.stringify({ error: errorMsg }),
-                metadata: { timestamp: new Date().toISOString() }
-              });
+              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
               continue;
             }
 
@@ -2849,7 +2866,7 @@ export class AgentModeService {
               skillsUpdated = true;
             }
 
-            const policyDecision = evaluateAgentToolPolicy({
+            const initialPolicyDecision = evaluateAgentToolPolicy({
               toolName: toolCall.function.name,
               args: functionArgs,
               isAdmin: hasAdminAccess,
@@ -2857,31 +2874,51 @@ export class AgentModeService {
               enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
             });
 
-            if (!policyDecision.allowed) {
-              const errorMsg = `Tool "${toolCall.function.name}" was blocked by Agent Tool Gateway policy: ${policyDecision.flags.map((flag) => flag.message).join(' ')}`;
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: JSON.stringify({ error: errorMsg, policy: policyDecision }),
-                metadata: { timestamp: new Date().toISOString() }
-              });
+            const toolDefinition = this.toolRegistry.getTool(toolCall.function.name)?.definition;
+            const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.inputSchema;
+            const contractResult = validateAndRepairToolArgs({
+              toolName: toolCall.function.name,
+              args: functionArgs,
+              inputSchema,
+              effect: initialPolicyDecision.effect,
+            });
+
+            if (contractResult.status === 'invalid') {
+              const errorContent = this.formatToolError(toolCall.function.name, contractResult.modelMessage);
+              appendPreflightToolFailure(toolCall, functionArgs, contractResult.modelMessage, errorContent, initialPolicyDecision);
               continue;
             }
 
-            preparedCalls.push({ toolCall, functionArgs, policyDecision });
+            const preparedFunctionArgs = contractResult.args;
+            const policyDecision = evaluateAgentToolPolicy({
+              toolName: toolCall.function.name,
+              args: preparedFunctionArgs,
+              isAdmin: hasAdminAccess,
+              isSharedSession: isInteractiveShare,
+              enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
+            });
+
+            if (contractResult.status === 'repaired') {
+              policyDecision.flags.push({
+                code: 'args_repaired',
+                severity: 'info',
+                message: `Tool arguments were repaired before execution: ${contractResult.repairs.join(', ')}`,
+              });
+            }
+
+            if (!policyDecision.allowed) {
+              const errorMsg = `Tool "${toolCall.function.name}" was blocked by Agent Tool Gateway policy: ${policyDecision.flags.map((flag) => flag.message).join(' ')}`;
+              appendPreflightToolFailure(toolCall, preparedFunctionArgs, errorMsg, JSON.stringify({ error: errorMsg, policy: policyDecision }), policyDecision);
+              continue;
+            }
+
+            preparedCalls.push({ toolCall, functionArgs: preparedFunctionArgs, policyDecision });
           } catch (error) {
             // JSON parse failure — append error message for LLM
             console.error(`AgentMode: Tool argument parse error for ${toolCall.function.name}:`, error);
             const errMsg = error instanceof Error ? error.message : String(error);
             const errorContent = this.formatToolError(toolCall.function.name, `Failed to parse arguments: ${errMsg}`);
-            (messages as any[]).push({
-              tool_call_id: toolCall.id,
-              role: 'tool',
-              name: toolCall.function.name,
-              content: errorContent,
-              metadata: { timestamp: new Date().toISOString() }
-            });
+            appendPreflightToolFailure(toolCall, undefined, `Failed to parse arguments: ${errMsg}`, errorContent);
           }
         }
 
@@ -2964,6 +3001,7 @@ export class AgentModeService {
             policyDecision: toolResult.policyDecision,
           };
         });
+        const telemetryToolResults = [...preflightToolResults, ...toolResults];
 
         // Runtime spine V0 telemetry: record this iteration's decision + each
         // tool's invoked/succeeded/failed outcome into the shared LoopEvents
@@ -2971,7 +3009,7 @@ export class AgentModeService {
         // errors and is a no-op unless AGENT_RUNTIME_SPINE_ENABLED=true (or the
         // legacy AGENT_MODE_LOOP_ENABLED=true). This is observability-only and
         // must not affect tool execution, retries, streaming, or responses.
-        recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, toolResults);
+        recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults);
 
         // Phase 3: Process results in original order — append to messages, toolCalls, counters
         for (const toolResult of toolResults) {
@@ -3757,6 +3795,7 @@ export class AgentModeService {
     // Discovery
     'install_skills',
     'list_available_skills',
+    'resolve_skill',
 
     // GTM Context (Read/Write)
     'update_brand_guidelines',
@@ -3840,6 +3879,11 @@ export class AgentModeService {
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
   // Made public for use in MCP server skill gating.
   public static FOUNDATION_TOOLS: Set<string> = new Set(AgentModeService.DEFAULT_FOUNDATION_TOOLS);
+  private static readonly MANDATORY_FOUNDATION_TOOLS: ReadonlyArray<string> = [
+    'install_skills',
+    'list_available_skills',
+    'resolve_skill',
+  ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
 
@@ -3903,8 +3947,9 @@ export class AgentModeService {
       if (setting?.settingValue) {
         const toolNames: string[] = JSON.parse(setting.settingValue);
         if (Array.isArray(toolNames) && toolNames.length > 0) {
-          AgentModeService.FOUNDATION_TOOLS = new Set(toolNames);
-          console.log(`AgentMode: Loaded ${toolNames.length} foundation tools from DB`);
+          const merged = [...new Set([...toolNames, ...AgentModeService.MANDATORY_FOUNDATION_TOOLS])];
+          AgentModeService.FOUNDATION_TOOLS = new Set(merged);
+          console.log(`AgentMode: Loaded ${merged.length} foundation tools from DB`);
           return;
         }
       }
@@ -3918,7 +3963,7 @@ export class AgentModeService {
    * Update foundation tools in DB and refresh the in-memory set.
    */
   public async updateFoundationTools(toolNames: string[], updatedBy: string): Promise<string[]> {
-    const unique = [...new Set(toolNames)];
+    const unique = [...new Set([...toolNames, ...AgentModeService.MANDATORY_FOUNDATION_TOOLS])];
     await settingsService.setSetting(
       AgentModeService.FOUNDATION_TOOLS_SETTING,
       JSON.stringify(unique),
@@ -4035,6 +4080,10 @@ export class AgentModeService {
 
   public async installSkills(skillIds: string[], userId: string, sessionId: string, isDelegatedAccess: boolean = false): Promise<any> {
     try {
+      if (!Array.isArray(skillIds) || skillIds.length === 0 || skillIds.some((id) => typeof id !== 'string')) {
+        return { message: "skillIds must be a non-empty array of skill IDs." };
+      }
+
       let installUserOrgId: string | undefined;
       try {
         const { userDb: uDb } = await import('./db');
@@ -5367,7 +5416,7 @@ export class AgentModeService {
       case 'update_html_file':
         // Mock validation for update_html_file
         try {
-          const instructions = JSON.parse(args.replacement_json);
+          const instructions = JSON.parse(args.operations_json || args.replacement_json);
 
           // Validate that it's an array
           if (!Array.isArray(instructions)) {
@@ -5459,7 +5508,7 @@ export class AgentModeService {
         } catch (error) {
           return {
             success: false,
-            message: 'Invalid JSON in replacement_json',
+            message: 'Invalid JSON in operations_json',
             error: error instanceof Error ? error.message : 'Unknown error'
           };
         }
@@ -5524,15 +5573,58 @@ export class AgentModeService {
   }
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
+    const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
+    const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
+    const initialPolicyDecision = evaluateAgentToolPolicy({
+      toolName,
+      args,
+      isAdmin: extraContext?.isDelegatedAdmin === true,
+      enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
+    });
+    const contractResult = validateAndRepairToolArgs({
+      toolName,
+      args,
+      inputSchema,
+      effect: initialPolicyDecision.effect,
+    });
+
+    if (contractResult.status === 'invalid') {
+      return {
+        success: false,
+        error: contractResult.modelMessage,
+        validation: {
+          status: contractResult.status,
+          issues: contractResult.issues,
+          repairs: contractResult.repairs,
+        },
+      };
+    }
+
+    const preparedArgs = contractResult.args;
+    const policyDecision = evaluateAgentToolPolicy({
+      toolName,
+      args: preparedArgs,
+      isAdmin: extraContext?.isDelegatedAdmin === true,
+      enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
+    });
+
+    if (!policyDecision.allowed) {
+      return {
+        success: false,
+        error: `Tool "${toolName}" was blocked by Agent Tool Gateway policy: ${policyDecision.flags.map((flag) => flag.message).join(' ')}`,
+        policy: policyDecision,
+      };
+    }
+
     // In mock mode, only session-state tools (install_skills) execute for real
     // because they modify DynamoDB session state with no external side effects
     // and are required for the skill-gated tool flow to work during benchmark tests.
     if (mockMode && !AgentModeService.MOCK_BYPASS_TOOLS.has(toolName)) {
-      return this.getMockToolResult(toolName, args);
+      return this.getMockToolResult(toolName, preparedArgs);
     }
 
     try {
-      return await this.toolRegistry.execute(toolName, args, {
+      return await this.toolRegistry.execute(toolName, preparedArgs, {
         userId,
         sessionId,
         llmModel,
