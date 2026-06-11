@@ -539,6 +539,21 @@ export async function resolveIdentity(
     const derived = extractDomainFromEmail(email);
     if (derived) resolved.emailDomain = derived;
   }
+  // 4.5. Derive emailDomain from a known website when we still have none. Pure
+  // local op (no API call), so it runs regardless of needsCompanyFields. The
+  // web-search tiers (0.5 / 3.6) only set emailDomain while *finding* a website,
+  // and skip entirely when one is already on the lead — so a lead that already
+  // carries a website but no emailDomain (e.g. a name+company CSV import
+  // enriched to a website) would otherwise gate out of the email-finder tiers
+  // (5.5 / 7), which key off emailDomain rather than website.
+  if (!lead.emailDomain && !resolved.emailDomain) {
+    const knownWebsite = lead.website || resolved.website;
+    const derived = knownWebsite ? deriveDomainFromWebsite(knownWebsite) : null;
+    if (derived) {
+      resolved.emailDomain = derived;
+      meta.emailDomain = { source: 'existing_data', provider: 'website', enrichedAt: new Date().toISOString() };
+    }
+  }
   const emailDomain = lead.emailDomain || resolved.emailDomain;
 
   // (Tier 5 merged into unified Apollo call above.)
