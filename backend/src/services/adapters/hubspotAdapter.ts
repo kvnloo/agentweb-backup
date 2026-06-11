@@ -67,6 +67,20 @@ export class HubspotAdapter implements CrmAdapter {
         const result: SyncResult = { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
         const svc = await this.getSvc(auth); // token resolved ONCE here
 
+        // Resolve the source list's display name once so leads can be enriched with
+        // listName/listId before mapping. Leads carry listId natively but not the
+        // human-readable list name (it lives on the AW-LeadLists record). Mapping
+        // these to CRM properties lets contacts be segmented by their Emma list.
+        // Falls back to config.listName, then config.listId, so a failed/absent
+        // lookup never aborts the push — the mapping just resolves to whatever's known.
+        let resolvedListName = config.listName;
+        try {
+            const list = await crmDb.getLeadListById(config.listId);
+            if (list?.name) resolvedListName = list.name;
+        } catch (err: any) {
+            console.warn(`[HubspotAdapter] failed to resolve list name for ${config.listId}: ${this.formatError(err)}`);
+        }
+
         // ── 1. Pre-create any missing non-standard contact properties ────────────
         // buildHubSpotProps pushes properties from BOTH contactFieldMapping and
         // customFieldMapping, so any non-standard property in either list must be
@@ -124,9 +138,18 @@ export class HubspotAdapter implements CrmAdapter {
                     continue;
                 }
 
+                // Enrich with the source lead-list identity so listName/listId
+                // mappings resolve. listId is already on the lead; listName is not,
+                // so we graft the resolved name on (without persisting it back).
+                const enrichedLead = {
+                    ...lead,
+                    listId: lead.listId ?? config.listId,
+                    listName: lead.listName ?? resolvedListName,
+                };
+
                 // Build contact properties from contact + custom mappings
-                const contactProps = this.buildHubSpotProps(lead, config.contactFieldMapping);
-                const customProps = this.buildHubSpotProps(lead, config.customFieldMapping);
+                const contactProps = this.buildHubSpotProps(enrichedLead, config.contactFieldMapping);
+                const customProps = this.buildHubSpotProps(enrichedLead, config.customFieldMapping);
                 const allContactProps = { ...contactProps, ...customProps };
 
                 if (Object.keys(allContactProps).length === 0) continue;

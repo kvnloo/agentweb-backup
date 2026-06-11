@@ -113,8 +113,13 @@ export const DEFAULT_HUBSPOT_CONTACT_MAPPING: FieldMapping[] = [
 
 // 'notes' has no standard HubSpot contact property — pushed as a custom property
 // so ensureContactProperty runs before the push and creates it if absent.
+// 'listName'/'listId' identify the source lead list so contacts can be segmented
+// in HubSpot by which Emma list they came from. They are push-only (the values
+// are owned by Emma) and resolved per-push in HubspotAdapter.pushLeads.
 export const DEFAULT_HUBSPOT_CUSTOM_MAPPING: FieldMapping[] = [
   { agentwebField: 'notes', crmProperty: 'notes', direction: 'both', enabled: true },
+  { agentwebField: 'listName', crmProperty: 'lead_list_name', direction: 'push', enabled: true },
+  { agentwebField: 'listId', crmProperty: 'lead_list_id', direction: 'push', enabled: true },
 ];
 
 export const DEFAULT_HUBSPOT_DEAL_MAPPING: FieldMapping[] = [
