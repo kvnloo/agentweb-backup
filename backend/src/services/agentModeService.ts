@@ -2781,6 +2781,41 @@ export class AgentModeService {
 
         // Phase 1: Validate and prepare tool calls (synchronous)
         const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision }> = [];
+        const preflightToolResults: Array<{ status: 'error'; toolCall: any; functionArgs: any; error: Error; duration: number; policyDecision?: AgentToolPolicyDecision }> = [];
+
+        const appendPreflightToolFailure = (
+          toolCall: any,
+          functionArgs: any,
+          errorMessage: string,
+          content: any,
+          policyDecision?: AgentToolPolicyDecision,
+        ) => {
+          const error = new Error(errorMessage);
+          (messages as any[]).push({
+            tool_call_id: toolCall.id,
+            role: 'tool',
+            name: toolCall.function.name,
+            content,
+            metadata: { timestamp: new Date().toISOString() }
+          });
+          toolCalls.push({
+            id: toolCall.id,
+            name: toolCall.function.name,
+            arguments: functionArgs ?? toolCall.function.arguments,
+            error: error.message,
+            duration: 0
+          });
+          failedCounterUpdates[toolCall.function.name] =
+            (failedCounterUpdates[toolCall.function.name] || 0) + 1;
+          preflightToolResults.push({
+            status: 'error',
+            toolCall,
+            functionArgs,
+            error,
+            duration: 0,
+            policyDecision,
+          });
+        };
 
         for (const toolCall of responseMessage.tool_calls) {
           try {
@@ -2800,48 +2835,26 @@ export class AgentModeService {
               const errorMsg = isInteractiveShare
                 ? `Tool "${toolCall.function.name}" is not available in shared sessions. You can continue to use it in Agent Mode in your own session.`
                 : `Tool "${toolCall.function.name}" requires admin access. This session does not have admin privileges.`;
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: JSON.stringify({ error: errorMsg }),
-                metadata: { timestamp: new Date().toISOString() }
-              });
+              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
               continue;
             }
 
             if (isInteractiveShare && toolCall.function.name === 'connect_account') {
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: JSON.stringify({ error: 'Account connections are not available in shared sessions. Tell the user they need to open Agent Mode in their own account to connect this account, then come back here.' }),
-                metadata: { timestamp: new Date().toISOString() }
-              });
+              const errorMsg = 'Account connections are not available in shared sessions. Tell the user they need to open Agent Mode in their own account to connect this account, then come back here.';
+              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
               continue;
             }
 
             // Block context-restricted tools even if LLM hallucinates the call from history
             if (excludeTools?.includes(toolCall.function.name)) {
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: JSON.stringify({ error: `Tool "${toolCall.function.name}" is not available in this context.` }),
-                metadata: { timestamp: new Date().toISOString() }
-              });
+              const errorMsg = `Tool "${toolCall.function.name}" is not available in this context.`;
+              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
               continue;
             }
 
             if (publishedSkills.length > 0 && sessionAssociatedSkillIds.length > 0 && !allowedToolNames.has(toolCall.function.name)) {
               const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: JSON.stringify({ error: errorMsg }),
-                metadata: { timestamp: new Date().toISOString() }
-              });
+              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
               continue;
             }
 
@@ -2869,13 +2882,7 @@ export class AgentModeService {
 
             if (contractResult.status === 'invalid') {
               const errorContent = this.formatToolError(toolCall.function.name, contractResult.modelMessage);
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: errorContent,
-                metadata: { timestamp: new Date().toISOString() }
-              });
+              appendPreflightToolFailure(toolCall, functionArgs, contractResult.modelMessage, errorContent, initialPolicyDecision);
               continue;
             }
 
@@ -2898,13 +2905,7 @@ export class AgentModeService {
 
             if (!policyDecision.allowed) {
               const errorMsg = `Tool "${toolCall.function.name}" was blocked by Agent Tool Gateway policy: ${policyDecision.flags.map((flag) => flag.message).join(' ')}`;
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: JSON.stringify({ error: errorMsg, policy: policyDecision }),
-                metadata: { timestamp: new Date().toISOString() }
-              });
+              appendPreflightToolFailure(toolCall, preparedFunctionArgs, errorMsg, JSON.stringify({ error: errorMsg, policy: policyDecision }), policyDecision);
               continue;
             }
 
@@ -2914,13 +2915,7 @@ export class AgentModeService {
             console.error(`AgentMode: Tool argument parse error for ${toolCall.function.name}:`, error);
             const errMsg = error instanceof Error ? error.message : String(error);
             const errorContent = this.formatToolError(toolCall.function.name, `Failed to parse arguments: ${errMsg}`);
-            (messages as any[]).push({
-              tool_call_id: toolCall.id,
-              role: 'tool',
-              name: toolCall.function.name,
-              content: errorContent,
-              metadata: { timestamp: new Date().toISOString() }
-            });
+            appendPreflightToolFailure(toolCall, undefined, `Failed to parse arguments: ${errMsg}`, errorContent);
           }
         }
 
@@ -3003,6 +2998,7 @@ export class AgentModeService {
             policyDecision: toolResult.policyDecision,
           };
         });
+        const telemetryToolResults = [...preflightToolResults, ...toolResults];
 
         // Runtime spine V0 telemetry: record this iteration's decision + each
         // tool's invoked/succeeded/failed outcome into the shared LoopEvents
@@ -3010,7 +3006,7 @@ export class AgentModeService {
         // errors and is a no-op unless AGENT_RUNTIME_SPINE_ENABLED=true (or the
         // legacy AGENT_MODE_LOOP_ENABLED=true). This is observability-only and
         // must not affect tool execution, retries, streaming, or responses.
-        recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, toolResults);
+        recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults);
 
         // Phase 3: Process results in original order — append to messages, toolCalls, counters
         for (const toolResult of toolResults) {
