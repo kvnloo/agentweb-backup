@@ -13268,10 +13268,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           await metaService.updateAd(accessToken, adId, adLevelParams);
         }
 
+        // The same silent-success trap applies here: POST /{ad-id} can return 200 while the
+        // ad keeps its old creative. Read back the ad to confirm the swap actually took.
+        const verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId);
+        if (!verification.attached) {
+          return {
+            success: false,
+            message: `Ad ${adId} did not switch to creative ${newCreativeId} — it still references `
+              + `${verification.liveCreativeId || 'its previous creative'}. This is usually a transient `
+              + `Meta propagation issue; retry the AD UPDATE with the same creative_id.`,
+            error: 'SWAP_NOT_REFLECTED',
+            new_creative_id: newCreativeId,
+            live_creative_id: verification.liveCreativeId,
+          };
+        }
+
         return {
           success: true,
           message: `Ad updated successfully. Swapped in creative ${newCreativeId}.`,
-          new_creative_id: newCreativeId
+          new_creative_id: newCreativeId,
+          verified: verification.verified,
         };
       }
 
@@ -13467,9 +13483,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // trap), so a 200 from updateAd is NOT proof the destination URL changed. Re-fetch the ad,
     // confirm the new creative is attached, and — when the caller changed the destination —
     // confirm the live URL matches what was requested.
-    const verification = await this.verifyCreativeSwap(
-      accessToken, adId, newCreativeId, oldCreativeId, newLinkUrl
-    );
+    const verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId, newLinkUrl);
 
     if (!verification.attached) {
       return {
@@ -13502,10 +13516,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       success: true,
       message: `Ad updated successfully. Created new creative (${newCreativeId}) with updated ${creativeKeys.join(', ')} `
         + `and swapped it in for the old creative (${oldCreativeId})`
-        + (verification.liveLinkUrl ? `. Verified live destination URL: ${verification.liveLinkUrl}` : '.'),
+        + (verification.liveLinkUrl
+          ? `. Verified live destination URL: ${verification.liveLinkUrl}`
+          : verification.verified
+            ? '.'
+            : '. NOTE: the confirmation read-back failed, so the swap could not be verified — re-check the ad in Ads Manager.'),
       old_creative_id: oldCreativeId,
       new_creative_id: newCreativeId,
-      verified: true,
+      verified: verification.verified,
       live_link_url: verification.liveLinkUrl,
     };
   }
@@ -13519,9 +13537,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     accessToken: string,
     adId: string,
     newCreativeId: string,
-    oldCreativeId: string,
     expectedLinkUrl?: string
-  ): Promise<{ attached: boolean; liveCreativeId?: string; liveLinkUrl?: string }> {
+  ): Promise<{ attached: boolean; verified: boolean; liveCreativeId?: string; liveLinkUrl?: string }> {
     try {
       const ad = await metaService.getAd(accessToken, adId);
       const liveCreativeId = ad?.creative?.creative_id || ad?.creative?.id;
@@ -13536,13 +13553,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           || liveCreative?.link_url;
       }
 
-      return { attached, liveCreativeId, liveLinkUrl };
+      return { attached, verified: true, liveCreativeId, liveLinkUrl };
     } catch (err: any) {
       // Verification is best-effort. If the read-back itself fails we can't prove the swap
-      // failed, so don't block — report attached so the swap is treated as successful but
-      // surface no live URL.
+      // failed, so don't block — treat the swap as successful but flag verified:false so the
+      // caller never claims a confirmation that didn't happen.
       console.warn(`AgentMode: creative-swap verification read-back failed for ad ${adId}:`, err?.message);
-      return { attached: true, liveCreativeId: newCreativeId };
+      return { attached: true, verified: false, liveCreativeId: newCreativeId };
     }
   }
 
@@ -13568,15 +13585,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
-   * Compare the live destination URL against the requested one. Meta normalizes URLs (e.g. adds a
-   * trailing slash, lowercases the host), so compare leniently: strip trailing slashes and ignore
-   * case on the origin. A requested URL is considered reflected if the live URL starts with it.
+   * Compare the live destination URL against the requested one, tolerating only Meta's
+   * normalizations: host case, a trailing slash, and query parameters (Meta appends the
+   * creative's url_tags to the link at delivery time). The origin and path must match
+   * exactly — prefix matches (e.g. a bare domain, or /icp1 vs /icp10) are NOT a reflected
+   * destination.
    */
   private linkUrlMatches(liveUrl: string, requestedUrl: string): boolean {
-    const normalize = (u: string) => u.trim().replace(/\/+$/, '').toLowerCase();
-    const live = normalize(liveUrl);
-    const requested = normalize(requestedUrl);
-    return live === requested || live.startsWith(requested) || requested.startsWith(live);
+    const stripTrailingSlash = (s: string) => s.replace(/\/+$/, '');
+    try {
+      const live = new URL(liveUrl.trim());
+      const requested = new URL(requestedUrl.trim());
+      // URL lowercases protocol and host, so origin comparison is already case-insensitive.
+      return live.origin === requested.origin
+        && stripTrailingSlash(live.pathname) === stripTrailingSlash(requested.pathname);
+    } catch {
+      // Not parseable as absolute URLs — fall back to a strict normalized string comparison.
+      const normalize = (u: string) => stripTrailingSlash(u.trim()).toLowerCase();
+      return normalize(liveUrl) === normalize(requestedUrl);
+    }
   }
 
   public async deleteMetaAdsAd(userId: string, adId: string, account_id?: string): Promise<any> {
