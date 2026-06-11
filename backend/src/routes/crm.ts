@@ -2793,17 +2793,34 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
         return res.status(400).json({ message: mappingValidationError });
       }
 
-      // Required fields: at least one of email or linkedin must be mapped, or
-      // we have no way to dedup or message the lead.
-      const mappedFields = Object.values(columnMapping)
+      // Required identity for dedup: at least one of email or linkedin, OR a
+      // full-name + company combination (firstName + lastName + company). The
+      // latter lets name-only CSVs in — the importer dedups them on a
+      // firstName|lastName|company composite key.
+      const mappedTargets = Object.values(columnMapping);
+      const mappedFields = mappedTargets
         .map((t) => (typeof t === 'string' ? t : ''))
         .filter(Boolean);
+      // A "Split full name → First + Last" directive yields both name parts
+      // (or one, when scoped to 'first'/'last').
+      const splitNameVals = mappedTargets
+        .filter((t): t is { splitFullName: true | 'first' | 'last' } =>
+          !!t && typeof t === 'object' && 'splitFullName' in t)
+        .map((t) => t.splitFullName);
       const hasEmailOrLinkedIn =
         mappedFields.includes('email') || mappedFields.includes('linkedin');
-      if (!hasEmailOrLinkedIn) {
+      const hasFirstName =
+        mappedFields.includes('firstName') ||
+        splitNameVals.some((v) => v === true || v === 'first');
+      const hasLastName =
+        mappedFields.includes('lastName') ||
+        splitNameVals.some((v) => v === true || v === 'last');
+      const hasNameCompany =
+        hasFirstName && hasLastName && mappedFields.includes('company');
+      if (!hasEmailOrLinkedIn && !hasNameCompany) {
         return res.status(400).json({
           message:
-            'At least one column must be mapped to Email or LinkedIn — these are required for deduplication.',
+            'Map at least one column to Email or LinkedIn, or map First Name, Last Name, and Company together — these are required for deduplication.',
         });
       }
     }
@@ -2829,8 +2846,9 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
 
     const leads = records.map((record) => projectRecordWithMapping(record, columnMapping));
 
-    // Batch create leads
-    const results = await crmDb.batchCreateLeads(listId, leads);
+    // Batch create leads. Opt into the name+company dedup axis so CSVs without
+    // email/LinkedIn still merge on re-import instead of duplicating.
+    const results = await crmDb.batchCreateLeads(listId, leads, { dedupByNameCompany: true });
 
     if (results.newCount > 0) {
       void autoEnrollListIntoSequences(userId, listId);

@@ -5489,7 +5489,14 @@ export const crmDb = {
      *  leak into CSV exports, email-template variables, or the
      *  lead-filter UI. */
     system?: Record<string, any>;
-  }>) {
+  }>, opts?: {
+    /** Opt-in third dedup axis: match leads that have no email/LinkedIn by a
+     *  firstName+lastName+company composite key. Used by the CSV importer so
+     *  name-only uploads merge on re-import instead of duplicating. Off by
+     *  default — every other caller keeps email/LinkedIn-only dedup. */
+    dedupByNameCompany?: boolean;
+  }) {
+    const dedupByNameCompany = opts?.dedupByNameCompany === true;
     try {
       const results = {
         successCount: 0,
@@ -5519,12 +5526,21 @@ export const crmDb = {
       // imports inflate the list with duplicates.
       const existingLeadsByEmail = new Map<string, any>();
       const existingLeadsByLinkedIn = new Map<string, any>();
+      // Third dedup axis (opt-in): firstName+lastName+company composite key,
+      // for leads that carry no email/LinkedIn. Built from any existing lead
+      // that has a nameCompanyKey — regardless of whether it also has an
+      // email — so a name-only CSV row merges into the richer existing record.
+      const existingLeadsByNameCompany = new Map<string, any>();
       allExistingLeads.forEach(lead => {
         if (lead.email && lead.email.trim()) {
           existingLeadsByEmail.set(lead.email.trim().toLowerCase(), lead);
         }
         const liKey = normalizeLinkedInUrl(lead.linkedin);
         if (liKey) existingLeadsByLinkedIn.set(liKey, lead);
+        if (dedupByNameCompany) {
+          const nck = lead.nameCompanyKey || computeNameCompanyKey(lead.firstName, lead.lastName, lead.company);
+          if (nck && !existingLeadsByNameCompany.has(nck)) existingLeadsByNameCompany.set(nck, lead);
+        }
       });
 
       // Separate leads into new leads and leads to update
@@ -5534,9 +5550,17 @@ export const crmDb = {
       // Deduplicate leads within the upload by email AND by normalized LinkedIn URL.
       const uniqueLeads = new Map<string, typeof leads[0]>();
       const seenLinkedIn = new Set<string>();
+      const seenNameCompany = new Set<string>();
       leads.forEach((lead, index) => {
         const emailKey = lead.email?.trim().toLowerCase() || `__no_email_${index + 1}__`;
         const liKey = normalizeLinkedInUrl(lead.linkedin);
+        // Name+company is only a fallback identity: compute it solely for
+        // leads with no stronger key (email/LinkedIn), so email-bearing rows
+        // never collapse onto a same-name-and-company sibling.
+        const hasStrongId = Boolean((lead.email && lead.email.trim()) || liKey);
+        const nckKey = dedupByNameCompany && !hasStrongId
+          ? computeNameCompanyKey(lead.firstName, lead.lastName, lead.company)
+          : undefined;
 
         if (lead.email && lead.email.trim()) {
           if (uniqueLeads.has(emailKey)) {
@@ -5570,6 +5594,23 @@ export const crmDb = {
             return;
           }
           seenLinkedIn.add(liKey);
+        }
+
+        // Name+company fallback dedup (opt-in). Reached only when the lead has
+        // no email/LinkedIn, so the stronger axes above always take precedence.
+        if (nckKey) {
+          if (seenNameCompany.has(nckKey)) {
+            results.errorCount++;
+            results.errors.push(`Row ${index + 1}: Duplicate name + company "${[lead.firstName, lead.lastName].filter(Boolean).join(' ')} @ ${lead.company}" found in upload data`);
+            return;
+          }
+          const existingByNck = existingLeadsByNameCompany.get(nckKey);
+          if (existingByNck) {
+            leadsToUpdate.push({ existingLead: existingByNck, newData: lead });
+            seenNameCompany.add(nckKey);
+            return;
+          }
+          seenNameCompany.add(nckKey);
         }
 
         uniqueLeads.set(emailKey, lead);
