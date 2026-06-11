@@ -24,6 +24,7 @@ import { HubSpotService } from '../services/hubspotService';
 const mockAxiosGet = axios.get as jest.Mock;
 const mockAxiosPost = axios.post as jest.Mock;
 const mockAxiosPatch = axios.patch as jest.Mock;
+const mockAxiosDelete = axios.delete as jest.Mock;
 const mockAxiosRequest = axios.request as jest.Mock;
 
 const MOCK_RAW_CAMPAIGN = {
@@ -124,6 +125,10 @@ describe('HubSpotService — getCampaign', () => {
     await expect(svc.getCampaign('nonexistent-guid')).rejects.toMatchObject({
       response: { status: 404 },
     });
+  });
+
+  it('throws if guid is empty', async () => {
+    await expect(svc.getCampaign('')).rejects.toThrow(/guid/i);
   });
 });
 
@@ -229,17 +234,16 @@ describe('HubSpotService — deleteCampaign', () => {
   });
 
   it('calls DELETE endpoint with campaign guid', async () => {
-    mockAxiosRequest.mockResolvedValue({ data: {} });
+    mockAxiosDelete.mockResolvedValue({ status: 204, data: null });
 
     await svc.deleteCampaign('campaign-guid-1');
 
-    expect(mockAxiosRequest).toHaveBeenCalledWith(
-      expect.objectContaining({
-        method: 'DELETE',
-        url: expect.stringContaining('marketing/v3/campaigns/campaign-guid-1'),
-        headers: expect.objectContaining({ Authorization: 'Bearer valid-token' }),
-      })
-    );
+    const url = mockAxiosDelete.mock.calls[0][0];
+    expect(url).toContain('marketing/v3/campaigns/campaign-guid-1');
+  });
+
+  it('throws if guid is empty', async () => {
+    await expect(svc.deleteCampaign('')).rejects.toThrow(/guid/i);
   });
 });
 
@@ -272,5 +276,79 @@ describe('HubSpotService — getCampaignMetrics', () => {
     await expect(svc.getCampaignMetrics('bad-guid')).rejects.toMatchObject({
       response: { status: 404 },
     });
+  });
+});
+
+// ─── listCampaignAssets ───────────────────────────────────────────────────────
+
+describe('HubSpotService — listCampaignAssets', () => {
+  let svc: HubSpotService;
+  beforeEach(() => {
+    svc = HubSpotService.fromToken('valid-token');
+    jest.clearAllMocks();
+  });
+
+  it('fetches single asset type and returns raw response', async () => {
+    const raw = { results: [{ id: 'email-1', type: 'MARKETING_EMAIL', metrics: { clicks: 10 } }] };
+    mockAxiosGet.mockResolvedValue({ data: raw });
+
+    const result = await svc.listCampaignAssets('campaign-guid-1', 'MARKETING_EMAIL');
+
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      expect.stringContaining('marketing/v3/campaigns/campaign-guid-1/assets/MARKETING_EMAIL'),
+      expect.any(Object)
+    );
+    expect(result).toEqual(raw);
+  });
+
+  it('appends startDate and endDate to URL', async () => {
+    mockAxiosGet.mockResolvedValue({ data: { results: [] } });
+
+    await svc.listCampaignAssets('campaign-guid-1', 'FORM', {
+      startDate: '2025-01-01',
+      endDate: '2025-06-30',
+    });
+
+    const calledUrl: string = mockAxiosGet.mock.calls[0][0];
+    expect(calledUrl).toContain('startDate=2025-01-01');
+    expect(calledUrl).toContain('endDate=2025-06-30');
+  });
+
+  it('appends cursor as after param', async () => {
+    mockAxiosGet.mockResolvedValue({ data: { results: [] } });
+    await svc.listCampaignAssets('campaign-guid-1', 'MARKETING_EMAIL', { cursor: 'tok123' });
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      expect.stringContaining('after=tok123'),
+      expect.any(Object)
+    );
+  });
+
+  it('fans out across all asset types when none specified', async () => {
+    mockAxiosGet.mockResolvedValue({ data: { results: [] } });
+
+    const result = await svc.listCampaignAssets('campaign-guid-1');
+
+    // Should have called for each known type
+    expect(mockAxiosGet.mock.calls.length).toBeGreaterThanOrEqual(
+      HubSpotService.CAMPAIGN_ASSET_TYPES.length
+    );
+    expect(result).toHaveProperty('byType');
+    HubSpotService.CAMPAIGN_ASSET_TYPES.forEach(t => {
+      expect(result.byType).toHaveProperty(t);
+    });
+  });
+
+  it('partial success: failed type recorded as error, others succeed', async () => {
+    const err: any = new Error('Forbidden');
+    err.response = { status: 403 };
+    mockAxiosGet
+      .mockRejectedValueOnce(err) // first type fails
+      .mockResolvedValue({ data: { results: [] } }); // rest succeed
+
+    const result = await svc.listCampaignAssets('campaign-guid-1');
+
+    expect(result.byType).toBeDefined();
+    const firstType = HubSpotService.CAMPAIGN_ASSET_TYPES[0];
+    expect(result.byType[firstType]).toHaveProperty('error');
   });
 });

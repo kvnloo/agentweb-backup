@@ -24520,71 +24520,360 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     throw new Error('No HubSpot account connected. Please connect HubSpot in Settings → External CRM Sync or via OAuth in Connected Accounts.');
   }
 
-  public async handleHubspotCampaignsApi(userId: string, args: any): Promise<any> {
+  public async handleHubspotApi(userId: string, args: any): Promise<any> {
+    const entityType: string = (args?.entity_type ?? '').toUpperCase();
     const action: string = (args?.action ?? '').toUpperCase();
-    const guid: string | undefined = args?.guid;
     try {
       const svc = await this.resolveHubSpotService(userId);
-      switch (action) {
-        case 'LIST': {
-          const data = await svc.listCampaigns(args?.cursor);
-          return { success: true, ...data };
+
+      // ─── CONTACT_LIST ──────────────────────────────────────────────────────
+      if (entityType === 'CONTACT_LIST') {
+        switch (action) {
+          case 'LIST': {
+            const data = await svc.listContactLists({ query: args?.query, cursor: args?.cursor });
+            return { success: true, ...data };
+          }
+          case 'GET': {
+            if (!args?.list_id) return { success: false, error: 'list_id is required for CONTACT_LIST GET.' };
+            const data = await svc.getContactList(args.list_id);
+            return { success: true, ...data };
+          }
+          case 'CREATE': {
+            const name: string = args?.name ?? '';
+            if (!name.trim()) return { success: false, error: 'name is required for CONTACT_LIST CREATE.' };
+            const processingType: string = args?.processing_type ?? '';
+            if (!processingType.trim()) return { success: false, error: 'processing_type (MANUAL|SNAPSHOT|DYNAMIC) is required for CONTACT_LIST CREATE.' };
+            const data = await svc.createContactList(name, processingType, { objectTypeId: args?.object_type_id, filterBranch: args?.filter_branch });
+            return { success: true, ...data };
+          }
+          case 'ADD_CONTACTS': {
+            if (!args?.list_id) return { success: false, error: 'list_id is required for CONTACT_LIST ADD_CONTACTS.' };
+            const recordIds: string[] = args?.record_ids ?? [];
+            if (!recordIds.length) return { success: false, error: 'record_ids array is required for CONTACT_LIST ADD_CONTACTS.' };
+            const data = await svc.addContactsToList(args.list_id, recordIds);
+            return { success: true, ...data };
+          }
+          case 'REMOVE_CONTACTS': {
+            if (!args?.list_id) return { success: false, error: 'list_id is required for CONTACT_LIST REMOVE_CONTACTS.' };
+            const recordIds: string[] = args?.record_ids ?? [];
+            if (!recordIds.length) return { success: false, error: 'record_ids array is required for CONTACT_LIST REMOVE_CONTACTS.' };
+            const data = await svc.removeContactsFromList(args.list_id, recordIds);
+            return { success: true, ...data };
+          }
+          case 'DELETE': {
+            if (!args?.list_id) return { success: false, error: 'list_id is required for CONTACT_LIST DELETE.' };
+            await svc.deleteContactList(args.list_id);
+            return { success: true, deleted: args.list_id };
+          }
+          default:
+            return { success: false, error: `Unknown action "${action}" for CONTACT_LIST. Valid: LIST, GET, CREATE, ADD_CONTACTS, REMOVE_CONTACTS, DELETE.` };
         }
-        case 'GET': {
-          if (!guid) return { success: false, error: 'guid is required for GET.' };
-          const [campaign, metrics] = await Promise.allSettled([
-            svc.getCampaign(guid),
-            svc.getCampaignMetrics(guid),
-          ]);
-          return {
-            success: true,
-            campaign: campaign.status === 'fulfilled' ? campaign.value : null,
-            metrics: metrics.status === 'fulfilled' ? metrics.value : null,
-          };
-        }
-        case 'CREATE': {
-          const name: string = args?.name ?? '';
-          if (!name.trim()) return { success: false, error: 'name is required for CREATE.' };
-          const data = await svc.createCampaign(name, {
-            startDate: args?.start_date,
-            notes: args?.notes,
-            utm: args?.utm,
-          });
-          return { success: true, ...data };
-        }
-        case 'UPDATE': {
-          if (!guid) return { success: false, error: 'guid is required for UPDATE.' };
-          const data = await svc.updateCampaign(guid, {
-            name: args?.name,
-            startDate: args?.start_date,
-            notes: args?.notes,
-            utm: args?.utm,
-          });
-          return { success: true, ...data };
-        }
-        case 'DELETE': {
-          if (!guid) return { success: false, error: 'guid is required for DELETE.' };
-          await svc.deleteCampaign(guid);
-          return { success: true, deleted: guid };
-        }
-        case 'GET_METRICS': {
-          if (!guid) return { success: false, error: 'guid is required for GET_METRICS.' };
-          const data = await svc.getCampaignMetrics(guid);
-          return { success: true, ...data };
-        }
-        default:
-          return { success: false, error: `Unknown action "${action}". Valid: LIST, GET, CREATE, UPDATE, DELETE, GET_METRICS.` };
       }
+
+      // ─── CAMPAIGN ──────────────────────────────────────────────────────────
+      if (entityType === 'CAMPAIGN') {
+        const guid: string | undefined = args?.guid;
+        switch (action) {
+          case 'LIST': {
+            const data = await svc.listCampaigns(args?.cursor);
+            return { success: true, ...data };
+          }
+          case 'GET': {
+            if (!guid) return { success: false, error: 'guid is required for CAMPAIGN GET.' };
+            const [campaign, metrics] = await Promise.allSettled([
+              svc.getCampaign(guid),
+              svc.getCampaignMetrics(guid),
+            ]);
+            return {
+              success: true,
+              campaign: campaign.status === 'fulfilled' ? campaign.value : { error: (campaign as PromiseRejectedResult).reason?.message },
+              metrics: metrics.status === 'fulfilled' ? metrics.value : { error: (metrics as PromiseRejectedResult).reason?.message },
+            };
+          }
+          case 'CREATE': {
+            const name: string = args?.name ?? '';
+            if (!name.trim()) return { success: false, error: 'name is required for CAMPAIGN CREATE.' };
+            const data = await svc.createCampaign(name, { startDate: args?.start_date, notes: args?.notes, utm: args?.utm });
+            return { success: true, ...data };
+          }
+          case 'UPDATE': {
+            if (!guid) return { success: false, error: 'guid is required for CAMPAIGN UPDATE.' };
+            const data = await svc.updateCampaign(guid, { name: args?.name, startDate: args?.start_date, notes: args?.notes, utm: args?.utm });
+            return { success: true, ...data };
+          }
+          case 'DELETE': {
+            if (!guid) return { success: false, error: 'guid is required for CAMPAIGN DELETE.' };
+            await svc.deleteCampaign(guid);
+            return { success: true, deleted: guid };
+          }
+          case 'GET_METRICS': {
+            if (!guid) return { success: false, error: 'guid is required for CAMPAIGN GET_METRICS.' };
+            const data = await svc.getCampaignMetrics(guid);
+            return { success: true, ...data };
+          }
+          case 'LIST_ASSETS': {
+            if (!guid) return { success: false, error: 'guid is required for CAMPAIGN LIST_ASSETS.' };
+            const data = await svc.listCampaignAssets(guid, args?.asset_type, { startDate: args?.start_date, endDate: args?.end_date, cursor: args?.cursor });
+            return { success: true, ...data };
+          }
+          case 'ADD_ASSET': {
+            if (!guid) return { success: false, error: 'guid is required for CAMPAIGN ADD_ASSET.' };
+            if (!args?.asset_type) return { success: false, error: 'asset_type is required for CAMPAIGN ADD_ASSET.' };
+            if (!args?.asset_id) return { success: false, error: 'asset_id is required for CAMPAIGN ADD_ASSET.' };
+            await svc.addCampaignAsset(guid, args.asset_type, args.asset_id);
+            return { success: true, added: { guid, assetType: args.asset_type, assetId: args.asset_id } };
+          }
+          case 'REMOVE_ASSET': {
+            if (!guid) return { success: false, error: 'guid is required for CAMPAIGN REMOVE_ASSET.' };
+            if (!args?.asset_type) return { success: false, error: 'asset_type is required for CAMPAIGN REMOVE_ASSET.' };
+            if (!args?.asset_id) return { success: false, error: 'asset_id is required for CAMPAIGN REMOVE_ASSET.' };
+            await svc.removeCampaignAsset(guid, args.asset_type, args.asset_id);
+            return { success: true, removed: { guid, assetType: args.asset_type, assetId: args.asset_id } };
+          }
+          default:
+            return { success: false, error: `Unknown action "${action}" for CAMPAIGN. Valid: LIST, GET, CREATE, UPDATE, DELETE, GET_METRICS, LIST_ASSETS, ADD_ASSET, REMOVE_ASSET.` };
+        }
+      }
+
+      // ─── EMAIL ─────────────────────────────────────────────────────────────
+      if (entityType === 'EMAIL') {
+        switch (action) {
+          case 'LIST': {
+            const data = await svc.listEmails(args?.cursor);
+            return { success: true, ...data };
+          }
+          case 'GET': {
+            if (!args?.email_id) return { success: false, error: 'email_id is required for EMAIL GET.' };
+            const data = await svc.getEmail(args.email_id);
+            return { success: true, ...data };
+          }
+          case 'GET_STATS': {
+            const emailIds: string[] = args?.email_ids ?? [];
+            if (!emailIds.length) return { success: false, error: 'email_ids array is required for EMAIL GET_STATS.' };
+            const data = await svc.getEmailStatistics(emailIds, { startTimestamp: args?.start_timestamp, endTimestamp: args?.end_timestamp });
+            return { success: true, ...data };
+          }
+          case 'CREATE': {
+            const name: string = args?.name ?? '';
+            if (!name.trim()) return { success: false, error: 'name is required for EMAIL CREATE.' };
+            const data = await svc.createEmail(name, { subject: args?.subject, fromName: args?.from_name, fromEmail: args?.from_email });
+            return { success: true, ...data };
+          }
+          case 'UPDATE': {
+            if (!args?.email_id) return { success: false, error: 'email_id is required for EMAIL UPDATE.' };
+            const data = await svc.updateEmail(args.email_id, { name: args?.name, subject: args?.subject, fromName: args?.from_name, fromEmail: args?.from_email });
+            return { success: true, ...data };
+          }
+          case 'CLONE': {
+            if (!args?.email_id) return { success: false, error: 'email_id is required for EMAIL CLONE.' };
+            const name: string = args?.name ?? '';
+            if (!name.trim()) return { success: false, error: 'name is required for EMAIL CLONE.' };
+            const data = await svc.cloneEmail(args.email_id, name);
+            return { success: true, ...data };
+          }
+          case 'DELETE': {
+            if (!args?.email_id) return { success: false, error: 'email_id is required for EMAIL DELETE.' };
+            await svc.deleteEmail(args.email_id);
+            return { success: true, deleted: args.email_id };
+          }
+          default:
+            return { success: false, error: `Unknown action "${action}" for EMAIL. Valid: LIST, GET, GET_STATS, CREATE, UPDATE, CLONE, DELETE.` };
+        }
+      }
+
+      // ─── FORM ──────────────────────────────────────────────────────────────
+      if (entityType === 'FORM') {
+        switch (action) {
+          case 'LIST': {
+            const data = await svc.listForms(args?.cursor);
+            return { success: true, ...data };
+          }
+          case 'GET': {
+            if (!args?.form_id) return { success: false, error: 'form_id is required for FORM GET.' };
+            const data = await svc.getForm(args.form_id);
+            return { success: true, ...data };
+          }
+          case 'GET_SUBMISSIONS': {
+            if (!args?.form_id) return { success: false, error: 'form_id is required for FORM GET_SUBMISSIONS.' };
+            const data = await svc.getFormSubmissions(args.form_id, args?.cursor);
+            return { success: true, ...data };
+          }
+          case 'CREATE': {
+            if (!args?.name?.trim()) return { success: false, error: 'name is required for FORM CREATE.' };
+            const { entity_type: _et3, action: _a3, form_id: _fid, ...props } = args;
+            const data = await svc.createForm(props);
+            return { success: true, ...data };
+          }
+          case 'UPDATE': {
+            if (!args?.form_id) return { success: false, error: 'form_id is required for FORM UPDATE.' };
+            const { form_id, entity_type: _et4, action: _a4, ...props } = args;
+            const data = await svc.updateForm(form_id, props);
+            return { success: true, ...data };
+          }
+          case 'DELETE': {
+            if (!args?.form_id) return { success: false, error: 'form_id is required for FORM DELETE.' };
+            await svc.deleteForm(args.form_id);
+            return { success: true, deleted: args.form_id };
+          }
+          default:
+            return { success: false, error: `Unknown action "${action}" for FORM. Valid: LIST, GET, GET_SUBMISSIONS, CREATE, UPDATE, DELETE.` };
+        }
+      }
+
+      // ─── LANDING_PAGE ──────────────────────────────────────────────────────
+      if (entityType === 'LANDING_PAGE') {
+        switch (action) {
+          case 'LIST': {
+            const data = await svc.listLandingPages(args?.cursor);
+            return { success: true, ...data };
+          }
+          case 'GET': {
+            if (!args?.page_id) return { success: false, error: 'page_id is required for LANDING_PAGE GET.' };
+            const data = await svc.getLandingPage(args.page_id);
+            return { success: true, ...data };
+          }
+          case 'CREATE': {
+            const name: string = args?.name ?? '';
+            if (!name.trim()) return { success: false, error: 'name is required for LANDING_PAGE CREATE.' };
+            const data = await svc.createLandingPage(name, { templatePath: args?.template_path, slug: args?.slug, metaDescription: args?.meta_description });
+            return { success: true, ...data };
+          }
+          case 'PUBLISH': {
+            if (!args?.page_id) return { success: false, error: 'page_id is required for LANDING_PAGE PUBLISH.' };
+            const data = await svc.publishLandingPage(args.page_id);
+            return { success: true, ...data };
+          }
+          case 'UPDATE': {
+            if (!args?.page_id) return { success: false, error: 'page_id is required for LANDING_PAGE UPDATE.' };
+            const { page_id, entity_type: _et1, action: _a1, ...rawProps } = args;
+            const props: Record<string, any> = {};
+            for (const [k, v] of Object.entries(rawProps)) {
+              props[k.replace(/_([a-z])/g, (_, c) => c.toUpperCase())] = v;
+            }
+            const data = await svc.updateLandingPage(page_id, props);
+            return { success: true, ...data };
+          }
+          case 'DELETE': {
+            if (!args?.page_id) return { success: false, error: 'page_id is required for LANDING_PAGE DELETE.' };
+            await svc.deleteLandingPage(args.page_id);
+            return { success: true, deleted: args.page_id };
+          }
+          default:
+            return { success: false, error: `Unknown action "${action}" for LANDING_PAGE. Valid: LIST, GET, CREATE, PUBLISH, UPDATE, DELETE.` };
+        }
+      }
+
+      // ─── BLOG_POST ─────────────────────────────────────────────────────────
+      if (entityType === 'BLOG_POST') {
+        switch (action) {
+          case 'LIST': {
+            const data = await svc.listBlogPosts(args?.cursor);
+            return { success: true, ...data };
+          }
+          case 'GET': {
+            if (!args?.post_id) return { success: false, error: 'post_id is required for BLOG_POST GET.' };
+            const data = await svc.getBlogPost(args.post_id);
+            return { success: true, ...data };
+          }
+          case 'CREATE': {
+            const name: string = args?.name ?? '';
+            if (!name.trim()) return { success: false, error: 'name is required for BLOG_POST CREATE.' };
+            const contentGroupId: string = args?.content_group_id ?? '';
+            if (!contentGroupId.trim()) return { success: false, error: 'content_group_id (blog ID) is required for BLOG_POST CREATE.' };
+            const data = await svc.createBlogPost(name, contentGroupId, { slug: args?.slug, metaDescription: args?.meta_description, postBody: args?.post_body });
+            return { success: true, ...data };
+          }
+          case 'PUBLISH': {
+            if (!args?.post_id) return { success: false, error: 'post_id is required for BLOG_POST PUBLISH.' };
+            await svc.publishBlogPost(args.post_id);
+            return { success: true, published: args.post_id };
+          }
+          case 'UPDATE': {
+            if (!args?.post_id) return { success: false, error: 'post_id is required for BLOG_POST UPDATE.' };
+            const { post_id, entity_type: _et2, action: _a2, ...rawProps } = args;
+            const props: Record<string, any> = {};
+            for (const [k, v] of Object.entries(rawProps)) {
+              props[k.replace(/_([a-z])/g, (_, c) => c.toUpperCase())] = v;
+            }
+            const data = await svc.updateBlogPost(post_id, props);
+            return { success: true, ...data };
+          }
+          case 'DELETE': {
+            if (!args?.post_id) return { success: false, error: 'post_id is required for BLOG_POST DELETE.' };
+            await svc.deleteBlogPost(args.post_id);
+            return { success: true, deleted: args.post_id };
+          }
+          default:
+            return { success: false, error: `Unknown action "${action}" for BLOG_POST. Valid: LIST, GET, CREATE, PUBLISH, UPDATE, DELETE.` };
+        }
+      }
+
+      // ─── WORKFLOW ──────────────────────────────────────────────────────────
+      if (entityType === 'WORKFLOW') {
+        switch (action) {
+          case 'LIST': {
+            const data = await svc.listWorkflows();
+            return { success: true, ...data };
+          }
+          case 'GET': {
+            if (!args?.workflow_id) return { success: false, error: 'workflow_id is required for WORKFLOW GET.' };
+            const data = await svc.getWorkflow(args.workflow_id);
+            return { success: true, ...data };
+          }
+          case 'DELETE': {
+            if (!args?.workflow_id) return { success: false, error: 'workflow_id is required for WORKFLOW DELETE.' };
+            await svc.deleteWorkflow(args.workflow_id);
+            return { success: true, deleted: args.workflow_id };
+          }
+          case 'GET_PERFORMANCE': {
+            if (!args?.workflow_id) return { success: false, error: 'workflow_id is required for WORKFLOW GET_PERFORMANCE.' };
+            if (!args?.start) return { success: false, error: 'start (epoch ms) is required for WORKFLOW GET_PERFORMANCE.' };
+            if (!args?.end) return { success: false, error: 'end (epoch ms) is required for WORKFLOW GET_PERFORMANCE.' };
+            if (!args?.bucket) return { success: false, error: 'bucket (DAY|WEEK|MONTH) is required for WORKFLOW GET_PERFORMANCE.' };
+            const data = await svc.getWorkflowPerformance(args.workflow_id, args.start, args.end, args.bucket);
+            return { success: true, performance: data };
+          }
+          default:
+            return { success: false, error: `Unknown action "${action}" for WORKFLOW. Valid: LIST, GET, DELETE, GET_PERFORMANCE.` };
+        }
+      }
+
+      // ─── SOCIAL ────────────────────────────────────────────────────────────
+      if (entityType === 'SOCIAL') {
+        switch (action) {
+          case 'LIST_CHANNELS': {
+            const data = await svc.listSocialChannels();
+            return { success: true, ...data };
+          }
+          case 'LIST_BROADCASTS': {
+            const data = await svc.listSocialBroadcasts();
+            return { success: true, ...data };
+          }
+          case 'CREATE_BROADCAST': {
+            const channelKey: string = args?.channel_key ?? '';
+            if (!channelKey.trim()) return { success: false, error: 'channel_key is required for SOCIAL CREATE_BROADCAST.' };
+            const body: string = args?.body ?? '';
+            if (!body.trim()) return { success: false, error: 'body is required for SOCIAL CREATE_BROADCAST.' };
+            const data = await svc.createSocialBroadcast(channelKey, body, { triggerAt: args?.trigger_at });
+            return { success: true, ...data };
+          }
+          case 'DELETE_BROADCAST': {
+            if (!args?.broadcast_guid) return { success: false, error: 'broadcast_guid is required for SOCIAL DELETE_BROADCAST.' };
+            await svc.deleteSocialBroadcast(args.broadcast_guid);
+            return { success: true, deleted: args.broadcast_guid };
+          }
+          default:
+            return { success: false, error: `Unknown action "${action}" for SOCIAL. Valid: LIST_CHANNELS, LIST_BROADCASTS, CREATE_BROADCAST, DELETE_BROADCAST.` };
+        }
+      }
+
+      return { success: false, error: `Unknown entity_type "${entityType}". Valid: CONTACT_LIST, CAMPAIGN, EMAIL, FORM, LANDING_PAGE, BLOG_POST, WORKFLOW, SOCIAL.` };
     } catch (err: any) {
-      if (err?.response?.status === 403) return { success: false, error: 'HubSpot Campaigns API requires Marketing Hub Professional or higher.' };
-      return {
-        success: false,
-        error: err?.message ?? 'HubSpot campaigns API call failed.',
-        hubspotError: err?.response?.data ?? null,
-        status: err?.response?.status ?? null,
-      };
+      if (err?.response?.status === 403) return { success: false, error: 'HubSpot API access denied. Check your HubSpot subscription tier and OAuth scopes (content, automation required for some entity types).' };
+      return { success: false, error: err?.message ?? 'HubSpot API call failed.', hubspotError: err?.response?.data ?? null, status: err?.response?.status ?? null };
     }
   }
+
 }
 
 /**

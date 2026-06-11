@@ -1,6 +1,6 @@
 /**
- * Tests for Emma call_hubspot_campaigns_api tool (defined in emma/tools.ts).
- * Single unified tool — business logic in agentModeService.handleHubspotCampaignsApi.
+ * Tests for Emma call_hubspot_api tool (defined in emma/tools.ts).
+ * Unified tool — business logic in agentModeService.handleHubspotApi.
  */
 
 // ── Mocks BEFORE imports ─────────────────────────────────────────────────────
@@ -43,11 +43,11 @@ jest.mock('../../services/contactCaptureHooks', () => ({
   onPublicPageVisited: jest.fn(),
 }));
 
-const mockHandleHubspotCampaignsApi = jest.fn();
+const mockHandleHubspotApi = jest.fn();
 
 jest.mock('../../services/agentModeService', () => ({
   agentModeService: {
-    handleHubspotCampaignsApi: (...a: any[]) => mockHandleHubspotCampaignsApi(...a),
+    handleHubspotApi: (...a: any[]) => mockHandleHubspotApi(...a),
   },
 }));
 
@@ -62,7 +62,6 @@ jest.mock('../../services/db', () => ({
   orgMemoryDb: { getMemories: jest.fn().mockResolvedValue([]) },
 }));
 
-// MCP registry mock
 const toolMap = new Map<string, any>();
 const mockRegistryInstance = {
   register: jest.fn((handler: any) => toolMap.set(handler.name, handler)),
@@ -85,7 +84,7 @@ const MOCK_CAMPAIGN = { guid: 'campaign-guid-1', name: 'Q1 Email Campaign' };
 
 async function getTool() {
   await import('../../emma/tools');
-  const tool = emmaToolRegistry.getTool('call_hubspot_campaigns_api');
+  const tool = emmaToolRegistry.getTool('call_hubspot_api');
   expect(tool).toBeDefined();
   return tool!;
 }
@@ -96,120 +95,198 @@ beforeEach(() => {
 
 // ─── Registration ─────────────────────────────────────────────────────────────
 
-describe('call_hubspot_campaigns_api — registration', () => {
+describe('call_hubspot_api — registration', () => {
   it('is registered with correct name', async () => {
     const tool = await getTool();
-    expect(tool.definition.name).toBe('call_hubspot_campaigns_api');
+    expect(tool.definition.name).toBe('call_hubspot_api');
   });
 
-  it('schema has action as the only required field', async () => {
+  it('schema has entity_type and action as required fields', async () => {
     const tool = await getTool();
-    expect(tool.definition.inputSchema.required).toEqual(['action']);
+    expect(tool.definition.inputSchema.required).toEqual(expect.arrayContaining(['entity_type', 'action']));
   });
 
-  it('action enum includes all 6 actions', async () => {
+  it('entity_type enum includes all entity types', async () => {
     const tool = await getTool();
-    const actionEnum = tool.definition.inputSchema.properties.action.enum;
-    expect(actionEnum).toEqual(expect.arrayContaining(['LIST', 'GET', 'CREATE', 'UPDATE', 'DELETE', 'GET_METRICS']));
+    const entityEnum = tool.definition.inputSchema.properties.entity_type.enum;
+    expect(entityEnum).toEqual(expect.arrayContaining(['CAMPAIGN', 'EMAIL', 'FORM', 'LANDING_PAGE', 'BLOG_POST', 'WORKFLOW', 'SOCIAL', 'CONTACT_LIST']));
   });
 
-  it('description mentions Marketing Hub Professional', async () => {
+  it('description covers all entity types', async () => {
     const tool = await getTool();
-    expect(tool.definition.description).toMatch(/marketing hub professional/i);
+    const desc = tool.definition.description;
+    expect(desc).toMatch(/CAMPAIGN/);
+    expect(desc).toMatch(/EMAIL/);
+    expect(desc).toMatch(/WORKFLOW/);
+    expect(desc).toMatch(/SOCIAL/);
   });
 });
 
 // ─── Auth guard ───────────────────────────────────────────────────────────────
 
-describe('call_hubspot_campaigns_api — auth guard', () => {
+describe('call_hubspot_api — auth guard', () => {
   it('returns auth error when no userId', async () => {
     const tool = await getTool();
-    const result = await tool.execute({ action: 'LIST' }, {});
+    const result = await tool.execute({ entity_type: 'CAMPAIGN', action: 'LIST' }, {});
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/authentication/i);
-    expect(mockHandleHubspotCampaignsApi).not.toHaveBeenCalled();
+    expect(mockHandleHubspotApi).not.toHaveBeenCalled();
   });
 
   it('returns auth error when context is missing entirely', async () => {
     const tool = await getTool();
-    const result = await tool.execute({ action: 'LIST' }, undefined);
+    const result = await tool.execute({ entity_type: 'CAMPAIGN', action: 'LIST' }, undefined);
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/authentication/i);
-    expect(mockHandleHubspotCampaignsApi).not.toHaveBeenCalled();
+    expect(mockHandleHubspotApi).not.toHaveBeenCalled();
   });
 });
 
 // ─── Delegation ───────────────────────────────────────────────────────────────
 
-describe('call_hubspot_campaigns_api — delegation', () => {
-  it('delegates LIST to agentModeService with full args', async () => {
-    mockHandleHubspotCampaignsApi.mockResolvedValue({ success: true, campaigns: [MOCK_CAMPAIGN], count: 1 });
-
+describe('call_hubspot_api — delegation', () => {
+  it('delegates CAMPAIGN LIST to agentModeService with full args', async () => {
+    mockHandleHubspotApi.mockResolvedValue({ success: true, results: [MOCK_CAMPAIGN] });
     const tool = await getTool();
-    const args = { action: 'LIST', cursor: 'abc123' };
+    const args = { entity_type: 'CAMPAIGN', action: 'LIST', cursor: 'abc123' };
     const result = await tool.execute(args, { userId: USER });
-
-    expect(mockHandleHubspotCampaignsApi).toHaveBeenCalledWith(USER, args);
+    expect(mockHandleHubspotApi).toHaveBeenCalledWith(USER, args);
     expect(result.success).toBe(true);
   });
 
-  it('delegates GET to agentModeService', async () => {
-    mockHandleHubspotCampaignsApi.mockResolvedValue({ success: true, campaign: MOCK_CAMPAIGN, metrics: {} });
-
+  it('delegates EMAIL GET_STATS to agentModeService', async () => {
+    mockHandleHubspotApi.mockResolvedValue({ success: true, results: [] });
     const tool = await getTool();
-    const args = { action: 'GET', guid: 'campaign-guid-1' };
+    const args = { entity_type: 'EMAIL', action: 'GET_STATS', email_ids: ['e1', 'e2'] };
     await tool.execute(args, { userId: USER });
-
-    expect(mockHandleHubspotCampaignsApi).toHaveBeenCalledWith(USER, args);
+    expect(mockHandleHubspotApi).toHaveBeenCalledWith(USER, args);
   });
 
-  it('delegates CREATE to agentModeService', async () => {
-    mockHandleHubspotCampaignsApi.mockResolvedValue({ success: true, campaign: MOCK_CAMPAIGN });
-
+  it('delegates WORKFLOW LIST to agentModeService', async () => {
+    mockHandleHubspotApi.mockResolvedValue({ success: true, workflows: [] });
     const tool = await getTool();
-    const args = { action: 'CREATE', name: 'Q1 Campaign', start_date: '2025-10-30', notes: 'Test', utm: 'utm_test' };
+    const args = { entity_type: 'WORKFLOW', action: 'LIST' };
     await tool.execute(args, { userId: USER });
-
-    expect(mockHandleHubspotCampaignsApi).toHaveBeenCalledWith(USER, args);
+    expect(mockHandleHubspotApi).toHaveBeenCalledWith(USER, args);
   });
 
-  it('delegates UPDATE to agentModeService', async () => {
-    mockHandleHubspotCampaignsApi.mockResolvedValue({ success: true, campaign: MOCK_CAMPAIGN });
-
+  it('delegates SOCIAL CREATE_BROADCAST to agentModeService', async () => {
+    mockHandleHubspotApi.mockResolvedValue({ success: true, id: 'sb1' });
     const tool = await getTool();
-    const args = { action: 'UPDATE', guid: 'campaign-guid-1', name: 'New Name' };
+    const args = { entity_type: 'SOCIAL', action: 'CREATE_BROADCAST', channel_key: 'Twitter:123', body: 'Hello' };
     await tool.execute(args, { userId: USER });
-
-    expect(mockHandleHubspotCampaignsApi).toHaveBeenCalledWith(USER, args);
+    expect(mockHandleHubspotApi).toHaveBeenCalledWith(USER, args);
   });
 
-  it('delegates DELETE to agentModeService', async () => {
-    mockHandleHubspotCampaignsApi.mockResolvedValue({ success: true, deleted: 'campaign-guid-1' });
-
+  it('delegates SOCIAL DELETE_BROADCAST to agentModeService', async () => {
+    mockHandleHubspotApi.mockResolvedValue({ success: true, deleted: 'bg1' });
     const tool = await getTool();
-    const args = { action: 'DELETE', guid: 'campaign-guid-1' };
+    const args = { entity_type: 'SOCIAL', action: 'DELETE_BROADCAST', broadcast_guid: 'bg1' };
     await tool.execute(args, { userId: USER });
-
-    expect(mockHandleHubspotCampaignsApi).toHaveBeenCalledWith(USER, args);
+    expect(mockHandleHubspotApi).toHaveBeenCalledWith(USER, args);
   });
 
-  it('delegates GET_METRICS to agentModeService', async () => {
-    mockHandleHubspotCampaignsApi.mockResolvedValue({ success: true, metrics: { sessions: 500 } });
-
+  it('delegates EMAIL DELETE to agentModeService', async () => {
+    mockHandleHubspotApi.mockResolvedValue({ success: true, deleted: 'em1' });
     const tool = await getTool();
-    const args = { action: 'GET_METRICS', guid: 'campaign-guid-1' };
+    const args = { entity_type: 'EMAIL', action: 'DELETE', email_id: 'em1' };
     await tool.execute(args, { userId: USER });
+    expect(mockHandleHubspotApi).toHaveBeenCalledWith(USER, args);
+  });
 
-    expect(mockHandleHubspotCampaignsApi).toHaveBeenCalledWith(USER, args);
+  it('delegates FORM CREATE to agentModeService', async () => {
+    mockHandleHubspotApi.mockResolvedValue({ success: true, id: 'f1' });
+    const tool = await getTool();
+    const args = { entity_type: 'FORM', action: 'CREATE', name: 'My Form' };
+    await tool.execute(args, { userId: USER });
+    expect(mockHandleHubspotApi).toHaveBeenCalledWith(USER, args);
+  });
+
+  it('delegates FORM UPDATE to agentModeService', async () => {
+    mockHandleHubspotApi.mockResolvedValue({ success: true, id: 'f1' });
+    const tool = await getTool();
+    const args = { entity_type: 'FORM', action: 'UPDATE', form_id: 'f1', name: 'Updated' };
+    await tool.execute(args, { userId: USER });
+    expect(mockHandleHubspotApi).toHaveBeenCalledWith(USER, args);
+  });
+
+  it('delegates FORM DELETE to agentModeService', async () => {
+    mockHandleHubspotApi.mockResolvedValue({ success: true, deleted: 'f1' });
+    const tool = await getTool();
+    const args = { entity_type: 'FORM', action: 'DELETE', form_id: 'f1' };
+    await tool.execute(args, { userId: USER });
+    expect(mockHandleHubspotApi).toHaveBeenCalledWith(USER, args);
+  });
+
+  it('delegates LANDING_PAGE UPDATE to agentModeService', async () => {
+    mockHandleHubspotApi.mockResolvedValue({ success: true, id: 'p1' });
+    const tool = await getTool();
+    const args = { entity_type: 'LANDING_PAGE', action: 'UPDATE', page_id: 'p1', html_title: 'New Title' };
+    await tool.execute(args, { userId: USER });
+    expect(mockHandleHubspotApi).toHaveBeenCalledWith(USER, args);
+  });
+
+  it('delegates LANDING_PAGE DELETE to agentModeService', async () => {
+    mockHandleHubspotApi.mockResolvedValue({ success: true, deleted: 'p1' });
+    const tool = await getTool();
+    const args = { entity_type: 'LANDING_PAGE', action: 'DELETE', page_id: 'p1' };
+    await tool.execute(args, { userId: USER });
+    expect(mockHandleHubspotApi).toHaveBeenCalledWith(USER, args);
+  });
+
+  it('delegates BLOG_POST UPDATE to agentModeService', async () => {
+    mockHandleHubspotApi.mockResolvedValue({ success: true, id: 'bp1' });
+    const tool = await getTool();
+    const args = { entity_type: 'BLOG_POST', action: 'UPDATE', post_id: 'bp1', html_title: 'Updated' };
+    await tool.execute(args, { userId: USER });
+    expect(mockHandleHubspotApi).toHaveBeenCalledWith(USER, args);
+  });
+
+  it('delegates BLOG_POST DELETE to agentModeService', async () => {
+    mockHandleHubspotApi.mockResolvedValue({ success: true, deleted: 'bp1' });
+    const tool = await getTool();
+    const args = { entity_type: 'BLOG_POST', action: 'DELETE', post_id: 'bp1' };
+    await tool.execute(args, { userId: USER });
+    expect(mockHandleHubspotApi).toHaveBeenCalledWith(USER, args);
+  });
+
+  it('delegates CONTACT_LIST LIST to agentModeService', async () => {
+    mockHandleHubspotApi.mockResolvedValue({ success: true, lists: [] });
+    const tool = await getTool();
+    const args = { entity_type: 'CONTACT_LIST', action: 'LIST' };
+    await tool.execute(args, { userId: USER });
+    expect(mockHandleHubspotApi).toHaveBeenCalledWith(USER, args);
+  });
+
+  it('delegates CONTACT_LIST CREATE to agentModeService', async () => {
+    mockHandleHubspotApi.mockResolvedValue({ success: true, listId: 'cl1' });
+    const tool = await getTool();
+    const args = { entity_type: 'CONTACT_LIST', action: 'CREATE', name: 'VIP', processing_type: 'MANUAL' };
+    await tool.execute(args, { userId: USER });
+    expect(mockHandleHubspotApi).toHaveBeenCalledWith(USER, args);
+  });
+
+  it('delegates CONTACT_LIST ADD_CONTACTS to agentModeService', async () => {
+    mockHandleHubspotApi.mockResolvedValue({ success: true, recordIdsAdded: ['r1'] });
+    const tool = await getTool();
+    const args = { entity_type: 'CONTACT_LIST', action: 'ADD_CONTACTS', list_id: 'cl1', record_ids: ['r1'] };
+    await tool.execute(args, { userId: USER });
+    expect(mockHandleHubspotApi).toHaveBeenCalledWith(USER, args);
+  });
+
+  it('delegates CONTACT_LIST DELETE to agentModeService', async () => {
+    mockHandleHubspotApi.mockResolvedValue({ success: true, deleted: 'cl1' });
+    const tool = await getTool();
+    const args = { entity_type: 'CONTACT_LIST', action: 'DELETE', list_id: 'cl1' };
+    await tool.execute(args, { userId: USER });
+    expect(mockHandleHubspotApi).toHaveBeenCalledWith(USER, args);
   });
 
   it('passes handler error through to caller', async () => {
-    mockHandleHubspotCampaignsApi.mockResolvedValue({ success: false, error: 'Marketing Hub Professional required.' });
-
+    mockHandleHubspotApi.mockResolvedValue({ success: false, error: 'Access denied.' });
     const tool = await getTool();
-    const result = await tool.execute({ action: 'LIST' }, { userId: USER });
-
+    const result = await tool.execute({ entity_type: 'CAMPAIGN', action: 'LIST' }, { userId: USER });
     expect(result.success).toBe(false);
-    expect(result.error).toMatch(/professional/i);
+    expect(result.error).toMatch(/access denied/i);
   });
 });

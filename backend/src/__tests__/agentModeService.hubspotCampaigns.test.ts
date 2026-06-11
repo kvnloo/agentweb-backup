@@ -1,5 +1,5 @@
 /**
- * Tests for agentModeService.handleHubspotCampaignsApi and resolveHubSpotService.
+ * Tests for agentModeService.handleHubspotApi (entity_type=CAMPAIGN) and resolveHubSpotService.
  * Covers: action dispatch, param validation, 403 handling, OAuth→token fallback.
  */
 
@@ -13,6 +13,7 @@ const mockCreateCampaign = jest.fn();
 const mockUpdateCampaign = jest.fn();
 const mockDeleteCampaign = jest.fn();
 const mockGetCampaignMetrics = jest.fn();
+const mockListCampaignAssets = jest.fn();
 
 const mockSvcInstance = {
   listCampaigns: mockListCampaigns,
@@ -21,6 +22,7 @@ const mockSvcInstance = {
   updateCampaign: mockUpdateCampaign,
   deleteCampaign: mockDeleteCampaign,
   getCampaignMetrics: mockGetCampaignMetrics,
+  listCampaignAssets: mockListCampaignAssets,
 };
 
 const mockHubSpotCreate = jest.fn();
@@ -105,6 +107,9 @@ const RAW_LIST = { results: [{ id: GUID, properties: { hs_name: 'Camp1' } }], to
 const RAW_CAMPAIGN = { id: GUID, properties: { hs_name: 'Camp1' } };
 const RAW_METRICS = { id: GUID, metrics: { sessions: 100 } };
 
+// Helper: call handleHubspotApi with entity_type=CAMPAIGN
+const hubspot = (args: any) => agentModeService.handleHubspotApi(USER, { entity_type: 'CAMPAIGN', ...args });
+
 beforeEach(() => {
   jest.clearAllMocks();
   mockHubSpotCreate.mockResolvedValue(mockSvcInstance);
@@ -115,7 +120,7 @@ beforeEach(() => {
 describe('resolveHubSpotService', () => {
   it('uses OAuth token when HubSpotService.create succeeds', async () => {
     mockListCampaigns.mockResolvedValue(RAW_LIST);
-    const result = await agentModeService.handleHubspotCampaignsApi(USER, { action: 'LIST' });
+    const result = await hubspot({ action: 'LIST' });
     expect(mockHubSpotCreate).toHaveBeenCalledWith(USER);
     expect(result.success).toBe(true);
   });
@@ -126,11 +131,10 @@ describe('resolveHubSpotService', () => {
       { externalCrmSyncConfigs: { hubspot: { apiKeyEncrypted: 'encrypted-key' } } },
     ]);
 
-    // Mock crypto decrypt
     jest.doMock('../utils/crypto', () => ({ decryptPassword: jest.fn().mockReturnValue({ password: 'plain-token' }) }));
     mockListCampaigns.mockResolvedValue(RAW_LIST);
 
-    const result = await agentModeService.handleHubspotCampaignsApi(USER, { action: 'LIST' });
+    const result = await hubspot({ action: 'LIST' });
     expect(mockHubSpotFromToken).toHaveBeenCalledWith('plain-token');
     expect(result.success).toBe(true);
   });
@@ -139,18 +143,18 @@ describe('resolveHubSpotService', () => {
     mockHubSpotCreate.mockRejectedValue(new Error('no OAuth'));
     mockGetLeadLists.mockResolvedValue([]);
 
-    const result = await agentModeService.handleHubspotCampaignsApi(USER, { action: 'LIST' });
+    const result = await hubspot({ action: 'LIST' });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/no hubspot account connected/i);
   });
 });
 
-// ─── handleHubspotCampaignsApi — action dispatch ─────────────────────────────
+// ─── CAMPAIGN — action dispatch ───────────────────────────────────────────────
 
-describe('handleHubspotCampaignsApi — LIST', () => {
+describe('CAMPAIGN LIST', () => {
   it('calls listCampaigns and spreads raw response', async () => {
     mockListCampaigns.mockResolvedValue(RAW_LIST);
-    const result = await agentModeService.handleHubspotCampaignsApi(USER, { action: 'LIST' });
+    const result = await hubspot({ action: 'LIST' });
     expect(mockListCampaigns).toHaveBeenCalledWith(undefined);
     expect(result.success).toBe(true);
     expect(result.results).toEqual(RAW_LIST.results);
@@ -158,14 +162,14 @@ describe('handleHubspotCampaignsApi — LIST', () => {
 
   it('passes cursor to listCampaigns', async () => {
     mockListCampaigns.mockResolvedValue(RAW_LIST);
-    await agentModeService.handleHubspotCampaignsApi(USER, { action: 'LIST', cursor: 'abc' });
+    await hubspot({ action: 'LIST', cursor: 'abc' });
     expect(mockListCampaigns).toHaveBeenCalledWith('abc');
   });
 });
 
-describe('handleHubspotCampaignsApi — GET', () => {
+describe('CAMPAIGN GET', () => {
   it('returns error when guid missing', async () => {
-    const result = await agentModeService.handleHubspotCampaignsApi(USER, { action: 'GET' });
+    const result = await hubspot({ action: 'GET' });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/guid/i);
     expect(mockGetCampaign).not.toHaveBeenCalled();
@@ -174,7 +178,7 @@ describe('handleHubspotCampaignsApi — GET', () => {
   it('fetches campaign + metrics in parallel', async () => {
     mockGetCampaign.mockResolvedValue(RAW_CAMPAIGN);
     mockGetCampaignMetrics.mockResolvedValue(RAW_METRICS);
-    const result = await agentModeService.handleHubspotCampaignsApi(USER, { action: 'GET', guid: GUID });
+    const result = await hubspot({ action: 'GET', guid: GUID });
     expect(result.success).toBe(true);
     expect(result.campaign).toEqual(RAW_CAMPAIGN);
     expect(result.metrics).toEqual(RAW_METRICS);
@@ -183,41 +187,39 @@ describe('handleHubspotCampaignsApi — GET', () => {
   it('returns campaign even when metrics fail', async () => {
     mockGetCampaign.mockResolvedValue(RAW_CAMPAIGN);
     mockGetCampaignMetrics.mockRejectedValue(new Error('metrics unavailable'));
-    const result = await agentModeService.handleHubspotCampaignsApi(USER, { action: 'GET', guid: GUID });
+    const result = await hubspot({ action: 'GET', guid: GUID });
     expect(result.success).toBe(true);
     expect(result.campaign).toEqual(RAW_CAMPAIGN);
-    expect(result.metrics).toBeNull();
+    expect(result.metrics).toEqual({ error: 'metrics unavailable' });
   });
 });
 
-describe('handleHubspotCampaignsApi — CREATE', () => {
+describe('CAMPAIGN CREATE', () => {
   it('returns error when name missing', async () => {
-    const result = await agentModeService.handleHubspotCampaignsApi(USER, { action: 'CREATE' });
+    const result = await hubspot({ action: 'CREATE' });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/name/i);
     expect(mockCreateCampaign).not.toHaveBeenCalled();
   });
 
   it('returns error when name is blank', async () => {
-    const result = await agentModeService.handleHubspotCampaignsApi(USER, { action: 'CREATE', name: '   ' });
+    const result = await hubspot({ action: 'CREATE', name: '   ' });
     expect(result.success).toBe(false);
     expect(mockCreateCampaign).not.toHaveBeenCalled();
   });
 
   it('calls createCampaign with name and opts, spreads raw response', async () => {
     mockCreateCampaign.mockResolvedValue(RAW_CAMPAIGN);
-    const result = await agentModeService.handleHubspotCampaignsApi(USER, {
-      action: 'CREATE', name: 'Camp1', start_date: '2025-01-01', notes: 'n', utm: 'u',
-    });
+    const result = await hubspot({ action: 'CREATE', name: 'Camp1', start_date: '2025-01-01', notes: 'n', utm: 'u' });
     expect(mockCreateCampaign).toHaveBeenCalledWith('Camp1', { startDate: '2025-01-01', notes: 'n', utm: 'u' });
     expect(result.success).toBe(true);
     expect(result.id).toBe(GUID);
   });
 });
 
-describe('handleHubspotCampaignsApi — UPDATE', () => {
+describe('CAMPAIGN UPDATE', () => {
   it('returns error when guid missing', async () => {
-    const result = await agentModeService.handleHubspotCampaignsApi(USER, { action: 'UPDATE', name: 'X' });
+    const result = await hubspot({ action: 'UPDATE', name: 'X' });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/guid/i);
     expect(mockUpdateCampaign).not.toHaveBeenCalled();
@@ -225,15 +227,15 @@ describe('handleHubspotCampaignsApi — UPDATE', () => {
 
   it('calls updateCampaign and spreads raw response', async () => {
     mockUpdateCampaign.mockResolvedValue(RAW_CAMPAIGN);
-    const result = await agentModeService.handleHubspotCampaignsApi(USER, { action: 'UPDATE', guid: GUID, name: 'New' });
+    const result = await hubspot({ action: 'UPDATE', guid: GUID, name: 'New' });
     expect(mockUpdateCampaign).toHaveBeenCalledWith(GUID, expect.objectContaining({ name: 'New' }));
     expect(result.success).toBe(true);
   });
 });
 
-describe('handleHubspotCampaignsApi — DELETE', () => {
+describe('CAMPAIGN DELETE', () => {
   it('returns error when guid missing', async () => {
-    const result = await agentModeService.handleHubspotCampaignsApi(USER, { action: 'DELETE' });
+    const result = await hubspot({ action: 'DELETE' });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/guid/i);
     expect(mockDeleteCampaign).not.toHaveBeenCalled();
@@ -241,52 +243,84 @@ describe('handleHubspotCampaignsApi — DELETE', () => {
 
   it('calls deleteCampaign and returns deleted guid', async () => {
     mockDeleteCampaign.mockResolvedValue(undefined);
-    const result = await agentModeService.handleHubspotCampaignsApi(USER, { action: 'DELETE', guid: GUID });
+    const result = await hubspot({ action: 'DELETE', guid: GUID });
     expect(mockDeleteCampaign).toHaveBeenCalledWith(GUID);
     expect(result.success).toBe(true);
     expect(result.deleted).toBe(GUID);
   });
 });
 
-describe('handleHubspotCampaignsApi — GET_METRICS', () => {
+describe('CAMPAIGN GET_METRICS', () => {
   it('returns error when guid missing', async () => {
-    const result = await agentModeService.handleHubspotCampaignsApi(USER, { action: 'GET_METRICS' });
+    const result = await hubspot({ action: 'GET_METRICS' });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/guid/i);
   });
 
   it('calls getCampaignMetrics and spreads raw response', async () => {
     mockGetCampaignMetrics.mockResolvedValue(RAW_METRICS);
-    const result = await agentModeService.handleHubspotCampaignsApi(USER, { action: 'GET_METRICS', guid: GUID });
+    const result = await hubspot({ action: 'GET_METRICS', guid: GUID });
     expect(mockGetCampaignMetrics).toHaveBeenCalledWith(GUID);
     expect(result.success).toBe(true);
     expect(result.metrics).toEqual(RAW_METRICS.metrics);
   });
 });
 
-describe('handleHubspotCampaignsApi — error handling', () => {
+describe('CAMPAIGN LIST_ASSETS', () => {
+  it('returns error when guid missing', async () => {
+    const result = await hubspot({ action: 'LIST_ASSETS' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/guid/i);
+    expect(mockListCampaignAssets).not.toHaveBeenCalled();
+  });
+
+  it('calls listCampaignAssets with asset_type and date range', async () => {
+    const raw = { results: [{ id: 'email-1' }] };
+    mockListCampaignAssets.mockResolvedValue(raw);
+    const result = await hubspot({ action: 'LIST_ASSETS', guid: GUID, asset_type: 'MARKETING_EMAIL', start_date: '2025-01-01', end_date: '2025-06-30' });
+    expect(mockListCampaignAssets).toHaveBeenCalledWith(GUID, 'MARKETING_EMAIL', { startDate: '2025-01-01', endDate: '2025-06-30', cursor: undefined });
+    expect(result.success).toBe(true);
+    expect(result.results).toEqual(raw.results);
+  });
+
+  it('fans out across all types when asset_type omitted', async () => {
+    const raw = { byType: { MARKETING_EMAIL: { results: [] } } };
+    mockListCampaignAssets.mockResolvedValue(raw);
+    const result = await hubspot({ action: 'LIST_ASSETS', guid: GUID });
+    expect(mockListCampaignAssets).toHaveBeenCalledWith(GUID, undefined, expect.any(Object));
+    expect(result.success).toBe(true);
+  });
+});
+
+describe('CAMPAIGN — error handling', () => {
   it('returns specific message on 403', async () => {
     const err: any = new Error('Forbidden');
     err.response = { status: 403 };
     mockListCampaigns.mockRejectedValue(err);
-    const result = await agentModeService.handleHubspotCampaignsApi(USER, { action: 'LIST' });
+    const result = await hubspot({ action: 'LIST' });
     expect(result.success).toBe(false);
-    expect(result.error).toMatch(/marketing hub professional/i);
+    expect(result.error).toMatch(/access denied/i);
   });
 
   it('surfaces hubspotError body on non-403 errors', async () => {
     const err: any = new Error('Request failed with status code 400');
     err.response = { status: 400, data: { message: 'Forbidden properties' } };
     mockListCampaigns.mockRejectedValue(err);
-    const result = await agentModeService.handleHubspotCampaignsApi(USER, { action: 'LIST' });
+    const result = await hubspot({ action: 'LIST' });
     expect(result.success).toBe(false);
     expect(result.hubspotError).toEqual({ message: 'Forbidden properties' });
     expect(result.status).toBe(400);
   });
 
   it('returns error on unknown action', async () => {
-    const result = await agentModeService.handleHubspotCampaignsApi(USER, { action: 'INVALID' });
+    const result = await hubspot({ action: 'INVALID' });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/unknown action/i);
+  });
+
+  it('returns error on unknown entity_type', async () => {
+    const result = await agentModeService.handleHubspotApi(USER, { entity_type: 'INVALID', action: 'LIST' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/unknown entity_type/i);
   });
 });

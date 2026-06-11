@@ -7363,43 +7363,134 @@ GAQL EXAMPLES:
   },
 });
 
-// ─── HubSpot Campaigns (Marketing Hub Professional+) ─────────────────────────
+// ─── HubSpot ──────────────────────────────────────────────────────────────────
 
 emmaToolRegistry.register({
-  name: 'call_hubspot_campaigns_api',
+  name: 'call_hubspot_api',
   definition: {
-    name: 'call_hubspot_campaigns_api',
-    description: `Manage HubSpot campaigns. Requires Marketing Hub Professional or higher.
+    name: 'call_hubspot_api',
+    description: `Manage HubSpot marketing assets and data via a single unified tool.
+Use entity_type to select the resource, action to select the operation.
 
-ACTION MATRIX:
-  LIST        → List all campaigns. Optional: cursor (pagination).
-  GET         → Get campaign details + performance metrics. Requires: guid.
-  CREATE      → Create a new campaign (reporting/attribution container). Requires: name. Optional: start_date (YYYY-MM-DD), notes, utm.
-  UPDATE      → Update campaign fields. Requires: guid. Optional: name, start_date, notes, utm.
-  DELETE      → Permanently delete a campaign. Requires: guid.
-  GET_METRICS → Get performance metrics only (sessions, contacts, revenue). Requires: guid.
+ENTITY_TYPE + ACTION MATRIX:
 
-WORKFLOW:
-  1. LIST to discover campaign guids and names.
-  2. GET or GET_METRICS with guid to view details/stats.
-  3. CREATE to start a new campaign, then associate emails/ads to it in HubSpot.`,
+  CAMPAIGN   → LIST | GET (guid) | CREATE (name) | UPDATE (guid) | DELETE (guid) | GET_METRICS (guid)
+             → LIST_ASSETS (guid; optional: asset_type, start_date, end_date, cursor)
+             → ADD_ASSET (guid, asset_type, asset_id) | REMOVE_ASSET (guid, asset_type, asset_id)
+             Requires Marketing Hub Professional+. asset_type: MARKETING_EMAIL, LANDING_PAGE, BLOG_POST, FORM, WEB_INTERACTIVE, CTA, SOCIAL_BROADCAST, WORKFLOW.
+
+  EMAIL      → LIST (cursor?) | GET (email_id) | GET_STATS (email_ids[], start_timestamp?, end_timestamp?)
+             → CREATE (name; subject?, from_name?, from_email?) | UPDATE (email_id) | CLONE (email_id, name)
+             → DELETE (email_id)
+             Requires "content" OAuth scope.
+
+  FORM       → LIST (cursor?) | GET (form_id) | GET_SUBMISSIONS (form_id; cursor?)
+             → CREATE (name, formType="hubspot", fieldGroups=[], configuration, displayOptions, legalConsentOptions, archived=false)
+             → UPDATE (form_id; name?, fieldGroups?, configuration?, displayOptions?, legalConsentOptions?)
+             → DELETE (form_id)
+             Requires "forms" OAuth scope. CREATE requires full nested body — see HubSpot Forms v3 spec.
+             DELETE is a soft-delete (archive); permanently purged after 3 months.
+
+  LANDING_PAGE → LIST (cursor?) | GET (page_id) | CREATE (name; template_path?, slug?, meta_description?)
+               → PUBLISH (page_id) | UPDATE (page_id; name?, html_title?, meta_description?, slug?, ...)
+               → DELETE (page_id)
+               Requires "content" scope + CMS Hub.
+
+  BLOG_POST  → LIST (cursor?) | GET (post_id) | CREATE (name, content_group_id; slug?, meta_description?, post_body?)
+             → PUBLISH (post_id) | UPDATE (post_id; name?, html_title?, meta_description?, slug?, ...)
+             → DELETE (post_id)
+             Requires "content" scope. Get content_group_id from LIST.
+
+  WORKFLOW   → LIST | GET (workflow_id) | DELETE (workflow_id) | GET_PERFORMANCE (workflow_id, start, end, bucket)
+             Requires "automation" scope + Marketing Hub Professional+.
+             Enrollment stats in contactListIds.enrolled / contactListIds.active.
+             GET_PERFORMANCE: start/end = epoch ms, bucket = DAY|WEEK|MONTH. Returns ENROLLED/UNENROLLED/COMPLETED counts per bucket.
+             WARNING: DELETE is irreversible via API — deleted workflow can only be restored by HubSpot Support.
+
+  SOCIAL     → LIST_CHANNELS | LIST_BROADCASTS | CREATE_BROADCAST (channel_key, body; trigger_at?)
+             → DELETE_BROADCAST (broadcast_guid)
+             channel_key format: "Twitter:403551555". trigger_at: epoch ms.
+             NOTE: DELETE_BROADCAST only cancels pending/scheduled broadcasts — already-published ones are not retracted.
+
+ASSET METRICS (CAMPAIGN LIST_ASSETS):
+  MARKETING_EMAIL → opens, clicks, bounces, unsubscribes
+  FORM → views, submissions, conversion_rate
+  LANDING_PAGE → views, conversions  |  BLOG_POST → views
+  WORKFLOW → enrolled, active, completed counts
+  SOCIAL_BROADCAST → facebook_clicks, linkedin_clicks, twitter_clicks
+
+  CONTACT_LIST → LIST (query?, cursor?) | GET (list_id) | CREATE (name, processing_type; object_type_id?)
+               → ADD_CONTACTS (list_id, record_ids[]) | REMOVE_CONTACTS (list_id, record_ids[])
+               → DELETE (list_id)
+               processing_type: MANUAL (static, edit via API) | DYNAMIC (auto-filters) | SNAPSHOT (filter once, then static).
+               ADD_CONTACTS/REMOVE_CONTACTS only work on MANUAL or SNAPSHOT lists.
+               DELETE is soft-delete — recoverable within 90 days. Scopes: crm.lists.read / crm.lists.write.
+
+NOT AVAILABLE VIA API: Ad metrics (Google/Meta — use those tools), social engagement counts.
+
+TYPICAL WORKFLOW:
+  1. CAMPAIGN LIST → get guid
+  2. CAMPAIGN LIST_ASSETS (guid, asset_type?) → see assets + per-asset metrics
+  3. CAMPAIGN GET_METRICS (guid) → campaign roll-up`,
     inputSchema: {
       type: 'object',
       properties: {
-        action:     { type: 'string', enum: ['LIST', 'GET', 'CREATE', 'UPDATE', 'DELETE', 'GET_METRICS'], description: 'Action to perform.' },
-        guid:       { type: 'string', description: 'Campaign guid. Required for GET, UPDATE, DELETE, GET_METRICS.' },
-        name:       { type: 'string', description: 'Campaign name. Required for CREATE.' },
-        start_date: { type: 'string', description: 'Campaign start date in YYYY-MM-DD format.' },
-        notes:      { type: 'string', description: 'Internal notes about the campaign.' },
-        utm:        { type: 'string', description: 'UTM campaign value for tracking.' },
-        cursor:     { type: 'string', description: 'Pagination cursor for LIST (from previous nextCursor).' },
+        entity_type:      { type: 'string', enum: ['CAMPAIGN', 'EMAIL', 'FORM', 'LANDING_PAGE', 'BLOG_POST', 'WORKFLOW', 'SOCIAL', 'CONTACT_LIST'], description: 'HubSpot resource to operate on.' },
+        action:           { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
+        // CAMPAIGN
+        guid:             { type: 'string', description: 'Campaign guid. Required for CAMPAIGN GET/UPDATE/DELETE/GET_METRICS/LIST_ASSETS/ADD_ASSET/REMOVE_ASSET.' },
+        asset_type:       { type: 'string', description: 'Asset type for CAMPAIGN LIST_ASSETS/ADD_ASSET/REMOVE_ASSET. One of: MARKETING_EMAIL, LANDING_PAGE, BLOG_POST, FORM, WEB_INTERACTIVE, CTA, SOCIAL_BROADCAST, WORKFLOW.' },
+        asset_id:         { type: 'string', description: 'Asset ID for CAMPAIGN ADD_ASSET/REMOVE_ASSET.' },
+        utm:              { type: 'string', description: 'UTM campaign value. CAMPAIGN CREATE/UPDATE.' },
+        notes:            { type: 'string', description: 'Internal notes. CAMPAIGN CREATE/UPDATE.' },
+        // EMAIL
+        email_id:         { type: 'string', description: 'Email ID. Required for EMAIL GET/UPDATE/CLONE/DELETE.' },
+        email_ids:        { type: 'array', items: { type: 'string' }, description: 'Email IDs for EMAIL GET_STATS.' },
+        subject:          { type: 'string', description: 'Email subject line. EMAIL CREATE/UPDATE.' },
+        from_name:        { type: 'string', description: 'Sender display name. EMAIL CREATE/UPDATE.' },
+        from_email:       { type: 'string', description: 'Sender email address. EMAIL CREATE/UPDATE.' },
+        start_timestamp:  { type: 'string', description: 'Start of date range (string). Filter EMAIL GET_STATS.' },
+        end_timestamp:    { type: 'string', description: 'End of date range (string). Filter EMAIL GET_STATS.' },
+        // FORM
+        form_id:          { type: 'string', description: 'Form ID. Required for FORM GET/GET_SUBMISSIONS/UPDATE/DELETE.' },
+        // LANDING_PAGE
+        page_id:          { type: 'string', description: 'Landing page ID. Required for LANDING_PAGE GET/PUBLISH/UPDATE/DELETE.' },
+        template_path:    { type: 'string', description: 'HubSpot template path (no leading slash). LANDING_PAGE CREATE.' },
+        // BLOG_POST
+        post_id:          { type: 'string', description: 'Blog post ID. Required for BLOG_POST GET/PUBLISH/UPDATE/DELETE.' },
+        content_group_id: { type: 'string', description: 'Blog ID (contentGroupId). Required for BLOG_POST CREATE.' },
+        post_body:        { type: 'string', description: 'HTML body. BLOG_POST CREATE.' },
+        // shared
+        name:             { type: 'string', description: 'Name/title. Required for CAMPAIGN CREATE, EMAIL CREATE/CLONE, LANDING_PAGE CREATE, BLOG_POST CREATE.' },
+        start_date:       { type: 'string', description: 'YYYY-MM-DD. CAMPAIGN CREATE/UPDATE; metrics window start for LIST_ASSETS.' },
+        end_date:         { type: 'string', description: 'YYYY-MM-DD. Metrics window end for CAMPAIGN LIST_ASSETS.' },
+        slug:             { type: 'string', description: 'URL slug. LANDING_PAGE/BLOG_POST CREATE.' },
+        meta_description: { type: 'string', description: 'SEO meta description. LANDING_PAGE/BLOG_POST CREATE.' },
+        cursor:           { type: 'string', description: 'Pagination cursor for LIST actions.' },
+        // WORKFLOW
+        workflow_id:      { type: 'string', description: 'Workflow ID. Required for WORKFLOW GET, DELETE, GET_PERFORMANCE.' },
+        start:            { type: 'number', description: 'Start time as Unix epoch milliseconds. Required for WORKFLOW GET_PERFORMANCE.' },
+        end:              { type: 'number', description: 'End time as Unix epoch milliseconds. Required for WORKFLOW GET_PERFORMANCE.' },
+        bucket:           { type: 'string', enum: ['DAY', 'WEEK', 'MONTH'], description: 'Time bucket granularity. Required for WORKFLOW GET_PERFORMANCE.' },
+        // SOCIAL
+        channel_key:      { type: 'string', description: 'Social channel key (e.g. "Twitter:403551555"). From SOCIAL LIST_CHANNELS. Required for CREATE_BROADCAST.' },
+        body:             { type: 'string', description: 'Post text. Required for SOCIAL CREATE_BROADCAST.' },
+        trigger_at:       { type: 'number', description: 'Scheduled time as Unix epoch ms. Omit to post immediately. SOCIAL CREATE_BROADCAST.' },
+        broadcast_guid:   { type: 'string', description: 'Broadcast GUID. Required for SOCIAL DELETE_BROADCAST.' },
+        // CONTACT_LIST
+        list_id:          { type: 'string', description: 'ILS list ID. Required for CONTACT_LIST GET/ADD_CONTACTS/REMOVE_CONTACTS/DELETE.' },
+        processing_type:  { type: 'string', enum: ['MANUAL', 'SNAPSHOT', 'DYNAMIC'], description: 'List type. Required for CONTACT_LIST CREATE.' },
+        object_type_id:   { type: 'string', description: 'HubSpot object type ID. Defaults to "0-1" (contacts). CONTACT_LIST CREATE.' },
+        record_ids:       { type: 'array', items: { type: 'string' }, description: 'Contact record IDs. Required for CONTACT_LIST ADD_CONTACTS/REMOVE_CONTACTS.' },
+        query:            { type: 'string', description: 'Search query for CONTACT_LIST LIST.' },
+        filter_branch:    { type: 'object', description: 'Filter criteria for DYNAMIC/SNAPSHOT CONTACT_LIST CREATE.' },
       },
-      required: ['action'],
+      required: ['entity_type', 'action'],
     },
   },
   execute: async (args: any, context?: any) => {
     const userId = context?.userId;
     if (!userId) return { success: false, error: 'Authentication required: no user context.' };
-    return agentModeService.handleHubspotCampaignsApi(userId, args);
+    return agentModeService.handleHubspotApi(userId, args);
   },
 });

@@ -867,6 +867,7 @@ export class HubSpotService {
   }
 
   async getCampaign(guid: string): Promise<any> {
+    if (!guid?.trim()) throw new Error('Campaign guid is required');
     const CAMPAIGN_PROPS = 'hs_name,hs_start_date,hs_end_date,hs_notes,hs_utm,hs_campaign_status';
     const res = await axiosInstance.get(
       `${HUBSPOT_API_BASE}/marketing/v3/campaigns/${guid}?properties=${CAMPAIGN_PROPS}`,
@@ -913,11 +914,11 @@ export class HubSpotService {
   }
 
   async deleteCampaign(guid: string): Promise<void> {
-    await axiosInstance.request({
-      method: 'DELETE',
-      url: `${HUBSPOT_API_BASE}/marketing/v3/campaigns/${guid}`,
-      headers: await this.authHeaders(),
-    });
+    if (!guid?.trim()) throw new Error('Campaign guid is required');
+    await axiosInstance.delete(
+      `${HUBSPOT_API_BASE}/marketing/v3/campaigns/${guid}`,
+      { headers: await this.authHeaders() }
+    );
   }
 
   async getCampaignMetrics(guid: string): Promise<any> {
@@ -926,6 +927,487 @@ export class HubSpotService {
       { headers: await this.authHeaders() }
     );
     return res.data;
+  }
+
+  static readonly CAMPAIGN_ASSET_TYPES = [
+    'MARKETING_EMAIL', 'LANDING_PAGE', 'BLOG_POST', 'FORM',
+    'WEB_INTERACTIVE', 'CTA', 'SOCIAL_BROADCAST', 'WORKFLOW',
+  ] as const;
+
+  async listCampaignAssets(
+    guid: string,
+    assetType?: string,
+    opts?: { startDate?: string; endDate?: string; cursor?: string }
+  ): Promise<any> {
+    if (assetType) {
+      return this._fetchAssetType(guid, assetType, opts);
+    }
+    const results = await Promise.allSettled(
+      HubSpotService.CAMPAIGN_ASSET_TYPES.map(t => this._fetchAssetType(guid, t, opts))
+    );
+    const byType: Record<string, any> = {};
+    HubSpotService.CAMPAIGN_ASSET_TYPES.forEach((t, i) => {
+      const r = results[i];
+      byType[t] = r.status === 'fulfilled' ? r.value : { error: (r as PromiseRejectedResult).reason?.message };
+    });
+    return { byType };
+  }
+
+  private async _fetchAssetType(
+    guid: string,
+    assetType: string,
+    opts?: { startDate?: string; endDate?: string; cursor?: string }
+  ): Promise<any> {
+    const params: string[] = ['limit=100'];
+    if (opts?.startDate) params.push(`startDate=${encodeURIComponent(opts.startDate)}`);
+    if (opts?.endDate) params.push(`endDate=${encodeURIComponent(opts.endDate)}`);
+    if (opts?.cursor) params.push(`after=${encodeURIComponent(opts.cursor)}`);
+    const url = `${HUBSPOT_API_BASE}/marketing/v3/campaigns/${guid}/assets/${assetType}?${params.join('&')}`;
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
+    return res.data;
+  }
+
+  // ─── Campaign Asset Association ───────────────────────────────────────────
+
+  async addCampaignAsset(guid: string, assetType: string, assetId: string): Promise<void> {
+    if (!guid?.trim()) throw new Error('Campaign guid is required');
+    if (!assetType?.trim()) throw new Error('assetType is required');
+    if (!assetId?.trim()) throw new Error('assetId is required');
+    await axiosInstance.put(
+      `${HUBSPOT_API_BASE}/marketing/v3/campaigns/${guid}/assets/${assetType}/${assetId}`,
+      {},
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  async removeCampaignAsset(guid: string, assetType: string, assetId: string): Promise<void> {
+    if (!guid?.trim()) throw new Error('Campaign guid is required');
+    if (!assetType?.trim()) throw new Error('assetType is required');
+    if (!assetId?.trim()) throw new Error('assetId is required');
+    await axiosInstance.delete(
+      `${HUBSPOT_API_BASE}/marketing/v3/campaigns/${guid}/assets/${assetType}/${assetId}`,
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  // ─── Marketing Emails ─────────────────────────────────────────────────────
+  // Scope: content
+
+  async listEmails(cursor?: string): Promise<any> {
+    let url = `${HUBSPOT_API_BASE}/marketing/v3/emails?limit=50`;
+    if (cursor) url += `&after=${encodeURIComponent(cursor)}`;
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
+    return res.data;
+  }
+
+  async getEmail(emailId: string): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/marketing/v3/emails/${emailId}`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async createEmail(name: string, opts?: { subject?: string; fromName?: string; fromEmail?: string }): Promise<any> {
+    if (!name?.trim()) throw new Error('Email name is required');
+    const body: Record<string, any> = { name: name.trim() };
+    if (opts?.subject) body.subject = opts.subject;
+    if (opts?.fromName !== undefined || opts?.fromEmail !== undefined) {
+      body.from = {};
+      if (opts?.fromName) body.from.name = opts.fromName;
+      if (opts?.fromEmail) body.from.email = opts.fromEmail;
+    }
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/marketing/v3/emails`,
+      body,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async updateEmail(
+    emailId: string,
+    props: { name?: string; subject?: string; fromName?: string; fromEmail?: string }
+  ): Promise<any> {
+    const body: Record<string, any> = {};
+    if (props.name !== undefined) body.name = props.name;
+    if (props.subject !== undefined) body.subject = props.subject;
+    if (props.fromName !== undefined || props.fromEmail !== undefined) {
+      body.from = {};
+      if (props.fromName !== undefined) body.from.name = props.fromName;
+      if (props.fromEmail !== undefined) body.from.email = props.fromEmail;
+    }
+    const res = await axiosInstance.patch(
+      `${HUBSPOT_API_BASE}/marketing/v3/emails/${emailId}`,
+      body,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async cloneEmail(emailId: string, name: string): Promise<any> {
+    if (!name?.trim()) throw new Error('Email name is required');
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/marketing/v3/emails/${emailId}/clone`,
+      { name: name.trim() },
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async getEmailStatistics(
+    emailIds: string[],
+    opts?: { startTimestamp?: string; endTimestamp?: string }
+  ): Promise<any> {
+    if (!emailIds?.length) throw new Error('emailIds array must not be empty');
+    const params: string[] = emailIds.map(id => `emailIds=${encodeURIComponent(id)}`);
+    if (opts?.startTimestamp) params.push(`startTimestamp=${encodeURIComponent(opts.startTimestamp)}`);
+    if (opts?.endTimestamp) params.push(`endTimestamp=${encodeURIComponent(opts.endTimestamp)}`);
+    const url = `${HUBSPOT_API_BASE}/marketing/v3/emails/statistics/list?${params.join('&')}`;
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
+    return res.data;
+  }
+
+  // ─── Contact Lists (2026-03 API) ─────────────────────────────────────────
+
+  async listContactLists(opts?: { query?: string; cursor?: string }): Promise<any> {
+    const body: Record<string, any> = { objectTypeId: '0-1', count: 50 };
+    if (opts?.query) body.query = opts.query;
+    if (opts?.cursor) body.after = opts.cursor;
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/crm/lists/2026-03/search`,
+      body,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async getContactList(listId: string): Promise<any> {
+    if (!listId?.trim()) throw new Error('listId is required');
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/crm/lists/2026-03/${listId}`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async createContactList(
+    name: string,
+    processingType: string,
+    opts?: { objectTypeId?: string; filterBranch?: any }
+  ): Promise<any> {
+    if (!name?.trim()) throw new Error('name is required');
+    if (!processingType?.trim()) throw new Error('processingType is required');
+    const body: Record<string, any> = {
+      name: name.trim(),
+      processingType: processingType.trim(),
+      objectTypeId: opts?.objectTypeId ?? '0-1',
+    };
+    if (opts?.filterBranch) body.filterBranch = opts.filterBranch;
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/crm/lists/2026-03`,
+      body,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async addContactsToList(listId: string, recordIds: string[]): Promise<any> {
+    if (!listId?.trim()) throw new Error('listId is required');
+    if (!recordIds?.length) throw new Error('recordIds array must not be empty');
+    const res = await axiosInstance.put(
+      `${HUBSPOT_API_BASE}/crm/lists/2026-03/${listId}/memberships/add`,
+      recordIds,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async removeContactsFromList(listId: string, recordIds: string[]): Promise<any> {
+    if (!listId?.trim()) throw new Error('listId is required');
+    if (!recordIds?.length) throw new Error('recordIds array must not be empty');
+    const res = await axiosInstance.put(
+      `${HUBSPOT_API_BASE}/crm/lists/2026-03/${listId}/memberships/add-and-remove`,
+      { recordIdsToAdd: [], recordIdsToRemove: recordIds },
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async deleteContactList(listId: string): Promise<void> {
+    if (!listId?.trim()) throw new Error('listId is required');
+    await axiosInstance.delete(
+      `${HUBSPOT_API_BASE}/crm/lists/2026-03/${listId}`,
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  async deleteEmail(emailId: string): Promise<void> {
+    if (!emailId?.trim()) throw new Error('emailId is required');
+    await axiosInstance.delete(
+      `${HUBSPOT_API_BASE}/marketing/v3/emails/${emailId}`,
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  // ─── Forms ────────────────────────────────────────────────────────────────
+  // Scope: forms
+
+  async listForms(cursor?: string): Promise<any> {
+    let url = `${HUBSPOT_API_BASE}/marketing/v3/forms?limit=50`;
+    if (cursor) url += `&after=${encodeURIComponent(cursor)}`;
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
+    return res.data;
+  }
+
+  async getForm(formId: string): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/marketing/v3/forms/${formId}`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async createForm(props: Record<string, any>): Promise<any> {
+    if (!props?.name?.trim()) throw new Error('name is required for form creation');
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/marketing/v3/forms`,
+      props,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async updateForm(formId: string, props: Record<string, any>): Promise<any> {
+    if (!formId?.trim()) throw new Error('formId is required');
+    const res = await axiosInstance.patch(
+      `${HUBSPOT_API_BASE}/marketing/v3/forms/${formId}`,
+      props,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async deleteForm(formId: string): Promise<void> {
+    if (!formId?.trim()) throw new Error('formId is required');
+    await axiosInstance.delete(
+      `${HUBSPOT_API_BASE}/marketing/v3/forms/${formId}`,
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  async getFormSubmissions(formId: string, cursor?: string): Promise<any> {
+    let url = `${HUBSPOT_API_BASE}/marketing/v3/forms/${formId}/submissions?limit=50`;
+    if (cursor) url += `&after=${encodeURIComponent(cursor)}`;
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
+    return res.data;
+  }
+
+  // ─── Landing Pages ────────────────────────────────────────────────────────
+  // Scope: content
+
+  async listLandingPages(cursor?: string): Promise<any> {
+    let url = `${HUBSPOT_API_BASE}/cms/v3/pages/landing-pages?limit=50`;
+    if (cursor) url += `&after=${encodeURIComponent(cursor)}`;
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
+    return res.data;
+  }
+
+  async getLandingPage(pageId: string): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/cms/v3/pages/landing-pages/${pageId}`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async createLandingPage(
+    name: string,
+    opts?: { templatePath?: string; slug?: string; metaDescription?: string }
+  ): Promise<any> {
+    if (!name?.trim()) throw new Error('Landing page name is required');
+    const body: Record<string, any> = { name: name.trim() };
+    if (opts?.templatePath) body.templatePath = opts.templatePath;
+    if (opts?.slug) body.slug = opts.slug;
+    if (opts?.metaDescription) body.metaDescription = opts.metaDescription;
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/cms/v3/pages/landing-pages`,
+      body,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async publishLandingPage(pageId: string): Promise<any> {
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/cms/v3/pages/landing-pages/${pageId}/draft/push-live`,
+      {},
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async updateLandingPage(pageId: string, props: Record<string, any>): Promise<any> {
+    if (!pageId?.trim()) throw new Error('pageId is required');
+    const res = await axiosInstance.patch(
+      `${HUBSPOT_API_BASE}/cms/v3/pages/landing-pages/${pageId}`,
+      props,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async deleteLandingPage(pageId: string): Promise<void> {
+    if (!pageId?.trim()) throw new Error('pageId is required');
+    await axiosInstance.delete(
+      `${HUBSPOT_API_BASE}/cms/v3/pages/landing-pages/${pageId}`,
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  // ─── Blog Posts ───────────────────────────────────────────────────────────
+  // Scope: content
+
+  async listBlogPosts(cursor?: string): Promise<any> {
+    let url = `${HUBSPOT_API_BASE}/cms/v3/blogs/posts?limit=50`;
+    if (cursor) url += `&after=${encodeURIComponent(cursor)}`;
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
+    return res.data;
+  }
+
+  async getBlogPost(postId: string): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/cms/v3/blogs/posts/${postId}`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async createBlogPost(
+    name: string,
+    contentGroupId: string,
+    opts?: { slug?: string; metaDescription?: string; postBody?: string }
+  ): Promise<any> {
+    if (!name?.trim()) throw new Error('Blog post name is required');
+    if (!contentGroupId?.trim()) throw new Error('contentGroupId (blog ID) is required');
+    const body: Record<string, any> = { name: name.trim(), contentGroupId: contentGroupId.trim() };
+    if (opts?.slug) body.slug = opts.slug;
+    if (opts?.metaDescription) body.metaDescription = opts.metaDescription;
+    if (opts?.postBody) body.postBody = opts.postBody;
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/cms/v3/blogs/posts`,
+      body,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async publishBlogPost(postId: string): Promise<void> {
+    await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/cms/v3/blogs/posts/${postId}/draft/push-live`,
+      {},
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  async updateBlogPost(postId: string, props: Record<string, any>): Promise<any> {
+    if (!postId?.trim()) throw new Error('postId is required');
+    const res = await axiosInstance.patch(
+      `${HUBSPOT_API_BASE}/cms/v3/blogs/posts/${postId}`,
+      props,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async deleteBlogPost(postId: string): Promise<void> {
+    if (!postId?.trim()) throw new Error('postId is required');
+    await axiosInstance.delete(
+      `${HUBSPOT_API_BASE}/cms/v3/blogs/posts/${postId}`,
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  // ─── Workflows ────────────────────────────────────────────────────────────
+  // Scope: automation
+
+  async listWorkflows(): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/automation/v3/workflows`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async getWorkflow(workflowId: string): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/automation/v3/workflows/${workflowId}`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async deleteWorkflow(workflowId: string): Promise<void> {
+    if (!workflowId?.trim()) throw new Error('workflowId is required');
+    await axiosInstance.delete(
+      `${HUBSPOT_API_BASE}/automation/v4/flows/${workflowId}`,
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  async getWorkflowPerformance(
+    workflowId: string,
+    start: number,
+    end: number,
+    bucket: 'DAY' | 'WEEK' | 'MONTH'
+  ): Promise<any> {
+    if (!workflowId?.trim()) throw new Error('workflowId is required');
+    const url = `${HUBSPOT_API_BASE}/automation/v3/performance/workflow/${workflowId}?start=${start}&end=${end}&bucket=${bucket}`;
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
+    return res.data;
+  }
+
+  // ─── Social Broadcasts (deprecated v1, still functional) ─────────────────
+
+  async listSocialChannels(): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/broadcast/v1/channels/setting/publish/current`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async listSocialBroadcasts(): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/broadcast/v1/broadcasts`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async createSocialBroadcast(
+    channelKey: string,
+    body: string,
+    opts?: { triggerAt?: number }
+  ): Promise<any> {
+    if (!channelKey?.trim()) throw new Error('channelKey is required');
+    if (!body?.trim()) throw new Error('broadcast body is required');
+    const payload: Record<string, any> = { channelKey, content: { body } };
+    if (opts?.triggerAt) payload.triggerAt = opts.triggerAt;
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/broadcast/v1/broadcasts`,
+      payload,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async deleteSocialBroadcast(broadcastGuid: string): Promise<void> {
+    if (!broadcastGuid?.trim()) throw new Error('broadcastGuid is required');
+    await axiosInstance.delete(
+      `${HUBSPOT_API_BASE}/broadcast/v1/broadcasts/${broadcastGuid}`,
+      { headers: await this.authHeaders() }
+    );
   }
 
   async getAllLists(query?: string): Promise<Array<{ id: string; name: string }>> {

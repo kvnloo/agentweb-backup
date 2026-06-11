@@ -140,6 +140,9 @@ export const INTEGRATION_CONFIG = {
       'marketing.campaigns.read',
       'marketing.campaigns.revenue.read',
       'marketing.campaigns.write',
+      'content',
+      'automation',
+      'forms',
     ],
   },
 
