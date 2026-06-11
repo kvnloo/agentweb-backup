@@ -396,6 +396,25 @@ describe('ExternalCrmSyncService', () => {
     });
   });
 
+  // ─── getDefaultMappings ─────────────────────────────────────────────────────
+
+  describe('getDefaultMappings', () => {
+    it('includes push-only listName/listId in the HubSpot custom mapping defaults', async () => {
+      const defaults = await service.getDefaultMappings('hubspot');
+      expect(defaults.customFieldMapping).toEqual(expect.arrayContaining([
+        expect.objectContaining({ agentwebField: 'listName', crmProperty: 'lead_list_name', direction: 'push', enabled: true }),
+        expect.objectContaining({ agentwebField: 'listId', crmProperty: 'lead_list_id', direction: 'push', enabled: true }),
+      ]));
+    });
+
+    it('does not add listName/listId to the Attio custom mapping defaults', async () => {
+      const defaults = await service.getDefaultMappings('attio');
+      const fields = defaults.customFieldMapping.map(m => m.agentwebField);
+      expect(fields).not.toContain('listName');
+      expect(fields).not.toContain('listId');
+    });
+  });
+
   // ─── testConnection ───────────────────────────────────────────────────────
 
   describe('testConnection', () => {
