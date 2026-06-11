@@ -2547,6 +2547,53 @@ export async function resolveSiteForCaller(
 }
 
 /**
+ * Whether `callerUserId` may EDIT `page`, accounting for org sharing.
+ *
+ * Single source of truth for the edit decision, shared by the route layer
+ * (authorizeLandingPageAccess), the list/get endpoints (to surface an
+ * `editable` flag), and the coding agent (to fail fast before spinning up the
+ * LLM loop). Mirrors canEditItem: the page owner always passes; otherwise the
+ * caller must be in the page owner's org AND be an org owner or a listed
+ * landingPages editor. Visibility (canViewItem) is deliberately broader — a
+ * plain member can VIEW a shared page but not edit it, which is exactly the
+ * gap this helper lets callers report up front.
+ *
+ * Best-effort and non-throwing: any lookup failure resolves to `false` (deny)
+ * so a transient DB error can't accidentally grant edit access.
+ */
+export async function canUserEditLandingPage(
+  page: Pick<GeneratedLandingPage, "userId">,
+  callerUserId: string,
+): Promise<boolean> {
+  try {
+    if (page.userId === callerUserId) return true;
+    const [user, pageOwner] = await Promise.all([
+      userDb.getUserById(callerUserId),
+      userDb.getUserById(page.userId),
+    ]);
+    const ownerOrgId = pageOwner?.orgId;
+    const org =
+      user?.orgId && user.orgId === ownerOrgId
+        ? await orgDb.getOrgById(user.orgId)
+        : null;
+    return canEditItem(
+      { userId: page.userId },
+      {
+        userId: callerUserId,
+        orgId: user?.orgId,
+        orgRole: user?.orgRole as "owner" | "member" | undefined,
+      },
+      org,
+      ownerOrgId,
+      "landingPages",
+    );
+  } catch (e) {
+    console.warn("[LP] canUserEditLandingPage check failed; denying edit:", e);
+    return false;
+  }
+}
+
+/**
  * Remove a page route file from the GitHub repo.
  */
 async function removePageFromGitHub(githubRepoUrl: string, slug: string): Promise<void> {
