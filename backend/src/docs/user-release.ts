@@ -84,7 +84,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
     changes: [
       'Fixed: Updating a Meta Ad\'s Destination URL Now Reliably Takes Effect',
       '- When you asked Emma to change a Meta ad\'s destination link, she would build a new ad creative and report success — but in some cases the ad kept pointing at the old URL, so the change never showed up in Ads Manager',
-      '- Emma now double-checks her own work after every destination-URL change: she re-reads the ad to confirm the new creative actually attached and that the live URL matches what you asked for. If it didn\'t take (usually a temporary Meta delay), she tells you instead of falsely reporting success, so you can retry',
+      '- Emma now double-checks her own work after every destination-URL change: she re-reads the ad to confirm the new creative actually attached and that the live URL matches what you asked for, automatically retrying a few times to ride out Meta\'s usual propagation delay',
+      '- If Meta still hasn\'t reflected the change after those retries, Emma tells you it\'s applied and pending on Meta\'s side (it will show up shortly) instead of falsely reporting it as done — and surfaces Meta\'s ad-review status when relevant',
       '- Your existing tracking parameters (UTM tags) are now carried over automatically when the destination changes, instead of being silently dropped',
     ],
   },
