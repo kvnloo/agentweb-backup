@@ -14,17 +14,22 @@ jest.mock('axios', () => ({
 }));
 
 // Mock blog controller
-const mockGetWebflowConfig = jest.fn();
+var mockGetWebflowConfig: jest.Mock;
+var mockGetWordPressConfig: jest.Mock;
 jest.mock('../controllers/blog', () => ({
-  getWebflowConfig: mockGetWebflowConfig
+  getWebflowConfig: (...args: any[]) => mockGetWebflowConfig(...args),
+  getWordPressConfig: (...args: any[]) => mockGetWordPressConfig(...args)
 }));
+mockGetWebflowConfig = jest.fn();
+mockGetWordPressConfig = jest.fn();
 
 // Mock secrets manager for Payload CMS credentials
-const mockGetSecret = jest.fn();
+var mockGetSecret: jest.Mock;
 jest.mock('../utils/secretsManager', () => ({
-  getSecret: (...args: any[]) => mockGetSecret(...args),
+  getSecret: (...args: any[]) => mockGetSecret ? mockGetSecret(...args) : Promise.resolve(null),
   getGCSPPrivateKey: jest.fn(),
 }));
+mockGetSecret = jest.fn();
 
 // Mock database
 jest.mock('../services/db', () => ({
