@@ -8,6 +8,16 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2026-06-10",
+    changes: [
+      "Authoritative Stripe Status Reconcile (Admin)",
+      "- Fixed: accounts could get stuck showing \"overdue\"/past_due even when their Stripe subscription was active — a stale local status that a missed payment-recovery webhook never cleared",
+      "- The per-user \"Sync Stripe\" button now authoritatively reconciles status against Stripe (Stripe wins), so it overwrites a stuck status instead of only filling blank fields",
+      "- \"Resync Payments\" now reconciles subscription status, payment method, tier, period end, and offer for every user in addition to the amount, and reports a new \"statuses reconciled\" count in the result toast",
+      "- The \"canceling\" pseudo-status set by cancel-at-period-end is preserved and never flipped back to active",
+    ],
+  },
+  {
     date: "2026-05-22",
     changes: [
       "Self-Service Analytics & SEO Configuration",

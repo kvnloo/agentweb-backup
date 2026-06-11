@@ -353,6 +353,90 @@ describe('AgentModeService - LLM Timing Metadata', () => {
       expect(lastAssistant.metadata.toolCalls[1].name).toBe('tool_b');
     });
 
+    it('should count pre-execution unavailable tools as failed tool calls', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        sessionId: 'test-session',
+        userId: 'test-user',
+        messages: [],
+        workPlan: null,
+        associatedSkills: ['skill-html-create'],
+      });
+
+      const { skillService } = require('../services/skillService');
+      skillService.getPublishedSkills.mockResolvedValue([
+        {
+          skillId: 'skill-html-create',
+          name: 'HTML Create',
+          description: 'Create HTML documents',
+          toolNames: ['create_html_file'],
+          isPublished: true,
+        },
+      ]);
+      skillService.getSkillsByIds.mockResolvedValue([
+        {
+          skillId: 'skill-html-create',
+          name: 'HTML Create',
+          description: 'Create HTML documents',
+          toolNames: ['create_html_file'],
+          isPublished: true,
+        },
+      ]);
+
+      llmCallSpy.mockResolvedValueOnce({
+        choices: [{
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'tc-unavailable',
+                function: {
+                  name: 'update_html_file',
+                  arguments: JSON.stringify({
+                    file_url: 'https://example.com/report.html',
+                    update_type: 'css',
+                    operations_json: '[]',
+                  }),
+                },
+              },
+            ],
+          },
+        }],
+      }).mockResolvedValueOnce({
+        choices: [{
+          message: {
+            role: 'assistant',
+            content: 'Recovered after installing the missing skill.',
+            tool_calls: null,
+          },
+        }],
+      });
+
+      const executeToolSpy = jest.spyOn(agentModeService as any, 'executeTool');
+
+      const result = await agentModeService.generateMarketingResponse(
+        'Update the HTML file', [], 'test-user', 'test-model', 'test-session', true
+      );
+
+      expect(executeToolSpy).not.toHaveBeenCalled();
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.toolCalls[0]).toMatchObject({
+        id: 'tc-unavailable',
+        name: 'update_html_file',
+        error: 'Tool "update_html_file" is not available. You must install the required skill first using install_skills.',
+        duration: 0,
+      });
+      expect(chatbotDb.incrementFailedFunctions).toHaveBeenCalledWith(
+        'test-session',
+        { update_html_file: 1 }
+      );
+
+      const assistantMessages = result.responseMessages.filter((m: any) => m.role === 'assistant');
+      const lastAssistant = assistantMessages[assistantMessages.length - 1];
+      expect(lastAssistant.metadata.toolCalls).toHaveLength(1);
+      expect(lastAssistant.metadata.toolCalls[0].error).toContain('not available');
+    });
+
     it('should handle mixed success and failure in parallel tools', async () => {
       llmCallSpy.mockResolvedValueOnce({
         choices: [{

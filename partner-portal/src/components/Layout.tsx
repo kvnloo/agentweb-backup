@@ -201,6 +201,14 @@ export default function Layout() {
                       <Button
                         color="primary"
                         component={RouterLink}
+                        to="/agent-runs"
+                        variant={isActivePath('/agent-runs') ? 'contained' : 'text'}
+                      >
+                        Agent Runs
+                      </Button>
+                      <Button
+                        color="primary"
+                        component={RouterLink}
                         to="/prompt-templates"
                         variant={isActivePath('/prompt-templates') ? 'contained' : 'text'}
                       >

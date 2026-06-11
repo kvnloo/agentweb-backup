@@ -2,7 +2,8 @@ import {
   SESSION_LIMIT_ERROR_CODES,
   isSessionLimitError,
   isContextLimitError,
-  isTransientLLMError
+  isTransientLLMError,
+  isWorkerShutdownError
 } from '../../utils/agentModeErrors';
 
 describe('agentModeErrors utils', () => {
@@ -123,6 +124,27 @@ describe('agentModeErrors utils', () => {
     it('should handle string errors', () => {
       expect(isContextLimitError('context length exceeded')).toBe(true);
       expect(isContextLimitError('random error')).toBe(false);
+    });
+  });
+
+  describe('isWorkerShutdownError', () => {
+    it('should return false for null/undefined', () => {
+      expect(isWorkerShutdownError(null)).toBe(false);
+      expect(isWorkerShutdownError(undefined)).toBe(false);
+    });
+
+    it('should detect graceful worker shutdown errors', () => {
+      expect(isWorkerShutdownError(new Error('Worker shutdown'))).toBe(true);
+    });
+
+    it('should detect worker process exit errors', () => {
+      expect(isWorkerShutdownError(new Error('Worker process exited with code 1 and signal null'))).toBe(true);
+      expect(isWorkerShutdownError('Worker process exited with code null and signal SIGKILL')).toBe(true);
+    });
+
+    it('should return false for unrelated worker strings', () => {
+      expect(isWorkerShutdownError(new Error('Worker shutdown unexpectedly'))).toBe(false);
+      expect(isWorkerShutdownError('ordinary failure')).toBe(false);
     });
   });
 

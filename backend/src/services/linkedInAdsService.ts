@@ -321,6 +321,54 @@ function normalizeTargetingCriteria(tc: any): any {
   return result;
 }
 
+/**
+ * Resolve a LinkedIn targetingCriteria object from the various param shapes Emma may pass.
+ * This is the single source of truth shared by CAMPAIGN CREATE and TARGETING ESTIMATE_REACH:
+ *   1. targeting_include / targeting_exclude — simple flat arrays (preferred, easiest for the model)
+ *   2. targeting_criteria / targetingCriteria — a raw LinkedIn-format object (normalized)
+ * Returns null when no targeting was supplied.
+ */
+export function resolveTargetingCriteria(params: Record<string, any>): any | null {
+  if (params.targeting_include && Array.isArray(params.targeting_include)) {
+    return buildTargetingCriteria(params.targeting_include, params.targeting_exclude);
+  }
+  const raw = params.targetingCriteria || params.targeting_criteria;
+  if (raw) return normalizeTargetingCriteria(raw);
+  return null;
+}
+
+/**
+ * Serialize a targetingCriteria object into LinkedIn's RestLi 2.0 "reduced" query encoding,
+ * e.g. (include:(and:List((or:(urn%3A...:List(urn%3A...))))),exclude:(or:(...))).
+ * Structural tokens stay literal; URN keys and values are percent-encoded (per LinkedIn docs).
+ */
+function encodeTargetingCriteriaParam(tc: any): string {
+  const encodeOrMap = (orMap: Record<string, string[]>): string => {
+    const entries = Object.entries(orMap).map(([facetUrn, values]) => {
+      const encodedValues = (values || []).map((v) => encodeURIComponent(v)).join(',');
+      return `${encodeURIComponent(facetUrn)}:List(${encodedValues})`;
+    });
+    return `(or:(${entries.join(',')}))`;
+  };
+
+  const parts: string[] = [];
+  const andClauses: any[] = tc?.include?.and || [];
+  const includeGroups = andClauses
+    .map((clause) => encodeOrMap(normalizeOrClause(clause.or)))
+    .join(',');
+  parts.push(`include:(and:List(${includeGroups}))`);
+
+  if (tc?.exclude?.or) {
+    const excludeEntries = Object.entries(normalizeOrClause(tc.exclude.or)).map(
+      ([facetUrn, values]) =>
+        `${encodeURIComponent(facetUrn)}:List(${((values as string[]) || []).map((v) => encodeURIComponent(v)).join(',')})`
+    );
+    parts.push(`exclude:(or:(${excludeEntries.join(',')}))`);
+  }
+
+  return `(${parts.join(',')})`;
+}
+
 export async function createCampaign(
   accessToken: string,
   adAccountId: string,
@@ -382,12 +430,8 @@ export async function createCampaign(
 
   // targetingCriteria: prefer simple flat format (targeting_include/targeting_exclude arrays),
   // fall back to raw object (targetingCriteria / targeting_criteria) with normalization
-  if (params.targeting_include && Array.isArray(params.targeting_include)) {
-    body.targetingCriteria = buildTargetingCriteria(params.targeting_include, params.targeting_exclude);
-  } else {
-    const targetingCriteria = params.targetingCriteria || params.targeting_criteria;
-    if (targetingCriteria) body.targetingCriteria = normalizeTargetingCriteria(targetingCriteria);
-  }
+  const targetingCriteria = resolveTargetingCriteria(params);
+  if (targetingCriteria) body.targetingCriteria = targetingCriteria;
 
   // politicalIntent: required in LinkedIn API v202603+
   body.politicalIntent = params.politicalIntent || 'NOT_POLITICAL';
@@ -764,21 +808,20 @@ export async function getAudienceCount(
   accessToken: string,
   targetingCriteria: Record<string, any>
 ): Promise<LinkedInAdsApiResult> {
-  // Build query params from targeting criteria
-  const facets = targetingCriteria?.include?.and || [];
-  let queryParts = ['q=targetingCriteria'];
-  let idx = 0;
-  for (const group of facets) {
-    const orFacets = group?.or || {};
-    for (const [facetUrn, values] of Object.entries(orFacets)) {
-      const encodedFacet = encodeURIComponent(facetUrn);
-      (values as string[]).forEach((val: string, i: number) => {
-        queryParts.push(`target.includedTargetingFacets.${encodedFacet}[${idx + i}]=${encodeURIComponent(val)}`);
-      });
-      idx += (values as string[]).length;
-    }
+  // The current REST audienceCounts endpoint uses the targetingCriteriaV2 finder: a single
+  // RestLi-2.0-encoded `targetingCriteria` query param. The legacy dotted
+  // `target.includedTargetingFacets.X[i]=` form is rejected with "Parameter 'target' is required".
+  const andClauses = targetingCriteria?.include?.and || [];
+  if (!Array.isArray(andClauses) || andClauses.length === 0) {
+    return { success: false, error: 'ESTIMATE_REACH requires at least one include targeting facet' };
   }
-  return makeRequest('GET', `/rest/audienceCounts?${queryParts.join('&')}`, accessToken);
+
+  const encodedCriteria = encodeTargetingCriteriaParam(targetingCriteria);
+  return makeRequest(
+    'GET',
+    `/rest/audienceCounts?q=targetingCriteriaV2&targetingCriteria=${encodedCriteria}`,
+    accessToken
+  );
 }
 
 // ─── Analytics ────────────────────────────────────────────────────────────────

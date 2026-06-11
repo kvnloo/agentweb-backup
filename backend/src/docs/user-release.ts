@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-06-05
+// Last updated: 2026-06-11
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,104 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-06-11',
+    changes: [
+      'Fixed: Skills You Create by Chatting with Emma Are Now Shared with Your Organization',
+      '- When you asked Emma to create a skill, it was saved without linking it to your organization, so teammates could not see it and it did not behave like other shared skills',
+      '- Skills created through Emma are now shared across your whole organization by default, just like skills created from Settings > Skills',
+      '- Creating a skill via Emma now follows the same permissions as the rest of the app — only an org owner or a designated skills editor can create org skills; other members are asked to have an admin do it',
+      'Fixed: Custom Domains for Landing Pages Now Wait for DNS Verification',
+      '- Connecting your own domain (for example store.yoursite.com) to a landing page used to show as "Active" right away, even before you had set up any DNS records — so the page looked live but the domain did not actually work',
+      '- Your domain now stays in a "Pending DNS" state until your DNS records are correctly pointed at us, and only flips to "Active" once it is genuinely reachable',
+      '- The setup instructions now include the main DNS record your domain needs (not just the wildcard), so following them actually makes the domain work',
+      '- Re-adding a domain you already connected no longer fails with an error, and domain-related messages are now clearer about what to do next',
+    ],
+  },
+  {
+    date: '2026-06-10',
+    changes: [
+      'Fixed: Skills Built by a Teammate Are Now Shared Across Your Organization',
+      '- A skill created by one member of your organization is now visible to every other member in their skills catalog (Settings > Skills and when Emma lists available skills), so teammates can reuse each other\'s skills',
+      '- Previously a new skill was only visible to the person who created it, even though work plans and other org resources were already shared org-wide',
+      '- Skills and work plans are shared with your whole org by default; an org owner can still turn sharing off for either from Settings > Organization',
+    ],
+  },
+  {
+    date: '2026-06-10',
+    changes: [
+      'New: Send Us Any Kind of Feedback, Not Just Bugs',
+      '- The "Report a bug" button is now a "Send feedback" button — use it to report a bug, request a feature, suggest an improvement, or share general feedback',
+      '- Just pick the kind of feedback you\'re sending, type a quick note, and hit send — we still automatically attach a screenshot of the page you were looking at for extra context',
+      '- Each type goes straight to our team, clearly labeled and tracked, and we follow up at your account email if we need more detail',
+    ],
+  },
+  {
+    date: '2026-06-10',
+    changes: [
+      'New: Report a Bug in One Click, Screenshot Included',
+      '- A new "Report a bug" button is always within reach in the bottom-right corner of every page',
+      '- Click it and we automatically grab a screenshot of the page you were just looking at — no need to capture or attach anything yourself',
+      '- Just type a quick note about what went wrong and hit send; your report (with the screenshot) goes straight to our team and is tracked like any other issue',
+      '- We follow up at your account email if we need more detail',
+    ],
+  },
+  {
+    date: '2026-06-10',
+    changes: [
+      'New: Undo a Landing Page Publish in One Click',
+      '- Published a landing page change and want it back the way it was? Each landing page card now has a "Revert last publish" button that rolls the live site back to exactly how it looked before your most recent publish, then redeploys automatically',
+      '- The button only appears when there is a publish to undo, and a confirmation dialog explains what will happen before anything changes',
+      '- You can also just ask Emma to "revert the last publish" on a page and she will do the same thing',
+      '- Only the most recent publish can be reverted, and only once — so it is safe and predictable',
+    ],
+  },
+  {
+    date: '2026-06-10',
+    changes: [
+      'Fixed: LinkedIn Ads Audience Size Check Now Works Before Launching a Campaign',
+      '- Asking Emma to estimate the reach of a LinkedIn Ads audience used to fail with confusing, contradictory errors and never returned a number',
+      '- The audience-size check now accepts the same targeting you use to build a campaign (locations, job titles, skills, seniorities, industries, and more) and returns the estimated audience size',
+      '- This lets Emma confirm your audience meets LinkedIn\'s 300-member minimum before creating the campaign, so you don\'t set up a campaign that can\'t run',
+    ],
+  },
+  {
+    date: '2026-06-10',
+    changes: [
+      'Fixed: Account Wrongly Showing "Overdue" Despite an Active Subscription',
+      '- Some accounts kept showing a past-due/overdue banner even though their subscription was active and paid in Stripe — caused by a stale billing status that a payment-recovery event failed to clear',
+      '- Our team can now re-sync an account directly against Stripe to correct the status immediately, and the sync is authoritative so it no longer leaves a stuck status in place',
+      '- If you ever see an incorrect overdue message while your payment is current, contact support and we can resolve it on the spot',
+      'Fixed: Emma Now Shares Your Landing Pages by Their Custom Domain, Not the Internal Address',
+      '- When Emma listed or published a landing page, she sometimes gave you the raw internal hosting address instead of the custom domain you actually use and share with customers',
+      '- Emma now always reports the live custom-domain URL for a page when one is set, so the links she gives you are the ones your visitors see',
+      '- This applies everywhere Emma surfaces a page link — listing your pages, confirming a publish, and verification or QA instructions',
+      'Fixed: Files From Data Analysis Now Come With Working Download Links',
+      '- When you asked Emma to run a data analysis and save the result as a file (for example a CSV audience or export), the link she gave back sometimes did not actually open — it was just a filename or an address pointing to nothing',
+      '- Generated files are now saved to real, secure storage and Emma returns a download link that genuinely opens the file',
+      '- This works for CSV, JSON, and other text-based exports produced during analysis',
+    ],
+  },
+  {
+    date: '2026-06-09',
+    changes: [
+      'New: Start and Run Guided Work Plans Right From Emma Chat',
+      '- You can now ask Emma "what work plans can I start?" to see the available step-by-step templates (onboarding, landing page builder, AI news to LinkedIn post, and more), then say "start the …" to launch one without leaving the chat',
+      '- Once a plan is active, Emma follows it: she walks you through each step, marks steps complete as you go, and picks up where you left off in later messages',
+      '- Launching a plan automatically turns on the tools and skills that plan needs, so each step just works',
+      '- If a plan is already in progress, Emma checks with you before replacing it so you don\'t lose your place',
+    ],
+  },
+  {
+    date: '2026-06-09',
+    changes: [
+      'Improved: Emma Now Remembers Your Preferences and Lessons Across Sessions',
+      '- When you tell Emma something worth keeping — a preferred tone or format, a recurring workflow, or a hard-won lesson about your business — she now saves it to your account memory so it carries into every future chat',
+      '- You no longer have to repeat the same context each session; Emma recalls what she learned and applies it automatically',
+      '- Learnings that apply to your whole team can be saved to your organization\'s shared memory, so teammates benefit too',
+      '- You stay in control: ask Emma to forget or update anything she\'s remembered, and account memory can be turned off in settings',
+    ],
+  },
   {
     date: '2026-06-08',
     changes: [

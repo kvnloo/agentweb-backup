@@ -2207,8 +2207,8 @@ export default function AdminDashboard() {
         {},
         { headers: { Authorization: `Bearer ${token}` } }
       );
-      const { checked, updated, skipped, errors } = response.data;
-      setSuccess(`Payments resynced: ${updated} updated, ${skipped} skipped, ${errors} errors (${checked} total checked)`);
+      const { checked, updated, reconciled, skipped, errors } = response.data;
+      setSuccess(`Payments resynced: ${updated} amounts updated, ${reconciled ?? 0} statuses reconciled, ${skipped} skipped, ${errors} errors (${checked} total checked)`);
     } catch (err: any) {
       setError(err.response?.data?.message || "Failed to resync payments");
     } finally {

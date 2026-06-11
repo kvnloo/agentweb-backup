@@ -2011,6 +2011,35 @@ const createEnrichmentRawCacheTable = async () => {
   }
 };
 
+// Shared event sink for every closed-loop instance (funnel loops + agent-mode).
+// PK loopId, SK tsSession (`<ts ISO>#<subjectId>#<eventType>`); see
+// loops/core/sensors/eventTableEventSource.ts for the row shape.
+const createLoopEventsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: 'Dev-AW-LoopEvents',
+    AttributeDefinitions: [
+      { AttributeName: 'loopId', AttributeType: 'S' },
+      { AttributeName: 'tsSession', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'loopId', KeyType: 'HASH' },
+      { AttributeName: 'tsSession', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const createLoopLearningTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: 'Dev-AW-LoopLearning',
@@ -2091,6 +2120,7 @@ const main = async () => {
     await createDripSendsTable();
     await createEnrichmentHistoryTable();
     await createEnrichmentRawCacheTable();
+    await createLoopEventsTable();
     await createLoopLearningTable();
     await createCharactersTable();
     await createCRMCompaniesTable();

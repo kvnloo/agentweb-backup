@@ -12,7 +12,13 @@ import { _testing } from '../loops/instances/ai-readiness-funnel';
 import type { DynamoPort, DynamoAttributeMap } from '../loops/core/ports';
 import type { LoopRunResult } from '../loops/core/types';
 
-const { summarizeFunnel, buildDigestLines, buildDailyDigestClaimItem, postDigest } = _testing;
+const {
+  summarizeFunnel,
+  buildDigestLines,
+  buildDailyDigestClaimItem,
+  buildLowDataDecisions,
+  postDigest,
+} = _testing;
 
 function dynamoReturning(items: DynamoAttributeMap[]): DynamoPort {
   return {
@@ -62,11 +68,15 @@ describe('ai-readiness-funnel summarizeFunnel', () => {
 
 describe('ai-readiness-funnel buildDigestLines — never reports "healthy"', () => {
   it('empty window: says empty, not healthy', () => {
-    const lines = buildDigestLines(result({ eventsScanned: 0 }), null).join('\n');
+    const lines = buildDigestLines(
+      result({ eventsScanned: 0 }),
+      { landed: 0, quiz_started: 0, form_submitted: 0, book_clicked: 0, signup_clicked: 0 },
+    ).join('\n');
     expect(lines.toLowerCase()).not.toContain('funnel is healthy');
     expect(lines.toLowerCase()).not.toContain('looks healthy');
     expect(lines.toLowerCase()).not.toContain('no issues');
     expect(lines).toContain('empty');
+    expect(lines).toContain('low-data-no-traffic');
   });
 
   it('events but no findings + low captures: reports the binding constraint, not healthy', () => {
@@ -99,6 +109,50 @@ describe('ai-readiness-funnel buildDigestLines — never reports "healthy"', () 
     expect(lines).toContain('What I found');
     expect(lines).toContain('Quiz step drops 40%');
     expect(lines).toContain('shorten the quiz to one question');
+  });
+});
+
+describe('ai-readiness-funnel low-data decisions', () => {
+  it('empty window: recommends a telemetry and traffic sanity check instead of waiting for significance', () => {
+    const decisions = buildLowDataDecisions({ landed: 0, quiz_started: 0, form_submitted: 0, book_clicked: 0, signup_clicked: 0 });
+
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0].id).toBe('low-data-no-traffic');
+    expect(decisions[0].confidence).toBe('low');
+    expect(decisions[0].requiresApproval).toBe(true);
+  });
+
+  it('low captures: recommends an awareness/routing action even when there are too few samples', () => {
+    const decisions = buildLowDataDecisions({ landed: 19, quiz_started: 2, form_submitted: 9, book_clicked: 0, signup_clicked: 1 });
+
+    expect(decisions.map((d) => d.id)).toContain('low-data-awareness-routing');
+    expect(decisions[0].requiresApproval).toBe(true);
+    expect(decisions[0].evidence).toContain('9 captures');
+  });
+
+  it('quiz-start leak: recommends a first-screen hypothesis from weak signal', () => {
+    const decisions = buildLowDataDecisions({ landed: 30, quiz_started: 2, form_submitted: 1, book_clicked: 0, signup_clicked: 0 });
+
+    expect(decisions.map((d) => d.id)).toContain('low-data-quiz-start-leak');
+    expect(decisions.find((d) => d.id === 'low-data-quiz-start-leak')?.action).toContain('above-the-fold');
+  });
+
+  it('captured leads with no next-step clicks: recommends fixing the thank-you CTA', () => {
+    const decisions = buildLowDataDecisions({ landed: 40, quiz_started: 16, form_submitted: 12, book_clicked: 0, signup_clicked: 0 });
+
+    expect(decisions.map((d) => d.id)).toContain('low-data-post-capture-cta');
+    expect(decisions.find((d) => d.id === 'low-data-post-capture-cta')?.evidence).toContain('0 next-step clicks');
+  });
+
+  it('digest includes startup decisions when findings are empty', () => {
+    const lines = buildDigestLines(
+      result({ eventsScanned: 31, proposals: [] }),
+      { landed: 19, quiz_started: 2, form_submitted: 9, book_clicked: 0, signup_clicked: 1 },
+    ).join('\n');
+
+    expect(lines).toContain('Startup decisions');
+    expect(lines).toContain('Needs approval');
+    expect(lines).toContain('low-data-awareness-routing');
   });
 });
 

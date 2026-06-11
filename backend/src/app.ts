@@ -66,6 +66,7 @@ import emmaApiRoutes from "./routes/emmaApi";
 import memoryRoutes from "./routes/memory";
 import leadMagnetAdminRoutes from "./routes/leadMagnetAdmin";
 import onboardingLoopAdminRoutes from "./routes/onboardingLoopAdmin";
+import agentRunsRoutes from "./routes/agentRuns";
 import socialPostsRoutes from "./routes/socialPosts";
 import landingPagesRoutes from "./routes/landingPages";
 import htmlTemplatesRoutes from "./routes/htmlTemplates";
@@ -86,6 +87,8 @@ import onboardingVariantsRoutes from "./routes/onboardingVariants";
 import loopEventsRoutes from "./routes/loopEvents";
 import { registerAiEvalFunnelForProduction } from "./loops/instances/ai-eval-funnel/cron";
 import { registerAiReadinessFunnel } from "./loops/instances/ai-readiness-funnel";
+import { registerAgentModeLoop } from "./loops/instances/agent-mode";
+import loopHealthRoutes from "./routes/loopHealth";
 import brandBuildRoutes from "./routes/brandBuild";
 import adGenRoutes from "./routes/adGen";
 import onboardingStepsRoutes from "./routes/onboardingSteps";
@@ -110,6 +113,30 @@ import {
 import { serveAsset, getAssetStats } from "./controllers/assetController";
 
 const app = express();
+
+// Security hardening (TAC Security report — Low findings):
+//   1. Remove the default "X-Powered-By: Express" header so the framework is not
+//      disclosed to unauthenticated clients (fingerprinting aid).
+//   2. Add standard security response headers on every response. We set these
+//      manually rather than pulling in helmet to avoid a new dependency and to
+//      keep full control over values (helmet's CSP/defaults can break the
+//      existing CORS + cross-origin asset flows).
+app.disable("x-powered-by");
+app.use((req, res, next) => {
+  // Prevent MIME-type sniffing.
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  // Disallow framing to mitigate clickjacking. The API is not meant to be framed.
+  res.setHeader("X-Frame-Options", "DENY");
+  // Do not leak the full URL (which may contain tokens/ids) in the Referer header.
+  res.setHeader("Referrer-Policy", "no-referrer");
+  // Enforce HTTPS for one year, including subdomains. Safe because all production
+  // traffic is served over TLS via nginx/Elastic Beanstalk.
+  res.setHeader(
+    "Strict-Transport-Security",
+    "max-age=31536000; includeSubDomains"
+  );
+  next();
+});
 
 // Initialize MCP Server routes BEFORE global body parsers
 setupMcpServer(app);
@@ -295,6 +322,8 @@ app.use("/api/oauth", connectedAccountsRoutes);
 app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
 app.use("/api/admin/lead-magnets", authenticateToken, isAdmin, leadMagnetAdminRoutes);
 app.use("/api/admin/onboarding-loop", authenticateToken, isAdmin, onboardingLoopAdminRoutes);
+app.use("/api/admin/loops", authenticateToken, isAdmin, loopHealthRoutes);
+app.use("/api/admin/agent-runs", authenticateToken, isAdmin, agentRunsRoutes);
 app.use("/api/client-health", authenticateToken, isAdmin, clientHealthRoutes);
 app.use("/api/skills", authenticateToken, isAdmin, skillRoutes);
 app.use("/api/user-skills", authenticateToken, userSkillRoutes);
@@ -326,6 +355,15 @@ try {
   registerAiReadinessFunnel();
 } catch (err) {
   console.warn("[loops] registerAiReadinessFunnel skipped:", String(err));
+}
+// Always registered so the agent-mode loop is visible to /api/admin/loops/health
+// and the attribution cron; the recorder hot-path hook is gated separately by
+// AGENT_RUNTIME_SPINE_ENABLED, while the daily analysis run is gated by
+// AGENT_MODE_LOOP_ENABLED.
+try {
+  registerAgentModeLoop();
+} catch (err) {
+  console.warn("[loops] registerAgentModeLoop skipped:", String(err));
 }
 app.use("/api/onboarding", brandBuildRoutes);
 app.use("/api/onboarding", adGenRoutes);

@@ -421,6 +421,46 @@ describe('AgentMode Progress SSE Endpoints', () => {
       // Verify progress was emitted
       expect(emitProgress).toHaveBeenCalled();
     });
+
+    it('emits terminal complete progress after a successful generateResponse', async () => {
+      (generateMarketingResponseWorkerService.runInWorker as jest.Mock).mockImplementation(
+        (params, onProgress) => {
+          if (onProgress) {
+            onProgress({
+              iteration: 2,
+              status: 'executing_tools',
+              pendingTools: ['create_html_file'],
+              toolCalls: [],
+            });
+          }
+          return Promise.resolve({
+            content: 'Done with final link',
+            toolCalls: [{ name: 'create_html_file', result: { success: true } }],
+            knowledgeBaseQueries: [],
+            sources: [],
+            responseMessages: []
+          });
+        }
+      );
+
+      const req = mockRequest({
+        body: {
+          sessionId,
+          userMessage: 'Create an HTML report'
+        },
+        user: { userId: 'test-user-id', email: 'test@example.com' } as User
+      }) as Request;
+      const res = mockResponse() as Response;
+
+      await agentModeController.generateResponse(req as any, res);
+
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+        content: 'Done with final link',
+      }));
+      expect(emitProgress).toHaveBeenLastCalledWith(sessionId, {
+        iteration: 0,
+        status: 'complete',
+      });
+    });
   });
 });
-

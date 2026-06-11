@@ -156,19 +156,115 @@ describe("customDomainService", () => {
       expect(result.verificationRecords!.length).toBeGreaterThan(0);
     });
 
-    it("should mark as active if Vercel says already verified", async () => {
+    it("should stay pending_verification when Vercel reports ownership-verified but DNS is still misconfigured", async () => {
+      // Vercel returns verified:true on add based on ownership alone, before the
+      // customer has pointed any DNS records at Vercel.
       mockAxiosPost.mockResolvedValueOnce({
         data: { name: "landing.example.com", verified: true },
+      });
+      // The config endpoint reports misconfigured: true (DNS not yet pointed).
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { misconfigured: true },
+      });
+
+      const result = await addCustomDomain("user-123", "proj-id", "landing.example.com");
+      expect(result.status).toBe("pending_verification");
+      // Config endpoint must have been consulted.
+      expect(mockAxiosGet).toHaveBeenCalledWith(
+        expect.stringContaining("/v6/domains/landing.example.com/config"),
+        expect.any(Object)
+      );
+    });
+
+    it("should mark as active only when verified AND DNS is correctly configured", async () => {
+      mockAxiosPost.mockResolvedValueOnce({
+        data: { name: "landing.example.com", verified: true },
+      });
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { misconfigured: false },
       });
 
       const result = await addCustomDomain("user-123", "proj-id", "landing.example.com");
       expect(result.status).toBe("active");
+      expect(result.verificationRecords).toBeUndefined();
+    });
+
+    it("should stay pending_verification (not crash) when the config check fails", async () => {
+      mockAxiosPost.mockResolvedValueOnce({
+        data: { name: "landing.example.com", verified: true },
+      });
+      mockAxiosGet.mockRejectedValueOnce(new Error("network error"));
+
+      const result = await addCustomDomain("user-123", "proj-id", "landing.example.com");
+      expect(result.status).toBe("pending_verification");
     });
 
     it("should reject invalid domain formats", async () => {
       await expect(addCustomDomain("user-123", "proj-id", "not a domain")).rejects.toThrow(
         /invalid domain/i
       );
+    });
+
+    it("should treat a 409 (domain already on THIS project) as success", async () => {
+      // Vercel rejects the add because the domain already exists...
+      mockAxiosPost.mockRejectedValueOnce({ response: { status: 409 } });
+      // ...but a GET confirms it's on this project (pending DNS).
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          name: "landing.example.com",
+          verified: false,
+          verification: [{ type: "TXT", domain: "_vercel.landing.example.com", value: "vc=abc" }],
+        },
+      });
+
+      const result = await addCustomDomain("user-123", "proj-id", "landing.example.com");
+      expect(result.status).toBe("pending_verification");
+      expect(result.verificationRecords!.length).toBeGreaterThan(0);
+      // Confirmed via the project-scoped domain GET.
+      expect(mockAxiosGet).toHaveBeenCalledWith(
+        expect.stringContaining("/projects/proj-id/domains/landing.example.com"),
+        expect.any(Object)
+      );
+    });
+
+    it("should reuse the existing DynamoDB record id on a re-add (no duplicate)", async () => {
+      mockAxiosPost.mockRejectedValueOnce({ response: { status: 409 } });
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { name: "landing.example.com", verified: false, verification: [] },
+      });
+      // An existing record for this user+domain is already stored.
+      mockQuery.mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Items: [
+              {
+                id: "existing-dom-id",
+                userId: "user-123",
+                domain: "landing.example.com",
+                type: "custom",
+                status: "pending_verification",
+                vercelProjectId: "proj-id",
+                createdAt: "2024-01-01T00:00:00.000Z",
+                updatedAt: "2024-01-01T00:00:00.000Z",
+              },
+            ],
+          }),
+      });
+
+      const result = await addCustomDomain("user-123", "proj-id", "landing.example.com");
+      expect(result.id).toBe("existing-dom-id");
+      expect(result.createdAt).toBe("2024-01-01T00:00:00.000Z");
+    });
+
+    it("should propagate the original 409 when the domain is on a DIFFERENT project", async () => {
+      mockAxiosPost.mockRejectedValueOnce({ response: { status: 409 } });
+      // GET fails (domain not on this project) — the original 409 must surface
+      // so the route returns "already in use on another project".
+      mockAxiosGet.mockRejectedValueOnce({ response: { status: 404 } });
+
+      await expect(
+        addCustomDomain("user-123", "proj-id", "landing.example.com")
+      ).rejects.toMatchObject({ response: { status: 409 } });
     });
   });
 
@@ -335,9 +431,10 @@ describe("customDomainService", () => {
           }),
       });
 
-      mockAxiosGet.mockResolvedValueOnce({
-        data: { name: "landing.example.com", verified: true },
-      });
+      // First GET: domain status (verified). Second GET: config (not misconfigured).
+      mockAxiosGet
+        .mockResolvedValueOnce({ data: { name: "landing.example.com", verified: true } })
+        .mockResolvedValueOnce({ data: { misconfigured: false } });
 
       const result = await verifyDomain("dom-1", "user-123");
       expect(result.verified).toBe(true);
@@ -350,6 +447,32 @@ describe("customDomainService", () => {
           Key: { id: "dom-1" },
         })
       );
+    });
+
+    it("should NOT mark active when ownership-verified but DNS still misconfigured", async () => {
+      mockGet.mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Item: {
+              id: "dom-1",
+              userId: "user-123",
+              domain: "landing.example.com",
+              type: "custom",
+              status: "pending_verification",
+              vercelProjectId: "proj-1",
+            },
+          }),
+      });
+
+      mockAxiosGet
+        .mockResolvedValueOnce({ data: { name: "landing.example.com", verified: true } })
+        .mockResolvedValueOnce({ data: { misconfigured: true } });
+
+      const result = await verifyDomain("dom-1", "user-123");
+      expect(result.verified).toBe(false);
+      expect(result.status).toBe("pending_verification");
+      // Must not have flipped the record to active.
+      expect(mockUpdate).not.toHaveBeenCalled();
     });
 
     it("should return not verified when DNS is not configured", async () => {

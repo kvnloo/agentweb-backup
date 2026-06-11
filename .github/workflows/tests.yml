@@ -154,6 +154,14 @@ jobs:
               });
             }
 
+            if (!allMet) {
+              core.setFailed(
+                `Backend coverage below 95% threshold: ` +
+                `statements=${statements.pct}%, branches=${branches.pct}%, ` +
+                `functions=${functions.pct}%, lines=${lines.pct}%`
+              );
+            }
+
   backend-staging-deploy:
     name: Backend deploy to staging (after tests pass)
     needs: [detect-changes, backend-tests-a, backend-tests-b]

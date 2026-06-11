@@ -1039,6 +1039,141 @@ export async function findUserByStripeCustomerId(stripeCustomerId: string): Prom
 // ─── Reconciliation ──────────────────────────────────────────────────
 
 /**
+ * Reconcile a single user's DynamoDB record against their live Stripe state.
+ *
+ * AUTHORITATIVE — Stripe wins. Unlike syncSubscriptionFromStripe() (which is
+ * additive-only and used by the /auth/me lazy login sync), this overwrites a
+ * stale subscription_status. That is what lets an admin unstick an account
+ * whose recovery webhook never landed (e.g. stuck on "past_due" while Stripe
+ * reports "active").
+ *
+ * Returns the map of fields actually changed (a non-empty object), or null when
+ * the user has no Stripe customer, has no subscriptions, or already matches.
+ * The "canceling" pseudo-status written by /api/stripe/cancel-subscription is
+ * preserved via the same effectiveStatus derivation as handleSubscriptionUpdated.
+ */
+export async function reconcileStripeUser(
+  user: Record<string, any>
+): Promise<Record<string, any> | null> {
+  if (!user.stripe_customer_id) {
+    return null;
+  }
+
+  const stripe = getStripeOrThrow();
+
+  // Fetch subscriptions from Stripe and pick the most relevant one
+  const subscriptions = await stripe.subscriptions.list({
+    customer: user.stripe_customer_id,
+    status: 'all',
+    limit: 10,
+    expand: ['data.discount.coupon'],
+  });
+
+  // Find the most relevant subscription: active > trialing > past_due > canceled
+  const statusPriority: Record<string, number> = { active: 0, trialing: 1, past_due: 2, canceled: 3 };
+  const sorted = [...subscriptions.data].sort(
+    (a, b) => (statusPriority[a.status] ?? 99) - (statusPriority[b.status] ?? 99)
+  );
+  const sub = sorted[0]; // best subscription, or undefined
+
+  if (!sub) {
+    // No subscriptions in Stripe — ensure DynamoDB reflects that.
+    // Guard excludes null/free/canceled to avoid overwriting records that
+    // were manually provisioned or already cleaned up.
+    const noSubStatuses = new Set([undefined, null, 'canceled', 'free', '']);
+    if (!noSubStatuses.has(user.subscription_status as any)) {
+      const updates = { subscription_status: 'canceled', has_payment_method: false };
+      await userDb.updateUser(user.userId, updates);
+      return updates;
+    }
+    return null;
+  }
+
+  // Check payment methods
+  let hasPaymentMethod = !!(sub.default_payment_method || (sub as any).default_source);
+  if (!hasPaymentMethod) {
+    const methods = await stripe.paymentMethods.list({ customer: user.stripe_customer_id, limit: 1 });
+    hasPaymentMethod = methods.data.length > 0;
+  }
+
+  // Derive tier
+  const priceId = sub.items?.data?.[0]?.price?.id;
+  const derivedType = priceId ? deriveSubscriptionTypeFromPriceId(priceId) : null;
+
+  // Build updates only for fields that are wrong
+  const updates: Record<string, any> = {};
+
+  // Mirror handleSubscriptionUpdated's effectiveStatus derivation so the
+  // reconcile does not clobber the "canceling" pseudo-status that
+  // /api/stripe/cancel-subscription writes. Without this, reconciling a
+  // canceling user would flip them back to "active" and the UI would lose
+  // the "Canceling" badge.
+  const effectiveStatus =
+    sub.cancel_at_period_end &&
+    (sub.status === 'active' || sub.status === 'trialing')
+      ? 'canceling'
+      : sub.status;
+  if (user.subscription_status !== effectiveStatus) {
+    updates.subscription_status = effectiveStatus;
+  }
+  if (user.stripe_subscription_id !== sub.id) {
+    updates.stripe_subscription_id = sub.id;
+  }
+  if (user.has_payment_method !== hasPaymentMethod) {
+    updates.has_payment_method = hasPaymentMethod;
+  }
+  if (derivedType && user.subscriptionType !== derivedType) {
+    updates.subscriptionType = derivedType;
+    const tierConfig = await getTierConfig(derivedType);
+    if (tierConfig) {
+      updates.allowedPages = tierConfig.allowedPages;
+      updates.allowedSkills = tierConfig.allowedSkills;
+    }
+  }
+
+  const periodEnd = (sub as any).current_period_end;
+  if (periodEnd) {
+    const periodEndIso = new Date(typeof periodEnd === 'number' ? periodEnd * 1000 : periodEnd).toISOString();
+    if (user.current_period_end !== periodEndIso) {
+      updates.current_period_end = periodEndIso;
+    }
+  }
+
+  // Sync activeOffer — always overwrite so removed discounts are cleared
+  const newOffer = extractActiveOffer(sub);
+  const existingOfferJson = user.activeOffer ? JSON.stringify(user.activeOffer) : null;
+  const newOfferJson = newOffer ? JSON.stringify(newOffer) : null;
+  if (existingOfferJson !== newOfferJson) {
+    updates.activeOffer = newOffer;
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return null;
+  }
+
+  await userDb.updateUser(user.userId, updates);
+  syncUserUpdateToLeadList(user.email, {
+    subscriptionType: updates.subscriptionType,
+    subscription_status: updates.subscription_status,
+  });
+  return updates;
+}
+
+/**
+ * Reconcile a single user by id. Authoritative (Stripe wins). Returns the
+ * fields changed, or null when the user is missing / has no Stripe customer /
+ * already matches Stripe. Used by the admin per-user "Sync Stripe" button.
+ */
+export async function reconcileStripeUserById(userId: string): Promise<Record<string, any> | null> {
+  const user = await userDb.getUserById(userId);
+  if (!user) {
+    console.warn(`[STRIPE RECONCILE] User ${userId} not found in DB`);
+    return null;
+  }
+  return reconcileStripeUser(user);
+}
+
+/**
  * Reconcile all users who have a stripe_customer_id by checking their actual
  * Stripe subscription status. Fixes any drift between DynamoDB and Stripe.
  *
@@ -1050,7 +1185,7 @@ export async function reconcileAllStripeUsers(): Promise<{
   errors: number;
   details: Array<{ email: string; action: string }>;
 }> {
-  const stripe = getStripeOrThrow();
+  getStripeOrThrow(); // fail fast before scanning the whole table if Stripe is unconfigured
   const summary = { checked: 0, fixed: 0, errors: 0, details: [] as Array<{ email: string; action: string }> };
 
   // Find all users with a stripe_customer_id
@@ -1069,108 +1204,26 @@ export async function reconcileAllStripeUsers(): Promise<{
     }
 
     try {
-      // Fetch active/trialing subscriptions from Stripe
-      const subscriptions = await stripe.subscriptions.list({
-        customer: user.stripe_customer_id,
-        status: 'all',
-        limit: 10,
-        expand: ['data.discount.coupon'],
-      });
-
-      // Find the most relevant subscription: active > trialing > past_due > canceled
-      const statusPriority: Record<string, number> = { active: 0, trialing: 1, past_due: 2, canceled: 3 };
-      const sorted = [...subscriptions.data].sort(
-        (a, b) => (statusPriority[a.status] ?? 99) - (statusPriority[b.status] ?? 99)
-      );
-      const sub = sorted[0]; // best subscription, or undefined
-
-      if (!sub) {
-        // No subscriptions in Stripe — ensure DynamoDB reflects that.
-        // Guard excludes null/free/canceled to avoid overwriting records that
-        // were manually provisioned or already cleaned up.
-        const noSubStatuses = new Set([undefined, null, 'canceled', 'free', '']);
-        if (!noSubStatuses.has(user.subscription_status as any)) {
-          await userDb.updateUser(user.userId, {
-            subscription_status: 'canceled',
-            has_payment_method: false,
-          });
-          summary.fixed++;
-          summary.details.push({ email: user.email, action: `status ${user.subscription_status} -> canceled (no Stripe subs)` });
+      const updates = await reconcileStripeUser(user);
+      if (updates && Object.keys(updates).length > 0) {
+        // Build a human-readable change list for the admin summary. Only the
+        // primary fields are surfaced; allowedPages/allowedSkills ride along
+        // with a tier change and don't need their own line.
+        const changes: string[] = [];
+        if ('subscription_status' in updates) {
+          changes.push(`status ${user.subscription_status || 'null'} -> ${updates.subscription_status}`);
         }
-        continue;
-      }
-
-      // Check payment methods
-      let hasPaymentMethod = !!(sub.default_payment_method || (sub as any).default_source);
-      if (!hasPaymentMethod) {
-        const methods = await stripe.paymentMethods.list({ customer: user.stripe_customer_id, limit: 1 });
-        hasPaymentMethod = methods.data.length > 0;
-      }
-
-      // Derive tier
-      const priceId = sub.items?.data?.[0]?.price?.id;
-      const derivedType = priceId ? deriveSubscriptionTypeFromPriceId(priceId) : null;
-
-      // Build updates only for fields that are wrong
-      const updates: Record<string, any> = {};
-      const changes: string[] = [];
-
-      // Mirror handleSubscriptionUpdated's effectiveStatus derivation so the
-      // reconcile sweep does not clobber the "canceling" pseudo-status that
-      // /api/stripe/cancel-subscription writes. Without this, any admin
-      // triggered /reconcile run would flip a canceling user back to
-      // "active" and the UI would lose the "Canceling" badge.
-      const effectiveStatus =
-        sub.cancel_at_period_end &&
-        (sub.status === 'active' || sub.status === 'trialing')
-          ? 'canceling'
-          : sub.status;
-      if (user.subscription_status !== effectiveStatus) {
-        updates.subscription_status = effectiveStatus;
-        changes.push(`status ${user.subscription_status || 'null'} -> ${effectiveStatus}`);
-      }
-      if (user.stripe_subscription_id !== sub.id) {
-        updates.stripe_subscription_id = sub.id;
-        changes.push(`sub_id synced`);
-      }
-      if (user.has_payment_method !== hasPaymentMethod) {
-        updates.has_payment_method = hasPaymentMethod;
-        changes.push(`payment_method ${user.has_payment_method} -> ${hasPaymentMethod}`);
-      }
-      if (derivedType && user.subscriptionType !== derivedType) {
-        updates.subscriptionType = derivedType;
-        const tierConfig = await getTierConfig(derivedType);
-        if (tierConfig) {
-          updates.allowedPages = tierConfig.allowedPages;
-          updates.allowedSkills = tierConfig.allowedSkills;
+        if ('stripe_subscription_id' in updates) changes.push('sub_id synced');
+        if ('has_payment_method' in updates) {
+          changes.push(`payment_method ${user.has_payment_method} -> ${updates.has_payment_method}`);
         }
-        changes.push(`tier ${user.subscriptionType || 'null'} -> ${derivedType}`);
-      }
-
-      const periodEnd = (sub as any).current_period_end;
-      if (periodEnd) {
-        const periodEndIso = new Date(typeof periodEnd === 'number' ? periodEnd * 1000 : periodEnd).toISOString();
-        if (user.current_period_end !== periodEndIso) {
-          updates.current_period_end = periodEndIso;
-          changes.push(`period_end synced`);
+        if ('subscriptionType' in updates) {
+          changes.push(`tier ${user.subscriptionType || 'null'} -> ${updates.subscriptionType}`);
         }
-      }
-
-      // Sync activeOffer — always overwrite so removed discounts are cleared
-      const newOffer = extractActiveOffer(sub);
-      const existingOfferJson = user.activeOffer ? JSON.stringify(user.activeOffer) : null;
-      const newOfferJson = newOffer ? JSON.stringify(newOffer) : null;
-      if (existingOfferJson !== newOfferJson) {
-        updates.activeOffer = newOffer;
-        changes.push(newOffer ? `offer synced (${newOffer.couponId})` : `offer cleared`);
-      }
-
-      if (Object.keys(updates).length > 0) {
-        await userDb.updateUser(user.userId, updates);
-        syncUserUpdateToLeadList(user.email, {
-          subscriptionType: updates.subscriptionType,
-          subscription_status: updates.subscription_status,
-        });
+        if ('current_period_end' in updates) changes.push('period_end synced');
+        if ('activeOffer' in updates) {
+          changes.push(updates.activeOffer ? `offer synced (${updates.activeOffer.couponId})` : 'offer cleared');
+        }
         summary.fixed++;
         summary.details.push({ email: user.email, action: changes.join(', ') });
         console.log(`[STRIPE RECONCILE] Fixed ${user.email}: ${changes.join(', ')}`);
@@ -1189,17 +1242,27 @@ export async function reconcileAllStripeUsers(): Promise<{
 // ─── Subscription Amount Resync ───────────────────────────────────────────────
 
 /**
- * Sync subscription_amount for all paying users by fetching their latest
- * paid invoice from Stripe. Can be triggered on demand from the admin UI.
+ * Resync all paying users against Stripe. For each user this:
+ *   1. Authoritatively reconciles subscription_status / has_payment_method /
+ *      tier / period_end / offer via reconcileStripeUser (Stripe wins), so a
+ *      stale "past_due"/overdue account whose recovery webhook never landed
+ *      gets unstuck.
+ *   2. Refreshes subscription_amount from the latest paid invoice.
+ *
+ * Can be triggered on demand from the admin UI ("Resync Payments").
+ *
+ * `updated` counts amount changes; `reconciled` counts users whose
+ * status/payment-method/etc. drift was corrected.
  */
 export async function resyncAllSubscriptionAmounts(): Promise<{
   checked: number;
   updated: number;
+  reconciled: number;
   skipped: number;
   errors: number;
 }> {
   const stripe = getStripeOrThrow();
-  const summary = { checked: 0, updated: 0, skipped: 0, errors: 0 };
+  const summary = { checked: 0, updated: 0, reconciled: 0, skipped: 0, errors: 0 };
 
   // Exclude empty strings — attribute_exists matches "" which causes Stripe errors
   const users = await userDb.scanWithFilter(
@@ -1217,6 +1280,15 @@ export async function resyncAllSubscriptionAmounts(): Promise<{
     }
 
     try {
+      // 1. Authoritative status/payment-method/tier reconcile (Stripe wins).
+      //    This is what unsticks an overdue account, not the amount sync below.
+      const reconcileUpdates = await reconcileStripeUser(user);
+      if (reconcileUpdates && Object.keys(reconcileUpdates).length > 0) {
+        summary.reconciled++;
+        console.log(`[STRIPE RESYNC] ${user.email}: reconciled ${Object.keys(reconcileUpdates).join(', ')}`);
+      }
+
+      // 2. Refresh subscription_amount from the latest paid invoice.
       const invoices = await stripe.invoices.list({
         customer: user.stripe_customer_id,
         status: 'paid',
@@ -1225,12 +1297,12 @@ export async function resyncAllSubscriptionAmounts(): Promise<{
 
       const latestPaid = invoices.data[0];
       if (!latestPaid || typeof latestPaid.amount_paid !== 'number' || latestPaid.amount_paid <= 0) {
-        summary.skipped++;
+        if (!reconcileUpdates) summary.skipped++;
         continue;
       }
 
       if (user.subscription_amount === latestPaid.amount_paid) {
-        summary.skipped++;
+        if (!reconcileUpdates) summary.skipped++;
         continue;
       }
 
@@ -1243,6 +1315,6 @@ export async function resyncAllSubscriptionAmounts(): Promise<{
     }
   }
 
-  console.log(`[STRIPE RESYNC] Done: checked=${summary.checked}, updated=${summary.updated}, skipped=${summary.skipped}, errors=${summary.errors}`);
+  console.log(`[STRIPE RESYNC] Done: checked=${summary.checked}, updated=${summary.updated}, reconciled=${summary.reconciled}, skipped=${summary.skipped}, errors=${summary.errors}`);
   return summary;
 }

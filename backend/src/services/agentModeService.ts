@@ -34,7 +34,11 @@ import { mergeCustomFields } from '../utils/customFieldsGuard';
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
-const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'manage_user_guide', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage'];
+// Note: list_predefined_work_plans is intentionally NOT admin-gated — it is a
+// foundation tool that returns published/launchable templates for non-admins and
+// the full management list for admins (role-aware in apiTools.ts). The admin-only
+// mutation tool remains manage_predefined_work_plan.
+const ADMIN_SKILL_TOOL_NAMES = ['manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'manage_user_guide', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -68,6 +72,15 @@ import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
+import { getAgentRunRecorder } from '../loops/instances/agent-mode';
+import {
+  AgentToolPolicyDecision,
+  executeAgentToolThroughGateway,
+  evaluateAgentToolPolicy,
+  summarizeAgentToolPolicyFlags,
+  summarizeAgentToolPolicyModes,
+  validateAndRepairToolArgs,
+} from './agentToolGatewayService';
 
 type MetaApiResult = {
   success: boolean;
@@ -97,6 +110,218 @@ const openai = new OpenAI({
   defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION },
   defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
 });
+
+/**
+ * Self-learning loop telemetry for agent-mode tool calls.
+ *
+ * Emits one decision event + per-tool invoked/succeeded/failed events into the
+ * shared LoopEvents table. Fire-and-forget: never awaited on the chat hot path,
+ * and a no-op unless AGENT_RUNTIME_SPINE_ENABLED=true (or the legacy
+ * AGENT_MODE_LOOP_ENABLED=true) because getAgentRunRecorder returns null.
+ *
+ * Keep V0 observability-only: this must not change tool execution, retries,
+ * prompts, streaming, or user-facing responses.
+ */
+function recordAgentModeToolTelemetry(
+  runId: string,
+  sessionId: string,
+  iteration: number,
+  toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>,
+): void {
+  const recorder = getAgentRunRecorderSafe();
+  if (!recorder || toolResults.length === 0) return;
+
+  void (async () => {
+    try {
+      const toolNames = toolResults.map(r => r.toolCall?.function?.name ?? 'unknown');
+      await recorder.decision(runId, {
+        iteration,
+        toolNames,
+        sessionId,
+        toolArgKeys: summarizeToolArgKeys(toolResults),
+        toolArgsPreview: summarizeToolArgs(toolResults),
+        decisionExplanation: summarizeToolDecision(toolResults),
+        explanationSource: 'deterministic_tool_summary',
+        toolPolicyFlags: summarizeAgentToolPolicyFlags(toolResults.map((r) => r.policyDecision)),
+        toolPolicySummary: summarizeAgentToolPolicyModes(toolResults.map((r) => r.policyDecision)),
+      });
+      for (const r of toolResults) {
+        const toolName = r.toolCall?.function?.name ?? 'unknown';
+        await recorder.toolInvoked(runId, { toolName, iteration, sessionId });
+        if (r.status === 'success') {
+          await recorder.toolSucceeded(runId, { toolName, durationMs: r.duration, sessionId });
+        } else {
+          await recorder.toolFailed(runId, { toolName, error: r.error, durationMs: r.duration, sessionId });
+        }
+      }
+    } catch (err) {
+      console.error('[agent-mode] tool telemetry failed (swallowed):', err);
+    }
+  })();
+}
+
+function toolResultError(result: unknown): Error | null {
+  if (!result || typeof result !== 'object') return null;
+  const obj = result as Record<string, any>;
+
+  if (obj.isError === true) {
+    return new Error(extractToolResultMessage(obj) || 'Tool returned isError=true');
+  }
+
+  if (obj.success === false) {
+    return new Error(extractToolResultMessage(obj) || 'Tool returned success=false');
+  }
+
+  return null;
+}
+
+function extractToolResultMessage(obj: Record<string, any>): string {
+  if (typeof obj.error === 'string' && obj.error.trim()) return obj.error.trim();
+  if (typeof obj.message === 'string' && obj.message.trim()) return obj.message.trim();
+  if (typeof obj.content === 'string' && obj.content.trim()) return obj.content.trim();
+
+  if (Array.isArray(obj.content)) {
+    const text = obj.content
+      .map((part: any) => typeof part?.text === 'string' ? part.text : '')
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+    if (text) return text;
+  }
+
+  return '';
+}
+
+function recordAgentModeRunStarted(
+  runId: string,
+  info: { llmModel?: string; sessionType?: string; userId?: string; sessionId?: string },
+): void {
+  const recorder = getAgentRunRecorderSafe();
+  if (!recorder) return;
+  void recorder.runStarted(runId, info);
+}
+
+function recordAgentModeRunCompleted(
+  runId: string,
+  info: { toolCalls?: number; failedToolCalls?: number; sessionId?: string },
+): void {
+  const recorder = getAgentRunRecorderSafe();
+  if (!recorder) return;
+  void recorder.runCompleted(runId, info);
+}
+
+function recordAgentModeRunFailed(
+  runId: string,
+  info: { error: unknown; toolCalls?: number; failedToolCalls?: number; sessionId?: string },
+): void {
+  const recorder = getAgentRunRecorderSafe();
+  if (!recorder) return;
+  void recorder.runFailed(runId, info);
+}
+
+function countFailedToolCalls(toolCalls: any[]): number {
+  return toolCalls.filter((toolCall) => toolCall && 'error' in toolCall).length;
+}
+
+const AGENT_RUNTIME_ARG_PREVIEW_MAX_CHARS = 1200;
+const AGENT_RUNTIME_REDACTED_ARG_KEYS = /token|secret|password|credential|authorization|api[_-]?key|cookie/i;
+
+function summarizeToolArgKeys(
+  toolResults: Array<{ toolCall: any; functionArgs?: any }>,
+): string {
+  return toolResults
+    .map((r) => {
+      const toolName = r.toolCall?.function?.name ?? 'unknown';
+      const keys = r.functionArgs && typeof r.functionArgs === 'object' && !Array.isArray(r.functionArgs)
+        ? Object.keys(r.functionArgs).sort().join('|')
+        : '';
+      return keys ? `${toolName}:${keys}` : `${toolName}:`;
+    })
+    .join(',');
+}
+
+function summarizeToolArgs(
+  toolResults: Array<{ toolCall: any; functionArgs?: any }>,
+): string {
+  const safe = toolResults.map((r) => ({
+    tool: r.toolCall?.function?.name ?? 'unknown',
+    args: redactTelemetryValue(r.functionArgs),
+  }));
+  const json = JSON.stringify(safe);
+  return json.length > AGENT_RUNTIME_ARG_PREVIEW_MAX_CHARS
+    ? `${json.slice(0, AGENT_RUNTIME_ARG_PREVIEW_MAX_CHARS - 3)}...`
+    : json;
+}
+
+function summarizeToolDecision(
+  toolResults: Array<{ toolCall: any; functionArgs?: any }>,
+): string {
+  const toolNames = toolResults.map((r) => r.toolCall?.function?.name ?? 'unknown');
+  const uniqueTools = [...new Set(toolNames)];
+  if (uniqueTools.length === 0) return 'No tool decision was recorded.';
+  if (uniqueTools.every((name) => name === 'search_web')) {
+    const queries = toolResults
+      .map((r) => typeof r.functionArgs?.query === 'string' ? r.functionArgs.query : '')
+      .filter(Boolean)
+      .slice(0, 3);
+    return queries.length > 0
+      ? `Chose web search to gather external or current information for: ${queries.join(' | ')}.`
+      : 'Chose web search to gather external or current information.';
+  }
+  const reasons: string[] = [];
+  if (uniqueTools.includes('save_memory')) reasons.push('save_memory to persist user-provided information for future context');
+  if (uniqueTools.includes('read_file_content')) reasons.push('read_file_content to inspect a file artifact before answering');
+  if (uniqueTools.includes('save_file')) reasons.push('save_file to create or update a durable file artifact');
+  if (uniqueTools.includes('install_skills')) reasons.push('install_skills to make a required skill or work-plan capability available before continuing');
+  if (reasons.length === 1 && uniqueTools.length === 1) return `Chose ${reasons[0]}.`;
+  if (reasons.length > 0) return `Chose multiple tools: ${reasons.join('; ')}.`;
+  if (uniqueTools.some((name) => name.startsWith('playwright_browser_'))) {
+    return `Chose browser automation to inspect or interact with a webpage using: ${uniqueTools.join(', ')}.`;
+  }
+  if (uniqueTools.includes('create_task_from_prompt')) {
+    return 'Chose create_task_from_prompt because the request appears to require creating a tracked task.';
+  }
+  if (uniqueTools.length === 1) {
+    return `Chose ${uniqueTools[0]} based on the requested action and available tool schema.`;
+  }
+  return `Chose multiple tools in one iteration: ${uniqueTools.join(', ')}.`;
+}
+
+function redactTelemetryValue(value: unknown, depth = 0): unknown {
+  if (depth > 3) return '[truncated]';
+  if (value === null || value === undefined) return value ?? null;
+  if (typeof value === 'string') {
+    return value.length > 240 ? `${value.slice(0, 237)}...` : value;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+  if (Array.isArray(value)) {
+    return value.slice(0, 8).map((item) => redactTelemetryValue(item, depth + 1));
+  }
+  if (typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value as Record<string, unknown>).slice(0, 24)) {
+      out[key] = AGENT_RUNTIME_REDACTED_ARG_KEYS.test(key)
+        ? '[redacted]'
+        : redactTelemetryValue(child, depth + 1);
+    }
+    return out;
+  }
+  return String(value);
+}
+
+function getAgentRunRecorderSafe() {
+  try {
+    return getAgentRunRecorder();
+  } catch (err) {
+    console.error('[agent-mode] runtime spine recorder unavailable (swallowed):', err);
+    return null;
+  }
+}
+
+function buildAgentRuntimeRunId(sessionId: string): string {
+  const randomSuffix = Math.random().toString(36).slice(2, 8);
+  return `${sessionId}:run:${Date.now().toString(36)}:${randomSuffix}`;
+}
 
 // Type declaration for pdf-parse module
 interface PDFData {
@@ -187,6 +412,15 @@ interface LLMCallOptions {
 // Diagnosis agent configuration
 const DIAGNOSIS_MODEL = 'gemini-3.1-flash-lite';
 const DIAGNOSIS_TIMEOUT_MS = 10_000;
+
+// Markers used by perform_data_analysis to capture files the Gemini code-execution
+// sandbox produces. The sandbox filesystem is discarded after execution and Gemini
+// never returns arbitrary on-disk files (only inline images), so the model is told
+// to print a file's full contents to stdout between these markers. The backend then
+// extracts the content and uploads it to real, downloadable S3 storage.
+const DATA_ANALYSIS_FILE_START_PREFIX = '<<<AGENTWEB_FILE:';
+const DATA_ANALYSIS_FILE_MARKER_SUFFIX = '>>>';
+const DATA_ANALYSIS_FILE_END_MARKER = '<<<AGENTWEB_FILE_END>>>';
 
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'avif', 'heic', 'heif']);
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wmv', 'm4v', 'ogv', '3gp', 'ts']);
@@ -589,10 +823,12 @@ export class AgentModeService {
             properties: {
               s3_key: {
                 type: 'string',
+                'x-aliases': ['s3Key', 'key', 'file_key', 'storage_key', 'object_key'],
                 description: 'The S3 key from the "[Full response stored at S3 key: ...]" reference in the tool result'
               },
               query: {
                 type: 'string',
+                'x-aliases': ['search_query', 'search', 'q', 'term'],
                 description: 'The text or field name to search for (e.g. "link_url", "destination_url", "sessionId")'
               },
               match_offset: {
@@ -629,6 +865,7 @@ export class AgentModeService {
             properties: {
               s3_key: {
                 type: 'string',
+                'x-aliases': ['s3Key', 'key', 'file_key', 'storage_key', 'object_key'],
                 description: 'The S3 key from the "[Full response stored at S3 key: ...]" reference in the tool result'
               },
               char_offset: {
@@ -1982,6 +2219,14 @@ export class AgentModeService {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
+    let _toolCallsForTelemetry: any[] = [];
+    const agentRuntimeRunId = buildAgentRuntimeRunId(sessionId);
+    recordAgentModeRunStarted(agentRuntimeRunId, {
+      llmModel,
+      userId,
+      sessionId,
+      sessionType: isInteractiveShare ? 'interactive_share' : 'regular',
+    });
     try {
       // Map legacy/renamed model ids forward (e.g. old sessions persisted the
       // pre-rename "claude-opus-4-8") so metadata, pricing, and routing all use
@@ -2188,6 +2433,7 @@ export class AgentModeService {
 
       let content = '';
       const toolCalls: any[] = [];
+      _toolCallsForTelemetry = toolCalls;
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
       const iterationTimings: { iteration: number; llmDurationMs: number; toolNames: string[] }[] = [];
@@ -2546,7 +2792,42 @@ export class AgentModeService {
         const failedCounterUpdates: Record<string, number> = {};
 
         // Phase 1: Validate and prepare tool calls (synchronous)
-        const preparedCalls: Array<{ toolCall: any; functionArgs: any }> = [];
+        const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision }> = [];
+        const preflightToolResults: Array<{ status: 'error'; toolCall: any; functionArgs: any; error: Error; duration: number; policyDecision?: AgentToolPolicyDecision }> = [];
+
+        const appendPreflightToolFailure = (
+          toolCall: any,
+          functionArgs: any,
+          errorMessage: string,
+          content: any,
+          policyDecision?: AgentToolPolicyDecision,
+        ) => {
+          const error = new Error(errorMessage);
+          (messages as any[]).push({
+            tool_call_id: toolCall.id,
+            role: 'tool',
+            name: toolCall.function.name,
+            content,
+            metadata: { timestamp: new Date().toISOString() }
+          });
+          toolCalls.push({
+            id: toolCall.id,
+            name: toolCall.function.name,
+            arguments: functionArgs ?? toolCall.function.arguments,
+            error: error.message,
+            duration: 0
+          });
+          failedCounterUpdates[toolCall.function.name] =
+            (failedCounterUpdates[toolCall.function.name] || 0) + 1;
+          preflightToolResults.push({
+            status: 'error',
+            toolCall,
+            functionArgs,
+            error,
+            duration: 0,
+            policyDecision,
+          });
+        };
 
         for (const toolCall of responseMessage.tool_calls) {
           try {
@@ -2566,48 +2847,26 @@ export class AgentModeService {
               const errorMsg = isInteractiveShare
                 ? `Tool "${toolCall.function.name}" is not available in shared sessions. You can continue to use it in Agent Mode in your own session.`
                 : `Tool "${toolCall.function.name}" requires admin access. This session does not have admin privileges.`;
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: JSON.stringify({ error: errorMsg }),
-                metadata: { timestamp: new Date().toISOString() }
-              });
+              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
               continue;
             }
 
             if (isInteractiveShare && toolCall.function.name === 'connect_account') {
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: JSON.stringify({ error: 'Account connections are not available in shared sessions. Tell the user they need to open Agent Mode in their own account to connect this account, then come back here.' }),
-                metadata: { timestamp: new Date().toISOString() }
-              });
+              const errorMsg = 'Account connections are not available in shared sessions. Tell the user they need to open Agent Mode in their own account to connect this account, then come back here.';
+              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
               continue;
             }
 
             // Block context-restricted tools even if LLM hallucinates the call from history
             if (excludeTools?.includes(toolCall.function.name)) {
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: JSON.stringify({ error: `Tool "${toolCall.function.name}" is not available in this context.` }),
-                metadata: { timestamp: new Date().toISOString() }
-              });
+              const errorMsg = `Tool "${toolCall.function.name}" is not available in this context.`;
+              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
               continue;
             }
 
             if (publishedSkills.length > 0 && sessionAssociatedSkillIds.length > 0 && !allowedToolNames.has(toolCall.function.name)) {
               const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: JSON.stringify({ error: errorMsg }),
-                metadata: { timestamp: new Date().toISOString() }
-              });
+              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
               continue;
             }
 
@@ -2616,19 +2875,59 @@ export class AgentModeService {
               skillsUpdated = true;
             }
 
-            preparedCalls.push({ toolCall, functionArgs });
+            const initialPolicyDecision = evaluateAgentToolPolicy({
+              toolName: toolCall.function.name,
+              args: functionArgs,
+              isAdmin: hasAdminAccess,
+              isSharedSession: isInteractiveShare,
+              enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
+            });
+
+            const toolDefinition = this.toolRegistry.getTool(toolCall.function.name)?.definition;
+            const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.inputSchema;
+            const contractResult = validateAndRepairToolArgs({
+              toolName: toolCall.function.name,
+              args: functionArgs,
+              inputSchema,
+              effect: initialPolicyDecision.effect,
+            });
+
+            if (contractResult.status === 'invalid') {
+              const errorContent = this.formatToolError(toolCall.function.name, contractResult.modelMessage);
+              appendPreflightToolFailure(toolCall, functionArgs, contractResult.modelMessage, errorContent, initialPolicyDecision);
+              continue;
+            }
+
+            const preparedFunctionArgs = contractResult.args;
+            const policyDecision = evaluateAgentToolPolicy({
+              toolName: toolCall.function.name,
+              args: preparedFunctionArgs,
+              isAdmin: hasAdminAccess,
+              isSharedSession: isInteractiveShare,
+              enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
+            });
+
+            if (contractResult.status === 'repaired') {
+              policyDecision.flags.push({
+                code: 'args_repaired',
+                severity: 'info',
+                message: `Tool arguments were repaired before execution: ${contractResult.repairs.join(', ')}`,
+              });
+            }
+
+            if (!policyDecision.allowed) {
+              const errorMsg = `Tool "${toolCall.function.name}" was blocked by Agent Tool Gateway policy: ${policyDecision.flags.map((flag) => flag.message).join(' ')}`;
+              appendPreflightToolFailure(toolCall, preparedFunctionArgs, errorMsg, JSON.stringify({ error: errorMsg, policy: policyDecision }), policyDecision);
+              continue;
+            }
+
+            preparedCalls.push({ toolCall, functionArgs: preparedFunctionArgs, policyDecision });
           } catch (error) {
             // JSON parse failure — append error message for LLM
             console.error(`AgentMode: Tool argument parse error for ${toolCall.function.name}:`, error);
             const errMsg = error instanceof Error ? error.message : String(error);
             const errorContent = this.formatToolError(toolCall.function.name, `Failed to parse arguments: ${errMsg}`);
-            (messages as any[]).push({
-              tool_call_id: toolCall.id,
-              role: 'tool',
-              name: toolCall.function.name,
-              content: errorContent,
-              metadata: { timestamp: new Date().toISOString() }
-            });
+            appendPreflightToolFailure(toolCall, undefined, `Failed to parse arguments: ${errMsg}`, errorContent);
           }
         }
 
@@ -2642,46 +2941,84 @@ export class AgentModeService {
           toolCall.function.name === 'generate_image' || toolCall.function.name === 'generate_video' || toolCall.function.name === 'generate_voiceover'
         );
 
-        let toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs: any; result?: any; error?: any; duration: number }>;
+        let toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs: any; result?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>;
 
         if (hasWaitTool || hasMultipleMediaGenTools) {
           // Sequential execution — preserves ordering so wait_seconds acts as a pause between tools,
           // and prevents rate-limit throttling when batching multiple image/video generation calls
           toolResults = [];
-          for (const { toolCall, functionArgs } of preparedCalls) {
-            const toolStart = Date.now();
-            try {
-              const toolOptions: Record<string, any> = {};
-              if (socketEmit) toolOptions.socketEmit = socketEmit;
-              if (screenshotUrl) toolOptions.screenshotUrl = screenshotUrl;
-              if (isDelegatedAccess) toolOptions.isDelegatedAccess = true;
-              const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, Object.keys(toolOptions).length > 0 ? toolOptions : undefined);
-              const toolDuration = Date.now() - toolStart;
-              toolResults.push({ status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration });
-            } catch (error) {
-              const toolDuration = Date.now() - toolStart;
-              toolResults.push({ status: 'error' as const, toolCall, functionArgs, error, duration: toolDuration });
+          for (const { toolCall, functionArgs, policyDecision } of preparedCalls) {
+            const outcome = await executeAgentToolThroughGateway({
+              toolName: toolCall.function.name,
+              args: functionArgs,
+              policyDecision,
+              execute: () => this.executePreparedAgentTool({
+                llmModel,
+                toolName: toolCall.function.name,
+                functionArgs,
+                userId,
+                sessionId,
+                mockMode,
+                socketEmit,
+                screenshotUrl,
+                isDelegatedAccess,
+              }),
+            });
+            if (outcome.status === 'success') {
+              toolResults.push({ status: 'success' as const, toolCall, functionArgs, result: outcome.result, duration: outcome.durationMs, policyDecision: outcome.policyDecision });
+            } else {
+              toolResults.push({ status: 'error' as const, toolCall, functionArgs, error: outcome.error, duration: outcome.durationMs, policyDecision: outcome.policyDecision });
             }
           }
         } else {
           // Parallel execution (default)
-          const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs }) => {
-            const toolStart = Date.now();
-            try {
-              const toolOptions: Record<string, any> = {};
-              if (socketEmit) toolOptions.socketEmit = socketEmit;
-              if (screenshotUrl) toolOptions.screenshotUrl = screenshotUrl;
-              if (isDelegatedAccess) toolOptions.isDelegatedAccess = true;
-              const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, Object.keys(toolOptions).length > 0 ? toolOptions : undefined);
-              const toolDuration = Date.now() - toolStart;
-              return { status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration };
-            } catch (error) {
-              const toolDuration = Date.now() - toolStart;
-              return { status: 'error' as const, toolCall, functionArgs, error, duration: toolDuration };
+          const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs, policyDecision }) => {
+            const outcome = await executeAgentToolThroughGateway({
+              toolName: toolCall.function.name,
+              args: functionArgs,
+              policyDecision,
+              execute: () => this.executePreparedAgentTool({
+                llmModel,
+                toolName: toolCall.function.name,
+                functionArgs,
+                userId,
+                sessionId,
+                mockMode,
+                socketEmit,
+                screenshotUrl,
+                isDelegatedAccess,
+              }),
+            });
+            if (outcome.status === 'success') {
+              return { status: 'success' as const, toolCall, functionArgs, result: outcome.result, duration: outcome.durationMs, policyDecision: outcome.policyDecision };
             }
+            return { status: 'error' as const, toolCall, functionArgs, error: outcome.error, duration: outcome.durationMs, policyDecision: outcome.policyDecision };
           });
           toolResults = await Promise.all(toolPromises);
         }
+
+        toolResults = toolResults.map((toolResult) => {
+          if (toolResult.status !== 'success') return toolResult;
+          const error = toolResultError(toolResult.result);
+          if (!error) return toolResult;
+          return {
+            status: 'error' as const,
+            toolCall: toolResult.toolCall,
+            functionArgs: toolResult.functionArgs,
+            error,
+            duration: toolResult.duration,
+            policyDecision: toolResult.policyDecision,
+          };
+        });
+        const telemetryToolResults = [...preflightToolResults, ...toolResults];
+
+        // Runtime spine V0 telemetry: record this iteration's decision + each
+        // tool's invoked/succeeded/failed outcome into the shared LoopEvents
+        // table. Best-effort and non-blocking — the recorder swallows its own
+        // errors and is a no-op unless AGENT_RUNTIME_SPINE_ENABLED=true (or the
+        // legacy AGENT_MODE_LOOP_ENABLED=true). This is observability-only and
+        // must not affect tool execution, retries, streaming, or responses.
+        recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults);
 
         // Phase 3: Process results in original order — append to messages, toolCalls, counters
         for (const toolResult of toolResults) {
@@ -2938,6 +3275,11 @@ export class AgentModeService {
         (msg: any) => msg.role !== 'user'
       );
 
+      recordAgentModeRunCompleted(agentRuntimeRunId, {
+        sessionId,
+        toolCalls: toolCalls.length,
+        failedToolCalls: countFailedToolCalls(toolCalls),
+      });
       return {
         content,
         toolCalls,
@@ -2996,6 +3338,12 @@ export class AgentModeService {
       if (partialResponseMessages.length > 0) {
         wrappedError.partialUsageMessages = partialResponseMessages;
       }
+      recordAgentModeRunFailed(agentRuntimeRunId, {
+        error: wrappedError,
+        sessionId,
+        toolCalls: _toolCallsForTelemetry.length,
+        failedToolCalls: countFailedToolCalls(_toolCallsForTelemetry),
+      });
       throw wrappedError;
     }
   }
@@ -3129,6 +3477,79 @@ export class AgentModeService {
       default:
         return `${emoji} **${toolDescription}** status: ${status}`;
     }
+  }
+
+  /**
+   * Render a session work plan into LLM context message(s).
+   *
+   * Shared by agent mode (buildMarketingContext) and Emma (chatbotService.generateChatResponse)
+   * so that whichever assistant the user is chatting with sees and follows the same active plan.
+   *
+   * - When every step is terminal (completed/skipped): emits a single user-role [SYSTEM] message
+   *   instructing the LLM not to re-execute finished work.
+   * - Otherwise: emits an assistant-role message listing each step with its status, description,
+   *   required functions, and auto-installed skills, plus autocomplete guidance when enabled.
+   *
+   * Returns an empty array when there is no work plan or it has no steps.
+   */
+  public static buildWorkPlanContextMessages(workPlan?: any): any[] {
+    if (!workPlan || !Array.isArray(workPlan.steps) || workPlan.steps.length === 0) {
+      return [];
+    }
+
+    const statusIcons = {
+      completed: '✓',
+      pending: '○',
+      skipped: '⊘'
+    };
+
+    // Check if all steps are terminal (completed or skipped) — no pending work remains
+    const allStepsDone = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+
+    let workPlanContent = `⚠️ IMPORTANT: A WORK PLAN ALREADY EXISTS FOR THIS SESSION ⚠️\n\n`;
+    workPlanContent += `[Current Active Work Plan: "${workPlan.title}"]\n\n`;
+
+    if (allStepsDone) {
+      // When all steps are done, skip listing step details to avoid the LLM trying to "finish" them.
+      // Use a user-role message so it appears as a direct instruction right before the assistant responds.
+      const completedCount = workPlan.steps.filter((s: any) => s.status === 'completed').length;
+      const skippedCount = workPlan.steps.filter((s: any) => s.status === 'skipped').length;
+      workPlanContent += `✅ ALL ${workPlan.steps.length} STEPS ARE DONE (${completedCount} completed, ${skippedCount} skipped). `;
+      workPlanContent += `DO NOT retry or re-execute any work plan steps. DO NOT call generate_image or other tools to redo completed work. `;
+      workPlanContent += `If the user is asking about the completed work, respond with a plain-text summary. If the user is asking for something new and unrelated to the work plan, help them with that new request normally.`;
+      return [{ role: 'user', content: `[SYSTEM] ${workPlanContent.trim()}` }];
+    }
+
+    workPlanContent += `You MUST continue working with this existing plan. DO NOT create a new work plan. Use modify_work_plan if you need to add or change steps.\n\n`;
+
+    // If autocomplete is enabled, add instruction to auto-complete steps
+    if (workPlan.autocomplete) {
+      workPlanContent += `⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.\n\n`;
+    }
+
+    workPlan.steps.forEach((step: any) => {
+      const icon = statusIcons[step.status as keyof typeof statusIcons];
+      workPlanContent += `${step.stepCount}. ${icon} ${step.title} (${step.status})\n`;
+
+      // Include step description if available
+      if (step.description) {
+        workPlanContent += `   Description: ${step.description}\n`;
+      }
+
+      // Include required function calls if available
+      if (step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
+        workPlanContent += `   Required Functions: ${step.requiredFunctionCalls.join(', ')}\n`;
+      }
+
+      // Include skill IDs if available (for awareness)
+      if (step.skillIds && step.skillIds.length > 0) {
+        workPlanContent += `   Skills (auto-installed when this step becomes active): ${step.skillIds.join(', ')}\n`;
+      }
+
+      workPlanContent += '\n';
+    });
+
+    return [{ role: 'assistant', content: workPlanContent.trim() }];
   }
 
   private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string): any[] {
@@ -3289,62 +3710,7 @@ export class AgentModeService {
 
     // Insert work plan status as an assistant message if exists
     if (workPlan) {
-      const statusIcons = {
-        completed: '✓',
-        pending: '○',
-        skipped: '⊘'
-      };
-
-      // Check if all steps are terminal (completed or skipped) — no pending work remains
-      const allStepsDone = workPlan.steps.length > 0 &&
-        workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
-
-      let workPlanContent = `⚠️ IMPORTANT: A WORK PLAN ALREADY EXISTS FOR THIS SESSION ⚠️\n\n`;
-      workPlanContent += `[Current Active Work Plan: "${workPlan.title}"]\n\n`;
-
-      if (allStepsDone) {
-        // When all steps are done, skip listing step details to avoid the LLM trying to "finish" them.
-        // Use a user-role message so it appears as a direct instruction right before the assistant responds.
-        const completedCount = workPlan.steps.filter((s: any) => s.status === 'completed').length;
-        const skippedCount = workPlan.steps.filter((s: any) => s.status === 'skipped').length;
-        workPlanContent += `✅ ALL ${workPlan.steps.length} STEPS ARE DONE (${completedCount} completed, ${skippedCount} skipped). `;
-        workPlanContent += `DO NOT retry or re-execute any work plan steps. DO NOT call generate_image or other tools to redo completed work. `;
-        workPlanContent += `If the user is asking about the completed work, respond with a plain-text summary. If the user is asking for something new and unrelated to the work plan, help them with that new request normally.`;
-        console.log('workPlanContent', workPlanContent);
-        messages.push({ role: 'user', content: `[SYSTEM] ${workPlanContent.trim()}` });
-      } else {
-        workPlanContent += `You MUST continue working with this existing plan. DO NOT create a new work plan. Use modify_work_plan if you need to add or change steps.\n\n`;
-
-        // If autocomplete is enabled, add instruction to auto-complete steps
-        if (workPlan.autocomplete) {
-          workPlanContent += `⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.\n\n`;
-        }
-
-        workPlan.steps.forEach((step: any) => {
-          const icon = statusIcons[step.status as keyof typeof statusIcons];
-          workPlanContent += `${step.stepCount}. ${icon} ${step.title} (${step.status})\n`;
-
-          // Include step description if available
-          if (step.description) {
-            workPlanContent += `   Description: ${step.description}\n`;
-          }
-
-          // Include required function calls if available
-          if (step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
-            workPlanContent += `   Required Functions: ${step.requiredFunctionCalls.join(', ')}\n`;
-          }
-
-          // Include skill IDs if available (for awareness)
-          if (step.skillIds && step.skillIds.length > 0) {
-            workPlanContent += `   Skills (auto-installed when this step becomes active): ${step.skillIds.join(', ')}\n`;
-          }
-
-          workPlanContent += '\n';
-        });
-
-        console.log('workPlanContent', workPlanContent);
-        messages.push({ role: 'assistant', content: workPlanContent.trim() });
-      }
+      messages.push(...AgentModeService.buildWorkPlanContextMessages(workPlan));
     }
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)
@@ -3438,6 +3804,7 @@ export class AgentModeService {
     // Discovery
     'install_skills',
     'list_available_skills',
+    'resolve_skill',
 
     // GTM Context (Read/Write)
     'update_brand_guidelines',
@@ -3456,6 +3823,8 @@ export class AgentModeService {
     'modify_work_plan',
     'set_work_plan_status',
     'save_work_plan',
+    'list_predefined_work_plans',
+    'launch_predefined_work_plan',
 
     // Skill Creation (users can define custom skill bundles)
     'create_skill',
@@ -3519,6 +3888,11 @@ export class AgentModeService {
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
   // Made public for use in MCP server skill gating.
   public static FOUNDATION_TOOLS: Set<string> = new Set(AgentModeService.DEFAULT_FOUNDATION_TOOLS);
+  private static readonly MANDATORY_FOUNDATION_TOOLS: ReadonlyArray<string> = [
+    'install_skills',
+    'list_available_skills',
+    'resolve_skill',
+  ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
 
@@ -3582,8 +3956,9 @@ export class AgentModeService {
       if (setting?.settingValue) {
         const toolNames: string[] = JSON.parse(setting.settingValue);
         if (Array.isArray(toolNames) && toolNames.length > 0) {
-          AgentModeService.FOUNDATION_TOOLS = new Set(toolNames);
-          console.log(`AgentMode: Loaded ${toolNames.length} foundation tools from DB`);
+          const merged = [...new Set([...toolNames, ...AgentModeService.MANDATORY_FOUNDATION_TOOLS])];
+          AgentModeService.FOUNDATION_TOOLS = new Set(merged);
+          console.log(`AgentMode: Loaded ${merged.length} foundation tools from DB`);
           return;
         }
       }
@@ -3597,7 +3972,7 @@ export class AgentModeService {
    * Update foundation tools in DB and refresh the in-memory set.
    */
   public async updateFoundationTools(toolNames: string[], updatedBy: string): Promise<string[]> {
-    const unique = [...new Set(toolNames)];
+    const unique = [...new Set([...toolNames, ...AgentModeService.MANDATORY_FOUNDATION_TOOLS])];
     await settingsService.setSetting(
       AgentModeService.FOUNDATION_TOOLS_SETTING,
       JSON.stringify(unique),
@@ -3714,6 +4089,10 @@ export class AgentModeService {
 
   public async installSkills(skillIds: string[], userId: string, sessionId: string, isDelegatedAccess: boolean = false): Promise<any> {
     try {
+      if (!Array.isArray(skillIds) || skillIds.length === 0 || skillIds.some((id) => typeof id !== 'string')) {
+        return { message: "skillIds must be a non-empty array of skill IDs." };
+      }
+
       let installUserOrgId: string | undefined;
       try {
         const { userDb: uDb } = await import('./db');
@@ -5046,7 +5425,7 @@ export class AgentModeService {
       case 'update_html_file':
         // Mock validation for update_html_file
         try {
-          const instructions = JSON.parse(args.replacement_json);
+          const instructions = JSON.parse(args.operations_json || args.replacement_json);
 
           // Validate that it's an array
           if (!Array.isArray(instructions)) {
@@ -5138,7 +5517,7 @@ export class AgentModeService {
         } catch (error) {
           return {
             success: false,
-            message: 'Invalid JSON in replacement_json',
+            message: 'Invalid JSON in operations_json',
             error: error instanceof Error ? error.message : 'Unknown error'
           };
         }
@@ -5175,16 +5554,86 @@ export class AgentModeService {
     }
   }
 
+  private async executePreparedAgentTool(input: {
+    llmModel: string;
+    toolName: string;
+    functionArgs: any;
+    userId: string;
+    sessionId: string;
+    mockMode: boolean;
+    socketEmit?: any;
+    screenshotUrl?: string;
+    isDelegatedAccess?: boolean;
+  }): Promise<any> {
+    const toolOptions: Record<string, any> = {};
+    if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
+    if (input.screenshotUrl) toolOptions.screenshotUrl = input.screenshotUrl;
+    if (input.isDelegatedAccess) toolOptions.isDelegatedAccess = true;
+
+    return this.executeTool(
+      input.llmModel,
+      input.toolName,
+      input.functionArgs,
+      input.userId,
+      input.sessionId,
+      input.mockMode,
+      Object.keys(toolOptions).length > 0 ? toolOptions : undefined,
+    );
+  }
+
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
+    const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
+    const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
+    const initialPolicyDecision = evaluateAgentToolPolicy({
+      toolName,
+      args,
+      isAdmin: extraContext?.isDelegatedAdmin === true,
+      enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
+    });
+    const contractResult = validateAndRepairToolArgs({
+      toolName,
+      args,
+      inputSchema,
+      effect: initialPolicyDecision.effect,
+    });
+
+    if (contractResult.status === 'invalid') {
+      return {
+        success: false,
+        error: contractResult.modelMessage,
+        validation: {
+          status: contractResult.status,
+          issues: contractResult.issues,
+          repairs: contractResult.repairs,
+        },
+      };
+    }
+
+    const preparedArgs = contractResult.args;
+    const policyDecision = evaluateAgentToolPolicy({
+      toolName,
+      args: preparedArgs,
+      isAdmin: extraContext?.isDelegatedAdmin === true,
+      enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
+    });
+
+    if (!policyDecision.allowed) {
+      return {
+        success: false,
+        error: `Tool "${toolName}" was blocked by Agent Tool Gateway policy: ${policyDecision.flags.map((flag) => flag.message).join(' ')}`,
+        policy: policyDecision,
+      };
+    }
+
     // In mock mode, only session-state tools (install_skills) execute for real
     // because they modify DynamoDB session state with no external side effects
     // and are required for the skill-gated tool flow to work during benchmark tests.
     if (mockMode && !AgentModeService.MOCK_BYPASS_TOOLS.has(toolName)) {
-      return this.getMockToolResult(toolName, args);
+      return this.getMockToolResult(toolName, preparedArgs);
     }
 
     try {
-      return await this.toolRegistry.execute(toolName, args, {
+      return await this.toolRegistry.execute(toolName, preparedArgs, {
         userId,
         sessionId,
         llmModel,
@@ -5739,6 +6188,79 @@ export class AgentModeService {
     }
   }
 
+  // Infer a sensible Content-Type for a file the analysis sandbox produced, based
+  // on its extension. Defaults to text/plain so downloads are always served as a
+  // viewable/saveable file rather than an opaque octet-stream.
+  private static contentTypeForFilename(filename: string): string {
+    const ext = (filename.split('.').pop() || '').toLowerCase();
+    switch (ext) {
+      case 'csv': return 'text/csv';
+      case 'json': return 'application/json';
+      case 'tsv': return 'text/tab-separated-values';
+      case 'md': return 'text/markdown';
+      case 'html': case 'htm': return 'text/html';
+      case 'xml': return 'application/xml';
+      case 'txt': return 'text/plain';
+      default: return 'text/plain';
+    }
+  }
+
+  // Scan code-execution stdout/text for files the model emitted between the
+  // AGENTWEB_FILE markers, upload each to S3, and return real download links plus
+  // the text with the marker blocks stripped out (so the raw file contents are not
+  // dumped into the chat). Gemini's sandbox discards on-disk files, so this
+  // print-between-markers protocol is the only reliable way to deliver a generated
+  // file to the user.
+  private async extractAndUploadAnalysisFiles(
+    text: string,
+    userId: string
+  ): Promise<{ cleanedText: string; links: string[] }> {
+    const links: string[] = [];
+    if (!text || !text.includes(DATA_ANALYSIS_FILE_START_PREFIX)) {
+      return { cleanedText: text, links };
+    }
+
+    // Match a start marker (capturing the filename), the body, and the end marker.
+    // [\s\S] so the body can span newlines; non-greedy so adjacent files don't merge.
+    const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(
+      `${escapeRegExp(DATA_ANALYSIS_FILE_START_PREFIX)}([^\\r\\n>]*?)${escapeRegExp(DATA_ANALYSIS_FILE_MARKER_SUFFIX)}\\r?\\n([\\s\\S]*?)\\r?\\n?${escapeRegExp(DATA_ANALYSIS_FILE_END_MARKER)}`,
+      'g'
+    );
+
+    const { uploadFileToS3 } = await import('../utils/s3Utils');
+    let cleanedText = text;
+    const matches = [...text.matchAll(pattern)];
+    let fallbackIndex = 0;
+    for (const match of matches) {
+      const rawName = (match[1] || '').trim();
+      const body = match[2] ?? '';
+      // Sanitize/default the filename so we never produce an unusable S3 key.
+      const safeName = rawName.replace(/[\r\n]/g, '').trim() || `analysis_output_${fallbackIndex++}.csv`;
+      try {
+        const uploadResult = await uploadFileToS3(
+          Buffer.from(body, 'utf-8'),
+          safeName,
+          userId,
+          AgentModeService.contentTypeForFilename(safeName)
+        );
+        if (uploadResult.success && uploadResult.url) {
+          links.push(`**File saved:** [${safeName}](${uploadResult.url})`);
+          // Replace the whole marker block with a concise reference instead of the raw contents.
+          cleanedText = cleanedText.replace(match[0], `[Generated file: ${safeName} — download link below]`);
+        } else {
+          console.error(`AgentMode: performDataAnalysis failed to upload generated file "${safeName}":`, uploadResult.error);
+          cleanedText = cleanedText.replace(match[0], `[Generated file: ${safeName} — upload failed]`);
+        }
+      } catch (error) {
+        console.error(`AgentMode: performDataAnalysis error uploading generated file "${safeName}":`, error);
+        cleanedText = cleanedText.replace(match[0], `[Generated file: ${safeName} — upload failed]`);
+      }
+    }
+
+    return { cleanedText, links };
+  }
+
   public async performDataAnalysis(fileUrls: string[], analysisInstruction: string, userId: string): Promise<any> {
     try {
       const urlsToProcess = Array.isArray(fileUrls) ? fileUrls.filter(url => !!url) : [];
@@ -6002,7 +6524,7 @@ export class AgentModeService {
 
       // Add text part with analysis instruction so the model knows how to proceed with or without files
       parts.push({
-        text: `Please perform the following analysis task. ${fileGuidance}\n\n${analysisInstruction}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present.\n\nIMPORTANT: When generating charts or visualizations, you MUST use matplotlib or seaborn to produce rasterized PNG images. Do NOT use altair, vega, vega-lite, or any library that produces JSON specs instead of rendered images. Always call plt.savefig() or equivalent to emit the image as inline output, then call plt.close() to free memory.`
+        text: `Please perform the following analysis task. ${fileGuidance}\n\n${analysisInstruction}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present.\n\nIMPORTANT: When generating charts or visualizations, you MUST use matplotlib or seaborn to produce rasterized PNG images. Do NOT use altair, vega, vega-lite, or any library that produces JSON specs instead of rendered images. Always call plt.savefig() or equivalent to emit the image as inline output, then call plt.close() to free memory.\n\nSAVING FILES FOR DOWNLOAD: If the task asks you to save, export, or otherwise produce a file the user should download (e.g. a CSV, JSON, or text file), you MUST print its COMPLETE contents to stdout with print(), wrapped EXACTLY in these markers, each on its own line:\n${DATA_ANALYSIS_FILE_START_PREFIX}<filename>${DATA_ANALYSIS_FILE_MARKER_SUFFIX}\n<full file contents>\n${DATA_ANALYSIS_FILE_END_MARKER}\nUse a short, descriptive filename with the correct extension (e.g. seed_audience.csv). The platform captures everything between these markers and saves it to real, downloadable storage, then returns a working download link to the user. Do NOT invent, guess, fabricate, or report any download URL, S3 key, or file path yourself (e.g. a bare filename, an "https://...s3..." URL, or a "sandbox:/..." path) — the sandbox filesystem is discarded after execution and ANY such path will fail to download. Printing the contents between the markers above is the ONLY way to deliver a file to the user.`
       });
 
       // Call Gemini API directly via REST to enable code execution
@@ -6041,9 +6563,23 @@ export class AgentModeService {
       // Extract parts from response
       const responseParts = candidates[0].content.parts || [];
 
+      // Generated-file download links collected from marked stdout/text blocks.
+      const fileLinks: string[] = [];
+
       for (const part of responseParts) {
         if (part.text) {
-          resultParts.push(`**Analysis:** ${part.text}`);
+          const { cleanedText, links } = await this.extractAndUploadAnalysisFiles(part.text, userId);
+          fileLinks.push(...links);
+          resultParts.push(`**Analysis:** ${cleanedText}`);
+        }
+        // Capture files the model printed to stdout via code execution. Gemini returns
+        // executed-code output in a codeExecutionResult / code_execution_result part;
+        // the marker protocol means generated file contents arrive here, not on disk.
+        const execResult = (part as any).codeExecutionResult || (part as any).code_execution_result;
+        if (execResult && typeof execResult.output === 'string') {
+          codeExecuted = true;
+          const { links } = await this.extractAndUploadAnalysisFiles(execResult.output, userId);
+          fileLinks.push(...links);
         }
         // Handle inline data (images/charts from code execution) (handle both camelCase and snake_case)
         if ((part as any).inlineData && (part as any).inlineData.data) {
@@ -6110,6 +6646,11 @@ export class AgentModeService {
         }
       }
 
+      // Surface real, downloadable links for any files the model generated.
+      if (fileLinks.length > 0) {
+        resultParts.push(`**Generated Files:**\n${fileLinks.join('\n')}`);
+      }
+
       if (resultParts.length === 0) {
         return {
           success: false,
@@ -6125,7 +6666,8 @@ export class AgentModeService {
         message: 'Data analysis completed successfully',
         analysis: analysisResult,
         codeExecuted: codeExecuted,
-        formattedContent: analysisResult
+        formattedContent: analysisResult,
+        fileUrls: fileLinks.length > 0 ? fileLinks : undefined
       };
 
     } catch (error) {
@@ -7658,7 +8200,7 @@ export class AgentModeService {
   public async getLeadLists(userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const { listLandingPages } = await import('./v0Service');
+      const { listLandingPages, getLandingPageLiveUrl } = await import('./v0Service');
 
       const [lists, landingPages] = await Promise.all([
         crmDb.getLeadListsForUser(userId),
@@ -7672,7 +8214,7 @@ export class AgentModeService {
           pageByListId.set(page.leadListId, {
             pageId: page.id,
             name: page.name || '',
-            url: page.deployedUrl || page.customDomainUrl || ''
+            url: getLandingPageLiveUrl(page)
           });
         }
       }
@@ -16688,8 +17230,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     try {
       console.log('AgentMode: Reading file content from URL:', fileUrl);
 
+      if (typeof fileUrl !== 'string' || fileUrl.trim().length === 0) {
+        return {
+          success: false,
+          message: 'file_url is required and must be a non-empty HTTP or HTTPS URL.',
+          error: 'Missing file_url'
+        };
+      }
+
+      const normalizedFileUrl = fileUrl.trim();
+
       // Validate URL format
-      if (!fileUrl.startsWith('http://') && !fileUrl.startsWith('https://')) {
+      if (!normalizedFileUrl.startsWith('http://') && !normalizedFileUrl.startsWith('https://')) {
         return {
           success: false,
           message: 'Invalid URL format. Must be HTTP or HTTPS.',
@@ -16698,7 +17250,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       // Determine file type from URL
-      const urlPath = new URL(fileUrl).pathname;
+      const urlPath = new URL(normalizedFileUrl).pathname;
       const extension = urlPath.split('.').pop()?.toLowerCase() || '';
 
       if (IMAGE_EXTENSIONS.has(extension)) {
@@ -16718,7 +17270,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       // Fetch the file content
-      const response = await axios.get(fileUrl, {
+      const response = await axios.get(normalizedFileUrl, {
         timeout: 30000,
         responseType: 'arraybuffer',
         headers: {
@@ -16835,7 +17387,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         file_type: fileType,
         file_size: buffer.length,
         content_length: extractedContent.length,
-        file_url: fileUrl,
+        file_url: normalizedFileUrl,
         message: `Successfully read ${fileType} file content (${extractedContent.length} characters)`
       };
 
@@ -16860,7 +17412,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: errorMessage,
         error: error.message,
-        file_url: fileUrl
+        file_url: typeof fileUrl === 'string' ? fileUrl : undefined
       };
     }
   }
@@ -20595,6 +21147,148 @@ Please:
     }
   }
 
+  /**
+   * Instantiate a predefined work plan template into an existing chat session.
+   *
+   * This is the programmatic equivalent of Agent Mode's createSessionWithPlan, but
+   * applied to a session that already exists (e.g. an Emma conversation). It:
+   *   - resolves the template by title (case-insensitive) or planId, honoring the
+   *     same system/public/private visibility rules as the listing tool;
+   *   - copies the template's steps into session.workPlan with status 'pending';
+   *   - carries welcomeMessage / autocomplete / userInstructions through;
+   *   - auto-installs ALL skills referenced by the plan's steps so the required
+   *     tools are available from the next message (tool filtering is computed per
+   *     message, so skills must be installed upfront);
+   *   - applies the plan's defaultModel when supported.
+   *
+   * Refuses to overwrite an existing active (non-empty) work plan unless force=true.
+   */
+  public async applyPredefinedWorkPlan(planTitleOrId: string, sessionId: string, userId?: string, options?: { force?: boolean }): Promise<any> {
+    try {
+      const { workPlanService } = await import('./workPlanService');
+
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return { success: false, message: 'Session not found' };
+      }
+
+      // Guard: don't clobber an in-progress plan unless explicitly forced.
+      const existing = session.workPlan;
+      if (existing && Array.isArray(existing.steps) && existing.steps.length > 0 && !options?.force) {
+        return {
+          success: false,
+          message: `A work plan "${existing.title}" is already active in this session. Ask the user to confirm, then call launch_predefined_work_plan again with force=true to replace it.`,
+          requiresConfirmation: true,
+        };
+      }
+
+      // Resolve candidate plans with private (user/org) taking priority over system/public.
+      const candidates: any[] = [];
+      if (userId && !userId.startsWith('anon_')) {
+        try {
+          const { userDb } = await import('./db');
+          const user = await userDb.getUserById(userId);
+          const [ownPlans, orgPlans] = await Promise.all([
+            workPlanService.getWorkPlansByOwner(userId),
+            user?.orgId ? workPlanService.getWorkPlansByOrg(user.orgId) : Promise.resolve([]),
+          ]);
+          const seen = new Set<string>();
+          for (const p of [...ownPlans, ...orgPlans]) {
+            if (p.visibility === 'private' && !seen.has(p.planId)) {
+              seen.add(p.planId);
+              candidates.push(p);
+            }
+          }
+        } catch (err) {
+          console.warn('[applyPredefinedWorkPlan] Error loading private plans:', (err as Error).message);
+        }
+      }
+      const [systemPlans, publicPlans] = await Promise.all([
+        workPlanService.getWorkPlansByVisibility('system'),
+        workPlanService.getWorkPlansByVisibility('public'),
+      ]);
+      candidates.push(...systemPlans, ...publicPlans);
+
+      const needle = planTitleOrId.toLowerCase();
+      const predefinedPlan = candidates.find(
+        (p) => p.planId === planTitleOrId || (p.title && p.title.toLowerCase() === needle)
+      );
+
+      if (!predefinedPlan) {
+        return { success: false, message: `Work plan template "${planTitleOrId}" not found` };
+      }
+      if (predefinedPlan.visibility === 'private' && (!userId || userId.startsWith('anon_'))) {
+        return { success: false, message: 'Not authorized to use this private work plan' };
+      }
+
+      // Convert template steps -> session work plan (all steps start pending).
+      const workPlan = {
+        title: predefinedPlan.title,
+        steps: (predefinedPlan.steps || []).map((step: any) => ({
+          stepCount: step.stepCount,
+          title: step.title,
+          description: step.description,
+          ...(step.userInstructions !== undefined && { userInstructions: step.userInstructions }),
+          status: 'pending' as const,
+          completedAt: undefined,
+          notes: undefined,
+          requiredFunctionCalls: step.requiredFunctionCalls,
+          skillIds: step.skillIds,
+        })),
+        welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
+        autocomplete: predefinedPlan.autocomplete || false,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+
+      // Auto-install ALL skills from ALL steps upfront so their tools are available
+      // from the next message (tool filtering is computed at the start of each message).
+      const allSkillIds = new Set<string>();
+      for (const step of predefinedPlan.steps || []) {
+        if (step.skillIds?.length) {
+          step.skillIds.forEach((id: string) => allSkillIds.add(id));
+        }
+      }
+      if (allSkillIds.size > 0) {
+        try {
+          await chatbotDb.addAssociatedSkills(sessionId, Array.from(allSkillIds));
+        } catch (skillErr) {
+          console.error('[applyPredefinedWorkPlan] Error auto-installing plan skills:', skillErr);
+        }
+      }
+
+      // Apply the plan's default model when it is supported.
+      if (predefinedPlan.defaultModel) {
+        try {
+          const supportedModels = await this.getSupportedModels();
+          if (supportedModels.includes(predefinedPlan.defaultModel)) {
+            await chatbotDb.updateSessionLlmModel(sessionId, predefinedPlan.defaultModel);
+          } else {
+            console.warn(`[applyPredefinedWorkPlan] Plan model "${predefinedPlan.defaultModel}" not supported; leaving session model unchanged`);
+          }
+        } catch (modelErr) {
+          console.warn('[applyPredefinedWorkPlan] Error applying plan model:', (modelErr as Error).message);
+        }
+      }
+
+      return {
+        success: true,
+        message: `Started work plan "${predefinedPlan.title}" with ${workPlan.steps.length} steps`,
+        workPlan,
+        welcomeMessage: workPlan.welcomeMessage,
+        formattedContent: `Started work plan "${predefinedPlan.title}":\n${workPlan.steps.map((s: any) => `${s.stepCount}. ${s.title}`).join('\n')}`,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error applying predefined work plan:', error);
+      return {
+        success: false,
+        message: 'Failed to start work plan',
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  }
+
   public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
@@ -22978,8 +23672,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, entities: result.data?.elements || [] };
         }
         if (action === 'ESTIMATE_REACH') {
-          if (!params.targeting_criteria) throw new Error('ESTIMATE_REACH requires targeting_criteria');
-          const result = await linkedInAdsService.getAudienceCount(accessToken, params.targeting_criteria);
+          // Accept the same targeting shapes as CAMPAIGN CREATE: the flat
+          // targeting_include/targeting_exclude arrays (preferred) or a raw targeting_criteria object.
+          const targetingCriteria = linkedInAdsService.resolveTargetingCriteria(params);
+          if (!targetingCriteria) {
+            throw new Error('ESTIMATE_REACH requires targeting: pass targeting_include (array of { facet_urn, values }) or targeting_criteria.');
+          }
+          const result = await linkedInAdsService.getAudienceCount(accessToken, targetingCriteria);
           if (!result.success) throw new Error(result.error || 'Failed to estimate audience reach');
           return { success: true, audienceCount: result.data };
         }
