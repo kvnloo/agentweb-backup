@@ -494,6 +494,11 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
         (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+        // Post-swap verification read-back shows the new creative attached.
+        (metaService.getAd as jest.Mock).mockResolvedValue({
+          id: 'ad_123',
+          creative: { creative_id: 'new_creative_B' }
+        });
 
         const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
 
@@ -512,8 +517,9 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
           'ad_123',
           { creative_id: 'new_creative_B' }
         );
-        // A pre-built creative_id needs no rebuild from the old creative
-        expect(metaService.getAd).not.toHaveBeenCalled();
+        // A pre-built creative_id needs no rebuild from the old creative — getAd is only
+        // called once, for the post-swap verification read-back.
+        expect(metaService.getAd).toHaveBeenCalledTimes(1);
         expect(metaService.getAdCreative).not.toHaveBeenCalled();
         expect(metaService.createAdCreative).not.toHaveBeenCalled();
       });
@@ -523,6 +529,11 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
         (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+        // Post-swap verification read-back shows the new creative attached.
+        (metaService.getAd as jest.Mock).mockResolvedValue({
+          id: 'ad_123',
+          creative: { creative_id: 'new_creative_B' }
+        });
 
         const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
 
@@ -540,6 +551,45 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
           'ad_123',
           { status: 'ACTIVE' }
         );
+      });
+
+      it('verifies a direct creative_id swap via read-back and reports verified:true', async () => {
+        const params = { creative_id: 'new_creative_B' };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+        // Read-back shows the new creative attached.
+        (metaService.getAd as jest.Mock).mockResolvedValue({
+          id: 'ad_123',
+          creative: { creative_id: 'new_creative_B' }
+        });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(true);
+        expect(result.new_creative_id).toBe('new_creative_B');
+        expect(result.verified).toBe(true);
+      });
+
+      it('fails with SWAP_NOT_REFLECTED when a direct creative_id swap is not reflected on read-back', async () => {
+        // The same silent-success trap as the auto-build path: POST /{ad-id} returns 200
+        // but the ad keeps its old creative.
+        const params = { creative_id: 'new_creative_B' };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+        // Read-back: ad STILL on the old creative.
+        (metaService.getAd as jest.Mock).mockResolvedValue({
+          id: 'ad_123',
+          creative: { creative_id: 'old_creative_A' }
+        });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(false);
+        expect(result.error).toBe('SWAP_NOT_REFLECTED');
+        expect(result.new_creative_id).toBe('new_creative_B');
+        expect(result.live_creative_id).toBe('old_creative_A');
       });
 
       it('should use creative swap when link_url is in params', async () => {
@@ -726,6 +776,42 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         );
       });
 
+      it('clears url_tags when the caller explicitly overrides them with an empty string', async () => {
+        const params = { link_url: 'https://new-landing-page.com', url_tags: '' };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock)
+          .mockResolvedValueOnce({ id: 'ad_123', creative: { creative_id: 'old_creative_123' } })
+          .mockResolvedValue({
+            id: 'ad_123',
+            creative: {
+              creative_id: 'new_creative_456',
+              object_story_spec: { page_id: 'page_123', link_data: { link: 'https://new-landing-page.com' } }
+            }
+          });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'old_creative_123',
+          name: 'My Creative',
+          url_tags: 'utm_source=meta&utm_medium=paid',
+          object_story_spec: {
+            page_id: 'page_123',
+            link_data: { message: 'Hi', link: 'https://old.com', name: 'T', image_hash: 'abc123' }
+          }
+        });
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'new_creative_456' });
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(true);
+        // The old creative's tags must NOT be carried over when explicitly cleared.
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.not.objectContaining({ url_tags: 'utm_source=meta&utm_medium=paid' })
+        );
+      });
+
       it('fails with SWAP_NOT_REFLECTED when the read-back shows the old creative still attached', async () => {
         // Meta's POST /{ad-id} returned 200 but the ad kept its old creative (silent-success trap).
         const params = { link_url: 'https://new-landing-page.com' };
@@ -818,6 +904,102 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(result.verified).toBe(true);
       });
 
+      it('treats appended query parameters on the live URL as a matching destination (Meta url_tags)', async () => {
+        const params = { link_url: 'https://everyio.agentwebforms.com/icp1' };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock)
+          .mockResolvedValueOnce({ id: 'ad_123', creative: { creative_id: 'old_creative_123' } })
+          .mockResolvedValue({
+            id: 'ad_123',
+            creative: {
+              creative_id: 'new_creative_456',
+              // Meta appended the creative's url_tags to the link.
+              object_story_spec: {
+                page_id: 'page_123',
+                link_data: { link: 'https://everyio.agentwebforms.com/icp1?utm_source=meta&utm_medium=paid' }
+              }
+            }
+          });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'old_creative_123',
+          name: 'My Creative',
+          object_story_spec: {
+            page_id: 'page_123',
+            link_data: { message: 'Hi', link: 'https://old.com', name: 'T', image_hash: 'abc123' }
+          }
+        });
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'new_creative_456' });
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(true);
+        expect(result.verified).toBe(true);
+      });
+
+      it('fails with DESTINATION_NOT_REFLECTED when the live URL is only the bare domain of the requested page', async () => {
+        // A live URL that is merely a prefix of the requested one (missing the landing-page path)
+        // must NOT count as verified — this is exactly the wrong-destination bug class.
+        const params = { link_url: 'https://everyio.agentwebforms.com/icp1?utm_source=meta' };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock)
+          .mockResolvedValueOnce({ id: 'ad_123', creative: { creative_id: 'old_creative_123' } })
+          .mockResolvedValue({
+            id: 'ad_123',
+            creative: {
+              creative_id: 'new_creative_456',
+              object_story_spec: { page_id: 'page_123', link_data: { link: 'https://everyio.agentwebforms.com' } }
+            }
+          });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'old_creative_123',
+          name: 'My Creative',
+          object_story_spec: {
+            page_id: 'page_123',
+            link_data: { message: 'Hi', link: 'https://old.com', name: 'T', image_hash: 'abc123' }
+          }
+        });
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'new_creative_456' });
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(false);
+        expect(result.error).toBe('DESTINATION_NOT_REFLECTED');
+      });
+
+      it('fails with DESTINATION_NOT_REFLECTED when the live path merely shares a prefix (/icp1 vs /icp10)', async () => {
+        const params = { link_url: 'https://everyio.agentwebforms.com/icp1' };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock)
+          .mockResolvedValueOnce({ id: 'ad_123', creative: { creative_id: 'old_creative_123' } })
+          .mockResolvedValue({
+            id: 'ad_123',
+            creative: {
+              creative_id: 'new_creative_456',
+              object_story_spec: { page_id: 'page_123', link_data: { link: 'https://everyio.agentwebforms.com/icp10' } }
+            }
+          });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'old_creative_123',
+          name: 'My Creative',
+          object_story_spec: {
+            page_id: 'page_123',
+            link_data: { message: 'Hi', link: 'https://old.com', name: 'T', image_hash: 'abc123' }
+          }
+        });
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'new_creative_456' });
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(false);
+        expect(result.error).toBe('DESTINATION_NOT_REFLECTED');
+      });
+
       it('still succeeds when the post-swap read-back itself throws (best-effort verification)', async () => {
         const params = { link_url: 'https://new-landing-page.com' };
 
@@ -840,6 +1022,10 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
 
         expect(result.success).toBe(true);
         expect(result.new_creative_id).toBe('new_creative_456');
+        // The swap was sent but never confirmed — the result must NOT claim it was verified,
+        // since the tool doc tells the agent verified:true means the URL is live in Ads Manager.
+        expect(result.verified).toBe(false);
+        expect(result.live_link_url).toBeUndefined();
       });
 
       it('should return error when ad has no creative', async () => {
