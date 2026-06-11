@@ -341,6 +341,22 @@ describe("PATCH /api/landing-pages/v0/generated/:id/context — editor permissio
     expect(mockUpdateLandingPageContext).toHaveBeenCalled();
   });
 
+  it("org owner from org.ownerUserId can PATCH even if user orgRole is stale", async () => {
+    currentMockUser = { userId: mockOrgOwnerId, email: "orgowner@example.com", isAdmin: false };
+    mockGetLandingPageById.mockResolvedValue(memberPage); // owned by user-2
+    mockGetUserById
+      .mockResolvedValueOnce({ userId: mockOrgOwnerId, orgId: mockOrgId, orgRole: "member" })
+      .mockResolvedValueOnce({ userId: mockOrgMemberId, orgId: mockOrgId });
+    mockGetOrgById.mockResolvedValue(makeOrg(false, []));
+    mockUpdateLandingPageContext.mockResolvedValue(undefined);
+
+    const res = await request(app)
+      .patch("/api/landing-pages/v0/generated/page-2/context")
+      .send({ context: "Owner update despite stale role" });
+    expect(res.status).toBe(200);
+    expect(mockUpdateLandingPageContext).toHaveBeenCalled();
+  });
+
   it("user from different org gets 403 on PATCH", async () => {
     currentMockUser = { userId: mockOutsiderId, email: "outsider@example.com", isAdmin: false };
     mockGetLandingPageById.mockResolvedValue(memberPage); // owned by user-2 in org-abc

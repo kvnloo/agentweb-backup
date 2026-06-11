@@ -22,6 +22,7 @@ const orgA: Organization = {
 
 const owner   = { userId: "u-owner",  orgId: "org-A", orgRole: "member" as const };
 const admin   = { userId: "u-admin",  orgId: "org-A", orgRole: "owner"  as const };
+const staleAdmin = { userId: "u-admin", orgId: "org-A", orgRole: "member" as const };
 const editor  = { userId: "u-editor", orgId: "org-A", orgRole: "member" as const };
 const member  = { userId: "u-member", orgId: "org-A", orgRole: "member" as const };
 const other   = { userId: "u-other",  orgId: "org-B", orgRole: "member" as const };
@@ -67,6 +68,9 @@ describe("canViewItem", () => {
   it("org admin sees all items even when sharing is disabled", () => {
     expect(canViewItem(item, admin, orgA, ownerOrgId, "knowledgeBase")).toBe(true);
   });
+  it("canonical org owner sees all items even when user orgRole is stale", () => {
+    expect(canViewItem(item, staleAdmin, orgA, ownerOrgId, "landingPages")).toBe(true);
+  });
 });
 
 describe("canManageOrgFeature", () => {
@@ -76,6 +80,10 @@ describe("canManageOrgFeature", () => {
   it("org admin can manage regardless of toggle", () => {
     const orgOff = { ...orgA, shareSettings: { ...orgA.shareSettings!, landingPages: { enabled: false, editors: [] } } };
     expect(canManageOrgFeature(admin, orgOff as any, "landingPages")).toBe(true);
+  });
+  it("canonical org owner can manage even when user orgRole is stale", () => {
+    const orgOff = { ...orgA, shareSettings: { ...orgA.shareSettings!, landingPages: { enabled: false, editors: [] } } };
+    expect(canManageOrgFeature(staleAdmin, orgOff as any, "landingPages")).toBe(true);
   });
   it("listed editor can manage even when feature.enabled=false", () => {
     const orgOff = { ...orgA, shareSettings: { ...orgA.shareSettings!, landingPages: { enabled: false, editors: ["u-editor"] } } };
@@ -114,6 +122,9 @@ describe("canEditItem", () => {
   it("org admin always edits", () => {
     expect(canEditItem(item, admin, orgA, ownerOrgId, "knowledgeBase")).toBe(true);
     expect(canEditItem(item, admin, orgA, ownerOrgId, "brandGuidelines")).toBe(true);
+  });
+  it("canonical org owner edits even when user orgRole is stale", () => {
+    expect(canEditItem(item, staleAdmin, orgA, ownerOrgId, "landingPages")).toBe(true);
   });
   it("toggleable feature: editor allowed regardless of enabled toggle", () => {
     expect(canEditItem(item, editor, orgA, ownerOrgId, "htmlTemplates")).toBe(true);
