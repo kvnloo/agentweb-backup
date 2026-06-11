@@ -1875,3 +1875,83 @@ describe('resolveIdentity — makeApiMeta per-field confidence (Fix 6)', () => {
     expect(meta.linkedin.confidence).toBe('medium');
   });
 });
+
+// ─── emailDomain derived from a known website (local, no web search) ──────────
+//
+// Repro of the "Shawn Z" bug: a name+company CSV lead enriched to a website
+// (pmpsuk.com) but never to an emailDomain. The email-finder tiers (5.5
+// enrich.so, 7 pattern) gate on emailDomain, and the only steps that derive it
+// from a website are the web-search tiers, gated behind needsCompanyFields. The
+// bulk find-email path sets needsCompanyFields=false, so the finder never ran.
+// A known website should be converted to emailDomain locally so the finder can
+// run regardless.
+describe('resolveIdentity — emailDomain from known website', () => {
+  it('derives emailDomain from a stored website so the enrich.so finder runs (needsCompanyFields=false)', async () => {
+    const enrichSoFindEmail = jest.fn().mockResolvedValue({ email: 'shawn@pmpsuk.com' });
+    const resolveCompanyDomainViaWebSearch = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({ enrichSoFindEmail, resolveCompanyDomainViaWebSearch });
+
+    const result = await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          firstName: 'Shawn',
+          lastName: 'Z',
+          company: 'PMPS',
+          website: 'https://www.pmpsuk.com',
+        },
+        needsPersonFields: false,
+        needsCompanyFields: false,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    // Domain came from the website locally — no web search needed.
+    expect(resolveCompanyDomainViaWebSearch).not.toHaveBeenCalled();
+    expect(enrichSoFindEmail).toHaveBeenCalledWith(
+      expect.objectContaining({ firstName: 'Shawn', lastName: 'Z', domain: 'pmpsuk.com' }),
+    );
+    expect((result as any).resolved.email).toBe('shawn@pmpsuk.com');
+  });
+
+  it('does not run the finder when there is neither emailDomain nor website', async () => {
+    const enrichSoFindEmail = jest.fn().mockResolvedValue({ email: 'x@y.com' });
+    const deps = makeDeps({ enrichSoFindEmail });
+
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Shawn', lastName: 'Z', company: 'PMPS' },
+        needsPersonFields: false,
+        needsCompanyFields: false,
+      }),
+      deps,
+    );
+
+    expect(enrichSoFindEmail).not.toHaveBeenCalled();
+  });
+
+  it('respects an existing emailDomain and does not overwrite it from website', async () => {
+    const enrichSoFindEmail = jest.fn().mockResolvedValue({ email: 'shawn@explicit.com' });
+    const deps = makeDeps({ enrichSoFindEmail });
+
+    await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          firstName: 'Shawn',
+          lastName: 'Z',
+          emailDomain: 'explicit.com',
+          website: 'https://www.pmpsuk.com',
+        },
+        needsPersonFields: false,
+        needsCompanyFields: false,
+      }),
+      deps,
+    );
+
+    expect(enrichSoFindEmail).toHaveBeenCalledWith(
+      expect.objectContaining({ domain: 'explicit.com' }),
+    );
+  });
+});

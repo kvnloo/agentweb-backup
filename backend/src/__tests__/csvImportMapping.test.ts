@@ -218,6 +218,72 @@ describe('CSV Import Wizard endpoints', () => {
       expect(msg.toLowerCase()).toContain('email');
     });
 
+    it('accepts firstName + lastName + company as the dedup key when email/linkedin are absent', async () => {
+      const csv = 'F,L,Co\nJane,Doe,Acme\n';
+      const handler = findRouteHandler('/lists/:listId/leads/import', 'post');
+      const req = makeReq({
+        params: { listId: 'l1' },
+        file: { buffer: Buffer.from(csv), originalname: 'l.csv' } as any,
+        body: {
+          columnMapping: JSON.stringify({ F: 'firstName', L: 'lastName', Co: 'company' }),
+        },
+      });
+      const res = makeRes();
+      await handler!(req as Request, res as Response, jest.fn());
+      expect(res.status).not.toHaveBeenCalledWith(400);
+      expect(crmDb.batchCreateLeads).toHaveBeenCalled();
+    });
+
+    it('accepts a split full-name column + company as the dedup key', async () => {
+      const csv = 'Full Name,Co\nJane Doe,Acme\n';
+      const handler = findRouteHandler('/lists/:listId/leads/import', 'post');
+      const req = makeReq({
+        params: { listId: 'l1' },
+        file: { buffer: Buffer.from(csv), originalname: 'l.csv' } as any,
+        body: {
+          columnMapping: JSON.stringify({
+            'Full Name': { splitFullName: true },
+            Co: 'company',
+          }),
+        },
+      });
+      const res = makeRes();
+      await handler!(req as Request, res as Response, jest.fn());
+      expect(res.status).not.toHaveBeenCalledWith(400);
+      expect(crmDb.batchCreateLeads).toHaveBeenCalled();
+    });
+
+    it('still rejects when only firstName + company are mapped (lastName missing)', async () => {
+      const csv = 'F,Co\nJane,Acme\n';
+      const handler = findRouteHandler('/lists/:listId/leads/import', 'post');
+      const req = makeReq({
+        params: { listId: 'l1' },
+        file: { buffer: Buffer.from(csv), originalname: 'l.csv' } as any,
+        body: { columnMapping: JSON.stringify({ F: 'firstName', Co: 'company' }) },
+      });
+      const res = makeRes();
+      await handler!(req as Request, res as Response, jest.fn());
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(crmDb.batchCreateLeads).not.toHaveBeenCalled();
+    });
+
+    it('opts the CSV import into name+company dedup via batchCreateLeads', async () => {
+      const csv = 'Email\njane@x.com\n';
+      const handler = findRouteHandler('/lists/:listId/leads/import', 'post');
+      const req = makeReq({
+        params: { listId: 'l1' },
+        file: { buffer: Buffer.from(csv), originalname: 'l.csv' } as any,
+        body: { columnMapping: JSON.stringify({ Email: 'email' }) },
+      });
+      const res = makeRes();
+      await handler!(req as Request, res as Response, jest.fn());
+      expect(crmDb.batchCreateLeads).toHaveBeenCalledWith(
+        'l1',
+        expect.any(Array),
+        expect.objectContaining({ dedupByNameCompany: true }),
+      );
+    });
+
     it('skips columns marked as "skip"', async () => {
       const csv = 'Email,Garbage\njane@x.com,xyz\n';
       const handler = findRouteHandler('/lists/:listId/leads/import', 'post');
