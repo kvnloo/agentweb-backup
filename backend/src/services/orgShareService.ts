@@ -14,6 +14,51 @@ const ALWAYS_ON: ReadonlySet<Feature> = new Set<Feature>(["brandGuidelines", "ma
 
 export function isAlwaysOnFeature(f: Feature): boolean { return ALWAYS_ON.has(f); }
 
+// Single source of truth for per-feature share defaults. Used both as the
+// runtime fallback when an org's shareSettings (or a specific feature key) is
+// absent, and to initialize shareSettings on org creation. `skills` and
+// `workPlans` are shared org-wide by default; everything else is opt-in.
+// Always-on features (BG/MS) ignore `enabled` entirely, so their default is
+// irrelevant to gating but reported as `true` for completeness.
+const DEFAULT_ENABLED: Readonly<Record<ToggleableFeature, boolean>> = {
+  knowledgeBase: false,
+  htmlTemplates: false,
+  landingPages: false,
+  workPlans: true,
+  skills: true,
+  analytics: false,
+};
+
+// The effective `enabled` default for a feature when no explicit value exists.
+export function defaultEnabledFor(f: Feature): boolean {
+  if (isAlwaysOnFeature(f)) return true;
+  return DEFAULT_ENABLED[f as ToggleableFeature] === true;
+}
+
+// A complete shareSettings object using the per-feature defaults. Used to seed
+// `shareSettings` when an org is created so the toggle UI and gating agree.
+export function defaultShareSettings(): {
+  knowledgeBase: { enabled: boolean; editors: string[] };
+  htmlTemplates: { enabled: boolean; editors: string[] };
+  landingPages: { enabled: boolean; editors: string[] };
+  workPlans: { enabled: boolean; editors: string[] };
+  skills: { enabled: boolean; editors: string[] };
+  analytics: { enabled: boolean; editors: string[] };
+  brandGuidelines: { editors: string[] };
+  marketingStrategy: { editors: string[] };
+} {
+  return {
+    knowledgeBase:     { enabled: DEFAULT_ENABLED.knowledgeBase, editors: [] },
+    htmlTemplates:     { enabled: DEFAULT_ENABLED.htmlTemplates, editors: [] },
+    landingPages:      { enabled: DEFAULT_ENABLED.landingPages,  editors: [] },
+    workPlans:         { enabled: DEFAULT_ENABLED.workPlans,     editors: [] },
+    skills:            { enabled: DEFAULT_ENABLED.skills,        editors: [] },
+    analytics:         { enabled: DEFAULT_ENABLED.analytics,     editors: [] },
+    brandGuidelines:   { editors: [] },
+    marketingStrategy: { editors: [] },
+  };
+}
+
 export interface ItemLike { userId?: string }
 export interface UserLike { userId: string; orgId?: string; orgRole?: "owner" | "member" }
 export type OrgLike = Pick<Organization, "orgId" | "ownerUserId" | "shareSettings">;
@@ -21,6 +66,17 @@ export type OrgLike = Pick<Organization, "orgId" | "ownerUserId" | "shareSetting
 function configFor(org: OrgLike | null, f: Feature) {
   if (!org?.shareSettings) return undefined;
   return (org.shareSettings as any)[f] as { enabled?: boolean; editors: string[] } | undefined;
+}
+
+// Whether a feature is shared with plain members. Honors an explicit
+// `enabled` value when present; otherwise falls back to the per-feature
+// default. This makes default-on features (skills, workPlans) work even for
+// orgs whose `shareSettings` was never written (e.g. created after the
+// one-time backfill migration).
+function enabledForMembers(org: OrgLike | null, f: Feature): boolean {
+  const cfg = configFor(org, f);
+  if (cfg && typeof cfg.enabled === "boolean") return cfg.enabled;
+  return defaultEnabledFor(f);
 }
 
 // Permission model
@@ -45,7 +101,7 @@ export function canViewItem(
   if (ownerOrgId !== user.orgId) return false;
   if (isAlwaysOnFeature(feature)) return true;
   if (isEditorOrAdmin(user, org, feature)) return true;       // editors/admin always see
-  return configFor(org, feature)?.enabled === true;            // plain members: only when shared
+  return enabledForMembers(org, feature);                      // plain members: when shared (explicit or default)
 }
 
 export function canEditItem(
@@ -79,7 +135,7 @@ export function isFeatureEffectivelyEnabled(
   if (!org) return false;
   if (isAlwaysOnFeature(feature)) return true;
   if (isEditorOrAdmin(user, org, feature)) return true;
-  return configFor(org, feature)?.enabled === true;
+  return enabledForMembers(org, feature);
 }
 
 // Caps used by list-merge endpoints (per spec §5.4)

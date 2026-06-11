@@ -150,6 +150,23 @@ describe("GET /api/user-skills — org sharing", () => {
     expect(skill1Occurrences).toBe(1);
   });
 
+  it("includes org members' skills by default when org has no shareSettings (regression: shared-by-default)", async () => {
+    // Reproduces the reported bug: an org created without shareSettings (e.g.
+    // after the one-time backfill migration ran) should still share skills
+    // org-wide by default for plain members.
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "member" });
+    mockGetOrgById.mockResolvedValue({ orgId: mockOrgId, ownerUserId: "org-owner" }); // no shareSettings
+    mockGetSkillsByOwner.mockResolvedValue([mySkill]);
+    mockGetSkillsByOrg.mockResolvedValue([memberSkill]);
+
+    const res = await request(app).get("/api/user-skills");
+    expect(res.status).toBe(200);
+    const ids = res.body.items.map((s: any) => s.skillId);
+    expect(ids).toContain("skill-1");
+    expect(ids).toContain("skill-2");
+    expect(mockGetSkillsByOrg).toHaveBeenCalledWith(mockOrgId, mockUserId);
+  });
+
   it("list excludes other-member skills when shareSettings.skills.enabled is false", async () => {
     mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId });
     mockGetOrgById.mockResolvedValue(mockOrgDisabled);

@@ -14,6 +14,12 @@
 import {
   mmToPx,
   computePageContentHeightPx,
+  computePageContentWidthPx,
+  chooseOrientation,
+  computeFitScale,
+  measureContentSize,
+  parsePageSize,
+  readAuthoredPageRule,
   shouldRelaxBreakInside,
   applyPrintLayoutFixes,
   PRINT_SAFETY_CSS,
@@ -258,6 +264,393 @@ describe("applyPrintLayoutFixes", () => {
       expect(relaxed).toBe(0);
       expect(setCalls).toEqual([]);
     });
+  });
+});
+
+describe("computePageContentHeightPx — orientation", () => {
+  it("uses the format width as the height in landscape", () => {
+    // A4 landscape height = portrait width (210mm), minus 20+20mm margins => 170mm.
+    const h = computePageContentHeightPx("A4", "20mm", "20mm", "landscape");
+    expect(Math.round(h)).toBe(Math.round(mmToPx(170)));
+  });
+
+  it("defaults to portrait when orientation is omitted", () => {
+    const portrait = computePageContentHeightPx("A4", "0mm", "0mm");
+    expect(Math.round(portrait)).toBe(Math.round(mmToPx(297)));
+  });
+});
+
+describe("computePageContentWidthPx", () => {
+  it("returns A4 portrait printable width minus left/right margins", () => {
+    // A4 width = 210mm. With 15mm left + 15mm right => 180mm.
+    const w = computePageContentWidthPx("A4", "15mm", "15mm");
+    expect(Math.round(w)).toBe(Math.round(mmToPx(180)));
+  });
+
+  it("uses the format height as the width in landscape", () => {
+    // A4 landscape width = portrait height (297mm) minus 15+15mm => 267mm.
+    const w = computePageContentWidthPx("A4", "15mm", "15mm", "landscape");
+    expect(Math.round(w)).toBe(Math.round(mmToPx(267)));
+  });
+
+  it("falls back to A4 for an unknown format", () => {
+    const w = computePageContentWidthPx("nope", "0mm", "0mm");
+    expect(Math.round(w)).toBe(Math.round(mmToPx(210)));
+  });
+
+  it("treats missing margins as zero", () => {
+    const w = computePageContentWidthPx("Letter", undefined, undefined);
+    expect(Math.round(w)).toBe(Math.round(mmToPx(215.9)));
+  });
+});
+
+describe("chooseOrientation", () => {
+  // A4 printable widths at 15mm side margins.
+  const portraitW = computePageContentWidthPx("A4", "15mm", "15mm"); // ~680px
+  const landscapeW = computePageContentWidthPx("A4", "15mm", "15mm", "landscape"); // ~1008px
+
+  it("keeps a report that fits portrait in portrait", () => {
+    // 600px easily fits the ~680px portrait width.
+    expect(chooseOrientation(600, portraitW, landscapeW)).toBe("portrait");
+  });
+
+  it("switches a wide slide (1280px) to landscape", () => {
+    // 1280px would need heavy shrink in portrait but fits landscape better —
+    // this is the stacked-16:9-deck case that aspect ratio got wrong.
+    expect(chooseOrientation(1280, portraitW, landscapeW)).toBe("landscape");
+  });
+
+  it("stays portrait when content is just slightly over the portrait width", () => {
+    // Within the 0.85 comfort threshold (fit ~0.94) — not worth rotating.
+    expect(chooseOrientation(720, portraitW, landscapeW)).toBe("portrait");
+  });
+
+  it("rotates very wide content to landscape (landscape fits less badly)", () => {
+    // Neither orientation fits a 5000px element, but landscape shrinks less,
+    // so it is the better choice.
+    expect(chooseOrientation(5000, portraitW, landscapeW)).toBe("landscape");
+  });
+
+  it("defaults to portrait for invalid width", () => {
+    expect(chooseOrientation(0, portraitW, landscapeW)).toBe("portrait");
+    expect(chooseOrientation(-10, portraitW, landscapeW)).toBe("portrait");
+  });
+
+  it("stays portrait when landscape is not strictly better (equal widths)", () => {
+    // portrait doesn't fit comfortably, but landscapeFit == portraitFit, so the
+    // tie resolves to portrait (landscapeFit must strictly exceed portraitFit).
+    expect(chooseOrientation(2000, portraitW, portraitW)).toBe("portrait");
+  });
+
+  it("treats a non-positive landscape width as not fitting (guard)", () => {
+    // landscapeContentWidthPx <= 0 -> fitRatio returns 1 for it; with a tiny
+    // portrait width the content doesn't fit portrait, and landscapeFit (1) wins.
+    expect(chooseOrientation(2000, 100, 0)).toBe("landscape");
+  });
+
+  it("honors a custom portrait fit threshold", () => {
+    // With a strict threshold of 0.99, content needing any shrink rotates.
+    expect(chooseOrientation(720, portraitW, landscapeW, 0.99)).toBe("landscape");
+  });
+});
+
+describe("computeFitScale", () => {
+  const pageWidth = computePageContentWidthPx("A4", "15mm", "15mm"); // ~680px
+
+  it("returns 1 when content already fits", () => {
+    expect(computeFitScale(500, pageWidth)).toBe(1);
+  });
+
+  it("returns 1 when content is exactly the page width", () => {
+    expect(computeFitScale(pageWidth, pageWidth)).toBe(1);
+  });
+
+  it("scales down proportionally when content overflows", () => {
+    expect(computeFitScale(pageWidth * 2, pageWidth)).toBeCloseTo(0.5, 5);
+  });
+
+  it("never scales below the minimum so text stays legible", () => {
+    // 10x too wide would imply 0.1; clamp to default min 0.5.
+    expect(computeFitScale(pageWidth * 10, pageWidth)).toBe(0.5);
+  });
+
+  it("honors a custom minimum scale", () => {
+    expect(computeFitScale(pageWidth * 4, pageWidth, 0.3)).toBeCloseTo(0.3, 5);
+  });
+
+  it("returns 1 for invalid inputs", () => {
+    expect(computeFitScale(0, pageWidth)).toBe(1);
+    expect(computeFitScale(500, 0)).toBe(1);
+  });
+});
+
+describe("measureContentSize", () => {
+  it("returns the widest/tallest of the body/doc element box metrics", async () => {
+    const page = {
+      evaluate: async (fn: (...a: any[]) => any) => {
+        (global as any).document = {
+          body: {
+            scrollWidth: 1200,
+            offsetWidth: 1180,
+            scrollHeight: 800,
+            offsetHeight: 790,
+          },
+          documentElement: {
+            scrollWidth: 1000,
+            offsetWidth: 1000,
+            clientWidth: 990,
+            scrollHeight: 900,
+            offsetHeight: 880,
+            clientHeight: 870,
+          },
+        };
+        try {
+          return fn();
+        } finally {
+          delete (global as any).document;
+        }
+      },
+    };
+
+    const size = await measureContentSize(page);
+    expect(size).toEqual({ width: 1200, height: 900 });
+  });
+
+  it("handles a missing body/documentElement gracefully", async () => {
+    const page = {
+      evaluate: async (fn: (...a: any[]) => any) => {
+        (global as any).document = { body: null, documentElement: null };
+        try {
+          return fn();
+        } finally {
+          delete (global as any).document;
+        }
+      },
+    };
+
+    const size = await measureContentSize(page);
+    expect(size).toEqual({ width: 0, height: 0 });
+  });
+});
+
+describe("applyPrintLayoutFixes — orientation", () => {
+  it("passes the landscape page-content height to the in-browser pass", async () => {
+    let maxHeight = 0;
+    const page = {
+      addStyleTag: async () => {},
+      emulateMediaType: async () => {},
+      evaluate: async (_fn: (...a: any[]) => any, max: number) => {
+        maxHeight = max;
+        return 0;
+      },
+    };
+
+    await applyPrintLayoutFixes(page, "A4", "20mm", "20mm", "landscape");
+
+    expect(Math.round(maxHeight)).toBe(
+      Math.round(computePageContentHeightPx("A4", "20mm", "20mm", "landscape"))
+    );
+  });
+});
+
+describe("parsePageSize", () => {
+  it("parses two explicit lengths as landscape when width >= height", () => {
+    // The HomeReq deck: @page { size: 11in 8.5in }
+    expect(parsePageSize("11in 8.5in")).toEqual({
+      widthMm: 11 * 25.4,
+      heightMm: 8.5 * 25.4,
+      orientation: "landscape",
+    });
+  });
+
+  it("parses two explicit lengths as portrait when height > width", () => {
+    expect(parsePageSize("210mm 297mm")).toEqual({
+      widthMm: 210,
+      heightMm: 297,
+      orientation: "portrait",
+    });
+  });
+
+  it("parses a single length as a square page", () => {
+    expect(parsePageSize("8.5in")).toEqual({
+      widthMm: 8.5 * 25.4,
+      heightMm: 8.5 * 25.4,
+      orientation: "portrait",
+    });
+  });
+
+  it("parses a named format (portrait by default)", () => {
+    expect(parsePageSize("A4")).toEqual({
+      widthMm: 210,
+      heightMm: 297,
+      orientation: "portrait",
+    });
+  });
+
+  it("parses a named format with a landscape keyword (swapped)", () => {
+    expect(parsePageSize("A4 landscape")).toEqual({
+      widthMm: 297,
+      heightMm: 210,
+      orientation: "landscape",
+    });
+  });
+
+  it("parses keyword-before-format order too", () => {
+    expect(parsePageSize("landscape Letter")).toEqual({
+      widthMm: 279.4,
+      heightMm: 215.9,
+      orientation: "landscape",
+    });
+  });
+
+  it("returns null for a keyword-only size (no concrete dimensions)", () => {
+    expect(parsePageSize("landscape")).toBeNull();
+  });
+
+  it("returns null for auto / empty / undefined", () => {
+    expect(parsePageSize("auto")).toBeNull();
+    expect(parsePageSize("")).toBeNull();
+    expect(parsePageSize(undefined)).toBeNull();
+    expect(parsePageSize("   ")).toBeNull();
+  });
+
+  it("returns null for unparseable or unitless lengths", () => {
+    expect(parsePageSize("100 200")).toBeNull(); // unitless
+    expect(parsePageSize("banana")).toBeNull();
+    expect(parsePageSize("11in 8.5in 5in")).toBeNull(); // too many tokens
+  });
+
+  it("converts cm lengths", () => {
+    const r = parsePageSize("21cm 29.7cm");
+    expect(r).not.toBeNull();
+    expect(r!.widthMm).toBeCloseTo(210, 5);
+    expect(r!.heightMm).toBeCloseTo(297, 5);
+    expect(r!.orientation).toBe("portrait");
+  });
+
+  it("converts pt lengths", () => {
+    // 792pt x 612pt == 11in x 8.5in.
+    const r = parsePageSize("792pt 612pt");
+    expect(r).not.toBeNull();
+    expect(r!.widthMm).toBeCloseTo(11 * 25.4, 4);
+    expect(r!.heightMm).toBeCloseTo(8.5 * 25.4, 4);
+    expect(r!.orientation).toBe("landscape");
+  });
+
+  it("converts px lengths", () => {
+    // 96px == 1in == 25.4mm.
+    const r = parsePageSize("96px");
+    expect(r).not.toBeNull();
+    expect(r!.widthMm).toBeCloseTo(25.4, 4);
+  });
+
+  it("returns null when a numeric value is non-finite", () => {
+    // "." matches the digit pattern but parseFloat(".") is NaN.
+    expect(parsePageSize(".in .in")).toBeNull();
+  });
+});
+
+describe("readAuthoredPageRule", () => {
+  function fakePage(rules: any[]) {
+    return {
+      evaluate: async (fn: (...a: any[]) => any) => {
+        (global as any).document = {
+          styleSheets: [{ cssRules: rules }],
+        };
+        try {
+          return fn();
+        } finally {
+          delete (global as any).document;
+        }
+      },
+    };
+  }
+
+  // Mimic a CSSPageRule: constructor.name must be "CSSPageRule".
+  class CSSPageRule {
+    style: any;
+    constructor(style: any) {
+      this.style = style;
+    }
+  }
+  class CSSStyleRule {
+    style: any = {};
+  }
+
+  it("returns the size/margin from the first @page rule", async () => {
+    const page = fakePage([
+      new CSSStyleRule(),
+      new CSSPageRule({ size: "11in 8.5in", margin: "0px" }),
+    ]);
+    expect(await readAuthoredPageRule(page)).toEqual({
+      size: "11in 8.5in",
+      margin: "0px",
+    });
+  });
+
+  it("returns null when there is no @page rule", async () => {
+    const page = fakePage([new CSSStyleRule(), new CSSStyleRule()]);
+    expect(await readAuthoredPageRule(page)).toBeNull();
+  });
+
+  it("returns a margin-only @page rule (size undefined)", async () => {
+    const page = fakePage([new CSSPageRule({ margin: "1in" })]);
+    expect(await readAuthoredPageRule(page)).toEqual({
+      size: undefined,
+      margin: "1in",
+    });
+  });
+
+  it("skips an empty @page rule (no size and no margin)", async () => {
+    const page = fakePage([new CSSPageRule({}), new CSSPageRule({ size: "A4" })]);
+    expect(await readAuthoredPageRule(page)).toEqual({
+      size: "A4",
+      margin: undefined,
+    });
+  });
+
+  it("handles a stylesheet whose cssRules is null", async () => {
+    const page = {
+      evaluate: async (fn: (...a: any[]) => any) => {
+        (global as any).document = { styleSheets: [{ cssRules: null }] };
+        try {
+          return fn();
+        } finally {
+          delete (global as any).document;
+        }
+      },
+    };
+    expect(await readAuthoredPageRule(page)).toBeNull();
+  });
+
+  it("handles a CSSPageRule that has no style object", async () => {
+    // constructor.name matches but .style is undefined -> falls back to {}.
+    const noStyle = new CSSPageRule(undefined);
+    const page = fakePage([noStyle, new CSSPageRule({ size: "A4" })]);
+    expect(await readAuthoredPageRule(page)).toEqual({
+      size: "A4",
+      margin: undefined,
+    });
+  });
+
+  it("skips cross-origin stylesheets that throw on cssRules access", async () => {
+    const page = {
+      evaluate: async (fn: (...a: any[]) => any) => {
+        const crossOrigin = {
+          get cssRules(): any {
+            throw new Error("SecurityError");
+          },
+        };
+        const local = { cssRules: [new CSSPageRule({ size: "A4", margin: "" })] };
+        (global as any).document = { styleSheets: [crossOrigin, local] };
+        try {
+          return fn();
+        } finally {
+          delete (global as any).document;
+        }
+      },
+    };
+    expect(await readAuthoredPageRule(page)).toEqual({ size: "A4", margin: undefined });
   });
 });
 

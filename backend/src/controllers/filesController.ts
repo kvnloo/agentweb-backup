@@ -2,7 +2,6 @@ import { Request, Response } from "express";
 import http from "http"; // Import Node.js http module
 import https from "https"; // Import Node.js https module
 import axios from "axios";
-import puppeteer from "puppeteer-core";
 import path from "path";
 import {
   uploadFileToS3WithPath,
@@ -13,7 +12,7 @@ import {
 } from "../utils/s3Utils";
 import { ChatbotDB } from "../services/chatbotService";
 import { AuthenticatedRequest } from "../middleware/auth";
-import { applyPrintLayoutFixes } from "../utils/pdfPrintLayout";
+import { renderHtmlToPdf } from "../services/pdfRenderService";
 
 const DEFAULT_BUCKET = process.env.AWS_S3_BUCKET || "agentweb-user-files";
 
@@ -383,7 +382,12 @@ export const saveHtmlContent = async (req: Request, res: Response) => {
 };
 
 export const exportHtmlToPdf = async (req: Request, res: Response) => {
-  const { html, filename } = req.body as { html?: string; filename?: string };
+  const { html, filename, orientation, format } = req.body as {
+    html?: string;
+    filename?: string;
+    orientation?: "portrait" | "landscape" | "auto";
+    format?: string;
+  };
 
   if (!html || typeof html !== "string") {
     return res.status(400).json({ success: false, message: "html is required and must be a string." });
@@ -391,34 +395,19 @@ export const exportHtmlToPdf = async (req: Request, res: Response) => {
 
   const safeFilename = (filename || "export").replace(/[^a-zA-Z0-9_\-]/g, "_").replace(/\.html$/i, "") + ".pdf";
 
-  let browser: any = null;
   try {
-    browser = await puppeteer.launch({
-      executablePath: "/usr/bin/google-chrome",
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-      headless: true,
+    // Shared render path (orientation auto-detection + fit-to-width + overlap fix).
+    const { buffer } = await renderHtmlToPdf({
+      html,
+      orientation: orientation ?? "auto",
+      format,
     });
-    const page = await browser.newPage();
-    await page.setContent(html, { waitUntil: "networkidle0", timeout: 30000 });
-    // Prevent sections/tables taller than a page from overflowing and
-    // overwriting adjacent sections (relax unsatisfiable break-inside:avoid).
-    await applyPrintLayoutFixes(page, "A4", "20mm", "20mm");
-    const pdfBuffer = await page.pdf({
-      format: "A4",
-      printBackground: true,
-      margin: { top: "20mm", bottom: "20mm", left: "15mm", right: "15mm" },
-    });
-    await browser.close();
-    browser = null;
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
-    res.setHeader("Content-Length", pdfBuffer.length);
-    return res.send(Buffer.from(pdfBuffer));
+    res.setHeader("Content-Length", buffer.length);
+    return res.send(buffer);
   } catch (error: any) {
-    if (browser) {
-      try { await browser.close(); } catch {}
-    }
     console.error("Error generating PDF:", error);
     return res.status(500).json({ success: false, message: "Failed to generate PDF.", error: error.message });
   }

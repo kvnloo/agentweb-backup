@@ -2,7 +2,7 @@
  * Daily cron for the ai-eval-funnel closed loop.
  *
  * Composes the production wiring: real DynamoPort + real SlackPort +
- * NotionDigestTool + CaptureGate + InMemoryLearningStore + the manifest.
+ * NotionDigestTool + CaptureGate + DynamoLearningStore + the manifest.
  * After each runLoop() returns, drains CaptureGate's collected mutations
  * and posts a single Slack DM summarizing the run + the Notion task URLs
  * that were created.
@@ -15,32 +15,32 @@
  */
 
 import {
-  _resetRegistryForTesting,
   getLoopManifest,
   getRegisteredLoopIds,
-  registerGate,
-  registerLearningStore,
-  registerLoop,
-  registerRuleSet,
-  registerSensor,
-  registerTools,
+  registerOrReplaceGate,
+  registerOrReplaceLearningStore,
+  registerOrReplaceLoop,
+  registerOrReplaceRuleSet,
+  registerOrReplaceSensor,
+  registerOrReplaceTools,
 } from '../../index';
 import { aiEvalManifest, AI_EVAL_LOOP_ID } from './manifest';
 import { aiEvalRules } from './rules';
 import { CaptureGate } from '../../core/gates/captureGate';
-import { InMemoryLearningStore } from '../../core/learning/inMemoryLearningStore';
+import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
+import { CooldownRuleSet } from '../../core/policy/cooldownRuleSet';
 import { DslRuleSet } from '../../core/policy/dslRuleSet';
 import { LlmAnalystRuleSet } from '../../core/policy/llmAnalystRuleSet';
 import { EventTableEventSource } from '../../core/sensors/eventTableEventSource';
 import { runLoop } from '../../core/orchestrator';
 import { productionLoopPorts } from '../../adapters/awsAdapters';
 import { NotionDigestTool } from './notionDigestTool';
-import type { LoopRunResult, Mutation, NormalizedEvent } from '../../core/types';
+import type { LoopRunResult, Mutation, NormalizedEvent, RuleSet } from '../../core/types';
 import type { RcaEnrichment } from './rcaEnricher';
 
 // Hold module-level refs so the cron can drain the gate after orchestrator returns.
 let aiEvalGate: CaptureGate | null = null;
-let aiEvalLearning: InMemoryLearningStore | null = null;
+let aiEvalLearning: DynamoLearningStore | null = null;
 
 export function registerAiEvalFunnelForProduction(): void {
   const ports = productionLoopPorts();
@@ -50,13 +50,6 @@ export function registerAiEvalFunnelForProduction(): void {
   if (registered.includes(AI_EVAL_LOOP_ID)) {
     const existing = getLoopManifest(AI_EVAL_LOOP_ID);
     if (existing.sensorImpl === 'aiEvalSensor:prod') return;
-  }
-
-  // If a smoke/in-mem registration exists, blow away the registry so we can
-  // re-register with prod impls. Production code path expects this to be
-  // called once at boot before any smoke registration.
-  if (registered.length > 0) {
-    _resetRegistryForTesting();
   }
 
   // Scope the loop to the /ai-eval funnel itself: keep only `landed` events on
@@ -72,7 +65,8 @@ export function registerAiEvalFunnelForProduction(): void {
   // volume). Gated so merging is inert until the flag is flipped in prod after a
   // verification pass. The flowDescription is what gives the analyst its lens —
   // note the landerPath caveat so it doesn't false-alarm on site-wide `landed`.
-  const ruleSet =
+  const learning = new DynamoLearningStore(ports.dynamo);
+  const baseRuleSet = (
     process.env.AI_EVAL_LLM_ANALYST === 'true'
       ? new LlmAnalystRuleSet(AI_EVAL_LOOP_ID, ports.bedrock, {
           model: aiEvalManifest.generator.model,
@@ -90,20 +84,21 @@ export function registerAiEvalFunnelForProduction(): void {
             '`form_submitted` is a client event that under-fires. Goal: more eval completers ' +
             'become signups.',
         })
-      : new DslRuleSet(AI_EVAL_LOOP_ID, aiEvalRules);
+      : new DslRuleSet(AI_EVAL_LOOP_ID, aiEvalRules)
+  ) as RuleSet<NormalizedEvent, unknown>;
+  const ruleSet = new CooldownRuleSet(baseRuleSet, learning, AI_EVAL_LOOP_ID);
   const tools = new NotionDigestTool();
   const gate = new CaptureGate();
-  const learning = new InMemoryLearningStore();
 
-  registerSensor('aiEvalSensor:prod', sensor);
+  registerOrReplaceSensor('aiEvalSensor:prod', sensor);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  registerRuleSet('aiEvalRules:prod', ruleSet as any);
+  registerOrReplaceRuleSet('aiEvalRules:prod', ruleSet as any);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  registerTools('aiEvalSpecTool:prod', tools as any);
-  registerGate('aiEvalCaptureGate:prod', gate);
-  registerLearningStore('aiEvalLearning:prod', learning);
+  registerOrReplaceTools('aiEvalSpecTool:prod', tools as any);
+  registerOrReplaceGate('aiEvalCaptureGate:prod', gate);
+  registerOrReplaceLearningStore('aiEvalLearning:prod', learning);
 
-  registerLoop({
+  registerOrReplaceLoop({
     ...aiEvalManifest,
     sensorImpl: 'aiEvalSensor:prod',
     rulesetImpl: 'aiEvalRules:prod',

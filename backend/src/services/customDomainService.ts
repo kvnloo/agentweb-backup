@@ -102,6 +102,34 @@ async function getVercelHeaders(): Promise<Record<string, string>> {
   };
 }
 
+/**
+ * Check whether a domain's DNS is actually pointed at Vercel.
+ *
+ * Vercel's `verified` flag (returned when adding a domain or fetching the
+ * project-domain object) only reflects domain *ownership* — it comes back
+ * `true` as soon as no other Vercel account contests the domain, even when the
+ * customer has not added any A/CNAME records yet. The signal that the domain is
+ * genuinely reachable is the `misconfigured` flag from the domain config
+ * endpoint: `misconfigured: false` means the DNS records resolve to Vercel.
+ *
+ * Returns `true` (treat as misconfigured / not yet reachable) on any error, so
+ * we never mark a domain active without positive confirmation that DNS is set.
+ */
+async function isDomainMisconfigured(
+  domain: string,
+  headers: Record<string, string>
+): Promise<boolean> {
+  try {
+    const res = await axios.get(
+      `${VERCEL_API_BASE}/v6/domains/${domain}/config`,
+      { headers }
+    );
+    return (res.data as any)?.misconfigured === true;
+  } catch {
+    return true;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Core operations
 // ---------------------------------------------------------------------------
@@ -189,32 +217,71 @@ export async function addCustomDomain(
 
   const headers = await getVercelHeaders();
 
-  // Add domain to Vercel project
-  const response = await axios.post(
-    `${VERCEL_API_BASE}/v10/projects/${vercelProjectId}/domains`,
-    { name: cleanDomain },
-    { headers }
-  );
+  // Add domain to Vercel project. A 409 means the domain already exists on
+  // Vercel — if it's already on THIS project (e.g. a prior add, or a disconnect
+  // whose Vercel delete silently failed) we treat that as success and read its
+  // current state instead of erroring. If it's on a different project, the 409
+  // propagates so the user sees "already in use on another project".
+  let vercelData: any;
+  try {
+    const response = await axios.post(
+      `${VERCEL_API_BASE}/v10/projects/${vercelProjectId}/domains`,
+      { name: cleanDomain },
+      { headers }
+    );
+    vercelData = response.data;
+  } catch (err: any) {
+    if (err.response?.status !== 409) throw err;
+    // Already exists — confirm it's on this project by fetching it. If the GET
+    // fails, the domain is on a different project (or otherwise unavailable):
+    // re-throw the original 409 so the caller still sees the conflict.
+    try {
+      const existing = await axios.get(
+        `${VERCEL_API_BASE}/v9/projects/${vercelProjectId}/domains/${cleanDomain}`,
+        { headers }
+      );
+      vercelData = existing.data;
+    } catch {
+      throw err;
+    }
+  }
 
-  const vercelData = response.data as any;
   const isVerified = vercelData.verified === true;
+
+  // `verified` alone only proves domain ownership — Vercel returns it `true`
+  // even before the customer adds any DNS records. The domain is only truly
+  // reachable once its DNS resolves to Vercel (misconfigured === false), so we
+  // require BOTH before marking it active. Otherwise the domain stays
+  // pending_verification and we surface the DNS records the user must add.
+  const misconfigured = isVerified
+    ? await isDomainMisconfigured(cleanDomain, headers)
+    : true;
+  const isActive = isVerified && !misconfigured;
+
+  // Reuse an existing record for this user+domain if one is already stored, so
+  // a re-add (e.g. after a 409) updates in place rather than creating a
+  // duplicate row in DynamoDB.
+  const existingRecords = await listDomains(userId, vercelProjectId);
+  const existing = existingRecords.find(
+    (d) => d.type === "custom" && d.domain === cleanDomain
+  );
 
   const now = new Date().toISOString();
   const record: CustomDomainRecord = {
-    id: uuidv4(),
+    id: existing?.id ?? uuidv4(),
     userId,
     domain: cleanDomain,
     type: "custom",
-    status: isVerified ? "active" : "pending_verification",
+    status: isActive ? "active" : "pending_verification",
     vercelProjectId,
-    verificationRecords: isVerified
+    verificationRecords: isActive
       ? undefined
       : vercelData.verification?.map((v: any) => ({
           type: v.type,
           domain: v.domain,
           value: v.value,
         })),
-    createdAt: now,
+    createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   };
 
@@ -384,7 +451,14 @@ export async function verifyDomain(
   const vercelData = response.data as any;
   const isVerified = vercelData.verified === true;
 
-  if (isVerified && record.status !== "active") {
+  // Ownership-verified is not enough — confirm the DNS records actually resolve
+  // to Vercel (misconfigured === false) before marking the domain active.
+  const misconfigured = isVerified
+    ? await isDomainMisconfigured(record.domain, headers)
+    : true;
+  const isActive = isVerified && !misconfigured;
+
+  if (isActive && record.status !== "active") {
     // Update DynamoDB to active
     await dynamodb
       .update({
@@ -402,9 +476,9 @@ export async function verifyDomain(
   }
 
   return {
-    verified: isVerified,
-    status: isVerified ? "active" : "pending_verification",
-    verificationRecords: isVerified
+    verified: isActive,
+    status: isActive ? "active" : "pending_verification",
+    verificationRecords: isActive
       ? undefined
       : vercelData.verification?.map((v: any) => ({
           type: v.type,

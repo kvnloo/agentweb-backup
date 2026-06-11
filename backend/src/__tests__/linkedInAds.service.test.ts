@@ -424,6 +424,103 @@ describe('searchTargetingEntities', () => {
   });
 });
 
+describe('getAudienceCount', () => {
+  const CRITERIA = {
+    include: {
+      and: [
+        { or: { 'urn:li:adTargetingFacet:locations': ['urn:li:geo:103644278'] } },
+        { or: { 'urn:li:adTargetingFacet:skills': ['urn:li:skill:43774', 'urn:li:skill:31706'] } },
+      ],
+    },
+  };
+
+  it('uses the q=targetingCriteriaV2 finder (not the deprecated dotted target finder)', async () => {
+    await svc.getAudienceCount(ACCESS_TOKEN, CRITERIA);
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.method).toBe('GET');
+    expect(call.url).toContain('/rest/audienceCounts');
+    expect(call.url).toContain('q=targetingCriteriaV2');
+    // The old broken format used target.includedTargetingFacets dotted keys
+    expect(call.url).not.toContain('target.includedTargetingFacets');
+    expect(call.url).not.toContain('q=targetingCriteria&');
+  });
+
+  it('encodes the targetingCriteria param in RestLi 2.0 reduced form with URL-encoded URNs', async () => {
+    await svc.getAudienceCount(ACCESS_TOKEN, CRITERIA);
+    const url: string = mockAxiosFn.mock.calls[0][0].url;
+    // Structural tokens stay literal
+    expect(url).toContain('targetingCriteria=(include:(and:List(');
+    expect(url).toContain('(or:(');
+    expect(url).toContain(':List(');
+    // URNs (facet + values) are percent-encoded
+    expect(url).toContain(encodeURIComponent('urn:li:adTargetingFacet:locations'));
+    expect(url).toContain(encodeURIComponent('urn:li:geo:103644278'));
+    expect(url).toContain(encodeURIComponent('urn:li:skill:43774'));
+    expect(url).toContain(encodeURIComponent('urn:li:skill:31706'));
+  });
+
+  it('includes an exclude clause when the criteria has one', async () => {
+    await svc.getAudienceCount(ACCESS_TOKEN, {
+      ...CRITERIA,
+      exclude: { or: { 'urn:li:adTargetingFacet:seniorities': ['urn:li:seniority:1'] } },
+    });
+    const url: string = mockAxiosFn.mock.calls[0][0].url;
+    expect(url).toContain('exclude:(or:(');
+    expect(url).toContain(encodeURIComponent('urn:li:seniority:1'));
+  });
+
+  it('returns an error when there is no include facet', async () => {
+    const result = await svc.getAudienceCount(ACCESS_TOKEN, { include: { and: [] } });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('include');
+    expect(mockAxiosFn).not.toHaveBeenCalled();
+  });
+
+  it('returns an error when criteria is null', async () => {
+    const result = await svc.getAudienceCount(ACCESS_TOKEN, null as any);
+    expect(result.success).toBe(false);
+    expect(mockAxiosFn).not.toHaveBeenCalled();
+  });
+});
+
+describe('resolveTargetingCriteria', () => {
+  it('builds criteria from the flat targeting_include array (same shape as CAMPAIGN CREATE)', () => {
+    const tc = svc.resolveTargetingCriteria({
+      targeting_include: [
+        { facet_urn: 'urn:li:adTargetingFacet:locations', values: ['urn:li:geo:103644278'] },
+        { facet_urn: 'urn:li:adTargetingFacet:titles', values: ['urn:li:title:68'] },
+      ],
+    });
+    expect(tc).toEqual({
+      include: {
+        and: [
+          { or: { 'urn:li:adTargetingFacet:locations': ['urn:li:geo:103644278'] } },
+          { or: { 'urn:li:adTargetingFacet:titles': ['urn:li:title:68'] } },
+        ],
+      },
+    });
+  });
+
+  it('adds an exclude clause from targeting_exclude', () => {
+    const tc = svc.resolveTargetingCriteria({
+      targeting_include: [{ facet_urn: 'urn:li:adTargetingFacet:locations', values: ['urn:li:geo:103644278'] }],
+      targeting_exclude: [{ facet_urn: 'urn:li:adTargetingFacet:seniorities', values: ['urn:li:seniority:1'] }],
+    });
+    expect(tc.exclude).toEqual({ or: { 'urn:li:adTargetingFacet:seniorities': ['urn:li:seniority:1'] } });
+  });
+
+  it('normalizes a raw targeting_criteria object', () => {
+    const tc = svc.resolveTargetingCriteria({
+      targeting_criteria: { include: { and: [{ or: { 'urn:li:adTargetingFacet:locations': ['urn:li:geo:1'] } }] } },
+    });
+    expect(tc.include.and).toHaveLength(1);
+  });
+
+  it('returns null when no targeting is provided', () => {
+    expect(svc.resolveTargetingCriteria({})).toBeNull();
+  });
+});
+
 describe('createPost — article and document support', () => {
   it('creates post with article content', async () => {
     mockAxiosFn.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:post:art-1' }, status: 201 });

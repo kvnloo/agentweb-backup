@@ -31,6 +31,20 @@ export interface FieldMapping {
   enabled: boolean;
 }
 
+// State of an async (background) full-list push. Persisted on the sync config so
+// it survives a page refresh and is visible to any org member sharing the list.
+// The push runs detached from the HTTP request, so the client polls the status
+// endpoint instead of holding a long-lived connection open (which upstream
+// proxies sever at ~40s, producing a spurious "Push failed").
+export interface PushJob {
+  jobId: string;
+  status: 'running' | 'completed' | 'error';
+  startedAt: string;
+  finishedAt?: string;
+  result?: SyncResult;
+  error?: string;
+}
+
 export interface ExternalCrmSyncConfig {
   provider: 'hubspot' | 'attio';
   listId: string;
@@ -56,6 +70,8 @@ export interface ExternalCrmSyncConfig {
   lastPullSyncAt?: string;
   lastSyncStatus?: 'success' | 'error';
   lastSyncError?: string;
+  // Latest async full-list push job (status + result for the polling UI)
+  pushJob?: PushJob;
   createdAt: string;
   updatedAt: string;
   // Per-list webhook URL secret (embedded in webhook URL, verified on every request)
@@ -569,11 +585,93 @@ export class ExternalCrmSyncService {
 
   // ─── Push: all leads → CRM ───────────────────────────────────────────────────
 
+  // A running push job is considered abandoned (its process died mid-sync) after
+  // this long, so a new push may take over rather than the list being stuck.
+  private static readonly STALE_PUSH_JOB_MS = 20 * 60 * 1000;
+
   async pushAllLeads(userId: string, listId: string, provider: string): Promise<SyncResult> {
     const config = await this.getConfig(userId, listId, provider);
     if (!config) throw new Error('No sync configuration found');
     if (!config.accountId && !config.apiKeyEncrypted) throw new Error('No authentication method configured');
+    return this.runPush(config, listId, provider);
+  }
 
+  /**
+   * Starts a full-list push in the background and returns immediately with a
+   * running job. The HTTP route should return 202 + this job; the client then
+   * polls getPushJob for progress/result. Validation (config + auth) happens
+   * synchronously here so the caller gets a real error for misconfiguration
+   * rather than a job that fails asynchronously.
+   *
+   * Returns `completion` — a promise that resolves when the background push
+   * finishes — purely so tests (and any future caller that wants to await it)
+   * can do so. Route handlers intentionally do NOT await it.
+   */
+  async startPushJob(
+    userId: string,
+    listId: string,
+    provider: string
+  ): Promise<{ job: PushJob; completion: Promise<void> }> {
+    const config = await this.getConfig(userId, listId, provider);
+    if (!config) throw new Error('No sync configuration found');
+    if (!config.accountId && !config.apiKeyEncrypted) throw new Error('No authentication method configured');
+
+    // Idempotency: if a fresh push is already running, return it instead of
+    // launching a duplicate (double-click, two open tabs, etc.).
+    const existing = config.pushJob;
+    if (existing?.status === 'running' && !this.isPushJobStale(existing)) {
+      return { job: existing, completion: Promise.resolve() };
+    }
+
+    const job: PushJob = {
+      jobId: crypto.randomBytes(12).toString('hex'),
+      status: 'running',
+      startedAt: new Date().toISOString(),
+    };
+    config.pushJob = job;
+    await this.persistPushJob(config, job);
+
+    const completion = this.runPush(config, listId, provider)
+      .then(async (result) => {
+        const done: PushJob = { ...job, status: 'completed', finishedAt: new Date().toISOString(), result };
+        config.pushJob = done;
+        await this.persistPushJob(config, done);
+      })
+      .catch(async (err: any) => {
+        const message = this.formatError(err);
+        console.error(`[ExternalCrmSync] push job ${job.jobId} failed for list ${listId}/${provider}: ${message}`);
+        const failed: PushJob = { ...job, status: 'error', finishedAt: new Date().toISOString(), error: message };
+        config.pushJob = failed;
+        config.lastSyncStatus = 'error';
+        config.lastSyncError = message;
+        await this.persistPushJob(config, failed);
+      });
+
+    return { job, completion };
+  }
+
+  /** Returns the latest push job for the list, or null if none / no access. */
+  async getPushJob(userId: string, listId: string, provider: string): Promise<PushJob | null> {
+    const config = await this.getConfig(userId, listId, provider);
+    return config?.pushJob ?? null;
+  }
+
+  private isPushJobStale(job: PushJob): boolean {
+    const started = Date.parse(job.startedAt);
+    if (Number.isNaN(started)) return true;
+    return Date.now() - started > ExternalCrmSyncService.STALE_PUSH_JOB_MS;
+  }
+
+  /** Re-reads the config map and writes back only the pushJob field, so a job
+   *  status update doesn't clobber a concurrent config edit. */
+  private async persistPushJob(config: ExternalCrmSyncConfig, job: PushJob): Promise<void> {
+    config.updatedAt = new Date().toISOString();
+    await crmDb.setLeadListCrmSyncConfig(config.listId, config.provider, config as any)
+      .catch((err: any) => console.error(`[ExternalCrmSync] failed to persist push job ${job.jobId}:`, this.formatError(err)));
+  }
+
+  /** Core push loop, operating on an already-resolved config. */
+  private async runPush(config: ExternalCrmSyncConfig, listId: string, provider: string): Promise<SyncResult> {
     // Attach the human-readable list name so adapters can use it when naming external lists
     if (!config.listName) {
       const list = await crmDb.getLeadListById(listId);
@@ -744,6 +842,7 @@ export class ExternalCrmSyncService {
     if (direction === 'push') config.lastPushSyncAt = now;
     else config.lastPullSyncAt = now;
     config.lastSyncStatus = success ? 'success' : 'error';
+    if (success) config.lastSyncError = undefined;
     config.updatedAt = now;
     await this.saveUpdatedConfig(config);
   }

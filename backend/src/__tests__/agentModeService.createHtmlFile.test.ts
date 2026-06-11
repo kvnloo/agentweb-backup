@@ -484,36 +484,40 @@ describe('AgentModeService - createHtmlFile', () => {
     });
 
     it('should return error when title is missing', async () => {
-      await expect(
-        (agentModeService as any).executeTool(
-          'gpt-4',
-          'create_html_file',
-          {
-            content_draft: 'Test content'
-          },
-          'user123',
-          'session123',
-          false
-        )
-      ).rejects.toThrow('title is required and must be a string');
+      const result = await (agentModeService as any).executeTool(
+        'gpt-4',
+        'create_html_file',
+        {
+          content_draft: 'Test content'
+        },
+        'user123',
+        'session123',
+        false
+      );
 
+      expect(result).toMatchObject({
+        success: false,
+        error: expect.stringContaining('Missing required argument "title"')
+      });
       expect((singletonAgentService as any).createHtmlFile).not.toHaveBeenCalled();
     });
 
     it('should return error when content_draft is missing', async () => {
-      await expect(
-        (agentModeService as any).executeTool(
-          'gpt-4',
-          'create_html_file',
-          {
-            title: 'Test Title'
-          },
-          'user123',
-          'session123',
-          false
-        )
-      ).rejects.toThrow('content_draft is required and must be a string');
+      const result = await (agentModeService as any).executeTool(
+        'gpt-4',
+        'create_html_file',
+        {
+          title: 'Test Title'
+        },
+        'user123',
+        'session123',
+        false
+      );
 
+      expect(result).toMatchObject({
+        success: false,
+        error: expect.stringContaining('Missing required argument "content_draft"')
+      });
       expect((singletonAgentService as any).createHtmlFile).not.toHaveBeenCalled();
     });
 
@@ -551,7 +555,7 @@ describe('AgentModeService - createHtmlFile', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.message).toBe('title is required');
+      expect(result.error).toContain('Missing required argument "title"');
     });
 
     it('should validate content_draft in mock mode', async () => {
@@ -567,8 +571,93 @@ describe('AgentModeService - createHtmlFile', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.message).toBe('content_draft is required');
+      expect(result.error).toContain('Missing required argument "content_draft"');
+    });
+
+    it('should repair update_html_file replacement_json alias in direct executeTool calls', async () => {
+      const result = await (agentModeService as any).executeTool(
+        'gpt-4',
+        'update_html_file',
+        {
+          file_url: 'https://example.com/report.html',
+          update_type: 'full',
+          replacement_json: JSON.stringify([
+            {
+              old_content_hash: 'abc123',
+              new_content: '<!doctype html><html><body>Updated</body></html>',
+              expected_count: 1,
+            },
+          ]),
+        },
+        'user123',
+        'session123',
+        true
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.s3_url).toContain('mock-s3-bucket');
+      expect(result.replacements).toEqual([
+        expect.objectContaining({
+          old_content_hash: 'abc123',
+          new_content: '<!doctype html><html><body>Updated</body></html>',
+          expected_count: 1,
+          success: true,
+        }),
+      ]);
+    });
+
+    it('should validate and repair contracts in direct executeTool calls before registry execution', async () => {
+      const execute = jest.fn(async (args) => ({ success: true, args }));
+      (agentModeService as any).toolRegistry.register({
+        name: 'contract_test_tool',
+        definition: {
+          type: 'function',
+          function: {
+            name: 'contract_test_tool',
+            description: 'Test-only contract tool',
+            parameters: {
+              type: 'object',
+              properties: {
+                canonical: { type: 'string', 'x-aliases': ['alias'] },
+              },
+              required: ['canonical'],
+              additionalProperties: false,
+            },
+          },
+        },
+        execute,
+      });
+
+      const repaired = await (agentModeService as any).executeTool(
+        'gpt-4',
+        'contract_test_tool',
+        { alias: 'value' },
+        'user123',
+        'session123',
+        false
+      );
+
+      expect(repaired).toEqual({ success: true, args: { canonical: 'value' } });
+      expect(execute).toHaveBeenCalledWith(
+        { canonical: 'value' },
+        expect.objectContaining({ userId: 'user123', sessionId: 'session123' })
+      );
+
+      execute.mockClear();
+      const invalid = await (agentModeService as any).executeTool(
+        'gpt-4',
+        'contract_test_tool',
+        {},
+        'user123',
+        'session123',
+        false
+      );
+
+      expect(invalid).toMatchObject({
+        success: false,
+        error: expect.stringContaining('Missing required argument "canonical"'),
+      });
+      expect(execute).not.toHaveBeenCalled();
     });
   });
 });
-

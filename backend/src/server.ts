@@ -531,41 +531,46 @@ createTestAccount().then(async () => {
       // tested; re-enable here if we want the daily summary back.
 
       // Onboarding Loop — daily at 15:00 UTC (7am PT), gated by ONBOARDING_LOOP_ENABLED=true
-      try {
-        const LOOP_INTERVAL_MS = 24 * 60 * 60 * 1000;
-        const { runOnboardingLoop } = await import('./cron/onboardingLoop');
+      if (process.env.ONBOARDING_LOOP_ENABLED === 'true') {
+        try {
+          const LOOP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+          const { runOnboardingLoop } = await import('./cron/onboardingLoop');
 
-        const nowForLoop = new Date();
-        const nextLoopRun = new Date(nowForLoop);
-        nextLoopRun.setUTCHours(15, 0, 0, 0);
-        if (nextLoopRun <= nowForLoop) {
-          nextLoopRun.setUTCDate(nextLoopRun.getUTCDate() + 1);
-        }
-        const msUntilLoop = nextLoopRun.getTime() - nowForLoop.getTime();
+          const nowForLoop = new Date();
+          const nextLoopRun = new Date(nowForLoop);
+          nextLoopRun.setUTCHours(15, 0, 0, 0);
+          if (nextLoopRun <= nowForLoop) {
+            nextLoopRun.setUTCDate(nextLoopRun.getUTCDate() + 1);
+          }
+          const msUntilLoop = nextLoopRun.getTime() - nowForLoop.getTime();
 
-        console.log(`[OnboardingLoop] Initialized — first run at 15:00 UTC (in ${Math.round(msUntilLoop / 60000)} min)`);
-        setTimeout(() => {
-          runOnboardingLoop().catch(e => console.error('[OnboardingLoop] Error:', e));
-          setInterval(() => {
+          console.log(`[OnboardingLoop] Initialized — first run at 15:00 UTC (in ${Math.round(msUntilLoop / 60000)} min)`);
+          setTimeout(() => {
             runOnboardingLoop().catch(e => console.error('[OnboardingLoop] Error:', e));
-          }, LOOP_INTERVAL_MS);
-        }, msUntilLoop);
-      } catch (error) {
-        console.error('[OnboardingLoop] Failed to initialize:', error);
-      }
+            setInterval(() => {
+              runOnboardingLoop().catch(e => console.error('[OnboardingLoop] Error:', e));
+            }, LOOP_INTERVAL_MS);
+          }, msUntilLoop);
+        } catch (error) {
+          console.error('[OnboardingLoop] Failed to initialize:', error);
+        }
 
-      // Onboarding Loop Watchdog — hourly, gated by ONBOARDING_LOOP_ENABLED=true
-      try {
-        const WATCHDOG_INTERVAL_MS = 60 * 60 * 1000;
-        const { runOnboardingLoopWatchdog } = await import('./cron/onboardingLoopWatchdog');
+        // Onboarding Loop Watchdog — hourly, gated by ONBOARDING_LOOP_ENABLED=true
+        try {
+          const WATCHDOG_INTERVAL_MS = 60 * 60 * 1000;
+          const { runOnboardingLoopWatchdog } = await import('./cron/onboardingLoopWatchdog');
 
-        console.log('[OnboardingWatchdog] Initialized — running hourly');
-        runOnboardingLoopWatchdog().catch(e => console.error('[OnboardingWatchdog] Error on first run:', e));
-        setInterval(() => {
-          runOnboardingLoopWatchdog().catch(e => console.error('[OnboardingWatchdog] Error:', e));
-        }, WATCHDOG_INTERVAL_MS);
-      } catch (error) {
-        console.error('[OnboardingWatchdog] Failed to initialize:', error);
+          console.log('[OnboardingWatchdog] Initialized — running hourly');
+          runOnboardingLoopWatchdog().catch(e => console.error('[OnboardingWatchdog] Error on first run:', e));
+          setInterval(() => {
+            runOnboardingLoopWatchdog().catch(e => console.error('[OnboardingWatchdog] Error:', e));
+          }, WATCHDOG_INTERVAL_MS);
+        } catch (error) {
+          console.error('[OnboardingWatchdog] Failed to initialize:', error);
+        }
+      } else {
+        console.log('[OnboardingLoop] Disabled (set ONBOARDING_LOOP_ENABLED=true to enable)');
+        console.log('[OnboardingWatchdog] Disabled (set ONBOARDING_LOOP_ENABLED=true to enable)');
       }
 
       // AI Eval Funnel closed-loop — daily at 16:00 UTC (8am PT), one hour
@@ -602,11 +607,11 @@ createTestAccount().then(async () => {
       }
 
       // AI Readiness Funnel closed-loop — daily at 16:30 UTC, offset 30 min from
-      // ai-eval (16:00) so they don't race for Slack/Bedrock. Default ON (the
-      // loop is the value); kill with AI_READINESS_LOOP_ENABLED=false. The loop
-      // itself is always REGISTERED in app.ts so event ingestion works
-      // regardless of this schedule flag.
-      if (process.env.AI_READINESS_LOOP_ENABLED !== 'false') {
+      // ai-eval (16:00) so they don't race for Slack/Bedrock. Explicit opt-in so
+      // staging/dev environments with Emma Dev tokens cannot start DMing by
+      // accident. The loop itself is always REGISTERED in app.ts so event
+      // ingestion works regardless of this schedule flag.
+      if (process.env.AI_READINESS_LOOP_ENABLED === 'true') {
         try {
           const AI_READINESS_LOOP_INTERVAL_MS = 24 * 60 * 60 * 1000;
           const { runAiReadinessLoopOnce } = await import('./loops/instances/ai-readiness-funnel');
@@ -632,7 +637,7 @@ createTestAccount().then(async () => {
           console.error('[AiReadinessLoop] Failed to initialize:', error);
         }
       } else {
-        console.log('[AiReadinessLoop] Disabled (AI_READINESS_LOOP_ENABLED=false)');
+        console.log('[AiReadinessLoop] Disabled (set AI_READINESS_LOOP_ENABLED=true to enable)');
       }
 
       // Onboarding loop V2 (framework port, REVAMP) — daily at 17:00 UTC (9am
@@ -668,6 +673,75 @@ createTestAccount().then(async () => {
         console.log('[OnboardingLoopV2] Disabled (set ONBOARDING_LOOP_V2=true to enable)');
       }
 
+      // Agent-mode tool-reliability loop — daily at 17:30 UTC, offset from the
+      // funnel loops so they don't race for Slack/Bedrock. Reads agent_tool_*
+      // events the runtime-spine recorder wrote to Dev-AW-LoopEvents, clusters
+      // failures per tool, and DMs Harsha a cloud-dev fix spec per failing
+      // tool. This learning/dispatch loop is gated by AGENT_MODE_LOOP_ENABLED.
+      // Shadow-mode telemetry can be tested separately with
+      // AGENT_RUNTIME_SPINE_ENABLED=true.
+      if (process.env.AGENT_MODE_LOOP_ENABLED === 'true') {
+        try {
+          const AGENT_MODE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+          const { runAgentModeLoopOnce } = await import('./loops/instances/agent-mode');
+
+          const nowForAgentMode = new Date();
+          const nextAgentModeRun = new Date(nowForAgentMode);
+          nextAgentModeRun.setUTCHours(17, 30, 0, 0);
+          if (nextAgentModeRun <= nowForAgentMode) {
+            nextAgentModeRun.setUTCDate(nextAgentModeRun.getUTCDate() + 1);
+          }
+          const msUntilAgentMode = nextAgentModeRun.getTime() - nowForAgentMode.getTime();
+
+          console.log(
+            `[AgentModeLoop] Initialized — first run at 17:30 UTC (in ${Math.round(msUntilAgentMode / 60000)} min)`,
+          );
+          setTimeout(() => {
+            runAgentModeLoopOnce().catch(e => console.error('[AgentModeLoop] Error:', e));
+            setInterval(() => {
+              runAgentModeLoopOnce().catch(e => console.error('[AgentModeLoop] Error:', e));
+            }, AGENT_MODE_INTERVAL_MS);
+          }, msUntilAgentMode);
+        } catch (error) {
+          console.error('[AgentModeLoop] Failed to initialize:', error);
+        }
+      } else {
+        console.log('[AgentModeLoop] Disabled (set AGENT_MODE_LOOP_ENABLED=true to enable)');
+      }
+
+      // Generic Layer-5 attribution — daily at 18:00 UTC, after the product
+      // proposal loops. This measures shipped mutations for every registered
+      // loop and writes verdicts back to the durable learning store so future
+      // policy runs can read what worked or failed.
+      if (process.env.LOOP_ATTRIBUTION_ENABLED !== 'false') {
+        try {
+          const LOOP_ATTRIBUTION_INTERVAL_MS = 24 * 60 * 60 * 1000;
+          const { runLoopAttributionOnce } = await import('./loops/cron/loopAttributionCron');
+
+          const nowForAttribution = new Date();
+          const nextAttributionRun = new Date(nowForAttribution);
+          nextAttributionRun.setUTCHours(18, 0, 0, 0);
+          if (nextAttributionRun <= nowForAttribution) {
+            nextAttributionRun.setUTCDate(nextAttributionRun.getUTCDate() + 1);
+          }
+          const msUntilAttribution = nextAttributionRun.getTime() - nowForAttribution.getTime();
+
+          console.log(
+            `[LoopAttribution] Initialized — first run at 18:00 UTC (in ${Math.round(msUntilAttribution / 60000)} min)`,
+          );
+          setTimeout(() => {
+            runLoopAttributionOnce().catch(e => console.error('[LoopAttribution] Error:', e));
+            setInterval(() => {
+              runLoopAttributionOnce().catch(e => console.error('[LoopAttribution] Error:', e));
+            }, LOOP_ATTRIBUTION_INTERVAL_MS);
+          }, msUntilAttribution);
+        } catch (error) {
+          console.error('[LoopAttribution] Failed to initialize:', error);
+        }
+      } else {
+        console.log('[LoopAttribution] Disabled (LOOP_ATTRIBUTION_ENABLED=false)');
+      }
+
     }, 30000); // Delay 30s after startup to allow Agent Mode to boot first
   });
-}); 
+});

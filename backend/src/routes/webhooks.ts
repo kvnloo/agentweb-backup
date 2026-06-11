@@ -459,15 +459,33 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // WORKAROUND (2026-06-04): deliver the AI Readiness roadmap PDF directly.
     // The proper path (list-bound drip sequence) is not usable yet — the
     // sequence feature is not production ready and this webhook does not
-    // auto-enroll (AGW-37509247-c951-8108-9545-fb47c0914bdc). Send only on new
-    // leads to avoid re-sending on repeat submits. Fire-and-forget; never blocks.
-    if (isNew) {
-      void sendRoadmapDeliveryEmail({
-        to: lead.email,
-        stage: mergedCustomFields.stage,
-        source: mergedCustomFields.source,
-        firstName: lead.firstName,
-      });
+    // auto-enroll (AGW-37509247-c951-8108-9545-fb47c0914bdc). Do not gate this
+    // only on `isNew`: popup partials / AI Eval pretriggers can create the lead
+    // before the final roadmap submit arrives with a valid stage.
+    const roadmapCustomFields = lead.customFields || mergedCustomFields || {};
+    if (!roadmapCustomFields.roadmapEmailSentAt) {
+      void (async () => {
+        const sent = await sendRoadmapDeliveryEmail({
+          to: lead.email,
+          stage: roadmapCustomFields.stage,
+          source: roadmapCustomFields.source,
+          firstName: lead.firstName,
+        });
+
+        if (!sent) return;
+
+        try {
+          await crmDb.updateLead(leadList.listId, lead.leadId, {
+            customFields: {
+              ...roadmapCustomFields,
+              roadmapEmailSentAt: new Date().toISOString(),
+              roadmapEmailStage: Number(roadmapCustomFields.stage),
+            },
+          });
+        } catch (markError) {
+          console.error('[roadmapDelivery] sent but failed to mark lead:', markError);
+        }
+      })();
     }
 
     // After response is sent: auto-draft, auto-send, and alert (fire-and-forget, fully awaited internally)

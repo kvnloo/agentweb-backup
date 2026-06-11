@@ -51,11 +51,6 @@ export function sanitizePhone(raw: string): string | null {
       if (isValidPhoneNumber(trimmed, DEFAULT_COUNTRY)) {
         return parsePhoneNumberWithError(trimmed, DEFAULT_COUNTRY).formatInternational();
       }
-
-      // Tier 1c: full country code without + (e.g. "0049 70 49788959").
-      if (isValidPhoneNumber(trimmed)) {
-        return parsePhoneNumberWithError(trimmed).formatInternational();
-      }
     }
   } catch {
     // libphonenumber threw — fall through to digit-count check.

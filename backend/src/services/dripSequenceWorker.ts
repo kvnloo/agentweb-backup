@@ -108,13 +108,15 @@ async function processEnrollment(
 
   const user = await userDb.getUserById(enrollment.userId).catch(() => null);
 
-  const msgVars: Record<string, string> = {
+  const msgVars: Record<string, any> = {
     firstName: lead?.firstName ?? '',
     lastName: lead?.lastName ?? '',
     email: enrollment.leadEmail,
     company: lead?.company ?? '',
+    title: lead?.title ?? '',
     senderName: user?.displayName ?? user?.name ?? '',
     senderEmail: user?.email ?? '',
+    customFields: lead?.customFields ?? {},
   };
 
   if (channel === 'linkedin') {
@@ -140,7 +142,7 @@ async function sendEmailStep(
   enrollment: SequenceEnrollment,
   step: any,
   user: any,
-  msgVars: Record<string, string>,
+  msgVars: Record<string, any>,
 ): Promise<void> {
   // Load configured senders for this user
   const senderConfig = await loadSenderConfig(enrollment.userId);
@@ -185,7 +187,7 @@ async function sendLinkedInStep(
   enrollment: SequenceEnrollment,
   step: any,
   lead: any,
-  msgVars: Record<string, string>,
+  msgVars: Record<string, any>,
 ): Promise<void> {
   const linkedInUrl = lead?.linkedin?.trim();
   if (!linkedInUrl) {

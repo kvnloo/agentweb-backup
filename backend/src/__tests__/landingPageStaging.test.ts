@@ -56,6 +56,9 @@ jest.mock("../services/db", () => ({
 const mockGetLandingPage = jest.fn();
 const mockGetLandingPageById = jest.fn();
 const mockGetPreviewDeploymentUrl = jest.fn();
+const mockRecordPublish = jest.fn();
+const mockMarkReverted = jest.fn();
+const mockTriggerVercel = jest.fn();
 
 jest.mock("../services/v0Service", () => ({
   generateLandingPage: jest.fn(),
@@ -63,6 +66,7 @@ jest.mock("../services/v0Service", () => ({
   iterateLandingPage: jest.fn(),
   getLandingPage: (...args: any[]) => mockGetLandingPage(...args),
   getLandingPageById: (...args: any[]) => mockGetLandingPageById(...args),
+  getLandingPageLiveUrl: (page: any) => page?.customDomainUrl || page?.deployedUrl || "",
   getLandingPagesByOwner: jest.fn().mockResolvedValue([]),
   getLandingPagesByOrg: jest.fn().mockResolvedValue([]),
   listLandingPages: jest.fn().mockResolvedValue([]),
@@ -70,11 +74,13 @@ jest.mock("../services/v0Service", () => ({
   deleteLandingPageByRecord: jest.fn(),
   updateLandingPageGtm: jest.fn(),
   updateLandingPageContext: jest.fn(),
+  recordLandingPagePublish: (...args: any[]) => mockRecordPublish(...args),
+  markLandingPagePublishReverted: (...args: any[]) => mockMarkReverted(...args),
   buildBrandEnrichedPrompt: jest.fn(),
   getDeploymentStatus: jest.fn(),
   getPreviewDeploymentUrl: (...args: any[]) => mockGetPreviewDeploymentUrl(...args),
   resolveVercelProjectId: jest.fn().mockImplementation((page: any) => Promise.resolve(page.vercelProjectId || null)),
-  triggerVercelDeployment: jest.fn(),
+  triggerVercelDeployment: (...args: any[]) => mockTriggerVercel(...args),
   getProjectEnvVars: jest.fn().mockResolvedValue({}),
   upsertEnvVar: jest.fn(),
   deleteEnvVar: jest.fn(),
@@ -120,6 +126,9 @@ beforeEach(() => {
   // Routes go through authorizeLandingPageAccess (uses getLandingPageById)
   // for read+edit — owner fast-path passes when page.userId matches caller.
   mockGetLandingPageById.mockResolvedValue(TEST_PAGE);
+  mockTriggerVercel.mockResolvedValue(undefined);
+  mockRecordPublish.mockResolvedValue(undefined);
+  mockMarkReverted.mockResolvedValue(undefined);
 });
 
 // =============================================================================
@@ -426,6 +435,8 @@ describe("POST /publish", () => {
   });
 
   it("SUCCESS: merges branch and deletes it", async () => {
+    // Read pre-merge main SHA
+    mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha: "pre-merge-sha" } }));
     // Merge succeeds
     mockedAxios.post.mockResolvedValueOnce(axiosRes({ sha: "merge-sha-123" }));
     // Delete branch succeeds
@@ -455,9 +466,50 @@ describe("POST /publish", () => {
       expect.stringContaining("/git/refs/heads/draft/session-12345678"),
       expect.any(Object)
     );
+
+    // Verify publish history was recorded for later revert
+    expect(mockRecordPublish).toHaveBeenCalledWith(
+      "page-123",
+      expect.objectContaining({
+        preMergeSha: "pre-merge-sha",
+        mergeSha: "merge-sha-123",
+        branch: "draft/session-12345678",
+      })
+    );
+  });
+
+  it("SUCCESS: does not record publish history when pre-merge SHA is unreadable", async () => {
+    // Reading pre-merge main fails — revert won't be offered for this publish
+    mockedAxios.get.mockRejectedValueOnce(new Error("network"));
+    mockedAxios.post.mockResolvedValueOnce(axiosRes({ sha: "merge-sha-456" }));
+    mockedAxios.delete.mockResolvedValueOnce(axiosRes({}));
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-123/publish")
+      .send({ branch: "draft/session-12345678" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.merge_commit_sha).toBe("merge-sha-456");
+    expect(mockRecordPublish).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: publish still succeeds when recording publish history fails", async () => {
+    mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha: "pre-merge-sha" } }));
+    mockedAxios.post.mockResolvedValueOnce(axiosRes({ sha: "merge-sha-789" }));
+    mockedAxios.delete.mockResolvedValueOnce(axiosRes({}));
+    mockRecordPublish.mockRejectedValueOnce(new Error("dynamo down"));
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-123/publish")
+      .send({ branch: "draft/session-12345678" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.merge_commit_sha).toBe("merge-sha-789");
   });
 
   it("SUCCESS: merge conflict (409) falls back to force-advancing main", async () => {
+    // Read pre-merge main SHA
+    mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha: "pre-merge-sha" } }));
     // Standard merge returns 409
     mockedAxios.post.mockRejectedValueOnce({
       response: { status: 409, data: { message: "Merge conflict" } },
@@ -498,6 +550,141 @@ describe("POST /publish", () => {
 
     expect(res.status).toBe(404);
     expect(res.body.error).toMatch(/Branch not found/);
+  });
+});
+
+// =============================================================================
+// POST /revert-publish
+// =============================================================================
+describe("POST /revert-publish", () => {
+  const PUBLISHED_PAGE = {
+    ...TEST_PAGE,
+    lastPublish: {
+      preMergeSha: "pre-merge-sha-aaa",
+      mergeSha: "merge-sha-bbb",
+      branch: "draft/session-12345678",
+      publishedAt: "2026-06-01T00:00:00.000Z",
+    },
+  };
+
+  it("FAIL: no recorded publish → 400", async () => {
+    mockGetLandingPageById.mockResolvedValue(TEST_PAGE); // no lastPublish
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-123/revert-publish");
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/Nothing to revert/);
+    expect(mockedAxios.patch).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: publish already reverted → 400", async () => {
+    mockGetLandingPageById.mockResolvedValue({
+      ...PUBLISHED_PAGE,
+      lastPublish: { ...PUBLISHED_PAGE.lastPublish, revertedAt: "2026-06-02T00:00:00.000Z" },
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-123/revert-publish");
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/already been reverted/);
+    expect(mockedAxios.patch).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: page has no GitHub repo → 400", async () => {
+    mockGetLandingPageById.mockResolvedValue({
+      id: "page-123",
+      userId: "test-user-id",
+      lastPublish: PUBLISHED_PAGE.lastPublish,
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-123/revert-publish");
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/No GitHub repository/);
+  });
+
+  it("FAIL: main moved since publish → 409 (refuses to clobber newer changes)", async () => {
+    mockGetLandingPageById.mockResolvedValue(PUBLISHED_PAGE);
+    // Current main is NOT the merge commit this publish produced
+    mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha: "newer-sha-xyz" } }));
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-123/revert-publish");
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/main has changed/);
+    expect(mockedAxios.patch).not.toHaveBeenCalled();
+    expect(mockMarkReverted).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: force-resets main to pre-merge SHA, redeploys, marks reverted", async () => {
+    mockGetLandingPageById.mockResolvedValue(PUBLISHED_PAGE);
+    // Current main still at the publish merge commit
+    mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha: "merge-sha-bbb" } }));
+    // Force-reset main
+    mockedAxios.patch.mockResolvedValueOnce(axiosRes({ ref: "refs/heads/main" }));
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-123/revert-publish");
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.reverted_to_sha).toBe("pre-merge-sha-aaa");
+
+    // main reset back to the pre-merge SHA via force
+    expect(mockedAxios.patch).toHaveBeenCalledWith(
+      expect.stringContaining("/git/refs/heads/main"),
+      expect.objectContaining({ sha: "pre-merge-sha-aaa", force: true }),
+      expect.any(Object)
+    );
+    // publish marked consumed so it can't be reverted twice
+    expect(mockMarkReverted).toHaveBeenCalledWith("page-123", expect.any(String));
+  });
+
+  it("SUCCESS: still succeeds when Vercel redeploy and mark-reverted fail", async () => {
+    mockGetLandingPageById.mockResolvedValue(PUBLISHED_PAGE);
+    mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha: "merge-sha-bbb" } }));
+    mockedAxios.patch.mockResolvedValueOnce(axiosRes({ ref: "refs/heads/main" }));
+    // Both non-fatal post-steps fail
+    mockTriggerVercel.mockRejectedValueOnce(new Error("vercel down"));
+    mockMarkReverted.mockRejectedValueOnce(new Error("dynamo down"));
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-123/revert-publish");
+
+    expect(res.status).toBe(200);
+    expect(res.body.reverted_to_sha).toBe("pre-merge-sha-aaa");
+  });
+
+  it("FAIL: GitHub 404 during revert → 404", async () => {
+    mockGetLandingPageById.mockResolvedValue(PUBLISHED_PAGE);
+    // Reading main ref throws a GitHub 404
+    mockedAxios.get.mockRejectedValueOnce({
+      response: { status: 404, data: { message: "Not Found" } },
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-123/revert-publish");
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toMatch(/not found/i);
+  });
+
+  it("FAIL: GitHub error during force-reset → 500", async () => {
+    mockGetLandingPageById.mockResolvedValue(PUBLISHED_PAGE);
+    mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha: "merge-sha-bbb" } }));
+    mockedAxios.patch.mockRejectedValueOnce({
+      response: { status: 422, data: { message: "Update is not a fast forward" } },
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-123/revert-publish");
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toMatch(/Failed to revert/);
   });
 });
 

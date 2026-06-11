@@ -26,6 +26,7 @@ emmaToolRegistry.register({
       properties: {
         skillIds: {
           type: 'array',
+          minItems: 1,
           items: { type: 'string' },
           description: 'Array of ALL skill IDs to install. Include every skill you need in one call.'
         }
@@ -40,12 +41,15 @@ emmaToolRegistry.register({
       throw new Error("Authentication required: no user context");
     }
 
-    if (!Array.isArray(args.skillIds) || args.skillIds.length === 0) {
-      return { message: "skillIds must be a non-empty array of skill IDs." };
-    }
-
     // For external MCP clients: validate and update session state
     if (context?.updateInstalledSkills) {
+      const requestedSkillIds = Array.isArray(args.skillIds)
+        ? args.skillIds.filter((id: unknown): id is string => typeof id === 'string')
+        : [];
+      if (requestedSkillIds.length === 0) {
+        return { message: "skillIds must be a non-empty array of skill IDs." };
+      }
+
       const { skillService } = await import('../services/skillService');
       const { getAllowedSkills } = await import('../services/subscriptionService');
 
@@ -57,7 +61,7 @@ emmaToolRegistry.register({
       const isWildcard = userAllowedSkillIds.includes("*");
       const allowedSkillSet = new Set(userAllowedSkillIds);
 
-      const validSkillIds = args.skillIds.filter((id: string) => {
+      const validSkillIds = requestedSkillIds.filter((id: string) => {
         const skill = publishedSkills.find(s => s.skillId === id);
         const isOwnSkill = skill && (skill as any).ownerId === userId;
         return (id === '__other_skills__' || skill) &&
@@ -876,7 +880,7 @@ REQUIRED PARAMS PER ENTITY + ACTION:
   CREATIVE CREATE_DYNAMIC: campaign_id, format (JOBS|SPOTLIGHT|FOLLOW_COMPANY). JOBS needs headline+button_label. SPOTLIGHT needs headline+call_to_action+landing_page+logo_urn (logo_urn is REQUIRED — upload logo with MEDIA/UPLOAD_IMAGE first). FOLLOW_COMPANY needs headline.
   TARGETING SEARCH: facet (URN like urn:li:adTargetingFacet:locations), query (optional — omit for facets without typeahead like seniorities/industries)
     Common facets: locations, titles (job titles — NOT jobTitles), seniorities, industries, functions, staffCountRanges, memberInterests, skills
-  TARGETING ESTIMATE_REACH: targeting_criteria (object)
+  TARGETING ESTIMATE_REACH: targeting_include (array of { facet_urn, values } — SAME shape as CAMPAIGN CREATE; resolve value URNs via TARGETING SEARCH first). Optional targeting_exclude. Returns { active, total }; total is 0 when the audience is under the 300-member minimum. ALWAYS run this before CAMPAIGN CREATE to confirm reach ≥ 300.
   MEDIA UPLOAD_IMAGE: image_url (public URL). Returns image_urn.
   MEDIA UPLOAD_VIDEO: video_url (public URL). Auto-downloads, measures size, handles multipart upload. Returns video_urn. NEVER ask the user for file size.
   MEDIA UPLOAD_DOCUMENT: document_url (public URL to PDF/PPT/DOC). Returns document_urn.
@@ -926,7 +930,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
             runSchedule: { type: 'object', description: '{ start: <epoch_ms>, end?: <epoch_ms> }' },
             targeting_include: {
               type: 'array',
-              description: 'CAMPAIGN CREATE targeting (include). Each item: { facet_urn: string, values: string[] }. Use TARGETING SEARCH first to get value URNs.',
+              description: 'Targeting facets to include — used by both CAMPAIGN CREATE and TARGETING ESTIMATE_REACH. Each item: { facet_urn: string, values: string[] }. Use TARGETING SEARCH first to get value URNs.',
               items: {
                 type: 'object',
                 properties: {
@@ -937,7 +941,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
             },
             targeting_exclude: {
               type: 'array',
-              description: 'CAMPAIGN CREATE targeting (exclude). Same format as targeting_include.',
+              description: 'Targeting facets to exclude (CAMPAIGN CREATE and TARGETING ESTIMATE_REACH). Same format as targeting_include.',
               items: {
                 type: 'object',
                 properties: {
@@ -1706,10 +1710,12 @@ emmaToolRegistry.register({
       properties: {
         title_draft: {
           type: 'string',
+          'x-aliases': ['title', 'headline', 'subject'],
           description: 'A draft title for the blog article. The final title will be generated and optimized from this draft.'
         },
         content_draft: {
           type: 'string',
+          'x-aliases': ['content', 'body', 'text', 'markdown', 'article_content'],
           description: 'The blog article content in markdown format'
         },
         length: {
@@ -1973,13 +1979,6 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    if (!args.template_id) {
-      return {
-        success: false,
-        message: 'template_id is required'
-      };
-    }
-
     // Parse JSON strings
     let variableValues = {};
     let arrayVariableValues = {};
@@ -2037,6 +2036,7 @@ emmaToolRegistry.register({
         },
         operations_json: {
           type: 'string',
+          'x-aliases': ['replacement_json'],
           description: 'JSON string containing operations. ' +
             'For CSS mode: [{"action": "remove", "selector": ".card[data-id=\\"123\\"]"}, ' +
             '{"action": "replace", "selector": "h1.title", "html": "<h1 class=\\"title\\">New Title</h1>"}, ' +
@@ -2054,22 +2054,9 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    if (!args.file_url) {
-      return { success: false, message: 'file_url is required' };
-    }
-    if (!args.update_type) {
-      return { success: false, message: 'update_type is required' };
-    }
-
-    // Accept both operations_json (new) and replacement_json (legacy) parameter names
-    const jsonStr = args.operations_json || args.replacement_json;
-    if (!jsonStr) {
-      return { success: false, message: 'operations_json is required' };
-    }
-
     let operations;
     try {
-      operations = JSON.parse(jsonStr);
+      operations = JSON.parse(args.operations_json);
     } catch (error) {
       return {
         success: false,
@@ -4966,8 +4953,16 @@ emmaToolRegistry.register({
     inputSchema: {
       type: "object",
       properties: {
-        title: { type: "string", description: "Title of the HTML document, or the subject/headline for an email (e.g. 'Aquila May 2026 Newsletter'). Required." },
-        content_draft: { type: "string", description: "The full content to include. Include all data, scores, analysis, and text sections. Required." },
+        title: {
+          type: "string",
+          'x-aliases': ['file_name', 'filename', 'name', 'headline', 'subject'],
+          description: "Title of the HTML document, or the subject/headline for an email (e.g. 'Aquila May 2026 Newsletter'). Required."
+        },
+        content_draft: {
+          type: "string",
+          'x-aliases': ['html_content', 'content', 'body', 'text', 'markdown', 'document_content'],
+          description: "The full content to include. Include all data, scores, analysis, and text sections. Required."
+        },
         format_requirements: { type: "string", description: "Optional additional formatting instructions (e.g. 'use dark theme', 'include charts', 'brand color #1a73e8', 'add a CTA button to book a demo')." },
         document_type: { type: "string", enum: ["document", "email"], description: "Optional. Use 'email' for a one-off newsletter/marketing email so the HTML is email-client-safe (table-based layout, inline CSS, 600px container, no JS). Use 'document' (default) for reports, summaries, audits, and other web-style documents." }
       },
@@ -4975,12 +4970,6 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    if (!args.title || typeof args.title !== 'string') {
-      throw new Error('title is required and must be a string');
-    }
-    if (!args.content_draft || typeof args.content_draft !== 'string') {
-      throw new Error('content_draft is required and must be a string');
-    }
     const documentType = args.document_type === 'email' ? 'email' : 'document';
     return await agentModeService.createHtmlFile(args.title, args.content_draft, args.format_requirements || '', context?.userId, context?.sessionId, documentType);
   }
@@ -5075,7 +5064,7 @@ emmaToolRegistry.register({
   name: 'convert_to_pdf',
   definition: {
     name: 'convert_to_pdf',
-    description: 'Convert an HTML file (or any URL) to a PDF and upload it to S3. Use this when the user wants a PDF version of a previously generated HTML file or checklist. Pass the direct S3 URL of the HTML file as source_url.',
+    description: 'Convert an HTML file (or any URL) to a PDF and upload it to S3. Use this when the user wants a PDF version of a previously generated HTML file or checklist. Pass the direct S3 URL of the HTML file as source_url. Orientation is auto-detected (a wide 16:9 slide deck prints landscape, a report prints portrait); only set orientation explicitly to override.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -5087,12 +5076,25 @@ emmaToolRegistry.register({
           type: 'string',
           description: 'Desired filename for the PDF (without extension, e.g. "sentriq-readiness-checklist-v5")',
         },
+        orientation: {
+          type: 'string',
+          enum: ['auto', 'portrait', 'landscape'],
+          description: 'Page orientation. "auto" (default) detects landscape vs portrait from the content; use "landscape" to force it for a slide deck/presentation, "portrait" for a document.',
+        },
+        format: {
+          type: 'string',
+          enum: ['A4', 'Letter', 'Legal', 'A3', 'A5', 'Tabloid'],
+          description: 'Paper size. Defaults to A4.',
+        },
       },
       required: ['source_url', 'output_filename'],
     },
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.convertToPdf(args.source_url, args.output_filename, context?.userId);
+    return await agentModeService.convertToPdf(args.source_url, args.output_filename, context?.userId, {
+      orientation: args.orientation,
+      format: args.format,
+    });
   },
 });
 
@@ -5148,6 +5150,35 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     return await agentModeService.createWorkPlan(args.title, args.steps, context?.sessionId, args.autocomplete);
+  }
+});
+
+// Note: the listing tool for templates is `list_predefined_work_plans`, registered
+// in mcp/server/apiTools.ts. It is role-aware — non-admins get published/launchable
+// templates (system/public + their private), admins get the full management list.
+
+emmaToolRegistry.register({
+  name: 'launch_predefined_work_plan',
+  definition: {
+    name: 'launch_predefined_work_plan',
+    description: 'Launch (instantiate) a predefined work plan template into the current chat session. Use this when the user picks a template returned by list_predefined_work_plans. This copies the template\'s steps into the session as a fresh work plan (all pending), installs any skills the plan needs, and applies its settings, so you can then guide the user through the steps. If a work plan is already active in this session, the call returns requiresConfirmation — confirm with the user, then call again with force=true to replace it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        planTitle: {
+          type: 'string',
+          description: 'The exact title (or planId) of the work plan template to launch, as returned by list_predefined_work_plans.'
+        },
+        force: {
+          type: 'boolean',
+          description: 'Set to true to replace an existing active work plan in this session. Only do this after the user confirms.'
+        }
+      },
+      required: ['planTitle']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.applyPredefinedWorkPlan(args.planTitle, context?.sessionId, context?.userId, { force: args.force === true });
   }
 });
 
@@ -5964,7 +5995,9 @@ const bridgedToolNames = [
   // 'list_landing_page_files' — removed: coding_agent handles file listing internally
   'get_landing_page_preview_url',
   'publish_landing_page_changes',
+  'revert_landing_page_publish',
   'update_landing_page_context',
+  'resolve_skill',
 ];
 
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
@@ -6008,10 +6041,12 @@ emmaToolRegistry.register({
       properties: {
         page_id: {
           type: 'string',
+          'x-aliases': ['landing_page_id'],
           description: 'The landing page ID to edit'
         },
         task_description: {
           type: 'string',
+          'x-aliases': ['instructions'],
           description: 'Detailed description of what code changes to make. Include specific requirements, file paths if known, and any context about the desired outcome. Be as specific as possible.'
         }
       },
@@ -6019,20 +6054,6 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    // Auto-map common param name mistakes
-    if (!args.page_id && args.landing_page_id) {
-      args.page_id = args.landing_page_id;
-    }
-    if (!args.task_description && args.instructions) {
-      args.task_description = args.instructions;
-    }
-    if (!args.page_id) {
-      return { success: false, error: 'page_id is required. Provide the landing page ID to edit.' };
-    }
-    if (!args.task_description) {
-      return { success: false, error: 'task_description is required. Provide a detailed description of the code changes to make.' };
-    }
-
     const { runCodingAgent } = await import('../services/codingAgentService');
     const executeMcpTool = context?.service
       ? async (toolName: string, toolArgs: any) => {
@@ -6129,6 +6150,31 @@ emmaToolRegistry.register({
     }
     const toolNames: string[] = Array.isArray(rawTools) ? rawTools : [];
     const { skillService } = await import('../services/skillService');
+
+    // Mirror the REST route (POST /api/user-skills): org members may only
+    // create skills if they are the org owner or a listed skills editor, and
+    // the new skill must be stamped with the creator's orgId so it shows up in
+    // org-wide fanout (and editor/transfer logic). Without this, Emma-created
+    // skills were missing orgId and any plain member could create them.
+    const { userDb, orgDb } = await import('../services/db');
+    const { canManageOrgFeature } = await import('../services/orgShareService');
+    const creator = await userDb.getUserById(userId);
+    const orgId = creator?.orgId;
+    if (orgId) {
+      const org = await orgDb.getOrgById(orgId);
+      const allowed = canManageOrgFeature(
+        { userId, orgId, orgRole: creator?.orgRole as 'owner' | 'member' | undefined },
+        org,
+        'skills',
+      );
+      if (!allowed) {
+        return {
+          success: false,
+          error: 'Skills are managed by your org admin. Ask an org owner or a skills editor to create this skill.',
+        };
+      }
+    }
+
     const skill = await skillService.createSkill(
       args.name,
       args.description,
@@ -6141,6 +6187,7 @@ emmaToolRegistry.register({
     skill.visibility = 'private';
     skill.isBuiltIn = false;
     skill.toolNames = toolNames;
+    if (orgId) skill.orgId = orgId;
     await skillService.updateSkill(skill);
     return {
       success: true,

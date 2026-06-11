@@ -1,19 +1,12 @@
 import { DynamoDB } from "aws-sdk";
 import type { OrgShareSettings, Organization } from "../services/db";
+import { defaultShareSettings } from "../services/orgShareService";
 
 const TABLE_PREFIX = process.env.NODE_ENV === "production" ? "" : "Dev-";
 const TABLE = `${TABLE_PREFIX}AW-Organizations`;
 
-const defaults: OrgShareSettings = {
-  knowledgeBase:     { enabled: false, editors: [] },
-  htmlTemplates:     { enabled: false, editors: [] },
-  landingPages:      { enabled: false, editors: [] },
-  workPlans:         { enabled: true,  editors: [] },
-  skills:            { enabled: true,  editors: [] },
-  analytics:         { enabled: false, editors: [] },
-  brandGuidelines:   { editors: [] },
-  marketingStrategy: { editors: [] },
-};
+// Single source of truth — see orgShareService.defaultShareSettings().
+const defaults: OrgShareSettings = defaultShareSettings();
 
 export async function runMigration(): Promise<void> {
   const ddb = new DynamoDB.DocumentClient({ region: process.env.AWS_REGION || "us-west-2" });
