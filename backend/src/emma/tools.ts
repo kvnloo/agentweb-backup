@@ -4953,7 +4953,11 @@ emmaToolRegistry.register({
     inputSchema: {
       type: "object",
       properties: {
-        title: { type: "string", description: "Title of the HTML document, or the subject/headline for an email (e.g. 'Aquila May 2026 Newsletter'). Required." },
+        title: {
+          type: "string",
+          'x-aliases': ['file_name', 'filename', 'name', 'headline', 'subject'],
+          description: "Title of the HTML document, or the subject/headline for an email (e.g. 'Aquila May 2026 Newsletter'). Required."
+        },
         content_draft: {
           type: "string",
           'x-aliases': ['html_content', 'content', 'body', 'text', 'markdown', 'document_content'],

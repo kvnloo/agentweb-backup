@@ -542,6 +542,43 @@ describe('agentToolGatewayService', () => {
       expect(result.repairs).toEqual(['html_content->content_draft']);
     });
 
+    it('repairs create_html_file title and content aliases from model-shaped HTML args', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'create_html_file',
+        args: {
+          file_name: 'tool-gateway-schema-stress-test',
+          html_content: '<h1>Gateway Alias Test</h1><p>Body</p>',
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            title: {
+              type: 'string',
+              'x-aliases': ['file_name', 'filename', 'name', 'headline', 'subject'],
+            },
+            content_draft: {
+              type: 'string',
+              'x-aliases': ['html_content', 'content', 'body', 'text', 'markdown', 'document_content'],
+            },
+            format_requirements: { type: 'string' },
+          },
+          required: ['title', 'content_draft'],
+          additionalProperties: false,
+        },
+        effect: 'internal_write',
+      });
+
+      expect(result.status).toBe('repaired');
+      expect(result.args).toEqual({
+        title: 'tool-gateway-schema-stress-test',
+        content_draft: '<h1>Gateway Alias Test</h1><p>Body</p>',
+      });
+      expect(result.repairs).toEqual([
+        'file_name->title',
+        'html_content->content_draft',
+      ]);
+    });
+
     it('repairs common save_file aliases without tool-specific handler code', () => {
       const result = validateAndRepairToolArgs({
         toolName: 'save_file',
