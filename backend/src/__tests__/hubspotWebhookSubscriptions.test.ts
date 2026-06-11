@@ -47,7 +47,7 @@ describe('ensureWebhookSubscriptions', () => {
   });
 
   it('skips entirely when developerApiKey is absent', async () => {
-    mockGetCreds.mockResolvedValue({ clientId: 'id', clientSecret: 'secret' });
+    mockGetCreds.mockResolvedValue({ clientId: 'id', clientSecret: 'secret', hubspotAppId: 'test-app-id-123' });
     await ensureWebhookSubscriptions([], []);
     expect(mockAxiosGet).not.toHaveBeenCalled();
     expect(mockAxiosPost).not.toHaveBeenCalled();
@@ -172,6 +172,16 @@ describe('ensureWebhookSubscriptions', () => {
     expect(bodies).not.toContainEqual(expect.objectContaining({ propertyName: 'disabled_field' }));
   });
 
+  it('skips enabled mappings with a missing crmProperty', async () => {
+    await ensureWebhookSubscriptions(
+      [{ crmProperty: undefined as any, enabled: true, direction: 'both' }],
+      [{ crmProperty: '   ', enabled: true, direction: 'both' }]
+    );
+
+    // Only the 12 standard registrations — nothing from the malformed mappings
+    expect(mockAxiosPost).toHaveBeenCalledTimes(12);
+  });
+
   it('normalises crmProperty to lowercase before registering', async () => {
     await ensureWebhookSubscriptions(
       [],
@@ -259,6 +269,49 @@ describe('ensureWebhookSubscriptions', () => {
     await expect(ensureWebhookSubscriptions([], [])).resolves.not.toThrow();
     // 12 total attempted despite the 429 on the first call
     expect(mockAxiosPost).toHaveBeenCalledTimes(12);
+  });
+
+  it('continues registering remaining props when one POST fails with a plain Error', async () => {
+    mockAxiosPost
+      .mockRejectedValueOnce(new Error('socket hang up'))
+      .mockResolvedValue({ data: { id: 99 } });
+
+    await expect(ensureWebhookSubscriptions([], [])).resolves.not.toThrow();
+    expect(mockAxiosPost).toHaveBeenCalledTimes(12);
+  });
+
+  it('continues registering remaining props when one POST rejects with undefined', async () => {
+    mockAxiosPost
+      .mockRejectedValueOnce(undefined)
+      .mockResolvedValue({ data: { id: 99 } });
+
+    await expect(ensureWebhookSubscriptions([], [])).resolves.not.toThrow();
+    expect(mockAxiosPost).toHaveBeenCalledTimes(12);
+  });
+
+  it('swallows outer error gracefully when getHubSpotCredentials rejects with undefined', async () => {
+    mockGetCreds.mockRejectedValue(undefined);
+    await expect(ensureWebhookSubscriptions([], [])).resolves.not.toThrow();
+    expect(mockAxiosGet).not.toHaveBeenCalled();
+  });
+
+  it('warns when the batch approaches the 1,000 subscription limit', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const existing = Array.from({ length: 900 }, (_, i) => ({
+        eventType: 'contact.propertyChange',
+        propertyName: `existing_prop_${i}`,
+      }));
+      mockAxiosGet.mockResolvedValue(makeSubsResponse(existing));
+
+      await ensureWebhookSubscriptions([], []);
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Approaching subscription limit')
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it('does not double-register when called concurrently with identical props', async () => {
