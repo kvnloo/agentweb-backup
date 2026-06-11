@@ -460,6 +460,85 @@ describe('resolveIdentity — write semantics', () => {
     expect(deps.writeLeadFields).not.toHaveBeenCalled();
   });
 
+  it('excludePersistFields: resolves company in-memory but does NOT write it when company is deselected', async () => {
+    // Repro of the "LinkedIn only, but Company is enriched" bug. The user
+    // deselected `company` in the enrichment config, but kept `linkedin`.
+    // Apollo resolves company (needed in-memory as a signal to match the
+    // person), and linkedin is resolved too. Company must NOT be persisted;
+    // linkedin must be.
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        firstName: 'Jane', lastName: 'Doe', company: 'Acme Corp',
+        linkedin: 'https://linkedin.com/in/jane',
+      }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'jane@acme.com' },
+        needsPersonFields: true,
+        needsCompanyFields: true,
+        mode: 'enrich',
+        excludePersistFields: new Set(['company']),
+      }),
+      deps,
+    );
+
+    if (!result.ok) throw new Error('expected ok');
+    // Still resolved in-memory so downstream tiers / Apollo matching can use it.
+    expect(result.resolved.company).toBe('Acme Corp');
+    expect(result.resolved.linkedin).toBe('https://linkedin.com/in/jane');
+
+    expect(deps.writeLeadFields).toHaveBeenCalledTimes(1);
+    const call = (deps.writeLeadFields as jest.Mock).mock.calls[0][0];
+    // company is excluded from the write...
+    expect(call.fields.company).toBeUndefined();
+    expect(call.meta.company).toBeUndefined();
+    // ...but linkedin (and other included fields) are still written.
+    expect(call.fields.linkedin).toBe('https://linkedin.com/in/jane');
+    expect(call.fields.firstName).toBe('Jane');
+  });
+
+  it('excludePersistFields: skips writeLeadFields entirely when every resolved field is excluded', async () => {
+    // Only company resolves and company is excluded → nothing left to persist.
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({ company: 'Acme Corp' }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'jane@acme.com' },
+        needsCompanyFields: true,
+        mode: 'enrich',
+        excludePersistFields: new Set(['company']),
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.resolved.company).toBe('Acme Corp');
+    expect(deps.writeLeadFields).not.toHaveBeenCalled();
+  });
+
+  it('excludePersistFields: undefined preserves the existing persist-all behavior', async () => {
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        firstName: 'Jane', lastName: 'Doe', company: 'Acme Corp',
+      }),
+    });
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'jane@acme.com' },
+        needsPersonFields: true,
+        needsCompanyFields: true,
+        mode: 'enrich',
+      }),
+      deps,
+    );
+
+    const call = (deps.writeLeadFields as jest.Mock).mock.calls[0][0];
+    expect(call.fields.company).toBe('Acme Corp');
+    expect(call.fields.firstName).toBe('Jane');
+  });
+
   it('does not include lead fields that were already set (only newly-resolved ones)', async () => {
     // Apollo returns firstName, but lead already has lastName — only firstName
     // should appear in `resolved` and in the write payload.
