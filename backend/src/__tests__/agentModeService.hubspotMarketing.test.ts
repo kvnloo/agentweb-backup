@@ -185,6 +185,26 @@ describe('LANDING_PAGE UPDATE', () => {
     expect(props).not.toHaveProperty('action');
     expect(props).not.toHaveProperty('entityType');
   });
+
+  it('strips framework routing fields from props', async () => {
+    mockUpdateLandingPage.mockResolvedValue({ id: PAGE_ID });
+    await hs({
+      entity_type: 'LANDING_PAGE', action: 'UPDATE', page_id: PAGE_ID,
+      html_title: 'Keep Me',
+      post_id: 'leak', form_id: 'leak', email_id: 'leak', guid: 'leak',
+      cursor: 'leak', count: 99, start_date: 'leak', end_date: 'leak',
+    });
+    const props = mockUpdateLandingPage.mock.calls[0][1];
+    expect(props).toHaveProperty('htmlTitle', 'Keep Me');
+    expect(props).not.toHaveProperty('postId');
+    expect(props).not.toHaveProperty('formId');
+    expect(props).not.toHaveProperty('emailId');
+    expect(props).not.toHaveProperty('guid');
+    expect(props).not.toHaveProperty('cursor');
+    expect(props).not.toHaveProperty('count');
+    expect(props).not.toHaveProperty('startDate');
+    expect(props).not.toHaveProperty('endDate');
+  });
 });
 
 // ─── LANDING_PAGE DELETE ──────────────────────────────────────────────────────
@@ -243,6 +263,24 @@ describe('BLOG_POST UPDATE', () => {
     expect(props).not.toHaveProperty('entity_type');
     expect(props).not.toHaveProperty('action');
   });
+
+  it('strips framework routing fields from props', async () => {
+    mockUpdateBlogPost.mockResolvedValue({ id: POST_ID });
+    await hs({
+      entity_type: 'BLOG_POST', action: 'UPDATE', post_id: POST_ID,
+      html_title: 'Keep Me',
+      page_id: 'leak', form_id: 'leak', guid: 'leak',
+      cursor: 'leak', content_group_id: 'leak', template_path: 'leak',
+    });
+    const props = mockUpdateBlogPost.mock.calls[0][1];
+    expect(props).toHaveProperty('htmlTitle', 'Keep Me');
+    expect(props).not.toHaveProperty('pageId');
+    expect(props).not.toHaveProperty('formId');
+    expect(props).not.toHaveProperty('guid');
+    expect(props).not.toHaveProperty('cursor');
+    expect(props).not.toHaveProperty('contentGroupId');
+    expect(props).not.toHaveProperty('templatePath');
+  });
 });
 
 // ─── BLOG_POST DELETE ─────────────────────────────────────────────────────────
@@ -297,6 +335,22 @@ describe('FORM CREATE', () => {
     expect(props).not.toHaveProperty('action');
     expect(props).not.toHaveProperty('form_id');
   });
+
+  it('only passes allowlisted Form v3 fields to service', async () => {
+    mockCreateForm.mockResolvedValue({ id: FORM_ID });
+    await hs({
+      entity_type: 'FORM', action: 'CREATE',
+      name: 'X', formType: 'hubspot', fieldGroups: [], configuration: {}, displayOptions: {}, legalConsentOptions: { type: 'none' },
+      guid: 'leak', page_id: 'leak', post_id: 'leak', cursor: 'leak', count: 99,
+    });
+    const props = mockCreateForm.mock.calls[0][0];
+    expect(Object.keys(props)).toEqual(expect.arrayContaining(['name', 'formType', 'fieldGroups', 'configuration', 'displayOptions', 'legalConsentOptions']));
+    expect(props).not.toHaveProperty('guid');
+    expect(props).not.toHaveProperty('page_id');
+    expect(props).not.toHaveProperty('post_id');
+    expect(props).not.toHaveProperty('cursor');
+    expect(props).not.toHaveProperty('count');
+  });
 });
 
 // ─── FORM UPDATE ──────────────────────────────────────────────────────────────
@@ -324,6 +378,21 @@ describe('FORM UPDATE', () => {
     const props = mockUpdateForm.mock.calls[0][1];
     expect(props).not.toHaveProperty('entity_type');
     expect(props).not.toHaveProperty('action');
+  });
+
+  it('only passes allowlisted Form v3 fields to service', async () => {
+    mockUpdateForm.mockResolvedValue({ id: FORM_ID });
+    await hs({
+      entity_type: 'FORM', action: 'UPDATE', form_id: FORM_ID,
+      name: 'X', fieldGroups: [], configuration: {}, displayOptions: {}, legalConsentOptions: { type: 'none' },
+      guid: 'leak', page_id: 'leak', cursor: 'leak',
+    });
+    const props = mockUpdateForm.mock.calls[0][1];
+    expect(props).not.toHaveProperty('form_id');
+    expect(props).not.toHaveProperty('formType');
+    expect(props).not.toHaveProperty('guid');
+    expect(props).not.toHaveProperty('page_id');
+    expect(props).not.toHaveProperty('cursor');
   });
 });
 
@@ -524,6 +593,50 @@ describe('CONTACT_LIST DELETE', () => {
 describe('CONTACT_LIST — unknown action', () => {
   it('returns error on unrecognized action', async () => {
     const result = await hs({ entity_type: 'CONTACT_LIST', action: 'PUBLISH' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/unknown action/i);
+  });
+});
+
+// ─── Marketing entities — API error handling ──────────────────────────────────
+
+describe('Marketing entities — API error handling', () => {
+  it('returns access denied message on 403', async () => {
+    const err: any = new Error('Forbidden');
+    err.response = { status: 403 };
+    mockCreateForm.mockRejectedValue(err);
+    const result = await hs({
+      entity_type: 'FORM', action: 'CREATE',
+      name: 'X', formType: 'hubspot', fieldGroups: [], configuration: {}, displayOptions: {}, legalConsentOptions: { type: 'none' },
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/access denied/i);
+  });
+
+  it('surfaces hubspotError body on non-403 API error', async () => {
+    const err: any = new Error('Request failed with status code 400');
+    err.response = { status: 400, data: { message: 'Invalid field group' } };
+    mockUpdateLandingPage.mockRejectedValue(err);
+    const result = await hs({ entity_type: 'LANDING_PAGE', action: 'UPDATE', page_id: PAGE_ID, html_title: 'X' });
+    expect(result.success).toBe(false);
+    expect(result.hubspotError).toEqual({ message: 'Invalid field group' });
+    expect(result.status).toBe(400);
+  });
+
+  it('returns error on unknown action for EMAIL', async () => {
+    const result = await hs({ entity_type: 'EMAIL', action: 'INVALID' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/unknown action/i);
+  });
+
+  it('returns error on unknown action for BLOG_POST', async () => {
+    const result = await hs({ entity_type: 'BLOG_POST', action: 'INVALID' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/unknown action/i);
+  });
+
+  it('returns error on unknown action for SOCIAL', async () => {
+    const result = await hs({ entity_type: 'SOCIAL', action: 'UPDATE' });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/unknown action/i);
   });

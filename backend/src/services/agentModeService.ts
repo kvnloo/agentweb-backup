@@ -24703,14 +24703,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           }
           case 'CREATE': {
             if (!args?.name?.trim()) return { success: false, error: 'name is required for FORM CREATE.' };
-            const { entity_type: _et3, action: _a3, form_id: _fid, ...props } = args;
-            const data = await svc.createForm(props);
+            const formCreateProps: Record<string, any> = {};
+            for (const f of ['name', 'formType', 'fieldGroups', 'configuration', 'displayOptions', 'legalConsentOptions'] as const) {
+              if (args[f] !== undefined) formCreateProps[f] = args[f];
+            }
+            const data = await svc.createForm(formCreateProps);
             return { success: true, ...data };
           }
           case 'UPDATE': {
             if (!args?.form_id) return { success: false, error: 'form_id is required for FORM UPDATE.' };
-            const { form_id, entity_type: _et4, action: _a4, ...props } = args;
-            const data = await svc.updateForm(form_id, props);
+            const formUpdateProps: Record<string, any> = {};
+            for (const f of ['name', 'fieldGroups', 'configuration', 'displayOptions', 'legalConsentOptions'] as const) {
+              if (args[f] !== undefined) formUpdateProps[f] = args[f];
+            }
+            const data = await svc.updateForm(args.form_id, formUpdateProps);
             return { success: true, ...data };
           }
           case 'DELETE': {
@@ -24749,9 +24755,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           case 'UPDATE': {
             if (!args?.page_id) return { success: false, error: 'page_id is required for LANDING_PAGE UPDATE.' };
             const { page_id, entity_type: _et1, action: _a1, ...rawProps } = args;
+            const FRAMEWORK_FIELDS = new Set(['form_id', 'email_id', 'guid', 'cursor', 'asset_type', 'start_date', 'end_date', 'count', 'query', 'broadcast_id', 'list_id', 'record_ids', 'content_group_id', 'template_path', 'post_id']);
             const props: Record<string, any> = {};
             for (const [k, v] of Object.entries(rawProps)) {
-              props[k.replace(/_([a-z])/g, (_, c) => c.toUpperCase())] = v;
+              if (!FRAMEWORK_FIELDS.has(k)) props[k.replace(/_([a-z])/g, (_, c) => c.toUpperCase())] = v;
             }
             const data = await svc.updateLandingPage(page_id, props);
             return { success: true, ...data };
@@ -24794,9 +24801,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           case 'UPDATE': {
             if (!args?.post_id) return { success: false, error: 'post_id is required for BLOG_POST UPDATE.' };
             const { post_id, entity_type: _et2, action: _a2, ...rawProps } = args;
+            const FRAMEWORK_FIELDS = new Set(['form_id', 'email_id', 'guid', 'cursor', 'asset_type', 'start_date', 'end_date', 'count', 'query', 'broadcast_id', 'list_id', 'record_ids', 'content_group_id', 'template_path', 'page_id']);
             const props: Record<string, any> = {};
             for (const [k, v] of Object.entries(rawProps)) {
-              props[k.replace(/_([a-z])/g, (_, c) => c.toUpperCase())] = v;
+              if (!FRAMEWORK_FIELDS.has(k)) props[k.replace(/_([a-z])/g, (_, c) => c.toUpperCase())] = v;
             }
             const data = await svc.updateBlogPost(post_id, props);
             return { success: true, ...data };
