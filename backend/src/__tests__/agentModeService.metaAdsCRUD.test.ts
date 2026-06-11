@@ -812,15 +812,52 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         );
       });
 
-      it('fails with SWAP_NOT_REFLECTED when the read-back shows the old creative still attached', async () => {
-        // Meta's POST /{ad-id} returned 200 but the ad kept its old creative (silent-success trap).
+      it('surfaces effective_status and review feedback on a verified swap', async () => {
         const params = { link_url: 'https://new-landing-page.com' };
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
         (metaService.getAd as jest.Mock)
           .mockResolvedValueOnce({ id: 'ad_123', creative: { creative_id: 'old_creative_123' } })
-          // Read-back: ad STILL on the old creative → swap did not take.
-          .mockResolvedValue({ id: 'ad_123', creative: { creative_id: 'old_creative_123' } });
+          .mockResolvedValue({
+            id: 'ad_123',
+            effective_status: 'PENDING_REVIEW',
+            ad_review_feedback: { global: { LANDING_PAGE: 'Landing page is still being reviewed' } },
+            creative: {
+              creative_id: 'new_creative_456',
+              object_story_spec: { page_id: 'page_123', link_data: { link: 'https://new-landing-page.com' } }
+            }
+          });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'old_creative_123',
+          name: 'My Creative',
+          object_story_spec: {
+            page_id: 'page_123',
+            link_data: { message: 'Hi', link: 'https://old.com', name: 'T', image_hash: 'abc123' }
+          }
+        });
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'new_creative_456' });
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(true);
+        expect(result.verified).toBe(true);
+        expect(result.effective_status).toBe('PENDING_REVIEW');
+        expect(result.review_feedback).toBe('Landing page is still being reviewed');
+        expect(result.message).toContain('PENDING_REVIEW');
+      });
+
+      it('returns SWAP_PENDING when, after all retries, the ad still shows the old creative', async () => {
+        // Meta's POST /{ad-id} returned 200 but the ad kept its old creative (silent-success trap).
+        // After 3 attempts it is reported as pending (transient Meta propagation), not a hard error.
+        const params = { link_url: 'https://new-landing-page.com' };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        jest.spyOn(agentModeService as any, 'sleep').mockResolvedValue(undefined); // skip backoff delays
+        (metaService.getAd as jest.Mock)
+          .mockResolvedValueOnce({ id: 'ad_123', creative: { creative_id: 'old_creative_123' } })
+          // Read-back (every retry): ad STILL on the old creative → swap did not take.
+          .mockResolvedValue({ id: 'ad_123', effective_status: 'PENDING_REVIEW', creative: { creative_id: 'old_creative_123' } });
         (metaService.getAdCreative as jest.Mock).mockResolvedValue({
           id: 'old_creative_123',
           name: 'My Creative',
@@ -835,18 +872,25 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
 
         expect(result.success).toBe(false);
-        expect(result.error).toBe('SWAP_NOT_REFLECTED');
+        expect(result.pending).toBe(true);
+        expect(result.error).toBe('SWAP_PENDING');
         expect(result.new_creative_id).toBe('new_creative_456');
         expect(result.live_creative_id).toBe('old_creative_123');
+        expect(result.effective_status).toBe('PENDING_REVIEW');
+        // Re-attach was attempted 3 times (plus 0 ad-level updates).
+        expect((metaService.updateAd as jest.Mock).mock.calls.filter(
+          (c: any[]) => c[2]?.creative?.creative_id === 'new_creative_456'
+        ).length).toBe(3);
       });
 
-      it('fails with DESTINATION_NOT_REFLECTED when the live URL does not match the requested one', async () => {
+      it('returns DESTINATION_PENDING when the live URL never matches after retries', async () => {
         const params = { link_url: 'https://new-landing-page.com' };
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        jest.spyOn(agentModeService as any, 'sleep').mockResolvedValue(undefined); // skip backoff delays
         (metaService.getAd as jest.Mock)
           .mockResolvedValueOnce({ id: 'ad_123', creative: { creative_id: 'old_creative_123' } })
-          // Read-back: new creative attached, but its live link is the OLD url.
+          // Read-back: new creative attached, but its live link stays the OLD url on every retry.
           .mockResolvedValue({
             id: 'ad_123',
             creative: {
@@ -868,9 +912,44 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
 
         expect(result.success).toBe(false);
-        expect(result.error).toBe('DESTINATION_NOT_REFLECTED');
+        expect(result.pending).toBe(true);
+        expect(result.error).toBe('DESTINATION_PENDING');
         expect(result.requested_link_url).toBe('https://new-landing-page.com');
         expect(result.live_link_url).toBe('https://old.com');
+      });
+
+      it('recovers on a later retry when Meta reflects the swap on the 2nd attempt', async () => {
+        // First read-back shows old creative (propagation lag); second shows the new one → success.
+        const params = { link_url: 'https://new-landing-page.com' };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        jest.spyOn(agentModeService as any, 'sleep').mockResolvedValue(undefined);
+        (metaService.getAd as jest.Mock)
+          .mockResolvedValueOnce({ id: 'ad_123', creative: { creative_id: 'old_creative_123' } }) // initial fetch
+          .mockResolvedValueOnce({ id: 'ad_123', creative: { creative_id: 'old_creative_123' } }) // attempt 1 read-back: lag
+          .mockResolvedValue({ // attempt 2 read-back: reflected
+            id: 'ad_123',
+            creative: {
+              creative_id: 'new_creative_456',
+              object_story_spec: { page_id: 'page_123', link_data: { link: 'https://new-landing-page.com' } }
+            }
+          });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'old_creative_123',
+          name: 'My Creative',
+          object_story_spec: {
+            page_id: 'page_123',
+            link_data: { message: 'Hi', link: 'https://old.com', name: 'T', image_hash: 'abc123' }
+          }
+        });
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'new_creative_456' });
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(true);
+        expect(result.verified).toBe(true);
+        expect(result.live_link_url).toBe('https://new-landing-page.com');
       });
 
       it('treats a trailing-slash / case difference as a matching destination (Meta normalization)', async () => {
@@ -938,12 +1017,14 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(result.verified).toBe(true);
       });
 
-      it('fails with DESTINATION_NOT_REFLECTED when the live URL is only the bare domain of the requested page', async () => {
+      it('returns DESTINATION_PENDING when the live URL is only the bare domain of the requested page', async () => {
         // A live URL that is merely a prefix of the requested one (missing the landing-page path)
-        // must NOT count as verified — this is exactly the wrong-destination bug class.
+        // must NOT count as verified — this is exactly the wrong-destination bug class. After retries
+        // it is reported as pending (Meta still propagating), not a confirmed success.
         const params = { link_url: 'https://everyio.agentwebforms.com/icp1?utm_source=meta' };
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        jest.spyOn(agentModeService as any, 'sleep').mockResolvedValue(undefined); // skip backoff delays
         (metaService.getAd as jest.Mock)
           .mockResolvedValueOnce({ id: 'ad_123', creative: { creative_id: 'old_creative_123' } })
           .mockResolvedValue({
@@ -967,13 +1048,15 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
 
         expect(result.success).toBe(false);
-        expect(result.error).toBe('DESTINATION_NOT_REFLECTED');
+        expect(result.pending).toBe(true);
+        expect(result.error).toBe('DESTINATION_PENDING');
       });
 
-      it('fails with DESTINATION_NOT_REFLECTED when the live path merely shares a prefix (/icp1 vs /icp10)', async () => {
+      it('returns DESTINATION_PENDING when the live path merely shares a prefix (/icp1 vs /icp10)', async () => {
         const params = { link_url: 'https://everyio.agentwebforms.com/icp1' };
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        jest.spyOn(agentModeService as any, 'sleep').mockResolvedValue(undefined); // skip backoff delays
         (metaService.getAd as jest.Mock)
           .mockResolvedValueOnce({ id: 'ad_123', creative: { creative_id: 'old_creative_123' } })
           .mockResolvedValue({
@@ -997,7 +1080,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
 
         expect(result.success).toBe(false);
-        expect(result.error).toBe('DESTINATION_NOT_REFLECTED');
+        expect(result.pending).toBe(true);
+        expect(result.error).toBe('DESTINATION_PENDING');
       });
 
       it('still succeeds when the post-swap read-back itself throws (best-effort verification)', async () => {
