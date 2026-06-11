@@ -814,10 +814,12 @@ export class AgentModeService {
             properties: {
               s3_key: {
                 type: 'string',
+                'x-aliases': ['s3Key', 'key', 'file_key', 'storage_key', 'object_key'],
                 description: 'The S3 key from the "[Full response stored at S3 key: ...]" reference in the tool result'
               },
               query: {
                 type: 'string',
+                'x-aliases': ['search_query', 'search', 'q', 'term'],
                 description: 'The text or field name to search for (e.g. "link_url", "destination_url", "sessionId")'
               },
               match_offset: {
@@ -854,6 +856,7 @@ export class AgentModeService {
             properties: {
               s3_key: {
                 type: 'string',
+                'x-aliases': ['s3Key', 'key', 'file_key', 'storage_key', 'object_key'],
                 description: 'The S3 key from the "[Full response stored at S3 key: ...]" reference in the tool result'
               },
               char_offset: {

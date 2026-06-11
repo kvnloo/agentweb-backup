@@ -1710,10 +1710,12 @@ emmaToolRegistry.register({
       properties: {
         title_draft: {
           type: 'string',
+          'x-aliases': ['title', 'headline', 'subject'],
           description: 'A draft title for the blog article. The final title will be generated and optimized from this draft.'
         },
         content_draft: {
           type: 'string',
+          'x-aliases': ['content', 'body', 'text', 'markdown', 'article_content'],
           description: 'The blog article content in markdown format'
         },
         length: {
@@ -4952,7 +4954,11 @@ emmaToolRegistry.register({
       type: "object",
       properties: {
         title: { type: "string", description: "Title of the HTML document, or the subject/headline for an email (e.g. 'Aquila May 2026 Newsletter'). Required." },
-        content_draft: { type: "string", description: "The full content to include. Include all data, scores, analysis, and text sections. Required." },
+        content_draft: {
+          type: "string",
+          'x-aliases': ['html_content', 'content', 'body', 'text', 'markdown', 'document_content'],
+          description: "The full content to include. Include all data, scores, analysis, and text sections. Required."
+        },
         format_requirements: { type: "string", description: "Optional additional formatting instructions (e.g. 'use dark theme', 'include charts', 'brand color #1a73e8', 'add a CTA button to book a demo')." },
         document_type: { type: "string", enum: ["document", "email"], description: "Optional. Use 'email' for a one-off newsletter/marketing email so the HTML is email-client-safe (table-based layout, inline CSS, 600px container, no JS). Use 'document' (default) for reports, summaries, audits, and other web-style documents." }
       },

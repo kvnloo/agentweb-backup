@@ -514,6 +514,147 @@ describe('agentToolGatewayService', () => {
       ]);
     });
 
+    it('repairs common content aliases through the central gateway contract map', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'create_html_file',
+        args: {
+          title: 'Gateway Alias Test',
+          html_content: '<h1>Hello</h1><p>Body</p>',
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            title: { type: 'string' },
+            content_draft: { type: 'string' },
+            format_requirements: { type: 'string' },
+          },
+          required: ['title', 'content_draft'],
+          additionalProperties: false,
+        },
+        effect: 'internal_write',
+      });
+
+      expect(result.status).toBe('repaired');
+      expect(result.args).toEqual({
+        title: 'Gateway Alias Test',
+        content_draft: '<h1>Hello</h1><p>Body</p>',
+      });
+      expect(result.repairs).toEqual(['html_content->content_draft']);
+    });
+
+    it('repairs common save_file aliases without tool-specific handler code', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'save_file',
+        args: {
+          filename: 'report.html',
+          content: '<html>Saved</html>',
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            file_name: { type: 'string' },
+            file_content: { type: 'string' },
+          },
+          required: ['file_name', 'file_content'],
+          additionalProperties: false,
+        },
+        effect: 'internal_write',
+      });
+
+      expect(result.status).toBe('repaired');
+      expect(result.args).toEqual({
+        file_name: 'report.html',
+        file_content: '<html>Saved</html>',
+      });
+      expect(result.repairs).toEqual([
+        'filename->file_name',
+        'content->file_content',
+      ]);
+    });
+
+    it('repairs blog draft aliases while preserving canonical values when present', () => {
+      const repaired = validateAndRepairToolArgs({
+        toolName: 'create_blog_article',
+        args: {
+          title: 'Launch lessons',
+          content: 'Draft article body',
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            title_draft: { type: 'string' },
+            content_draft: { type: 'string' },
+          },
+          required: ['title_draft', 'content_draft'],
+          additionalProperties: false,
+        },
+        effect: 'internal_write',
+      });
+
+      expect(repaired.status).toBe('repaired');
+      expect(repaired.args).toEqual({
+        title_draft: 'Launch lessons',
+        content_draft: 'Draft article body',
+      });
+
+      const canonical = validateAndRepairToolArgs({
+        toolName: 'create_blog_article',
+        args: {
+          title_draft: 'Canonical title',
+          title: 'Alias title',
+          content_draft: 'Canonical body',
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            title_draft: { type: 'string' },
+            content_draft: { type: 'string' },
+            title: { type: 'string' },
+          },
+          required: ['title_draft', 'content_draft'],
+          additionalProperties: true,
+        },
+        effect: 'internal_write',
+      });
+
+      expect(canonical.status).toBe('valid');
+      expect(canonical.args).toEqual({
+        title_draft: 'Canonical title',
+        title: 'Alias title',
+        content_draft: 'Canonical body',
+      });
+    });
+
+    it('repairs S3 key aliases for tool-response readers', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'search_tool_response',
+        args: {
+          key: 'tool-responses/session/result.json',
+          q: 'destination_url',
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            s3_key: { type: 'string' },
+            query: { type: 'string' },
+          },
+          required: ['s3_key', 'query'],
+          additionalProperties: false,
+        },
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('repaired');
+      expect(result.args).toEqual({
+        s3_key: 'tool-responses/session/result.json',
+        query: 'destination_url',
+      });
+      expect(result.repairs).toEqual([
+        'key->s3_key',
+        'q->query',
+      ]);
+    });
+
     it('enforces array minItems and item types from schema', () => {
       const emptyResult = validateAndRepairToolArgs({
         toolName: 'install_skills',

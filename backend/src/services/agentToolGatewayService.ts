@@ -149,6 +149,28 @@ const READ_PREFIXES = [
   'search_',
 ];
 
+const DEFAULT_ARG_ALIASES: Record<string, string[]> = {
+  content_draft: [
+    'html_content',
+    'content',
+    'body',
+    'text',
+    'markdown',
+    'draft',
+    'document_content',
+    'article_content',
+  ],
+  title_draft: ['title', 'headline', 'subject'],
+  file_name: ['filename', 'fileName', 'name'],
+  file_content: ['content', 'file', 'text', 'body', 'html_content', 'markdown'],
+  file_url: ['url', 'fileUrl', 'file', 'href', 'link'],
+  s3_key: ['s3Key', 'key', 'file_key', 'storage_key', 'object_key'],
+  query: ['search_query', 'search', 'q', 'term'],
+  page_id: ['pageId', 'landing_page_id', 'landingPageId'],
+  task_description: ['instructions', 'instruction', 'prompt', 'task', 'description'],
+  operations_json: ['replacement_json', 'operations', 'replacements', 'replacement_instructions'],
+};
+
 export function evaluateAgentToolPolicy(input: AgentToolPolicyInput): AgentToolPolicyDecision {
   const toolName = input.toolName || 'unknown';
   const effect = classifyToolEffect(toolName, input.args);
@@ -461,6 +483,11 @@ function findAliasTarget(input: {
       getSchemaAliases(input.properties[name]).some((alias) => normalizeArgName(alias) === normalizedKey)
     );
     if (explicitMatch && input.existingArgs[explicitMatch] === undefined) return explicitMatch;
+
+    const defaultMatch = propertyNames.find((name) =>
+      getDefaultAliases(name).some((alias) => normalizeArgName(alias) === normalizedKey)
+    );
+    if (defaultMatch && input.existingArgs[defaultMatch] === undefined) return defaultMatch;
   }
 
   if (!input.allowSemanticUrlRepair || typeof input.value !== 'string') return null;
@@ -493,7 +520,10 @@ function findKnownAliasSource(input: {
   }
 
   if (input.allowExplicitAliasRepair) {
-    const targetAliases = getSchemaAliases(input.properties[input.target]).map(normalizeArgName);
+    const targetAliases = [
+      ...getSchemaAliases(input.properties[input.target]),
+      ...getDefaultAliases(input.target),
+    ].map(normalizeArgName);
     for (const key of Object.keys(input.existingArgs)) {
       if (key === input.target) continue;
       if (targetAliases.includes(normalizeArgName(key))) return key;
@@ -587,6 +617,10 @@ function shouldStringifyJsonValue(name: string, value: unknown, schema: any): bo
 function getSchemaAliases(schema: any): string[] {
   const aliases = schema?.['x-aliases'] ?? schema?.aliases;
   return Array.isArray(aliases) ? aliases.filter((alias): alias is string => typeof alias === 'string') : [];
+}
+
+function getDefaultAliases(target: string): string[] {
+  return DEFAULT_ARG_ALIASES[target] ?? [];
 }
 
 function normalizeArgName(value: string): string {

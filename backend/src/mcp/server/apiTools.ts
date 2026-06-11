@@ -1177,8 +1177,8 @@ mcpToolRegistry.register({
     inputSchema: {
       type: 'object',
       properties: {
-        title_draft: { type: 'string', description: 'A draft title for the blog article.' },
-        content_draft: { type: 'string', description: 'The blog article content in markdown format' },
+        title_draft: { type: 'string', 'x-aliases': ['title', 'headline', 'subject'], description: 'A draft title for the blog article.' },
+        content_draft: { type: 'string', 'x-aliases': ['content', 'body', 'text', 'markdown', 'article_content'], description: 'The blog article content in markdown format' },
         length: { type: 'string', enum: ['short', 'medium', 'long'], description: 'Desired article length', default: 'medium' },
         researchContext: { type: 'string', description: 'Optional research context or background information' },
         requirements: { type: 'string', description: 'Specific requirements (e.g., internal links, CTAs, branding)' },
@@ -2601,8 +2601,8 @@ mcpToolRegistry.register({
     inputSchema: {
       type: 'object',
       properties: {
-        file_name: { type: 'string', description: 'Name for the file' },
-        file_content: { type: 'string', description: 'File content to save' }
+        file_name: { type: 'string', 'x-aliases': ['filename', 'fileName', 'name'], description: 'Name for the file' },
+        file_content: { type: 'string', 'x-aliases': ['content', 'file', 'text', 'body', 'html_content', 'markdown'], description: 'File content to save' }
       },
       required: ['file_name', 'file_content']
     }
