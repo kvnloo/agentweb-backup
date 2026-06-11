@@ -98,8 +98,6 @@ export async function ensureWebhookSubscriptions(
       candidateProps.add(`deal.propertyChange:${prop}`);
     }
 
-    if (candidateProps.size === 0) return;
-
     const existingSubscriptions = await getExistingSubscriptions(appId, developerApiKey);
 
     const toRegister = Array.from(candidateProps).filter(p => !existingSubscriptions.has(p));
