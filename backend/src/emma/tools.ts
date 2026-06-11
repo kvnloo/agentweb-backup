@@ -6150,6 +6150,31 @@ emmaToolRegistry.register({
     }
     const toolNames: string[] = Array.isArray(rawTools) ? rawTools : [];
     const { skillService } = await import('../services/skillService');
+
+    // Mirror the REST route (POST /api/user-skills): org members may only
+    // create skills if they are the org owner or a listed skills editor, and
+    // the new skill must be stamped with the creator's orgId so it shows up in
+    // org-wide fanout (and editor/transfer logic). Without this, Emma-created
+    // skills were missing orgId and any plain member could create them.
+    const { userDb, orgDb } = await import('../services/db');
+    const { canManageOrgFeature } = await import('../services/orgShareService');
+    const creator = await userDb.getUserById(userId);
+    const orgId = creator?.orgId;
+    if (orgId) {
+      const org = await orgDb.getOrgById(orgId);
+      const allowed = canManageOrgFeature(
+        { userId, orgId, orgRole: creator?.orgRole as 'owner' | 'member' | undefined },
+        org,
+        'skills',
+      );
+      if (!allowed) {
+        return {
+          success: false,
+          error: 'Skills are managed by your org admin. Ask an org owner or a skills editor to create this skill.',
+        };
+      }
+    }
+
     const skill = await skillService.createSkill(
       args.name,
       args.description,
@@ -6162,6 +6187,7 @@ emmaToolRegistry.register({
     skill.visibility = 'private';
     skill.isBuiltIn = false;
     skill.toolNames = toolNames;
+    if (orgId) skill.orgId = orgId;
     await skillService.updateSkill(skill);
     return {
       success: true,
