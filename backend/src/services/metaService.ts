@@ -1165,8 +1165,11 @@ export class MetaService {
       this.initApi(accessToken);
       const ad = new Ad(adId);
       const fields = [
-        'id', 'name', 'status', 'adset_id', 'campaign_id',
-        'creative{id,name,body,title,image_url,thumbnail_url,object_story_spec}'
+        'id', 'name', 'status', 'effective_status', 'adset_id', 'campaign_id',
+        // ad_review_feedback + the creative's own status surface Meta's async policy/technical
+        // review verdict, so a post-swap read-back can report PENDING/rejected creatives.
+        'ad_review_feedback',
+        'creative{id,name,body,title,image_url,thumbnail_url,object_story_spec,status}'
       ];
       this.log(`Fetching ad: ${adId}`);
       const result = await ad.get(fields);

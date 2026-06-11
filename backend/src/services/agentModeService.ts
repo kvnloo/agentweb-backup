@@ -13464,10 +13464,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     console.log(`AgentMode: New creative ${newCreativeId} created. Updating ad ${adId} to use it.`);
 
-    // Step 4: Update the ad to use the new creative
-    await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } });
-
-    // Also apply any ad-level params (status, name) that were provided alongside creative content
+    // Step 4: Apply any ad-level params (status, name) provided alongside creative content. These
+    // are independent of the creative swap, so apply them once up front.
     const adLevelParams: any = {};
     for (const key of Object.keys(params)) {
       if (!AgentModeService.CREATIVE_CONTENT_KEYS.includes(key) && key !== 'name') {
@@ -13478,37 +13476,92 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       await metaService.updateAd(accessToken, adId, adLevelParams);
     }
 
-    // Step 5: Read back the ad to VERIFY the swap actually took effect. Meta's POST /{ad-id}
-    // can return success while leaving the ad on its old creative (the documented silent-success
-    // trap), so a 200 from updateAd is NOT proof the destination URL changed. Re-fetch the ad,
-    // confirm the new creative is attached, and — when the caller changed the destination —
-    // confirm the live URL matches what was requested.
-    const verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId, newLinkUrl);
+    // Step 5: Attach the new creative, then read back to VERIFY it took effect. Meta's POST /{ad-id}
+    // can return success while leaving the ad on its old creative (documented silent-success trap)
+    // because the just-created creative isn't yet consistent across Meta's backend. This is usually
+    // transient, so re-attach + re-verify up to SWAP_VERIFY_ATTEMPTS times with a short backoff
+    // before giving up. A 200 from updateAd is NOT proof the destination changed.
+    const SWAP_VERIFY_ATTEMPTS = 3;
+    const SWAP_VERIFY_BACKOFF_MS = 3000;
+    let verification: Awaited<ReturnType<AgentModeService['verifyCreativeSwap']>> | undefined;
 
-    if (!verification.attached) {
+    for (let attempt = 1; attempt <= SWAP_VERIFY_ATTEMPTS; attempt++) {
+      await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } });
+      verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId, newLinkUrl);
+
+      const destinationOk = !newLinkUrl || !verification.liveLinkUrl
+        || this.linkUrlMatches(verification.liveLinkUrl, newLinkUrl);
+      // Stop early on a confirmed swap. Also stop if the read-back itself failed (verified:false):
+      // we can't prove anything, and retrying a failing read is pointless — treat as unverified.
+      if (!verification.verified || (verification.attached && destinationOk)) {
+        break;
+      }
+
+      if (attempt < SWAP_VERIFY_ATTEMPTS) {
+        console.log(`AgentMode: swap verification for ad ${adId} not yet reflected `
+          + `(attempt ${attempt}/${SWAP_VERIFY_ATTEMPTS}, attached=${verification.attached}, `
+          + `liveUrl=${verification.liveLinkUrl}). Retrying in ${SWAP_VERIFY_BACKOFF_MS}ms.`);
+        await this.sleep(SWAP_VERIFY_BACKOFF_MS);
+      }
+    }
+
+    const v = verification!;
+    const reviewNote = v.effectiveStatus
+      ? ` Ad review status: ${v.effectiveStatus}${v.reviewFeedback ? ` (${v.reviewFeedback})` : ''}.`
+      : '';
+
+    // The read-back never succeeded — we can't prove the swap took effect. Don't claim it did:
+    // report success (the attach API calls returned 200) but verified:false so callers don't lie.
+    if (!v.verified) {
       return {
-        success: false,
-        message: `The new creative (${newCreativeId}) was created, but ad ${adId} did not switch to it — `
-          + `it still references ${verification.liveCreativeId || oldCreativeId}. This is usually a transient `
-          + `Meta propagation issue; retry the AD UPDATE. The destination URL was NOT changed.`,
-        error: 'SWAP_NOT_REFLECTED',
+        success: true,
+        message: `Ad updated. Created new creative (${newCreativeId}) with updated ${creativeKeys.join(', ')} `
+          + `and attached it to ad ${adId}. NOTE: the confirmation read-back failed, so the swap could not be `
+          + `verified — re-check the ad in Ads Manager.`,
         old_creative_id: oldCreativeId,
         new_creative_id: newCreativeId,
-        live_creative_id: verification.liveCreativeId,
+        verified: false,
+        live_link_url: v.liveLinkUrl,
       };
     }
 
-    if (newLinkUrl && verification.liveLinkUrl && !this.linkUrlMatches(verification.liveLinkUrl, newLinkUrl)) {
+    // After all attempts: the ad never switched creatives. Treat as PENDING (not a hard error) —
+    // Meta likely just hasn't propagated yet and it should reflect shortly.
+    if (!v.attached) {
       return {
         success: false,
-        message: `Ad ${adId} switched to the new creative (${newCreativeId}), but its live destination URL `
-          + `is "${verification.liveLinkUrl}" instead of the requested "${newLinkUrl}". The update did not `
-          + `take effect as expected — please verify in Ads Manager and retry.`,
-        error: 'DESTINATION_NOT_REFLECTED',
+        pending: true,
+        message: `The new creative (${newCreativeId}) was created and attached to ad ${adId}, but after `
+          + `${SWAP_VERIFY_ATTEMPTS} checks the ad still shows the previous creative `
+          + `(${v.liveCreativeId || oldCreativeId}). This is typically Meta still propagating the change — `
+          + `it should reflect within a few minutes. No further action is needed; re-check shortly to confirm.`
+          + reviewNote,
+        error: 'SWAP_PENDING',
+        old_creative_id: oldCreativeId,
+        new_creative_id: newCreativeId,
+        live_creative_id: v.liveCreativeId,
+        effective_status: v.effectiveStatus,
+        review_feedback: v.reviewFeedback,
+      };
+    }
+
+    // New creative attached, but the live destination URL doesn't match what was requested. Also
+    // PENDING — Meta may still be settling the creative's link, or it's under review.
+    if (newLinkUrl && v.liveLinkUrl && !this.linkUrlMatches(v.liveLinkUrl, newLinkUrl)) {
+      return {
+        success: false,
+        pending: true,
+        message: `Ad ${adId} switched to the new creative (${newCreativeId}), but after `
+          + `${SWAP_VERIFY_ATTEMPTS} checks its live destination URL still reads "${v.liveLinkUrl}" `
+          + `instead of the requested "${newLinkUrl}". This is usually Meta still propagating — it should `
+          + `reflect shortly. Re-check in a few minutes to confirm.` + reviewNote,
+        error: 'DESTINATION_PENDING',
         old_creative_id: oldCreativeId,
         new_creative_id: newCreativeId,
         requested_link_url: newLinkUrl,
-        live_link_url: verification.liveLinkUrl,
+        live_link_url: v.liveLinkUrl,
+        effective_status: v.effectiveStatus,
+        review_feedback: v.reviewFeedback,
       };
     }
 
@@ -13516,15 +13569,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       success: true,
       message: `Ad updated successfully. Created new creative (${newCreativeId}) with updated ${creativeKeys.join(', ')} `
         + `and swapped it in for the old creative (${oldCreativeId})`
-        + (verification.liveLinkUrl
-          ? `. Verified live destination URL: ${verification.liveLinkUrl}`
-          : verification.verified
-            ? '.'
-            : '. NOTE: the confirmation read-back failed, so the swap could not be verified — re-check the ad in Ads Manager.'),
+        + (v.liveLinkUrl ? `. Verified live destination URL: ${v.liveLinkUrl}` : '.')
+        + reviewNote,
       old_creative_id: oldCreativeId,
       new_creative_id: newCreativeId,
-      verified: verification.verified,
-      live_link_url: verification.liveLinkUrl,
+      verified: true,
+      live_link_url: v.liveLinkUrl,
+      effective_status: v.effectiveStatus,
+      review_feedback: v.reviewFeedback,
     };
   }
 
@@ -13538,7 +13590,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     adId: string,
     newCreativeId: string,
     expectedLinkUrl?: string
-  ): Promise<{ attached: boolean; verified: boolean; liveCreativeId?: string; liveLinkUrl?: string }> {
+  ): Promise<{ attached: boolean; verified: boolean; liveCreativeId?: string; liveLinkUrl?: string; effectiveStatus?: string; reviewFeedback?: string }> {
     try {
       const ad = await metaService.getAd(accessToken, adId);
       const liveCreativeId = ad?.creative?.creative_id || ad?.creative?.id;
@@ -13553,7 +13605,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           || liveCreative?.link_url;
       }
 
-      return { attached, verified: true, liveCreativeId, liveLinkUrl };
+      // Surface Meta's async review state (informational): effective_status tells us if the ad is
+      // still PENDING_REVIEW / DISAPPROVED, and ad_review_feedback carries the human-readable reason.
+      const effectiveStatus = ad?.effective_status;
+      const feedback = ad?.ad_review_feedback;
+      let reviewFeedback: string | undefined;
+      if (feedback && typeof feedback === 'object') {
+        const reasons = [
+          ...Object.values(feedback.global || {}),
+          ...Object.values(feedback.placement_specific || {}).flatMap((p: any) => Object.values(p || {})),
+        ].filter(Boolean);
+        if (reasons.length) reviewFeedback = reasons.join('; ');
+      }
+
+      return { attached, verified: true, liveCreativeId, liveLinkUrl, effectiveStatus, reviewFeedback };
     } catch (err: any) {
       // Verification is best-effort. If the read-back itself fails we can't prove the swap
       // failed, so don't block — treat the swap as successful but flag verified:false so the
