@@ -7385,10 +7385,10 @@ ENTITY_TYPE + ACTION MATRIX:
              Requires "content" OAuth scope.
 
   FORM       → LIST (cursor?) | GET (form_id) | GET_SUBMISSIONS (form_id; cursor?)
-             → CREATE (name, formType="hubspot", fieldGroups=[], configuration, displayOptions, legalConsentOptions, archived=false)
+             → CREATE (name, formType="hubspot", fieldGroups=[], configuration={}, displayOptions={}, legalConsentOptions={type:"none"})
              → UPDATE (form_id; name?, fieldGroups?, configuration?, displayOptions?, legalConsentOptions?)
              → DELETE (form_id)
-             Requires "forms" OAuth scope. CREATE requires full nested body — see HubSpot Forms v3 spec.
+             Requires "forms" OAuth scope. CREATE: formType must be "hubspot" (only valid value). All 6 fields required by HubSpot schema. Pass minimum: formType="hubspot", fieldGroups=[], configuration={}, displayOptions={}, legalConsentOptions={type:"none"}.
              DELETE is a soft-delete (archive); permanently purged after 3 months.
 
   LANDING_PAGE → LIST (cursor?) | GET (page_id) | CREATE (name; template_path?, slug?, meta_description?)
@@ -7419,7 +7419,7 @@ ASSET METRICS (CAMPAIGN LIST_ASSETS):
   WORKFLOW → enrolled, active, completed counts
   SOCIAL_BROADCAST → facebook_clicks, linkedin_clicks, twitter_clicks
 
-  CONTACT_LIST → LIST (query?, cursor?) | GET (list_id) | CREATE (name, processing_type; object_type_id?)
+  CONTACT_LIST → LIST (query?, cursor?, count?) | GET (list_id) | CREATE (name, processing_type; object_type_id?)
                → ADD_CONTACTS (list_id, record_ids[]) | REMOVE_CONTACTS (list_id, record_ids[])
                → DELETE (list_id)
                processing_type: MANUAL (static, edit via API) | DYNAMIC (auto-filters) | SNAPSHOT (filter once, then static).
@@ -7483,6 +7483,7 @@ TYPICAL WORKFLOW:
         object_type_id:   { type: 'string', description: 'HubSpot object type ID. Defaults to "0-1" (contacts). CONTACT_LIST CREATE.' },
         record_ids:       { type: 'array', items: { type: 'string' }, description: 'Contact record IDs. Required for CONTACT_LIST ADD_CONTACTS/REMOVE_CONTACTS.' },
         query:            { type: 'string', description: 'Search query for CONTACT_LIST LIST.' },
+        count:            { type: 'number', description: 'Page size for CONTACT_LIST LIST. Default 50, max 500.' },
         filter_branch:    { type: 'object', description: 'Filter criteria for DYNAMIC/SNAPSHOT CONTACT_LIST CREATE.' },
       },
       required: ['entity_type', 'action'],

@@ -350,17 +350,16 @@ describe('addContactsToList', () => {
 });
 
 describe('removeContactsFromList', () => {
-  it('PUTs to add-and-remove endpoint with recordIdsToRemove', async () => {
-    const data = { recordsIdsAdded: [], recordIdsRemoved: ['c1'], recordIdsMissing: [] };
+  it('PUTs to /memberships/remove with raw array body', async () => {
+    const data = { recordIdsRemoved: ['c1'], recordIdsMissing: [] };
     mockPut.mockResolvedValue({ data });
     const svc = makeSvc();
     const result = await svc.removeContactsFromList('l1', ['c1']);
     expect(result).toEqual(data);
     const url = mockPut.mock.calls[0][0];
-    expect(url).toContain('/crm/lists/2026-03/l1/memberships/add-and-remove');
+    expect(url).toContain('/crm/lists/2026-03/l1/memberships/remove');
     const body = mockPut.mock.calls[0][1];
-    expect(body.recordIdsToRemove).toEqual(['c1']);
-    expect(body.recordIdsToAdd).toEqual([]);
+    expect(body).toEqual(['c1']);
   });
 
   it('throws if listId is empty', async () => {
@@ -577,7 +576,7 @@ describe('publishBlogPost', () => {
     mockPost.mockResolvedValue({ status: 204, data: null });
     const svc = makeSvc();
     await expect(svc.publishBlogPost('bp1')).resolves.toBeUndefined();
-    expect(mockPost.mock.calls[0][0]).toContain('/cms/v3/blogs/posts/bp1/draft/push-live');
+    expect(mockPost.mock.calls[0][0]).toContain('/cms/blogs/2026-03/posts/bp1/draft/push-live');
   });
 });
 

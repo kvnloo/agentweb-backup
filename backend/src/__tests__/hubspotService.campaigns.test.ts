@@ -295,7 +295,7 @@ describe('HubSpotService — listCampaignAssets', () => {
     const result = await svc.listCampaignAssets('campaign-guid-1', 'MARKETING_EMAIL');
 
     expect(mockAxiosGet).toHaveBeenCalledWith(
-      expect.stringContaining('marketing/v3/campaigns/campaign-guid-1/assets/MARKETING_EMAIL'),
+      expect.stringContaining('marketing/campaigns/2026-03/campaign-guid-1/assets/MARKETING_EMAIL'),
       expect.any(Object)
     );
     expect(result).toEqual(raw);

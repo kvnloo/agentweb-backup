@@ -372,15 +372,15 @@ describe('CONTACT_LIST LIST', () => {
     const raw = { lists: [{ listId: LIST_ID, name: 'Test List' }], total: 1 };
     mockListContactLists.mockResolvedValue(raw);
     const result = await hs({ entity_type: 'CONTACT_LIST', action: 'LIST' });
-    expect(mockListContactLists).toHaveBeenCalledWith({ query: undefined, cursor: undefined });
+    expect(mockListContactLists).toHaveBeenCalledWith({ query: undefined, cursor: undefined, count: undefined });
     expect(result.success).toBe(true);
     expect(result.lists).toEqual(raw.lists);
   });
 
-  it('passes query and cursor', async () => {
+  it('passes query, cursor, and count', async () => {
     mockListContactLists.mockResolvedValue({ lists: [] });
-    await hs({ entity_type: 'CONTACT_LIST', action: 'LIST', query: 'VIP', cursor: 'tok123' });
-    expect(mockListContactLists).toHaveBeenCalledWith({ query: 'VIP', cursor: 'tok123' });
+    await hs({ entity_type: 'CONTACT_LIST', action: 'LIST', query: 'VIP', cursor: 'tok123', count: 100 });
+    expect(mockListContactLists).toHaveBeenCalledWith({ query: 'VIP', cursor: 'tok123', count: 100 });
   });
 });
 

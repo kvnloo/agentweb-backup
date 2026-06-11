@@ -962,7 +962,7 @@ export class HubSpotService {
     if (opts?.startDate) params.push(`startDate=${encodeURIComponent(opts.startDate)}`);
     if (opts?.endDate) params.push(`endDate=${encodeURIComponent(opts.endDate)}`);
     if (opts?.cursor) params.push(`after=${encodeURIComponent(opts.cursor)}`);
-    const url = `${HUBSPOT_API_BASE}/marketing/v3/campaigns/${guid}/assets/${assetType}?${params.join('&')}`;
+    const url = `${HUBSPOT_API_BASE}/marketing/campaigns/2026-03/${guid}/assets/${assetType}?${params.join('&')}`;
     const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
     return res.data;
   }
@@ -1070,8 +1070,8 @@ export class HubSpotService {
 
   // ─── Contact Lists (2026-03 API) ─────────────────────────────────────────
 
-  async listContactLists(opts?: { query?: string; cursor?: string }): Promise<any> {
-    const body: Record<string, any> = { objectTypeId: '0-1', count: 50 };
+  async listContactLists(opts?: { query?: string; cursor?: string; count?: number }): Promise<any> {
+    const body: Record<string, any> = { objectTypeId: '0-1', count: opts?.count ?? 50 };
     if (opts?.query) body.query = opts.query;
     if (opts?.cursor) body.after = opts.cursor;
     const res = await axiosInstance.post(
@@ -1127,8 +1127,8 @@ export class HubSpotService {
     if (!listId?.trim()) throw new Error('listId is required');
     if (!recordIds?.length) throw new Error('recordIds array must not be empty');
     const res = await axiosInstance.put(
-      `${HUBSPOT_API_BASE}/crm/lists/2026-03/${listId}/memberships/add-and-remove`,
-      { recordIdsToAdd: [], recordIdsToRemove: recordIds },
+      `${HUBSPOT_API_BASE}/crm/lists/2026-03/${listId}/memberships/remove`,
+      recordIds,
       { headers: await this.authHeaders() }
     );
     return res.data;
@@ -1304,7 +1304,7 @@ export class HubSpotService {
 
   async publishBlogPost(postId: string): Promise<void> {
     await axiosInstance.post(
-      `${HUBSPOT_API_BASE}/cms/v3/blogs/posts/${postId}/draft/push-live`,
+      `${HUBSPOT_API_BASE}/cms/blogs/2026-03/posts/${postId}/draft/push-live`,
       {},
       { headers: await this.authHeaders() }
     );

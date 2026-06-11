@@ -24530,7 +24530,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       if (entityType === 'CONTACT_LIST') {
         switch (action) {
           case 'LIST': {
-            const data = await svc.listContactLists({ query: args?.query, cursor: args?.cursor });
+            const data = await svc.listContactLists({ query: args?.query, cursor: args?.cursor, count: args?.count });
             return { success: true, ...data };
           }
           case 'GET': {
@@ -24584,9 +24584,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               svc.getCampaign(guid),
               svc.getCampaignMetrics(guid),
             ]);
+            if (campaign.status === 'rejected') {
+              return { success: false, error: (campaign as PromiseRejectedResult).reason?.message ?? 'Failed to fetch campaign.' };
+            }
             return {
               success: true,
-              campaign: campaign.status === 'fulfilled' ? campaign.value : { error: (campaign as PromiseRejectedResult).reason?.message },
+              campaign: campaign.value,
               metrics: metrics.status === 'fulfilled' ? metrics.value : { error: (metrics as PromiseRejectedResult).reason?.message },
             };
           }

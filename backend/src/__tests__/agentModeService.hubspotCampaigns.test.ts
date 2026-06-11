@@ -192,6 +192,14 @@ describe('CAMPAIGN GET', () => {
     expect(result.campaign).toEqual(RAW_CAMPAIGN);
     expect(result.metrics).toEqual({ error: 'metrics unavailable' });
   });
+
+  it('returns success:false when campaign fetch fails', async () => {
+    mockGetCampaign.mockRejectedValue(new Error('Campaign not found'));
+    mockGetCampaignMetrics.mockResolvedValue(RAW_METRICS);
+    const result = await hubspot({ action: 'GET', guid: GUID });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/campaign not found/i);
+  });
 });
 
 describe('CAMPAIGN CREATE', () => {
