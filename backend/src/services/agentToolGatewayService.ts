@@ -305,6 +305,13 @@ export function validateAndRepairToolArgs(
 
   for (const [name, propSchema] of Object.entries(properties)) {
     if (repairedArgs[name] === undefined || repairedArgs[name] === null) continue;
+    if (!shouldStringifyJsonValue(name, repairedArgs[name], propSchema)) continue;
+    repairedArgs[name] = JSON.stringify(repairedArgs[name]);
+    repairs.push(`${name}:json_stringify`);
+  }
+
+  for (const [name, propSchema] of Object.entries(properties)) {
+    if (repairedArgs[name] === undefined || repairedArgs[name] === null) continue;
     const typeIssue = validateJsonSchemaType(name, repairedArgs[name], propSchema);
     if (typeIssue) issues.push(typeIssue);
     issues.push(...validateJsonSchemaConstraints(name, repairedArgs[name], propSchema));
@@ -563,6 +570,18 @@ function schemaAllowsType(schema: any, type: string): boolean {
   if (!expected) return false;
   const expectedTypes = Array.isArray(expected) ? expected : [expected];
   return expectedTypes.includes(type);
+}
+
+function shouldStringifyJsonValue(name: string, value: unknown, schema: any): boolean {
+  if (!schemaAllowsType(schema, 'string')) return false;
+  if (!value || typeof value !== 'object') return false;
+
+  const normalizedName = normalizeArgName(name);
+  const description = typeof schema?.description === 'string' ? schema.description.toLowerCase() : '';
+  const contentMediaType = typeof schema?.contentMediaType === 'string' ? schema.contentMediaType.toLowerCase() : '';
+  return normalizedName.endsWith('json') ||
+    description.includes('json') ||
+    contentMediaType.includes('json');
 }
 
 function getSchemaAliases(schema: any): string[] {

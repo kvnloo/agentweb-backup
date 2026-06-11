@@ -471,6 +471,49 @@ describe('agentToolGatewayService', () => {
       ]);
     });
 
+    it('repairs explicit JSON aliases by serializing object values to the canonical string field', () => {
+      const operations = [{
+        action: 'replaceInner',
+        selector: 'p',
+        html: 'The gateway normalized the alias and the update still worked.'
+      }];
+
+      const result = validateAndRepairToolArgs({
+        toolName: 'update_html_file',
+        args: {
+          file_url: 'https://example.com/source.html',
+          replacement_json: operations,
+          update_type: 'css',
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            file_url: { type: 'string' },
+            operations_json: {
+              type: 'string',
+              description: 'JSON array of CSS-selector operations',
+              'x-aliases': ['replacement_json'],
+            },
+            update_type: { type: 'string' },
+          },
+          required: ['file_url', 'operations_json'],
+          additionalProperties: false,
+        },
+        effect: 'internal_write',
+      });
+
+      expect(result.status).toBe('repaired');
+      expect(result.args).toEqual({
+        file_url: 'https://example.com/source.html',
+        operations_json: JSON.stringify(operations),
+        update_type: 'css',
+      });
+      expect(result.repairs).toEqual([
+        'replacement_json->operations_json',
+        'operations_json:json_stringify',
+      ]);
+    });
+
     it('enforces array minItems and item types from schema', () => {
       const emptyResult = validateAndRepairToolArgs({
         toolName: 'install_skills',
