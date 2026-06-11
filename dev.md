@@ -1,3 +1,65 @@
+## Resend Sender Domain DKIM Verification Failure — mail.incentivpay.com (2026-06-11)
+
+Reported by user `info@pmps.ai` (userId `1359ace4-0565-4018-9926-f51efdcf4c47`): the email sender domain `mail.incentivpay.com` shows DKIM **failed** in Resend even though the user says they added the DKIM record in GoDaddy. Investigation only — no code changed.
+
+### What the live data shows
+
+The DB side is **correct** — no app/wiring bug. User `info@pmps.ai` is properly linked: `emailDomain = mail.incentivpay.com`, `resendDomainId = 7d133b9e-663d-4faf-8a89-ec88d60c49e7` (matches the Resend domain). (Lookup was a one-off scan of the prod `AW-Users` table by email/emailDomain/resendDomainId.)
+
+Resend domain state (prod account, id `7d133b9e-663d-4faf-8a89-ec88d60c49e7`, US East, created 2026-06-02), pulled live from `GET https://api.resend.com/domains/{id}`:
+
+| Record | Host (relative) | Type | Resend status |
+|--------|-----------------|------|---------------|
+| SPF (MX) | `send.mail` | MX | ✅ verified |
+| SPF (TXT) | `send.mail` | TXT | ✅ verified |
+| **DKIM** | `resend._domainkey.mail` | **TXT** | ❌ **failed** |
+
+DKIM value Resend expects (TXT): `p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCZNDIpPbcMn89NOxV5JtOfgx28SS2dDrRWMB6i4eBE2QySQ7HeiHObv1eQ1rwbqeEY+v9gbA7x6r3EAa4UvTPnigYOJti70VPMbdviX+nt2lTAFtFqqWaUGLBs96lpuSSK9tRMi80Mr7OwqViESrRArLrcrmoFN+x0wnywYD2YNwIDAQAB`
+
+The overall domain badge reads "failed" **only** because of the single DKIM row; both SPF rows already passed.
+
+### Root cause: the DKIM TXT record is NOT actually published in DNS
+
+Live DNS-over-HTTPS lookups (Google DoH) confirm the DKIM TXT record returns **NXDOMAIN** at the correct host and at every common GoDaddy-mistake variant, while the SPF host resolves fine:
+
+- `resend._domainkey.mail.incentivpay.com` (TXT, correct host) → **NXDOMAIN**
+- `resend._domainkey.incentivpay.com` (TXT, "forgot the .mail") → NXDOMAIN
+- `resend._domainkey.mail.incentivpay.com.incentivpay.com` (TXT, GoDaddy double-append) → NXDOMAIN
+- `resend._domainkey.mail.incentivpay.com` as CNAME → NXDOMAIN
+- `send.mail.incentivpay.com` (SPF TXT + MX) → **resolves** ✅ (this is why SPF verified)
+
+So the user successfully added the two SPF entries but the DKIM TXT entry is absent from the zone — never saved, saved at the wrong host, or saved as the wrong type. Domain was created 2026-06-02, so 48h propagation is long past; this is a data-entry problem, not propagation.
+
+### Likely GoDaddy entry mistakes (in order of likelihood)
+
+1. **Host entered as FQDN.** Resend shows the host relative (`resend._domainkey.mail`). GoDaddy auto-appends the zone, so the user must enter `resend._domainkey.mail` (NOT `resend._domainkey.mail.incentivpay.com`, which GoDaddy stores doubled).
+2. **Wrong record type.** This domain's DKIM is a **TXT** record (some Resend setups use CNAME). If added as CNAME it won't match.
+3. **Value truncation.** GoDaddy can split/truncate the long `p=…` TXT value.
+4. **Record silently not persisted** by GoDaddy.
+
+### Exact record the user must add in GoDaddy
+
+- **Type:** `TXT`
+- **Name/Host:** `resend._domainkey.mail`  (relative — do NOT append `.incentivpay.com`)
+- **Value:** the `p=MIGf…IDAQAB` key above
+- **TTL:** default / 1 hour
+
+Then click **Verify Domain** in the portal (no Resend dashboard needed — see below).
+
+### Verify path in our UI
+
+There IS a "Verify Domain" button in the customer portal: CRM page → Email Sender Domain section, shown whenever the domain is registered-but-unverified, directly under the DNS records table.
+- `customer-portal/src/pages/CRM.tsx:10690` — the button → `handleVerifyDomain` (`CRM.tsx:1009`) → `POST /api/crm/email-domain/verify` → `resendService.verifyDomain(resendDomainId)`, which re-queries DNS and re-renders per-record status. "Change Domain" (`handleChangeDomain`) resets the config.
+- Caveat: the button only **re-checks**; it has no effect until the record actually exists in DNS. Clicking it now will keep returning "failed."
+
+### Note: same issue on mail.pmps.ai
+
+`mail.pmps.ai` (resendDomainId `2b581c4e-3849-49da-b70b-6fdc3ae09bfa`) is also in `failed` state in the same Resend account — likely the same DKIM gap if the user intends to use it.
+
+### Possible product improvement (not implemented)
+
+The DNS records table (`customer-portal/src/pages/CRM.tsx:10625-10714`) renders `rec.name` raw from the Resend API (e.g. `resend._domainkey.mail`) with only generic "add at your registrar" helper text — no note that GoDaddy/Namecheap hosts are **relative** and the root domain must not be appended. That's exactly the trap that produced this failure. A short per-provider hint ("enter the host *without* your domain") would prevent repeat cases.
+
 ## Self-Learning Loop Adoption — Health Endpoint + AgentMode as a Loop (2026-06-09)
 
 Follow-up to the YC-style learning-loop audit + retro. PR #1799 (branch `rui/self-learning-loop-adoption`). The retro's framing: a *bug-feedback* loop (user/Emma notices → Slack/Notion → eng fixes → next bug) is useful but is **not self-learning**. A *self-learning* loop must **store the decision, ship or reject the change, measure the outcome, and feed that result back into future policy** — the five layers Sensor → Policy → Tools → Quality gate → Learning, with Layer 5 writing back into Layer 2.
@@ -39,7 +101,6 @@ Letting the loops run and observing before building the gate. What to watch:
 - Whether the AgentMode policy surfaces *real* repeatedly-failing tools (signal) vs. noise — tune the count/rate thresholds in `AgentFailureRuleSet` from what we see.
 - The 17:30 UTC Slack digest: are the proposed fix-specs actionable as-is?
 - Once enough loops are stuck at `pending_approval`, that's the cue to prioritize the real approval gate.
-
 ## Judge Scoring False-Negative on Brand/Topic Mismatch (2026-06-05)
 
 Systemic pattern across 3 sessions (satisfaction score 2): when a requested content topic (email, LinkedIn post, ad, analysis) does **not** match the stored brand guidelines, the agent correctly flags the mismatch and either asks a clarifying question or proceeds with placeholders (`[Brand Name]`, `[URL]`). This is the **desired** behavior — but the satisfaction judge was scoring these sessions low (`goalCompletion` 1–2), treating the flag/clarification as a failure. The fix is to the **judge**, not the agent.
