@@ -11,6 +11,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-11',
     changes: [
+      'Fixed: Skills You Create by Chatting with Emma Are Now Shared with Your Organization',
+      '- When you asked Emma to create a skill, it was saved without linking it to your organization, so teammates could not see it and it did not behave like other shared skills',
+      '- Skills created through Emma are now shared across your whole organization by default, just like skills created from Settings > Skills',
+      '- Creating a skill via Emma now follows the same permissions as the rest of the app — only an org owner or a designated skills editor can create org skills; other members are asked to have an admin do it',
       'Fixed: Custom Domains for Landing Pages Now Wait for DNS Verification',
       '- Connecting your own domain (for example store.yoursite.com) to a landing page used to show as "Active" right away, even before you had set up any DNS records — so the page looked live but the domain did not actually work',
       '- Your domain now stays in a "Pending DNS" state until your DNS records are correctly pointed at us, and only flips to "Active" once it is genuinely reachable',
