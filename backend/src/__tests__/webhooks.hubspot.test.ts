@@ -292,7 +292,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
       .set('x-hubspot-signature', makeSignature(body))
       .send(body);
 
-    await new Promise(r => setTimeout(r, 200));
+    await flushPromises();
     expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 

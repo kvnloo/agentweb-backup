@@ -1159,4 +1159,32 @@ describe('agentToolGatewayService', () => {
       expect(outcome.status).toBe('success');
     });
   });
+
+  describe('call_hubspot_api effect classification', () => {
+    const cases: Array<{ action: string; expectedEffect: string }> = [
+      { action: 'LIST', expectedEffect: 'read' },
+      { action: 'GET', expectedEffect: 'read' },
+      { action: 'GET_STATS', expectedEffect: 'read' },
+      { action: 'CREATE', expectedEffect: 'internal_write' },
+      { action: 'UPDATE', expectedEffect: 'internal_write' },
+      { action: 'CLONE', expectedEffect: 'internal_write' },
+      { action: 'ADD_CONTACTS', expectedEffect: 'internal_write' },
+      { action: 'ARCHIVE', expectedEffect: 'internal_write' },
+      { action: 'DELETE', expectedEffect: 'destructive' },
+      { action: 'DELETE_BROADCAST', expectedEffect: 'destructive' },
+      { action: 'REMOVE_CONTACTS', expectedEffect: 'destructive' },
+      { action: 'PUBLISH', expectedEffect: 'destructive' },
+      { action: 'CREATE_BROADCAST', expectedEffect: 'external_publish' },
+    ];
+
+    for (const { action, expectedEffect } of cases) {
+      it(`action=${action} → effect=${expectedEffect}`, () => {
+        const decision = evaluateAgentToolPolicy({
+          toolName: 'call_hubspot_api',
+          args: { entity_type: 'CAMPAIGN', action },
+        });
+        expect(decision.effect).toBe(expectedEffect);
+      });
+    }
+  });
 });
