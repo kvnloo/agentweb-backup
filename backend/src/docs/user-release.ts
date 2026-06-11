@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-06-10
+// Last updated: 2026-06-11
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,16 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-06-11',
+    changes: [
+      'Fixed: Custom Domains for Landing Pages Now Wait for DNS Verification',
+      '- Connecting your own domain (for example store.yoursite.com) to a landing page used to show as "Active" right away, even before you had set up any DNS records — so the page looked live but the domain did not actually work',
+      '- Your domain now stays in a "Pending DNS" state until your DNS records are correctly pointed at us, and only flips to "Active" once it is genuinely reachable',
+      '- The setup instructions now include the main DNS record your domain needs (not just the wildcard), so following them actually makes the domain work',
+      '- Re-adding a domain you already connected no longer fails with an error, and domain-related messages are now clearer about what to do next',
+    ],
+  },
   {
     date: '2026-06-10',
     changes: [
