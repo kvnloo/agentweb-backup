@@ -154,6 +154,13 @@ async function handleSlackTriggeredSession(params: {
       return;
     }
 
+    // Respect the per-user opt-out: when suggested replies are disabled, skip the whole flow
+    // (no triage, no session, no email) so we don't generate suggestions for this customer.
+    if (user.slackSuggestedRepliesDisabled) {
+      console.log(`📨 [slack-triggered] suggested replies disabled for user ${user.userId}, skipping`);
+      return;
+    }
+
     // Triage: does this message need handling?
     console.log(`📨 [slack-triggered] user found (${user.email}), starting triage...`);
     const needsHandling = await agentModeService.triageSlackMessage(rawMessage);
@@ -833,6 +840,13 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
                   return;
                 }
 
+                // Respect the per-user opt-out before generating a response or sending email.
+                const user = await userDb.getUserById(userId);
+                if (user?.slackSuggestedRepliesDisabled) {
+                  console.log(`📨 [slack-triggered] suggested replies disabled for user ${userId}, skipping thread reply`);
+                  return;
+                }
+
                 const displayName = await getSlackUserDisplayName(slackUserId);
                 const formattedMessage = `${displayName}: ${text}`.trim();
 
@@ -854,7 +868,6 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
                   channelName = (info.channel as any)?.name || channel;
                 } catch { /* non-blocking */ }
 
-                const user = await userDb.getUserById(userId);
                 await emailService.sendSlackTriggeredSessionEmail('founders@agentweb.pro', {
                   sessionId,
                   userEmail: user?.email || userId,
