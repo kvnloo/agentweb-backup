@@ -214,7 +214,7 @@ function recordAgentModeRunStarted(
 
 function recordAgentModeRunCompleted(
   runId: string,
-  info: { toolCalls?: number; failedToolCalls?: number; sessionId?: string },
+  info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
 ): void {
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
@@ -223,7 +223,7 @@ function recordAgentModeRunCompleted(
 
 function recordAgentModeRunFailed(
   runId: string,
-  info: { error: unknown; toolCalls?: number; failedToolCalls?: number; sessionId?: string },
+  info: { error: unknown; toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
 ): void {
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
@@ -232,6 +232,17 @@ function recordAgentModeRunFailed(
 
 function countFailedToolCalls(toolCalls: any[]): number {
   return toolCalls.filter((toolCall) => toolCall && 'error' in toolCall).length;
+}
+
+/** Highest per-tool failure count — feeds the retry-spiral degraded-run rule. */
+function maxSameToolFailureCount(toolCalls: any[]): number {
+  const counts = new Map<string, number>();
+  for (const toolCall of toolCalls) {
+    if (!toolCall || !('error' in toolCall)) continue;
+    const name = toolCall.name ?? 'unknown';
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  return counts.size > 0 ? Math.max(...counts.values()) : 0;
 }
 
 const AGENT_RUNTIME_ARG_PREVIEW_MAX_CHARS = 1200;
@@ -3292,6 +3303,7 @@ export class AgentModeService {
         sessionId,
         toolCalls: toolCalls.length,
         failedToolCalls: countFailedToolCalls(toolCalls),
+        maxSameToolFailures: maxSameToolFailureCount(toolCalls),
       });
       return {
         content,
@@ -3356,6 +3368,7 @@ export class AgentModeService {
         sessionId,
         toolCalls: _toolCallsForTelemetry.length,
         failedToolCalls: countFailedToolCalls(_toolCallsForTelemetry),
+        maxSameToolFailures: maxSameToolFailureCount(_toolCallsForTelemetry),
       });
       throw wrappedError;
     }
