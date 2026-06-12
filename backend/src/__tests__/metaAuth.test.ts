@@ -82,6 +82,63 @@ describe('Meta Auth Routes', () => {
         mockSessionStore.clear();
     });
 
+    describe('POST /finalize — getAdAccounts error reporting', () => {
+        const finalizeMarketing = async () => {
+            (axios.get as jest.Mock).mockResolvedValue({
+                data: { access_token: 'valid_access_token', expires_in: 3600 }
+            });
+            jest.spyOn(jwt, 'verify').mockReturnValue({ userId: 'test_user_id', flow: 'marketing' } as any);
+            return request(app)
+                .post('/auth/meta/finalize')
+                .send({ code: 'valid_code', state: 'valid_state' });
+        };
+
+        it('sets adAccountsError and logs via console.error when getAdAccounts throws', async () => {
+            const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+            const metaError: any = new Error('(#200) Requires business_management permission');
+            metaError.structuredError = { code: 200, classification: 'PERMISSION_ERROR' };
+            (metaService.getAdAccounts as jest.Mock).mockRejectedValue(metaError);
+
+            const res = await finalizeMarketing();
+
+            expect(res.status).toBe(200);
+            expect(res.body.success).toBe(true);
+            expect(res.body.adAccounts).toBeUndefined();
+            expect(res.body.adAccountsError).toBe(true);
+            expect(consoleErrorSpy).toHaveBeenCalledWith(
+                expect.stringContaining('[Meta Finalize] getAdAccounts failed'),
+                expect.objectContaining({
+                    code: 200,
+                    classification: 'PERMISSION_ERROR',
+                    message: expect.stringContaining('business_management')
+                })
+            );
+            consoleErrorSpy.mockRestore();
+        });
+
+        it('does not set adAccountsError when getAdAccounts succeeds', async () => {
+            (metaService.getAdAccounts as jest.Mock).mockResolvedValue([
+                { id: 'act_1', name: 'A', account_id: '1', currency: 'USD', account_status: 1 }
+            ]);
+
+            const res = await finalizeMarketing();
+
+            expect(res.status).toBe(200);
+            expect(res.body.adAccounts).toHaveLength(1);
+            expect(res.body.adAccountsError).toBeUndefined();
+        });
+
+        it('does not set adAccountsError when the user genuinely has zero ad accounts', async () => {
+            (metaService.getAdAccounts as jest.Mock).mockResolvedValue([]);
+
+            const res = await finalizeMarketing();
+
+            expect(res.status).toBe(200);
+            expect(res.body.adAccounts).toBeUndefined();
+            expect(res.body.adAccountsError).toBeUndefined();
+        });
+    });
+
     describe('POST /connect-ad-accounts', () => {
         it('should connect ad accounts using valid session ID', async () => {
             // 1. Setup: Call /finalize first to generate a valid session ID
