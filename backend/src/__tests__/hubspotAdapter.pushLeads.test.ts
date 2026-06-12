@@ -302,4 +302,62 @@ describe('HubspotAdapter.pushLeads — lead list name/id enrichment', () => {
       })
     );
   });
+
+  it('injects listName/listId for a legacy config that lacks them (no manual re-save needed)', async () => {
+    // A config saved before this feature: customFieldMapping has only 'notes'.
+    const legacy = makeListConfig({
+      customFieldMapping: [{ agentwebField: 'notes', crmProperty: 'notes', direction: 'both', enabled: true }],
+    });
+    const leads = [{ leadId: 'l1', listId: 'list_1', email: 'real@example.com' }];
+
+    await adapter.pushLeads(auth, leads, legacy);
+
+    // Properties are still pre-created and the values still reach HubSpot.
+    expect(mockEnsureContactProperty).toHaveBeenCalledWith('lead_list_name', expect.any(String));
+    expect(mockEnsureContactProperty).toHaveBeenCalledWith('lead_list_id', expect.any(String));
+    expect(mockUpsertContact).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customFields: expect.objectContaining({
+          lead_list_name: 'Q1 Outbound',
+          lead_list_id: 'list_1',
+        }),
+      })
+    );
+  });
+
+  it('respects an explicit listName mapping override instead of injecting the default', async () => {
+    // User re-mapped listName to a different HubSpot property in the dialog.
+    const config = makeListConfig({
+      customFieldMapping: [
+        { agentwebField: 'listName', crmProperty: 'custom_segment', direction: 'push', enabled: true },
+      ],
+    });
+    const leads = [{ leadId: 'l1', listId: 'list_1', email: 'real@example.com' }];
+
+    await adapter.pushLeads(auth, leads, config);
+
+    const call = mockUpsertContact.mock.calls[0][0];
+    // Honors the user's property name, not the default lead_list_name…
+    expect(call.customFields?.custom_segment).toBe('Q1 Outbound');
+    expect(call.customFields?.lead_list_name).toBeUndefined();
+    // …but listId (not explicitly configured) is still injected with the default.
+    expect(call.customFields?.lead_list_id).toBe('list_1');
+  });
+
+  it('does not re-enable a listName mapping the user explicitly disabled', async () => {
+    // User unchecked listName in the dialog → an explicit disabled entry is stored.
+    const config = makeListConfig({
+      customFieldMapping: [
+        { agentwebField: 'listName', crmProperty: 'lead_list_name', direction: 'push', enabled: false },
+      ],
+    });
+    const leads = [{ leadId: 'l1', listId: 'list_1', email: 'real@example.com' }];
+
+    await adapter.pushLeads(auth, leads, config);
+
+    const call = mockUpsertContact.mock.calls[0][0];
+    expect(call.customFields?.lead_list_name).toBeUndefined();
+    // listId has no explicit entry, so it is still injected.
+    expect(call.customFields?.lead_list_id).toBe('list_1');
+  });
 });
