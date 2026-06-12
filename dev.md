@@ -1,3 +1,16 @@
+## Prod AW-OnboardingMetrics table was missing — heartbeat blind since launch (2026-06-12)
+
+The onboarding heartbeat's recurring "No step timing data found yet; verify AW-OnboardingMetrics writes" warning had a trivial root cause: **the prod table `AW-OnboardingMetrics` never existed**. `Dev-AW-OnboardingMetrics` exists (100 items — dev writes work), but there is no entry for it in `scripts/create-tables.ts`, so the dev table was created ad-hoc and prod never got one. Every prod write hit ResourceNotFound and was swallowed by `logStepMetric()`'s fire-and-forget catch; the heartbeat's read hit the same missing table and degraded to empty.
+
+**Fix applied 2026-06-12**: created `AW-OnboardingMetrics` in prod (us-west-2) via aws cli, mirroring the dev schema — PK `metricId` (S), GSI `StepStartedAtIndex` (`step` HASH / `startedAt` RANGE, ALL projection), PAY_PER_REQUEST.
+
+### Assumptions to validate
+- Step metrics should start appearing in tomorrow's heartbeat ("Step timings" section non-empty) as users complete brand/ICP/ad steps. If still empty after 48h with real onboarding activity, the writer has a second issue (IAM PutItem permission is next suspect).
+- The 86% "(unset)" funnel state is a SEPARATE, expected artifact — legacy users predate `onboardingStage`; only users emitting onboarding events get a stage. No fix needed unless we want a backfill migration.
+
+### Follow-up
+- Add `AW-OnboardingMetrics` to `scripts/create-tables.ts` so environments stop diverging ad-hoc (small PR).
+
 ## Replay-eval groundwork — failed runs become eval cases (2026-06-12)
 
 Frontier-agent robustness pattern: failed trajectories become regression tests. The spine records every run; nothing turned the failed/degraded ones into reusable eval material. This is the Phase-4 seed (white-box beats Okareo — we own the trace).
