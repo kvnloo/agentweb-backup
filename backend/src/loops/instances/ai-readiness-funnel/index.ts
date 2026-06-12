@@ -20,16 +20,6 @@
  */
 
 import AWS from 'aws-sdk';
-import {
-  getLoopManifest,
-  getRegisteredLoopIds,
-  registerOrReplaceGate,
-  registerOrReplaceLearningStore,
-  registerOrReplaceLoop,
-  registerOrReplaceRuleSet,
-  registerOrReplaceSensor,
-  registerOrReplaceTools,
-} from '../../index';
 import { CaptureGate } from '../../core/gates/captureGate';
 import {
   analystFindingsBody,
@@ -37,12 +27,12 @@ import {
   postLoopDigest,
   type LoopDigestTemplate,
 } from '../../core/digest/loopDigest';
+import { createInstanceRunner } from '../../core/instanceRunner';
 import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
 import { CooldownRuleSet } from '../../core/policy/cooldownRuleSet';
 import { LlmAnalystRuleSet } from '../../core/policy/llmAnalystRuleSet';
 import { EventTableEventSource, LOOP_EVENTS_TABLE } from '../../core/sensors/eventTableEventSource';
 import { SpecOutputTool } from '../../core/tools/specOutputTool';
-import { runLoop } from '../../core/orchestrator';
 import { productionLoopPorts } from '../../adapters/awsAdapters';
 import type { DynamoPort } from '../../core/ports';
 import type { LoopRunResult, NormalizedEvent } from '../../core/types';
@@ -59,44 +49,54 @@ const READINESS_SCOPE = {
 } as const;
 const DAILY_DIGEST_CLAIM_LOOP_ID = `${AI_READINESS_LOOP_ID}#daily-digest`;
 
-// Held so the tick can drain the gate after the orchestrator returns.
-let aiReadinessGate: CaptureGate | null = null;
 let digestDynamo: AWS.DynamoDB.DocumentClient | null = null;
+
+const runner = createInstanceRunner({
+  loopId: AI_READINESS_LOOP_ID,
+  ports: productionLoopPorts,
+  implNames: {
+    sensor: 'aiReadinessSensor',
+    ruleSet: 'aiReadinessAnalyst',
+    tools: 'aiReadinessSpecTool',
+    gate: 'aiReadinessGate',
+    learning: 'aiReadinessLearning',
+  },
+  buildLayers: (ports) => {
+    const learning = new DynamoLearningStore(ports.dynamo);
+    const analyst = new LlmAnalystRuleSet(AI_READINESS_LOOP_ID, ports.bedrock, {
+      model: aiReadinessManifest.generator.model,
+      targetMetricName: aiReadinessManifest.targetMetric.name,
+      flowDescription: AI_READINESS_FLOW_DESCRIPTION,
+      maxProposals: 3,
+      chapterDimension: 'landerPath',
+    });
+    return {
+      sensor: new EventTableEventSource(ports.dynamo, AI_READINESS_LOOP_ID, {
+        scope: { ...READINESS_SCOPE },
+      }),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ruleSet: new CooldownRuleSet(analyst, learning, AI_READINESS_LOOP_ID) as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      tools: new SpecOutputTool(AI_READINESS_LOOP_ID) as any,
+      gate: new CaptureGate(),
+      learning,
+    };
+  },
+  manifest: () => aiReadinessManifest,
+  // The digest is a daily heartbeat: it posts even when no gate is held, so
+  // "no message" can never be confused with "all good".
+  onRunComplete: async ({ result, ports, manifest }) => {
+    const shape = await summarizeFunnel(ports.dynamo).catch(() => null);
+    await postDigest(result, shape, ports.slack, manifest.approval.slackUserId);
+  },
+});
 
 /**
  * Register the loop. Idempotent. Does NOT reset the registry, so it coexists
  * with ai-eval + onboarding regardless of boot order.
  */
 export function registerAiReadinessFunnel(): void {
-  if ((getRegisteredLoopIds() as readonly string[]).includes(AI_READINESS_LOOP_ID)) return;
-
-  const ports = productionLoopPorts();
-
-  const sensor = new EventTableEventSource(ports.dynamo, AI_READINESS_LOOP_ID, {
-    scope: { ...READINESS_SCOPE },
-  });
-  const learning = new DynamoLearningStore(ports.dynamo);
-  const analyst = new LlmAnalystRuleSet(AI_READINESS_LOOP_ID, ports.bedrock, {
-    model: aiReadinessManifest.generator.model,
-    targetMetricName: aiReadinessManifest.targetMetric.name,
-    flowDescription: AI_READINESS_FLOW_DESCRIPTION,
-    maxProposals: 3,
-    chapterDimension: 'landerPath',
-  });
-  const ruleSet = new CooldownRuleSet(analyst, learning, AI_READINESS_LOOP_ID);
-  const tools = new SpecOutputTool(AI_READINESS_LOOP_ID);
-  const gate = new CaptureGate();
-
-  registerOrReplaceSensor('aiReadinessSensor', sensor);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  registerOrReplaceRuleSet('aiReadinessAnalyst', ruleSet as any);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  registerOrReplaceTools('aiReadinessSpecTool', tools as any);
-  registerOrReplaceGate('aiReadinessGate', gate);
-  registerOrReplaceLearningStore('aiReadinessLearning', learning);
-  registerOrReplaceLoop(aiReadinessManifest);
-
-  aiReadinessGate = gate;
+  runner.register();
 }
 
 /**
@@ -105,18 +105,8 @@ export function registerAiReadinessFunnel(): void {
  * a digest (heartbeat). Never throws — errors are logged.
  */
 export async function runAiReadinessLoopOnce(): Promise<LoopRunResult> {
-  registerAiReadinessFunnel();
-
-  const ports = productionLoopPorts();
-  const manifest = getLoopManifest(AI_READINESS_LOOP_ID);
-  const result = await runLoop(manifest, ports);
-
-  if (aiReadinessGate) aiReadinessGate.drain();
-
-  const shape = await summarizeFunnel(ports.dynamo).catch(() => null);
-  await postDigest(result, shape, ports.slack, manifest.approval.slackUserId);
-
-  return result;
+  // Never null: this instance has no env gate, so register() always succeeds.
+  return (await runner.runOnce()) as LoopRunResult;
 }
 
 interface FunnelShape {
@@ -376,7 +366,7 @@ async function postDigest(
 }
 
 /** Test seam. */
-export const _internal = { get aiReadinessGate() { return aiReadinessGate; } };
+export const _internal = { get aiReadinessGate() { return runner.gate; } };
 export const _testing = {
   summarizeFunnel,
   buildDigestLines,

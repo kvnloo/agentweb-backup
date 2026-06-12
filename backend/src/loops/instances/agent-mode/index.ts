@@ -16,23 +16,13 @@
  * gated separately by AGENT_MODE_LOOP_ENABLED.
  */
 
-import {
-  getLoopManifest,
-  getRegisteredLoopIds,
-  registerOrReplaceGate,
-  registerOrReplaceLearningStore,
-  registerOrReplaceLoop,
-  registerOrReplaceRuleSet,
-  registerOrReplaceSensor,
-  registerOrReplaceTools,
-} from '../../index';
 import { CaptureGate } from '../../core/gates/captureGate';
 import { postLoopDigest, type LoopDigestTemplate } from '../../core/digest/loopDigest';
+import { createInstanceRunner } from '../../core/instanceRunner';
 import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
 import { CooldownRuleSet } from '../../core/policy/cooldownRuleSet';
 import { EventTableEventSource } from '../../core/sensors/eventTableEventSource';
 import { SpecOutputTool } from '../../core/tools/specOutputTool';
-import { runLoop } from '../../core/orchestrator';
 import { productionLoopPorts } from '../../adapters/awsAdapters';
 import type { LoopRunResult } from '../../core/types';
 import { AGENT_MODE_LOOP_ID } from './eventTypes';
@@ -40,35 +30,43 @@ import { AgentFailureRuleSet } from './failureRuleSet';
 import { agentModeManifest } from './manifest';
 import { AgentRunRecorder } from './runRecorder';
 
-let agentModeGate: CaptureGate | null = null;
 let recorderSingleton: AgentRunRecorder | null = null;
+
+const runner = createInstanceRunner({
+  loopId: AGENT_MODE_LOOP_ID,
+  ports: productionLoopPorts,
+  implNames: {
+    sensor: 'agentModeSensor',
+    ruleSet: 'agentModeFailurePolicy',
+    tools: 'agentModeSpecTool',
+    gate: 'agentModeGate',
+    learning: 'agentModeLearning',
+  },
+  buildLayers: (ports) => {
+    const learning = new DynamoLearningStore(ports.dynamo);
+    return {
+      sensor: new EventTableEventSource(ports.dynamo, AGENT_MODE_LOOP_ID),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ruleSet: new CooldownRuleSet(new AgentFailureRuleSet(), learning, AGENT_MODE_LOOP_ID) as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      tools: new SpecOutputTool(AGENT_MODE_LOOP_ID, ['cloud-dev', 'auto-loop', 'agent-mode']) as any,
+      gate: new CaptureGate(),
+      learning,
+    };
+  },
+  manifest: () => agentModeManifest,
+  onRunComplete: async ({ result, drained, ports, manifest }) => {
+    if (drained === null) return;
+    await postLoopDigest(result, ports.slack, manifest.approval.slackUserId, agentModeDigestTemplate, drained.length);
+  },
+});
 
 /**
  * Register the loop. Idempotent. Does NOT reset the registry, so it coexists
  * with the funnel loops regardless of boot order.
  */
 export function registerAgentModeLoop(): void {
-  if ((getRegisteredLoopIds() as readonly string[]).includes(AGENT_MODE_LOOP_ID)) return;
-
-  const ports = productionLoopPorts();
-
-  const sensor = new EventTableEventSource(ports.dynamo, AGENT_MODE_LOOP_ID);
-  const learning = new DynamoLearningStore(ports.dynamo);
-  const policy = new AgentFailureRuleSet();
-  const ruleSet = new CooldownRuleSet(policy, learning, AGENT_MODE_LOOP_ID);
-  const tools = new SpecOutputTool(AGENT_MODE_LOOP_ID, ['cloud-dev', 'auto-loop', 'agent-mode']);
-  const gate = new CaptureGate();
-
-  registerOrReplaceSensor('agentModeSensor', sensor);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  registerOrReplaceRuleSet('agentModeFailurePolicy', ruleSet as any);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  registerOrReplaceTools('agentModeSpecTool', tools as any);
-  registerOrReplaceGate('agentModeGate', gate);
-  registerOrReplaceLearningStore('agentModeLearning', learning);
-  registerOrReplaceLoop(agentModeManifest);
-
-  agentModeGate = gate;
+  runner.register();
 }
 
 /**
@@ -98,18 +96,8 @@ export function isAgentRuntimeSpineEnabled(): boolean {
  * logged. Scheduled from server.ts behind AGENT_MODE_LOOP_ENABLED.
  */
 export async function runAgentModeLoopOnce(): Promise<LoopRunResult> {
-  registerAgentModeLoop();
-
-  const ports = productionLoopPorts();
-  const manifest = getLoopManifest(AGENT_MODE_LOOP_ID);
-  const result = await runLoop(manifest, ports);
-
-  if (agentModeGate) {
-    const drained = agentModeGate.drain();
-    await postLoopDigest(result, ports.slack, manifest.approval.slackUserId, agentModeDigestTemplate, drained.length);
-  }
-
-  return result;
+  // Never null: this instance has no env gate, so register() always succeeds.
+  return (await runner.runOnce()) as LoopRunResult;
 }
 
 /** TExtra = the count of fix specs drained from the gate this tick. */
@@ -133,10 +121,10 @@ const agentModeDigestTemplate: LoopDigestTemplate<number> = {
 /** Test seam. */
 export const _internal = {
   get agentModeGate() {
-    return agentModeGate;
+    return runner.gate;
   },
   resetForTesting() {
-    agentModeGate = null;
+    runner.resetForTesting();
     recorderSingleton = null;
   },
 };
