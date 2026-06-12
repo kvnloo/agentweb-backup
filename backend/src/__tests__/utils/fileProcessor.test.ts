@@ -11,6 +11,7 @@ describe('fileProcessor utils', () => {
       expect(SUPPORTED_FILE_TYPES).toContain('pdf');
       expect(SUPPORTED_FILE_TYPES).toContain('docx');
       expect(SUPPORTED_FILE_TYPES).toContain('xlsx');
+      expect(SUPPORTED_FILE_TYPES).toContain('csv');
     });
 
     it('should include image types', () => {
@@ -33,6 +34,13 @@ describe('fileProcessor utils', () => {
       expect(isSupportedFileType('image.jpg')).toBe(true);
       expect(isSupportedFileType('video.mp4')).toBe(true);
       expect(isSupportedFileType('file.txt')).toBe(true);
+      expect(isSupportedFileType('data.csv')).toBe(true);
+    });
+
+    it('should return true for csv mime types', () => {
+      expect(isSupportedFileType('file.unknown', 'text/csv')).toBe(true);
+      expect(isSupportedFileType('file.unknown', 'application/csv')).toBe(true);
+      expect(isSupportedFileType('file.unknown', 'application/vnd.ms-excel')).toBe(true);
     });
 
     it('should return true for uppercase extensions', () => {
@@ -113,6 +121,10 @@ describe('fileProcessor utils', () => {
     it('should return content types for html files', () => {
       expect(getContentType('file.html')).toBe('text/html');
       expect(getContentType('file.htm')).toBe('text/html');
+    });
+
+    it('should return content type for csv files', () => {
+      expect(getContentType('file.csv')).toBe('text/csv');
     });
 
     it('should return content types for office documents', () => {
