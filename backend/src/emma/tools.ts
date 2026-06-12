@@ -6103,6 +6103,12 @@ emmaToolRegistry.register({
         previewUrl: result.previewUrl,
         branch: result.branch,
         is_staging: !!result.branch && result.branch !== 'main',
+        // Authorization denials are not retryable — the caller lacks edit rights
+        // on this page. Signal the parent agent to surface the message and stop
+        // re-invoking coding_agent (which previously burned several attempts).
+        ...(result.notAuthorized
+          ? { notAuthorized: true, retryable: false }
+          : {}),
       };
     }
   }
