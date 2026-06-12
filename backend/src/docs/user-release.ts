@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-12',
     changes: [
+      'Improved: Changing Your Password Now Signs You Out Everywhere Else',
+      '- When you change your password from Settings — or reset it through the "forgot password" email — every other device and browser that was signed in to your account is now signed out automatically',
+      '- This protects your account if a device was lost or someone else still had access: updating your password instantly cuts off all other active sessions',
+      '- The device you used to make the change stays signed in, so there is nothing extra you need to do',
+    ],
+  },
+  {
+    date: '2026-06-12',
+    changes: [
       'New: Your Lead List Name and ID Now Sync to HubSpot for Easy Segmentation',
       '- When you push leads to HubSpot, each contact now carries the name and ID of the Emma lead list it came from (as the "lead_list_name" and "lead_list_id" properties), so you can filter, segment, and build lists in HubSpot by their source',
       '- This works for every list — including ones you connected before this update — with no need to reconnect or re-save; just push and the fields appear (HubSpot creates the two properties automatically on the first push)',
