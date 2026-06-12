@@ -8,15 +8,12 @@
 
 import express, { Request, Response } from 'express';
 import AWS from 'aws-sdk';
-import { AGENT_MODE_LOOP_ID } from '../loops/instances/agent-mode/eventTypes';
-import { LOOP_EVENTS_TABLE } from '../loops/core/sensors/eventTableEventSource';
 import {
   AgentRunChatContext,
   AgentRunChatMessageRow,
   AgentRunChatSessionRow,
   buildAgentRunChatContext,
-  buildAgentRunSummaries,
-  AgentRunEventRow,
+  fetchAgentRunSummaries,
 } from '../services/agentRunInspectorService';
 
 const router = express.Router();
@@ -33,8 +30,6 @@ const CHAT_MESSAGES_TABLE = `${TABLE_PREFIX}AW-ChatMessages`;
 // newest run or two and makes every older sessionId filter come back empty.
 const DEFAULT_RUN_LIMIT = 50;
 const MAX_RUN_LIMIT = 500;
-const PAGE_EVENT_LIMIT = 1000;
-const MAX_SCANNED_EVENTS = 20000;
 const FIRST_MESSAGE_LIMIT = 25;
 const LATEST_MESSAGE_LIMIT = 60;
 
@@ -45,48 +40,13 @@ router.get('/', async (req: Request, res: Response) => {
     const sessionId = parseOptionalString(req.query.sessionId);
     const userId = parseOptionalString(req.query.userId);
 
-    const matchesFilters = (run: { runId: string; sessionId?: string; userId?: string }) =>
-      (!runId || run.runId === runId)
-      && (!sessionId || run.sessionId === sessionId)
-      && (!userId || run.userId === userId);
+    const { runs: limitedRuns, scannedEvents, truncated } = await fetchAgentRunSummaries({
+      runId,
+      sessionId,
+      userId,
+      limit,
+    });
 
-    const rows: AgentRunEventRow[] = [];
-    let runs: ReturnType<typeof buildAgentRunSummaries> = [];
-    let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
-    let scannedEvents = 0;
-    let truncated = false;
-
-    do {
-      const result = await dynamodb.query({
-        TableName: LOOP_EVENTS_TABLE,
-        KeyConditionExpression: 'loopId = :loopId',
-        ExpressionAttributeValues: {
-          ':loopId': AGENT_MODE_LOOP_ID,
-          ...(runId ? { ':runId': runId } : {}),
-        },
-        ...(runId ? { FilterExpression: 'subjectId = :runId' } : {}),
-        ScanIndexForward: false,
-        Limit: PAGE_EVENT_LIMIT,
-        ExclusiveStartKey: lastKey,
-      }).promise();
-
-      const items = (result.Items ?? []) as AgentRunEventRow[];
-      scannedEvents += result.ScannedCount ?? items.length;
-      rows.push(...items.filter((row) => row.eventType && row.subjectId && row.ts));
-      lastKey = result.LastEvaluatedKey;
-
-      runs = buildAgentRunSummaries(rows).filter(matchesFilters);
-
-      // Collect one run beyond the limit: the oldest collected run may still be
-      // missing events on the next page, and the slice below drops it anyway.
-      if (lastKey && runs.length > limit) break;
-      if (lastKey && scannedEvents >= MAX_SCANNED_EVENTS) {
-        truncated = true;
-        break;
-      }
-    } while (lastKey);
-
-    const limitedRuns = runs.slice(0, limit);
     const chatContexts = await fetchChatContexts([...new Set(limitedRuns.map((run) => run.sessionId).filter(isPresent))]);
     const enrichedRuns = limitedRuns.map((run) => ({
       ...run,

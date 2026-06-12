@@ -139,14 +139,16 @@ export class AgentRunRecorder {
 
   async toolFailed(
     runId: string,
-    info: { toolName: string; error: unknown; durationMs?: number; sessionId?: string },
+    info: { toolName: string; error: unknown; durationMs?: number; sessionId?: string; args?: unknown },
   ): Promise<void> {
+    const failedArgsJson = serializeFailedArgs(info.args);
     await this.emit(runId, EVT_TOOL_FAILED, {
       toolName: info.toolName,
       ...(info.durationMs != null ? { durationMs: info.durationMs } : {}),
       ...(info.sessionId ? { sessionId: info.sessionId } : {}),
       errorClass: errorClassOf(info.error),
       errorMessage: errorMessageOf(info.error),
+      ...(failedArgsJson ? { failedArgsJson } : {}),
     });
   }
 
@@ -240,4 +242,28 @@ function errorClassOf(error: unknown): string {
 function errorMessageOf(error: unknown): string {
   const msg = error instanceof Error ? error.message : String(error);
   return msg.slice(0, 300);
+}
+
+/**
+ * Serialize a failing call's arguments for root-cause investigation.
+ * Failed calls only — successes never store full args (size + privacy).
+ * Secret-like keys are redacted at any nesting depth; output is capped so a
+ * single chatty payload can't bloat the event row. Returns undefined when
+ * args are absent or unserializable (telemetry must never throw).
+ */
+const FAILED_ARGS_MAX_CHARS = 4096;
+const SECRET_KEY_PATTERN = /token|secret|password|api[_-]?key|authorization|credential|private[_-]?key/i;
+
+function serializeFailedArgs(args: unknown): string | undefined {
+  if (args == null) return undefined;
+  try {
+    const json = JSON.stringify(args, (key, value) =>
+      key && SECRET_KEY_PATTERN.test(key) ? '[redacted]' : value,
+    );
+    if (!json) return undefined;
+    if (json.length <= FAILED_ARGS_MAX_CHARS) return json;
+    return json.slice(0, FAILED_ARGS_MAX_CHARS - 12) + '…[truncated]';
+  } catch {
+    return undefined;
+  }
 }
