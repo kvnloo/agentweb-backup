@@ -2952,6 +2952,7 @@ export class AgentModeService {
               toolName: toolCall.function.name,
               args: functionArgs,
               policyDecision,
+              runId: agentRuntimeRunId,
               execute: () => this.executePreparedAgentTool({
                 llmModel,
                 toolName: toolCall.function.name,
@@ -2977,6 +2978,7 @@ export class AgentModeService {
               toolName: toolCall.function.name,
               args: functionArgs,
               policyDecision,
+              runId: agentRuntimeRunId,
               execute: () => this.executePreparedAgentTool({
                 llmModel,
                 toolName: toolCall.function.name,
