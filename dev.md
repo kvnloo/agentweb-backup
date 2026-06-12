@@ -14,6 +14,27 @@ Telemetry finding from the June 9-12 window: every recorded tool failure had err
 - Brave 429s → rate_limit and Meta 5xx → upstream_5xx in prod (heuristics verified against June messages, not live traffic).
 - errorClass consumers (failureRuleSet clustering, inspector) benefit rather than break from the rename — historical events keep old classes, so mixed-class clusters during transition are expected for ~7 days.
 
+## Approval persistence closes the learning loop (Layer 4→5) (2026-06-12)
+
+The June 8 audit's last open item: Slack ✅ approvals dispatched cloud-dev fixes but never wrote `decision`/`shippedAt`/`verdict` back to `Dev-AW-LoopLearning`. Net effect measured this week: CooldownRuleSet was wired but inert (reads `shippedAt`, always null) and the 18:00 UTC attribution cron had zero gradable records. The system sensed and proposed but could not learn.
+
+### What shipped (this PR)
+
+1. **`loops/core/learning/approvalPersistence.ts` — `recordLoopApproval()`**: finds the run's `decision:'pending'` records by the digest's Run ID, appends one `decision:'approved'` record per proposal with `shippedAt` set when its dispatch succeeded. Dispatch failures are recorded approved-but-not-shipped with `mutation.error` — auditable, still re-proposable.
+2. **Dispatcher wiring** (`loopSlackApprovalDispatcher.ts`): both dispatch branches persist after launching, post a `📒 Learning store: N approved, M shipped` thread line, and loudly warn when no pending records match (legacy digests).
+3. **Test-double parity fix**: `InMemoryLearningStore` status/ruleIds filters passed records with no decision/proposal; `DynamoLearningStore` excludes them. Aligned in-memory to Dynamo semantics — test doubles must match prod behavior or tests lock in bugs.
+
+### Matching semantics (deliberate)
+
+Digest item ↔ proposal matching: exact `sourceRuleId`, `:slug` suffix (AI Readiness analyst ids), `proposalId`, or `mutationId`. Unmatched proposals (generic digests use synthetic ids) are marked shipped only when EVERY dispatch succeeded. Bias: when uncertain, leave a rule re-proposable rather than wrongly suppress it for the 14-day cooldown.
+
+### Assumptions to validate
+
+- Digest Run IDs uniquely identify one loop's run (sort-key collision across loops would mis-attribute approvals).
+- The first ✅ on a digest covers all its items — partial approval (✅ some items only) is not modeled; v2 could parse per-item reactions.
+- Attribution at 18:00 UTC will now grade these records once the settle window elapses — verify the first `improved/regressed/no_change` verdict appears in `/api/admin/loops/health` within ~windowDays of the first persisted ship.
+- The `📒 Learning store` thread line appears on the next real ✅ (first live validation of the whole write path).
+
 ## AgentRun Telemetry Failure Analysis → Gateway Circuit Breaker + Tool Guidance Fixes (2026-06-11)
 
 First product decision driven by the runtime-spine telemetry. Analyzed all 3,172 agent-mode events in `Dev-AW-LoopEvents` (June 9–12: 223 runs, 1,016 tool calls, 78 failures = 7.7% tool failure rate; 35 runs had ≥1 failure; zero hard run failures — failures are absorbed and runs "complete" degraded).
