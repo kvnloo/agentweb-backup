@@ -1,3 +1,28 @@
+## Lander funnel was unmeasurable from agent-tool telemetry — service/route-layer lifecycle sensor added (2026-06-12)
+
+Attempting to answer "why do 32 landing-page sessions produce only 3 publishes" exposed two instrumentation holes that made the funnel analysis come back blind (24 "created" sessions, 0 visible previews/publishes/errors — obviously wrong):
+
+1. **The runtime spine only sees agent tool calls.** The lander lifecycle spans two channels — Emma tools AND portal UI buttons — and UI actions never touched the spine. The agent tools call the same `/api/landing-pages/v0/*` routes via `mcpFetch` that the UI calls directly, so the routes are the single chokepoint both channels share.
+2. **`create_html_file` is generic** (email templates, analysis outputs), so tool-name-based session classification over-counts "landing-page sessions."
+
+### What shipped (this PR)
+
+- `services/landerLifecycleEvents.ts` — best-effort emitter (same swallow-errors contract as AgentRunRecorder) writing `lander_created / deploy_retried / iterated / edited / published / publish_reverted` events into the shared `Dev-AW-LoopEvents` table under loopId `lander-lifecycle`, keyed by pageId, with dimensions: channel (`agent`/`ui`), mode (`cold_start`/`incremental`), outcome, userId, sessionId.
+- Hooks in all six mutation routes in `routes/landingPageGeneration.ts` (generate incl. failure path, deploy, iterate, github-edit, publish, revert-publish).
+- `mcpFetch` now sends `X-AgentWeb-Channel: agent` so routes can attribute agent-channel requests; absence of the header = UI.
+
+Complexity note: net simplification — a few emit lines replace an entire class of inference (guessing artifact lifecycle from ambiguous tool names across channels). No new tables, no new loop registration (sensor-only v1; events are queryable but the loop has no policy/manifest yet — deliberately, until the funnel data says what the policy should be).
+
+### Assumptions to validate (next 1–2 weeks)
+
+- **The routes are the complete chokepoint.** Falsified if landers get created/published through any path that bypasses these six routes (e.g. a batch job or admin script) — check for pageIds in the landing-pages store with no `lander_created` event.
+- **Real funnel numbers within ~1 week of deploy**: cold-start publish rate, where sessions die (created→never-touched-again vs iterated→abandoned vs published). The June 12 estimate (9% publish rate) is unverified until this data exists.
+- **Channel split matters**: expectation is agent-channel creations dominate, UI-channel publishes dominate. If everything is one channel, the header plumbing was unnecessary (cheap, but note it).
+- **Junk-lander rate**: count of `created` events with no subsequent lifecycle event after 48h — the candidate definition of "junk." If that definition misfires (users legitimately park drafts for weeks), redefine before building any cleanup.
+
+### Follow-up (deliberately NOT in this PR)
+- Eval-loop wiring: commit-point (`lander_published`) → Slack tag to Matt with the Emma session link; enrichment execute → Fangfang (~5/wk and ~7/wk projected). Blocked on this sensor accumulating ~1 week of data first.
+
 ## Prod AW-OnboardingMetrics table was missing — heartbeat blind since launch (2026-06-12)
 
 The onboarding heartbeat's recurring "No step timing data found yet; verify AW-OnboardingMetrics writes" warning had a trivial root cause: **the prod table `AW-OnboardingMetrics` never existed**. `Dev-AW-OnboardingMetrics` exists (100 items — dev writes work), but there is no entry for it in `scripts/create-tables.ts`, so the dev table was created ad-hoc and prod never got one. Every prod write hit ResourceNotFound and was swallowed by `logStepMetric()`'s fire-and-forget catch; the heartbeat's read hit the same missing table and degraded to empty.
