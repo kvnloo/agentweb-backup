@@ -85,7 +85,7 @@ import testAccountsRoutes from "./routes/testAccounts";
 import onboardingEventsRoutes from "./routes/onboardingEvents";
 import onboardingVariantsRoutes from "./routes/onboardingVariants";
 import loopEventsRoutes from "./routes/loopEvents";
-import { registerAiEvalFunnelForProduction } from "./loops/instances/ai-eval-funnel/cron";
+import { registerAiEvalFunnelForProduction } from "./loops/instances/ai-eval-funnel";
 import { registerAiReadinessFunnel } from "./loops/instances/ai-readiness-funnel";
 import { registerAgentModeLoop } from "./loops/instances/agent-mode";
 import loopHealthRoutes from "./routes/loopHealth";
