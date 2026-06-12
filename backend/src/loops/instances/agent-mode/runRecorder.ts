@@ -28,18 +28,54 @@ import type { ClockPort } from '../../core/ports';
 import type { EventDimensions, NormalizedEvent } from '../../core/types';
 import { asSubjectId } from '../../core/types';
 import { eventToItem, LOOP_EVENTS_TABLE } from '../../core/sensors/eventTableEventSource';
+import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
 import { AGENT_MODE_LOOP_ID } from './eventTypes';
 import {
   EVT_DECISION,
   EVT_RUN_COMPLETED,
   EVT_RUN_FAILED,
   EVT_RUN_STARTED,
+  EVT_RUN_VERDICT,
   EVT_TOOL_FAILED,
   EVT_TOOL_INVOKED,
   EVT_TOOL_SUCCEEDED,
 } from './eventTypes';
 
 let recorderSeq = 0;
+
+export type RunOutcomeVerdict = 'ok' | 'degraded' | 'failed';
+
+export interface RunVerdictInput {
+  failed: boolean;
+  toolCalls: number;
+  failedToolCalls: number;
+  /** Highest per-tool failure count in the run — catches retry spirals that a
+   * low overall ratio hides (e.g. one tool retried 15× in a 100-call run). */
+  maxSameToolFailures?: number;
+}
+
+/**
+ * Deterministic post-run verdict. June 12 telemetry: 165 runs, 0 hard
+ * failures, 60+ tool failures absorbed — "completed" ≠ "succeeded". Thresholds
+ * tuned against that window: 1-2 sporadic failures in a busy run are normal
+ * (ok); 3+ failures, a third of calls failing, or one tool failing repeatedly
+ * are user-visible degradation.
+ */
+export function computeRunVerdict(input: RunVerdictInput): {
+  verdict: RunOutcomeVerdict;
+  reasons: string[];
+} {
+  if (input.failed) return { verdict: 'failed', reasons: ['run_failed'] };
+
+  const reasons: string[] = [];
+  if (input.failedToolCalls >= 3) reasons.push('failed_tool_calls');
+  if (input.toolCalls > 0 && input.failedToolCalls / input.toolCalls >= 1 / 3) {
+    reasons.push('high_failure_ratio');
+  }
+  if ((input.maxSameToolFailures ?? 0) >= 3) reasons.push('repeated_tool_failures');
+
+  return reasons.length > 0 ? { verdict: 'degraded', reasons } : { verdict: 'ok', reasons: [] };
+}
 
 export class AgentRunRecorder {
   constructor(
@@ -67,6 +103,10 @@ export class AgentRunRecorder {
       explanationSource?: string;
       toolPolicyFlags?: string;
       toolPolicySummary?: string;
+      /** Tools whose args the contract layer repaired before execution. */
+      argsRepairedCount?: number;
+      /** Failed tools classified as invalid_args (model emitted bad args). */
+      schemaErrorCount?: number;
     },
   ): Promise<void> {
     await this.emit(runId, EVT_DECISION, {
@@ -112,14 +152,15 @@ export class AgentRunRecorder {
 
   async runCompleted(
     runId: string,
-    info: { toolCalls?: number; failedToolCalls?: number; sessionId?: string } = {},
+    info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string } = {},
   ): Promise<void> {
     await this.emit(runId, EVT_RUN_COMPLETED, cleanDims(info));
+    await this.emitVerdict(runId, false, info);
   }
 
   async runFailed(
     runId: string,
-    info: { error: unknown; toolCalls?: number; failedToolCalls?: number; sessionId?: string },
+    info: { error: unknown; toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
   ): Promise<void> {
     await this.emit(runId, EVT_RUN_FAILED, {
       ...(info.toolCalls != null ? { toolCalls: info.toolCalls } : {}),
@@ -127,6 +168,30 @@ export class AgentRunRecorder {
       ...(info.sessionId ? { sessionId: info.sessionId } : {}),
       errorClass: errorClassOf(info.error),
       errorMessage: errorMessageOf(info.error),
+    });
+    await this.emitVerdict(runId, true, info);
+  }
+
+  /** Durable outcome verdict alongside the terminal event — the loop's sensor
+   * reads these; the inspector's read-time flags are invisible to the policy. */
+  private async emitVerdict(
+    runId: string,
+    failed: boolean,
+    info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
+  ): Promise<void> {
+    const { verdict, reasons } = computeRunVerdict({
+      failed,
+      toolCalls: info.toolCalls ?? 0,
+      failedToolCalls: info.failedToolCalls ?? 0,
+      maxSameToolFailures: info.maxSameToolFailures,
+    });
+    await this.emit(runId, EVT_RUN_VERDICT, {
+      verdict,
+      reasons: reasons.join(','),
+      toolCalls: info.toolCalls ?? 0,
+      failedToolCalls: info.failedToolCalls ?? 0,
+      ...(info.maxSameToolFailures != null ? { maxSameToolFailures: info.maxSameToolFailures } : {}),
+      ...(info.sessionId ? { sessionId: info.sessionId } : {}),
     });
   }
 
@@ -167,16 +232,9 @@ function cleanDims(obj: Record<string, unknown>): EventDimensions {
 }
 
 function errorClassOf(error: unknown): string {
-  if (error instanceof Error) {
-    // Prefer an explicitly-set `.name` (e.g. AWS SDK errors set name to the
-    // error code); otherwise fall back to the runtime constructor name, which
-    // is what custom `class FooError extends Error {}` subclasses carry since
-    // `.name` is inherited as the generic 'Error'.
-    if (error.name && error.name !== 'Error') return error.name;
-    return error.constructor?.name || 'Error';
-  }
-  if (typeof error === 'string') return 'StringError';
-  return 'UnknownError';
+  // Semantic taxonomy (timeout/auth/rate_limit/…) with the old name-based
+  // class as fallback — most tools throw plain Error, which carried no signal.
+  return classifyToolErrorClass(error);
 }
 
 function errorMessageOf(error: unknown): string {

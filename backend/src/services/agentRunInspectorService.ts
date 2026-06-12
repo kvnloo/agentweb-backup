@@ -3,6 +3,7 @@ import {
   EVT_RUN_COMPLETED,
   EVT_RUN_FAILED,
   EVT_RUN_STARTED,
+  EVT_RUN_VERDICT,
   EVT_TOOL_FAILED,
   EVT_TOOL_INVOKED,
   EVT_TOOL_SUCCEEDED,
@@ -86,6 +87,9 @@ export interface AgentRunSummary {
   toolCalls: number;
   failedToolCalls: number;
   durationMs?: number;
+  /** Durable outcome verdict from the agent_run_verdict spine event. */
+  outcomeVerdict?: 'ok' | 'degraded' | 'failed';
+  outcomeReasons?: string;
   flags: AgentRunFlagSummary[];
   decisions: AgentRunDecisionSummary[];
   outcomes: AgentRunToolOutcomeSummary[];
@@ -160,6 +164,9 @@ function buildOneRunSummary(runId: string, events: AgentRunEventRow[]): AgentRun
   const runFailed = [...sorted].reverse().find((e) => e.eventType === EVT_RUN_FAILED);
   const firstWithDims = sorted.find((e) => e.dimensions?.sessionId || e.dimensions?.userId || e.dimensions?.llmModel);
   const terminal = runFailed ?? runCompleted;
+  const verdictEvent = [...sorted].reverse().find((e) => e.eventType === EVT_RUN_VERDICT);
+  const outcomeVerdict = asVerdict(verdictEvent?.dimensions?.verdict);
+  const outcomeReasons = asString(verdictEvent?.dimensions?.reasons);
 
   const decisions: AgentRunDecisionSummary[] = sorted
     .filter((e) => e.eventType === EVT_DECISION)
@@ -210,7 +217,9 @@ function buildOneRunSummary(runId: string, events: AgentRunEventRow[]): AgentRun
     toolCalls,
     failedToolCalls,
     durationMs,
-    flags: buildRunFlags({ status, toolCalls, failedToolCalls, durationMs, decisions, outcomes }),
+    outcomeVerdict,
+    outcomeReasons,
+    flags: buildRunFlags({ status, toolCalls, failedToolCalls, durationMs, decisions, outcomes, outcomeVerdict, outcomeReasons }),
     decisions,
     outcomes,
     events: sorted,
@@ -224,8 +233,18 @@ function buildRunFlags(input: {
   durationMs?: number;
   decisions: AgentRunDecisionSummary[];
   outcomes: AgentRunToolOutcomeSummary[];
+  outcomeVerdict?: AgentRunSummary['outcomeVerdict'];
+  outcomeReasons?: string;
 }): AgentRunFlagSummary[] {
   const flags: AgentRunFlagSummary[] = [];
+
+  if (input.outcomeVerdict === 'degraded') {
+    flags.push({
+      code: 'degraded_run',
+      severity: 'warning',
+      message: `Run completed but degraded: ${input.outcomeReasons || 'see verdict event'}.`,
+    });
+  }
 
   if (input.status === 'failed') {
     flags.push({
@@ -307,6 +326,10 @@ function parsePolicyFlags(raw: string | undefined): Array<{ toolName: string; co
         severity: severity === 'critical' || severity === 'warning' || severity === 'info' ? severity : 'warning',
       };
     });
+}
+
+function asVerdict(v: unknown): AgentRunSummary['outcomeVerdict'] {
+  return v === 'ok' || v === 'degraded' || v === 'failed' ? v : undefined;
 }
 
 function dedupeFlags(flags: AgentRunFlagSummary[]): AgentRunFlagSummary[] {

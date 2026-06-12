@@ -580,7 +580,7 @@ createTestAccount().then(async () => {
       if (process.env.AI_EVAL_LOOP_ENABLED === 'true') {
         try {
           const AI_EVAL_LOOP_INTERVAL_MS = 24 * 60 * 60 * 1000;
-          const { runAiEvalLoopOnce } = await import('./loops/instances/ai-eval-funnel/cron');
+          const { runAiEvalLoopOnce } = await import('./loops/instances/ai-eval-funnel');
 
           const nowForAiEval = new Date();
           const nextAiEvalRun = new Date(nowForAiEval);

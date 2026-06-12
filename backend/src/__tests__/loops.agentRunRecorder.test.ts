@@ -98,7 +98,7 @@ describe('AgentRunRecorder', () => {
     expect((puts[1].item as any).dimensions.durationMs).toBe(1234);
   });
 
-  it('records tool failure with errorClass derived from the error', async () => {
+  it('records tool failure with a semantic errorClass derived from the error', async () => {
     const { port, puts } = fakeDynamo();
     const rec = new AgentRunRecorder(port, clock);
 
@@ -108,8 +108,33 @@ describe('AgentRunRecorder', () => {
     const item = puts[0].item as any;
     expect(item.eventType).toBe(EVT_TOOL_FAILED);
     expect(item.dimensions.toolName).toBe('publish_post');
-    expect(item.dimensions.errorClass).toBe('TimeoutError');
+    // Semantic taxonomy: timed-out failures classify as 'timeout' regardless
+    // of whether the tool threw a named TimeoutError or a plain Error.
+    expect(item.dimensions.errorClass).toBe('timeout');
     expect(String(item.dimensions.errorMessage)).toContain('took too long');
+  });
+
+  it('records a plain-Error rate limit as rate_limit, not the flat Error class', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    await rec.toolFailed('sess-1', {
+      toolName: 'bravesearch_brave_web_search',
+      error: new Error('Request failed with status code 429'),
+    });
+
+    expect((puts[0].item as any).dimensions.errorClass).toBe('rate_limit');
+  });
+
+  it('keeps the legacy named class for unrecognized custom errors', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    const err = new Error('weird');
+    err.name = 'CustomDomainError';
+    await rec.toolFailed('sess-1', { toolName: 'custom_tool', error: err });
+
+    expect((puts[0].item as any).dimensions.errorClass).toBe('CustomDomainError');
   });
 
   it('records run completed + run failed terminal events', async () => {
@@ -121,8 +146,13 @@ describe('AgentRunRecorder', () => {
 
     expect((puts[0].item as any).eventType).toBe(EVT_RUN_COMPLETED);
     expect((puts[0].item as any).dimensions.toolCalls).toBe(3);
-    expect((puts[1].item as any).eventType).toBe(EVT_RUN_FAILED);
-    expect((puts[1].item as any).subjectId).toBe('sess-2');
+    // Every terminal event is followed by a durable agent_run_verdict event.
+    expect((puts[1].item as any).eventType).toBe('agent_run_verdict');
+    expect((puts[1].item as any).dimensions.verdict).toBe('ok');
+    expect((puts[2].item as any).eventType).toBe(EVT_RUN_FAILED);
+    expect((puts[2].item as any).subjectId).toBe('sess-2');
+    expect((puts[3].item as any).eventType).toBe('agent_run_verdict');
+    expect((puts[3].item as any).dimensions.verdict).toBe('failed');
   });
 
   it('never throws into the caller hot path when Dynamo fails', async () => {

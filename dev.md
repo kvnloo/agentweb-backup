@@ -1,3 +1,90 @@
+## Prod AW-OnboardingMetrics table was missing — heartbeat blind since launch (2026-06-12)
+
+The onboarding heartbeat's recurring "No step timing data found yet; verify AW-OnboardingMetrics writes" warning had a trivial root cause: **the prod table `AW-OnboardingMetrics` never existed**. `Dev-AW-OnboardingMetrics` exists (100 items — dev writes work), but there is no entry for it in `scripts/create-tables.ts`, so the dev table was created ad-hoc and prod never got one. Every prod write hit ResourceNotFound and was swallowed by `logStepMetric()`'s fire-and-forget catch; the heartbeat's read hit the same missing table and degraded to empty.
+
+**Fix applied 2026-06-12**: created `AW-OnboardingMetrics` in prod (us-west-2) via aws cli, mirroring the dev schema — PK `metricId` (S), GSI `StepStartedAtIndex` (`step` HASH / `startedAt` RANGE, ALL projection), PAY_PER_REQUEST.
+
+### Assumptions to validate
+- Step metrics should start appearing in tomorrow's heartbeat ("Step timings" section non-empty) as users complete brand/ICP/ad steps. If still empty after 48h with real onboarding activity, the writer has a second issue (IAM PutItem permission is next suspect).
+- The 86% "(unset)" funnel state is a SEPARATE, expected artifact — legacy users predate `onboardingStage`; only users emitting onboarding events get a stage. No fix needed unless we want a backfill migration.
+
+### Follow-up
+- Add `AW-OnboardingMetrics` to `scripts/create-tables.ts` so environments stop diverging ad-hoc (small PR).
+
+## Replay-eval groundwork — failed runs become eval cases (2026-06-12)
+
+Frontier-agent robustness pattern: failed trajectories become regression tests. The spine records every run; nothing turned the failed/degraded ones into reusable eval material. This is the Phase-4 seed (white-box beats Okareo — we own the trace).
+
+### What shipped (this PR)
+
+1. **`loops/scripts/exportEvalCases.ts`** — CLI: queries agent-mode spine events (default 7d), exports each failed/degraded run as a JSON eval case (verdict + reasons, per-failure toolName/errorClass/errorMessage, decision context with upstream-redacted arg previews) plus a worst-first `toolName × errorClass` cluster summary. Output to `backend/eval-cases/` — gitignored, fixtures never committed.
+2. **Pure core** (`buildEvalCases` / `summarizeEvalCases`) exported for tests + future runners. Pre-verdict-era runs are judged by `computeRunVerdict` over their counts so history exports too.
+
+### How this becomes the eval harness
+
+1. Run the export → `_summary.json` names the worst clusters (June data: linkedin_outreach × invalid_args, run_local_agent_task, bravesearch × rate_limit).
+2. Harsha + Fangfang curate: pick top clusters, write HUMAN expected-behavior assertions per cluster (per loop-acceptance-tests discipline).
+3. v2 runner replays curated cases against the current contract layer / tool schemas on change — regression suite from production failures.
+
+### Assumptions to validate
+
+- Run the export once against real data: `cd backend && npx ts-node src/loops/scripts/exportEvalCases.ts --days 7` — expect ~35 cases. If far fewer, the grouping window or the tsSession key-condition prefix logic needs a look.
+- Arg previews are sufficiently redacted for fixture storage (they go through AGENT_RUNTIME_REDACTED_ARG_KEYS upstream); spot-check one case file before sharing any externally.
+
+## Post-run outcome verdicts — degraded-run detection (2026-06-12)
+
+Telemetry blind spot: 165 runs in the June window, ZERO hard failures, 60+ tool failures silently absorbed. "Completed" ≠ "succeeded" — the user feels the degradation but nothing durable records it, so the agent-mode loop (whose sensor reads spine events) could never learn from degraded runs. The inspector's read-time flags don't help the policy: they exist only in the projection.
+
+### What shipped (this PR)
+
+1. **`agent_run_verdict` spine event** emitted alongside every terminal run event. Dims: `verdict: ok|degraded|failed`, machine-readable `reasons`, counts.
+2. **`computeRunVerdict()`** (pure, exported): failed terminal → failed; ≥3 failed tool calls OR ≥1/3 failure ratio OR same tool failing ≥3× (the linkedin_outreach retry-spiral shape) → degraded; else ok. Thresholds tuned so the typical healthy-but-imperfect run (28 calls, 1-2 failures) does NOT flag.
+3. **`maxSameToolFailures`** computed at both run-completion call sites from the toolCalls array — catches retry spirals a low overall ratio hides.
+4. **Inspector surfacing**: `outcomeVerdict`/`outcomeReasons` on run summaries + a `degraded_run` warning flag.
+
+### Assumptions to validate
+
+- Degraded-rate baseline: expect ~20% of runs degraded based on June data (35/165 runs had ≥1 failure; threshold ≥3 cuts that down). If >40% flag degraded, thresholds are too tight to be actionable.
+- The agent-mode loop's failureRuleSet does NOT yet consume verdict events — next step is a policy rule that clusters degraded runs by reasons + dominant errorClass. Verdicts accumulate from deploy time so that rule will have data when written.
+- One extra event per run (~165/day) is negligible Dynamo volume.
+
+## Semantic tool-error taxonomy + contract-layer counters (2026-06-12)
+
+Telemetry finding from the June 9-12 window: every recorded tool failure had errorClass "Error" — tools throw plain `new Error(message)`, so the constructor-name fallback carried zero signal. The failure policy could only cluster by toolName; the model (and the breaker) could not distinguish retryable timeouts from terminal auth failures.
+
+### What shipped (this PR)
+
+1. **`utils/toolErrorClassifier.ts`** — `classifyToolErrorClass()`: stable semantic classes `timeout | auth | rate_limit | invalid_args | not_found | network | upstream_5xx | policy_blocked | repeated_failure`, derived from gateway error names, numeric status props, and message heuristics. Unrecognized errors keep the legacy name-based class (named custom errors lose nothing).
+2. **Run recorder** uses it for `errorClass` on `agent_tool_failed` / `agent_run_failed` events.
+3. **Decision telemetry counters** (#1818 follow-up): `argsRepairedCount` (contract layer repaired args pre-execution) and `schemaErrorCount` (failures classified invalid_args) per decision event — the data needed for the AGENT_TOOL_GATEWAY_ENFORCE go/no-go.
+
+### Assumptions to validate
+
+- The taxonomy covers the real distribution: after a few days, `SELECT errorClass COUNT` on new agent_tool_failed events should show <20% falling back to legacy names. If higher, extend classFromMessage patterns from actual messages.
+- Brave 429s → rate_limit and Meta 5xx → upstream_5xx in prod (heuristics verified against June messages, not live traffic).
+- errorClass consumers (failureRuleSet clustering, inspector) benefit rather than break from the rename — historical events keep old classes, so mixed-class clusters during transition are expected for ~7 days.
+
+## Approval persistence closes the learning loop (Layer 4→5) (2026-06-12)
+
+The June 8 audit's last open item: Slack ✅ approvals dispatched cloud-dev fixes but never wrote `decision`/`shippedAt`/`verdict` back to `Dev-AW-LoopLearning`. Net effect measured this week: CooldownRuleSet was wired but inert (reads `shippedAt`, always null) and the 18:00 UTC attribution cron had zero gradable records. The system sensed and proposed but could not learn.
+
+### What shipped (this PR)
+
+1. **`loops/core/learning/approvalPersistence.ts` — `recordLoopApproval()`**: finds the run's `decision:'pending'` records by the digest's Run ID, appends one `decision:'approved'` record per proposal with `shippedAt` set when its dispatch succeeded. Dispatch failures are recorded approved-but-not-shipped with `mutation.error` — auditable, still re-proposable.
+2. **Dispatcher wiring** (`loopSlackApprovalDispatcher.ts`): both dispatch branches persist after launching, post a `📒 Learning store: N approved, M shipped` thread line, and loudly warn when no pending records match (legacy digests).
+3. **Test-double parity fix**: `InMemoryLearningStore` status/ruleIds filters passed records with no decision/proposal; `DynamoLearningStore` excludes them. Aligned in-memory to Dynamo semantics — test doubles must match prod behavior or tests lock in bugs.
+
+### Matching semantics (deliberate)
+
+Digest item ↔ proposal matching: exact `sourceRuleId`, `:slug` suffix (AI Readiness analyst ids), `proposalId`, or `mutationId`. Unmatched proposals (generic digests use synthetic ids) are marked shipped only when EVERY dispatch succeeded. Bias: when uncertain, leave a rule re-proposable rather than wrongly suppress it for the 14-day cooldown.
+
+### Assumptions to validate
+
+- Digest Run IDs uniquely identify one loop's run (sort-key collision across loops would mis-attribute approvals).
+- The first ✅ on a digest covers all its items — partial approval (✅ some items only) is not modeled; v2 could parse per-item reactions.
+- Attribution at 18:00 UTC will now grade these records once the settle window elapses — verify the first `improved/regressed/no_change` verdict appears in `/api/admin/loops/health` within ~windowDays of the first persisted ship.
+- The `📒 Learning store` thread line appears on the next real ✅ (first live validation of the whole write path).
+
 ## AgentRun Telemetry Failure Analysis → Gateway Circuit Breaker + Tool Guidance Fixes (2026-06-11)
 
 First product decision driven by the runtime-spine telemetry. Analyzed all 3,172 agent-mode events in `Dev-AW-LoopEvents` (June 9–12: 223 runs, 1,016 tool calls, 78 failures = 7.7% tool failure rate; 35 runs had ≥1 failure; zero hard run failures — failures are absorbed and runs "complete" degraded).
