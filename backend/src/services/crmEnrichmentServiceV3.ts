@@ -165,6 +165,9 @@ export interface OrchestratorDeps {
     mode: 'preview' | 'enrich';
     /** Forwarded to enable Tier 0a (CRM-history) per-field bypass. */
     refreshFields?: Set<string>;
+    /** Standard identity fields the user deselected — resolved in-memory but
+     *  not persisted (see resolveIdentity's excludePersistFields). */
+    excludePersistFields?: Set<string>;
   }): Promise<ResolveIdentityResult>; // success result now includes `siblings` for Tier 0b
 
   runWaterfall(input: {
@@ -223,6 +226,14 @@ export interface OrchestratorDeps {
  *  from STANDARD_ENRICHABLE_FIELDS plus `website` — a genuine top-level
  *  AW-Leads column that is not part of the enrichable-fields list. */
 const STANDARD_LEAD_COLUMNS = new Set<string>([...STANDARD_ENRICHABLE_FIELDS, 'website']);
+
+/** Identity-signal fields the resolver (enrichmentIdentityResolver) can write
+ *  directly, keyed by the same names the config uses. Used to build the
+ *  resolver's excludePersistFields so a deselected standard field is resolved
+ *  in-memory (as a matching signal) but not persisted. */
+const IDENTITY_PERSIST_FIELDS = new Set<string>([
+  'firstName', 'lastName', 'email', 'linkedin', 'company', 'website', 'title',
+]);
 
 type SourceKey = 'apollo' | 'unipile' | 'enrichSo' | 'webSearch' | 'sibling' | 'llm';
 
@@ -452,13 +463,16 @@ interface ProcessLeadContext {
   smartFields: EnrichmentFieldConfig[];
   injectedDepNames: Set<string>;
   smartEvalSemaphore: Semaphore;
+  /** Standard identity fields the user deselected — passed to resolveIdentity
+   *  so they are resolved in-memory but not persisted. */
+  excludePersistFields: Set<string>;
 }
 
 async function processLead(
   lead: LeadRecord,
   ctx: ProcessLeadContext,
 ): Promise<PerLeadOutcome> {
-  const { input, deps, routing, needsPerson, needsCompany, refreshSet, configFieldsByName, siblingMappingTable, smartFields, injectedDepNames, smartEvalSemaphore } = ctx;
+  const { input, deps, routing, needsPerson, needsCompany, refreshSet, configFieldsByName, siblingMappingTable, smartFields, injectedDepNames, smartEvalSemaphore, excludePersistFields } = ctx;
   const perGroupTierFills = new Map<string, TierCount>();
   const allFills: FieldFill[] = [];
   const apolloCtx = createApolloFetchContext();
@@ -477,6 +491,7 @@ async function processLead(
       needsCompanyFields: needsCompany,
       mode: input.mode,
       refreshFields: refreshSet,
+      excludePersistFields,
     });
     console.log(`[v3:${input.listId}:${lead.leadId}] identity resolved in ${Date.now() - idStart}ms (ok=${identity.ok})`);
   } catch (err) {
@@ -914,6 +929,18 @@ export async function runEnrichment(
     .filter(f => f.include)
     .map(f => f.name);
 
+  // Standard identity fields the user deselected. The identity resolver still
+  // resolves these in-memory (company/website are matching signals for e.g.
+  // a LinkedIn-only lookup) but must NOT persist them — otherwise selecting
+  // "LinkedIn only" would still write a company discovered as a side effect.
+  // Restricted to the resolver-written identity keys so a deselected *custom*
+  // field can't accidentally suppress an identical-named resolver write.
+  const excludePersistFields = new Set(
+    input.config.fields
+      .filter(f => !f.include && IDENTITY_PERSIST_FIELDS.has(f.name))
+      .map(f => f.name),
+  );
+
   const tierBreakdown: Record<string, TierCount> = {};
   const previewSamples: NonNullable<RunEnrichmentResult['preview']> = [];
   let processed = 0;
@@ -966,6 +993,7 @@ export async function runEnrichment(
     input, deps, routing, needsPerson, needsCompany, refreshSet,
     configFieldsByName, siblingMappingTable, smartFields, injectedDepNames,
     smartEvalSemaphore: new Semaphore(SMART_EVAL_CONCURRENCY),
+    excludePersistFields,
   };
   for (let i = 0; i < leads.length; i += CONCURRENCY) {
     const chunk = leads.slice(i, i + CONCURRENCY);

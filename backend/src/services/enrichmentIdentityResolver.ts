@@ -151,6 +151,14 @@ export interface ResolveIdentityInput {
    *  (run_waterfall_email) via `deps.apolloBrokerChain`. Without this hint
    *  there is no lead to write the async result back to, so Tier 6.5 is skipped. */
   leadHint?: { listId: string; leadId: string };
+  /** Standard identity-signal field names (firstName, lastName, email,
+   *  linkedin, company, website, title) the user did NOT opt into enriching.
+   *  These are still resolved IN MEMORY — company/website are needed as signals
+   *  to match the person (e.g. resolving a LinkedIn URL via Apollo) — but are
+   *  NOT persisted to the lead. Without this, deselecting `company` in the
+   *  enrichment config still wrote a company value discovered as a side effect
+   *  of LinkedIn resolution. Omit (or empty set) to persist every resolved field. */
+  excludePersistFields?: Set<string>;
 }
 
 export type ResolveIdentityResult =
@@ -691,6 +699,11 @@ export async function resolveIdentity(
     // web-search-resolved website, the lead has no email to re-derive
     // from on the next run — persist it so the value is not lost.
     if (key === 'emailDomain' && !meta.emailDomain) continue;
+    // Fields the user deselected in the enrichment config are resolved
+    // in-memory (used as matching signals above) but never persisted —
+    // otherwise "LinkedIn only" would still write the company discovered
+    // while resolving the LinkedIn URL.
+    if (input.excludePersistFields?.has(key)) continue;
     if (typeof value === 'string' && value.length > 0) {
       writableFields[key] = value;
     }
