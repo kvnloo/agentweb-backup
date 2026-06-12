@@ -1,3 +1,36 @@
+## AgentRun Telemetry Failure Analysis → Gateway Circuit Breaker + Tool Guidance Fixes (2026-06-11)
+
+First product decision driven by the runtime-spine telemetry. Analyzed all 3,172 agent-mode events in `Dev-AW-LoopEvents` (June 9–12: 223 runs, 1,016 tool calls, 78 failures = 7.7% tool failure rate; 35 runs had ≥1 failure; zero hard run failures — failures are absorbed and runs "complete" degraded).
+
+### Top failure clusters found
+
+- `linkedin_outreach` 16/59 (27%) — the single worst run retried it **15 times in 16 seconds**: 7× "Invitation message is too long (201–231 chars)" then 6× blind "Invalid parameters" retries in the same second.
+- `run_local_agent_task` 11/20 (55%) — model keeps sending out-of-scope tasks; rejection message only echoed the forbidden regex.
+- `bravesearch_*` ~41% (429 rate limits), `call_meta_ads_insights_api` 41% (sync wait on slow async job) — NOT fixed here; belong to search consolidation / background-job pattern respectively.
+
+### Root cause of the LinkedIn cluster — misleading schema text
+
+The tool schema said "message must be 300 characters or fewer". The real limit is **per-account: 200 free / 300 Premium** (`linkedInOutreachService.ts` `INVITE_MESSAGE_MAX_CHARS_FREE`). Every too-long failure was 201–231 chars — the model was *obeying the documented 300* and failing on a free account. Lesson: when telemetry shows the model consistently landing in a narrow wrong band, suspect the tool description before the model.
+
+### What shipped (this PR)
+
+1. **Per-run repeated-failure circuit breaker** in `agentToolGatewayService.ts`: same tool + same error head (80 chars) failing ≥3× in one run → subsequent calls return `AgentToolRepeatedFailureError` with model-visible "do not retry / change approach" guidance, without executing. A success for the tool clears its counts (mixed batches not punished). Keyed by `runId` (threaded from `agentRuntimeRunId` at both gateway call sites); no runId = no breaker, so non-AgentMode callers are untouched. State is in-memory, capped at 500 runs (oldest evicted) — acceptable because a runaway retry loop is intra-run by nature.
+2. **Schema descriptions** for `linkedin_outreach` now teach 200-free/300-premium + "don't invite FIRST_DEGREE connections, use send-message" (the already-connected failure, independently the same branch Fangfang is adding to the event-lead skill).
+3. **`run_local_agent_task` rejections** now state the read-only browsing scope and name the right alternative tools (`coding_agent`, `perform_data_analysis`, `search_web`).
+
+### Assumptions to validate against next week's telemetry
+
+- **Breaker threshold 3 / error-head 80 chars is right.** Watch for `AgentToolRepeatedFailureError` in `Dev-AW-LoopEvents` (it flows through the normal toolFailed path, so it's queryable via `/api/agent-runs`). If legit retry patterns trip it (e.g. polling tools that fail transiently), raise threshold or exempt tool classes.
+- **The schema text alone fixes the too-long cluster.** If 201–231-char invite failures persist after deploy, the model isn't reading the description and the fix moves to a gateway pre-flight that knows `is_premium` from config.
+- **Enforcement stays narrow.** This breaker is deliberately the ONLY enforcing gateway rule; `AGENT_TOOL_GATEWAY_ENFORCE` (policy flags) stays off pending trace review per PR #1808.
+- **In-memory breaker state is fine on EB single-instance.** If prod backend scales to multiple instances, breaker counts fragment per instance — degrades gracefully (each instance still breaks at 3), but note it.
+
+### Not fixed, filed for owners
+
+- Brave search 429s (consolidate on `search_web` at 1% failure, or add backoff) — Rui/backend.
+- Meta Insights timeout → background-job + poll pattern (same shape as CRM push #1791) — Rui.
+- `coding_agent` landing-page auth — already fixed by Rui's open #1835.
+
 ## Resend Sender Domain DKIM Verification Failure — mail.incentivpay.com (2026-06-11)
 
 Reported by user `info@pmps.ai` (userId `1359ace4-0565-4018-9926-f51efdcf4c47`): the email sender domain `mail.incentivpay.com` shows DKIM **failed** in Resend even though the user says they added the DKIM record in GoDaddy. Investigation only — no code changed.
