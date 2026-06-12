@@ -20,7 +20,7 @@ import type { LoopRunResult, Mutation } from '../loops/core/types';
 import { runAgentModeLoopOnce, _internal as agentModeInternal } from '../loops/instances/agent-mode';
 import { runOnboardingLoopV2Once } from '../loops/instances/onboarding';
 import { _testing as aiReadinessTesting } from '../loops/instances/ai-readiness-funnel';
-import { _postDailyDigestForTesting } from '../loops/instances/ai-eval-funnel/cron';
+import { _postDailyDigestForTesting } from '../loops/instances/ai-eval-funnel';
 
 jest.mock('../loops/adapters/awsAdapters', () => ({
   productionLoopPorts: jest.fn(),

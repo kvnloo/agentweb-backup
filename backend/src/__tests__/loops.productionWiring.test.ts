@@ -33,7 +33,7 @@ describe('production loop wiring', () => {
 
   it('registers ai-eval and ai-readiness in either order without wiping the registry', async () => {
     const { registerAiReadinessFunnel } = await import('../loops/instances/ai-readiness-funnel');
-    const { registerAiEvalFunnelForProduction } = await import('../loops/instances/ai-eval-funnel/cron');
+    const { registerAiEvalFunnelForProduction } = await import('../loops/instances/ai-eval-funnel');
 
     registerAiReadinessFunnel();
     registerAiEvalFunnelForProduction();
@@ -42,7 +42,7 @@ describe('production loop wiring', () => {
   });
 
   it('uses durable learning + cooldown read-back for ai-eval production', async () => {
-    const { registerAiEvalFunnelForProduction } = await import('../loops/instances/ai-eval-funnel/cron');
+    const { registerAiEvalFunnelForProduction } = await import('../loops/instances/ai-eval-funnel');
 
     registerAiEvalFunnelForProduction();
 
