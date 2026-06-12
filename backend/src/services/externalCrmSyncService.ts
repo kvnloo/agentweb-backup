@@ -3,7 +3,7 @@ import { crmDb, userDb } from './db';
 import { decryptPassword, encryptPassword } from '../utils/crypto';
 import { CrmAuth, CrmAdapter } from './adapters/crmAdapterTypes';
 import { AttioAdapter } from './adapters/attioAdapter';
-import { HubspotAdapter } from './adapters/hubspotAdapter';
+import { HubspotAdapter, HUBSPOT_LIST_IDENTITY_MAPPING } from './adapters/hubspotAdapter';
 import { HubSpotService, HubSpotPipelineStage } from './hubspotService';
 import { AttioService } from './attioService';
 
@@ -113,8 +113,12 @@ export const DEFAULT_HUBSPOT_CONTACT_MAPPING: FieldMapping[] = [
 
 // 'notes' has no standard HubSpot contact property — pushed as a custom property
 // so ensureContactProperty runs before the push and creates it if absent.
+// HUBSPOT_LIST_IDENTITY_MAPPING (listName/listId) is defined in hubspotAdapter to
+// avoid a circular import — this module constructs a HubspotAdapter at load time —
+// and spread in here so it also surfaces as a dialog default for new configs.
 export const DEFAULT_HUBSPOT_CUSTOM_MAPPING: FieldMapping[] = [
   { agentwebField: 'notes', crmProperty: 'notes', direction: 'both', enabled: true },
+  ...HUBSPOT_LIST_IDENTITY_MAPPING,
 ];
 
 export const DEFAULT_HUBSPOT_DEAL_MAPPING: FieldMapping[] = [
