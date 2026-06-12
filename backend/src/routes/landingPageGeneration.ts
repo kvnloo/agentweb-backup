@@ -1,4 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
+import { emitLanderLifecycle, landerChannelFromRequest } from "../services/landerLifecycleEvents";
 import axios from "axios";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { settingsService } from "../services/settingsService";
@@ -394,6 +395,7 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
     }
 
     const result = await generateLandingPage(userId, prompt, pageName, brandContext, lead_list_id, template_html);
+    void emitLanderLifecycle("created", { pageId: (result as any)?.id || "unknown", userId, channel: landerChannelFromRequest(req), mode: "cold_start", outcome: (result as any)?.status === "failed" ? "failed" : "ok" });
     res.status(201).json(result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error generating landing page:", {
@@ -403,6 +405,7 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       errorMessage: error?.message,
       stack: error?.stack,
     });
+    void emitLanderLifecycle("created", { pageId: "unknown", userId: (req as unknown as AuthenticatedRequest).user?.userId, channel: landerChannelFromRequest(req), mode: "cold_start", outcome: "failed" });
     res.status(500).json({ error: "Failed to generate landing page", details: error?.message });
   }
 });
@@ -422,6 +425,7 @@ router.post("/generated/:id/deploy", rateLimiter, async (req, res: Response) => 
     if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
 
     const result = await deployLandingPage(auth.page.id, auth.page.userId);
+    void emitLanderLifecycle("deploy_retried", { pageId: auth.page.id, userId, channel: landerChannelFromRequest(req) });
     res.json(result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error deploying:", error);
@@ -454,6 +458,7 @@ router.post("/generated/:id/iterate", rateLimiter, async (req, res: Response) =>
     if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
 
     const result = await iterateLandingPage(auth.page.id, auth.page.userId, message);
+    void emitLanderLifecycle("iterated", { pageId: auth.page.id, userId, channel: landerChannelFromRequest(req), mode: "incremental" });
     res.json(result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error iterating:", error);
@@ -923,6 +928,7 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
 
     const isStaging = branch !== "main";
     const liveUrl = getLandingPageLiveUrl(page);
+    void emitLanderLifecycle("edited", { pageId: page.id, userId: (req as unknown as AuthenticatedRequest).user?.userId, channel: landerChannelFromRequest(req), mode: "incremental" });
     res.json({
       success: true,
       commit_url: commitRes.data.commit?.html_url || commitRes.data.html_url,
@@ -1370,6 +1376,7 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
     }
 
     const liveUrl = getLandingPageLiveUrl(page);
+    void emitLanderLifecycle("published", { pageId: page.id, userId: (req as unknown as AuthenticatedRequest).user?.userId, channel: landerChannelFromRequest(req) });
     res.json({
       success: true,
       merge_commit_sha: mergeCommitSha,
@@ -1475,6 +1482,7 @@ router.post("/generated/:id/revert-publish", async (req, res: Response) => {
       console.warn(`[LP GENERATION] Could not mark publish reverted: ${markErr.message}`);
     }
 
+    void emitLanderLifecycle("publish_reverted", { pageId: page.id, userId: (req as unknown as AuthenticatedRequest).user?.userId, channel: landerChannelFromRequest(req) });
     res.json({
       success: true,
       reverted_to_sha: lastPublish.preMergeSha,
