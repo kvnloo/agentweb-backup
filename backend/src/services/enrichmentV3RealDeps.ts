@@ -14,6 +14,7 @@ import type { MappedPerson, MappedOrganization } from './apolloFieldMapper';
 import type { OrchestratorDeps } from './crmEnrichmentServiceV3';
 import { CrmEnrichmentService, type LeadRecord } from './crmEnrichmentService';
 import { sanitizePhone } from '../utils/phoneValidation';
+import { nameTokensMatch } from '../utils/nameMatch';
 import type { IdentityResolverDeps } from './enrichmentIdentityResolver';
 import { resolveIdentity as pureResolveIdentity } from './enrichmentIdentityResolver';
 import { runWaterfall as pureRunWaterfall, type LLMFilledValue, type EnrichSoFetchResult } from './enrichmentGroupWaterfall';
@@ -811,13 +812,8 @@ export function unipileNameMatches(
   // Can't verify without at least one name field — reject for correctness.
   if (itemFirst === null && itemLast === null) return false;
 
-  const normFirst = (leadFirst ?? '').trim().toLowerCase();
-  const normLast  = (leadLast  ?? '').trim().toLowerCase();
-
-  if (itemFirst !== null && normFirst && !itemFirst.startsWith(normFirst) && !normFirst.startsWith(itemFirst)) return false;
-  if (itemLast  !== null && normLast  && !itemLast.startsWith(normLast)   && !normLast.startsWith(itemLast))   return false;
-
-  return true;
+  // Bidirectional-prefix token comparison shared with the Apollo identity gate.
+  return nameTokensMatch(itemFirst, itemLast, leadFirst, leadLast);
 }
 
 export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
