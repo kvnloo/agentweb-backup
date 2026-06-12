@@ -18,14 +18,17 @@ if (!STATE_SECRET) {
   throw new Error('JWT_SECRET environment variable must be set for OAuth state verification');
 }
 
+type HubSpotAccountType = 'crm' | 'marketing';
+
 interface StatePayload {
   userId: string;
   nonce: string;
+  accountType: HubSpotAccountType;
 }
 
-const generateState = (userId: string): string => {
+const generateState = (userId: string, accountType: HubSpotAccountType): string => {
   const nonce = crypto.randomBytes(16).toString('hex');
-  return jwt.sign({ userId, nonce } as StatePayload, STATE_SECRET, { expiresIn: STATE_EXPIRATION });
+  return jwt.sign({ userId, nonce, accountType } as StatePayload, STATE_SECRET, { expiresIn: STATE_EXPIRATION });
 };
 
 const verifyState = (state: string, userId: string): StatePayload | null => {
@@ -49,6 +52,9 @@ interface TokenSession {
     hub_domain: string;
     user: string;
   };
+  accountType: HubSpotAccountType;
+  grantedScopes: string[];
+  missingScopes: string[];
   userId: string;
   expires: number;
 }
@@ -62,32 +68,41 @@ setInterval(() => {
   }
 }, SESSION_CLEANUP_INTERVAL_MS).unref();
 
-const storeTokenSession = (userId: string, tokens: TokenSession['tokens'], hubInfo: TokenSession['hubInfo']): string => {
+const storeTokenSession = (
+  userId: string,
+  tokens: TokenSession['tokens'],
+  hubInfo: TokenSession['hubInfo'],
+  accountType: HubSpotAccountType,
+  grantedScopes: string[],
+  missingScopes: string[],
+): string => {
   const sessionId = crypto.randomBytes(32).toString('hex');
-  tokenSessions.set(sessionId, { tokens, hubInfo, userId, expires: Date.now() + TOKEN_SESSION_TTL_MS });
+  tokenSessions.set(sessionId, { tokens, hubInfo, accountType, grantedScopes, missingScopes, userId, expires: Date.now() + TOKEN_SESSION_TTL_MS });
   return sessionId;
 };
 
-const retrieveTokenSession = (sessionId: string, userId: string): Pick<TokenSession, 'tokens' | 'hubInfo'> | null => {
+const retrieveTokenSession = (sessionId: string, userId: string): Pick<TokenSession, 'tokens' | 'hubInfo' | 'accountType' | 'grantedScopes' | 'missingScopes'> | null => {
   const session = tokenSessions.get(sessionId);
   if (!session || session.userId !== userId || Date.now() > session.expires) {
     tokenSessions.delete(sessionId);
     return null;
   }
   tokenSessions.delete(sessionId);
-  return { tokens: session.tokens, hubInfo: session.hubInfo };
+  return { tokens: session.tokens, hubInfo: session.hubInfo, accountType: session.accountType, grantedScopes: session.grantedScopes, missingScopes: session.missingScopes };
 };
 
 // GET /init
 router.get('/init', authenticateToken, async (req: any, res) => {
   try {
+    const accountType: HubSpotAccountType = req.query.accountType === 'marketing' ? 'marketing' : 'crm';
     const config = await getHubSpotConfig();
-    const state = generateState(req.user.userId);
+    const state = generateState(req.user.userId, accountType);
+    const scopes = accountType === 'marketing' ? config.marketingScopes : config.scopes;
 
     const params = new URLSearchParams({
       client_id: config.clientId,
       redirect_uri: config.redirectUri,
-      scope: config.scopes.join(' '),
+      scope: scopes.join(' '),
       state,
     });
 
@@ -151,21 +166,34 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
       expires_in: number;
     };
 
-    // Fetch HubSpot portal info using the access token
+    // Fetch HubSpot portal info + granted scopes using the access token
     const tokenInfoResponse = await axios.get(`${config.tokenInfoUrl}/${access_token}`);
-    const { hub_id, hub_domain, user } = tokenInfoResponse.data as {
+    const { hub_id, hub_domain, user, scopes: rawGrantedScopes } = tokenInfoResponse.data as {
       hub_id: number;
       hub_domain: string;
       user: string;
+      scopes: string | string[] | undefined;
     };
+
+    const accountType = statePayload.accountType ?? 'crm';
+    const requestedScopes = accountType === 'marketing' ? config.marketingScopes : config.scopes;
+    const grantedScopes: string[] = Array.isArray(rawGrantedScopes)
+      ? rawGrantedScopes
+      : typeof rawGrantedScopes === 'string'
+        ? rawGrantedScopes.split(/[\s,]+/).filter(Boolean)
+        : [];
+    const missingScopes = requestedScopes.filter(s => !grantedScopes.includes(s));
 
     const tokenSessionId = storeTokenSession(
       userId,
       { access_token, refresh_token, expires_in },
-      { hub_id, hub_domain, user }
+      { hub_id, hub_domain, user },
+      accountType,
+      grantedScopes,
+      missingScopes,
     );
 
-    res.json({ success: true, tokenSessionId });
+    res.json({ success: true, tokenSessionId, missingScopes });
   } catch (error: any) {
     console.error('[HubSpot OAuth /finalize]', error?.response?.data || error);
     const details = IS_PRODUCTION ? undefined : error.message;
@@ -188,7 +216,7 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
   }
 
   try {
-    const { tokens, hubInfo } = session;
+    const { tokens, hubInfo, accountType, grantedScopes } = session;
 
     const account = await createAccount(userId, 'hubspot', {
       account_id: String(hubInfo.hub_id),
@@ -200,6 +228,8 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
         token_expires_at: Date.now() + (tokens.expires_in * 1000),
         hub_id: hubInfo.hub_id,
         hub_domain: hubInfo.hub_domain,
+        hubspot_account_type: accountType,
+        granted_scopes: grantedScopes,
       },
     });
 

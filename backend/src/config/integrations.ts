@@ -137,7 +137,16 @@ export const INTEGRATION_CONFIG = {
       'crm.schemas.contacts.write',
       'crm.schemas.deals.read',
       'crm.schemas.deals.write',
-    ],
+    ] as const,
+    marketingOnlyScopes: [
+      'marketing.campaigns.read',
+      'marketing.campaigns.revenue.read',
+      'marketing.campaigns.write',
+      'content',
+      'automation',
+      'forms',
+    ] as const,
+    get marketingScopes() { return [...this.scopes, ...this.marketingOnlyScopes]; },
   },
 
   clickup: {
@@ -475,6 +484,8 @@ export interface HubSpotOAuthConfig {
   clientSecret: string;
   redirectUri: string;
   scopes: string[];
+  marketingOnlyScopes: string[];
+  marketingScopes: string[];
   authorizationUrl: string;
   tokenUrl: string;
   tokenInfoUrl: string;
@@ -493,7 +504,9 @@ export async function getHubSpotConfig(): Promise<HubSpotOAuthConfig> {
     clientId: credentials.clientId,
     clientSecret: credentials.clientSecret,
     redirectUri: INTEGRATION_CONFIG.hubspot.redirectUri,
-    scopes: INTEGRATION_CONFIG.hubspot.scopes,
+    scopes: [...INTEGRATION_CONFIG.hubspot.scopes],
+    marketingOnlyScopes: [...INTEGRATION_CONFIG.hubspot.marketingOnlyScopes],
+    marketingScopes: INTEGRATION_CONFIG.hubspot.marketingScopes,
     authorizationUrl: INTEGRATION_CONFIG.hubspot.authorizationUrl,
     tokenUrl: INTEGRATION_CONFIG.hubspot.tokenUrl,
     tokenInfoUrl: INTEGRATION_CONFIG.hubspot.tokenInfoUrl,
