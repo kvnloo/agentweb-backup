@@ -47,6 +47,11 @@ jest.mock('../services/notionService', () => ({
   getSprintTasksDatabaseId: (...args: unknown[]) => mockGetSprintTasksDatabaseId(...args),
 }));
 
+const mockRecordLoopApproval = jest.fn();
+jest.mock('../loops/core/learning/approvalPersistence', () => ({
+  recordLoopApproval: (...args: unknown[]) => mockRecordLoopApproval(...args),
+}));
+
 // Generic mocks so unrelated handlers in the same file don't blow up.
 jest.mock('../services/db', () => ({
   userDb: { getAllUsers: jest.fn(), getUserById: jest.fn(), getUserByEmail: jest.fn() },
@@ -187,6 +192,7 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
 
     mockAuthTest.mockResolvedValue({ ok: true, user_id: EMMA_BOT });
     mockChatPostMessage.mockResolvedValue({ ok: true, ts: 'reply-ts' });
+    mockRecordLoopApproval.mockResolvedValue({ loopId: null, approved: 0, shipped: 0, dispatchFailures: 0 });
     mockGetNotionCredentials.mockResolvedValue({ apiToken: 'notion-token', userGuidePageId: 'guide' });
     mockGetSprintTasksDatabaseId.mockResolvedValue(SPRINT_TASKS_DATA_SOURCE);
     jest.spyOn(global, 'fetch').mockResolvedValue({
@@ -320,6 +326,54 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
     expect(replies[0][0].text).toMatch(/Creating 1 cloud-dev task for AI Readiness/i);
     expect(replies[replies.length - 1][0].text).toMatch(/Launched 1\/1 cloud-dev run for AI Readiness/i);
     expect(isDispatched(AI_READINESS_MESSAGE_TS)).toBe(true);
+  });
+
+  it('persists the approval to the learning store after dispatch (Layer-4→5 write)', async () => {
+    mockRecordLoopApproval.mockResolvedValue({
+      loopId: 'ai-readiness-funnel',
+      approved: 1,
+      shipped: 1,
+      dispatchFailures: 0,
+    });
+    mockConversationsHistory.mockResolvedValue({
+      ok: true,
+      messages: [
+        {
+          ts: AI_READINESS_MESSAGE_TS,
+          user: EMMA_BOT,
+          bot_id: 'B_EMMA',
+          text: buildAiReadinessDmMessage(),
+        },
+      ],
+    });
+
+    const res = await request(buildApp())
+      .post('/api/slack/events')
+      .send({
+        type: 'event_callback',
+        event: {
+          type: 'reaction_added',
+          reaction: 'white_check_mark',
+          user: HARSHA,
+          item: { type: 'message', channel: DM_CHANNEL, ts: AI_READINESS_MESSAGE_TS },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    await wait();
+
+    expect(mockRecordLoopApproval).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: 'loop-ai-readiness-funnel-2026-06-10T16:30:00.087Z-523167',
+        approver: `slack:${HARSHA}`,
+        items: [expect.objectContaining({ id: 'low-data-quiz-start-leak', ok: true })],
+        stores: expect.any(Array),
+      }),
+    );
+    const replies = mockChatPostMessage.mock.calls.filter(
+      ([arg]) => arg.thread_ts === AI_READINESS_MESSAGE_TS,
+    );
+    expect(replies[replies.length - 1][0].text).toMatch(/Learning store: 1 approved, 1 marked shipped/);
   });
 
   it('lets a new loop use the shared ✅ footer without adding a bespoke Slack handler', async () => {

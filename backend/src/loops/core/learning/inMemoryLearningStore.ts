@@ -21,8 +21,9 @@ export class InMemoryLearningStore implements LearningStore {
       if (filter.window) {
         if (e.ts < filter.window.start || e.ts > filter.window.end) return false;
       }
-      if (filter.ruleIds && e.proposal && !filter.ruleIds.includes(e.proposal.sourceRuleId)) return false;
-      if (filter.status && e.decision && !filter.status.includes(e.decision.status)) return false;
+      if (filter.ruleIds && (!e.proposal || !filter.ruleIds.includes(e.proposal.sourceRuleId))) return false;
+      // Match DynamoLearningStore: a status filter excludes records with no decision.
+      if (filter.status && (!e.decision || !filter.status.includes(e.decision.status))) return false;
       return true;
     });
   }
