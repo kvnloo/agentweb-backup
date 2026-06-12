@@ -163,7 +163,7 @@ function recordAgentModeToolTelemetry(
         if (r.status === 'success') {
           await recorder.toolSucceeded(runId, { toolName, durationMs: r.duration, sessionId });
         } else {
-          await recorder.toolFailed(runId, { toolName, error: r.error, durationMs: r.duration, sessionId });
+          await recorder.toolFailed(runId, { toolName, error: r.error, durationMs: r.duration, sessionId, args: r.functionArgs });
         }
       }
     } catch (err) {

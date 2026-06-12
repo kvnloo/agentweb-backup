@@ -166,3 +166,79 @@ describe('AgentRunRecorder', () => {
     await expect(rec.toolFailed('sess-1', { toolName: 't', error: new Error('x') })).resolves.toBeUndefined();
   });
 });
+
+describe('AgentRunRecorder failed-call args capture', () => {
+  // Root-cause material for failure investigation (Rui/Argusoft ask, 2026-06-12):
+  // the exact arguments of a FAILING call are recorded — capped + redacted.
+  // Successful calls never store full args (size + privacy).
+
+  it('records serialized args on tool failure', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    await rec.toolFailed('run-1', {
+      toolName: 'linkedin_outreach',
+      error: new Error('Invalid parameters'),
+      args: { action: 'send-invite', profile_url: 'https://linkedin.com/in/x', message: 'hey' },
+    });
+
+    const item = puts[0].item as any;
+    expect(item.eventType).toBe(EVT_TOOL_FAILED);
+    const parsed = JSON.parse(item.dimensions.failedArgsJson);
+    expect(parsed.action).toBe('send-invite');
+    expect(parsed.message).toBe('hey');
+  });
+
+  it('redacts secret-like keys in captured args', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    await rec.toolFailed('run-1', {
+      toolName: 'call_meta_marketing_api',
+      error: new Error('boom'),
+      args: { endpoint: '/campaigns', access_token: 'EAAB-secret', apiKey: 'k-123', password: 'hunter2' },
+    });
+
+    const parsed = JSON.parse((puts[0].item as any).dimensions.failedArgsJson);
+    expect(parsed.endpoint).toBe('/campaigns');
+    expect(parsed.access_token).toBe('[redacted]');
+    expect(parsed.apiKey).toBe('[redacted]');
+    expect(parsed.password).toBe('[redacted]');
+  });
+
+  it('caps oversized args payloads', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    await rec.toolFailed('run-1', {
+      toolName: 'update_html_file',
+      error: new Error('hash mismatch'),
+      args: { operations_json: 'x'.repeat(20000) },
+    });
+
+    const stored = (puts[0].item as any).dimensions.failedArgsJson as string;
+    expect(stored.length).toBeLessThanOrEqual(4096);
+    expect(stored).toContain('…[truncated]');
+  });
+
+  it('omits the field when args are absent or unserializable', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    await rec.toolFailed('run-1', { toolName: 'search_web', error: new Error('x') });
+    const circular: any = {}; circular.self = circular;
+    await rec.toolFailed('run-1', { toolName: 'search_web', error: new Error('y'), args: circular });
+
+    expect((puts[0].item as any).dimensions.failedArgsJson).toBeUndefined();
+    expect((puts[1].item as any).dimensions.failedArgsJson).toBeUndefined();
+  });
+
+  it('never records args on success', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    await rec.toolSucceeded('run-1', { toolName: 'search_web', durationMs: 10 });
+
+    expect((puts[0].item as any).dimensions.failedArgsJson).toBeUndefined();
+  });
+});
