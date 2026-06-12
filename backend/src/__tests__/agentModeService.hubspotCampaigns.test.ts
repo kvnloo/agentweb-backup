@@ -121,8 +121,41 @@ describe('resolveHubSpotService', () => {
   it('uses OAuth token when HubSpotService.create succeeds', async () => {
     mockListCampaigns.mockResolvedValue(RAW_LIST);
     const result = await hubspot({ action: 'LIST' });
-    expect(mockHubSpotCreate).toHaveBeenCalledWith(USER);
+    expect(mockHubSpotCreate).toHaveBeenCalledWith(USER, undefined);
     expect(result.success).toBe(true);
+  });
+
+  it('passes account_id through to HubSpotService.create', async () => {
+    mockListCampaigns.mockResolvedValue(RAW_LIST);
+    const result = await hubspot({ action: 'LIST', account_id: 'acc-2' });
+    expect(mockHubSpotCreate).toHaveBeenCalledWith(USER, 'acc-2');
+    expect(result.success).toBe(true);
+  });
+
+  it('surfaces multi-account ambiguity instead of falling back to token-paste', async () => {
+    mockHubSpotCreate.mockRejectedValue(
+      new Error('Multiple HubSpot accounts found: [Acme (ID: acc-1), Beta (ID: acc-2)]. Specify account_id.'),
+    );
+    mockGetLeadLists.mockResolvedValue([
+      { externalCrmSyncConfigs: { hubspot: { apiKeyEncrypted: 'encrypted-key' } } },
+    ]);
+
+    const result = await hubspot({ action: 'LIST' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/multiple hubspot accounts/i);
+    expect(mockHubSpotFromToken).not.toHaveBeenCalled();
+  });
+
+  it('surfaces the error when an explicit account_id fails instead of falling back', async () => {
+    mockHubSpotCreate.mockRejectedValue(new Error('HubSpot account "acc-9" not found. Please reconnect your account.'));
+    mockGetLeadLists.mockResolvedValue([
+      { externalCrmSyncConfigs: { hubspot: { apiKeyEncrypted: 'encrypted-key' } } },
+    ]);
+
+    const result = await hubspot({ action: 'LIST', account_id: 'acc-9' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/"acc-9" not found/i);
+    expect(mockHubSpotFromToken).not.toHaveBeenCalled();
   });
 
   it('falls back to token-paste when OAuth fails', async () => {
@@ -308,6 +341,29 @@ describe('CAMPAIGN — error handling', () => {
     const result = await hubspot({ action: 'LIST' });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/access denied/i);
+    expect(result.status).toBe(403);
+  });
+
+  it('returns reconnect guidance on 403 with MISSING_SCOPES category', async () => {
+    const err: any = new Error('Forbidden');
+    err.response = { status: 403, data: { category: 'MISSING_SCOPES', message: 'scopes missing' } };
+    mockListCampaigns.mockRejectedValue(err);
+    const result = await hubspot({ action: 'LIST' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/reconnect your hubspot account/i);
+    expect(result.hubspotError).toEqual({ category: 'MISSING_SCOPES', message: 'scopes missing' });
+    expect(result.status).toBe(403);
+  });
+
+  it('keeps the tier/scopes message on 403 without MISSING_SCOPES and surfaces the body', async () => {
+    const err: any = new Error('Forbidden');
+    err.response = { status: 403, data: { category: 'BANNED', message: 'nope' } };
+    mockListCampaigns.mockRejectedValue(err);
+    const result = await hubspot({ action: 'LIST' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/access denied/i);
+    expect(result.hubspotError).toEqual({ category: 'BANNED', message: 'nope' });
+    expect(result.status).toBe(403);
   });
 
   it('surfaces hubspotError body on non-403 errors', async () => {

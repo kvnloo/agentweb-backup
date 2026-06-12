@@ -112,6 +112,14 @@ describe('call_hubspot_api — registration', () => {
     expect(entityEnum).toEqual(expect.arrayContaining(['CAMPAIGN', 'EMAIL', 'FORM', 'LANDING_PAGE', 'BLOG_POST', 'WORKFLOW', 'SOCIAL', 'CONTACT_LIST']));
   });
 
+  it('schema exposes account_id for multi-account disambiguation', async () => {
+    const tool = await getTool();
+    const accountId = tool.definition.inputSchema.properties.account_id;
+    expect(accountId).toBeDefined();
+    expect(accountId.type).toBe('string');
+    expect(accountId.description).toMatch(/multiple hubspot accounts/i);
+  });
+
   it('description covers all entity types', async () => {
     const tool = await getTool();
     const desc = tool.definition.description;
