@@ -36,6 +36,8 @@ export interface AgentRunToolOutcomeSummary {
   durationMs?: number;
   errorClass?: string;
   errorMessage?: string;
+  /** Full args of a FAILED call (capped + redacted at write time) — root-cause material. */
+  failedArgsJson?: string;
 }
 
 export interface AgentRunChatContext {
@@ -196,6 +198,7 @@ function buildOneRunSummary(runId: string, events: AgentRunEventRow[]): AgentRun
       durationMs: asNumber(e.dimensions?.durationMs),
       errorClass: asString(e.dimensions?.errorClass),
       errorMessage: asString(e.dimensions?.errorMessage),
+      failedArgsJson: asString(e.dimensions?.failedArgsJson),
     }));
 
   const startedAt = runStarted?.ts ?? sorted[0]?.ts;
