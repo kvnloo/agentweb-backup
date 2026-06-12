@@ -407,3 +407,88 @@ function trimTrailingSlash(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed.replace(/\/+$/, '') : undefined;
 }
+
+/**
+ * Query the runtime-spine events and build run summaries — the single query
+ * seam shared by the admin inspector route and the report_product_issues
+ * enrichment. Pagination is by RUNS collected, not events scanned (one chatty
+ * run emits hundreds of events).
+ */
+import AWS from 'aws-sdk';
+import { AGENT_MODE_LOOP_ID } from '../loops/instances/agent-mode/eventTypes';
+import { LOOP_EVENTS_TABLE } from '../loops/core/sensors/eventTableEventSource';
+
+const PAGE_EVENT_LIMIT = 1000;
+const MAX_SCANNED_EVENTS = 20000;
+
+let inspectorDynamo: AWS.DynamoDB.DocumentClient | null = null;
+function getInspectorDynamo(): AWS.DynamoDB.DocumentClient {
+  if (!inspectorDynamo) {
+    inspectorDynamo = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || 'us-west-2' });
+  }
+  return inspectorDynamo;
+}
+
+export interface FetchAgentRunSummariesParams {
+  runId?: string;
+  sessionId?: string;
+  userId?: string;
+  /** Max RUNS returned. */
+  limit: number;
+}
+
+export interface FetchAgentRunSummariesResult {
+  runs: AgentRunSummary[];
+  scannedEvents: number;
+  truncated: boolean;
+}
+
+export async function fetchAgentRunSummaries(
+  params: FetchAgentRunSummariesParams,
+): Promise<FetchAgentRunSummariesResult> {
+  const { runId, sessionId, userId, limit } = params;
+  const dynamo = getInspectorDynamo();
+
+  const matchesFilters = (run: AgentRunSummary) =>
+    (!runId || run.runId === runId)
+    && (!sessionId || run.sessionId === sessionId)
+    && (!userId || run.userId === userId);
+
+  const rows: AgentRunEventRow[] = [];
+  let runs: AgentRunSummary[] = [];
+  let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+  let scannedEvents = 0;
+  let truncated = false;
+
+  do {
+    const result = await dynamo.query({
+      TableName: LOOP_EVENTS_TABLE,
+      KeyConditionExpression: 'loopId = :loopId',
+      ExpressionAttributeValues: {
+        ':loopId': AGENT_MODE_LOOP_ID,
+        ...(runId ? { ':runId': runId } : {}),
+      },
+      ...(runId ? { FilterExpression: 'subjectId = :runId' } : {}),
+      ScanIndexForward: false,
+      Limit: PAGE_EVENT_LIMIT,
+      ExclusiveStartKey: lastKey,
+    }).promise();
+
+    const items = (result.Items ?? []) as AgentRunEventRow[];
+    scannedEvents += result.ScannedCount ?? items.length;
+    rows.push(...items.filter((row) => row.eventType && row.subjectId && row.ts));
+    lastKey = result.LastEvaluatedKey;
+
+    runs = buildAgentRunSummaries(rows).filter(matchesFilters);
+
+    // Collect one run beyond the limit: the oldest collected run may still be
+    // missing events on the next page, and the caller's slice drops it anyway.
+    if (lastKey && runs.length > limit) break;
+    if (lastKey && scannedEvents >= MAX_SCANNED_EVENTS) {
+      truncated = true;
+      break;
+    }
+  } while (lastKey);
+
+  return { runs: runs.slice(0, limit), scannedEvents, truncated };
+}
