@@ -6359,6 +6359,15 @@ emmaToolRegistry.register({
               pageUrl: {
                 type: 'string',
                 description: 'URL of the page where the issue occurred (optional)'
+              },
+              attachment_urls: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Optional https URLs of screenshots or files (e.g. S3 links) that evidence the issue. Upload files first, then pass their URLs here.'
+              },
+              run_id: {
+                type: 'string',
+                description: 'Optional AgentRun id (from the AgentRun inspector / runtime telemetry). When given, the server automatically attaches the run dossier — verdict, failed tool calls with error class/message and the failing arguments — to the report. Strongly recommended when reporting an agent/tool failure.'
               }
             },
             required: ['title', 'description']
@@ -6417,14 +6426,56 @@ emmaToolRegistry.register({
           'Session ID': context?.sessionId || 'N/A',
         };
 
+        const attachmentUrls = Array.isArray(issue.attachment_urls)
+          ? issue.attachment_urls.filter((u: unknown): u is string => typeof u === 'string' && /^https?:\/\//.test(u))
+          : [];
+        if (attachmentUrls.length > 0) {
+          issueContext['Attachments'] = attachmentUrls.join('\n');
+        }
+
+        // Server-side run-dossier enrichment: the reporter passes a run_id and
+        // the server pulls the telemetry it already has. Best-effort — a
+        // failed lookup must never block the report.
+        let description: string = issue.description;
+        if (typeof issue.run_id === 'string' && issue.run_id.trim()) {
+          try {
+            const { fetchAgentRunSummaries } = await import('../services/agentRunInspectorService');
+            const { runs } = await fetchAgentRunSummaries({ runId: issue.run_id.trim(), limit: 1 });
+            const run = runs[0];
+            if (run) {
+              const failures = (run.outcomes || [])
+                .filter((o: any) => o.eventType === 'agent_tool_failed')
+                .slice(0, 10)
+                .map((o: any) => {
+                  const argsPart = o.failedArgsJson ? `\n  args: ${o.failedArgsJson}` : '';
+                  return `- ${o.toolName || 'unknown'} [${o.errorClass || 'Error'}]: ${o.errorMessage || ''}${argsPart}`;
+                });
+              description += [
+                '',
+                '',
+                '---',
+                `AgentRun dossier (auto-attached from run_id ${run.runId}):`,
+                `- verdict: ${(run as any).verdict || 'n/a'}  |  tool calls: ${(run as any).toolCalls ?? 'n/a'}  |  failed: ${(run as any).failedToolCalls ?? 'n/a'}`,
+                ...(run.sessionId ? [`- session: ${run.sessionId}`] : []),
+                ...(failures.length > 0 ? ['- failed tool calls:', ...failures] : []),
+              ].join('\n');
+              issueContext['AgentRun ID'] = run.runId;
+            }
+          } catch (e) {
+            console.warn('[report_product_issues] run dossier enrichment failed (report still filed):', e instanceof Error ? e.message : e);
+          }
+        }
+
         if (isDelegatedAdmin && adminEmail) {
           issueContext['Reported By (Admin)'] = adminEmail;
         }
 
         const result = await createOncallItem({
           title: issue.title,
-          description: issue.description,
-          additionalTags: ['Customer Reported'],
+          description,
+          // External MCP clients (Claude Code etc.) are tagged distinctly so
+          // benchmark filters on Customer Reported stay clean.
+          additionalTags: [context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported'],
           context: issueContext,
         });
 

@@ -89,6 +89,9 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
       llmModel,
       agentUserId: sessionContext?.agentUserId,
       isInternal: sessionContext?.isInternal,
+      // True only for external MCP clients (API key / OAuth) — in-process
+      // portal callers never set this. Tools use it for source attribution.
+      externalMcp: sessionContext ? sessionContext.isInternal !== true : false,
     };
 
     try {
