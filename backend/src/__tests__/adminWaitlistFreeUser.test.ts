@@ -334,10 +334,14 @@ describe('Admin Waitlist Free User Management', () => {
 
       expect(response.status).toBe(200);
       const createdUserId = (mockUserDb as any).createUser.mock.calls[0][1];
+      // New users get Free tier defaults plus a short-lived, must-change
+      // initial password (see secure-initial-passwords feature).
       expect((mockUserDb as any).updateUser).toHaveBeenCalledWith(createdUserId, {
         subscriptionType: 'Free',
         allowedPages: ['/agent-mode'],
         allowedSkills: ['skill-1'],
+        mustChangePassword: true,
+        tempPasswordExpires: expect.any(String),
       });
       expect(response.body.user).toMatchObject({
         userId: createdUserId,
