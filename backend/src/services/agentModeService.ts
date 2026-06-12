@@ -81,6 +81,7 @@ import {
   summarizeAgentToolPolicyModes,
   validateAndRepairToolArgs,
 } from './agentToolGatewayService';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 
 type MetaApiResult = {
   success: boolean;
@@ -134,6 +135,14 @@ function recordAgentModeToolTelemetry(
   void (async () => {
     try {
       const toolNames = toolResults.map(r => r.toolCall?.function?.name ?? 'unknown');
+      // PR #1818 follow-up: contract-layer activity as countable telemetry so
+      // the enforcement decision has data (args_repaired / schema-error rates).
+      const argsRepairedCount = toolResults.filter(
+        (r) => r.policyDecision?.flags?.some((flag) => flag.code === 'args_repaired'),
+      ).length;
+      const schemaErrorCount = toolResults.filter(
+        (r) => r.status === 'error' && classifyToolErrorClass(r.error) === 'invalid_args',
+      ).length;
       await recorder.decision(runId, {
         iteration,
         toolNames,
@@ -144,6 +153,8 @@ function recordAgentModeToolTelemetry(
         explanationSource: 'deterministic_tool_summary',
         toolPolicyFlags: summarizeAgentToolPolicyFlags(toolResults.map((r) => r.policyDecision)),
         toolPolicySummary: summarizeAgentToolPolicyModes(toolResults.map((r) => r.policyDecision)),
+        argsRepairedCount,
+        schemaErrorCount,
       });
       for (const r of toolResults) {
         const toolName = r.toolCall?.function?.name ?? 'unknown';
