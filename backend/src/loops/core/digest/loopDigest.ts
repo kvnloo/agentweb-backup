@@ -1,33 +1,20 @@
 /**
  * loopDigest — shared template-driven builder for the per-loop Slack digest DM.
  *
- * Every loop instance posts the same digest skeleton after a tick:
- *
- *   *<emoji> <loop name> <YYYY-MM-DD>*          ← header
- *   Run ID: `<runId>`                           ← parsed by the approval dispatcher
- *   <counts line>                               ← per-loop wording
- *   [optional pre-body lines, e.g. funnel shape]
- *   <blank>
- *   <empty | quiet | findings body>             ← branch on eventsScanned/proposals
- *   [optional extra sections, e.g. low-data decisions]
- *   <blank>
- *   React ✅ to dispatch all to cloud-dev  |  ❌ to skip  |  🛑 to pause loop
- *   [optional footer-extra lines]
+ * Every loop instance posts the same skeleton after a tick: bold header with
+ * the date, the Run ID line, a counts line, an empty/quiet/findings body
+ * branch, optional extra sections, and the shared React ✅ footer.
  *
  * CRITICAL: the rendered text is a wire format. The Slack approval dispatcher
  * (services/loopSlackApprovalDispatcher.ts) regex-parses the Run ID line, the
  * numbered items, and the footer. Characterization tests in
  * __tests__/loops.digestCharacterization.test.ts pin every loop's exact
  * output — change wording only with the dispatcher in view.
- *
- * Stays inside core/ rules: no imports from the rest of agentweb; the Slack
- * surface arrives as a minimal structural type.
  */
 
 import type { LoopRunResult } from '../types';
 
-/** Minimal slice of SlackPort the digest poster actually uses, so unit tests
- * can pass a stub with only the method we call. */
+/** Minimal slice of SlackPort the digest poster actually uses. */
 export type SlackPosterLike = {
   postMessage: (channelOrUserId: string, markdown: string) => Promise<unknown>;
 };
@@ -37,8 +24,8 @@ export const LOOP_DIGEST_FOOTER =
   'React ✅ to dispatch all to cloud-dev  |  ❌ to skip  |  🛑 to pause loop';
 
 /**
- * Per-loop digest template. `TExtra` carries whatever loop-specific context the
- * sections need (drained mutation count, funnel shape, captured mutations, …).
+ * Per-loop digest template. `TExtra` carries whatever loop-specific context
+ * the sections need (drained mutation count, funnel shape, mutations, …).
  */
 export interface LoopDigestTemplate<TExtra = void> {
   /** Console-log prefix, e.g. '[agent-mode-loop]'. */

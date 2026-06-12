@@ -1,18 +1,11 @@
 /**
  * instanceRunner — shared register/run plumbing for production loop instances.
  *
- * Every instance module (agent-mode, onboarding, ai-readiness, ai-eval prod)
- * repeated the same choreography:
- *
- *   register():  gate on env flag → skip if already in the registry →
- *                build the 5 layers → registerOrReplace* each → register the
- *                manifest → hold the CaptureGate in a module singleton
- *   runOnce():   register → runLoop(manifest, ports) → drain the gate →
- *                post the digest DM
- *
- * `createInstanceRunner(config)` owns that choreography; the instance module
- * keeps only what is actually loop-specific (layer construction, env gating,
- * digest template) and re-exports its public function names unchanged.
+ * Every instance module repeated the same choreography: env-gated idempotent
+ * registration of the 5 layers + manifest, a module-level CaptureGate
+ * singleton, and a runOnce that registers, runs the orchestrator, drains the
+ * gate, and posts the digest. `createInstanceRunner(config)` owns that; the
+ * instance keeps only layer construction, env gating, and its digest template.
  *
  * Boundary note: core/ normally only depends on ports, but the runner exists
  * precisely to wrap the registry (../index), so that import is deliberate.
@@ -44,11 +37,13 @@ import {
   type RuleSet,
 } from './types';
 
-/** The five layer implementations one instance registers. */
+/** The five layer implementations one instance registers. `ruleSet` and
+ * `tools` are type-erased here (the registry stores them erased anyway), so
+ * instances can return their concrete generics without per-call casts. */
 export interface InstanceLayers {
   sensor: EventSource<NormalizedEvent>;
-  ruleSet: RuleSet<NormalizedEvent, unknown>;
-  tools: MutationTools<unknown>;
+  ruleSet: unknown;
+  tools: unknown;
   /** Must be a CaptureGate — the runner drains it after each tick. */
   gate: CaptureGate;
   learning: LearningStore;
@@ -122,8 +117,8 @@ export function createInstanceRunner(config: InstanceRunnerConfig): InstanceRunn
     const layers = config.buildLayers(ports);
 
     registerOrReplaceSensor(config.implNames.sensor, layers.sensor);
-    registerOrReplaceRuleSet(config.implNames.ruleSet, layers.ruleSet);
-    registerOrReplaceTools(config.implNames.tools, layers.tools);
+    registerOrReplaceRuleSet(config.implNames.ruleSet, layers.ruleSet as RuleSet<NormalizedEvent, unknown>);
+    registerOrReplaceTools(config.implNames.tools, layers.tools as MutationTools<unknown>);
     registerOrReplaceGate(config.implNames.gate, layers.gate);
     registerOrReplaceLearningStore(config.implNames.learning, layers.learning);
     registerOrReplaceLoop(config.manifest());

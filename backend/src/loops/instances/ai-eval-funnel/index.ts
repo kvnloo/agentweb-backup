@@ -148,10 +148,8 @@ const runner = createInstanceRunner({
     ) as RuleSet<NormalizedEvent, unknown>;
     return {
       sensor,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      ruleSet: new CooldownRuleSet(baseRuleSet, learning, AI_EVAL_LOOP_ID) as any,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      tools: new NotionDigestTool() as any,
+      ruleSet: new CooldownRuleSet(baseRuleSet, learning, AI_EVAL_LOOP_ID),
+      tools: new NotionDigestTool(),
       gate: new CaptureGate(),
       learning,
     };

@@ -59,10 +59,8 @@ const runner = createInstanceRunner({
       sensor: new UserArrayEventSource(
         async () => (await userDb.getAllUsers(true)) as UserArrayRecord[],
       ),
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      ruleSet: new CooldownRuleSet(analyst, learning, ONBOARDING_LOOP_ID) as any,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      tools: new SpecOutputTool(ONBOARDING_LOOP_ID) as any,
+      ruleSet: new CooldownRuleSet(analyst, learning, ONBOARDING_LOOP_ID),
+      tools: new SpecOutputTool(ONBOARDING_LOOP_ID),
       gate: new CaptureGate(),
       learning,
     };

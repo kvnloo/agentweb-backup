@@ -8,7 +8,11 @@
 
 import { _resetRegistryForTesting, getRegisteredLoopIds, getSensor } from '../loops';
 import { CaptureGate } from '../loops/core/gates/captureGate';
-import { createInstanceRunner, type InstanceRunnerConfig } from '../loops/core/instanceRunner';
+import {
+  createInstanceRunner,
+  type InstanceLayers,
+  type InstanceRunnerConfig,
+} from '../loops/core/instanceRunner';
 import { runLoop } from '../loops/core/orchestrator';
 import type { LoopPorts } from '../loops/core/ports';
 import type { LoopManifest, LoopRunResult, Mutation } from '../loops/core/types';
@@ -63,13 +67,14 @@ function config(over: Partial<InstanceRunnerConfig> = {}): InstanceRunnerConfig 
     },
     buildLayers: () => ({
       sensor: { fetchEvents: jest.fn().mockResolvedValue([]) },
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      ruleSet: { evaluate: jest.fn().mockResolvedValue([]) } as any,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      tools: { apply: jest.fn() } as any,
+      ruleSet: { evaluate: jest.fn().mockResolvedValue([]) },
+      tools: { apply: jest.fn() },
       gate: new CaptureGate(),
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      learning: { recordDecision: jest.fn(), recordOutcome: jest.fn(), getHistory: jest.fn().mockResolvedValue([]) } as any,
+      learning: {
+        recordDecision: jest.fn(),
+        recordOutcome: jest.fn(),
+        getHistory: jest.fn().mockResolvedValue([]),
+      } as unknown as InstanceLayers['learning'],
     }),
     manifest: () => manifest(),
     onRunComplete: jest.fn().mockResolvedValue(undefined),

@@ -46,10 +46,8 @@ const runner = createInstanceRunner({
     const learning = new DynamoLearningStore(ports.dynamo);
     return {
       sensor: new EventTableEventSource(ports.dynamo, AGENT_MODE_LOOP_ID),
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      ruleSet: new CooldownRuleSet(new AgentFailureRuleSet(), learning, AGENT_MODE_LOOP_ID) as any,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      tools: new SpecOutputTool(AGENT_MODE_LOOP_ID, ['cloud-dev', 'auto-loop', 'agent-mode']) as any,
+      ruleSet: new CooldownRuleSet(new AgentFailureRuleSet(), learning, AGENT_MODE_LOOP_ID),
+      tools: new SpecOutputTool(AGENT_MODE_LOOP_ID, ['cloud-dev', 'auto-loop', 'agent-mode']),
       gate: new CaptureGate(),
       learning,
     };

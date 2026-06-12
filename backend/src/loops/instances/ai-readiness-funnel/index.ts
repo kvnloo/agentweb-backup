@@ -74,10 +74,8 @@ const runner = createInstanceRunner({
       sensor: new EventTableEventSource(ports.dynamo, AI_READINESS_LOOP_ID, {
         scope: { ...READINESS_SCOPE },
       }),
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      ruleSet: new CooldownRuleSet(analyst, learning, AI_READINESS_LOOP_ID) as any,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      tools: new SpecOutputTool(AI_READINESS_LOOP_ID) as any,
+      ruleSet: new CooldownRuleSet(analyst, learning, AI_READINESS_LOOP_ID),
+      tools: new SpecOutputTool(AI_READINESS_LOOP_ID),
       gate: new CaptureGate(),
       learning,
     };
