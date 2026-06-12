@@ -29,6 +29,11 @@ export const register = async (req: Request, res: Response) => {
         .status(400)
         .json({ message: "Email and password are required" });
     }
+    if (password.length < 12) {
+      return res
+        .status(400)
+        .json({ message: "Password must be at least 12 characters long" });
+    }
     email = email.toLowerCase();
 
     if (!isCompanyEmail(email)) {
@@ -645,8 +650,8 @@ export const resetPassword = async (req: Request, res: Response) => {
       return res.status(400).json({ message: "Token and password are required" });
     }
 
-    if (password.length < 6) {
-      return res.status(400).json({ message: "Password must be at least 6 characters long" });
+    if (password.length < 12) {
+      return res.status(400).json({ message: "Password must be at least 12 characters long" });
     }
 
     // Find user by reset token
