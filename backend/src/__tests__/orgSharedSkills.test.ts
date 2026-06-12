@@ -2,9 +2,10 @@
  * Tests for org-shared skills.
  *
  * When a user belongs to an org, GET /api/user-skills should include
- * private skills from other org members (not just their own). Skills remain
- * private; only the owner (or org admin) can delete a skill, and only the
- * owner or an approved editor can edit a skill.
+ * private skills from other org members (not just their own) when the org's
+ * skills sharing toggle is enabled. Skills are member-owned: any member may
+ * create their own, and only the item owner may edit or delete it (no editor
+ * delegation, no org-owner override).
  */
 import request from "supertest";
 import express from "express";
@@ -231,8 +232,8 @@ describe("PUT /api/user-skills/:skillId — org member cannot edit another membe
   });
 });
 
-describe("PUT /api/user-skills/:skillId — editor in shareSettings can edit another member's skill", () => {
-  // Use a separate app where the authenticated user is user-3 (an editor)
+describe("PUT /api/user-skills/:skillId — skills are owner-edit-only (no editor delegation)", () => {
+  // Use a separate app where the authenticated user is user-3 (a listed editor)
   const editorApp = express();
   editorApp.use(express.json());
   editorApp.use("/api/user-skills", (req: any, _res: any, next: any) => {
@@ -244,7 +245,7 @@ describe("PUT /api/user-skills/:skillId — editor in shareSettings can edit ano
     jest.clearAllMocks();
   });
 
-  it("editor in shareSettings.skills.editors can PATCH another member's skill", async () => {
+  it("a listed skills editor CANNOT PATCH another member's skill (owner-only)", async () => {
     mockGetSkill.mockResolvedValue(memberSkill);
     // When getUserById is called for editorId (caller) or ownerId (user-2), return appropriate objects
     mockGetUserById.mockImplementation((uid: string) => {
@@ -253,14 +254,13 @@ describe("PUT /api/user-skills/:skillId — editor in shareSettings can edit ano
       return Promise.resolve(null);
     });
     mockGetOrgById.mockResolvedValue(mockOrgEnabled);
-    mockUpdateSkill.mockResolvedValue(undefined);
 
     const res = await request(editorApp)
       .put("/api/user-skills/skill-2")
       .send({ name: "Editor Update" });
 
-    expect(res.status).toBe(200);
-    expect(mockUpdateSkill).toHaveBeenCalled();
+    expect(res.status).toBe(403);
+    expect(mockUpdateSkill).not.toHaveBeenCalled();
   });
 
   it("non-editor org member is rejected with 403 on PATCH", async () => {
@@ -298,7 +298,7 @@ describe("DELETE /api/user-skills/:skillId — org member cannot delete another 
   });
 });
 
-describe("DELETE /api/user-skills/:skillId — DELETE remains owner-only or admin; editor cannot delete", () => {
+describe("DELETE /api/user-skills/:skillId — DELETE is owner-only (no editor or org-owner override)", () => {
   // Editor app (user-3 is an editor but not org owner)
   const editorApp = express();
   editorApp.use(express.json());
@@ -330,16 +330,15 @@ describe("DELETE /api/user-skills/:skillId — DELETE remains owner-only or admi
     expect(mockDeleteSkill).not.toHaveBeenCalled();
   });
 
-  it("org owner (orgRole=owner) can delete another member's skill", async () => {
+  it("org owner (orgRole=owner) CANNOT delete another member's skill (owner-only)", async () => {
     const privateSkillByMember = { ...memberSkill, visibility: "private" };
     mockGetSkill.mockResolvedValue(privateSkillByMember);
     mockGetUserById.mockResolvedValue({ userId: orgOwnerUserId, orgId: mockOrgId, orgRole: "owner" });
-    mockDeleteSkill.mockResolvedValue(undefined);
 
     const res = await request(orgOwnerApp).delete("/api/user-skills/skill-2");
 
-    expect(res.status).toBe(200);
-    expect(mockDeleteSkill).toHaveBeenCalledWith("skill-2");
+    expect(res.status).toBe(403);
+    expect(mockDeleteSkill).not.toHaveBeenCalled();
   });
 
   it("skill owner can delete their own skill", async () => {
@@ -392,7 +391,7 @@ describe("POST /api/user-skills — new skill gets orgId stamped", () => {
   });
 });
 
-describe("POST /api/user-skills — org-level create gating", () => {
+describe("POST /api/user-skills — any org member may create their own skill", () => {
   beforeEach(() => { jest.clearAllMocks(); });
 
   it("org owner can create regardless of toggle", async () => {
@@ -412,35 +411,37 @@ describe("POST /api/user-skills — org-level create gating", () => {
     expect(mockCreateSkill).toHaveBeenCalledTimes(1);
   });
 
-  it("listed editor can create even when enabled=false", async () => {
+  it("a plain org member can create even when sharing is disabled (skills are member-owned)", async () => {
     mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "member" });
     mockGetOrgById.mockResolvedValue({
       orgId: mockOrgId,
-      shareSettings: { skills: { enabled: false, editors: [mockUserId] } },
+      shareSettings: { skills: { enabled: false, editors: [] } },
     });
-    mockCreateSkill.mockResolvedValue({ ...mySkill, skillId: "editor-skill" });
+    mockCreateSkill.mockResolvedValue({ ...mySkill, skillId: "member-skill" });
     mockUpdateSkill.mockResolvedValue(undefined);
 
     const res = await request(app)
       .post("/api/user-skills")
-      .send({ name: "Editor Skill", description: "d" });
+      .send({ name: "Member Skill", description: "d" });
 
     expect(res.status).toBe(201);
     expect(mockCreateSkill).toHaveBeenCalledTimes(1);
   });
 
-  it("non-editor org member gets 403 on create", async () => {
+  it("a plain org member can create when sharing is enabled (no editor list required)", async () => {
     mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "member" });
     mockGetOrgById.mockResolvedValue({
       orgId: mockOrgId,
       shareSettings: { skills: { enabled: true, editors: [] } },
     });
+    mockCreateSkill.mockResolvedValue({ ...mySkill, skillId: "member-skill-2" });
+    mockUpdateSkill.mockResolvedValue(undefined);
 
     const res = await request(app)
       .post("/api/user-skills")
       .send({ name: "Member Attempt", description: "d" });
 
-    expect(res.status).toBe(403);
-    expect(mockCreateSkill).not.toHaveBeenCalled();
+    expect(res.status).toBe(201);
+    expect(mockCreateSkill).toHaveBeenCalledTimes(1);
   });
 });
