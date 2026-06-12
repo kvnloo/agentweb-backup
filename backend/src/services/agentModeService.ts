@@ -24501,10 +24501,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   // ─── HubSpot Campaigns ──────────────────────────────────────────────────────
 
-  private async resolveHubSpotService(userId: string): Promise<HubSpotService> {
+  private async resolveHubSpotService(userId: string, accountId?: string): Promise<HubSpotService> {
     try {
-      return await HubSpotService.create(userId);
-    } catch {
+      return await HubSpotService.create(userId, accountId);
+    } catch (err: any) {
+      // An explicit account_id or a multi-account ambiguity is actionable by the
+      // caller — surface it instead of silently falling back to token-paste.
+      if (accountId || /multiple hubspot accounts/i.test(err?.message ?? '')) throw err;
       // Fall back to token-paste: scan lead lists for HubSpot apiKeyEncrypted
     }
     const { crmDb } = await import('./db');
@@ -24524,7 +24527,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     const entityType: string = (args?.entity_type ?? '').toUpperCase();
     const action: string = (args?.action ?? '').toUpperCase();
     try {
-      const svc = await this.resolveHubSpotService(userId);
+      const svc = await this.resolveHubSpotService(userId, args?.account_id);
 
       // ─── CONTACT_LIST ──────────────────────────────────────────────────────
       if (entityType === 'CONTACT_LIST') {
@@ -24880,7 +24883,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       return { success: false, error: `Unknown entity_type "${entityType}". Valid: CONTACT_LIST, CAMPAIGN, EMAIL, FORM, LANDING_PAGE, BLOG_POST, WORKFLOW, SOCIAL.` };
     } catch (err: any) {
-      if (err?.response?.status === 403) return { success: false, error: 'HubSpot API access denied. Check your HubSpot subscription tier and OAuth scopes (content, automation required for some entity types).' };
+      if (err?.response?.status === 403) {
+        // HubSpot returns 403 both for tier/scope limits and for tokens granted
+        // before newer scopes were added to the app — distinguish them.
+        const missingScopes = err?.response?.data?.category === 'MISSING_SCOPES';
+        return {
+          success: false,
+          error: missingScopes
+            ? 'Your HubSpot connection is missing the required permissions. Please reconnect your HubSpot account in Settings → Connected Accounts to grant them.'
+            : 'HubSpot API access denied. Check your HubSpot subscription tier and OAuth scopes (content, automation required for some entity types).',
+          hubspotError: err?.response?.data ?? null,
+          status: 403,
+        };
+      }
       return { success: false, error: err?.message ?? 'HubSpot API call failed.', hubspotError: err?.response?.data ?? null, status: err?.response?.status ?? null };
     }
   }

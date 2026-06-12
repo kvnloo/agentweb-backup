@@ -7485,6 +7485,7 @@ TYPICAL WORKFLOW:
         query:            { type: 'string', description: 'Search query for CONTACT_LIST LIST.' },
         count:            { type: 'number', description: 'Page size for CONTACT_LIST LIST. Default 50, max 500.' },
         filter_branch:    { type: 'object', description: 'Filter criteria for DYNAMIC/SNAPSHOT CONTACT_LIST CREATE.' },
+        account_id:       { type: 'string', description: 'HubSpot account ID. Required when the user has multiple HubSpot accounts connected — the error message will list them; ask the user which to use.' },
       },
       required: ['entity_type', 'action'],
     },
