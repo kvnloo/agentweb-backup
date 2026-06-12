@@ -27,8 +27,12 @@ import {
   deleteEnvVar,
   updateLandingPageContext,
   updateLandingPageLeadList,
+  recordLandingPagePublish,
+  markLandingPagePublishReverted,
   INTEGRATIONS,
   resolveSiteForCaller,
+  getLandingPageLiveUrl,
+  canUserEditLandingPage,
 } from "../services/v0Service";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/customDomainService";
@@ -582,7 +586,26 @@ router.get("/generated", async (req, res: Response) => {
       }
     }
 
-    res.json({ pages });
+    // Annotate each page with whether THIS caller can edit it. The list mixes
+    // the caller's own pages with org-shared pages they may only be able to
+    // view; without this flag the agent can't tell which it may edit and wastes
+    // attempts (and mislabels the resulting 403 as a platform bug). Every page
+    // here is either the caller's own or owned by an org member (same org via
+    // fanout), so the already-loaded `org` is the right context — no extra DB
+    // calls. Owner fast-paths to true; otherwise canEditItem gates on
+    // editor/owner role.
+    const annotated = pages.map((p) => ({
+      ...p,
+      editable: canEditItem(
+        { userId: p.userId },
+        { userId, orgId, orgRole: user?.orgRole as "owner" | "member" | undefined },
+        org,
+        orgId,
+        "landingPages",
+      ),
+    }));
+
+    res.json({ pages: annotated });
   } catch (error) {
     console.error("[LP GENERATION] Error listing pages:", error);
     res.status(500).json({ error: "Failed to list landing pages" });
@@ -603,7 +626,11 @@ router.get("/generated/:id", async (req, res: Response) => {
     const auth = await authorizeLandingPageAccess(req.params.id, userId, "view");
     if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
 
-    res.json(auth.page);
+    // Surface whether the caller may edit (vs only view) this page so the agent
+    // doesn't attempt edits it isn't authorized for. Owner short-circuits to
+    // true; org viewers without editor rights get false.
+    const editable = await canUserEditLandingPage(auth.page, userId);
+    res.json({ ...auth.page, editable });
   } catch (error) {
     console.error("[LP GENERATION] Error getting page:", error);
     res.status(500).json({ error: "Failed to get landing page" });
@@ -895,17 +922,19 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
     }
 
     const isStaging = branch !== "main";
+    const liveUrl = getLandingPageLiveUrl(page);
     res.json({
       success: true,
       commit_url: commitRes.data.commit?.html_url || commitRes.data.html_url,
       file_path,
       page_id: page.id,
+      live_url: liveUrl,
       deployed_url: page.deployedUrl,
       branch,
       is_staging: isStaging,
       message: isStaging
         ? `File "${file_path}" updated on branch ${branch}. A Vercel preview deployment will be created. Use get_preview_url to check the preview, then publish_landing_page_changes when ready to go live.`
-        : `File "${file_path}" updated. Changes will auto-deploy to ${page.deployedUrl} within ~30 seconds.`,
+        : `File "${file_path}" updated. Changes will auto-deploy to ${liveUrl} within ~30 seconds.`,
     });
   } catch (error: any) {
     const ghStatus = error.response?.status;
@@ -1252,6 +1281,20 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
 
     let mergeCommitSha: string;
 
+    // Capture the current main SHA before merging. This is the exact byte-perfect
+    // rollback target — revert-publish force-resets main back to it. Non-fatal if
+    // it can't be read (revert simply won't be offered for this publish).
+    let preMergeSha: string | undefined;
+    try {
+      const mainRefRes = await axios.get<any>(
+        `${repoBase}/git/ref/heads/main`,
+        { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+      );
+      preMergeSha = mainRefRes.data.object.sha;
+    } catch (refErr: any) {
+      console.warn(`[LP GENERATION] Could not read pre-merge main SHA: ${refErr.message}`);
+    }
+
     // Try a standard merge first; on conflict (409) fall back to force-advancing
     // main to the draft branch tip. This is safe because landing page repos are
     // exclusively managed by our system — there is no external contributor whose
@@ -1311,11 +1354,28 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
       }
     }
 
+    // Record what we need to revert this publish (exact pre-merge state).
+    // Only possible when the pre-merge SHA was captured and actually changed.
+    if (preMergeSha && preMergeSha !== mergeCommitSha) {
+      try {
+        await recordLandingPagePublish(page.id, {
+          preMergeSha,
+          mergeSha: mergeCommitSha,
+          branch,
+          publishedAt: new Date().toISOString(),
+        });
+      } catch (recErr: any) {
+        console.warn(`[LP GENERATION] Could not record publish history: ${recErr.message}`);
+      }
+    }
+
+    const liveUrl = getLandingPageLiveUrl(page);
     res.json({
       success: true,
       merge_commit_sha: mergeCommitSha,
+      live_url: liveUrl,
       deployed_url: page.deployedUrl,
-      message: `Changes from ${branch} have been published to main. Your site at ${page.deployedUrl} will update shortly.`,
+      message: `Changes from ${branch} have been published to main. Your site at ${liveUrl} will update shortly.`,
     });
   } catch (error: any) {
     const ghStatus = error.response?.status;
@@ -1326,6 +1386,110 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
       res.status(404).json({ error: "Branch not found. It may have already been merged or deleted." });
     } else {
       res.status(500).json({ error: `Failed to publish: ${ghMessage}` });
+    }
+  }
+});
+
+/**
+ * POST /api/landing-pages/v0/generated/:id/revert-publish
+ * Undo the most recent publish by force-resetting main back to the SHA it
+ * pointed at before that publish merged. This is the inverse of /publish and
+ * relies on the `lastPublish` state recorded at publish time. Re-deploys Vercel.
+ */
+router.post("/generated/:id/revert-publish", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const page = auth.page;
+    if (!page.githubRepoUrl) return res.status(400).json({ error: "No GitHub repository" });
+
+    const lastPublish = page.lastPublish;
+    if (!lastPublish || !lastPublish.preMergeSha) {
+      return res.status(400).json({
+        error: "Nothing to revert — no recorded publish for this landing page.",
+      });
+    }
+    if (lastPublish.revertedAt) {
+      return res.status(400).json({
+        error: "The last publish has already been reverted.",
+      });
+    }
+
+    const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+    if (!repoMatch) return res.status(400).json({ error: "Invalid GitHub repo URL" });
+
+    const [, owner, repo] = repoMatch;
+    const repoName = repo.replace('.git', '');
+    const { getGitHubOrgToken } = await import("../utils/secretsManager");
+    const { token } = await getGitHubOrgToken();
+    const ghHeaders = {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github.v3+json",
+    };
+    const GITHUB_TIMEOUT_MS = 30_000;
+    const repoBase = `https://api.github.com/repos/${owner}/${repoName}`;
+
+    // Safety: only revert if main is still at the commit this publish produced.
+    // If something newer was published or pushed, main has moved on and a blind
+    // reset would silently discard that newer work — refuse instead.
+    const mainRefRes = await axios.get<any>(
+      `${repoBase}/git/ref/heads/main`,
+      { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+    );
+    const currentMainSha: string = mainRefRes.data.object.sha;
+    if (currentMainSha !== lastPublish.mergeSha) {
+      return res.status(409).json({
+        error:
+          "Cannot revert — main has changed since the last publish (newer changes were published). " +
+          "Reverting would discard those changes.",
+      });
+    }
+
+    // Force-reset main back to the pre-merge SHA. Safe for these system-managed
+    // repos (no external contributors) — same primitive publish uses to advance main.
+    await axios.patch<any>(
+      `${repoBase}/git/refs/heads/main`,
+      { sha: lastPublish.preMergeSha, force: true },
+      { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+    );
+    console.log(
+      `[LP GENERATION] Reverted main to pre-publish ${lastPublish.preMergeSha.substring(0, 7)} (was ${lastPublish.mergeSha.substring(0, 7)})`
+    );
+
+    // Trigger a Vercel deployment so the live site reflects the revert.
+    if (page.vercelProjectId) {
+      try {
+        await triggerVercelDeployment(page.vercelProjectId, `${owner}/${repoName}`);
+      } catch (deployErr: any) {
+        console.warn(`[LP GENERATION] Could not trigger Vercel deployment after revert: ${deployErr.message}`);
+      }
+    }
+
+    // Mark the publish consumed so it can't be reverted twice.
+    try {
+      await markLandingPagePublishReverted(page.id, new Date().toISOString());
+    } catch (markErr: any) {
+      console.warn(`[LP GENERATION] Could not mark publish reverted: ${markErr.message}`);
+    }
+
+    res.json({
+      success: true,
+      reverted_to_sha: lastPublish.preMergeSha,
+      deployed_url: page.deployedUrl,
+      message: `Reverted the last publish. Your site at ${page.deployedUrl} will update shortly.`,
+    });
+  } catch (error: any) {
+    const ghStatus = error.response?.status;
+    const ghMessage = error.response?.data?.message || error.message;
+    console.error(`[LP GENERATION] Error reverting publish (HTTP ${ghStatus}):`, ghMessage);
+
+    if (ghStatus === 404) {
+      res.status(404).json({ error: "Repository or branch not found." });
+    } else {
+      res.status(500).json({ error: `Failed to revert: ${ghMessage}` });
     }
   }
 });

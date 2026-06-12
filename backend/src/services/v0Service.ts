@@ -132,8 +132,41 @@ export interface GeneratedLandingPage {
   archivedAt?: string;
   gtmContainerId?: string;
   context?: string;
+  /**
+   * State captured at the most recent publish, used to revert it. The pre-merge
+   * `main` SHA is the exact byte-perfect rollback target — reverting simply
+   * force-resets `main` back to it. Marked with `revertedAt` once consumed.
+   */
+  lastPublish?: LandingPagePublishRecord;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface LandingPagePublishRecord {
+  /** The `main` SHA immediately before the publish merge — the revert target. */
+  preMergeSha: string;
+  /** The merge (or force-advanced) commit SHA that became the new `main`. */
+  mergeSha: string;
+  /** The draft branch that was published. */
+  branch: string;
+  /** ISO timestamp of the publish. */
+  publishedAt: string;
+  /** ISO timestamp set when a revert consumes this record (undefined = revertable). */
+  revertedAt?: string;
+}
+
+/**
+ * Resolve the canonical live URL to report to the user for a landing page.
+ *
+ * `customDomainUrl` (the user's custom domain or the managed *.agentwebforms.com
+ * subdomain) is the public-facing address the user knows their page by, so it
+ * takes priority over the raw Vercel `deployedUrl`. Falls back to `deployedUrl`
+ * when no custom domain is set, and to an empty string when neither exists.
+ */
+export function getLandingPageLiveUrl(
+  page: Pick<GeneratedLandingPage, "deployedUrl" | "customDomainUrl">
+): string {
+  return page.customDomainUrl || page.deployedUrl || "";
 }
 
 export interface BrandContext {
@@ -2173,16 +2206,30 @@ export async function triggerVercelDeployment(
   });
   const repoId = repoInfoRes.data.id;
 
+  // Deployments created via the REST API default to the "preview" environment.
+  // For the production branch (main) we must explicitly set target=production,
+  // otherwise the production alias is never updated and the live site keeps
+  // serving the previous deployment. This normally goes unnoticed because a
+  // git PUSH to main fires Vercel's native git integration (which marks main
+  // builds as production) — but a force-update of the main ref (used by
+  // publish's 409 fallback and by revert-publish) often does NOT fire a fresh
+  // push webhook, so this API deployment is the only one — and it must target
+  // production itself.
+  const body: Record<string, unknown> = {
+    name: vercelProjectId,
+    project: vercelProjectId,
+    gitSource: { type: "github", repo: repoFullName, ref, repoId },
+  };
+  if (ref === "main") {
+    body.target = "production";
+  }
+
   await axios.post<any>(
     "https://api.vercel.com/v13/deployments",
-    {
-      name: vercelProjectId,
-      project: vercelProjectId,
-      gitSource: { type: "github", repo: repoFullName, ref, repoId },
-    },
+    body,
     { headers }
   );
-  console.log(`[V0 SERVICE] Triggered deployment for ${repoFullName} on ${ref}`);
+  console.log(`[V0 SERVICE] Triggered ${ref === "main" ? "production " : ""}deployment for ${repoFullName} on ${ref}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -2500,6 +2547,53 @@ export async function resolveSiteForCaller(
 }
 
 /**
+ * Whether `callerUserId` may EDIT `page`, accounting for org sharing.
+ *
+ * Single source of truth for the edit decision, shared by the route layer
+ * (authorizeLandingPageAccess), the list/get endpoints (to surface an
+ * `editable` flag), and the coding agent (to fail fast before spinning up the
+ * LLM loop). Mirrors canEditItem: the page owner always passes; otherwise the
+ * caller must be in the page owner's org AND be an org owner or a listed
+ * landingPages editor. Visibility (canViewItem) is deliberately broader — a
+ * plain member can VIEW a shared page but not edit it, which is exactly the
+ * gap this helper lets callers report up front.
+ *
+ * Best-effort and non-throwing: any lookup failure resolves to `false` (deny)
+ * so a transient DB error can't accidentally grant edit access.
+ */
+export async function canUserEditLandingPage(
+  page: Pick<GeneratedLandingPage, "userId">,
+  callerUserId: string,
+): Promise<boolean> {
+  try {
+    if (page.userId === callerUserId) return true;
+    const [user, pageOwner] = await Promise.all([
+      userDb.getUserById(callerUserId),
+      userDb.getUserById(page.userId),
+    ]);
+    const ownerOrgId = pageOwner?.orgId;
+    const org =
+      user?.orgId && user.orgId === ownerOrgId
+        ? await orgDb.getOrgById(user.orgId)
+        : null;
+    return canEditItem(
+      { userId: page.userId },
+      {
+        userId: callerUserId,
+        orgId: user?.orgId,
+        orgRole: user?.orgRole as "owner" | "member" | undefined,
+      },
+      org,
+      ownerOrgId,
+      "landingPages",
+    );
+  } catch (e) {
+    console.warn("[LP] canUserEditLandingPage check failed; denying edit:", e);
+    return false;
+  }
+}
+
+/**
  * Remove a page route file from the GitHub repo.
  */
 async function removePageFromGitHub(githubRepoUrl: string, slug: string): Promise<void> {
@@ -2602,6 +2696,47 @@ export async function updateLandingPageGtm(
       })
       .promise();
   }
+}
+
+/**
+ * Persist the state needed to revert the most recent publish. Overwrites any
+ * prior `lastPublish` — only the latest publish is revertable (single-step).
+ */
+export async function recordLandingPagePublish(
+  id: string,
+  publishRecord: LandingPagePublishRecord
+): Promise<void> {
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      UpdateExpression: "SET lastPublish = :lp, updatedAt = :now",
+      ExpressionAttributeValues: {
+        ":lp": publishRecord,
+        ":now": new Date().toISOString(),
+      },
+    })
+    .promise();
+}
+
+/**
+ * Mark the recorded publish as reverted so it cannot be reverted twice.
+ */
+export async function markLandingPagePublishReverted(
+  id: string,
+  revertedAt: string
+): Promise<void> {
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      UpdateExpression: "SET lastPublish.revertedAt = :ra, updatedAt = :now",
+      ExpressionAttributeValues: {
+        ":ra": revertedAt,
+        ":now": new Date().toISOString(),
+      },
+    })
+    .promise();
 }
 
 export async function updateLandingPageContext(

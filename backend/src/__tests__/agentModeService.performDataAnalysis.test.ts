@@ -494,6 +494,170 @@ describe('AgentModeService.performDataAnalysis', () => {
     expect(prompt).toContain('input_file_1.csv');
   });
 
+  // ─── generated file capture (marker protocol → real S3 download URL) ────────
+  // Gemini's sandbox discards on-disk files and only returns inline images, so the
+  // model is told to print a generated file's full contents between AGENTWEB_FILE
+  // markers. The backend extracts that content, uploads it to S3, and returns a real
+  // download link instead of a fabricated bare filename / fake S3 key / sandbox: path.
+
+  test('prompt instructs the model to print files between AGENTWEB_FILE markers and not invent URLs', async () => {
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [{ text: 'Done.' }] } }] }
+    });
+
+    await (service as any).performDataAnalysis([], 'Save the results as a CSV.', 'user-1');
+
+    const postBody = mockedAxiosPost.mock.calls[0][1];
+    const prompt = postBody.contents[0].parts[postBody.contents[0].parts.length - 1].text as string;
+    expect(prompt).toContain('<<<AGENTWEB_FILE:');
+    expect(prompt).toContain('<<<AGENTWEB_FILE_END>>>');
+    expect(prompt.toLowerCase()).toContain('do not invent');
+    expect(prompt.toLowerCase()).toContain('sandbox:/');
+  });
+
+  test('captures a file printed to code execution stdout and returns a real S3 download link', async () => {
+    mockedUploadFileToS3.mockResolvedValueOnce({
+      success: true,
+      url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user-7/files/123/abc/seed.csv',
+      key: 'users/user-7/files/123/abc/seed.csv'
+    });
+
+    const csv = 'email,score\na@x.com,9\nb@y.com,8';
+    const stdout = `Wrote file.\n<<<AGENTWEB_FILE:seed.csv>>>\n${csv}\n<<<AGENTWEB_FILE_END>>>\nDone.`;
+
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: {
+        candidates: [
+          {
+            content: {
+              parts: [
+                { text: 'Built the seed audience.' },
+                { codeExecutionResult: { outcome: 'OUTCOME_OK', output: stdout } }
+              ]
+            }
+          }
+        ]
+      }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Build a seed audience and save as seed.csv.', 'user-7');
+
+    expect(mockedUploadFileToS3).toHaveBeenCalledWith(
+      Buffer.from(csv, 'utf-8'),
+      'seed.csv',
+      'user-7',
+      'text/csv'
+    );
+    expect(result.success).toBe(true);
+    expect(result.analysis).toContain('**Generated Files:**');
+    expect(result.analysis).toContain('[seed.csv](https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user-7/files/123/abc/seed.csv)');
+    expect(result.fileUrls).toEqual([
+      '**File saved:** [seed.csv](https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user-7/files/123/abc/seed.csv)'
+    ]);
+  });
+
+  test('captures a file printed in a text part (snake_case code_execution_result also handled)', async () => {
+    mockedUploadFileToS3.mockResolvedValueOnce({
+      success: true,
+      url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user-1/files/1/x/out.json',
+      key: 'users/user-1/files/1/x/out.json'
+    });
+
+    const json = '{"total": 42}';
+    const text = `Here are the results.\n<<<AGENTWEB_FILE:out.json>>>\n${json}\n<<<AGENTWEB_FILE_END>>>`;
+
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [{ text }] } }] }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Save totals as out.json.', 'user-1');
+
+    expect(mockedUploadFileToS3).toHaveBeenCalledWith(
+      Buffer.from(json, 'utf-8'),
+      'out.json',
+      'user-1',
+      'application/json'
+    );
+    expect(result.success).toBe(true);
+    // The raw file contents must be stripped from the analysis text (replaced by a reference)
+    expect(result.analysis).not.toContain('{"total": 42}');
+    expect(result.analysis).toContain('[Generated file: out.json — download link below]');
+    expect(result.analysis).toContain('[out.json](https://agentweb-user-files');
+  });
+
+  test('captures multiple generated files in one stdout block', async () => {
+    mockedUploadFileToS3
+      .mockResolvedValueOnce({ success: true, url: 'https://agentweb-user-files.s3.amazonaws.com/a.csv', key: 'a.csv' })
+      .mockResolvedValueOnce({ success: true, url: 'https://agentweb-user-files.s3.amazonaws.com/b.csv', key: 'b.csv' });
+
+    const stdout = `<<<AGENTWEB_FILE:a.csv>>>\nx,y\n1,2\n<<<AGENTWEB_FILE_END>>>\n<<<AGENTWEB_FILE:b.csv>>>\np,q\n3,4\n<<<AGENTWEB_FILE_END>>>`;
+
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: {
+        candidates: [{ content: { parts: [{ codeExecutionResult: { output: stdout } }] } }]
+      }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Save two files.', 'user-1');
+
+    expect(mockedUploadFileToS3).toHaveBeenCalledTimes(2);
+    expect(result.fileUrls).toHaveLength(2);
+    expect(result.analysis).toContain('a.csv');
+    expect(result.analysis).toContain('b.csv');
+  });
+
+  test('reports upload failure for a generated file without failing the whole analysis', async () => {
+    mockedUploadFileToS3.mockResolvedValueOnce({ success: false, error: 'S3 down' });
+
+    const stdout = `<<<AGENTWEB_FILE:seed.csv>>>\na,b\n1,2\n<<<AGENTWEB_FILE_END>>>`;
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [{ text: 'Analysis text.' }, { codeExecutionResult: { output: stdout } }] } }] }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Save seed.csv.', 'user-1');
+
+    expect(result.success).toBe(true);
+    expect(result.fileUrls).toBeUndefined();
+    expect(result.analysis).toContain('**Analysis:** Analysis text.');
+    expect(result.analysis).not.toContain('**Generated Files:**');
+  });
+
+  test('falls back to a default filename when the marker filename is empty', async () => {
+    mockedUploadFileToS3.mockResolvedValueOnce({
+      success: true,
+      url: 'https://agentweb-user-files.s3.amazonaws.com/analysis_output_0.csv',
+      key: 'analysis_output_0.csv'
+    });
+
+    const stdout = `<<<AGENTWEB_FILE:>>>\na,b\n1,2\n<<<AGENTWEB_FILE_END>>>`;
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [{ codeExecutionResult: { output: stdout } }] } }] }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Save a file.', 'user-1');
+
+    expect(mockedUploadFileToS3).toHaveBeenCalledWith(
+      expect.any(Buffer),
+      'analysis_output_0.csv',
+      'user-1',
+      'text/csv'
+    );
+    expect(result.success).toBe(true);
+  });
+
+  test('does not call upload when no file markers are present', async () => {
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [{ text: 'Just a plain summary, no files.' }] } }] }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Summarize only.', 'user-1');
+
+    expect(mockedUploadFileToS3).not.toHaveBeenCalled();
+    expect(result.success).toBe(true);
+    expect(result.fileUrls).toBeUndefined();
+    expect(result.analysis).not.toContain('**Generated Files:**');
+  });
+
   test('defaults to the gemini-3.5-flash model for code execution', async () => {
     delete process.env.DATA_ANALYSIS_LLM_NAME;
     mockedAxiosPost.mockResolvedValueOnce({

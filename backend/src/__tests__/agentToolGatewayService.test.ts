@@ -1,9 +1,12 @@
 import {
   AgentToolPolicyBlockedError,
+  AgentToolRepeatedFailureError,
+  _resetAgentToolFailureBreaker,
   executeAgentToolThroughGateway,
   evaluateAgentToolPolicy,
   summarizeAgentToolPolicyFlags,
   summarizeAgentToolPolicyModes,
+  validateAndRepairToolArgs,
 } from '../services/agentToolGatewayService';
 
 describe('agentToolGatewayService', () => {
@@ -59,6 +62,33 @@ describe('agentToolGatewayService', () => {
 
     expect(decision.flags).toEqual(expect.arrayContaining([
       expect.objectContaining({ code: 'possible_task_tool_mismatch', severity: 'warning' }),
+    ]));
+  });
+
+  it('marks session-state tools as low-risk side effects', () => {
+    const decision = evaluateAgentToolPolicy({
+      toolName: 'save_memory',
+      args: { content: 'User prefers concise status updates' },
+    });
+
+    expect(decision.effect).toBe('session_state');
+    expect(decision.risk).toBe('low');
+    expect(decision.flags).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'side_effecting_tool', severity: 'info' }),
+    ]));
+  });
+
+  it('raises shared-session side effects to high risk', () => {
+    const decision = evaluateAgentToolPolicy({
+      toolName: 'update_html_file',
+      args: { file_url: 'https://example.com/page.html' },
+      isSharedSession: true,
+    });
+
+    expect(decision.effect).toBe('internal_write');
+    expect(decision.risk).toBe('high');
+    expect(decision.flags).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'shared_session_side_effect', severity: 'critical' }),
     ]));
   });
 
@@ -127,5 +157,730 @@ describe('agentToolGatewayService', () => {
       expect(outcome.error).toBeInstanceOf(AgentToolPolicyBlockedError);
       expect(outcome.policyDecision.allowed).toBe(false);
     }
+  });
+
+  describe('tool contract validation', () => {
+    const readFileSchema = {
+      type: 'object',
+      properties: {
+        file_url: { type: 'string' }
+      },
+      required: ['file_url'],
+      additionalProperties: false
+    };
+
+    it('passes args through when no object schema exists', () => {
+      const args = { anything: ['goes'] };
+
+      expect(validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args,
+      })).toEqual({
+        status: 'valid',
+        args,
+        issues: [],
+        repairs: [],
+      });
+
+      expect(validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args,
+        inputSchema: { type: 'string' },
+      })).toEqual({
+        status: 'valid',
+        args,
+        issues: [],
+        repairs: [],
+      });
+    });
+
+    it('rejects non-object args before tool code runs', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args: ['https://example.com/pasted-text.txt'],
+        inputSchema: readFileSchema,
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('invalid');
+      if (result.status === 'invalid') {
+        expect(result.issues).toEqual([
+          expect.objectContaining({ code: 'invalid_args', path: '$' }),
+        ]);
+      }
+    });
+
+    it('passes valid args unchanged', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args: { file_url: 'https://example.com/pasted-text.txt' },
+        inputSchema: readFileSchema,
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('valid');
+      expect(result.args).toEqual({ file_url: 'https://example.com/pasted-text.txt' });
+      expect(result.repairs).toEqual([]);
+    });
+
+    it('repairs low-risk url alias drift before execution', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args: { url: 'https://example.com/pasted-text.txt' },
+        inputSchema: readFileSchema,
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('repaired');
+      expect(result.args).toEqual({ file_url: 'https://example.com/pasted-text.txt' });
+      expect(result.repairs).toEqual(['url->file_url']);
+    });
+
+    it('repairs known optional alias fields when the canonical required field is missing', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args: { url: 'https://example.com/pasted-text.txt' },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            file_url: { type: 'string' },
+            url: { type: 'string' }
+          },
+          required: ['file_url']
+        },
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('repaired');
+      expect(result.args).toEqual({ file_url: 'https://example.com/pasted-text.txt' });
+      expect(result.repairs).toEqual(['url->file_url']);
+    });
+
+    it('repairs camelCase property drift when the target field is known', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args: { fileUrl: 'https://example.com/pasted-text.txt' },
+        inputSchema: readFileSchema,
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('repaired');
+      expect(result.args).toEqual({ file_url: 'https://example.com/pasted-text.txt' });
+      expect(result.repairs).toEqual(['fileUrl->file_url']);
+    });
+
+    it('does not guess when URL alias repair is ambiguous', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'compare_pages',
+        args: { url: 'https://example.com/page-a.html' },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            source_url: { type: 'string' },
+            target_url: { type: 'string' },
+          },
+          required: ['source_url', 'target_url'],
+          additionalProperties: false
+        },
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('invalid');
+      expect(result.repairs).toEqual([]);
+      if (result.status === 'invalid') {
+        expect(result.issues.map((issue) => issue.code)).toEqual(expect.arrayContaining([
+          'unknown_property',
+          'missing_required',
+        ]));
+      }
+    });
+
+    it('rejects missing required args with a model-visible retry message', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args: {},
+        inputSchema: readFileSchema,
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('invalid');
+      if (result.status === 'invalid') {
+        expect(result.modelMessage).toContain('failed schema validation before execution');
+        expect(result.modelMessage).toContain('Missing required argument "file_url"');
+      }
+    });
+
+    it('does not semantically repair URL aliases for side-effecting tools', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'send_email',
+        args: { url: 'https://example.com' },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            body_url: { type: 'string' }
+          },
+          required: ['body_url'],
+          additionalProperties: false
+        },
+        effect: 'external_send',
+      });
+
+      expect(result.status).toBe('invalid');
+      expect(result.args).toEqual({ url: 'https://example.com' });
+      expect(result.repairs).toEqual([]);
+    });
+
+    it('rejects unknown fields when schema is strict', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args: {
+          file_url: 'https://example.com/pasted-text.txt',
+          unexpected: true
+        },
+        inputSchema: readFileSchema,
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('invalid');
+      if (result.status === 'invalid') {
+        expect(result.issues.map((issue) => issue.code)).toContain('unknown_property');
+      }
+    });
+
+    it('allows extra fields when the schema permits additional properties', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args: {
+          file_url: 'https://example.com/pasted-text.txt',
+          metadata: { source: 'upload' }
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            file_url: { type: 'string' }
+          },
+          required: ['file_url']
+        },
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('valid');
+      expect(result.args).toEqual({
+        file_url: 'https://example.com/pasted-text.txt',
+        metadata: { source: 'upload' }
+      });
+    });
+
+    it('rejects wrong primitive types before tool code runs', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_file_content',
+        args: { file_url: 123 },
+        inputSchema: readFileSchema,
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('invalid');
+      if (result.status === 'invalid') {
+        expect(result.issues).toEqual(expect.arrayContaining([
+          expect.objectContaining({ code: 'type_mismatch', path: '$.file_url' }),
+        ]));
+      }
+    });
+
+    it('validates common JSON schema primitive types', () => {
+      const schema = {
+        type: 'object',
+        properties: {
+          count: { type: 'integer' },
+          ratio: { type: 'number' },
+          enabled: { type: 'boolean' },
+          tags: { type: 'array' },
+          options: { type: 'object' },
+          maybe: { type: ['string', 'null'] },
+        },
+        required: ['count', 'ratio', 'enabled', 'tags', 'options', 'maybe'],
+        additionalProperties: false
+      };
+
+      expect(validateAndRepairToolArgs({
+        toolName: 'read_metrics',
+        args: {
+          count: 2,
+          ratio: 0.5,
+          enabled: true,
+          tags: ['a'],
+          options: { compact: true },
+          maybe: null,
+        },
+        inputSchema: schema,
+        effect: 'read',
+      }).status).toBe('valid');
+
+      const result = validateAndRepairToolArgs({
+        toolName: 'read_metrics',
+        args: {
+          count: 2.5,
+          ratio: Number.POSITIVE_INFINITY,
+          enabled: 'true',
+          tags: 'a',
+          options: ['compact'],
+          maybe: false,
+        },
+        inputSchema: schema,
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('invalid');
+      if (result.status === 'invalid') {
+        expect(result.issues.map((issue) => issue.path)).toEqual(expect.arrayContaining([
+          '$.count',
+          '$.ratio',
+          '$.enabled',
+          '$.tags',
+          '$.options',
+          '$.maybe',
+        ]));
+      }
+    });
+
+    it('repairs explicit schema aliases even for side-effecting tools', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'coding_agent',
+        args: {
+          landing_page_id: 'lp_123',
+          instructions: 'Make the hero headline clearer'
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            page_id: { type: 'string', 'x-aliases': ['landing_page_id'] },
+            task_description: { type: 'string', 'x-aliases': ['instructions'] },
+          },
+          required: ['page_id', 'task_description'],
+          additionalProperties: false
+        },
+        effect: 'internal_write',
+      });
+
+      expect(result.status).toBe('repaired');
+      expect(result.args).toEqual({
+        page_id: 'lp_123',
+        task_description: 'Make the hero headline clearer'
+      });
+      expect(result.repairs).toEqual([
+        'landing_page_id->page_id',
+        'instructions->task_description',
+      ]);
+    });
+
+    it('repairs explicit JSON aliases by serializing object values to the canonical string field', () => {
+      const operations = [{
+        action: 'replaceInner',
+        selector: 'p',
+        html: 'The gateway normalized the alias and the update still worked.'
+      }];
+
+      const result = validateAndRepairToolArgs({
+        toolName: 'update_html_file',
+        args: {
+          file_url: 'https://example.com/source.html',
+          replacement_json: operations,
+          update_type: 'css',
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            file_url: { type: 'string' },
+            operations_json: {
+              type: 'string',
+              description: 'JSON array of CSS-selector operations',
+              'x-aliases': ['replacement_json'],
+            },
+            update_type: { type: 'string' },
+          },
+          required: ['file_url', 'operations_json'],
+          additionalProperties: false,
+        },
+        effect: 'internal_write',
+      });
+
+      expect(result.status).toBe('repaired');
+      expect(result.args).toEqual({
+        file_url: 'https://example.com/source.html',
+        operations_json: JSON.stringify(operations),
+        update_type: 'css',
+      });
+      expect(result.repairs).toEqual([
+        'replacement_json->operations_json',
+        'operations_json:json_stringify',
+      ]);
+    });
+
+    it('repairs common content aliases through the central gateway contract map', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'create_html_file',
+        args: {
+          title: 'Gateway Alias Test',
+          html_content: '<h1>Hello</h1><p>Body</p>',
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            title: { type: 'string' },
+            content_draft: { type: 'string' },
+            format_requirements: { type: 'string' },
+          },
+          required: ['title', 'content_draft'],
+          additionalProperties: false,
+        },
+        effect: 'internal_write',
+      });
+
+      expect(result.status).toBe('repaired');
+      expect(result.args).toEqual({
+        title: 'Gateway Alias Test',
+        content_draft: '<h1>Hello</h1><p>Body</p>',
+      });
+      expect(result.repairs).toEqual(['html_content->content_draft']);
+    });
+
+    it('repairs create_html_file title and content aliases from model-shaped HTML args', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'create_html_file',
+        args: {
+          file_name: 'tool-gateway-schema-stress-test',
+          html_content: '<h1>Gateway Alias Test</h1><p>Body</p>',
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            title: {
+              type: 'string',
+              'x-aliases': ['file_name', 'filename', 'name', 'headline', 'subject'],
+            },
+            content_draft: {
+              type: 'string',
+              'x-aliases': ['html_content', 'content', 'body', 'text', 'markdown', 'document_content'],
+            },
+            format_requirements: { type: 'string' },
+          },
+          required: ['title', 'content_draft'],
+          additionalProperties: false,
+        },
+        effect: 'internal_write',
+      });
+
+      expect(result.status).toBe('repaired');
+      expect(result.args).toEqual({
+        title: 'tool-gateway-schema-stress-test',
+        content_draft: '<h1>Gateway Alias Test</h1><p>Body</p>',
+      });
+      expect(result.repairs).toEqual([
+        'file_name->title',
+        'html_content->content_draft',
+      ]);
+    });
+
+    it('repairs common save_file aliases without tool-specific handler code', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'save_file',
+        args: {
+          filename: 'report.html',
+          content: '<html>Saved</html>',
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            file_name: { type: 'string' },
+            file_content: { type: 'string' },
+          },
+          required: ['file_name', 'file_content'],
+          additionalProperties: false,
+        },
+        effect: 'internal_write',
+      });
+
+      expect(result.status).toBe('repaired');
+      expect(result.args).toEqual({
+        file_name: 'report.html',
+        file_content: '<html>Saved</html>',
+      });
+      expect(result.repairs).toEqual([
+        'filename->file_name',
+        'content->file_content',
+      ]);
+    });
+
+    it('repairs blog draft aliases while preserving canonical values when present', () => {
+      const repaired = validateAndRepairToolArgs({
+        toolName: 'create_blog_article',
+        args: {
+          title: 'Launch lessons',
+          content: 'Draft article body',
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            title_draft: { type: 'string' },
+            content_draft: { type: 'string' },
+          },
+          required: ['title_draft', 'content_draft'],
+          additionalProperties: false,
+        },
+        effect: 'internal_write',
+      });
+
+      expect(repaired.status).toBe('repaired');
+      expect(repaired.args).toEqual({
+        title_draft: 'Launch lessons',
+        content_draft: 'Draft article body',
+      });
+
+      const canonical = validateAndRepairToolArgs({
+        toolName: 'create_blog_article',
+        args: {
+          title_draft: 'Canonical title',
+          title: 'Alias title',
+          content_draft: 'Canonical body',
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            title_draft: { type: 'string' },
+            content_draft: { type: 'string' },
+            title: { type: 'string' },
+          },
+          required: ['title_draft', 'content_draft'],
+          additionalProperties: true,
+        },
+        effect: 'internal_write',
+      });
+
+      expect(canonical.status).toBe('valid');
+      expect(canonical.args).toEqual({
+        title_draft: 'Canonical title',
+        title: 'Alias title',
+        content_draft: 'Canonical body',
+      });
+    });
+
+    it('repairs S3 key aliases for tool-response readers', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'search_tool_response',
+        args: {
+          key: 'tool-responses/session/result.json',
+          q: 'destination_url',
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            s3_key: { type: 'string' },
+            query: { type: 'string' },
+          },
+          required: ['s3_key', 'query'],
+          additionalProperties: false,
+        },
+        effect: 'read',
+      });
+
+      expect(result.status).toBe('repaired');
+      expect(result.args).toEqual({
+        s3_key: 'tool-responses/session/result.json',
+        query: 'destination_url',
+      });
+      expect(result.repairs).toEqual([
+        'key->s3_key',
+        'q->query',
+      ]);
+    });
+
+    it('enforces array minItems and item types from schema', () => {
+      const emptyResult = validateAndRepairToolArgs({
+        toolName: 'install_skills',
+        args: { skillIds: [] },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            skillIds: { type: 'array', minItems: 1, items: { type: 'string' } },
+          },
+          required: ['skillIds'],
+          additionalProperties: false
+        },
+        effect: 'session_state',
+      });
+
+      expect(emptyResult.status).toBe('invalid');
+      if (emptyResult.status === 'invalid') {
+        expect(emptyResult.issues).toEqual(expect.arrayContaining([
+          expect.objectContaining({
+            code: 'invalid_args',
+            path: '$.skillIds',
+            message: 'Argument "skillIds" must contain at least 1 item(s).',
+          }),
+        ]));
+      }
+
+      const wrongItemResult = validateAndRepairToolArgs({
+        toolName: 'install_skills',
+        args: { skillIds: ['__other_skills__', 123] },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            skillIds: { type: 'array', minItems: 1, items: { type: 'string' } },
+          },
+          required: ['skillIds'],
+          additionalProperties: false
+        },
+        effect: 'session_state',
+      });
+
+      expect(wrongItemResult.status).toBe('invalid');
+      if (wrongItemResult.status === 'invalid') {
+        expect(wrongItemResult.issues).toEqual(expect.arrayContaining([
+          expect.objectContaining({ code: 'type_mismatch', path: '$.skillIds[1]' }),
+        ]));
+      }
+    });
+  });
+
+  describe('repeated-failure circuit breaker', () => {
+    beforeEach(() => {
+      _resetAgentToolFailureBreaker();
+    });
+
+    const failingExecute = (message: string) => () => Promise.reject(new Error(message));
+
+    async function failNTimes(runId: string, toolName: string, message: string, n: number): Promise<void> {
+      for (let i = 0; i < n; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName,
+          args: { attempt: i },
+          runId,
+          execute: failingExecute(message),
+        });
+        expect(outcome.status).toBe('error');
+      }
+    }
+
+    it('blocks the next call after three identical failures in the same run', async () => {
+      await failNTimes('run-a', 'linkedin_outreach', 'Invalid parameters', 3);
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite' },
+        runId: 'run-a',
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+        const message = (outcome.error as Error).message;
+        expect(message).toContain('linkedin_outreach');
+        expect(message).toContain('Invalid parameters');
+        expect(message.toLowerCase()).toContain('do not retry');
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('resets the failure count when the tool succeeds', async () => {
+      await failNTimes('run-b', 'linkedin_outreach', 'Invitation message is too long', 2);
+
+      const success = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite' },
+        runId: 'run-b',
+        execute: () => Promise.resolve({ ok: true }),
+      });
+      expect(success.status).toBe('success');
+
+      await failNTimes('run-b', 'linkedin_outreach', 'Invitation message is too long', 2);
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite' },
+        runId: 'run-b',
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not trip on three different errors for the same tool', async () => {
+      await failNTimes('run-c', 'update_html_file', 'File hash mismatch', 1);
+      await failNTimes('run-c', 'update_html_file', 'No selectors matched', 1);
+      await failNTimes('run-c', 'update_html_file', 'Schema validation failed', 1);
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'update_html_file',
+        args: {},
+        runId: 'run-c',
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('isolates failure counts between runs', async () => {
+      await failNTimes('run-d', 'linkedin_outreach', 'Invalid parameters', 3);
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: {},
+        runId: 'run-e',
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('evicts the oldest run once the tracked-run cap is exceeded', async () => {
+      await failNTimes('run-oldest', 'linkedin_outreach', 'Invalid parameters', 3);
+
+      // Push 500 more runs through to evict run-oldest from the tracker.
+      for (let i = 0; i < 500; i += 1) {
+        await failNTimes(`run-filler-${i}`, 'search_web', 'No search results found', 1);
+      }
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: {},
+        runId: 'run-oldest',
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('never blocks calls without a runId', async () => {
+      for (let i = 0; i < 4; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'linkedin_outreach',
+          args: {},
+          execute: failingExecute('Invalid parameters'),
+        });
+        expect(outcome.status).toBe('error');
+        if (outcome.status === 'error') {
+          expect(outcome.error).not.toBeInstanceOf(AgentToolRepeatedFailureError);
+        }
+      }
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: {},
+        execute,
+      });
+      expect(outcome.status).toBe('success');
+    });
   });
 });

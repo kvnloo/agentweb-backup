@@ -79,6 +79,7 @@ import {
   evaluateAgentToolPolicy,
   summarizeAgentToolPolicyFlags,
   summarizeAgentToolPolicyModes,
+  validateAndRepairToolArgs,
 } from './agentToolGatewayService';
 
 type MetaApiResult = {
@@ -157,6 +158,38 @@ function recordAgentModeToolTelemetry(
       console.error('[agent-mode] tool telemetry failed (swallowed):', err);
     }
   })();
+}
+
+function toolResultError(result: unknown): Error | null {
+  if (!result || typeof result !== 'object') return null;
+  const obj = result as Record<string, any>;
+
+  if (obj.isError === true) {
+    return new Error(extractToolResultMessage(obj) || 'Tool returned isError=true');
+  }
+
+  if (obj.success === false) {
+    return new Error(extractToolResultMessage(obj) || 'Tool returned success=false');
+  }
+
+  return null;
+}
+
+function extractToolResultMessage(obj: Record<string, any>): string {
+  if (typeof obj.error === 'string' && obj.error.trim()) return obj.error.trim();
+  if (typeof obj.message === 'string' && obj.message.trim()) return obj.message.trim();
+  if (typeof obj.content === 'string' && obj.content.trim()) return obj.content.trim();
+
+  if (Array.isArray(obj.content)) {
+    const text = obj.content
+      .map((part: any) => typeof part?.text === 'string' ? part.text : '')
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+    if (text) return text;
+  }
+
+  return '';
 }
 
 function recordAgentModeRunStarted(
@@ -379,6 +412,15 @@ interface LLMCallOptions {
 // Diagnosis agent configuration
 const DIAGNOSIS_MODEL = 'gemini-3.1-flash-lite';
 const DIAGNOSIS_TIMEOUT_MS = 10_000;
+
+// Markers used by perform_data_analysis to capture files the Gemini code-execution
+// sandbox produces. The sandbox filesystem is discarded after execution and Gemini
+// never returns arbitrary on-disk files (only inline images), so the model is told
+// to print a file's full contents to stdout between these markers. The backend then
+// extracts the content and uploads it to real, downloadable S3 storage.
+const DATA_ANALYSIS_FILE_START_PREFIX = '<<<AGENTWEB_FILE:';
+const DATA_ANALYSIS_FILE_MARKER_SUFFIX = '>>>';
+const DATA_ANALYSIS_FILE_END_MARKER = '<<<AGENTWEB_FILE_END>>>';
 
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'avif', 'heic', 'heif']);
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wmv', 'm4v', 'ogv', '3gp', 'ts']);
@@ -781,10 +823,12 @@ export class AgentModeService {
             properties: {
               s3_key: {
                 type: 'string',
+                'x-aliases': ['s3Key', 'key', 'file_key', 'storage_key', 'object_key'],
                 description: 'The S3 key from the "[Full response stored at S3 key: ...]" reference in the tool result'
               },
               query: {
                 type: 'string',
+                'x-aliases': ['search_query', 'search', 'q', 'term'],
                 description: 'The text or field name to search for (e.g. "link_url", "destination_url", "sessionId")'
               },
               match_offset: {
@@ -821,6 +865,7 @@ export class AgentModeService {
             properties: {
               s3_key: {
                 type: 'string',
+                'x-aliases': ['s3Key', 'key', 'file_key', 'storage_key', 'object_key'],
                 description: 'The S3 key from the "[Full response stored at S3 key: ...]" reference in the tool result'
               },
               char_offset: {
@@ -2748,6 +2793,41 @@ export class AgentModeService {
 
         // Phase 1: Validate and prepare tool calls (synchronous)
         const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision }> = [];
+        const preflightToolResults: Array<{ status: 'error'; toolCall: any; functionArgs: any; error: Error; duration: number; policyDecision?: AgentToolPolicyDecision }> = [];
+
+        const appendPreflightToolFailure = (
+          toolCall: any,
+          functionArgs: any,
+          errorMessage: string,
+          content: any,
+          policyDecision?: AgentToolPolicyDecision,
+        ) => {
+          const error = new Error(errorMessage);
+          (messages as any[]).push({
+            tool_call_id: toolCall.id,
+            role: 'tool',
+            name: toolCall.function.name,
+            content,
+            metadata: { timestamp: new Date().toISOString() }
+          });
+          toolCalls.push({
+            id: toolCall.id,
+            name: toolCall.function.name,
+            arguments: functionArgs ?? toolCall.function.arguments,
+            error: error.message,
+            duration: 0
+          });
+          failedCounterUpdates[toolCall.function.name] =
+            (failedCounterUpdates[toolCall.function.name] || 0) + 1;
+          preflightToolResults.push({
+            status: 'error',
+            toolCall,
+            functionArgs,
+            error,
+            duration: 0,
+            policyDecision,
+          });
+        };
 
         for (const toolCall of responseMessage.tool_calls) {
           try {
@@ -2767,48 +2847,26 @@ export class AgentModeService {
               const errorMsg = isInteractiveShare
                 ? `Tool "${toolCall.function.name}" is not available in shared sessions. You can continue to use it in Agent Mode in your own session.`
                 : `Tool "${toolCall.function.name}" requires admin access. This session does not have admin privileges.`;
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: JSON.stringify({ error: errorMsg }),
-                metadata: { timestamp: new Date().toISOString() }
-              });
+              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
               continue;
             }
 
             if (isInteractiveShare && toolCall.function.name === 'connect_account') {
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: JSON.stringify({ error: 'Account connections are not available in shared sessions. Tell the user they need to open Agent Mode in their own account to connect this account, then come back here.' }),
-                metadata: { timestamp: new Date().toISOString() }
-              });
+              const errorMsg = 'Account connections are not available in shared sessions. Tell the user they need to open Agent Mode in their own account to connect this account, then come back here.';
+              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
               continue;
             }
 
             // Block context-restricted tools even if LLM hallucinates the call from history
             if (excludeTools?.includes(toolCall.function.name)) {
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: JSON.stringify({ error: `Tool "${toolCall.function.name}" is not available in this context.` }),
-                metadata: { timestamp: new Date().toISOString() }
-              });
+              const errorMsg = `Tool "${toolCall.function.name}" is not available in this context.`;
+              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
               continue;
             }
 
             if (publishedSkills.length > 0 && sessionAssociatedSkillIds.length > 0 && !allowedToolNames.has(toolCall.function.name)) {
               const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: JSON.stringify({ error: errorMsg }),
-                metadata: { timestamp: new Date().toISOString() }
-              });
+              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
               continue;
             }
 
@@ -2817,7 +2875,7 @@ export class AgentModeService {
               skillsUpdated = true;
             }
 
-            const policyDecision = evaluateAgentToolPolicy({
+            const initialPolicyDecision = evaluateAgentToolPolicy({
               toolName: toolCall.function.name,
               args: functionArgs,
               isAdmin: hasAdminAccess,
@@ -2825,31 +2883,51 @@ export class AgentModeService {
               enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
             });
 
-            if (!policyDecision.allowed) {
-              const errorMsg = `Tool "${toolCall.function.name}" was blocked by Agent Tool Gateway policy: ${policyDecision.flags.map((flag) => flag.message).join(' ')}`;
-              (messages as any[]).push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: JSON.stringify({ error: errorMsg, policy: policyDecision }),
-                metadata: { timestamp: new Date().toISOString() }
-              });
+            const toolDefinition = this.toolRegistry.getTool(toolCall.function.name)?.definition;
+            const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.inputSchema;
+            const contractResult = validateAndRepairToolArgs({
+              toolName: toolCall.function.name,
+              args: functionArgs,
+              inputSchema,
+              effect: initialPolicyDecision.effect,
+            });
+
+            if (contractResult.status === 'invalid') {
+              const errorContent = this.formatToolError(toolCall.function.name, contractResult.modelMessage);
+              appendPreflightToolFailure(toolCall, functionArgs, contractResult.modelMessage, errorContent, initialPolicyDecision);
               continue;
             }
 
-            preparedCalls.push({ toolCall, functionArgs, policyDecision });
+            const preparedFunctionArgs = contractResult.args;
+            const policyDecision = evaluateAgentToolPolicy({
+              toolName: toolCall.function.name,
+              args: preparedFunctionArgs,
+              isAdmin: hasAdminAccess,
+              isSharedSession: isInteractiveShare,
+              enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
+            });
+
+            if (contractResult.status === 'repaired') {
+              policyDecision.flags.push({
+                code: 'args_repaired',
+                severity: 'info',
+                message: `Tool arguments were repaired before execution: ${contractResult.repairs.join(', ')}`,
+              });
+            }
+
+            if (!policyDecision.allowed) {
+              const errorMsg = `Tool "${toolCall.function.name}" was blocked by Agent Tool Gateway policy: ${policyDecision.flags.map((flag) => flag.message).join(' ')}`;
+              appendPreflightToolFailure(toolCall, preparedFunctionArgs, errorMsg, JSON.stringify({ error: errorMsg, policy: policyDecision }), policyDecision);
+              continue;
+            }
+
+            preparedCalls.push({ toolCall, functionArgs: preparedFunctionArgs, policyDecision });
           } catch (error) {
             // JSON parse failure — append error message for LLM
             console.error(`AgentMode: Tool argument parse error for ${toolCall.function.name}:`, error);
             const errMsg = error instanceof Error ? error.message : String(error);
             const errorContent = this.formatToolError(toolCall.function.name, `Failed to parse arguments: ${errMsg}`);
-            (messages as any[]).push({
-              tool_call_id: toolCall.id,
-              role: 'tool',
-              name: toolCall.function.name,
-              content: errorContent,
-              metadata: { timestamp: new Date().toISOString() }
-            });
+            appendPreflightToolFailure(toolCall, undefined, `Failed to parse arguments: ${errMsg}`, errorContent);
           }
         }
 
@@ -2874,6 +2952,7 @@ export class AgentModeService {
               toolName: toolCall.function.name,
               args: functionArgs,
               policyDecision,
+              runId: agentRuntimeRunId,
               execute: () => this.executePreparedAgentTool({
                 llmModel,
                 toolName: toolCall.function.name,
@@ -2899,6 +2978,7 @@ export class AgentModeService {
               toolName: toolCall.function.name,
               args: functionArgs,
               policyDecision,
+              runId: agentRuntimeRunId,
               execute: () => this.executePreparedAgentTool({
                 llmModel,
                 toolName: toolCall.function.name,
@@ -2919,13 +2999,28 @@ export class AgentModeService {
           toolResults = await Promise.all(toolPromises);
         }
 
+        toolResults = toolResults.map((toolResult) => {
+          if (toolResult.status !== 'success') return toolResult;
+          const error = toolResultError(toolResult.result);
+          if (!error) return toolResult;
+          return {
+            status: 'error' as const,
+            toolCall: toolResult.toolCall,
+            functionArgs: toolResult.functionArgs,
+            error,
+            duration: toolResult.duration,
+            policyDecision: toolResult.policyDecision,
+          };
+        });
+        const telemetryToolResults = [...preflightToolResults, ...toolResults];
+
         // Runtime spine V0 telemetry: record this iteration's decision + each
         // tool's invoked/succeeded/failed outcome into the shared LoopEvents
         // table. Best-effort and non-blocking — the recorder swallows its own
         // errors and is a no-op unless AGENT_RUNTIME_SPINE_ENABLED=true (or the
         // legacy AGENT_MODE_LOOP_ENABLED=true). This is observability-only and
         // must not affect tool execution, retries, streaming, or responses.
-        recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, toolResults);
+        recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults);
 
         // Phase 3: Process results in original order — append to messages, toolCalls, counters
         for (const toolResult of toolResults) {
@@ -3711,6 +3806,7 @@ export class AgentModeService {
     // Discovery
     'install_skills',
     'list_available_skills',
+    'resolve_skill',
 
     // GTM Context (Read/Write)
     'update_brand_guidelines',
@@ -3794,6 +3890,11 @@ export class AgentModeService {
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
   // Made public for use in MCP server skill gating.
   public static FOUNDATION_TOOLS: Set<string> = new Set(AgentModeService.DEFAULT_FOUNDATION_TOOLS);
+  private static readonly MANDATORY_FOUNDATION_TOOLS: ReadonlyArray<string> = [
+    'install_skills',
+    'list_available_skills',
+    'resolve_skill',
+  ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
 
@@ -3857,8 +3958,9 @@ export class AgentModeService {
       if (setting?.settingValue) {
         const toolNames: string[] = JSON.parse(setting.settingValue);
         if (Array.isArray(toolNames) && toolNames.length > 0) {
-          AgentModeService.FOUNDATION_TOOLS = new Set(toolNames);
-          console.log(`AgentMode: Loaded ${toolNames.length} foundation tools from DB`);
+          const merged = [...new Set([...toolNames, ...AgentModeService.MANDATORY_FOUNDATION_TOOLS])];
+          AgentModeService.FOUNDATION_TOOLS = new Set(merged);
+          console.log(`AgentMode: Loaded ${merged.length} foundation tools from DB`);
           return;
         }
       }
@@ -3872,7 +3974,7 @@ export class AgentModeService {
    * Update foundation tools in DB and refresh the in-memory set.
    */
   public async updateFoundationTools(toolNames: string[], updatedBy: string): Promise<string[]> {
-    const unique = [...new Set(toolNames)];
+    const unique = [...new Set([...toolNames, ...AgentModeService.MANDATORY_FOUNDATION_TOOLS])];
     await settingsService.setSetting(
       AgentModeService.FOUNDATION_TOOLS_SETTING,
       JSON.stringify(unique),
@@ -3989,6 +4091,10 @@ export class AgentModeService {
 
   public async installSkills(skillIds: string[], userId: string, sessionId: string, isDelegatedAccess: boolean = false): Promise<any> {
     try {
+      if (!Array.isArray(skillIds) || skillIds.length === 0 || skillIds.some((id) => typeof id !== 'string')) {
+        return { message: "skillIds must be a non-empty array of skill IDs." };
+      }
+
       let installUserOrgId: string | undefined;
       try {
         const { userDb: uDb } = await import('./db');
@@ -5321,7 +5427,7 @@ export class AgentModeService {
       case 'update_html_file':
         // Mock validation for update_html_file
         try {
-          const instructions = JSON.parse(args.replacement_json);
+          const instructions = JSON.parse(args.operations_json || args.replacement_json);
 
           // Validate that it's an array
           if (!Array.isArray(instructions)) {
@@ -5413,7 +5519,7 @@ export class AgentModeService {
         } catch (error) {
           return {
             success: false,
-            message: 'Invalid JSON in replacement_json',
+            message: 'Invalid JSON in operations_json',
             error: error instanceof Error ? error.message : 'Unknown error'
           };
         }
@@ -5478,15 +5584,58 @@ export class AgentModeService {
   }
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
+    const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
+    const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
+    const initialPolicyDecision = evaluateAgentToolPolicy({
+      toolName,
+      args,
+      isAdmin: extraContext?.isDelegatedAdmin === true,
+      enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
+    });
+    const contractResult = validateAndRepairToolArgs({
+      toolName,
+      args,
+      inputSchema,
+      effect: initialPolicyDecision.effect,
+    });
+
+    if (contractResult.status === 'invalid') {
+      return {
+        success: false,
+        error: contractResult.modelMessage,
+        validation: {
+          status: contractResult.status,
+          issues: contractResult.issues,
+          repairs: contractResult.repairs,
+        },
+      };
+    }
+
+    const preparedArgs = contractResult.args;
+    const policyDecision = evaluateAgentToolPolicy({
+      toolName,
+      args: preparedArgs,
+      isAdmin: extraContext?.isDelegatedAdmin === true,
+      enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
+    });
+
+    if (!policyDecision.allowed) {
+      return {
+        success: false,
+        error: `Tool "${toolName}" was blocked by Agent Tool Gateway policy: ${policyDecision.flags.map((flag) => flag.message).join(' ')}`,
+        policy: policyDecision,
+      };
+    }
+
     // In mock mode, only session-state tools (install_skills) execute for real
     // because they modify DynamoDB session state with no external side effects
     // and are required for the skill-gated tool flow to work during benchmark tests.
     if (mockMode && !AgentModeService.MOCK_BYPASS_TOOLS.has(toolName)) {
-      return this.getMockToolResult(toolName, args);
+      return this.getMockToolResult(toolName, preparedArgs);
     }
 
     try {
-      return await this.toolRegistry.execute(toolName, args, {
+      return await this.toolRegistry.execute(toolName, preparedArgs, {
         userId,
         sessionId,
         llmModel,
@@ -6041,6 +6190,79 @@ export class AgentModeService {
     }
   }
 
+  // Infer a sensible Content-Type for a file the analysis sandbox produced, based
+  // on its extension. Defaults to text/plain so downloads are always served as a
+  // viewable/saveable file rather than an opaque octet-stream.
+  private static contentTypeForFilename(filename: string): string {
+    const ext = (filename.split('.').pop() || '').toLowerCase();
+    switch (ext) {
+      case 'csv': return 'text/csv';
+      case 'json': return 'application/json';
+      case 'tsv': return 'text/tab-separated-values';
+      case 'md': return 'text/markdown';
+      case 'html': case 'htm': return 'text/html';
+      case 'xml': return 'application/xml';
+      case 'txt': return 'text/plain';
+      default: return 'text/plain';
+    }
+  }
+
+  // Scan code-execution stdout/text for files the model emitted between the
+  // AGENTWEB_FILE markers, upload each to S3, and return real download links plus
+  // the text with the marker blocks stripped out (so the raw file contents are not
+  // dumped into the chat). Gemini's sandbox discards on-disk files, so this
+  // print-between-markers protocol is the only reliable way to deliver a generated
+  // file to the user.
+  private async extractAndUploadAnalysisFiles(
+    text: string,
+    userId: string
+  ): Promise<{ cleanedText: string; links: string[] }> {
+    const links: string[] = [];
+    if (!text || !text.includes(DATA_ANALYSIS_FILE_START_PREFIX)) {
+      return { cleanedText: text, links };
+    }
+
+    // Match a start marker (capturing the filename), the body, and the end marker.
+    // [\s\S] so the body can span newlines; non-greedy so adjacent files don't merge.
+    const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(
+      `${escapeRegExp(DATA_ANALYSIS_FILE_START_PREFIX)}([^\\r\\n>]*?)${escapeRegExp(DATA_ANALYSIS_FILE_MARKER_SUFFIX)}\\r?\\n([\\s\\S]*?)\\r?\\n?${escapeRegExp(DATA_ANALYSIS_FILE_END_MARKER)}`,
+      'g'
+    );
+
+    const { uploadFileToS3 } = await import('../utils/s3Utils');
+    let cleanedText = text;
+    const matches = [...text.matchAll(pattern)];
+    let fallbackIndex = 0;
+    for (const match of matches) {
+      const rawName = (match[1] || '').trim();
+      const body = match[2] ?? '';
+      // Sanitize/default the filename so we never produce an unusable S3 key.
+      const safeName = rawName.replace(/[\r\n]/g, '').trim() || `analysis_output_${fallbackIndex++}.csv`;
+      try {
+        const uploadResult = await uploadFileToS3(
+          Buffer.from(body, 'utf-8'),
+          safeName,
+          userId,
+          AgentModeService.contentTypeForFilename(safeName)
+        );
+        if (uploadResult.success && uploadResult.url) {
+          links.push(`**File saved:** [${safeName}](${uploadResult.url})`);
+          // Replace the whole marker block with a concise reference instead of the raw contents.
+          cleanedText = cleanedText.replace(match[0], `[Generated file: ${safeName} — download link below]`);
+        } else {
+          console.error(`AgentMode: performDataAnalysis failed to upload generated file "${safeName}":`, uploadResult.error);
+          cleanedText = cleanedText.replace(match[0], `[Generated file: ${safeName} — upload failed]`);
+        }
+      } catch (error) {
+        console.error(`AgentMode: performDataAnalysis error uploading generated file "${safeName}":`, error);
+        cleanedText = cleanedText.replace(match[0], `[Generated file: ${safeName} — upload failed]`);
+      }
+    }
+
+    return { cleanedText, links };
+  }
+
   public async performDataAnalysis(fileUrls: string[], analysisInstruction: string, userId: string): Promise<any> {
     try {
       const urlsToProcess = Array.isArray(fileUrls) ? fileUrls.filter(url => !!url) : [];
@@ -6304,7 +6526,7 @@ export class AgentModeService {
 
       // Add text part with analysis instruction so the model knows how to proceed with or without files
       parts.push({
-        text: `Please perform the following analysis task. ${fileGuidance}\n\n${analysisInstruction}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present.\n\nIMPORTANT: When generating charts or visualizations, you MUST use matplotlib or seaborn to produce rasterized PNG images. Do NOT use altair, vega, vega-lite, or any library that produces JSON specs instead of rendered images. Always call plt.savefig() or equivalent to emit the image as inline output, then call plt.close() to free memory.`
+        text: `Please perform the following analysis task. ${fileGuidance}\n\n${analysisInstruction}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present.\n\nIMPORTANT: When generating charts or visualizations, you MUST use matplotlib or seaborn to produce rasterized PNG images. Do NOT use altair, vega, vega-lite, or any library that produces JSON specs instead of rendered images. Always call plt.savefig() or equivalent to emit the image as inline output, then call plt.close() to free memory.\n\nSAVING FILES FOR DOWNLOAD: If the task asks you to save, export, or otherwise produce a file the user should download (e.g. a CSV, JSON, or text file), you MUST print its COMPLETE contents to stdout with print(), wrapped EXACTLY in these markers, each on its own line:\n${DATA_ANALYSIS_FILE_START_PREFIX}<filename>${DATA_ANALYSIS_FILE_MARKER_SUFFIX}\n<full file contents>\n${DATA_ANALYSIS_FILE_END_MARKER}\nUse a short, descriptive filename with the correct extension (e.g. seed_audience.csv). The platform captures everything between these markers and saves it to real, downloadable storage, then returns a working download link to the user. Do NOT invent, guess, fabricate, or report any download URL, S3 key, or file path yourself (e.g. a bare filename, an "https://...s3..." URL, or a "sandbox:/..." path) — the sandbox filesystem is discarded after execution and ANY such path will fail to download. Printing the contents between the markers above is the ONLY way to deliver a file to the user.`
       });
 
       // Call Gemini API directly via REST to enable code execution
@@ -6343,9 +6565,23 @@ export class AgentModeService {
       // Extract parts from response
       const responseParts = candidates[0].content.parts || [];
 
+      // Generated-file download links collected from marked stdout/text blocks.
+      const fileLinks: string[] = [];
+
       for (const part of responseParts) {
         if (part.text) {
-          resultParts.push(`**Analysis:** ${part.text}`);
+          const { cleanedText, links } = await this.extractAndUploadAnalysisFiles(part.text, userId);
+          fileLinks.push(...links);
+          resultParts.push(`**Analysis:** ${cleanedText}`);
+        }
+        // Capture files the model printed to stdout via code execution. Gemini returns
+        // executed-code output in a codeExecutionResult / code_execution_result part;
+        // the marker protocol means generated file contents arrive here, not on disk.
+        const execResult = (part as any).codeExecutionResult || (part as any).code_execution_result;
+        if (execResult && typeof execResult.output === 'string') {
+          codeExecuted = true;
+          const { links } = await this.extractAndUploadAnalysisFiles(execResult.output, userId);
+          fileLinks.push(...links);
         }
         // Handle inline data (images/charts from code execution) (handle both camelCase and snake_case)
         if ((part as any).inlineData && (part as any).inlineData.data) {
@@ -6412,6 +6648,11 @@ export class AgentModeService {
         }
       }
 
+      // Surface real, downloadable links for any files the model generated.
+      if (fileLinks.length > 0) {
+        resultParts.push(`**Generated Files:**\n${fileLinks.join('\n')}`);
+      }
+
       if (resultParts.length === 0) {
         return {
           success: false,
@@ -6427,7 +6668,8 @@ export class AgentModeService {
         message: 'Data analysis completed successfully',
         analysis: analysisResult,
         codeExecuted: codeExecuted,
-        formattedContent: analysisResult
+        formattedContent: analysisResult,
+        fileUrls: fileLinks.length > 0 ? fileLinks : undefined
       };
 
     } catch (error) {
@@ -7960,7 +8202,7 @@ export class AgentModeService {
   public async getLeadLists(userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const { listLandingPages } = await import('./v0Service');
+      const { listLandingPages, getLandingPageLiveUrl } = await import('./v0Service');
 
       const [lists, landingPages] = await Promise.all([
         crmDb.getLeadListsForUser(userId),
@@ -7974,7 +8216,7 @@ export class AgentModeService {
           pageByListId.set(page.leadListId, {
             pageId: page.id,
             name: page.name || '',
-            url: page.deployedUrl || page.customDomainUrl || ''
+            url: getLandingPageLiveUrl(page)
           });
         }
       }
@@ -16990,8 +17232,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     try {
       console.log('AgentMode: Reading file content from URL:', fileUrl);
 
+      if (typeof fileUrl !== 'string' || fileUrl.trim().length === 0) {
+        return {
+          success: false,
+          message: 'file_url is required and must be a non-empty HTTP or HTTPS URL.',
+          error: 'Missing file_url'
+        };
+      }
+
+      const normalizedFileUrl = fileUrl.trim();
+
       // Validate URL format
-      if (!fileUrl.startsWith('http://') && !fileUrl.startsWith('https://')) {
+      if (!normalizedFileUrl.startsWith('http://') && !normalizedFileUrl.startsWith('https://')) {
         return {
           success: false,
           message: 'Invalid URL format. Must be HTTP or HTTPS.',
@@ -17000,7 +17252,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       // Determine file type from URL
-      const urlPath = new URL(fileUrl).pathname;
+      const urlPath = new URL(normalizedFileUrl).pathname;
       const extension = urlPath.split('.').pop()?.toLowerCase() || '';
 
       if (IMAGE_EXTENSIONS.has(extension)) {
@@ -17020,7 +17272,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       // Fetch the file content
-      const response = await axios.get(fileUrl, {
+      const response = await axios.get(normalizedFileUrl, {
         timeout: 30000,
         responseType: 'arraybuffer',
         headers: {
@@ -17137,7 +17389,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         file_type: fileType,
         file_size: buffer.length,
         content_length: extractedContent.length,
-        file_url: fileUrl,
+        file_url: normalizedFileUrl,
         message: `Successfully read ${fileType} file content (${extractedContent.length} characters)`
       };
 
@@ -17162,7 +17414,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: errorMessage,
         error: error.message,
-        file_url: fileUrl
+        file_url: typeof fileUrl === 'string' ? fileUrl : undefined
       };
     }
   }
@@ -23422,8 +23674,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, entities: result.data?.elements || [] };
         }
         if (action === 'ESTIMATE_REACH') {
-          if (!params.targeting_criteria) throw new Error('ESTIMATE_REACH requires targeting_criteria');
-          const result = await linkedInAdsService.getAudienceCount(accessToken, params.targeting_criteria);
+          // Accept the same targeting shapes as CAMPAIGN CREATE: the flat
+          // targeting_include/targeting_exclude arrays (preferred) or a raw targeting_criteria object.
+          const targetingCriteria = linkedInAdsService.resolveTargetingCriteria(params);
+          if (!targetingCriteria) {
+            throw new Error('ESTIMATE_REACH requires targeting: pass targeting_include (array of { facet_urn, values }) or targeting_criteria.');
+          }
+          const result = await linkedInAdsService.getAudienceCount(accessToken, targetingCriteria);
           if (!result.success) throw new Error(result.error || 'Failed to estimate audience reach');
           return { success: true, audienceCount: result.data };
         }

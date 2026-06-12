@@ -138,6 +138,10 @@ import {
   getDeploymentStatus,
   isOrphanedFailedPage,
   cleanupOrphanedFailedPages,
+  getLandingPageLiveUrl,
+  recordLandingPagePublish,
+  markLandingPagePublishReverted,
+  triggerVercelDeployment,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig } from "../services/v0Service";
@@ -905,6 +909,41 @@ describe("v0Service - listLandingPages", () => {
     const result = await listLandingPages("user-1");
     expect(result).toHaveLength(2);
     expect(result[0].name).toBe("Page 1");
+  });
+});
+
+// =============================================================================
+// getLandingPageLiveUrl — prefer customDomainUrl over deployedUrl
+// =============================================================================
+describe("v0Service - getLandingPageLiveUrl", () => {
+  it("prefers customDomainUrl when both are set", () => {
+    expect(
+      getLandingPageLiveUrl({
+        deployedUrl: "https://everyio-day-zero-founders.agentwebforms.com/every-io-day-zero-pre-seed-fou",
+        customDomainUrl: "https://everyio.agentwebforms.com/every-io-day-zero-pre-seed-fou",
+      })
+    ).toBe("https://everyio.agentwebforms.com/every-io-day-zero-pre-seed-fou");
+  });
+
+  it("falls back to deployedUrl when customDomainUrl is missing", () => {
+    expect(
+      getLandingPageLiveUrl({
+        deployedUrl: "https://my-project.vercel.app",
+      })
+    ).toBe("https://my-project.vercel.app");
+  });
+
+  it("falls back to deployedUrl when customDomainUrl is an empty string", () => {
+    expect(
+      getLandingPageLiveUrl({
+        deployedUrl: "https://my-project.vercel.app",
+        customDomainUrl: "",
+      })
+    ).toBe("https://my-project.vercel.app");
+  });
+
+  it("returns empty string when neither URL is set", () => {
+    expect(getLandingPageLiveUrl({})).toBe("");
   });
 });
 
@@ -1830,5 +1869,89 @@ describe("v0Service - buildPageSlug", () => {
     const result = buildPageSlug("a".repeat(40));
     expect(result.length).toBeLessThanOrEqual(30);
     expect(result).not.toMatch(/^-|-$/);
+  });
+});
+
+// =============================================================================
+// recordLandingPagePublish / markLandingPagePublishReverted
+// =============================================================================
+describe("v0Service - publish history (record + mark reverted)", () => {
+  const PUBLISH_RECORD = {
+    preMergeSha: "pre-sha",
+    mergeSha: "merge-sha",
+    branch: "draft/session-12345678",
+    publishedAt: "2026-06-01T00:00:00.000Z",
+  };
+
+  it("SUCCESS: recordLandingPagePublish writes lastPublish via update", async () => {
+    await expect(
+      recordLandingPagePublish("page-1", PUBLISH_RECORD)
+    ).resolves.toBeUndefined();
+
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+    const params = mockUpdate.mock.calls[0][0];
+    expect(params.Key).toEqual({ id: "page-1" });
+    expect(params.UpdateExpression).toContain("lastPublish");
+    expect(params.ExpressionAttributeValues[":lp"]).toEqual(PUBLISH_RECORD);
+  });
+
+  it("SUCCESS: markLandingPagePublishReverted sets nested revertedAt via update", async () => {
+    await expect(
+      markLandingPagePublishReverted("page-1", "2026-06-02T00:00:00.000Z")
+    ).resolves.toBeUndefined();
+
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+    const params = mockUpdate.mock.calls[0][0];
+    expect(params.Key).toEqual({ id: "page-1" });
+    expect(params.UpdateExpression).toContain("lastPublish.revertedAt");
+    expect(params.ExpressionAttributeValues[":ra"]).toBe("2026-06-02T00:00:00.000Z");
+  });
+
+  it("FAIL: propagates DynamoDB update errors", async () => {
+    mockUpdate.mockReturnValueOnce({
+      promise: () => Promise.reject(new Error("dynamo down")),
+    });
+
+    await expect(
+      recordLandingPagePublish("page-1", PUBLISH_RECORD)
+    ).rejects.toThrow("dynamo down");
+  });
+});
+
+// =============================================================================
+// triggerVercelDeployment — production target for main
+// =============================================================================
+describe("v0Service - triggerVercelDeployment", () => {
+  beforeEach(() => {
+    // repo info lookup (for repoId)
+    mockAxiosGet.mockResolvedValue({ data: { id: 12345 } });
+    mockAxiosPost.mockResolvedValue({ data: { id: "dpl_1" } });
+  });
+
+  it("sets target=production when deploying main (so the production alias updates)", async () => {
+    await triggerVercelDeployment("prj_1", "Org/repo", "main");
+
+    expect(mockAxiosPost).toHaveBeenCalledWith(
+      "https://api.vercel.com/v13/deployments",
+      expect.objectContaining({
+        target: "production",
+        gitSource: expect.objectContaining({ ref: "main", repo: "Org/repo", repoId: 12345 }),
+      }),
+      expect.any(Object)
+    );
+  });
+
+  it("defaults ref to main and targets production", async () => {
+    await triggerVercelDeployment("prj_1", "Org/repo");
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.target).toBe("production");
+    expect(body.gitSource.ref).toBe("main");
+  });
+
+  it("does NOT set production target for a non-main (preview) ref", async () => {
+    await triggerVercelDeployment("prj_1", "Org/repo", "draft/session-12345678");
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.target).toBeUndefined();
+    expect(body.gitSource.ref).toBe("draft/session-12345678");
   });
 });

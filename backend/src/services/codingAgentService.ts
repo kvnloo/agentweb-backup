@@ -12,7 +12,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { mcpFetch } from '../mcp/server/httpClient';
 import { agentModeService } from './agentModeService';
 import { getSecret } from '../utils/secretsManager';
-import { getLandingPageById, getLandingPagesByOwner, GeneratedLandingPage } from './v0Service';
+import { getLandingPageById, getLandingPagesByOwner, canUserEditLandingPage, GeneratedLandingPage } from './v0Service';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -96,6 +96,11 @@ const DEFAULT_CODING_AGENT_MODEL = 'anthropic.claude-sonnet-4-6'; // Fallback if
 const AGENT_TIMEOUT_MS = 20 * 60 * 1000; // 20 minutes max for the entire agent run
 const MAX_TOOL_RESULT_CHARS = 30000; // Truncate tool results to prevent context bloat
 const MAX_RETRIES = 2;
+
+// Shared message for an authorization denial. Used by the upfront preflight and
+// the mid-run 403 catch so the user sees one consistent, actionable instruction.
+const NOT_AUTHORIZED_MESSAGE =
+  'Not authorized to edit this landing page. The org owner needs to add you as an editor under Settings → Organization → Org-wide Sharing → Landing Pages.';
 
 function is403Error(e: unknown): boolean {
   return e instanceof Error && /API error \(403\)/i.test(e.message);
@@ -1515,7 +1520,7 @@ async function runCodingAgentInternal(
   context: CodingAgentContext,
   maxIterations: number,
   model: string
-): Promise<{ success: boolean; message: string; iterations: number; previewUrl?: string; branch?: string }> {
+): Promise<{ success: boolean; message: string; iterations: number; previewUrl?: string; branch?: string; notAuthorized?: boolean }> {
 
   const client = await getClientForModel(model);
   const tools = getToolDefinitions();
@@ -1679,8 +1684,9 @@ async function runCodingAgentInternal(
     if (is403Error(error)) {
       return {
         success: false,
-        message: `Not authorized to edit this landing page. The org owner needs to add you as an editor under Settings → Organization → Org-wide Sharing → Landing Pages.`,
-        iterations: iteration
+        message: NOT_AUTHORIZED_MESSAGE,
+        iterations: iteration,
+        notAuthorized: true,
       };
     }
     return {
@@ -1699,7 +1705,24 @@ export async function runCodingAgent(
   taskDescription: string,
   context: CodingAgentContext,
   maxIterations: number = DEFAULT_MAX_ITERATIONS
-): Promise<{ success: boolean; message: string; iterations: number; previewUrl?: string; branch?: string }> {
+): Promise<{ success: boolean; message: string; iterations: number; previewUrl?: string; branch?: string; notAuthorized?: boolean }> {
+
+  // Preflight authorization. The page may be org-visible (so the agent could
+  // see and select it) yet not editable by this caller — a plain member can
+  // view a shared page but only the owner / listed editors can edit it. Checking
+  // up front means a denied caller gets one clear, actionable message instead of
+  // the LLM loop spinning up, hitting a 403 on the first write, and the parent
+  // agent retrying coding_agent several times (the failure mode this fixes).
+  // Best-effort: if the page record is missing we skip the check and let the
+  // edit path enforce authorization as before.
+  try {
+    const page = await getLandingPageById(context.pageId);
+    if (page && !(await canUserEditLandingPage(page, context.userId))) {
+      return { success: false, message: NOT_AUTHORIZED_MESSAGE, iterations: 0, notAuthorized: true };
+    }
+  } catch (e) {
+    console.warn('[CODING AGENT] Preflight authorization check failed; proceeding to edit path:', e);
+  }
 
   // Fetch the coding agent model from settings (defaults to Sonnet 4.6)
   let model: string;
@@ -1725,8 +1748,9 @@ export async function runCodingAgent(
       if (is403Error(error)) {
         return {
           success: false,
-          message: `Not authorized to edit this landing page. The org owner needs to add you as an editor under Settings → Organization → Org-wide Sharing → Landing Pages.`,
-          iterations: 0
+          message: NOT_AUTHORIZED_MESSAGE,
+          iterations: 0,
+          notAuthorized: true,
         };
       }
       throw error;

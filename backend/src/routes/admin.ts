@@ -22,7 +22,7 @@ import { encryptPassword } from "../utils/crypto";
 import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
 import { getRevenueMetrics } from "../services/revenueService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
-import { resyncAllSubscriptionAmounts, syncSubscriptionFromStripe } from "../services/stripeService";
+import { resyncAllSubscriptionAmounts, reconcileStripeUserById } from "../services/stripeService";
 import { syncNewUserToLeadList, syncUserUpdateToLeadList } from "../services/crmAutoSyncService";
 import { DEFAULT_PAGES, getTierConfig } from "../services/subscriptionService";
 import { getActivationFields } from "../cron/activationAnalysisCron";
@@ -1080,6 +1080,29 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
   } catch (error) {
     console.error("Error updating user slack channels:", error);
     res.status(500).json({ message: "Error updating slack channels" });
+  }
+});
+
+// Toggle Slack suggested-reply (slack-triggered) monitoring for a user.
+// Body: { enabled: boolean } — true = suggestions on (default), false = suppress.
+// Persisted as the inverse `slackSuggestedRepliesDisabled` flag so absent = enabled.
+router.put("/users/:userId/slack-suggested-replies", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { enabled } = req.body;
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const updatedUser = await userDb.updateUser(userId, {
+      slackSuggestedRepliesDisabled: !enabled,
+    });
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error updating slack suggested replies setting:", error);
+    res.status(500).json({ message: "Error updating slack suggested replies setting" });
   }
 });
 
@@ -5152,7 +5175,11 @@ router.post("/users/:userId/sync-stripe", async (req, res) => {
     if (!user.stripe_customer_id) {
       return res.status(400).json({ message: "User has no Stripe Customer ID" });
     }
-    const updates = await syncSubscriptionFromStripe(userId, user.stripe_customer_id);
+    // Authoritative reconcile (Stripe wins) — overwrites a stale local
+    // subscription_status (e.g. an account stuck on "past_due" whose recovery
+    // webhook never landed). The additive-only syncSubscriptionFromStripe only
+    // fills NULL fields and cannot unstick such an account.
+    const updates = await reconcileStripeUserById(userId);
     const updatedUser = await userDb.getUserById(userId);
     res.json({ updates, user: updatedUser });
   } catch (error: any) {

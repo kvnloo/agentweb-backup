@@ -531,41 +531,46 @@ createTestAccount().then(async () => {
       // tested; re-enable here if we want the daily summary back.
 
       // Onboarding Loop — daily at 15:00 UTC (7am PT), gated by ONBOARDING_LOOP_ENABLED=true
-      try {
-        const LOOP_INTERVAL_MS = 24 * 60 * 60 * 1000;
-        const { runOnboardingLoop } = await import('./cron/onboardingLoop');
+      if (process.env.ONBOARDING_LOOP_ENABLED === 'true') {
+        try {
+          const LOOP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+          const { runOnboardingLoop } = await import('./cron/onboardingLoop');
 
-        const nowForLoop = new Date();
-        const nextLoopRun = new Date(nowForLoop);
-        nextLoopRun.setUTCHours(15, 0, 0, 0);
-        if (nextLoopRun <= nowForLoop) {
-          nextLoopRun.setUTCDate(nextLoopRun.getUTCDate() + 1);
-        }
-        const msUntilLoop = nextLoopRun.getTime() - nowForLoop.getTime();
+          const nowForLoop = new Date();
+          const nextLoopRun = new Date(nowForLoop);
+          nextLoopRun.setUTCHours(15, 0, 0, 0);
+          if (nextLoopRun <= nowForLoop) {
+            nextLoopRun.setUTCDate(nextLoopRun.getUTCDate() + 1);
+          }
+          const msUntilLoop = nextLoopRun.getTime() - nowForLoop.getTime();
 
-        console.log(`[OnboardingLoop] Initialized — first run at 15:00 UTC (in ${Math.round(msUntilLoop / 60000)} min)`);
-        setTimeout(() => {
-          runOnboardingLoop().catch(e => console.error('[OnboardingLoop] Error:', e));
-          setInterval(() => {
+          console.log(`[OnboardingLoop] Initialized — first run at 15:00 UTC (in ${Math.round(msUntilLoop / 60000)} min)`);
+          setTimeout(() => {
             runOnboardingLoop().catch(e => console.error('[OnboardingLoop] Error:', e));
-          }, LOOP_INTERVAL_MS);
-        }, msUntilLoop);
-      } catch (error) {
-        console.error('[OnboardingLoop] Failed to initialize:', error);
-      }
+            setInterval(() => {
+              runOnboardingLoop().catch(e => console.error('[OnboardingLoop] Error:', e));
+            }, LOOP_INTERVAL_MS);
+          }, msUntilLoop);
+        } catch (error) {
+          console.error('[OnboardingLoop] Failed to initialize:', error);
+        }
 
-      // Onboarding Loop Watchdog — hourly, gated by ONBOARDING_LOOP_ENABLED=true
-      try {
-        const WATCHDOG_INTERVAL_MS = 60 * 60 * 1000;
-        const { runOnboardingLoopWatchdog } = await import('./cron/onboardingLoopWatchdog');
+        // Onboarding Loop Watchdog — hourly, gated by ONBOARDING_LOOP_ENABLED=true
+        try {
+          const WATCHDOG_INTERVAL_MS = 60 * 60 * 1000;
+          const { runOnboardingLoopWatchdog } = await import('./cron/onboardingLoopWatchdog');
 
-        console.log('[OnboardingWatchdog] Initialized — running hourly');
-        runOnboardingLoopWatchdog().catch(e => console.error('[OnboardingWatchdog] Error on first run:', e));
-        setInterval(() => {
-          runOnboardingLoopWatchdog().catch(e => console.error('[OnboardingWatchdog] Error:', e));
-        }, WATCHDOG_INTERVAL_MS);
-      } catch (error) {
-        console.error('[OnboardingWatchdog] Failed to initialize:', error);
+          console.log('[OnboardingWatchdog] Initialized — running hourly');
+          runOnboardingLoopWatchdog().catch(e => console.error('[OnboardingWatchdog] Error on first run:', e));
+          setInterval(() => {
+            runOnboardingLoopWatchdog().catch(e => console.error('[OnboardingWatchdog] Error:', e));
+          }, WATCHDOG_INTERVAL_MS);
+        } catch (error) {
+          console.error('[OnboardingWatchdog] Failed to initialize:', error);
+        }
+      } else {
+        console.log('[OnboardingLoop] Disabled (set ONBOARDING_LOOP_ENABLED=true to enable)');
+        console.log('[OnboardingWatchdog] Disabled (set ONBOARDING_LOOP_ENABLED=true to enable)');
       }
 
       // AI Eval Funnel closed-loop — daily at 16:00 UTC (8am PT), one hour

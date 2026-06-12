@@ -221,6 +221,35 @@ describe('readFileContent', () => {
   });
 
   describe('error handling', () => {
+    it('should reject missing file_url without crashing', async () => {
+      const result = await (agentModeService as any).readFileContent(undefined);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('file_url is required');
+      expect(result.error).toBe('Missing file_url');
+      expect((axios.get as jest.Mock)).not.toHaveBeenCalled();
+    });
+
+    it('should trim file_url before validation and fetch', async () => {
+      const testContent = 'trimmed url content';
+      const mockResponse = {
+        data: Buffer.from(testContent),
+        headers: { 'content-type': 'text/plain' }
+      };
+      const axios = require('axios');
+      axios.get.mockResolvedValue(mockResponse);
+
+      const result = await (agentModeService as any).readFileContent('  https://example.com/file.txt  ');
+
+      expect(result.success).toBe(true);
+      expect(result.content).toBe(testContent);
+      expect(result.file_url).toBe('https://example.com/file.txt');
+      expect(axios.get).toHaveBeenCalledWith(
+        'https://example.com/file.txt',
+        expect.any(Object)
+      );
+    });
+
     it('should handle network errors gracefully', async () => {
       const axios = require('axios');
       axios.get.mockRejectedValue(new Error('Network error'));

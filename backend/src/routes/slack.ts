@@ -24,228 +24,14 @@ import { emailService } from "../services/emailService";
 import { createRevisionExecutionFromSlack } from "../controllers/tasks";
 import { isSessionLimitError } from "../utils/agentModeErrors";
 import { sendAgentModeOncallAlert } from "../utils/agentModeAlerts";
+import { getEmmaBotUserId, handleLoopApprovalReaction } from "../services/loopSlackApprovalDispatcher";
 
 const router = express.Router();
-
-// Cached Emma bot user ID (fetched lazily via auth.test on first use)
-let emmaBotUserId: string | null = null;
-
-async function getEmmaBotUserId(): Promise<string | null> {
-  if (emmaBotUserId) return emmaBotUserId;
-  try {
-    const { WebClient } = await import('@slack/web-api');
-    const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-    const authResult = await slackClient.auth.test();
-    emmaBotUserId = (authResult.user_id as string) ?? null;
-    console.log('🤖 Emma bot user ID cached:', emmaBotUserId);
-  } catch (err) {
-    console.warn('⚠️ Could not fetch Emma bot user ID:', err);
-  }
-  return emmaBotUserId;
-}
 
 function userMatchesChannel(u: any, channel: string): boolean {
   // Skip tombstoned (deleted) users
   if (u.userId?.startsWith('deleted_')) return false;
   return (u.slackChannels && u.slackChannels.includes(channel)) || u.slackChannel === channel;
-}
-
-// ---------------------------------------------------------------------------
-// ai-eval-funnel ✅ reaction → cloud-dev dispatch
-// ---------------------------------------------------------------------------
-//
-// Spec: Notion task 36d09247c95181a9bf6fe75a7cb7c6af.
-// When Harsha reacts ✅ on the daily AI-Eval-Funnel digest DM (posted by
-// Emma the bot to his DM channel), parse every Notion task URL out of the
-// message, fetch each task's title + content, and call launchEnvironment
-// to spawn a cloud-dev EC2 per task.
-
-/** Harsha's Slack user ID. The only user the reaction handler dispatches for. */
-const AI_EVAL_REACTION_USER_ID = 'U08TM4QFQ1L';
-
-/** Substring that identifies the daily-digest DM (see cron.ts L115). */
-const AI_EVAL_DM_MARKER = 'AI Eval Funnel — daily run';
-
-/** Sprint Tasks data source ID, matches notionDigestTool.ts. */
-const AI_EVAL_SPRINT_TASKS_DATA_SOURCE = '2bf09247-c951-812a-bd0a-000bd4c05bbf';
-
-/**
- * Extract Notion page IDs from a Slack DM body. Notion URLs render in
- * Slack as `<https://www.notion.so/<slug>-<32-hex-id>|<label>>` (the
- * trailing 32-hex segment before `|` is the page id, dashes stripped).
- */
-function extractNotionPageIds(text: string): string[] {
-  const ids: string[] = [];
-  const seen = new Set<string>();
-  const re = /notion\.so\/[^|>\s]*-([a-f0-9]{32})/gi;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(text)) !== null) {
-    const id = match[1].toLowerCase();
-    if (!seen.has(id)) {
-      seen.add(id);
-      ids.push(id);
-    }
-  }
-  return ids;
-}
-
-/**
- * Look up the reacted-to message via conversations.history (limit=1,
- * inclusive=true on the exact ts). Returns null on any Slack error.
- *
- * If the error is `missing_scope` (`reactions:read` not granted), logs a
- * loud actionable error pointing at the Slack app admin URL and returns
- * null — caller acknowledges the event with 200 OK and does nothing.
- */
-async function fetchReactedMessage(
-  channel: string,
-  ts: string,
-): Promise<{ text: string; user?: string; bot_id?: string } | null> {
-  const { WebClient } = await import('@slack/web-api');
-  const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-  try {
-    const resp = await slackClient.conversations.history({
-      channel,
-      latest: ts,
-      oldest: ts,
-      limit: 1,
-      inclusive: true,
-    });
-    const msg = resp.messages?.[0] as { text?: string; user?: string; bot_id?: string } | undefined;
-    if (!msg) return null;
-    return { text: msg.text ?? '', user: msg.user, bot_id: msg.bot_id };
-  } catch (err: unknown) {
-    const errorObj = err as { data?: { error?: string; needed?: string }; message?: string };
-    const slackCode = errorObj?.data?.error;
-    if (slackCode === 'missing_scope' || /missing_scope/.test(errorObj?.message ?? '')) {
-      console.error(
-        `❌ Slack reaction handler: missing_scope from conversations.history. ` +
-          `reactions:read scope required — add via Slack app manifest at ` +
-          `api.slack.com/apps/<appId>/oauth?scopes. Needed: ${errorObj?.data?.needed ?? 'reactions:read'}`,
-      );
-    } else {
-      console.error('❌ Slack reaction handler: conversations.history failed:', err);
-    }
-    return null;
-  }
-}
-
-interface ReactionItem {
-  type?: string;
-  channel?: string;
-  ts?: string;
-}
-
-interface ReactionAddedEvent {
-  type: 'reaction_added';
-  reaction?: string;
-  user?: string;
-  item?: ReactionItem;
-}
-
-async function handleAiEvalReaction(event: ReactionAddedEvent): Promise<void> {
-  // --- Guard chain (cheap-to-expensive ordering) ---
-  if (event.reaction !== 'white_check_mark') return;
-  if (event.user !== AI_EVAL_REACTION_USER_ID) return;
-
-  const item = event.item;
-  if (!item || item.type !== 'message' || !item.channel || !item.ts) return;
-
-  // DM channels start with D. Ignore reactions in public/private channels.
-  if (!item.channel.startsWith('D')) return;
-
-  const { isDispatched, markDispatched } = await import('../services/loopDispatchTracker');
-  if (isDispatched(item.ts)) {
-    console.log(`🔁 ai-eval reaction: ${item.ts} already dispatched — skipping`);
-    return;
-  }
-
-  // Fetch the reacted message body.
-  const message = await fetchReactedMessage(item.channel, item.ts);
-  if (!message) return; // error already logged
-
-  // Must be from the Emma bot.
-  if (!message.bot_id) {
-    const botUserId = await getEmmaBotUserId();
-    if (!botUserId || message.user !== botUserId) return;
-  }
-
-  // Must contain the daily-digest marker.
-  if (!message.text.includes(AI_EVAL_DM_MARKER)) return;
-
-  // Extract page IDs.
-  const pageIds = extractNotionPageIds(message.text);
-  if (pageIds.length === 0) {
-    console.log('⚠️ ai-eval reaction: no Notion page IDs found in DM body — nothing to dispatch');
-    return;
-  }
-
-  console.log(`🚀 ai-eval reaction: dispatching ${pageIds.length} cloud-dev run(s)`);
-
-  // Post the "Dispatching..." thread reply BEFORE launching EC2s so Harsha sees
-  // immediate feedback. Mark dispatched right after posting so a duplicate
-  // reaction during the (slow) launch sequence is a no-op.
-  const { WebClient } = await import('@slack/web-api');
-  const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-
-  try {
-    await slackClient.chat.postMessage({
-      channel: item.channel,
-      thread_ts: item.ts,
-      text: `🚀 Dispatching ${pageIds.length} cloud-dev run${pageIds.length === 1 ? '' : 's'}...`,
-    });
-  } catch (err) {
-    console.error('❌ ai-eval reaction: failed to post initial thread reply:', err);
-    // Don't bail — still attempt the launches. The summary message at the
-    // end carries the actionable info.
-  }
-
-  markDispatched(item.ts, pageIds);
-
-  // Launch one cloud-dev per page id, capturing per-task outcomes for the
-  // summary reply.
-  const { launchEnvironment, getNotionPage, getNotionPageContent } = await import(
-    '../services/devEnvService'
-  );
-
-  const results: Array<{ pageId: string; title: string; ok: boolean; error?: string }> = [];
-
-  for (const pageId of pageIds) {
-    let title = pageId;
-    try {
-      const page = await getNotionPage(pageId);
-      title = page.title || pageId;
-      const { text } = await getNotionPageContent(pageId);
-      await launchEnvironment(pageId, title, text, AI_EVAL_SPRINT_TASKS_DATA_SOURCE);
-      results.push({ pageId, title, ok: true });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`❌ ai-eval reaction: launchEnvironment failed for ${pageId}:`, err);
-      results.push({ pageId, title, ok: false, error: message });
-    }
-  }
-
-  // Summary reply.
-  const successCount = results.filter((r) => r.ok).length;
-  const lines: string[] = [];
-  lines.push(`✅ Launched ${successCount}/${results.length} cloud-dev runs:`);
-  for (const r of results) {
-    if (r.ok) {
-      lines.push(`  • ${r.title} — launching (cloud-dev EC2 spawning)`);
-    } else {
-      lines.push(`  • ${r.title} — ⚠️ Failed: ${r.error ?? 'unknown error'}`);
-    }
-  }
-
-  try {
-    await slackClient.chat.postMessage({
-      channel: item.channel,
-      thread_ts: item.ts,
-      text: lines.join('\n'),
-    });
-  } catch (err) {
-    console.error('❌ ai-eval reaction: failed to post summary thread reply:', err);
-  }
 }
 
 /**
@@ -365,6 +151,13 @@ async function handleSlackTriggeredSession(params: {
 
     if (!user) {
       console.log(`📨 [slack-triggered] channel ${channel} not connected to any user, ignoring`);
+      return;
+    }
+
+    // Respect the per-user opt-out: when suggested replies are disabled, skip the whole flow
+    // (no triage, no session, no email) so we don't generate suggestions for this customer.
+    if (user.slackSuggestedRepliesDisabled) {
+      console.log(`📨 [slack-triggered] suggested replies disabled for user ${user.userId}, skipping`);
       return;
     }
 
@@ -782,11 +575,11 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
       // Import shared services for event handling
       const { settingsService } = await import('../services/settingsService');
 
-      // Handle the ai-eval-funnel ✅ reaction → cloud-dev dispatch flow.
-      // See ~/Notion task 36d09247c95181a9bf6fe75a7cb7c6af for the spec.
+      // Shared loop approval contract: any Emma DM digest with the standard
+      // "React ✅ to dispatch all to cloud-dev" footer uses the same path.
       if (event.type === 'reaction_added') {
-        await handleAiEvalReaction(event).catch((err) => {
-          console.error('❌ Error in ai-eval reaction handler:', err);
+        await handleLoopApprovalReaction(event).catch((err) => {
+          console.error('❌ Error in loop approval reaction handler:', err);
         });
       }
 
@@ -1047,6 +840,13 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
                   return;
                 }
 
+                // Respect the per-user opt-out before generating a response or sending email.
+                const user = await userDb.getUserById(userId);
+                if (user?.slackSuggestedRepliesDisabled) {
+                  console.log(`📨 [slack-triggered] suggested replies disabled for user ${userId}, skipping thread reply`);
+                  return;
+                }
+
                 const displayName = await getSlackUserDisplayName(slackUserId);
                 const formattedMessage = `${displayName}: ${text}`.trim();
 
@@ -1068,7 +868,6 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
                   channelName = (info.channel as any)?.name || channel;
                 } catch { /* non-blocking */ }
 
-                const user = await userDb.getUserById(userId);
                 await emailService.sendSlackTriggeredSessionEmail('founders@agentweb.pro', {
                   sessionId,
                   userEmail: user?.email || userId,

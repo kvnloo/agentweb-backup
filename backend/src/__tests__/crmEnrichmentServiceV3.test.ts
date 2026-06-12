@@ -268,6 +268,48 @@ describe('runEnrichment — group routing', () => {
     expect(call.requestedFields).toEqual(['company_name']);
   });
 
+  it('passes deselected standard identity fields to resolveIdentity as excludePersistFields', async () => {
+    // Repro of "LinkedIn only, but Company is enriched": user keeps linkedin
+    // included and deselects company. The orchestrator must tell the resolver
+    // not to persist company (resolved in-memory only as a matching signal).
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead()]),
+    });
+    const config = makeConfig({
+      fields: [
+        { name: 'linkedin', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty', aliasFor: 'linkedin_url' },
+        { name: 'company', type: 'string', instruction: '', include: false, overwritePolicy: 'fill_if_empty', aliasFor: 'company_name' },
+        { name: 'firstName', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty', aliasFor: 'first_name' },
+      ],
+    });
+
+    await runEnrichment(makeInput({ config }), deps);
+
+    expect(deps.resolveIdentity).toHaveBeenCalledTimes(1);
+    const call = (deps.resolveIdentity as jest.Mock).mock.calls[0][0];
+    expect(call.excludePersistFields).toBeInstanceOf(Set);
+    expect(Array.from(call.excludePersistFields)).toEqual(['company']);
+  });
+
+  it('excludePersistFields ignores deselected custom (non-identity) fields', async () => {
+    // A deselected custom field must NOT enter excludePersistFields — that set
+    // only governs resolver-written standard identity columns.
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead()]),
+    });
+    const config = makeConfig({
+      fields: [
+        { name: 'company_name', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+        { name: 'funding_stage', type: 'string', instruction: '', include: false, overwritePolicy: 'fill_if_empty' },
+      ],
+    });
+
+    await runEnrichment(makeInput({ config }), deps);
+
+    const call = (deps.resolveIdentity as jest.Mock).mock.calls[0][0];
+    expect(Array.from(call.excludePersistFields)).toEqual([]);
+  });
+
   it('routes ungrouped (custom-named) fields through extractUngroupedFieldsViaWeb', async () => {
     const deps = makeDeps({
       loadLeads: jest.fn().mockResolvedValue([makeLead()]),

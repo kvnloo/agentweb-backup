@@ -11,9 +11,11 @@ jest.mock('../mcp/server/httpClient', () => ({
 // unrestricted, matching the pre-scope behavior the bulk of these tests assert.
 const mockGetLandingPageById = jest.fn();
 const mockGetLandingPagesByOwner = jest.fn();
+const mockCanUserEditLandingPage = jest.fn();
 jest.mock('../services/v0Service', () => ({
   getLandingPageById: (...a: any[]) => mockGetLandingPageById(...a),
   getLandingPagesByOwner: (...a: any[]) => mockGetLandingPagesByOwner(...a),
+  canUserEditLandingPage: (...a: any[]) => mockCanUserEditLandingPage(...a),
 }));
 
 import { mcpFetch } from '../mcp/server/httpClient';
@@ -186,6 +188,60 @@ describe('runCodingAgent', () => {
     expect(result.message).toMatch(/not authorized|403|permission/i);
     // Should NOT have called the LLM at all
     expect(mockCreate).not.toHaveBeenCalled();
+  });
+
+  test('preflight: denies up front when caller cannot edit the page (no LLM, no edit attempt)', async () => {
+    // The page exists and is visible to the caller, but they lack edit rights
+    // (plain org member viewing a shared page). The preflight must short-circuit.
+    mockGetLandingPageById.mockResolvedValue({ id: 'test-page-123', userId: 'owner-999' });
+    mockCanUserEditLandingPage.mockResolvedValue(false);
+
+    const result = await runCodingAgent('Change the heading', mockContext);
+
+    expect(result.success).toBe(false);
+    expect(result.notAuthorized).toBe(true);
+    expect(result.message).toMatch(/not authorized.*editor.*Org-wide Sharing/is);
+    expect(result.iterations).toBe(0);
+    // No LLM call and no GitHub edit call — fully short-circuited.
+    expect(mockCreate).not.toHaveBeenCalled();
+    expect(mockedMcpFetch).not.toHaveBeenCalled();
+    expect(mockCanUserEditLandingPage).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: 'owner-999' }),
+      'user-456',
+    );
+  });
+
+  test('preflight: allows the run when caller can edit the page', async () => {
+    mockGetLandingPageById.mockResolvedValue({ id: 'test-page-123', userId: 'user-456' });
+    mockCanUserEditLandingPage.mockResolvedValue(true);
+    // Agent immediately reports success — we only care that the preflight let it run.
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Done!', status: 'success' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    const result = await runCodingAgent('Change the heading', mockContext);
+
+    expect(result.success).toBe(true);
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+  });
+
+  test('preflight: proceeds when the page record is missing (auth enforced downstream)', async () => {
+    // getLandingPageById returns undefined → preflight skipped → behaves as before.
+    mockGetLandingPageById.mockResolvedValue(undefined);
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Done!', status: 'success' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    const result = await runCodingAgent('Change the heading', mockContext);
+
+    expect(result.success).toBe(true);
+    expect(mockCanUserEditLandingPage).not.toHaveBeenCalled();
   });
 
   test('returns structured failure info when max iterations reached', async () => {

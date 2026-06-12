@@ -1495,6 +1495,11 @@ function hasActiveProgress(sessionId: string): boolean {
   return latestProgress.status !== 'complete' && latestProgress.status !== 'suggestions';
 }
 
+function markProgressComplete(sessionId: string): void {
+  emitProgress(sessionId, { iteration: 0, status: 'complete' });
+  progressStore.delete(sessionId);
+}
+
 // Helper to update a GTM work item's status in the GTM plan
 async function updateGtmWorkItemStatus(
   gtmWorkItem: { planId: string; phaseId: string; workItemId: string },
@@ -2171,8 +2176,7 @@ export const agentModeController = {
           console.log(`AgentMode: Client disconnected for session ${sessionId} — signalling cancellation`);
           requestCancel(sessionId);
           generateMarketingResponseWorkerService.cancelSession(sessionId);
-          emitProgress(sessionId, { iteration: 0, status: 'complete' });
-          progressStore.delete(sessionId);
+          markProgressComplete(sessionId);
         }
       });
 
@@ -2206,8 +2210,7 @@ export const agentModeController = {
         sessionId
       );
 
-      // Clear progress store after completion (keep connections open for future messages)
-      progressStore.delete(sessionId);
+      markProgressComplete(sessionId);
 
       // Compute page invalidations for emma-sidebar sessions so the frontend
       // can refresh the underlying page after a mutating tool call.
@@ -2265,8 +2268,7 @@ export const agentModeController = {
       // Clean up progress store on error so session doesn't appear stuck in generating state
       const sessionId = req.body?.sessionId;
       if (sessionId) {
-        emitProgress(sessionId, { iteration: 0, status: 'complete' });
-        progressStore.delete(sessionId);
+        markProgressComplete(sessionId);
       }
 
       // Persist partial token usage from messages accumulated before the error.
@@ -2922,8 +2924,7 @@ export const agentModeController = {
         session.sessionId
       );
 
-      // Clear progress store after completion (keep connections open for future messages)
-      progressStore.delete(session.sessionId);
+      markProgressComplete(session.sessionId);
 
       res.json({
         content: response.content,
@@ -2943,8 +2944,7 @@ export const agentModeController = {
       // Clean up progress store on error so session doesn't appear stuck in generating state
       const shareId = req.params?.shareId;
       if (shareId) {
-        emitProgress(shareId, { iteration: 0, status: 'complete' });
-        progressStore.delete(shareId);
+        markProgressComplete(shareId);
       }
 
       // Persist an error message to the session so the user sees feedback on reload.
@@ -3153,8 +3153,7 @@ export const agentModeController = {
       generateMarketingResponseWorkerService.cancelSession(sessionId);
 
       // Emit complete progress so the frontend SSE stream gets the signal
-      emitProgress(sessionId, { iteration: 0, status: 'complete' });
-      progressStore.delete(sessionId);
+      markProgressComplete(sessionId);
 
       res.json({ success: true });
     } catch (error) {
@@ -3183,8 +3182,7 @@ export const agentModeController = {
       requestCancel(shareId);
       generateMarketingResponseWorkerService.cancelSession(shareId);
 
-      emitProgress(shareId, { iteration: 0, status: 'complete' });
-      progressStore.delete(shareId);
+      markProgressComplete(shareId);
 
       res.json({ success: true });
     } catch (error) {
@@ -5215,7 +5213,7 @@ export const agentModeController = {
         attachments
       );
 
-      progressStore.delete(session.sessionId);
+      markProgressComplete(session.sessionId);
 
       res.json({
         content: response.content,
@@ -5232,8 +5230,7 @@ export const agentModeController = {
       // Clean up progress store on error so session doesn't appear stuck in generating state
       const convSessionId = req.params?.shareId;
       if (convSessionId) {
-        emitProgress(convSessionId, { iteration: 0, status: 'complete' });
-        progressStore.delete(convSessionId);
+        markProgressComplete(convSessionId);
       }
 
       // Handle specific error types (same as generateResponse)
@@ -5699,7 +5696,7 @@ export const agentModeController = {
             }
 
             // Emit progress complete so the frontend stops showing the loading state and refreshes
-            emitProgress(sessionId, { iteration: 0, status: 'complete' });
+            markProgressComplete(sessionId);
 
             // Send oncall alert so the team is notified
             sendAgentModeOncallAlert({

@@ -11,6 +11,7 @@
 jest.mock('../services/db', () => ({
   crmDb: {
     updateLead: jest.fn().mockResolvedValue(undefined),
+    getLeadListById: jest.fn().mockResolvedValue({ listId: 'list_1', name: 'Q1 Outbound' }),
   },
 }));
 
@@ -37,6 +38,7 @@ jest.mock('../services/hubspotService', () => ({
 import { HubspotAdapter } from '../services/adapters/hubspotAdapter';
 import { ExternalCrmSyncConfig, FieldMapping } from '../services/externalCrmSyncService';
 import { CrmAuth } from '../services/adapters/crmAdapterTypes';
+import { crmDb } from '../services/db';
 
 const auth: CrmAuth = { type: 'token', apiKey: 'pat-test' };
 
@@ -185,5 +187,177 @@ describe('HubspotAdapter.pushLeads — email validation', () => {
     expect(result.errorCount).toBe(1);
     expect(result.errors).toHaveLength(1);
     expect(result.errors[0]).toContain('https://superdm.me/chessbaseindia');
+  });
+});
+
+describe('HubspotAdapter.pushLeads — lead list name/id enrichment', () => {
+  let adapter: HubspotAdapter;
+
+  const listMapping: FieldMapping[] = [
+    { agentwebField: 'email', crmProperty: 'email', direction: 'both', enabled: true },
+    { agentwebField: 'listName', crmProperty: 'lead_list_name', direction: 'push', enabled: true },
+    { agentwebField: 'listId', crmProperty: 'lead_list_id', direction: 'push', enabled: true },
+  ];
+
+  function makeListConfig(overrides: Partial<ExternalCrmSyncConfig> = {}): ExternalCrmSyncConfig {
+    return {
+      provider: 'hubspot',
+      listId: 'list_1',
+      userId: 'user_1',
+      apiKeyEncrypted: 'enc',
+      autoSyncEnabled: false,
+      contactFieldMapping: [{ agentwebField: 'email', crmProperty: 'email', direction: 'both', enabled: true }],
+      dealFieldMapping: [],
+      customFieldMapping: listMapping.filter(m => m.agentwebField !== 'email'),
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockUpsertContact.mockResolvedValue({ contactId: 'c1', isNew: true });
+    (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list_1', name: 'Q1 Outbound' });
+    adapter = new HubspotAdapter();
+  });
+
+  it('pushes the resolved list name and list id as custom contact properties', async () => {
+    const leads = [{ leadId: 'l1', listId: 'list_1', email: 'real@example.com' }];
+
+    const result = await adapter.pushLeads(auth, leads, makeListConfig());
+
+    expect(crmDb.getLeadListById).toHaveBeenCalledWith('list_1');
+    // ensureContactProperty runs for the non-standard list properties
+    expect(mockEnsureContactProperty).toHaveBeenCalledWith('lead_list_name', expect.any(String));
+    expect(mockEnsureContactProperty).toHaveBeenCalledWith('lead_list_id', expect.any(String));
+    // The resolved list name + id reach HubSpot via customFields
+    expect(mockUpsertContact).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customFields: expect.objectContaining({
+          lead_list_name: 'Q1 Outbound',
+          lead_list_id: 'list_1',
+        }),
+      })
+    );
+    expect(result.successCount).toBe(1);
+    expect(result.errorCount).toBe(0);
+  });
+
+  it('falls back to config.listName when the list lookup returns no name', async () => {
+    (crmDb.getLeadListById as jest.Mock).mockResolvedValue(null);
+    const leads = [{ leadId: 'l1', listId: 'list_1', email: 'real@example.com' }];
+
+    await adapter.pushLeads(auth, leads, makeListConfig({ listName: 'Fallback List' }));
+
+    expect(mockUpsertContact).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customFields: expect.objectContaining({
+          lead_list_name: 'Fallback List',
+          lead_list_id: 'list_1',
+        }),
+      })
+    );
+  });
+
+  it('does not abort the push when the list lookup throws — list id still syncs', async () => {
+    (crmDb.getLeadListById as jest.Mock).mockRejectedValue(new Error('dynamo down'));
+    const leads = [{ leadId: 'l1', listId: 'list_1', email: 'real@example.com' }];
+
+    const result = await adapter.pushLeads(auth, leads, makeListConfig());
+
+    expect(result.successCount).toBe(1);
+    expect(result.errorCount).toBe(0);
+    expect(mockUpsertContact).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customFields: expect.objectContaining({ lead_list_id: 'list_1' }),
+      })
+    );
+  });
+
+  it('omits list properties whose mappings are disabled', async () => {
+    const config = makeListConfig({
+      customFieldMapping: [
+        { agentwebField: 'listName', crmProperty: 'lead_list_name', direction: 'push', enabled: false },
+        { agentwebField: 'listId', crmProperty: 'lead_list_id', direction: 'push', enabled: false },
+      ],
+    });
+    const leads = [{ leadId: 'l1', listId: 'list_1', email: 'real@example.com' }];
+
+    await adapter.pushLeads(auth, leads, config);
+
+    const call = mockUpsertContact.mock.calls[0][0];
+    expect(call.customFields?.lead_list_name).toBeUndefined();
+    expect(call.customFields?.lead_list_id).toBeUndefined();
+  });
+
+  it('prefers a list name already present on the lead over the looked-up name', async () => {
+    const leads = [{ leadId: 'l1', listId: 'list_1', email: 'real@example.com', listName: 'Lead-level Name' }];
+
+    await adapter.pushLeads(auth, leads, makeListConfig());
+
+    expect(mockUpsertContact).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customFields: expect.objectContaining({ lead_list_name: 'Lead-level Name' }),
+      })
+    );
+  });
+
+  it('injects listName/listId for a legacy config that lacks them (no manual re-save needed)', async () => {
+    // A config saved before this feature: customFieldMapping has only 'notes'.
+    const legacy = makeListConfig({
+      customFieldMapping: [{ agentwebField: 'notes', crmProperty: 'notes', direction: 'both', enabled: true }],
+    });
+    const leads = [{ leadId: 'l1', listId: 'list_1', email: 'real@example.com' }];
+
+    await adapter.pushLeads(auth, leads, legacy);
+
+    // Properties are still pre-created and the values still reach HubSpot.
+    expect(mockEnsureContactProperty).toHaveBeenCalledWith('lead_list_name', expect.any(String));
+    expect(mockEnsureContactProperty).toHaveBeenCalledWith('lead_list_id', expect.any(String));
+    expect(mockUpsertContact).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customFields: expect.objectContaining({
+          lead_list_name: 'Q1 Outbound',
+          lead_list_id: 'list_1',
+        }),
+      })
+    );
+  });
+
+  it('respects an explicit listName mapping override instead of injecting the default', async () => {
+    // User re-mapped listName to a different HubSpot property in the dialog.
+    const config = makeListConfig({
+      customFieldMapping: [
+        { agentwebField: 'listName', crmProperty: 'custom_segment', direction: 'push', enabled: true },
+      ],
+    });
+    const leads = [{ leadId: 'l1', listId: 'list_1', email: 'real@example.com' }];
+
+    await adapter.pushLeads(auth, leads, config);
+
+    const call = mockUpsertContact.mock.calls[0][0];
+    // Honors the user's property name, not the default lead_list_name…
+    expect(call.customFields?.custom_segment).toBe('Q1 Outbound');
+    expect(call.customFields?.lead_list_name).toBeUndefined();
+    // …but listId (not explicitly configured) is still injected with the default.
+    expect(call.customFields?.lead_list_id).toBe('list_1');
+  });
+
+  it('does not re-enable a listName mapping the user explicitly disabled', async () => {
+    // User unchecked listName in the dialog → an explicit disabled entry is stored.
+    const config = makeListConfig({
+      customFieldMapping: [
+        { agentwebField: 'listName', crmProperty: 'lead_list_name', direction: 'push', enabled: false },
+      ],
+    });
+    const leads = [{ leadId: 'l1', listId: 'list_1', email: 'real@example.com' }];
+
+    await adapter.pushLeads(auth, leads, config);
+
+    const call = mockUpsertContact.mock.calls[0][0];
+    expect(call.customFields?.lead_list_name).toBeUndefined();
+    // listId has no explicit entry, so it is still injected.
+    expect(call.customFields?.lead_list_id).toBe('list_1');
   });
 });

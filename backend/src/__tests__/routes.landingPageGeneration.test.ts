@@ -110,6 +110,8 @@ jest.mock("../services/v0Service", () => ({
   extractTemplateOutline: jest.fn(),
   getDeploymentStatus: jest.fn(),
   getPreviewDeploymentUrl: jest.fn(),
+  // Owner fast-path returns true; non-owner cases aren't exercised by this suite.
+  canUserEditLandingPage: jest.fn().mockResolvedValue(true),
   BrandContext: {},
   INTEGRATIONS: {
     recaptcha: {
