@@ -19,6 +19,7 @@ import { workflowDb } from "../services/workflowDb";
 import { paginatedScan } from "../utils/dynamoPagination";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
+import { generateInitialPassword, getInitialPasswordExpiry } from "../utils/passwordGenerator";
 import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
 import { getRevenueMetrics } from "../services/revenueService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
@@ -1475,17 +1476,8 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
       // Send welcome email without password for existing user upgrade
       await emailService.sendWelcomeEmail(email);
     } else {
-      // Create new user with waitlist data
-      const generateRandomPassword = (length: number = 12) => {
-        const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*';
-        let password = '';
-        for (let i = 0; i < length; i++) {
-          password += charset.charAt(Math.floor(Math.random() * charset.length));
-        }
-        return password;
-      };
-
-      temporaryPassword = generateRandomPassword(16);
+      // Create new user with a secure, short-lived system-generated password.
+      temporaryPassword = generateInitialPassword(16);
       const hashedPassword = await bcrypt.hash(temporaryPassword, 10);
 
       const userId = require('uuid').v4();
@@ -1507,9 +1499,16 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
         return res.status(500).json({ message: "Failed to create user" });
       }
 
-      resultUser = await userDb.updateUser(userId, freeTierDefaults) || {
-        ...newUser,
+      // Mark the initial password as temporary + short-lived so it can't become
+      // the user's long-term password (expires in 1 month; login is blocked after).
+      const initialPasswordFields = {
         ...freeTierDefaults,
+        mustChangePassword: true,
+        tempPasswordExpires: getInitialPasswordExpiry(),
+      };
+      resultUser = await userDb.updateUser(userId, initialPasswordFields) || {
+        ...newUser,
+        ...initialPasswordFields,
       };
 
       // Auto-sync new user to CRM lead list (fire-and-forget)

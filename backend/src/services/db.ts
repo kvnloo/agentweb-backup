@@ -389,6 +389,20 @@ export interface User {
   introductionEmailSent?: string; // ISO date when the team introduction email was sent
   resetPasswordToken?: string;
   resetPasswordExpires?: string;
+  /**
+   * Set when the account is created with a system-generated initial password
+   * (e.g. admin creating a user from the waitlist). The user MUST set their own
+   * password before this timestamp; the initial secret cannot become a
+   * long-term password. Login is rejected once `Date.now()` passes this value
+   * (see the login controller). Cleared when the user resets their password.
+   */
+  tempPasswordExpires?: string;
+  /**
+   * True while the account still holds its system-generated initial password.
+   * Surfaced to the frontend (via /login and /me) to prompt an immediate
+   * password change. Cleared when the user sets their own password.
+   */
+  mustChangePassword?: boolean;
   subscriptionType?: string | null; // Subscription type for customer-portal users (defaults to "Free")
   tokenUsage?: {
     month: string;        // "YYYY-MM" format for current tracking month

@@ -12,6 +12,7 @@ import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
 import { normalizeAttribution } from "../types/attribution";
 import { onUserRegistered } from "../services/contactCaptureHooks";
 import { isCompanyEmail } from "../utils/validation";
+import { isInitialPasswordExpired } from "../utils/passwordGenerator";
 
 export const register = async (req: Request, res: Response) => {
   try {
@@ -212,6 +213,16 @@ export const login = async (req: Request, res: Response) => {
       return res.status(401).json({
         message: "Invalid credentials. Please check your email and password.",
         code: "invalid_credentials",
+      });
+    }
+
+    // A system-generated initial password must not become a long-term password.
+    // Once it expires, block login and direct the user to reset their password.
+    if (user.mustChangePassword && isInitialPasswordExpired(user.tempPasswordExpires)) {
+      return res.status(401).json({
+        message:
+          "Your temporary password has expired. Please reset your password to continue.",
+        code: "temp_password_expired",
       });
     }
 
@@ -663,11 +674,15 @@ export const resetPassword = async (req: Request, res: Response) => {
     // Hash new password
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Update user password and clear reset token
+    // Update user password and clear reset token. Also clear the initial /
+    // temporary password lifecycle fields — the user has now set their own
+    // long-term password.
     await userDb.updateUser(user.userId, {
       password: hashedPassword,
       resetPasswordToken: undefined,
-      resetPasswordExpires: undefined
+      resetPasswordExpires: undefined,
+      mustChangePassword: false,
+      tempPasswordExpires: undefined
     });
 
     res.json({ message: "Password has been reset successfully" });
