@@ -27,6 +27,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-06-12',
+    changes: [
+      'Fixed: LinkedIn and Profile Details No Longer Get Filled in from the Wrong Person',
+      '- When enriching a lead, our data provider would sometimes return a different person\'s profile as a "best guess" and even stamp your lead\'s email onto it — so a lead could end up with a LinkedIn URL, job title, or company belonging to a complete stranger',
+      '- We now verify that the returned profile actually matches your lead — by a confirmed email, a matching name, or a direct LinkedIn match — before saving any of those details',
+      '- If we can\'t confirm the match, we leave those fields untouched rather than fill them with the wrong person\'s information',
+    ],
+  },
+  {
     date: '2026-06-11',
     changes: [
       'Fixed: Clearer Message When You Cannot Edit a Shared Landing Page',

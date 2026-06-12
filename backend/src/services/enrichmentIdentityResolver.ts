@@ -248,8 +248,17 @@ export async function resolveIdentity(
     if (siblings && siblings.length > 0) {
       const enrichedAt = new Date().toISOString();
       const refresh = input.refreshFields;
+      // `linkedin` and `title` are deliberately NOT copied across sibling leads.
+      // They are profile-anchored: two leads sharing only an email (often a junk
+      // address like joe@us.com) are not necessarily the same person, and a
+      // sibling's linkedin URL may itself be a wrong-person value from a prior
+      // enrichment. Copying it verbatim re-affirms the bad URL onto every sibling
+      // and a name check can't catch it (the siblings share the same name). These
+      // fields are instead re-derived per-lead through the gated Apollo/Unipile
+      // paths. email/company/website are safe to copy — name is the match anchor
+      // and these are not person-profile-specific.
       const copyableFields: Array<keyof SiblingLeadResult & keyof LeadRecord> = [
-        'firstName', 'lastName', 'email', 'linkedin', 'company', 'website', 'title',
+        'firstName', 'lastName', 'email', 'company', 'website',
       ];
       for (const field of copyableFields) {
         const currentValue = (lead as any)[field];

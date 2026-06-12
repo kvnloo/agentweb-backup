@@ -99,6 +99,94 @@ describe('ApolloService', () => {
     });
   });
 
+  describe('matchPerson — identity gate (Joe Hio bug)', () => {
+    it('drops a name-fallback match whose name differs from the lead, even when Apollo echoes the input email', async () => {
+      // Exact prod payload: lead "Joe Hio"/joe@us.com → Apollo returns "Awais
+      // Haider" with the input email echoed back and email_status null.
+      const http = makeHttp({
+        match: jest.fn().mockResolvedValue({
+          person: {
+            id: 'p_awais',
+            first_name: 'Awais',
+            last_name: 'Haider',
+            email: 'joe@us.com',
+            email_status: null,
+            linkedin_url: 'http://www.linkedin.com/in/awais-haider-8291b2179',
+          },
+        }),
+      });
+      const store = makeStore();
+      const svc = new ApolloService({ http, store });
+
+      const r = await svc.matchPerson({
+        email: 'joe@us.com',
+        firstName: 'Joe',
+        lastName: 'Hio',
+      });
+      expect(r.found).toBe(false);
+      expect(r.match).toBeUndefined();
+    });
+
+    it('keeps a match when the returned name matches the lead', async () => {
+      const http = makeHttp({
+        match: jest.fn().mockResolvedValue({
+          person: { id: 'p_joe', first_name: 'Joe', last_name: 'Hio', linkedin_url: 'https://linkedin.com/in/joe-hio' },
+        }),
+      });
+      const svc = new ApolloService({ http, store: makeStore() });
+
+      const r = await svc.matchPerson({ email: 'joe@us.com', firstName: 'Joe', lastName: 'Hio' });
+      expect(r.found).toBe(true);
+      expect(r.match!.person.linkedin).toBe('https://linkedin.com/in/joe-hio');
+    });
+
+    it('keeps a name-mismatched match when Apollo reports email_status verified', async () => {
+      const http = makeHttp({
+        match: jest.fn().mockResolvedValue({
+          person: { id: 'p', first_name: 'Awais', last_name: 'Haider', email: 'joe@us.com', email_status: 'verified' },
+        }),
+      });
+      const svc = new ApolloService({ http, store: makeStore() });
+
+      const r = await svc.matchPerson({ email: 'joe@us.com', firstName: 'Joe', lastName: 'Hio' });
+      expect(r.found).toBe(true);
+    });
+
+    it('keeps a name-mismatched match when the lookup was keyed by LinkedIn URL', async () => {
+      const http = makeHttp({
+        match: jest.fn().mockResolvedValue({
+          person: { id: 'p', first_name: 'Awais', last_name: 'Haider' },
+        }),
+      });
+      const svc = new ApolloService({ http, store: makeStore() });
+
+      const r = await svc.matchPerson({ linkedinUrl: 'https://linkedin.com/in/awais', firstName: 'Joe', lastName: 'Hio' });
+      expect(r.found).toBe(true);
+    });
+
+    it('does NOT write the email-keyed fanout row for a rejected mismatch', async () => {
+      // A name-keyed lookup (no input email) that returns a mismatched person
+      // with an email must not poison the email-keyed cache.
+      const http = makeHttp({
+        match: jest.fn().mockResolvedValue({
+          person: { id: 'p', first_name: 'Awais', last_name: 'Haider', email: 'joe@us.com' },
+        }),
+      });
+      const store = makeStore();
+      const svc = new ApolloService({ http, store });
+
+      const r = await svc.matchPerson({ firstName: 'Joe', lastName: 'Hio', domain: 'us.com' });
+      expect(r.found).toBe(false);
+      // A subsequent email-keyed lookup must NOT be served from a fanout row.
+      const sizeAfter = store.rows.size;
+      const r2 = await svc.matchPerson({ email: 'joe@us.com' });
+      // No fanout hit → it had to call the API again (still mismatch → not found).
+      expect(http.match).toHaveBeenCalledTimes(2);
+      void sizeAfter;
+      void r2;
+    });
+  });
+
   describe('matchPerson — negative caching', () => {
     it('caches not_found for 7d on person:null', async () => {
       const http = makeHttp({ match: jest.fn().mockResolvedValue({ person: null }) });
