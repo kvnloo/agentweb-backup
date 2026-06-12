@@ -1,3 +1,19 @@
+## Semantic tool-error taxonomy + contract-layer counters (2026-06-12)
+
+Telemetry finding from the June 9-12 window: every recorded tool failure had errorClass "Error" — tools throw plain `new Error(message)`, so the constructor-name fallback carried zero signal. The failure policy could only cluster by toolName; the model (and the breaker) could not distinguish retryable timeouts from terminal auth failures.
+
+### What shipped (this PR)
+
+1. **`utils/toolErrorClassifier.ts`** — `classifyToolErrorClass()`: stable semantic classes `timeout | auth | rate_limit | invalid_args | not_found | network | upstream_5xx | policy_blocked | repeated_failure`, derived from gateway error names, numeric status props, and message heuristics. Unrecognized errors keep the legacy name-based class (named custom errors lose nothing).
+2. **Run recorder** uses it for `errorClass` on `agent_tool_failed` / `agent_run_failed` events.
+3. **Decision telemetry counters** (#1818 follow-up): `argsRepairedCount` (contract layer repaired args pre-execution) and `schemaErrorCount` (failures classified invalid_args) per decision event — the data needed for the AGENT_TOOL_GATEWAY_ENFORCE go/no-go.
+
+### Assumptions to validate
+
+- The taxonomy covers the real distribution: after a few days, `SELECT errorClass COUNT` on new agent_tool_failed events should show <20% falling back to legacy names. If higher, extend classFromMessage patterns from actual messages.
+- Brave 429s → rate_limit and Meta 5xx → upstream_5xx in prod (heuristics verified against June messages, not live traffic).
+- errorClass consumers (failureRuleSet clustering, inspector) benefit rather than break from the rename — historical events keep old classes, so mixed-class clusters during transition are expected for ~7 days.
+
 ## AgentRun Telemetry Failure Analysis → Gateway Circuit Breaker + Tool Guidance Fixes (2026-06-11)
 
 First product decision driven by the runtime-spine telemetry. Analyzed all 3,172 agent-mode events in `Dev-AW-LoopEvents` (June 9–12: 223 runs, 1,016 tool calls, 78 failures = 7.7% tool failure rate; 35 runs had ≥1 failure; zero hard run failures — failures are absorbed and runs "complete" degraded).
