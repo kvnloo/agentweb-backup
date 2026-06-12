@@ -27,6 +27,11 @@ import {
   registerOrReplaceTools,
 } from '../../index';
 import { CaptureGate } from '../../core/gates/captureGate';
+import {
+  analystFindingsBody,
+  postLoopDigest,
+  type LoopDigestTemplate,
+} from '../../core/digest/loopDigest';
 import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
 import { CooldownRuleSet } from '../../core/policy/cooldownRuleSet';
 import { LlmAnalystRuleSet } from '../../core/policy/llmAnalystRuleSet';
@@ -96,46 +101,17 @@ export async function runOnboardingLoopV2Once(): Promise<LoopRunResult | null> {
 
   if (onboardingGate) {
     onboardingGate.drain();
-    await postOnboardingDigest(result, ports.slack, manifest.approval.slackUserId);
+    await postLoopDigest(result, ports.slack, manifest.approval.slackUserId, onboardingDigestTemplate, undefined);
   }
   return result;
 }
 
-async function postOnboardingDigest(
-  result: LoopRunResult,
-  slack: { postMessage: (channelOrUserId: string, markdown: string) => Promise<unknown> },
-  slackUserId: string | undefined,
-): Promise<void> {
-  if (!slackUserId) {
-    console.warn('[onboarding-loop-v2] no approval.slackUserId — skipping DM');
-    return;
-  }
-  const lines: string[] = [];
-  lines.push(`*🚀 Onboarding loop — daily run ${new Date().toISOString().slice(0, 10)}*`);
-  lines.push(`Run ID: \`${result.runId}\``);
-  lines.push(`Users/events scanned: ${result.eventsScanned}  |  Findings: ${result.proposals.length}`);
-  lines.push('');
-
-  if (result.eventsScanned === 0) {
-    lines.push(`_No onboarding events in the window — too thin to judge._`);
-  } else if (result.proposals.length === 0) {
-    lines.push(`_Funnel looks healthy — no issues surfaced._`);
-  } else {
-    lines.push(`*What I found*`);
-    for (let i = 0; i < result.proposals.length; i++) {
-      const p = result.proposals[i];
-      const directive =
-        (p.payload as { directive?: string } | undefined)?.directive ?? '';
-      lines.push(`${i + 1}. ${p.hypothesis}`);
-      lines.push(`   Kind: \`${p.kind}\`${directive ? `  |  Fix: ${directive}` : ''}`);
-    }
-  }
-  lines.push('');
-  lines.push(`React ✅ to dispatch all to cloud-dev  |  ❌ to skip  |  🛑 to pause loop`);
-
-  try {
-    await slack.postMessage(slackUserId, lines.join('\n'));
-  } catch (err) {
-    console.error('[onboarding-loop-v2] Slack DM post failed:', err);
-  }
-}
+const onboardingDigestTemplate: LoopDigestTemplate = {
+  logTag: '[onboarding-loop-v2]',
+  header: (date) => `*🚀 Onboarding loop — daily run ${date}*`,
+  counts: (result) =>
+    `Users/events scanned: ${result.eventsScanned}  |  Findings: ${result.proposals.length}`,
+  emptyBody: () => [`_No onboarding events in the window — too thin to judge._`],
+  quietBody: () => [`_Funnel looks healthy — no issues surfaced._`],
+  findingsBody: analystFindingsBody,
+};

@@ -27,6 +27,7 @@ import {
   registerOrReplaceTools,
 } from '../../index';
 import { CaptureGate } from '../../core/gates/captureGate';
+import { postLoopDigest, type LoopDigestTemplate } from '../../core/digest/loopDigest';
 import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
 import { CooldownRuleSet } from '../../core/policy/cooldownRuleSet';
 import { EventTableEventSource } from '../../core/sensors/eventTableEventSource';
@@ -105,48 +106,29 @@ export async function runAgentModeLoopOnce(): Promise<LoopRunResult> {
 
   if (agentModeGate) {
     const drained = agentModeGate.drain();
-    await postDigest(result, drained.length, ports.slack, manifest.approval.slackUserId);
+    await postLoopDigest(result, ports.slack, manifest.approval.slackUserId, agentModeDigestTemplate, drained.length);
   }
 
   return result;
 }
 
-async function postDigest(
-  result: LoopRunResult,
-  drainedCount: number,
-  slack: { postMessage: (channelOrUserId: string, markdown: string) => Promise<unknown> },
-  slackUserId: string | undefined,
-): Promise<void> {
-  if (!slackUserId) {
-    console.warn('[agent-mode-loop] no approval.slackUserId — skipping DM');
-    return;
-  }
-  const lines: string[] = [];
-  lines.push(`*🤖 Agent Mode — tool reliability ${new Date().toISOString().slice(0, 10)}*`);
-  lines.push(`Run ID: \`${result.runId}\``);
-  lines.push(`Tool events scanned: ${result.eventsScanned}  |  Failing tools: ${result.proposals.length}`);
-  lines.push('');
-
-  if (result.eventsScanned === 0) {
-    lines.push(`_No agent-mode tool events in the 7d window — recorder off, or no tool use. Not "healthy", just empty._`);
-  } else if (result.proposals.length === 0) {
-    lines.push(`_No tool crossed the failure threshold this window. Tool reliability looks healthy._`);
-  } else {
-    lines.push(`*Failing tools (fix specs dispatched: ${drainedCount})*`);
-    for (let i = 0; i < result.proposals.length; i++) {
-      const p = result.proposals[i];
-      lines.push(`${i + 1}. ${p.hypothesis}`);
-    }
-  }
-  lines.push('');
-  lines.push(`React ✅ to dispatch all to cloud-dev  |  ❌ to skip  |  🛑 to pause loop`);
-
-  try {
-    await slack.postMessage(slackUserId, lines.join('\n'));
-  } catch (err) {
-    console.error('[agent-mode-loop] Slack DM post failed:', err);
-  }
-}
+/** TExtra = the count of fix specs drained from the gate this tick. */
+const agentModeDigestTemplate: LoopDigestTemplate<number> = {
+  logTag: '[agent-mode-loop]',
+  header: (date) => `*🤖 Agent Mode — tool reliability ${date}*`,
+  counts: (result) =>
+    `Tool events scanned: ${result.eventsScanned}  |  Failing tools: ${result.proposals.length}`,
+  emptyBody: () => [
+    `_No agent-mode tool events in the 7d window — recorder off, or no tool use. Not "healthy", just empty._`,
+  ],
+  quietBody: () => [
+    `_No tool crossed the failure threshold this window. Tool reliability looks healthy._`,
+  ],
+  findingsBody: (result, drainedCount) => [
+    `*Failing tools (fix specs dispatched: ${drainedCount})*`,
+    ...result.proposals.map((p, i) => `${i + 1}. ${p.hypothesis}`),
+  ],
+};
 
 /** Test seam. */
 export const _internal = {

@@ -31,6 +31,12 @@ import {
   registerOrReplaceTools,
 } from '../../index';
 import { CaptureGate } from '../../core/gates/captureGate';
+import {
+  analystFindingsBody,
+  buildLoopDigestLines,
+  postLoopDigest,
+  type LoopDigestTemplate,
+} from '../../core/digest/loopDigest';
 import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
 import { CooldownRuleSet } from '../../core/policy/cooldownRuleSet';
 import { LlmAnalystRuleSet } from '../../core/policy/llmAnalystRuleSet';
@@ -306,43 +312,38 @@ async function claimDailyDigestPost(digestDate: string, slackUserId: string, run
 
 type DailyDigestClaim = (digestDate: string, slackUserId: string, runId: string) => Promise<boolean>;
 
-/** Build the digest DM lines. Pure (no I/O) so it can be unit-tested across
- * the three branches: empty window, no-finding (constraint), and findings.
- * Never emits "healthy". */
-export function buildDigestLines(result: LoopRunResult, shape: FunnelShape | null): string[] {
-  const lines: string[] = [];
-  const lowDataDecisions = shape && result.proposals.length === 0 ? buildLowDataDecisions(shape) : [];
-  lines.push(`*🧭 AI Readiness Funnel — daily run ${new Date().toISOString().slice(0, 10)}*`);
-  lines.push(`Run ID: \`${result.runId}\``);
-  lines.push(`Events scanned: ${result.eventsScanned}  |  Findings: ${result.proposals.length}`);
-  if (shape) lines.push(shapeLine(shape));
-  lines.push('');
-
-  if (result.eventsScanned === 0) {
-    lines.push(`_No events in the 7d window — the lander isn't getting traffic, or telemetry just turned on. Not "healthy", just empty._`);
-  } else if (result.proposals.length === 0) {
-    lines.push(shape ? constraintLine(shape) : `_No page-level fix surfaced — check the binding constraint manually._`);
-  } else {
-    lines.push(`*What I found*`);
-    for (let i = 0; i < result.proposals.length; i++) {
-      const p = result.proposals[i];
-      const directive = (p.payload as { directive?: string } | undefined)?.directive ?? '';
-      lines.push(`${i + 1}. ${p.hypothesis}`);
-      lines.push(`   Kind: \`${p.kind}\`${directive ? `  |  Fix: ${directive}` : ''}`);
-    }
-  }
-  if (lowDataDecisions.length > 0) {
-    lines.push('');
-    lines.push('*Startup decisions (low-data, permission-gated)*');
+/** TExtra = the 7d funnel shape (null when the tally failed). */
+const aiReadinessDigestTemplate: LoopDigestTemplate<FunnelShape | null> = {
+  logTag: '[ai-readiness-funnel]',
+  header: (date) => `*🧭 AI Readiness Funnel — daily run ${date}*`,
+  counts: (result) =>
+    `Events scanned: ${result.eventsScanned}  |  Findings: ${result.proposals.length}`,
+  preBody: (_result, shape) => (shape ? [shapeLine(shape)] : []),
+  emptyBody: () => [
+    `_No events in the 7d window — the lander isn't getting traffic, or telemetry just turned on. Not "healthy", just empty._`,
+  ],
+  quietBody: (_result, shape) => [
+    shape ? constraintLine(shape) : `_No page-level fix surfaced — check the binding constraint manually._`,
+  ],
+  findingsBody: analystFindingsBody,
+  extraSections: (result, shape) => {
+    const lowDataDecisions = shape && result.proposals.length === 0 ? buildLowDataDecisions(shape) : [];
+    if (lowDataDecisions.length === 0) return [];
+    const lines = ['*Startup decisions (low-data, permission-gated)*'];
     for (let i = 0; i < lowDataDecisions.length; i++) {
       const d = lowDataDecisions[i];
       lines.push(`${i + 1}. \`${d.id}\` — ${d.action}`);
       lines.push(`   Evidence: ${d.evidence}  |  Confidence: ${d.confidence}  |  Needs approval: yes`);
     }
-  }
-  lines.push('');
-  lines.push(`React ✅ to dispatch all to cloud-dev  |  ❌ to skip  |  🛑 to pause loop`);
-  return lines;
+    return lines;
+  },
+};
+
+/** Build the digest DM lines. Pure (no I/O) so it can be unit-tested across
+ * the three branches: empty window, no-finding (constraint), and findings.
+ * Never emits "healthy". */
+export function buildDigestLines(result: LoopRunResult, shape: FunnelShape | null): string[] {
+  return buildLoopDigestLines(result, aiReadinessDigestTemplate, shape);
 }
 
 async function postDigest(
@@ -371,11 +372,7 @@ async function postDigest(
     return;
   }
 
-  try {
-    await slack.postMessage(slackUserId, buildDigestLines(result, shape).join('\n'));
-  } catch (err) {
-    console.error('[ai-readiness-funnel] Slack DM post failed:', err);
-  }
+  await postLoopDigest(result, slack, slackUserId, aiReadinessDigestTemplate, shape);
 }
 
 /** Test seam. */
