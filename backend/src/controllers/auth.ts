@@ -12,6 +12,7 @@ import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
 import { normalizeAttribution } from "../types/attribution";
 import { onUserRegistered } from "../services/contactCaptureHooks";
 import { isCompanyEmail } from "../utils/validation";
+import { AuthenticatedRequest } from "../middleware/auth";
 
 export const register = async (req: Request, res: Response) => {
   try {
@@ -232,6 +233,7 @@ export const login = async (req: Request, res: Response) => {
       email: user.email,
       roles: user.roles || [],
       isAdmin: user.isAdmin || false,
+      sv: user.sessionVersion ?? 0,
     };
     const token = jwt.sign(
       jwtPayload,
@@ -506,6 +508,7 @@ export const googleCallback = async (
       email: user.email,
       roles: userRoles,
       isAdmin: user.isAdmin || false,
+      sv: user.sessionVersion ?? 0,
     };
     const token = jwt.sign(
       tokenPayload,
@@ -670,9 +673,86 @@ export const resetPassword = async (req: Request, res: Response) => {
       resetPasswordExpires: undefined
     });
 
+    // Invalidate all existing sessions (every device) after the password reset.
+    // Recovery is exactly the case where logging out other sessions matters most:
+    // a recovered account may have had its old sessions opened by an attacker.
+    await userDb.incrementSessionVersion(user.userId);
+
     res.json({ message: "Password has been reset successfully" });
   } catch (error) {
     console.error("Error in reset password:", error);
     res.status(500).json({ message: "Error resetting password" });
+  }
+};
+
+// Authenticated password change (user is logged in and supplies current password).
+// On success, all OTHER sessions are terminated and the caller receives a fresh
+// token minted with the new sessionVersion so the current device stays signed in.
+export const changePassword = async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: "User not authenticated" });
+    }
+
+    // Delegated/contractor sessions act as the target user but must not be able
+    // to change that user's password (they never supplied the customer's password).
+    if (authReq.delegateInfo?.isDelegated) {
+      return res.status(403).json({ message: "Password change is not allowed in a delegated session" });
+    }
+
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ message: "Current password and new password are required" });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ message: "New password must be at least 6 characters long" });
+    }
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // OAuth-only accounts have a placeholder password and cannot change it here.
+    if (user.isOAuthUser) {
+      return res.status(400).json({ message: "Password change is not available for accounts that sign in with Google" });
+    }
+
+    const isValidPassword = await bcrypt.compare(currentPassword, user.password);
+    if (!isValidPassword) {
+      return res.status(401).json({ message: "Current password is incorrect", code: "invalid_current_password" });
+    }
+
+    if (currentPassword === newPassword) {
+      return res.status(400).json({ message: "New password must be different from the current password" });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    await userDb.updateUser(userId, { password: hashedPassword });
+
+    // Terminate every other session by bumping sessionVersion, then re-issue a
+    // token for the current device carrying the new version so it stays logged in.
+    const newSessionVersion = await userDb.incrementSessionVersion(userId);
+
+    const token = jwt.sign(
+      {
+        userId: user.userId,
+        email: user.email,
+        roles: user.roles || [],
+        isAdmin: user.isAdmin || false,
+        sv: newSessionVersion,
+      },
+      process.env.JWT_SECRET || "your-secret-key",
+      { expiresIn: "90d" }
+    );
+
+    res.json({ message: "Password changed successfully", token });
+  } catch (error) {
+    console.error("Error in change password:", error);
+    res.status(500).json({ message: "Error changing password" });
   }
 };

@@ -22,6 +22,12 @@ export interface UserPayload {
   email: string;
   isAdmin: boolean;
   roles?: ('partner' | 'customer' | 'free')[];
+  /**
+   * Session version the token was minted with. Compared against the user's current
+   * `sessionVersion` in the DB; a mismatch means the password was changed after this
+   * token was issued, so the token is rejected (other-device logout). Absent = 0.
+   */
+  sv?: number;
   /** Marks short-lived service-to-service self-call tokens — isAdmin claim is trusted directly */
   _svc?: boolean;
   // Delegation fields
@@ -112,6 +118,13 @@ export async function getUserFromToken(req: Request): Promise<{
       const user = await userDb.getUserById(decoded.userId);
 
       if (!user) {
+        return { user: null };
+      }
+
+      // Reject tokens minted before the user's most recent password change.
+      // A bumped sessionVersion invalidates every token carrying an older `sv`,
+      // logging out all other devices. Both sides default to 0 for backward compat.
+      if ((user.sessionVersion ?? 0) !== (decoded.sv ?? 0)) {
         return { user: null };
       }
 

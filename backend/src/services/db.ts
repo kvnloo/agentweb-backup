@@ -389,6 +389,13 @@ export interface User {
   introductionEmailSent?: string; // ISO date when the team introduction email was sent
   resetPasswordToken?: string;
   resetPasswordExpires?: string;
+  /**
+   * Monotonic session generation counter. Embedded as `sv` in every issued JWT.
+   * Incremented on any successful password change (authenticated change-password
+   * or reset-via-token) so that all previously-issued tokens — i.e. sessions on
+   * other devices — are rejected by the auth middleware. Absent = 0.
+   */
+  sessionVersion?: number;
   subscriptionType?: string | null; // Subscription type for customer-portal users (defaults to "Free")
   tokenUsage?: {
     month: string;        // "YYYY-MM" format for current tracking month
@@ -1293,6 +1300,38 @@ export class UserDB {
     } catch (error) {
       handleDynamoDbError(error, "updateUser");
       throw error; // Re-throw after logging
+    }
+  }
+
+  /**
+   * Atomically increment a user's sessionVersion, invalidating all tokens issued
+   * with the prior value. Used after a password change so that every other active
+   * session (other devices) is logged out. Returns the new sessionVersion.
+   *
+   * Uses a DynamoDB ADD expression with if_not_present so records that predate the
+   * field (sessionVersion absent) are treated as 0 and bumped to 1.
+   */
+  async incrementSessionVersion(userId: string): Promise<number> {
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) {
+      throw new Error(`User with ID '${userId}' not found or has no email.`);
+    }
+
+    const params = {
+      TableName: this.tableName,
+      Key: { email: user.email },
+      UpdateExpression: "SET #sv = if_not_present(#sv, :zero) + :one",
+      ExpressionAttributeNames: { "#sv": "sessionVersion" },
+      ExpressionAttributeValues: { ":zero": 0, ":one": 1 },
+      ReturnValues: "UPDATED_NEW",
+    };
+
+    try {
+      const result = await this.docClient.update(params).promise();
+      return (result.Attributes as { sessionVersion: number }).sessionVersion;
+    } catch (error) {
+      handleDynamoDbError(error, "incrementSessionVersion");
+      throw error;
     }
   }
 

@@ -70,7 +70,23 @@ io.use(async (socket, next) => {
 
   if (token) {
     try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key') as {
+        userId?: string;
+        sv?: number;
+        delegateAccess?: unknown;
+        _svc?: boolean;
+      };
+
+      // Enforce session versioning for normal user tokens so a password change
+      // disconnects other devices' sockets too. Delegate/service tokens are
+      // exempt (same policy as the HTTP auth middleware).
+      if (decoded.userId && !decoded.delegateAccess && !decoded._svc) {
+        const user = await userDb.getUserById(decoded.userId);
+        if (!user || (user.sessionVersion ?? 0) !== (decoded.sv ?? 0)) {
+          return next(new Error('Authentication error'));
+        }
+      }
+
       socket.data.user = decoded;
       return next();
     } catch {

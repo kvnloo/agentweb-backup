@@ -231,6 +231,9 @@ router.post('/login', authRateLimiter, authController.login);
 router.post('/forgot-password', authController.forgotPassword);
 router.post('/reset-password', authController.resetPassword);
 
+// Authenticated password change (terminates all other sessions on success)
+router.put('/change-password', authenticateToken, authController.changePassword);
+
 // Google OAuth routes
 router.get('/google', (req: Request, res: Response, next: NextFunction) => {
   const portal = req.query.portal === 'customer' ? 'customer' : 
