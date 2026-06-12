@@ -4,7 +4,6 @@ import { emailService } from "../services/emailService";
 import { userDb, orgDb } from "../services/db";
 import {
   canEditItem,
-  canManageOrgFeature,
   isFeatureEffectivelyEnabled,
 } from "../services/orgShareService";
 
@@ -68,18 +67,8 @@ router.post("/", async (req, res) => {
     const user = await userDb.getUserById(userId);
     const orgId = user?.orgId;
 
-    // Org-level create gating: only org owner or listed skills editor
-    if (orgId) {
-      const org = await orgDb.getOrgById(orgId);
-      const allowed = canManageOrgFeature(
-        { userId, orgId, orgRole: user?.orgRole as "owner" | "member" | undefined },
-        org,
-        "skills",
-      );
-      if (!allowed) {
-        return res.status(403).json({ message: "Skills are managed by your org admin" });
-      }
-    }
+    // Skills are member-owned: any user may create their own. Org-wide
+    // visibility is governed separately by the shareSettings `enabled` toggle.
 
     const skill = await skillService.createSkill(
       name,
@@ -157,12 +146,9 @@ router.delete("/:skillId", async (req, res) => {
 
     if (!skill) return res.status(404).json({ message: "Skill not found" });
 
-    // Only the skill owner or an org owner (admin override) may delete
+    // Skills are member-owned: only the skill owner may delete.
     if (skill.ownerId !== userId) {
-      const callerUser = await userDb.getUserById(userId);
-      if (callerUser?.orgRole !== "owner") {
-        return res.status(403).json({ message: "Not authorized" });
-      }
+      return res.status(403).json({ message: "Not authorized" });
     }
 
     if (skill.visibility !== 'private') {
