@@ -28,6 +28,7 @@ import type { ClockPort } from '../../core/ports';
 import type { EventDimensions, NormalizedEvent } from '../../core/types';
 import { asSubjectId } from '../../core/types';
 import { eventToItem, LOOP_EVENTS_TABLE } from '../../core/sensors/eventTableEventSource';
+import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
 import { AGENT_MODE_LOOP_ID } from './eventTypes';
 import {
   EVT_DECISION,
@@ -67,6 +68,10 @@ export class AgentRunRecorder {
       explanationSource?: string;
       toolPolicyFlags?: string;
       toolPolicySummary?: string;
+      /** Tools whose args the contract layer repaired before execution. */
+      argsRepairedCount?: number;
+      /** Failed tools classified as invalid_args (model emitted bad args). */
+      schemaErrorCount?: number;
     },
   ): Promise<void> {
     await this.emit(runId, EVT_DECISION, {
@@ -167,16 +172,9 @@ function cleanDims(obj: Record<string, unknown>): EventDimensions {
 }
 
 function errorClassOf(error: unknown): string {
-  if (error instanceof Error) {
-    // Prefer an explicitly-set `.name` (e.g. AWS SDK errors set name to the
-    // error code); otherwise fall back to the runtime constructor name, which
-    // is what custom `class FooError extends Error {}` subclasses carry since
-    // `.name` is inherited as the generic 'Error'.
-    if (error.name && error.name !== 'Error') return error.name;
-    return error.constructor?.name || 'Error';
-  }
-  if (typeof error === 'string') return 'StringError';
-  return 'UnknownError';
+  // Semantic taxonomy (timeout/auth/rate_limit/…) with the old name-based
+  // class as fallback — most tools throw plain Error, which carried no signal.
+  return classifyToolErrorClass(error);
 }
 
 function errorMessageOf(error: unknown): string {
