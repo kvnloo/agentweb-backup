@@ -442,6 +442,43 @@ describe('resolveIdentity — write semantics', () => {
     expect(call.meta.company.provider).toBe('enrich.so');
   });
 
+  it('does NOT copy a sibling lead\'s linkedin or title (profile-anchored), but does copy company', async () => {
+    // Regression (joe@us.com / "Joe Hio"): a sibling lead sharing the same email
+    // held a wrong-person linkedin URL (awais-haider). Copying it verbatim
+    // re-affirmed the bad URL onto every sibling, and a name check can't catch
+    // it because the siblings share the same name. linkedin/title must NOT be
+    // copied across siblings; company (not person-profile-specific) still is.
+    const deps = makeDeps({
+      findSiblingLeads: jest.fn().mockResolvedValue([
+        {
+          leadId: 'sibling-1',
+          listId: 'other-list',
+          userId: 'u1',
+          firstName: 'Joe',
+          lastName: 'Hio',
+          linkedin: 'http://www.linkedin.com/in/awais-haider-8291b2179',
+          title: 'Finance Manager',
+          company: 'Otsuka',
+        },
+      ]),
+    });
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'joe@us.com' },
+        needsPersonFields: false,
+        needsCompanyFields: false,
+        mode: 'enrich',
+      }),
+      deps,
+    );
+
+    const call = (deps.writeLeadFields as jest.Mock).mock.calls[0]?.[0];
+    expect(call?.fields ?? {}).not.toHaveProperty('linkedin');
+    expect(call?.fields ?? {}).not.toHaveProperty('title');
+    // company is still copyable from a same-name sibling
+    expect(call?.fields ?? {}).toMatchObject({ company: 'Otsuka' });
+  });
+
   it('mode=preview: never calls writeLeadFields even when fields are resolved', async () => {
     const deps = makeDeps({
       apolloPeopleMatch: jest.fn().mockResolvedValue({ firstName: 'Jane', lastName: 'Doe' }),
