@@ -1,3 +1,23 @@
+## Replay-eval groundwork — failed runs become eval cases (2026-06-12)
+
+Frontier-agent robustness pattern: failed trajectories become regression tests. The spine records every run; nothing turned the failed/degraded ones into reusable eval material. This is the Phase-4 seed (white-box beats Okareo — we own the trace).
+
+### What shipped (this PR)
+
+1. **`loops/scripts/exportEvalCases.ts`** — CLI: queries agent-mode spine events (default 7d), exports each failed/degraded run as a JSON eval case (verdict + reasons, per-failure toolName/errorClass/errorMessage, decision context with upstream-redacted arg previews) plus a worst-first `toolName × errorClass` cluster summary. Output to `backend/eval-cases/` — gitignored, fixtures never committed.
+2. **Pure core** (`buildEvalCases` / `summarizeEvalCases`) exported for tests + future runners. Pre-verdict-era runs are judged by `computeRunVerdict` over their counts so history exports too.
+
+### How this becomes the eval harness
+
+1. Run the export → `_summary.json` names the worst clusters (June data: linkedin_outreach × invalid_args, run_local_agent_task, bravesearch × rate_limit).
+2. Harsha + Fangfang curate: pick top clusters, write HUMAN expected-behavior assertions per cluster (per loop-acceptance-tests discipline).
+3. v2 runner replays curated cases against the current contract layer / tool schemas on change — regression suite from production failures.
+
+### Assumptions to validate
+
+- Run the export once against real data: `cd backend && npx ts-node src/loops/scripts/exportEvalCases.ts --days 7` — expect ~35 cases. If far fewer, the grouping window or the tsSession key-condition prefix logic needs a look.
+- Arg previews are sufficiently redacted for fixture storage (they go through AGENT_RUNTIME_REDACTED_ARG_KEYS upstream); spot-check one case file before sharing any externally.
+
 ## Post-run outcome verdicts — degraded-run detection (2026-06-12)
 
 Telemetry blind spot: 165 runs in the June window, ZERO hard failures, 60+ tool failures silently absorbed. "Completed" ≠ "succeeded" — the user feels the degradation but nothing durable records it, so the agent-mode loop (whose sensor reads spine events) could never learn from degraded runs. The inspector's read-time flags don't help the policy: they exist only in the projection.
