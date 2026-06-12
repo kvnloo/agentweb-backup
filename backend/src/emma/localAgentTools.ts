@@ -151,15 +151,21 @@ const BROWSER_TASK_PATTERNS = [
   /\bpage.*summary/i,
 ];
 
-function validateBrowserTask(task: string): string | null {
+const SCOPE_GUIDANCE =
+  'run_local_agent_task only handles READ-ONLY web browsing and data extraction (visit a URL, read/scrape page content). ' +
+  'It cannot run commands, edit files or accounts, submit forms, log in, send messages, or handle credentials. ' +
+  'Do not retry this task here — use coding_agent for code changes, perform_data_analysis for data analysis, ' +
+  'search_web for research, or the dedicated tool for the action you need (e.g. linkedin_outreach, send_email).';
+
+export function validateBrowserTask(task: string): string | null {
   for (const pattern of BLOCKED_TASK_PATTERNS) {
     if (pattern.test(task)) {
-      return `Task rejected: local agent may only be used for web browsing and data extraction. Forbidden pattern detected: "${pattern.source}".`;
+      return `Task rejected (matched forbidden pattern "${pattern.source}"). ${SCOPE_GUIDANCE}`;
     }
   }
   const isBrowserTask = BROWSER_TASK_PATTERNS.some((p) => p.test(task));
   if (!isBrowserTask) {
-    return 'Task rejected: local agent may only be used for web browsing and data extraction tasks. Please specify a URL or web site to visit.';
+    return `Task rejected: no URL or web-browsing intent found in the task. ${SCOPE_GUIDANCE} If you do want a page read, restate the task with the specific URL to visit.`;
   }
   return null;
 }
