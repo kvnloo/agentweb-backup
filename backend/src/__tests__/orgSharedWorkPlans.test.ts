@@ -343,7 +343,7 @@ describe("PUT /api/user-work-plans/:planId — work plans are owner-edit-only (n
     expect(mockUpdateWorkPlan).not.toHaveBeenCalled();
   });
 
-  it("org owner (orgRole=owner) CANNOT PATCH another member's plan (owner-only)", async () => {
+  it("org owner (orgRole=owner) can PATCH another same-org member's plan (admin override)", async () => {
     const orgOwnerUserId = "user-org-owner";
     const orgOwnerApp = express();
     orgOwnerApp.use(express.json());
@@ -359,17 +359,18 @@ describe("PUT /api/user-work-plans/:planId — work plans are owner-edit-only (n
       return Promise.resolve(null);
     });
     mockGetOrgById.mockResolvedValue(mockOrgNoEditors);
+    mockUpdateWorkPlan.mockResolvedValue(undefined);
 
     const res = await request(orgOwnerApp)
       .put("/api/user-work-plans/plan-2")
       .send({ title: "Owner Override" });
 
-    expect(res.status).toBe(403);
-    expect(mockUpdateWorkPlan).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(mockUpdateWorkPlan).toHaveBeenCalled();
   });
 });
 
-describe("DELETE /api/user-work-plans/:planId — DELETE is owner-only (no editor or org-owner override)", () => {
+describe("DELETE /api/user-work-plans/:planId — owner or org-owner may delete; editors cannot", () => {
   // App where authenticated user is the editor (user-3)
   const editorApp = express();
   editorApp.use(express.json());
@@ -401,18 +402,19 @@ describe("DELETE /api/user-work-plans/:planId — DELETE is owner-only (no edito
     expect(mockDeleteWorkPlan).not.toHaveBeenCalled();
   });
 
-  it("org owner (orgRole=owner) CANNOT DELETE another member's plan (owner-only)", async () => {
+  it("org owner (orgRole=owner) can DELETE another same-org member's plan (admin override)", async () => {
     mockGetWorkPlan.mockResolvedValue(memberPlan); // owned by user-2
     mockGetUserById.mockImplementation((uid: string) => {
       if (uid === orgOwnerUserId) return Promise.resolve({ userId: orgOwnerUserId, orgId: mockOrgId, orgRole: "owner" });
       if (uid === mockOrgMemberId) return Promise.resolve({ userId: mockOrgMemberId, orgId: mockOrgId, orgRole: "member" });
       return Promise.resolve(null);
     });
+    mockDeleteWorkPlan.mockResolvedValue(undefined);
 
     const res = await request(orgOwnerApp).delete("/api/user-work-plans/plan-2");
 
-    expect(res.status).toBe(403);
-    expect(mockDeleteWorkPlan).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(mockDeleteWorkPlan).toHaveBeenCalledWith("plan-2");
   });
 
   it("plan owner can delete their own plan", async () => {

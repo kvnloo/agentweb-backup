@@ -280,6 +280,32 @@ describe("PUT /api/user-skills/:skillId — skills are owner-edit-only (no edito
     expect(res.status).toBe(403);
     expect(mockUpdateSkill).not.toHaveBeenCalled();
   });
+
+  it("org owner can PATCH another same-org member's skill (admin override)", async () => {
+    const orgOwnerUserId = "user-org-owner";
+    const orgOwnerApp = express();
+    orgOwnerApp.use(express.json());
+    orgOwnerApp.use("/api/user-skills", (req: any, _res: any, next: any) => {
+      req.user = { userId: orgOwnerUserId, email: "orgowner@example.com", isAdmin: false };
+      next();
+    }, userSkillRoutes);
+
+    mockGetSkill.mockResolvedValue(memberSkill); // owned by user-2
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === orgOwnerUserId) return Promise.resolve({ userId: orgOwnerUserId, orgId: mockOrgId, orgRole: "owner" });
+      if (uid === mockOrgMemberId) return Promise.resolve({ userId: mockOrgMemberId, orgId: mockOrgId, orgRole: "member" });
+      return Promise.resolve(null);
+    });
+    mockGetOrgById.mockResolvedValue(mockOrgEnabled);
+    mockUpdateSkill.mockResolvedValue(undefined);
+
+    const res = await request(orgOwnerApp)
+      .put("/api/user-skills/skill-2")
+      .send({ name: "Owner Override" });
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateSkill).toHaveBeenCalled();
+  });
 });
 
 describe("DELETE /api/user-skills/:skillId — org member cannot delete another member's skill", () => {
@@ -298,7 +324,7 @@ describe("DELETE /api/user-skills/:skillId — org member cannot delete another 
   });
 });
 
-describe("DELETE /api/user-skills/:skillId — DELETE is owner-only (no editor or org-owner override)", () => {
+describe("DELETE /api/user-skills/:skillId — owner or org-owner may delete; editors cannot", () => {
   // Editor app (user-3 is an editor but not org owner)
   const editorApp = express();
   editorApp.use(express.json());
@@ -322,7 +348,11 @@ describe("DELETE /api/user-skills/:skillId — DELETE is owner-only (no editor o
 
   it("editor cannot delete another member's skill even when in editors list", async () => {
     mockGetSkill.mockResolvedValue(memberSkill);
-    mockGetUserById.mockResolvedValue({ userId: mockEditorId, orgId: mockOrgId, orgRole: "member" });
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === mockEditorId) return Promise.resolve({ userId: mockEditorId, orgId: mockOrgId, orgRole: "member" });
+      if (uid === mockOrgMemberId) return Promise.resolve({ userId: mockOrgMemberId, orgId: mockOrgId, orgRole: "member" });
+      return Promise.resolve(null);
+    });
 
     const res = await request(editorApp).delete("/api/user-skills/skill-2");
 
@@ -330,15 +360,20 @@ describe("DELETE /api/user-skills/:skillId — DELETE is owner-only (no editor o
     expect(mockDeleteSkill).not.toHaveBeenCalled();
   });
 
-  it("org owner (orgRole=owner) CANNOT delete another member's skill (owner-only)", async () => {
+  it("org owner (orgRole=owner) can delete another same-org member's skill (admin override)", async () => {
     const privateSkillByMember = { ...memberSkill, visibility: "private" };
     mockGetSkill.mockResolvedValue(privateSkillByMember);
-    mockGetUserById.mockResolvedValue({ userId: orgOwnerUserId, orgId: mockOrgId, orgRole: "owner" });
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === orgOwnerUserId) return Promise.resolve({ userId: orgOwnerUserId, orgId: mockOrgId, orgRole: "owner" });
+      if (uid === mockOrgMemberId) return Promise.resolve({ userId: mockOrgMemberId, orgId: mockOrgId, orgRole: "member" });
+      return Promise.resolve(null);
+    });
+    mockDeleteSkill.mockResolvedValue(undefined);
 
     const res = await request(orgOwnerApp).delete("/api/user-skills/skill-2");
 
-    expect(res.status).toBe(403);
-    expect(mockDeleteSkill).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(mockDeleteSkill).toHaveBeenCalledWith("skill-2");
   });
 
   it("skill owner can delete their own skill", async () => {

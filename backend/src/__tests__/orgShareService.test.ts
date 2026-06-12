@@ -99,11 +99,11 @@ describe("member-owned features (skills, workPlans)", () => {
     expect(canManageOrgFeature(member, orgA, "workPlans")).toBe(true); // enabled=true in orgA
   });
 
-  it("only the item owner may edit — no editor or admin override", () => {
+  it("the item owner or the org owner may edit — but not listed editors", () => {
     expect(canEditItem(item, owner, orgA, ownerOrgId, "skills")).toBe(true);   // owns the item
-    expect(canEditItem(item, admin, orgA, ownerOrgId, "skills")).toBe(false);  // org owner cannot
-    expect(canEditItem(item, member, orgA, ownerOrgId, "workPlans")).toBe(false);
-    // even a user listed as an editor cannot edit another member's item
+    expect(canEditItem(item, admin, orgA, ownerOrgId, "skills")).toBe(true);   // org owner admin override
+    expect(canEditItem(item, member, orgA, ownerOrgId, "workPlans")).toBe(false); // plain non-owner member cannot
+    // a user merely listed as an editor cannot edit another member's item
     const orgWithSkillEditor = {
       ...orgA,
       shareSettings: { ...orgA.shareSettings!, skills: { enabled: true, editors: ["u-editor"] } },
