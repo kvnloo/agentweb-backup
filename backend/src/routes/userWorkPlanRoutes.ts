@@ -172,9 +172,16 @@ router.delete("/:planId", async (req, res) => {
       return res.status(403).json({ message: "Cannot delete plans that are public or pending review" });
     }
 
-    // Work plans are member-owned: only the plan owner may delete.
+    // Work plans are member-owned: the plan owner may delete; the org owner may
+    // also delete a same-org member's plan as an admin override.
     if (plan.ownerId !== userId) {
-      return res.status(403).json({ message: "Not authorized" });
+      const callerUser = await userDb.getUserById(userId);
+      let allowed = false;
+      if (callerUser?.orgRole === "owner" && callerUser?.orgId && plan.ownerId) {
+        const owner = await userDb.getUserById(plan.ownerId);
+        if (owner?.orgId === callerUser.orgId) allowed = true;
+      }
+      if (!allowed) return res.status(403).json({ message: "Not authorized" });
     }
 
     await workPlanService.deleteWorkPlan(planId);

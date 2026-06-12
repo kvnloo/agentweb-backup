@@ -146,9 +146,16 @@ router.delete("/:skillId", async (req, res) => {
 
     if (!skill) return res.status(404).json({ message: "Skill not found" });
 
-    // Skills are member-owned: only the skill owner may delete.
+    // Skills are member-owned: the skill owner may delete; the org owner may
+    // also delete a same-org member's skill as an admin override.
     if (skill.ownerId !== userId) {
-      return res.status(403).json({ message: "Not authorized" });
+      const callerUser = await userDb.getUserById(userId);
+      let allowed = false;
+      if (callerUser?.orgRole === "owner" && callerUser?.orgId && skill.ownerId) {
+        const owner = await userDb.getUserById(skill.ownerId);
+        if (owner?.orgId === callerUser.orgId) allowed = true;
+      }
+      if (!allowed) return res.status(403).json({ message: "Not authorized" });
     }
 
     if (skill.visibility !== 'private') {

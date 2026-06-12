@@ -121,11 +121,11 @@ export function canEditItem(
   item: ItemLike, user: UserLike, org: OrgLike | null, ownerOrgId: string | undefined, feature: Feature,
 ): boolean {
   if (item.userId && item.userId === user.userId) return true;
-  // Member-owned features (skills/workPlans) are edited by the item owner only —
-  // no editor delegation or org-owner override.
-  if (isMemberOwnedFeature(feature)) return false;
   if (!user.orgId || !org || !ownerOrgId) return false;
   if (ownerOrgId !== user.orgId) return false;
+  // Member-owned features (skills/workPlans): edited by the item owner (handled
+  // above) or the org owner as an admin override — but NOT listed editors.
+  if (isMemberOwnedFeature(feature)) return user.orgRole === "owner";
   return isEditorOrAdmin(user, org, feature);
 }
 
