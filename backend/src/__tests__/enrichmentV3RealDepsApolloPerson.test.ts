@@ -208,6 +208,35 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
     expect(matchPersonSpy).toHaveBeenCalledWith(expect.objectContaining({ email: 'jane@acme.com' }));
     expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ domain: expect.anything() }));
   });
+
+  it('passes the lead name alongside the email so matchPerson can run its identity gate', async () => {
+    // Regression: the email-only input starved matchPerson's identity gate of
+    // the lead name, so an Apollo name-fallback match that echoes the input
+    // email onto a DIFFERENT person (prod: joe@us.com → "Awais Haider") was
+    // trusted. The name must be threaded even when email is present.
+    const matchPersonSpy = jest.fn().mockResolvedValue(MATCH_RESULT);
+    mockApolloService(matchPersonSpy);
+
+    const deps = buildOrchestratorDeps('user-1');
+    const lead = makeLead({ email: 'joe@us.com', firstName: 'Joe', lastName: 'Hio' });
+
+    await deps.runWaterfall({
+      listId: 'list-1',
+      lead,
+      groupName: 'person_identity',
+      requestedFields: ['linkedin_url'],
+      configFieldsByName: {},
+      apolloCtx: createApolloFetchContext(),
+      enrichSoCtx: createEnrichSoFetchContext(),
+      refreshFields: new Set(),
+    });
+
+    expect(matchPersonSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ email: 'joe@us.com', firstName: 'Joe', lastName: 'Hio' }),
+    );
+    // Still must NOT send domain on the email path (preserves cache-key behavior).
+    expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ domain: expect.anything() }));
+  });
 });
 
 // ─── resolveIdentity no longer uses Apollo name+domain path ───────────────────

@@ -1473,7 +1473,7 @@ router.post('/:taskId/knowledge-base/files', authenticateToken, upload.array('fi
       // Validate file type
       if (!isSupportedFileType(file.originalname, file.mimetype)) {
         return res.status(400).json({ 
-          message: `Unsupported file type: ${file.originalname}. Supported document types: TXT, PDF, HTML, DOCX, PPTX, XLSX, XLSM. Image types: JPG, JPEG, PNG, GIF, WEBP, BMP, SVG. Video types: MP4, MOV, WEBM, OGG, M4V, AVI.` 
+          message: `Unsupported file type: ${file.originalname}. Supported document types: TXT, PDF, HTML, DOCX, PPTX, XLSX, XLSM, CSV. Image types: JPG, JPEG, PNG, GIF, WEBP, BMP, SVG. Video types: MP4, MOV, WEBM, OGG, M4V, AVI.`
         });
       }
 

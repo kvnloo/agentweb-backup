@@ -14,6 +14,7 @@ import type { MappedPerson, MappedOrganization } from './apolloFieldMapper';
 import type { OrchestratorDeps } from './crmEnrichmentServiceV3';
 import { CrmEnrichmentService, type LeadRecord } from './crmEnrichmentService';
 import { sanitizePhone } from '../utils/phoneValidation';
+import { nameTokensMatch } from '../utils/nameMatch';
 import type { IdentityResolverDeps } from './enrichmentIdentityResolver';
 import { resolveIdentity as pureResolveIdentity } from './enrichmentIdentityResolver';
 import { runWaterfall as pureRunWaterfall, type LLMFilledValue, type EnrichSoFetchResult } from './enrichmentGroupWaterfall';
@@ -811,13 +812,8 @@ export function unipileNameMatches(
   // Can't verify without at least one name field — reject for correctness.
   if (itemFirst === null && itemLast === null) return false;
 
-  const normFirst = (leadFirst ?? '').trim().toLowerCase();
-  const normLast  = (leadLast  ?? '').trim().toLowerCase();
-
-  if (itemFirst !== null && normFirst && !itemFirst.startsWith(normFirst) && !normFirst.startsWith(itemFirst)) return false;
-  if (itemLast  !== null && normLast  && !itemLast.startsWith(normLast)   && !normLast.startsWith(itemLast))   return false;
-
-  return true;
+  // Bidirectional-prefix token comparison shared with the Apollo identity gate.
+  return nameTokensMatch(itemFirst, itemLast, leadFirst, leadLast);
 }
 
 export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
@@ -884,8 +880,14 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
           return null;
         }
         try {
+          // Always pass the lead's name alongside the email. Apollo's cache key
+          // prefers email (so this neither changes the key nor costs an extra
+          // call), but matchPerson's identity gate needs the lead name to reject
+          // a name-fallback match where Apollo echoes the input email onto a
+          // DIFFERENT person (prod: joe@us.com → "Awais Haider"). Without the
+          // name the gate has nothing to compare and trusts the wrong profile.
           const apolloInput = lead.email
-            ? { email: lead.email }
+            ? { email: lead.email, firstName: lead.firstName ?? undefined, lastName: lead.lastName ?? undefined }
             : { firstName: lead.firstName ?? undefined, lastName: lead.lastName ?? undefined, domain: domain! };
           console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:person] matchPerson input=${JSON.stringify(apolloInput)}`);
           const result = await getApolloService().matchPerson(apolloInput);
@@ -941,9 +943,24 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
                 const s = typeof v === 'string' ? v.trim() : '';
                 return s || undefined;
               };
+              const profileFirst = trimStr(raw.first_name);
+              const profileLast = trimStr(raw.last_name);
+
+              // Identity guard: the lead's stored linkedin URL may be wrong (e.g.
+              // copied from a sibling lead or a bad prior enrichment). If the
+              // fetched profile's name contradicts the lead's name, the URL points
+              // at the wrong person — reject so we don't re-affirm awais-haider
+              // onto "Joe Hio". Skip the check only when we have no name on either
+              // side to compare (can't verify → no worse than before).
+              if ((lead.firstName || lead.lastName) && (profileFirst || profileLast) &&
+                  !nameTokensMatch(profileFirst, profileLast, lead.firstName, lead.lastName)) {
+                console.log(`${tag} Case A REJECT name mismatch profile="${profileFirst ?? '∅'} ${profileLast ?? '∅'}" lead="${lead.firstName ?? '∅'} ${lead.lastName ?? '∅'}"`);
+                return null;
+              }
+
               const result = {
-                first_name:   trimStr(raw.first_name),
-                last_name:    trimStr(raw.last_name),
+                first_name:   profileFirst,
+                last_name:    profileLast,
                 linkedin_url: raw.public_identifier ? `https://www.linkedin.com/in/${raw.public_identifier}` : undefined,
                 title:        trimStr(current?.position),
                 fromCache:    profileResult.fromCache,

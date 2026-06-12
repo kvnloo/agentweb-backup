@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-06-11
+// Last updated: 2026-06-12
 
 export interface UserReleaseNote {
   date: string;
@@ -9,8 +9,39 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-06-12',
+    changes: [
+      'New: Your Lead List Name and ID Now Sync to HubSpot for Easy Segmentation',
+      '- When you push leads to HubSpot, each contact now carries the name and ID of the Emma lead list it came from (as the "lead_list_name" and "lead_list_id" properties), so you can filter, segment, and build lists in HubSpot by their source',
+      '- This works for every list — including ones you connected before this update — with no need to reconnect or re-save; just push and the fields appear (HubSpot creates the two properties automatically on the first push)',
+      '- New leads added to a synced list carry these fields automatically when auto-sync is on',
+      '- Fully customizable in Configure External CRM: you can map the list name and ID to different HubSpot properties, or turn either off, and your choice is always respected',
+    ],
+  },
+  {
+    date: '2026-06-12',
+    changes: [
+      'Fixed: You Can Now Upload CSV Files to Your Knowledge Base',
+      '- CSV files (for example spreadsheets exported as .csv) were being rejected when you tried to add them to a knowledge base, even though they are a common way to share data',
+      '- CSV is now a supported file type — you can select or drag in .csv files alongside the documents, images, and videos you could already upload',
+    ],
+  },
+  {
+    date: '2026-06-12',
+    changes: [
+      'Fixed: LinkedIn and Profile Details No Longer Get Filled in from the Wrong Person',
+      '- When enriching a lead, our data provider would sometimes return a different person\'s profile as a "best guess" and even stamp your lead\'s email onto it — so a lead could end up with a LinkedIn URL, job title, or company belonging to a complete stranger',
+      '- We now verify that the returned profile actually matches your lead — by a confirmed email, a matching name, or a direct LinkedIn match — before saving any of those details',
+      '- If we can\'t confirm the match, we leave those fields untouched rather than fill them with the wrong person\'s information',
+    ],
+  },
+  {
     date: '2026-06-11',
     changes: [
+      'Fixed: Clearer Message When You Cannot Edit a Shared Landing Page',
+      '- If you asked Emma to edit a teammate\'s landing page that you can see but are not allowed to change, Emma would keep trying and then report it as a platform error',
+      '- Emma now checks up front whether you have edit access to a page and, if not, tells you right away to ask your org owner to add you as a landing-page editor (Settings > Organization > Org-wide Sharing > Landing Pages) — no more wasted attempts or confusing error messages',
+      '- Your landing page list also now marks which pages you can edit versus only view',
       'Fixed: Skills You Create by Chatting with Emma Are Now Shared with Your Organization',
       '- When you asked Emma to create a skill, it was saved without linking it to your organization, so teammates could not see it and it did not behave like other shared skills',
       '- Skills created through Emma are now shared across your whole organization by default, just like skills created from Settings > Skills',

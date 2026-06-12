@@ -32,6 +32,7 @@ import {
   INTEGRATIONS,
   resolveSiteForCaller,
   getLandingPageLiveUrl,
+  canUserEditLandingPage,
 } from "../services/v0Service";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/customDomainService";
@@ -585,7 +586,26 @@ router.get("/generated", async (req, res: Response) => {
       }
     }
 
-    res.json({ pages });
+    // Annotate each page with whether THIS caller can edit it. The list mixes
+    // the caller's own pages with org-shared pages they may only be able to
+    // view; without this flag the agent can't tell which it may edit and wastes
+    // attempts (and mislabels the resulting 403 as a platform bug). Every page
+    // here is either the caller's own or owned by an org member (same org via
+    // fanout), so the already-loaded `org` is the right context — no extra DB
+    // calls. Owner fast-paths to true; otherwise canEditItem gates on
+    // editor/owner role.
+    const annotated = pages.map((p) => ({
+      ...p,
+      editable: canEditItem(
+        { userId: p.userId },
+        { userId, orgId, orgRole: user?.orgRole as "owner" | "member" | undefined },
+        org,
+        orgId,
+        "landingPages",
+      ),
+    }));
+
+    res.json({ pages: annotated });
   } catch (error) {
     console.error("[LP GENERATION] Error listing pages:", error);
     res.status(500).json({ error: "Failed to list landing pages" });
@@ -606,7 +626,11 @@ router.get("/generated/:id", async (req, res: Response) => {
     const auth = await authorizeLandingPageAccess(req.params.id, userId, "view");
     if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
 
-    res.json(auth.page);
+    // Surface whether the caller may edit (vs only view) this page so the agent
+    // doesn't attempt edits it isn't authorized for. Owner short-circuits to
+    // true; org viewers without editor rights get false.
+    const editable = await canUserEditLandingPage(auth.page, userId);
+    res.json({ ...auth.page, editable });
   } catch (error) {
     console.error("[LP GENERATION] Error getting page:", error);
     res.status(500).json({ error: "Failed to get landing page" });

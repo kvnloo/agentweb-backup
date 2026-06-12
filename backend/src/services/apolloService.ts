@@ -31,6 +31,7 @@ import {
 import {
   mapApolloMatchResponse,
   mapApolloOrganization,
+  apolloMatchIsTrustworthy,
   type MappedMatch,
   type MappedOrganization,
   type MapMatchInputs,
@@ -293,6 +294,8 @@ export class ApolloService {
       hadLinkedinUrl: !!input.linkedinUrl,
       hadEmail: !!input.email,
       hadNameAndOrg: !!((input.firstName || input.lastName) && (input.domain || input.organizationName)),
+      leadFirstName: input.firstName,
+      leadLastName: input.lastName,
     };
 
     const result = await this.runCachedCall(
@@ -322,8 +325,18 @@ export class ApolloService {
       return { found: false, fromCache: result.fromCache, checkedAt: result.row.fetchedAt };
     }
 
+    // Identity gate: Apollo's name-fallback match can return a DIFFERENT person
+    // and echo the input email onto them (prod: "Joe Hio"/joe@us.com → "Awais
+    // Haider"). Reject the match unless we can confirm it belongs to this lead,
+    // so we never persist the wrong LinkedIn URL / title / company.
+    if (!apolloMatchIsTrustworthy(mapped.person, inputs)) {
+      return { found: false, fromCache: result.fromCache, checkedAt: result.row.fetchedAt };
+    }
+
     // Cross-key fan-out: a linkedin/name lookup that returns an email writes
-    // an email-keyed copy so a future email-keyed lookup is a free hit.
+    // an email-keyed copy so a future email-keyed lookup is a free hit. Only
+    // reached for trustworthy matches — we never fan out an echoed-email
+    // mismatch onto the email-keyed cache.
     if (!result.fromCache && !input.email && mapped.person.email) {
       await this.writeEmailFanout(mapped.person.email, result.row);
     }
