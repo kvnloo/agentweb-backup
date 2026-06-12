@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-12',
     changes: [
+      'New: Your Lead List Name and ID Now Sync to HubSpot for Easy Segmentation',
+      '- When you push leads to HubSpot, each contact now carries the name and ID of the Emma lead list it came from (as the "lead_list_name" and "lead_list_id" properties), so you can filter, segment, and build lists in HubSpot by their source',
+      '- This works for every list — including ones you connected before this update — with no need to reconnect or re-save; just push and the fields appear (HubSpot creates the two properties automatically on the first push)',
+      '- New leads added to a synced list carry these fields automatically when auto-sync is on',
+      '- Fully customizable in Configure External CRM: you can map the list name and ID to different HubSpot properties, or turn either off, and your choice is always respected',
+    ],
+  },
+  {
+    date: '2026-06-12',
+    changes: [
       'Fixed: You Can Now Upload CSV Files to Your Knowledge Base',
       '- CSV files (for example spreadsheets exported as .csv) were being rejected when you tried to add them to a knowledge base, even though they are a common way to share data',
       '- CSV is now a supported file type — you can select or drag in .csv files alongside the documents, images, and videos you could already upload',
