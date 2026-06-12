@@ -1402,8 +1402,8 @@ router.put("/users/:userId/password", async (req, res) => {
     const { password } = req.body;
 
     // Validate password
-    if (!password || password.length < 6) {
-      return res.status(400).json({ message: "Password must be at least 6 characters long" });
+    if (!password || password.length < 12) {
+      return res.status(400).json({ message: "Password must be at least 12 characters long" });
     }
 
     // Check if user exists

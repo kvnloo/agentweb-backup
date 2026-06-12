@@ -194,7 +194,7 @@ describe('register controller — company email enforcement', () => {
     const app = makeApp();
     const res = await request(app)
       .post('/register')
-      .send({ email: 'user@gmail.com', password: 'pw123' });
+      .send({ email: 'user@gmail.com', password: 'ValidPass123!' });
 
     expect(res.status).toBe(400);
     expect(res.body.message).toMatch(/company email/i);
@@ -205,7 +205,7 @@ describe('register controller — company email enforcement', () => {
     const app = makeApp();
     const res = await request(app)
       .post('/register')
-      .send({ email: 'user@yahoo.com', password: 'pw123' });
+      .send({ email: 'user@yahoo.com', password: 'ValidPass123!' });
 
     expect(res.status).toBe(400);
     expect(res.body.message).toMatch(/company email/i);
@@ -215,7 +215,7 @@ describe('register controller — company email enforcement', () => {
     const app = makeApp();
     const res = await request(app)
       .post('/register')
-      .send({ email: 'user@hotmail.com', password: 'pw123' });
+      .send({ email: 'user@hotmail.com', password: 'ValidPass123!' });
 
     expect(res.status).toBe(400);
     expect(res.body.message).toMatch(/company email/i);
@@ -225,7 +225,7 @@ describe('register controller — company email enforcement', () => {
     const app = makeApp();
     const res = await request(app)
       .post('/register')
-      .send({ email: 'user@outlook.com', password: 'pw123' });
+      .send({ email: 'user@outlook.com', password: 'ValidPass123!' });
 
     expect(res.status).toBe(400);
     expect(res.body.message).toMatch(/company email/i);
@@ -235,7 +235,7 @@ describe('register controller — company email enforcement', () => {
     const app = makeApp();
     const res = await request(app)
       .post('/register')
-      .send({ email: 'alice@acmecorp.com', password: 'pw123' });
+      .send({ email: 'alice@acmecorp.com', password: 'ValidPass123!' });
 
     expect(res.status).toBe(201);
     expect(mockCreateUser).toHaveBeenCalledTimes(1);
