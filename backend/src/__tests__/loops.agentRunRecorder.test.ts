@@ -146,8 +146,13 @@ describe('AgentRunRecorder', () => {
 
     expect((puts[0].item as any).eventType).toBe(EVT_RUN_COMPLETED);
     expect((puts[0].item as any).dimensions.toolCalls).toBe(3);
-    expect((puts[1].item as any).eventType).toBe(EVT_RUN_FAILED);
-    expect((puts[1].item as any).subjectId).toBe('sess-2');
+    // Every terminal event is followed by a durable agent_run_verdict event.
+    expect((puts[1].item as any).eventType).toBe('agent_run_verdict');
+    expect((puts[1].item as any).dimensions.verdict).toBe('ok');
+    expect((puts[2].item as any).eventType).toBe(EVT_RUN_FAILED);
+    expect((puts[2].item as any).subjectId).toBe('sess-2');
+    expect((puts[3].item as any).eventType).toBe('agent_run_verdict');
+    expect((puts[3].item as any).dimensions.verdict).toBe('failed');
   });
 
   it('never throws into the caller hot path when Dynamo fails', async () => {

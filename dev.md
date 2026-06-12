@@ -1,3 +1,20 @@
+## Post-run outcome verdicts — degraded-run detection (2026-06-12)
+
+Telemetry blind spot: 165 runs in the June window, ZERO hard failures, 60+ tool failures silently absorbed. "Completed" ≠ "succeeded" — the user feels the degradation but nothing durable records it, so the agent-mode loop (whose sensor reads spine events) could never learn from degraded runs. The inspector's read-time flags don't help the policy: they exist only in the projection.
+
+### What shipped (this PR)
+
+1. **`agent_run_verdict` spine event** emitted alongside every terminal run event. Dims: `verdict: ok|degraded|failed`, machine-readable `reasons`, counts.
+2. **`computeRunVerdict()`** (pure, exported): failed terminal → failed; ≥3 failed tool calls OR ≥1/3 failure ratio OR same tool failing ≥3× (the linkedin_outreach retry-spiral shape) → degraded; else ok. Thresholds tuned so the typical healthy-but-imperfect run (28 calls, 1-2 failures) does NOT flag.
+3. **`maxSameToolFailures`** computed at both run-completion call sites from the toolCalls array — catches retry spirals a low overall ratio hides.
+4. **Inspector surfacing**: `outcomeVerdict`/`outcomeReasons` on run summaries + a `degraded_run` warning flag.
+
+### Assumptions to validate
+
+- Degraded-rate baseline: expect ~20% of runs degraded based on June data (35/165 runs had ≥1 failure; threshold ≥3 cuts that down). If >40% flag degraded, thresholds are too tight to be actionable.
+- The agent-mode loop's failureRuleSet does NOT yet consume verdict events — next step is a policy rule that clusters degraded runs by reasons + dominant errorClass. Verdicts accumulate from deploy time so that rule will have data when written.
+- One extra event per run (~165/day) is negligible Dynamo volume.
+
 ## Semantic tool-error taxonomy + contract-layer counters (2026-06-12)
 
 Telemetry finding from the June 9-12 window: every recorded tool failure had errorClass "Error" — tools throw plain `new Error(message)`, so the constructor-name fallback carried zero signal. The failure policy could only cluster by toolName; the model (and the breaker) could not distinguish retryable timeouts from terminal auth failures.
