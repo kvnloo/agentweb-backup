@@ -703,6 +703,7 @@ describe('Security Tests', () => {
       } as any);
       (mockBcryptHash as unknown as jest.Mock).mockResolvedValue('new-hashed-password');
       (mockUserDb as any).updateUser.mockResolvedValue(undefined);
+      (mockUserDb as any).incrementSessionVersion.mockResolvedValue(1);
 
       await resetPassword(req, res);
 
@@ -711,6 +712,8 @@ describe('Security Tests', () => {
         resetPasswordToken: undefined,
         resetPasswordExpires: undefined,
       }));
+      // Recovery must invalidate all existing sessions (other devices)
+      expect(mockUserDb.incrementSessionVersion).toHaveBeenCalledWith('user-1');
       expect(res.json).toHaveBeenCalledWith({ message: 'Password has been reset successfully' });
     });
   });
