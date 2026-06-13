@@ -127,6 +127,26 @@ export interface GeneratedLandingPage {
   leadListId?: string;
   templateHtml?: string;
   isRootPage?: boolean;
+  /**
+   * The site this page belongs to. A site = the repo/Vercel project/subdomain a
+   * page is deployed into. The site's root record has `siteId === id`; sub-pages
+   * carry their root's id. Explicit identity that replaces the old "guess the
+   * user's oldest repo" heuristic in {@link findSiteById} / generateLandingPage.
+   */
+  siteId?: string;
+  /**
+   * The agent-mode chat session that spawned this generation. Set when a page is
+   * generated from a session so a long-running build can be reconnected to that
+   * session on completion (durable execution — see durableLandingService).
+   */
+  originatingSessionId?: string;
+  /**
+   * Set, exactly once, when a completion has been delivered back to the
+   * originating session. Written via a conditional `attribute_not_exists` update
+   * so the in-process completion hook and the redeploy-backstop poller can never
+   * both deliver (idempotency). See durableLandingService.claimCompletion.
+   */
+  claimedCompletionAt?: string;
   slug?: string;
   archived?: boolean;
   archivedAt?: string;
