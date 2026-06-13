@@ -15,7 +15,7 @@ import type { EnrichmentFieldConfig } from './crmEnrichmentServiceV3';
 import type { SiblingLeadResult } from './enrichmentIdentityResolver';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
 import { FIELD_GROUPS } from './enrichmentGroups';
-import { createLLMService } from '../utils/llmService';
+import { createLLMService, LLMUsageContext } from '../utils/llmService';
 
 const IDENTITY_FIELDS = new Set([
   'firstName', 'lastName', 'email', 'linkedin', 'company', 'website', 'title',
@@ -79,6 +79,7 @@ export function buildCanonicalFieldMap(
 
 export async function buildLLMFieldMapping(
   unaliasedConfigFields: EnrichmentFieldConfig[],
+  usageContext?: LLMUsageContext,
 ): Promise<Map<string, string[]>> {
   const result = new Map<string, string[]>();
   if (unaliasedConfigFields.length === 0) return result;
@@ -99,7 +100,15 @@ export async function buildLLMFieldMapping(
 
   try {
     const llm = createLLMService(MAPPING_MODEL, 0.0);
-    const parsed = await llm.generateJSONContent<Record<string, string[]>>(systemPrompt, userPrompt);
+    // Shadow usage metering: callers that don't pass a context still get the
+    // call recorded under feature "enrichment" (userId falls back to "system").
+    const parsed = await llm.generateJSONContent<Record<string, string[]>>(
+      systemPrompt,
+      userPrompt,
+      'json',
+      undefined,
+      usageContext ?? { feature: 'enrichment' },
+    );
     for (const [fieldName, aliases] of Object.entries(parsed)) {
       if (Array.isArray(aliases)) {
         result.set(fieldName, aliases.map(a => String(a).trim()).filter(Boolean));
@@ -125,6 +134,7 @@ export interface SiblingFieldMappingTable {
 
 export async function buildSiblingFieldMappingTable(
   configFields: EnrichmentFieldConfig[],
+  usageContext?: LLMUsageContext,
 ): Promise<SiblingFieldMappingTable> {
   const nonIdentity = configFields.filter(f => !IDENTITY_FIELDS.has(f.name));
   const withAlias = nonIdentity.filter(f => !!f.aliasFor);
@@ -132,7 +142,7 @@ export async function buildSiblingFieldMappingTable(
 
   const [canonical, llm] = await Promise.all([
     Promise.resolve(buildCanonicalFieldMap(withAlias)),
-    buildLLMFieldMapping(withoutAlias),
+    buildLLMFieldMapping(withoutAlias, usageContext),
   ]);
 
   return { canonical, llm };

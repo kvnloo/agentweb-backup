@@ -432,7 +432,10 @@ Be precise. Only report genuine issues. If the email looks clean, return an empt
 
       const userPrompt = `Sender email: ${senderEmail ?? 'not provided'}\nSubject: ${subject}\n\nHTML:\n${htmlContent}`;
 
-      const parsed = await llm.generateJsonRobust<{ passed: boolean; issues: any[] }>(systemPrompt, userPrompt);
+      const parsed = await llm.generateJsonRobust<{ passed: boolean; issues: any[] }>(systemPrompt, userPrompt, undefined, {
+        userId,
+        feature: 'content_gen',
+      });
       const issues = Array.isArray(parsed.issues) ? parsed.issues : [];
       const errors = issues.filter((i: any) => i.severity === 'error');
       return res.json({
@@ -496,7 +499,10 @@ Return your response in this exact format:
 
       const userPrompt = `Issues to fix:\n${issueList}\n${contextSection}\nSubject: ${subject}\n\nHTML:\n${htmlContent}`;
 
-      const rawText = await llm.generateRaw(systemPrompt, userPrompt);
+      const rawText = await llm.generateRaw(systemPrompt, userPrompt, undefined, {
+        userId,
+        feature: 'content_gen',
+      });
 
       const htmlMatch = rawText.match(/<html_content>([\s\S]*?)<\/html_content>/i);
       const subjectMatch = rawText.match(/<subject>([\s\S]*?)<\/subject>/i);

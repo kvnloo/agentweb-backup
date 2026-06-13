@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { getAzureClient } from "../utils/llmClients";
 import { v4 as uuidv4 } from "uuid";
 import AWS from "aws-sdk";
 import dotenv from "dotenv";
@@ -46,30 +47,30 @@ export const dynamodb = new AWS.DynamoDB.DocumentClient({
   },
 });
 
-// Initialize Azure OpenAI client
-const openai = new OpenAI({
-  apiKey: process.env.AZURE_OPENAI_API_KEY,
-  baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT}`,
-  defaultQuery: {
-    "api-version": process.env.AZURE_OPENAI_API_VERSION || "2024-08-01-preview",
-  },
-  defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
-});
+// Metered Azure OpenAI client for Emma chat. Same standard deployment the
+// module singleton used; usage is recorded per user/session via the factory.
+function chatClient(userId?: string, sessionId?: string) {
+  return getAzureClient(
+    { userId, feature: "chat", sessionId },
+    process.env.AZURE_OPENAI_DEPLOYMENT
+  );
+}
 
-// Separate client for embeddings
-const embeddingsClient = new OpenAI({
-  apiKey: process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY,
-  baseURL: `${
-    process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT
-  }/openai/deployments/${
-    process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT || "text-embedding-3-large"
-  }`,
-  defaultQuery: {
-    "api-version":
-      process.env.AZURE_OPENAI_EMBEDDINGS_API_VERSION || "2024-08-01-preview",
-  },
-  defaultHeaders: { "api-key": process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY },
-});
+// Metered client for embeddings (knowledge-base semantic search). Uses the
+// separate EMBEDDINGS endpoint/key/api-version the module singleton used. No
+// userId is in scope on this path, so usage is attributed to platform overhead.
+function embeddingsClientFor() {
+  return getAzureClient(
+    { feature: "embeddings" },
+    process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT || "text-embedding-3-large",
+    {
+      endpoint: process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT,
+      apiKey: process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY,
+      apiVersion:
+        process.env.AZURE_OPENAI_EMBEDDINGS_API_VERSION || "2024-08-01-preview",
+    }
+  );
+}
 
 // Interface for message feedback
 export interface MessageFeedback {
@@ -388,7 +389,7 @@ async function findRelevantChunks(
 
   try {
     // For simple semantic search, we'll use OpenAI embeddings
-    const queryEmbeddingResponse = await embeddingsClient.embeddings.create({
+    const queryEmbeddingResponse = await embeddingsClientFor().embeddings.create({
       model: `${process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT}`,
       input: query,
       dimensions: 1536,
@@ -399,7 +400,7 @@ async function findRelevantChunks(
     // Get embeddings for all chunks (in a real system, you'd cache these)
     const chunkEmbeddings = await Promise.all(
       chunks.map(async (chunk) => {
-        const response = await embeddingsClient.embeddings.create({
+        const response = await embeddingsClientFor().embeddings.create({
           model: `${process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT}`,
           input: chunk.content,
           dimensions: 1536,
@@ -4112,14 +4113,12 @@ export async function generateChatResponse(
     } else if (isGeminiModel) {
       activeClient = await agentModeService!.getGeminiClient();
     } else {
-      activeClient = model
-        ? new OpenAI({
-            apiKey: process.env.AZURE_OPENAI_API_KEY,
-            baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${model}`,
-            defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION || "2024-08-01-preview" },
-            defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
-          })
-        : openai;
+      // model specified → that Azure deployment; otherwise the default
+      // deployment (what the module singleton used). Metered via the factory.
+      activeClient = getAzureClient(
+        { userId, feature: "chat", sessionId },
+        model || process.env.AZURE_OPENAI_DEPLOYMENT
+      );
     }
 
     // Helper: Sleep function for exponential backoff

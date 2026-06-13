@@ -49,8 +49,10 @@ async function extractAdminMessageIntent(
       return null;
     }
 
-    const { GoogleGenAI } = await import('@google/genai');
-    const ai = new GoogleGenAI({ apiKey: apiKey.trim() });
+    // Metered factory client (shadow usage metering). System context — admin
+    // channel parsing has no single attributable user, so no userId is passed.
+    const { getGeminiClient } = await import('../utils/llmClients');
+    const ai = await getGeminiClient({ feature: 'other' }, apiKey);
 
     const prompt = `Extract the target user email address and task description from this admin Slack message.
 

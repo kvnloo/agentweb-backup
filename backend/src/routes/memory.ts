@@ -62,7 +62,7 @@ router.post('/', async (req, res) => {
 
     // Embed at write time so the memory can later be retrieved by relevance. Best-effort:
     // a failure here must not block saving the memory (it falls back to recency on read).
-    const embedding = (await embedText(content)) ?? undefined;
+    const embedding = (await embedText(content, { userId, feature: 'embeddings' })) ?? undefined;
     const memory = await accountMemoryDb.addMemory(userId, category, content, sourceSessionId, embedding);
     res.status(201).json({ memory });
   } catch (error: any) {
