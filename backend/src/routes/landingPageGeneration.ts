@@ -32,6 +32,7 @@ import {
   markLandingPagePublishReverted,
   INTEGRATIONS,
   resolveSiteForCaller,
+  resolveLockedSiteMode,
   getLandingPageLiveUrl,
   canUserEditLandingPage,
 } from "../services/v0Service";
@@ -396,12 +397,15 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       }
     }
 
-    // Effective site mode: an explicit request value wins, else the user's saved
-    // preference, else the cost-safe default (unified).
-    const effectiveMode: "unified" | "separate" =
-      requestedMode === "separate" || requestedMode === "unified"
-        ? requestedMode
-        : userSiteMode ?? "unified";
+    // Effective site mode, WRITE-ONCE locked. A saved mode is immutable (switching
+    // single<->multi would re-home deployed pages across repos/domains); the first
+    // explicit pick sets + locks it; otherwise default unified.
+    const { mode: effectiveMode, lockNow } = resolveLockedSiteMode(userSiteMode, requestedMode);
+    if (lockNow) {
+      await userDb
+        .setLandingSiteMode(userId, effectiveMode)
+        .catch((e) => console.warn(`[LP GENERATION] could not lock site mode: ${e?.message}`));
+    }
 
     const result = await generateLandingPage(userId, prompt, pageName, brandContext, lead_list_id, template_html, {
       siteId: typeof site_id === "string" ? site_id : undefined,

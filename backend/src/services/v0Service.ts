@@ -423,6 +423,35 @@ async function getV0Client() {
  * - If user ALREADY has a deployed landing page → add a new page route to the EXISTING
  *   GitHub repo via the GitHub Contents API. No v0 call, no new repo. Vercel auto-redeploys.
  */
+export type LandingSiteMode = "unified" | "separate";
+
+/**
+ * Resolve the effective landing-site mode, enforcing the WRITE-ONCE lock.
+ *
+ * Behavioral contract (single page vs multi page):
+ * - "single page" = `unified` (new pages become sub-pages of one site).
+ * - "multi page"  = `separate` (each page its own site/domain).
+ * The choice is LOCKED once made: switching would mean physically re-homing
+ * already-deployed pages across repos/projects/domains (broken URLs + SEO). So:
+ * - If the user already has a saved mode, it is authoritative and immutable
+ *   (a conflicting request is ignored), and `lockNow` is false.
+ * - If no saved mode and the request explicitly picks one, that pick becomes the
+ *   mode and `lockNow` is true (persist it write-once).
+ * - If neither, fall back to `unified` without locking (no explicit choice yet).
+ */
+export function resolveLockedSiteMode(
+  savedMode: LandingSiteMode | undefined,
+  requestedMode: unknown
+): { mode: LandingSiteMode; lockNow: boolean } {
+  if (savedMode === "unified" || savedMode === "separate") {
+    return { mode: savedMode, lockNow: false };
+  }
+  if (requestedMode === "unified" || requestedMode === "separate") {
+    return { mode: requestedMode, lockNow: true };
+  }
+  return { mode: "unified", lockNow: false };
+}
+
 export interface GenerateLandingPageOptions {
   /**
    * Target a specific existing site — add this page/variant to its repo. Wins over
