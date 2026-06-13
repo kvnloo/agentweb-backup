@@ -25,8 +25,16 @@ Telemetry says duplicate building ALREADY happens, independent of any retry: **1
 
 The naive commit-retry would have ADDED a vector: if `patch-ref` succeeds on GitHub but the response is lost ("fetch failed" on the reply), a blind retry re-commits → a 2nd commit + 2nd Vercel build for the same page. Fixed with **idempotency**: `commitFilesToRepoMain` tracks the commit it tried to set and, on any failure, re-reads `main` — if it's already at our commit, the patch landed (lost response) → return success, never re-commit. A non-fast-forward 422 (patch rejected, main NOT at our commit) correctly falls through to rebase+retry. So retries can rebase and recover transient failures but can never double-build.
 
-### Still open (telemetry-flagged, not in this change)
-- The broader dedup: a `generateLandingPage`-entry guard ("this exact route is already deployed or in-flight → reuse it") would prevent the 11 duplicate-route builds at the source (the durable reconnect covers in-flight; an already-deployed check would cover the rest).
+### Route-level idempotency — kills the 11 duplicate builds at the source (DONE)
+A multi-agent audit + a fresh telemetry pass established the key fact: **all 11 duplicate `(repo,slug)` routes came from DIFFERENT chat sessions re-asking the same route** — not concurrency, not the same session. So the right key is **route identity (userId, slug)**, not a session lock or a serial writer. `generateLandingPage` now calls `findReusablePageForRoute(userId, slug)` in the existing-site branch: if a non-archived page at that slug is already `deployed`/`generating`/`deploying`, it's returned (reuse) instead of building a duplicate. Explicitly NOT `failed` (a retry after a failure must rebuild); legitimate refreshes go through the dedicated iterate endpoint. ~15 lines, no lock — the lightweight "idempotent entry" the design research endorsed as the simplest first step.
+
+### Design direction (research, separate doc) — platform-native, net-removes complexity
+Research (Webflow/Framer/Vercel/v0 + canonical patterns) concluded the simplest *target* is "repo is the source of truth, content-addressed, read live state": Vercel already returns the existing deployment for an already-seen commit SHA and cancels superseded builds (`autoJobCancellation`), so the duplicate/race/orphan problems are best solved by leaning on that + a `generationKey` idempotency on the v0 call, which would let us DELETE the orphan-sweep + redeploy poller + scattered guards rather than add more. The route-dedup above is the first, direction-agnostic step toward it.
+
+### Still open (audit-confirmed, safe, next)
+- **Vercel calls are bare axios** (createVercelProject/triggerVercelDeployment/poll/status) — wrap in `withRetry` (extend the classifier for axios `err.response.status`), the same gap as the GitHub commit path. High value (the 6 v0-500 + transient deploy failures).
+- **First-page push** (`createGitHubRepoAndPush` blob/tree/commit/ref-patch) is still bare — route it through `commitFilesToRepoMain`.
+- `generateFirstPage` put + `cleanupOrphanedFailedPages` could use conditional writes (compare-and-swap) to close the first-page concurrency race.
 - v0 HTTP 500s (6) are retried by `withRetry` but a sustained v0 outage still surfaces; consider a longer/again-later retry or a user-facing "v0 is down, try again" rather than a hard fail.
 - Vercel deploy 422 (1) — check `createVercelProject` / `triggerVercelDeployment` retry coverage next.
 
