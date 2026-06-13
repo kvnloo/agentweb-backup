@@ -2044,6 +2044,40 @@ const createEnrichmentRawCacheTable = async () => {
 // Shared event sink for every closed-loop instance (funnel loops + agent-mode).
 // PK loopId, SK tsSession (`<ts ISO>#<subjectId>#<eventType>`); see
 // loops/core/sensors/eventTableEventSource.ts for the row shape.
+const createOnboardingMetricsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${process.env.NODE_ENV === 'development' ? 'Dev-' : ''}AW-OnboardingMetrics`,
+    AttributeDefinitions: [
+      { AttributeName: 'metricId', AttributeType: 'S' },
+      { AttributeName: 'step', AttributeType: 'S' },
+      { AttributeName: 'startedAt', AttributeType: 'S' },
+    ],
+    KeySchema: [{ AttributeName: 'metricId', KeyType: 'HASH' }],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'StepStartedAtIndex',
+        KeySchema: [
+          { AttributeName: 'step', KeyType: 'HASH' },
+          { AttributeName: 'startedAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const createLoopEventsTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: 'Dev-AW-LoopEvents',
@@ -2151,6 +2185,7 @@ const main = async () => {
     await createDripSendsTable();
     await createEnrichmentHistoryTable();
     await createEnrichmentRawCacheTable();
+    await createOnboardingMetricsTable();
     await createLoopEventsTable();
     await createLoopLearningTable();
     await createCharactersTable();
