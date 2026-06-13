@@ -485,7 +485,22 @@ describe("v0Service - commitFilesToRepoMain (retry + rebase)", () => {
 
     const res = await commitFilesToRepoMain("o/r", {}, files, "msg", 2);
     expect(res.pushedCommitSha).toBe("new-sha");
-    expect(mockAxiosGet).toHaveBeenCalledTimes(2); // re-read main on the retry = rebase
+    expect(mockAxiosGet.mock.calls.length).toBeGreaterThanOrEqual(2); // re-read main = rebase
+  });
+
+  it("is idempotent: a lost response after a successful patch does NOT build twice", async () => {
+    // attempt 1: read old main, create commit "new-sha", patch throws (response lost)
+    // — but the catch re-reads main and sees it's already at "new-sha" → success, no re-commit.
+    mockAxiosGet
+      .mockResolvedValueOnce({ data: { object: { sha: "old-sha" } } }) // initial read
+      .mockResolvedValueOnce({ data: { object: { sha: "new-sha" } } }); // catch re-check: our commit landed
+    mockAxiosPost.mockResolvedValue({ data: { sha: "new-sha" } }); // blob/tree/commit
+    mockAxiosPatch.mockRejectedValue(Object.assign(new Error("fetch failed"))); // lost response
+
+    const res = await commitFilesToRepoMain("o/r", {}, files, "msg", 4);
+    expect(res.pushedCommitSha).toBe("new-sha");
+    // one commit only (1 blob + 1 tree + 1 commit = 3 posts) — no duplicate build
+    expect(mockAxiosPost).toHaveBeenCalledTimes(3);
   });
 
   it("retries a transient 'fetch failed' then succeeds", async () => {

@@ -655,15 +655,28 @@ export async function commitFilesToRepoMain(
   commitMessage: string,
   maxAttempts = 4
 ): Promise<{ pushedCommitSha: string; pushTimestampMs: number }> {
+  const getMainSha = async (): Promise<string> => {
+    const refRes = await axios.get<any>(
+      `https://api.github.com/repos/${repoFullName}/git/ref/heads/main`,
+      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+    );
+    return refRes.data.object.sha;
+  };
+
   let lastErr: any;
+  // The commit SHA we last tried to advance main to. The idempotency anchor: if a
+  // retry sees main already AT this SHA, our patch actually landed (we just lost the
+  // response) — we must NOT re-commit, or we'd build the same page twice.
+  let pendingCommitSha: string | undefined;
+
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      // Re-read main on every attempt → rebase onto any concurrent commit.
-      const refRes = await axios.get<any>(
-        `https://api.github.com/repos/${repoFullName}/git/ref/heads/main`,
-        { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
-      );
-      const latestCommitSha = refRes.data.object.sha;
+      const latestCommitSha = await getMainSha();
+
+      // Idempotency: a prior attempt's patch already landed (lost-response case).
+      if (pendingCommitSha && latestCommitSha === pendingCommitSha) {
+        return { pushedCommitSha: pendingCommitSha, pushTimestampMs: Date.now() };
+      }
 
       const treeItems = await Promise.all(
         filesToCommit.map(async (file) => {
@@ -688,6 +701,8 @@ export async function commitFilesToRepoMain(
         { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
       );
       const pushedCommitSha: string = commitRes.data.sha;
+      // Mark BEFORE the mutating patch so the catch can tell if it landed.
+      pendingCommitSha = pushedCommitSha;
 
       // The ref update is where a concurrent commit surfaces as a non-fast-forward.
       await axios.patch<any>(
@@ -699,6 +714,21 @@ export async function commitFilesToRepoMain(
       return { pushedCommitSha, pushTimestampMs: Date.now() };
     } catch (err: any) {
       lastErr = err;
+
+      // Did the patch actually land despite this error? (lost response after a
+      // successful write.) If main is already at our commit, STOP — re-committing
+      // would create a duplicate page build. Best-effort: a failed check just falls
+      // through to the normal retry decision.
+      if (pendingCommitSha) {
+        try {
+          if ((await getMainSha()) === pendingCommitSha) {
+            return { pushedCommitSha: pendingCommitSha, pushTimestampMs: Date.now() };
+          }
+        } catch {
+          // ignore — the next attempt's top-of-loop check will catch it too
+        }
+      }
+
       const { retryable, reason } = isRetryableGithubPushError(err);
       if (!retryable || attempt === maxAttempts) {
         console.error(`[V0 SERVICE] commit to ${repoFullName} failed after ${attempt} attempt(s) (${reason}): ${err?.message}`);
