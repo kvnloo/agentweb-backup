@@ -20,7 +20,13 @@ New `commitFilesToRepoMain(repoFullName, ghHeaders, files, message, maxAttempts=
 
 This kills the dominant "fetch failed" class AND the concurrent-commit race in one move. Flag-independent — strictly more resilient, applies to `main` today. Branch `harsha/harden-landing-commit-retry`.
 
+### Duplicate/unnecessary builds — does retrying make it worse? (the right question)
+Telemetry says duplicate building ALREADY happens, independent of any retry: **18/110 orphaned failed records** (started, produced nothing), **11 `(repo,slug)` pairs built >1× (some 3×)**, **7 retry storms** (same user+page <10min apart). Source: users/Emma re-asking + orphaned/detached builds (the durable-reconnect work targets that class).
+
+The naive commit-retry would have ADDED a vector: if `patch-ref` succeeds on GitHub but the response is lost ("fetch failed" on the reply), a blind retry re-commits → a 2nd commit + 2nd Vercel build for the same page. Fixed with **idempotency**: `commitFilesToRepoMain` tracks the commit it tried to set and, on any failure, re-reads `main` — if it's already at our commit, the patch landed (lost response) → return success, never re-commit. A non-fast-forward 422 (patch rejected, main NOT at our commit) correctly falls through to rebase+retry. So retries can rebase and recover transient failures but can never double-build.
+
 ### Still open (telemetry-flagged, not in this change)
+- The broader dedup: a `generateLandingPage`-entry guard ("this exact route is already deployed or in-flight → reuse it") would prevent the 11 duplicate-route builds at the source (the durable reconnect covers in-flight; an already-deployed check would cover the rest).
 - v0 HTTP 500s (6) are retried by `withRetry` but a sustained v0 outage still surfaces; consider a longer/again-later retry or a user-facing "v0 is down, try again" rather than a hard fail.
 - Vercel deploy 422 (1) — check `createVercelProject` / `triggerVercelDeployment` retry coverage next.
 
