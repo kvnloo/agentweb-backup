@@ -3,6 +3,7 @@ import express from 'express';
 import webhookRouter from '../routes/webhooks';
 import { crmDb } from '../services/db';
 import { leadListAlertService } from '../services/leadListAlertService';
+import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { agentModeService } from '../services/agentModeService';
 import { resendService } from '../services/resendService';
 import { dripSequenceDb } from '../services/dripSequenceDb';
@@ -29,6 +30,10 @@ jest.mock('../services/leadListAlertService', () => ({
   leadListAlertService: {
     notifyLeadListOwnerIfConfigured: jest.fn(),
   },
+}));
+
+jest.mock('../services/leadCaptureFailureService', () => ({
+  recordLeadCaptureFailure: jest.fn(),
 }));
 
 jest.mock('../services/agentModeService', () => ({
@@ -161,6 +166,76 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
 
       expect(response.status).toBe(403);
       expect(response.body.success).toBe(false);
+    });
+
+    it('records a capture failure when the listId does not exist (404)', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(null);
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({
+          listId: 'list_nonexistent',
+          email: 'lead@acme.com',
+          source: 'demystifying_ai_lead_magnet',
+        });
+
+      expect(response.status).toBe(404);
+      expect(recordLeadCaptureFailure).toHaveBeenCalledTimes(1);
+      expect(recordLeadCaptureFailure).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: 'list_not_found',
+          listId: 'list_nonexistent',
+          status: 404,
+          source: 'demystifying_ai_lead_magnet',
+        })
+      );
+    });
+
+    it('records a capture failure when public access is disabled (403)', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+        ...mockLeadList,
+        publicAccessEnabled: false,
+      });
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({
+          listId: 'list_123',
+          email: 'lead@acme.com',
+          source: 'ai-readiness-roadmap',
+        });
+
+      expect(response.status).toBe(403);
+      expect(recordLeadCaptureFailure).toHaveBeenCalledTimes(1);
+      expect(recordLeadCaptureFailure).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: 'public_access_disabled',
+          listId: 'list_123',
+          status: 403,
+          source: 'ai-readiness-roadmap',
+          userId: mockLeadList.userId,
+        })
+      );
+    });
+
+    it('does not record a capture failure on a successful forward', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.createLead as jest.Mock).mockResolvedValue({
+        leadId: 'lead_ok',
+        listId: 'list_123',
+        email: 'lead@acme.com',
+      });
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({
+          listId: 'list_123',
+          email: 'lead@acme.com',
+          source: 'ai-readiness-roadmap',
+        });
+
+      expect(response.status).toBe(201);
+      expect(recordLeadCaptureFailure).not.toHaveBeenCalled();
     });
 
     it('should reject requests without email', async () => {
