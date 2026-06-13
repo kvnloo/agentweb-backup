@@ -1,7 +1,8 @@
-import OpenAI from "openai";
 import axios from "axios";
 import { getSecret } from "../utils/secretsManager";
 import { uploadFileToS3 } from "../utils/s3Utils";
+import { getOpenAIClient, getGeminiClient } from "../utils/llmClients";
+import { recordUsage } from "./usageRecorderService";
 
 interface ImageGenerationResult {
   success: boolean;
@@ -509,19 +510,25 @@ export class ImageService {
    */
   private async generateWithGoogleGemini(params: ImageGenerationParams): Promise<ImageGenerationResult> {
     try {
-      const { GoogleGenerativeAI } = require('@google/generative-ai');
       const axios = require('axios');
-      
-      const apiKey = await this.getApiKey("gemini-2.5-flash-image");
-      const genAI = new GoogleGenerativeAI(apiKey);
-      const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-image" });
+
+      const geminiModelId = "gemini-2.5-flash-image";
+      const apiKey = await this.getApiKey(geminiModelId);
+      // Metered Gemini client (shadow usage metering) — same @google/genai SDK
+      // family as generateWithGoogleGemini3Pro below; request/stream shapes are
+      // unchanged, metering only observes the stream.
+      const ai = await getGeminiClient(
+        { userId: params.userId, feature: "content_gen" },
+        apiKey
+      );
       
       const inputImageCount = params.inputImages ? params.inputImages.length : 0;
       
       if (inputImageCount === 0) {
         // Text-to-image generation - use streaming (with retry for transient 503/429 errors)
         const streamResult = await this.retryWithBackoff(
-          () => model.generateContentStream({
+          () => ai.models.generateContentStream({
+            model: geminiModelId,
             contents: [{
               role: "user",
               parts: [{
@@ -600,7 +607,8 @@ export class ImageService {
         
         // Use streaming for image generation (with retry for transient 503/429 errors)
         const streamResult = await this.retryWithBackoff(
-          () => model.generateContentStream({
+          () => ai.models.generateContentStream({
+            model: geminiModelId,
             contents: [
               {
                 role: "user",
@@ -706,7 +714,8 @@ export class ImageService {
         
         // Use streaming for image generation (with retry for transient 503/429 errors)
         const streamResult = await this.retryWithBackoff(
-          () => model.generateContentStream({
+          () => ai.models.generateContentStream({
+            model: geminiModelId,
             contents: [{
               role: "user",
               parts: parts
@@ -842,13 +851,14 @@ export class ImageService {
    */
   private async generateWithGoogleGemini3Pro(params: ImageGenerationParams): Promise<ImageGenerationResult> {
     try {
-      const { GoogleGenAI } = require('@google/genai');
-      
       const modelId = params.imageModel || 'gemini-3-pro-image-preview';
       const apiKey = await this.getApiKey(modelId);
-      const ai = new GoogleGenAI({
-        apiKey: apiKey,
-      });
+      // Metered Gemini client (shadow usage metering) — wraps the same
+      // @google/genai GoogleGenAI client; the stream is passed through unchanged.
+      const ai = await getGeminiClient(
+        { userId: params.userId, feature: 'content_gen' },
+        apiKey
+      );
 
       const model = modelId;
       const inputImageCount = params.inputImages ? params.inputImages.length : 0;
@@ -1106,10 +1116,13 @@ export class ImageService {
   private async generateWithOpenAI(params: ImageGenerationParams, model: string): Promise<ImageGenerationResult> {
     const apiKey = await this.getApiKey(model);
     
-    // Create client with the fetched API key
-    const client = new OpenAI({
-      apiKey: apiKey
-    });
+    // Create metered client with the fetched API key (shadow usage metering).
+    // Note: the factory does not wrap images.generate, so the generation is
+    // recorded explicitly below (fire-and-forget, fail-open).
+    const client = getOpenAIClient(
+      { userId: params.userId, feature: 'content_gen' },
+      { apiKey }
+    );
 
     const result = await client.images.generate({
       model: model,
@@ -1117,6 +1130,22 @@ export class ImageService {
           size: params.size as any,
           quality: (params.quality || 'medium') as any,
         });
+
+        // Shadow-record the image generation. gpt-image models return token
+        // usage; DALL-E does not (records 0 tokens, call count still visible).
+        try {
+          const usage: any = (result as any)?.usage;
+          void recordUsage({
+            userId: params.userId,
+            model: model,
+            provider: 'openai',
+            feature: 'content_gen',
+            inputTokens: usage?.input_tokens || 0,
+            outputTokens: usage?.output_tokens || 0,
+          });
+        } catch {
+          // Metering must never break image generation.
+        }
 
         // Return the image URL directly from OpenAI
         if (result.data && result.data.length > 0) {

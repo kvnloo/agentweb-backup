@@ -1,5 +1,5 @@
 import yaml from 'js-yaml';
-import OpenAI from 'openai';
+import { getAzureClient } from '../utils/llmClients';
 import { taskDb } from './db';
 import { Task } from '../types/task';
 
@@ -48,12 +48,6 @@ interface TaskReference {
   category?: string;
 }
 
-const openai = new OpenAI({
-  apiKey: process.env.AZURE_OPENAI_API_KEY,
-  baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT}`,
-  defaultQuery: { 'api-version': process.env.AZURE_OPENAI_API_VERSION },
-  defaultHeaders: { 'api-key': process.env.AZURE_OPENAI_API_KEY }
-});
 
 function generateVisualization(workflowData: any): { nodes: Node[], edges: Edge[] } {
   // Calculate node positions
@@ -206,6 +200,7 @@ When creating task nodes, you can either:
 If referencing an existing task, use its taskId and the task's prompt will be automatically used.
 If creating a new task, provide a prompt that describes what the task should do.`;
 
+  const openai = getAzureClient({ userId, feature: 'workflow_gen' }, process.env.AZURE_OPENAI_DEPLOYMENT);
   const completion = await openai.chat.completions.create({
     model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
     messages: [
@@ -264,6 +259,7 @@ export async function generateWorkflowFromDescription(
     const { nodes, edges } = generateVisualization(workflowData);
 
     // Get a user-friendly explanation of the workflow
+    const openai = getAzureClient({ userId, feature: 'workflow_gen' }, process.env.AZURE_OPENAI_DEPLOYMENT);
     const explanation = await openai.chat.completions.create({
       model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
       messages: [

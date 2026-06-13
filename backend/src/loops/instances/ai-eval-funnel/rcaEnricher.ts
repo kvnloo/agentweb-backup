@@ -226,8 +226,11 @@ function parseAndValidate(raw: string): { topHypotheses: string[]; rankedFixes: 
 // ---------------------------------------------------------------------------
 
 async function callBedrockSonnet46(systemText: string, userText: string): Promise<string> {
-  // Lazy-import the AWS SDK so the test mock applies.
-  const { BedrockRuntimeClient, ConverseCommand } = await import('@aws-sdk/client-bedrock-runtime');
+  // Lazy-import the AWS SDK so the test mock applies. The metered factory
+  // (llmClients) is lazy-imported for the same reason — it constructs the
+  // (mocked) BedrockRuntimeClient internally.
+  const { ConverseCommand } = await import('@aws-sdk/client-bedrock-runtime');
+  const { getBedrockClient } = await import('../../../utils/llmClients');
 
   const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
   const credentials = process.env.AWS_ACCESS_KEY_ID
@@ -237,14 +240,19 @@ async function callBedrockSonnet46(systemText: string, userText: string): Promis
       }
     : undefined;
 
-  const client = new BedrockRuntimeClient({
-    region,
-    credentials,
-    requestHandler: {
-      connectionTimeout: 10_000,
-      requestTimeout: RCA_TIMEOUT_MS,
-    } as unknown as Record<string, unknown>,
-  });
+  // Shadow usage metering: cron/loop context — no attributable user, so the
+  // recorder attributes to 'system'.
+  const client = await getBedrockClient(
+    { feature: 'other' },
+    {
+      region,
+      credentials,
+      requestHandler: {
+        connectionTimeout: 10_000,
+        requestTimeout: RCA_TIMEOUT_MS,
+      } as unknown as Record<string, unknown>,
+    }
+  );
 
   // System prompt is stable across runs — attach cachePoint so Bedrock caches it.
   // Use `any` for the input bag because cachePoint blocks aren't in the public

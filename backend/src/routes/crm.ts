@@ -2179,7 +2179,8 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
 
     let variants;
     try {
-      variants = await extractIcpFiltersWithLlm(persona);
+      // userId is passed for shadow usage-metering attribution only.
+      variants = await extractIcpFiltersWithLlm(persona, { userId });
     } catch (llmError: any) {
       console.error('Error extracting ICP filters via LLM:', llmError);
       return res.status(503).json({
@@ -3620,7 +3621,10 @@ Please analyze each lead and return a JSON array with your assessment.`;
               isMatch: boolean;
               score: number;
               reason: string;
-            }>>(escapedSystemPrompt, escapedUserPrompt, 'json');
+            }>>(escapedSystemPrompt, escapedUserPrompt, 'json', undefined, {
+              userId,
+              feature: 'enrichment',
+            });
 
             // Update each lead with ICP match result
             for (const result of response) {

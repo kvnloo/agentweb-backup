@@ -5496,7 +5496,7 @@ emmaToolRegistry.register({
     // Embed at write time so the memory can later be retrieved by relevance, not just
     // recency. Best-effort: a failure must not block saving (read path falls back to recency).
     const { embedText } = await import('../utils/embeddings');
-    const embedding = (await embedText(args.content)) ?? undefined;
+    const embedding = (await embedText(args.content, { userId, feature: 'embeddings' })) ?? undefined;
     const memory = await accountMemoryDb.addMemory(
       userId,
       args.category,
@@ -5580,7 +5580,7 @@ emmaToolRegistry.register({
 
     // Embed at write time so the memory can later be retrieved by relevance (best-effort).
     const { embedText } = await import('../utils/embeddings');
-    const embedding = (await embedText(args.content)) ?? undefined;
+    const embedding = (await embedText(args.content, { userId, feature: 'embeddings' })) ?? undefined;
     const memory = await orgMemoryDb.addMemory(
       user.orgId,
       args.category,

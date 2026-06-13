@@ -99,7 +99,7 @@ router.post('/:orgId/memory', async (req, res) => {
     }
 
     // Embed at write time so the memory can later be retrieved by relevance (best-effort).
-    const embedding = (await embedText(content)) ?? undefined;
+    const embedding = (await embedText(content, { userId, feature: 'embeddings' })) ?? undefined;
     const memory = await orgMemoryDb.addMemory(orgId, category, content, userId, embedding);
     res.status(201).json({ memory });
   } catch (error: any) {
