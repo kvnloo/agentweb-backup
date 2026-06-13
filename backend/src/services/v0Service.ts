@@ -442,6 +442,35 @@ export interface GenerateLandingPageOptions {
   originatingSessionId?: string;
 }
 
+/**
+ * Add a page to an existing site. Picks the engine: with CODING_AGENT_SUBPAGES on,
+ * the coding agent writes the page into the repo (no v0 call — cheaper, matches the
+ * existing design); off, the v0 path (addPageToExistingRepo) is used unchanged.
+ * The coding-agent module is loaded via a dynamic import to break the
+ * v0Service <-> codingAgentService import cycle.
+ */
+async function addSubPage(
+  site: GeneratedLandingPage,
+  userId: string,
+  prompt: string,
+  name: string,
+  brandContext: BrandContext,
+  leadListId?: string,
+  templateHtml?: string,
+  originatingSessionId?: string
+): Promise<GeneratedLandingPage> {
+  if (process.env.CODING_AGENT_SUBPAGES === "true") {
+    const { addPageViaCodingAgent } = await import("./codingAgentSubpageService");
+    return addPageViaCodingAgent(site, userId, prompt, name, brandContext, {
+      leadListId,
+      originatingSessionId,
+    });
+  }
+  return addPageToExistingRepo(
+    site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
+  );
+}
+
 export async function generateLandingPage(
   userId: string,
   prompt: string,
@@ -460,7 +489,7 @@ export async function generateLandingPage(
     if (opts?.siteId) {
       const site = await findSiteById(opts.siteId, userId);
       if (site?.githubRepoUrl) {
-        return addPageToExistingRepo(
+        return addSubPage(
           site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
         );
       }
@@ -480,7 +509,7 @@ export async function generateLandingPage(
     //    under it. Falls back to creating the first site if none exists yet.
     const existing = await findUserSiteRecord(userId);
     if (existing?.githubRepoUrl) {
-      return addPageToExistingRepo(
+      return addSubPage(
         existing, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
       );
     }
