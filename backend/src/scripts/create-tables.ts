@@ -1689,6 +1689,36 @@ const createMcpOAuthTokensTable = async () => {
   }
 };
 
+// Create Usage Records table (shadow LLM usage metering — one row per
+// userId, day, model, feature; see services/usageRecordDb.ts).
+// TTL: enable DynamoDB TTL on the `ttl` attribute (epoch seconds, 180d) so
+// rows self-prune — same manual TTL-enable step as the MCP OAuth tables.
+const createUsageRecordsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-UsageRecords`,
+    AttributeDefinitions: [
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'sk', AttributeType: 'S' } // "{YYYY-MM-DD}#{model}#{feature}"
+    ],
+    KeySchema: [
+      { AttributeName: 'userId', KeyType: 'HASH' },
+      { AttributeName: 'sk', KeyType: 'RANGE' }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const createAccountMemoryTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: `${TABLE_PREFIX}AW-AccountMemory`,
@@ -2100,6 +2130,7 @@ const main = async () => {
     await createMcpOAuthClientsTable();
     await createMcpOAuthCodesTable();
     await createMcpOAuthTokensTable();
+    await createUsageRecordsTable();
     await createLandingPagesTable();
     await createAccountMemoryTable();
     await createOrgMemoryTable();
