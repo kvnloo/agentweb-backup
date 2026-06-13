@@ -1,3 +1,19 @@
+## Fix: self-healing telemetry-table provisioning — close the silent-missing-table class (2026-06-13)
+
+Three missing-table incidents in two days (AW-OnboardingMetrics, Dev-AW-LoopLearning, and the loop tables) shared one root cause: tables are defined in create-tables.ts but the script is never run on deploy, and every writer swallows ResourceNotFound — so an absent table is invisible until someone reads the data weeks later. For the loop tables the entire gate→attribution→verdict chain ran as a no-op with zero signal.
+
+### What shipped (this PR)
+- `services/ensureCriticalTables.ts` — idempotent, non-fatal boot-time ensure for the three critical telemetry tables (LoopEvents, LoopLearning, OnboardingMetrics). Table-name constants imported from the modules that WRITE them, so the ensure can never drift from the writers. createTable swallows ResourceInUseException; any other failure logs loudly ("telemetry for this loop will be lost until fixed") but never blocks startup.
+- Wired fire-and-forget into `server.ts` boot (after listen). On every deploy, missing telemetry tables self-create.
+- Added the missing `createOnboardingMetricsTable()` to `scripts/create-tables.ts` (it was never in the script — the source-of-truth gap that caused the 2026-06-12 incident).
+
+### Why self-heal instead of "run the script on deploy"
+No ops dependency, no risk of a hard boot crash, and it fixes past + future instances in one place. Matches the silent→loud principle: the only way a missing telemetry table now persists is if createTable itself is denied, which logs an ERROR every boot.
+
+### Assumptions to validate
+- After deploy, prod logs show either "created missing table X" once or nothing (all present). A recurring "could NOT ensure" ERROR = IAM lacks CreateTable; fix the role.
+- This does NOT cover non-telemetry tables (users, tasks, etc.) — those predate the issue and are assumed present. If a core table ever goes missing the symptom is louder (immediate 500s), not silent, so they are intentionally out of scope here.
+
 ## Dev-AW-LoopLearning table was missing — the entire gate→attribution→verdict chain wrote to a void (2026-06-13)
 
 Checking for pending-approval proposals (now that gate persistence #1841 is live) surfaced that **`Dev-AW-LoopLearning` did not exist in this account.** `dynamoLearningStore.ts:27` hardcodes the table name; `scripts/create-tables.ts:2043` defines `createLoopLearningTable()` — but the script was never run against this account, so the table was absent. Every `learning.record()` (proposals, approvals, shippedAt, verdicts) hit ResourceNotFound and was swallowed best-effort.
