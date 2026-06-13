@@ -605,6 +605,113 @@ async function generateFirstPage(
  * Calls v0 to generate a full-quality page, extracts files, and commits them
  * under app/<slug>/ in the existing repo. Vercel auto-redeploys.
  */
+/** A file to commit: repo-relative path + raw bytes. */
+interface RepoFileToCommit {
+  path: string;
+  content: Buffer;
+}
+
+/** Whether a GitHub-push error is worth retrying (transient network/server) or a
+ * fast-forward race (someone else committed to main between our read and write). */
+export function isRetryableGithubPushError(err: any): { retryable: boolean; reason: string } {
+  const status: number | undefined = err?.response?.status;
+  const body = (() => {
+    try { return JSON.stringify(err?.response?.data || ""); } catch { return ""; }
+  })();
+  // 422 "Update is not a fast forward" / 409 conflict = a concurrent commit landed.
+  if ((status === 422 && /fast[ -]?forward/i.test(body)) || status === 409) {
+    return { retryable: true, reason: "non-fast-forward race" };
+  }
+  if (status !== undefined && (status >= 500 || status === 429 || status === 408)) {
+    return { retryable: true, reason: `http ${status}` };
+  }
+  const msg = err?.message || "";
+  if (
+    err?.code === "ECONNRESET" || err?.code === "ECONNABORTED" || err?.code === "ETIMEDOUT" ||
+    /fetch failed|network error|socket hang up|timeout/i.test(msg)
+  ) {
+    return { retryable: true, reason: err?.code || "transient network" };
+  }
+  return { retryable: false, reason: status ? `http ${status}` : (err?.code || "non-retryable") };
+}
+
+/**
+ * Commit files to a repo's `main` and advance the ref, with retry + rebase.
+ *
+ * Every attempt re-reads the current `main` SHA and bases the new commit on it,
+ * so when two pages are generated into the SAME repo concurrently (the common
+ * case under unified multi-site), the second push rebases onto the first instead
+ * of failing as a non-fast-forward. Transient network/5xx failures are retried
+ * with backoff. This replaces the previous bare-axios sequence, which had no
+ * retry and was the dominant source of "fetch failed" generation failures.
+ *
+ * Returns the pushed commit SHA and the post-push timestamp (used to scope the
+ * Vercel deployment poll).
+ */
+export async function commitFilesToRepoMain(
+  repoFullName: string,
+  ghHeaders: Record<string, string>,
+  filesToCommit: RepoFileToCommit[],
+  commitMessage: string,
+  maxAttempts = 4
+): Promise<{ pushedCommitSha: string; pushTimestampMs: number }> {
+  let lastErr: any;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      // Re-read main on every attempt → rebase onto any concurrent commit.
+      const refRes = await axios.get<any>(
+        `https://api.github.com/repos/${repoFullName}/git/ref/heads/main`,
+        { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+      );
+      const latestCommitSha = refRes.data.object.sha;
+
+      const treeItems = await Promise.all(
+        filesToCommit.map(async (file) => {
+          const blobRes = await axios.post<any>(
+            `https://api.github.com/repos/${repoFullName}/git/blobs`,
+            { content: file.content.toString("base64"), encoding: "base64" },
+            { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+          );
+          return { path: file.path, mode: "100644" as const, type: "blob" as const, sha: blobRes.data.sha };
+        })
+      );
+
+      const treeRes = await axios.post<any>(
+        `https://api.github.com/repos/${repoFullName}/git/trees`,
+        { base_tree: latestCommitSha, tree: treeItems },
+        { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+      );
+
+      const commitRes = await axios.post<any>(
+        `https://api.github.com/repos/${repoFullName}/git/commits`,
+        { message: commitMessage, tree: treeRes.data.sha, parents: [latestCommitSha] },
+        { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+      );
+      const pushedCommitSha: string = commitRes.data.sha;
+
+      // The ref update is where a concurrent commit surfaces as a non-fast-forward.
+      await axios.patch<any>(
+        `https://api.github.com/repos/${repoFullName}/git/refs/heads/main`,
+        { sha: pushedCommitSha },
+        { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+      );
+
+      return { pushedCommitSha, pushTimestampMs: Date.now() };
+    } catch (err: any) {
+      lastErr = err;
+      const { retryable, reason } = isRetryableGithubPushError(err);
+      if (!retryable || attempt === maxAttempts) {
+        console.error(`[V0 SERVICE] commit to ${repoFullName} failed after ${attempt} attempt(s) (${reason}): ${err?.message}`);
+        throw err;
+      }
+      const delay = 800 * Math.pow(2, attempt - 1) + Math.random() * 400;
+      console.warn(`[V0 SERVICE] commit to ${repoFullName} attempt ${attempt} failed (${reason}); rebasing + retrying in ${Math.round(delay)}ms`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
+}
+
 async function addPageToExistingRepo(
   existingPage: GeneratedLandingPage,
   userId: string,
@@ -800,59 +907,17 @@ async function addPageToExistingRepo(
       Accept: "application/vnd.github.v3+json",
     };
 
-    // Get latest commit SHA
-    const refRes = await axios.get<any>(
-      `https://api.github.com/repos/${repoFullName}/git/ref/heads/main`,
-      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+    // Commit the new page's files to main with retry + rebase. Each attempt
+    // re-reads the latest main SHA, so a concurrent commit (another page being
+    // generated into the SAME repo) is rebased onto rather than rejected as a
+    // non-fast-forward. Transient network/5xx failures are retried too — this
+    // path was previously bare axios, the dominant source of "fetch failed".
+    const { pushedCommitSha, pushTimestampMs } = await commitFilesToRepoMain(
+      repoFullName,
+      ghHeaders,
+      filesToCommit,
+      `Add new page: ${name} (/${slug})`
     );
-    const latestCommitSha = refRes.data.object.sha;
-
-    // Create blobs for each file
-    const blobPromises = filesToCommit.map(async (file) => {
-      const blobRes = await axios.post<any>(
-        `https://api.github.com/repos/${repoFullName}/git/blobs`,
-        {
-          content: file.content.toString("base64"),
-          encoding: "base64",
-        },
-        { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
-      );
-      return {
-        path: file.path,
-        mode: "100644" as const,
-        type: "blob" as const,
-        sha: blobRes.data.sha,
-      };
-    });
-    const treeItems = await Promise.all(blobPromises);
-
-    // Create tree → commit → update ref
-    const treeRes = await axios.post<any>(
-      `https://api.github.com/repos/${repoFullName}/git/trees`,
-      { base_tree: latestCommitSha, tree: treeItems },
-      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
-    );
-
-    const commitRes = await axios.post<any>(
-      `https://api.github.com/repos/${repoFullName}/git/commits`,
-      {
-        message: `Add new page: ${name} (/${slug})`,
-        tree: treeRes.data.sha,
-        parents: [latestCommitSha],
-      },
-      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
-    );
-    const pushedCommitSha: string = commitRes.data.sha;
-
-    await axios.patch<any>(
-      `https://api.github.com/repos/${repoFullName}/git/refs/heads/main`,
-      { sha: pushedCommitSha },
-      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
-    );
-
-    // Capture timestamp after the ref push (Vercel webhook fires on push).
-    // pollVercelDeployment uses this to ignore pre-existing READY deployments.
-    const pushTimestampMs = Date.now();
 
     console.log(`[V0 SERVICE] Pushed ${filesToCommit.length} files for /${slug} to ${repoFullName} (${pushedCommitSha.substring(0, 7)}) — polling Vercel for build status`);
 
