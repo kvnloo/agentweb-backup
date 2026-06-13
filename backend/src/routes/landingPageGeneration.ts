@@ -292,7 +292,7 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       }
     }
 
-    const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_id } = req.body;
+    const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_id, site_id, originating_session_id } = req.body;
     // Condense uploaded HTML to avoid exceeding v0 prompt size limits
     let template_html: string | undefined = rawTemplateHtml
       ? extractTemplateOutline(rawTemplateHtml)
@@ -394,7 +394,10 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       }
     }
 
-    const result = await generateLandingPage(userId, prompt, pageName, brandContext, lead_list_id, template_html);
+    const result = await generateLandingPage(userId, prompt, pageName, brandContext, lead_list_id, template_html, {
+      siteId: typeof site_id === "string" ? site_id : undefined,
+      originatingSessionId: typeof originating_session_id === "string" ? originating_session_id : undefined,
+    });
     void emitLanderLifecycle("created", { pageId: (result as any)?.id || "unknown", userId, channel: landerChannelFromRequest(req), mode: "cold_start", outcome: (result as any)?.status === "failed" ? "failed" : "ok" });
     res.status(201).json(result);
   } catch (error: any) {
