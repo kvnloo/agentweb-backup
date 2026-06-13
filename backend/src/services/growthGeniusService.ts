@@ -1,4 +1,4 @@
-import OpenAI from 'openai';
+import { getAzureClient } from '../utils/llmClients';
 import { searchPlatformKnowledgeBase } from './chatbotService';
 
 export interface GrowthGeniusMessage {
@@ -24,17 +24,17 @@ export interface GrowthGeniusSession {
 }
 
 export class GrowthGeniusService {
-  private openai: OpenAI;
-
-  constructor() {
-    this.openai = new OpenAI({
-      apiKey: process.env.AZURE_OPENAI_API_KEY,
-      baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2'}`,
-      defaultQuery: {
-        "api-version": process.env.AZURE_OPENAI_API_VERSION_GROWTH_GENIUS || "2025-01-01-preview",
-      },
-      defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
-    });
+  /**
+   * Metered Azure client for Growth Genius. Preserves the original bespoke
+   * deployment + api-version (GROWTH_GENIUS env vars) so usage is recorded
+   * without changing which endpoint/version the calls hit.
+   */
+  private client(userId?: string) {
+    return getAzureClient(
+      { userId, feature: 'growth_genius' },
+      process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
+      { apiVersion: process.env.AZURE_OPENAI_API_VERSION_GROWTH_GENIUS || '2025-01-01-preview' }
+    );
   }
 
   private getSystemPrompt(): string {
@@ -93,7 +93,7 @@ Remember: You're here to help startups and businesses grow through smart marketi
     try {
       console.log('GrowthGenius: Generating session title for message:', userMessage);
 
-      const response = await this.openai.chat.completions.create({
+      const response = await this.client().chat.completions.create({
         model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
         messages: [
           {
@@ -133,7 +133,7 @@ Remember: You're here to help startups and businesses grow through smart marketi
       const initialContext = this.buildContext(userMessage, sessionHistory, [], selectedStartupId);
       
       // First API call: Ask the model to use the functions
-      const response = await this.openai.chat.completions.create({
+      const response = await this.client(userId).chat.completions.create({
         model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
         messages: [
           { role: 'system', content: this.getSystemPrompt() },
@@ -215,7 +215,7 @@ Remember: You're here to help startups and businesses grow through smart marketi
         
         // Second API call: Get the final response with knowledge base results
         const finalContext = this.buildContext(userMessage, sessionHistory, knowledgeBaseResults, selectedStartupId);
-        const finalResponse = await this.openai.chat.completions.create({
+        const finalResponse = await this.client(userId).chat.completions.create({
           model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
           messages: [
             { role: 'system', content: this.getSystemPrompt() },

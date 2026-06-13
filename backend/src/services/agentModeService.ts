@@ -26,7 +26,8 @@ import { extractVariables } from '../utils/templateParser';
 import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 import { incrementUserTokenUsage } from './tokenUsageService';
-import type { LLMUsageData } from '../utils/llmService';
+import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
+import { recordUsage } from './usageRecorderService';
 import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
 import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmMutationEvents';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
@@ -430,6 +431,12 @@ interface LLMCallOptions {
   max_completion_tokens?: number | null;
   temperature?: number | null;
   response_format?: { type: 'text' | 'json_object' } | null;
+  /**
+   * Optional attribution for shadow usage metering (Ship 1). Recording is
+   * fire-and-forget and fail-open — it never changes the call's behavior.
+   * When omitted, usage is recorded under userId "system".
+   */
+  usageContext?: LLMUsageContext | null;
 }
 
 // Diagnosis agent configuration
@@ -2047,7 +2054,8 @@ export class AgentModeService {
       tool_choice = null,
       max_completion_tokens = null,
       temperature = null,
-      response_format = { type: "text" }
+      response_format = { type: "text" },
+      usageContext = null
     } = options || {};
 
     const params: any = {
@@ -2110,6 +2118,33 @@ export class AgentModeService {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         const res = await client.chat.completions.create(params);
+        // Shadow usage metering (Ship 1): every client returned above (Azure
+        // OpenAI, Gemini OpenAI-compat, Bedrock Converse wrapper, Vertex
+        // wrapper) responds in OpenAI shape, so `res.usage` is the single
+        // observation point — including the Bedrock ConverseCommand path,
+        // whose cache metrics surface as cache_read/creation_input_tokens.
+        // Fire-and-forget + fail-open: never awaited, never throws.
+        try {
+          const usage: any = (res as any)?.usage;
+          if (usage) {
+            void recordUsage({
+              userId: usageContext?.userId,
+              sessionId: usageContext?.sessionId,
+              model,
+              provider: model.startsWith('gemini-') ? 'gemini'
+                : model.startsWith('anthropic.') ? 'bedrock'
+                : model.startsWith('claude-') ? 'vertex'
+                : 'azure-openai',
+              feature: usageContext?.feature || 'agent_task',
+              inputTokens: usage.prompt_tokens || 0,
+              outputTokens: usage.completion_tokens || 0,
+              cacheReadTokens: usage.cache_read_input_tokens || usage.prompt_tokens_details?.cached_tokens || 0,
+              cacheWriteTokens: usage.cache_creation_input_tokens || 0,
+            });
+          }
+        } catch {
+          // Metering must never break an LLM call.
+        }
         return res;
       } catch (error) {
         const isLastAttempt = attempt >= maxAttempts;
@@ -2345,7 +2380,7 @@ export class AgentModeService {
         let queryEmbedding: number[] | null | undefined;
         const getQueryEmbedding = async (): Promise<number[] | null> => {
           if (queryEmbedding === undefined) {
-            queryEmbedding = messageContent ? await embedText(messageContent) : null;
+            queryEmbedding = messageContent ? await embedText(messageContent, { userId, feature: 'agent_task' }) : null;
           }
           return queryEmbedding;
         };
@@ -2366,7 +2401,7 @@ export class AgentModeService {
           }
           for (const m of all) {
             if (!Array.isArray(m.embedding) || m.embedding.length === 0) {
-              const emb = await embedText(m.content);
+              const emb = await embedText(m.content, { userId, feature: 'agent_task' });
               if (emb) {
                 m.embedding = emb;
                 backfill(m.memoryId, emb);
@@ -2605,7 +2640,8 @@ export class AgentModeService {
             tools: filteredToolsCache,
             tool_choice: 'auto',
             max_completion_tokens: 12384,
-            temperature: 0.1
+            temperature: 0.1,
+            usageContext: { userId, sessionId, feature: 'agent_task' }
           });
         } catch (callError) {
           if (isTransientLLMError(callError) && !backupModelUsed) {
@@ -2626,7 +2662,8 @@ export class AgentModeService {
                 tools: filteredToolsCache,
                 tool_choice: 'auto',
                 max_completion_tokens: 12384,
-                temperature: 0.1
+                temperature: 0.1,
+                usageContext: { userId, sessionId, feature: 'agent_task' }
               });
             } else {
               throw callError;
@@ -5951,8 +5988,11 @@ export class AgentModeService {
         };
       }
 
-      const { GoogleGenAI } = await import('@google/genai');
-      aiClient = new GoogleGenAI({ apiKey: geminiApiKey.trim() });
+      // Metered Gemini client (Ship 1 shadow metering). describeVideo has no
+      // userId in its signature, so usage attributes to "system" for now —
+      // follow-up: thread userId from the tool-dispatch / emmaApi callers.
+      const { getGeminiClient } = await import('../utils/llmClients');
+      aiClient = await getGeminiClient({ feature: 'agent_task' }, geminiApiKey.trim());
 
       const modelName = 'gemini-3-flash-preview';
 
@@ -6573,6 +6613,26 @@ export class AgentModeService {
           timeout: 20 * 60 * 1000, // 20 minutes — code execution can be slow but must not hang indefinitely
         }
       );
+
+      // Shadow usage metering (Ship 1): direct REST call, so observe the
+      // usageMetadata off the already-resolved response. Fire-and-forget +
+      // fail-open — never awaited, never throws.
+      try {
+        const usageMetadata = (apiResponse.data as any)?.usageMetadata;
+        if (usageMetadata) {
+          void recordUsage({
+            userId,
+            model: modelName,
+            provider: 'gemini',
+            feature: 'agent_task',
+            inputTokens: usageMetadata.promptTokenCount || 0,
+            outputTokens: usageMetadata.candidatesTokenCount || 0,
+            cacheReadTokens: usageMetadata.cachedContentTokenCount || 0,
+          });
+        }
+      } catch {
+        // Metering must never break the call.
+      }
 
       // Extract and format the response
       const candidates = (apiResponse.data as any).candidates;
@@ -20362,7 +20422,7 @@ Please generate a complete, professional HTML document that properly formats and
 
       // Generate HTML using LLMService
       console.log(`AgentMode: Generating HTML ${isEmail ? 'email' : 'file'} with LLMService (Claude model)`);
-      const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'));
+      const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
 
       if (!htmlContent || htmlContent.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
@@ -20526,7 +20586,7 @@ Please:
 
       // Generate enhanced HTML template using LLMService
       console.log('AgentMode: Generating HTML email template with Claude model');
-      const enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'));
+      const enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'), { userId, sessionId, feature: 'content_gen' });
 
       if (!enhancedHtml || enhancedHtml.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
@@ -21636,7 +21696,7 @@ IMPORTANT:
 IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly.`}`;
 
       // Generate content using LangChain with appropriate format
-      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(userId, sessionId, 'generateBookContent'));
+      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(userId, sessionId, 'generateBookContent'), { userId, sessionId, feature: 'content_gen' });
 
       // Extract content from JSON
       if (!contentData.content) {

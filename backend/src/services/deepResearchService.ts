@@ -1,6 +1,7 @@
-import { GoogleGenAI } from '@google/genai';
 import { getSecret } from "../utils/secretsManager";
 import { DEEP_RESEARCH_AGENT_SPEED, DEEP_RESEARCH_AGENT_MAX } from '../config';
+import { getGeminiClient, normalizeGeminiUsage } from '../utils/llmClients';
+import { recordUsage } from './usageRecorderService';
 
 /**
  * Result from deep research operation
@@ -127,7 +128,10 @@ export class DeepResearchService {
   async performDeepResearch(params: DeepResearchParams): Promise<DeepResearchResult> {
     try {
       const apiKey = await this.getGeminiApiKey();
-      const ai = new GoogleGenAI({ apiKey });
+      // Metered factory client (shadow metering). Deep research runs in a
+      // system/background context — no per-user attribution available here, so
+      // the recorder attributes usage to 'system'.
+      const ai = await getGeminiClient({ feature: 'content_gen' }, apiKey);
 
       // Build the research prompt with tone/style steerability
       // See: https://ai.google.dev/gemini-api/docs/deep-research#steerability_and_formatting
@@ -279,6 +283,26 @@ export class DeepResearchService {
       }
 
       console.log('Deep research completed successfully');
+
+      // Shadow metering: the llmClients Gemini wrapper covers
+      // models.generateContent / generateContentStream, NOT the interactions
+      // API — so the completed interaction is recorded here directly.
+      // Fire-and-forget + fully guarded: metering must never affect the
+      // research result or add latency.
+      try {
+        const usage = normalizeGeminiUsage((interaction as any)?.usageMetadata);
+        const hasUsage = usage.inputTokens > 0 || usage.outputTokens > 0;
+        void recordUsage({
+          model: agent,
+          provider: 'gemini',
+          feature: hasUsage ? 'content_gen' : 'content_gen:interactions-no-usage',
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+          cacheReadTokens: usage.cacheReadTokens,
+        });
+      } catch {
+        // Metering must never break deep research.
+      }
 
       // Extract the research report. The April 2026 Deep Research agents return
       // the report under `steps` (each model_output step holds a chunk of the

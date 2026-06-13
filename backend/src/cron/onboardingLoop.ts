@@ -92,7 +92,12 @@ async function logRun(
 function wrapLLMService(svc: LLMService): LLMServiceInterface {
   return {
     async callLLM(system: string, user: string, _format: 'json' | 'text'): Promise<string> {
-      const result = await svc.generateJsonRobust<unknown>(system, user);
+      // Shadow usage metering attribution only — no behavior change. The
+      // loop's LLM calls are per onboarding step (not per user), so there is
+      // no single userId to attribute; the recorder logs them under 'system'.
+      const result = await svc.generateJsonRobust<unknown>(system, user, undefined, {
+        feature: 'onboarding:cron',
+      });
       return typeof result === 'string' ? result : JSON.stringify(result);
     },
   };

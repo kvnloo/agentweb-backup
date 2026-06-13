@@ -67,7 +67,9 @@ Return ONLY the complete fixed HTML wrapped in <actual_html_content>...</actual_
 
     const userPrompt = `Convert this email HTML to use inline styles instead of CSS classes:\n\n${html}`;
 
-    const inlined = await llm.generateHTML(systemPrompt, userPrompt);
+    // Shadow metering: no userId reachable in this utility (callers don't pass
+    // identity) — recorder attributes to 'system'.
+    const inlined = await llm.generateHTML(systemPrompt, userPrompt, undefined, { feature: 'content_gen' });
     if (inlined && inlined.length > html.length * 0.5) {
       return { html: inlined, wasFixed: true };
     }

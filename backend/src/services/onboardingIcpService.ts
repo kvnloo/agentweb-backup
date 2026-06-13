@@ -248,12 +248,17 @@ async function mirrorIcpsToMarketStrategy(
 export async function generateIcpsForUser(
   brand: IcpBrandContext,
   deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {},
+  userId?: string,
 ): Promise<ICPPersona[]> {
   const llm =
     deps.llm ?? new LLMService(ICP_MODEL, ICP_TEMPERATURE, ICP_MAX_TOKENS);
   const system = ICP_DISCOVERY_SYSTEM_PROMPT;
   const user = buildUserPrompt(brand);
-  const raw = await llm.generateJsonRobust<LlmResponse>(system, user);
+  // Shadow usage metering attribution only — no behavior change.
+  const raw = await llm.generateJsonRobust<LlmResponse>(system, user, undefined, {
+    userId,
+    feature: 'onboarding',
+  });
   if (!raw || !Array.isArray((raw as LlmResponse).icps)) {
     throw new Error("LLM returned no icps");
   }
@@ -277,7 +282,7 @@ export async function triggerIcpDiscoveryForUser(
   if (!user) return;
   const brand = extractIcpBrandContext(user as any);
   try {
-    const personas = await generateIcpsForUser(brand, deps);
+    const personas = await generateIcpsForUser(brand, deps, userId);
     const current = await userDb.getUserById(userId);
     const patch = icpReadyPatch((current as any) || {}, personas);
     if (!patch) {
