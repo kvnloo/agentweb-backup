@@ -507,6 +507,15 @@ createTestAccount().then(async () => {
         console.error('[dripWorker] Failed to initialize:', error);
       }
 
+      // Durable Landing-Page Poller — redeploy backstop for in-flight builds.
+      // No-op unless DURABLE_LANDING_GENERATION is on. Runs every 5 minutes.
+      try {
+        const { startDurableLandingPoller } = await import('./services/durableLandingPoller');
+        startDurableLandingPoller();
+      } catch (error) {
+        console.error('[durableLandingPoller] Failed to initialize:', error);
+      }
+
       // LinkedIn Connection Sync — runs every 10 minutes
       // Polls Unipile for accepted connections, upserts into AW-UnipileConnections cache,
       // and activates any awaiting_connection drip enrollments.
