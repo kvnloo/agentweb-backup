@@ -138,6 +138,7 @@ import {
   getDeploymentStatus,
   isOrphanedFailedPage,
   cleanupOrphanedFailedPages,
+  findSiteById,
   getLandingPageLiveUrl,
   recordLandingPagePublish,
   markLandingPagePublishReverted,
@@ -429,6 +430,86 @@ describe("v0Service - generateLandingPage", () => {
 // =============================================================================
 // Orphaned failed page helpers (v0 outage cleanup)
 // =============================================================================
+describe("v0Service - multi-site routing (DURABLE_LANDING_GENERATION=on)", () => {
+  const ORIG = process.env.DURABLE_LANDING_GENERATION;
+  beforeEach(() => {
+    process.env.DURABLE_LANDING_GENERATION = "true";
+  });
+  afterEach(() => {
+    if (ORIG === undefined) delete process.env.DURABLE_LANDING_GENERATION;
+    else process.env.DURABLE_LANDING_GENERATION = ORIG;
+  });
+
+  it("no site_id → creates a NEW site root (cardiology-demo fix: new campaign is not crammed into the oldest repo)", async () => {
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_new" });
+
+    await generateLandingPage("user-1", "New campaign", "Front Desk EMMA", {});
+
+    // First persisted record is a fresh site root: siteId === its own id, isRootPage true.
+    const firstPut = mockPut.mock.calls[0][0].Item;
+    expect(firstPut.isRootPage).toBe(true);
+    expect(firstPut.siteId).toBe(firstPut.id);
+    // Went straight to a new-site build (v0.chats.create), not the legacy join heuristic.
+    expect(mockChatsCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it("stamps originatingSessionId on the new site record when provided (durable-execution marker)", async () => {
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_sess" });
+
+    await generateLandingPage("user-1", "p", "n", {}, undefined, undefined, {
+      originatingSessionId: "sess-9",
+    });
+
+    expect(mockPut.mock.calls[0][0].Item.originatingSessionId).toBe("sess-9");
+  });
+});
+
+describe("v0Service - findSiteById (explicit site identity, replaces oldest-repo guess)", () => {
+  it("returns the record directly when it owns a repo (a site root)", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: { id: "s1", userId: "user-1", githubRepoUrl: "https://github.com/o/r" },
+        }),
+    });
+    const site = await findSiteById("s1", "user-1");
+    expect(site?.id).toBe("s1");
+  });
+
+  it("resolves a sub-page id to its site root", async () => {
+    mockGet
+      .mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Item: { id: "sub", userId: "user-1", siteId: "root", slug: "pricing" },
+          }),
+      })
+      .mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Item: { id: "root", userId: "user-1", githubRepoUrl: "https://github.com/o/r" },
+          }),
+      });
+    const site = await findSiteById("sub", "user-1");
+    expect(site?.id).toBe("root");
+  });
+
+  it("returns null when the record is not owned by the caller", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({ Item: { id: "s1", userId: "someone-else", githubRepoUrl: "x" } }),
+    });
+    expect(await findSiteById("s1", "user-1")).toBeNull();
+  });
+
+  it("returns null when the record has no repo and no resolvable root", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () => Promise.resolve({ Item: { id: "s1", userId: "user-1" } }),
+    });
+    expect(await findSiteById("s1", "user-1")).toBeNull();
+  });
+});
+
 describe("v0Service - isOrphanedFailedPage", () => {
   const base = {
     id: "p",
