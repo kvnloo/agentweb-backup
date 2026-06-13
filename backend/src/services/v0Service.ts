@@ -395,6 +395,26 @@ async function getV0Client() {
  * - If user ALREADY has a deployed landing page → add a new page route to the EXISTING
  *   GitHub repo via the GitHub Contents API. No v0 call, no new repo. Vercel auto-redeploys.
  */
+/**
+ * Find a page at the SAME route (slug) that is already live or being built, so a
+ * repeated "build the X page" reuses it instead of producing a duplicate. Matches
+ * non-archived pages (listLandingPages already excludes archived) on their effective
+ * slug, in a deployed/in-flight status — explicitly NOT `failed`, because a retry
+ * after a failed build must be allowed to rebuild. Legitimate content refreshes of
+ * an already-deployed page go through the dedicated iterate endpoint, not here.
+ */
+export async function findReusablePageForRoute(
+  userId: string,
+  slug: string
+): Promise<GeneratedLandingPage | null> {
+  const pages = await listLandingPages(userId);
+  const REUSE_STATUSES = ["deployed", "generating", "deploying"];
+  const match = pages.find(
+    (p) => (p.slug || buildPageSlug(p.name)) === slug && REUSE_STATUSES.includes(p.status)
+  );
+  return match || null;
+}
+
 export async function generateLandingPage(
   userId: string,
   prompt: string,
@@ -408,6 +428,18 @@ export async function generateLandingPage(
   const siteRecord = await findUserSiteRecord(userId);
 
   if (siteRecord) {
+    // Route-level idempotency: if this user already has a live or in-flight page at
+    // this exact route (slug), reuse it instead of building a duplicate. Re-asking
+    // to "build the X page" must not produce a second build of X — the dedicated
+    // iterate endpoint handles legitimate content refreshes. Telemetry: 11 routes
+    // were built >1x, every one from a DIFFERENT chat session re-asking the same
+    // route — so route identity, not session, is the right key.
+    const slug = buildPageSlug(name);
+    const reuse = await findReusablePageForRoute(userId, slug);
+    if (reuse) {
+      console.log(`[V0 SERVICE] Route /${slug} is already ${reuse.status} (${reuse.id}) — reusing, skipping duplicate build`);
+      return reuse;
+    }
     // ── Add new page route to existing repo (no v0 call) ──
     return addPageToExistingRepo(siteRecord, userId, prompt, name, brandContext, leadListId, templateHtml);
   }

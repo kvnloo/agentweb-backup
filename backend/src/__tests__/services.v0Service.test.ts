@@ -140,6 +140,7 @@ import {
   cleanupOrphanedFailedPages,
   commitFilesToRepoMain,
   isRetryableGithubPushError,
+  findReusablePageForRoute,
   getLandingPageLiveUrl,
   recordLandingPagePublish,
   markLandingPagePublishReverted,
@@ -431,6 +432,43 @@ describe("v0Service - generateLandingPage", () => {
 // =============================================================================
 // Orphaned failed page helpers (v0 outage cleanup)
 // =============================================================================
+describe("v0Service - findReusablePageForRoute (route-level idempotency, kills duplicate builds)", () => {
+  const items = (...arr: any[]) => mockQuery.mockReturnValue({ promise: () => Promise.resolve({ Items: arr }) });
+  const page = (over: any = {}) => ({ id: "p1", userId: "u1", name: "Pricing", slug: "pricing", status: "deployed", ...over });
+
+  beforeEach(() => mockQuery.mockReset());
+
+  it("reuses a deployed page at the same route", async () => {
+    items(page({ status: "deployed" }));
+    expect((await findReusablePageForRoute("u1", "pricing"))?.id).toBe("p1");
+  });
+
+  it("reuses an in-flight build at the same route (generating/deploying)", async () => {
+    items(page({ status: "generating" }));
+    expect((await findReusablePageForRoute("u1", "pricing"))?.status).toBe("generating");
+  });
+
+  it("does NOT reuse a FAILED page — a retry after a failure must rebuild", async () => {
+    items(page({ status: "failed" }));
+    expect(await findReusablePageForRoute("u1", "pricing")).toBeNull();
+  });
+
+  it("does NOT match a different route", async () => {
+    items(page({ slug: "about", status: "deployed" }));
+    expect(await findReusablePageForRoute("u1", "pricing")).toBeNull();
+  });
+
+  it("matches on the name-derived slug when the slug field is absent (legacy/root records)", async () => {
+    items(page({ slug: undefined, name: "Pricing", status: "deployed" }));
+    expect(await findReusablePageForRoute("u1", "pricing")).not.toBeNull();
+  });
+
+  it("returns null when the user has no matching page", async () => {
+    items();
+    expect(await findReusablePageForRoute("u1", "pricing")).toBeNull();
+  });
+});
+
 describe("v0Service - isRetryableGithubPushError", () => {
   const r = (e: any) => isRetryableGithubPushError(e).retryable;
   it("treats a non-fast-forward 422 as retryable (concurrent-commit race)", () => {
