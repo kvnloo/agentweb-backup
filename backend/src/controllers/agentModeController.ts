@@ -16,7 +16,7 @@ import { generateMarketingResponseWorkerService } from '../services/generateMark
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
-import { findInFlightJobForSession, claimCompletion } from '../services/durableLandingService';
+import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
@@ -2284,6 +2284,7 @@ export const agentModeController = {
           try {
             const inFlight = await findInFlightJobForSession(session.userId, sessionId);
             if (inFlight) {
+              await markAwaitingReconnect(inFlight.id);
               attachInProcessCompletion(genPromise, inFlight.id, session.userId, sessionId);
               markProgressComplete(sessionId);
               await chatbotDb.addMessageToSession(sessionId, {

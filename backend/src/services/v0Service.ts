@@ -147,6 +147,14 @@ export interface GeneratedLandingPage {
    * both deliver (idempotency). See durableLandingService.claimCompletion.
    */
   claimedCompletionAt?: string;
+  /**
+   * True once a build's run timed out and a "still building" message was shown to
+   * the user — i.e. this build still owes the session a completion. The redeploy
+   * poller only ever acts on records with this flag, so builds that completed
+   * normally (within the run timeout, already delivered over HTTP) are never
+   * re-delivered. Cleared implicitly by claimedCompletionAt being set.
+   */
+  awaitingReconnect?: boolean;
   slug?: string;
   archived?: boolean;
   archivedAt?: string;

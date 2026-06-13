@@ -98,6 +98,27 @@ export async function claimCompletion(pageId: string): Promise<boolean> {
   }
 }
 
+/**
+ * Mark that a build's run timed out and it still owes its session a completion.
+ * The redeploy poller only acts on records flagged this way, so normally-completed
+ * builds are never re-delivered. Best-effort — a failure here just means the
+ * poller won't pick this build up if the in-process hook also dies.
+ */
+export async function markAwaitingReconnect(pageId: string): Promise<void> {
+  try {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id: pageId },
+        UpdateExpression: "SET awaitingReconnect = :t, updatedAt = :now",
+        ExpressionAttributeValues: { ":t": true, ":now": new Date().toISOString() },
+      })
+      .promise();
+  } catch (err: any) {
+    console.error(`[DURABLE LANDING] markAwaitingReconnect failed for ${pageId}: ${err?.message}`);
+  }
+}
+
 /** The user-facing completion line for a finished build, derived from the record. */
 export function buildCompletionMessage(page: GeneratedLandingPage): string {
   const url = page.customDomainUrl || page.deployedUrl;
@@ -122,15 +143,54 @@ export async function deliverCompletion(page: GeneratedLandingPage): Promise<boo
   const claimed = await claimCompletion(page.id);
   if (!claimed) return false;
 
-  const content = buildCompletionMessage(page);
+  await postToSession(page, buildCompletionMessage(page));
+  return true;
+}
+
+/**
+ * Deliver a truthful FAILURE for a build that has been stuck past the ceiling
+ * (e.g. the run timed out, then a redeploy killed the detached work mid-build so
+ * it never reached `deployed`). Claims exactly once, marks the record failed, and
+ * tells the user plainly instead of leaving "still building" forever.
+ */
+export async function deliverStuckFailure(page: GeneratedLandingPage): Promise<boolean> {
+  if (!page.originatingSessionId) return false;
+  const claimed = await claimCompletion(page.id);
+  if (!claimed) return false;
+
+  try {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id: page.id },
+        UpdateExpression: "SET #s = :failed, errorMessage = :msg, updatedAt = :now",
+        ExpressionAttributeNames: { "#s": "status" },
+        ExpressionAttributeValues: {
+          ":failed": "failed",
+          ":msg": "Generation exceeded the maximum build time and was marked failed by the poller.",
+          ":now": new Date().toISOString(),
+        },
+      })
+      .promise();
+  } catch (err: any) {
+    console.error(`[DURABLE LANDING] deliverStuckFailure status update failed for ${page.id}: ${err?.message}`);
+  }
+
+  await postToSession(
+    page,
+    `⚠️ Your landing page **${page.name}** didn't finish building in time. Nothing was deployed — just ask me to try again and I'll rebuild it.`
+  );
+  return true;
+}
+
+/** Append a message to the originating session (if it still exists) and push it live. */
+async function postToSession(page: GeneratedLandingPage, content: string): Promise<void> {
+  if (!page.originatingSessionId) return;
   try {
     const { chatbotDb } = await import("./chatbotService");
     const session = await chatbotDb.getChatSession(page.originatingSessionId).catch(() => null);
     if (session) {
-      await chatbotDb.addMessageToSession(page.originatingSessionId, {
-        role: "assistant",
-        content,
-      });
+      await chatbotDb.addMessageToSession(page.originatingSessionId, { role: "assistant", content });
     }
     const { io } = await import("../server");
     io.to(`user:${page.userId}`).emit("session-message-appended", {
@@ -139,8 +199,7 @@ export async function deliverCompletion(page: GeneratedLandingPage): Promise<boo
     });
   } catch (err: any) {
     console.error(
-      `[DURABLE LANDING] deliverCompletion delivery failed for page ${page.id} (claim already held): ${err?.message}`
+      `[DURABLE LANDING] post-back delivery failed for page ${page.id} (claim already held): ${err?.message}`
     );
   }
-  return true;
 }
