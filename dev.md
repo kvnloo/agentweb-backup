@@ -1,3 +1,28 @@
+## Landing-Page Generation Failures — Empathia Incident Root-Cause + Durable-Execution/Multi-Site Fix (2026-06-12)
+
+Triggered by Angela (Empathia, `demo@empathiaai.com`, userId `a643f408-4ddf-4790-a9ae-4aa7f99de87a`) reporting landing-page "bugs, it's matching things" during an active evaluation (decision ~Jun 17–18; campaign sends Jun 15). Reconstructed prod session `332dafe1-ec34-44c5-a55a-40ae4131a43a` (Jun 8, 14:03–14:55 UTC) from `AW-ChatMessages`. Five failures in one 52-minute session; they collapse into **two root causes**, both the same shape: **identity is implicit and reconstructed by runtime heuristics.**
+
+### What failed (timeline)
+1. **14:03 — attachment never read.** `read_knowledge_base_files` → "Knowledge base not found"; fallback file read threw `Cannot read properties of undefined (reading 'startsWith')`. Page built WITHOUT the product doc. Separate bug.
+2. **14:13 — timeout lie #1.** Run hit `GENERATION_TIMEOUT_MS` (600s, `agentModeController.ts:55`) while `generate_landing_page` was still running (its MCP timeout is 25min, `apiTools.ts:1301`). The run lost a `Promise.race`, released the session lock, and showed "took longer than expected" — but the generation was **not aborted; it kept running detached and updated `AW-LandingPages` to `deployed`** (`agentModeController.ts:50-53`). Nobody reconnected to it.
+3. **14:15 — prompt-as-name → poisoned repo.** Page `name` was the full multi-line prompt → broke the Next.js build and blocked all later builds; `deploy_landing_page` 404'd. (Prompt-as-name now capped/slugified at `landingPageGeneration.ts:335` / `v0Service.ts:104`.)
+4. **14:42 / 14:54 — timeout lie #2**, two manual retries before it went live. Each retry started a *new* build racing the first (lock already released) — the source of the poisoned repo.
+5. **Wrong project/subdomain.** Final URL `empathia-ai-cardiology-demo.agentwebforms.com/front-desk-emma-empathia-ai` — physician campaign on a subdomain named after a Jun 1 throwaway demo.
+
+### RC1 — no durable job identity (telemetry ≠ durability)
+The spine in flight (Agent Run/Event/Tool Gateway) is *telemetry* — makes failures visible, orthogonal, does NOT fix this. The failure is *durable execution*: the long tool runs inside the HTTP request; on run-timeout the work detaches and finishes but nothing reconnects → the timeout lie + the retry race. Rui's Jun 9 point (a redeploy on a long backend task "causes problems… also for other users") is the same class and correct. Fix: a tracked job (`originatingSessionId` + atomic `claimedCompletionAt`) — on late completion, post back into the session (`io.to('user:'+userId)`, primitive exists `gtmPlan.ts:1499`; `addMessagesToSession` already persists). A retry **reconnects** to the in-flight job instead of starting a second build. **Honest limit:** in-process detachment survives a run-timeout but not a backend redeploy — a `dripSequenceWorker`-style poller is the redeploy backstop; full mid-build survival is the eventual separate-engine's job.
+
+### RC2 — no site identity
+`findUserSiteRecord` (`v0Service.ts:2482`) returns the oldest repo forever (+ a read-time `isRootPage` mutation inside a `find`), so every page is a route in page #1's project and the subdomain is frozen to page #1's name. Fix: explicit `siteId` on each page; the tool gains `site_id` (omit → new site with its own domain; pass → add to existing). Opt-in, existing single-site users backfilled to their root id (byte-identical).
+
+### Why the fix REDUCES complexity (the point)
+Both bugs are heuristics compensating for missing explicit identity. Adding `siteId` + the job marker lets us DELETE: `findUserSiteRecord`'s 3-way guess + its read-time mutation; `isOrphanedFailedPage` + `cleanupOrphanedFailedPages` + the reusable/recyclable orphan-scavenging scan in `generateLandingPage` (these exist only to scavenge orphans the missing lifecycle creates); and the landing-page false-failure diagnostic branch. One explicit job+site identity model replaces four scattered heuristics, a side-effecting finder, and a lie. Flag-gated `DURABLE_LANDING_GENERATION`, fail-open, scoped to landing-page generation. Full spec: `docs/durable-execution-rc1-spec.md`. Plan: `~/.claude/plans/swift-humming-meadow.md`.
+
+### Assumptions to validate
+- The `startsWith` crash (#1) reproduces independently — needs its own repro/ticket.
+- Late completion's `responseMessages` may be persisted before OR after the timeout race; the hook must handle both orderings (suppress the false-failure message, never double-append).
+- Re-pointing Empathia's *current* live page is operational (custom-domain tooling); the multi-site change only prevents the *next* page from repeating it.
+
 ## Lander funnel was unmeasurable from agent-tool telemetry — service/route-layer lifecycle sensor added (2026-06-12)
 
 Attempting to answer "why do 32 landing-page sessions produce only 3 publishes" exposed two instrumentation holes that made the funnel analysis come back blind (24 "created" sessions, 0 visible previews/publishes/errors — obviously wrong):
