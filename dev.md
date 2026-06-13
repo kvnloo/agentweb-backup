@@ -1,3 +1,18 @@
+## Dev-AW-LoopLearning table was missing — the entire gate→attribution→verdict chain wrote to a void (2026-06-13)
+
+Checking for pending-approval proposals (now that gate persistence #1841 is live) surfaced that **`Dev-AW-LoopLearning` did not exist in this account.** `dynamoLearningStore.ts:27` hardcodes the table name; `scripts/create-tables.ts:2043` defines `createLoopLearningTable()` — but the script was never run against this account, so the table was absent. Every `learning.record()` (proposals, approvals, shippedAt, verdicts) hit ResourceNotFound and was swallowed best-effort.
+
+Impact: the whole point of the "close Layer 4→5" sprint was inert. Even after #1841 wired Slack approvals to write shippedAt, the write went nowhere — so CooldownRuleSet read empty history, attribution had nothing to grade, and a ✅ on any loop proposal (e.g. the AI-readiness quiz-start-leak) would never reach a learned/regressed verdict.
+
+**Fix applied 2026-06-13**: created `Dev-AW-LoopLearning` in us-west-2 (PK `loopId` HASH / `sortKey` RANGE, PAY_PER_REQUEST) mirroring the create-tables definition. The loop can now persist decisions.
+
+### Systemic finding (third instance)
+This is the THIRD table defined-in-code-but-never-created in this account: `AW-OnboardingMetrics` (2026-06-12), now `Dev-AW-LoopLearning`. Root cause: `create-tables.ts` is not run when new tables are added, and every writer is best-effort/swallowed so the absence is invisible until someone reads the data. **Follow-up: run `NODE_ENV=... create-tables.ts` against dev AND prod as part of deploy, or add a startup assertion that required tables exist (fail loud, not silent).**
+
+### Assumptions to validate
+- After this table exists, the next ✅ on a loop proposal should write a record with decision + shippedAt, visible via `GET /api/admin/loops/health` moving that loop to `in_flight`. Falsified if health still shows `empty`/`pending_approval` after an approval — would mean the prod backend uses an unprefixed `AW-LoopLearning` that ALSO doesn't exist (check prod table list).
+- Prod (NODE_ENV=production) may resolve a different table name than dev. The recorder hardcodes `Dev-AW-LoopEvents` (env-agnostic); confirm the learning store does the same vs. honoring a prefix — if prod expects unprefixed `AW-LoopLearning`, that table needs creating too.
+
 ## Lander funnel was unmeasurable from agent-tool telemetry — service/route-layer lifecycle sensor added (2026-06-12)
 
 Attempting to answer "why do 32 landing-page sessions produce only 3 publishes" exposed two instrumentation holes that made the funnel analysis come back blind (24 "created" sessions, 0 visible previews/publishes/errors — obviously wrong):
