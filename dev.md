@@ -1,3 +1,17 @@
+## Loop Slack egress gated to prod — fixes "Emma Dev yaps" class (2026-06-13)
+
+Root cause of the duplicate "Emma Dev" AI-readiness DMs: ≥2 stale test-env backends had AI_READINESS_LOOP_ENABLED=true set per-instance (not in the shared secret — verified: the shared `agentweb/test-env/backend-env` secret sets the emma_dev Slack token but NO loop flags), and the loop's Slack post was gated only by that per-loop flag. So any dev box with the flag flipped could DM the founder via the shared emma_dev bot. Only ai-readiness yapped because only that one flag was ever turned on in dev.
+
+### Fix (this PR) — best-practice, defense-in-depth
+`shouldSuppressLoopSlackPost(env)` in `loops/adapters/awsAdapters.ts`, applied at the single Slack egress (`SlackPort.postMessage`) every loop uses (digest, attribution, dispatcher). Non-prod (`NODE_ENV !== 'production'`) suppresses the post and logs instead; overridable with `LOOP_SLACK_ALLOW_NONPROD=true` for intentional dev-channel testing. The per-loop enable flag controls behavior; this controls blast radius — they're separate concerns. emma_dev stays usable for everything else; only loop DMs are gated.
+
+### Note
+This prevents recurrence but does NOT stop already-running stale backends (their process is up). Those were stopped separately (see below / ops action 2026-06-13). The durable systemic fix beyond this is a TTL reaper on test-env instances (the real enabler was boxes living Feb→June) — filed as follow-up.
+
+### Assumptions to validate
+- After deploy, the prod readiness loop still DMs (NODE_ENV=production on prod EB → not suppressed). Falsified if prod stops posting — would mean prod env isn't NODE_ENV=production (it is, verified).
+- No other legit non-prod loop posting relied on the old behavior. If a dev/staging channel digest was wanted, set LOOP_SLACK_ALLOW_NONPROD=true there.
+
 ## report_product_issues was never on the EXTERNAL MCP surface — #1851 enriched the wrong registry (2026-06-13)
 
 Reconnecting the claude.ai Emma connector surfaced that `report_product_issues` is not exposed to it at all. Root cause: AgentWeb has TWO tool registries — `emmaToolRegistry` (in-app Emma chatbot/agent mode, ~141 tools) and `mcpToolRegistry` (the EXTERNAL MCP server at api.agentweb.pro/mcp that claude.ai connectors talk to, ~72 tools from apiTools.ts). `report_product_issues` is registered only on `emmaToolRegistry`. PR #1851 enriched it there (attachment_urls, run_id, MCP-source tag) and its test asserted against `emmaToolRegistry` — so it went green while testing a surface the external connector never sees. Net: in-app Emma got the enrichment; Claude-Code-via-MCP bug reporting (the actual goal) was unreachable.
