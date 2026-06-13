@@ -1437,11 +1437,18 @@ export async function deployLandingPage(
 
     console.log(`[V0 SERVICE] Deployment complete: ${deployedUrl} | GitHub: ${githubRepoUrl}`);
 
-    // Auto-assign an agentwebforms.com subdomain after successful deploy
+    // Auto-assign an agentwebforms.com subdomain after successful deploy. Retried:
+    // a transient Vercel domains-API blip here used to be swallowed, leaving the
+    // page on its raw *.vercel.app URL permanently (≈30% of deployed pages showed
+    // "vercel junk" instead of the clean subdomain). addSubdomain already handles
+    // 409 collisions; withRetry covers fetch-failed/5xx/timeout.
     let customDomain: string | undefined;
     try {
       const subdomain = generateSubdomain(record.name || "page");
-      const domainRecord = await addSubdomain(userId, vercelProjectId, subdomain);
+      const domainRecord = await withRetry(
+        () => addSubdomain(userId, vercelProjectId, subdomain),
+        "assign subdomain"
+      );
       customDomain = domainRecord.domain;
       console.log(`[V0 SERVICE] Auto-assigned subdomain: ${customDomain}`);
       // Persist customDomainUrl so it's available on subsequent fetches without relying on enrichment
