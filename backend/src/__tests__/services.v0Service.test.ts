@@ -138,6 +138,8 @@ import {
   getDeploymentStatus,
   isOrphanedFailedPage,
   cleanupOrphanedFailedPages,
+  commitFilesToRepoMain,
+  isRetryableGithubPushError,
   getLandingPageLiveUrl,
   recordLandingPagePublish,
   markLandingPagePublishReverted,
@@ -429,6 +431,86 @@ describe("v0Service - generateLandingPage", () => {
 // =============================================================================
 // Orphaned failed page helpers (v0 outage cleanup)
 // =============================================================================
+describe("v0Service - isRetryableGithubPushError", () => {
+  const r = (e: any) => isRetryableGithubPushError(e).retryable;
+  it("treats a non-fast-forward 422 as retryable (concurrent-commit race)", () => {
+    expect(r({ response: { status: 422, data: { message: "Update is not a fast forward" } } })).toBe(true);
+  });
+  it("treats 409 conflict as retryable", () => {
+    expect(r({ response: { status: 409, data: {} } })).toBe(true);
+  });
+  it("treats 5xx / 429 / 408 as retryable", () => {
+    expect(r({ response: { status: 502 } })).toBe(true);
+    expect(r({ response: { status: 429 } })).toBe(true);
+    expect(r({ response: { status: 408 } })).toBe(true);
+  });
+  it("treats transient network errors as retryable", () => {
+    expect(r({ message: "fetch failed" })).toBe(true);
+    expect(r({ code: "ECONNRESET" })).toBe(true);
+    expect(r({ message: "timeout of 60000ms exceeded" })).toBe(true);
+  });
+  it("does NOT retry a 404 or a plain 422 validation error", () => {
+    expect(r({ response: { status: 404, data: {} } })).toBe(false);
+    expect(r({ response: { status: 422, data: { message: "Invalid request" } } })).toBe(false);
+  });
+});
+
+describe("v0Service - commitFilesToRepoMain (retry + rebase)", () => {
+  const ref = { data: { object: { sha: "main-sha" } } };
+  const post = { data: { sha: "new-sha" } };
+  const files = [{ path: "app/pricing/page.tsx", content: Buffer.from("export default () => null") }];
+
+  beforeEach(() => {
+    mockAxiosGet.mockReset();
+    mockAxiosPost.mockReset();
+    mockAxiosPatch.mockReset();
+  });
+
+  it("commits in one attempt on the happy path (no re-read)", async () => {
+    mockAxiosGet.mockResolvedValue(ref);
+    mockAxiosPost.mockResolvedValue(post);
+    mockAxiosPatch.mockResolvedValue({ data: {} });
+
+    const res = await commitFilesToRepoMain("o/r", {}, files, "msg");
+    expect(res.pushedCommitSha).toBe("new-sha");
+    expect(mockAxiosGet).toHaveBeenCalledTimes(1); // no rebase needed
+  });
+
+  it("rebases and retries on a non-fast-forward 422 (concurrent commit landed)", async () => {
+    mockAxiosGet.mockResolvedValue(ref);
+    mockAxiosPost.mockResolvedValue(post);
+    mockAxiosPatch
+      .mockRejectedValueOnce({ response: { status: 422, data: { message: "Update is not a fast forward" } } })
+      .mockResolvedValueOnce({ data: {} });
+
+    const res = await commitFilesToRepoMain("o/r", {}, files, "msg", 2);
+    expect(res.pushedCommitSha).toBe("new-sha");
+    expect(mockAxiosGet).toHaveBeenCalledTimes(2); // re-read main on the retry = rebase
+  });
+
+  it("retries a transient 'fetch failed' then succeeds", async () => {
+    mockAxiosGet
+      .mockRejectedValueOnce(Object.assign(new Error("fetch failed")))
+      .mockResolvedValue(ref);
+    mockAxiosPost.mockResolvedValue(post);
+    mockAxiosPatch.mockResolvedValue({ data: {} });
+
+    const res = await commitFilesToRepoMain("o/r", {}, files, "msg", 2);
+    expect(res.pushedCommitSha).toBe("new-sha");
+  });
+
+  it("throws after exhausting retries on persistent transient failure", async () => {
+    mockAxiosGet.mockRejectedValue(Object.assign(new Error("fetch failed")));
+    await expect(commitFilesToRepoMain("o/r", {}, files, "msg", 2)).rejects.toThrow(/fetch failed/);
+  });
+
+  it("does NOT retry a non-retryable error (e.g. 404) — fails fast", async () => {
+    mockAxiosGet.mockRejectedValue({ response: { status: 404, data: {} }, message: "Not Found" });
+    await expect(commitFilesToRepoMain("o/r", {}, files, "msg")).rejects.toBeDefined();
+    expect(mockAxiosGet).toHaveBeenCalledTimes(1); // one attempt, no retry
+  });
+});
+
 describe("v0Service - isOrphanedFailedPage", () => {
   const base = {
     id: "p",
