@@ -15,9 +15,25 @@ jest.mock("aws-sdk", () => {
   };
 });
 
+// Mock the dynamic imports deliverCompletion uses for post-back delivery.
+const mockEmit = jest.fn();
+const mockTo = jest.fn(() => ({ emit: mockEmit }));
+jest.mock("../server", () => ({ io: { to: mockTo } }));
+
+const mockGetChatSession = jest.fn();
+const mockAddMessageToSession = jest.fn();
+jest.mock("../services/chatbotService", () => ({
+  chatbotDb: {
+    getChatSession: (...a: any[]) => mockGetChatSession(...a),
+    addMessageToSession: (...a: any[]) => mockAddMessageToSession(...a),
+  },
+}));
+
 import {
   claimCompletion,
   findInFlightJobForSession,
+  deliverCompletion,
+  buildCompletionMessage,
 } from "../services/durableLandingService";
 
 const ok = (value: any) => ({ promise: () => Promise.resolve(value) });
@@ -26,6 +42,12 @@ const fail = (err: any) => ({ promise: () => Promise.reject(err) });
 beforeEach(() => {
   mockUpdate.mockReset();
   mockQuery.mockReset();
+  mockEmit.mockReset();
+  mockTo.mockClear();
+  mockGetChatSession.mockReset();
+  mockAddMessageToSession.mockReset();
+  mockGetChatSession.mockResolvedValue({ sessionId: "s1" });
+  mockAddMessageToSession.mockResolvedValue(undefined);
 });
 
 describe("claimCompletion — exactly-once idempotency guard", () => {
@@ -84,5 +106,81 @@ describe("findInFlightJobForSession — reconnect lookup", () => {
     mockQuery.mockReturnValue(fail(new Error("ddb down")));
     const job = await findInFlightJobForSession("u1", "s1");
     expect(job).toBeNull();
+  });
+});
+
+describe("buildCompletionMessage", () => {
+  it("includes the live URL when deployed", () => {
+    const msg = buildCompletionMessage({
+      name: "Front Desk EMMA",
+      deployedUrl: "https://x.agentwebforms.com/front-desk-emma",
+    } as any);
+    expect(msg).toContain("Front Desk EMMA");
+    expect(msg).toContain("https://x.agentwebforms.com/front-desk-emma");
+  });
+
+  it("prefers the custom domain over the vercel URL", () => {
+    const msg = buildCompletionMessage({
+      name: "P",
+      deployedUrl: "https://p.vercel.app",
+      customDomainUrl: "https://p.agentwebforms.com",
+    } as any);
+    expect(msg).toContain("https://p.agentwebforms.com");
+    expect(msg).not.toContain("vercel.app");
+  });
+
+  it("falls back to a generic line when there is no URL", () => {
+    const msg = buildCompletionMessage({ name: "P" } as any);
+    expect(msg).toContain("finished building");
+  });
+});
+
+describe("deliverCompletion — exactly-once post-back", () => {
+  const page = {
+    id: "p1",
+    userId: "u1",
+    name: "Front Desk EMMA",
+    originatingSessionId: "s1",
+    deployedUrl: "https://x.agentwebforms.com/fde",
+  } as any;
+
+  it("appends to the session and emits live when it wins the claim", async () => {
+    mockUpdate.mockReturnValue(ok({})); // claim succeeds
+    const delivered = await deliverCompletion(page);
+    expect(delivered).toBe(true);
+    expect(mockAddMessageToSession).toHaveBeenCalledWith(
+      "s1",
+      expect.objectContaining({ role: "assistant", content: expect.stringContaining("https://x.agentwebforms.com/fde") })
+    );
+    expect(mockTo).toHaveBeenCalledWith("user:u1");
+    expect(mockEmit).toHaveBeenCalledWith(
+      "session-message-appended",
+      expect.objectContaining({ sessionId: "s1" })
+    );
+  });
+
+  it("no-ops (no append, no emit) when another deliverer already claimed", async () => {
+    mockUpdate.mockReturnValue(
+      fail(Object.assign(new Error("c"), { code: "ConditionalCheckFailedException" }))
+    );
+    const delivered = await deliverCompletion(page);
+    expect(delivered).toBe(false);
+    expect(mockAddMessageToSession).not.toHaveBeenCalled();
+    expect(mockEmit).not.toHaveBeenCalled();
+  });
+
+  it("returns false without claiming when the page has no originating session", async () => {
+    const delivered = await deliverCompletion({ ...page, originatingSessionId: undefined });
+    expect(delivered).toBe(false);
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("still emits (and returns true) when the session was deleted before completion", async () => {
+    mockUpdate.mockReturnValue(ok({})); // claim succeeds
+    mockGetChatSession.mockResolvedValue(null); // session gone
+    const delivered = await deliverCompletion(page);
+    expect(delivered).toBe(true);
+    expect(mockAddMessageToSession).not.toHaveBeenCalled(); // nothing to append to
+    expect(mockEmit).toHaveBeenCalled();
   });
 });
