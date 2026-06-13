@@ -1,3 +1,16 @@
+## report_product_issues was never on the EXTERNAL MCP surface — #1851 enriched the wrong registry (2026-06-13)
+
+Reconnecting the claude.ai Emma connector surfaced that `report_product_issues` is not exposed to it at all. Root cause: AgentWeb has TWO tool registries — `emmaToolRegistry` (in-app Emma chatbot/agent mode, ~141 tools) and `mcpToolRegistry` (the EXTERNAL MCP server at api.agentweb.pro/mcp that claude.ai connectors talk to, ~72 tools from apiTools.ts). `report_product_issues` is registered only on `emmaToolRegistry`. PR #1851 enriched it there (attachment_urls, run_id, MCP-source tag) and its test asserted against `emmaToolRegistry` — so it went green while testing a surface the external connector never sees. Net: in-app Emma got the enrichment; Claude-Code-via-MCP bug reporting (the actual goal) was unreachable.
+
+### Fix (this PR)
+One-line bridge in emma/tools.ts after the registration block — `mcpToolRegistry.register(emmaToolRegistry.getTool('report_product_issues'))` — same pattern the codebase already uses for `visualContextTool` (tools.ts:5973). The handler reads `context.userId` (agentUserId for external clients) and `context.externalMcp` (true only on the external server, for the MCP Reported tag), so the same handler is correct on both surfaces.
+
+### Lesson (process)
+When a tool must be reachable from the external MCP connector, the test MUST assert against `mcpToolRegistry` (the external surface), not `emmaToolRegistry`. The new test `mcpReportProductIssuesExposure.test.ts` guards exactly this. Two registries existing is itself latent complexity — future consolidation candidate, but out of scope here.
+
+### Assumptions to validate
+- After deploy + connector refresh, `report_product_issues` appears in the claude.ai Emma tool list with attachment_urls + run_id. Falsified if the connector still doesn't show it — would mean the external server caches tool lists beyond a reconnect, or apiTools registration order drops the late bridge.
+
 ## Fix: self-healing telemetry-table provisioning — close the silent-missing-table class (2026-06-13)
 
 Three missing-table incidents in two days (AW-OnboardingMetrics, Dev-AW-LoopLearning, and the loop tables) shared one root cause: tables are defined in create-tables.ts but the script is never run on deploy, and every writer swallows ResourceNotFound — so an absent table is invisible until someone reads the data weeks later. For the loop tables the entire gate→attribution→verdict chain ran as a no-op with zero signal.
