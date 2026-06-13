@@ -440,20 +440,64 @@ describe("v0Service - multi-site routing (DURABLE_LANDING_GENERATION=on)", () =>
     else process.env.DURABLE_LANDING_GENERATION = ORIG;
   });
 
-  it("no site_id → creates a NEW site root (cardiology-demo fix: new campaign is not crammed into the oldest repo)", async () => {
+  const siteRow = (over: Record<string, any> = {}) => ({
+    promise: () =>
+      Promise.resolve({
+        Items: [
+          {
+            id: "site-1",
+            userId: "user-1",
+            githubRepoUrl: "https://github.com/o/r",
+            vercelProjectId: "vp1",
+            isRootPage: true,
+            siteId: "site-1",
+            ...over,
+          },
+        ],
+      }),
+  });
+  const noSites = () => ({ promise: () => Promise.resolve({ Items: [] }) });
+
+  it("unified default + no existing site → creates the first site root", async () => {
+    mockQuery.mockReturnValue(noSites());
     mockChatsCreate.mockResolvedValueOnce({ id: "chat_new" });
 
     await generateLandingPage("user-1", "New campaign", "Front Desk EMMA", {});
 
-    // First persisted record is a fresh site root: siteId === its own id, isRootPage true.
-    const firstPut = mockPut.mock.calls[0][0].Item;
-    expect(firstPut.isRootPage).toBe(true);
-    expect(firstPut.siteId).toBe(firstPut.id);
-    // Went straight to a new-site build (v0.chats.create), not the legacy join heuristic.
+    const put = mockPut.mock.calls[0][0].Item;
+    expect(put.isRootPage).toBe(true);
+    expect(put.siteId).toBe(put.id);
     expect(mockChatsCreate).toHaveBeenCalledTimes(1);
   });
 
-  it("stamps originatingSessionId on the new site record when provided (durable-execution marker)", async () => {
+  it("unified default + existing site → adds a page to that site (cheap, no new root)", async () => {
+    mockQuery.mockReturnValue(siteRow());
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_sub" });
+
+    await generateLandingPage("user-1", "Variant", "Pricing", {});
+
+    const put = mockPut.mock.calls[0][0].Item;
+    expect(put.slug).toBeDefined(); // a sub-page route
+    expect(put.githubRepoUrl).toBe("https://github.com/o/r"); // inherited the existing repo
+    expect(put.siteId).toBe("site-1"); // belongs to the existing site
+    expect(put.isRootPage).toBeUndefined(); // not a new site root
+  });
+
+  it("separate mode → creates a new site even when one exists (opt-in, costlier)", async () => {
+    mockQuery.mockReturnValue(siteRow());
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_sep" });
+
+    await generateLandingPage("user-1", "Campaign", "FDE", {}, undefined, undefined, {
+      mode: "separate",
+    });
+
+    const put = mockPut.mock.calls[0][0].Item;
+    expect(put.isRootPage).toBe(true);
+    expect(put.siteId).toBe(put.id); // its own new site
+  });
+
+  it("stamps originatingSessionId on the build record", async () => {
+    mockQuery.mockReturnValue(noSites());
     mockChatsCreate.mockResolvedValueOnce({ id: "chat_sess" });
 
     await generateLandingPage("user-1", "p", "n", {}, undefined, undefined, {

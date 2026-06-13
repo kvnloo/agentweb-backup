@@ -425,11 +425,19 @@ async function getV0Client() {
  */
 export interface GenerateLandingPageOptions {
   /**
-   * Target an existing site (add a page/variant to its repo). Omit to create a
-   * NEW site with its own repo/project/subdomain — the multi-site default that
-   * stops a new campaign from being crammed into the user's oldest repo.
+   * Target a specific existing site — add this page/variant to its repo. Wins over
+   * `mode`. When omitted, `mode` decides whether to reuse the user's site or make
+   * a new one.
    */
   siteId?: string;
+  /**
+   * `unified` (cost-safe default): add the page to the user's existing site (a
+   * route under the shared subdomain) — only the first page spends a v0 site
+   * generation. `separate`: each campaign gets its own site/subdomain (a fresh v0
+   * generation + repo + project) — costlier, opt-in. Resolved from the user's
+   * landingSiteMode preference, overridable per request by the agent.
+   */
+  mode?: "unified" | "separate";
   /** The agent-mode session that spawned this build (durable-execution marker). */
   originatingSessionId?: string;
 }
@@ -445,10 +453,10 @@ export async function generateLandingPage(
 ): Promise<GeneratedLandingPage> {
   const multiSite = process.env.DURABLE_LANDING_GENERATION === "true";
   const originatingSessionId = opts?.originatingSessionId;
+  const mode = opts?.mode ?? "unified";
 
   if (multiSite) {
-    // ── Explicit site identity. No guessing, no orphan-scavenging. ──
-    // A caller either targets an existing site, or gets a brand-new one.
+    // 1. Explicit target site → add a page/variant to it (shares the subdomain).
     if (opts?.siteId) {
       const site = await findSiteById(opts.siteId, userId);
       if (site?.githubRepoUrl) {
@@ -456,7 +464,25 @@ export async function generateLandingPage(
           site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
         );
       }
-      // siteId given but not a usable site (deleted / never deployed) → new site.
+      // siteId given but not a usable site (deleted / never deployed) → fall through.
+    }
+
+    // 2. "separate" → each campaign gets its OWN site (fresh v0 generation + repo +
+    //    subdomain). The costlier, opt-in path (e.g. distinct campaign URLs).
+    if (mode === "separate") {
+      return generateFirstPage(
+        userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId
+      );
+    }
+
+    // 3. "unified" (cost-safe default) → add the page to the user's existing site;
+    //    only the first page spends a v0 site generation, later pages are routes
+    //    under it. Falls back to creating the first site if none exists yet.
+    const existing = await findUserSiteRecord(userId);
+    if (existing?.githubRepoUrl) {
+      return addPageToExistingRepo(
+        existing, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
+      );
     }
     return generateFirstPage(
       userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId

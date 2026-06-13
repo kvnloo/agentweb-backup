@@ -322,6 +322,16 @@ export interface User {
     rating: "like" | "reject";
     ratedAt: string;
   }>;
+  /**
+   * How new landing pages are organized when the agent doesn't target a specific
+   * site. `unified` (default): add the page to the user's existing site as a route
+   * — cheap (no new repo/project, shares the subdomain). `separate`: each new
+   * campaign gets its OWN site/subdomain — more costly (a fresh v0 generation +
+   * repo + project). Cost-safe default is `unified`; users who want distinct
+   * campaign URLs (e.g. Empathia) opt into `separate`. The agent can still override
+   * per request. Only consulted when DURABLE_LANDING_GENERATION is on.
+   */
+  landingSiteMode?: "unified" | "separate";
   brandGuidelines?: {
     brandData: {
       brandName: string;
