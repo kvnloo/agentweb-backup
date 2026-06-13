@@ -97,3 +97,50 @@ export async function claimCompletion(pageId: string): Promise<boolean> {
     throw err;
   }
 }
+
+/** The user-facing completion line for a finished build, derived from the record. */
+export function buildCompletionMessage(page: GeneratedLandingPage): string {
+  const url = page.customDomainUrl || page.deployedUrl;
+  return url
+    ? `✅ Your landing page **${page.name}** is live: ${url}`
+    : `✅ Your landing page **${page.name}** finished building.`;
+}
+
+/**
+ * Deliver a finished build's result back into the session that spawned it, EXACTLY
+ * once. Used by the redeploy-backstop poller (which holds only the page record, not
+ * the original agent response) — it appends the completion line to the session and
+ * pushes it live to the user. The in-process controller hook delivers its own
+ * (already-persisted) response and only needs claimCompletion + the socket emit.
+ *
+ * Returns true if THIS call delivered, false if another deliverer already claimed
+ * it or the page has no originating session. Delivery-side failures (session gone,
+ * socket down) are swallowed after the claim so the poller doesn't retry forever.
+ */
+export async function deliverCompletion(page: GeneratedLandingPage): Promise<boolean> {
+  if (!page.originatingSessionId) return false;
+  const claimed = await claimCompletion(page.id);
+  if (!claimed) return false;
+
+  const content = buildCompletionMessage(page);
+  try {
+    const { chatbotDb } = await import("./chatbotService");
+    const session = await chatbotDb.getChatSession(page.originatingSessionId).catch(() => null);
+    if (session) {
+      await chatbotDb.addMessageToSession(page.originatingSessionId, {
+        role: "assistant",
+        content,
+      });
+    }
+    const { io } = await import("../server");
+    io.to(`user:${page.userId}`).emit("session-message-appended", {
+      sessionId: page.originatingSessionId,
+      message: { role: "assistant", content },
+    });
+  } catch (err: any) {
+    console.error(
+      `[DURABLE LANDING] deliverCompletion delivery failed for page ${page.id} (claim already held): ${err?.message}`
+    );
+  }
+  return true;
+}
