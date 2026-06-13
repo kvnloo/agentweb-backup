@@ -1,3 +1,29 @@
+## Landing-page builder reliability — telemetry-driven hardening of the GitHub commit path (2026-06-13)
+
+Scanned `AW-LandingPages` (prod) to ground "the builder is unreliable" in data rather than one anecdote.
+
+### What the telemetry says
+- **110 pages, 26 failed = 23.6% failure rate.**
+- Failure modes (clustered by errorMessage):
+  - **15 "fetch failed"** (58% of all failures) — a Node transient network error to an upstream (v0 / GitHub / Vercel) that was NOT retried.
+  - **6 × v0 HTTP 500** — v0 outage symptom.
+  - **2 × 422, 2 × 409** — GitHub ref-update conflicts (non-fast-forward).
+  - 1 stuck `generating` (the orphan/timeout-lie class — addressed separately by the durable-execution work).
+
+### Root cause of the dominant failures
+`withRetry` already covers `fetch failed`/5xx/429/ECONNRESET, and the **v0 calls** and the **first-page repo creation** (`createGitHubRepoAndPush`, ~line 1700) ARE wrapped. But the **sub-page commit path in `addPageToExistingRepo`** was **bare axios with no retry** — five sequential GitHub calls (get-ref → blobs → tree → commit → patch-ref). A transient blip on any one failed the whole build as "fetch failed". That path is exactly where the 15 "fetch failed" came from.
+
+Plus a **race**: the ref-update `patch` used a parent SHA read ~40 lines earlier. If another commit landed on `main` in between — which happens when two pages generate into the **same repo concurrently** — GitHub returns 422 "not a fast forward" (the 422/409s). **Unified multi-site makes this worse**, because it routes more pages into one repo.
+
+### The fix
+New `commitFilesToRepoMain(repoFullName, ghHeaders, files, message, maxAttempts=4)` wraps the commit sequence with retry + **rebase**: every attempt re-reads the current `main` SHA and bases the new commit on it, so a concurrent commit is rebased onto rather than rejected. `isRetryableGithubPushError` decides retry: non-fast-forward 422 / 409 (race) and transient 5xx/429/408/`fetch failed`/ECONNRESET/timeout → retry with backoff; 404/auth/validation → fail fast. `addPageToExistingRepo` now calls it instead of the inline axios sequence.
+
+This kills the dominant "fetch failed" class AND the concurrent-commit race in one move. Flag-independent — strictly more resilient, applies to `main` today. Branch `harsha/harden-landing-commit-retry`.
+
+### Still open (telemetry-flagged, not in this change)
+- v0 HTTP 500s (6) are retried by `withRetry` but a sustained v0 outage still surfaces; consider a longer/again-later retry or a user-facing "v0 is down, try again" rather than a hard fail.
+- Vercel deploy 422 (1) — check `createVercelProject` / `triggerVercelDeployment` retry coverage next.
+
 ## Lander funnel was unmeasurable from agent-tool telemetry — service/route-layer lifecycle sensor added (2026-06-12)
 
 Attempting to answer "why do 32 landing-page sessions produce only 3 publishes" exposed two instrumentation holes that made the funnel analysis come back blind (24 "created" sessions, 0 visible previews/publishes/errors — obviously wrong):
