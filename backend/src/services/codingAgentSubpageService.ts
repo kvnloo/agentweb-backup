@@ -16,6 +16,7 @@
 import AWS from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
 import { runCodingAgent } from "./codingAgentService";
+import { mcpFetch } from "../mcp/server/httpClient";
 import { buildPageSlug } from "./v0Service";
 import type { GeneratedLandingPage, BrandContext } from "./v0Service";
 
@@ -81,32 +82,57 @@ export async function addPageViaCodingAgent(
 
   await dynamodb.put({ TableName: TABLE_NAME, Item: record }).promise();
 
+  // Best practice for agentic code generation: never commit unverified LLM output
+  // to the production branch. Stage the agent's edits on an isolated draft branch;
+  // the agent builds and self-verifies on that branch's Vercel preview
+  // (check_deployment), and we promote to main ONLY on a green build — so the live
+  // site is never broken by a bad generation.
+  const draftBranch = `draft/cap-${id.replace(/-/g, "").slice(0, 12)}`;
   const task = buildSubPageTask(slug, name, prompt, brandContext, opts.leadListId);
 
   try {
     const result = await runCodingAgent(task, {
       pageId: id,
       userId,
-      // Reuse the originating chat session if present so the agent's edits stage on
-      // that session's draft branch; otherwise a synthetic id keeps edits isolated.
       sessionId: opts.originatingSessionId || `subpage-${id}`,
       llmModel: SUBPAGE_MODEL,
+      draftBranch,
     });
 
-    const deployed = result.success;
-    await updateRecordOutcome(
-      id,
-      deployed ? "deployed" : "failed",
-      result.previewUrl,
-      deployed ? undefined : result.message
-    );
+    if (!result.success) {
+      // Build never went green on the preview — main is untouched.
+      await updateRecordOutcome(id, "failed", result.previewUrl, result.message);
+      return {
+        ...record,
+        status: "failed",
+        ...(result.previewUrl ? { deployedUrl: result.previewUrl } : {}),
+        errorMessage: result.message,
+      };
+    }
 
-    return {
-      ...record,
-      status: deployed ? "deployed" : "failed",
-      ...(result.previewUrl ? { deployedUrl: result.previewUrl } : {}),
-      ...(deployed ? {} : { errorMessage: result.message }),
-    };
+    // Verified green on the preview → promote the draft to main (page goes live).
+    try {
+      const pub = await mcpFetch({
+        method: "POST",
+        path: `/api/landing-pages/v0/generated/${id}/publish`,
+        context: { userId },
+        body: { branch: draftBranch },
+      });
+      const liveUrl = pub?.live_url || pub?.deployed_url || result.previewUrl;
+      await updateRecordOutcome(id, "deployed", liveUrl, undefined);
+      return { ...record, status: "deployed", ...(liveUrl ? { deployedUrl: liveUrl } : {}) };
+    } catch (pubErr: any) {
+      // Built and verified on the preview, but the merge to main failed. Leave it as
+      // a draft (preview URL) — main stays untouched and it can be re-published.
+      const message = `Built on preview but publish to main failed: ${pubErr?.message || "unknown error"}`;
+      await updateRecordOutcome(id, "draft", result.previewUrl, message).catch(() => {});
+      return {
+        ...record,
+        status: "draft",
+        ...(result.previewUrl ? { deployedUrl: result.previewUrl } : {}),
+        errorMessage: message,
+      };
+    }
   } catch (err: any) {
     const message = err?.message || "Coding-agent sub-page generation failed";
     await updateRecordOutcome(id, "failed", undefined, message).catch(() => {});

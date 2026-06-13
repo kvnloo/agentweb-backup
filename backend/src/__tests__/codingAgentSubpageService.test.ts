@@ -20,6 +20,11 @@ jest.mock("../services/codingAgentService", () => ({
   runCodingAgent: (...a: any[]) => mockRunCodingAgent(...a),
 }));
 
+const mockMcpFetch = jest.fn();
+jest.mock("../mcp/server/httpClient", () => ({
+  mcpFetch: (...a: any[]) => mockMcpFetch(...a),
+}));
+
 jest.mock("../services/v0Service", () => ({
   buildPageSlug: (n: string) =>
     n.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 30),
@@ -40,16 +45,18 @@ beforeEach(() => {
   mockPut.mockReset().mockReturnValue(ok({}));
   mockUpdate.mockReset().mockReturnValue(ok({}));
   mockRunCodingAgent.mockReset();
+  mockMcpFetch.mockReset();
 });
 
 describe("addPageViaCodingAgent", () => {
-  it("creates a sub-page record under the site and runs the agent with Opus, scoped to the new page", async () => {
+  it("stages on a draft, runs the agent with Opus, then promotes to main on a green build", async () => {
     mockRunCodingAgent.mockResolvedValue({
       success: true,
       message: "done",
       iterations: 5,
       previewUrl: "https://r.vercel.app/pricing",
     });
+    mockMcpFetch.mockResolvedValue({ success: true, live_url: "https://acme.agentwebforms.com/pricing" });
 
     const res = await addPageViaCodingAgent(
       site,
@@ -71,17 +78,39 @@ describe("addPageViaCodingAgent", () => {
     expect(ctx.llmModel).toContain("opus-4-8"); // net-new design → most capable model
     expect(ctx.pageId).toBe(put.id);
     expect(ctx.sessionId).toBe("s9");
+    expect(ctx.draftBranch).toMatch(/^draft\//); // staged on an isolated branch, not main
     expect(task).toContain("app/pricing/page.tsx");
 
+    // Promoted to main via the publish endpoint, using the same draft branch.
+    const pubCall = mockMcpFetch.mock.calls[0][0];
+    expect(pubCall.path).toBe(`/api/landing-pages/v0/generated/${put.id}/publish`);
+    expect(pubCall.body.branch).toBe(ctx.draftBranch);
+    expect(pubCall.context.userId).toBe("u1");
+
     expect(res.status).toBe("deployed");
-    expect(res.deployedUrl).toBe("https://r.vercel.app/pricing");
+    expect(res.deployedUrl).toBe("https://acme.agentwebforms.com/pricing"); // the live URL, not the preview
   });
 
-  it("maps a failed agent run to a failed record", async () => {
+  it("does NOT promote to main when the build never goes green (main untouched)", async () => {
     mockRunCodingAgent.mockResolvedValue({ success: false, message: "build broke", iterations: 3 });
     const res = await addPageViaCodingAgent(site, "u1", "p", "Contact", {} as any);
+    expect(mockMcpFetch).not.toHaveBeenCalled(); // never publishes a failing build
     expect(res.status).toBe("failed");
     expect(res.errorMessage).toContain("build broke");
+  });
+
+  it("leaves the page as a draft (main untouched) when the build is green but the promote fails", async () => {
+    mockRunCodingAgent.mockResolvedValue({
+      success: true,
+      message: "done",
+      iterations: 4,
+      previewUrl: "https://r.vercel.app/contact",
+    });
+    mockMcpFetch.mockRejectedValue(new Error("merge conflict"));
+    const res = await addPageViaCodingAgent(site, "u1", "p", "Contact", {} as any);
+    expect(res.status).toBe("draft");
+    expect(res.deployedUrl).toBe("https://r.vercel.app/contact"); // the verified preview
+    expect(res.errorMessage).toContain("publish to main failed");
   });
 
   it("maps a thrown agent error to a failed record (never throws to the caller)", async () => {
