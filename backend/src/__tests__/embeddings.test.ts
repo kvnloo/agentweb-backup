@@ -5,9 +5,17 @@
 const mockCreate = jest.fn();
 jest.mock('openai', () =>
   jest.fn().mockImplementation(() => ({
+    // embedText now goes through the metered llmClients factory, which wraps
+    // chat.completions.create and embeddings.create at construction time.
+    chat: { completions: { create: jest.fn() } },
     embeddings: { create: mockCreate },
   }))
 );
+
+// Shadow metering is fire-and-forget; mock it so tests never touch the recorder.
+jest.mock('../services/usageRecorderService', () => ({
+  recordUsage: jest.fn().mockResolvedValue(undefined),
+}));
 
 import { embedText } from '../utils/embeddings';
 

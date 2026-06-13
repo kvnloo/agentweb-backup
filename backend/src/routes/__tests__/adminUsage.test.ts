@@ -1,0 +1,136 @@
+/**
+ * Tests for the admin shadow-usage routes (routes/adminUsage.ts).
+ */
+
+import express from 'express';
+import request from 'supertest';
+
+// Pass-through auth by default; individual tests flip behavior.
+jest.mock('../../middleware/auth', () => ({
+  authenticateToken: jest.fn((req: any, _res: any, next: any) => {
+    req.user = { userId: 'admin-1', email: 'admin@example.com', isAdmin: true };
+    next();
+  }),
+}));
+
+jest.mock('../../middleware/admin', () => ({
+  isAdmin: jest.fn((req: any, res: any, next: any) => {
+    if (!req.user?.isAdmin) {
+      return res.status(403).json({ message: 'Access denied. Admin privileges required.' });
+    }
+    next();
+  }),
+}));
+
+jest.mock('../../services/usageAnalyticsService', () => ({
+  getUserUsageByModelDay: jest.fn(),
+  getUsageComparison: jest.fn(),
+}));
+
+import adminUsageRoutes from '../adminUsage';
+import { authenticateToken } from '../../middleware/auth';
+import {
+  getUserUsageByModelDay,
+  getUsageComparison,
+} from '../../services/usageAnalyticsService';
+
+const mockByModelDay = getUserUsageByModelDay as jest.Mock;
+const mockComparison = getUsageComparison as jest.Mock;
+const mockAuth = authenticateToken as unknown as jest.Mock;
+
+let app: express.Application;
+
+describe('admin usage routes', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockAuth.mockImplementation((req: any, _res: any, next: any) => {
+      req.user = { userId: 'admin-1', email: 'admin@example.com', isAdmin: true };
+      next();
+    });
+    app = express();
+    app.use(express.json());
+    app.use('/api/admin', adminUsageRoutes);
+  });
+
+  describe('GET /api/admin/users/:userId/usage/by-model-day', () => {
+    it('400s when start/end are missing or malformed', async () => {
+      await request(app).get('/api/admin/users/u1/usage/by-model-day').expect(400);
+      await request(app)
+        .get('/api/admin/users/u1/usage/by-model-day?start=June&end=2026-06-30')
+        .expect(400);
+      expect(mockByModelDay).not.toHaveBeenCalled();
+    });
+
+    it('400s when start > end', async () => {
+      await request(app)
+        .get('/api/admin/users/u1/usage/by-model-day?start=2026-06-30&end=2026-06-01')
+        .expect(400);
+      expect(mockByModelDay).not.toHaveBeenCalled();
+    });
+
+    it('403s for non-admin users', async () => {
+      mockAuth.mockImplementation((req: any, _res: any, next: any) => {
+        req.user = { userId: 'basic-1', email: 'basic@example.com', isAdmin: false };
+        next();
+      });
+      await request(app)
+        .get('/api/admin/users/u1/usage/by-model-day?start=2026-06-01&end=2026-06-30')
+        .expect(403);
+      expect(mockByModelDay).not.toHaveBeenCalled();
+    });
+
+    it('returns the analytics payload for valid requests', async () => {
+      const payload = { userId: 'u1', start: '2026-06-01', end: '2026-06-30', rows: [], totals: {} };
+      mockByModelDay.mockResolvedValue(payload);
+
+      const res = await request(app)
+        .get('/api/admin/users/u1/usage/by-model-day?start=2026-06-01&end=2026-06-30')
+        .expect(200);
+
+      expect(res.body).toEqual(payload);
+      expect(mockByModelDay).toHaveBeenCalledWith('u1', '2026-06-01', '2026-06-30');
+    });
+
+    it('500s (with a message) when the service throws', async () => {
+      mockByModelDay.mockRejectedValue(new Error('dynamo down'));
+      const res = await request(app)
+        .get('/api/admin/users/u1/usage/by-model-day?start=2026-06-01&end=2026-06-30')
+        .expect(500);
+      expect(res.body.message).toBe('Failed to load usage');
+    });
+  });
+
+  describe('GET /api/admin/users/:userId/usage/comparison', () => {
+    it('400s when month is missing or malformed', async () => {
+      await request(app).get('/api/admin/users/u1/usage/comparison').expect(400);
+      await request(app).get('/api/admin/users/u1/usage/comparison?month=2026-6').expect(400);
+      expect(mockComparison).not.toHaveBeenCalled();
+    });
+
+    it('returns the comparison payload for valid requests', async () => {
+      const payload = {
+        userId: 'u1',
+        month: '2026-06',
+        shadow: { totalTokens: 10, costUsd: 0.1, callCount: 2 },
+        legacy: { totalTokens: 8, costUsd: 0.08, source: 'current' },
+        delta: { totalTokens: 2, costUsd: 0.02 },
+      };
+      mockComparison.mockResolvedValue(payload);
+
+      const res = await request(app)
+        .get('/api/admin/users/u1/usage/comparison?month=2026-06')
+        .expect(200);
+
+      expect(res.body).toEqual(payload);
+      expect(mockComparison).toHaveBeenCalledWith('u1', '2026-06');
+    });
+
+    it('500s when the service throws', async () => {
+      mockComparison.mockRejectedValue(new Error('boom'));
+      const res = await request(app)
+        .get('/api/admin/users/u1/usage/comparison?month=2026-06')
+        .expect(500);
+      expect(res.body.message).toBe('Failed to load usage comparison');
+    });
+  });
+});
