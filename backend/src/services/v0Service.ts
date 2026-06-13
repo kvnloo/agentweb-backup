@@ -415,24 +415,58 @@ async function getV0Client() {
  * - If user ALREADY has a deployed landing page → add a new page route to the EXISTING
  *   GitHub repo via the GitHub Contents API. No v0 call, no new repo. Vercel auto-redeploys.
  */
+export interface GenerateLandingPageOptions {
+  /**
+   * Target an existing site (add a page/variant to its repo). Omit to create a
+   * NEW site with its own repo/project/subdomain — the multi-site default that
+   * stops a new campaign from being crammed into the user's oldest repo.
+   */
+  siteId?: string;
+  /** The agent-mode session that spawned this build (durable-execution marker). */
+  originatingSessionId?: string;
+}
+
 export async function generateLandingPage(
   userId: string,
   prompt: string,
   name: string,
   brandContext: BrandContext,
   leadListId?: string,
-  templateHtml?: string
+  templateHtml?: string,
+  opts?: GenerateLandingPageOptions
 ): Promise<GeneratedLandingPage> {
-  // Check if user already has a site (GitHub repo) — includes archived records.
-  // This is the core guard: v0 is only called if NO site exists at all.
+  const multiSite = process.env.DURABLE_LANDING_GENERATION === "true";
+  const originatingSessionId = opts?.originatingSessionId;
+
+  if (multiSite) {
+    // ── Explicit site identity. No guessing, no orphan-scavenging. ──
+    // A caller either targets an existing site, or gets a brand-new one.
+    if (opts?.siteId) {
+      const site = await findSiteById(opts.siteId, userId);
+      if (site?.githubRepoUrl) {
+        return addPageToExistingRepo(
+          site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
+        );
+      }
+      // siteId given but not a usable site (deleted / never deployed) → new site.
+    }
+    return generateFirstPage(
+      userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId
+    );
+  }
+
+  // ── Legacy single-site behavior (flag off). DEPRECATED: delete this whole
+  // block (plus findUserSiteRecord's guess + the orphan-scavenging helpers) when
+  // DURABLE_LANDING_GENERATION defaults on. The guessing and recycling below exist
+  // ONLY because site and job identity were implicit; the multi-site branch above
+  // needs none of it — the controller's retry-reconnect (findInFlightJobForSession)
+  // and the redeploy poller subsume the reusable/recyclable scans. ──
   const siteRecord = await findUserSiteRecord(userId);
 
   if (siteRecord) {
-    // ── Add new page route to existing repo (no v0 call) ──
     return addPageToExistingRepo(siteRecord, userId, prompt, name, brandContext, leadListId, templateHtml);
   }
 
-  // Dedup: if this user already has a page in-progress with a v0ChatId, reuse it.
   const existingPages = await listLandingPages(userId);
   const reusable = existingPages.find(
     (p) => p.v0ChatId && ["generating", "draft", "deploying"].includes(p.status)
@@ -442,21 +476,35 @@ export async function generateLandingPage(
     return reusable;
   }
 
-  // Recovery: a prior first-page attempt that failed *before* a v0 chat was ever
-  // created (e.g. v0 returned HTTP 500) leaves an orphaned record with no v0ChatId
-  // and no GitHub repo. Recycle the newest such record instead of creating yet
-  // another orphan, so repeated retries don't pile up dead "failed" pages.
   const recyclable = existingPages.find(isOrphanedFailedPage);
   if (recyclable) {
     console.log(`[V0 SERVICE] Recycling failed page record ${recyclable.id} (no v0 chat) for retry`);
-    // Recycling reuses ONE orphan's id; archive any OTHER orphaned failed records so a
-    // backlog from earlier failures (e.g. a sustained v0 outage) doesn't linger on the
-    // user's page list. Best-effort — never blocks the new generation.
     await cleanupOrphanedFailedPages(userId, existingPages, recyclable.id);
   }
 
-  // ── First page: call v0 → create repo → deploy ──
   return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id);
+}
+
+/**
+ * Resolve a site (the record that owns the repo/Vercel project) by id, scoped to
+ * the owner. Accepts either a site-root id or a sub-page id (resolves to its
+ * site root via `siteId`). Returns null if not found, not owned, or not yet
+ * deployed (no repo). Replaces the old "guess the user's oldest repo" heuristic
+ * with an explicit, unambiguous lookup.
+ */
+export async function findSiteById(
+  siteId: string,
+  userId: string
+): Promise<GeneratedLandingPage | null> {
+  const record = await getLandingPage(siteId, userId);
+  if (!record) return null;
+  if (record.githubRepoUrl) return record;
+  // A sub-page id was passed and it isn't the repo owner — resolve to its root.
+  if (record.siteId && record.siteId !== record.id) {
+    const root = await getLandingPage(record.siteId, userId);
+    if (root?.githubRepoUrl) return root;
+  }
+  return null;
 }
 
 /**
@@ -526,7 +574,8 @@ async function generateFirstPage(
   brandContext: BrandContext,
   leadListId?: string,
   templateHtml?: string,
-  existingId?: string
+  existingId?: string,
+  originatingSessionId?: string
 ): Promise<GeneratedLandingPage> {
   // Reuse a recyclable failed record's id when retrying, otherwise mint a new one.
   const id = existingId ?? uuidv4();
@@ -546,12 +595,16 @@ async function generateFirstPage(
     status: "generating",
     iterations: 0,
     isRootPage: true,
+    // A new site's root record IS its own site — explicit identity that replaces
+    // the old "guess the oldest repo" heuristic.
+    siteId: id,
     createdAt: now,
     updatedAt: now,
   };
 
   if (leadListId) record.leadListId = leadListId;
   if (templateHtml) record.templateHtml = templateHtml;
+  if (originatingSessionId) record.originatingSessionId = originatingSessionId;
 
   await dynamodb.put({ TableName: TABLE_NAME, Item: record }).promise();
 
@@ -632,7 +685,8 @@ async function addPageToExistingRepo(
   name: string,
   brandContext: BrandContext,
   leadListId?: string,
-  templateHtml?: string
+  templateHtml?: string,
+  originatingSessionId?: string
 ): Promise<GeneratedLandingPage> {
   const id = uuidv4();
   const now = new Date().toISOString();
@@ -671,6 +725,10 @@ async function addPageToExistingRepo(
     slug,
     githubRepoUrl: existingPage.githubRepoUrl,
     vercelProjectId: existingPage.vercelProjectId,
+    // Belongs to the same site as the page it was added to. A site's root has
+    // siteId === id, so a sub-page inherits the root's siteId (or the root's id).
+    siteId: existingPage.siteId ?? existingPage.id,
+    ...(originatingSessionId ? { originatingSessionId } : {}),
     deployedUrl: baseUrl ? `${baseUrl}/${slug}` : undefined,
     createdAt: now,
     updatedAt: now,
