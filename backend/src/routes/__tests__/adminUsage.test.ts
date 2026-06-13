@@ -97,6 +97,18 @@ describe('admin usage routes', () => {
         .get('/api/admin/users/u1/usage/by-model-day?start=2026-06-01&end=2026-06-30')
         .expect(500);
       expect(res.body.message).toBe('Failed to load usage');
+      expect(res.body.error).toBe('dynamo down');
+    });
+
+    it('500s with "Unknown error" when a non-Error value is thrown', async () => {
+      // The catch block does `error instanceof Error ? error.message : "Unknown error"`.
+      // Rejecting with a non-Error exercises the falsy side of that ternary.
+      mockByModelDay.mockRejectedValue('plain string failure');
+      const res = await request(app)
+        .get('/api/admin/users/u1/usage/by-model-day?start=2026-06-01&end=2026-06-30')
+        .expect(500);
+      expect(res.body.message).toBe('Failed to load usage');
+      expect(res.body.error).toBe('Unknown error');
     });
   });
 
@@ -131,6 +143,17 @@ describe('admin usage routes', () => {
         .get('/api/admin/users/u1/usage/comparison?month=2026-06')
         .expect(500);
       expect(res.body.message).toBe('Failed to load usage comparison');
+      expect(res.body.error).toBe('boom');
+    });
+
+    it('500s with "Unknown error" when a non-Error value is thrown', async () => {
+      // Falsy side of `error instanceof Error ? error.message : "Unknown error"`.
+      mockComparison.mockRejectedValue({ code: 'WEIRD' });
+      const res = await request(app)
+        .get('/api/admin/users/u1/usage/comparison?month=2026-06')
+        .expect(500);
+      expect(res.body.message).toBe('Failed to load usage comparison');
+      expect(res.body.error).toBe('Unknown error');
     });
   });
 });

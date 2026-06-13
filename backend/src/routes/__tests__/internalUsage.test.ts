@@ -74,6 +74,13 @@ describe('POST /api/internal/usage', () => {
     expect(mockRecordUsage).not.toHaveBeenCalled();
   });
 
+  it('400s when there is no request body at all', async () => {
+    // No body is sent and no JSON content-type, so express.json() leaves
+    // req.body undefined — exercises the `(req.body || {})` fallback branch.
+    await request(app).post('/api/internal/usage').expect(400);
+    expect(mockRecordUsage).not.toHaveBeenCalled();
+  });
+
   it('400s when the batch exceeds the size cap', async () => {
     const records = Array.from({ length: 501 }, () => ({ ...validRecord }));
     await request(app).post('/api/internal/usage').send({ records }).expect(400);
@@ -134,6 +141,36 @@ describe('POST /api/internal/usage', () => {
     });
   });
 
+  it('forwards a valid cacheWriteTokens value instead of defaulting to 0', async () => {
+    // validRecord omits cacheWriteTokens (defaults to 0). Provide a valid one
+    // here to exercise the truthy side of the cacheWriteTokens ternary.
+    const withCacheWrite = { ...validRecord, cacheWriteTokens: 42 };
+    const res = await request(app)
+      .post('/api/internal/usage')
+      .send({ records: [withCacheWrite] })
+      .expect(202);
+
+    expect(res.body).toEqual({ accepted: 1, skipped: 0 });
+    expect(mockRecordUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ cacheWriteTokens: 42, cacheReadTokens: 100 })
+    );
+  });
+
+  it('defaults cacheReadTokens to 0 when the value is invalid', async () => {
+    // Provide a negative cacheReadTokens so isNonNegativeFiniteNumber returns
+    // false — exercises the falsy side of the cacheReadTokens ternary.
+    const badCacheRead = { ...validRecord, cacheReadTokens: -1 };
+    const res = await request(app)
+      .post('/api/internal/usage')
+      .send({ records: [badCacheRead] })
+      .expect(202);
+
+    expect(res.body).toEqual({ accepted: 1, skipped: 0 });
+    expect(mockRecordUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ cacheReadTokens: 0 })
+    );
+  });
+
   it('re-attributes records claiming another userId to the authenticated user (non-admin)', async () => {
     const res = await request(app)
       .post('/api/internal/usage')
@@ -168,5 +205,17 @@ describe('POST /api/internal/usage', () => {
       .send({ records: [validRecord] })
       .expect(500);
     expect(res.body.message).toBe('Failed to ingest usage records');
+    expect(res.body.error).toBe('unexpected');
+  });
+
+  it('500s with "Unknown error" when a non-Error value is thrown', async () => {
+    // Falsy side of `error instanceof Error ? error.message : "Unknown error"`.
+    mockRecordUsage.mockRejectedValue('boom-string');
+    const res = await request(app)
+      .post('/api/internal/usage')
+      .send({ records: [validRecord] })
+      .expect(500);
+    expect(res.body.message).toBe('Failed to ingest usage records');
+    expect(res.body.error).toBe('Unknown error');
   });
 });

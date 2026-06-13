@@ -178,4 +178,38 @@ describe('usageRecordDb', () => {
       expect(rows).toEqual([]);
     });
   });
+
+  describe('table name prefix', () => {
+    const baseIncrement = {
+      userId: 'user-1',
+      date: '2026-06-12',
+      model: 'm',
+      feature: 'f',
+      inputTokens: 1,
+      outputTokens: 1,
+      costMicroUsd: 1,
+      billingUserId: 'owner-1',
+    };
+
+    it('uses the unprefixed prod table name outside development', async () => {
+      // The default test env (NODE_ENV !== 'development') takes the '' branch.
+      await usageRecordDb.incrementUsage(baseIncrement);
+      expect(mockDynamoDB.update.mock.calls[0][0].TableName).toBe('AW-UsageRecords');
+    });
+
+    it('prefixes the table with Dev- in development', async () => {
+      const prev = process.env.NODE_ENV;
+      process.env.NODE_ENV = 'development';
+      try {
+        await jest.isolateModulesAsync(async () => {
+          const { usageRecordDb: devDb } = require('../services/usageRecordDb');
+          await devDb.incrementUsage(baseIncrement);
+        });
+      } finally {
+        process.env.NODE_ENV = prev;
+      }
+      const lastCall = mockDynamoDB.update.mock.calls.at(-1)[0];
+      expect(lastCall.TableName).toBe('Dev-AW-UsageRecords');
+    });
+  });
 });

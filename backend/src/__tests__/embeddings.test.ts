@@ -36,6 +36,14 @@ describe('embedText', () => {
     expect(mockCreate).toHaveBeenCalledTimes(1);
   });
 
+  it('honors an explicit meterCtx feature/userId', async () => {
+    mockCreate.mockResolvedValue({ data: [{ embedding: [0.4] }] });
+    expect(
+      await embedText('hi', { userId: 'u-9', feature: 'kb_index' })
+    ).toEqual([0.4]);
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+  });
+
   it('returns null (does not throw) when the API call fails', async () => {
     mockCreate.mockRejectedValue(new Error('network down'));
     expect(await embedText('hello')).toBeNull();

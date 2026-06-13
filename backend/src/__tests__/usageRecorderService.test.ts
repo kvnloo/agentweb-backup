@@ -67,6 +67,14 @@ describe('usageRecorderService', () => {
 
       expect(errorSpy).toHaveBeenCalledTimes(1);
     });
+
+    it('logs a non-Error rejection value without throwing', async () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockIncrement.mockRejectedValue('plain string failure');
+
+      await expect(recordUsage(baseCtx)).resolves.toBeUndefined();
+      expect(errorSpy).toHaveBeenCalled();
+    });
   });
 
   describe('recording', () => {
@@ -123,6 +131,25 @@ describe('usageRecorderService', () => {
       expect(inc.inputTokens).toBe(0);
       expect(inc.outputTokens).toBe(11);
     });
+
+    it('treats zero / undefined token counts as 0', async () => {
+      await recordUsage({
+        ...baseCtx,
+        inputTokens: 0,
+        outputTokens: undefined as any,
+      });
+      const inc = mockIncrement.mock.calls[0][0];
+      expect(inc.inputTokens).toBe(0);
+      expect(inc.outputTokens).toBe(0);
+    });
+
+    it('defaults model and feature to "unknown" when both are missing', async () => {
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      await recordUsage({ ...baseCtx, model: undefined as any, feature: undefined as any });
+      const inc = mockIncrement.mock.calls[0][0];
+      expect(inc.model).toBe('unknown');
+      expect(inc.feature).toBe('unknown');
+    });
   });
 
   describe('computeCostMicroUsd', () => {
@@ -143,6 +170,15 @@ describe('usageRecorderService', () => {
     it('returns 0 for unknown models', () => {
       jest.spyOn(console, 'warn').mockImplementation(() => {});
       expect(computeCostMicroUsd('nope-model', 1_000_000, 1_000_000)).toBe(0);
+    });
+
+    it('derives cache prices from input price when the entry omits them', () => {
+      // text-embedding-3-large is a literal price entry with NO explicit
+      // cacheReadPerM/cacheWritePerM, so the `?? inPerM*0.1` / `?? inPerM*1.25`
+      // fallbacks apply. in $0.13/M → cacheRead $0.013/M, cacheWrite $0.1625/M.
+      expect(
+        computeCostMicroUsd('text-embedding-3-large', 0, 0, 1_000_000, 1_000_000)
+      ).toBe(Math.round(1_000_000 * 0.013 + 1_000_000 * 0.1625));
     });
   });
 });
