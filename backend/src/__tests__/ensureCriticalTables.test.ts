@@ -65,6 +65,7 @@ describe('ensureCriticalTables', () => {
     expect(names).toEqual(expect.arrayContaining([
       'Dev-AW-LoopEvents',
       'Dev-AW-LoopLearning',
+      'Dev-AW-LoopDispatches',
     ]));
     expect(names.some((n) => n.endsWith('AW-OnboardingMetrics'))).toBe(true);
   });

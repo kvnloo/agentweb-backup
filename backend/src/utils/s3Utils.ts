@@ -92,78 +92,11 @@ export async function getS3ObjectMetadata(key: string, bucket: string = DEFAULT_
 }
 
 /**
- * Classify an S3/AWS error as transient (worth retrying) vs terminal.
- * Terminal: the object/bucket is gone or access is denied — retrying cannot help.
- * Transient: throttling, timeouts, 5xx, and connection resets — a short retry helps.
- */
-function isTransientS3Error(error: any): boolean {
-  const code = error?.code || error?.name || '';
-  const status = error?.statusCode;
-  const terminalCodes = new Set([
-    'NoSuchKey',
-    'NoSuchBucket',
-    'AccessDenied',
-    'AllAccessDisabled',
-    'InvalidObjectState',
-    'PermanentRedirect',
-  ]);
-  if (terminalCodes.has(code)) return false;
-  if (status === 404 || status === 403) return false;
-
-  const transientCodes = new Set([
-    'RequestTimeout',
-    'RequestTimeoutException',
-    'Throttling',
-    'ThrottlingException',
-    'SlowDown',
-    'ProvisionedThroughputExceededException',
-    'InternalError',
-    'ServiceUnavailable',
-    'TimeoutError',
-    'ETIMEDOUT',
-    'ECONNRESET',
-    'ECONNREFUSED',
-    'EPIPE',
-    'NetworkingError',
-  ]);
-  if (transientCodes.has(code)) return true;
-  if (typeof status === 'number' && status >= 500) return true;
-  // Unknown error class: treat as transient so a flaky call gets one more chance,
-  // but the bounded retry count keeps this from spiraling.
-  return true;
-}
-
-/**
  * Download an S3 object and return its content as a UTF-8 string.
- *
- * Retries transient failures (throttling, timeouts, 5xx, connection resets) with
- * exponential backoff. Terminal failures (NoSuchKey/NoSuchBucket/AccessDenied) throw
- * immediately so callers can surface a model-actionable "data no longer available"
- * message instead of pointlessly retrying. The success path is unchanged.
  */
-export async function getS3ObjectAsString(
-  key: string,
-  bucket: string = DEFAULT_BUCKET,
-  options?: { maxRetries?: number; baseDelayMs?: number; sleep?: (ms: number) => Promise<void> },
-): Promise<string> {
-  const maxRetries = options?.maxRetries ?? 3;
-  const baseDelayMs = options?.baseDelayMs ?? 100;
-  const sleep = options?.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-
-  let lastError: any;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      const result = await s3.getObject({ Bucket: bucket, Key: key }).promise();
-      return result.Body?.toString('utf-8') || '';
-    } catch (error) {
-      lastError = error;
-      if (attempt >= maxRetries || !isTransientS3Error(error)) throw error;
-      // Exponential backoff with light jitter: 100ms, 200ms, 400ms (+ up to 50ms).
-      const delay = baseDelayMs * Math.pow(2, attempt) + Math.floor(Math.random() * 50);
-      await sleep(delay);
-    }
-  }
-  throw lastError;
+export async function getS3ObjectAsString(key: string, bucket: string = DEFAULT_BUCKET): Promise<string> {
+  const result = await s3.getObject({ Bucket: bucket, Key: key }).promise();
+  return result.Body?.toString('utf-8') || '';
 }
 
 export interface S3UploadResult {
