@@ -86,6 +86,10 @@ describe('AgentModeService - CRM Tools', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     service = new AgentModeService();
+    // Default: caller has org access to the list (owner or same-org member).
+    // clearAllMocks() does not reset implementations, so set this deterministically
+    // on every test; deny tests override to false explicitly.
+    (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
   });
 
   // ─── getLeads ──────────────────────────────────────────────────────────
@@ -1124,6 +1128,7 @@ describe('AgentModeService - CRM Tools', () => {
 
     it('should deny access for wrong user', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other-user' } as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
 
       const result = await service.deleteLeadList(listId, userId);
 
@@ -1332,6 +1337,7 @@ describe('AgentModeService - CRM Tools', () => {
 
     it('should deny access for wrong user', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other-user' } as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
 
       const result = await service.addLeadEngagement(
         listId, leadId, 'custom.note', userId
@@ -1608,6 +1614,7 @@ describe('AgentModeService - CRM Tools', () => {
 
     it('updateLeadList denies access for wrong user', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other' } as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
       const result = await service.updateLeadList(listId, { name: 'X' }, userId);
       expect(result.success).toBe(false);
       expect(result.message).toBe('Access denied');
@@ -1876,6 +1883,7 @@ describe('AgentModeService - CRM Tools', () => {
 
     it('should reject when list not owned by user', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other-user' } as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
 
       const result = await service.deleteLeadsByFilter(
         listId,
@@ -1885,6 +1893,94 @@ describe('AgentModeService - CRM Tools', () => {
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('Access denied');
+    });
+  });
+
+  // ─── org-shared access: non-owner org member (PR #1895 follow-up) ──────────
+  // Every CRM list method must gate on the org-aware canOrgMemberAccessList, not
+  // a raw `list.userId !== userId` owner check. A same-org member who is NOT the
+  // list owner must be allowed to operate on a shared list; an outsider must be
+  // denied. Covers the 9 methods migrated alongside addLeadsToList.
+  describe('org-shared access — non-owner org member (PR #1895)', () => {
+    const listOwnerId = 'list-owner-id';
+    const orgMemberId = 'org-member-id';
+    const sharedList = { ...mockList, userId: listOwnerId, statusConfig: undefined };
+
+    type AccessCase = {
+      name: string;
+      run: (svc: AgentModeService, caller: string) => Promise<any>;
+      denyError?: string;
+      writeMock?: jest.Mock;
+    };
+
+    const cases: AccessCase[] = [
+      { name: 'setLeadContactStatus',
+        run: (s, u) => s.setLeadContactStatus(listId, [leadId], 'do-not-contact', undefined, undefined, u),
+        writeMock: mockCrmDb.updateLead as jest.Mock },
+      { name: 'deleteLeads',
+        run: (s, u) => s.deleteLeads(listId, [leadId], u),
+        denyError: 'You do not have permission to delete leads from this list',
+        writeMock: mockCrmDb.deleteLead as jest.Mock },
+      { name: 'deleteLeadsByFilter',
+        run: (s, u) => s.deleteLeadsByFilter(listId, [{ field: 'status', operator: 'equals', value: 'lost' }], u, true),
+        denyError: 'You do not have permission to delete leads from this list',
+        writeMock: mockCrmDb.deleteLead as jest.Mock },
+      { name: 'updateLeadList',
+        run: (s, u) => s.updateLeadList(listId, { description: 'updated by org member' }, u),
+        denyError: 'You do not have permission to modify this list',
+        writeMock: mockCrmDb.updateLeadList as jest.Mock },
+      { name: 'getLeadListStatuses',
+        run: (s, u) => s.getLeadListStatuses(listId, u),
+        denyError: 'You do not have permission to view this list' },
+      { name: 'configureLeadStatuses',
+        run: (s, u) => s.configureLeadStatuses(listId, [{ value: 'new', label: 'New', color: 'gray', type: 'active' }], u),
+        denyError: 'You do not have permission to modify this list',
+        writeMock: mockCrmDb.updateLeadList as jest.Mock },
+      { name: 'deleteLeadList',
+        run: (s, u) => s.deleteLeadList(listId, u),
+        denyError: 'You do not have permission to delete this list',
+        writeMock: mockCrmDb.deleteLeadList as jest.Mock },
+      { name: 'getLeadEngagements',
+        run: (s, u) => s.getLeadEngagements(listId, leadId, u),
+        denyError: 'You do not have permission to access this list' },
+      { name: 'addLeadEngagement',
+        run: (s, u) => s.addLeadEngagement(listId, leadId, 'custom.call', u),
+        denyError: 'You do not have permission to modify leads in this list',
+        writeMock: mockCrmDb.addLeadEngagement as jest.Mock },
+    ];
+
+    cases.forEach(({ name, run, denyError, writeMock }) => {
+      it(`${name} allows a same-org member who is not the list owner`, async () => {
+        mockCrmDb.getLeadListById.mockResolvedValue({ ...sharedList } as any);
+        (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+        // Downstream mocks so each method can proceed past the access gate.
+        mockCrmDb.getLeadById.mockResolvedValue({ ...mockLead } as any);
+        mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: undefined } as any);
+        (mockCrmDb.getLeadEngagementCount as jest.Mock).mockResolvedValue(0);
+        mockCrmDb.getLeadEngagements.mockResolvedValue([] as any);
+
+        const result = await run(service, orgMemberId);
+
+        // The bug returned a hard 'Access denied' for non-owner members. The
+        // downstream outcome may vary, but it must NOT be the permission denial,
+        // and the org-aware check must have been consulted with the caller + list.
+        expect(result.message).not.toBe('Access denied');
+        expect(mockCrmDb.canOrgMemberAccessList).toHaveBeenCalledWith(
+          orgMemberId, expect.objectContaining({ userId: listOwnerId })
+        );
+      });
+
+      it(`${name} denies a user who fails the org access check`, async () => {
+        mockCrmDb.getLeadListById.mockResolvedValue({ ...sharedList } as any);
+        (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
+
+        const result = await run(service, 'outsider-id');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toBe('Access denied');
+        if (denyError) expect(result.error).toBe(denyError);
+        if (writeMock) expect(writeMock).not.toHaveBeenCalled();
+      });
     });
   });
 });
