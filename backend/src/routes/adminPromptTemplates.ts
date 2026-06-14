@@ -29,6 +29,7 @@ import {
   type Archetype,
 } from "../services/brick5Archetypes";
 import { PROMPT_BUILDER_VERSION } from "../services/onboardingAdImageService";
+import { analyzeImagePromptQuality } from "../services/imagePromptQualityService";
 
 const router = express.Router();
 
@@ -89,6 +90,25 @@ router.put("/global/image-directives", async (req: Request, res: Response) => {
   } catch (err) {
     console.error("[admin/prompt-templates] global save failed", err);
     return res.status(500).json({ message: "Failed to save global image directives" });
+  }
+});
+
+// Image-prompt quality analysis (WS1c). Ranks underperforming archetypes from
+// the captured like/skip signals so the taste team knows what to edit.
+// Registered before /:id so "image-quality" isn't matched as an archetype.
+// Optional query: ?threshold=0.5&minSample=20
+router.get("/image-quality", async (req: Request, res: Response) => {
+  const threshold = Number(req.query.threshold);
+  const minSample = Number(req.query.minSample);
+  try {
+    const report = await analyzeImagePromptQuality({
+      ...(Number.isFinite(threshold) ? { likeRateThreshold: threshold } : {}),
+      ...(Number.isFinite(minSample) ? { minSample } : {}),
+    });
+    return res.json(report);
+  } catch (err) {
+    console.error("[admin/prompt-templates] image-quality failed", err);
+    return res.status(500).json({ message: "Failed to analyze image prompt quality" });
   }
 });
 
