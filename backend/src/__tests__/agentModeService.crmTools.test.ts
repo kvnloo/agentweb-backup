@@ -13,6 +13,7 @@ jest.mock('../services/db', () => ({
     getLeadsByEngagedFlag: jest.fn(),
     getLeadById: jest.fn(),
     updateLead: jest.fn(),
+    batchCreateLeads: jest.fn(),
     deleteLead: jest.fn(),
     updateLeadList: jest.fn(),
     deleteLeadList: jest.fn(),
@@ -905,6 +906,86 @@ describe('AgentModeService - CRM Tools', () => {
         expect.objectContaining({ source: 'agentMode.updateLead', listId, leadId, type: 'string' }),
       );
       errorSpy.mockRestore();
+    });
+  });
+
+  // ─── addLeadsToList ───────────────────────────────────────────────────
+
+  describe('addLeadsToList', () => {
+    const newLead = {
+      email: 'kyle@example.com',
+      firstName: 'Kyle',
+      lastName: 'Bimm',
+      company: 'Acme',
+      dinnerSeat: 'confirmed',
+    };
+
+    beforeEach(() => {
+      mockCrmDb.batchCreateLeads.mockResolvedValue({
+        successCount: 1,
+        newCount: 1,
+        mergedCount: 0,
+        errorCount: 0,
+        errors: [],
+      } as any);
+    });
+
+    it('allows the list owner to add leads through the shared access helper', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+
+      const result = await service.addLeadsToList(listId, [newLead], userId);
+
+      expect(result.success).toBe(true);
+      expect(mockCrmDb.canOrgMemberAccessList).toHaveBeenCalledWith(userId, mockList);
+      expect(mockCrmDb.batchCreateLeads).toHaveBeenCalledWith(listId, [
+        {
+          email: 'kyle@example.com',
+          firstName: 'Kyle',
+          lastName: 'Bimm',
+          company: 'Acme',
+          customFields: { dinnerSeat: 'confirmed' },
+        },
+      ]);
+    });
+
+    it('allows a same-org member with write access to add leads to an org-shared list', async () => {
+      const listOwnerId = 'list-owner-id';
+      const orgMemberId = 'org-member-id';
+      const orgSharedList = { ...mockList, userId: listOwnerId };
+      mockCrmDb.getLeadListById.mockResolvedValue(orgSharedList as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+
+      const result = await service.addLeadsToList(listId, [newLead], orgMemberId);
+
+      expect(result.success).toBe(true);
+      expect(result.newCount).toBe(1);
+      expect(mockCrmDb.canOrgMemberAccessList).toHaveBeenCalledWith(orgMemberId, orgSharedList);
+      expect(mockCrmDb.batchCreateLeads).toHaveBeenCalledTimes(1);
+    });
+
+    it('denies users who fail the org-aware list access check', async () => {
+      const outsiderList = { ...mockList, userId: 'other-user' };
+      mockCrmDb.getLeadListById.mockResolvedValue(outsiderList as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
+
+      const result = await service.addLeadsToList(listId, [newLead], userId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Access denied');
+      expect(mockCrmDb.canOrgMemberAccessList).toHaveBeenCalledWith(userId, outsiderList);
+      expect(mockCrmDb.batchCreateLeads).not.toHaveBeenCalled();
+    });
+
+    it('returns not found when the target list is missing', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(null as any);
+
+      const result = await service.addLeadsToList(listId, [newLead], userId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Lead list not found');
+      expect(mockCrmDb.canOrgMemberAccessList).not.toHaveBeenCalled();
+      expect(mockCrmDb.batchCreateLeads).not.toHaveBeenCalled();
     });
   });
 

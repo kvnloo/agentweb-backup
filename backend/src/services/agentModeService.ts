@@ -8085,7 +8085,7 @@ export class AgentModeService {
     try {
       const { crmDb } = await import('./db');
 
-      // Verify list ownership
+      // Verify list access
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
         return {
@@ -8095,7 +8095,8 @@ export class AgentModeService {
         };
       }
 
-      if (list.userId !== userId) {
+      const hasAccessAddLeads = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccessAddLeads) {
         return {
           success: false,
           message: 'Access denied',
