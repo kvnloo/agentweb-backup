@@ -5,6 +5,7 @@
 
 import { fork, ChildProcess } from 'child_process';
 import path from 'path';
+import { clearTerminalProgress } from '../utils/sseProgress';
 
 interface GenerateMarketingResponseParams {
   messageContent: string;
@@ -203,27 +204,32 @@ export class GenerateMarketingResponseWorkerService {
       if (readyReject) {
         readyReject(error);
       }
-      // Reject all pending requests
-      for (const [requestId, pending] of this.pendingRequests.entries()) {
-        clearTimeout(pending.timeout);
-        pending.reject(error);
-      }
-      this.pendingRequests.clear();
+      // Clear SSE progress for every in-flight session BEFORE failAllPendingRequests
+      // drops the session→request mapping — otherwise a worker that died
+      // mid-iteration leaves a stale progress entry that streams "Thinking…"
+      // to the frontend forever (the SSE-zombie-progress bug, B4). This runs
+      // while sessionToRequestId is still populated.
+      this.clearProgressForInFlightSessions();
+      // Reject all pending requests and clear BOTH pendingRequests and
+      // sessionToRequestId so the controller's lock releases immediately (B1).
+      this.failAllPendingRequests(error);
       this.worker = null;
     });
 
     // Handle worker exit
     this.worker.on('exit', (code, signal) => {
       console.log(`[Worker] Worker process exited with code ${code} and signal ${signal}`);
+      const exitError = new Error(`Worker process exited with code ${code} and signal ${signal}`);
       if (readyReject) {
-        readyReject(new Error(`Worker process exited with code ${code} and signal ${signal}`));
+        readyReject(exitError);
       }
-      // Reject all pending requests
-      for (const [requestId, pending] of this.pendingRequests.entries()) {
-        clearTimeout(pending.timeout);
-        pending.reject(new Error(`Worker process exited with code ${code} and signal ${signal}`));
-      }
-      this.pendingRequests.clear();
+      // See the 'error' handler above: clear SSE progress BEFORE
+      // failAllPendingRequests drops the session→request mapping, so a worker
+      // that exits mid-iteration cannot orphan its sessions' progress entries (B4).
+      this.clearProgressForInFlightSessions();
+      // Reject all pending requests and clear both maps so the controller's
+      // generation lock releases immediately instead of waiting the timeout (B1).
+      this.failAllPendingRequests(exitError);
       this.worker = null;
     });
 
@@ -233,11 +239,47 @@ export class GenerateMarketingResponseWorkerService {
   }
 
   /**
+   * Reject every in-flight request and fully clear the request bookkeeping when the
+   * worker dies (exit/error). Clearing BOTH pendingRequests and sessionToRequestId is
+   * essential: a leftover session→requestId mapping for a dead session would make a
+   * later cancelSession() mis-fire a {type:'cancel'} at the *fresh* worker, and the
+   * map would grow unbounded across crashes. Rejecting promptly here is what lets the
+   * controller's try/finally release the per-session generation lock immediately
+   * instead of waiting out GENERATION_TIMEOUT_MS.
+   */
+  private failAllPendingRequests(error: Error): void {
+    for (const pending of this.pendingRequests.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(error);
+    }
+    this.pendingRequests.clear();
+    this.sessionToRequestId.clear();
+  }
+
+  /**
    * Pre-start the worker process so it's ready before the first request.
    * Called at server startup to avoid cold-start latency on the first chat message.
    */
   async ensureWorkerReady(): Promise<void> {
     await this.ensureWorker();
+  }
+
+  /**
+   * Clear the SSE progress entry for every session that currently has an
+   * in-flight request. Called on worker death (`error`/`exit`) so a generation
+   * that dies mid-iteration cannot leave a zombie progress entry that the
+   * frontend streams as "Thinking…" indefinitely. Best-effort: a failure to
+   * clear one session's progress must not block clearing the others or the
+   * surrounding worker teardown.
+   */
+  private clearProgressForInFlightSessions(): void {
+    for (const sessionId of this.sessionToRequestId.keys()) {
+      try {
+        clearTerminalProgress(sessionId);
+      } catch (err) {
+        console.error(`[Worker] Failed to clear progress for session ${sessionId} on worker death:`, err);
+      }
+    }
   }
 
   /**
@@ -258,12 +300,8 @@ export class GenerateMarketingResponseWorkerService {
       this.worker.kill('SIGTERM');
       this.worker = null;
     }
-    // Clear all pending requests
-    for (const [requestId, pending] of this.pendingRequests.entries()) {
-      clearTimeout(pending.timeout);
-      pending.reject(new Error('Worker shutdown'));
-    }
-    this.pendingRequests.clear();
+    // Reject all pending requests and clear the request/session bookkeeping.
+    this.failAllPendingRequests(new Error('Worker shutdown'));
   }
 
   /**

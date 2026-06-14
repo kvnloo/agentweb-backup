@@ -52,6 +52,7 @@ const mockUpdateLeadList = jest.fn();
 jest.mock("../services/db", () => ({
   userDb: {
     getUserById: mockGetUserById,
+    setLandingSiteMode: jest.fn(async (_id: string, m: string) => m),
   },
   orgDb: {
     getOrgById: mockGetOrgById,
@@ -89,6 +90,13 @@ const mockUpsertEnvVar = jest.fn();
 const mockDeleteEnvVar = jest.fn();
 
 jest.mock("../services/v0Service", () => ({
+  // Real lock logic (pure) so the route resolves the mode correctly under test.
+  resolveLockedSiteMode: (saved: any, req: any) =>
+    saved === "unified" || saved === "separate"
+      ? { mode: saved, lockNow: false }
+      : req === "unified" || req === "separate"
+      ? { mode: req, lockNow: true }
+      : { mode: "unified", lockNow: false },
   generateLandingPage: (...args: any[]) => mockGenerateLandingPage(...args),
   deployLandingPage: (...args: any[]) => mockDeployLandingPage(...args),
   iterateLandingPage: (...args: any[]) => mockIterateLandingPage(...args),
