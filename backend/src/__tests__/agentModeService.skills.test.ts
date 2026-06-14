@@ -889,15 +889,13 @@ describe('AgentModeService - Skills', () => {
       await agentModeService.loadFoundationTools();
 
       const tools = agentModeService.getFoundationToolNames();
-      expect(tools.size).toBe(8);
+      expect(tools.size).toBe(6);
       expect(tools.has('tool_a')).toBe(true);
       expect(tools.has('tool_b')).toBe(true);
       expect(tools.has('tool_c')).toBe(true);
       expect(tools.has('install_skills')).toBe(true);
       expect(tools.has('list_available_skills')).toBe(true);
       expect(tools.has('resolve_skill')).toBe(true);
-      expect(tools.has('search_tool_response')).toBe(true);
-      expect(tools.has('read_tool_response')).toBe(true);
     });
 
     it('should fall back to defaults when no DB setting exists', async () => {
@@ -947,15 +945,15 @@ describe('AgentModeService - Skills', () => {
 
       const result = await agentModeService.updateFoundationTools(['tool_x', 'tool_y'], 'admin@test.com');
 
-      expect(result).toEqual(['tool_x', 'tool_y', 'install_skills', 'list_available_skills', 'resolve_skill', 'search_tool_response', 'read_tool_response']);
+      expect(result).toEqual(['tool_x', 'tool_y', 'install_skills', 'list_available_skills', 'resolve_skill']);
       expect(settingsService.setSetting).toHaveBeenCalledWith(
         'foundation_tools',
-        JSON.stringify(['tool_x', 'tool_y', 'install_skills', 'list_available_skills', 'resolve_skill', 'search_tool_response', 'read_tool_response']),
+        JSON.stringify(['tool_x', 'tool_y', 'install_skills', 'list_available_skills', 'resolve_skill']),
         expect.any(String),
         'admin@test.com'
       );
       const tools = agentModeService.getFoundationToolNames();
-      expect(tools.size).toBe(7);
+      expect(tools.size).toBe(5);
       expect(tools.has('tool_x')).toBe(true);
       expect(tools.has('tool_y')).toBe(true);
       expect(tools.has('resolve_skill')).toBe(true);
@@ -967,7 +965,7 @@ describe('AgentModeService - Skills', () => {
 
       const result = await agentModeService.updateFoundationTools(['tool_a', 'tool_a', 'tool_b'], 'admin@test.com');
 
-      expect(result).toEqual(['tool_a', 'tool_b', 'install_skills', 'list_available_skills', 'resolve_skill', 'search_tool_response', 'read_tool_response']);
+      expect(result).toEqual(['tool_a', 'tool_b', 'install_skills', 'list_available_skills', 'resolve_skill']);
     });
   });
 
