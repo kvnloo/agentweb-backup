@@ -1,3 +1,15 @@
+## AgentMode B3 review fix — trim WeakMap memo DROPPED after splice-path staleness found (2026-06-14)
+
+Independent review of PR #1878 found the B3 WeakMap memo unsafe — and it failed on exactly the assumption flagged below in "Assumptions to validate (a)": the append-only invariant does **not** hold. `updateConversationContext()` (agentModeService.ts ~:3411-3434) runs on the same `messages` array reference inside the loop (called ~:2547, before the trim call ~:2603) whenever the agent installs skills. Its install_skills path does `messages.splice(idx, 1)` (remove the prior skill-context message wherever it sits) then `messages.splice(1, 0, …)` (reinsert near the top) — a remove-then-reinsert that is **net-zero in length** but shifts every absolute index between the two positions. The memo's `cached.length <= messages.length` guard sees no growth, walks an empty tail, and serves STALE absolute indices (`toolIndices` / `toolIdToIndex`) against the shifted array → wrong `preserveSet` / `oldAssistantIndices` → trimmed output DIVERGES from the original algorithm. Not behavior-preserving; AC-breaking.
+
+**Fix:** removed the WeakMap memo entirely. Kept the `tool_call_id → index` Map — that alone kills the originally-reported per-call nested O(n²) scan (O(1) lookups) and is fully behavior-preserving on every path including splice/reorder, because the scan is recomputed against the live array each call and can never go stale. Net effect: fewer lines and less per-instance state than the merged PR, no correctness caveat.
+
+**Proof:** added a `splice/reorder safety` describe block to `agentModeService.trimToolContext.test.ts` with two cases (net-zero reorder that shifts the preserved tail + a length-changing reorder), each mutating the SAME array ref and asserting deep-equality against the golden oracle on the post-splice array. Both FAIL against the memo'd version (verified by reverting the service file) and PASS with the memo removed. Existing golden-oracle characterization + sub-quadratic perf tests retained and still pass (32/32 across trim + publishFixes suites; `npx tsc` clean).
+
+**Lesson:** a length-only memo guard cannot detect an in-place reorder that preserves length. The "Assumptions to validate (a)" note below correctly predicted this; the safe move was to not ship the memo at all, since the Map already solves the reported defect.
+
+---
+
 ## AgentMode B3 — `trimToolMessagesForContext` made incremental, killing per-iteration O(n²) reprocessing (2026-06-14)
 
 `AgentModeService.trimToolMessagesForContext()` (agentModeService.ts ~:16612) is called once **per loop iteration** from the main agent loop (`while (iteration < maxIterations)` at :2501, call site :2603) on the full, monotonically-growing `messages` array. Old shape was O(n²) *per call*: the `oldAssistantIndices` pass ran a nested forward scan (for each assistant-with-tool_calls, scan all following messages looking for a preserved tool result). Across an N-iteration session that's O(N²)+ total reprocessing of the same history.
