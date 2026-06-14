@@ -1,3 +1,18 @@
+## B5 — Dedupe/rate-limit context-limit oncall alerts (stop flooding) (2026-06-14)
+
+The context-limit error path in `controllers/agentModeController.ts` fires `sendAgentModeOncallAlert` (`utils/agentModeAlerts.ts`) on **every** occurrence. Two sites hit it: the regular `/generate` path (re-grepped to ~line 2453) and the shared/interactive-response path (~line 3111). On a high-concurrency day, one user repeatedly retrying a too-long session would generate one oncall email **per request** — pure noise.
+
+**Notion side was already deduped**: `autoReportContextLimitToNotion` sets a per-session `contextLimitReported` flag and skips if set, so Notion only ever files one issue per session. The flood risk was the **oncall email**, which had no dedupe at all.
+
+**Fix (contained, behavior-preserving):** added an opt-in `dedupeKey` + `dedupeWindowMs` (+ injectable `now` for tests) to `sendAgentModeOncallAlert`. When `dedupeKey` is set, an in-memory `Map<key, lastAlertTs>` suppresses repeat alerts inside the window (default 10 min); the map is lazily pruned past 1000 entries. When `dedupeKey` is absent, behavior is unchanged — every call fires (all other ~14 call sites untouched). The two context-limit sites now pass `context_limit:<userId|sessionId>` and `context_limit_shared:<userId|shareId>` respectively (distinct error classes key independently).
+
+**Assumptions to validate:**
+- In-memory dedupe is per-process. With multiple backend workers, the worst case is ~1 alert per worker per window (still a >N× reduction from per-occurrence). A shared store (Dynamo/Redis) would make it global but adds a moving part — deferred unless per-worker volume is still noisy in prod.
+- 10-min default window chosen to match a typical retry-storm; tune via `dedupeWindowMs` if oncall still sees clusters.
+- The user-facing 413 `CONTEXT_LIMIT_EXCEEDED` response is unchanged — dedupe only gates the alert email, never the HTTP response (existing `errorHandling` test 1026 still passes).
+
+---
+
 ## Live tool-failure telemetry — 227 failures classified; raw failure-rate OVERSTATES breakage (2026-06-13)
 
 Pulled actual error strings from `Dev-AW-LoopEvents` (failure events carry `dimensions.errorClass`/`errorMessage`; `agent_tool_invoked`/`agent_tool_succeeded` do NOT — a failure = invoked-without-a-matching-succeed, which is how the loop derives rates). 227 sampled failures classified by root cause. Confirms + makes empirical the Section-C "tool-list truncation" finding below and the 2026-06-11 #eng thread with Rui (June 9–12 window: 223 runs, 1,016 calls, 78 failures).
