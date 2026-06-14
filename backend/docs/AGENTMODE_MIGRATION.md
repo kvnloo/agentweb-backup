@@ -112,6 +112,37 @@ inline. One seam per PR.
   4/4. Monolith 24,205 → 24,213 (+8 net). Seams 1/6. **Outcome: GREEN — strangler approach validated
   end-to-end on one path.** Branch `swarm/agentmode-core-proofslice` → PR vs `harsha/swarm` (not merged).
 
+## Reliability snapshot — the trend line (telemetry-only, 2026-06-14)
+
+The recorder writes per-run agent-mode events to `Dev-AW-LoopEvents`
+(`loopId='agent-mode'`), and the 17:30 UTC analysis loop clusters failures for
+fix dispatch — but neither leaves a **daily reliability trend line**. The
+snapshot job adds one without touching the chat path.
+
+- **Job**: `backend/src/cron/agentReliabilitySnapshotCron.ts`
+  (`runAgentReliabilitySnapshot`), wired in `server.ts` to run daily at **17:45
+  UTC** (between the agent-mode learning loop at 17:30 and generic attribution at
+  18:00). Gated by **`AGENT_RELIABILITY_SNAPSHOT_ENABLED=true`** (off by default,
+  consistent with the other loop crons). Best-effort/swallowed — never crashes
+  boot. Pure metric math lives in `backend/src/cron/agentReliabilitySnapshot.ts`.
+- **Computes** (24h + 7d rolling, both persisted): `tool_success_rate`
+  (`agent_tool_succeeded / agent_tool_invoked`), `degraded_run_rate` /
+  `failed_run_rate` (over `agent_run_verdict` events), `run_count`, median/p90
+  iterations (per-run max `agent_decision.iteration`), and the top 5
+  `toolName×errorClass` failure clusters.
+- **Where it writes**: back into the SAME `Dev-AW-LoopEvents` table under a
+  distinct **`loopId='agent-reliability-daily'`**, SK=`<date>#<window>` so the
+  write is an idempotent overwrite (re-running a day replaces, never duplicates).
+  No new table / no `create-tables` / `ensureCriticalTables` change needed — the
+  existing PK+SK schema + `query` path cover it.
+- **How to read the trend**:
+  - CLI: `npx ts-node backend/scripts/show-reliability-trend.ts`
+    (`--days=30`, `--window=7d`, `--json`).
+  - Admin endpoint: `GET /api/admin/loops/reliability-trend?days=14&window=24h`
+    (auth + isAdmin; returns snapshots oldest-first).
+- **Behavior-preserving**: summarizes events the recorder already wrote; reads
+  from / writes to telemetry only. Zero change to chat outputs, tool selection,
+  prompts, or model defaults.
 - **2026-06-14 · Reliability/observability — tool-error classifier fix** — production telemetry
   showed the error taxonomy was blind: a 7-day sweep of `Dev-AW-LoopEvents` `agent_tool_failed`
   events (283 failures) had **85.5% recorded as the generic `Error` fallback**, and even
