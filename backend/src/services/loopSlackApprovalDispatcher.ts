@@ -418,7 +418,7 @@ export async function handleLoopApprovalReaction(event: ReactionAddedEvent): Pro
   if (!item || item.type !== 'message' || !item.channel || !item.ts) return;
   if (!item.channel.startsWith('D')) return;
 
-  if (isDispatched(item.ts)) {
+  if (await isDispatched(item.ts)) {
     console.log(`🔁 loop approval reaction: ${item.ts} already dispatched — skipping`);
     return;
   }
@@ -438,7 +438,7 @@ export async function handleLoopApprovalReaction(event: ReactionAddedEvent): Pro
 
   if (pageIds.length > 0) {
     await postThread(item.channel, item.ts, `🚀 Dispatching ${pageIds.length} cloud-dev run${pageIds.length === 1 ? '' : 's'} for ${loopTitle}...`);
-    markDispatched(item.ts, pageIds);
+    await markDispatched(item.ts, pageIds);
     const results = await dispatchExistingNotionPages(pageIds);
     await postThread(item.channel, item.ts, formatSummary(loopTitle, results));
     await persistApproval(item.channel, item.ts, message.text, event.user, results);
@@ -456,7 +456,7 @@ export async function handleLoopApprovalReaction(event: ReactionAddedEvent): Pro
   }
 
   await postThread(item.channel, item.ts, `🚀 Creating ${tasks.length} cloud-dev task${tasks.length === 1 ? '' : 's'} for ${loopTitle}...`);
-  markDispatched(item.ts, tasks.map((t) => t.id));
+  await markDispatched(item.ts, tasks.map((t) => t.id));
   const results = await dispatchCreatedTasks(tasks);
   await postThread(item.channel, item.ts, formatSummary(loopTitle, results));
   await persistApproval(item.channel, item.ts, message.text, event.user, results);
