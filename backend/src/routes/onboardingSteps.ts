@@ -77,6 +77,10 @@ import {
   isValidVariantId,
   ratingSummary,
 } from "../services/adVariantRatingService";
+import {
+  appendImageRatingPatch,
+  imageRatingSummary,
+} from "../services/adImageVariantRatingService";
 
 const router = express.Router();
 
@@ -808,6 +812,67 @@ router.post("/ad-variant/rate", authenticateToken, async (req, res) => {
     return res
       .status(500)
       .json({ message: "Failed to record ad-variant rating" });
+  }
+});
+
+// ─────────────────── Ad-IMAGE-variant rating (Ads Tinder) ───────────────────
+//
+// The image-side analogue of /ad-variant/rate. The Phase 4 image reveal deck
+// fires this on every ♥/✕ commit. Stored on the User record under
+// `adImageVariantsRated` (separate field from copy) and fed back into the
+// next image generation as negative visual directions. See
+// `adImageVariantRatingService.ts` for the pure-function side.
+//
+// POST /api/onboarding/ad-image-variant/rate
+// Body: { variantId: string, rating: "like" | "reject" }
+// Response: { summary: { likes, rejects, total } }
+router.post("/ad-image-variant/rate", authenticateToken, async (req, res) => {
+  try {
+    const userId = requireUserId(req, res);
+    if (!userId) return;
+
+    const variantId = req.body?.variantId;
+    if (!isValidVariantId(variantId)) {
+      return res.status(400).json({
+        message: "variantId must be a non-empty string up to 64 characters",
+      });
+    }
+
+    const rating = req.body?.rating;
+    if (!isAdVariantRating(rating)) {
+      return res.status(400).json({ message: 'rating must be "like" or "reject"' });
+    }
+
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const patch = appendImageRatingPatch(user, variantId, rating);
+    await userDb.updateUser(userId, patch as any);
+
+    // Log the signal to PromptSignals attributed to the image variant's
+    // prompt version + archetype so the partner-portal Prompt Templates tab
+    // shows image like-rate per archetype. Image prompt versions are a
+    // distinct namespace from copy (brick-8 vs brick-10) so they don't
+    // collide in the metric.
+    const updatedUser = (await userDb.getUserById(userId)) as any;
+    const variants = updatedUser?.adImageResult?.variants ?? [];
+    const variant = variants.find((v: any) => v?.id === variantId);
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { logPromptSignal } = require("../services/promptSignalsService");
+    void logPromptSignal({
+      userId,
+      variantId,
+      promptVersion: variant?.promptVersion,
+      archetype: variant?.archetype,
+      signal: rating === "like" ? "like" : "skip",
+    });
+
+    return res.json({ summary: imageRatingSummary(updatedUser || patch) });
+  } catch (err) {
+    console.error("[ad-image-variant] rate failed", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to record ad-image-variant rating" });
   }
 });
 
