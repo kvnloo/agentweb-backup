@@ -38,6 +38,11 @@ import { imageService as defaultImageService } from "./imageGeneration";
 import { reportUIError } from "../utils/errorReporter";
 import { userDb } from "./db";
 import {
+  DEFAULT_IMAGE_STYLE_SPEC,
+  DEFAULT_IMAGE_HARD_CONSTRAINTS,
+  type GlobalImageDirectives,
+} from "./imagePromptDefaults";
+import {
   adImageFailedPatch,
   adImageReadyPatch,
   adImageStartPatch,
@@ -243,14 +248,23 @@ export function buildSixLayerPromptForVariant(
     name: string;
   },
   /**
-   * Negative visual directions distilled from the user's recent image
-   * rejects (♥/✕ swipe). When non-empty it is appended as a dedicated
-   * block so the model steers away from concepts the user already
-   * disliked. Empty string (the default) keeps the first-run prompt clean.
-   * Built by `buildNegativeExamplesBlockForImages` in the rating service.
+   * Optional extras:
+   *  - negativeExamples: visual directions distilled from the user's recent
+   *    image rejects (♥/✕). Appended as a dedicated block so the model steers
+   *    away from disliked concepts. Empty (default) keeps the first run clean.
+   *  - globalDirectives: runtime-overridable style spec + hard constraints
+   *    (WS1a). Absent fields fall back to the DEFAULT_IMAGE_* constants so the
+   *    rendered prompt is byte-identical until the managed row is edited.
    */
-  negativeExamples = "",
+  opts: {
+    negativeExamples?: string;
+    globalDirectives?: GlobalImageDirectives;
+  } = {},
 ): string {
+  const negativeExamples = opts.negativeExamples ?? "";
+  const styleSpec = opts.globalDirectives?.styleSpec ?? DEFAULT_IMAGE_STYLE_SPEC;
+  const hardConstraints =
+    opts.globalDirectives?.hardConstraints ?? DEFAULT_IMAGE_HARD_CONSTRAINTS;
   const { variantIndex, format, concept, copyAngle, formatArchetype, brand, persona } =
     inputs;
   const archetypeId: Archetype = resolveArchetype(formatArchetype, variantIndex);
@@ -351,12 +365,11 @@ export function buildSixLayerPromptForVariant(
   );
   lines.push(``);
 
-  // Layer 6 — STYLE SPECIFICATION
+  // Layer 6 — STYLE SPECIFICATION (lead from managed directives; the
+  // format-confirmation sentence stays dynamic).
   lines.push(`LAYER 6: STYLE SPECIFICATION`);
   lines.push(
-    `Photorealistic, premium editorial. Mood: confident, trustworthy. ` +
-      `What this should NOT look like: stock photography, cluttered collages, generic gradient backgrounds, AI-paragraph text walls rendered on the canvas. ` +
-      `Format confirmation: ${format} ${isFeed ? "square" : "vertical"} format.`,
+    `${styleSpec} Format confirmation: ${format} ${isFeed ? "square" : "vertical"} format.`,
   );
   lines.push(``);
 
@@ -371,20 +384,12 @@ export function buildSixLayerPromptForVariant(
   }
 
   // Final reminder — Gemini sometimes ignores text-budget rules without
-  // an explicit re-statement. This catches the common failure mode.
+  // an explicit re-statement. This catches the common failure mode. The
+  // block comes from the managed directives (default = DEFAULT_IMAGE_HARD_
+  // CONSTRAINTS), pushed as one block — identical output to the prior
+  // four separate line pushes after lines.join("\n").
   lines.push(`HARD CONSTRAINTS:`);
-  lines.push(
-    `- Respect the TEXT BUDGET in Layer 4 EXACTLY. Count text elements before rendering. If the budget caps the headline at N words, the headline MUST be ≤ N words.`,
-  );
-  lines.push(
-    `- Do NOT render any sentence longer than the budget allows. If you need to fit more meaning, cut the sentence — do not over-write.`,
-  );
-  lines.push(
-    `- Every text element MUST be legible at thumbnail size (the ad will appear in a feed). If a text element wouldn't be legible, drop it rather than shrink it.`,
-  );
-  lines.push(
-    `- All UI text inside dashboards/screens must be coherent English. If you can't render coherent text at the chosen size, use abstract bars/lines/numbers without text — never lorem-ipsum or hallucinated placeholder strings.`,
-  );
+  lines.push(hardConstraints);
 
   return lines.join("\n");
 }
@@ -535,10 +540,17 @@ export async function generateAdImagesForUser(
      * away from disliked concepts. Empty on the first generation.
      */
     negativeExamples?: string;
+    /**
+     * Runtime-overridable global directives (style spec + hard constraints)
+     * loaded from the managed store by the orchestrator. Undefined falls
+     * back to the DEFAULT_IMAGE_* constants (byte-identical).
+     */
+    globalDirectives?: GlobalImageDirectives;
   } = {}
 ): Promise<AdImageResult> {
   const gen = deps.imageGen ?? (defaultImageService as AdImageGeneratorDep);
   const negativeExamples = deps.negativeExamples ?? "";
+  const globalDirectives = deps.globalDirectives;
   const timeoutMs = deps.timeoutMs ?? PER_VARIANT_TIMEOUT_MS;
   const loadTemplate =
     deps.loadTemplate ??
@@ -606,7 +618,7 @@ export async function generateAdImagesForUser(
           persona,
         },
         template,
-        negativeExamples,
+        { negativeExamples, globalDirectives },
       );
       const filename = `ad-image-${userId}-${i + 1}-${Date.now()}.png`;
       const promptVersion =
