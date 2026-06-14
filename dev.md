@@ -120,6 +120,30 @@ Investigated WS-B1 (worker crash holds `activeSessionGenerations` until `GENERAT
 
 Assumptions to validate: (a) no caller depends on `sessionToRequestId` surviving a crash (verified: only `cancelSession` reads it, and post-crash there's nothing to cancel); (b) the controller path remains the sole lock owner (verified: lock lives only in the controller, worker service has no reference to it).
 
+
+---
+
+## B4 — SSE zombie progress: worker death now clears progressStore at the source (2026-06-14)
+
+WS-B4 fragility fix. `progressStore` (`utils/sseProgress.ts`) is an in-memory `Map<sessionId, ProgressUpdate>` that backs the agent-mode progress SSE stream. The frontend treats a stored entry whose `status` is not `complete`/`suggestions` as "still generating" (`hasActiveProgress`, controller). Cleanup was entirely the controller's job: every terminal path calls `markProgressComplete(sessionId)` (emit `complete` → `progressStore.delete`).
+
+**Re-grepped the spec's line refs (the monolith moves):** `progressStore` is set only in `emitProgress` (`sseProgress.ts:45`); deleted in `cleanupProgress`, `markProgressComplete` (controller ~1545), and inline at controller ~2213/2992/5695/5749. The generation worker is `generateMarketingResponseWorkerService` (fork child process); on `worker.on('error')`/`worker.on('exit')` it rejected all `pendingRequests` but did **nothing** to `progressStore`.
+
+**The gap:** progressStore cleanup depended on the *awaiting* controller path reaching a `markProgressComplete`. The detached fire-and-forget plan-start path (controller ~5693, `.then().catch()`, not awaited by any HTTP handler) and any future caller that doesn't wrap in that exact catch leak a stale entry forever when the worker dies mid-iteration → frontend streams "Thinking…" indefinitely even after reload. This is the charter's "crash of a turn must not orphan a stream" invariant.
+
+**Fix (behavior-preserving, additive on the crash path only):**
+- New leaf helper `clearTerminalProgress(sessionId)` in `sseProgress.ts` — the single definition of terminal cleanup: emit `complete` *iff* a live entry exists (so it never resurrects an already-cleaned entry), then delete. Active SSE connections are intentionally left registered so a reconnecting client still gets `complete`.
+- `generateMarketingResponseWorkerService` now calls `clearProgressForInFlightSessions()` (iterates `sessionToRequestId`, best-effort `clearTerminalProgress` per session) inside both the `error` and `exit` handlers, before clearing the maps. Also clears the previously-leaked `sessionToRequestId` map on death.
+
+No change to chat outputs, tool selection, prompts, or model defaults — only guaranteed reliability cleanup on worker death.
+
+**Assumptions to validate:**
+- `sessionToRequestId` holds exactly the sessions with in-flight worker requests at death time — confirmed: set in `runInWorker`, deleted on the matching `message` response. A session whose request already settled is not in the map, so we don't touch its (possibly post-run `suggestions`) progress.
+- Importing `sseProgress` (a zero-dependency leaf util) into the worker service introduces no import cycle — confirmed (`sseProgress.ts` imports nothing).
+- The controller's happy/cancel paths are unchanged (`markProgressComplete` left intact), so this is purely a second, source-level safety net for the crash case.
+
+---
+
 ## Live tool-failure telemetry — 227 failures classified; raw failure-rate OVERSTATES breakage (2026-06-13)
 
 Pulled actual error strings from `Dev-AW-LoopEvents` (failure events carry `dimensions.errorClass`/`errorMessage`; `agent_tool_invoked`/`agent_tool_succeeded` do NOT — a failure = invoked-without-a-matching-succeed, which is how the loop derives rates). 227 sampled failures classified by root cause. Confirms + makes empirical the Section-C "tool-list truncation" finding below and the 2026-06-11 #eng thread with Rui (June 9–12 window: 223 runs, 1,016 calls, 78 failures).

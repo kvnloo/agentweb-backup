@@ -5,6 +5,7 @@
 
 import { fork, ChildProcess } from 'child_process';
 import path from 'path';
+import { clearTerminalProgress } from '../utils/sseProgress';
 
 interface GenerateMarketingResponseParams {
   messageContent: string;
@@ -203,6 +204,14 @@ export class GenerateMarketingResponseWorkerService {
       if (readyReject) {
         readyReject(error);
       }
+      // Clear SSE progress for every in-flight session BEFORE failAllPendingRequests
+      // drops the session→request mapping — otherwise a worker that died
+      // mid-iteration leaves a stale progress entry that streams "Thinking…"
+      // to the frontend forever (the SSE-zombie-progress bug, B4). This runs
+      // while sessionToRequestId is still populated.
+      this.clearProgressForInFlightSessions();
+      // Reject all pending requests and clear BOTH pendingRequests and
+      // sessionToRequestId so the controller's lock releases immediately (B1).
       this.failAllPendingRequests(error);
       this.worker = null;
     });
@@ -214,6 +223,12 @@ export class GenerateMarketingResponseWorkerService {
       if (readyReject) {
         readyReject(exitError);
       }
+      // See the 'error' handler above: clear SSE progress BEFORE
+      // failAllPendingRequests drops the session→request mapping, so a worker
+      // that exits mid-iteration cannot orphan its sessions' progress entries (B4).
+      this.clearProgressForInFlightSessions();
+      // Reject all pending requests and clear both maps so the controller's
+      // generation lock releases immediately instead of waiting the timeout (B1).
       this.failAllPendingRequests(exitError);
       this.worker = null;
     });
@@ -247,6 +262,24 @@ export class GenerateMarketingResponseWorkerService {
    */
   async ensureWorkerReady(): Promise<void> {
     await this.ensureWorker();
+  }
+
+  /**
+   * Clear the SSE progress entry for every session that currently has an
+   * in-flight request. Called on worker death (`error`/`exit`) so a generation
+   * that dies mid-iteration cannot leave a zombie progress entry that the
+   * frontend streams as "Thinking…" indefinitely. Best-effort: a failure to
+   * clear one session's progress must not block clearing the others or the
+   * surrounding worker teardown.
+   */
+  private clearProgressForInFlightSessions(): void {
+    for (const sessionId of this.sessionToRequestId.keys()) {
+      try {
+        clearTerminalProgress(sessionId);
+      } catch (err) {
+        console.error(`[Worker] Failed to clear progress for session ${sessionId} on worker death:`, err);
+      }
+    }
   }
 
   /**
