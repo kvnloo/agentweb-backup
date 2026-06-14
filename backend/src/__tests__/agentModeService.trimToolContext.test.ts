@@ -13,6 +13,12 @@
  *     neutrally by counting `role` property reads through a Proxy, for growing
  *     session sizes. The original nested scan grew ~quadratically; the fixed
  *     version grows ~linearly.
+ *  3. Guards the install_skills splice/reorder path: updateConversationContext
+ *     mutates the SAME messages array in place (splice remove + reinsert) before
+ *     trimToolMessagesForContext runs. An earlier per-array length-guarded WeakMap
+ *     memo served stale absolute indices after such a mutation and DIVERGED from
+ *     the original algorithm; an independent review caught it and the memo was
+ *     removed. These tests pin behavior on the post-splice array.
  *
  * The golden reference below is a faithful copy of the algorithm as it stood
  * before the fix. DO NOT "simplify" it to match the new implementation — its
@@ -250,18 +256,17 @@ describe('trimToolMessagesForContext — sub-quadratic work', () => {
     expect(ratio).toBeLessThan(6);
   });
 
-  it('incremental calls on a growing array reuse the memo (tail-only rescan)', () => {
+  it('a single call on a long established session stays linear (Map-only, no memo)', () => {
     const service = new AgentModeService();
     const base = buildSyntheticSession(120); // long, established session
 
-    // Prime the memo with the full array once.
+    // Run once to mirror an established session before the measured call.
     service.trimToolMessagesForContext(base);
 
-    // Append one more assistant+tool turn and re-trim. With memoization the
-    // scan only touches the appended tail, so `role` reads on the long PREFIX
-    // (everything before the appended pair) should be limited to the single
-    // `.map` pass — far fewer than a from-scratch O(n) re-scan would incur,
-    // and nowhere near the O(n^2) nested scan of the original.
+    // Append one more assistant+tool turn and re-trim. The unsafe per-array WeakMap
+    // memo was removed after review (it served stale indices on the install_skills
+    // splice path); the tool_call_id -> index Map alone keeps each call O(n) and
+    // far below the original O(n^2) nested forward scan.
     base.push({
       role: 'assistant',
       content: null,
@@ -278,12 +283,75 @@ describe('trimToolMessagesForContext — sub-quadratic work', () => {
         },
       }),
     );
-    // NOTE: proxied is a new array reference, so this measures a fresh (non-memo)
-    // O(n) pass — still must be linear, not quadratic. The memo-reuse correctness
-    // is covered by the incremental characterization test above; here we just
-    // confirm a single call on a long array stays linear (<= ~4 reads/message:
+    // A single call on a long array must stay linear (<= ~4 reads/message:
     // 1 tool-scan + 1 old-assistant loop + 1 map pass, plus a little slack).
     service.trimToolMessagesForContext(proxied);
     expect(reads).toBeLessThan(base.length * 5);
+  });
+});
+
+describe('trimToolMessagesForContext — splice/reorder safety on the same array ref', () => {
+  let AgentModeService: any;
+
+  beforeAll(async () => {
+    const mod = await import('../services/agentModeService');
+    AgentModeService = mod.AgentModeService;
+  });
+
+  // Regression for the install_skills splice path. updateConversationContext()
+  // does messages.splice(idx, 1) (remove the old skill-context message wherever it
+  // sits) then messages.splice(1, 0, …) (reinsert near the top) on the SAME
+  // messages array reference, in place. When the removed element and the reinserted
+  // element are at DIFFERENT positions, every absolute index between them shifts —
+  // even though the total length is unchanged (net-zero). A length-guarded memo
+  // (`cached.length <= messages.length`) sees no length growth, walks an empty
+  // tail, and serves STALE absolute indices against the shifted array, producing a
+  // wrong preserveSet / oldAssistantIndices and a trimmed output that DIVERGES from
+  // the original algorithm. The Map-only implementation recomputes the scan against
+  // the live array each call, so it must still match the golden oracle exactly.
+  //
+  // This test FAILS against the memo'd version of #1878 and PASSES after the memo
+  // is dropped.
+  it('matches the original after a net-zero splice/reorder on the SAME array ref', () => {
+    const service = new AgentModeService();
+    // Establish a session and prime the (former) memo with a first trim call.
+    const live = buildSyntheticSession(30); // ~63 messages, well past preserve threshold
+    const first = service.trimToolMessagesForContext(live);
+    expect(first).toEqual(goldenTrim(structuredClone(live)));
+
+    // Mirror updateConversationContext's install_skills mutation: it relocates the
+    // skill-context message to near the top. Here we model a stale skill-context
+    // message that had drifted to the END of the history being removed and a fresh
+    // one reinserted at index 1 — exactly the remove-then-reinsert shape of
+    // updateConversationContext, with NET-ZERO length. Inserting at index 1 shifts
+    // EVERY subsequent message (including all preserved tail tool results) down by
+    // one, so the absolute indices the memo cached no longer match the live array.
+    expect(live[live.length - 1].role).not.toBe('tool'); // the trailing wrap-up assistant
+    live.splice(live.length - 1, 1); // remove the stale/relocated skill-context stand-in
+    live.splice(1, 0, { role: 'assistant', content: 'Installed Skills: foo, bar' });
+    expect(live.length).toBe(63); // net-zero confirmed
+
+    // The original algorithm run on the post-splice array is the oracle.
+    const expected = goldenTrim(structuredClone(live));
+    const actual = service.trimToolMessagesForContext(live);
+    expect(actual).toEqual(expected);
+  });
+
+  it('matches the original after a length-changing splice/reorder on the SAME array ref', () => {
+    const service = new AgentModeService();
+    const live = buildSyntheticSession(30);
+    service.trimToolMessagesForContext(live); // prime
+
+    // Remove one element and reinsert two — a length delta this time — still on
+    // the same array reference. The recomputed scan must track the new layout.
+    live.splice(1, 1);
+    live.splice(1, 0,
+      { role: 'assistant', content: 'Available Skills: alpha' },
+      { role: 'assistant', content: 'Installed Skills: alpha' },
+    );
+
+    const expected = goldenTrim(structuredClone(live));
+    const actual = service.trimToolMessagesForContext(live);
+    expect(actual).toEqual(expected);
   });
 });
