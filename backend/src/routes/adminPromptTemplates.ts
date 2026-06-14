@@ -17,6 +17,8 @@ import {
   getTemplateForArchetype,
   listAllTemplates,
   saveTemplate,
+  getGlobalImageDirectives,
+  saveGlobalImageDirectives,
 } from "../services/promptTemplatesService";
 import {
   computeLikeRate,
@@ -44,6 +46,49 @@ router.get("/", async (_req, res) => {
     return res
       .status(500)
       .json({ message: "Failed to list prompt templates" });
+  }
+});
+
+// Global image directives (WS1a). Registered BEFORE /:id so "global" isn't
+// matched as an archetype id. Edits the cross-archetype style spec + hard
+// constraints that drive every image variant.
+router.get("/global/image-directives", async (_req: Request, res: Response) => {
+  try {
+    const row = await getGlobalImageDirectives();
+    return res.json({ directives: row });
+  } catch (err) {
+    console.error("[admin/prompt-templates] global get failed", err);
+    return res.status(500).json({ message: "Failed to get global image directives" });
+  }
+});
+
+router.put("/global/image-directives", async (req: Request, res: Response) => {
+  const body = req.body ?? {};
+  const updatedBy =
+    (req as any).user?.userId || (req as any).user?.email || "unknown-admin";
+  if (
+    body.styleSpec !== undefined &&
+    (typeof body.styleSpec !== "string" || body.styleSpec.trim().length === 0)
+  ) {
+    return res.status(400).json({ message: "styleSpec must be a non-empty string" });
+  }
+  if (
+    body.hardConstraints !== undefined &&
+    (typeof body.hardConstraints !== "string" || body.hardConstraints.trim().length === 0)
+  ) {
+    return res.status(400).json({ message: "hardConstraints must be a non-empty string" });
+  }
+  try {
+    const row = await saveGlobalImageDirectives({
+      styleSpec: typeof body.styleSpec === "string" ? body.styleSpec : undefined,
+      hardConstraints:
+        typeof body.hardConstraints === "string" ? body.hardConstraints : undefined,
+      updatedBy,
+    });
+    return res.json({ directives: row });
+  } catch (err) {
+    console.error("[admin/prompt-templates] global save failed", err);
+    return res.status(500).json({ message: "Failed to save global image directives" });
   }
 });
 
