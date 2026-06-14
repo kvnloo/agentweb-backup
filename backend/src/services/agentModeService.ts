@@ -11,6 +11,7 @@ import { rankMemoriesByRelevance } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { computeTermination } from './agentMode/core/agentStep';
+import { executePreparedTools } from './agentMode/core/toolDispatch';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
@@ -2823,377 +2824,58 @@ export class AgentModeService {
           });
         }
 
-        // Execute tool calls in parallel for performance
-        // When the LLM returns multiple tool_calls in one response, they are independent
-        // and can run concurrently instead of sequentially.
-        const pendingCounterUpdates: Record<string, number> = {};
-        const failedCounterUpdates: Record<string, number> = {};
-
-        // Phase 1: Validate and prepare tool calls (synchronous)
-        const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision }> = [];
-        const preflightToolResults: Array<{ status: 'error'; toolCall: any; functionArgs: any; error: Error; duration: number; policyDecision?: AgentToolPolicyDecision }> = [];
-
-        const appendPreflightToolFailure = (
-          toolCall: any,
-          functionArgs: any,
-          errorMessage: string,
-          content: any,
-          policyDecision?: AgentToolPolicyDecision,
-        ) => {
-          const error = new Error(errorMessage);
-          (messages as any[]).push({
-            tool_call_id: toolCall.id,
-            role: 'tool',
-            name: toolCall.function.name,
-            content,
-            metadata: { timestamp: new Date().toISOString() }
-          });
-          toolCalls.push({
-            id: toolCall.id,
-            name: toolCall.function.name,
-            arguments: functionArgs ?? toolCall.function.arguments,
-            error: error.message,
-            duration: 0
-          });
-          failedCounterUpdates[toolCall.function.name] =
-            (failedCounterUpdates[toolCall.function.name] || 0) + 1;
-          preflightToolResults.push({
-            status: 'error',
-            toolCall,
-            functionArgs,
-            error,
-            duration: 0,
-            policyDecision,
-          });
-        };
-
-        for (const toolCall of responseMessage.tool_calls) {
-          try {
-            const functionArgs = JSON.parse(toolCall.function.arguments);
-
-            // Enforce skill-based tool access: reject calls to tools not in allowedToolNames.
-            // LLMs may hallucinate tool calls from conversation history even when the tool
-            // isn't in the current tools list. Return an error so the LLM learns to install skills first.
-            // Only enforce when:
-            //   1. The skills system is active (published skills exist), AND
-            //   2. The session was created with the skills system (has associatedSkills).
-            // Sessions created before the skills implementation have no associatedSkills
-            // and should retain access to all tools for backward compatibility.
-            // Block non-admin users from invoking admin-only tools, and block admin tools in shared sessions.
-            // hasAdminAccess is true for real admins or admin delegated access (never for iShare).
-            if (!hasAdminAccess && ADMIN_SKILL_TOOL_NAMES.includes(toolCall.function.name)) {
-              const errorMsg = isInteractiveShare
-                ? `Tool "${toolCall.function.name}" is not available in shared sessions. You can continue to use it in Agent Mode in your own session.`
-                : `Tool "${toolCall.function.name}" requires admin access. This session does not have admin privileges.`;
-              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
-              continue;
-            }
-
-            if (isInteractiveShare && toolCall.function.name === 'connect_account') {
-              const errorMsg = 'Account connections are not available in shared sessions. Tell the user they need to open Agent Mode in their own account to connect this account, then come back here.';
-              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
-              continue;
-            }
-
-            // Block context-restricted tools even if LLM hallucinates the call from history
-            if (excludeTools?.includes(toolCall.function.name)) {
-              const errorMsg = `Tool "${toolCall.function.name}" is not available in this context.`;
-              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
-              continue;
-            }
-
-            if (publishedSkills.length > 0 && sessionAssociatedSkillIds.length > 0 && !allowedToolNames.has(toolCall.function.name)) {
-              const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
-              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
-              continue;
-            }
-
-            // Check if we need to refresh skills for next iteration
-            if (toolCall.function.name === 'install_skills') {
-              skillsUpdated = true;
-            }
-
-            const initialPolicyDecision = evaluateAgentToolPolicy({
-              toolName: toolCall.function.name,
-              args: functionArgs,
-              isAdmin: hasAdminAccess,
-              isSharedSession: isInteractiveShare,
-              enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
-            });
-
-            const toolDefinition = this.toolRegistry.getTool(toolCall.function.name)?.definition;
-            const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.inputSchema;
-            const contractResult = validateAndRepairToolArgs({
-              toolName: toolCall.function.name,
-              args: functionArgs,
-              inputSchema,
-              effect: initialPolicyDecision.effect,
-            });
-
-            if (contractResult.status === 'invalid') {
-              const errorContent = this.formatToolError(toolCall.function.name, contractResult.modelMessage);
-              appendPreflightToolFailure(toolCall, functionArgs, contractResult.modelMessage, errorContent, initialPolicyDecision);
-              continue;
-            }
-
-            const preparedFunctionArgs = contractResult.args;
-            const policyDecision = evaluateAgentToolPolicy({
-              toolName: toolCall.function.name,
-              args: preparedFunctionArgs,
-              isAdmin: hasAdminAccess,
-              isSharedSession: isInteractiveShare,
-              enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
-            });
-
-            if (contractResult.status === 'repaired') {
-              policyDecision.flags.push({
-                code: 'args_repaired',
-                severity: 'info',
-                message: `Tool arguments were repaired before execution: ${contractResult.repairs.join(', ')}`,
-              });
-            }
-
-            if (!policyDecision.allowed) {
-              const errorMsg = `Tool "${toolCall.function.name}" was blocked by Agent Tool Gateway policy: ${policyDecision.flags.map((flag) => flag.message).join(' ')}`;
-              appendPreflightToolFailure(toolCall, preparedFunctionArgs, errorMsg, JSON.stringify({ error: errorMsg, policy: policyDecision }), policyDecision);
-              continue;
-            }
-
-            preparedCalls.push({ toolCall, functionArgs: preparedFunctionArgs, policyDecision });
-          } catch (error) {
-            // JSON parse failure — append error message for LLM
-            console.error(`AgentMode: Tool argument parse error for ${toolCall.function.name}:`, error);
-            const errMsg = error instanceof Error ? error.message : String(error);
-            const errorContent = this.formatToolError(toolCall.function.name, `Failed to parse arguments: ${errMsg}`);
-            appendPreflightToolFailure(toolCall, undefined, `Failed to parse arguments: ${errMsg}`, errorContent);
-          }
-        }
-
-        // Phase 2: Execute tools — sequential if wait_seconds is present, parallel otherwise.
-        // Sequential is required when wait_seconds is in the batch so the wait happens
-        // in the correct order relative to the tools before/after it.
-        // Also run sequentially when multiple generate_image or generate_video calls are batched
-        // together — these APIs (Gemini 3 Pro in particular) throttle under concurrent load.
-        const hasWaitTool = preparedCalls.some(({ toolCall }) => toolCall.function.name === 'wait_seconds');
-        const hasMultipleMediaGenTools = preparedCalls.length > 1 && preparedCalls.some(({ toolCall }) =>
-          toolCall.function.name === 'generate_image' || toolCall.function.name === 'generate_video' || toolCall.function.name === 'generate_voiceover'
-        );
-
-        let toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs: any; result?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>;
-
-        if (hasWaitTool || hasMultipleMediaGenTools) {
-          // Sequential execution — preserves ordering so wait_seconds acts as a pause between tools,
-          // and prevents rate-limit throttling when batching multiple image/video generation calls
-          toolResults = [];
-          for (const { toolCall, functionArgs, policyDecision } of preparedCalls) {
-            const outcome = await executeAgentToolThroughGateway({
-              toolName: toolCall.function.name,
-              args: functionArgs,
-              policyDecision,
-              runId: agentRuntimeRunId,
-              execute: () => this.executePreparedAgentTool({
-                llmModel,
-                toolName: toolCall.function.name,
-                functionArgs,
-                userId,
-                sessionId,
-                mockMode,
-                socketEmit,
-                screenshotUrl,
-                isDelegatedAccess,
-              }),
-            });
-            if (outcome.status === 'success') {
-              toolResults.push({ status: 'success' as const, toolCall, functionArgs, result: outcome.result, duration: outcome.durationMs, policyDecision: outcome.policyDecision });
-            } else {
-              toolResults.push({ status: 'error' as const, toolCall, functionArgs, error: outcome.error, duration: outcome.durationMs, policyDecision: outcome.policyDecision });
-            }
-          }
-        } else {
-          // Parallel execution (default)
-          const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs, policyDecision }) => {
-            const outcome = await executeAgentToolThroughGateway({
-              toolName: toolCall.function.name,
-              args: functionArgs,
-              policyDecision,
-              runId: agentRuntimeRunId,
-              execute: () => this.executePreparedAgentTool({
-                llmModel,
-                toolName: toolCall.function.name,
-                functionArgs,
-                userId,
-                sessionId,
-                mockMode,
-                socketEmit,
-                screenshotUrl,
-                isDelegatedAccess,
-              }),
-            });
-            if (outcome.status === 'success') {
-              return { status: 'success' as const, toolCall, functionArgs, result: outcome.result, duration: outcome.durationMs, policyDecision: outcome.policyDecision };
-            }
-            return { status: 'error' as const, toolCall, functionArgs, error: outcome.error, duration: outcome.durationMs, policyDecision: outcome.policyDecision };
-          });
-          toolResults = await Promise.all(toolPromises);
-        }
-
-        toolResults = toolResults.map((toolResult) => {
-          if (toolResult.status !== 'success') return toolResult;
-          const error = toolResultError(toolResult.result);
-          if (!error) return toolResult;
-          return {
-            status: 'error' as const,
-            toolCall: toolResult.toolCall,
-            functionArgs: toolResult.functionArgs,
-            error,
-            duration: toolResult.duration,
-            policyDecision: toolResult.policyDecision,
-          };
+        // Tool-dispatch boundary (core seam): validate/prepare tool calls,
+        // decide parallel-vs-sequential, execute through the gateway, classify
+        // tool-result errors, process results (screenshot S3, minimal-result, CRM
+        // socket emit, large-response S3 offload, truncation) and append tool
+        // messages + counter deltas. Extracted into core/toolDispatch.ts; the loop
+        // wires its entangled side-effects as injected ports. Behavior-preserving.
+        const dispatchResult = await executePreparedTools({
+          toolCalls: responseMessage.tool_calls,
+          messages: messages as any[],
+          toolCallsLedger: toolCalls,
+          iteration,
+          agentRuntimeRunId,
+          sessionId,
+          userId,
+          llmModel,
+          mockMode,
+          screenshotUrl,
+          isDelegatedAccess,
+          hasAdminAccess,
+          isInteractiveShare,
+          adminSkillToolNames: ADMIN_SKILL_TOOL_NAMES,
+          excludeTools,
+          publishedSkillsCount: publishedSkills.length,
+          sessionAssociatedSkillIdsCount: sessionAssociatedSkillIds.length,
+          allowedToolNames,
+          toolResponseS3Threshold: TOOL_RESPONSE_S3_THRESHOLD,
+          maxToolContentSize: MAX_TOOL_CONTENT_SIZE,
+          ports: {
+            evaluateAgentToolPolicy,
+            validateAndRepairToolArgs,
+            getToolInputSchema: (toolName: string) => {
+              const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
+              return toolDefinition?.function?.parameters || toolDefinition?.inputSchema;
+            },
+            executeAgentToolThroughGateway,
+            executePreparedAgentTool: (toolInput: any) => this.executePreparedAgentTool(toolInput),
+            toolResultError,
+            recordToolTelemetry: (telemetryToolResults) =>
+              recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults as any),
+            extractMinimalToolResult: (result: any, toolName: string) => this.extractMinimalToolResult(result, toolName),
+            extractToolContent,
+            formatToolError: (toolName: string, errorMessage: string) => this.formatToolError(toolName, errorMessage),
+            uploadScreenshotToS3,
+            uploadFileToS3WithPath,
+            buildCrmDataChangedPayload,
+            crmDataChangedEvent: CRM_DATA_CHANGED_EVENT,
+            socketEmit,
+          },
         });
-        const telemetryToolResults = [...preflightToolResults, ...toolResults];
-
-        // Runtime spine V0 telemetry: record this iteration's decision + each
-        // tool's invoked/succeeded/failed outcome into the shared LoopEvents
-        // table. Best-effort and non-blocking — the recorder swallows its own
-        // errors and is a no-op unless AGENT_RUNTIME_SPINE_ENABLED=true (or the
-        // legacy AGENT_MODE_LOOP_ENABLED=true). This is observability-only and
-        // must not affect tool execution, retries, streaming, or responses.
-        recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults);
-
-        // Phase 3: Process results in original order — append to messages, toolCalls, counters
-        for (const toolResult of toolResults) {
-          if (toolResult.status === 'success') {
-            const { toolCall, functionArgs, result, duration } = toolResult;
-
-            // For playwright screenshots, upload the base64 image to S3.
-            // This replaces the ~300KB base64 JSON payload with a lightweight URL,
-            // and makes the screenshot displayable in the frontend.
-            let processedResult = result;
-            if (toolCall.function.name === 'playwright_browser_take_screenshot') {
-              const imageContent = (result.raw?.content as any[])?.find((c: any) => c.type === 'image');
-              if (imageContent?.data) {
-                try {
-                  const dataUrl = `data:${imageContent.mimeType || 'image/png'};base64,${imageContent.data}`;
-                  const uploadResult = await uploadScreenshotToS3(dataUrl, userId);
-                  if (uploadResult) {
-                    // Keep dataUrl so the LLM can visually analyze the screenshot
-                    processedResult = { screenshotUrl: uploadResult.url, dataUrl, success: true };
-                  }
-                } catch (e) {
-                  console.error('AgentMode: Failed to upload playwright screenshot to S3:', e);
-                }
-              }
-            }
-
-            const minimalResult = this.extractMinimalToolResult(processedResult, toolCall.function.name);
-
-            toolCalls.push({
-              id: toolCall.id,
-              name: toolCall.function.name,
-              arguments: functionArgs,
-              result: minimalResult,
-              duration
-            });
-
-            // Notify the CRM page to refresh after a successful CRM-mutating tool.
-            // Enrichment / tech-stack tools broadcast their own completion events,
-            // so this covers the rest (update/status/email/delete/import/…). Emitted
-            // to the user's room so it reaches the CRM page regardless of which agent
-            // surface (full agent mode or Emma sidebar) ran the tool. Guard on a
-            // success flag so a tool that returned { success: false } doesn't trigger
-            // a spurious refresh.
-            if (socketEmit) {
-              const crmPayload = buildCrmDataChangedPayload(toolCall.function.name, functionArgs);
-              const toolSucceeded = !(processedResult && (processedResult as any).success === false);
-              if (crmPayload && toolSucceeded) {
-                socketEmit(`user:${userId}`, CRM_DATA_CHANGED_EVENT, crmPayload);
-              }
-            }
-
-            // For create_social_media_posts, count actual posts in the array (not function calls)
-            const counterIncrement = toolCall.function.name === 'create_social_media_posts'
-              ? ((functionArgs.posts as any[])?.length ?? 1)
-              : 1;
-            pendingCounterUpdates[toolCall.function.name] =
-              (pendingCounterUpdates[toolCall.function.name] || 0) + counterIncrement;
-
-            // For playwright screenshots, pass the image back to the LLM as a vision input
-            // so it can visually analyze the result (e.g. verify mobile layout, check for UI issues).
-            // The screenshot is also displayed to the user via the tool call card in the frontend.
-            // We use a text prefix to discourage embedding the raw URL in markdown responses.
-            let toolContent: any;
-            // Gemini's OpenAI-compat endpoint returns a silent 400 if tool-role messages contain image_url content.
-            // For Gemini, pass the S3 URL as text so the model can use describe_image on it if needed.
-            const isGeminiModel = llmModel.startsWith('gemini-');
-            if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).dataUrl && !isGeminiModel) {
-              toolContent = [
-                { type: 'text', text: 'Screenshot captured. Analyze the image below to verify the result visually. Do not include the raw image URL or data URI in your response to the user.' },
-                { type: 'image_url', image_url: { url: (processedResult as any).dataUrl, detail: 'high' } }
-              ];
-            } else if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).screenshotUrl && isGeminiModel) {
-              toolContent = `Screenshot captured. URL: ${(processedResult as any).screenshotUrl}\n\n${extractToolContent(result)}`;
-            } else {
-              toolContent = extractToolContent(result);
-            }
-
-            // When the response exceeds the S3 threshold: upload full content to S3 so the LLM
-            // can retrieve specific fields later via search_tool_response, then cap the in-memory
-            // copy at MAX_TOOL_CONTENT_SIZE to prevent worker OOM on sessions with many large tool
-            // calls (e.g. multiple read_page_source + search_web calls in a single work plan step).
-            const S3_IN_MEMORY_CAP = 20_000; // Keep only 20KB in memory after S3 upload
-            if (typeof toolContent === 'string' && toolContent.length > TOOL_RESPONSE_S3_THRESHOLD) {
-              try {
-                const uploadResult = await uploadFileToS3WithPath(
-                  toolContent,
-                  `${toolCall.id}.txt`,
-                  'text/plain',
-                  `tool-responses/${sessionId}`
-                );
-                if (uploadResult.success && uploadResult.key) {
-                  const header = `[Full response stored at S3 key: ${uploadResult.key} (${toolContent.length} chars) — use search_tool_response tool to find specific fields]\n\n`;
-                  const preview = toolContent.length > S3_IN_MEMORY_CAP
-                    ? toolContent.substring(0, S3_IN_MEMORY_CAP) + '\n\n[Content truncated — full response in S3]'
-                    : toolContent;
-                  toolContent = header + preview;
-                }
-              } catch (e) {
-                console.error('AgentMode: Failed to save large tool response to S3:', e);
-              }
-            }
-
-            const truncatedToolContent = typeof toolContent === 'string' && toolContent.length > MAX_TOOL_CONTENT_SIZE
-              ? toolContent.substring(0, MAX_TOOL_CONTENT_SIZE) + '\n\n[Content truncated for storage — original size: ' + toolContent.length + ' chars]'
-              : toolContent;
-            (messages as any[]).push({
-              tool_call_id: toolCall.id,
-              role: 'tool',
-              name: toolCall.function.name,
-              content: truncatedToolContent,
-              metadata: { timestamp: new Date().toISOString() }
-            });
-          } else {
-            const { toolCall, functionArgs, error, duration } = toolResult;
-            toolCalls.push({
-              id: toolCall.id,
-              name: toolCall.function.name,
-              arguments: functionArgs || toolCall.function.arguments,
-              error: error instanceof Error ? error.message : 'Unknown error',
-              duration
-            });
-
-            failedCounterUpdates[toolCall.function.name] =
-              (failedCounterUpdates[toolCall.function.name] || 0) + 1;
-
-            const errMsg = error instanceof Error ? error.message : String(error);
-            const errorContent = this.formatToolError(toolCall.function.name, errMsg);
-            messages.push({
-              tool_call_id: toolCall.id,
-              role: 'tool',
-              name: toolCall.function.name,
-              content: errorContent,
-              metadata: { timestamp: new Date().toISOString() }
-            });
-          }
+        const { pendingCounterUpdates, failedCounterUpdates } = dispatchResult;
+        if (dispatchResult.skillsUpdated) {
+          skillsUpdated = true;
         }
 
         // Send progress update after all tools complete.
