@@ -19,6 +19,10 @@ import {
   buildSixLayerPromptForVariant,
   generateAdImagesForUser,
 } from "../services/onboardingAdImageService";
+import {
+  DEFAULT_IMAGE_STYLE_SPEC,
+  DEFAULT_IMAGE_HARD_CONSTRAINTS,
+} from "../services/imagePromptDefaults";
 
 const brand = {
   companyName: "Linear",
@@ -73,7 +77,7 @@ describe("buildSixLayerPromptForVariant — negative examples", () => {
   };
 
   it("appends the negative block before HARD CONSTRAINTS when provided", () => {
-    const prompt = buildSixLayerPromptForVariant(baseInputs, undefined, NEG_BLOCK);
+    const prompt = buildSixLayerPromptForVariant(baseInputs, undefined, { negativeExamples: NEG_BLOCK });
     expect(prompt).toContain("REJECTED");
     expect(prompt).toContain("neon gradient hero");
     expect(prompt.indexOf("REJECTED")).toBeLessThan(prompt.indexOf("HARD CONSTRAINTS"));
@@ -81,7 +85,51 @@ describe("buildSixLayerPromptForVariant — negative examples", () => {
 
   it("omits the block when negativeExamples is empty / default", () => {
     expect(buildSixLayerPromptForVariant(baseInputs)).not.toContain("REJECTED");
-    expect(buildSixLayerPromptForVariant(baseInputs, undefined, "   ")).not.toContain("REJECTED");
+    expect(buildSixLayerPromptForVariant(baseInputs, undefined, { negativeExamples: "   " })).not.toContain("REJECTED");
+  });
+});
+
+describe("buildSixLayerPromptForVariant — managed global directives (WS1a)", () => {
+  const baseInputs = {
+    variantIndex: 0,
+    format: "1080x1080" as const,
+    concept: "VISCERAL MOMENT (VM)",
+    copyAngle: "PA",
+    formatArchetype: "A",
+    brand,
+    persona,
+  };
+
+  it("default output embeds the DEFAULT_IMAGE_* constants verbatim (behavior-preserving)", () => {
+    const prompt = buildSixLayerPromptForVariant(baseInputs);
+    // Style spec lead + the dynamic format-confirmation sentence stay intact.
+    expect(prompt).toContain(
+      `${DEFAULT_IMAGE_STYLE_SPEC} Format confirmation: 1080x1080 square format.`,
+    );
+    // Hard-constraints block appears verbatim right after the header.
+    expect(prompt).toContain(`HARD CONSTRAINTS:\n${DEFAULT_IMAGE_HARD_CONSTRAINTS}`);
+  });
+
+  it("overrides style spec + hard constraints when globalDirectives provided", () => {
+    const prompt = buildSixLayerPromptForVariant(baseInputs, undefined, {
+      globalDirectives: {
+        styleSpec: "CUSTOM STYLE LEAD",
+        hardConstraints: "- CUSTOM CONSTRAINT ONE\n- CUSTOM CONSTRAINT TWO",
+      },
+    });
+    expect(prompt).toContain("CUSTOM STYLE LEAD Format confirmation: 1080x1080 square format.");
+    expect(prompt).toContain("HARD CONSTRAINTS:\n- CUSTOM CONSTRAINT ONE\n- CUSTOM CONSTRAINT TWO");
+    // The defaults must be gone when overridden.
+    expect(prompt).not.toContain(DEFAULT_IMAGE_STYLE_SPEC);
+  });
+
+  it("falls back per-field — only the provided field is overridden", () => {
+    const prompt = buildSixLayerPromptForVariant(baseInputs, undefined, {
+      globalDirectives: { styleSpec: "ONLY STYLE OVERRIDDEN" },
+    });
+    expect(prompt).toContain("ONLY STYLE OVERRIDDEN Format confirmation");
+    // hardConstraints absent → default still used
+    expect(prompt).toContain(DEFAULT_IMAGE_HARD_CONSTRAINTS);
   });
 });
 
