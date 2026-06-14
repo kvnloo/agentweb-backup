@@ -19,12 +19,16 @@ import { classifyToolFailureType } from '../utils/toolFailureType';
 
 const doc = new DynamoDB.DocumentClient({ region: process.env.AWS_REGION || 'us-west-2' });
 const APPLY = process.argv.includes('--apply');
+// --force re-tags events that already carry a failureType (use after tuning the
+// classifier). Without it the run only fills gaps (the original idempotent path).
+const FORCE = process.argv.includes('--force');
 
 async function main(): Promise<void> {
   let lastKey: DynamoDB.DocumentClient.Key | undefined;
   let failedEvents = 0;
   let tagged = 0;
   let alreadyTagged = 0;
+  let changed = 0;
   const distribution: Record<string, number> = {};
 
   do {
@@ -41,10 +45,12 @@ async function main(): Promise<void> {
     for (const item of res.Items || []) {
       failedEvents++;
       const dims = (item.dimensions || {}) as Record<string, unknown>;
+      const existing = typeof dims.failureType === 'string' ? dims.failureType : undefined;
       const ft = classifyToolFailureType(dims.errorClass as string, dims.errorMessage as string);
       distribution[ft] = (distribution[ft] || 0) + 1;
+      if (existing && existing !== ft) changed++;
 
-      if (dims.failureType) {
+      if (existing && !FORCE) {
         alreadyTagged++;
         continue;
       }
@@ -56,7 +62,8 @@ async function main(): Promise<void> {
             TableName: LOOP_EVENTS_TABLE,
             Key: { loopId: item.loopId, tsSession: item.tsSession },
             UpdateExpression: 'SET dimensions.#ft = :v',
-            ConditionExpression: 'attribute_exists(dimensions) AND attribute_not_exists(dimensions.#ft)',
+            // gap-fill keeps the idempotent guard; --force overwrites unconditionally
+            ...(FORCE ? {} : { ConditionExpression: 'attribute_exists(dimensions) AND attribute_not_exists(dimensions.#ft)' }),
             ExpressionAttributeNames: { '#ft': 'failureType' },
             ExpressionAttributeValues: { ':v': ft },
           })
@@ -75,7 +82,7 @@ async function main(): Promise<void> {
 
   console.log(
     JSON.stringify(
-      { mode: APPLY ? 'apply' : 'dry-run', table: LOOP_EVENTS_TABLE, failedEvents, tagged, alreadyTagged, distribution },
+      { mode: `${APPLY ? 'apply' : 'dry-run'}${FORCE ? ' (force)' : ''}`, table: LOOP_EVENTS_TABLE, failedEvents, tagged, alreadyTagged, changedCategory: changed, distribution },
       null,
       2,
     ),

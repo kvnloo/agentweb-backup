@@ -96,11 +96,8 @@ describe('classifyToolFailureType', () => {
     });
   });
 
-  describe('bug — genuine/transient failure to investigate (default)', () => {
-    it('classifies a transient abort/timeout as a bug, not config', () => {
-      expect(classifyToolFailureType('timeout', 'AbortError: This operation was aborted')).toBe('bug');
-    });
-    it('classifies a network drop', () => {
+  describe('bug — genuine code defect / unknown to investigate (default)', () => {
+    it('classifies a network drop (transient, but worth investigating if recurring)', () => {
       expect(classifyToolFailureType('network', 'socket hang up')).toBe('bug');
     });
     it('classifies an opaque error', () => {
@@ -109,9 +106,45 @@ describe('classifyToolFailureType', () => {
     it('classifies an opaque success=false', () => {
       expect(classifyToolFailureType('Error', 'Tool returned success=false')).toBe('bug');
     });
+    it('classifies a playwright locator timeout as a bug (browser robustness), NOT config', () => {
+      // distinct from an AbortController "operation was aborted" — a 5s locator
+      // timeout is real browser flakiness to fix, not tunable infra.
+      expect(classifyToolFailureType('Error', 'TimeoutError: Timeout 5000ms exceeded waiting for locator')).toBe('bug');
+    });
     it('handles empty/undefined input without throwing', () => {
       expect(classifyToolFailureType('', '')).toBe('bug');
       expect(classifyToolFailureType(undefined as unknown as string, undefined as unknown as string)).toBe('bug');
+    });
+  });
+
+  describe('tuned rules — reclassify the previously-bug-tagged misclassifications', () => {
+    it('LinkedIn "Cannot resend yet" is by_design (platform state)', () => {
+      expect(classifyToolFailureType('Error', 'Cannot resend yet')).toBe('by_design');
+    });
+    it('LinkedIn "Recipient cannot be reached" is by_design', () => {
+      expect(classifyToolFailureType('Error', 'Recipient cannot be reached')).toBe('by_design');
+    });
+    it('"No search results found" is by_design, not a bug', () => {
+      expect(classifyToolFailureType('Error', 'No search results found')).toBe('by_design');
+    });
+    it('a corrupted/password-protected PDF is by_design (bad input)', () => {
+      expect(
+        classifyToolFailureType('Error', 'Failed to parse PDF file. The file may be corrupted or password-protected. Invalid PDF structure'),
+      ).toBe('by_design');
+    });
+    it('a too-long LinkedIn invitation note is schema_reject (arg constraint)', () => {
+      expect(
+        classifyToolFailureType('Error', 'Invitation message is too long (201 characters). LinkedIn limits invitation notes to 200 characters'),
+      ).toBe('schema_reject');
+    });
+    it('the Brave summarizer cascade is config (downstream of a 429)', () => {
+      expect(classifyToolFailureType('Error', 'Unable to retrieve a Summarizer summary.')).toBe('config');
+    });
+    it('a perform_data_analysis 404 is config (missing resource)', () => {
+      expect(classifyToolFailureType('Error', 'Request failed with status code 404')).toBe('config');
+    });
+    it('an AbortController timeout is config (tunable infra), not a code bug', () => {
+      expect(classifyToolFailureType('timeout', 'AbortError: This operation was aborted')).toBe('config');
     });
   });
 });
