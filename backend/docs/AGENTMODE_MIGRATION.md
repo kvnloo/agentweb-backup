@@ -111,6 +111,33 @@ inline. One seam per PR.
   `npx tsc` exit 0. agentModeService suite 1495/1495 pass; core termination 10/10; characterization
   4/4. Monolith 24,205 → 24,213 (+8 net). Seams 1/6. **Outcome: GREEN — strangler approach validated
   end-to-end on one path.** Branch `swarm/agentmode-core-proofslice` → PR vs `harsha/swarm` (not merged).
+
+- **2026-06-14 · Reliability/observability — tool-error classifier fix** — production telemetry
+  showed the error taxonomy was blind: a 7-day sweep of `Dev-AW-LoopEvents` `agent_tool_failed`
+  events (283 failures) had **85.5% recorded as the generic `Error` fallback**, and even
+  re-classifying the raw messages with the then-current patterns still left **63.3% as `Error`**
+  (dev.md target: <20%). Extended `classFromMessage` in `utils/toolErrorClassifier.ts` with patterns
+  drawn from the real messages and added three new classes:
+  - `tool_unavailable` (~41) — `Tool "X" is not available. You must install the required skill…`
+    (model called an uninstalled skill — the single largest missed cluster).
+  - `upstream_rejected` (~28) — LinkedIn business-rule refusals (`Cannot resend yet`, `Should delay
+    new invitation`, `not a 1st-degree connection`): the provider accepted the call and deliberately
+    refused the action.
+  - `empty_result` (~9) — `No search results found`, `Unable to retrieve a Summarizer summary.`,
+    `No analysis results received from Gemini` (call succeeded, no data).
+  Also widened `invalid_args` to catch schema-validation rejections (`arguments failed schema
+  validation`, `has the wrong type`, `Missing required argument/variable`, `… (is|are) required`,
+  ~45 newly caught), `auth` to catch permission/missing-connection failures, `timeout` for
+  `operation was aborted`, and `not_found` for `does not exist`. `utils/toolFailureType.ts` updated
+  to route the new classes (`tool_unavailable`→`model_uninstalled_tool`, `upstream_rejected` +
+  `empty_result`→`by_design`).
+  **Result on the same 283-failure set: fallback `Error` 63.3% → 10.2%** (29 residual are
+  idiosyncratic one-offs — `Unknown error`, `success=false`, file-hash mismatch — with no
+  clusterable class). Now-visible clusters: invalid_args 28.3%, tool_unavailable 14.5%,
+  rate_limit 13.8%, auth 9.9%, upstream_rejected 9.9%, timeout 4.9%, not_found 4.6%,
+  empty_result 3.2%. **Chat behavior unchanged — telemetry labels only.** `npx tsc` exit 0;
+  toolErrorClassifier 17/17, toolFailureType + runRecorder suites green (62/62 across the three).
+  Branch `swarm/agentmode-error-classifier` → PR vs `harsha/swarm` (not merged).
 - **2026-06-14 · Tool-dispatch seam** — extracted the per-iteration validate → dispatch → process-
   results block (~372 lines) out of `generateMarketingResponse` into `core/toolDispatch.ts`
   (`executePreparedTools`, 522 lines), entangled side-effects injected as ports; the loop delegates
