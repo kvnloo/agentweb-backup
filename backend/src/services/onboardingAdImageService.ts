@@ -721,13 +721,64 @@ export async function triggerAdImageGenerationForUser(
     })),
   );
 
-  const result = await generateAdImagesForUser(
-    creativeDir,
-    brand,
-    personas,
-    userId,
-    { ...deps, negativeExamples }
-  );
+  // WS2 telemetry: record image-gen lifecycle onto the onboarding loop so a
+  // degraded model / timeout clusters on the health endpoint. Best-effort.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const {
+    recordOnboardingEvent,
+    recordOnboardingFailure,
+    ONBOARDING_TELEMETRY_EVENTS,
+  } = require("./onboardingTelemetry");
+  const isRegen = priorVariants.length > 0;
+  void recordOnboardingEvent(userId, ONBOARDING_TELEMETRY_EVENTS.imageGenStarted, {
+    regen: isRegen,
+  });
+  const genStartedAt = Date.now();
+
+  let result: AdImageResult;
+  try {
+    result = await generateAdImagesForUser(
+      creativeDir,
+      brand,
+      personas,
+      userId,
+      { ...deps, negativeExamples }
+    );
+  } catch (genErr) {
+    void recordOnboardingFailure(
+      userId,
+      ONBOARDING_TELEMETRY_EVENTS.imageGenFailed,
+      genErr,
+      { regen: isRegen, durationMs: Date.now() - genStartedAt },
+    );
+    throw genErr;
+  }
+
+  // generateAdImagesForUser swallows per-variant failures and substitutes a
+  // placeholder URL, so "completed" with liveCount < variantCount is a
+  // partial failure; liveCount === 0 is a full failure of the external model.
+  const variantCount = result.variants.length;
+  const liveCount = result.variants.filter(
+    (v) => typeof v.imageUrl === "string" && !v.imageUrl.includes("placeholder"),
+  ).length;
+  const durationMs = Date.now() - genStartedAt;
+  if (liveCount === 0 && variantCount > 0) {
+    void recordOnboardingFailure(
+      userId,
+      ONBOARDING_TELEMETRY_EVENTS.imageGenFailed,
+      new Error("all image variants failed (every URL is a placeholder)"),
+      { regen: isRegen, variantCount, liveCount, durationMs },
+    );
+  } else {
+    void recordOnboardingEvent(userId, ONBOARDING_TELEMETRY_EVENTS.imageGenCompleted, {
+      regen: isRegen,
+      variantCount,
+      liveCount,
+      failedCount: variantCount - liveCount,
+      durationMs,
+    });
+  }
+
   const current = await userDb.getUserById(userId);
   const patch = adImageReadyPatch(((current as any) || {}) as AdImageStatusFields, result);
   if (!patch) {
