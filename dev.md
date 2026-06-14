@@ -30,6 +30,34 @@ cross-session independence; release-then-reclaim; idempotent release. Existing
 
 ---
 
+## AgentMode B3 review fix — trim WeakMap memo DROPPED after splice-path staleness found (2026-06-14)
+
+Independent review of PR #1878 found the B3 WeakMap memo unsafe — and it failed on exactly the assumption flagged below in "Assumptions to validate (a)": the append-only invariant does **not** hold. `updateConversationContext()` (agentModeService.ts ~:3411-3434) runs on the same `messages` array reference inside the loop (called ~:2547, before the trim call ~:2603) whenever the agent installs skills. Its install_skills path does `messages.splice(idx, 1)` (remove the prior skill-context message wherever it sits) then `messages.splice(1, 0, …)` (reinsert near the top) — a remove-then-reinsert that is **net-zero in length** but shifts every absolute index between the two positions. The memo's `cached.length <= messages.length` guard sees no growth, walks an empty tail, and serves STALE absolute indices (`toolIndices` / `toolIdToIndex`) against the shifted array → wrong `preserveSet` / `oldAssistantIndices` → trimmed output DIVERGES from the original algorithm. Not behavior-preserving; AC-breaking.
+
+**Fix:** removed the WeakMap memo entirely. Kept the `tool_call_id → index` Map — that alone kills the originally-reported per-call nested O(n²) scan (O(1) lookups) and is fully behavior-preserving on every path including splice/reorder, because the scan is recomputed against the live array each call and can never go stale. Net effect: fewer lines and less per-instance state than the merged PR, no correctness caveat.
+
+**Proof:** added a `splice/reorder safety` describe block to `agentModeService.trimToolContext.test.ts` with two cases (net-zero reorder that shifts the preserved tail + a length-changing reorder), each mutating the SAME array ref and asserting deep-equality against the golden oracle on the post-splice array. Both FAIL against the memo'd version (verified by reverting the service file) and PASS with the memo removed. Existing golden-oracle characterization + sub-quadratic perf tests retained and still pass (32/32 across trim + publishFixes suites; `npx tsc` clean).
+
+**Lesson:** a length-only memo guard cannot detect an in-place reorder that preserves length. The "Assumptions to validate (a)" note below correctly predicted this; the safe move was to not ship the memo at all, since the Map already solves the reported defect.
+
+---
+
+## AgentMode B3 — `trimToolMessagesForContext` made incremental, killing per-iteration O(n²) reprocessing (2026-06-14)
+
+`AgentModeService.trimToolMessagesForContext()` (agentModeService.ts ~:16612) is called once **per loop iteration** from the main agent loop (`while (iteration < maxIterations)` at :2501, call site :2603) on the full, monotonically-growing `messages` array. Old shape was O(n²) *per call*: the `oldAssistantIndices` pass ran a nested forward scan (for each assistant-with-tool_calls, scan all following messages looking for a preserved tool result). Across an N-iteration session that's O(N²)+ total reprocessing of the same history.
+
+**Fix (behavior-preserving, internal only):**
+1. Replaced the per-assistant nested forward scan with a single `tool_call_id → tool-message-index` map built in one linear pass, so the "is this assistant old?" predicate is O(1) lookups instead of an O(n) scan. A single call drops from O(n²) to O(n).
+2. Added a per-instance `WeakMap<messagesArray, {length, toolIndices, toolIdToIndex}>` memo. The agent loop only ever **appends** to `messages` (verified: the sole in-loop mutation is `messages.push` at :3181 — no splice/shift/reorder), so on repeat calls with the same array reference the scan only walks the appended tail. Amortized per-call cost is O(tail); a full session is O(n) total. The memo is validated by `cached.length <= messages.length`; any reference/shrink mismatch falls back to a full O(n) rebuild, so a stale memo can never corrupt output.
+
+**Exact predicate preserved:** the original flips `allOld=false` only when a resolving tool result exists at an index `> i` AND is in `preserveSet`. The map stores the first tool index per `tool_call_id` (ids are unique by construction), and the new check is `resolvedIdx !== undefined && resolvedIdx > i && preserveSet.has(resolvedIdx)` — identical semantics.
+
+**Proof:** new characterization test `agentModeService.trimToolContext.test.ts` carries a golden reference that replicates the original nested-loop algorithm and asserts deep-equality of production output on a long synthetic session AND across the real incremental (append-per-turn, same array ref) calling pattern. Validated TDD-style by stashing the fix: against the ORIGINAL code the 4 characterization tests pass (golden == original) and the 2 sub-quadratic tests fail (4×-session work ratio 14.1× ≈ quadratic; incremental case 15,750 `role` reads). With the fix all 6 pass (ratio < 6, linear). Existing 24 `publishFixes` trim tests unaffected.
+
+**Assumptions to validate:** (a) the in-loop append-only invariant holds for all code paths feeding this method — if a future change ever reorders/removes earlier messages on the same array reference *without* shrinking length, the memo could go stale; the `length`-only guard would not catch that. Mitigation if that ever happens: also stamp a cheap head-identity check. Today no such path exists. (b) `chatbotService.ts` has its own standalone copy of `trimToolMessagesForContext` (:3702) — NOT touched here; same optimization could be applied there in a follow-up.
+
+---
+
 ## Live tool-failure telemetry — 227 failures classified; raw failure-rate OVERSTATES breakage (2026-06-13)
 
 Pulled actual error strings from `Dev-AW-LoopEvents` (failure events carry `dimensions.errorClass`/`errorMessage`; `agent_tool_invoked`/`agent_tool_succeeded` do NOT — a failure = invoked-without-a-matching-succeed, which is how the loop derives rates). 227 sampled failures classified by root cause. Confirms + makes empirical the Section-C "tool-list truncation" finding below and the 2026-06-11 #eng thread with Rui (June 9–12 window: 223 runs, 1,016 calls, 78 failures).
