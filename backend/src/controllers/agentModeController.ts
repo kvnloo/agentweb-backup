@@ -2484,6 +2484,9 @@ export const agentModeController = {
             subject: 'Agent Mode: Context limit exceeded',
             message: `The request exceeded the model context window.\n\nError: ${error.message || 'Unknown error'}`,
             sessionId,
+            // Dedupe per (user, errorClass) so a user repeatedly hitting the context
+            // limit on a busy day floods neither oncall email nor Notion (B5).
+            dedupeKey: `context_limit:${user?.userId || sessionId || 'unknown'}`,
             context: {
               'Error Message': error.message || 'Unknown error',
               'Error Stack': error.stack || 'No stack trace available',
@@ -3140,6 +3143,9 @@ export const agentModeController = {
             subject: 'Agent Mode: Context limit exceeded (shared response)',
             message: `The request exceeded the model context window.\n\nError: ${error.message || 'Unknown error'}`,
             sessionId: shareId,
+            // Dedupe per (user/share, errorClass) — the shared path is a distinct
+            // error class, so it keys independently from the regular path (B5).
+            dedupeKey: `context_limit_shared:${session?.userId || shareId || 'unknown'}`,
             context: {
               'Error Message': error.message || 'Unknown error',
               'Error Stack': error.stack || 'No stack trace available',

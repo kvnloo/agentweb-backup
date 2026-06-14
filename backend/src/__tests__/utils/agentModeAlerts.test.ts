@@ -1,4 +1,4 @@
-import { sendAgentModeOncallAlert } from '../../utils/agentModeAlerts';
+import { sendAgentModeOncallAlert, __resetAgentModeAlertDedupeForTests } from '../../utils/agentModeAlerts';
 
 // Mock the dependencies
 jest.mock('../../services/chatbotService', () => ({
@@ -22,11 +22,13 @@ describe('agentModeAlerts utils', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    __resetAgentModeAlertDedupeForTests();
     process.env.CUSTOMER_FRONTEND_URL = 'https://app.example.com';
   });
 
   afterEach(() => {
     delete process.env.CUSTOMER_FRONTEND_URL;
+    __resetAgentModeAlertDedupeForTests();
   });
 
   describe('sendAgentModeOncallAlert', () => {
@@ -171,6 +173,97 @@ describe('agentModeAlerts utils', () => {
           'iShare Link': 'custom-link'
         })
       );
+    });
+  });
+
+  describe('dedupe / rate-limit (per user + errorClass window)', () => {
+    beforeEach(() => {
+      mockedEmailService.sendOncallAlert.mockResolvedValue(undefined);
+    });
+
+    // AC: a test firing N context-limit errors in the window files <=1 alert.
+    it('fires at most one alert per dedupeKey within the window (N firings -> 1 email)', async () => {
+      const N = 8;
+      const baseTs = 1_700_000_000_000;
+      for (let i = 0; i < N; i++) {
+        await sendAgentModeOncallAlert({
+          subject: 'Agent Mode: Context limit exceeded',
+          message: `attempt ${i}`,
+          dedupeKey: 'context_limit:user-123',
+          dedupeWindowMs: 60_000,
+          now: baseTs + i * 1_000, // all within the 60s window
+        });
+      }
+
+      expect(mockedEmailService.sendOncallAlert).toHaveBeenCalledTimes(1);
+    });
+
+    // AC: a later error after the window files again.
+    it('fires again once the window has elapsed', async () => {
+      const baseTs = 1_700_000_000_000;
+      await sendAgentModeOncallAlert({
+        subject: 'Agent Mode: Context limit exceeded',
+        message: 'first',
+        dedupeKey: 'context_limit:user-123',
+        dedupeWindowMs: 60_000,
+        now: baseTs,
+      });
+      // Suppressed inside the window.
+      await sendAgentModeOncallAlert({
+        subject: 'Agent Mode: Context limit exceeded',
+        message: 'suppressed',
+        dedupeKey: 'context_limit:user-123',
+        dedupeWindowMs: 60_000,
+        now: baseTs + 30_000,
+      });
+      // After the window -> fires again.
+      await sendAgentModeOncallAlert({
+        subject: 'Agent Mode: Context limit exceeded',
+        message: 'second',
+        dedupeKey: 'context_limit:user-123',
+        dedupeWindowMs: 60_000,
+        now: baseTs + 61_000,
+      });
+
+      expect(mockedEmailService.sendOncallAlert).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not suppress across different dedupeKeys (per user/errorClass isolation)', async () => {
+      const ts = 1_700_000_000_000;
+      await sendAgentModeOncallAlert({
+        subject: 'Agent Mode: Context limit exceeded',
+        message: 'user A',
+        dedupeKey: 'context_limit:user-A',
+        dedupeWindowMs: 60_000,
+        now: ts,
+      });
+      await sendAgentModeOncallAlert({
+        subject: 'Agent Mode: Context limit exceeded',
+        message: 'user B',
+        dedupeKey: 'context_limit:user-B',
+        dedupeWindowMs: 60_000,
+        now: ts + 1_000,
+      });
+      // Same user, different error class -> separate key.
+      await sendAgentModeOncallAlert({
+        subject: 'Agent Mode: Session limit exceeded',
+        message: 'user A other class',
+        dedupeKey: 'session_limit:user-A',
+        dedupeWindowMs: 60_000,
+        now: ts + 2_000,
+      });
+
+      expect(mockedEmailService.sendOncallAlert).toHaveBeenCalledTimes(3);
+    });
+
+    it('preserves existing behavior: no dedupeKey => every call fires (backwards compatible)', async () => {
+      for (let i = 0; i < 3; i++) {
+        await sendAgentModeOncallAlert({
+          subject: 'Some other alert',
+          message: `attempt ${i}`,
+        });
+      }
+      expect(mockedEmailService.sendOncallAlert).toHaveBeenCalledTimes(3);
     });
   });
 });
