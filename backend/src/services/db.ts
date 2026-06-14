@@ -322,6 +322,16 @@ export interface User {
     rating: "like" | "reject";
     ratedAt: string;
   }>;
+  /**
+   * How new landing pages are organized when the agent doesn't target a specific
+   * site. `unified` (default): add the page to the user's existing site as a route
+   * — cheap (no new repo/project, shares the subdomain). `separate`: each new
+   * campaign gets its OWN site/subdomain — more costly (a fresh v0 generation +
+   * repo + project). Cost-safe default is `unified`; users who want distinct
+   * campaign URLs (e.g. Empathia) opt into `separate`. The agent can still override
+   * per request. Only consulted when DURABLE_LANDING_GENERATION is on.
+   */
+  landingSiteMode?: "unified" | "separate";
   brandGuidelines?: {
     brandData: {
       brandName: string;
@@ -1238,6 +1248,43 @@ export class UserDB {
       return result.Attributes;
     } catch (error) {
       this.handleError(error, isActive ? "reactivateUser" : "deactivateUser");
+    }
+  }
+
+  /**
+   * Set the user's landing-site mode WRITE-ONCE. "single page" = unified, "multi
+   * page" = separate. Once chosen it cannot be switched — switching would require
+   * physically re-homing deployed pages across repos/projects/domains (broken
+   * URLs + SEO loss), so it's a deliberate migration, not a toggle. Returns the
+   * effective (locked) mode: the existing one if already set, else the new one.
+   */
+  async setLandingSiteMode(
+    userId: string,
+    mode: "unified" | "separate"
+  ): Promise<"unified" | "separate"> {
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) throw new Error(`User with ID '${userId}' not found.`);
+    if (user.landingSiteMode === "unified" || user.landingSiteMode === "separate") {
+      return user.landingSiteMode; // already locked — immutable
+    }
+    try {
+      await this.docClient
+        .update({
+          TableName: this.tableName,
+          Key: { email: user.email },
+          UpdateExpression: "SET landingSiteMode = :m",
+          ConditionExpression: "attribute_not_exists(landingSiteMode)",
+          ExpressionAttributeValues: { ":m": mode },
+        })
+        .promise();
+      return mode;
+    } catch (err: any) {
+      if (err?.code === "ConditionalCheckFailedException") {
+        // A concurrent request locked it first — return whatever is now stored.
+        const fresh = await this.getUserById(userId);
+        return (fresh?.landingSiteMode as "unified" | "separate") || mode;
+      }
+      throw err;
     }
   }
 

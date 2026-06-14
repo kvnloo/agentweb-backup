@@ -32,6 +32,7 @@ import {
   markLandingPagePublishReverted,
   INTEGRATIONS,
   resolveSiteForCaller,
+  resolveLockedSiteMode,
   getLandingPageLiveUrl,
   canUserEditLandingPage,
 } from "../services/v0Service";
@@ -292,7 +293,7 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       }
     }
 
-    const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_id } = req.body;
+    const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_id, site_id, originating_session_id, mode: requestedMode } = req.body;
     // Condense uploaded HTML to avoid exceeding v0 prompt size limits
     let template_html: string | undefined = rawTemplateHtml
       ? extractTemplateOutline(rawTemplateHtml)
@@ -338,8 +339,10 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
 
     // Fetch brand guidelines + market strategy for maximum context
     let brandContext: BrandContext = {};
+    let userSiteMode: "unified" | "separate" | undefined;
     try {
       const user = await userDb.getUserById(userId);
+      userSiteMode = user?.landingSiteMode;
       if (user?.brandGuidelines) {
         const bg = user.brandGuidelines;
         const bd = (bg as any).brandData || {};
@@ -394,7 +397,21 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       }
     }
 
-    const result = await generateLandingPage(userId, prompt, pageName, brandContext, lead_list_id, template_html);
+    // Effective site mode, WRITE-ONCE locked. A saved mode is immutable (switching
+    // single<->multi would re-home deployed pages across repos/domains); the first
+    // explicit pick sets + locks it; otherwise default unified.
+    const { mode: effectiveMode, lockNow } = resolveLockedSiteMode(userSiteMode, requestedMode);
+    if (lockNow) {
+      await userDb
+        .setLandingSiteMode(userId, effectiveMode)
+        .catch((e) => console.warn(`[LP GENERATION] could not lock site mode: ${e?.message}`));
+    }
+
+    const result = await generateLandingPage(userId, prompt, pageName, brandContext, lead_list_id, template_html, {
+      siteId: typeof site_id === "string" ? site_id : undefined,
+      originatingSessionId: typeof originating_session_id === "string" ? originating_session_id : undefined,
+      mode: effectiveMode,
+    });
     void emitLanderLifecycle("created", { pageId: (result as any)?.id || "unknown", userId, channel: landerChannelFromRequest(req), mode: "cold_start", outcome: (result as any)?.status === "failed" ? "failed" : "ok" });
     res.status(201).json(result);
   } catch (error: any) {
