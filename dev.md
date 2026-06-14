@@ -27,6 +27,12 @@ Pulled actual error strings from `Dev-AW-LoopEvents` (failure events carry `dime
 
 So **only 28% of "failures" are real bugs** — the scorecard/policy should filter `dimensions.failureType = 'bug'`. Classifier reads signals from the error *message* too, so pre-classifier events (errorClass `'Error'`) still classify (rescues the Brave 429s from `bug`).
 
+**UPDATE 2 — classifier TUNED + Theme 1 fixed.** Investigated the 63 `bug`s: many were misclassified. Tuned the classifier (LinkedIn "cannot resend"/"recipient cannot be reached"/"no results"/bad-PDF → by_design; invite-too-long → schema_reject; Brave-summarizer cascade / 404 / aborted-op → config) and re-tagged all 227 (`backfill --force`, 27 changed). **Real `bug` count: 63 → 36 (16%).** New split: config 66 / schema_reject 55 / by_design 36 / **bug 36** / model_uninstalled_tool 34.
+
+The 36 real bugs cluster into: **opaque error propagation** (run_local "success=false", Meta "unknown error", linkedin "Invalid parameters", describe_image 400) · stale-file editing (`update_html_file` hash mismatch) · browser flakiness (playwright timeouts/snapshots) · misc (`get_leads` bad pagination key, `report_product_issues` self-failure).
+
+**Theme 1 (opaque errors) — central fix SHIPPED:** extracted `toolResultError`/`extractToolResultMessage` to `utils/toolResultError.ts` and hardened it to surface object-shaped errors (Meta Graph `{error:{message,code,error_subcode}}`) + status/reason instead of the opaque "Tool returned success=false". **`run_local_agent_task` source fix SHIPPED:** `buildLocalAgentResult` (localAgentTools.ts) now always populates a failure reason (`error` → `result` → `returncode N`) so an ok:false relay response is never opaque. Remaining per-integration follow-ups: Meta subcode extraction at its handler, describe_image 400-body capture.
+
 ---
 
 ## Platform state audit — reliability fixes, complexity levers, SOTA gaps, learning-loop health (2026-06-13)
