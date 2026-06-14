@@ -1,3 +1,35 @@
+## AgentMode B2 — session-generation claim made atomic (no double-proceed race) (2026-06-14)
+
+WS-B / B2 reliability increment. The `/generate` and the interactive-share `/generate`
+endpoints in `controllers/agentModeController.ts` each rejected concurrent requests for the
+same session via a hand-rolled `activeSessionGenerations.has(sessionId)` check followed by a
+separate `.add(sessionId)`. The two statements were duplicated at both call sites (re-grepped:
+the regular path was ~line 2185, the interactive-share path ~line 2980 on `harsha/swarm` at
+`187a06a9`).
+
+**Assumption validated:** the pair is race-free *today* only because nothing `await`s between
+the `has` and the `add` (Node's single thread won't interleave synchronous code). The fragility
+the spec names is structural — any future edit inserting an `await` between check and set
+(easy to do, since the two statements look independent and are separated by other request
+setup) re-opens a window where two near-simultaneous `/generate` calls both pass the check and
+both proceed, corrupting the single-flight guarantee.
+
+**Fix (behavior-preserving):** co-located check-and-set into one indivisible primitive,
+`tryClaimSessionGeneration(sessionId): boolean` (returns `true` for the winner, `false` for a
+busy session), plus a symmetric idempotent `releaseSessionGeneration(sessionId)`. Both call
+sites now call the primitive; an `await` can no longer be wedged between the check and the set,
+so the claim is atomic by construction. Single-request path is unchanged (same 409 SESSION_BUSY
+body, same lock lifecycle). No new tables/flags/branches; net moving parts ~flat (one helper
+pair added, two duplicated 2-statement blocks collapsed to one call each).
+
+**Tests:** `agentModeController.atomicClaim.test.ts` (5 cases) pins the contract — two
+back-to-back synchronous claims on one sessionId yield exactly one `true` + one `false`;
+cross-session independence; release-then-reclaim; idempotent release. Existing
+`agentModeController.concurrentRequests.test.ts` (6) + `errorHandling.test.ts` (24) +
+`delegatedCrmAccess.test.ts` (3) stay green unchanged → behavior preserved. `npx tsc` clean.
+
+---
+
 ## Live tool-failure telemetry — 227 failures classified; raw failure-rate OVERSTATES breakage (2026-06-13)
 
 Pulled actual error strings from `Dev-AW-LoopEvents` (failure events carry `dimensions.errorClass`/`errorMessage`; `agent_tool_invoked`/`agent_tool_succeeded` do NOT — a failure = invoked-without-a-matching-succeed, which is how the loop derives rates). 227 sampled failures classified by root cause. Confirms + makes empirical the Section-C "tool-list truncation" finding below and the 2026-06-11 #eng thread with Rui (June 9–12 window: 223 runs, 1,016 calls, 78 failures).
