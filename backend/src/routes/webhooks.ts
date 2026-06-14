@@ -435,6 +435,28 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         changed = true;
       }
 
+      // Attribution merge (Lead UTM — mirrors the User schema contract).
+      // The new-lead path stamps firstTouch+lastTouch via createLead; the merge
+      // path previously dropped attribution entirely, leaving lastTouch DOA
+      // (lastTouch === firstTouch forever for any repeat-touch lead).
+      //   - lastTouch  : ALWAYS refreshed when this touch carries attribution.
+      //   - firstTouch : immutable — only backfilled if the lead has none yet.
+      //   - utmSource / utmMedium : denormalized from firstTouch — only
+      //     backfilled when absent, never overwritten.
+      if (touch) {
+        updates.lastTouch = touch;
+        changed = true;
+        if (!existingLead.firstTouch) {
+          updates.firstTouch = touch;
+          if (!existingLead.utmSource && touch.utm?.source) {
+            updates.utmSource = touch.utm.source;
+          }
+          if (!existingLead.utmMedium && touch.utm?.medium) {
+            updates.utmMedium = touch.utm.medium;
+          }
+        }
+      }
+
       if (changed) {
         await crmDb.updateLead(leadList.listId, existingLead.leadId, updates);
         isUpdated = true;
