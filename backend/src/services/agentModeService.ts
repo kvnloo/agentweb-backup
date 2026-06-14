@@ -16609,51 +16609,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     'update_html_file': { fields: ['html_content', 'css_content'], limit: 200 },
   };
 
-  /**
-   * Per-array memo of the linear index scan (`toolIndices` + the
-   * `tool_call_id -> tool message index` map). The original implementation
-   * re-derived `oldAssistantIndices` with a nested forward scan (O(n^2) per
-   * call) and was invoked once per loop iteration on a monotonically-growing
-   * `messages` array, making a full session O(n^2) overall. This WeakMap caches
-   * the linear-scan results keyed by array identity so subsequent calls on the
-   * same (append-only) array only scan the newly-appended tail. It is purely
-   * derived data validated by length below; it never changes the output.
-   */
-  private readonly _trimScanMemo: WeakMap<object, { length: number; toolIndices: number[]; toolIdToIndex: Map<string, number> }> = new WeakMap();
-
   trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
-    // Reuse the cached linear scan when the same array reference is passed again
-    // and has only grown (the AgentMode loop appends; it never reorders/removes).
-    // The scan is rebuilt from scratch on any reference/shrink mismatch, so a
-    // stale memo can never corrupt output — worst case is one O(n) recompute.
-    const cached = this._trimScanMemo.get(messages);
-    let toolIndices: number[];
-    let toolIdToIndex: Map<string, number>;
-    if (cached && cached.length <= messages.length) {
-      toolIndices = cached.toolIndices;
-      toolIdToIndex = cached.toolIdToIndex;
-      // Scan only the appended tail.
-      for (let i = cached.length; i < messages.length; i++) {
-        if (messages[i].role === 'tool') {
-          toolIndices.push(i);
-          const tcid = messages[i].tool_call_id;
-          if (tcid !== undefined && !toolIdToIndex.has(tcid)) toolIdToIndex.set(tcid, i);
-        }
-      }
-    } else {
-      // Full linear scan: collect tool-role indices and map each tool_call_id to
-      // the index of its (first) resolving tool message.
-      toolIndices = [];
-      toolIdToIndex = new Map<string, number>();
-      for (let i = 0; i < messages.length; i++) {
-        if (messages[i].role === 'tool') {
-          toolIndices.push(i);
-          const tcid = messages[i].tool_call_id;
-          if (tcid !== undefined && !toolIdToIndex.has(tcid)) toolIdToIndex.set(tcid, i);
-        }
+    // Single linear scan: collect tool-role indices and map each tool_call_id to
+    // the index of its (first) resolving tool message. This map replaces the
+    // original per-assistant nested forward scan (O(n^2) per call) with O(1)
+    // lookups below, which was the originally-reported defect. The scan is
+    // recomputed every call against the live array, so it is correct on every
+    // path — including the install_skills splice/reorder in
+    // updateConversationContext, which mutates this same array reference in place.
+    const toolIndices: number[] = [];
+    const toolIdToIndex = new Map<string, number>();
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].role === 'tool') {
+        toolIndices.push(i);
+        const tcid = messages[i].tool_call_id;
+        if (tcid !== undefined && !toolIdToIndex.has(tcid)) toolIdToIndex.set(tcid, i);
       }
     }
-    this._trimScanMemo.set(messages, { length: messages.length, toolIndices, toolIdToIndex });
 
     if (toolIndices.length <= recentToPreserve) return messages;
 
