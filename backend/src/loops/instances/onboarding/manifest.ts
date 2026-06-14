@@ -55,6 +55,16 @@ export const onboardingManifest: LoopManifest<NormalizedEvent, LlmAnalystProposa
     'onboarding_completed',
     'onboarding_skipped',
     'deviation',
+    // WS2 reliability telemetry — per-step success/failure of the two fragile
+    // external steps (AI image generation + brand-scrape). Failures carry a
+    // semantic errorClass so the cluster cron + health endpoint surface them.
+    // Mirrors ONBOARDING_TELEMETRY_EVENTS in services/onboardingTelemetry.ts.
+    'image_generation_started',
+    'image_generation_completed',
+    'image_generation_failed',
+    'brand_scrape_started',
+    'brand_scrape_completed',
+    'brand_scrape_failed',
   ],
   // Structural changes allowed, not just copy — so the loop can escape a
   // local maximum (guardrail #1), not just polish wording on a broken flow.

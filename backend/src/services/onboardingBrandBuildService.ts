@@ -297,6 +297,17 @@ export async function triggerBrandBuildForUser(
   const user = await userDb.getUserById(userId);
   if (!user) return;
 
+  // WS2 telemetry — record brand-scrape lifecycle onto the onboarding loop so
+  // a flaky scrape / degraded LLM clusters on the health endpoint. Lazy-
+  // required to keep this module importable in tests without pulling the loop
+  // registry. Best-effort.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const brandTelemetry = require("./onboardingTelemetry");
+  void brandTelemetry.recordOnboardingEvent(
+    userId,
+    brandTelemetry.ONBOARDING_TELEMETRY_EVENTS.brandScrapeStarted,
+  );
+
   const companyUrl = pickCompanyUrl(user);
   if (!companyUrl) {
     await persistFailure(
@@ -413,6 +424,18 @@ export async function triggerBrandBuildForUser(
       status: "ready",
     });
   }
+
+  // WS2 telemetry — successful brand-scrape.
+  void brandTelemetry.recordOnboardingEvent(
+    userId,
+    brandTelemetry.ONBOARDING_TELEMETRY_EVENTS.brandScrapeCompleted,
+    {
+      durationMs:
+        startedAt && completedAt
+          ? Math.max(0, Date.parse(completedAt) - Date.parse(startedAt))
+          : null,
+    },
+  );
 }
 
 async function persistFailure(
@@ -442,4 +465,14 @@ async function persistFailure(
     userId,
     message,
   });
+  // WS2 telemetry — brand-scrape failure with a semantic errorClass derived
+  // from the message. Best-effort.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const brandTelemetry = require("./onboardingTelemetry");
+  void brandTelemetry.recordOnboardingFailure(
+    userId,
+    brandTelemetry.ONBOARDING_TELEMETRY_EVENTS.brandScrapeFailed,
+    message,
+    { durationMs: patch.brandBuildDurationMs ?? 0 },
+  );
 }

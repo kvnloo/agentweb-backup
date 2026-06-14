@@ -24,6 +24,10 @@ import {
   type Archetype,
   type ArchetypeTemplate,
 } from "./brick5Archetypes";
+import {
+  DEFAULT_IMAGE_STYLE_SPEC,
+  DEFAULT_IMAGE_HARD_CONSTRAINTS,
+} from "./imagePromptDefaults";
 
 const TABLE_PREFIX =
   process.env.NODE_ENV === "development" ? "Dev-" : "";
@@ -211,7 +215,117 @@ function bumpVersion(prev: string): string {
   return `v1-${today}`;
 }
 
+// ───────────────────── Global image directives (WS1a) ──────────────────────
+//
+// The cross-archetype scaffolding (style-spec lead + HARD CONSTRAINTS) lives
+// in ONE row in the same table, so the whole image prompt — per-archetype
+// layouts AND the global directives — is runtime-editable + versioned without
+// a deploy. Seeded byte-identical from imagePromptDefaults, so the rendered
+// prompt is unchanged until an admin edits the row.
+
+export const GLOBAL_IMAGE_DIRECTIVES_ID = "global-image-directives";
+
+export interface GlobalImageDirectivesRow {
+  templateId: string;
+  /** Bumped on every save; carried into the variant's promptVersion. */
+  version: string;
+  styleSpec: string;
+  hardConstraints: string;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+let globalCache: { row: GlobalImageDirectivesRow; loadedAt: number } | null = null;
+
+function seedGlobalDirectivesRow(): GlobalImageDirectivesRow {
+  return {
+    templateId: GLOBAL_IMAGE_DIRECTIVES_ID,
+    version: "v1-seed",
+    styleSpec: DEFAULT_IMAGE_STYLE_SPEC,
+    hardConstraints: DEFAULT_IMAGE_HARD_CONSTRAINTS,
+    updatedAt: new Date().toISOString(),
+    updatedBy: "system",
+  };
+}
+
+/**
+ * Read the global image directives row. cache → Dynamo → seed-from-constants
+ * (best-effort seed write), mirroring getTemplateForArchetype. Never throws —
+ * the image generator must degrade to the constants if Dynamo is unreachable.
+ */
+export async function getGlobalImageDirectives(): Promise<GlobalImageDirectivesRow> {
+  if (globalCache && nowMs() - globalCache.loadedAt < CACHE_TTL_MS) {
+    return globalCache.row;
+  }
+  let row: GlobalImageDirectivesRow | null = null;
+  try {
+    const resp = await docClient
+      .get({ TableName: TEMPLATES_TABLE, Key: { templateId: GLOBAL_IMAGE_DIRECTIVES_ID } })
+      .promise();
+    if (resp.Item) row = resp.Item as GlobalImageDirectivesRow;
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn("[promptTemplatesService] global get failed; using seed", {
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+  if (!row) {
+    row = seedGlobalDirectivesRow();
+    try {
+      await docClient
+        .put({
+          TableName: TEMPLATES_TABLE,
+          Item: row,
+          ConditionExpression: "attribute_not_exists(templateId)",
+        })
+        .promise();
+    } catch (e: any) {
+      if (e?.code !== "ConditionalCheckFailedException") {
+        // eslint-disable-next-line no-console
+        console.warn("[promptTemplatesService] global seed write failed", {
+          error: e?.message ?? String(e),
+        });
+      }
+      try {
+        const reread = await docClient
+          .get({ TableName: TEMPLATES_TABLE, Key: { templateId: GLOBAL_IMAGE_DIRECTIVES_ID } })
+          .promise();
+        if (reread.Item) row = reread.Item as GlobalImageDirectivesRow;
+      } catch {
+        // best-effort; fall back to seeded row
+      }
+    }
+  }
+  globalCache = { row, loadedAt: nowMs() };
+  return row;
+}
+
+export interface SaveGlobalImageDirectivesInput {
+  styleSpec?: string;
+  hardConstraints?: string;
+  updatedBy: string;
+}
+
+/** Overwrite the global directives row, bumping `version`. Returns the row. */
+export async function saveGlobalImageDirectives(
+  input: SaveGlobalImageDirectivesInput,
+): Promise<GlobalImageDirectivesRow> {
+  const existing = await getGlobalImageDirectives();
+  const next: GlobalImageDirectivesRow = {
+    templateId: GLOBAL_IMAGE_DIRECTIVES_ID,
+    styleSpec: input.styleSpec ?? existing.styleSpec,
+    hardConstraints: input.hardConstraints ?? existing.hardConstraints,
+    version: bumpVersion(existing.version),
+    updatedAt: new Date().toISOString(),
+    updatedBy: input.updatedBy,
+  };
+  await docClient.put({ TableName: TEMPLATES_TABLE, Item: next }).promise();
+  globalCache = { row: next, loadedAt: nowMs() };
+  return next;
+}
+
 /** For tests only — drop the in-memory cache. */
 export function _clearCacheForTests(): void {
   cache = new Map();
+  globalCache = null;
 }
