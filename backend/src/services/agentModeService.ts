@@ -16610,11 +16610,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   };
 
   trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
-    // Find indices of all tool-role messages
+    // Single linear scan: collect tool-role indices and map each tool_call_id to
+    // the index of its (first) resolving tool message. This map replaces the
+    // original per-assistant nested forward scan (O(n^2) per call) with O(1)
+    // lookups below, which was the originally-reported defect. The scan is
+    // recomputed every call against the live array, so it is correct on every
+    // path — including the install_skills splice/reorder in
+    // updateConversationContext, which mutates this same array reference in place.
     const toolIndices: number[] = [];
+    const toolIdToIndex = new Map<string, number>();
     for (let i = 0; i < messages.length; i++) {
       if (messages[i].role === 'tool') {
         toolIndices.push(i);
+        const tcid = messages[i].tool_call_id;
+        if (tcid !== undefined && !toolIdToIndex.has(tcid)) toolIdToIndex.set(tcid, i);
       }
     }
 
@@ -16623,21 +16632,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // Most recent N tool results: keep at full size
     const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
 
-    // Track which assistant messages are "old" (all their tool_calls have been resolved
-    // and are not in the preserve set). We identify these to trim large argument fields.
+    // Track which assistant messages are "old" (none of their tool_calls resolve
+    // to a preserved tool result after them). We trim large argument fields on these.
+    // The precomputed tool_call_id -> index map replaces the original per-assistant
+    // forward scan with O(1) lookups, eliminating the nested loop while preserving
+    // the exact predicate: a resolving tool result must exist, sit at an index > i,
+    // and be in preserveSet for the assistant to be considered "recent" (not old).
     const oldAssistantIndices = new Set<number>();
     for (let i = 0; i < messages.length; i++) {
       const msg = messages[i];
       if (msg.role === 'assistant' && msg.tool_calls?.length) {
-        // Find the tool result indices for this assistant message's tool calls
-        const toolCallIds = new Set(msg.tool_calls.map((tc: any) => tc.id));
         let allOld = true;
-        for (let j = i + 1; j < messages.length; j++) {
-          if (messages[j].role === 'tool' && toolCallIds.has(messages[j].tool_call_id)) {
-            if (preserveSet.has(j)) {
-              allOld = false;
-              break;
-            }
+        for (const tc of msg.tool_calls) {
+          const resolvedIdx = toolIdToIndex.get(tc.id);
+          if (resolvedIdx !== undefined && resolvedIdx > i && preserveSet.has(resolvedIdx)) {
+            allOld = false;
+            break;
           }
         }
         if (allOld) {
