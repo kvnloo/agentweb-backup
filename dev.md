@@ -1,3 +1,16 @@
+## Onboarding loop Phase 2 — cutover PR 1: V2 is now the live default (legacy off, no double-fire) (2026-06-14)
+
+The framework V2 onboarding loop (analyst-policy REVAMP) was already built and wired in gated parallel behind `ONBOARDING_LOOP_V2=true`, running ALONGSIDE the legacy threshold heartbeat (`cron/onboardingLoop.ts`, behind `ONBOARDING_LOOP_ENABLED=true`). Phase 2 = behavior-preserving consolidation; PR 1 is the **cutover** (PR 2 = delete ~1k LOC of now-dormant legacy, on a green characterization test).
+
+**What shipped (PR 1):** a single cutover-policy module `loops/instances/onboarding/cutover.ts` owns the "which onboarding loop is live" decision. New defaults:
+- nothing set → **V2 live**, legacy off (was: both off by default, both opt-in).
+- `ONBOARDING_LOOP_ENABLED=true` → legacy fallback wins, **V2 yields** (invariant: at most one live → no double Slack DM / double Bedrock spend).
+- `ONBOARDING_LOOP_V2=false` → explicit rollback (both off).
+
+`server.ts` boot gates each cron on the policy and logs the resolved mode; the V2 runner's `isEnabled` uses the same policy so a live tick actually runs under the default env.
+
+**Assumptions to validate (post-deploy):** (1) exactly ONE onboarding DM lands per day after deploy (mode=`v2`); the legacy 15:00 UTC DM should stop. (2) V2's analyst digest is equal-or-better than the legacy heartbeat on real traffic — the characterization test only proves the sensor preserves skip/deviation/loop-back signals into the analyst prompt, not that the LLM always names them on live data. (3) Watch Bedrock spend drops (one loop, not two). If V2 underperforms, set `ONBOARDING_LOOP_ENABLED=true` to revert in one flag.
+
 ## Live tool-failure telemetry — 227 failures classified; raw failure-rate OVERSTATES breakage (2026-06-13)
 
 Pulled actual error strings from `Dev-AW-LoopEvents` (failure events carry `dimensions.errorClass`/`errorMessage`; `agent_tool_invoked`/`agent_tool_succeeded` do NOT — a failure = invoked-without-a-matching-succeed, which is how the loop derives rates). 227 sampled failures classified by root cause. Confirms + makes empirical the Section-C "tool-list truncation" finding below and the 2026-06-11 #eng thread with Rui (June 9–12 window: 223 runs, 1,016 calls, 78 failures).
