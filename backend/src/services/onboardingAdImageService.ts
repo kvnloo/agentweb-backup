@@ -242,6 +242,14 @@ export function buildSixLayerPromptForVariant(
     textBudget: string;
     name: string;
   },
+  /**
+   * Negative visual directions distilled from the user's recent image
+   * rejects (♥/✕ swipe). When non-empty it is appended as a dedicated
+   * block so the model steers away from concepts the user already
+   * disliked. Empty string (the default) keeps the first-run prompt clean.
+   * Built by `buildNegativeExamplesBlockForImages` in the rating service.
+   */
+  negativeExamples = "",
 ): string {
   const { variantIndex, format, concept, copyAngle, formatArchetype, brand, persona } =
     inputs;
@@ -351,6 +359,16 @@ export function buildSixLayerPromptForVariant(
       `Format confirmation: ${format} ${isFeed ? "square" : "vertical"} format.`,
   );
   lines.push(``);
+
+  // Negative examples — the user's recent rejects, distilled into visual
+  // directions to avoid. Placed just before HARD CONSTRAINTS so it carries
+  // weight without being buried mid-prompt. Skipped on the first run.
+  const trimmedNegatives = negativeExamples.trim();
+  if (trimmedNegatives) {
+    lines.push(``);
+    lines.push(trimmedNegatives);
+    lines.push(``);
+  }
 
   // Final reminder — Gemini sometimes ignores text-budget rules without
   // an explicit re-statement. This catches the common failure mode.
@@ -511,9 +529,16 @@ export async function generateAdImagesForUser(
       name: string;
       version: string;
     }>;
+    /**
+     * Negative visual directions distilled from the user's recent image
+     * rejects. Threaded into every variant's prompt so a regen steers
+     * away from disliked concepts. Empty on the first generation.
+     */
+    negativeExamples?: string;
   } = {}
 ): Promise<AdImageResult> {
   const gen = deps.imageGen ?? (defaultImageService as AdImageGeneratorDep);
+  const negativeExamples = deps.negativeExamples ?? "";
   const timeoutMs = deps.timeoutMs ?? PER_VARIANT_TIMEOUT_MS;
   const loadTemplate =
     deps.loadTemplate ??
@@ -581,11 +606,12 @@ export async function generateAdImagesForUser(
           persona,
         },
         template,
+        negativeExamples,
       );
       const filename = `ad-image-${userId}-${i + 1}-${Date.now()}.png`;
       const promptVersion =
         template?.version ?? PROMPT_BUILDER_VERSION;
-      return { prompt, filename, format, index: i, archetype, promptVersion };
+      return { prompt, filename, format, index: i, archetype, concept, promptVersion };
     }),
   );
 
@@ -610,6 +636,7 @@ export async function generateAdImagesForUser(
         // "same builder, edited template text" when iterating.
         promptVersion: `${PROMPT_BUILDER_VERSION}/${t.promptVersion}`,
         archetype: t.archetype,
+        concept: t.concept,
       };
       if (!r.success) {
         // eslint-disable-next-line no-console
@@ -676,12 +703,30 @@ export async function triggerAdImageGenerationForUser(
       : { concepts: [], copy_angles: [], format_archetypes: [] };
   const brand = extractAdImageBrandContext(u);
 
+  // Close the image feedback loop: if the user has rejected variants on a
+  // prior generation (♥/✕ swipe → adImageVariantsRated), distill those
+  // rejects into negative visual directions so this generation steers
+  // away from them. Empty on the first run (nothing rated yet). See
+  // adImageVariantRatingService.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { buildNegativeExamplesBlockForImages } = require("./adImageVariantRatingService");
+  const priorVariants: Array<{ id: string; concept?: string; archetype?: string }> =
+    Array.isArray(u.adImageResult?.variants) ? u.adImageResult.variants : [];
+  const negativeExamples: string = buildNegativeExamplesBlockForImages(
+    { adImageVariantsRated: u.adImageVariantsRated },
+    priorVariants.map((v) => ({
+      id: v.id,
+      conceptLabel: v.concept,
+      archetype: v.archetype,
+    })),
+  );
+
   const result = await generateAdImagesForUser(
     creativeDir,
     brand,
     personas,
     userId,
-    deps
+    { ...deps, negativeExamples }
   );
   const current = await userDb.getUserById(userId);
   const patch = adImageReadyPatch(((current as any) || {}) as AdImageStatusFields, result);
