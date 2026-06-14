@@ -17,6 +17,7 @@ import { GoogleGenAI, Modality, LiveServerMessage, Session, Transcription } from
 import { chatbotDb, ChatMessage } from './chatbotService';
 import { getSecret } from '../utils/secretsManager';
 import { agentModeService } from './agentModeService';
+import { recordUsage } from './usageRecorderService';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -588,6 +589,29 @@ function isNoiseTurn(text: string): boolean {
 async function handleIncomingMessage(sessionId: string, message: LiveServerMessage): Promise<void> {
   const entry = activeSessions.get(sessionId);
   if (!entry) return;
+
+  // Shadow usage metering (Ship 1): Gemini Live runs over a WebSocket that the
+  // llmClients factory does not wrap, so usage is recorded here directly from
+  // the per-message usageMetadata. The Live API reports output tokens as
+  // `responseTokenCount` (not `candidatesTokenCount`). Fire-and-forget — a
+  // metering failure must never affect the audio stream.
+  if (message.usageMetadata) {
+    try {
+      const um: any = message.usageMetadata;
+      void recordUsage({
+        userId: entry.userId,
+        model: LIVE_MODEL.replace(/^models\//, ''),
+        provider: 'gemini',
+        feature: 'agent_task',
+        inputTokens: um.promptTokenCount || 0,
+        outputTokens: um.responseTokenCount || um.candidatesTokenCount || 0,
+        cacheReadTokens: um.cachedContentTokenCount || 0,
+        sessionId,
+      });
+    } catch {
+      /* metering must never break the live stream */
+    }
+  }
 
   const { emitFn } = entry;
   const parts = message.serverContent?.modelTurn?.parts;

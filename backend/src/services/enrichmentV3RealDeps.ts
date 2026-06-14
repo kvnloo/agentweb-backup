@@ -193,6 +193,7 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
         const result = await llm.generateJSONContentWithWebSearch<{ website: string | null; company?: string | null; searchedDomain?: string | null }>(
           systemPrompt,
           userPrompt,
+          { userId, feature: 'enrichment' },
         );
         const website = typeof result?.website === 'string' ? result.website.trim() : undefined;
         const companyName = typeof result?.company === 'string' ? result.company.trim() : undefined;
@@ -529,7 +530,7 @@ async function extractFieldsViaLLMReal(input: {
   lead: LeadRecord;
   configFieldsByName: Record<string, { instruction?: string } | undefined>;
   listId?: string;
-}): Promise<{ filled: Record<string, LLMFilledValue>; missing: string[] }> {
+}, userId?: string): Promise<{ filled: Record<string, LLMFilledValue>; missing: string[] }> {
   if (input.fields.length === 0) return { filled: {}, missing: [] };
   const ltag = `[v3:${input.listId ? `${input.listId}:` : ''}${input.lead.leadId ?? input.lead.email ?? '?'}:llm:${input.groupName}:${input.tier}]`;
   console.log(`${ltag} START fields=[${input.fields.join(',')}] contextLen=${input.sourceContext.length}`);
@@ -586,10 +587,10 @@ async function extractFieldsViaLLMReal(input: {
     let parsed: Record<string, any>;
     if (isWebTier) {
       const llm = createLLMService(WEB_SEARCH_MODEL, 0.0);
-      parsed = await llm.generateJSONContentWithWebSearch<Record<string, any>>(systemPrompt, userPrompt);
+      parsed = await llm.generateJSONContentWithWebSearch<Record<string, any>>(systemPrompt, userPrompt, { userId, feature: 'enrichment' });
     } else {
       const llm = createLLMService(EXTRACT_MODEL, 0.0);
-      parsed = await llm.generateJSONContent<Record<string, any>>(systemPrompt, userPrompt);
+      parsed = await llm.generateJSONContent<Record<string, any>>(systemPrompt, userPrompt, 'json', undefined, { userId, feature: 'enrichment' });
     }
     const filled: Record<string, LLMFilledValue> = {};
     const missing: string[] = [];
@@ -640,7 +641,7 @@ async function extractFieldsViaLLMReal(input: {
 async function runCriticReal(input: {
   lead: LeadRecord;
   fills: Array<{ field: string; value: string; meta: any }>;
-}): Promise<{ verdicts: Record<string, 'supported' | 'partially-supported' | 'unsupported' | 'contradicted'> }> {
+}, userId?: string): Promise<{ verdicts: Record<string, 'supported' | 'partially-supported' | 'unsupported' | 'contradicted'> }> {
   if (input.fills.length === 0) return { verdicts: {} };
 
   const claims = input.fills.map(f => ({
@@ -663,7 +664,7 @@ async function runCriticReal(input: {
 
   try {
     const llm = createLLMService(CRITIC_MODEL, 0.0);
-    const parsed = await llm.generateJSONContent<Record<string, string>>(systemPrompt, userPrompt);
+    const parsed = await llm.generateJSONContent<Record<string, string>>(systemPrompt, userPrompt, 'json', undefined, { userId, feature: 'enrichment' });
     const verdicts: Record<string, any> = {};
     for (const claim of claims) {
       const v = parsed?.[claim.field];
@@ -908,7 +909,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
         }
       },
 
-      extractFieldsViaLLM: extractFieldsViaLLMReal,
+      extractFieldsViaLLM: (input) => extractFieldsViaLLMReal(input, userId),
       fetchWebForGroup: fetchWebForGroupReal,
 
       // Tier 3.5b: person enrichment via Unipile.
@@ -1014,7 +1015,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
               ).join('\n')}`;
             let picked: { chosenIndex: number | null; title: string | null; company_name: string | null; first_name: string | null; last_name: string | null } | null = null;
             try {
-              const raw = await llm.generateRaw(systemPrompt, userPrompt);
+              const raw = await llm.generateRaw(systemPrompt, userPrompt, undefined, { userId, feature: 'enrichment' });
               picked = extractJson(raw);
             } catch (err) {
               console.warn(`${tag} Case B LLM parse failed: ${(err as Error).message}`);
@@ -1191,7 +1192,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       const llmResult = await extractFieldsViaLLMReal({
         tier: 'web', sourceContext: webContext, fields, groupName: '__ungrouped__',
         lead, configFieldsByName, listId,
-      });
+      }, userId);
       const filled: any[] = [];
       for (const field of fields) {
         const entry = llmResult.filled[field];
@@ -1244,6 +1245,9 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
         const result = await llm.generateJSONContent<{ value: string | null; reasoning: string }>(
           buildSmartFieldEvalSystemPrompt(),
           buildSmartFieldEvalUserPrompt(fieldName, condition, mergedDepValues),
+          'json',
+          undefined,
+          { userId, feature: 'enrichment' },
         );
         return {
           value: result?.value != null ? String(result.value) : null,
@@ -1256,7 +1260,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       }
     },
 
-    runCriticOverWebFills: runCriticReal,
+    runCriticOverWebFills: (input) => runCriticReal(input, userId),
 
     setLeadFields: async ({ listId, leadId, topLevel, customFields, enrichmentMetadata, ifNotExists }) => {
       // When writing to topLevel, also clear stale customFields[name] entries

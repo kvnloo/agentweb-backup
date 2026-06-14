@@ -197,6 +197,15 @@ class WebAgent:
         if not full_llm_name:
             raise ValueError("full_llm_name must be provided")
         self.llm, self.llm_name = get_llm(full_llm_name)
+        # Shadow usage metering (Ship 1) — fail-open, never affects the task.
+        self.usage_reporter = None
+        try:
+            from usage_reporter import UsageReporter, attach_usage_callback
+            self.usage_reporter = UsageReporter(self.llm_name)
+            attach_usage_callback(self.llm, self.usage_reporter)
+        except Exception as usage_err:
+            logger.warning(f"Usage metering disabled for this run: {usage_err}")
+            self.usage_reporter = None
         self.task = None
         self.action_history = []
         self.user_id = user_id
@@ -4165,6 +4174,12 @@ async def main():
         }))
         sys.exit(1)
     finally:
+        try:
+            # Shadow usage metering flush — fail-open, never affects the task.
+            if getattr(agent, 'usage_reporter', None):
+                agent.usage_reporter.flush(args.user_id, args.task_id)
+        except Exception:
+            pass
         await agent.cleanup()
 
 if __name__ == '__main__':
