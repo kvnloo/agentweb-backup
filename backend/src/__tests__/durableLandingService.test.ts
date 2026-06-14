@@ -58,6 +58,9 @@ describe("claimCompletion — exactly-once idempotency guard", () => {
     const arg = mockUpdate.mock.calls[0][0];
     expect(arg.ConditionExpression).toMatch(/attribute_not_exists\(claimedCompletionAt\)/);
     expect(arg.Key).toEqual({ id: "page-1" });
+    // The claim also clears awaitingReconnect in the same atomic write, so a
+    // delivered build drops off the poller's sweep and leaves no stale flag.
+    expect(arg.UpdateExpression).toMatch(/REMOVE awaitingReconnect/);
   });
 
   it("returns false when another deliverer already claimed (ConditionalCheckFailedException)", async () => {

@@ -86,7 +86,12 @@ export async function claimCompletion(pageId: string): Promise<boolean> {
       .update({
         TableName: TABLE_NAME,
         Key: { id: pageId },
-        UpdateExpression: "SET claimedCompletionAt = :now, updatedAt = :now",
+        // Clear awaitingReconnect in the same atomic write: once a completion is
+        // claimed (by the in-process hook or the poller), the build no longer owes
+        // its session anything, so it must drop off the poller's awaiting-reconnect
+        // sweep. Leaving the flag set was harmless (claimedCompletionAt already
+        // blocks re-delivery) but left stale state on the record.
+        UpdateExpression: "SET claimedCompletionAt = :now, updatedAt = :now REMOVE awaitingReconnect",
         ConditionExpression: "attribute_not_exists(claimedCompletionAt)",
         ExpressionAttributeValues: { ":now": new Date().toISOString() },
       })
