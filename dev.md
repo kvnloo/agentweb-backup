@@ -15,6 +15,18 @@ Pulled actual error strings from `Dev-AW-LoopEvents` (failure events carry `dime
 
 **Decision implication:** retire/keep cannot run off raw failure rate — it needs failure-**type** classification first (real-bug vs by-design vs model-error vs config). This is exactly Fangfang's #eng point (a human, then an LLM judge, classifies output + tool-call quality *before* fixes). The loop's *sensing* works; the missing layer is **failure classification, not more sensing**. Concretely: tag each `Dev-AW-LoopEvents` failure with one of {bug, by_design, model_uninstalled_tool, schema_reject, config} so the weekly scorecard reflects real tool health.
 
+**UPDATE — classifier SHIPPED (`utils/toolFailureType.ts`, 100% cov; `runRecorder.toolFailed` now stamps `dimensions.failureType`; backfilled all 227 historical `agent_tool_failed` via `scripts/backfillFailureTypes.ts`).** Final distribution of the 227:
+
+| failureType | count | share |
+|---|---|---|
+| bug (real candidates) | 63 | **28%** |
+| config | 56 | 25% |
+| schema_reject | 49 | 22% |
+| model_uninstalled_tool | 34 | 15% |
+| by_design | 25 | 11% |
+
+So **only 28% of "failures" are real bugs** — the scorecard/policy should filter `dimensions.failureType = 'bug'`. Classifier reads signals from the error *message* too, so pre-classifier events (errorClass `'Error'`) still classify (rescues the Brave 429s from `bug`).
+
 ---
 
 ## Platform state audit — reliability fixes, complexity levers, SOTA gaps, learning-loop health (2026-06-13)
