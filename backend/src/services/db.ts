@@ -6718,6 +6718,9 @@ export const crmDb = {
     // row as a field-group row (or vice versa). Note: this used to be optional
     // with a 'field_group' default — review C1 flagged that as fragile.
     cacheType: 'field_group' | 'enrichso' | 'unipile' | 'unipile_company' | 'unipile_search_param' | 'apollo';
+    // Marks a cached payload with no usable signal — written with a short
+    // negative TTL so it doesn't lock a lead out of re-enrichment. (WS4)
+    negative?: boolean;
   }, opts?: { force?: boolean }): Promise<void> {
     try {
       // `force: true` is set by callers that explicitly asked for a fresh API
