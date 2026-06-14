@@ -541,16 +541,39 @@ export async function generateAdImagesForUser(
      */
     negativeExamples?: string;
     /**
-     * Runtime-overridable global directives (style spec + hard constraints)
-     * loaded from the managed store by the orchestrator. Undefined falls
-     * back to the DEFAULT_IMAGE_* constants (byte-identical).
+     * Runtime-overridable global directives (style spec + hard constraints).
+     * If provided, used directly. If absent, loaded via loadGlobalDirectives
+     * (default = the managed store). A load failure degrades to the
+     * DEFAULT_IMAGE_* constants (byte-identical) — never blocks generation.
      */
     globalDirectives?: GlobalImageDirectives;
+    /** Inject the directives loader for tests. Defaults to the managed store. */
+    loadGlobalDirectives?: () => Promise<GlobalImageDirectives>;
   } = {}
 ): Promise<AdImageResult> {
   const gen = deps.imageGen ?? (defaultImageService as AdImageGeneratorDep);
   const negativeExamples = deps.negativeExamples ?? "";
-  const globalDirectives = deps.globalDirectives;
+  let globalDirectives = deps.globalDirectives;
+  if (!globalDirectives) {
+    try {
+      const loadGlobalDirectives =
+        deps.loadGlobalDirectives ??
+        (async () => {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const { getGlobalImageDirectives } = require("./promptTemplatesService");
+          const row = await getGlobalImageDirectives();
+          return { styleSpec: row.styleSpec, hardConstraints: row.hardConstraints };
+        });
+      globalDirectives = await loadGlobalDirectives();
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[onboardingAdImageService] global directives load failed; using constants",
+        { error: e instanceof Error ? e.message : String(e) },
+      );
+      globalDirectives = undefined; // builder falls back to DEFAULT_IMAGE_*
+    }
+  }
   const timeoutMs = deps.timeoutMs ?? PER_VARIANT_TIMEOUT_MS;
   const loadTemplate =
     deps.loadTemplate ??
