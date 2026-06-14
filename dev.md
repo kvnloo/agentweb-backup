@@ -106,6 +106,20 @@ Verified WS-C2 ("attribution reaches a verdict"): drove the real Layer-4→5 app
 
 ---
 
+---
+
+## AgentMode B1 — worker-crash session-lock leak: already-released on crash, but session→request map leaked (2026-06-14)
+
+Investigated WS-B1 (worker crash holds `activeSessionGenerations` until `GENERATION_TIMEOUT_MS`). Re-grepped the current sites:
+- The session-generation lock is `activeSessionGenerations` (`controllers/agentModeController.ts:40`), claimed at `:2192`/`:2987`, released in a `finally` at `:2356`/`:3032`. `GENERATION_TIMEOUT_MS` = 600s (`:56`).
+- `generateSessionResponse` (`:1592`) `await`s `generateMarketingResponseWorkerService.runInWorker` (`:1819`). The worker is a forked child (`services/generateMarketingResponseWorkerService.ts`).
+
+**Finding (assumption corrected):** the literal "lock only releases after the timeout on crash" is NO LONGER true. The worker `error`/`exit` handlers (worker service `:201`/`:216`, added Feb 2026 in the "Improved Agent Mode Response Speed" change) already reject every in-flight `pendingRequests` entry on worker death. That rejection unwinds through `runInWorker` → `generateSessionResponse` → the controller's `try/finally`, which deletes the lock **immediately**. Pinned by `agentModeController.workerCrashLockRelease.test.ts` (simulated worker death → next `/generate` for the same session is accepted, no timer advanced) — passes on the pre-fix code.
+
+**Real remaining defect in the same region (this is what the fix addresses):** both crash handlers (and `shutdown`) reject + `clear()` `pendingRequests` but never clear `sessionToRequestId`. So after a crash a dead session's `requestId` lingers — a later `cancelSession()` for that session mis-fires a `{type:'cancel'}` at the *fresh* worker, and the map grows unbounded across crashes. Fixed by a single `failAllPendingRequests(error)` helper that rejects pending requests and clears BOTH maps; `error`/`exit`/`shutdown` now call it (dedupes three near-identical handler bodies → net-negative branches). Behavior-preserving: the rejection path and error messages are unchanged; only the stale-mapping/leak is closed. Repro test: `generateMarketingResponseWorkerService.test.ts` "clears the session→request mapping when the worker crashes" (failed pre-fix: stale cancel fired; passes post-fix).
+
+Assumptions to validate: (a) no caller depends on `sessionToRequestId` surviving a crash (verified: only `cancelSession` reads it, and post-crash there's nothing to cancel); (b) the controller path remains the sole lock owner (verified: lock lives only in the controller, worker service has no reference to it).
+
 ## Live tool-failure telemetry — 227 failures classified; raw failure-rate OVERSTATES breakage (2026-06-13)
 
 Pulled actual error strings from `Dev-AW-LoopEvents` (failure events carry `dimensions.errorClass`/`errorMessage`; `agent_tool_invoked`/`agent_tool_succeeded` do NOT — a failure = invoked-without-a-matching-succeed, which is how the loop derives rates). 227 sampled failures classified by root cause. Confirms + makes empirical the Section-C "tool-list truncation" finding below and the 2026-06-11 #eng thread with Rui (June 9–12 window: 223 runs, 1,016 calls, 78 failures).
