@@ -39,19 +39,32 @@ the behavior-preserving proof reused by every seam.
 
 Baseline = `origin/harsha/swarm` at commit 47e3594c (post reliability-v1 #1882).
 
-| Metric | Baseline | After proof slice |
-|---|---|---|
-| `agentModeService.ts` (the monolith) | 24,205 lines | 24,213 lines (+8) |
-| `agentModeController.ts` | 6,511 lines | 6,511 lines |
-| Lines in `services/agentMode/core/` (prod) | 0 | 279 (types 95 + termination 128 + agentStep 56) |
-| Characterization harness | ❌ none | ✅ 203-line harness + 3 scenarios (4 tests) |
-| Core unit tests | 0 | 10 (termination) |
-| **Seams migrated** | **0 / 6** | **1 / 6** (termination) |
+| Metric | Baseline | After proof slice | After dispatch seam |
+|---|---|---|---|
+| `agentModeService.ts` (the monolith) | 24,205 lines | 24,213 lines (+8) | **23,895 lines (−318)** |
+| `agentModeController.ts` | 6,511 lines | 6,511 lines | 6,511 lines |
+| Lines in `services/agentMode/core/` (prod) | 0 | 279 | **801** (types 95 + termination 128 + agentStep 56 + toolDispatch 522) |
+| Characterization harness | ❌ none | ✅ 203-line harness + 3 scenarios (4 tests) | ✅ + 4 dispatch scenarios (8 char tests total) |
+| Core unit tests | 0 | 10 (termination) | **19** (termination 10 + toolDispatch 9) |
+| **Seams migrated** | **0 / 6** | **1 / 6** (termination) | **2 / 6** (termination + tool dispatch) |
 
-> The monolith is +8 net this slice: the inline branch ladder moved to a tested pure
-> module, but the loop now applies counter deltas explicitly (a few lines). Honest, flat.
-> The decision *logic* + its full branch coverage now live in a 128-line tested module
-> instead of inline. Subsequent seams (parse, dispatch, anti-loop) trend the monolith down.
+> The proof slice was +8 (the inline termination ladder moved to a tested pure module,
+> the loop applies counter deltas explicitly). The **dispatch seam is the first
+> NET-NEGATIVE slice: the monolith drops 318 lines** as the per-iteration validate →
+> dispatch → process-results block (~372 lines inline) moves into a single tested
+> boundary, `core/toolDispatch.ts → executePreparedTools`. That module owns Phase 1
+> (gateway policy + arg validation/repair + preflight failures), Phase 2 (parallel-vs-
+> sequential decision + gateway execution + `toolResultError` classification), and
+> Phase 3 (screenshot S3 upload, minimal-result extraction, CRM socket emit, large-
+> response S3 offload, DynamoDB truncation, tool-message + counter-delta appending).
+> Every entangled side-effect is **injected as a port** (gateway executor, leaf tool
+> executor, S3 uploaders, socket emitter, telemetry recorder, classifiers, the
+> instance helpers `extractMinimalToolResult`/`formatToolError`, CRM payload builder),
+> so core drags none of the 24k-line monolith. **Left inline (separate concerns / loop
+> state):** the counter-flush DB calls (`incrementCalledFunctions`/`incrementFailedFunctions`,
+> which consume the returned delta maps), the `onProgress` events, and the anti-loop
+> detection (consecutive + sliding-window signature) — those are loop-state, not
+> dispatch, and belong to a later seam.
 
 ### Agentic-reliability parity checklist (vs Claude Code / Codex)
 - ✅ Structured tool-error taxonomy (`toolErrorClassifier`)
@@ -60,17 +73,25 @@ Baseline = `origin/harsha/swarm` at commit 47e3594c (post reliability-v1 #1882).
 - ✅ Eval-from-failures seeded (`loops/scripts/exportEvalCases.ts`)
 - ✅ Learning-loop gate built (Slack-reaction ApprovalGate stamps `shippedAt`) — ⚠️ OFF by default
 - ✅ Fragility fixes shipped (worker-crash lock, concurrent-claim race, O(n²) trim, SSE zombie, alert flood) — #1882
-- 🟡 Small composable core loop — **STARTED** (characterization harness + core scaffold + seam #1)
+- 🟡 Small composable core loop — **IN PROGRESS** (characterization harness + core scaffold + termination + tool-dispatch boundary extracted)
 - ❌ Typed tool registry at the boundary (gateway exists; not yet a typed-registry abstraction — `core/types.ts` defines the target interface)
 - ❌ Idempotent / resumable runs keyed by run id (runId threaded for telemetry only)
 - ❌ Streaming as an explicit contract
 
 ## Seam roadmap (strangler order, from the 2026-06-14 loop map)
 
-1. **Seam 1 — termination decision** → `core/termination.ts`. ✅ **DONE** (this slice).
+1. **Seam 1 — termination decision** → `core/termination.ts`. ✅ **DONE** (proof slice).
 2. Seam 2 — tool-call parse/normalization → extract `JSON.parse(arguments)` + shaping into core (pure).
-3. Seam 3 — tool dispatch boundary → `executePreparedTools` behind `ToolRegistry`.
+   ⏳ NOT YET as a standalone seam — `JSON.parse(arguments)` currently lives inside the dispatch
+   boundary's Phase 1 (`core/toolDispatch.ts`). A future PR can lift the pure parse/normalization
+   step out of `executePreparedTools` into its own module if it earns the split.
+3. **Seam 3 — tool dispatch boundary** → `core/toolDispatch.ts → executePreparedTools`. ✅ **DONE**
+   (this slice). NOTE: branched/PR'd under the title "Seam 2: tool-dispatch boundary" — the *roadmap*
+   numbers it #3; it is the dispatch seam regardless of the PR label. Not yet behind a typed
+   `ToolRegistry.execute` abstraction — dispatch goes through injected gateway/executor ports today;
+   converging on the `ToolRegistry` interface (`core/types.ts`) is follow-up.
 4. Seam 4 — anti-loop detection → pluggable pure policy (consecutive + sliding-window signature).
+   (Still inline in the loop after this slice — it is loop-state, not dispatch.)
 5. Seam 5 — message trimming → wire existing `trimToolMessagesForContext` through core.
 6. Seam 6 — model backup selection → already inside `callLLM` (no-op; document the boundary).
 
@@ -90,3 +111,15 @@ inline. One seam per PR.
   `npx tsc` exit 0. agentModeService suite 1495/1495 pass; core termination 10/10; characterization
   4/4. Monolith 24,205 → 24,213 (+8 net). Seams 1/6. **Outcome: GREEN — strangler approach validated
   end-to-end on one path.** Branch `swarm/agentmode-core-proofslice` → PR vs `harsha/swarm` (not merged).
+- **2026-06-14 · Tool-dispatch seam** — extracted the per-iteration validate → dispatch → process-
+  results block (~372 lines) out of `generateMarketingResponse` into `core/toolDispatch.ts`
+  (`executePreparedTools`, 522 lines), entangled side-effects injected as ports; the loop delegates
+  and consumes the returned counter-delta maps. Added 4 dispatch-specific characterization scenarios
+  (parallel multi-tool / sequential wait_seconds / tool-error mid-batch / large-result S3 offload),
+  captured against the UNCHANGED monolith FIRST, then byte-identical AFTER. **Behavior-preserving
+  proof: all 8 characterization snapshots identical before/after.** `npx tsc` exit 0; characterization
+  8/8, core termination 10/10, toolDispatch unit 9/9; agentModeService regression (generateImage /
+  crmTools / socialTools / backupModel / extractMinimalToolResult / fathomToolAccess) 189/189.
+  Monolith 24,213 → **23,895 (−318 net — first net-negative slice)**; core prod 279 → 801. Seams 2/6.
+  Left inline: counter-flush DB calls, onProgress events, anti-loop detection (loop-state, later seams).
+  **Outcome: GREEN.** Branch `swarm/agentmode-core-dispatch` → PR vs `harsha/swarm` (not merged).
