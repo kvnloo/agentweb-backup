@@ -421,6 +421,14 @@ createTestAccount().then(async () => {
     console.log(`WebSocket server is ready`);
     console.log(`Test account email: ${process.env.TEST_EMAIL}`);
 
+    // Self-heal the telemetry/loop tables if missing — fire-and-forget, non-fatal.
+    // Prevents the silent-no-op class of bug where a writer swallows
+    // ResourceNotFound and a whole loop subsystem runs against a table that
+    // was never provisioned (see services/ensureCriticalTables.ts).
+    void import('./services/ensureCriticalTables')
+      .then(({ ensureCriticalTables }) => ensureCriticalTables())
+      .catch((err) => console.error('[startup] ensureCriticalTables failed (non-fatal):', err?.message || err));
+
     // Initialize Agent Mode tools in background - don't block server startup
     // This prevents health check timeouts during deployment (e.g. Elastic Beanstalk)
     console.log('Initializing Agent Mode Tools (non-blocking)...');
@@ -505,6 +513,15 @@ createTestAccount().then(async () => {
         console.log('[dripWorker] Initialized — running every 5 minutes');
       } catch (error) {
         console.error('[dripWorker] Failed to initialize:', error);
+      }
+
+      // Durable Landing-Page Poller — redeploy backstop for in-flight builds.
+      // No-op unless DURABLE_LANDING_GENERATION is on. Runs every 5 minutes.
+      try {
+        const { startDurableLandingPoller } = await import('./services/durableLandingPoller');
+        startDurableLandingPoller();
+      } catch (error) {
+        console.error('[durableLandingPoller] Failed to initialize:', error);
       }
 
       // LinkedIn Connection Sync — runs every 10 minutes

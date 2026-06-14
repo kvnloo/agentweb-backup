@@ -6540,6 +6540,17 @@ emmaToolRegistry.register({
   }
 });
 
+// Bridge report_product_issues onto the EXTERNAL MCP registry so the claude.ai
+// Emma connector (api.agentweb.pro/mcp) can file bug reports directly — without
+// portal login. Without this it is only reachable by in-app Emma. The handler
+// reads context.userId (set to agentUserId for external clients) and
+// context.externalMcp (true only on the external server) for source tagging, so
+// the same handler works on both surfaces.
+const reportProductIssuesHandler = emmaToolRegistry.getTool('report_product_issues');
+if (reportProductIssuesHandler) {
+  mcpToolRegistry.register(reportProductIssuesHandler);
+}
+
 emmaToolRegistry.register({
   name: 'get_user_profile',
   definition: {

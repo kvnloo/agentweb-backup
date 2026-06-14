@@ -9,6 +9,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
 import { rankMemoriesByRelevance } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
+import { toolResultError } from '../utils/toolResultError';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
@@ -173,37 +174,6 @@ function recordAgentModeToolTelemetry(
   })();
 }
 
-function toolResultError(result: unknown): Error | null {
-  if (!result || typeof result !== 'object') return null;
-  const obj = result as Record<string, any>;
-
-  if (obj.isError === true) {
-    return new Error(extractToolResultMessage(obj) || 'Tool returned isError=true');
-  }
-
-  if (obj.success === false) {
-    return new Error(extractToolResultMessage(obj) || 'Tool returned success=false');
-  }
-
-  return null;
-}
-
-function extractToolResultMessage(obj: Record<string, any>): string {
-  if (typeof obj.error === 'string' && obj.error.trim()) return obj.error.trim();
-  if (typeof obj.message === 'string' && obj.message.trim()) return obj.message.trim();
-  if (typeof obj.content === 'string' && obj.content.trim()) return obj.content.trim();
-
-  if (Array.isArray(obj.content)) {
-    const text = obj.content
-      .map((part: any) => typeof part?.text === 'string' ? part.text : '')
-      .filter(Boolean)
-      .join('\n')
-      .trim();
-    if (text) return text;
-  }
-
-  return '';
-}
 
 function recordAgentModeRunStarted(
   runId: string,
