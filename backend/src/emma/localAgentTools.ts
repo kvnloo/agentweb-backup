@@ -8,6 +8,45 @@ interface RelayConfig {
   apiKey: string;
 }
 
+interface RelayResponse {
+  ok?: boolean;
+  result?: unknown;
+  session_id?: string;
+  returncode?: number;
+  error?: string;
+}
+
+/**
+ * Map the relay's JSON response into the tool result. On failure the relay
+ * sometimes returns `{ ok: false }` with the detail only in `result`/`returncode`
+ * and no `error` — which the agent loop would surface as the opaque "Tool
+ * returned success=false". Always populate a reason on failure so the model (and
+ * the failure telemetry) get something actionable (dev.md "Theme 1").
+ */
+export function buildLocalAgentResult(
+  parsed: RelayResponse,
+  screenshotUrls: string[],
+): { success: boolean; result: unknown; session_id: string; returncode: number; screenshot_urls?: string[]; error?: string } {
+  const ok = parsed.ok === true;
+  const result = parsed.result ?? '';
+  const returncode = parsed.returncode ?? -1;
+  const error = !ok
+    ? (typeof parsed.error === 'string' && parsed.error.trim()) ||
+      (typeof result === 'string' && result.trim()) ||
+      `Local agent task failed (returncode ${returncode})`
+    : typeof parsed.error === 'string'
+      ? parsed.error.trim()
+      : '';
+  return {
+    success: ok,
+    result,
+    session_id: parsed.session_id ?? '',
+    returncode,
+    ...(screenshotUrls.length > 0 ? { screenshot_urls: screenshotUrls } : {}),
+    ...(error ? { error } : {}),
+  };
+}
+
 async function getRelayConfig(): Promise<RelayConfig | null> {
   const { getSecret, secretExists } = await import('../utils/secretsManager');
   const env = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
@@ -302,14 +341,7 @@ This tool is read-only, browser-only. If the user asks for anything outside web 
       }
     }
 
-    return {
-      success: parsed.ok === true,
-      result: parsed.result ?? '',
-      session_id: parsed.session_id ?? '',
-      returncode: parsed.returncode ?? -1,
-      ...(screenshotUrls.length > 0 ? { screenshot_urls: screenshotUrls } : {}),
-      ...(parsed.error ? { error: parsed.error } : {}),
-    };
+    return buildLocalAgentResult(parsed, screenshotUrls);
   },
 });
 
