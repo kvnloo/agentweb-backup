@@ -1,3 +1,17 @@
+## Layer 4→5 closed: real Slack-reaction approval gate that stamps shippedAt (INCREMENT C1, 2026-06-14)
+
+The dev.md-named #1 learning-loop gap (2026-06-09): production `ApprovalGate` is `CaptureGate` (`loops/core/gates/captureGate.ts`), whose `pollDecision()` ALWAYS returns `pending` → `shippedAt` is never stamped → the attribution cron (`loops/core/learning/attribution.ts:143`, filter `decision.status in {approved,auto_shipped}` AND `shippedAt` set AND `verdict==null`) has nothing to grade → every loop sits at `pending_approval` forever.
+
+**Shipped:** `loops/core/gates/slackReactionGate.ts` — `SlackReactionGate implements ApprovalGate`. `requestApproval` posts the proposal DM via the injected `SlackPort` and returns a handle (`{channel, ts, approver}`). `pollDecision` reads reactions and resolves via the pure `resolveReactionDecision(reactions, approver, now)`: ✅ `white_check_mark` from the approver → `approved`; ❌ `x` → `denied`; none → `pending`. **Reject wins over approve** when both present (safety). Reactions from non-approvers ignored (matches the `slack.aiEvalReaction` handler convention + `awsAdapters.getReactions`). `settleDecision(store, loopId, mutation, decision)` performs the Layer-5 write: approved → appends a record with `decision=approved` + `shippedAt` stamped (the exact shape attribution grades); denied → record `decision=denied`, NO `shippedAt`; pending → no-op. Idempotent per proposal (in-process `settled` set) so a repeated poll never double-ships.
+
+**Assumptions to validate (NOT yet wired into the live runner):**
+- This PR ships the capability + tests, NOT a prod flip. `CaptureGate` is still the registered `agentModeGate`. The gate is gated behind `AGENT_MODE_SLACK_REACTION_GATE` (default OFF) via `buildAgentModeSlackReactionGate()` in `instances/agent-mode/index.ts`, which builds-but-does-not-register.
+- **Why deferred:** `createInstanceRunner` (`loops/core/instanceRunner.ts:48`) types its held `gate` as `CaptureGate` and `drain()`s it each tick to batch the digest DM. Promoting `SlackReactionGate` into the runner means restructuring that drain path — a separate, larger change with its own behavior-preserving proof. Doing it here would change the digest-batching behavior, which is out of C1's contained scope.
+- C2 (attribution reaches a verdict) depends on this gate's `settleDecision` actually running in prod, which depends on the runner-wiring PR above. Until then `shippedAt` is stamped only in tests.
+- Reaction polling is single-shot per `pollDecision` call; no long-poll. The watchdog cron cadence determines how fast an approval is observed — confirm the cron actually calls `pollDecision`+`settleDecision` once wired.
+
+---
+
 ## Live tool-failure telemetry — 227 failures classified; raw failure-rate OVERSTATES breakage (2026-06-13)
 
 Pulled actual error strings from `Dev-AW-LoopEvents` (failure events carry `dimensions.errorClass`/`errorMessage`; `agent_tool_invoked`/`agent_tool_succeeded` do NOT — a failure = invoked-without-a-matching-succeed, which is how the loop derives rates). 227 sampled failures classified by root cause. Confirms + makes empirical the Section-C "tool-list truncation" finding below and the 2026-06-11 #eng thread with Rui (June 9–12 window: 223 runs, 1,016 calls, 78 failures).
