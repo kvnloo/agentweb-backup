@@ -543,6 +543,66 @@ describe('s3Utils', () => {
 
       expect(mockGetObject).toHaveBeenCalledWith({ Bucket: 'agentweb-user-files', Key: 'file.txt' });
     });
+
+    it('retries a transient error then succeeds (behavior preserved on success)', async () => {
+      const transient = Object.assign(new Error('throttled'), { code: 'Throttling' });
+      mockGetObject
+        .mockReturnValueOnce({ promise: () => Promise.reject(transient) })
+        .mockReturnValueOnce({ promise: () => Promise.resolve({ Body: Buffer.from('recovered') }) });
+
+      const noSleep = jest.fn(() => Promise.resolve());
+      const result = await getS3ObjectAsString('flaky.txt', 'test-bucket', { sleep: noSleep });
+
+      expect(result).toBe('recovered');
+      expect(mockGetObject).toHaveBeenCalledTimes(2);
+      expect(noSleep).toHaveBeenCalledTimes(1);
+    });
+
+    it('retries 5xx server errors with backoff', async () => {
+      const serverErr = Object.assign(new Error('internal'), { statusCode: 503 });
+      mockGetObject
+        .mockReturnValueOnce({ promise: () => Promise.reject(serverErr) })
+        .mockReturnValueOnce({ promise: () => Promise.reject(serverErr) })
+        .mockReturnValueOnce({ promise: () => Promise.resolve({ Body: Buffer.from('ok') }) });
+
+      const noSleep = jest.fn(() => Promise.resolve());
+      const result = await getS3ObjectAsString('flaky.txt', 'test-bucket', { sleep: noSleep });
+
+      expect(result).toBe('ok');
+      expect(mockGetObject).toHaveBeenCalledTimes(3);
+    });
+
+    it('does NOT retry terminal NoSuchKey errors', async () => {
+      const notFound = Object.assign(new Error('The specified key does not exist.'), { code: 'NoSuchKey' });
+      mockGetObject.mockReturnValue({ promise: () => Promise.reject(notFound) });
+
+      const noSleep = jest.fn(() => Promise.resolve());
+      await expect(getS3ObjectAsString('gone.txt', 'test-bucket', { sleep: noSleep })).rejects.toThrow('key does not exist');
+      expect(mockGetObject).toHaveBeenCalledTimes(1);
+      expect(noSleep).not.toHaveBeenCalled();
+    });
+
+    it('does NOT retry terminal AccessDenied errors', async () => {
+      const denied = Object.assign(new Error('Access Denied'), { code: 'AccessDenied' });
+      mockGetObject.mockReturnValue({ promise: () => Promise.reject(denied) });
+
+      const noSleep = jest.fn(() => Promise.resolve());
+      await expect(getS3ObjectAsString('denied.txt', 'test-bucket', { sleep: noSleep })).rejects.toThrow('Access Denied');
+      expect(mockGetObject).toHaveBeenCalledTimes(1);
+    });
+
+    it('gives up after maxRetries on persistent transient errors', async () => {
+      const transient = Object.assign(new Error('timeout'), { code: 'TimeoutError' });
+      mockGetObject.mockReturnValue({ promise: () => Promise.reject(transient) });
+
+      const noSleep = jest.fn(() => Promise.resolve());
+      await expect(
+        getS3ObjectAsString('flaky.txt', 'test-bucket', { maxRetries: 2, sleep: noSleep }),
+      ).rejects.toThrow('timeout');
+      // initial attempt + 2 retries = 3 calls
+      expect(mockGetObject).toHaveBeenCalledTimes(3);
+      expect(noSleep).toHaveBeenCalledTimes(2);
+    });
   });
 
   describe('uploadScreenshotToS3', () => {

@@ -3616,6 +3616,14 @@ export class AgentModeService {
     'install_skills',
     'list_available_skills',
     'resolve_skill',
+    // S3 overflow retrieval is infrastructure, not a skill: whenever a tool result
+    // is offloaded to S3 the model is handed a "[Full response stored at S3 key: ...]"
+    // pointer and MUST be able to resolve it. A DB `foundation_tools` setting that
+    // omitted these made the tools "not available", which was the #2 production
+    // failure mode for search/read_tool_response. Force-merge them so no config can
+    // strip them.
+    'search_tool_response',
+    'read_tool_response',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
@@ -5386,6 +5394,20 @@ export class AgentModeService {
     }
   }
 
+  /**
+   * Classify an S3 retrieve error as "the object/key is gone" (terminal-for-this-key)
+   * vs a real unexpected error. Checks both the AWS error code and the message text so
+   * variants like code `AccessDenied` / message "Access Denied" are both caught.
+   */
+  private isS3MissingError(error: unknown): boolean {
+    const code = (error as any)?.code || (error as any)?.name || '';
+    const msg = error instanceof Error ? error.message : String(error ?? '');
+    const terminal = ['NoSuchKey', 'NoSuchBucket', 'AccessDenied', 'AllAccessDisabled'];
+    if (terminal.includes(code)) return true;
+    const normalized = msg.replace(/\s+/g, '');
+    return terminal.some((t) => msg.includes(t) || normalized.includes(t));
+  }
+
   private async executeSearchToolResponse(args: {
     s3_key: string;
     query: string;
@@ -5405,7 +5427,18 @@ export class AgentModeService {
     try {
       const content = await getS3ObjectAsString(s3_key);
       if (!content) {
-        return { success: false, message: 'Empty response from S3' };
+        // Empty stored object is not an execution failure — return a graceful,
+        // model-actionable empty result so it isn't counted as a tool failure.
+        return {
+          success: true,
+          query,
+          total_matches_found: 0,
+          match_offset: matchOffset,
+          matches_returned: 0,
+          total_size: 0,
+          matches: [],
+          message: 'The stored tool response is empty. There is nothing to search; proceed using the in-context preview or re-run the source tool if you need the data.',
+        };
       }
 
       const queryLower = query.toLowerCase();
@@ -5434,18 +5467,29 @@ export class AgentModeService {
         match_offset: matchOffset,
         matches_returned: matches.length,
         total_size: content.length,
+        // Zero matches is a valid, non-error outcome — guide the model rather than
+        // letting it treat an empty match list as a failure.
+        ...(allOffsets.length === 0
+          ? { message: `No matches for "${query}" in the stored response (${content.length} chars). Try a different search term, or use read_tool_response to page through the raw content.` }
+          : {}),
         matches,
       };
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : 'Unknown error';
-      const isFatal = errMsg.includes('NoSuchBucket') || errMsg.includes('AccessDenied') || errMsg.includes('NoSuchKey');
-      if (isFatal) {
+      const isMissing = this.isS3MissingError(error);
+      if (isMissing) {
+        // The key is gone/expired. This is not a transient bug — surface it as a
+        // graceful, terminal-for-this-key signal (success: true so it is not counted
+        // as a tool failure) with a clear instruction to stop retrying this key.
         return {
-          success: false,
-          fatal: true,
-          message: `S3 access failed (${errMsg}). The tool-response data is no longer available. Do NOT retry search_tool_response or read_tool_response for this key. Summarize what you know from the in-context preview and proceed.`,
+          success: true,
+          not_found: true,
+          total_matches_found: 0,
+          matches: [],
+          message: `The tool-response data for this S3 key is no longer available (${errMsg}). Do NOT retry search_tool_response or read_tool_response for this key. Summarize what you know from the in-context preview, or re-run the original source tool to regenerate the data.`,
         };
       }
+      // Unexpected/transient error after retries exhausted — this IS a real failure.
       return {
         success: false,
         message: `Failed to search tool response: ${errMsg}`,
@@ -5469,7 +5513,17 @@ export class AgentModeService {
     try {
       const content = await getS3ObjectAsString(s3_key);
       if (!content) {
-        return { success: false, message: 'Empty response from S3' };
+        // Empty stored object is not an execution failure — graceful empty result.
+        return {
+          success: true,
+          char_offset: charOffset,
+          chars_returned: 0,
+          total_size: 0,
+          has_more: false,
+          next_offset: charOffset,
+          content: '',
+          message: 'The stored tool response is empty. There is nothing to read; proceed using the in-context preview or re-run the source tool if you need the data.',
+        };
       }
 
       const slice = content.slice(charOffset, charOffset + charLength);
@@ -5480,18 +5534,27 @@ export class AgentModeService {
         total_size: content.length,
         has_more: charOffset + charLength < content.length,
         next_offset: charOffset + slice.length,
+        // A char_offset past the end yields an empty slice — guide the model instead
+        // of returning a bare empty string it might misread as a failure.
+        ...(slice.length === 0
+          ? { message: `char_offset ${charOffset} is at or beyond the end of the response (total_size ${content.length}). The full content has already been read.` }
+          : {}),
         content: slice,
       };
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : 'Unknown error';
-      const isFatal = errMsg.includes('NoSuchBucket') || errMsg.includes('AccessDenied') || errMsg.includes('NoSuchKey');
-      if (isFatal) {
+      const isMissing = this.isS3MissingError(error);
+      if (isMissing) {
+        // Key gone/expired — graceful terminal-for-this-key signal, not a failure.
         return {
-          success: false,
-          fatal: true,
-          message: `S3 access failed (${errMsg}). The tool-response data is no longer available. Do NOT retry read_tool_response or search_tool_response for this key. Summarize what you know from the in-context preview and proceed.`,
+          success: true,
+          not_found: true,
+          chars_returned: 0,
+          content: '',
+          message: `The tool-response data for this S3 key is no longer available (${errMsg}). Do NOT retry read_tool_response or search_tool_response for this key. Summarize what you know from the in-context preview, or re-run the original source tool to regenerate the data.`,
         };
       }
+      // Unexpected/transient error after retries exhausted — this IS a real failure.
       return {
         success: false,
         message: `Failed to read tool response: ${errMsg}`,
