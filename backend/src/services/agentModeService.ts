@@ -16609,35 +16609,73 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     'update_html_file': { fields: ['html_content', 'css_content'], limit: 200 },
   };
 
+  /**
+   * Per-array memo of the linear index scan (`toolIndices` + the
+   * `tool_call_id -> tool message index` map). The original implementation
+   * re-derived `oldAssistantIndices` with a nested forward scan (O(n^2) per
+   * call) and was invoked once per loop iteration on a monotonically-growing
+   * `messages` array, making a full session O(n^2) overall. This WeakMap caches
+   * the linear-scan results keyed by array identity so subsequent calls on the
+   * same (append-only) array only scan the newly-appended tail. It is purely
+   * derived data validated by length below; it never changes the output.
+   */
+  private readonly _trimScanMemo: WeakMap<object, { length: number; toolIndices: number[]; toolIdToIndex: Map<string, number> }> = new WeakMap();
+
   trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
-    // Find indices of all tool-role messages
-    const toolIndices: number[] = [];
-    for (let i = 0; i < messages.length; i++) {
-      if (messages[i].role === 'tool') {
-        toolIndices.push(i);
+    // Reuse the cached linear scan when the same array reference is passed again
+    // and has only grown (the AgentMode loop appends; it never reorders/removes).
+    // The scan is rebuilt from scratch on any reference/shrink mismatch, so a
+    // stale memo can never corrupt output — worst case is one O(n) recompute.
+    const cached = this._trimScanMemo.get(messages);
+    let toolIndices: number[];
+    let toolIdToIndex: Map<string, number>;
+    if (cached && cached.length <= messages.length) {
+      toolIndices = cached.toolIndices;
+      toolIdToIndex = cached.toolIdToIndex;
+      // Scan only the appended tail.
+      for (let i = cached.length; i < messages.length; i++) {
+        if (messages[i].role === 'tool') {
+          toolIndices.push(i);
+          const tcid = messages[i].tool_call_id;
+          if (tcid !== undefined && !toolIdToIndex.has(tcid)) toolIdToIndex.set(tcid, i);
+        }
+      }
+    } else {
+      // Full linear scan: collect tool-role indices and map each tool_call_id to
+      // the index of its (first) resolving tool message.
+      toolIndices = [];
+      toolIdToIndex = new Map<string, number>();
+      for (let i = 0; i < messages.length; i++) {
+        if (messages[i].role === 'tool') {
+          toolIndices.push(i);
+          const tcid = messages[i].tool_call_id;
+          if (tcid !== undefined && !toolIdToIndex.has(tcid)) toolIdToIndex.set(tcid, i);
+        }
       }
     }
+    this._trimScanMemo.set(messages, { length: messages.length, toolIndices, toolIdToIndex });
 
     if (toolIndices.length <= recentToPreserve) return messages;
 
     // Most recent N tool results: keep at full size
     const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
 
-    // Track which assistant messages are "old" (all their tool_calls have been resolved
-    // and are not in the preserve set). We identify these to trim large argument fields.
+    // Track which assistant messages are "old" (none of their tool_calls resolve
+    // to a preserved tool result after them). We trim large argument fields on these.
+    // The precomputed tool_call_id -> index map replaces the original per-assistant
+    // forward scan with O(1) lookups, eliminating the nested loop while preserving
+    // the exact predicate: a resolving tool result must exist, sit at an index > i,
+    // and be in preserveSet for the assistant to be considered "recent" (not old).
     const oldAssistantIndices = new Set<number>();
     for (let i = 0; i < messages.length; i++) {
       const msg = messages[i];
       if (msg.role === 'assistant' && msg.tool_calls?.length) {
-        // Find the tool result indices for this assistant message's tool calls
-        const toolCallIds = new Set(msg.tool_calls.map((tc: any) => tc.id));
         let allOld = true;
-        for (let j = i + 1; j < messages.length; j++) {
-          if (messages[j].role === 'tool' && toolCallIds.has(messages[j].tool_call_id)) {
-            if (preserveSet.has(j)) {
-              allOld = false;
-              break;
-            }
+        for (const tc of msg.tool_calls) {
+          const resolvedIdx = toolIdToIndex.get(tc.id);
+          if (resolvedIdx !== undefined && resolvedIdx > i && preserveSet.has(resolvedIdx)) {
+            allOld = false;
+            break;
           }
         }
         if (allOld) {
