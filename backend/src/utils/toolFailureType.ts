@@ -68,18 +68,13 @@ export function classifyToolFailureType(errorClass?: string, errorMessage?: stri
   const cls = (errorClass || '').toLowerCase();
   const msg = errorMessage || '';
 
-  // 1. Model called a tool that isn't installed. Message-driven: pre-classifier
-  //    events threw a plain Error so errorClass carried no signal; the
-  //    'tool_unavailable' class (added 2026-06-14) now carries it directly.
-  //    Checked first so the "required skill" wording is never mistaken for a
-  //    schema reject.
-  if (cls === 'tool_unavailable' || UNINSTALLED_RE.test(msg)) return 'model_uninstalled_tool';
+  // 1. Model called a tool that isn't installed. Message-driven: these throw a
+  //    plain Error, so errorClass carries no signal. Checked first so the
+  //    "required skill" wording is never mistaken for a schema reject.
+  if (UNINSTALLED_RE.test(msg)) return 'model_uninstalled_tool';
 
-  // 2. Working-as-designed: a policy/validator deliberately rejected the call,
-  //    or an upstream returned a benign empty result. 'upstream_rejected' =
-  //    provider business-rule refusal (LinkedIn cadence); 'empty_result' = the
-  //    call succeeded but yielded no data — neither is a tool bug.
-  if (cls === 'policy_blocked' || cls === 'upstream_rejected' || cls === 'empty_result') return 'by_design';
+  // 2. Working-as-designed: a policy/validator deliberately rejected the call.
+  if (cls === 'policy_blocked') return 'by_design';
   if (BY_DESIGN_RE.test(msg)) return 'by_design';
 
   // 3. Arguments rejected by schema validation before execution.

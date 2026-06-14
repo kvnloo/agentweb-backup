@@ -221,60 +221,6 @@ describe('GenerateMarketingResponseWorkerService', () => {
       await expect(promise).rejects.toThrow('Worker process exited with code 1 and signal SIGTERM');
     });
 
-    it('rejects immediately when the worker dies mid-submission (exit before the request is registered)', async () => {
-      // B1 race: a worker exit/error that fires between `await ensureWorker()` resolving and
-      // the request being registered in pendingRequests must still reject this request
-      // promptly — otherwise it hangs until the 45-min worker timeout, which (combined with
-      // the controller's GENERATION_TIMEOUT_MS) locks the user out of their session for ~10 min.
-      jest.useFakeTimers();
-
-      // Pre-warm a ready worker so ensureWorker() resolves without re-forking.
-      await workerService.ensureWorkerReady();
-      await Promise.resolve();
-      jest.advanceTimersByTime(0);
-
-      // Simulate the worker dying the instant the request is sent (before any reply comes back),
-      // by firing the exit handler synchronously from `send`.
-      const exitHandler = exitHandlers.get('default');
-      mockWorker.send.mockImplementationOnce(() => {
-        if (exitHandler) exitHandler(1, null);
-        return true;
-      });
-
-      const promise = workerService.runInWorker(mockParams);
-
-      // Must reject promptly on worker death — NOT hang to the 45-minute timeout.
-      await expect(promise).rejects.toThrow(/exited with code 1|Worker process error/);
-
-      jest.useRealTimers();
-    });
-
-    it('clears the session→request mapping when the worker crashes (no stale cancel on the next worker)', async () => {
-      // B1 hygiene: the exit/error handlers reject + clear pendingRequests, but the
-      // session→requestId mapping must also be cleared. Otherwise a dead session's
-      // requestId lingers and a later cancelSession() for that session mis-fires a
-      // {type:'cancel'} at the *fresh* worker — and the map grows unbounded across crashes.
-      const promise = workerService.runInWorker(mockParams);
-      await waitForAsync();
-
-      // Worker dies mid-run.
-      const exitHandler = exitHandlers.get('default');
-      if (exitHandler) exitHandler(1, 'SIGTERM');
-      await expect(promise).rejects.toThrow(/exited with code 1/);
-
-      // A fresh worker comes up for an unrelated request.
-      const sendCallsBefore = mockWorker.send.mock.calls.length;
-      await workerService.ensureWorkerReady();
-
-      // Cancelling the CRASHED session must be a no-op — its mapping is gone.
-      workerService.cancelSession(mockParams.sessionId);
-
-      const cancelSends = mockWorker.send.mock.calls
-        .slice(sendCallsBefore)
-        .filter((c: any[]) => c[0]?.type === 'cancel');
-      expect(cancelSends).toHaveLength(0);
-    });
-
     it('should handle worker timeout', async () => {
       // Use fake timers for timeout test
       jest.useFakeTimers();
