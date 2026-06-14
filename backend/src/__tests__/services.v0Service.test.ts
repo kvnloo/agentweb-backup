@@ -120,6 +120,20 @@ jest.mock("fs", () => ({
   readFileSync: (...args: any[]) => mockFsReadFileSync(...args),
 }));
 
+// Mock managed-subdomain assignment so tests can assert it's called (root pages)
+// or skipped (sub-pages) without hitting the real Vercel domains API.
+const mockAddSubdomain = jest
+  .fn()
+  .mockResolvedValue({ domain: "healed-root.agentwebforms.com" });
+const mockGenerateSubdomain = jest.fn((...args: any[]) => {
+  const name = args[0] as string | undefined;
+  return (name || "page").toLowerCase().replace(/[^a-z0-9]+/g, "-");
+});
+jest.mock("../services/customDomainService", () => ({
+  addSubdomain: (...args: any[]) => mockAddSubdomain(...args),
+  generateSubdomain: (...args: any[]) => mockGenerateSubdomain(...args),
+}));
+
 import {
   buildBrandEnrichedPrompt,
   generateLandingPage,
@@ -882,6 +896,54 @@ describe("v0Service - getDeploymentStatus (auto-heal URL verification)", () => {
 
     expect(result.status).toBe("deployed");
     expect(mockUpdate).toHaveBeenCalledTimes(1);
+    // Sub-pages inherit the root's subdomain — healing one must NOT assign a new one.
+    expect(mockAddSubdomain).not.toHaveBeenCalled();
+  });
+
+  // A ROOT page that healed failed→deployed here never ran the first-build
+  // post-deploy subdomain assignment, so it was stuck on its raw *.vercel.app URL.
+  // The heal path must now assign the managed subdomain.
+  const failedRootPage = {
+    id: "root-1",
+    userId: "user-1",
+    name: "Acme Root",
+    status: "failed",
+    siteId: "root-1", // root: siteId === id
+    isRootPage: true,
+    vercelProjectId: "prj_root123",
+    deployedUrl: "https://lp-acme-root-root1.vercel.app",
+    // no customDomainUrl — never got a managed subdomain
+  };
+
+  it("SUCCESS: root page healed failed→deployed without a custom domain → assigns the managed subdomain", async () => {
+    mockAddSubdomain.mockResolvedValue({ domain: "acme-root.agentwebforms.com" });
+    mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: failedRootPage }) });
+    mockAxiosGet.mockResolvedValueOnce({
+      data: { deployments: [{ uid: "dpl_ready", readyState: "READY" }] },
+    });
+    mockAxiosGet.mockResolvedValueOnce({ status: 200, data: "<html>ok</html>" });
+
+    const result = await getDeploymentStatus("root-1", "user-1");
+
+    expect(result.status).toBe("deployed");
+    expect(mockAddSubdomain).toHaveBeenCalled();
+  });
+
+  it("does NOT re-assign a subdomain when the healed root already has a customDomainUrl", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: { ...failedRootPage, customDomainUrl: "https://acme-root.agentwebforms.com" },
+        }),
+    });
+    mockAxiosGet.mockResolvedValueOnce({
+      data: { deployments: [{ uid: "dpl_ready", readyState: "READY" }] },
+    });
+    mockAxiosGet.mockResolvedValueOnce({ status: 200, data: "<html>ok</html>" });
+
+    await getDeploymentStatus("root-1", "user-1");
+
+    expect(mockAddSubdomain).not.toHaveBeenCalled();
   });
 });
 

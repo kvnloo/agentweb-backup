@@ -1442,31 +1442,7 @@ export async function deployLandingPage(
     // page on its raw *.vercel.app URL permanently (≈30% of deployed pages showed
     // "vercel junk" instead of the clean subdomain). addSubdomain already handles
     // 409 collisions; withRetry covers fetch-failed/5xx/timeout.
-    let customDomain: string | undefined;
-    try {
-      const subdomain = generateSubdomain(record.name || "page");
-      const domainRecord = await withRetry(
-        () => addSubdomain(userId, vercelProjectId, subdomain),
-        "assign subdomain"
-      );
-      customDomain = domainRecord.domain;
-      console.log(`[V0 SERVICE] Auto-assigned subdomain: ${customDomain}`);
-      // Persist customDomainUrl so it's available on subsequent fetches without relying on enrichment
-      await dynamodb
-        .update({
-          TableName: TABLE_NAME,
-          Key: { id },
-          UpdateExpression: "SET customDomainUrl = :customUrl, updatedAt = :updatedAt",
-          ExpressionAttributeValues: {
-            ":customUrl": `https://${customDomain}`,
-            ":updatedAt": new Date().toISOString(),
-          },
-        })
-        .promise();
-    } catch (subdomainErr: any) {
-      // Non-fatal — the Vercel URL still works
-      console.warn(`[V0 SERVICE] Could not auto-assign subdomain: ${subdomainErr.message}`);
-    }
+    const customDomain = await assignManagedSubdomain(id, userId, vercelProjectId, record.name);
 
     // Auto-configure GSC domain + GA4 property when deployed to a managed subdomain
     if (customDomain) {
@@ -2145,6 +2121,47 @@ async function isLandingPageUrlLive(url?: string): Promise<boolean> {
 }
 
 /**
+ * Assign a managed agentwebforms.com subdomain to a root site's Vercel project and
+ * persist `customDomainUrl`. Retried: a transient Vercel domains-API blip here used
+ * to be swallowed, leaving the page on its raw *.vercel.app URL permanently
+ * (≈30% of deployed pages showed "vercel junk" instead of the clean subdomain).
+ * `addSubdomain` already handles 409 collisions; `withRetry` covers
+ * fetch-failed/5xx/timeout. Non-fatal — the Vercel URL still works if this throws.
+ * Returns the assigned domain (no scheme) or undefined.
+ */
+async function assignManagedSubdomain(
+  id: string,
+  userId: string,
+  vercelProjectId: string,
+  name: string | undefined
+): Promise<string | undefined> {
+  try {
+    const subdomain = generateSubdomain(name || "page");
+    const domainRecord = await withRetry(
+      () => addSubdomain(userId, vercelProjectId, subdomain),
+      "assign subdomain"
+    );
+    const customDomain = domainRecord.domain;
+    console.log(`[V0 SERVICE] Auto-assigned subdomain: ${customDomain}`);
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "SET customDomainUrl = :customUrl, updatedAt = :updatedAt",
+        ExpressionAttributeValues: {
+          ":customUrl": `https://${customDomain}`,
+          ":updatedAt": new Date().toISOString(),
+        },
+      })
+      .promise();
+    return customDomain;
+  } catch (subdomainErr: any) {
+    console.warn(`[V0 SERVICE] Could not auto-assign subdomain: ${subdomainErr.message}`);
+    return undefined;
+  }
+}
+
+/**
  * Get the current deployment status and build logs for a landing page.
  * Exposed as a tool so Emma can check on builds.
  */
@@ -2197,6 +2214,14 @@ export async function getDeploymentStatus(
         }).promise();
       } catch (_e) {
         // Best-effort — don't block the status response
+      }
+      // A root page healed from failed→deployed here never ran the post-deploy
+      // subdomain assignment (that only fires on a first-try success), so it stayed
+      // on its raw *.vercel.app URL. Assign the managed subdomain now. Root-only:
+      // sub-pages inherit the root's subdomain; skipped if one is already attached.
+      const isRoot = record.isRootPage || record.siteId === record.id || !record.slug;
+      if (isRoot && !record.customDomainUrl && record.vercelProjectId) {
+        await assignManagedSubdomain(record.id, userId, record.vercelProjectId, record.name);
       }
       return {
         status: "deployed",
