@@ -321,6 +321,24 @@ export async function triggerBrandBuildForUser(
   const companyName = pickCompanyName(user);
   const goal = pickGoal(user);
 
+  // WS3 (flag-gated via SLACK_CONNECT_ENABLED, OFF by default): provision a
+  // Slack Connect channel for this account. Best-effort + fire-and-forget —
+  // never blocks the brand build, and inert until the flag + a bot token with
+  // the conversations.connect scope are configured. See slackConnectService.
+  void (async () => {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { provisionOnboardingSlackConnect } = require("./slackConnectService");
+      await provisionOnboardingSlackConnect({
+        userId,
+        companyName,
+        companyEmail: (user as any).email ?? "",
+      });
+    } catch {
+      /* best-effort */
+    }
+  })();
+
   // Resolve deps lazily so importing this module in tests doesn't pull
   // agentModeController + chatbotService.
   const { createChatSession, generateSessionResponse } = {
