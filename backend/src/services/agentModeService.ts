@@ -10,6 +10,7 @@ import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotSe
 import { rankMemoriesByRelevance } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
+import { computeTermination } from './agentMode/core/agentStep';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
@@ -2724,34 +2725,41 @@ export class AgentModeService {
         if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
           // No tool calls — check WHY the model stopped
 
-          if (finishReason === 'length' && maxTokensContinuations < MAX_TOKEN_CONTINUATIONS) {
-            // Model hit max_tokens and was truncated — ask it to continue
-            maxTokensContinuations++;
+          // Termination decision extracted into a PURE core module (strangler seam #1).
+          // The decision ladder (max_tokens continuation -> content-filter canned
+          // message -> empty-synthesis nudge -> final) lives in core/termination.ts;
+          // the loop here applies the returned counter deltas, inject messages, and
+          // canned content, preserving identical behavior (proven by the
+          // characterization harness). Logging is kept inline so log output is unchanged.
+          const termination = computeTermination({
+            finishReason,
+            stopReason,
+            content,
+            toolCallsSoFar: toolCalls.length,
+            maxTokensContinuations,
+            maxTokenContinuationsLimit: MAX_TOKEN_CONTINUATIONS,
+            emptySynthesisRetries,
+            maxEmptySynthesisRetries: MAX_EMPTY_SYNTHESIS_RETRIES,
+          });
+          maxTokensContinuations += termination.counterDelta.maxTokensContinuations;
+          emptySynthesisRetries += termination.counterDelta.emptySynthesisRetries;
+          if (termination.contentIfEmpty !== undefined && !content) {
+            content = termination.contentIfEmpty;
+          }
+
+          if (termination.reason === 'max_tokens_continuation') {
             console.warn(`AgentMode: Response truncated (max_tokens) in session ${sessionId}, continuation ${maxTokensContinuations}/${MAX_TOKEN_CONTINUATIONS}`);
-            (messages as any[]).push({
-              role: 'user',
-              content: '[SYSTEM] Your previous response was cut off because it exceeded the token limit. Please continue exactly where you left off.'
-            });
+            (messages as any[]).push({ role: 'user', content: termination.injectMessage });
             continue;
           }
 
           if (finishReason === 'content_filter' || stopReason === 'guardrail_intervened' || stopReason === 'content_filtered') {
             console.warn(`AgentMode: Response blocked by content filter in session ${sessionId}, reason: ${stopReason || finishReason}`);
-            if (!content) {
-              content = "I'm unable to complete this request due to content safety guidelines. Please try rephrasing your request.";
-            }
           }
 
-          // If the model returned empty text but tool calls ran earlier this session,
-          // it skipped the synthesis step (observed with Gemini extended-thinking on
-          // large contexts). Nudge it once to produce the final response.
-          if (!content && toolCalls.length > 0 && emptySynthesisRetries < MAX_EMPTY_SYNTHESIS_RETRIES) {
-            emptySynthesisRetries++;
+          if (termination.reason === 'empty_synthesis_retry') {
             console.warn(`AgentMode: Empty response after ${toolCalls.length} tool calls in session ${sessionId} — injecting synthesis prompt (retry ${emptySynthesisRetries}/${MAX_EMPTY_SYNTHESIS_RETRIES})`);
-            (messages as any[]).push({
-              role: 'user',
-              content: '[SYSTEM] You have gathered all the necessary data. Please now synthesize the information and provide your complete final response to the user.'
-            });
+            (messages as any[]).push({ role: 'user', content: termination.injectMessage });
             continue;
           }
 
