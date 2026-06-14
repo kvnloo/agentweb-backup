@@ -1,3 +1,22 @@
+## C2 — approval→attribution→verdict path verified end-to-end; found + fixed a `computeLoopHealth` stall (2026-06-14)
+
+Verified WS-C2 ("attribution reaches a verdict"): drove the real Layer-4→5 approval write (`recordLoopApproval`, the C1 gate contract — stamps `decision=approved` + `shippedAt`) → elapsed the settle window → ran the generic `runAttribution`. The grading path itself works: a verdict (`improved`/`regressed`) is computed and appended to the learning store, and the dedup is idempotent (a second pass writes nothing). New end-to-end mocked test: `backend/src/__tests__/loops.c2.approvalToVerdict.test.ts` (in-memory learning store + fake sensor, zero network).
+
+**But the loop never visibly came off `pending_approval`, which is the AC.** Root cause = the learning store is **append-only**: one logical proposal accumulates a `pending` row → an `approved`+`shippedAt` row (from `recordLoopApproval`) → a graded `verdict` row. `computeLoopHealth` (`loops/core/health.ts`) counted EVERY matching row, so:
+- the original `pending` row kept counting as `pendingApproval` even after the ✅ → state stuck at `pending_approval` forever; and
+- the pre-verdict `approved`+`shippedAt` row kept counting as `inFlight` even after grading → state stuck at `in_flight`, never reaching `learned`.
+
+`GET /api/admin/loops/health` reads with no status filter (`loopHealthService` → `queryHistory({loopId})`), and both `InMemoryLearningStore` and `DynamoLearningStore` return all rows — so this misreport is real in prod, not a test artifact.
+
+**Fix (behavior-preserving, pure):** in `computeLoopHealth`, de-dup by proposal/mutation id — count a `pending` row only if no later row has resolved that proposal (approved/auto_shipped/shipped/graded), and count an `in_flight` row only if no graded verdict exists for it. Each logical proposal is now summarized by its furthest-progressed row. All 22 existing `loops.health.test.ts` cases stay green (single-row states are unaffected — there's no later row to supersede them).
+
+**Assumptions to validate:**
+- The attribution **scheduling** wasn't exercised here (this drives `runAttribution` directly); `loopAttributionCron` already iterates manifests + skips paused loops (covered by `loops.attributionCron.test.ts`). The settle-window gating is `runAttribution`'s own logic.
+- C1 (the Slack-reaction `ApprovalGate` that calls `recordLoopApproval` on a ✅) is **not yet landed on `harsha/swarm`** — production gate is still `CaptureGate` (`pollDecision` always `pending`). This test builds against the documented C1 contract (the persistence primitive `recordLoopApproval` that produces `approved`+`shippedAt`). Once C1 lands, its gate must call that primitive for the health transition to fire in prod.
+- The health de-dup keys on `proposalId ?? mutationId`, matching attribution's own `recordKey`. If a future loop emits rows with neither id, those rows can't be de-duped (they fall back to counting as-is) — acceptable since every current emitter sets a proposal.
+
+---
+
 ## Live tool-failure telemetry — 227 failures classified; raw failure-rate OVERSTATES breakage (2026-06-13)
 
 Pulled actual error strings from `Dev-AW-LoopEvents` (failure events carry `dimensions.errorClass`/`errorMessage`; `agent_tool_invoked`/`agent_tool_succeeded` do NOT — a failure = invoked-without-a-matching-succeed, which is how the loop derives rates). 227 sampled failures classified by root cause. Confirms + makes empirical the Section-C "tool-list truncation" finding below and the 2026-06-11 #eng thread with Rui (June 9–12 window: 223 runs, 1,016 calls, 78 failures).
