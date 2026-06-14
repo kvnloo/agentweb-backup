@@ -171,4 +171,34 @@ describe("generateAdImagesForUser — negative examples + concept stamp", () => 
       expect(p).not.toContain("REJECTED");
     }
   });
+
+  it("loads global directives via the injected loader and uses them in prompts", async () => {
+    const gen = new FakeGen();
+    await generateAdImagesForUser(creativeDir, brand, [persona], "user-1", {
+      imageGen: gen as any,
+      loadTemplate: fakeLoadTemplate as any,
+      loadGlobalDirectives: async () => ({
+        styleSpec: "STORE-SOURCED STYLE",
+        hardConstraints: "- STORE CONSTRAINT",
+      }),
+    });
+    for (const p of gen.lastPrompts) {
+      expect(p).toContain("STORE-SOURCED STYLE");
+      expect(p).toContain("HARD CONSTRAINTS:\n- STORE CONSTRAINT");
+    }
+  });
+
+  it("falls back to DEFAULT_IMAGE_* when the directives loader throws", async () => {
+    const gen = new FakeGen();
+    await generateAdImagesForUser(creativeDir, brand, [persona], "user-1", {
+      imageGen: gen as any,
+      loadTemplate: fakeLoadTemplate as any,
+      loadGlobalDirectives: async () => {
+        throw new Error("store down");
+      },
+    });
+    for (const p of gen.lastPrompts) {
+      expect(p).toContain(DEFAULT_IMAGE_STYLE_SPEC);
+    }
+  });
 });
