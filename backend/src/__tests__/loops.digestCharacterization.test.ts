@@ -239,8 +239,10 @@ describe('loop digest characterization (exact rendered text)', () => {
       );
     });
 
-    it('returns null and posts nothing when ONBOARDING_LOOP_V2 is off', async () => {
-      delete process.env.ONBOARDING_LOOP_V2;
+    it('returns null and posts nothing when V2 is explicitly disabled (ONBOARDING_LOOP_V2=false rollback)', async () => {
+      // Post-cutover V2 is live by default; the off-path is the explicit
+      // rollback flag (or opting the legacy heartbeat back in).
+      process.env.ONBOARDING_LOOP_V2 = 'false';
       const result = await runOnboardingLoopV2Once();
       expect(result).toBeNull();
       expect(slackPosts).toHaveLength(0);
