@@ -1,3 +1,25 @@
+## "Emma Dev" Slack chirping — agent-mode reliability loop DM'd Harsha on EVERY run, killed (2026-06-14)
+
+**Symptom:** a recurring "Emma Dev" Slack DM chirp that only ever came from the **AI Reliability loop** (the agent-mode tool-reliability loop), arriving at seemingly **random** times with no obvious source.
+
+**Where it came from:** the "Emma Dev" sender is the backend's `SLACK_BOT_TOKEN` Slack app (`loops/adapters/awsAdapters.ts` `awsSlackAdapter` → `chat.postMessage`). `server.ts:700` schedules the agent-mode tool-reliability loop behind `AGENT_MODE_LOOP_ENABLED` (on in prod): each booting process does `setTimeout(→ next 17:30 UTC)` then `setInterval(24h)`. After each run, `loops/instances/agent-mode/index.ts` `onRunComplete` called `postLoopDigest(...)`, which DMs `manifest.approval.slackUserId` (`U08TM4QFQ1L` = Harsha). That digest is the chirp.
+
+**Why it chirped (the "for some reason"):**
+1. **Only this loop is both scheduled AND enabled in prod.** Siblings `ai-eval` (`AI_EVAL_LOOP_ENABLED`), `ai-readiness` (`AI_READINESS_LOOP_ENABLED`), and `onboarding-v2` (`ONBOARDING_LOOP_V2`) are env-gated off, so they never fire. Only `AGENT_MODE_LOOP_ENABLED` is on.
+2. **It DM'd unconditionally, even on empty/quiet windows.** `postLoopDigest`/`buildLoopDigestLines` (`loops/core/digest/loopDigest.ts`) always renders a message. `ai-eval` guards its post with `if (drained.length > 0 || result.eventsScanned > 0)`; agent-mode had **no such guard** (only `if (drained === null) return`, and `drained` is never null because the loop holds a `CaptureGate`). The recorder that feeds it is gated *separately* by `AGENT_RUNTIME_SPINE_ENABLED` (off in prod), so every run scanned **0 events** and still fired the "_No agent-mode tool events… not 'healthy', just empty_" DM. Pure noise content.
+
+**Why it felt RANDOM (the part the first writeup missed) — no daily-dedup claim + multi-process prod:** `ai-readiness` wraps its DM in `claimDailyDigestPost()` (`ai-readiness-funnel/index.ts:285`) — a DynamoDB conditional `put` keyed on `(digestDate, slackUserId)`, so only ONE poster per calendar day wins and every other process gets `ConditionalCheckFailedException` → "already posted, skipping duplicate." **Agent-mode has no such claim** — `onRunComplete` posts directly. Prod runs on Elastic Beanstalk with **multiple instances + a worker process**, and each process schedules its own boot-aligned timer. Every redeploy, autoscale event, crash-restart, and the nightly 2am scheduled deploy spins up a fresh process with a fresh `setTimeout` → **duplicate DMs at staggered, unpredictable times**. That's the "random": not one daily chirp, but N-per-day from N independent processes with no lock.
+
+**Note (correcting the loop's own dev.md §~110):** the gate being `CaptureGate` does NOT mean the DM is dead — approval is out-of-band (Harsha ✅ → `routes/slack.ts` → `recordLoopApproval`, and `shippedAt` IS stamped via `approvalPersistence.ts`). So the digest was *actionable*; it was just noisy + duplicated. The kill is about noise, not because the DM never worked.
+
+**Fix (complete kill, reversible):** `onRunComplete` now returns before posting unless `AGENT_MODE_LOOP_DIGEST === 'true'` (default off) — the dedicated flag. This kills the chirp **regardless of how many instances/processes fire**, because every process checks the flag and stays silent (so it also sidesteps the missing-dedup problem). The loop still registers, records, runs, and surfaces via `GET /api/admin/loops/health` — it is simply **silent**. No EB env change needed: even with `AGENT_MODE_LOOP_ENABLED=true` the chirp is gone. To re-enable, set `AGENT_MODE_LOOP_DIGEST=true`. The exact digest wire format is still pinned by characterization tests (now under that flag) so the dispatcher contract is preserved.
+
+**Proper follow-up if the digest is ever re-enabled:** add the `claimDailyDigestPost()` dedup (copy the `ai-readiness` pattern) so the multi-process duplication is fixed at the source, not just muted by the flag. Tracked as a TODO in the dev.md, not done here (the flag fully solves the reported problem).
+
+**Tests:** `loops.digestCharacterization.test.ts` — added "is silent by default — posts NO digest DM even when tools are failing"; the 3 verbatim-format tests run under `AGENT_MODE_LOOP_DIGEST=true`. `npx tsc` clean, 22/22 pass.
+
+---
+
 ## Live tool-failure telemetry — 227 failures classified; raw failure-rate OVERSTATES breakage (2026-06-13)
 
 Pulled actual error strings from `Dev-AW-LoopEvents` (failure events carry `dimensions.errorClass`/`errorMessage`; `agent_tool_invoked`/`agent_tool_succeeded` do NOT — a failure = invoked-without-a-matching-succeed, which is how the loop derives rates). 227 sampled failures classified by root cause. Confirms + makes empirical the Section-C "tool-list truncation" finding below and the 2026-06-11 #eng thread with Rui (June 9–12 window: 223 runs, 1,016 calls, 78 failures).
