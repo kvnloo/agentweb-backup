@@ -151,6 +151,14 @@ export interface ResolveIdentityInput {
    *  (run_waterfall_email) via `deps.apolloBrokerChain`. Without this hint
    *  there is no lead to write the async result back to, so Tier 6.5 is skipped. */
   leadHint?: { listId: string; leadId: string };
+  /** Standard identity-signal field names (firstName, lastName, email,
+   *  linkedin, company, website, title) the user did NOT opt into enriching.
+   *  These are still resolved IN MEMORY — company/website are needed as signals
+   *  to match the person (e.g. resolving a LinkedIn URL via Apollo) — but are
+   *  NOT persisted to the lead. Without this, deselecting `company` in the
+   *  enrichment config still wrote a company value discovered as a side effect
+   *  of LinkedIn resolution. Omit (or empty set) to persist every resolved field. */
+  excludePersistFields?: Set<string>;
 }
 
 export type ResolveIdentityResult =
@@ -240,8 +248,17 @@ export async function resolveIdentity(
     if (siblings && siblings.length > 0) {
       const enrichedAt = new Date().toISOString();
       const refresh = input.refreshFields;
+      // `linkedin` and `title` are deliberately NOT copied across sibling leads.
+      // They are profile-anchored: two leads sharing only an email (often a junk
+      // address like joe@us.com) are not necessarily the same person, and a
+      // sibling's linkedin URL may itself be a wrong-person value from a prior
+      // enrichment. Copying it verbatim re-affirms the bad URL onto every sibling
+      // and a name check can't catch it (the siblings share the same name). These
+      // fields are instead re-derived per-lead through the gated Apollo/Unipile
+      // paths. email/company/website are safe to copy — name is the match anchor
+      // and these are not person-profile-specific.
       const copyableFields: Array<keyof SiblingLeadResult & keyof LeadRecord> = [
-        'firstName', 'lastName', 'email', 'linkedin', 'company', 'website', 'title',
+        'firstName', 'lastName', 'email', 'company', 'website',
       ];
       for (const field of copyableFields) {
         const currentValue = (lead as any)[field];
@@ -691,6 +708,11 @@ export async function resolveIdentity(
     // web-search-resolved website, the lead has no email to re-derive
     // from on the next run — persist it so the value is not lost.
     if (key === 'emailDomain' && !meta.emailDomain) continue;
+    // Fields the user deselected in the enrichment config are resolved
+    // in-memory (used as matching signals above) but never persisted —
+    // otherwise "LinkedIn only" would still write the company discovered
+    // while resolving the LinkedIn URL.
+    if (input.excludePersistFields?.has(key)) continue;
     if (typeof value === 'string' && value.length > 0) {
       writableFields[key] = value;
     }

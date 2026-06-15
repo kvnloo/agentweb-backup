@@ -66,7 +66,8 @@ jest.mock("../services/v0Service", () => ({
   iterateLandingPage: jest.fn(),
   getLandingPage: (...args: any[]) => mockGetLandingPage(...args),
   getLandingPageById: (...args: any[]) => mockGetLandingPageById(...args),
-  getLandingPageLiveUrl: (page: any) => page?.customDomainUrl || page?.deployedUrl || "",
+  resolveLandingPageLiveUrl: (page: any) =>
+    Promise.resolve(page?.customDomainUrl || page?.deployedUrl || ""),
   getLandingPagesByOwner: jest.fn().mockResolvedValue([]),
   getLandingPagesByOrg: jest.fn().mockResolvedValue([]),
   listLandingPages: jest.fn().mockResolvedValue([]),

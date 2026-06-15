@@ -8,6 +8,15 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2026-06-12",
+    changes: [
+      "Stronger Password Minimum (12 Characters)",
+      "- The minimum password length is now 12 characters across the platform — enforced on signup, password reset, the customer change-password form, and the admin \"Set Password\" dialog",
+      "- The admin Set Password dialog now validates length client-side and the helper text reflects the new 12-character minimum",
+      "- Existing passwords are unaffected; the new minimum applies only when a password is created or changed",
+    ],
+  },
+  {
     date: "2026-06-10",
     changes: [
       "Authoritative Stripe Status Reconcile (Admin)",

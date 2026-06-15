@@ -20,23 +20,19 @@
  */
 
 import AWS from 'aws-sdk';
-import {
-  getLoopManifest,
-  getRegisteredLoopIds,
-  registerOrReplaceGate,
-  registerOrReplaceLearningStore,
-  registerOrReplaceLoop,
-  registerOrReplaceRuleSet,
-  registerOrReplaceSensor,
-  registerOrReplaceTools,
-} from '../../index';
 import { CaptureGate } from '../../core/gates/captureGate';
+import {
+  analystFindingsBody,
+  buildLoopDigestLines,
+  postLoopDigest,
+  type LoopDigestTemplate,
+} from '../../core/digest/loopDigest';
+import { createInstanceRunner } from '../../core/instanceRunner';
 import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
 import { CooldownRuleSet } from '../../core/policy/cooldownRuleSet';
 import { LlmAnalystRuleSet } from '../../core/policy/llmAnalystRuleSet';
 import { EventTableEventSource, LOOP_EVENTS_TABLE } from '../../core/sensors/eventTableEventSource';
 import { SpecOutputTool } from '../../core/tools/specOutputTool';
-import { runLoop } from '../../core/orchestrator';
 import { productionLoopPorts } from '../../adapters/awsAdapters';
 import type { DynamoPort } from '../../core/ports';
 import type { LoopRunResult, NormalizedEvent } from '../../core/types';
@@ -53,44 +49,52 @@ const READINESS_SCOPE = {
 } as const;
 const DAILY_DIGEST_CLAIM_LOOP_ID = `${AI_READINESS_LOOP_ID}#daily-digest`;
 
-// Held so the tick can drain the gate after the orchestrator returns.
-let aiReadinessGate: CaptureGate | null = null;
 let digestDynamo: AWS.DynamoDB.DocumentClient | null = null;
+
+const runner = createInstanceRunner({
+  loopId: AI_READINESS_LOOP_ID,
+  ports: productionLoopPorts,
+  implNames: {
+    sensor: 'aiReadinessSensor',
+    ruleSet: 'aiReadinessAnalyst',
+    tools: 'aiReadinessSpecTool',
+    gate: 'aiReadinessGate',
+    learning: 'aiReadinessLearning',
+  },
+  buildLayers: (ports) => {
+    const learning = new DynamoLearningStore(ports.dynamo);
+    const analyst = new LlmAnalystRuleSet(AI_READINESS_LOOP_ID, ports.bedrock, {
+      model: aiReadinessManifest.generator.model,
+      targetMetricName: aiReadinessManifest.targetMetric.name,
+      flowDescription: AI_READINESS_FLOW_DESCRIPTION,
+      maxProposals: 3,
+      chapterDimension: 'landerPath',
+    });
+    return {
+      sensor: new EventTableEventSource(ports.dynamo, AI_READINESS_LOOP_ID, {
+        scope: { ...READINESS_SCOPE },
+      }),
+      ruleSet: new CooldownRuleSet(analyst, learning, AI_READINESS_LOOP_ID),
+      tools: new SpecOutputTool(AI_READINESS_LOOP_ID),
+      gate: new CaptureGate(),
+      learning,
+    };
+  },
+  manifest: () => aiReadinessManifest,
+  // The digest is a daily heartbeat: it posts even when no gate is held, so
+  // "no message" can never be confused with "all good".
+  onRunComplete: async ({ result, ports, manifest }) => {
+    const shape = await summarizeFunnel(ports.dynamo).catch(() => null);
+    await postDigest(result, shape, ports.slack, manifest.approval.slackUserId);
+  },
+});
 
 /**
  * Register the loop. Idempotent. Does NOT reset the registry, so it coexists
  * with ai-eval + onboarding regardless of boot order.
  */
 export function registerAiReadinessFunnel(): void {
-  if ((getRegisteredLoopIds() as readonly string[]).includes(AI_READINESS_LOOP_ID)) return;
-
-  const ports = productionLoopPorts();
-
-  const sensor = new EventTableEventSource(ports.dynamo, AI_READINESS_LOOP_ID, {
-    scope: { ...READINESS_SCOPE },
-  });
-  const learning = new DynamoLearningStore(ports.dynamo);
-  const analyst = new LlmAnalystRuleSet(AI_READINESS_LOOP_ID, ports.bedrock, {
-    model: aiReadinessManifest.generator.model,
-    targetMetricName: aiReadinessManifest.targetMetric.name,
-    flowDescription: AI_READINESS_FLOW_DESCRIPTION,
-    maxProposals: 3,
-    chapterDimension: 'landerPath',
-  });
-  const ruleSet = new CooldownRuleSet(analyst, learning, AI_READINESS_LOOP_ID);
-  const tools = new SpecOutputTool(AI_READINESS_LOOP_ID);
-  const gate = new CaptureGate();
-
-  registerOrReplaceSensor('aiReadinessSensor', sensor);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  registerOrReplaceRuleSet('aiReadinessAnalyst', ruleSet as any);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  registerOrReplaceTools('aiReadinessSpecTool', tools as any);
-  registerOrReplaceGate('aiReadinessGate', gate);
-  registerOrReplaceLearningStore('aiReadinessLearning', learning);
-  registerOrReplaceLoop(aiReadinessManifest);
-
-  aiReadinessGate = gate;
+  runner.register();
 }
 
 /**
@@ -99,18 +103,8 @@ export function registerAiReadinessFunnel(): void {
  * a digest (heartbeat). Never throws — errors are logged.
  */
 export async function runAiReadinessLoopOnce(): Promise<LoopRunResult> {
-  registerAiReadinessFunnel();
-
-  const ports = productionLoopPorts();
-  const manifest = getLoopManifest(AI_READINESS_LOOP_ID);
-  const result = await runLoop(manifest, ports);
-
-  if (aiReadinessGate) aiReadinessGate.drain();
-
-  const shape = await summarizeFunnel(ports.dynamo).catch(() => null);
-  await postDigest(result, shape, ports.slack, manifest.approval.slackUserId);
-
-  return result;
+  // Never null: this instance has no env gate, so register() always succeeds.
+  return (await runner.runOnce()) as LoopRunResult;
 }
 
 interface FunnelShape {
@@ -306,43 +300,38 @@ async function claimDailyDigestPost(digestDate: string, slackUserId: string, run
 
 type DailyDigestClaim = (digestDate: string, slackUserId: string, runId: string) => Promise<boolean>;
 
-/** Build the digest DM lines. Pure (no I/O) so it can be unit-tested across
- * the three branches: empty window, no-finding (constraint), and findings.
- * Never emits "healthy". */
-export function buildDigestLines(result: LoopRunResult, shape: FunnelShape | null): string[] {
-  const lines: string[] = [];
-  const lowDataDecisions = shape && result.proposals.length === 0 ? buildLowDataDecisions(shape) : [];
-  lines.push(`*🧭 AI Readiness Funnel — daily run ${new Date().toISOString().slice(0, 10)}*`);
-  lines.push(`Run ID: \`${result.runId}\``);
-  lines.push(`Events scanned: ${result.eventsScanned}  |  Findings: ${result.proposals.length}`);
-  if (shape) lines.push(shapeLine(shape));
-  lines.push('');
-
-  if (result.eventsScanned === 0) {
-    lines.push(`_No events in the 7d window — the lander isn't getting traffic, or telemetry just turned on. Not "healthy", just empty._`);
-  } else if (result.proposals.length === 0) {
-    lines.push(shape ? constraintLine(shape) : `_No page-level fix surfaced — check the binding constraint manually._`);
-  } else {
-    lines.push(`*What I found*`);
-    for (let i = 0; i < result.proposals.length; i++) {
-      const p = result.proposals[i];
-      const directive = (p.payload as { directive?: string } | undefined)?.directive ?? '';
-      lines.push(`${i + 1}. ${p.hypothesis}`);
-      lines.push(`   Kind: \`${p.kind}\`${directive ? `  |  Fix: ${directive}` : ''}`);
-    }
-  }
-  if (lowDataDecisions.length > 0) {
-    lines.push('');
-    lines.push('*Startup decisions (low-data, permission-gated)*');
+/** TExtra = the 7d funnel shape (null when the tally failed). */
+const aiReadinessDigestTemplate: LoopDigestTemplate<FunnelShape | null> = {
+  logTag: '[ai-readiness-funnel]',
+  header: (date) => `*🧭 AI Readiness Funnel — daily run ${date}*`,
+  counts: (result) =>
+    `Events scanned: ${result.eventsScanned}  |  Findings: ${result.proposals.length}`,
+  preBody: (_result, shape) => (shape ? [shapeLine(shape)] : []),
+  emptyBody: () => [
+    `_No events in the 7d window — the lander isn't getting traffic, or telemetry just turned on. Not "healthy", just empty._`,
+  ],
+  quietBody: (_result, shape) => [
+    shape ? constraintLine(shape) : `_No page-level fix surfaced — check the binding constraint manually._`,
+  ],
+  findingsBody: analystFindingsBody,
+  extraSections: (result, shape) => {
+    const lowDataDecisions = shape && result.proposals.length === 0 ? buildLowDataDecisions(shape) : [];
+    if (lowDataDecisions.length === 0) return [];
+    const lines = ['*Startup decisions (low-data, permission-gated)*'];
     for (let i = 0; i < lowDataDecisions.length; i++) {
       const d = lowDataDecisions[i];
       lines.push(`${i + 1}. \`${d.id}\` — ${d.action}`);
       lines.push(`   Evidence: ${d.evidence}  |  Confidence: ${d.confidence}  |  Needs approval: yes`);
     }
-  }
-  lines.push('');
-  lines.push(`React ✅ to dispatch all to cloud-dev  |  ❌ to skip  |  🛑 to pause loop`);
-  return lines;
+    return lines;
+  },
+};
+
+/** Build the digest DM lines. Pure (no I/O) so it can be unit-tested across
+ * the three branches: empty window, no-finding (constraint), and findings.
+ * Never emits "healthy". */
+export function buildDigestLines(result: LoopRunResult, shape: FunnelShape | null): string[] {
+  return buildLoopDigestLines(result, aiReadinessDigestTemplate, shape);
 }
 
 async function postDigest(
@@ -371,15 +360,11 @@ async function postDigest(
     return;
   }
 
-  try {
-    await slack.postMessage(slackUserId, buildDigestLines(result, shape).join('\n'));
-  } catch (err) {
-    console.error('[ai-readiness-funnel] Slack DM post failed:', err);
-  }
+  await postLoopDigest(result, slack, slackUserId, aiReadinessDigestTemplate, shape);
 }
 
 /** Test seam. */
-export const _internal = { get aiReadinessGate() { return aiReadinessGate; } };
+export const _internal = { get aiReadinessGate() { return runner.gate; } };
 export const _testing = {
   summarizeFunnel,
   buildDigestLines,

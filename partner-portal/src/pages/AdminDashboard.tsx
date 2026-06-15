@@ -43,6 +43,7 @@ import {
   InputAdornment,
   Autocomplete,
   Divider,
+  Switch,
 } from "@mui/material";
 import { format } from "date-fns";
 import axios from "axios";
@@ -245,6 +246,7 @@ interface User {
   fromName?: string; // From name for emails
   slackChannel?: string; // @deprecated — use slackChannels
   slackChannels?: string[]; // Slack channels configured for this user
+  slackSuggestedRepliesDisabled?: boolean; // When true, suppress Slack suggested-reply monitoring for this user
   secretNames?: string[]; // Names of configured secrets (values not exposed)
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
@@ -2460,6 +2462,40 @@ export default function AdminDashboard() {
     }
   };
 
+  // Toggle Slack suggested-reply monitoring for a user. `enabled` true = suggestions on.
+  const handleToggleSlackSuggestedReplies = async (userId: string, enabled: boolean) => {
+    // Optimistically reflect the change so the switch responds immediately.
+    setUsers((prevUsers: User[]) =>
+      prevUsers.map((user: User) =>
+        user.userId === userId ? { ...user, slackSuggestedRepliesDisabled: !enabled } : user
+      )
+    );
+    try {
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/users/${userId}/slack-suggested-replies`),
+        { enabled },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setUsers((prevUsers: User[]) =>
+        prevUsers.map((user: User) =>
+          user.userId === userId
+            ? { ...user, slackSuggestedRepliesDisabled: response.data.slackSuggestedRepliesDisabled ?? !enabled }
+            : user
+        )
+      );
+      setSuccess(`Slack suggested replies ${enabled ? "enabled" : "disabled"} successfully!`);
+    } catch (error: any) {
+      console.error("Error updating slack suggested replies setting:", error);
+      setError(error.response?.data?.message || "Failed to update slack suggested replies setting");
+      // Revert optimistic update on failure.
+      setUsers((prevUsers: User[]) =>
+        prevUsers.map((user: User) =>
+          user.userId === userId ? { ...user, slackSuggestedRepliesDisabled: enabled } : user
+        )
+      );
+    }
+  };
+
   const handleSaveAdminSlackChannel = async () => {
     try {
       setAdminSlackChannelLoading(true);
@@ -2973,6 +3009,11 @@ export default function AdminDashboard() {
   const handlePasswordReset = async () => {
     if (!passwordUserId || !newPassword.trim()) {
       setError("Please enter a new password");
+      return;
+    }
+
+    if (newPassword.length < 12) {
+      setError("Password must be at least 12 characters long");
       return;
     }
 
@@ -4441,6 +4482,23 @@ export default function AdminDashboard() {
                                       resolveSlackChannelNames(channels);
                                     }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
                                   </Box>
+                                  {(() => {
+                                    const hasChannels = (user.slackChannels && user.slackChannels.length > 0) || !!user.slackChannel;
+                                    if (!hasChannels) return null;
+                                    return (
+                                      <FormControlLabel
+                                        sx={{ mt: 0.5, ml: 0 }}
+                                        control={
+                                          <Switch
+                                            size="small"
+                                            checked={!user.slackSuggestedRepliesDisabled}
+                                            onChange={(e) => handleToggleSlackSuggestedReplies(user.userId, e.target.checked)}
+                                          />
+                                        }
+                                        label={<Typography variant="caption">Suggested replies</Typography>}
+                                      />
+                                    );
+                                  })()}
                                 </Grid>
                                 <Grid item xs={3}>
                                   <Typography variant="caption" color="text.secondary">SEO / GA / Clarity</Typography>
@@ -7534,7 +7592,7 @@ export default function AdminDashboard() {
             onChange={(e) => setNewPassword(e.target.value)}
             placeholder="Enter new password"
             disabled={passwordResetLoading}
-            helperText="Minimum 6 characters"
+            helperText="Minimum 12 characters"
           />
         </DialogContent>
         <DialogActions>

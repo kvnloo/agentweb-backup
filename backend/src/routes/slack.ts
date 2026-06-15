@@ -49,8 +49,10 @@ async function extractAdminMessageIntent(
       return null;
     }
 
-    const { GoogleGenAI } = await import('@google/genai');
-    const ai = new GoogleGenAI({ apiKey: apiKey.trim() });
+    // Metered factory client (shadow usage metering). System context — admin
+    // channel parsing has no single attributable user, so no userId is passed.
+    const { getGeminiClient } = await import('../utils/llmClients');
+    const ai = await getGeminiClient({ feature: 'other' }, apiKey);
 
     const prompt = `Extract the target user email address and task description from this admin Slack message.
 
@@ -151,6 +153,13 @@ async function handleSlackTriggeredSession(params: {
 
     if (!user) {
       console.log(`📨 [slack-triggered] channel ${channel} not connected to any user, ignoring`);
+      return;
+    }
+
+    // Respect the per-user opt-out: when suggested replies are disabled, skip the whole flow
+    // (no triage, no session, no email) so we don't generate suggestions for this customer.
+    if (user.slackSuggestedRepliesDisabled) {
+      console.log(`📨 [slack-triggered] suggested replies disabled for user ${user.userId}, skipping`);
       return;
     }
 
@@ -833,6 +842,13 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
                   return;
                 }
 
+                // Respect the per-user opt-out before generating a response or sending email.
+                const user = await userDb.getUserById(userId);
+                if (user?.slackSuggestedRepliesDisabled) {
+                  console.log(`📨 [slack-triggered] suggested replies disabled for user ${userId}, skipping thread reply`);
+                  return;
+                }
+
                 const displayName = await getSlackUserDisplayName(slackUserId);
                 const formattedMessage = `${displayName}: ${text}`.trim();
 
@@ -854,7 +870,6 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
                   channelName = (info.channel as any)?.name || channel;
                 } catch { /* non-blocking */ }
 
-                const user = await userDb.getUserById(userId);
                 await emailService.sendSlackTriggeredSessionEmail('founders@agentweb.pro', {
                   sessionId,
                   userEmail: user?.email || userId,

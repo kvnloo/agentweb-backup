@@ -1,3 +1,405 @@
+## "Emma Dev" Slack chirping — agent-mode reliability loop DM'd Harsha on EVERY run, killed (2026-06-14)
+
+**Symptom:** a recurring "Emma Dev" Slack DM chirp that only ever came from the **AI Reliability loop** (the agent-mode tool-reliability loop), arriving at seemingly **random** times with no obvious source.
+
+**Where it came from:** the "Emma Dev" sender is the backend's `SLACK_BOT_TOKEN` Slack app (`loops/adapters/awsAdapters.ts` `awsSlackAdapter` → `chat.postMessage`). `server.ts:700` schedules the agent-mode tool-reliability loop behind `AGENT_MODE_LOOP_ENABLED` (on in prod): each booting process does `setTimeout(→ next 17:30 UTC)` then `setInterval(24h)`. After each run, `loops/instances/agent-mode/index.ts` `onRunComplete` called `postLoopDigest(...)`, which DMs `manifest.approval.slackUserId` (`U08TM4QFQ1L` = Harsha). That digest is the chirp.
+
+**Why it chirped (the "for some reason"):**
+1. **Only this loop is both scheduled AND enabled in prod.** Siblings `ai-eval` (`AI_EVAL_LOOP_ENABLED`), `ai-readiness` (`AI_READINESS_LOOP_ENABLED`), and `onboarding-v2` (`ONBOARDING_LOOP_V2`) are env-gated off, so they never fire. Only `AGENT_MODE_LOOP_ENABLED` is on.
+2. **It DM'd unconditionally, even on empty/quiet windows.** `postLoopDigest`/`buildLoopDigestLines` (`loops/core/digest/loopDigest.ts`) always renders a message. `ai-eval` guards its post with `if (drained.length > 0 || result.eventsScanned > 0)`; agent-mode had **no such guard** (only `if (drained === null) return`, and `drained` is never null because the loop holds a `CaptureGate`). The recorder that feeds it is gated *separately* by `AGENT_RUNTIME_SPINE_ENABLED` (off in prod), so every run scanned **0 events** and still fired the "_No agent-mode tool events… not 'healthy', just empty_" DM. Pure noise content.
+
+**Why it felt RANDOM (the part the first writeup missed) — no daily-dedup claim + multi-process prod:** `ai-readiness` wraps its DM in `claimDailyDigestPost()` (`ai-readiness-funnel/index.ts:285`) — a DynamoDB conditional `put` keyed on `(digestDate, slackUserId)`, so only ONE poster per calendar day wins and every other process gets `ConditionalCheckFailedException` → "already posted, skipping duplicate." **Agent-mode has no such claim** — `onRunComplete` posts directly. Prod runs on Elastic Beanstalk with **multiple instances + a worker process**, and each process schedules its own boot-aligned timer. Every redeploy, autoscale event, crash-restart, and the nightly 2am scheduled deploy spins up a fresh process with a fresh `setTimeout` → **duplicate DMs at staggered, unpredictable times**. That's the "random": not one daily chirp, but N-per-day from N independent processes with no lock.
+
+**Note (correcting the loop's own dev.md §~110):** the gate being `CaptureGate` does NOT mean the DM is dead — approval is out-of-band (Harsha ✅ → `routes/slack.ts` → `recordLoopApproval`, and `shippedAt` IS stamped via `approvalPersistence.ts`). So the digest was *actionable*; it was just noisy + duplicated. The kill is about noise, not because the DM never worked.
+
+**Fix (complete kill, reversible):** `onRunComplete` now returns before posting unless `AGENT_MODE_LOOP_DIGEST === 'true'` (default off) — the dedicated flag. This kills the chirp **regardless of how many instances/processes fire**, because every process checks the flag and stays silent (so it also sidesteps the missing-dedup problem). The loop still registers, records, runs, and surfaces via `GET /api/admin/loops/health` — it is simply **silent**. No EB env change needed: even with `AGENT_MODE_LOOP_ENABLED=true` the chirp is gone. To re-enable, set `AGENT_MODE_LOOP_DIGEST=true`. The exact digest wire format is still pinned by characterization tests (now under that flag) so the dispatcher contract is preserved.
+
+**Proper follow-up if the digest is ever re-enabled:** add the `claimDailyDigestPost()` dedup (copy the `ai-readiness` pattern) so the multi-process duplication is fixed at the source, not just muted by the flag. Tracked as a TODO in the dev.md, not done here (the flag fully solves the reported problem).
+
+**Tests:** `loops.digestCharacterization.test.ts` — added "is silent by default — posts NO digest DM even when tools are failing"; the 3 verbatim-format tests run under `AGENT_MODE_LOOP_DIGEST=true`. `npx tsc` clean, 22/22 pass.
+
+---
+
+## Live tool-failure telemetry — 227 failures classified; raw failure-rate OVERSTATES breakage (2026-06-13)
+
+Pulled actual error strings from `Dev-AW-LoopEvents` (failure events carry `dimensions.errorClass`/`errorMessage`; `agent_tool_invoked`/`agent_tool_succeeded` do NOT — a failure = invoked-without-a-matching-succeed, which is how the loop derives rates). 227 sampled failures classified by root cause. Confirms + makes empirical the Section-C "tool-list truncation" finding below and the 2026-06-11 #eng thread with Rui (June 9–12 window: 223 runs, 1,016 calls, 78 failures).
+
+**THE updated assumption (this changes retire/keep decisions): raw per-call failure rate ≠ breakage.** Only a minority of the 227 are real tool bugs. Buckets:
+1. **Model calling tools that aren't installed** — "Tool X is not available. You must install the required skill first" (`search_tool_response` ×15, `describe_image` ×8, `linkedin_outreach` ×8, `read_file_content`, `wait_seconds`, `get_login_credentials`…). This is the **live symptom of the Section-C tool-list truncation** (~141 tools vs 128 Azure cap, `agentModeService.ts:2070`): dropped tools become "not available" when the model calls them. NOT per-tool bugs — fixing truncation (tool-search instead of drop) removes a large share of ALL failures at once.
+2. **Validators correctly rejecting bad input (working-as-designed, NOT failure)** — `run_local_agent_task` "Task rejected: web browsing/data extraction only" ×10 + forbidden-pattern `post.*comment` ×2; `linkedin_outreach` "Should delay new invitation to this recipient" ×9 (LinkedIn anti-spam delay). These inflate the rate; a naive ">30% → retire" rule would kill tools that are working. (run_local was the "55%" in the thread — most of it is this.)
+3. **Schema-validation rejections caught pre-execution (cheap)** — `read_tool_response` ×18, `search_tool_response`, `wait_seconds`: "arguments failed schema validation" / "s3_key and query required". Fix = mark args required; #1818 gateway pre-flight already catches these before execution.
+4. **Real config/infra bugs (the actually-actionable list):**
+   - **Brave 429 — CONFIRMED LIVE across every variant** (`brave_web/news/video/local/image_search` all "429 Too Many Requests" with a Brave `ErrorResponse` body; `brave_summarizer` 100% is a *cascade* — nothing to summarize once web-search 429s). One shared Brave key throttled. Fix: quota/key bump, or route to `search_web` (failed only 2×, both benign "No search results"). `brave_llm_context` = 400 (separate arg issue).
+   - `perform_data_analysis`: `404` / "The specified bucket does not exist" — missing/misconfigured S3 bucket.
+   - `call_meta_ads_insights_api`: "Meta Insights Job timed out" — matches the Section-A background-job fix.
+   - `slack_get_recent_messages`: "The Slack bot is not a member of channel …" ×4 — backend bot needs inviting (same class as the `LEAD_CAPTURE_ALERT_SLACK_CHANNEL` / #lead-capture caveat).
+   - `coding_agent` "Not authorized to edit this landing page" / `get_file_contents` GitHub "Bad credentials" — per-user secret/auth gaps.
+
+**Decision implication:** retire/keep cannot run off raw failure rate — it needs failure-**type** classification first (real-bug vs by-design vs model-error vs config). This is exactly Fangfang's #eng point (a human, then an LLM judge, classifies output + tool-call quality *before* fixes). The loop's *sensing* works; the missing layer is **failure classification, not more sensing**. Concretely: tag each `Dev-AW-LoopEvents` failure with one of {bug, by_design, model_uninstalled_tool, schema_reject, config} so the weekly scorecard reflects real tool health.
+
+**UPDATE — classifier SHIPPED (`utils/toolFailureType.ts`, 100% cov; `runRecorder.toolFailed` now stamps `dimensions.failureType`; backfilled all 227 historical `agent_tool_failed` via `scripts/backfillFailureTypes.ts`).** Final distribution of the 227:
+
+| failureType | count | share |
+|---|---|---|
+| bug (real candidates) | 63 | **28%** |
+| config | 56 | 25% |
+| schema_reject | 49 | 22% |
+| model_uninstalled_tool | 34 | 15% |
+| by_design | 25 | 11% |
+
+So **only 28% of "failures" are real bugs** — the scorecard/policy should filter `dimensions.failureType = 'bug'`. Classifier reads signals from the error *message* too, so pre-classifier events (errorClass `'Error'`) still classify (rescues the Brave 429s from `bug`).
+
+**UPDATE 2 — classifier TUNED + Theme 1 fixed.** Investigated the 63 `bug`s: many were misclassified. Tuned the classifier (LinkedIn "cannot resend"/"recipient cannot be reached"/"no results"/bad-PDF → by_design; invite-too-long → schema_reject; Brave-summarizer cascade / 404 / aborted-op → config) and re-tagged all 227 (`backfill --force`, 27 changed). **Real `bug` count: 63 → 36 (16%).** New split: config 66 / schema_reject 55 / by_design 36 / **bug 36** / model_uninstalled_tool 34.
+
+The 36 real bugs cluster into: **opaque error propagation** (run_local "success=false", Meta "unknown error", linkedin "Invalid parameters", describe_image 400) · stale-file editing (`update_html_file` hash mismatch) · browser flakiness (playwright timeouts/snapshots) · misc (`get_leads` bad pagination key, `report_product_issues` self-failure).
+
+**Theme 1 (opaque errors) — central fix SHIPPED:** extracted `toolResultError`/`extractToolResultMessage` to `utils/toolResultError.ts` and hardened it to surface object-shaped errors (Meta Graph `{error:{message,code,error_subcode}}`) + status/reason instead of the opaque "Tool returned success=false". **`run_local_agent_task` source fix SHIPPED:** `buildLocalAgentResult` (localAgentTools.ts) now always populates a failure reason (`error` → `result` → `returncode N`) so an ok:false relay response is never opaque. Remaining per-integration follow-ups: Meta subcode extraction at its handler, describe_image 400-body capture.
+
+---
+
+## Platform state audit — reliability fixes, complexity levers, SOTA gaps, learning-loop health (2026-06-13)
+
+Whole-backend deep-dive (6 parallel agents; reliability + complexity findings adversarially verified, 0 false-positives). Recorded as the "where we are vs where we need to be" baseline so it isn't re-researched. Loop framework = `backend/src/loops`. Findings cross-checked vs `origin/harsha/dev`. Branch at audit time: `harsha/durable-landing-multisite` / `harsha/retire-stale-agent-models`.
+
+### A. Reliability — fixes needed (all verified, file:line)
+
+**CRITICAL**
+- **Stripe webhook user lookup is a single-page full-table Scan → silently drops billing events at scale.** `findUserByStripeCustomerId` (stripeService.ts:1024) → `userDb.scanWithFilter` (db.ts:1133-1147) is one `.scan()` with NO `LastEvaluatedKey` loop; once `AW-Users` exceeds ~1MB a real paying user on a later page returns null. Called at the top of every webhook handler (handleSubscriptionUpdated stripeService.ts:534, handleInvoicePaymentSucceeded :643, +4). On null, `isNonRetryableError` (stripeController.ts:27-33) treats "user not found" as permanent → HTTP 200 → Stripe STOPS retrying. This IS the State-Reconciliation failure mode. Fix: GSI on `stripe_customer_id` + Query; interim, paginate the scan (`scanAllItems` helper already at db.ts:1193) and make "user not found" retryable (500). Effort M.
+
+**HIGH**
+- **No event-level idempotency + ordering bug on Stripe webhooks.** Switch dispatch (stripeController.ts:86-143) has no `event.id` dedup → redeliveries re-run; stale-guard (stripeService.ts:544-553) compares only `subscription.id`, never `event.created`, so out-of-order `.updated` events both pass and the later-arriving-older event clobbers `subscription_status`/`current_period_end` (stripeService.ts:569,596-601). Replayed `.created` (isNew bypasses guard) resurrects a canceled sub. event.id dedup exists ONLY in the fire-and-forget CRM mirror (stripeController.ts:307), not on user state. Fix: persist processed event.ids (TTL item + attribute_not_exists) + per-sub last-event-created ordering guard. Effort M. ← core of the State Reconciliation epic.
+- **googleAdsService uses bare axios, no timeout** (6 calls; only image download :681 has one) while every peer (hubspot/attio/linkedIn 15s, apollo/enrichSo 30s) uses `axios.create({timeout})`. Hung socket blocks forever. Fix: module-level `axios.create({timeout:15000})` + 429/5xx backoff. Effort S.
+- **call_meta_ads_insights_api blocks the agent run up to 10 min synchronously** (agentModeService.ts:12441-12492): 60×10s poll, no axios timeout, unbounded pagination — the documented 41% failure source. Fix: background-job pattern (return report_run_id + separate poller) + per-poll timeout + maxPages. Effort L.
+- **uncaughtException handler only logs, never exits** (server.ts:298-304) → process serves traffic in an undefined state; EB won't restart a hung-but-alive instance. Fix: log+flush+metric+`process.exit(1)`; add unhandledRejection alarm metric. Effort S.
+
+**MEDIUM**
+- **Fire-and-forget `void` re-throws → unhandled rejection that only logs** (crmFindEmailRunner.ts:80-83 records then `throw`s; called `void` at autoEnrich.ts:165 with no `.catch`). With the no-exit handler, silent in prod. Effort S.
+- **Boot crons are in-process setInterval, no distributed lock** (onboardingLoop server.ts:545-561 — gated by ONBOARDING_LOOP_ENABLED; watchdog :572). Multi-instance → double-fire; restart near schedule → skip. Copy the correct `claimAction` pattern from socialEngagementExecutor.ts:168. Effort M.
+- **Generation timeout releases the lock but doesn't cancel upstream work** (agentModeController.ts:50-53) — no AbortController, so orphaned generations (the Meta poll, hung axios) keep running/spending. Effort L.
+- **Agent-tool gateway has no per-tool timeout** (agentToolGatewayService.ts:488) — the (real, working) repeated-failure breaker only trips after 3 failures; a first-call HANG is never counted, blocks until the 10-min outer timeout. Fix: per-effect timeout feeding the breaker. Effort M.
+
+**LOW**
+- **updateUser is get-then-write, no conditional/version guard** (db.ts:1244-1297) — per-field SET avoids whole-record clobber, but same-field concurrent writers (webhook vs settings) are last-write-wins. Effort M.
+
+**Verified GOOD (do NOT re-flag):** the agent-tool repeated-failure circuit breaker DOES exist + is correctly wired (agentToolGatewayService.ts:107-166, 459-505 — file is flagged binary, use `grep -a`); metered LLM factory is non-blocking (llmClients.ts:118-168); payment history dedups by invoiceId+eventType; the generation lock has a wall-clock timeout that fixed the 409-busy-forever deadlock.
+
+### B. Complexity — reduction levers (verified behavior-preserving)
+
+- **agentModeService.ts = 24,225 LOC / ~270 methods god-object.** Extract LeadCrm (8287-10521, 22 methods), GtmPlan (7238-8287, 13), Book, Media (describeImage:5850/describeVideo:5945/performDataAnalysis:6331) — ~5,000+ LOC verbatim relocation. Effort L.
+- **getMockToolResult (973 LOC switch, agentModeService.ts:4648) is benchmark-only** (only benchmark.ts:351 sets mockMode:true). Move to a benchmark module. CAVEAT: prod-tree unit tests call it via `(svc as any).getMockToolResult` (mockResponses/searchKnowledgeBase/knowledgeBaseFiles tests) — move those too. Effort M.
+- **Primitives.tsx (2,340 LOC dev gallery) is eager-imported into the prod customer bundle** (App.tsx:90 static import, route :197, no lazy/DEV guard; App.tsx has zero React.lazy). Fix: React.lazy + `import.meta.env.DEV` gate. Effort S — easy win.
+- **13 copy-paste model-getter methods** (agentModeService.ts:999-1197) → one `resolveConfiguredModel(settingName, fallback)`. ~185 LOC. Effort S.
+- **Agent-tool gateway policy runs observe-only on every call** (agentToolGatewayService.ts:289 `allowed = !enforce || ...`; AGENT_TOOL_GATEWAY_ENFORCE set NOWHERE in tree or origin/harsha/dev) → 726 LOC of per-call eval for zero enforcement. NOTE: the "double eval" is NOT redundant (first feeds arg-repair, second runs on repaired args — don't naively dedupe). Decide: enable enforcement or make it sampled/async.
+- **CRM.tsx = 11,169 LOC / 183 useState single component.** Extract state islands into hooks/subcomponents (pattern exists: LeadDetailPanel, SequenceBuilder, ExternalCrmSyncDialog). Effort L.
+- **crmEnrichment V1 (106KB) + V3 (51KB+65KB) co-live mid-migration** with dual waterfalls; old service has 13 prod importers and V3 imports a type from it → tracked cutover, not blind delete. ~130KB once done. Effort L.
+- **loops framework 7,356 LOC, all 4 instances env-gated OFF; ai-eval-funnel (1,384 LOC) superseded by ai-readiness-funnel (501 LOC)** — delete ai-eval-funnel incl. server.ts:588-614 block + index.ts registration. Effort M.
+- **Build lever: jest maxWorkers 2→4** (jest.config.js:8 + package.json:9,11; ts-jest preset, isolatedModules already on). Cost-negative (CI isn't the gate). Optional: @swc/jest transpile-only. Effort S.
+- **~11,300 `any`/`as any` in backend/src** (agentModeService 818, crm.ts 234, db.ts 161) — root enabler of god-object growth. Type the 3 hottest boundaries (ToolArgs, DynamoRecord<T>, LLMToolResult) alongside the agentModeService split. Effort L, advisory.
+
+### C. SOTA gaps — where we lag (the models themselves are current)
+
+Good: model IDs are current (claude-opus-4-8, claude-sonnet-4-6, gpt-5.x, gemini-3.x); prompt caching IS wired (Bedrock cachePoint, agentModeService.ts:1544); native Bedrock toolConfig used.
+
+- **HIGH — zero extended-thinking / effort on any Claude call.** grep for thinking/reasoningConfig/effort/budget_tokens returns no model-call hits; Converse sends only maxTokens (agentModeService.ts:1567-1576). Opus 4.8 / Sonnet 4.6 support adaptive thinking + effort — the single biggest quality lever, ~free given models are current. Pass `thinking:{type:'adaptive'}` + per-surface effort (high/xhigh agent loop & codingAgent, low/medium classify/score) via additionalModelRequestFields.
+- **HIGH — tool failures handled by text-injected "do not retry" guidance + SILENT tool-list truncation.** ~141 emma tools vs a 128 Azure cap → tools dropped non-deterministically (agentModeService.ts:2070); args parsed with bare JSON.parse→{} (:1328,1777); no strict schemas / structured output / programmatic arg-repair. Upstream cause of the 27/55/41% tool failures. Fix: strict input schemas + validate-before-dispatch + one structured repair; tool-search instead of truncation.
+- **HIGH — no eval harness / tracing.** No Okareo, no OTEL/Sentry/Langfuse; only shadow usage metering + an internal LLM-judge (sessionScoringService.ts). The repeated silent-telemetry-table failures (3 in 2 days) are the symptom. Stand up Okareo seeded from real sessions + per-turn trace ids.
+- **MEDIUM — model selection not centralized.** agentModeService has its own Bedrock/Vertex/Azure/Gemini clients separate from the metered factory (llmClients.ts); inference-profile ARN map duplicated in 3 files (agentModeService.ts:1525, codingAgentService.ts:1375, llmService.ts:74) — a model swap touches 3-4 files. Route the agent loop through the factory + one shared ARN map.
+- **MEDIUM — non-streaming agent loop** (ConverseCommand not Stream; maxTokens hardcoded 12384) → long Opus/Fable turns risk request-timeout truncation. Switch to ConverseStreamCommand (factory already meters streaming, llmClients.ts:280).
+
+### D. Learning loop — ~30-40% closes, one instance only
+
+Architecture (sensor→policy→tools→gate→learning, host-agnostic `core/`):
+- **Sensor**: agent-mode runRecorder writes real tool telemetry → Dev-AW-LoopEvents (WORKING, gated by AGENT_RUNTIME_SPINE_ENABLED). Funnel sensors wired but starved (<10 captures/wk).
+- **Policy**: agent-mode failure-clustering (DSL, no LLM) WORKS; the LLM-analyst policy used by ai-readiness + onboarding-V2 is INERT — the prod Bedrock adapter throws unconditionally (awsAdapters.ts:151-156), analyst swallows it → zero proposals from those two loops.
+- **Gate**: CaptureGate.pollDecision() always returns 'pending' (captureGate.ts:30-34); no SlackReactionGate exists. Real approval is OUT-OF-BAND: digest DM → Harsha ✅ → routes/slack.ts:582 → recordLoopApproval. **CORRECTION to earlier notes (incl. the 2026-06-13 "wrote to a void" entry below): shippedAt IS now stamped** (approvalPersistence.ts:102-112) now that Dev-AW-LoopLearning exists.
+- **THE structural break (highest-leverage, new): proposal-provenance bug.** orchestrator.ts:163-169 writes the pending record WITHOUT the `proposal` field; recordLoopApproval copies that undefined forward (approvalPersistence.ts:105-110); CooldownRuleSet.onCooldown (cooldownRuleSet.ts:61) and lastOutcomeForRule (dynamoLearningStore.ts:89) both key on `proposal.sourceRuleId` = undefined → the policy can NEVER read back its own outcomes. The loop records verdicts it structurally cannot consume. **Fix: carry `proposal` onto the pending record in orchestrator.ts:163-169 (~3 lines).** This is the one thing that makes everything else matter.
+- Other gaps: analysis runs env-gated (likely OFF in prod) → attribution has nothing to grade; loop tables hardcoded to Dev- prefix (eventTableEventSource.ts:27, dynamoLearningStore.ts:27) even in prod.
+
+**Verdict:** plumbing is genuinely impressive; ~30-40% closes for the agent-mode loop only (live sensor → DSL policy → fix-spec → ✅ → Notion+cloud-dev → shippedAt). It does NOT yet learn because (1) LLM-policy loops inert, (2) outcome read-back severed by the proposal bug, (3) gated on manual ✅ + likely-off flags. Fix order to actually close it: (1) proposal-provenance ~3-line fix; (2) implement awsBedrockAdapter.invoke against the existing Claude client; (3) confirm prod AGENT_RUNTIME_SPINE_ENABLED + AGENT_MODE_LOOP_ENABLED ON; (4) env-aware loop table names.
+
+### Assumptions to validate
+- **Stripe Scan blast radius:** check current `AW-Users` size + whether a `stripe_customer_id` GSI already exists in prod. If the table is already >1MB, billing events are ALREADY being dropped — look for webhooks that Stripe retried then gave up on. (Falsified if a GSI exists / table is small.)
+- **"Settings.gmail crashes blocking Mega PR #600" is UNVERIFIED** (read-only audit) — the test has no skip markers and mocks cleanly, so a crash is likely environmental (jsdom/act), not a code defect.
+- **Prod EB instance count (single vs multi)** sets the blast radius of the cron-lock + in-memory-breaker findings.
+- **Which loop env flags are true in prod** (AGENT_RUNTIME_SPINE_ENABLED, AGENT_MODE_LOOP_ENABLED, AI_*_LOOP_ENABLED) — determines whether the learning loop runs at all.
+- **Prod table prefix:** recorder/learning hardcode `Dev-AW-LoopEvents`/`Dev-AW-LoopLearning`; confirm prod isn't expecting unprefixed `AW-Loop*` (which would also be missing).
+
+## report_product_issues was never on the EXTERNAL MCP surface — #1851 enriched the wrong registry (2026-06-13)
+
+Reconnecting the claude.ai Emma connector surfaced that `report_product_issues` is not exposed to it at all. Root cause: AgentWeb has TWO tool registries — `emmaToolRegistry` (in-app Emma chatbot/agent mode, ~141 tools) and `mcpToolRegistry` (the EXTERNAL MCP server at api.agentweb.pro/mcp that claude.ai connectors talk to, ~72 tools from apiTools.ts). `report_product_issues` is registered only on `emmaToolRegistry`. PR #1851 enriched it there (attachment_urls, run_id, MCP-source tag) and its test asserted against `emmaToolRegistry` — so it went green while testing a surface the external connector never sees. Net: in-app Emma got the enrichment; Claude-Code-via-MCP bug reporting (the actual goal) was unreachable.
+
+### Fix (this PR)
+One-line bridge in emma/tools.ts after the registration block — `mcpToolRegistry.register(emmaToolRegistry.getTool('report_product_issues'))` — same pattern the codebase already uses for `visualContextTool` (tools.ts:5973). The handler reads `context.userId` (agentUserId for external clients) and `context.externalMcp` (true only on the external server, for the MCP Reported tag), so the same handler is correct on both surfaces.
+
+### Lesson (process)
+When a tool must be reachable from the external MCP connector, the test MUST assert against `mcpToolRegistry` (the external surface), not `emmaToolRegistry`. The new test `mcpReportProductIssuesExposure.test.ts` guards exactly this. Two registries existing is itself latent complexity — future consolidation candidate, but out of scope here.
+
+### Assumptions to validate
+- After deploy + connector refresh, `report_product_issues` appears in the claude.ai Emma tool list with attachment_urls + run_id. Falsified if the connector still doesn't show it — would mean the external server caches tool lists beyond a reconnect, or apiTools registration order drops the late bridge.
+
+## Fix: self-healing telemetry-table provisioning — close the silent-missing-table class (2026-06-13)
+
+Three missing-table incidents in two days (AW-OnboardingMetrics, Dev-AW-LoopLearning, and the loop tables) shared one root cause: tables are defined in create-tables.ts but the script is never run on deploy, and every writer swallows ResourceNotFound — so an absent table is invisible until someone reads the data weeks later. For the loop tables the entire gate→attribution→verdict chain ran as a no-op with zero signal.
+
+### What shipped (this PR)
+- `services/ensureCriticalTables.ts` — idempotent, non-fatal boot-time ensure for the three critical telemetry tables (LoopEvents, LoopLearning, OnboardingMetrics). Table-name constants imported from the modules that WRITE them, so the ensure can never drift from the writers. createTable swallows ResourceInUseException; any other failure logs loudly ("telemetry for this loop will be lost until fixed") but never blocks startup.
+- Wired fire-and-forget into `server.ts` boot (after listen). On every deploy, missing telemetry tables self-create.
+- Added the missing `createOnboardingMetricsTable()` to `scripts/create-tables.ts` (it was never in the script — the source-of-truth gap that caused the 2026-06-12 incident).
+
+### Why self-heal instead of "run the script on deploy"
+No ops dependency, no risk of a hard boot crash, and it fixes past + future instances in one place. Matches the silent→loud principle: the only way a missing telemetry table now persists is if createTable itself is denied, which logs an ERROR every boot.
+
+### Assumptions to validate
+- After deploy, prod logs show either "created missing table X" once or nothing (all present). A recurring "could NOT ensure" ERROR = IAM lacks CreateTable; fix the role.
+- This does NOT cover non-telemetry tables (users, tasks, etc.) — those predate the issue and are assumed present. If a core table ever goes missing the symptom is louder (immediate 500s), not silent, so they are intentionally out of scope here.
+
+## Dev-AW-LoopLearning table was missing — the entire gate→attribution→verdict chain wrote to a void (2026-06-13)
+
+Checking for pending-approval proposals (now that gate persistence #1841 is live) surfaced that **`Dev-AW-LoopLearning` did not exist in this account.** `dynamoLearningStore.ts:27` hardcodes the table name; `scripts/create-tables.ts:2043` defines `createLoopLearningTable()` — but the script was never run against this account, so the table was absent. Every `learning.record()` (proposals, approvals, shippedAt, verdicts) hit ResourceNotFound and was swallowed best-effort.
+
+Impact: the whole point of the "close Layer 4→5" sprint was inert. Even after #1841 wired Slack approvals to write shippedAt, the write went nowhere — so CooldownRuleSet read empty history, attribution had nothing to grade, and a ✅ on any loop proposal (e.g. the AI-readiness quiz-start-leak) would never reach a learned/regressed verdict.
+
+**Fix applied 2026-06-13**: created `Dev-AW-LoopLearning` in us-west-2 (PK `loopId` HASH / `sortKey` RANGE, PAY_PER_REQUEST) mirroring the create-tables definition. The loop can now persist decisions.
+
+### Systemic finding (third instance)
+This is the THIRD table defined-in-code-but-never-created in this account: `AW-OnboardingMetrics` (2026-06-12), now `Dev-AW-LoopLearning`. Root cause: `create-tables.ts` is not run when new tables are added, and every writer is best-effort/swallowed so the absence is invisible until someone reads the data. **Follow-up: run `NODE_ENV=... create-tables.ts` against dev AND prod as part of deploy, or add a startup assertion that required tables exist (fail loud, not silent).**
+
+### Assumptions to validate
+- After this table exists, the next ✅ on a loop proposal should write a record with decision + shippedAt, visible via `GET /api/admin/loops/health` moving that loop to `in_flight`. Falsified if health still shows `empty`/`pending_approval` after an approval — would mean the prod backend uses an unprefixed `AW-LoopLearning` that ALSO doesn't exist (check prod table list).
+- Prod (NODE_ENV=production) may resolve a different table name than dev. The recorder hardcodes `Dev-AW-LoopEvents` (env-agnostic); confirm the learning store does the same vs. honoring a prefix — if prod expects unprefixed `AW-LoopLearning`, that table needs creating too.
+
+## Landing-Page Generation Failures — Empathia Incident Root-Cause + Durable-Execution/Multi-Site Fix (2026-06-12)
+
+Triggered by Angela (Empathia, `demo@empathiaai.com`, userId `a643f408-4ddf-4790-a9ae-4aa7f99de87a`) reporting landing-page "bugs, it's matching things" during an active evaluation (decision ~Jun 17–18; campaign sends Jun 15). Reconstructed prod session `332dafe1-ec34-44c5-a55a-40ae4131a43a` (Jun 8, 14:03–14:55 UTC) from `AW-ChatMessages`. Five failures in one 52-minute session; they collapse into **two root causes**, both the same shape: **identity is implicit and reconstructed by runtime heuristics.**
+
+### What failed (timeline)
+1. **14:03 — attachment never read.** `read_knowledge_base_files` → "Knowledge base not found"; fallback file read threw `Cannot read properties of undefined (reading 'startsWith')`. Page built WITHOUT the product doc. Separate bug.
+2. **14:13 — timeout lie #1.** Run hit `GENERATION_TIMEOUT_MS` (600s, `agentModeController.ts:55`) while `generate_landing_page` was still running (its MCP timeout is 25min, `apiTools.ts:1301`). The run lost a `Promise.race`, released the session lock, and showed "took longer than expected" — but the generation was **not aborted; it kept running detached and updated `AW-LandingPages` to `deployed`** (`agentModeController.ts:50-53`). Nobody reconnected to it.
+3. **14:15 — prompt-as-name → poisoned repo.** Page `name` was the full multi-line prompt → broke the Next.js build and blocked all later builds; `deploy_landing_page` 404'd. (Prompt-as-name now capped/slugified at `landingPageGeneration.ts:335` / `v0Service.ts:104`.)
+4. **14:42 / 14:54 — timeout lie #2**, two manual retries before it went live. Each retry started a *new* build racing the first (lock already released) — the source of the poisoned repo.
+5. **Wrong project/subdomain.** Final URL `empathia-ai-cardiology-demo.agentwebforms.com/front-desk-emma-empathia-ai` — physician campaign on a subdomain named after a Jun 1 throwaway demo.
+
+### RC1 — no durable job identity (telemetry ≠ durability)
+The spine in flight (Agent Run/Event/Tool Gateway) is *telemetry* — makes failures visible, orthogonal, does NOT fix this. The failure is *durable execution*: the long tool runs inside the HTTP request; on run-timeout the work detaches and finishes but nothing reconnects → the timeout lie + the retry race. Rui's Jun 9 point (a redeploy on a long backend task "causes problems… also for other users") is the same class and correct. Fix: a tracked job (`originatingSessionId` + atomic `claimedCompletionAt`) — on late completion, post back into the session (`io.to('user:'+userId)`, primitive exists `gtmPlan.ts:1499`; `addMessagesToSession` already persists). A retry **reconnects** to the in-flight job instead of starting a second build. **Honest limit:** in-process detachment survives a run-timeout but not a backend redeploy — a `dripSequenceWorker`-style poller is the redeploy backstop; full mid-build survival is the eventual separate-engine's job.
+
+### RC2 — no site identity
+`findUserSiteRecord` (`v0Service.ts:2482`) returns the oldest repo forever (+ a read-time `isRootPage` mutation inside a `find`), so every page is a route in page #1's project and the subdomain is frozen to page #1's name. Fix: explicit `siteId` on each page; the tool gains `site_id` (omit → new site with its own domain; pass → add to existing). Opt-in, existing single-site users backfilled to their root id (byte-identical).
+
+### Why the fix REDUCES complexity (the point)
+Both bugs are heuristics compensating for missing explicit identity. Adding `siteId` + the job marker lets us DELETE: `findUserSiteRecord`'s 3-way guess + its read-time mutation; `isOrphanedFailedPage` + `cleanupOrphanedFailedPages` + the reusable/recyclable orphan-scavenging scan in `generateLandingPage` (these exist only to scavenge orphans the missing lifecycle creates); and the landing-page false-failure diagnostic branch. One explicit job+site identity model replaces four scattered heuristics, a side-effecting finder, and a lie. Flag-gated `DURABLE_LANDING_GENERATION`, fail-open, scoped to landing-page generation. Full spec: `docs/durable-execution-rc1-spec.md`. Plan: `~/.claude/plans/swift-humming-meadow.md`.
+
+### Assumptions to validate
+- The `startsWith` crash (#1) reproduces independently — needs its own repro/ticket.
+- Late completion's `responseMessages` may be persisted before OR after the timeout race; the hook must handle both orderings (suppress the false-failure message, never double-append).
+- Re-pointing Empathia's *current* live page is operational (custom-domain tooling); the multi-site change only prevents the *next* page from repeating it.
+
+## Lander funnel was unmeasurable from agent-tool telemetry — service/route-layer lifecycle sensor added (2026-06-12)
+
+Attempting to answer "why do 32 landing-page sessions produce only 3 publishes" exposed two instrumentation holes that made the funnel analysis come back blind (24 "created" sessions, 0 visible previews/publishes/errors — obviously wrong):
+
+1. **The runtime spine only sees agent tool calls.** The lander lifecycle spans two channels — Emma tools AND portal UI buttons — and UI actions never touched the spine. The agent tools call the same `/api/landing-pages/v0/*` routes via `mcpFetch` that the UI calls directly, so the routes are the single chokepoint both channels share.
+2. **`create_html_file` is generic** (email templates, analysis outputs), so tool-name-based session classification over-counts "landing-page sessions."
+
+### What shipped (this PR)
+
+- `services/landerLifecycleEvents.ts` — best-effort emitter (same swallow-errors contract as AgentRunRecorder) writing `lander_created / deploy_retried / iterated / edited / published / publish_reverted` events into the shared `Dev-AW-LoopEvents` table under loopId `lander-lifecycle`, keyed by pageId, with dimensions: channel (`agent`/`ui`), mode (`cold_start`/`incremental`), outcome, userId, sessionId.
+- Hooks in all six mutation routes in `routes/landingPageGeneration.ts` (generate incl. failure path, deploy, iterate, github-edit, publish, revert-publish).
+- `mcpFetch` now sends `X-AgentWeb-Channel: agent` so routes can attribute agent-channel requests; absence of the header = UI.
+
+Complexity note: net simplification — a few emit lines replace an entire class of inference (guessing artifact lifecycle from ambiguous tool names across channels). No new tables, no new loop registration (sensor-only v1; events are queryable but the loop has no policy/manifest yet — deliberately, until the funnel data says what the policy should be).
+
+### Assumptions to validate (next 1–2 weeks)
+
+- **The routes are the complete chokepoint.** Falsified if landers get created/published through any path that bypasses these six routes (e.g. a batch job or admin script) — check for pageIds in the landing-pages store with no `lander_created` event.
+- **Real funnel numbers within ~1 week of deploy**: cold-start publish rate, where sessions die (created→never-touched-again vs iterated→abandoned vs published). The June 12 estimate (9% publish rate) is unverified until this data exists.
+- **Channel split matters**: expectation is agent-channel creations dominate, UI-channel publishes dominate. If everything is one channel, the header plumbing was unnecessary (cheap, but note it).
+- **Junk-lander rate**: count of `created` events with no subsequent lifecycle event after 48h — the candidate definition of "junk." If that definition misfires (users legitimately park drafts for weeks), redefine before building any cleanup.
+
+### Follow-up (deliberately NOT in this PR)
+- Eval-loop wiring: commit-point (`lander_published`) → Slack tag to Matt with the Emma session link; enrichment execute → Fangfang (~5/wk and ~7/wk projected). Blocked on this sensor accumulating ~1 week of data first.
+
+## Prod AW-OnboardingMetrics table was missing — heartbeat blind since launch (2026-06-12)
+
+The onboarding heartbeat's recurring "No step timing data found yet; verify AW-OnboardingMetrics writes" warning had a trivial root cause: **the prod table `AW-OnboardingMetrics` never existed**. `Dev-AW-OnboardingMetrics` exists (100 items — dev writes work), but there is no entry for it in `scripts/create-tables.ts`, so the dev table was created ad-hoc and prod never got one. Every prod write hit ResourceNotFound and was swallowed by `logStepMetric()`'s fire-and-forget catch; the heartbeat's read hit the same missing table and degraded to empty.
+
+**Fix applied 2026-06-12**: created `AW-OnboardingMetrics` in prod (us-west-2) via aws cli, mirroring the dev schema — PK `metricId` (S), GSI `StepStartedAtIndex` (`step` HASH / `startedAt` RANGE, ALL projection), PAY_PER_REQUEST.
+
+### Assumptions to validate
+- Step metrics should start appearing in tomorrow's heartbeat ("Step timings" section non-empty) as users complete brand/ICP/ad steps. If still empty after 48h with real onboarding activity, the writer has a second issue (IAM PutItem permission is next suspect).
+- The 86% "(unset)" funnel state is a SEPARATE, expected artifact — legacy users predate `onboardingStage`; only users emitting onboarding events get a stage. No fix needed unless we want a backfill migration.
+
+### Follow-up
+- Add `AW-OnboardingMetrics` to `scripts/create-tables.ts` so environments stop diverging ad-hoc (small PR).
+
+## Replay-eval groundwork — failed runs become eval cases (2026-06-12)
+
+Frontier-agent robustness pattern: failed trajectories become regression tests. The spine records every run; nothing turned the failed/degraded ones into reusable eval material. This is the Phase-4 seed (white-box beats Okareo — we own the trace).
+
+### What shipped (this PR)
+
+1. **`loops/scripts/exportEvalCases.ts`** — CLI: queries agent-mode spine events (default 7d), exports each failed/degraded run as a JSON eval case (verdict + reasons, per-failure toolName/errorClass/errorMessage, decision context with upstream-redacted arg previews) plus a worst-first `toolName × errorClass` cluster summary. Output to `backend/eval-cases/` — gitignored, fixtures never committed.
+2. **Pure core** (`buildEvalCases` / `summarizeEvalCases`) exported for tests + future runners. Pre-verdict-era runs are judged by `computeRunVerdict` over their counts so history exports too.
+
+### How this becomes the eval harness
+
+1. Run the export → `_summary.json` names the worst clusters (June data: linkedin_outreach × invalid_args, run_local_agent_task, bravesearch × rate_limit).
+2. Harsha + Fangfang curate: pick top clusters, write HUMAN expected-behavior assertions per cluster (per loop-acceptance-tests discipline).
+3. v2 runner replays curated cases against the current contract layer / tool schemas on change — regression suite from production failures.
+
+### Assumptions to validate
+
+- Run the export once against real data: `cd backend && npx ts-node src/loops/scripts/exportEvalCases.ts --days 7` — expect ~35 cases. If far fewer, the grouping window or the tsSession key-condition prefix logic needs a look.
+- Arg previews are sufficiently redacted for fixture storage (they go through AGENT_RUNTIME_REDACTED_ARG_KEYS upstream); spot-check one case file before sharing any externally.
+
+## Post-run outcome verdicts — degraded-run detection (2026-06-12)
+
+Telemetry blind spot: 165 runs in the June window, ZERO hard failures, 60+ tool failures silently absorbed. "Completed" ≠ "succeeded" — the user feels the degradation but nothing durable records it, so the agent-mode loop (whose sensor reads spine events) could never learn from degraded runs. The inspector's read-time flags don't help the policy: they exist only in the projection.
+
+### What shipped (this PR)
+
+1. **`agent_run_verdict` spine event** emitted alongside every terminal run event. Dims: `verdict: ok|degraded|failed`, machine-readable `reasons`, counts.
+2. **`computeRunVerdict()`** (pure, exported): failed terminal → failed; ≥3 failed tool calls OR ≥1/3 failure ratio OR same tool failing ≥3× (the linkedin_outreach retry-spiral shape) → degraded; else ok. Thresholds tuned so the typical healthy-but-imperfect run (28 calls, 1-2 failures) does NOT flag.
+3. **`maxSameToolFailures`** computed at both run-completion call sites from the toolCalls array — catches retry spirals a low overall ratio hides.
+4. **Inspector surfacing**: `outcomeVerdict`/`outcomeReasons` on run summaries + a `degraded_run` warning flag.
+
+### Assumptions to validate
+
+- Degraded-rate baseline: expect ~20% of runs degraded based on June data (35/165 runs had ≥1 failure; threshold ≥3 cuts that down). If >40% flag degraded, thresholds are too tight to be actionable.
+- The agent-mode loop's failureRuleSet does NOT yet consume verdict events — next step is a policy rule that clusters degraded runs by reasons + dominant errorClass. Verdicts accumulate from deploy time so that rule will have data when written.
+- One extra event per run (~165/day) is negligible Dynamo volume.
+
+## Semantic tool-error taxonomy + contract-layer counters (2026-06-12)
+
+Telemetry finding from the June 9-12 window: every recorded tool failure had errorClass "Error" — tools throw plain `new Error(message)`, so the constructor-name fallback carried zero signal. The failure policy could only cluster by toolName; the model (and the breaker) could not distinguish retryable timeouts from terminal auth failures.
+
+### What shipped (this PR)
+
+1. **`utils/toolErrorClassifier.ts`** — `classifyToolErrorClass()`: stable semantic classes `timeout | auth | rate_limit | invalid_args | not_found | network | upstream_5xx | policy_blocked | repeated_failure`, derived from gateway error names, numeric status props, and message heuristics. Unrecognized errors keep the legacy name-based class (named custom errors lose nothing).
+2. **Run recorder** uses it for `errorClass` on `agent_tool_failed` / `agent_run_failed` events.
+3. **Decision telemetry counters** (#1818 follow-up): `argsRepairedCount` (contract layer repaired args pre-execution) and `schemaErrorCount` (failures classified invalid_args) per decision event — the data needed for the AGENT_TOOL_GATEWAY_ENFORCE go/no-go.
+
+### Assumptions to validate
+
+- The taxonomy covers the real distribution: after a few days, `SELECT errorClass COUNT` on new agent_tool_failed events should show <20% falling back to legacy names. If higher, extend classFromMessage patterns from actual messages.
+- Brave 429s → rate_limit and Meta 5xx → upstream_5xx in prod (heuristics verified against June messages, not live traffic).
+- errorClass consumers (failureRuleSet clustering, inspector) benefit rather than break from the rename — historical events keep old classes, so mixed-class clusters during transition are expected for ~7 days.
+
+## Approval persistence closes the learning loop (Layer 4→5) (2026-06-12)
+
+The June 8 audit's last open item: Slack ✅ approvals dispatched cloud-dev fixes but never wrote `decision`/`shippedAt`/`verdict` back to `Dev-AW-LoopLearning`. Net effect measured this week: CooldownRuleSet was wired but inert (reads `shippedAt`, always null) and the 18:00 UTC attribution cron had zero gradable records. The system sensed and proposed but could not learn.
+
+### What shipped (this PR)
+
+1. **`loops/core/learning/approvalPersistence.ts` — `recordLoopApproval()`**: finds the run's `decision:'pending'` records by the digest's Run ID, appends one `decision:'approved'` record per proposal with `shippedAt` set when its dispatch succeeded. Dispatch failures are recorded approved-but-not-shipped with `mutation.error` — auditable, still re-proposable.
+2. **Dispatcher wiring** (`loopSlackApprovalDispatcher.ts`): both dispatch branches persist after launching, post a `📒 Learning store: N approved, M shipped` thread line, and loudly warn when no pending records match (legacy digests).
+3. **Test-double parity fix**: `InMemoryLearningStore` status/ruleIds filters passed records with no decision/proposal; `DynamoLearningStore` excludes them. Aligned in-memory to Dynamo semantics — test doubles must match prod behavior or tests lock in bugs.
+
+### Matching semantics (deliberate)
+
+Digest item ↔ proposal matching: exact `sourceRuleId`, `:slug` suffix (AI Readiness analyst ids), `proposalId`, or `mutationId`. Unmatched proposals (generic digests use synthetic ids) are marked shipped only when EVERY dispatch succeeded. Bias: when uncertain, leave a rule re-proposable rather than wrongly suppress it for the 14-day cooldown.
+
+### Assumptions to validate
+
+- Digest Run IDs uniquely identify one loop's run (sort-key collision across loops would mis-attribute approvals).
+- The first ✅ on a digest covers all its items — partial approval (✅ some items only) is not modeled; v2 could parse per-item reactions.
+- Attribution at 18:00 UTC will now grade these records once the settle window elapses — verify the first `improved/regressed/no_change` verdict appears in `/api/admin/loops/health` within ~windowDays of the first persisted ship.
+- The `📒 Learning store` thread line appears on the next real ✅ (first live validation of the whole write path).
+
+## AgentRun Telemetry Failure Analysis → Gateway Circuit Breaker + Tool Guidance Fixes (2026-06-11)
+
+First product decision driven by the runtime-spine telemetry. Analyzed all 3,172 agent-mode events in `Dev-AW-LoopEvents` (June 9–12: 223 runs, 1,016 tool calls, 78 failures = 7.7% tool failure rate; 35 runs had ≥1 failure; zero hard run failures — failures are absorbed and runs "complete" degraded).
+
+### Top failure clusters found
+
+- `linkedin_outreach` 16/59 (27%) — the single worst run retried it **15 times in 16 seconds**: 7× "Invitation message is too long (201–231 chars)" then 6× blind "Invalid parameters" retries in the same second.
+- `run_local_agent_task` 11/20 (55%) — model keeps sending out-of-scope tasks; rejection message only echoed the forbidden regex.
+- `bravesearch_*` ~41% (429 rate limits), `call_meta_ads_insights_api` 41% (sync wait on slow async job) — NOT fixed here; belong to search consolidation / background-job pattern respectively.
+
+### Root cause of the LinkedIn cluster — misleading schema text
+
+The tool schema said "message must be 300 characters or fewer". The real limit is **per-account: 200 free / 300 Premium** (`linkedInOutreachService.ts` `INVITE_MESSAGE_MAX_CHARS_FREE`). Every too-long failure was 201–231 chars — the model was *obeying the documented 300* and failing on a free account. Lesson: when telemetry shows the model consistently landing in a narrow wrong band, suspect the tool description before the model.
+
+### What shipped (this PR)
+
+1. **Per-run repeated-failure circuit breaker** in `agentToolGatewayService.ts`: same tool + same error head (80 chars) failing ≥3× in one run → subsequent calls return `AgentToolRepeatedFailureError` with model-visible "do not retry / change approach" guidance, without executing. A success for the tool clears its counts (mixed batches not punished). Keyed by `runId` (threaded from `agentRuntimeRunId` at both gateway call sites); no runId = no breaker, so non-AgentMode callers are untouched. State is in-memory, capped at 500 runs (oldest evicted) — acceptable because a runaway retry loop is intra-run by nature.
+2. **Schema descriptions** for `linkedin_outreach` now teach 200-free/300-premium + "don't invite FIRST_DEGREE connections, use send-message" (the already-connected failure, independently the same branch Fangfang is adding to the event-lead skill).
+3. **`run_local_agent_task` rejections** now state the read-only browsing scope and name the right alternative tools (`coding_agent`, `perform_data_analysis`, `search_web`).
+
+### Assumptions to validate against next week's telemetry
+
+- **Breaker threshold 3 / error-head 80 chars is right.** Watch for `AgentToolRepeatedFailureError` in `Dev-AW-LoopEvents` (it flows through the normal toolFailed path, so it's queryable via `/api/agent-runs`). If legit retry patterns trip it (e.g. polling tools that fail transiently), raise threshold or exempt tool classes.
+- **The schema text alone fixes the too-long cluster.** If 201–231-char invite failures persist after deploy, the model isn't reading the description and the fix moves to a gateway pre-flight that knows `is_premium` from config.
+- **Enforcement stays narrow.** This breaker is deliberately the ONLY enforcing gateway rule; `AGENT_TOOL_GATEWAY_ENFORCE` (policy flags) stays off pending trace review per PR #1808.
+- **In-memory breaker state is fine on EB single-instance.** If prod backend scales to multiple instances, breaker counts fragment per instance — degrades gracefully (each instance still breaks at 3), but note it.
+
+### Not fixed, filed for owners
+
+- Brave search 429s (consolidate on `search_web` at 1% failure, or add backoff) — Rui/backend.
+- Meta Insights timeout → background-job + poll pattern (same shape as CRM push #1791) — Rui.
+- `coding_agent` landing-page auth — already fixed by Rui's open #1835.
+
+## Resend Sender Domain DKIM Verification Failure — mail.incentivpay.com (2026-06-11)
+
+Reported by user `info@pmps.ai` (userId `1359ace4-0565-4018-9926-f51efdcf4c47`): the email sender domain `mail.incentivpay.com` shows DKIM **failed** in Resend even though the user says they added the DKIM record in GoDaddy. Investigation only — no code changed.
+
+### What the live data shows
+
+The DB side is **correct** — no app/wiring bug. User `info@pmps.ai` is properly linked: `emailDomain = mail.incentivpay.com`, `resendDomainId = 7d133b9e-663d-4faf-8a89-ec88d60c49e7` (matches the Resend domain). (Lookup was a one-off scan of the prod `AW-Users` table by email/emailDomain/resendDomainId.)
+
+Resend domain state (prod account, id `7d133b9e-663d-4faf-8a89-ec88d60c49e7`, US East, created 2026-06-02), pulled live from `GET https://api.resend.com/domains/{id}`:
+
+| Record | Host (relative) | Type | Resend status |
+|--------|-----------------|------|---------------|
+| SPF (MX) | `send.mail` | MX | ✅ verified |
+| SPF (TXT) | `send.mail` | TXT | ✅ verified |
+| **DKIM** | `resend._domainkey.mail` | **TXT** | ❌ **failed** |
+
+DKIM value Resend expects (TXT): `p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCZNDIpPbcMn89NOxV5JtOfgx28SS2dDrRWMB6i4eBE2QySQ7HeiHObv1eQ1rwbqeEY+v9gbA7x6r3EAa4UvTPnigYOJti70VPMbdviX+nt2lTAFtFqqWaUGLBs96lpuSSK9tRMi80Mr7OwqViESrRArLrcrmoFN+x0wnywYD2YNwIDAQAB`
+
+The overall domain badge reads "failed" **only** because of the single DKIM row; both SPF rows already passed.
+
+### Root cause: the DKIM TXT record is NOT actually published in DNS
+
+Live DNS-over-HTTPS lookups (Google DoH) confirm the DKIM TXT record returns **NXDOMAIN** at the correct host and at every common GoDaddy-mistake variant, while the SPF host resolves fine:
+
+- `resend._domainkey.mail.incentivpay.com` (TXT, correct host) → **NXDOMAIN**
+- `resend._domainkey.incentivpay.com` (TXT, "forgot the .mail") → NXDOMAIN
+- `resend._domainkey.mail.incentivpay.com.incentivpay.com` (TXT, GoDaddy double-append) → NXDOMAIN
+- `resend._domainkey.mail.incentivpay.com` as CNAME → NXDOMAIN
+- `send.mail.incentivpay.com` (SPF TXT + MX) → **resolves** ✅ (this is why SPF verified)
+
+So the user successfully added the two SPF entries but the DKIM TXT entry is absent from the zone — never saved, saved at the wrong host, or saved as the wrong type. Domain was created 2026-06-02, so 48h propagation is long past; this is a data-entry problem, not propagation.
+
+### Likely GoDaddy entry mistakes (in order of likelihood)
+
+1. **Host entered as FQDN.** Resend shows the host relative (`resend._domainkey.mail`). GoDaddy auto-appends the zone, so the user must enter `resend._domainkey.mail` (NOT `resend._domainkey.mail.incentivpay.com`, which GoDaddy stores doubled).
+2. **Wrong record type.** This domain's DKIM is a **TXT** record (some Resend setups use CNAME). If added as CNAME it won't match.
+3. **Value truncation.** GoDaddy can split/truncate the long `p=…` TXT value.
+4. **Record silently not persisted** by GoDaddy.
+
+### Exact record the user must add in GoDaddy
+
+- **Type:** `TXT`
+- **Name/Host:** `resend._domainkey.mail`  (relative — do NOT append `.incentivpay.com`)
+- **Value:** the `p=MIGf…IDAQAB` key above
+- **TTL:** default / 1 hour
+
+Then click **Verify Domain** in the portal (no Resend dashboard needed — see below).
+
+### Verify path in our UI
+
+There IS a "Verify Domain" button in the customer portal: CRM page → Email Sender Domain section, shown whenever the domain is registered-but-unverified, directly under the DNS records table.
+- `customer-portal/src/pages/CRM.tsx:10690` — the button → `handleVerifyDomain` (`CRM.tsx:1009`) → `POST /api/crm/email-domain/verify` → `resendService.verifyDomain(resendDomainId)`, which re-queries DNS and re-renders per-record status. "Change Domain" (`handleChangeDomain`) resets the config.
+- Caveat: the button only **re-checks**; it has no effect until the record actually exists in DNS. Clicking it now will keep returning "failed."
+
+### Note: same issue on mail.pmps.ai
+
+`mail.pmps.ai` (resendDomainId `2b581c4e-3849-49da-b70b-6fdc3ae09bfa`) is also in `failed` state in the same Resend account — likely the same DKIM gap if the user intends to use it.
+
+### Possible product improvement (not implemented)
+
+The DNS records table (`customer-portal/src/pages/CRM.tsx:10625-10714`) renders `rec.name` raw from the Resend API (e.g. `resend._domainkey.mail`) with only generic "add at your registrar" helper text — no note that GoDaddy/Namecheap hosts are **relative** and the root domain must not be appended. That's exactly the trap that produced this failure. A short per-provider hint ("enter the host *without* your domain") would prevent repeat cases.
+
 ## Self-Learning Loop Adoption — Health Endpoint + AgentMode as a Loop (2026-06-09)
 
 Follow-up to the YC-style learning-loop audit + retro. PR #1799 (branch `rui/self-learning-loop-adoption`). The retro's framing: a *bug-feedback* loop (user/Emma notices → Slack/Notion → eng fixes → next bug) is useful but is **not self-learning**. A *self-learning* loop must **store the decision, ship or reject the change, measure the outcome, and feed that result back into future policy** — the five layers Sensor → Policy → Tools → Quality gate → Learning, with Layer 5 writing back into Layer 2.
@@ -39,7 +441,6 @@ Letting the loops run and observing before building the gate. What to watch:
 - Whether the AgentMode policy surfaces *real* repeatedly-failing tools (signal) vs. noise — tune the count/rate thresholds in `AgentFailureRuleSet` from what we see.
 - The 17:30 UTC Slack digest: are the proposed fix-specs actionable as-is?
 - Once enough loops are stuck at `pending_approval`, that's the cue to prioritize the real approval gate.
-
 ## Judge Scoring False-Negative on Brand/Topic Mismatch (2026-06-05)
 
 Systemic pattern across 3 sessions (satisfaction score 2): when a requested content topic (email, LinkedIn post, ad, analysis) does **not** match the stored brand guidelines, the agent correctly flags the mismatch and either asks a clarifying question or proceeds with placeholders (`[Brand Name]`, `[URL]`). This is the **desired** behavior — but the satisfaction judge was scoring these sessions low (`goalCompletion` 1–2), treating the flag/clarification as a failure. The fix is to the **judge**, not the agent.

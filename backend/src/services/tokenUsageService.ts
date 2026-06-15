@@ -171,15 +171,18 @@ export async function incrementUserTokenUsage(
         tokenUsageHistory: newHistory,
       });
     } else {
-      // Same month — increment atomically
-      await userDb.updateUser(billingUserId, {
-        tokenUsage: {
-          month: currentMonth,
-          totalTokens: (user.tokenUsage?.totalTokens || 0) + tokens,
-          totalCost: (user.tokenUsage?.totalCost || 0) + cost,
-          resetDate: user.tokenUsage?.resetDate || getNextResetDate(),
-        },
-      });
+      const updated = await userDb.incrementTokenUsageForMonth(
+        billingUserId,
+        currentMonth,
+        tokens,
+        cost,
+        user.tokenUsage?.resetDate || getNextResetDate()
+      );
+      if (!updated) {
+        console.warn(
+          `[tokenUsageService] Skipped token increment for ${billingUserId}: tokenUsage month changed during update`
+        );
+      }
     }
   } catch (error) {
     // Don't block message flow on usage tracking failures

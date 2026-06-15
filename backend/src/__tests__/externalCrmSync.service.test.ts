@@ -453,6 +453,25 @@ describe('ExternalCrmSyncService', () => {
     });
   });
 
+  // ─── getDefaultMappings ─────────────────────────────────────────────────────
+
+  describe('getDefaultMappings', () => {
+    it('includes push-only listName/listId in the HubSpot custom mapping defaults', async () => {
+      const defaults = await service.getDefaultMappings('hubspot');
+      expect(defaults.customFieldMapping).toEqual(expect.arrayContaining([
+        expect.objectContaining({ agentwebField: 'listName', crmProperty: 'lead_list_name', direction: 'push', enabled: true }),
+        expect.objectContaining({ agentwebField: 'listId', crmProperty: 'lead_list_id', direction: 'push', enabled: true }),
+      ]));
+    });
+
+    it('does not add listName/listId to the Attio custom mapping defaults', async () => {
+      const defaults = await service.getDefaultMappings('attio');
+      const fields = defaults.customFieldMapping.map(m => m.agentwebField);
+      expect(fields).not.toContain('listName');
+      expect(fields).not.toContain('listId');
+    });
+  });
+
   // ─── testConnection ───────────────────────────────────────────────────────
 
   describe('testConnection', () => {
@@ -736,7 +755,13 @@ describe('ExternalCrmSyncService', () => {
 
       await service.pushAllLeads('user1', 'list1', 'hubspot');
 
-      expect(mockHubSpotServiceInstance.ensureContactProperty).not.toHaveBeenCalled();
+      // Standard contact properties are never pre-created. (The system
+      // list-identity properties are injected + ensured separately — see the
+      // hubspotAdapter.pushLeads tests — so we assert on the specific props here.)
+      const ensuredProps = mockHubSpotServiceInstance.ensureContactProperty.mock.calls.map(c => c[0]);
+      for (const standard of ['email', 'firstname', 'company', 'hs_linkedin_url']) {
+        expect(ensuredProps).not.toContain(standard);
+      }
     });
 
     it('ensures each non-standard property only once across contact and custom mappings', async () => {
@@ -789,7 +814,10 @@ describe('ExternalCrmSyncService', () => {
 
       await service.pushAllLeads('user1', 'list1', 'hubspot');
 
-      expect(mockHubSpotServiceInstance.ensureContactProperty).not.toHaveBeenCalled();
+      // The pull-only 'notes' property is not pre-created. (System list-identity
+      // properties are injected + ensured regardless — assert on 'notes' here.)
+      const ensuredProps = mockHubSpotServiceInstance.ensureContactProperty.mock.calls.map(c => c[0]);
+      expect(ensuredProps).not.toContain('notes');
     });
   });
 

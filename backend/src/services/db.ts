@@ -123,6 +123,7 @@ export interface User {
   fromName?: string; // From name for emails
   slackChannel?: string; // @deprecated — use slackChannels. Kept for backward-compat reads.
   slackChannels?: string[]; // Slack channels configured for this user (agent tools are restricted to these)
+  slackSuggestedRepliesDisabled?: boolean; // When true, suppress Slack suggested-reply (slack-triggered) sessions/emails for this user. Absent/false = enabled (default).
   secrets?: Record<string, string>; // Encrypted per-user secrets (key → encrypted value)
   seoDomains?: string[]; // SEO domains to track (e.g., ["example.com", "subdomain.example.com"])
   googleAnalyticsPropertyId?: string; // DEPRECATED: Google Analytics Property ID (numeric, e.g., 123456789) - use googleAnalyticsProperties instead
@@ -321,6 +322,16 @@ export interface User {
     rating: "like" | "reject";
     ratedAt: string;
   }>;
+  /**
+   * How new landing pages are organized when the agent doesn't target a specific
+   * site. `unified` (default): add the page to the user's existing site as a route
+   * — cheap (no new repo/project, shares the subdomain). `separate`: each new
+   * campaign gets its OWN site/subdomain — more costly (a fresh v0 generation +
+   * repo + project). Cost-safe default is `unified`; users who want distinct
+   * campaign URLs (e.g. Empathia) opt into `separate`. The agent can still override
+   * per request. Only consulted when DURABLE_LANDING_GENERATION is on.
+   */
+  landingSiteMode?: "unified" | "separate";
   brandGuidelines?: {
     brandData: {
       brandName: string;
@@ -1240,6 +1251,43 @@ export class UserDB {
     }
   }
 
+  /**
+   * Set the user's landing-site mode WRITE-ONCE. "single page" = unified, "multi
+   * page" = separate. Once chosen it cannot be switched — switching would require
+   * physically re-homing deployed pages across repos/projects/domains (broken
+   * URLs + SEO loss), so it's a deliberate migration, not a toggle. Returns the
+   * effective (locked) mode: the existing one if already set, else the new one.
+   */
+  async setLandingSiteMode(
+    userId: string,
+    mode: "unified" | "separate"
+  ): Promise<"unified" | "separate"> {
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) throw new Error(`User with ID '${userId}' not found.`);
+    if (user.landingSiteMode === "unified" || user.landingSiteMode === "separate") {
+      return user.landingSiteMode; // already locked — immutable
+    }
+    try {
+      await this.docClient
+        .update({
+          TableName: this.tableName,
+          Key: { email: user.email },
+          UpdateExpression: "SET landingSiteMode = :m",
+          ConditionExpression: "attribute_not_exists(landingSiteMode)",
+          ExpressionAttributeValues: { ":m": mode },
+        })
+        .promise();
+      return mode;
+    } catch (err: any) {
+      if (err?.code === "ConditionalCheckFailedException") {
+        // A concurrent request locked it first — return whatever is now stored.
+        const fresh = await this.getUserById(userId);
+        return (fresh?.landingSiteMode as "unified" | "separate") || mode;
+      }
+      throw err;
+    }
+  }
+
   async updateUser(userId: string, updates: Partial<User>) {
     // First, get the user by userId to ensure they exist and to get their email
     const user = await this.getUserById(userId);
@@ -1292,6 +1340,58 @@ export class UserDB {
     } catch (error) {
       handleDynamoDbError(error, "updateUser");
       throw error; // Re-throw after logging
+    }
+  }
+
+  async incrementTokenUsageForMonth(
+    userId: string,
+    month: string,
+    tokens: number,
+    cost: number,
+    resetDate: string
+  ): Promise<User | null> {
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) {
+      throw new Error(`User with ID '${userId}' not found or has no email.`);
+    }
+
+    const params: AWS.DynamoDB.DocumentClient.UpdateItemInput = {
+      TableName: this.tableName,
+      Key: { email: user.email },
+      UpdateExpression:
+        "SET #tokenUsage.#month = :month, " +
+        "#tokenUsage.#totalTokens = if_not_exists(#tokenUsage.#totalTokens, :zero) + :tokens, " +
+        "#tokenUsage.#totalCost = if_not_exists(#tokenUsage.#totalCost, :zero) + :cost, " +
+        "#tokenUsage.#resetDate = if_not_exists(#tokenUsage.#resetDate, :resetDate)",
+      ConditionExpression: "#userId = :userId AND #tokenUsage.#month = :month",
+      ExpressionAttributeNames: {
+        "#userId": "userId",
+        "#tokenUsage": "tokenUsage",
+        "#month": "month",
+        "#totalTokens": "totalTokens",
+        "#totalCost": "totalCost",
+        "#resetDate": "resetDate",
+      },
+      ExpressionAttributeValues: {
+        ":userId": userId,
+        ":month": month,
+        ":tokens": tokens,
+        ":cost": cost,
+        ":zero": 0,
+        ":resetDate": resetDate,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await this.docClient.update(params).promise();
+      return (result.Attributes as User) || null;
+    } catch (error: any) {
+      if (error?.code === "ConditionalCheckFailedException") {
+        return null;
+      }
+      handleDynamoDbError(error, "incrementTokenUsageForMonth");
+      throw error;
     }
   }
 

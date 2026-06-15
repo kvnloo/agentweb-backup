@@ -4,6 +4,22 @@ import { HubSpotService } from '../hubspotService';
 import { crmDb } from '../db';
 import { validateEmail } from '../../utils/validation';
 
+/**
+ * System list-identity mappings: the source lead list's name and id, pushed to
+ * HubSpot so contacts can be segmented by which Emma list they came from.
+ * Push-only (the values are owned by Emma). Defined here — not in
+ * externalCrmSyncService — because that module constructs a HubspotAdapter at
+ * load time, so importing a runtime value the other way would form a cycle.
+ * pushLeads injects these at push time when a stored config doesn't already
+ * carry them, so lists connected before this feature shipped sync the fields
+ * without a manual re-save. An explicit config entry (re-mapped or disabled in
+ * the dialog) always wins.
+ */
+export const HUBSPOT_LIST_IDENTITY_MAPPING: FieldMapping[] = [
+  { agentwebField: 'listName', crmProperty: 'lead_list_name', direction: 'push', enabled: true },
+  { agentwebField: 'listId', crmProperty: 'lead_list_id', direction: 'push', enabled: true },
+];
+
 
 /**
  * HubSpot CRM Adapter
@@ -30,6 +46,11 @@ export class HubspotAdapter implements CrmAdapter {
     private static readonly STANDARD_CONTACT_PROPS = new Set([
         'email', 'firstname', 'lastname', 'phone', 'jobtitle', 'company', 'hs_linkedin_url',
     ]);
+
+    /** agentwebFields that carry only source-list identity, not lead content. */
+    private static readonly LIST_IDENTITY_FIELDS = new Set(
+        HUBSPOT_LIST_IDENTITY_MAPPING.map(m => m.agentwebField)
+    );
 
     private formatError(err: any): string {
         return err?.response?.data?.message
@@ -67,6 +88,35 @@ export class HubspotAdapter implements CrmAdapter {
         const result: SyncResult = { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
         const svc = await this.getSvc(auth); // token resolved ONCE here
 
+        // Resolve the source list's display name once so leads can be enriched with
+        // listName/listId before mapping. Leads carry listId natively but not the
+        // human-readable list name (it lives on the AW-LeadLists record). Mapping
+        // these to CRM properties lets contacts be segmented by their Emma list.
+        // Falls back to config.listName, then config.listId, so a failed/absent
+        // lookup never aborts the push — the mapping just resolves to whatever's known.
+        let resolvedListName = config.listName;
+        try {
+            const list = await crmDb.getLeadListById(config.listId);
+            if (list?.name) resolvedListName = list.name;
+        } catch (err: any) {
+            console.warn(`[HubspotAdapter] failed to resolve list name for ${config.listId}: ${this.formatError(err)}`);
+        }
+
+        // Ensure the system list-identity mappings (listName/listId) are present.
+        // Configs created before this feature shipped don't carry them in their
+        // stored customFieldMapping, so inject them here unless the config already
+        // has an explicit entry for that agentwebField — an explicit entry (user
+        // re-mapped or disabled it in the dialog) always wins. This is the single
+        // choke point for every push path (full push + auto-sync single lead).
+        const effectiveCustomMapping = this.withListIdentityMappings(config.customFieldMapping);
+        // CRM property names that carry only list identity — used to decide whether
+        // a lead has any real content worth syncing (see the per-lead guard below).
+        const listIdentityProps = new Set(
+            effectiveCustomMapping
+                .filter(m => HubspotAdapter.LIST_IDENTITY_FIELDS.has(m.agentwebField))
+                .map(m => m.crmProperty)
+        );
+
         // ── 1. Pre-create any missing non-standard contact properties ────────────
         // buildHubSpotProps pushes properties from BOTH contactFieldMapping and
         // customFieldMapping, so any non-standard property in either list must be
@@ -74,7 +124,7 @@ export class HubspotAdapter implements CrmAdapter {
         // place a non-standard property such as "notes" in contactFieldMapping.)
         const pushContactMappings = [
             ...config.contactFieldMapping,
-            ...config.customFieldMapping,
+            ...effectiveCustomMapping,
         ].filter(m => m.enabled && m.direction !== 'pull');
         const ensuredProps = new Set<string>();
         for (const m of pushContactMappings) {
@@ -124,12 +174,28 @@ export class HubspotAdapter implements CrmAdapter {
                     continue;
                 }
 
+                // Enrich with the source lead-list identity so listName/listId
+                // mappings resolve. listId is already on the lead; listName is not,
+                // so we graft the resolved name on (without persisting it back).
+                const enrichedLead = {
+                    ...lead,
+                    listId: lead.listId ?? config.listId,
+                    listName: lead.listName ?? resolvedListName,
+                };
+
                 // Build contact properties from contact + custom mappings
-                const contactProps = this.buildHubSpotProps(lead, config.contactFieldMapping);
-                const customProps = this.buildHubSpotProps(lead, config.customFieldMapping);
+                const contactProps = this.buildHubSpotProps(enrichedLead, config.contactFieldMapping);
+                const customProps = this.buildHubSpotProps(enrichedLead, effectiveCustomMapping);
                 const allContactProps = { ...contactProps, ...customProps };
 
-                if (Object.keys(allContactProps).length === 0) continue;
+                // Skip leads with no real content. List identity is injected onto
+                // every lead, so a lead carrying ONLY list-identity props (e.g. an
+                // empty email-less lead) has nothing worth syncing — pushing it
+                // would create a junk HubSpot contact tagged with just a list.
+                const hasRealProps = Object.keys(allContactProps).some(
+                    k => !listIdentityProps.has(k)
+                );
+                if (!hasRealProps) continue;
 
                 const contactData = {
                     ...(email ? { email } : {}),
@@ -378,6 +444,20 @@ export class HubspotAdapter implements CrmAdapter {
 
     private getNestedValue(obj: any, path: string): any {
         return path.split('.').reduce((cur, part) => (cur == null ? undefined : cur[part]), obj);
+    }
+
+    /**
+     * Returns the custom mapping with the system list-identity mappings
+     * (listName/listId) appended for any agentwebField the config doesn't already
+     * define. An existing entry — whether the user re-mapped its CRM property or
+     * disabled it — is left untouched so explicit configuration always wins.
+     * Lets lists connected before this feature shipped sync listName/listId
+     * without a manual re-save.
+     */
+    private withListIdentityMappings(customMapping: FieldMapping[]): FieldMapping[] {
+        const present = new Set(customMapping.map(m => m.agentwebField));
+        const missing = HUBSPOT_LIST_IDENTITY_MAPPING.filter(m => !present.has(m.agentwebField));
+        return missing.length > 0 ? [...customMapping, ...missing] : customMapping;
     }
 
     /**

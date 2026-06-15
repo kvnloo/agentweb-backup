@@ -48,6 +48,11 @@ export const EVT_TOOL_FAILED = 'agent_tool_failed';
 export const EVT_RUN_COMPLETED = 'agent_run_completed';
 /** The run aborted with an unrecovered error. */
 export const EVT_RUN_FAILED = 'agent_run_failed';
+/** Durable outcome verdict (ok | degraded | failed), emitted alongside every
+ * terminal run event. "Completed" ≠ "succeeded": runs absorb tool failures and
+ * still complete, and only a durable event lets the loop's sensor learn from
+ * degraded runs (the inspector's read-time flags are invisible to the policy). */
+export const EVT_RUN_VERDICT = 'agent_run_verdict';
 
 export const AGENT_MODE_EVENT_TYPES = [
   EVT_RUN_STARTED,
@@ -57,4 +62,5 @@ export const AGENT_MODE_EVENT_TYPES = [
   EVT_TOOL_FAILED,
   EVT_RUN_COMPLETED,
   EVT_RUN_FAILED,
+  EVT_RUN_VERDICT,
 ] as const;

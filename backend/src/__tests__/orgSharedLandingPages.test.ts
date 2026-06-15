@@ -86,12 +86,32 @@ const mockDeleteLandingPageByRecord = jest.fn();
 const mockUpdateLandingPageContext = jest.fn();
 const mockGetLandingPage = jest.fn();
 
-jest.mock("../services/v0Service", () => ({
+jest.mock("../services/v0Service", () => {
+  // Real edit decision so `editable` annotations are exercised end-to-end.
+  const { canEditItem } = jest.requireActual("../services/orgShareService");
+  const { userDb, orgDb } = jest.requireMock("../services/db");
+  return {
   getLandingPage: (...args: any[]) => mockGetLandingPage(...args),
   getLandingPageById: (...args: any[]) => mockGetLandingPageById(...args),
   getLandingPagesByOwner: (...args: any[]) => mockGetLandingPagesByOwner(...args),
   getLandingPagesByOrg: (...args: any[]) => mockGetLandingPagesByOrg(...args),
   listLandingPages: (...args: any[]) => mockListLandingPages(...args),
+  canUserEditLandingPage: async (page: any, callerUserId: string) => {
+    if (page.userId === callerUserId) return true;
+    const [user, owner] = await Promise.all([
+      userDb.getUserById(callerUserId),
+      userDb.getUserById(page.userId),
+    ]);
+    const ownerOrgId = owner?.orgId;
+    const org = user?.orgId && user.orgId === ownerOrgId ? await orgDb.getOrgById(user.orgId) : null;
+    return canEditItem(
+      { userId: page.userId },
+      { userId: callerUserId, orgId: user?.orgId, orgRole: user?.orgRole },
+      org,
+      ownerOrgId,
+      "landingPages",
+    );
+  },
   deleteLandingPage: jest.fn(),
   deleteLandingPageByRecord: (...args: any[]) => mockDeleteLandingPageByRecord(...args),
   updateLandingPageContext: (...args: any[]) => mockUpdateLandingPageContext(...args),
@@ -114,7 +134,8 @@ jest.mock("../services/v0Service", () => ({
       secretKey: { envKey: "RECAPTCHA_SECRET_KEY", type: "encrypted", target: ["production"] },
     },
   },
-}));
+  };
+});
 
 // ---------------------------------------------------------------------------
 // Mock db
@@ -268,6 +289,92 @@ describe("GET /api/landing-pages/v0/generated — org sharing", () => {
     expect(res.status).toBe(200);
     const ids = res.body.pages.map((p: any) => p.id);
     expect(ids).not.toContain("page-diff");
+  });
+
+  it("marks own pages editable=true and view-only org pages editable=false (plain member)", async () => {
+    // Caller is a plain member (no editor rights). They own page-1 and can SEE
+    // page-2 (sharing on) but must NOT be allowed to edit it.
+    mockGetUserById.mockImplementation(async (id: string) => {
+      if (id === mockUserId) return { userId: mockUserId, orgId: mockOrgId, orgRole: "member" };
+      if (id === mockOrgMemberId) return { userId: mockOrgMemberId, orgId: mockOrgId, orgRole: "member" };
+      return null;
+    });
+    mockGetOrgById.mockResolvedValue(makeOrg(true, [])); // enabled, no editors
+    mockGetLandingPagesByOwner.mockResolvedValue([myPage]);
+    mockGetLandingPagesByOrg.mockResolvedValue([memberPage]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+    expect(res.status).toBe(200);
+    const byId = Object.fromEntries(res.body.pages.map((p: any) => [p.id, p.editable]));
+    expect(byId["page-1"]).toBe(true);  // own page
+    expect(byId["page-2"]).toBe(false); // view-only shared page
+  });
+
+  it("marks org pages editable=true when caller is a listed editor", async () => {
+    mockGetUserById.mockImplementation(async (id: string) => {
+      if (id === mockUserId) return { userId: mockUserId, orgId: mockOrgId, orgRole: "member" };
+      if (id === mockOrgMemberId) return { userId: mockOrgMemberId, orgId: mockOrgId, orgRole: "member" };
+      return null;
+    });
+    mockGetOrgById.mockResolvedValue(makeOrg(true, [mockUserId])); // caller is editor
+    mockGetLandingPagesByOwner.mockResolvedValue([myPage]);
+    mockGetLandingPagesByOrg.mockResolvedValue([memberPage]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+    expect(res.status).toBe(200);
+    const byId = Object.fromEntries(res.body.pages.map((p: any) => [p.id, p.editable]));
+    expect(byId["page-1"]).toBe(true);
+    expect(byId["page-2"]).toBe(true); // editor can edit shared page
+  });
+
+  it("marks org pages editable=true when caller is the org owner", async () => {
+    currentMockUser = { userId: mockOrgOwnerId, email: "orgowner@example.com", isAdmin: false };
+    mockGetUserById.mockImplementation(async (id: string) => {
+      if (id === mockOrgOwnerId) return { userId: mockOrgOwnerId, orgId: mockOrgId, orgRole: "owner" };
+      if (id === mockOrgMemberId) return { userId: mockOrgMemberId, orgId: mockOrgId, orgRole: "member" };
+      return null;
+    });
+    mockGetOrgById.mockResolvedValue(makeOrg(true, []));
+    mockGetLandingPagesByOwner.mockResolvedValue([]);
+    mockGetLandingPagesByOrg.mockResolvedValue([memberPage]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+    expect(res.status).toBe(200);
+    const byId = Object.fromEntries(res.body.pages.map((p: any) => [p.id, p.editable]));
+    expect(byId["page-2"]).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: GET /api/landing-pages/v0/generated/:id — editable flag
+// ---------------------------------------------------------------------------
+describe("GET /api/landing-pages/v0/generated/:id — editable flag", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    currentMockUser = { userId: mockUserId, email: "user1@example.com", isAdmin: false };
+  });
+
+  it("returns editable=true for the page owner", async () => {
+    mockGetLandingPageById.mockResolvedValue(myPage); // owned by user-1
+    const res = await request(app).get("/api/landing-pages/v0/generated/page-1");
+    expect(res.status).toBe(200);
+    expect(res.body.editable).toBe(true);
+  });
+
+  it("returns editable=false for a plain member viewing a shared page", async () => {
+    currentMockUser = { userId: mockOrgMemberId, email: "member@example.com", isAdmin: false };
+    mockGetLandingPageById.mockResolvedValue(myPage); // owned by user-1
+    mockGetUserById.mockImplementation(async (id: string) => {
+      if (id === mockOrgMemberId) return { userId: mockOrgMemberId, orgId: mockOrgId, orgRole: "member" };
+      if (id === mockUserId) return { userId: mockUserId, orgId: mockOrgId, orgRole: "member" };
+      return null;
+    });
+    mockGetOrgById.mockResolvedValue(makeOrg(true, [])); // enabled, no editors
+
+    const res = await request(app).get("/api/landing-pages/v0/generated/page-1");
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe("page-1"); // can view
+    expect(res.body.editable).toBe(false); // but not edit
   });
 });
 

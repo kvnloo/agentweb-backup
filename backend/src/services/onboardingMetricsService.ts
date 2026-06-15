@@ -30,7 +30,9 @@ import { v4 as uuidv4 } from "uuid";
 
 const TABLE_PREFIX =
   process.env.NODE_ENV === "development" ? "Dev-" : "";
-const METRICS_TABLE = `${TABLE_PREFIX}AW-OnboardingMetrics`;
+export const ONBOARDING_METRICS_TABLE = `${TABLE_PREFIX}AW-OnboardingMetrics`;
+export const ONBOARDING_METRICS_STEP_INDEX = "StepStartedAtIndex";
+const METRICS_TABLE = ONBOARDING_METRICS_TABLE;
 
 const docClient = new AWS.DynamoDB.DocumentClient();
 

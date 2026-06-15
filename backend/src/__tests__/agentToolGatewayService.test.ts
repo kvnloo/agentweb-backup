@@ -1,5 +1,7 @@
 import {
   AgentToolPolicyBlockedError,
+  AgentToolRepeatedFailureError,
+  _resetAgentToolFailureBreaker,
   executeAgentToolThroughGateway,
   evaluateAgentToolPolicy,
   summarizeAgentToolPolicyFlags,
@@ -767,5 +769,146 @@ describe('agentToolGatewayService', () => {
         expect(decision.effect).toBe(expectedEffect);
       });
     }
+  });
+
+  describe('repeated-failure circuit breaker', () => {
+    beforeEach(() => {
+      _resetAgentToolFailureBreaker();
+    });
+
+    const failingExecute = (message: string) => () => Promise.reject(new Error(message));
+
+    async function failNTimes(runId: string, toolName: string, message: string, n: number): Promise<void> {
+      for (let i = 0; i < n; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName,
+          args: { attempt: i },
+          runId,
+          execute: failingExecute(message),
+        });
+        expect(outcome.status).toBe('error');
+      }
+    }
+
+    it('blocks the next call after three identical failures in the same run', async () => {
+      await failNTimes('run-a', 'linkedin_outreach', 'Invalid parameters', 3);
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite' },
+        runId: 'run-a',
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+        const message = (outcome.error as Error).message;
+        expect(message).toContain('linkedin_outreach');
+        expect(message).toContain('Invalid parameters');
+        expect(message.toLowerCase()).toContain('do not retry');
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('resets the failure count when the tool succeeds', async () => {
+      await failNTimes('run-b', 'linkedin_outreach', 'Invitation message is too long', 2);
+
+      const success = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite' },
+        runId: 'run-b',
+        execute: () => Promise.resolve({ ok: true }),
+      });
+      expect(success.status).toBe('success');
+
+      await failNTimes('run-b', 'linkedin_outreach', 'Invitation message is too long', 2);
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite' },
+        runId: 'run-b',
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not trip on three different errors for the same tool', async () => {
+      await failNTimes('run-c', 'update_html_file', 'File hash mismatch', 1);
+      await failNTimes('run-c', 'update_html_file', 'No selectors matched', 1);
+      await failNTimes('run-c', 'update_html_file', 'Schema validation failed', 1);
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'update_html_file',
+        args: {},
+        runId: 'run-c',
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('isolates failure counts between runs', async () => {
+      await failNTimes('run-d', 'linkedin_outreach', 'Invalid parameters', 3);
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: {},
+        runId: 'run-e',
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('evicts the oldest run once the tracked-run cap is exceeded', async () => {
+      await failNTimes('run-oldest', 'linkedin_outreach', 'Invalid parameters', 3);
+
+      // Push 500 more runs through to evict run-oldest from the tracker.
+      for (let i = 0; i < 500; i += 1) {
+        await failNTimes(`run-filler-${i}`, 'search_web', 'No search results found', 1);
+      }
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: {},
+        runId: 'run-oldest',
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('never blocks calls without a runId', async () => {
+      for (let i = 0; i < 4; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'linkedin_outreach',
+          args: {},
+          execute: failingExecute('Invalid parameters'),
+        });
+        expect(outcome.status).toBe('error');
+        if (outcome.status === 'error') {
+          expect(outcome.error).not.toBeInstanceOf(AgentToolRepeatedFailureError);
+        }
+      }
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: {},
+        execute,
+      });
+      expect(outcome.status).toBe('success');
+    });
   });
 });

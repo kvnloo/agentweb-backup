@@ -7,7 +7,7 @@
  * enrichment is missing or carries an error.
  */
 
-import { _postDailyDigestForTesting } from '../loops/instances/ai-eval-funnel/cron';
+import { _postDailyDigestForTesting } from '../loops/instances/ai-eval-funnel';
 import type { LoopRunResult, Mutation, MutationProposal } from '../loops/core/types';
 import { asLoopId, asMutationId, asRunId } from '../loops/core/types';
 import type { AiEvalProposalPayload } from '../loops/instances/ai-eval-funnel/rules';

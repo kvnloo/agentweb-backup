@@ -6,7 +6,7 @@ import path from "path";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken, getLandingPagesConfig } from "../utils/secretsManager";
 import { userDb, orgDb } from "./db";
 import { canEditItem } from "./orgShareService";
-import { addSubdomain, generateSubdomain } from "./customDomainService";
+import { addSubdomain, generateSubdomain, listDomains, SUBDOMAIN_BASE } from "./customDomainService";
 import { settingsService } from "./settingsService";
 import { paginatedQuery } from "../utils/dynamoPagination";
 
@@ -127,6 +127,34 @@ export interface GeneratedLandingPage {
   leadListId?: string;
   templateHtml?: string;
   isRootPage?: boolean;
+  /**
+   * The site this page belongs to. A site = the repo/Vercel project/subdomain a
+   * page is deployed into. The site's root record has `siteId === id`; sub-pages
+   * carry their root's id. Explicit identity that replaces the old "guess the
+   * user's oldest repo" heuristic in {@link findSiteById} / generateLandingPage.
+   */
+  siteId?: string;
+  /**
+   * The agent-mode chat session that spawned this generation. Set when a page is
+   * generated from a session so a long-running build can be reconnected to that
+   * session on completion (durable execution — see durableLandingService).
+   */
+  originatingSessionId?: string;
+  /**
+   * Set, exactly once, when a completion has been delivered back to the
+   * originating session. Written via a conditional `attribute_not_exists` update
+   * so the in-process completion hook and the redeploy-backstop poller can never
+   * both deliver (idempotency). See durableLandingService.claimCompletion.
+   */
+  claimedCompletionAt?: string;
+  /**
+   * True once a build's run timed out and a "still building" message was shown to
+   * the user — i.e. this build still owes the session a completion. The redeploy
+   * poller only ever acts on records with this flag, so builds that completed
+   * normally (within the run timeout, already delivered over HTTP) are never
+   * re-delivered. Cleared implicitly by claimedCompletionAt being set.
+   */
+  awaitingReconnect?: boolean;
   slug?: string;
   archived?: boolean;
   archivedAt?: string;
@@ -167,6 +195,82 @@ export function getLandingPageLiveUrl(
   page: Pick<GeneratedLandingPage, "deployedUrl" | "customDomainUrl">
 ): string {
   return page.customDomainUrl || page.deployedUrl || "";
+}
+
+/**
+ * Resolve a page's live URL against the domain ACTUALLY attached to its Vercel
+ * project (AW-CustomDomains is the source of truth), then fall back to
+ * {@link getLandingPageLiveUrl}.
+ *
+ * `customDomainUrl` is persisted at deploy time and can go stale: a managed
+ * `*.agentwebforms.com` subdomain may silently detach from the project (e.g. a
+ * re-deploy or a 409 collision that re-added the subdomain with a different
+ * suffix), leaving the page with an old subdomain that now serves a Vercel
+ * DEPLOYMENT_NOT_FOUND 404. The list endpoint (`GET /generated`) already
+ * corrects this in bulk; this is the single-page equivalent so the publish and
+ * edit endpoints report the live, attached URL instead of the stale one.
+ *
+ * Correction rules (mirroring the list endpoint):
+ *   - Only MANAGED subdomains (`*.agentwebforms.com`) are corrected. A real
+ *     custom domain stored on the page is user-managed and left untouched.
+ *   - Among the project's attached domains, prefer a verified custom domain
+ *     over a managed subdomain; break ties by most-recently-updated.
+ *   - Lookups are scoped to the page OWNER (page.userId), not the caller, so an
+ *     org member editing a shared page sees the same attached URL the owner does.
+ *
+ * Never throws: any failure (no project, no owner, domain lookup error) falls
+ * back to the stored value via {@link getLandingPageLiveUrl}.
+ */
+export async function resolveLandingPageLiveUrl(
+  page: Pick<
+    GeneratedLandingPage,
+    "deployedUrl" | "customDomainUrl" | "vercelProjectId" | "userId" | "slug"
+  >
+): Promise<string> {
+  const fallback = getLandingPageLiveUrl(page);
+  if (!page.vercelProjectId || !page.userId) return fallback;
+
+  try {
+    const domains = await listDomains(page.userId, page.vercelProjectId);
+    if (domains.length === 0) return fallback;
+
+    const rank = (d: { type: string }) => (d.type === "custom" ? 1 : 0);
+    let best = domains[0];
+    for (const d of domains) {
+      if (
+        rank(d) > rank(best) ||
+        (rank(d) === rank(best) && d.updatedAt > best.updatedAt)
+      ) {
+        best = d;
+      }
+    }
+
+    const targetUrl = page.slug
+      ? `https://${best.domain}/${page.slug}`
+      : `https://${best.domain}`;
+
+    // No stored URL → adopt the attached domain.
+    if (!page.customDomainUrl) return targetUrl;
+
+    // Only correct stored managed subdomains that have gone stale; leave real
+    // custom domains and already-correct values as-is.
+    let storedHost: string | null = null;
+    try {
+      storedHost = new URL(page.customDomainUrl).host;
+    } catch {
+      return fallback;
+    }
+    if (
+      storedHost &&
+      storedHost.endsWith(`.${SUBDOMAIN_BASE}`) &&
+      storedHost !== best.domain
+    ) {
+      return targetUrl;
+    }
+    return fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 export interface BrandContext {
@@ -395,24 +499,113 @@ async function getV0Client() {
  * - If user ALREADY has a deployed landing page → add a new page route to the EXISTING
  *   GitHub repo via the GitHub Contents API. No v0 call, no new repo. Vercel auto-redeploys.
  */
+export type LandingSiteMode = "unified" | "separate";
+
+/**
+ * Resolve the effective landing-site mode, enforcing the WRITE-ONCE lock.
+ *
+ * Behavioral contract (single page vs multi page):
+ * - "single page" = `unified` (new pages become sub-pages of one site).
+ * - "multi page"  = `separate` (each page its own site/domain).
+ * The choice is LOCKED once made: switching would mean physically re-homing
+ * already-deployed pages across repos/projects/domains (broken URLs + SEO). So:
+ * - If the user already has a saved mode, it is authoritative and immutable
+ *   (a conflicting request is ignored), and `lockNow` is false.
+ * - If no saved mode and the request explicitly picks one, that pick becomes the
+ *   mode and `lockNow` is true (persist it write-once).
+ * - If neither, fall back to `unified` without locking (no explicit choice yet).
+ */
+export function resolveLockedSiteMode(
+  savedMode: LandingSiteMode | undefined,
+  requestedMode: unknown
+): { mode: LandingSiteMode; lockNow: boolean } {
+  if (savedMode === "unified" || savedMode === "separate") {
+    return { mode: savedMode, lockNow: false };
+  }
+  if (requestedMode === "unified" || requestedMode === "separate") {
+    return { mode: requestedMode, lockNow: true };
+  }
+  return { mode: "unified", lockNow: false };
+}
+
+export interface GenerateLandingPageOptions {
+  /**
+   * Target a specific existing site — add this page/variant to its repo. Wins over
+   * `mode`. When omitted, `mode` decides whether to reuse the user's site or make
+   * a new one.
+   */
+  siteId?: string;
+  /**
+   * `unified` (cost-safe default): add the page to the user's existing site (a
+   * route under the shared subdomain) — only the first page spends a v0 site
+   * generation. `separate`: each campaign gets its own site/subdomain (a fresh v0
+   * generation + repo + project) — costlier, opt-in. Resolved from the user's
+   * landingSiteMode preference, overridable per request by the agent.
+   */
+  mode?: "unified" | "separate";
+  /** The agent-mode session that spawned this build (durable-execution marker). */
+  originatingSessionId?: string;
+}
+
 export async function generateLandingPage(
   userId: string,
   prompt: string,
   name: string,
   brandContext: BrandContext,
   leadListId?: string,
-  templateHtml?: string
+  templateHtml?: string,
+  opts?: GenerateLandingPageOptions
 ): Promise<GeneratedLandingPage> {
-  // Check if user already has a site (GitHub repo) — includes archived records.
-  // This is the core guard: v0 is only called if NO site exists at all.
+  const multiSite = process.env.DURABLE_LANDING_GENERATION === "true";
+  const originatingSessionId = opts?.originatingSessionId;
+  const mode = opts?.mode ?? "unified";
+
+  if (multiSite) {
+    // 1. Explicit target site → add a page/variant to it (shares the subdomain).
+    if (opts?.siteId) {
+      const site = await findSiteById(opts.siteId, userId);
+      if (site?.githubRepoUrl) {
+        return addPageToExistingRepo(
+          site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
+        );
+      }
+      // siteId given but not a usable site (deleted / never deployed) → fall through.
+    }
+
+    // 2. "separate" → each campaign gets its OWN site (fresh v0 generation + repo +
+    //    subdomain). The costlier, opt-in path (e.g. distinct campaign URLs).
+    if (mode === "separate") {
+      return generateFirstPage(
+        userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId
+      );
+    }
+
+    // 3. "unified" (cost-safe default) → add the page to the user's existing site;
+    //    only the first page spends a v0 site generation, later pages are routes
+    //    under it. Falls back to creating the first site if none exists yet.
+    const existing = await findUserSiteRecord(userId);
+    if (existing?.githubRepoUrl) {
+      return addPageToExistingRepo(
+        existing, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
+      );
+    }
+    return generateFirstPage(
+      userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId
+    );
+  }
+
+  // ── Legacy single-site behavior (flag off). DEPRECATED: delete this whole
+  // block (plus findUserSiteRecord's guess + the orphan-scavenging helpers) when
+  // DURABLE_LANDING_GENERATION defaults on. The guessing and recycling below exist
+  // ONLY because site and job identity were implicit; the multi-site branch above
+  // needs none of it — the controller's retry-reconnect (findInFlightJobForSession)
+  // and the redeploy poller subsume the reusable/recyclable scans. ──
   const siteRecord = await findUserSiteRecord(userId);
 
   if (siteRecord) {
-    // ── Add new page route to existing repo (no v0 call) ──
     return addPageToExistingRepo(siteRecord, userId, prompt, name, brandContext, leadListId, templateHtml);
   }
 
-  // Dedup: if this user already has a page in-progress with a v0ChatId, reuse it.
   const existingPages = await listLandingPages(userId);
   const reusable = existingPages.find(
     (p) => p.v0ChatId && ["generating", "draft", "deploying"].includes(p.status)
@@ -422,21 +615,35 @@ export async function generateLandingPage(
     return reusable;
   }
 
-  // Recovery: a prior first-page attempt that failed *before* a v0 chat was ever
-  // created (e.g. v0 returned HTTP 500) leaves an orphaned record with no v0ChatId
-  // and no GitHub repo. Recycle the newest such record instead of creating yet
-  // another orphan, so repeated retries don't pile up dead "failed" pages.
   const recyclable = existingPages.find(isOrphanedFailedPage);
   if (recyclable) {
     console.log(`[V0 SERVICE] Recycling failed page record ${recyclable.id} (no v0 chat) for retry`);
-    // Recycling reuses ONE orphan's id; archive any OTHER orphaned failed records so a
-    // backlog from earlier failures (e.g. a sustained v0 outage) doesn't linger on the
-    // user's page list. Best-effort — never blocks the new generation.
     await cleanupOrphanedFailedPages(userId, existingPages, recyclable.id);
   }
 
-  // ── First page: call v0 → create repo → deploy ──
   return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id);
+}
+
+/**
+ * Resolve a site (the record that owns the repo/Vercel project) by id, scoped to
+ * the owner. Accepts either a site-root id or a sub-page id (resolves to its
+ * site root via `siteId`). Returns null if not found, not owned, or not yet
+ * deployed (no repo). Replaces the old "guess the user's oldest repo" heuristic
+ * with an explicit, unambiguous lookup.
+ */
+export async function findSiteById(
+  siteId: string,
+  userId: string
+): Promise<GeneratedLandingPage | null> {
+  const record = await getLandingPage(siteId, userId);
+  if (!record) return null;
+  if (record.githubRepoUrl) return record;
+  // A sub-page id was passed and it isn't the repo owner — resolve to its root.
+  if (record.siteId && record.siteId !== record.id) {
+    const root = await getLandingPage(record.siteId, userId);
+    if (root?.githubRepoUrl) return root;
+  }
+  return null;
 }
 
 /**
@@ -506,7 +713,8 @@ async function generateFirstPage(
   brandContext: BrandContext,
   leadListId?: string,
   templateHtml?: string,
-  existingId?: string
+  existingId?: string,
+  originatingSessionId?: string
 ): Promise<GeneratedLandingPage> {
   // Reuse a recyclable failed record's id when retrying, otherwise mint a new one.
   const id = existingId ?? uuidv4();
@@ -526,12 +734,16 @@ async function generateFirstPage(
     status: "generating",
     iterations: 0,
     isRootPage: true,
+    // A new site's root record IS its own site — explicit identity that replaces
+    // the old "guess the oldest repo" heuristic.
+    siteId: id,
     createdAt: now,
     updatedAt: now,
   };
 
   if (leadListId) record.leadListId = leadListId;
   if (templateHtml) record.templateHtml = templateHtml;
+  if (originatingSessionId) record.originatingSessionId = originatingSessionId;
 
   await dynamodb.put({ TableName: TABLE_NAME, Item: record }).promise();
 
@@ -612,7 +824,8 @@ async function addPageToExistingRepo(
   name: string,
   brandContext: BrandContext,
   leadListId?: string,
-  templateHtml?: string
+  templateHtml?: string,
+  originatingSessionId?: string
 ): Promise<GeneratedLandingPage> {
   const id = uuidv4();
   const now = new Date().toISOString();
@@ -651,6 +864,10 @@ async function addPageToExistingRepo(
     slug,
     githubRepoUrl: existingPage.githubRepoUrl,
     vercelProjectId: existingPage.vercelProjectId,
+    // Belongs to the same site as the page it was added to. A site's root has
+    // siteId === id, so a sub-page inherits the root's siteId (or the root's id).
+    siteId: existingPage.siteId ?? existingPage.id,
+    ...(originatingSessionId ? { originatingSessionId } : {}),
     deployedUrl: baseUrl ? `${baseUrl}/${slug}` : undefined,
     createdAt: now,
     updatedAt: now,
@@ -1296,29 +1513,12 @@ export async function deployLandingPage(
 
     console.log(`[V0 SERVICE] Deployment complete: ${deployedUrl} | GitHub: ${githubRepoUrl}`);
 
-    // Auto-assign an agentwebforms.com subdomain after successful deploy
-    let customDomain: string | undefined;
-    try {
-      const subdomain = generateSubdomain(record.name || "page");
-      const domainRecord = await addSubdomain(userId, vercelProjectId, subdomain);
-      customDomain = domainRecord.domain;
-      console.log(`[V0 SERVICE] Auto-assigned subdomain: ${customDomain}`);
-      // Persist customDomainUrl so it's available on subsequent fetches without relying on enrichment
-      await dynamodb
-        .update({
-          TableName: TABLE_NAME,
-          Key: { id },
-          UpdateExpression: "SET customDomainUrl = :customUrl, updatedAt = :updatedAt",
-          ExpressionAttributeValues: {
-            ":customUrl": `https://${customDomain}`,
-            ":updatedAt": new Date().toISOString(),
-          },
-        })
-        .promise();
-    } catch (subdomainErr: any) {
-      // Non-fatal — the Vercel URL still works
-      console.warn(`[V0 SERVICE] Could not auto-assign subdomain: ${subdomainErr.message}`);
-    }
+    // Auto-assign an agentwebforms.com subdomain after successful deploy. Retried:
+    // a transient Vercel domains-API blip here used to be swallowed, leaving the
+    // page on its raw *.vercel.app URL permanently (≈30% of deployed pages showed
+    // "vercel junk" instead of the clean subdomain). addSubdomain already handles
+    // 409 collisions; withRetry covers fetch-failed/5xx/timeout.
+    const customDomain = await assignManagedSubdomain(id, userId, vercelProjectId, record.name);
 
     // Auto-configure GSC domain + GA4 property when deployed to a managed subdomain
     if (customDomain) {
@@ -1997,6 +2197,47 @@ async function isLandingPageUrlLive(url?: string): Promise<boolean> {
 }
 
 /**
+ * Assign a managed agentwebforms.com subdomain to a root site's Vercel project and
+ * persist `customDomainUrl`. Retried: a transient Vercel domains-API blip here used
+ * to be swallowed, leaving the page on its raw *.vercel.app URL permanently
+ * (≈30% of deployed pages showed "vercel junk" instead of the clean subdomain).
+ * `addSubdomain` already handles 409 collisions; `withRetry` covers
+ * fetch-failed/5xx/timeout. Non-fatal — the Vercel URL still works if this throws.
+ * Returns the assigned domain (no scheme) or undefined.
+ */
+async function assignManagedSubdomain(
+  id: string,
+  userId: string,
+  vercelProjectId: string,
+  name: string | undefined
+): Promise<string | undefined> {
+  try {
+    const subdomain = generateSubdomain(name || "page");
+    const domainRecord = await withRetry(
+      () => addSubdomain(userId, vercelProjectId, subdomain),
+      "assign subdomain"
+    );
+    const customDomain = domainRecord.domain;
+    console.log(`[V0 SERVICE] Auto-assigned subdomain: ${customDomain}`);
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "SET customDomainUrl = :customUrl, updatedAt = :updatedAt",
+        ExpressionAttributeValues: {
+          ":customUrl": `https://${customDomain}`,
+          ":updatedAt": new Date().toISOString(),
+        },
+      })
+      .promise();
+    return customDomain;
+  } catch (subdomainErr: any) {
+    console.warn(`[V0 SERVICE] Could not auto-assign subdomain: ${subdomainErr.message}`);
+    return undefined;
+  }
+}
+
+/**
  * Get the current deployment status and build logs for a landing page.
  * Exposed as a tool so Emma can check on builds.
  */
@@ -2049,6 +2290,14 @@ export async function getDeploymentStatus(
         }).promise();
       } catch (_e) {
         // Best-effort — don't block the status response
+      }
+      // A root page healed from failed→deployed here never ran the post-deploy
+      // subdomain assignment (that only fires on a first-try success), so it stayed
+      // on its raw *.vercel.app URL. Assign the managed subdomain now. Root-only:
+      // sub-pages inherit the root's subdomain; skipped if one is already attached.
+      const isRoot = record.isRootPage || record.siteId === record.id || !record.slug;
+      if (isRoot && !record.customDomainUrl && record.vercelProjectId) {
+        await assignManagedSubdomain(record.id, userId, record.vercelProjectId, record.name);
       }
       return {
         status: "deployed",
@@ -2544,6 +2793,53 @@ export async function resolveSiteForCaller(
     if (allowed) return site;
   }
   return null;
+}
+
+/**
+ * Whether `callerUserId` may EDIT `page`, accounting for org sharing.
+ *
+ * Single source of truth for the edit decision, shared by the route layer
+ * (authorizeLandingPageAccess), the list/get endpoints (to surface an
+ * `editable` flag), and the coding agent (to fail fast before spinning up the
+ * LLM loop). Mirrors canEditItem: the page owner always passes; otherwise the
+ * caller must be in the page owner's org AND be an org owner or a listed
+ * landingPages editor. Visibility (canViewItem) is deliberately broader — a
+ * plain member can VIEW a shared page but not edit it, which is exactly the
+ * gap this helper lets callers report up front.
+ *
+ * Best-effort and non-throwing: any lookup failure resolves to `false` (deny)
+ * so a transient DB error can't accidentally grant edit access.
+ */
+export async function canUserEditLandingPage(
+  page: Pick<GeneratedLandingPage, "userId">,
+  callerUserId: string,
+): Promise<boolean> {
+  try {
+    if (page.userId === callerUserId) return true;
+    const [user, pageOwner] = await Promise.all([
+      userDb.getUserById(callerUserId),
+      userDb.getUserById(page.userId),
+    ]);
+    const ownerOrgId = pageOwner?.orgId;
+    const org =
+      user?.orgId && user.orgId === ownerOrgId
+        ? await orgDb.getOrgById(user.orgId)
+        : null;
+    return canEditItem(
+      { userId: page.userId },
+      {
+        userId: callerUserId,
+        orgId: user?.orgId,
+        orgRole: user?.orgRole as "owner" | "member" | undefined,
+      },
+      org,
+      ownerOrgId,
+      "landingPages",
+    );
+  } catch (e) {
+    console.warn("[LP] canUserEditLandingPage check failed; denying edit:", e);
+    return false;
+  }
 }
 
 /**

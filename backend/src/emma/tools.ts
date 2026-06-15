@@ -215,7 +215,7 @@ Actions:
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
 - list-received-invitations: (exact action string: "list-received-invitations") List pending connection requests received from others. Returns paginated results with sender info.
-- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended. IMPORTANT: message must be 300 characters or fewer — LinkedIn rejects longer notes. Always count characters before sending; if over limit, trim the message first.
+- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended. IMPORTANT: the invite note limit is 200 characters on free LinkedIn accounts and 300 on Premium. Unless you know the account is Premium, keep the message at 200 characters or fewer — LinkedIn rejects longer notes. Always count characters before sending; if over limit, trim the message first. Also: do not send-invite to someone you are already connected with (network_distance FIRST_DEGREE) — use send-message instead; check with get-profile or list-connections if unsure.
 - send-message: Send a direct message. Requires profile_url or provider_id. message required. Only works for 1st-degree connections or open profiles. When sending to a CRM lead, always provide list_id and lead_id — the system enforces that update-conversation-history was called within the last 24 hours before allowing a send.
 - send-inmail: Send a LinkedIn InMail to any profile regardless of connection degree (2nd/3rd-degree connections). Requires profile_url or provider_id, message (body), and subject. Requires a LinkedIn Premium account with available InMail credits. Use this when send-message is not possible due to connection degree restrictions. list_id and lead_id are optional but recommended for CRM persistence.
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
@@ -249,7 +249,7 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         message: {
           type: 'string',
-          description: 'Message content. Required for send-message and send-inmail; recommended for send-invite. For send-invite: must be 300 characters or fewer (LinkedIn hard limit).'
+          description: 'Message content. Required for send-message and send-inmail; recommended for send-invite. For send-invite: 200 characters max on free LinkedIn accounts, 300 on Premium — stay at 200 or fewer unless you know the account is Premium.'
         },
         subject: {
           type: 'string',
@@ -5496,7 +5496,7 @@ emmaToolRegistry.register({
     // Embed at write time so the memory can later be retrieved by relevance, not just
     // recency. Best-effort: a failure must not block saving (read path falls back to recency).
     const { embedText } = await import('../utils/embeddings');
-    const embedding = (await embedText(args.content)) ?? undefined;
+    const embedding = (await embedText(args.content, { userId, feature: 'embeddings' })) ?? undefined;
     const memory = await accountMemoryDb.addMemory(
       userId,
       args.category,
@@ -5580,7 +5580,7 @@ emmaToolRegistry.register({
 
     // Embed at write time so the memory can later be retrieved by relevance (best-effort).
     const { embedText } = await import('../utils/embeddings');
-    const embedding = (await embedText(args.content)) ?? undefined;
+    const embedding = (await embedText(args.content, { userId, feature: 'embeddings' })) ?? undefined;
     const memory = await orgMemoryDb.addMemory(
       user.orgId,
       args.category,
@@ -6103,6 +6103,12 @@ emmaToolRegistry.register({
         previewUrl: result.previewUrl,
         branch: result.branch,
         is_staging: !!result.branch && result.branch !== 'main',
+        // Authorization denials are not retryable — the caller lacks edit rights
+        // on this page. Signal the parent agent to surface the message and stop
+        // re-invoking coding_agent (which previously burned several attempts).
+        ...(result.notAuthorized
+          ? { notAuthorized: true, retryable: false }
+          : {}),
       };
     }
   }
@@ -6353,6 +6359,15 @@ emmaToolRegistry.register({
               pageUrl: {
                 type: 'string',
                 description: 'URL of the page where the issue occurred (optional)'
+              },
+              attachment_urls: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Optional https URLs of screenshots or files (e.g. S3 links) that evidence the issue. Upload files first, then pass their URLs here.'
+              },
+              run_id: {
+                type: 'string',
+                description: 'Optional AgentRun id (from the AgentRun inspector / runtime telemetry). When given, the server automatically attaches the run dossier — verdict, failed tool calls with error class/message and the failing arguments — to the report. Strongly recommended when reporting an agent/tool failure.'
               }
             },
             required: ['title', 'description']
@@ -6411,14 +6426,56 @@ emmaToolRegistry.register({
           'Session ID': context?.sessionId || 'N/A',
         };
 
+        const attachmentUrls = Array.isArray(issue.attachment_urls)
+          ? issue.attachment_urls.filter((u: unknown): u is string => typeof u === 'string' && /^https?:\/\//.test(u))
+          : [];
+        if (attachmentUrls.length > 0) {
+          issueContext['Attachments'] = attachmentUrls.join('\n');
+        }
+
+        // Server-side run-dossier enrichment: the reporter passes a run_id and
+        // the server pulls the telemetry it already has. Best-effort — a
+        // failed lookup must never block the report.
+        let description: string = issue.description;
+        if (typeof issue.run_id === 'string' && issue.run_id.trim()) {
+          try {
+            const { fetchAgentRunSummaries } = await import('../services/agentRunInspectorService');
+            const { runs } = await fetchAgentRunSummaries({ runId: issue.run_id.trim(), limit: 1 });
+            const run = runs[0];
+            if (run) {
+              const failures = (run.outcomes || [])
+                .filter((o: any) => o.eventType === 'agent_tool_failed')
+                .slice(0, 10)
+                .map((o: any) => {
+                  const argsPart = o.failedArgsJson ? `\n  args: ${o.failedArgsJson}` : '';
+                  return `- ${o.toolName || 'unknown'} [${o.errorClass || 'Error'}]: ${o.errorMessage || ''}${argsPart}`;
+                });
+              description += [
+                '',
+                '',
+                '---',
+                `AgentRun dossier (auto-attached from run_id ${run.runId}):`,
+                `- verdict: ${(run as any).verdict || 'n/a'}  |  tool calls: ${(run as any).toolCalls ?? 'n/a'}  |  failed: ${(run as any).failedToolCalls ?? 'n/a'}`,
+                ...(run.sessionId ? [`- session: ${run.sessionId}`] : []),
+                ...(failures.length > 0 ? ['- failed tool calls:', ...failures] : []),
+              ].join('\n');
+              issueContext['AgentRun ID'] = run.runId;
+            }
+          } catch (e) {
+            console.warn('[report_product_issues] run dossier enrichment failed (report still filed):', e instanceof Error ? e.message : e);
+          }
+        }
+
         if (isDelegatedAdmin && adminEmail) {
           issueContext['Reported By (Admin)'] = adminEmail;
         }
 
         const result = await createOncallItem({
           title: issue.title,
-          description: issue.description,
-          additionalTags: ['Customer Reported'],
+          description,
+          // External MCP clients (Claude Code etc.) are tagged distinctly so
+          // benchmark filters on Customer Reported stay clean.
+          additionalTags: [context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported'],
           context: issueContext,
         });
 
@@ -6482,6 +6539,17 @@ emmaToolRegistry.register({
     };
   }
 });
+
+// Bridge report_product_issues onto the EXTERNAL MCP registry so the claude.ai
+// Emma connector (api.agentweb.pro/mcp) can file bug reports directly — without
+// portal login. Without this it is only reachable by in-app Emma. The handler
+// reads context.userId (set to agentUserId for external clients) and
+// context.externalMcp (true only on the external server) for source tagging, so
+// the same handler works on both surfaces.
+const reportProductIssuesHandler = emmaToolRegistry.getTool('report_product_issues');
+if (reportProductIssuesHandler) {
+  mcpToolRegistry.register(reportProductIssuesHandler);
+}
 
 emmaToolRegistry.register({
   name: 'get_user_profile',

@@ -56,6 +56,10 @@ jest.mock('facebook-nodejs-business-sdk', () => {
     };
 });
 
+jest.mock('../utils/secretsManager', () => ({
+    getMetaCredentials: jest.fn(),
+}));
+
 // Mock static fields that are used in code
 // @ts-ignore
 AdSet.Fields = {
@@ -790,8 +794,6 @@ describe('MetaService', () => {
                     account_id: '123',
                     currency: 'USD',
                     account_status: 1,
-                    owner: 'user123',
-                    business: { id: 'biz123', name: 'Test Business' }
                 }
             ];
             const mockGetAdAccounts = jest.fn().mockResolvedValue(mockAdAccounts);
@@ -804,9 +806,22 @@ describe('MetaService', () => {
             expect(FacebookAdsApi.init).toHaveBeenCalledWith(mockAccessToken);
             expect(User).toHaveBeenCalledWith('me');
             expect(mockGetAdAccounts).toHaveBeenCalledWith(
-                expect.arrayContaining(['id', 'name', 'account_id', 'currency', 'account_status', 'owner', 'business'])
+                expect.arrayContaining(['id', 'name', 'account_id', 'currency', 'account_status'])
             );
             expect(result).toEqual(mockAdAccounts);
+        });
+
+        it('must not request the owner or business fields (Meta silently omits non-owned ad accounts when owner is requested)', async () => {
+            const mockGetAdAccounts = jest.fn().mockResolvedValue([]);
+            (User as unknown as jest.Mock).mockImplementation(() => ({
+                getAdAccounts: mockGetAdAccounts,
+            }));
+
+            await service.getAdAccounts(mockAccessToken);
+
+            const requestedFields = mockGetAdAccounts.mock.calls[0][0];
+            expect(requestedFields).not.toContain('owner');
+            expect(requestedFields).not.toContain('business');
         });
 
         it('should include ad accounts without a business object (Business Manager accounts)', async () => {
@@ -873,6 +888,108 @@ describe('MetaService', () => {
 
             expect(result).toHaveLength(1);
             expect(result[0].account_id).toBe('123');
+        });
+
+        describe('getPages granular fallback (when /me/accounts is empty)', () => {
+            // Meta quirk: tokens whose page access comes via Business Manager task
+            // assignment (Facebook Login for Business) return [] from /me/accounts even
+            // though debug_token granular_scopes lists the opted-in pages. The fallback
+            // enumerates those page IDs and reads each page directly.
+            const { getMetaCredentials } = require('../utils/secretsManager');
+            const realFetch = global.fetch;
+
+            afterEach(() => {
+                global.fetch = realFetch;
+            });
+
+            const mockFetchByUrl = (routes: Array<[string, any]>) => {
+                global.fetch = jest.fn().mockImplementation((url: string) => {
+                    const match = routes.find(([frag]) => String(url).includes(frag));
+                    return Promise.resolve({ json: () => Promise.resolve(match ? match[1] : {}) });
+                }) as any;
+            };
+
+            it('returns pages from granular scopes when /me/accounts is empty', async () => {
+                (User as unknown as jest.Mock).mockImplementation(() => ({
+                    getAccounts: jest.fn().mockResolvedValue([]),
+                }));
+                (getMetaCredentials as jest.Mock).mockResolvedValue({
+                    clientId: 'app_id', clientSecret: 'app_secret',
+                    instagramClientId: 'x', instagramClientSecret: 'y',
+                });
+                mockFetchByUrl([
+                    ['debug_token', { data: { granular_scopes: [{ scope: 'pages_show_list', target_ids: ['p1', 'p2'] }] } }],
+                    ['/p1?', { id: 'p1', name: 'Page One', access_token: 'p1_token', category: 'Brand' }],
+                    ['/p2?', { id: 'p2', name: 'Page Two', access_token: 'p2_token', category: 'Agency' }],
+                ]);
+
+                const result = await service.getPages('user_token');
+
+                expect(result).toHaveLength(2);
+                expect(result[0]).toEqual(expect.objectContaining({ id: 'p1', name: 'Page One', access_token: 'p1_token', category: 'Brand' }));
+                expect(result[1]).toEqual(expect.objectContaining({ id: 'p2', name: 'Page Two', access_token: 'p2_token', category: 'Agency' }));
+            });
+
+            it('skips pages that error during direct read', async () => {
+                (User as unknown as jest.Mock).mockImplementation(() => ({
+                    getAccounts: jest.fn().mockResolvedValue([]),
+                }));
+                (getMetaCredentials as jest.Mock).mockResolvedValue({
+                    clientId: 'app_id', clientSecret: 'app_secret',
+                    instagramClientId: 'x', instagramClientSecret: 'y',
+                });
+                mockFetchByUrl([
+                    ['debug_token', { data: { granular_scopes: [{ scope: 'pages_show_list', target_ids: ['p1', 'p2'] }] } }],
+                    ['/p1?', { error: { message: 'missing permission', code: 100 } }],
+                    ['/p2?', { id: 'p2', name: 'Page Two', access_token: 'p2_token', category: 'Agency' }],
+                ]);
+
+                const result = await service.getPages('user_token');
+
+                expect(result).toHaveLength(1);
+                expect(result[0].id).toBe('p2');
+            });
+
+            it('returns empty array when granular scopes have no page ids', async () => {
+                (User as unknown as jest.Mock).mockImplementation(() => ({
+                    getAccounts: jest.fn().mockResolvedValue([]),
+                }));
+                (getMetaCredentials as jest.Mock).mockResolvedValue({
+                    clientId: 'app_id', clientSecret: 'app_secret',
+                    instagramClientId: 'x', instagramClientSecret: 'y',
+                });
+                mockFetchByUrl([
+                    ['debug_token', { data: { granular_scopes: [{ scope: 'ads_read' }] } }],
+                ]);
+
+                const result = await service.getPages('user_token');
+                expect(result).toEqual([]);
+            });
+
+            it('returns empty array when credentials lookup fails (fallback is best-effort)', async () => {
+                (User as unknown as jest.Mock).mockImplementation(() => ({
+                    getAccounts: jest.fn().mockResolvedValue([]),
+                }));
+                (getMetaCredentials as jest.Mock).mockRejectedValue(new Error('no secret'));
+
+                const result = await service.getPages('user_token');
+                expect(result).toEqual([]);
+            });
+
+            it('does not invoke fallback when /me/accounts returns pages', async () => {
+                (User as unknown as jest.Mock).mockImplementation(() => ({
+                    getAccounts: jest.fn().mockResolvedValue([
+                        { id: 'page_123', name: 'Direct Page', access_token: 't', category: 'Brand', tasks: [] }
+                    ]),
+                }));
+                const fetchSpy = jest.fn();
+                global.fetch = fetchSpy as any;
+
+                const result = await service.getPages('user_token');
+
+                expect(result).toHaveLength(1);
+                expect(fetchSpy).not.toHaveBeenCalled();
+            });
         });
 
         it('should get pages', async () => {

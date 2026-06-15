@@ -1,9 +1,8 @@
 import { Request, Response } from "express";
 import { imageService } from "../services/imageGeneration";
-import { GoogleGenAI } from '@google/genai';
 import { getSecret } from '../utils/secretsManager';
+import { getGeminiClient } from '../utils/llmClients';
 import { CONTENT_RESTYLE_MODEL } from '../config';
-import OpenAI from "openai";
 import axios from "axios";
 import AWS from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
@@ -12,14 +11,6 @@ import { v4 as uuidv4 } from "uuid";
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
 }
-
-// Initialize Azure OpenAI client for text generation
-const openai = new OpenAI({
-  apiKey: process.env.AZURE_OPENAI_API_KEY,
-  baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT}`,
-  defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION },
-  defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
-});
 
 // Initialize AWS S3
 const s3 = new AWS.S3({
@@ -450,7 +441,7 @@ CRITICAL REQUIREMENT: The article content must be approximately ${finalTargetWor
       description: string;
       content: string;
       imagePrompt: string;
-    }>(systemPrompt, blogPrompt);
+    }>(systemPrompt, blogPrompt, 'json', undefined, { feature: 'content_gen' });
 
     // Validate the response structure
     if (!blogData.title || !blogData.content) {
@@ -593,8 +584,10 @@ OUTPUT FORMAT (STRICT JSON):
     const secretName = `${environment}/AgentWeb/GeminiAPIKey`;
     const apiKey = await getSecret(secretName);
     
-    const ai = new GoogleGenAI({ apiKey });
-    
+    // Metered Gemini client (Ship 1 shadow metering). restyleContent is a
+    // utility with no user in scope, so usage attributes to "system".
+    const ai = await getGeminiClient({ feature: 'content_gen' }, apiKey);
+
     const systemInstruction = "You are an expert content editor. Restyle content while preserving key information. Always respond with valid JSON only, no markdown code blocks.";
     
     const response = await ai.models.generateContent({

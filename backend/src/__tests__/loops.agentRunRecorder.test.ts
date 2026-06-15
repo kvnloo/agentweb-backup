@@ -98,7 +98,7 @@ describe('AgentRunRecorder', () => {
     expect((puts[1].item as any).dimensions.durationMs).toBe(1234);
   });
 
-  it('records tool failure with errorClass derived from the error', async () => {
+  it('records tool failure with a semantic errorClass derived from the error', async () => {
     const { port, puts } = fakeDynamo();
     const rec = new AgentRunRecorder(port, clock);
 
@@ -108,8 +108,33 @@ describe('AgentRunRecorder', () => {
     const item = puts[0].item as any;
     expect(item.eventType).toBe(EVT_TOOL_FAILED);
     expect(item.dimensions.toolName).toBe('publish_post');
-    expect(item.dimensions.errorClass).toBe('TimeoutError');
+    // Semantic taxonomy: timed-out failures classify as 'timeout' regardless
+    // of whether the tool threw a named TimeoutError or a plain Error.
+    expect(item.dimensions.errorClass).toBe('timeout');
     expect(String(item.dimensions.errorMessage)).toContain('took too long');
+  });
+
+  it('records a plain-Error rate limit as rate_limit, not the flat Error class', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    await rec.toolFailed('sess-1', {
+      toolName: 'bravesearch_brave_web_search',
+      error: new Error('Request failed with status code 429'),
+    });
+
+    expect((puts[0].item as any).dimensions.errorClass).toBe('rate_limit');
+  });
+
+  it('keeps the legacy named class for unrecognized custom errors', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    const err = new Error('weird');
+    err.name = 'CustomDomainError';
+    await rec.toolFailed('sess-1', { toolName: 'custom_tool', error: err });
+
+    expect((puts[0].item as any).dimensions.errorClass).toBe('CustomDomainError');
   });
 
   it('records run completed + run failed terminal events', async () => {
@@ -121,8 +146,13 @@ describe('AgentRunRecorder', () => {
 
     expect((puts[0].item as any).eventType).toBe(EVT_RUN_COMPLETED);
     expect((puts[0].item as any).dimensions.toolCalls).toBe(3);
-    expect((puts[1].item as any).eventType).toBe(EVT_RUN_FAILED);
-    expect((puts[1].item as any).subjectId).toBe('sess-2');
+    // Every terminal event is followed by a durable agent_run_verdict event.
+    expect((puts[1].item as any).eventType).toBe('agent_run_verdict');
+    expect((puts[1].item as any).dimensions.verdict).toBe('ok');
+    expect((puts[2].item as any).eventType).toBe(EVT_RUN_FAILED);
+    expect((puts[2].item as any).subjectId).toBe('sess-2');
+    expect((puts[3].item as any).eventType).toBe('agent_run_verdict');
+    expect((puts[3].item as any).dimensions.verdict).toBe('failed');
   });
 
   it('never throws into the caller hot path when Dynamo fails', async () => {
@@ -134,5 +164,81 @@ describe('AgentRunRecorder', () => {
     const rec = new AgentRunRecorder(port, clock);
     // Should resolve, not reject.
     await expect(rec.toolFailed('sess-1', { toolName: 't', error: new Error('x') })).resolves.toBeUndefined();
+  });
+});
+
+describe('AgentRunRecorder failed-call args capture', () => {
+  // Root-cause material for failure investigation (Rui/Argusoft ask, 2026-06-12):
+  // the exact arguments of a FAILING call are recorded — capped + redacted.
+  // Successful calls never store full args (size + privacy).
+
+  it('records serialized args on tool failure', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    await rec.toolFailed('run-1', {
+      toolName: 'linkedin_outreach',
+      error: new Error('Invalid parameters'),
+      args: { action: 'send-invite', profile_url: 'https://linkedin.com/in/x', message: 'hey' },
+    });
+
+    const item = puts[0].item as any;
+    expect(item.eventType).toBe(EVT_TOOL_FAILED);
+    const parsed = JSON.parse(item.dimensions.failedArgsJson);
+    expect(parsed.action).toBe('send-invite');
+    expect(parsed.message).toBe('hey');
+  });
+
+  it('redacts secret-like keys in captured args', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    await rec.toolFailed('run-1', {
+      toolName: 'call_meta_marketing_api',
+      error: new Error('boom'),
+      args: { endpoint: '/campaigns', access_token: 'EAAB-secret', apiKey: 'k-123', password: 'hunter2' },
+    });
+
+    const parsed = JSON.parse((puts[0].item as any).dimensions.failedArgsJson);
+    expect(parsed.endpoint).toBe('/campaigns');
+    expect(parsed.access_token).toBe('[redacted]');
+    expect(parsed.apiKey).toBe('[redacted]');
+    expect(parsed.password).toBe('[redacted]');
+  });
+
+  it('caps oversized args payloads', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    await rec.toolFailed('run-1', {
+      toolName: 'update_html_file',
+      error: new Error('hash mismatch'),
+      args: { operations_json: 'x'.repeat(20000) },
+    });
+
+    const stored = (puts[0].item as any).dimensions.failedArgsJson as string;
+    expect(stored.length).toBeLessThanOrEqual(4096);
+    expect(stored).toContain('…[truncated]');
+  });
+
+  it('omits the field when args are absent or unserializable', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    await rec.toolFailed('run-1', { toolName: 'search_web', error: new Error('x') });
+    const circular: any = {}; circular.self = circular;
+    await rec.toolFailed('run-1', { toolName: 'search_web', error: new Error('y'), args: circular });
+
+    expect((puts[0].item as any).dimensions.failedArgsJson).toBeUndefined();
+    expect((puts[1].item as any).dimensions.failedArgsJson).toBeUndefined();
+  });
+
+  it('never records args on success', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    await rec.toolSucceeded('run-1', { toolName: 'search_web', durationMs: 10 });
+
+    expect((puts[0].item as any).dimensions.failedArgsJson).toBeUndefined();
   });
 });

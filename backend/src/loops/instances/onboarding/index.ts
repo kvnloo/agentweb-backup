@@ -16,17 +16,13 @@
  *   learning = DynamoLearningStore + CooldownRuleSet read-back
  */
 
-import {
-  getLoopManifest,
-  getRegisteredLoopIds,
-  registerOrReplaceGate,
-  registerOrReplaceLearningStore,
-  registerOrReplaceLoop,
-  registerOrReplaceRuleSet,
-  registerOrReplaceSensor,
-  registerOrReplaceTools,
-} from '../../index';
 import { CaptureGate } from '../../core/gates/captureGate';
+import {
+  analystFindingsBody,
+  postLoopDigest,
+  type LoopDigestTemplate,
+} from '../../core/digest/loopDigest';
+import { createInstanceRunner } from '../../core/instanceRunner';
 import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
 import { CooldownRuleSet } from '../../core/policy/cooldownRuleSet';
 import { LlmAnalystRuleSet } from '../../core/policy/llmAnalystRuleSet';
@@ -35,51 +31,53 @@ import {
   type UserArrayRecord,
 } from '../../core/sensors/userArrayEventSource';
 import { SpecOutputTool } from '../../core/tools/specOutputTool';
-import { runLoop } from '../../core/orchestrator';
 import { productionLoopPorts } from '../../adapters/awsAdapters';
 import type { LoopRunResult } from '../../core/types';
 import { userDb } from '../../../services/db';
 import { ONBOARDING_FLOW_DESCRIPTION, ONBOARDING_LOOP_ID, onboardingManifest } from './manifest';
 
-// Held so the tick can drain the gate's captured mutations after the
-// orchestrator returns and post a single digest DM.
-let onboardingGate: CaptureGate | null = null;
+const runner = createInstanceRunner({
+  loopId: ONBOARDING_LOOP_ID,
+  ports: productionLoopPorts,
+  isEnabled: () => process.env.ONBOARDING_LOOP_V2 === 'true',
+  implNames: {
+    sensor: 'onboardingUserSensor',
+    ruleSet: 'onboardingAnalyst',
+    tools: 'onboardingSpecTool',
+    gate: 'onboardingGate',
+    learning: 'onboardingLearning',
+  },
+  buildLayers: (ports) => {
+    const learning = new DynamoLearningStore(ports.dynamo);
+    const analyst = new LlmAnalystRuleSet(ONBOARDING_LOOP_ID, ports.bedrock, {
+      model: onboardingManifest.generator.model,
+      targetMetricName: onboardingManifest.targetMetric.name,
+      flowDescription: ONBOARDING_FLOW_DESCRIPTION,
+      maxProposals: 3,
+    });
+    return {
+      sensor: new UserArrayEventSource(
+        async () => (await userDb.getAllUsers(true)) as UserArrayRecord[],
+      ),
+      ruleSet: new CooldownRuleSet(analyst, learning, ONBOARDING_LOOP_ID),
+      tools: new SpecOutputTool(ONBOARDING_LOOP_ID),
+      gate: new CaptureGate(),
+      learning,
+    };
+  },
+  manifest: () => onboardingManifest,
+  onRunComplete: async ({ result, drained, ports, manifest }) => {
+    if (drained === null) return;
+    await postLoopDigest(result, ports.slack, manifest.approval.slackUserId, onboardingDigestTemplate, undefined);
+  },
+});
 
 /**
  * Register the framework onboarding loop. No-op (returns false) unless
  * ONBOARDING_LOOP_V2=true. Idempotent. Does NOT touch the legacy cron.
  */
 export function registerOnboardingLoopV2(): boolean {
-  if (process.env.ONBOARDING_LOOP_V2 !== 'true') return false;
-  if ((getRegisteredLoopIds() as readonly string[]).includes(ONBOARDING_LOOP_ID)) return true;
-
-  const ports = productionLoopPorts();
-
-  const sensor = new UserArrayEventSource(
-    async () => (await userDb.getAllUsers(true)) as UserArrayRecord[],
-  );
-  const learning = new DynamoLearningStore(ports.dynamo);
-  const analyst = new LlmAnalystRuleSet(ONBOARDING_LOOP_ID, ports.bedrock, {
-    model: onboardingManifest.generator.model,
-    targetMetricName: onboardingManifest.targetMetric.name,
-    flowDescription: ONBOARDING_FLOW_DESCRIPTION,
-    maxProposals: 3,
-  });
-  const ruleSet = new CooldownRuleSet(analyst, learning, ONBOARDING_LOOP_ID);
-  const tools = new SpecOutputTool(ONBOARDING_LOOP_ID);
-  const gate = new CaptureGate();
-
-  registerOrReplaceSensor('onboardingUserSensor', sensor);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  registerOrReplaceRuleSet('onboardingAnalyst', ruleSet as any);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  registerOrReplaceTools('onboardingSpecTool', tools as any);
-  registerOrReplaceGate('onboardingGate', gate);
-  registerOrReplaceLearningStore('onboardingLearning', learning);
-  registerOrReplaceLoop(onboardingManifest);
-
-  onboardingGate = gate;
-  return true;
+  return runner.register();
 }
 
 /**
@@ -88,54 +86,15 @@ export function registerOnboardingLoopV2(): boolean {
  * Returns null when the loop is gated off. Never throws — errors are logged.
  */
 export async function runOnboardingLoopV2Once(): Promise<LoopRunResult | null> {
-  if (!registerOnboardingLoopV2()) return null;
-
-  const ports = productionLoopPorts();
-  const manifest = getLoopManifest(ONBOARDING_LOOP_ID);
-  const result = await runLoop(manifest, ports);
-
-  if (onboardingGate) {
-    onboardingGate.drain();
-    await postOnboardingDigest(result, ports.slack, manifest.approval.slackUserId);
-  }
-  return result;
+  return runner.runOnce();
 }
 
-async function postOnboardingDigest(
-  result: LoopRunResult,
-  slack: { postMessage: (channelOrUserId: string, markdown: string) => Promise<unknown> },
-  slackUserId: string | undefined,
-): Promise<void> {
-  if (!slackUserId) {
-    console.warn('[onboarding-loop-v2] no approval.slackUserId — skipping DM');
-    return;
-  }
-  const lines: string[] = [];
-  lines.push(`*🚀 Onboarding loop — daily run ${new Date().toISOString().slice(0, 10)}*`);
-  lines.push(`Run ID: \`${result.runId}\``);
-  lines.push(`Users/events scanned: ${result.eventsScanned}  |  Findings: ${result.proposals.length}`);
-  lines.push('');
-
-  if (result.eventsScanned === 0) {
-    lines.push(`_No onboarding events in the window — too thin to judge._`);
-  } else if (result.proposals.length === 0) {
-    lines.push(`_Funnel looks healthy — no issues surfaced._`);
-  } else {
-    lines.push(`*What I found*`);
-    for (let i = 0; i < result.proposals.length; i++) {
-      const p = result.proposals[i];
-      const directive =
-        (p.payload as { directive?: string } | undefined)?.directive ?? '';
-      lines.push(`${i + 1}. ${p.hypothesis}`);
-      lines.push(`   Kind: \`${p.kind}\`${directive ? `  |  Fix: ${directive}` : ''}`);
-    }
-  }
-  lines.push('');
-  lines.push(`React ✅ to dispatch all to cloud-dev  |  ❌ to skip  |  🛑 to pause loop`);
-
-  try {
-    await slack.postMessage(slackUserId, lines.join('\n'));
-  } catch (err) {
-    console.error('[onboarding-loop-v2] Slack DM post failed:', err);
-  }
-}
+const onboardingDigestTemplate: LoopDigestTemplate = {
+  logTag: '[onboarding-loop-v2]',
+  header: (date) => `*🚀 Onboarding loop — daily run ${date}*`,
+  counts: (result) =>
+    `Users/events scanned: ${result.eventsScanned}  |  Findings: ${result.proposals.length}`,
+  emptyBody: () => [`_No onboarding events in the window — too thin to judge._`],
+  quietBody: () => [`_Funnel looks healthy — no issues surfaced._`],
+  findingsBody: analystFindingsBody,
+};

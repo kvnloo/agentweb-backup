@@ -8,15 +8,12 @@
 
 import express, { Request, Response } from 'express';
 import AWS from 'aws-sdk';
-import { AGENT_MODE_LOOP_ID } from '../loops/instances/agent-mode/eventTypes';
-import { LOOP_EVENTS_TABLE } from '../loops/core/sensors/eventTableEventSource';
 import {
   AgentRunChatContext,
   AgentRunChatMessageRow,
   AgentRunChatSessionRow,
   buildAgentRunChatContext,
-  buildAgentRunSummaries,
-  AgentRunEventRow,
+  fetchAgentRunSummaries,
 } from '../services/agentRunInspectorService';
 
 const router = express.Router();
@@ -28,8 +25,11 @@ const dynamodb = new AWS.DynamoDB.DocumentClient({
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 const CHAT_SESSIONS_TABLE = `${TABLE_PREFIX}AW-ChatSessions`;
 const CHAT_MESSAGES_TABLE = `${TABLE_PREFIX}AW-ChatMessages`;
-const DEFAULT_LIMIT = 120;
-const MAX_LIMIT = 500;
+// `limit` counts RUNS returned, not events scanned. A single chatty run emits
+// hundreds of spine events, so an event-based window only ever shows the
+// newest run or two and makes every older sessionId filter come back empty.
+const DEFAULT_RUN_LIMIT = 50;
+const MAX_RUN_LIMIT = 500;
 const FIRST_MESSAGE_LIMIT = 25;
 const LATEST_MESSAGE_LIMIT = 60;
 
@@ -40,23 +40,15 @@ router.get('/', async (req: Request, res: Response) => {
     const sessionId = parseOptionalString(req.query.sessionId);
     const userId = parseOptionalString(req.query.userId);
 
-    const result = await dynamodb.query({
-      TableName: LOOP_EVENTS_TABLE,
-      KeyConditionExpression: 'loopId = :loopId',
-      ExpressionAttributeValues: { ':loopId': AGENT_MODE_LOOP_ID },
-      ScanIndexForward: false,
-      Limit: limit,
-    }).promise();
+    const { runs: limitedRuns, scannedEvents, truncated } = await fetchAgentRunSummaries({
+      runId,
+      sessionId,
+      userId,
+      limit,
+    });
 
-    const rows = ((result.Items ?? []) as AgentRunEventRow[])
-      .filter((row) => row.eventType && row.subjectId && row.ts)
-      .filter((row) => !runId || row.subjectId === runId);
-
-    const runs = buildAgentRunSummaries(rows)
-      .filter((run) => !sessionId || run.sessionId === sessionId)
-      .filter((run) => !userId || run.userId === userId);
-    const chatContexts = await fetchChatContexts([...new Set(runs.map((run) => run.sessionId).filter(isPresent))]);
-    const enrichedRuns = runs.map((run) => ({
+    const chatContexts = await fetchChatContexts([...new Set(limitedRuns.map((run) => run.sessionId).filter(isPresent))]);
+    const enrichedRuns = limitedRuns.map((run) => ({
       ...run,
       chat: run.sessionId ? chatContexts.get(run.sessionId) : undefined,
     }));
@@ -64,7 +56,8 @@ router.get('/', async (req: Request, res: Response) => {
     return res.status(200).json({
       runs: enrichedRuns,
       count: enrichedRuns.length,
-      scannedEvents: result.Items?.length ?? 0,
+      scannedEvents,
+      truncated,
       filters: { runId, sessionId, userId, limit },
     });
   } catch (err) {
@@ -75,9 +68,9 @@ router.get('/', async (req: Request, res: Response) => {
 
 function parseLimit(raw: unknown): number {
   const value = Array.isArray(raw) ? raw[0] : raw;
-  const n = typeof value === 'string' ? Number(value) : DEFAULT_LIMIT;
-  if (!Number.isFinite(n) || n <= 0) return DEFAULT_LIMIT;
-  return Math.min(Math.floor(n), MAX_LIMIT);
+  const n = typeof value === 'string' ? Number(value) : DEFAULT_RUN_LIMIT;
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_RUN_LIMIT;
+  return Math.min(Math.floor(n), MAX_RUN_LIMIT);
 }
 
 function parseOptionalString(raw: unknown): string | undefined {
