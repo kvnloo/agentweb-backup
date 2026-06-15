@@ -40,6 +40,35 @@ const LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS = 7;
 export const activeSessionGenerations = new Set<string>();
 
 /**
+ * Atomically claim the generation lock for a session.
+ *
+ * Replaces the previous hand-rolled `has()`-then-`add()` pattern that was
+ * duplicated at the /generate call sites. Those two statements were only
+ * race-free because nothing `await`ed between them; co-locating the
+ * check-and-set in a single synchronous function makes the claim atomic by
+ * construction — an `await` can never be inserted between the check and the
+ * set, so two near-simultaneous requests can never both proceed.
+ *
+ * @returns `true` if the caller claimed the lock (session was free),
+ *          `false` if the session is already generating (caller must reject).
+ */
+export function tryClaimSessionGeneration(sessionId: string): boolean {
+  if (activeSessionGenerations.has(sessionId)) {
+    return false;
+  }
+  activeSessionGenerations.add(sessionId);
+  return true;
+}
+
+/**
+ * Release a session's generation lock. Idempotent — safe to call in a
+ * `finally` block whether or not the claim succeeded.
+ */
+export function releaseSessionGeneration(sessionId: string): void {
+  activeSessionGenerations.delete(sessionId);
+}
+
+/**
  * Wall-clock timeout for a single agent-mode generation. Without this, a hung
  * LLM call (stuck await, runaway tool loop, never-resolving upstream) keeps
  * the activeSessionGenerations lock held indefinitely — every subsequent
@@ -2181,15 +2210,16 @@ export const agentModeController = {
         return res.status(400).json({ error: 'Session ID and user message are required' });
       }
 
-      // Reject concurrent requests for the same session (synchronous check before any await)
-      if (activeSessionGenerations.has(sessionId)) {
+      // Reject concurrent requests for the same session. The claim is atomic
+      // (check-and-set in one call) so two near-simultaneous requests can never
+      // both proceed — exactly one wins, the other gets 409 SESSION_BUSY.
+      if (!tryClaimSessionGeneration(sessionId)) {
         return res.status(409).json({
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
           code: 'SESSION_BUSY',
         });
       }
-      activeSessionGenerations.add(sessionId);
 
       try {
 
@@ -2353,7 +2383,7 @@ export const agentModeController = {
         ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
       } finally {
-        activeSessionGenerations.delete(sessionId);
+        releaseSessionGeneration(sessionId);
       }
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
@@ -2454,6 +2484,9 @@ export const agentModeController = {
             subject: 'Agent Mode: Context limit exceeded',
             message: `The request exceeded the model context window.\n\nError: ${error.message || 'Unknown error'}`,
             sessionId,
+            // Dedupe per (user, errorClass) so a user repeatedly hitting the context
+            // limit on a busy day floods neither oncall email nor Notion (B5).
+            dedupeKey: `context_limit:${user?.userId || sessionId || 'unknown'}`,
             context: {
               'Error Message': error.message || 'Unknown error',
               'Error Stack': error.stack || 'No stack trace available',
@@ -2976,15 +3009,16 @@ export const agentModeController = {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
 
-      // Reject concurrent requests for the same session (synchronous check before any await)
-      if (activeSessionGenerations.has(session.sessionId)) {
+      // Reject concurrent requests for the same session. Atomic check-and-set
+      // (see tryClaimSessionGeneration) — two near-simultaneous requests can
+      // never both proceed; exactly one wins, the other gets 409 SESSION_BUSY.
+      if (!tryClaimSessionGeneration(session.sessionId)) {
         return res.status(409).json({
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
           code: 'SESSION_BUSY',
         });
       }
-      activeSessionGenerations.add(session.sessionId);
 
       try {
 
@@ -3029,7 +3063,7 @@ export const agentModeController = {
         ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
       } finally {
-        activeSessionGenerations.delete(session.sessionId);
+        releaseSessionGeneration(session.sessionId);
       }
     } catch (error) {
       console.error('AgentMode: Generate shared response error:', error);
@@ -3109,6 +3143,9 @@ export const agentModeController = {
             subject: 'Agent Mode: Context limit exceeded (shared response)',
             message: `The request exceeded the model context window.\n\nError: ${error.message || 'Unknown error'}`,
             sessionId: shareId,
+            // Dedupe per (user/share, errorClass) — the shared path is a distinct
+            // error class, so it keys independently from the regular path (B5).
+            dedupeKey: `context_limit_shared:${session?.userId || shareId || 'unknown'}`,
             context: {
               'Error Message': error.message || 'Unknown error',
               'Error Stack': error.stack || 'No stack trace available',

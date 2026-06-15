@@ -6045,6 +6045,12 @@ const bridgedToolNames = [
   'revert_landing_page_publish',
   'update_landing_page_context',
   'resolve_skill',
+  // Self account status (no-arg; wraps /api/auth/me for the CALLER's own account).
+  // Bridged so the in-app loop can resolve the handler; also added to
+  // DEFAULT_FOUNDATION_TOOLS so the loop actually offers it. Without this, Emma
+  // had no self-status tool and fell back to assess_client_health (admin lookup
+  // by email) — the user-reported "asked me for my email" bug.
+  'get_account_status',
 ];
 
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────

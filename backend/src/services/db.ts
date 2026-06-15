@@ -5121,6 +5121,16 @@ export const crmDb = {
     accountOwnerUserId?: string | null;
     pocEmails?: string[] | null;
     syncMetadata?: Record<string, any>;
+    /**
+     * Lead UTM attribution (mirrors the User schema, see utils/leadSchema.ts).
+     * firstTouch is immutable once stamped; lastTouch is refreshed on any repeat
+     * touch (e.g. the public webhook merge path). utmSource / utmMedium are
+     * denormalized from firstTouch for cheap channel-attribution filter queries.
+     */
+    firstTouch?: AttributionTouch;
+    lastTouch?: AttributionTouch;
+    utmSource?: string;
+    utmMedium?: string;
     /** Enrichment metadata sidecar — keyed by field name (custom or standard). See utils/enrichedFieldValue.ts. */
     enrichmentMetadata?: Record<string, any>;
     /** ISO timestamp set when a LinkedIn connection invite is manually sent from the CRM. */
@@ -5452,6 +5462,29 @@ export const crmDb = {
       if (updates.syncMetadata !== undefined) {
         setExpressions.push('syncMetadata = :syncMetadata');
         expressionAttributeValues[':syncMetadata'] = updates.syncMetadata;
+      }
+
+      // Lead UTM attribution. firstTouch is immutable once stamped, but the
+      // public webhook merge path backfills it when a lead predates attribution
+      // and refreshes lastTouch on every repeat touch. utmSource / utmMedium
+      // are denormalized strings. Callers enforce the immutability contract
+      // (only-if-absent backfill for firstTouch/utm denorm); this layer just
+      // persists whatever the caller passes.
+      if (updates.firstTouch !== undefined) {
+        setExpressions.push('firstTouch = :firstTouch');
+        expressionAttributeValues[':firstTouch'] = updates.firstTouch;
+      }
+      if (updates.lastTouch !== undefined) {
+        setExpressions.push('lastTouch = :lastTouch');
+        expressionAttributeValues[':lastTouch'] = updates.lastTouch;
+      }
+      if (updates.utmSource !== undefined) {
+        setExpressions.push('utmSource = :utmSource');
+        expressionAttributeValues[':utmSource'] = updates.utmSource;
+      }
+      if (updates.utmMedium !== undefined) {
+        setExpressions.push('utmMedium = :utmMedium');
+        expressionAttributeValues[':utmMedium'] = updates.utmMedium;
       }
 
       // Always update updatedAt
