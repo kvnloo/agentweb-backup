@@ -72,6 +72,28 @@ export function cleanupProgress(sessionId: string) {
   progressStore.delete(sessionId);
 }
 
+/**
+ * Terminal-state cleanup for a session's progress.
+ *
+ * Emits a final `complete` status to any live SSE listener (so the frontend
+ * stops showing "Thinking…") and then removes the stored progress entry so it
+ * cannot leak. Active SSE connections are intentionally left registered — a
+ * reconnecting client must still receive the `complete` signal.
+ *
+ * This is the single definition of "a run reached a terminal state" used by
+ * every terminal path (normal completion, cancel, and worker crash/exit). It
+ * MUST be called on worker death so a generation that dies mid-iteration does
+ * not orphan a stale progress entry forever (the SSE-zombie-progress bug).
+ */
+export function clearTerminalProgress(sessionId: string) {
+  // Only emit `complete` if a live progress entry exists, so we don't resurrect
+  // an entry for a session that was already cleaned up.
+  if (progressStore.has(sessionId)) {
+    emitProgress(sessionId, { iteration: 0, status: 'complete' });
+  }
+  progressStore.delete(sessionId);
+}
+
 // Cancel store - tracks sessions whose generation should be stopped
 const cancelledSessions = new Set<string>();
 

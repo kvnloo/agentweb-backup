@@ -11,6 +11,7 @@ This prevents recurrence but does NOT stop already-running stale backends (their
 ### Assumptions to validate
 - After deploy, the prod readiness loop still DMs (NODE_ENV=production on prod EB → not suppressed). Falsified if prod stops posting — would mean prod env isn't NODE_ENV=production (it is, verified).
 - No other legit non-prod loop posting relied on the old behavior. If a dev/staging channel digest was wanted, set LOOP_SLACK_ALLOW_NONPROD=true there.
+
 ## AgentMode B2 — session-generation claim made atomic (no double-proceed race) (2026-06-14)
 
 WS-B / B2 reliability increment. The `/generate` and the interactive-share `/generate`
