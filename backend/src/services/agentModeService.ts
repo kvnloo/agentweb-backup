@@ -3559,6 +3559,7 @@ export class AgentModeService {
     'list_connected_accounts', // Social/ads integration teaser
 
     'get_user_profile',         // Account info teaser
+    'get_account_status',       // Self account status (plan, usage, api-key count) — wraps /api/auth/me, no args
 
     // Account Memory (cross-session knowledge)
     'save_memory',
