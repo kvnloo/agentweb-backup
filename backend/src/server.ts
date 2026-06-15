@@ -563,6 +563,23 @@ createTestAccount().then(async () => {
         console.error('[linkedInConnectionSync] Failed to initialize:', error);
       }
 
+      // Meta Ad-Account Token Refresh — runs every 12 hours.
+      // Meta issues no refresh tokens; long-lived ad-account tokens (~60 days)
+      // must be re-exchanged while still valid. Proactively refreshes any token
+      // within the refresh window so Meta tools / the ad builder never block on
+      // an expired token.
+      try {
+        const { runMetaTokenRefresh } = await import('./cron/metaTokenRefreshCron');
+        const META_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
+        runMetaTokenRefresh().catch(e => console.error('[metaTokenRefreshCron] Error on first run:', e));
+        setInterval(() => {
+          runMetaTokenRefresh().catch(e => console.error('[metaTokenRefreshCron] Error:', e));
+        }, META_REFRESH_INTERVAL_MS);
+        console.log('[metaTokenRefreshCron] Initialized — running every 12 hours');
+      } catch (error) {
+        console.error('[metaTokenRefreshCron] Failed to initialize:', error);
+      }
+
       // Onboarding stuck-user detector — DISABLED 2026-05-07. Was posting one
       // Notion oncall task per day grouped by stage. The cron itself is well-
       // designed but the broader telemetry pipeline (incl. per-event UI Error

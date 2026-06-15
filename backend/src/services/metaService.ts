@@ -1,5 +1,8 @@
 import { FacebookAdsApi, User, AdAccount, Campaign, AdSet, AdCreative, Ad, CustomAudience } from 'facebook-nodejs-business-sdk';
+import axios from 'axios';
 import { MetaAdAccount, MetaPage } from '../types/meta';
+import { INTEGRATION_CONFIG } from '../config/integrations';
+import { getMetaCredentials } from '../utils/secretsManager';
 
 export interface MetaAdsCampaignParams {
   name: string;
@@ -469,6 +472,45 @@ export class MetaService {
       this.handleError(error);
       return []; // Unreachable due to throw in handleError
     }
+  }
+
+  /**
+   * Re-exchange a still-valid long-lived Meta user access token for a fresh
+   * 60-day long-lived token.
+   *
+   * Meta/Facebook do NOT issue refresh tokens for ad-account (Marketing API)
+   * access. Instead, a long-lived token that is not yet expired can be swapped
+   * for a new one via grant_type=fb_exchange_token. This MUST be done while the
+   * current token is still valid — once expired, the only recovery is a full
+   * manual reconnect. This is why refreshes need to happen proactively.
+   *
+   * @param currentToken - The current (still-valid) long-lived access token.
+   * @returns The new access token and its lifetime in seconds. `expires_in`
+   *          may be absent if Meta returns a non-expiring token, in which case
+   *          callers should fall back to the 60-day convention.
+   * @throws if the exchange fails (e.g. token already expired/revoked).
+   */
+  async extendAccessToken(currentToken: string): Promise<{ access_token: string; expires_in?: number }> {
+    const { clientId, clientSecret } = await getMetaCredentials();
+    const url = `${INTEGRATION_CONFIG.meta.tokenUrl}`;
+    const response = await axios.get<any>(url, {
+      params: {
+        grant_type: 'fb_exchange_token',
+        client_id: clientId,
+        client_secret: clientSecret,
+        fb_exchange_token: currentToken,
+      },
+      timeout: 15000,
+    });
+
+    const accessToken = response.data?.access_token;
+    if (!accessToken) {
+      throw new Error('Meta token exchange returned no access_token');
+    }
+    return {
+      access_token: accessToken,
+      expires_in: response.data?.expires_in,
+    };
   }
 
   /**
