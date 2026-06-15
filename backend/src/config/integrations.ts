@@ -46,6 +46,10 @@ export const INTEGRATION_CONFIG = {
       'ads_management',
       'ads_read',
       'pages_show_list',
+      // Required for /me/accounts (page listing) and page reads. Removed in Mar 2026
+      // (db9ab4cf) which silently broke pages for every token minted after — legacy
+      // tokens kept the old grant, masking the breakage in testing.
+      'pages_read_engagement',
     ],
 
     instagramScopes: [
