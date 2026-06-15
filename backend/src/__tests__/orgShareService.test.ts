@@ -1,6 +1,6 @@
 import {
   canViewItem, canEditItem, canManageOrgFeature, isAlwaysOnFeature,
-  isFeatureEffectivelyEnabled,
+  isMemberOwnedFeature, isFeatureEffectivelyEnabled,
   defaultEnabledFor, defaultShareSettings,
   Feature,
   listOrgVisibleItems, MEMBER_FANOUT_CAP,
@@ -83,6 +83,41 @@ describe("canManageOrgFeature", () => {
   });
   it("non-editor org member blocked", () => {
     expect(canManageOrgFeature(member, orgA, "htmlTemplates")).toBe(false);
+  });
+});
+
+describe("member-owned features (skills, workPlans)", () => {
+  it("classifies skills and workPlans as member-owned, others not", () => {
+    expect(isMemberOwnedFeature("skills")).toBe(true);
+    expect(isMemberOwnedFeature("workPlans")).toBe(true);
+    expect(isMemberOwnedFeature("htmlTemplates")).toBe(false);
+    expect(isMemberOwnedFeature("brandGuidelines")).toBe(false);
+  });
+
+  it("any org member may create (manage) their own, regardless of toggle/editors", () => {
+    expect(canManageOrgFeature(member, orgA, "skills")).toBe(true);   // enabled=false in orgA
+    expect(canManageOrgFeature(member, orgA, "workPlans")).toBe(true); // enabled=true in orgA
+  });
+
+  it("the item owner or the org owner may edit — but not listed editors", () => {
+    expect(canEditItem(item, owner, orgA, ownerOrgId, "skills")).toBe(true);   // owns the item
+    expect(canEditItem(item, admin, orgA, ownerOrgId, "skills")).toBe(true);   // org owner admin override
+    expect(canEditItem(item, member, orgA, ownerOrgId, "workPlans")).toBe(false); // plain non-owner member cannot
+    // a user merely listed as an editor cannot edit another member's item
+    const orgWithSkillEditor = {
+      ...orgA,
+      shareSettings: { ...orgA.shareSettings!, skills: { enabled: true, editors: ["u-editor"] } },
+    };
+    expect(canEditItem(item, editor, orgWithSkillEditor as any, ownerOrgId, "skills")).toBe(false);
+  });
+
+  it("visibility follows the toggle only — no owner/editor override", () => {
+    // workPlans enabled=true → member sees; skills enabled=false → member does not
+    expect(isFeatureEffectivelyEnabled(member, orgA, "workPlans")).toBe(true);
+    expect(isFeatureEffectivelyEnabled(member, orgA, "skills")).toBe(false);
+    // admin/editor get no override for member-owned features when sharing is off
+    expect(isFeatureEffectivelyEnabled(admin, orgA, "skills")).toBe(false);
+    expect(canViewItem(item, admin, orgA, ownerOrgId, "skills")).toBe(false);
   });
 });
 
