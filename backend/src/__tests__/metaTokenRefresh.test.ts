@@ -128,6 +128,18 @@ describe('ensureFreshMetaAdAccountToken', () => {
     );
   });
 
+  it('falls back to 60-day TTL when Meta returns a non-positive expires_in (clock skew)', async () => {
+    (metaService.extendAccessToken as jest.Mock).mockResolvedValue({ access_token: 'NEW_TOKEN', expires_in: -100 });
+    const account = makeMetaAdAccount({ config: { token_expires_at: NOW - 1 } });
+
+    const result = await ensureFreshMetaAdAccountToken(account, 'user1', NOW);
+
+    expect(result.refreshed).toBe(true);
+    // Must NOT be persisted as already-expired
+    expect(result.newExpiresAt).toBe(NOW + META_DEFAULT_TOKEN_TTL_MS);
+    expect(account.config.token_expires_at).toBeGreaterThan(NOW);
+  });
+
   it('falls back to 60-day TTL when Meta returns no expires_in', async () => {
     (metaService.extendAccessToken as jest.Mock).mockResolvedValue({ access_token: 'NEW_TOKEN' });
     const account = makeMetaAdAccount({ config: { token_expires_at: NOW - 1 } });
