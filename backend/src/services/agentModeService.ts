@@ -8018,24 +8018,28 @@ export class AgentModeService {
   public async getLeadLists(userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const { listLandingPages, getLandingPageLiveUrl } = await import('./v0Service');
+      const { listLandingPages, resolveLandingPageLiveUrl } = await import('./v0Service');
 
       const [lists, landingPages] = await Promise.all([
         crmDb.getLeadListsForUser(userId),
         listLandingPages(userId).catch(() => [] as any[])
       ]);
 
-      // Build map: leadListId → landing page info
+      // Build map: leadListId → landing page info. Resolve each URL against the
+      // domain actually attached to the Vercel project so a stale stored
+      // subdomain isn't surfaced (AW-CustomDomains is the source of truth).
       const pageByListId = new Map<string, { pageId: string; name: string; url: string }>();
-      for (const page of landingPages) {
-        if (page.leadListId) {
-          pageByListId.set(page.leadListId, {
-            pageId: page.id,
-            name: page.name || '',
-            url: getLandingPageLiveUrl(page)
-          });
-        }
-      }
+      const pagesWithLists = landingPages.filter((page: any) => page.leadListId);
+      const resolvedUrls = await Promise.all(
+        pagesWithLists.map((page: any) => resolveLandingPageLiveUrl(page))
+      );
+      pagesWithLists.forEach((page: any, idx: number) => {
+        pageByListId.set(page.leadListId, {
+          pageId: page.id,
+          name: page.name || '',
+          url: resolvedUrls[idx]
+        });
+      });
 
       return {
         success: true,
@@ -17699,7 +17703,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       } else if (!finalFilename.endsWith('.png')) {
         // Ensure .png extension
-        const nameWithoutExt = finalFilename.substring(0, finalFilename.lastIndexOf('.') || finalFilename.length);
+        const dotIndex = finalFilename.lastIndexOf('.');
+        const nameWithoutExt = dotIndex > 0 ? finalFilename.substring(0, dotIndex) : finalFilename;
         finalFilename = `${nameWithoutExt}.png`;
       }
 
@@ -17740,6 +17745,174 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to remove C2PA metadata from image',
+        error: error.message
+      };
+    }
+  }
+
+  /**
+   * Remove a solid/near-solid background from an image, producing a genuine
+   * transparent-alpha PNG WITHOUT redrawing the artwork, and upload it to S3.
+   *
+   * This is the correct tool for "make this logo transparent" / "put this logo
+   * on a different colored background". It operates on the original pixels
+   * (edge-seeded flood fill), so the brand mark — its exact letters, shapes and
+   * colors — is preserved byte-for-byte; only the background becomes alpha=0.
+   *
+   * Optionally validates foreground/background contrast: if `surfaceColor`
+   * (the hex color of the surface the logo will sit on, e.g. a dark header) is
+   * provided, the result includes a WCAG contrast ratio and a warning when the
+   * logo would be hard to read on that surface (e.g. a dark wordmark on a dark
+   * header). This guards against the "black logo on dark purple" mistake.
+   */
+  public async removeImageBackground(
+    imageUrl: string,
+    filename?: string,
+    userId?: string,
+    options?: { tolerance?: number; surfaceColor?: string }
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Removing background from image:', imageUrl);
+
+      if (!imageUrl) {
+        return {
+          success: false,
+          message: 'Image URL is required',
+          error: 'missing_image_url'
+        };
+      }
+
+      const axios = require('axios');
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const { imageService, ImageService } = await import('./imageGeneration');
+
+      // Download the image (supports data URLs and HTTP(S) URLs).
+      let imageBuffer: Buffer;
+      if (imageUrl.startsWith('data:image/')) {
+        const base64Data = imageUrl.split(',')[1];
+        imageBuffer = Buffer.from(base64Data, 'base64');
+      } else {
+        const response = await axios.get(imageUrl, {
+          responseType: 'arraybuffer',
+          timeout: 30000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (compatible; AgentWeb/1.0)'
+          }
+        });
+        imageBuffer = Buffer.from(response.data);
+      }
+
+      const { buffer, detectedBackground, removedRatio } = await imageService.removeImageBackground(
+        imageBuffer,
+        { tolerance: options?.tolerance }
+      );
+
+      // Generate filename if not provided; always output PNG (alpha requires it).
+      let finalFilename = filename;
+      if (!finalFilename) {
+        try {
+          const urlObj = new URL(imageUrl);
+          const pathParts = urlObj.pathname.split('/');
+          const urlFilename = pathParts[pathParts.length - 1];
+          if (urlFilename && urlFilename.includes('.')) {
+            const nameWithoutExt = urlFilename.substring(0, urlFilename.lastIndexOf('.'));
+            finalFilename = `${nameWithoutExt}_transparent.png`;
+          } else {
+            finalFilename = `image_transparent_${Date.now()}.png`;
+          }
+        } catch {
+          finalFilename = `image_transparent_${Date.now()}.png`;
+        }
+      } else if (!finalFilename.endsWith('.png')) {
+        const dotIndex = finalFilename.lastIndexOf('.');
+        const nameWithoutExt = dotIndex > 0 ? finalFilename.substring(0, dotIndex) : finalFilename;
+        finalFilename = `${nameWithoutExt}.png`;
+      }
+
+      if (!userId) {
+        return {
+          success: false,
+          message: 'User ID is required for S3 upload',
+          error: 'missing_user_id'
+        };
+      }
+
+      const uploadResult = await uploadFileToS3(
+        buffer,
+        finalFilename,
+        userId,
+        'image/png'
+      );
+
+      if (!uploadResult.success || !uploadResult.url) {
+        return {
+          success: false,
+          message: uploadResult.error || 'Failed to upload transparent image to S3',
+          error: uploadResult.error || 's3_upload_failed'
+        };
+      }
+
+      // Optional foreground/background contrast check against the target surface.
+      let contrast: any = undefined;
+      if (options?.surfaceColor) {
+        const surface = ImageService.parseHexColor(options.surfaceColor);
+        if (!surface) {
+          contrast = {
+            surfaceColor: options.surfaceColor,
+            warning: `Could not parse surfaceColor "${options.surfaceColor}" as a hex color; skipped contrast check.`
+          };
+        } else {
+          // Re-read the transparent PNG's opaque pixels to estimate the logo's color.
+          // Wrapped in its own try/catch: the image was already uploaded
+          // successfully, so a failure here should only drop the contrast info,
+          // not fail the whole operation.
+          try {
+            const sharp = require('sharp');
+            const { data, info } = await sharp(buffer).raw().toBuffer({ resolveWithObject: true });
+            const fg = ImageService.averageOpaqueColor(data, (info as any).channels);
+            if (fg) {
+              const ratio = ImageService.contrastRatio(fg, surface);
+              const legible = ratio >= 3; // WCAG AA for large text / graphical objects
+              contrast = {
+                surfaceColor: options.surfaceColor,
+                foregroundColor: `rgb(${fg.r}, ${fg.g}, ${fg.b})`,
+                ratio: Math.round(ratio * 100) / 100,
+                legible,
+                ...(legible
+                  ? {}
+                  : {
+                      warning:
+                        `⚠️ Low contrast (${Math.round(ratio * 100) / 100}:1, below the 3:1 minimum): the logo's ` +
+                        `average color rgb(${fg.r}, ${fg.g}, ${fg.b}) may be hard to read on surface ${options.surfaceColor}. ` +
+                        `Consider an all-white or all-dark variant of the logo to match this surface.`
+                    })
+              };
+            }
+          } catch (contrastError: any) {
+            console.warn('AgentMode: contrast check failed (image still uploaded):', contrastError?.message);
+          }
+        }
+      }
+
+      return {
+        success: true,
+        message:
+          `✅ Background removed — genuine transparent-alpha PNG produced (original artwork preserved). ` +
+          `Detected background rgb(${detectedBackground.r}, ${detectedBackground.g}, ${detectedBackground.b}); ` +
+          `${Math.round(removedRatio * 100)}% of pixels made transparent.` +
+          (contrast?.warning ? ` ${contrast.warning}` : ''),
+        imageUrl: uploadResult.url,
+        filename: finalFilename,
+        originalUrl: imageUrl,
+        detectedBackground,
+        removedRatio,
+        ...(contrast ? { contrast } : {})
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error removing background from image:', error);
+      return {
+        success: false,
+        message: 'Failed to remove background from image',
         error: error.message
       };
     }

@@ -1343,6 +1343,58 @@ export class UserDB {
     }
   }
 
+  async incrementTokenUsageForMonth(
+    userId: string,
+    month: string,
+    tokens: number,
+    cost: number,
+    resetDate: string
+  ): Promise<User | null> {
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) {
+      throw new Error(`User with ID '${userId}' not found or has no email.`);
+    }
+
+    const params: AWS.DynamoDB.DocumentClient.UpdateItemInput = {
+      TableName: this.tableName,
+      Key: { email: user.email },
+      UpdateExpression:
+        "SET #tokenUsage.#month = :month, " +
+        "#tokenUsage.#totalTokens = if_not_exists(#tokenUsage.#totalTokens, :zero) + :tokens, " +
+        "#tokenUsage.#totalCost = if_not_exists(#tokenUsage.#totalCost, :zero) + :cost, " +
+        "#tokenUsage.#resetDate = if_not_exists(#tokenUsage.#resetDate, :resetDate)",
+      ConditionExpression: "#userId = :userId AND #tokenUsage.#month = :month",
+      ExpressionAttributeNames: {
+        "#userId": "userId",
+        "#tokenUsage": "tokenUsage",
+        "#month": "month",
+        "#totalTokens": "totalTokens",
+        "#totalCost": "totalCost",
+        "#resetDate": "resetDate",
+      },
+      ExpressionAttributeValues: {
+        ":userId": userId,
+        ":month": month,
+        ":tokens": tokens,
+        ":cost": cost,
+        ":zero": 0,
+        ":resetDate": resetDate,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await this.docClient.update(params).promise();
+      return (result.Attributes as User) || null;
+    } catch (error: any) {
+      if (error?.code === "ConditionalCheckFailedException") {
+        return null;
+      }
+      handleDynamoDbError(error, "incrementTokenUsageForMonth");
+      throw error;
+    }
+  }
+
   async deleteUserById(
     userId: string
   ): Promise<{ success: boolean; message?: string }> {

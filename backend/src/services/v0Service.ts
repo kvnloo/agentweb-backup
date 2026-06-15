@@ -6,7 +6,7 @@ import path from "path";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken, getLandingPagesConfig } from "../utils/secretsManager";
 import { userDb, orgDb } from "./db";
 import { canEditItem } from "./orgShareService";
-import { addSubdomain, generateSubdomain } from "./customDomainService";
+import { addSubdomain, generateSubdomain, listDomains, SUBDOMAIN_BASE } from "./customDomainService";
 import { settingsService } from "./settingsService";
 import { paginatedQuery } from "../utils/dynamoPagination";
 
@@ -195,6 +195,82 @@ export function getLandingPageLiveUrl(
   page: Pick<GeneratedLandingPage, "deployedUrl" | "customDomainUrl">
 ): string {
   return page.customDomainUrl || page.deployedUrl || "";
+}
+
+/**
+ * Resolve a page's live URL against the domain ACTUALLY attached to its Vercel
+ * project (AW-CustomDomains is the source of truth), then fall back to
+ * {@link getLandingPageLiveUrl}.
+ *
+ * `customDomainUrl` is persisted at deploy time and can go stale: a managed
+ * `*.agentwebforms.com` subdomain may silently detach from the project (e.g. a
+ * re-deploy or a 409 collision that re-added the subdomain with a different
+ * suffix), leaving the page with an old subdomain that now serves a Vercel
+ * DEPLOYMENT_NOT_FOUND 404. The list endpoint (`GET /generated`) already
+ * corrects this in bulk; this is the single-page equivalent so the publish and
+ * edit endpoints report the live, attached URL instead of the stale one.
+ *
+ * Correction rules (mirroring the list endpoint):
+ *   - Only MANAGED subdomains (`*.agentwebforms.com`) are corrected. A real
+ *     custom domain stored on the page is user-managed and left untouched.
+ *   - Among the project's attached domains, prefer a verified custom domain
+ *     over a managed subdomain; break ties by most-recently-updated.
+ *   - Lookups are scoped to the page OWNER (page.userId), not the caller, so an
+ *     org member editing a shared page sees the same attached URL the owner does.
+ *
+ * Never throws: any failure (no project, no owner, domain lookup error) falls
+ * back to the stored value via {@link getLandingPageLiveUrl}.
+ */
+export async function resolveLandingPageLiveUrl(
+  page: Pick<
+    GeneratedLandingPage,
+    "deployedUrl" | "customDomainUrl" | "vercelProjectId" | "userId" | "slug"
+  >
+): Promise<string> {
+  const fallback = getLandingPageLiveUrl(page);
+  if (!page.vercelProjectId || !page.userId) return fallback;
+
+  try {
+    const domains = await listDomains(page.userId, page.vercelProjectId);
+    if (domains.length === 0) return fallback;
+
+    const rank = (d: { type: string }) => (d.type === "custom" ? 1 : 0);
+    let best = domains[0];
+    for (const d of domains) {
+      if (
+        rank(d) > rank(best) ||
+        (rank(d) === rank(best) && d.updatedAt > best.updatedAt)
+      ) {
+        best = d;
+      }
+    }
+
+    const targetUrl = page.slug
+      ? `https://${best.domain}/${page.slug}`
+      : `https://${best.domain}`;
+
+    // No stored URL → adopt the attached domain.
+    if (!page.customDomainUrl) return targetUrl;
+
+    // Only correct stored managed subdomains that have gone stale; leave real
+    // custom domains and already-correct values as-is.
+    let storedHost: string | null = null;
+    try {
+      storedHost = new URL(page.customDomainUrl).host;
+    } catch {
+      return fallback;
+    }
+    if (
+      storedHost &&
+      storedHost.endsWith(`.${SUBDOMAIN_BASE}`) &&
+      storedHost !== best.domain
+    ) {
+      return targetUrl;
+    }
+    return fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 export interface BrandContext {

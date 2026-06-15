@@ -345,6 +345,13 @@ describe('Admin Waitlist Free User Management', () => {
         displayName: 'New User',
         roles: ['customer'],
       });
+
+      // The temporary password must be CSPRNG-generated: 16 chars from the
+      // expected charset (no Math.random-based generation).
+      const welcomeCall = (mockEmailService as any).sendWelcomeEmail.mock.calls[0];
+      const sentPassword: string = welcomeCall[1];
+      expect(sentPassword).toHaveLength(16);
+      expect(sentPassword).toMatch(/^[a-zA-Z0-9!@#$%^&*]{16}$/);
     });
 
     it('should block registered users from being created', async () => {

@@ -56,6 +56,16 @@ const runner = createInstanceRunner({
   manifest: () => agentModeManifest,
   onRunComplete: async ({ result, drained, ports, manifest }) => {
     if (drained === null) return;
+    // Chirp kill (2026-06-14): this loop was the only one scheduled+enabled in
+    // prod (AGENT_MODE_LOOP_ENABLED), and unlike its siblings it DM'd Harsha a
+    // digest on EVERY daily run — even empty/quiet windows. The recorder that
+    // feeds it is gated separately (AGENT_RUNTIME_SPINE_ENABLED, off in prod),
+    // so every run scanned 0 events and still fired the "healthy/empty" DM:
+    // pure daily noise. The approval gate is also still a no-op CaptureGate, so
+    // the DM can't dispatch a fix anyway. Default to silent. Re-enable with
+    // AGENT_MODE_LOOP_DIGEST=true once the Slack approval gate (C1) makes the
+    // digest actionable. See dev.md 2026-06-14.
+    if (process.env.AGENT_MODE_LOOP_DIGEST !== 'true') return;
     await postLoopDigest(result, ports.slack, manifest.approval.slackUserId, agentModeDigestTemplate, drained.length);
   },
 });
