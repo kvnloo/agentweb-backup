@@ -17,6 +17,7 @@
  */
 
 import { CaptureGate } from '../../core/gates/captureGate';
+import { SlackReactionGate } from '../../core/gates/slackReactionGate';
 import { postLoopDigest, type LoopDigestTemplate } from '../../core/digest/loopDigest';
 import { createInstanceRunner } from '../../core/instanceRunner';
 import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
@@ -96,6 +97,40 @@ export function getAgentRunRecorder(): AgentRunRecorder | null {
 export function isAgentRuntimeSpineEnabled(): boolean {
   return process.env.AGENT_RUNTIME_SPINE_ENABLED === 'true'
     || process.env.AGENT_MODE_LOOP_ENABLED === 'true';
+}
+
+/**
+ * Opt-in flag for the real Slack-reaction approval gate (INCREMENT C1).
+ *
+ * Production still runs `CaptureGate` (pollDecision() always pending, so
+ * shippedAt is never stamped). This flag gates the SlackReactionGate capability
+ * WITHOUT auto-flipping the live runner: the runner's drain path is tied to
+ * CaptureGate, so promoting this gate into the runner is a separate, larger
+ * wiring change. This increment ships the capability + tests behind the flag;
+ * Harsha enables + wires it explicitly. Default OFF.
+ */
+export function isSlackReactionGateEnabled(): boolean {
+  return process.env.AGENT_MODE_SLACK_REACTION_GATE === 'true';
+}
+
+/**
+ * Factory for the agent-mode Slack-reaction approval gate. Returns null when the
+ * flag is off so callers stay on CaptureGate. The gate resolves ✅/❌ on the
+ * proposal DM into a decision and stamps shippedAt on approval (Layer 4→5).
+ *
+ * Wiring is intentionally deferred: this builds the gate, it does not register
+ * it as the loop's `gateImpl`. See isSlackReactionGateEnabled() for why.
+ */
+export function buildAgentModeSlackReactionGate(): SlackReactionGate | null {
+  if (!isSlackReactionGateEnabled()) return null;
+  const ports = productionLoopPorts();
+  return new SlackReactionGate({
+    slack: ports.slack,
+    approver: agentModeManifest.approval.slackUserId ?? '',
+    clock: ports.clock,
+    channel: agentModeManifest.approval.slackChannel,
+    dmTitle: agentModeManifest.displayName,
+  });
 }
 
 /**

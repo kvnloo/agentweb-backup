@@ -984,6 +984,143 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
         expect(call.firstTouch).toBeUndefined();
         expect(call.lastTouch).toBeUndefined();
       });
+
+      // Regression: the existing-lead MERGE path used to drop attribution
+      // entirely — lastTouch was DOA for any lead that came through the webhook
+      // more than once (firstTouch === lastTouch forever). The merge whitelist
+      // previously only carried standardFields + customFields.
+      describe('existing-lead merge path (lastTouch refresh)', () => {
+        const firstTouch = {
+          timestamp: '2026-04-19T10:00:00.000Z',
+          utm: { source: 'linkedin', medium: 'social', campaign: 'first' },
+        };
+
+        it('refreshes lastTouch on a repeat touch, preserves firstTouch + utm denorm', async () => {
+          (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+            leadId: 'lead_repeat',
+            listId: 'list_123',
+            email: 'repeat@example.com',
+            firstName: 'Repeat',
+            firstTouch,
+            lastTouch: firstTouch,
+            utmSource: 'linkedin',
+            utmMedium: 'social',
+            customFields: { source: 'api' },
+          });
+
+          const response = await request(app)
+            .post('/api/webhooks/forward-lead')
+            .send({
+              listId: 'list_123',
+              email: 'repeat@example.com',
+              attribution: {
+                timestamp: '2026-04-20T10:00:00.000Z',
+                utm: { source: 'google', medium: 'cpc', campaign: 'second' },
+              },
+            });
+
+          expect(response.status).toBe(200);
+          expect(response.body.event).toBe('lead.updated');
+
+          const updates = (crmDb.updateLead as jest.Mock).mock.calls.find(
+            (c) => c[1] === 'lead_repeat'
+          )?.[2];
+          expect(updates).toBeDefined();
+          // lastTouch ALWAYS refreshes to the new touch
+          expect(updates.lastTouch).toEqual(
+            expect.objectContaining({
+              utm: expect.objectContaining({ source: 'google', medium: 'cpc' }),
+            })
+          );
+          // firstTouch must NEVER be in the update payload (immutable)
+          expect(updates.firstTouch).toBeUndefined();
+          // utmSource/utmMedium are denormalized from firstTouch — never overwritten
+          // once present, so they must not be in the update payload here.
+          expect(updates.utmSource).toBeUndefined();
+          expect(updates.utmMedium).toBeUndefined();
+        });
+
+        it('backfills firstTouch + utm denorm when an existing lead has none', async () => {
+          (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+            leadId: 'lead_noattr',
+            listId: 'list_123',
+            email: 'noattr@example.com',
+            firstName: 'NoAttr',
+            customFields: { source: 'manual' },
+            // no firstTouch / lastTouch / utmSource / utmMedium
+          });
+
+          const response = await request(app)
+            .post('/api/webhooks/forward-lead')
+            .send({
+              listId: 'list_123',
+              email: 'noattr@example.com',
+              attribution: {
+                timestamp: '2026-04-20T10:00:00.000Z',
+                utm: { source: 'twitter', medium: 'social', campaign: 'late' },
+              },
+            });
+
+          expect(response.status).toBe(200);
+          expect(response.body.event).toBe('lead.updated');
+
+          const updates = (crmDb.updateLead as jest.Mock).mock.calls.find(
+            (c) => c[1] === 'lead_noattr'
+          )?.[2];
+          expect(updates).toBeDefined();
+          // firstTouch backfilled (was absent) — only-if-absent
+          expect(updates.firstTouch).toEqual(
+            expect.objectContaining({
+              utm: expect.objectContaining({ source: 'twitter' }),
+            })
+          );
+          // lastTouch set too
+          expect(updates.lastTouch).toEqual(
+            expect.objectContaining({
+              utm: expect.objectContaining({ source: 'twitter' }),
+            })
+          );
+          // utm denorm backfilled from the new firstTouch
+          expect(updates.utmSource).toBe('twitter');
+          expect(updates.utmMedium).toBe('social');
+        });
+
+        it('does not touch attribution fields when the repeat touch carries none', async () => {
+          (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+            leadId: 'lead_noinc',
+            listId: 'list_123',
+            email: 'noinc@example.com',
+            firstName: 'Old',
+            firstTouch,
+            lastTouch: firstTouch,
+            utmSource: 'linkedin',
+            utmMedium: 'social',
+            customFields: { source: 'api' },
+          });
+
+          const response = await request(app)
+            .post('/api/webhooks/forward-lead')
+            .send({
+              listId: 'list_123',
+              email: 'noinc@example.com',
+              firstName: 'New', // forces a change so updateLead is called
+            });
+
+          expect(response.status).toBe(200);
+          expect(response.body.event).toBe('lead.updated');
+
+          const updates = (crmDb.updateLead as jest.Mock).mock.calls.find(
+            (c) => c[1] === 'lead_noinc'
+          )?.[2];
+          expect(updates).toBeDefined();
+          expect(updates.firstName).toBe('New');
+          // No incoming attribution → no attribution keys in the update
+          expect(updates.firstTouch).toBeUndefined();
+          expect(updates.lastTouch).toBeUndefined();
+          expect(updates.utmSource).toBeUndefined();
+          expect(updates.utmMedium).toBeUndefined();
+        });
+      });
     });
 
     describe('Auto-enroll into list-bound drip sequences', () => {

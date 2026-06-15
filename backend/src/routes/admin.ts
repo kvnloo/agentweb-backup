@@ -19,6 +19,7 @@ import { workflowDb } from "../services/workflowDb";
 import { paginatedScan } from "../utils/dynamoPagination";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
+import { generateSecurePassword } from "../utils/secureRandom";
 import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
 import { getRevenueMetrics } from "../services/revenueService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
@@ -1475,17 +1476,9 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
       // Send welcome email without password for existing user upgrade
       await emailService.sendWelcomeEmail(email);
     } else {
-      // Create new user with waitlist data
-      const generateRandomPassword = (length: number = 12) => {
-        const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*';
-        let password = '';
-        for (let i = 0; i < length; i++) {
-          password += charset.charAt(Math.floor(Math.random() * charset.length));
-        }
-        return password;
-      };
-
-      temporaryPassword = generateRandomPassword(16);
+      // Create new user with waitlist data. Use a CSPRNG for the temporary
+      // password — Math.random() is predictable and must never generate secrets.
+      temporaryPassword = generateSecurePassword(16);
       const hashedPassword = await bcrypt.hash(temporaryPassword, 10);
 
       const userId = require('uuid').v4();

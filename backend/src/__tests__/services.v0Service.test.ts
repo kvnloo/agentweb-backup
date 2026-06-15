@@ -129,9 +129,12 @@ const mockGenerateSubdomain = jest.fn((...args: any[]) => {
   const name = args[0] as string | undefined;
   return (name || "page").toLowerCase().replace(/[^a-z0-9]+/g, "-");
 });
+const mockListDomains = jest.fn().mockResolvedValue([]);
 jest.mock("../services/customDomainService", () => ({
   addSubdomain: (...args: any[]) => mockAddSubdomain(...args),
   generateSubdomain: (...args: any[]) => mockGenerateSubdomain(...args),
+  listDomains: (...args: any[]) => mockListDomains(...args),
+  SUBDOMAIN_BASE: "agentwebforms.com",
 }));
 
 import {
@@ -154,6 +157,7 @@ import {
   cleanupOrphanedFailedPages,
   findSiteById,
   getLandingPageLiveUrl,
+  resolveLandingPageLiveUrl,
   recordLandingPagePublish,
   markLandingPagePublishReverted,
   triggerVercelDeployment,
@@ -1131,6 +1135,151 @@ describe("v0Service - getLandingPageLiveUrl", () => {
 
   it("returns empty string when neither URL is set", () => {
     expect(getLandingPageLiveUrl({})).toBe("");
+  });
+});
+
+// =============================================================================
+// resolveLandingPageLiveUrl — correct stale managed subdomains against
+// AW-CustomDomains (the source of truth) before reporting the live URL.
+// =============================================================================
+describe("v0Service - resolveLandingPageLiveUrl", () => {
+  beforeEach(() => {
+    mockListDomains.mockReset();
+    mockListDomains.mockResolvedValue([]);
+  });
+
+  it("corrects a stale managed subdomain to the attached domain (the everyio bug)", async () => {
+    mockListDomains.mockResolvedValueOnce([
+      {
+        domain: "everyio.agentwebforms.com",
+        vercelProjectId: "proj-1",
+        type: "subdomain",
+        updatedAt: "2026-01-02T00:00:00Z",
+      },
+    ]);
+    const url = await resolveLandingPageLiveUrl({
+      customDomainUrl: "https://everyio-day-zero-founders.agentwebforms.com",
+      deployedUrl: "https://x.vercel.app",
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+    });
+    expect(url).toBe("https://everyio.agentwebforms.com");
+    expect(mockListDomains).toHaveBeenCalledWith("owner-1", "proj-1");
+  });
+
+  it("preserves the sub-page slug when correcting a stale subdomain", async () => {
+    mockListDomains.mockResolvedValueOnce([
+      { domain: "everyio.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+    const url = await resolveLandingPageLiveUrl({
+      customDomainUrl: "https://everyio-day-zero-founders.agentwebforms.com/every-io-day-zero-pre-seed-fou",
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+      slug: "every-io-day-zero-pre-seed-fou",
+    });
+    expect(url).toBe("https://everyio.agentwebforms.com/every-io-day-zero-pre-seed-fou");
+  });
+
+  it("adopts the attached domain when no customDomainUrl is stored", async () => {
+    mockListDomains.mockResolvedValueOnce([
+      { domain: "everyio.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+    const url = await resolveLandingPageLiveUrl({
+      deployedUrl: "https://x.vercel.app",
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+    });
+    expect(url).toBe("https://everyio.agentwebforms.com");
+  });
+
+  it("keeps a stored managed subdomain that already matches the attached domain", async () => {
+    mockListDomains.mockResolvedValueOnce([
+      { domain: "everyio.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+    const url = await resolveLandingPageLiveUrl({
+      customDomainUrl: "https://everyio.agentwebforms.com",
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+    });
+    expect(url).toBe("https://everyio.agentwebforms.com");
+  });
+
+  it("never touches a real custom domain stored on the page", async () => {
+    mockListDomains.mockResolvedValueOnce([
+      { domain: "everyio.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+    const url = await resolveLandingPageLiveUrl({
+      customDomainUrl: "https://landing.every.io",
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+    });
+    expect(url).toBe("https://landing.every.io");
+  });
+
+  it("prefers a verified custom domain over a managed subdomain when adopting", async () => {
+    mockListDomains.mockResolvedValueOnce([
+      { domain: "old.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", updatedAt: "2026-01-01T00:00:00Z" },
+      { domain: "landing.every.io", vercelProjectId: "proj-1", type: "custom", updatedAt: "2026-01-01T00:00:00Z" },
+    ]);
+    const url = await resolveLandingPageLiveUrl({
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+    });
+    expect(url).toBe("https://landing.every.io");
+  });
+
+  it("breaks ties between managed subdomains by most-recently-updated", async () => {
+    mockListDomains.mockResolvedValueOnce([
+      { domain: "older.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", updatedAt: "2026-01-01T00:00:00Z" },
+      { domain: "newer.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", updatedAt: "2026-03-01T00:00:00Z" },
+    ]);
+    const url = await resolveLandingPageLiveUrl({
+      customDomainUrl: "https://stale.agentwebforms.com",
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+    });
+    expect(url).toBe("https://newer.agentwebforms.com");
+  });
+
+  it("falls back to the stored value when the page has no vercelProjectId", async () => {
+    const url = await resolveLandingPageLiveUrl({
+      customDomainUrl: "https://stale.agentwebforms.com",
+      userId: "owner-1",
+    });
+    expect(url).toBe("https://stale.agentwebforms.com");
+    expect(mockListDomains).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the stored value when no domains are attached", async () => {
+    mockListDomains.mockResolvedValueOnce([]);
+    const url = await resolveLandingPageLiveUrl({
+      customDomainUrl: "https://stale.agentwebforms.com",
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+    });
+    expect(url).toBe("https://stale.agentwebforms.com");
+  });
+
+  it("falls back to the stored value when the domain lookup throws", async () => {
+    mockListDomains.mockRejectedValueOnce(new Error("DynamoDB down"));
+    const url = await resolveLandingPageLiveUrl({
+      customDomainUrl: "https://stale.agentwebforms.com",
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+    });
+    expect(url).toBe("https://stale.agentwebforms.com");
+  });
+
+  it("leaves a malformed stored URL untouched", async () => {
+    mockListDomains.mockResolvedValueOnce([
+      { domain: "everyio.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+    const url = await resolveLandingPageLiveUrl({
+      customDomainUrl: "not-a-url",
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+    });
+    expect(url).toBe("not-a-url");
   });
 });
 
