@@ -5165,3 +5165,28 @@ While PR #1752 (above) was in review (NOT deployed), a live flood of "invitation
 ### Root-cause fix (added to PR #1752)
 
 `runLinkedInConnectionSync` now checks the `__fullsync__` marker (`getFullSyncCompletedAt`) BEFORE syncing each account. If absent, this run is the one-time full backfill — covering **both empty AND partial caches** (the partial-cache path is what actually flooded) — so it caches the connections silently and skips BOTH `notifyNewConnections` and `enrollNewConnections`. Keying off the fullsync marker (not the watermark) is essential: the flood account had a non-null watermark, so a watermark-based check would have missed it. Combined with the sender-gate fix, this list would have sent **zero** emails. Covered by `linkedInConnectionSync.initialBackfillNoNotify.test.ts` (includes a partial-cache case).
+
+## POSTMORTEM — transparent-logo handling during newsletter HTML editing (2026-06-15)
+
+Session `eadb9fda-d255-479f-b122-356ae36cbc50` (user Aquila). Task: header logo = 3-color brand mark on a purple gradient (#3F51B5→#6E49BF); footer logo = all-white mark on dark navy (#1a1a2e). Both needed a transparent background. The agent made four mistakes before the user manually supplied transparent PNGs.
+
+### Mistakes & root causes
+
+1. **Used `remove_c2pa_from_image` expecting transparency.** It only re-encodes to strip metadata (`imageService.removeC2PAMetadata` → Sharp `withMetadata:false`); it never touches pixels, so it cannot remove a background or create an alpha channel. The tool name/description implied more than it does.
+2. **Used `generate_image` to "redraw the logo on a transparent background".** No real background-removal capability existed, so the only fallback was regenerating the mark — which risks icon/letter/color drift and cannot guarantee true alpha.
+3. **Selector `p:contains(AQUILA):first` clobbered the wrong element.** "AQUILA BRIEFING" in the header appears first in DOM order, so a `:contains + :first` selector aimed at the *footer* wordmark hit the *header*. Required a corrective pass.
+4. **Placed a black wordmark on the dark purple header** (illegible). No fg/bg contrast validation existed.
+
+### What worked
+User supplied real transparent PNGs (3-color for header, all-white for footer). Swapping `img src` via `update_html_file` CSS `setAttribute` preserved brand fidelity exactly, scoping by container background: header `td[style*="linear-gradient"] img[alt="Aquila"]`, footer `td[style*="#1a1a2e"] img[alt="Aquila"]`.
+
+### Fixes (this branch)
+
+- **New `remove_image_background` tool** (`imageGeneration.ts:removeImageBackground` + `agentModeService.removeImageBackground`, registered in `emma/tools.ts`). Edge-seeded flood fill over the original raw RGBA pixels via Sharp: detects the background color from the corner median, clears alpha on contiguous border-connected pixels within a tolerance. Produces a **genuine transparent-alpha PNG without redrawing the mark** — enclosed regions (e.g. a counter inside a letter) are preserved because the fill only follows border-connected pixels. Verified end-to-end: a real Google-logo PNG → 70.5% transparent / 26.4% opaque, `channels:4 hasAlpha:true`, foreground colors intact.
+- **Optional `surface_color` contrast check.** Computes the WCAG contrast ratio between the logo's average opaque color and the target surface; warns below 3:1 (the "black logo on dark purple" failure). E2E run reported 4.39:1 against #1a1a2e for the colored Google mark → legible.
+- **Description fixes.** `remove_c2pa_from_image` now states it does NOT remove backgrounds and points to the new tool. `generate_image` now forbids "redraw on transparent background" and routes such requests to `remove_image_background` / an existing transparent PNG.
+- **Selector guidance.** `update_html_file` now instructs scoping by container/section background (not `:contains + :first`) when a brand word appears multiple times, with the header/footer examples above.
+- **Bonus bug fix.** `removeC2PAFromImage`/`removeImageBackground` filename normalization truncated extension-less names (`"logo"` → `".png"`) because `lastIndexOf('.') || length` is dead code (`-1` is truthy). Fixed both to `dotIndex > 0 ? substring(0, dotIndex) : name`.
+
+### Tests
+`imageGeneration.backgroundRemoval.test.ts` (real Sharp — proves alpha, interior-counter preservation, tolerance, corner-median, WCAG helpers), `agentModeService.removeImageBackground.test.ts` (orchestration, filename, contrast, error paths), `remove_image_background.registration.test.ts` (tool registry + updated descriptions). 107 image-related tests pass; `npx tsc` clean.
