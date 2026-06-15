@@ -146,7 +146,8 @@ describe('AgentModeService - createHtmlFile', () => {
       expect(mockGenerateHTML).toHaveBeenCalledWith(
         expect.stringContaining('dark theme'),
         expect.stringContaining('Format Requirements:\nUse dark theme with modern design'),
-        expect.any(Function)
+        expect.any(Function),
+        { userId: expect.any(String), sessionId: expect.any(String), feature: 'content_gen' }
       );
     });
 
@@ -300,7 +301,8 @@ describe('AgentModeService - createHtmlFile', () => {
       expect(mockGenerateHTML).toHaveBeenCalledWith(
         expect.stringContaining('professional HTML document'),
         expect.stringContaining('professional HTML document'),
-        expect.any(Function)
+        expect.any(Function),
+        { userId: expect.any(String), sessionId: expect.any(String), feature: 'content_gen' }
       );
     });
 
@@ -341,7 +343,8 @@ describe('AgentModeService - createHtmlFile', () => {
       expect(mockGenerateHTML).toHaveBeenCalledWith(
         expect.stringContaining('#1a73e8'),
         expect.any(String),
-        expect.any(Function)
+        expect.any(Function),
+        { userId: expect.any(String), sessionId: expect.any(String), feature: 'content_gen' }
       );
     });
 

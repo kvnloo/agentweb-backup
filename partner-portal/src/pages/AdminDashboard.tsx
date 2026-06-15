@@ -3012,6 +3012,11 @@ export default function AdminDashboard() {
       return;
     }
 
+    if (newPassword.length < 12) {
+      setError("Password must be at least 12 characters long");
+      return;
+    }
+
     try {
       setPasswordResetLoading(true);
       setError("");
@@ -7587,7 +7592,7 @@ export default function AdminDashboard() {
             onChange={(e) => setNewPassword(e.target.value)}
             placeholder="Enter new password"
             disabled={passwordResetLoading}
-            helperText="Minimum 6 characters"
+            helperText="Minimum 12 characters"
           />
         </DialogContent>
         <DialogActions>

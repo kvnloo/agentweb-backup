@@ -16,22 +16,13 @@
  * gated separately by AGENT_MODE_LOOP_ENABLED.
  */
 
-import {
-  getLoopManifest,
-  getRegisteredLoopIds,
-  registerOrReplaceGate,
-  registerOrReplaceLearningStore,
-  registerOrReplaceLoop,
-  registerOrReplaceRuleSet,
-  registerOrReplaceSensor,
-  registerOrReplaceTools,
-} from '../../index';
 import { CaptureGate } from '../../core/gates/captureGate';
+import { postLoopDigest, type LoopDigestTemplate } from '../../core/digest/loopDigest';
+import { createInstanceRunner } from '../../core/instanceRunner';
 import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
 import { CooldownRuleSet } from '../../core/policy/cooldownRuleSet';
 import { EventTableEventSource } from '../../core/sensors/eventTableEventSource';
 import { SpecOutputTool } from '../../core/tools/specOutputTool';
-import { runLoop } from '../../core/orchestrator';
 import { productionLoopPorts } from '../../adapters/awsAdapters';
 import type { LoopRunResult } from '../../core/types';
 import { AGENT_MODE_LOOP_ID } from './eventTypes';
@@ -39,35 +30,51 @@ import { AgentFailureRuleSet } from './failureRuleSet';
 import { agentModeManifest } from './manifest';
 import { AgentRunRecorder } from './runRecorder';
 
-let agentModeGate: CaptureGate | null = null;
 let recorderSingleton: AgentRunRecorder | null = null;
+
+const runner = createInstanceRunner({
+  loopId: AGENT_MODE_LOOP_ID,
+  ports: productionLoopPorts,
+  implNames: {
+    sensor: 'agentModeSensor',
+    ruleSet: 'agentModeFailurePolicy',
+    tools: 'agentModeSpecTool',
+    gate: 'agentModeGate',
+    learning: 'agentModeLearning',
+  },
+  buildLayers: (ports) => {
+    const learning = new DynamoLearningStore(ports.dynamo);
+    return {
+      sensor: new EventTableEventSource(ports.dynamo, AGENT_MODE_LOOP_ID),
+      ruleSet: new CooldownRuleSet(new AgentFailureRuleSet(), learning, AGENT_MODE_LOOP_ID),
+      tools: new SpecOutputTool(AGENT_MODE_LOOP_ID, ['cloud-dev', 'auto-loop', 'agent-mode']),
+      gate: new CaptureGate(),
+      learning,
+    };
+  },
+  manifest: () => agentModeManifest,
+  onRunComplete: async ({ result, drained, ports, manifest }) => {
+    if (drained === null) return;
+    // Chirp kill (2026-06-14): this loop was the only one scheduled+enabled in
+    // prod (AGENT_MODE_LOOP_ENABLED), and unlike its siblings it DM'd Harsha a
+    // digest on EVERY daily run — even empty/quiet windows. The recorder that
+    // feeds it is gated separately (AGENT_RUNTIME_SPINE_ENABLED, off in prod),
+    // so every run scanned 0 events and still fired the "healthy/empty" DM:
+    // pure daily noise. The approval gate is also still a no-op CaptureGate, so
+    // the DM can't dispatch a fix anyway. Default to silent. Re-enable with
+    // AGENT_MODE_LOOP_DIGEST=true once the Slack approval gate (C1) makes the
+    // digest actionable. See dev.md 2026-06-14.
+    if (process.env.AGENT_MODE_LOOP_DIGEST !== 'true') return;
+    await postLoopDigest(result, ports.slack, manifest.approval.slackUserId, agentModeDigestTemplate, drained.length);
+  },
+});
 
 /**
  * Register the loop. Idempotent. Does NOT reset the registry, so it coexists
  * with the funnel loops regardless of boot order.
  */
 export function registerAgentModeLoop(): void {
-  if ((getRegisteredLoopIds() as readonly string[]).includes(AGENT_MODE_LOOP_ID)) return;
-
-  const ports = productionLoopPorts();
-
-  const sensor = new EventTableEventSource(ports.dynamo, AGENT_MODE_LOOP_ID);
-  const learning = new DynamoLearningStore(ports.dynamo);
-  const policy = new AgentFailureRuleSet();
-  const ruleSet = new CooldownRuleSet(policy, learning, AGENT_MODE_LOOP_ID);
-  const tools = new SpecOutputTool(AGENT_MODE_LOOP_ID, ['cloud-dev', 'auto-loop', 'agent-mode']);
-  const gate = new CaptureGate();
-
-  registerOrReplaceSensor('agentModeSensor', sensor);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  registerOrReplaceRuleSet('agentModeFailurePolicy', ruleSet as any);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  registerOrReplaceTools('agentModeSpecTool', tools as any);
-  registerOrReplaceGate('agentModeGate', gate);
-  registerOrReplaceLearningStore('agentModeLearning', learning);
-  registerOrReplaceLoop(agentModeManifest);
-
-  agentModeGate = gate;
+  runner.register();
 }
 
 /**
@@ -97,64 +104,35 @@ export function isAgentRuntimeSpineEnabled(): boolean {
  * logged. Scheduled from server.ts behind AGENT_MODE_LOOP_ENABLED.
  */
 export async function runAgentModeLoopOnce(): Promise<LoopRunResult> {
-  registerAgentModeLoop();
-
-  const ports = productionLoopPorts();
-  const manifest = getLoopManifest(AGENT_MODE_LOOP_ID);
-  const result = await runLoop(manifest, ports);
-
-  if (agentModeGate) {
-    const drained = agentModeGate.drain();
-    await postDigest(result, drained.length, ports.slack, manifest.approval.slackUserId);
-  }
-
-  return result;
+  // Never null: this instance has no env gate, so register() always succeeds.
+  return (await runner.runOnce()) as LoopRunResult;
 }
 
-async function postDigest(
-  result: LoopRunResult,
-  drainedCount: number,
-  slack: { postMessage: (channelOrUserId: string, markdown: string) => Promise<unknown> },
-  slackUserId: string | undefined,
-): Promise<void> {
-  if (!slackUserId) {
-    console.warn('[agent-mode-loop] no approval.slackUserId — skipping DM');
-    return;
-  }
-  const lines: string[] = [];
-  lines.push(`*🤖 Agent Mode — tool reliability ${new Date().toISOString().slice(0, 10)}*`);
-  lines.push(`Run ID: \`${result.runId}\``);
-  lines.push(`Tool events scanned: ${result.eventsScanned}  |  Failing tools: ${result.proposals.length}`);
-  lines.push('');
-
-  if (result.eventsScanned === 0) {
-    lines.push(`_No agent-mode tool events in the 7d window — recorder off, or no tool use. Not "healthy", just empty._`);
-  } else if (result.proposals.length === 0) {
-    lines.push(`_No tool crossed the failure threshold this window. Tool reliability looks healthy._`);
-  } else {
-    lines.push(`*Failing tools (fix specs dispatched: ${drainedCount})*`);
-    for (let i = 0; i < result.proposals.length; i++) {
-      const p = result.proposals[i];
-      lines.push(`${i + 1}. ${p.hypothesis}`);
-    }
-  }
-  lines.push('');
-  lines.push(`React ✅ to dispatch all to cloud-dev  |  ❌ to skip  |  🛑 to pause loop`);
-
-  try {
-    await slack.postMessage(slackUserId, lines.join('\n'));
-  } catch (err) {
-    console.error('[agent-mode-loop] Slack DM post failed:', err);
-  }
-}
+/** TExtra = the count of fix specs drained from the gate this tick. */
+const agentModeDigestTemplate: LoopDigestTemplate<number> = {
+  logTag: '[agent-mode-loop]',
+  header: (date) => `*🤖 Agent Mode — tool reliability ${date}*`,
+  counts: (result) =>
+    `Tool events scanned: ${result.eventsScanned}  |  Failing tools: ${result.proposals.length}`,
+  emptyBody: () => [
+    `_No agent-mode tool events in the 7d window — recorder off, or no tool use. Not "healthy", just empty._`,
+  ],
+  quietBody: () => [
+    `_No tool crossed the failure threshold this window. Tool reliability looks healthy._`,
+  ],
+  findingsBody: (result, drainedCount) => [
+    `*Failing tools (fix specs dispatched: ${drainedCount})*`,
+    ...result.proposals.map((p, i) => `${i + 1}. ${p.hypothesis}`),
+  ],
+};
 
 /** Test seam. */
 export const _internal = {
   get agentModeGate() {
-    return agentModeGate;
+    return runner.gate;
   },
   resetForTesting() {
-    agentModeGate = null;
+    runner.resetForTesting();
     recorderSingleton = null;
   },
 };

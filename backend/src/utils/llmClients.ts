@@ -1,0 +1,364 @@
+/**
+ * llmClients — the single factory for metered LLM provider clients (Ship 1: shadow).
+ *
+ * Every client returned here is the real SDK client with its inference entry
+ * points wrapped so that completed responses flow through a per-provider usage
+ * normalizer and `recordUsage` is fired (fire-and-forget, never awaited inline).
+ *
+ * Guarantees:
+ *  - The SDK response is returned UNMODIFIED (same object) — metering only
+ *    observes it. (Exception: provider stream iterables are re-wrapped with a
+ *    transparent passthrough so the final usage event can be captured; every
+ *    chunk is yielded unchanged.)
+ *  - No awaited latency is added to the hot path: usage is read off the already
+ *    resolved response and recordUsage is fired without await.
+ *  - Metering errors are swallowed — they can never fail an LLM call.
+ *  - Streaming calls where usage is not capturable record outputTokens 0 with a
+ *    ":streaming-no-usage" note appended to the feature.
+ *
+ * The sdkConstructionGuard unit test enforces that new direct SDK constructions
+ * (`new OpenAI(`, `new BedrockRuntimeClient(`, `new GoogleGenAI(`, ...) appear
+ * only in this file and the seeded legacy allowlist.
+ */
+
+import OpenAI from "openai";
+// Type-only import (erased at runtime). The Bedrock SDK is lazy-imported inside
+// getBedrockClient — a static import breaks test suites that mock node 'crypto'
+// (@smithy/uuid binds crypto.randomUUID at module load) and matches the
+// existing lazy-load pattern in agentModeService.
+import type {
+  BedrockRuntimeClient,
+  BedrockRuntimeClientConfig,
+} from "@aws-sdk/client-bedrock-runtime";
+import { recordUsage } from "../services/usageRecorderService";
+
+export interface MeterContext {
+  userId?: string;
+  billingUserId?: string;
+  onBehalfOf?: string;
+  feature: string;
+  sessionId?: string;
+  taskId?: string;
+}
+
+export interface NormalizedUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+}
+
+// ── Per-provider usage normalizers ────────────────────────────────────────────
+
+/** OpenAI / Azure OpenAI chat completions: usage{prompt_tokens, completion_tokens, prompt_tokens_details.cached_tokens}. */
+export function normalizeOpenAIUsage(usage: any): NormalizedUsage {
+  return {
+    inputTokens: usage?.prompt_tokens || 0,
+    outputTokens: usage?.completion_tokens || 0,
+    cacheReadTokens: usage?.prompt_tokens_details?.cached_tokens || 0,
+  };
+}
+
+/** OpenAI embeddings: usage{prompt_tokens, total_tokens} — no completion side. */
+export function normalizeEmbeddingsUsage(usage: any): NormalizedUsage {
+  return {
+    inputTokens: usage?.prompt_tokens || 0,
+    outputTokens: 0,
+  };
+}
+
+/** Bedrock Converse: usage{inputTokens, outputTokens, cacheReadInputTokens, cacheWriteInputTokens}. */
+export function normalizeBedrockUsage(usage: any): NormalizedUsage {
+  return {
+    inputTokens: usage?.inputTokens || 0,
+    outputTokens: usage?.outputTokens || 0,
+    cacheReadTokens: usage?.cacheReadInputTokens || 0,
+    cacheWriteTokens: usage?.cacheWriteInputTokens || 0,
+  };
+}
+
+/** Gemini: usageMetadata{promptTokenCount, candidatesTokenCount, cachedContentTokenCount}. */
+export function normalizeGeminiUsage(usageMetadata: any): NormalizedUsage {
+  return {
+    inputTokens: usageMetadata?.promptTokenCount || 0,
+    outputTokens: usageMetadata?.candidatesTokenCount || 0,
+    cacheReadTokens: usageMetadata?.cachedContentTokenCount || 0,
+  };
+}
+
+// ── Internal: fire recordUsage without ever throwing or awaiting ──────────────
+
+function fireRecord(
+  provider: string,
+  model: string | undefined,
+  ctx: MeterContext,
+  usage: NormalizedUsage,
+  note?: string
+): void {
+  try {
+    void recordUsage({
+      userId: ctx.userId,
+      billingUserId: ctx.billingUserId,
+      onBehalfOf: ctx.onBehalfOf,
+      model: model || "unknown",
+      provider,
+      feature: note ? `${ctx.feature}:${note}` : ctx.feature,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cacheReadTokens: usage.cacheReadTokens,
+      cacheWriteTokens: usage.cacheWriteTokens,
+      sessionId: ctx.sessionId,
+      taskId: ctx.taskId,
+    });
+  } catch {
+    // Metering must never break an LLM call.
+  }
+}
+
+// ── OpenAI-compatible wrapping (OpenAI direct + Azure OpenAI) ─────────────────
+
+function wrapOpenAICompatible(client: OpenAI, provider: string, ctx: MeterContext): OpenAI {
+  // chat.completions.create — guard in case a client/mock lacks the surface.
+  if (!client?.chat?.completions?.create) return client;
+  const origChatCreate = client.chat.completions.create.bind(client.chat.completions);
+  (client.chat.completions as any).create = (params: any, ...rest: any[]) => {
+    const result = (origChatCreate as any)(params, ...rest);
+    try {
+      if (params?.stream) {
+        // Stream object can't be observed without consuming it — record the call
+        // with zero tokens and a note so call volume stays visible.
+        fireRecord(provider, params?.model, ctx, { inputTokens: 0, outputTokens: 0 }, "streaming-no-usage");
+      } else {
+        Promise.resolve(result)
+          .then((resp: any) => {
+            if (resp?.usage) {
+              fireRecord(provider, resp?.model || params?.model, ctx, normalizeOpenAIUsage(resp.usage));
+            }
+          })
+          .catch(() => {
+            /* caller sees the original rejection; metering stays silent */
+          });
+      }
+    } catch {
+      /* never break the call */
+    }
+    return result;
+  };
+
+  // embeddings.create — optional surface; skip if the client/mock omits it.
+  if (!client?.embeddings?.create) return client;
+  const origEmbedCreate = client.embeddings.create.bind(client.embeddings);
+  (client.embeddings as any).create = (params: any, ...rest: any[]) => {
+    const result = (origEmbedCreate as any)(params, ...rest);
+    try {
+      Promise.resolve(result)
+        .then((resp: any) => {
+          if (resp?.usage) {
+            fireRecord(provider, resp?.model || params?.model, ctx, normalizeEmbeddingsUsage(resp.usage));
+          }
+        })
+        .catch(() => {});
+    } catch {
+      /* never break the call */
+    }
+    return result;
+  };
+
+  return client;
+}
+
+/** Metered OpenAI direct client. */
+export function getOpenAIClient(
+  meterCtx: MeterContext,
+  options?: ConstructorParameters<typeof OpenAI>[0]
+): OpenAI {
+  const client = new OpenAI(options ?? { apiKey: process.env.OPENAI_API_KEY });
+  return wrapOpenAICompatible(client, "openai", meterCtx);
+}
+
+/**
+ * Metered Azure OpenAI client for a deployment (same construction pattern the
+ * chatbot uses: deployment-scoped baseURL + api-key header).
+ */
+/**
+ * Overrides for Azure deployments that don't use the standard
+ * AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_API_KEY / AZURE_OPENAI_API_VERSION trio
+ * (e.g. the embeddings deployment has its own endpoint + key, and some services
+ * pin a different api-version). Pass the call site's exact values so migrating
+ * an existing bespoke `new OpenAI({...})` to the factory is behavior-neutral.
+ */
+export interface AzureClientOverrides {
+  endpoint?: string;
+  apiKey?: string;
+  apiVersion?: string;
+}
+
+export function getAzureClient(
+  meterCtx: MeterContext,
+  deployment?: string,
+  overrides?: AzureClientOverrides
+): OpenAI {
+  const dep = deployment || process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4";
+  const endpoint = overrides?.endpoint ?? process.env.AZURE_OPENAI_ENDPOINT;
+  const apiKey = overrides?.apiKey ?? process.env.AZURE_OPENAI_API_KEY;
+  const apiVersion =
+    overrides?.apiVersion ?? process.env.AZURE_OPENAI_API_VERSION ?? "2024-08-01-preview";
+  const client = new OpenAI({
+    apiKey,
+    baseURL: `${endpoint}/openai/deployments/${dep}`,
+    defaultQuery: { "api-version": apiVersion },
+    defaultHeaders: { "api-key": apiKey },
+  });
+  return wrapOpenAICompatible(client, "azure-openai", meterCtx);
+}
+
+// ── Bedrock wrapping ──────────────────────────────────────────────────────────
+
+/** Strip an inference-profile ARN down to the bare model id for pricing lookups. */
+export function bedrockModelIdFromArn(modelId: string | undefined): string {
+  if (!modelId) return "unknown";
+  const profileMatch = modelId.match(/inference-profile\/(?:global\.)?(.+)$/);
+  if (profileMatch) return profileMatch[1];
+  return modelId.replace(/^global\./, "");
+}
+
+/** Transparent passthrough over a Bedrock Converse stream that captures the final usage event. */
+async function* meterBedrockStream(
+  stream: AsyncIterable<any>,
+  model: string,
+  ctx: MeterContext
+): AsyncGenerator<any> {
+  let usage: any = null;
+  try {
+    for await (const event of stream) {
+      if (event?.metadata?.usage) usage = event.metadata.usage;
+      yield event;
+    }
+  } finally {
+    try {
+      if (usage) {
+        fireRecord("bedrock", model, ctx, normalizeBedrockUsage(usage));
+      } else {
+        fireRecord("bedrock", model, ctx, { inputTokens: 0, outputTokens: 0 }, "streaming-no-usage");
+      }
+    } catch {
+      /* never break the stream consumer */
+    }
+  }
+}
+
+/** Metered Bedrock runtime client. ConverseCommand + ConverseStreamCommand usage is recorded. */
+export async function getBedrockClient(
+  meterCtx: MeterContext,
+  config?: BedrockRuntimeClientConfig
+): Promise<BedrockRuntimeClient> {
+  const { BedrockRuntimeClient } = await import("@aws-sdk/client-bedrock-runtime");
+  const client = new BedrockRuntimeClient(
+    config ?? {
+      region: process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-west-2",
+      ...(process.env.AWS_ACCESS_KEY_ID
+        ? {
+            credentials: {
+              accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+              secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
+            },
+          }
+        : {}),
+    }
+  );
+
+  const origSend = client.send.bind(client);
+  (client as any).send = async (command: any, ...rest: any[]) => {
+    const response = await (origSend as any)(command, ...rest);
+    try {
+      const commandName = command?.constructor?.name;
+      const model = bedrockModelIdFromArn(command?.input?.modelId);
+      if (commandName === "ConverseCommand") {
+        if (response?.usage) {
+          fireRecord("bedrock", model, meterCtx, normalizeBedrockUsage(response.usage));
+        }
+      } else if (commandName === "ConverseStreamCommand") {
+        if (response?.stream && typeof response.stream[Symbol.asyncIterator] === "function") {
+          response.stream = meterBedrockStream(response.stream, model, meterCtx);
+        } else {
+          fireRecord("bedrock", model, meterCtx, { inputTokens: 0, outputTokens: 0 }, "streaming-no-usage");
+        }
+      }
+    } catch {
+      /* metering must never break the call */
+    }
+    return response;
+  };
+
+  return client;
+}
+
+// ── Gemini wrapping ───────────────────────────────────────────────────────────
+
+/** Transparent passthrough over a Gemini content stream capturing the last usageMetadata. */
+async function* meterGeminiStream(
+  stream: AsyncIterable<any>,
+  model: string | undefined,
+  ctx: MeterContext
+): AsyncGenerator<any> {
+  let usageMetadata: any = null;
+  try {
+    for await (const chunk of stream) {
+      if (chunk?.usageMetadata) usageMetadata = chunk.usageMetadata;
+      yield chunk;
+    }
+  } finally {
+    try {
+      if (usageMetadata) {
+        fireRecord("gemini", model, ctx, normalizeGeminiUsage(usageMetadata));
+      } else {
+        fireRecord("gemini", model, ctx, { inputTokens: 0, outputTokens: 0 }, "streaming-no-usage");
+      }
+    } catch {
+      /* never break the stream consumer */
+    }
+  }
+}
+
+/**
+ * Metered Gemini client (lazy-imports @google/genai like all existing call sites).
+ * models.generateContent and models.generateContentStream are wrapped.
+ */
+export async function getGeminiClient(meterCtx: MeterContext, apiKey?: string): Promise<any> {
+  const { GoogleGenAI } = await import("@google/genai");
+  const key = (apiKey ?? process.env.GEMINI_API_KEY ?? "").trim();
+  if (!key) throw new Error("GEMINI_API_KEY not set");
+  const client: any = new GoogleGenAI({ apiKey: key });
+
+  if (typeof client.models?.generateContent === "function") {
+    const origGenerate = client.models.generateContent.bind(client.models);
+    client.models.generateContent = async (params: any, ...rest: any[]) => {
+      const response = await origGenerate(params, ...rest);
+      try {
+        if (response?.usageMetadata) {
+          fireRecord("gemini", params?.model, meterCtx, normalizeGeminiUsage(response.usageMetadata));
+        }
+      } catch {
+        /* metering must never break the call */
+      }
+      return response;
+    };
+  }
+
+  if (typeof client.models?.generateContentStream === "function") {
+    const origGenerateStream = client.models.generateContentStream.bind(client.models);
+    client.models.generateContentStream = async (params: any, ...rest: any[]) => {
+      const stream = await origGenerateStream(params, ...rest);
+      try {
+        if (stream && typeof stream[Symbol.asyncIterator] === "function") {
+          return meterGeminiStream(stream, params?.model, meterCtx);
+        }
+      } catch {
+        /* fall through to unmetered stream */
+      }
+      return stream;
+    };
+  }
+
+  return client;
+}

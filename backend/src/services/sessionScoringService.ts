@@ -229,7 +229,8 @@ export async function scoreSession(
   messages: ChatMessage[],
   currentMessageCount: number,
   pageIdentifier?: string,
-  sessionType?: string
+  sessionType?: string,
+  usageContext?: { userId?: string; feature?: string; sessionId?: string }
 ): Promise<ScoringResult> {
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
   const baseConversationText = serializeMessagesForScoring(recentMessages);
@@ -253,6 +254,7 @@ export async function scoreSession(
       temperature: 0,
       max_completion_tokens: SCORING_MAX_COMPLETION_TOKENS,
       response_format: { type: "json_object" },
+      usageContext: { ...usageContext, feature: usageContext?.feature || "agent_task" },
     }
   );
 
@@ -287,7 +289,8 @@ export async function scoreSessionWithJudge(
   messages: ChatMessage[],
   currentMessageCount: number,
   judge: ScoringJudge,
-  sessionType?: string
+  sessionType?: string,
+  usageContext?: { userId?: string; feature?: string; sessionId?: string }
 ): Promise<ScoringResult> {
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
   const baseConversationText = serializeMessagesForScoring(recentMessages);
@@ -308,6 +311,7 @@ export async function scoreSessionWithJudge(
       temperature: 0,
       max_completion_tokens: SCORING_MAX_COMPLETION_TOKENS,
       response_format: { type: "json_object" },
+      usageContext: { ...usageContext, feature: usageContext?.feature || "agent_task" },
     }
   );
 
@@ -354,7 +358,10 @@ export async function scoreSessionWithJudgeIfNeeded(
     }
     result = buildFailedRunResult(messageCount);
   } else {
-    result = await scoreSessionWithJudge(session.messages || [], messageCount, judge, session.sessionType);
+    result = await scoreSessionWithJudge(session.messages || [], messageCount, judge, session.sessionType, {
+      userId: session.userId,
+      sessionId: session.sessionId,
+    });
   }
 
   const judgeScore = {
@@ -406,7 +413,10 @@ export async function scoreSessionIfNeeded(
     }
     result = buildFailedRunResult(messageCount);
   } else {
-    result = await scoreSession(session.messages || [], messageCount, session.pageIdentifier, session.sessionType);
+    result = await scoreSession(session.messages || [], messageCount, session.pageIdentifier, session.sessionType, {
+      userId: session.userId,
+      sessionId: session.sessionId,
+    });
   }
 
   const satisfactionScore: ChatSession["satisfactionScore"] = {

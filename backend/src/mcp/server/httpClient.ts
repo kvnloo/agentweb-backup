@@ -110,6 +110,9 @@ export async function mcpFetch(options: McpFetchOptions): Promise<any> {
   const headers: Record<string, string> = {
     'Authorization': `Bearer ${token}`,
     'Content-Type': 'application/json',
+    // Lets routes attribute the request to the agent channel (vs portal UI)
+    // for lifecycle telemetry — see services/landerLifecycleEvents.ts.
+    'X-AgentWeb-Channel': 'agent',
   };
 
   const controller = new AbortController();

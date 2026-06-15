@@ -32,7 +32,7 @@ describe('Auth token expiration', () => {
     const req: any = {
       body: {
         email: 'freeuser@example.com',
-        password: 'password123',
+        password: 'ValidPass123!',
         roles: ['free']
       }
     };
@@ -67,7 +67,7 @@ describe('Auth token expiration', () => {
     const req: any = {
       body: {
         email: 'user@example.com',
-        password: 'password123'
+        password: 'ValidPass123!'
       }
     };
     const res = createRes();

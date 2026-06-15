@@ -1289,7 +1289,9 @@ mcpToolRegistry.register({
         prompt: { type: 'string', description: 'Detailed description of the landing page including brand colors, fonts, tone, sections, copy guidance, and any specific requirements. The more detail, the better v0 output.' },
         name: { type: 'string', description: 'Optional display name for the page' },
         lead_list_id: { type: 'string', description: 'ID of the CRM lead list for the contact form (from create_lead_list)' },
-        template_id: { type: 'string', description: 'Optional ID of a saved landing page template to use as design inspiration (from list_html_templates with type=landing_page)' }
+        template_id: { type: 'string', description: 'Optional ID of a saved landing page template to use as design inspiration (from list_html_templates with type=landing_page)' },
+        site_id: { type: 'string', description: 'Optional. The id of an existing landing page/site to add this page to — use for a variant or sub-page that should live under that site\'s existing URL.' },
+        mode: { type: 'string', enum: ['unified', 'separate'], description: 'How to place a NEW page when site_id is not given. "unified" (default, cheaper): add it to the user\'s existing site as a page under the shared subdomain — only their first page does a full generation. "separate": give this campaign its OWN site and distinct URL — this costs more (a fresh full generation each time). Only choose "separate" when the user explicitly wants this campaign on a separate URL, and tell them it uses more of their generation budget first. When unsure, omit this and let the default (unified) apply.' }
       },
       required: ['prompt']
     }
@@ -1297,7 +1299,7 @@ mcpToolRegistry.register({
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'POST', path: '/api/landing-pages/v0/generate', context: ctx(context),
-      body: { prompt: args.prompt, name: args.name, lead_list_id: args.lead_list_id, template_id: args.template_id },
+      body: { prompt: args.prompt, name: args.name, lead_list_id: args.lead_list_id, template_id: args.template_id, site_id: args.site_id, mode: args.mode, originating_session_id: context?.sessionId },
       timeoutMs: 25 * 60 * 1000, // 25 minutes — v0 generation + GitHub + Vercel deploy (extra headroom vs 15 min default)
     });
     return jsonResult(data);

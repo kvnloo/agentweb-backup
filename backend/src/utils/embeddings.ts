@@ -1,4 +1,4 @@
-import OpenAI from 'openai';
+import { getOpenAIClient } from './llmClients';
 
 /**
  * Lightweight embeddings helper, intentionally free of AWS / secrets-manager side effects
@@ -8,7 +8,7 @@ import OpenAI from 'openai';
  * in-app chatbot already relies on, so relevance-based memory reuses capacity we already pay
  * for — no new vector database or API key.
  */
-const embeddingsClient = new OpenAI({
+const embeddingsClientOptions = {
   apiKey: process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY,
   baseURL: `${
     process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT
@@ -20,15 +20,25 @@ const embeddingsClient = new OpenAI({
       process.env.AZURE_OPENAI_EMBEDDINGS_API_VERSION || '2024-08-01-preview',
   },
   defaultHeaders: { 'api-key': process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY },
-});
+};
 
 /**
  * Embed arbitrary text. Returns null on empty input or any failure, so callers can degrade
  * gracefully (e.g. fall back to recency-based retrieval) instead of failing the request.
+ *
+ * `meterCtx` is shadow-metering attribution only (Ship 1): when omitted, usage is
+ * recorded under userId "system". It never affects the embedding call itself.
  */
-export async function embedText(text: string): Promise<number[] | null> {
+export async function embedText(
+  text: string,
+  meterCtx?: { userId?: string; feature?: string },
+): Promise<number[] | null> {
   try {
     if (!text || !text.trim()) return null;
+    const embeddingsClient = getOpenAIClient(
+      { userId: meterCtx?.userId, feature: meterCtx?.feature || 'embeddings' },
+      embeddingsClientOptions,
+    );
     const response = await embeddingsClient.embeddings.create({
       model: `${process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT}`,
       input: text,

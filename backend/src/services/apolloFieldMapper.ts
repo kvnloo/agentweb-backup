@@ -7,6 +7,8 @@
  *     the call provided (linkedin_url + email > linkedin_url > email > name+org)
  */
 
+import { nameTokensMatch } from '../utils/nameMatch';
+
 export type ApolloConfidence = 'high' | 'medium' | 'low';
 
 export interface ApolloEmploymentEntry {
@@ -78,6 +80,10 @@ export interface MapMatchInputs {
   hadLinkedinUrl?: boolean;
   hadEmail?: boolean;
   hadNameAndOrg?: boolean;
+  /** Lead's name, used by the identity-verification gate to confirm the
+   *  returned person actually belongs to the lead (see apolloMatchIsTrustworthy). */
+  leadFirstName?: string;
+  leadLastName?: string;
 }
 
 function inferBaseConfidence(inputs: MapMatchInputs): ApolloConfidence {
@@ -250,6 +256,52 @@ export interface MappedMatch {
   organization?: MappedOrganization;
   /** Apollo's request_id, used to correlate async webhooks (phone reveals). */
   requestId?: string;
+}
+
+/**
+ * Identity-verification gate for an Apollo /people/match result.
+ *
+ * Apollo's match falls back to a name+domain heuristic when it can't verify the
+ * exact email, and it ECHOES the input email back onto whatever person it picks
+ * (observed in prod: lead "Joe Hio" / joe@us.com got person "Awais Haider" with
+ * email joe@us.com, email_status:null). So email-equality is NOT a safe trust
+ * signal — only Apollo's own `email_status: verified` is.
+ *
+ * Returns true (trust the match, persist its identity fields) when ANY of:
+ *   1. The lookup was keyed by a LinkedIn URL — Apollo prioritizes the URL, so
+ *      the returned profile is authoritative regardless of name.
+ *   2. Apollo reports email_status `verified` — it confirmed the email belongs
+ *      to the returned person.
+ *   3. The lead carried no name to compare against — lenient fallback, no worse
+ *      than the pre-gate behavior, avoids over-dropping name-less leads.
+ *   4. The returned first/last name matches the lead's (bidirectional prefix,
+ *      so nicknames/truncations pass).
+ *
+ * Otherwise the match is a different person echoed onto the lead's email →
+ * reject so we never persist the wrong LinkedIn URL / title / company.
+ */
+export function apolloMatchIsTrustworthy(
+  person: { firstName?: string; lastName?: string; email?: string; emailStatus?: string },
+  inputs: MapMatchInputs = {},
+): boolean {
+  // 1. LinkedIn-keyed lookups are authoritative.
+  if (inputs.hadLinkedinUrl) return true;
+
+  // 2. Apollo-verified email → trust.
+  if ((person.emailStatus ?? '').toLowerCase() === 'verified') return true;
+
+  const leadFirst = (inputs.leadFirstName ?? '').trim();
+  const leadLast = (inputs.leadLastName ?? '').trim();
+
+  // 3. No lead name to verify against → lenient trust.
+  if (!leadFirst && !leadLast) return true;
+
+  // Lead has a name but Apollo returned none → can't confirm identity → reject.
+  const gotName = !!((person.firstName ?? '').trim() || (person.lastName ?? '').trim());
+  if (!gotName) return false;
+
+  // 4. Names must not contradict.
+  return nameTokensMatch(person.firstName, person.lastName, leadFirst, leadLast);
 }
 
 export function mapApolloMatchResponse(apiData: any, inputs: MapMatchInputs = {}): MappedMatch | null {

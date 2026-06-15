@@ -421,6 +421,14 @@ createTestAccount().then(async () => {
     console.log(`WebSocket server is ready`);
     console.log(`Test account email: ${process.env.TEST_EMAIL}`);
 
+    // Self-heal the telemetry/loop tables if missing — fire-and-forget, non-fatal.
+    // Prevents the silent-no-op class of bug where a writer swallows
+    // ResourceNotFound and a whole loop subsystem runs against a table that
+    // was never provisioned (see services/ensureCriticalTables.ts).
+    void import('./services/ensureCriticalTables')
+      .then(({ ensureCriticalTables }) => ensureCriticalTables())
+      .catch((err) => console.error('[startup] ensureCriticalTables failed (non-fatal):', err?.message || err));
+
     // Initialize Agent Mode tools in background - don't block server startup
     // This prevents health check timeouts during deployment (e.g. Elastic Beanstalk)
     console.log('Initializing Agent Mode Tools (non-blocking)...');
@@ -507,6 +515,15 @@ createTestAccount().then(async () => {
         console.error('[dripWorker] Failed to initialize:', error);
       }
 
+      // Durable Landing-Page Poller — redeploy backstop for in-flight builds.
+      // No-op unless DURABLE_LANDING_GENERATION is on. Runs every 5 minutes.
+      try {
+        const { startDurableLandingPoller } = await import('./services/durableLandingPoller');
+        startDurableLandingPoller();
+      } catch (error) {
+        console.error('[durableLandingPoller] Failed to initialize:', error);
+      }
+
       // LinkedIn Connection Sync — runs every 10 minutes
       // Polls Unipile for accepted connections, upserts into AW-UnipileConnections cache,
       // and activates any awaiting_connection drip enrollments.
@@ -580,7 +597,7 @@ createTestAccount().then(async () => {
       if (process.env.AI_EVAL_LOOP_ENABLED === 'true') {
         try {
           const AI_EVAL_LOOP_INTERVAL_MS = 24 * 60 * 60 * 1000;
-          const { runAiEvalLoopOnce } = await import('./loops/instances/ai-eval-funnel/cron');
+          const { runAiEvalLoopOnce } = await import('./loops/instances/ai-eval-funnel');
 
           const nowForAiEval = new Date();
           const nextAiEvalRun = new Date(nowForAiEval);

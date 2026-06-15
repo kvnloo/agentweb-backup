@@ -120,6 +120,23 @@ jest.mock("fs", () => ({
   readFileSync: (...args: any[]) => mockFsReadFileSync(...args),
 }));
 
+// Mock managed-subdomain assignment so tests can assert it's called (root pages)
+// or skipped (sub-pages) without hitting the real Vercel domains API.
+const mockAddSubdomain = jest
+  .fn()
+  .mockResolvedValue({ domain: "healed-root.agentwebforms.com" });
+const mockGenerateSubdomain = jest.fn((...args: any[]) => {
+  const name = args[0] as string | undefined;
+  return (name || "page").toLowerCase().replace(/[^a-z0-9]+/g, "-");
+});
+const mockListDomains = jest.fn().mockResolvedValue([]);
+jest.mock("../services/customDomainService", () => ({
+  addSubdomain: (...args: any[]) => mockAddSubdomain(...args),
+  generateSubdomain: (...args: any[]) => mockGenerateSubdomain(...args),
+  listDomains: (...args: any[]) => mockListDomains(...args),
+  SUBDOMAIN_BASE: "agentwebforms.com",
+}));
+
 import {
   buildBrandEnrichedPrompt,
   generateLandingPage,
@@ -138,7 +155,9 @@ import {
   getDeploymentStatus,
   isOrphanedFailedPage,
   cleanupOrphanedFailedPages,
+  findSiteById,
   getLandingPageLiveUrl,
+  resolveLandingPageLiveUrl,
   recordLandingPagePublish,
   markLandingPagePublishReverted,
   triggerVercelDeployment,
@@ -429,6 +448,130 @@ describe("v0Service - generateLandingPage", () => {
 // =============================================================================
 // Orphaned failed page helpers (v0 outage cleanup)
 // =============================================================================
+describe("v0Service - multi-site routing (DURABLE_LANDING_GENERATION=on)", () => {
+  const ORIG = process.env.DURABLE_LANDING_GENERATION;
+  beforeEach(() => {
+    process.env.DURABLE_LANDING_GENERATION = "true";
+  });
+  afterEach(() => {
+    if (ORIG === undefined) delete process.env.DURABLE_LANDING_GENERATION;
+    else process.env.DURABLE_LANDING_GENERATION = ORIG;
+  });
+
+  const siteRow = (over: Record<string, any> = {}) => ({
+    promise: () =>
+      Promise.resolve({
+        Items: [
+          {
+            id: "site-1",
+            userId: "user-1",
+            githubRepoUrl: "https://github.com/o/r",
+            vercelProjectId: "vp1",
+            isRootPage: true,
+            siteId: "site-1",
+            ...over,
+          },
+        ],
+      }),
+  });
+  const noSites = () => ({ promise: () => Promise.resolve({ Items: [] }) });
+
+  it("unified default + no existing site → creates the first site root", async () => {
+    mockQuery.mockReturnValue(noSites());
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_new" });
+
+    await generateLandingPage("user-1", "New campaign", "Front Desk EMMA", {});
+
+    const put = mockPut.mock.calls[0][0].Item;
+    expect(put.isRootPage).toBe(true);
+    expect(put.siteId).toBe(put.id);
+    expect(mockChatsCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it("unified default + existing site → adds a page to that site (cheap, no new root)", async () => {
+    mockQuery.mockReturnValue(siteRow());
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_sub" });
+
+    await generateLandingPage("user-1", "Variant", "Pricing", {});
+
+    const put = mockPut.mock.calls[0][0].Item;
+    expect(put.slug).toBeDefined(); // a sub-page route
+    expect(put.githubRepoUrl).toBe("https://github.com/o/r"); // inherited the existing repo
+    expect(put.siteId).toBe("site-1"); // belongs to the existing site
+    expect(put.isRootPage).toBeUndefined(); // not a new site root
+  });
+
+  it("separate mode → creates a new site even when one exists (opt-in, costlier)", async () => {
+    mockQuery.mockReturnValue(siteRow());
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_sep" });
+
+    await generateLandingPage("user-1", "Campaign", "FDE", {}, undefined, undefined, {
+      mode: "separate",
+    });
+
+    const put = mockPut.mock.calls[0][0].Item;
+    expect(put.isRootPage).toBe(true);
+    expect(put.siteId).toBe(put.id); // its own new site
+  });
+
+  it("stamps originatingSessionId on the build record", async () => {
+    mockQuery.mockReturnValue(noSites());
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_sess" });
+
+    await generateLandingPage("user-1", "p", "n", {}, undefined, undefined, {
+      originatingSessionId: "sess-9",
+    });
+
+    expect(mockPut.mock.calls[0][0].Item.originatingSessionId).toBe("sess-9");
+  });
+});
+
+describe("v0Service - findSiteById (explicit site identity, replaces oldest-repo guess)", () => {
+  it("returns the record directly when it owns a repo (a site root)", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: { id: "s1", userId: "user-1", githubRepoUrl: "https://github.com/o/r" },
+        }),
+    });
+    const site = await findSiteById("s1", "user-1");
+    expect(site?.id).toBe("s1");
+  });
+
+  it("resolves a sub-page id to its site root", async () => {
+    mockGet
+      .mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Item: { id: "sub", userId: "user-1", siteId: "root", slug: "pricing" },
+          }),
+      })
+      .mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Item: { id: "root", userId: "user-1", githubRepoUrl: "https://github.com/o/r" },
+          }),
+      });
+    const site = await findSiteById("sub", "user-1");
+    expect(site?.id).toBe("root");
+  });
+
+  it("returns null when the record is not owned by the caller", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({ Item: { id: "s1", userId: "someone-else", githubRepoUrl: "x" } }),
+    });
+    expect(await findSiteById("s1", "user-1")).toBeNull();
+  });
+
+  it("returns null when the record has no repo and no resolvable root", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () => Promise.resolve({ Item: { id: "s1", userId: "user-1" } }),
+    });
+    expect(await findSiteById("s1", "user-1")).toBeNull();
+  });
+});
+
 describe("v0Service - isOrphanedFailedPage", () => {
   const base = {
     id: "p",
@@ -757,6 +900,54 @@ describe("v0Service - getDeploymentStatus (auto-heal URL verification)", () => {
 
     expect(result.status).toBe("deployed");
     expect(mockUpdate).toHaveBeenCalledTimes(1);
+    // Sub-pages inherit the root's subdomain — healing one must NOT assign a new one.
+    expect(mockAddSubdomain).not.toHaveBeenCalled();
+  });
+
+  // A ROOT page that healed failed→deployed here never ran the first-build
+  // post-deploy subdomain assignment, so it was stuck on its raw *.vercel.app URL.
+  // The heal path must now assign the managed subdomain.
+  const failedRootPage = {
+    id: "root-1",
+    userId: "user-1",
+    name: "Acme Root",
+    status: "failed",
+    siteId: "root-1", // root: siteId === id
+    isRootPage: true,
+    vercelProjectId: "prj_root123",
+    deployedUrl: "https://lp-acme-root-root1.vercel.app",
+    // no customDomainUrl — never got a managed subdomain
+  };
+
+  it("SUCCESS: root page healed failed→deployed without a custom domain → assigns the managed subdomain", async () => {
+    mockAddSubdomain.mockResolvedValue({ domain: "acme-root.agentwebforms.com" });
+    mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: failedRootPage }) });
+    mockAxiosGet.mockResolvedValueOnce({
+      data: { deployments: [{ uid: "dpl_ready", readyState: "READY" }] },
+    });
+    mockAxiosGet.mockResolvedValueOnce({ status: 200, data: "<html>ok</html>" });
+
+    const result = await getDeploymentStatus("root-1", "user-1");
+
+    expect(result.status).toBe("deployed");
+    expect(mockAddSubdomain).toHaveBeenCalled();
+  });
+
+  it("does NOT re-assign a subdomain when the healed root already has a customDomainUrl", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: { ...failedRootPage, customDomainUrl: "https://acme-root.agentwebforms.com" },
+        }),
+    });
+    mockAxiosGet.mockResolvedValueOnce({
+      data: { deployments: [{ uid: "dpl_ready", readyState: "READY" }] },
+    });
+    mockAxiosGet.mockResolvedValueOnce({ status: 200, data: "<html>ok</html>" });
+
+    await getDeploymentStatus("root-1", "user-1");
+
+    expect(mockAddSubdomain).not.toHaveBeenCalled();
   });
 });
 
@@ -944,6 +1135,151 @@ describe("v0Service - getLandingPageLiveUrl", () => {
 
   it("returns empty string when neither URL is set", () => {
     expect(getLandingPageLiveUrl({})).toBe("");
+  });
+});
+
+// =============================================================================
+// resolveLandingPageLiveUrl — correct stale managed subdomains against
+// AW-CustomDomains (the source of truth) before reporting the live URL.
+// =============================================================================
+describe("v0Service - resolveLandingPageLiveUrl", () => {
+  beforeEach(() => {
+    mockListDomains.mockReset();
+    mockListDomains.mockResolvedValue([]);
+  });
+
+  it("corrects a stale managed subdomain to the attached domain (the everyio bug)", async () => {
+    mockListDomains.mockResolvedValueOnce([
+      {
+        domain: "everyio.agentwebforms.com",
+        vercelProjectId: "proj-1",
+        type: "subdomain",
+        updatedAt: "2026-01-02T00:00:00Z",
+      },
+    ]);
+    const url = await resolveLandingPageLiveUrl({
+      customDomainUrl: "https://everyio-day-zero-founders.agentwebforms.com",
+      deployedUrl: "https://x.vercel.app",
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+    });
+    expect(url).toBe("https://everyio.agentwebforms.com");
+    expect(mockListDomains).toHaveBeenCalledWith("owner-1", "proj-1");
+  });
+
+  it("preserves the sub-page slug when correcting a stale subdomain", async () => {
+    mockListDomains.mockResolvedValueOnce([
+      { domain: "everyio.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+    const url = await resolveLandingPageLiveUrl({
+      customDomainUrl: "https://everyio-day-zero-founders.agentwebforms.com/every-io-day-zero-pre-seed-fou",
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+      slug: "every-io-day-zero-pre-seed-fou",
+    });
+    expect(url).toBe("https://everyio.agentwebforms.com/every-io-day-zero-pre-seed-fou");
+  });
+
+  it("adopts the attached domain when no customDomainUrl is stored", async () => {
+    mockListDomains.mockResolvedValueOnce([
+      { domain: "everyio.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+    const url = await resolveLandingPageLiveUrl({
+      deployedUrl: "https://x.vercel.app",
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+    });
+    expect(url).toBe("https://everyio.agentwebforms.com");
+  });
+
+  it("keeps a stored managed subdomain that already matches the attached domain", async () => {
+    mockListDomains.mockResolvedValueOnce([
+      { domain: "everyio.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+    const url = await resolveLandingPageLiveUrl({
+      customDomainUrl: "https://everyio.agentwebforms.com",
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+    });
+    expect(url).toBe("https://everyio.agentwebforms.com");
+  });
+
+  it("never touches a real custom domain stored on the page", async () => {
+    mockListDomains.mockResolvedValueOnce([
+      { domain: "everyio.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+    const url = await resolveLandingPageLiveUrl({
+      customDomainUrl: "https://landing.every.io",
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+    });
+    expect(url).toBe("https://landing.every.io");
+  });
+
+  it("prefers a verified custom domain over a managed subdomain when adopting", async () => {
+    mockListDomains.mockResolvedValueOnce([
+      { domain: "old.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", updatedAt: "2026-01-01T00:00:00Z" },
+      { domain: "landing.every.io", vercelProjectId: "proj-1", type: "custom", updatedAt: "2026-01-01T00:00:00Z" },
+    ]);
+    const url = await resolveLandingPageLiveUrl({
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+    });
+    expect(url).toBe("https://landing.every.io");
+  });
+
+  it("breaks ties between managed subdomains by most-recently-updated", async () => {
+    mockListDomains.mockResolvedValueOnce([
+      { domain: "older.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", updatedAt: "2026-01-01T00:00:00Z" },
+      { domain: "newer.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", updatedAt: "2026-03-01T00:00:00Z" },
+    ]);
+    const url = await resolveLandingPageLiveUrl({
+      customDomainUrl: "https://stale.agentwebforms.com",
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+    });
+    expect(url).toBe("https://newer.agentwebforms.com");
+  });
+
+  it("falls back to the stored value when the page has no vercelProjectId", async () => {
+    const url = await resolveLandingPageLiveUrl({
+      customDomainUrl: "https://stale.agentwebforms.com",
+      userId: "owner-1",
+    });
+    expect(url).toBe("https://stale.agentwebforms.com");
+    expect(mockListDomains).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the stored value when no domains are attached", async () => {
+    mockListDomains.mockResolvedValueOnce([]);
+    const url = await resolveLandingPageLiveUrl({
+      customDomainUrl: "https://stale.agentwebforms.com",
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+    });
+    expect(url).toBe("https://stale.agentwebforms.com");
+  });
+
+  it("falls back to the stored value when the domain lookup throws", async () => {
+    mockListDomains.mockRejectedValueOnce(new Error("DynamoDB down"));
+    const url = await resolveLandingPageLiveUrl({
+      customDomainUrl: "https://stale.agentwebforms.com",
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+    });
+    expect(url).toBe("https://stale.agentwebforms.com");
+  });
+
+  it("leaves a malformed stored URL untouched", async () => {
+    mockListDomains.mockResolvedValueOnce([
+      { domain: "everyio.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", updatedAt: "2026-01-02T00:00:00Z" },
+    ]);
+    const url = await resolveLandingPageLiveUrl({
+      customDomainUrl: "not-a-url",
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+    });
+    expect(url).toBe("not-a-url");
   });
 });
 

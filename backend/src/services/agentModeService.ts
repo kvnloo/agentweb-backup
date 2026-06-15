@@ -9,6 +9,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
 import { rankMemoriesByRelevance } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
+import { toolResultError } from '../utils/toolResultError';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
@@ -26,10 +27,12 @@ import { extractVariables } from '../utils/templateParser';
 import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 import { incrementUserTokenUsage } from './tokenUsageService';
-import type { LLMUsageData } from '../utils/llmService';
+import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
+import { recordUsage } from './usageRecorderService';
 import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
 import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmMutationEvents';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
+import { publishWithResolvedBlogPublisher } from './blogPublishers';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -81,6 +84,7 @@ import {
   summarizeAgentToolPolicyModes,
   validateAndRepairToolArgs,
 } from './agentToolGatewayService';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 
 type MetaApiResult = {
   success: boolean;
@@ -134,6 +138,14 @@ function recordAgentModeToolTelemetry(
   void (async () => {
     try {
       const toolNames = toolResults.map(r => r.toolCall?.function?.name ?? 'unknown');
+      // PR #1818 follow-up: contract-layer activity as countable telemetry so
+      // the enforcement decision has data (args_repaired / schema-error rates).
+      const argsRepairedCount = toolResults.filter(
+        (r) => r.policyDecision?.flags?.some((flag) => flag.code === 'args_repaired'),
+      ).length;
+      const schemaErrorCount = toolResults.filter(
+        (r) => r.status === 'error' && classifyToolErrorClass(r.error) === 'invalid_args',
+      ).length;
       await recorder.decision(runId, {
         iteration,
         toolNames,
@@ -144,6 +156,8 @@ function recordAgentModeToolTelemetry(
         explanationSource: 'deterministic_tool_summary',
         toolPolicyFlags: summarizeAgentToolPolicyFlags(toolResults.map((r) => r.policyDecision)),
         toolPolicySummary: summarizeAgentToolPolicyModes(toolResults.map((r) => r.policyDecision)),
+        argsRepairedCount,
+        schemaErrorCount,
       });
       for (const r of toolResults) {
         const toolName = r.toolCall?.function?.name ?? 'unknown';
@@ -151,7 +165,7 @@ function recordAgentModeToolTelemetry(
         if (r.status === 'success') {
           await recorder.toolSucceeded(runId, { toolName, durationMs: r.duration, sessionId });
         } else {
-          await recorder.toolFailed(runId, { toolName, error: r.error, durationMs: r.duration, sessionId });
+          await recorder.toolFailed(runId, { toolName, error: r.error, durationMs: r.duration, sessionId, args: r.functionArgs });
         }
       }
     } catch (err) {
@@ -160,37 +174,6 @@ function recordAgentModeToolTelemetry(
   })();
 }
 
-function toolResultError(result: unknown): Error | null {
-  if (!result || typeof result !== 'object') return null;
-  const obj = result as Record<string, any>;
-
-  if (obj.isError === true) {
-    return new Error(extractToolResultMessage(obj) || 'Tool returned isError=true');
-  }
-
-  if (obj.success === false) {
-    return new Error(extractToolResultMessage(obj) || 'Tool returned success=false');
-  }
-
-  return null;
-}
-
-function extractToolResultMessage(obj: Record<string, any>): string {
-  if (typeof obj.error === 'string' && obj.error.trim()) return obj.error.trim();
-  if (typeof obj.message === 'string' && obj.message.trim()) return obj.message.trim();
-  if (typeof obj.content === 'string' && obj.content.trim()) return obj.content.trim();
-
-  if (Array.isArray(obj.content)) {
-    const text = obj.content
-      .map((part: any) => typeof part?.text === 'string' ? part.text : '')
-      .filter(Boolean)
-      .join('\n')
-      .trim();
-    if (text) return text;
-  }
-
-  return '';
-}
 
 function recordAgentModeRunStarted(
   runId: string,
@@ -203,7 +186,7 @@ function recordAgentModeRunStarted(
 
 function recordAgentModeRunCompleted(
   runId: string,
-  info: { toolCalls?: number; failedToolCalls?: number; sessionId?: string },
+  info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
 ): void {
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
@@ -212,7 +195,7 @@ function recordAgentModeRunCompleted(
 
 function recordAgentModeRunFailed(
   runId: string,
-  info: { error: unknown; toolCalls?: number; failedToolCalls?: number; sessionId?: string },
+  info: { error: unknown; toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
 ): void {
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
@@ -221,6 +204,17 @@ function recordAgentModeRunFailed(
 
 function countFailedToolCalls(toolCalls: any[]): number {
   return toolCalls.filter((toolCall) => toolCall && 'error' in toolCall).length;
+}
+
+/** Highest per-tool failure count — feeds the retry-spiral degraded-run rule. */
+function maxSameToolFailureCount(toolCalls: any[]): number {
+  const counts = new Map<string, number>();
+  for (const toolCall of toolCalls) {
+    if (!toolCall || !('error' in toolCall)) continue;
+    const name = toolCall.name ?? 'unknown';
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  return counts.size > 0 ? Math.max(...counts.values()) : 0;
 }
 
 const AGENT_RUNTIME_ARG_PREVIEW_MAX_CHARS = 1200;
@@ -407,6 +401,12 @@ interface LLMCallOptions {
   max_completion_tokens?: number | null;
   temperature?: number | null;
   response_format?: { type: 'text' | 'json_object' } | null;
+  /**
+   * Optional attribution for shadow usage metering (Ship 1). Recording is
+   * fire-and-forget and fail-open — it never changes the call's behavior.
+   * When omitted, usage is recorded under userId "system".
+   */
+  usageContext?: LLMUsageContext | null;
 }
 
 // Diagnosis agent configuration
@@ -2024,7 +2024,8 @@ export class AgentModeService {
       tool_choice = null,
       max_completion_tokens = null,
       temperature = null,
-      response_format = { type: "text" }
+      response_format = { type: "text" },
+      usageContext = null
     } = options || {};
 
     const params: any = {
@@ -2087,6 +2088,33 @@ export class AgentModeService {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         const res = await client.chat.completions.create(params);
+        // Shadow usage metering (Ship 1): every client returned above (Azure
+        // OpenAI, Gemini OpenAI-compat, Bedrock Converse wrapper, Vertex
+        // wrapper) responds in OpenAI shape, so `res.usage` is the single
+        // observation point — including the Bedrock ConverseCommand path,
+        // whose cache metrics surface as cache_read/creation_input_tokens.
+        // Fire-and-forget + fail-open: never awaited, never throws.
+        try {
+          const usage: any = (res as any)?.usage;
+          if (usage) {
+            void recordUsage({
+              userId: usageContext?.userId,
+              sessionId: usageContext?.sessionId,
+              model,
+              provider: model.startsWith('gemini-') ? 'gemini'
+                : model.startsWith('anthropic.') ? 'bedrock'
+                : model.startsWith('claude-') ? 'vertex'
+                : 'azure-openai',
+              feature: usageContext?.feature || 'agent_task',
+              inputTokens: usage.prompt_tokens || 0,
+              outputTokens: usage.completion_tokens || 0,
+              cacheReadTokens: usage.cache_read_input_tokens || usage.prompt_tokens_details?.cached_tokens || 0,
+              cacheWriteTokens: usage.cache_creation_input_tokens || 0,
+            });
+          }
+        } catch {
+          // Metering must never break an LLM call.
+        }
         return res;
       } catch (error) {
         const isLastAttempt = attempt >= maxAttempts;
@@ -2322,7 +2350,7 @@ export class AgentModeService {
         let queryEmbedding: number[] | null | undefined;
         const getQueryEmbedding = async (): Promise<number[] | null> => {
           if (queryEmbedding === undefined) {
-            queryEmbedding = messageContent ? await embedText(messageContent) : null;
+            queryEmbedding = messageContent ? await embedText(messageContent, { userId, feature: 'agent_task' }) : null;
           }
           return queryEmbedding;
         };
@@ -2343,7 +2371,7 @@ export class AgentModeService {
           }
           for (const m of all) {
             if (!Array.isArray(m.embedding) || m.embedding.length === 0) {
-              const emb = await embedText(m.content);
+              const emb = await embedText(m.content, { userId, feature: 'agent_task' });
               if (emb) {
                 m.embedding = emb;
                 backfill(m.memoryId, emb);
@@ -2582,7 +2610,8 @@ export class AgentModeService {
             tools: filteredToolsCache,
             tool_choice: 'auto',
             max_completion_tokens: 12384,
-            temperature: 0.1
+            temperature: 0.1,
+            usageContext: { userId, sessionId, feature: 'agent_task' }
           });
         } catch (callError) {
           if (isTransientLLMError(callError) && !backupModelUsed) {
@@ -2603,7 +2632,8 @@ export class AgentModeService {
                 tools: filteredToolsCache,
                 tool_choice: 'auto',
                 max_completion_tokens: 12384,
-                temperature: 0.1
+                temperature: 0.1,
+                usageContext: { userId, sessionId, feature: 'agent_task' }
               });
             } else {
               throw callError;
@@ -3281,6 +3311,7 @@ export class AgentModeService {
         sessionId,
         toolCalls: toolCalls.length,
         failedToolCalls: countFailedToolCalls(toolCalls),
+        maxSameToolFailures: maxSameToolFailureCount(toolCalls),
       });
       return {
         content,
@@ -3345,6 +3376,7 @@ export class AgentModeService {
         sessionId,
         toolCalls: _toolCallsForTelemetry.length,
         failedToolCalls: countFailedToolCalls(_toolCallsForTelemetry),
+        maxSameToolFailures: maxSameToolFailureCount(_toolCallsForTelemetry),
       });
       throw wrappedError;
     }
@@ -5926,8 +5958,11 @@ export class AgentModeService {
         };
       }
 
-      const { GoogleGenAI } = await import('@google/genai');
-      aiClient = new GoogleGenAI({ apiKey: geminiApiKey.trim() });
+      // Metered Gemini client (Ship 1 shadow metering). describeVideo has no
+      // userId in its signature, so usage attributes to "system" for now —
+      // follow-up: thread userId from the tool-dispatch / emmaApi callers.
+      const { getGeminiClient } = await import('../utils/llmClients');
+      aiClient = await getGeminiClient({ feature: 'agent_task' }, geminiApiKey.trim());
 
       const modelName = 'gemini-3-flash-preview';
 
@@ -6548,6 +6583,26 @@ export class AgentModeService {
           timeout: 20 * 60 * 1000, // 20 minutes — code execution can be slow but must not hang indefinitely
         }
       );
+
+      // Shadow usage metering (Ship 1): direct REST call, so observe the
+      // usageMetadata off the already-resolved response. Fire-and-forget +
+      // fail-open — never awaited, never throws.
+      try {
+        const usageMetadata = (apiResponse.data as any)?.usageMetadata;
+        if (usageMetadata) {
+          void recordUsage({
+            userId,
+            model: modelName,
+            provider: 'gemini',
+            feature: 'agent_task',
+            inputTokens: usageMetadata.promptTokenCount || 0,
+            outputTokens: usageMetadata.candidatesTokenCount || 0,
+            cacheReadTokens: usageMetadata.cachedContentTokenCount || 0,
+          });
+        }
+      } catch {
+        // Metering must never break the call.
+      }
 
       // Extract and format the response
       const candidates = (apiResponse.data as any).candidates;
@@ -8202,24 +8257,28 @@ export class AgentModeService {
   public async getLeadLists(userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const { listLandingPages, getLandingPageLiveUrl } = await import('./v0Service');
+      const { listLandingPages, resolveLandingPageLiveUrl } = await import('./v0Service');
 
       const [lists, landingPages] = await Promise.all([
         crmDb.getLeadListsForUser(userId),
         listLandingPages(userId).catch(() => [] as any[])
       ]);
 
-      // Build map: leadListId → landing page info
+      // Build map: leadListId → landing page info. Resolve each URL against the
+      // domain actually attached to the Vercel project so a stale stored
+      // subdomain isn't surfaced (AW-CustomDomains is the source of truth).
       const pageByListId = new Map<string, { pageId: string; name: string; url: string }>();
-      for (const page of landingPages) {
-        if (page.leadListId) {
-          pageByListId.set(page.leadListId, {
-            pageId: page.id,
-            name: page.name || '',
-            url: getLandingPageLiveUrl(page)
-          });
-        }
-      }
+      const pagesWithLists = landingPages.filter((page: any) => page.leadListId);
+      const resolvedUrls = await Promise.all(
+        pagesWithLists.map((page: any) => resolveLandingPageLiveUrl(page))
+      );
+      pagesWithLists.forEach((page: any, idx: number) => {
+        pageByListId.set(page.leadListId, {
+          pageId: page.id,
+          name: page.name || '',
+          url: resolvedUrls[idx]
+        });
+      });
 
       return {
         success: true,
@@ -18331,514 +18390,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         bodyHtml = styleBlocks.join('\n') + '\n' + bodyHtml;
       }
 
-      // Extract image filename from URL
-      let imageFilename: string | undefined;
-      if (heroImageUrl) {
-        const urlParts = heroImageUrl.split('/');
-        imageFilename = urlParts[urlParts.length - 1];
-      }
-
-      // Step 3: Get user's CMS type
-      const { userDb } = await import('./db');
-      const user = await userDb.getUserById(userId);
-
-      if (!user) {
-        throw new Error('User not found');
-      }
-
-      const cmsType = user.cmsType;
-
-      if (!cmsType) {
-        return {
-          success: false,
-          message: 'CMS Type is not configured for this user. Please contact an administrator to set up CMS publishing.',
-          error: 'CMS Type not configured'
-        };
-      }
-
-      console.log('AgentMode: User CMS Type:', cmsType);
-
-      // Step 4: Publish to CMS
-      // Only Webflow is supported for publish_blog_article function
-      if (cmsType === 'Webflow') {
-        const { getWebflowConfig } = await import('../controllers/blog');
-        const { apiToken, siteId, collectionId, fieldMappings, categories: categoryMapping } = await getWebflowConfig(userId);
-
-        // Call Webflow publishing
-        const axios = (await import('axios')).default;
-        const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-
-        // Use different field names based on whether we're using live endpoint or draft endpoint
-        const cmsItemData: any = {
-          fieldData: {
-            name: title,
-            slug: slug,
-          }
-        };
-
-        // For draft endpoint, use _archived and _draft
-        // For live endpoint, use isArchived and isDraft
-        if (status === 'draft') {
-          cmsItemData.fieldData._archived = false;
-          cmsItemData.fieldData._draft = true;
-        } else {
-          cmsItemData.isArchived = false;
-          cmsItemData.isDraft = false;
-        }
-
-        // Use body HTML directly for Webflow
-        // Webflow API may strip HTML tags if newlines are present, so remove them
-        const cleanBodyHtml = bodyHtml.replace(/\n/g, '').replace(/\r/g, '');
-
-        if (fieldMappings?.summary) {
-          cmsItemData.fieldData[fieldMappings.summary] = description;
-        }
-
-        if (fieldMappings?.body) {
-          cmsItemData.fieldData[fieldMappings.body] = cleanBodyHtml;
-        }
-
-        if (heroImageUrl && fieldMappings?.image) {
-          cmsItemData.fieldData[fieldMappings.image] = heroImageUrl;
-        }
-
-        // Add author if provided (use fieldMapping or default to 'author')
-        if (author) {
-          const authorField = fieldMappings?.author || 'author';
-          cmsItemData.fieldData[authorField] = author;
-        }
-
-        // Add categories - use fieldMapping or default to 'categories'
-        // Detect if field is single reference (singular name) or multi-reference (plural name)
-        // Convert category names to IDs using the mapping from secrets manager
-        const categoryField = fieldMappings?.category || 'categories';
-
-        // Detect if this is a single reference or multi-reference field
-        // Single reference: field name is singular (e.g., "category", "tag")
-        // Multi-reference: field name is plural (e.g., "categories", "tags")
-        const isSingleReference = !categoryField.endsWith('ies') && !categoryField.endsWith('s');
-
-        console.log(`AgentMode: Category field "${categoryField}" detected as ${isSingleReference ? 'single reference' : 'multi-reference'}`);
-
-        let categoryIds: string[] = [];
-        const invalidCategories: string[] = [];
-
-        // Check if category mapping is required but not configured
-        if (categories && categories.length > 0 && !categoryMapping) {
-          const availableCategories: string[] = [];
-          return {
-            success: false,
-            message: 'Category mapping is not configured in secrets manager. Please configure the "categories" field in your Webflow secrets with category name-to-ID mappings.',
-            error: 'Categories mapping required but not configured',
-            invalidCategories: categories,
-            availableCategories: availableCategories
-          };
-        }
-
-        if (categories && categories.length > 0 && categoryMapping) {
-          // Map category names to IDs
-          categoryIds = categories
-            .map(name => {
-              const id = categoryMapping[name];
-              if (!id) {
-                console.warn(`AgentMode: Category name "${name}" not found in mapping, skipping`);
-                invalidCategories.push(name);
-                return null;
-              }
-              return id;
-            })
-            .filter((id): id is string => id !== null);
-
-          // If all provided categories are invalid, return error immediately
-          if (categories.length > 0 && categoryIds.length === 0) {
-            const availableCategories = Object.keys(categoryMapping);
-            return {
-              success: false,
-              message: `All provided category names are invalid: ${invalidCategories.join(', ')}. Available categories: ${availableCategories.join(', ')}`,
-              error: 'Invalid category names',
-              invalidCategories: invalidCategories,
-              availableCategories: availableCategories
-            };
-          }
-        }
-
-        // Set the field value based on reference type
-        if (isSingleReference) {
-          // Single reference: use only the first category ID
-          cmsItemData.fieldData[categoryField] = categoryIds.length > 0 ? categoryIds[0] : '';
-          if (categoryIds.length > 1) {
-            console.warn(`AgentMode: Field "${categoryField}" is a single reference but ${categoryIds.length} categories provided. Using only the first one: ${categoryIds[0]}`);
-          }
-        } else {
-          // Multi-reference: use array of category IDs
-          cmsItemData.fieldData[categoryField] = categoryIds;
-        }
-
-        // Log warning if some categories were invalid but others were valid
-        if (invalidCategories.length > 0 && categoryIds.length > 0) {
-          const availableCategories = categoryMapping ? Object.keys(categoryMapping) : [];
-          console.warn(`AgentMode: Some invalid categories were skipped: ${invalidCategories.join(', ')}. Valid categories: ${availableCategories.join(', ')}`);
-        }
-
-        // Validate: if status is published, categories cannot be empty
-        if (status === 'published' && categoryIds.length === 0) {
-          const availableCategories = categoryMapping ? Object.keys(categoryMapping) : [];
-
-          const fieldType = isSingleReference ? 'category (single reference)' : 'categories (multi-reference)';
-          let errorMessage = `Cannot publish article without ${fieldType}. Please provide at least one category when status is "published".`;
-
-          // If invalid categories were provided, mention them
-          if (invalidCategories.length > 0) {
-            errorMessage = `Invalid category names provided: ${invalidCategories.join(', ')}.`;
-          }
-
-          // Add available categories to the message
-          if (availableCategories.length > 0) {
-            errorMessage += ` Available categories: ${availableCategories.join(', ')}`;
-          } else {
-            errorMessage += ' No category mapping found in configuration.';
-          }
-
-          // Add note about single reference if applicable
-          if (isSingleReference && categories.length > 1) {
-            errorMessage += ` Note: Field "${categoryField}" is a single reference - only the first valid category will be used.`;
-          }
-
-          return {
-            success: false,
-            message: errorMessage,
-            error: 'Categories required for published articles',
-            invalidCategories: invalidCategories,
-            availableCategories: availableCategories,
-            fieldType: isSingleReference ? 'single-reference' : 'multi-reference'
-          };
-        }
-
-        const headers = {
-          Authorization: `Bearer ${apiToken}`,
-          'Content-Type': 'application/json',
-          'accept-version': '2.0.0'
-        };
-
-        // Use /items/live endpoint for published articles, /items for drafts
-        // Note: The live endpoint uses /collections/{id}/items/live (without /sites/ prefix)
-        // while the draft endpoint uses /sites/{siteId}/collections/{id}/items
-        const endpoint = status === 'published'
-          ? `https://api.webflow.com/v2/collections/${collectionId}/items/live?skipInvalidFiles=true`
-          : `https://api.webflow.com/v2/sites/${siteId}/collections/${collectionId}/items`;
-
-        console.log(`AgentMode: Publishing to Webflow ${status === 'published' ? 'live' : 'draft'} endpoint: ${endpoint}`);
-
-        // Publish to Payload CMS instead of Webflow
-        let payloadEndpoint = 'https://www.agentweb.pro/api/publish-post';
-        let payloadSecret: string | undefined;
-
-        try {
-          const env = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-          const payloadSecretJson = await getSecret(`${env}/AgentWeb/PayloadCMS`);
-          if (payloadSecretJson) {
-            const parsed = JSON.parse(payloadSecretJson);
-            payloadEndpoint = parsed.PAYLOAD_PUBLISH_ENDPOINT || payloadEndpoint;
-            payloadSecret = parsed.PAYLOAD_PUBLISH_SECRET;
-          }
-        } catch (secretErr) {
-          console.warn('AgentMode: Could not load PayloadCMS secret, falling back to Webflow:', secretErr);
-        }
-
-        if (!payloadSecret) {
-          console.warn('AgentMode: PAYLOAD_PUBLISH_SECRET not available, falling back to Webflow');
-        }
-
-        try {
-          if (payloadSecret) {
-            // Map Webflow categories to Payload categories
-            const categoryMap: Record<string, string> = {
-              'AI in Marketing': 'AI in Marketing',
-              'Founder Playbooks': 'Founder Playbooks',
-              'Growth Tips': 'Growth Tips',
-              'Thought Leadership': 'Thought Leadership',
-              'Other': 'Other',
-              'Alternatives': 'Alternatives',
-              'Listicles': 'Listicles',
-              'User Guide': 'User Guide',
-              'Case Studies': 'Case Studies',
-            };
-            const payloadCategory = categories.length > 0
-              ? (categoryMap[categories[0]] || 'Other')
-              : 'Other';
-
-            // Map author to Payload author slug
-            const authorSlug = author?.toLowerCase().includes('rui') ? 'rui'
-              : author?.toLowerCase().includes('harsha') ? 'harsha'
-              : author?.toLowerCase().includes('fangfang') ? 'fangfang'
-              : author?.toLowerCase().includes('matthew') ? 'matthew'
-              : 'emma';
-
-            const payloadResponse = await axios.post(
-              payloadEndpoint,
-              {
-                title,
-                slug,
-                summary: description,
-                bodyHtml: cleanBodyHtml,
-                category: payloadCategory,
-                author: authorSlug,
-                featuredImageUrl: heroImageUrl,
-                publishedAt: new Date().toISOString(),
-                status,
-              },
-              {
-                headers: { 'Authorization': `Bearer ${payloadSecret}` },
-                timeout: 30000,
-              }
-            );
-
-            console.log(`AgentMode: Blog article published successfully to Payload CMS as ${status}`);
-
-            return {
-              success: true,
-              message: `Blog article published successfully to Payload CMS as ${status}`,
-              data: {
-                title,
-                slug,
-                status,
-                cmsType: 'Payload',
-                url: `/blog/${slug}`,
-                cmsResponse: payloadResponse.data,
-              }
-            };
-          }
-
-          // Fallback to Webflow if no Payload secret
-          const response = await axios.post(
-            endpoint,
-            cmsItemData,
-            { headers }
-          );
-
-          console.log(`AgentMode: Blog article published successfully to Webflow as ${status} (fallback)`);
-
-          // Sanitize response to remove large content fields before sending to LLM
-          const responseData = response.data as any;
-          const sanitizedResponse = responseData && typeof responseData === 'object'
-            ? { ...responseData }
-            : responseData;
-
-          if (sanitizedResponse && sanitizedResponse.fieldData && typeof sanitizedResponse.fieldData === 'object') {
-            const sanitizedFieldData = { ...sanitizedResponse.fieldData };
-            delete sanitizedFieldData['post-body'];
-            delete sanitizedFieldData['body'];
-            sanitizedResponse.fieldData = sanitizedFieldData;
-          }
-
-          return {
-            success: true,
-            message: `Blog article published successfully to Webflow as ${status}`,
-            data: {
-              title,
-              status,
-              cmsType: 'Webflow',
-              cmsResponse: sanitizedResponse
-            }
-          };
-        } catch (webflowError: any) {
-          // Extract detailed error information
-          const errorInfo: any = {
-            status: webflowError.response?.status,
-            statusText: webflowError.response?.statusText,
-          };
-
-          if (webflowError.response?.data) {
-            const errorData = webflowError.response.data;
-
-            if (errorData.message) {
-              errorInfo.message = errorData.message;
-            }
-
-            // Extract validation error details
-            if (errorData.details && Array.isArray(errorData.details)) {
-              errorInfo.details = errorData.details;
-              const detailMessages = errorData.details
-                .map((d: any) => `${d.param}: ${d.description}`)
-                .join('; ');
-              if (detailMessages) {
-                errorInfo.message = `${errorInfo.message || 'Validation Error'}. ${detailMessages}`;
-              }
-            }
-          }
-
-          // Add available categories to error response so LLM knows what to use
-          const availableCategories = categoryMapping ? Object.keys(categoryMapping) : [];
-          if (availableCategories.length > 0) {
-            errorInfo.message = `${errorInfo.message || 'Webflow API error'}. Available categories: ${availableCategories.join(', ')}`;
-            errorInfo.availableCategories = availableCategories;
-          }
-
-          // If error is related to file size, suggest using repair_blog_article
-          if (errorInfo.message && (
-            errorInfo.message.includes('File size limit') ||
-            errorInfo.message.includes('failed to import') ||
-            errorInfo.message.includes('image') && errorInfo.message.includes('too large')
-          )) {
-            errorInfo.message += '. SUGGESTION: Use repair_blog_article function to fix image size issues before retrying.';
-            errorInfo.repairSuggested = true;
-          }
-
-          // Log concise error summary
-          if (errorInfo.details && errorInfo.details.length > 0) {
-            const errorDetails = errorInfo.details
-              .map((d: any) => `${d.param}: ${d.description}`)
-              .join(', ');
-            console.error(`AgentMode: Webflow API error (${errorInfo.status}): ${errorDetails}`);
-          } else {
-            console.error(`AgentMode: Webflow API error (${errorInfo.status}): ${errorInfo.message}`);
-          }
-
-          // Return error response with available categories so LLM can retry with correct values
-          return {
-            success: false,
-            message: errorInfo.message || `Webflow API error: ${errorInfo.status} ${errorInfo.statusText}`,
-            error: 'Webflow API validation error',
-            availableCategories: errorInfo.availableCategories || [],
-            repairSuggested: errorInfo.repairSuggested || false
-          };
-        }
-      } else if (cmsType === 'WordPress') {
-        const { getWordPressConfig } = await import('../controllers/blog');
-        const wpConfig = await getWordPressConfig(userId);
-
-        const authHeader = 'Basic ' + Buffer.from(`${wpConfig.username}:${wpConfig.applicationPassword}`).toString('base64');
-
-        // Upload featured image if provided
-        let featuredMediaId: number | undefined;
-        if (heroImageUrl) {
-          try {
-            console.log('AgentMode: Uploading featured image to WordPress...');
-            const imgResponse = await axios.get(heroImageUrl, {
-              responseType: 'arraybuffer',
-              timeout: 30000,
-            });
-            const imageBuffer = Buffer.from(imgResponse.data as ArrayBuffer);
-            const contentType = imgResponse.headers['content-type'] || 'image/png';
-            const ext = contentType.includes('jpeg') || contentType.includes('jpg') ? 'jpg' : 'png';
-            const filename = `blog-hero-${Date.now()}.${ext}`;
-
-            const mediaResponse = await axios.post(
-              `${wpConfig.siteUrl}/wp-json/wp/v2/media`,
-              imageBuffer,
-              {
-                headers: {
-                  Authorization: authHeader,
-                  'Content-Type': contentType,
-                  'Content-Disposition': `attachment; filename="${filename}"`,
-                },
-                timeout: 60000,
-              }
-            );
-            featuredMediaId = (mediaResponse.data as any).id;
-            console.log('AgentMode: Featured image uploaded, media ID:', featuredMediaId);
-          } catch (imgError: any) {
-            console.error('AgentMode: Failed to upload featured image to WordPress:', imgError.message);
-          }
-        }
-
-        // Map category names to WordPress category IDs
-        let wpCategoryIds: number[] = [];
-        const invalidCategories: string[] = [];
-        if (categories && categories.length > 0 && wpConfig.categories) {
-          for (const name of categories) {
-            const id = wpConfig.categories[name];
-            if (id) {
-              wpCategoryIds.push(id);
-            } else {
-              invalidCategories.push(name);
-            }
-          }
-        }
-
-        const wpStatus = status === 'published' ? 'publish' : 'draft';
-        const postData: any = {
-          title: title,
-          content: bodyHtml,
-          excerpt: description,
-          status: wpStatus,
-        };
-
-        if (featuredMediaId) {
-          postData.featured_media = featuredMediaId;
-        }
-
-        if (wpCategoryIds.length > 0) {
-          postData.categories = wpCategoryIds;
-        }
-
-        console.log(`AgentMode: Publishing to WordPress as ${wpStatus}...`);
-
-        try {
-          const response = await axios.post(
-            `${wpConfig.siteUrl}/wp-json/wp/v2/posts`,
-            postData,
-            {
-              headers: {
-                Authorization: authHeader,
-                'Content-Type': 'application/json',
-              },
-              timeout: 30000,
-            }
-          );
-
-          const responseData = response.data as any;
-          console.log(`AgentMode: Blog article published successfully to WordPress as ${wpStatus}`);
-
-          return {
-            success: true,
-            message: `Blog article published successfully to WordPress as ${status}`,
-            data: {
-              title,
-              status,
-              cmsType: 'WordPress',
-              postId: responseData.id,
-              postUrl: responseData.link,
-              ...(invalidCategories.length > 0 ? {
-                warning: `Some categories were not found: ${invalidCategories.join(', ')}`,
-                availableCategories: wpConfig.categories ? Object.keys(wpConfig.categories) : []
-              } : {})
-            }
-          };
-        } catch (wpError: any) {
-          const errorInfo: any = {
-            status: wpError.response?.status,
-            statusText: wpError.response?.statusText,
-          };
-          if (wpError.response?.data) {
-            errorInfo.message = wpError.response.data.message || wpError.message;
-            errorInfo.code = wpError.response.data.code;
-          } else {
-            errorInfo.message = wpError.message;
-          }
-
-          console.error(`AgentMode: WordPress API error (${errorInfo.status}): ${errorInfo.message}`);
-
-          return {
-            success: false,
-            message: errorInfo.message || `WordPress API error: ${errorInfo.status} ${errorInfo.statusText}`,
-            error: 'WordPress API error',
-            availableCategories: wpConfig.categories ? Object.keys(wpConfig.categories) : []
-          };
-        }
-      } else if (cmsType === 'Basehub') {
-        return {
-          success: false,
-          message: 'Basehub CMS is not supported for publish_blog_article function. Please use the Research Reports page to publish to Basehub.',
-          error: 'Basehub not supported'
-        };
-      } else {
-        return {
-          success: false,
-          message: `Unsupported CMS Type: ${cmsType}. Supported types are 'Basehub', 'Webflow', and 'WordPress'.`,
-          error: 'Unsupported CMS Type'
-        };
-      }
+      const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+      return await publishWithResolvedBlogPublisher(
+        {
+          title,
+          slug,
+          summary: description,
+          bodyHtml,
+          heroImageUrl,
+          author,
+          categories,
+          status: status === 'published' ? 'published' : 'draft',
+          publishedAt: new Date().toISOString(),
+        },
+        { userId, sessionId }
+      );
     } catch (error: any) {
       console.error('AgentMode: Error publishing blog article:', error);
 
@@ -20830,7 +20396,7 @@ Please generate a complete, professional HTML document that properly formats and
 
       // Generate HTML using LLMService
       console.log(`AgentMode: Generating HTML ${isEmail ? 'email' : 'file'} with LLMService (Claude model)`);
-      const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'));
+      const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
 
       if (!htmlContent || htmlContent.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
@@ -20994,7 +20560,7 @@ Please:
 
       // Generate enhanced HTML template using LLMService
       console.log('AgentMode: Generating HTML email template with Claude model');
-      const enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'));
+      const enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'), { userId, sessionId, feature: 'content_gen' });
 
       if (!enhancedHtml || enhancedHtml.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
@@ -22104,7 +21670,7 @@ IMPORTANT:
 IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly.`}`;
 
       // Generate content using LangChain with appropriate format
-      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(userId, sessionId, 'generateBookContent'));
+      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(userId, sessionId, 'generateBookContent'), { userId, sessionId, feature: 'content_gen' });
 
       // Extract content from JSON
       if (!contentData.content) {

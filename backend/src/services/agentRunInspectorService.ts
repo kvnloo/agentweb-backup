@@ -3,6 +3,7 @@ import {
   EVT_RUN_COMPLETED,
   EVT_RUN_FAILED,
   EVT_RUN_STARTED,
+  EVT_RUN_VERDICT,
   EVT_TOOL_FAILED,
   EVT_TOOL_INVOKED,
   EVT_TOOL_SUCCEEDED,
@@ -35,6 +36,8 @@ export interface AgentRunToolOutcomeSummary {
   durationMs?: number;
   errorClass?: string;
   errorMessage?: string;
+  /** Full args of a FAILED call (capped + redacted at write time) — root-cause material. */
+  failedArgsJson?: string;
 }
 
 export interface AgentRunChatContext {
@@ -86,6 +89,9 @@ export interface AgentRunSummary {
   toolCalls: number;
   failedToolCalls: number;
   durationMs?: number;
+  /** Durable outcome verdict from the agent_run_verdict spine event. */
+  outcomeVerdict?: 'ok' | 'degraded' | 'failed';
+  outcomeReasons?: string;
   flags: AgentRunFlagSummary[];
   decisions: AgentRunDecisionSummary[];
   outcomes: AgentRunToolOutcomeSummary[];
@@ -160,6 +166,9 @@ function buildOneRunSummary(runId: string, events: AgentRunEventRow[]): AgentRun
   const runFailed = [...sorted].reverse().find((e) => e.eventType === EVT_RUN_FAILED);
   const firstWithDims = sorted.find((e) => e.dimensions?.sessionId || e.dimensions?.userId || e.dimensions?.llmModel);
   const terminal = runFailed ?? runCompleted;
+  const verdictEvent = [...sorted].reverse().find((e) => e.eventType === EVT_RUN_VERDICT);
+  const outcomeVerdict = asVerdict(verdictEvent?.dimensions?.verdict);
+  const outcomeReasons = asString(verdictEvent?.dimensions?.reasons);
 
   const decisions: AgentRunDecisionSummary[] = sorted
     .filter((e) => e.eventType === EVT_DECISION)
@@ -189,6 +198,7 @@ function buildOneRunSummary(runId: string, events: AgentRunEventRow[]): AgentRun
       durationMs: asNumber(e.dimensions?.durationMs),
       errorClass: asString(e.dimensions?.errorClass),
       errorMessage: asString(e.dimensions?.errorMessage),
+      failedArgsJson: asString(e.dimensions?.failedArgsJson),
     }));
 
   const startedAt = runStarted?.ts ?? sorted[0]?.ts;
@@ -210,7 +220,9 @@ function buildOneRunSummary(runId: string, events: AgentRunEventRow[]): AgentRun
     toolCalls,
     failedToolCalls,
     durationMs,
-    flags: buildRunFlags({ status, toolCalls, failedToolCalls, durationMs, decisions, outcomes }),
+    outcomeVerdict,
+    outcomeReasons,
+    flags: buildRunFlags({ status, toolCalls, failedToolCalls, durationMs, decisions, outcomes, outcomeVerdict, outcomeReasons }),
     decisions,
     outcomes,
     events: sorted,
@@ -224,8 +236,18 @@ function buildRunFlags(input: {
   durationMs?: number;
   decisions: AgentRunDecisionSummary[];
   outcomes: AgentRunToolOutcomeSummary[];
+  outcomeVerdict?: AgentRunSummary['outcomeVerdict'];
+  outcomeReasons?: string;
 }): AgentRunFlagSummary[] {
   const flags: AgentRunFlagSummary[] = [];
+
+  if (input.outcomeVerdict === 'degraded') {
+    flags.push({
+      code: 'degraded_run',
+      severity: 'warning',
+      message: `Run completed but degraded: ${input.outcomeReasons || 'see verdict event'}.`,
+    });
+  }
 
   if (input.status === 'failed') {
     flags.push({
@@ -309,6 +331,10 @@ function parsePolicyFlags(raw: string | undefined): Array<{ toolName: string; co
     });
 }
 
+function asVerdict(v: unknown): AgentRunSummary['outcomeVerdict'] {
+  return v === 'ok' || v === 'degraded' || v === 'failed' ? v : undefined;
+}
+
 function dedupeFlags(flags: AgentRunFlagSummary[]): AgentRunFlagSummary[] {
   const seen = new Set<string>();
   return flags.filter((flag) => {
@@ -380,4 +406,89 @@ function truncate(value: string | undefined, maxLength: number): string | undefi
 function trimTrailingSlash(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed.replace(/\/+$/, '') : undefined;
+}
+
+/**
+ * Query the runtime-spine events and build run summaries — the single query
+ * seam shared by the admin inspector route and the report_product_issues
+ * enrichment. Pagination is by RUNS collected, not events scanned (one chatty
+ * run emits hundreds of events).
+ */
+import AWS from 'aws-sdk';
+import { AGENT_MODE_LOOP_ID } from '../loops/instances/agent-mode/eventTypes';
+import { LOOP_EVENTS_TABLE } from '../loops/core/sensors/eventTableEventSource';
+
+const PAGE_EVENT_LIMIT = 1000;
+const MAX_SCANNED_EVENTS = 20000;
+
+let inspectorDynamo: AWS.DynamoDB.DocumentClient | null = null;
+function getInspectorDynamo(): AWS.DynamoDB.DocumentClient {
+  if (!inspectorDynamo) {
+    inspectorDynamo = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || 'us-west-2' });
+  }
+  return inspectorDynamo;
+}
+
+export interface FetchAgentRunSummariesParams {
+  runId?: string;
+  sessionId?: string;
+  userId?: string;
+  /** Max RUNS returned. */
+  limit: number;
+}
+
+export interface FetchAgentRunSummariesResult {
+  runs: AgentRunSummary[];
+  scannedEvents: number;
+  truncated: boolean;
+}
+
+export async function fetchAgentRunSummaries(
+  params: FetchAgentRunSummariesParams,
+): Promise<FetchAgentRunSummariesResult> {
+  const { runId, sessionId, userId, limit } = params;
+  const dynamo = getInspectorDynamo();
+
+  const matchesFilters = (run: AgentRunSummary) =>
+    (!runId || run.runId === runId)
+    && (!sessionId || run.sessionId === sessionId)
+    && (!userId || run.userId === userId);
+
+  const rows: AgentRunEventRow[] = [];
+  let runs: AgentRunSummary[] = [];
+  let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+  let scannedEvents = 0;
+  let truncated = false;
+
+  do {
+    const result = await dynamo.query({
+      TableName: LOOP_EVENTS_TABLE,
+      KeyConditionExpression: 'loopId = :loopId',
+      ExpressionAttributeValues: {
+        ':loopId': AGENT_MODE_LOOP_ID,
+        ...(runId ? { ':runId': runId } : {}),
+      },
+      ...(runId ? { FilterExpression: 'subjectId = :runId' } : {}),
+      ScanIndexForward: false,
+      Limit: PAGE_EVENT_LIMIT,
+      ExclusiveStartKey: lastKey,
+    }).promise();
+
+    const items = (result.Items ?? []) as AgentRunEventRow[];
+    scannedEvents += result.ScannedCount ?? items.length;
+    rows.push(...items.filter((row) => row.eventType && row.subjectId && row.ts));
+    lastKey = result.LastEvaluatedKey;
+
+    runs = buildAgentRunSummaries(rows).filter(matchesFilters);
+
+    // Collect one run beyond the limit: the oldest collected run may still be
+    // missing events on the next page, and the caller's slice drops it anyway.
+    if (lastKey && runs.length > limit) break;
+    if (lastKey && scannedEvents >= MAX_SCANNED_EVENTS) {
+      truncated = true;
+      break;
+    }
+  } while (lastKey);
+
+  return { runs: runs.slice(0, limit), scannedEvents, truncated };
 }
