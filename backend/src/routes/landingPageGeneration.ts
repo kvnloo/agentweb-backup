@@ -33,7 +33,7 @@ import {
   INTEGRATIONS,
   resolveSiteForCaller,
   resolveLockedSiteMode,
-  getLandingPageLiveUrl,
+  resolveLandingPageLiveUrl,
   canUserEditLandingPage,
 } from "../services/v0Service";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
@@ -944,7 +944,7 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
     }
 
     const isStaging = branch !== "main";
-    const liveUrl = getLandingPageLiveUrl(page);
+    const liveUrl = await resolveLandingPageLiveUrl(page);
     void emitLanderLifecycle("edited", { pageId: page.id, userId: (req as unknown as AuthenticatedRequest).user?.userId, channel: landerChannelFromRequest(req), mode: "incremental" });
     res.json({
       success: true,
@@ -1392,7 +1392,7 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
       }
     }
 
-    const liveUrl = getLandingPageLiveUrl(page);
+    const liveUrl = await resolveLandingPageLiveUrl(page);
     void emitLanderLifecycle("published", { pageId: page.id, userId: (req as unknown as AuthenticatedRequest).user?.userId, channel: landerChannelFromRequest(req) });
     res.json({
       success: true,

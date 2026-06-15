@@ -8257,24 +8257,28 @@ export class AgentModeService {
   public async getLeadLists(userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const { listLandingPages, getLandingPageLiveUrl } = await import('./v0Service');
+      const { listLandingPages, resolveLandingPageLiveUrl } = await import('./v0Service');
 
       const [lists, landingPages] = await Promise.all([
         crmDb.getLeadListsForUser(userId),
         listLandingPages(userId).catch(() => [] as any[])
       ]);
 
-      // Build map: leadListId → landing page info
+      // Build map: leadListId → landing page info. Resolve each URL against the
+      // domain actually attached to the Vercel project so a stale stored
+      // subdomain isn't surfaced (AW-CustomDomains is the source of truth).
       const pageByListId = new Map<string, { pageId: string; name: string; url: string }>();
-      for (const page of landingPages) {
-        if (page.leadListId) {
-          pageByListId.set(page.leadListId, {
-            pageId: page.id,
-            name: page.name || '',
-            url: getLandingPageLiveUrl(page)
-          });
-        }
-      }
+      const pagesWithLists = landingPages.filter((page: any) => page.leadListId);
+      const resolvedUrls = await Promise.all(
+        pagesWithLists.map((page: any) => resolveLandingPageLiveUrl(page))
+      );
+      pagesWithLists.forEach((page: any, idx: number) => {
+        pageByListId.set(page.leadListId, {
+          pageId: page.id,
+          name: page.name || '',
+          url: resolvedUrls[idx]
+        });
+      });
 
       return {
         success: true,
