@@ -1,12 +1,11 @@
 /**
  * Registers the onboarding loop as a framework instance — the REVAMP port.
  *
- * LIVE DEFAULT (Phase 2 cutover, 2026-06): this V2 instance is now the live
- * onboarding loop. The legacy heartbeat (`cron/onboardingLoop.ts`) is OFF
- * unless explicitly opted back in (ONBOARDING_LOOP_ENABLED=true), in which case
- * V2 yields so the two never double-fire. The live/off decision is owned by the
- * shared `cutover` policy module so the cron and the runner stay in agreement.
- * (Legacy code is not deleted yet — that is PR 2, pure subtraction.)
+ * GATED PARALLEL: only registers when ONBOARDING_LOOP_V2=true, and runs
+ * ALONGSIDE the legacy onboarding cron (`cron/onboardingLoop.ts`) — it does not
+ * touch or replace it. Cutover (pointing the live cron at this + disabling the
+ * old path) is the final step, after this parallel loop is verified
+ * equal-or-better.
  *
  * Layer mapping:
  *   sensor   = userArrayEventSource over AW-Users.onboardingEvents[]
@@ -35,15 +34,12 @@ import { SpecOutputTool } from '../../core/tools/specOutputTool';
 import { productionLoopPorts } from '../../adapters/awsAdapters';
 import type { LoopRunResult } from '../../core/types';
 import { userDb } from '../../../services/db';
-import { isOnboardingV2Live } from './cutover';
 import { ONBOARDING_FLOW_DESCRIPTION, ONBOARDING_LOOP_ID, onboardingManifest } from './manifest';
 
 const runner = createInstanceRunner({
   loopId: ONBOARDING_LOOP_ID,
   ports: productionLoopPorts,
-  // Phase 2 cutover: V2 is live by default. Honors the same cutover policy the
-  // server boot uses, so a live cron tick actually runs under the default env.
-  isEnabled: isOnboardingV2Live,
+  isEnabled: () => process.env.ONBOARDING_LOOP_V2 === 'true',
   implNames: {
     sensor: 'onboardingUserSensor',
     ruleSet: 'onboardingAnalyst',
@@ -77,9 +73,8 @@ const runner = createInstanceRunner({
 });
 
 /**
- * Register the framework onboarding loop. No-op (returns false) when the
- * cutover policy says V2 is not the live path (legacy opted in, or V2 explicitly
- * disabled). Idempotent. Does NOT touch the legacy cron.
+ * Register the framework onboarding loop. No-op (returns false) unless
+ * ONBOARDING_LOOP_V2=true. Idempotent. Does NOT touch the legacy cron.
  */
 export function registerOnboardingLoopV2(): boolean {
   return runner.register();

@@ -547,17 +547,8 @@ createTestAccount().then(async () => {
       // backend/src/cron/onboardingStuckDetector.ts is preserved and unit-
       // tested; re-enable here if we want the daily summary back.
 
-      // Onboarding loop cutover (Phase 2): the framework V2 loop is now the live
-      // default; the legacy threshold heartbeat below is OFF unless explicitly
-      // opted back in (ONBOARDING_LOOP_ENABLED=true), in which case V2 yields so
-      // the two never double-fire. Single source of truth: instances/onboarding/cutover.
-      const { isOnboardingLegacyLive, isOnboardingV2Live, resolveOnboardingLoopMode } =
-        await import('./loops/instances/onboarding/cutover');
-      console.log(`[OnboardingLoop] Cutover mode: ${resolveOnboardingLoopMode()}`);
-
-      // Onboarding Loop (legacy heartbeat) — daily at 15:00 UTC (7am PT). Opt-in
-      // only now (ONBOARDING_LOOP_ENABLED=true); V2 is the default live path.
-      if (isOnboardingLegacyLive()) {
+      // Onboarding Loop — daily at 15:00 UTC (7am PT), gated by ONBOARDING_LOOP_ENABLED=true
+      if (process.env.ONBOARDING_LOOP_ENABLED === 'true') {
         try {
           const LOOP_INTERVAL_MS = 24 * 60 * 60 * 1000;
           const { runOnboardingLoop } = await import('./cron/onboardingLoop');
@@ -667,11 +658,10 @@ createTestAccount().then(async () => {
       }
 
       // Onboarding loop V2 (framework port, REVAMP) — daily at 17:00 UTC (9am
-      // PT), offset from ai-eval (16:00) so they don't race for Slack/Bedrock.
-      // Now the LIVE default path (Phase 2 cutover): runs unless the legacy
-      // heartbeat is explicitly opted back in or V2 is explicitly disabled
-      // (ONBOARDING_LOOP_V2=false). See instances/onboarding/cutover.
-      if (isOnboardingV2Live()) {
+      // PT), offset from the legacy onboarding loop (15:00) + ai-eval (16:00) so
+      // they don't race for Slack/Bedrock. Gated by ONBOARDING_LOOP_V2=true; runs
+      // ALONGSIDE the legacy onboarding cron until cutover.
+      if (process.env.ONBOARDING_LOOP_V2 === 'true') {
         try {
           const ONBOARDING_V2_INTERVAL_MS = 24 * 60 * 60 * 1000;
           const { runOnboardingLoopV2Once } = await import('./loops/instances/onboarding');
@@ -697,7 +687,7 @@ createTestAccount().then(async () => {
           console.error('[OnboardingLoopV2] Failed to initialize:', error);
         }
       } else {
-        console.log('[OnboardingLoopV2] Not live (legacy heartbeat opted in via ONBOARDING_LOOP_ENABLED, or ONBOARDING_LOOP_V2=false)');
+        console.log('[OnboardingLoopV2] Disabled (set ONBOARDING_LOOP_V2=true to enable)');
       }
 
       // Agent-mode tool-reliability loop — daily at 17:30 UTC, offset from the

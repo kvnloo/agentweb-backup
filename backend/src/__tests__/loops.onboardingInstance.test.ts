@@ -40,39 +40,15 @@ describe('onboarding manifest (revamp contract)', () => {
   });
 });
 
-describe('registerOnboardingLoopV2 gating (post-cutover)', () => {
-  const OLD_V2 = process.env.ONBOARDING_LOOP_V2;
-  const OLD_LEGACY = process.env.ONBOARDING_LOOP_ENABLED;
-  beforeEach(async () => {
-    const { _resetRegistryForTesting } = await import('../loops');
-    _resetRegistryForTesting();
-  });
-  afterEach(async () => {
-    const { _resetRegistryForTesting } = await import('../loops');
-    _resetRegistryForTesting();
-    if (OLD_V2 === undefined) delete process.env.ONBOARDING_LOOP_V2;
-    else process.env.ONBOARDING_LOOP_V2 = OLD_V2;
-    if (OLD_LEGACY === undefined) delete process.env.ONBOARDING_LOOP_ENABLED;
-    else process.env.ONBOARDING_LOOP_ENABLED = OLD_LEGACY;
+describe('registerOnboardingLoopV2 gating', () => {
+  const OLD = process.env.ONBOARDING_LOOP_V2;
+  afterEach(() => {
+    if (OLD === undefined) delete process.env.ONBOARDING_LOOP_V2;
+    else process.env.ONBOARDING_LOOP_V2 = OLD;
   });
 
-  it('registers by default (V2 is the live path post-cutover) when nothing is set', async () => {
+  it('is a no-op (returns false) unless ONBOARDING_LOOP_V2=true — never touches the live cron by default', async () => {
     delete process.env.ONBOARDING_LOOP_V2;
-    delete process.env.ONBOARDING_LOOP_ENABLED;
-    const { registerOnboardingLoopV2 } = await import('../loops/instances/onboarding');
-    expect(registerOnboardingLoopV2()).toBe(true);
-  });
-
-  it('is a no-op (returns false) when the legacy heartbeat is explicitly opted in — never double-fires', async () => {
-    delete process.env.ONBOARDING_LOOP_V2;
-    process.env.ONBOARDING_LOOP_ENABLED = 'true';
-    const { registerOnboardingLoopV2 } = await import('../loops/instances/onboarding');
-    expect(registerOnboardingLoopV2()).toBe(false);
-  });
-
-  it('is a no-op (returns false) when V2 is explicitly disabled for rollback', async () => {
-    process.env.ONBOARDING_LOOP_V2 = 'false';
-    delete process.env.ONBOARDING_LOOP_ENABLED;
     const { registerOnboardingLoopV2 } = await import('../loops/instances/onboarding');
     expect(registerOnboardingLoopV2()).toBe(false);
   });
