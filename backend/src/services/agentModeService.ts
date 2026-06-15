@@ -3625,6 +3625,13 @@ export class AgentModeService {
     // strip them.
     'search_tool_response',
     'read_tool_response',
+    // Self account-status: a no-arg tool wrapping /api/auth/me for the caller's
+    // OWN account. Force-merged (not just DEFAULT) for the same reason as the two
+    // above — a DB `foundation_tools` setting that omits it makes it "not
+    // available", so Emma has no self-status tool and falls back to
+    // assess_client_health (admin lookup BY EMAIL → the "asked for my email" bug).
+    // Always reachable so Emma can answer "what's my plan/usage" directly.
+    'get_account_status',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
