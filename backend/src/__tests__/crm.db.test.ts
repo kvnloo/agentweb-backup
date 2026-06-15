@@ -50,7 +50,7 @@ jest.mock('../services/contactEventsDb', () => ({
   normalizeContactId: (raw: string) => raw.trim().toLowerCase(),
 }));
 
-import { crmDb } from '../services/db';
+import { crmDb, userDb } from '../services/db';
 import AWS from 'aws-sdk';
 
 describe('CRM Database Service', () => {
@@ -1770,6 +1770,80 @@ describe('CRM Database Service', () => {
       expect(mockDocumentClientMethods.update).not.toHaveBeenCalled();
       expect(mockDocumentClientMethods.get).toHaveBeenCalled();
       expect(result).toEqual(mockList);
+    });
+  });
+
+  // Direct unit coverage for the real org-shared access predicate. PR #1895 routes
+  // all 10 AgentModeService CRM-list methods through this helper, but those service
+  // tests MOCK it — so this is the only place its actual orgId-matching logic is
+  // exercised. The reported bug (Fangfang, a same-org non-owner, denied add_leads)
+  // is fixed iff this returns true for a same-org non-owner; that is the first case.
+  describe('canOrgMemberAccessList (org-shared access predicate)', () => {
+    const OWNER = 'owner-1';
+    const list = { listId: 'list-1', userId: OWNER };
+    let getUserByIdSpy: jest.SpyInstance;
+
+    const mockUsers = (byId: Record<string, any>) => {
+      getUserByIdSpy = jest
+        .spyOn(userDb, 'getUserById')
+        .mockImplementation(async (id: string) => byId[id] ?? null);
+    };
+
+    afterEach(() => {
+      getUserByIdSpy?.mockRestore();
+    });
+
+    it('returns true for the list owner without any user lookup (owner short-circuit)', async () => {
+      mockUsers({});
+      const result = await crmDb.canOrgMemberAccessList(OWNER, list);
+      expect(result).toBe(true);
+      expect(getUserByIdSpy).not.toHaveBeenCalled();
+    });
+
+    it('returns true for a same-org non-owner member (the reported Fangfang case)', async () => {
+      mockUsers({
+        'member-2': { userId: 'member-2', orgId: 'org-A' },
+        [OWNER]: { userId: OWNER, orgId: 'org-A' },
+      });
+      const result = await crmDb.canOrgMemberAccessList('member-2', list);
+      expect(result).toBe(true);
+    });
+
+    it('returns false for a user in a different org', async () => {
+      mockUsers({
+        'outsider-3': { userId: 'outsider-3', orgId: 'org-B' },
+        [OWNER]: { userId: OWNER, orgId: 'org-A' },
+      });
+      expect(await crmDb.canOrgMemberAccessList('outsider-3', list)).toBe(false);
+    });
+
+    it('returns false when the caller has no orgId', async () => {
+      mockUsers({
+        'solo-4': { userId: 'solo-4' },
+        [OWNER]: { userId: OWNER, orgId: 'org-A' },
+      });
+      expect(await crmDb.canOrgMemberAccessList('solo-4', list)).toBe(false);
+    });
+
+    it('returns false when the list owner has no orgId', async () => {
+      mockUsers({
+        'member-2': { userId: 'member-2', orgId: 'org-A' },
+        [OWNER]: { userId: OWNER },
+      });
+      expect(await crmDb.canOrgMemberAccessList('member-2', list)).toBe(false);
+    });
+
+    it('returns false when both users lack an orgId (no undefined===undefined match)', async () => {
+      mockUsers({
+        'member-2': { userId: 'member-2' },
+        [OWNER]: { userId: OWNER },
+      });
+      expect(await crmDb.canOrgMemberAccessList('member-2', list)).toBe(false);
+    });
+
+    it('returns false when the caller record is missing entirely', async () => {
+      mockUsers({ [OWNER]: { userId: OWNER, orgId: 'org-A' } });
+      expect(await crmDb.canOrgMemberAccessList('ghost-5', list)).toBe(false);
     });
   });
 });
