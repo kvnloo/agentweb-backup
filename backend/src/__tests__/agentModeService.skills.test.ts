@@ -889,7 +889,7 @@ describe('AgentModeService - Skills', () => {
       await agentModeService.loadFoundationTools();
 
       const tools = agentModeService.getFoundationToolNames();
-      expect(tools.size).toBe(8);
+      expect(tools.size).toBe(9);
       expect(tools.has('tool_a')).toBe(true);
       expect(tools.has('tool_b')).toBe(true);
       expect(tools.has('tool_c')).toBe(true);
@@ -898,6 +898,26 @@ describe('AgentModeService - Skills', () => {
       expect(tools.has('resolve_skill')).toBe(true);
       expect(tools.has('search_tool_response')).toBe(true);
       expect(tools.has('read_tool_response')).toBe(true);
+      // Force-merged so a DB config can't strip the self-status tool (else Emma
+      // falls back to assess_client_health, the admin lookup-by-email path).
+      expect(tools.has('get_account_status')).toBe(true);
+    });
+
+    it('force-merges get_account_status even when a DB config omits it', async () => {
+      // Regression: get_account_status must always be reachable so Emma can
+      // report the caller's own account; a stored foundation_tools list that
+      // leaves it out previously made it "not available" → Emma fell back to
+      // assess_client_health (admin lookup by email).
+      const { settingsService } = require('../services/settingsService');
+      settingsService.getSetting = jest.fn().mockResolvedValue({
+        settingName: 'foundation_tools',
+        settingValue: JSON.stringify(['tool_a']), // intentionally omits get_account_status
+      });
+
+      await agentModeService.loadFoundationTools();
+
+      const tools = agentModeService.getFoundationToolNames();
+      expect(tools.has('get_account_status')).toBe(true);
     });
 
     it('should fall back to defaults when no DB setting exists', async () => {
@@ -947,15 +967,15 @@ describe('AgentModeService - Skills', () => {
 
       const result = await agentModeService.updateFoundationTools(['tool_x', 'tool_y'], 'admin@test.com');
 
-      expect(result).toEqual(['tool_x', 'tool_y', 'install_skills', 'list_available_skills', 'resolve_skill', 'search_tool_response', 'read_tool_response']);
+      expect(result).toEqual(['tool_x', 'tool_y', 'install_skills', 'list_available_skills', 'resolve_skill', 'search_tool_response', 'read_tool_response', 'get_account_status']);
       expect(settingsService.setSetting).toHaveBeenCalledWith(
         'foundation_tools',
-        JSON.stringify(['tool_x', 'tool_y', 'install_skills', 'list_available_skills', 'resolve_skill', 'search_tool_response', 'read_tool_response']),
+        JSON.stringify(['tool_x', 'tool_y', 'install_skills', 'list_available_skills', 'resolve_skill', 'search_tool_response', 'read_tool_response', 'get_account_status']),
         expect.any(String),
         'admin@test.com'
       );
       const tools = agentModeService.getFoundationToolNames();
-      expect(tools.size).toBe(7);
+      expect(tools.size).toBe(8);
       expect(tools.has('tool_x')).toBe(true);
       expect(tools.has('tool_y')).toBe(true);
       expect(tools.has('resolve_skill')).toBe(true);
@@ -967,7 +987,7 @@ describe('AgentModeService - Skills', () => {
 
       const result = await agentModeService.updateFoundationTools(['tool_a', 'tool_a', 'tool_b'], 'admin@test.com');
 
-      expect(result).toEqual(['tool_a', 'tool_b', 'install_skills', 'list_available_skills', 'resolve_skill', 'search_tool_response', 'read_tool_response']);
+      expect(result).toEqual(['tool_a', 'tool_b', 'install_skills', 'list_available_skills', 'resolve_skill', 'search_tool_response', 'read_tool_response', 'get_account_status']);
     });
   });
 
