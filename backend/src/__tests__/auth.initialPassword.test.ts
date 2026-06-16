@@ -14,12 +14,14 @@ import request from 'supertest';
 
 const mockGetUserByEmail = jest.fn();
 const mockGetUserByResetToken = jest.fn();
+const mockGetUserById = jest.fn();
 const mockUpdateUser = jest.fn();
 
 jest.mock('../services/db', () => ({
   userDb: {
     getUserByEmail: (...args: any[]) => mockGetUserByEmail(...args),
     getUserByResetToken: (...args: any[]) => mockGetUserByResetToken(...args),
+    getUserById: (...args: any[]) => mockGetUserById(...args),
     updateUser: (...args: any[]) => mockUpdateUser(...args),
   },
   orgDb: {},
@@ -64,13 +66,19 @@ jest.mock('jsonwebtoken', () => ({
   sign: jest.fn().mockReturnValue('test.jwt.token'),
 }));
 
-import { login, resetPassword } from '../controllers/auth';
+import bcrypt from 'bcryptjs';
+import { login, resetPassword, changePassword } from '../controllers/auth';
 
 function makeApp() {
   const app = express();
   app.use(express.json());
   app.post('/login', login);
   app.post('/reset-password', resetPassword);
+  // Inject an authenticated user (as authenticateToken would) for change-password.
+  app.put('/change-password', (req, _res, next) => {
+    (req as any).user = { userId: 'u1', email: 'alice@acmecorp.com', isAdmin: false };
+    next();
+  }, changePassword);
   return app;
 }
 
@@ -86,6 +94,8 @@ const baseUser = {
 beforeEach(() => {
   jest.clearAllMocks();
   mockUpdateUser.mockResolvedValue({ userId: 'u1' });
+  // bcrypt.compare defaults to true; individual tests override as needed.
+  (bcrypt.compare as jest.Mock).mockResolvedValue(true);
 });
 
 // ---------------------------------------------------------------------------
@@ -164,7 +174,103 @@ describe('resetPassword — clears initial-password flags', () => {
         resetPasswordToken: undefined,
         resetPasswordExpires: undefined,
         mustChangePassword: false,
-        tempPasswordExpires: undefined,
+        tempPasswordExpires: null,
+      })
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// changePassword — authenticated self-service in-app password change.
+// This is the in-app path for converting an initial password into a long-term
+// one, so it must verify the current password and clear the temp flags.
+// ---------------------------------------------------------------------------
+
+describe('changePassword', () => {
+  it('rejects when currentPassword or newPassword is missing', async () => {
+    const res = await request(makeApp())
+      .put('/change-password')
+      .send({ currentPassword: 'TempPass123' });
+
+    expect(res.status).toBe(400);
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+  });
+
+  it('rejects a new password shorter than 6 characters', async () => {
+    const res = await request(makeApp())
+      .put('/change-password')
+      .send({ currentPassword: 'TempPass123', newPassword: 'abc' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/at least 6/i);
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+  });
+
+  it('rejects when the new password equals the current password', async () => {
+    const res = await request(makeApp())
+      .put('/change-password')
+      .send({ currentPassword: 'SamePass123', newPassword: 'SamePass123' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/different/i);
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+  });
+
+  it('rejects when the current password is incorrect (401)', async () => {
+    mockGetUserById.mockResolvedValue({ ...baseUser });
+    (bcrypt.compare as jest.Mock).mockResolvedValue(false);
+
+    const res = await request(makeApp())
+      .put('/change-password')
+      .send({ currentPassword: 'WrongPass', newPassword: 'BrandNewPass1' });
+
+    expect(res.status).toBe(401);
+    expect(res.body.message).toMatch(/incorrect/i);
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+  });
+
+  it('rejects OAuth (Google) accounts', async () => {
+    mockGetUserById.mockResolvedValue({ ...baseUser, isOAuthUser: true, googleId: 'g1' });
+
+    const res = await request(makeApp())
+      .put('/change-password')
+      .send({ currentPassword: 'whatever', newPassword: 'BrandNewPass1' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/google/i);
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+  });
+
+  it('returns 404 when the user does not exist', async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+
+    const res = await request(makeApp())
+      .put('/change-password')
+      .send({ currentPassword: 'TempPass123', newPassword: 'BrandNewPass1' });
+
+    expect(res.status).toBe(404);
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+  });
+
+  it('changes the password and clears temp-password flags on success', async () => {
+    mockGetUserById.mockResolvedValue({
+      ...baseUser,
+      mustChangePassword: true,
+      tempPasswordExpires: new Date(Date.now() + 60_000).toISOString(),
+    });
+    (bcrypt.compare as jest.Mock).mockResolvedValue(true);
+
+    const res = await request(makeApp())
+      .put('/change-password')
+      .send({ currentPassword: 'TempPass123', newPassword: 'BrandNewPass1' });
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateUser).toHaveBeenCalledWith(
+      'u1',
+      expect.objectContaining({
+        password: 'hashed-new-password',
+        mustChangePassword: false,
+        tempPasswordExpires: null,
       })
     );
   });
