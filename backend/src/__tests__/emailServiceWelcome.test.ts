@@ -116,8 +116,10 @@ describe('Email Service Welcome Email', () => {
       const htmlContent = callArgs[3]; // 4th argument is HTML
       const textContent = callArgs[2]; // 3rd argument is text
 
-      expect(htmlContent).toContain('Please change your password after your first login');
-      expect(textContent).toContain('Please change your password after your first login');
+      expect(htmlContent).toContain('set your own password');
+      expect(htmlContent).toContain('at least 12 characters');
+      expect(textContent).toContain('set your own password');
+      expect(textContent).toContain('at least 12 characters');
     });
 
     it('should not include password reminder for existing users', async () => {
@@ -129,8 +131,8 @@ describe('Email Service Welcome Email', () => {
       const htmlContent = callArgs[3]; // 4th argument is HTML
       const textContent = callArgs[2]; // 3rd argument is text
 
-      expect(htmlContent).not.toContain('Please change your password after your first login');
-      expect(textContent).not.toContain('Please change your password after your first login');
+      expect(htmlContent).not.toContain('set your own password');
+      expect(textContent).not.toContain('set your own password');
     });
 
     it('should use correct subject line for new users', async () => {

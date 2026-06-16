@@ -122,8 +122,10 @@ describe('EmailService', () => {
       let htmlContent = callArgs[3];
       let textContent = callArgs[2];
 
-      expect(htmlContent).toContain('Please change your password after your first login');
-      expect(textContent).toContain('Please change your password after your first login');
+      expect(htmlContent).toContain('set your own password');
+      expect(htmlContent).toContain('at least 12 characters');
+      expect(textContent).toContain('set your own password');
+      expect(textContent).toContain('at least 12 characters');
 
       // Test for existing user
       await emailService.sendWelcomeEmail(email);
@@ -131,8 +133,8 @@ describe('EmailService', () => {
       htmlContent = callArgs[3];
       textContent = callArgs[2];
 
-      expect(htmlContent).not.toContain('Please change your password');
-      expect(textContent).not.toContain('Please change your password');
+      expect(htmlContent).not.toContain('set your own password');
+      expect(textContent).not.toContain('set your own password');
     });
 
     it('should not duplicate support message', async () => {
