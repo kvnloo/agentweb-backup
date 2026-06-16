@@ -338,6 +338,37 @@ describe('LinkedInOutreachService', () => {
       // The whole emoji was dropped (it didn't fit), leaving the 199 'a's.
       expect(sent.message).toBe('a'.repeat(199));
     });
+
+    it('prefers a sentence boundary over a word boundary when it keeps >=60% of the limit', async () => {
+      // First sentence ends with a period inside the budget (>=120 of 200); the
+      // trailing sentence pushes the note over 200. Trim should drop the incomplete
+      // trailing sentence and keep whole sentence(s), not cut mid-sentence on a word.
+      const s1 = 'Ana, your activation-funnel work is the sharpest take I have seen all year and I genuinely keep coming back to re-read it.';
+      const s2 = ' Also wanted to add a long trailing tail that pushes us well past the limit so a trim must happen now.';
+      const msg = s1 + s2;
+      expect(s1.length).toBeGreaterThanOrEqual(Math.floor(200 * 0.6));
+      expect(s1.length).toBeLessThanOrEqual(200);
+      expect(msg.length).toBeGreaterThan(200);
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, msg, 200);
+      const sent = (mockUnipileClient.users.sendInvitation as jest.Mock).mock.calls[0][0];
+      expect(sent.message).toBe(s1);
+    });
+
+    it('falls back to a word boundary when the only sentence end is below the 60% threshold', async () => {
+      // A tiny leading sentence ("Hi.") sits far below 60% of the limit, so honouring
+      // it would throw away most of the note. Trim must ignore it and use the word boundary.
+      const tail = Array.from({ length: 60 }, (_, i) => `word${i}`).join(' ');
+      const msg = `Hi. ${tail}`;
+      expect(msg.length).toBeGreaterThan(200);
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, msg, 200);
+      const sent = (mockUnipileClient.users.sendInvitation as jest.Mock).mock.calls[0][0];
+      expect(sent.message.length).toBeLessThanOrEqual(200);
+      // Did NOT collapse to the early "Hi." sentence.
+      expect(sent.message.length).toBeGreaterThan(100);
+      // Still a clean whitespace-delimited prefix, no trailing space.
+      expect(msg.startsWith(sent.message)).toBe(true);
+      expect(sent.message.endsWith(' ')).toBe(false);
+    });
   });
 
   describe('sendMessage', () => {

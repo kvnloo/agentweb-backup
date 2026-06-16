@@ -143,4 +143,50 @@ describe('POST draft-invite-note — smart-trim to account limit', () => {
     const body = res.json.mock.calls[0][0];
     expect(body.content).toBe(shortNote);
   });
+
+  it('re-generates a shorter note when the first draft is over the limit, then returns it', async () => {
+    const longNote = 'x'.repeat(260);
+    const reworked = 'Fang, your funnel work at Acme is sharp — keeping this one tight.';
+    expect(reworked.length).toBeLessThanOrEqual(200);
+    mockGetInviteCharLimitForAccount.mockResolvedValue(200);
+    // 1st call = the original (over-limit) draft; 2nd call = the capped re-gen (fits).
+    mockGeminiCreate
+      .mockResolvedValueOnce({ choices: [{ message: { content: JSON.stringify({ content: longNote }) } }] })
+      .mockResolvedValueOnce({ choices: [{ message: { content: JSON.stringify({ content: reworked }) } }] });
+
+    const res = await callRoute();
+    const body = res.json.mock.calls[0][0];
+    expect(mockGeminiCreate).toHaveBeenCalledTimes(2); // 1 draft + 1 re-gen
+    expect(body.content).toBe(reworked);
+  });
+
+  it('hard-trims when the capped re-gen still cannot get under the limit', async () => {
+    const longNote = 'word '.repeat(80).trim(); // ~399 chars, well over 200
+    expect(longNote.length).toBeGreaterThan(200);
+    mockGetInviteCharLimitForAccount.mockResolvedValue(200);
+    // Draft + both re-gen attempts all stay over the limit → caller falls back to trim.
+    mockGeminiCreate.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({ content: longNote }) } }],
+    });
+
+    const res = await callRoute();
+    const body = res.json.mock.calls[0][0];
+    expect(mockGeminiCreate).toHaveBeenCalledTimes(3); // 1 draft + 2 capped re-gen attempts
+    expect(body.content.length).toBeLessThanOrEqual(200);
+    expect(longNote.startsWith(body.content)).toBe(true);
+  });
+
+  it('returns 500 when the note trims to empty (whitespace-only over-limit draft)', async () => {
+    // A non-empty but all-whitespace over-limit note passes the raw-note guard, gets a
+    // re-gen attempt, then trims down to '' — the final empty-content guard must 500.
+    const whitespaceNote = ' '.repeat(260);
+    mockGetInviteCharLimitForAccount.mockResolvedValue(200);
+    mockGeminiCreate.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({ content: whitespaceNote }) } }],
+    });
+
+    const res = await callRoute();
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.json).toHaveBeenCalledWith({ message: 'Failed to generate invite note' });
+  });
 });

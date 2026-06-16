@@ -365,7 +365,8 @@ export class LinkedInOutreachService {
 
   /**
    * Trim an invitation note to the per-account character limit, preferring a
-   * word boundary so we never cut mid-word. Returns the message unchanged when it
+   * sentence boundary (dropping an incomplete trailing sentence), then a word
+   * boundary, so we never cut mid-word. Returns the message unchanged when it
    * already fits. LinkedIn hard-rejects over-limit notes, so we trim deterministically
    * here rather than throwing — the LLM cannot reliably count characters, and a throw
    * just triggers a regenerate-and-retry loop (it produced 203/204/207/210-char notes
@@ -380,10 +381,23 @@ export class LinkedInOutreachService {
     // dangling high surrogate so we never emit invalid UTF-16 to LinkedIn.
     const lastUnit = hardCut.charCodeAt(hardCut.length - 1);
     if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) hardCut = hardCut.slice(0, -1);
-    // Prefer the last whitespace so we keep whole words. Only honour it when it
-    // retains most of the budget; otherwise (e.g. one giant token) hard-cut.
+    // Threshold (60% of the budget) below which we won't honour a cut point — keeping
+    // it would throw away too much of the note (e.g. a tiny leading "Hi." sentence).
+    const minKeep = Math.floor(maxChars * 0.6);
+    // Prefer a sentence boundary so we drop an incomplete trailing sentence rather than
+    // cutting mid-sentence on a word. Find the last sentence-ending punctuation in budget.
+    const lastSentenceEnd = Math.max(
+      hardCut.lastIndexOf('.'),
+      hardCut.lastIndexOf('!'),
+      hardCut.lastIndexOf('?'),
+    );
+    if (lastSentenceEnd >= minKeep) {
+      return hardCut.slice(0, lastSentenceEnd + 1).replace(/\s+$/, '');
+    }
+    // No usable sentence end — fall back to the last whitespace so we keep whole words.
+    // Only honour it when it retains most of the budget; otherwise (one giant token) hard-cut.
     const lastSpace = hardCut.lastIndexOf(' ');
-    const candidate = lastSpace >= Math.floor(maxChars * 0.6) ? hardCut.slice(0, lastSpace) : hardCut;
+    const candidate = lastSpace >= minKeep ? hardCut.slice(0, lastSpace) : hardCut;
     return candidate.replace(/\s+$/, '');
   }
 

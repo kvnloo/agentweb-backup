@@ -10220,8 +10220,16 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
       let messageDraft = null;
       if (messageData && messageData.content) {
         const now = new Date().toISOString();
+        let noteText = String(messageData.content);
+        // Layer 2: if the draft exceeds the account limit, ask the model to rewrite it
+        // shorter (capped), then Layer 3 hard-trims on a sentence/word boundary as the
+        // guarantee — same trimInviteMessage() the inline send path uses, kept consistent.
+        if (noteText.length > inviteCharLimit) {
+          const { shortenInviteNoteToLimit } = await import('./inviteNoteShortener');
+          noteText = await shortenInviteNoteToLimit(geminiClient, noteText, inviteCharLimit, 2);
+        }
         messageDraft = {
-          content: LinkedInOutreachService.trimInviteMessage(String(messageData.content), inviteCharLimit),
+          content: LinkedInOutreachService.trimInviteMessage(noteText, inviteCharLimit),
           createdAt: now,
           updatedAt: now,
           sessionId: sessionId
