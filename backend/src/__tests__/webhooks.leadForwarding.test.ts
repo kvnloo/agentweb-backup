@@ -7,6 +7,7 @@ import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService'
 import { agentModeService } from '../services/agentModeService';
 import { resendService } from '../services/resendService';
 import { dripSequenceDb } from '../services/dripSequenceDb';
+import { externalCrmSyncService } from '../services/externalCrmSyncService';
 
 // Mock dependencies
 jest.mock('../services/db', () => ({
@@ -23,6 +24,12 @@ jest.mock('../services/dripSequenceDb', () => ({
   dripSequenceDb: {
     getSequencesByAutoEnrollList: jest.fn(),
     bulkEnroll: jest.fn(),
+  },
+}));
+
+jest.mock('../services/externalCrmSyncService', () => ({
+  externalCrmSyncService: {
+    autoSyncLead: jest.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -87,6 +94,7 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
     });
     (dripSequenceDb.getSequencesByAutoEnrollList as jest.Mock).mockResolvedValue([]);
     (dripSequenceDb.bulkEnroll as jest.Mock).mockResolvedValue(undefined);
+    (externalCrmSyncService.autoSyncLead as jest.Mock).mockResolvedValue(undefined);
   });
 
   describe('POST /api/webhooks/forward-lead', () => {
@@ -1120,6 +1128,95 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
           expect(updates.utmSource).toBeUndefined();
           expect(updates.utmMedium).toBeUndefined();
         });
+      });
+    });
+
+    describe('Real-time external CRM sync (HubSpot / Attio)', () => {
+      const syncLeadList = {
+        listId: 'list_123',
+        userId: 'owner_123',
+        name: 'Test List',
+        publicAccessEnabled: true,
+        autoDraftEnabled: false,
+      };
+
+      beforeEach(() => {
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue(syncLeadList);
+        (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+      });
+
+      it('pushes a newly created lead to HubSpot and Attio with event "created"', async () => {
+        const createdLead = { leadId: 'lead_sync_new', listId: 'list_123', email: 'sync@example.com' };
+        (crmDb.createLead as jest.Mock).mockResolvedValue(createdLead);
+
+        const response = await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({ listId: 'list_123', email: 'sync@example.com' });
+
+        expect(response.status).toBe(201);
+        await flushAsyncWork();
+
+        expect(externalCrmSyncService.autoSyncLead).toHaveBeenCalledWith(
+          'owner_123', 'list_123', createdLead, 'hubspot', 'created'
+        );
+        expect(externalCrmSyncService.autoSyncLead).toHaveBeenCalledWith(
+          'owner_123', 'list_123', createdLead, 'attio', 'created'
+        );
+      });
+
+      it('pushes an updated existing lead with event "updated"', async () => {
+        (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+          leadId: 'lead_sync_existing',
+          listId: 'list_123',
+          email: 'existing@example.com',
+          firstName: '',
+        });
+
+        const response = await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({ listId: 'list_123', email: 'existing@example.com', firstName: 'Updated' });
+
+        expect(response.status).toBe(200);
+        await flushAsyncWork();
+
+        expect(externalCrmSyncService.autoSyncLead).toHaveBeenCalledWith(
+          'owner_123', 'list_123', expect.objectContaining({ leadId: 'lead_sync_existing' }), 'hubspot', 'updated'
+        );
+      });
+
+      it('does not sync when the lead exists with no changes (unchanged)', async () => {
+        (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+          leadId: 'lead_sync_same',
+          listId: 'list_123',
+          email: 'same@example.com',
+          firstName: 'Same',
+          customFields: { source: 'api' },
+        });
+
+        const response = await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({ listId: 'list_123', email: 'same@example.com', firstName: 'Same' });
+
+        expect(response.status).toBe(200);
+        expect(response.body.event).toBe('lead.unchanged');
+        await flushAsyncWork();
+
+        expect(externalCrmSyncService.autoSyncLead).not.toHaveBeenCalled();
+      });
+
+      it('does not fail the request when external CRM sync throws', async () => {
+        (crmDb.createLead as jest.Mock).mockResolvedValue({
+          leadId: 'lead_sync_err', listId: 'list_123', email: 'err@example.com',
+        });
+        (externalCrmSyncService.autoSyncLead as jest.Mock).mockRejectedValue(new Error('hubspot down'));
+
+        const response = await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({ listId: 'list_123', email: 'err@example.com' });
+
+        expect(response.status).toBe(201);
+        await flushAsyncWork();
+        expect(externalCrmSyncService.autoSyncLead).toHaveBeenCalled();
       });
     });
 
