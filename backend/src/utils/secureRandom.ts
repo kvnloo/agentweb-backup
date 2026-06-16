@@ -35,3 +35,36 @@ export function generateSecurePassword(
   }
   return password;
 }
+
+/**
+ * Initial-password lifecycle.
+ *
+ * A system-generated initial (temporary) password must not silently become the
+ * user's long-term password. It is issued with a short expiry; login is
+ * rejected once the expiry passes (see the login controller), forcing the user
+ * to set their own password via the forced-change / reset flow.
+ */
+
+/** Initial passwords expire one month after they are issued. */
+export const INITIAL_PASSWORD_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * ISO timestamp at which a newly-issued initial password expires
+ * (now + INITIAL_PASSWORD_TTL_MS).
+ */
+export function getInitialPasswordExpiry(): string {
+  return new Date(Date.now() + INITIAL_PASSWORD_TTL_MS).toISOString();
+}
+
+/**
+ * Whether an initial password has expired. Returns false when no expiry is set
+ * (account has no pending initial password) or when the value can't be parsed —
+ * callers treat "unknown" as "not expired" so a malformed field can never lock
+ * a user out.
+ */
+export function isInitialPasswordExpired(expiresAt?: string | null): boolean {
+  if (!expiresAt) return false;
+  const expiryMs = new Date(expiresAt).getTime();
+  if (Number.isNaN(expiryMs)) return false;
+  return expiryMs < Date.now();
+}
