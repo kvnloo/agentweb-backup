@@ -13,6 +13,7 @@ import { normalizeAttribution } from "../types/attribution";
 import { onUserRegistered } from "../services/contactCaptureHooks";
 import { isCompanyEmail } from "../utils/validation";
 import { isInitialPasswordExpired } from "../utils/passwordGenerator";
+import { AuthenticatedRequest } from "../middleware/auth";
 
 export const register = async (req: Request, res: Response) => {
   try {
@@ -682,12 +683,82 @@ export const resetPassword = async (req: Request, res: Response) => {
       resetPasswordToken: undefined,
       resetPasswordExpires: undefined,
       mustChangePassword: false,
-      tempPasswordExpires: undefined
+      // null (not undefined) — updateUser skips undefined, so a stale expiry
+      // timestamp would otherwise linger on the record.
+      tempPasswordExpires: null
     });
 
     res.json({ message: "Password has been reset successfully" });
   } catch (error) {
     console.error("Error in reset password:", error);
     res.status(500).json({ message: "Error resetting password" });
+  }
+};
+
+// Authenticated self-service password change (Settings → Change Password).
+// This is the in-app path for converting a system-generated initial password
+// into the user's own long-term password, so it MUST clear the temporary
+// password lifecycle flags on success.
+export const changePassword = async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: "User not authenticated" });
+    }
+
+    const { currentPassword, newPassword } = req.body || {};
+
+    if (!currentPassword || !newPassword) {
+      return res
+        .status(400)
+        .json({ message: "Current and new passwords are required" });
+    }
+
+    if (newPassword.length < 6) {
+      return res
+        .status(400)
+        .json({ message: "New password must be at least 6 characters long" });
+    }
+
+    if (newPassword === currentPassword) {
+      return res
+        .status(400)
+        .json({ message: "New password must be different from current password" });
+    }
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // OAuth accounts have no real password to verify against.
+    if (user.isOAuthUser || user.googleId) {
+      return res.status(400).json({
+        message: "Password change is not available for accounts that sign in with Google.",
+      });
+    }
+
+    const isValidPassword = await bcrypt.compare(currentPassword, user.password);
+    if (!isValidPassword) {
+      return res.status(401).json({ message: "Current password is incorrect" });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    // Set the new long-term password and clear the temporary-password
+    // lifecycle flags — the initial secret can no longer become the long-term
+    // password once the user has chosen their own.
+    await userDb.updateUser(userId, {
+      password: hashedPassword,
+      mustChangePassword: false,
+      // null (not undefined) — updateUser skips undefined values.
+      tempPasswordExpires: null,
+    });
+
+    res.json({ message: "Password has been changed successfully" });
+  } catch (error) {
+    console.error("Error in change password:", error);
+    res.status(500).json({ message: "Error changing password" });
   }
 };

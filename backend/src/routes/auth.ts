@@ -231,6 +231,9 @@ router.post('/login', authRateLimiter, authController.login);
 router.post('/forgot-password', authController.forgotPassword);
 router.post('/reset-password', authController.resetPassword);
 
+// Authenticated self-service password change (Settings → Change Password)
+router.put('/change-password', authenticateToken, authController.changePassword);
+
 // Google OAuth routes
 router.get('/google', (req: Request, res: Response, next: NextFunction) => {
   const portal = req.query.portal === 'customer' ? 'customer' : 
