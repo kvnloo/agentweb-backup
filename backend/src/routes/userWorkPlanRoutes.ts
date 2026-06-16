@@ -4,7 +4,6 @@ import { emailService } from "../services/emailService";
 import { userDb, orgDb } from "../services/db";
 import {
   canEditItem,
-  canManageOrgFeature,
   isFeatureEffectivelyEnabled,
   listOrgVisibleItems,
 } from "../services/orgShareService";
@@ -87,18 +86,8 @@ router.post("/", async (req, res) => {
     const user = await userDb.getUserById(userId);
     const orgId = user?.orgId;
 
-    // Org-level create gating: only org owner or listed workPlans editor
-    if (orgId) {
-      const org = await orgDb.getOrgById(orgId);
-      const allowed = canManageOrgFeature(
-        { userId, orgId, orgRole: user?.orgRole as "owner" | "member" | undefined },
-        org,
-        "workPlans",
-      );
-      if (!allowed) {
-        return res.status(403).json({ message: "Work plans are managed by your org admin" });
-      }
-    }
+    // Work plans are member-owned: any user may create their own. Org-wide
+    // visibility is governed separately by the shareSettings `enabled` toggle.
 
     const plan = await workPlanService.createWorkPlan({
       title,
@@ -183,16 +172,17 @@ router.delete("/:planId", async (req, res) => {
       return res.status(403).json({ message: "Cannot delete plans that are public or pending review" });
     }
 
-    // Only the plan owner or an org owner (admin override) may delete
-    let allowed = plan.ownerId === userId;
-    if (!allowed && plan.ownerId) {
+    // Work plans are member-owned: the plan owner may delete; the org owner may
+    // also delete a same-org member's plan as an admin override.
+    if (plan.ownerId !== userId) {
       const callerUser = await userDb.getUserById(userId);
-      if (callerUser?.orgRole === "owner" && callerUser?.orgId) {
+      let allowed = false;
+      if (callerUser?.orgRole === "owner" && callerUser?.orgId && plan.ownerId) {
         const owner = await userDb.getUserById(plan.ownerId);
         if (owner?.orgId === callerUser.orgId) allowed = true;
       }
+      if (!allowed) return res.status(403).json({ message: "Not authorized" });
     }
-    if (!allowed) return res.status(403).json({ message: "Not authorized" });
 
     await workPlanService.deleteWorkPlan(planId);
     res.json({ message: "Work plan deleted successfully" });

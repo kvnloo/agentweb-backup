@@ -47,6 +47,11 @@ jest.mock('../services/notionService', () => ({
   getSprintTasksDatabaseId: (...args: unknown[]) => mockGetSprintTasksDatabaseId(...args),
 }));
 
+const mockRecordLoopApproval = jest.fn();
+jest.mock('../loops/core/learning/approvalPersistence', () => ({
+  recordLoopApproval: (...args: unknown[]) => mockRecordLoopApproval(...args),
+}));
+
 // Generic mocks so unrelated handlers in the same file don't blow up.
 jest.mock('../services/db', () => ({
   userDb: { getAllUsers: jest.fn(), getUserById: jest.fn(), getUserByEmail: jest.fn() },
@@ -88,9 +93,31 @@ jest.mock('../services/slackService', () => ({
   downloadSlackFile: jest.fn(),
 }));
 
-// Tracker — use real impl, just reset between tests.
-import { _resetForTesting as resetTracker, isDispatched } from '../services/loopDispatchTracker';
+// Tracker — use the real DynamoDB-backed impl, but inject an in-memory fake
+// DynamoPort so the test never touches live AWS. Each test resets the tracker
+// with a FRESH fake table (so the dedupe set is empty), except the
+// "survives redeploy" test, which deliberately re-injects the SAME table.
+import {
+  _resetForTesting as resetTracker,
+  isDispatched,
+  DynamoLoopDispatchTracker,
+} from '../services/loopDispatchTracker';
+import type { DynamoAttributeMap, DynamoPort } from '../loops/core/ports';
 import { _resetLoopApprovalForTesting } from '../services/loopSlackApprovalDispatcher';
+
+/** In-memory fake DynamoPort keyed on the messageTs partition key. */
+function makeFakeDynamo() {
+  const items = new Map<string, DynamoAttributeMap>();
+  const port: DynamoPort = {
+    putItem: async (_table: string, item: DynamoAttributeMap) => {
+      items.set(String(item.messageTs), { ...item });
+    },
+    getItem: async (_table: string, key: DynamoAttributeMap) =>
+      items.get(String(key.messageTs)) ?? null,
+    query: async () => ({ items: [] }),
+  };
+  return { port, items };
+}
 
 // Import router AFTER all mocks declared.
 import slackRouter from '../routes/slack';
@@ -182,11 +209,13 @@ async function wait(ms = 200) {
 describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    resetTracker();
+    // Fresh fake DynamoDB-backed tracker per test → empty dedupe set, no live AWS.
+    resetTracker(makeFakeDynamo().port);
     _resetLoopApprovalForTesting();
 
     mockAuthTest.mockResolvedValue({ ok: true, user_id: EMMA_BOT });
     mockChatPostMessage.mockResolvedValue({ ok: true, ts: 'reply-ts' });
+    mockRecordLoopApproval.mockResolvedValue({ loopId: null, approved: 0, shipped: 0, dispatchFailures: 0 });
     mockGetNotionCredentials.mockResolvedValue({ apiToken: 'notion-token', userGuidePageId: 'guide' });
     mockGetSprintTasksDatabaseId.mockResolvedValue(SPRINT_TASKS_DATA_SOURCE);
     jest.spyOn(global, 'fetch').mockResolvedValue({
@@ -268,7 +297,7 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
     expect(replies[replies.length - 1][0].text).toMatch(/Launched 2\/2/i);
 
     // Idempotency: marked dispatched.
-    expect(isDispatched(MESSAGE_TS)).toBe(true);
+    expect(await isDispatched(MESSAGE_TS)).toBe(true);
   });
 
   it('creates and launches cloud-dev task when Harsha reacts ✅ on AI Readiness low-data digest', async () => {
@@ -319,7 +348,55 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
     expect(replies.length).toBeGreaterThanOrEqual(2);
     expect(replies[0][0].text).toMatch(/Creating 1 cloud-dev task for AI Readiness/i);
     expect(replies[replies.length - 1][0].text).toMatch(/Launched 1\/1 cloud-dev run for AI Readiness/i);
-    expect(isDispatched(AI_READINESS_MESSAGE_TS)).toBe(true);
+    expect(await isDispatched(AI_READINESS_MESSAGE_TS)).toBe(true);
+  });
+
+  it('persists the approval to the learning store after dispatch (Layer-4→5 write)', async () => {
+    mockRecordLoopApproval.mockResolvedValue({
+      loopId: 'ai-readiness-funnel',
+      approved: 1,
+      shipped: 1,
+      dispatchFailures: 0,
+    });
+    mockConversationsHistory.mockResolvedValue({
+      ok: true,
+      messages: [
+        {
+          ts: AI_READINESS_MESSAGE_TS,
+          user: EMMA_BOT,
+          bot_id: 'B_EMMA',
+          text: buildAiReadinessDmMessage(),
+        },
+      ],
+    });
+
+    const res = await request(buildApp())
+      .post('/api/slack/events')
+      .send({
+        type: 'event_callback',
+        event: {
+          type: 'reaction_added',
+          reaction: 'white_check_mark',
+          user: HARSHA,
+          item: { type: 'message', channel: DM_CHANNEL, ts: AI_READINESS_MESSAGE_TS },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    await wait();
+
+    expect(mockRecordLoopApproval).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: 'loop-ai-readiness-funnel-2026-06-10T16:30:00.087Z-523167',
+        approver: `slack:${HARSHA}`,
+        items: [expect.objectContaining({ id: 'low-data-quiz-start-leak', ok: true })],
+        stores: expect.any(Array),
+      }),
+    );
+    const replies = mockChatPostMessage.mock.calls.filter(
+      ([arg]) => arg.thread_ts === AI_READINESS_MESSAGE_TS,
+    );
+    expect(replies[replies.length - 1][0].text).toMatch(/Learning store: 1 approved, 1 marked shipped/);
   });
 
   it('lets a new loop use the shared ✅ footer without adding a bespoke Slack handler', async () => {
@@ -383,7 +460,7 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
     expect(replies[0][0].text).toMatch(/Creating 1 cloud-dev task for Revenue Loop/i);
     expect(replies[replies.length - 1][0].text).toMatch(/Launched 1\/1 cloud-dev run for Revenue Loop/i);
     expect(replies[replies.length - 1][0].text).toMatch(/futurelooppageid/i);
-    expect(isDispatched(FUTURE_LOOP_MESSAGE_TS)).toBe(true);
+    expect(await isDispatched(FUTURE_LOOP_MESSAGE_TS)).toBe(true);
   });
 
   it('reports a parse warning for new loop digests that have the shared footer but no dispatchable items', async () => {
@@ -462,7 +539,7 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
     );
     expect(replies[replies.length - 1][0].text).toMatch(/Launched 0\/1 cloud-dev run/i);
     expect(replies[replies.length - 1][0].text).toMatch(/Notion write denied/i);
-    expect(isDispatched(FUTURE_LOOP_MESSAGE_TS)).toBe(true);
+    expect(await isDispatched(FUTURE_LOOP_MESSAGE_TS)).toBe(true);
   });
 
   it('ignores reactions from users other than Harsha', async () => {
@@ -583,6 +660,50 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
     expect(mockLaunchEnvironment).toHaveBeenCalledTimes(1);
 
     // Second reaction on same ts → no new launches
+    await request(buildApp()).post('/api/slack/events').send(payload);
+    await wait();
+    expect(mockLaunchEnvironment).toHaveBeenCalledTimes(1);
+  });
+
+  // AC #2 (HUMAN-WRITTEN): reacting ✅ twice on the same DM ACROSS a simulated
+  // backend redeploy launches the cloud-dev EC2 exactly ONCE. This is the case
+  // the in-memory v1 tracker FAILED — the Map reset on restart, so the second
+  // ✅ re-dispatched. With DynamoDB persistence the dedupe survives.
+  it('does not double-dispatch across a simulated redeploy (DynamoDB persistence)', async () => {
+    const { port } = makeFakeDynamo(); // one persistent table shared across "restarts"
+    resetTracker(new DynamoLoopDispatchTracker(port));
+
+    mockConversationsHistory.mockResolvedValue({
+      ok: true,
+      messages: [
+        {
+          ts: MESSAGE_TS,
+          user: EMMA_BOT,
+          bot_id: 'B_EMMA',
+          text: buildLoopDmMessage([PAGE_URL_1]),
+        },
+      ],
+    });
+
+    const payload = {
+      type: 'event_callback',
+      event: {
+        type: 'reaction_added',
+        reaction: 'white_check_mark',
+        user: HARSHA,
+        item: { type: 'message', channel: DM_CHANNEL, ts: MESSAGE_TS },
+      },
+    };
+
+    // First ✅ → dispatches once.
+    await request(buildApp()).post('/api/slack/events').send(payload);
+    await wait();
+    expect(mockLaunchEnvironment).toHaveBeenCalledTimes(1);
+
+    // Simulate a redeploy: a BRAND-NEW tracker instance over the SAME table.
+    resetTracker(new DynamoLoopDispatchTracker(port));
+
+    // Re-✅ the same (pre-deploy) DM → must NOT launch again.
     await request(buildApp()).post('/api/slack/events').send(payload);
     await wait();
     expect(mockLaunchEnvironment).toHaveBeenCalledTimes(1);

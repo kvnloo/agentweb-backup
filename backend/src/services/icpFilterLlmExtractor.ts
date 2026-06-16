@@ -104,15 +104,22 @@ function sanitizeVariant(v: Partial<FilterVariant>): FilterVariant | null {
 
 /**
  * Pure LLM call. The `deps.llm` injection point exists so unit tests
- * can stub the model without touching Bedrock.
+ * can stub the model without touching Bedrock. `deps.userId` is only used
+ * for shadow usage-metering attribution (recorder attributes to 'system'
+ * when absent) — it never appears in prompts.
  */
 export async function extractIcpFiltersWithLlm(
   persona: ICPPersona,
-  deps: { llm?: { generateJsonRobust: LLMService['generateJsonRobust'] } } = {},
+  deps: { llm?: { generateJsonRobust: LLMService['generateJsonRobust'] }; userId?: string } = {},
 ): Promise<FilterVariant[]> {
   const llm =
     deps.llm ?? new LLMService(FILTER_MODEL, FILTER_TEMPERATURE, FILTER_MAX_TOKENS);
-  const raw = await llm.generateJsonRobust<LlmResponse>(SYSTEM_PROMPT, buildUserPrompt(persona));
+  const raw = await llm.generateJsonRobust<LlmResponse>(
+    SYSTEM_PROMPT,
+    buildUserPrompt(persona),
+    undefined,
+    { userId: deps.userId, feature: 'enrichment' },
+  );
   if (!raw || !Array.isArray((raw as LlmResponse).variants)) {
     throw new Error('LLM returned malformed response: missing variants array');
   }

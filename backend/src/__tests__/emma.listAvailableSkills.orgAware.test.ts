@@ -1,9 +1,9 @@
 // Verifies Emma's list_available_skills tool honors org-sharing semantics:
-//  - Passes orgId to skillService.getSkillsAvailableToUser when the caller
-//    is in an org AND `shareSettings.skills` is effectively enabled for them
-//    (plain members need enabled=true; editors and the org owner always do).
-//  - Falls back to no-orgId (no org fanout) for non-org users, plain members
-//    when the toggle is off, or when DB lookups fail.
+//  - Skills are a member-owned feature: org fanout is governed purely by the
+//    `shareSettings.skills` toggle, with no owner/editor override. orgId is
+//    passed to skillService.getSkillsAvailableToUser only when the toggle is on.
+//  - Falls back to no-orgId (no org fanout) for non-org users, anyone in an org
+//    where the toggle is off, or when DB lookups fail.
 
 jest.mock('../services/db', () => ({
   userDb: { getUserById: jest.fn() },
@@ -73,24 +73,24 @@ describe('Emma list_available_skills - org-sharing toggle gate', () => {
     expect(skillService.getSkillsAvailableToUser).toHaveBeenCalledWith('member-1', undefined);
   });
 
-  it('editor + sharing disabled → orgId IS passed (editors immune to toggle)', async () => {
+  it('editor + sharing disabled → orgId NOT passed (skills are pure-toggle, no editor override)', async () => {
     (userDb.getUserById as jest.Mock).mockResolvedValue(EDITOR);
     (orgDb.getOrgById as jest.Mock).mockResolvedValue(orgWithSkillsDisabled);
 
     const tool = emmaToolRegistry.getTool('list_available_skills')!;
     await tool.execute({}, { userId: 'editor-1' });
 
-    expect(skillService.getSkillsAvailableToUser).toHaveBeenCalledWith('editor-1', ORG_ID);
+    expect(skillService.getSkillsAvailableToUser).toHaveBeenCalledWith('editor-1', undefined);
   });
 
-  it('org owner + sharing disabled → orgId IS passed (owner immune to toggle)', async () => {
+  it('org owner + sharing disabled → orgId NOT passed (skills are pure-toggle, no owner override)', async () => {
     (userDb.getUserById as jest.Mock).mockResolvedValue(ORG_OWNER);
     (orgDb.getOrgById as jest.Mock).mockResolvedValue(orgWithSkillsDisabled);
 
     const tool = emmaToolRegistry.getTool('list_available_skills')!;
     await tool.execute({}, { userId: 'user-1' });
 
-    expect(skillService.getSkillsAvailableToUser).toHaveBeenCalledWith('user-1', ORG_ID);
+    expect(skillService.getSkillsAvailableToUser).toHaveBeenCalledWith('user-1', undefined);
   });
 
   it('non-org user → orgId undefined (does not break)', async () => {

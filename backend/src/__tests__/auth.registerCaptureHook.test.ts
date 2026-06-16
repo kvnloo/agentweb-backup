@@ -90,7 +90,7 @@ describe('register controller fires onUserRegistered', () => {
     const app = makeApp();
     const res = await request(app)
       .post('/register')
-      .send({ email: 'New@User.com', password: 'pw', displayName: 'Alice' });
+      .send({ email: 'New@User.com', password: 'ValidPass123!', displayName: 'Alice' });
 
     expect(res.status).toBe(201);
     expect(mockOnUserRegistered).toHaveBeenCalledTimes(1);
@@ -107,7 +107,7 @@ describe('register controller fires onUserRegistered', () => {
     const app = makeApp();
     const res = await request(app)
       .post('/register')
-      .send({ email: 'new@user.com', password: 'pw' });
+      .send({ email: 'new@user.com', password: 'ValidPass123!' });
 
     // 201 is returned before the hook's promise would settle — the test passes
     // as long as the controller doesn't throw synchronously.
@@ -119,7 +119,7 @@ describe('register controller fires onUserRegistered', () => {
     const app = makeApp();
     const res = await request(app)
       .post('/register')
-      .send({ email: 'taken@x.com', password: 'pw' });
+      .send({ email: 'taken@x.com', password: 'ValidPass123!' });
 
     expect(res.status).toBe(400);
     expect(mockOnUserRegistered).not.toHaveBeenCalled();

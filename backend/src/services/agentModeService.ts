@@ -9,6 +9,9 @@ import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
 import { rankMemoriesByRelevance } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
+import { toolResultError } from '../utils/toolResultError';
+import { computeTermination } from './agentMode/core/agentStep';
+import { executePreparedTools } from './agentMode/core/toolDispatch';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
@@ -26,10 +29,12 @@ import { extractVariables } from '../utils/templateParser';
 import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 import { incrementUserTokenUsage } from './tokenUsageService';
-import type { LLMUsageData } from '../utils/llmService';
+import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
+import { recordUsage } from './usageRecorderService';
 import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
 import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmMutationEvents';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
+import { publishWithResolvedBlogPublisher } from './blogPublishers';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -81,6 +86,7 @@ import {
   summarizeAgentToolPolicyModes,
   validateAndRepairToolArgs,
 } from './agentToolGatewayService';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 
 type MetaApiResult = {
   success: boolean;
@@ -134,6 +140,14 @@ function recordAgentModeToolTelemetry(
   void (async () => {
     try {
       const toolNames = toolResults.map(r => r.toolCall?.function?.name ?? 'unknown');
+      // PR #1818 follow-up: contract-layer activity as countable telemetry so
+      // the enforcement decision has data (args_repaired / schema-error rates).
+      const argsRepairedCount = toolResults.filter(
+        (r) => r.policyDecision?.flags?.some((flag) => flag.code === 'args_repaired'),
+      ).length;
+      const schemaErrorCount = toolResults.filter(
+        (r) => r.status === 'error' && classifyToolErrorClass(r.error) === 'invalid_args',
+      ).length;
       await recorder.decision(runId, {
         iteration,
         toolNames,
@@ -144,6 +158,8 @@ function recordAgentModeToolTelemetry(
         explanationSource: 'deterministic_tool_summary',
         toolPolicyFlags: summarizeAgentToolPolicyFlags(toolResults.map((r) => r.policyDecision)),
         toolPolicySummary: summarizeAgentToolPolicyModes(toolResults.map((r) => r.policyDecision)),
+        argsRepairedCount,
+        schemaErrorCount,
       });
       for (const r of toolResults) {
         const toolName = r.toolCall?.function?.name ?? 'unknown';
@@ -151,7 +167,7 @@ function recordAgentModeToolTelemetry(
         if (r.status === 'success') {
           await recorder.toolSucceeded(runId, { toolName, durationMs: r.duration, sessionId });
         } else {
-          await recorder.toolFailed(runId, { toolName, error: r.error, durationMs: r.duration, sessionId });
+          await recorder.toolFailed(runId, { toolName, error: r.error, durationMs: r.duration, sessionId, args: r.functionArgs });
         }
       }
     } catch (err) {
@@ -160,37 +176,6 @@ function recordAgentModeToolTelemetry(
   })();
 }
 
-function toolResultError(result: unknown): Error | null {
-  if (!result || typeof result !== 'object') return null;
-  const obj = result as Record<string, any>;
-
-  if (obj.isError === true) {
-    return new Error(extractToolResultMessage(obj) || 'Tool returned isError=true');
-  }
-
-  if (obj.success === false) {
-    return new Error(extractToolResultMessage(obj) || 'Tool returned success=false');
-  }
-
-  return null;
-}
-
-function extractToolResultMessage(obj: Record<string, any>): string {
-  if (typeof obj.error === 'string' && obj.error.trim()) return obj.error.trim();
-  if (typeof obj.message === 'string' && obj.message.trim()) return obj.message.trim();
-  if (typeof obj.content === 'string' && obj.content.trim()) return obj.content.trim();
-
-  if (Array.isArray(obj.content)) {
-    const text = obj.content
-      .map((part: any) => typeof part?.text === 'string' ? part.text : '')
-      .filter(Boolean)
-      .join('\n')
-      .trim();
-    if (text) return text;
-  }
-
-  return '';
-}
 
 function recordAgentModeRunStarted(
   runId: string,
@@ -203,7 +188,7 @@ function recordAgentModeRunStarted(
 
 function recordAgentModeRunCompleted(
   runId: string,
-  info: { toolCalls?: number; failedToolCalls?: number; sessionId?: string },
+  info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
 ): void {
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
@@ -212,7 +197,7 @@ function recordAgentModeRunCompleted(
 
 function recordAgentModeRunFailed(
   runId: string,
-  info: { error: unknown; toolCalls?: number; failedToolCalls?: number; sessionId?: string },
+  info: { error: unknown; toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
 ): void {
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
@@ -221,6 +206,17 @@ function recordAgentModeRunFailed(
 
 function countFailedToolCalls(toolCalls: any[]): number {
   return toolCalls.filter((toolCall) => toolCall && 'error' in toolCall).length;
+}
+
+/** Highest per-tool failure count — feeds the retry-spiral degraded-run rule. */
+function maxSameToolFailureCount(toolCalls: any[]): number {
+  const counts = new Map<string, number>();
+  for (const toolCall of toolCalls) {
+    if (!toolCall || !('error' in toolCall)) continue;
+    const name = toolCall.name ?? 'unknown';
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  return counts.size > 0 ? Math.max(...counts.values()) : 0;
 }
 
 const AGENT_RUNTIME_ARG_PREVIEW_MAX_CHARS = 1200;
@@ -407,11 +403,26 @@ interface LLMCallOptions {
   max_completion_tokens?: number | null;
   temperature?: number | null;
   response_format?: { type: 'text' | 'json_object' } | null;
+  /**
+   * Optional attribution for shadow usage metering (Ship 1). Recording is
+   * fire-and-forget and fail-open — it never changes the call's behavior.
+   * When omitted, usage is recorded under userId "system".
+   */
+  usageContext?: LLMUsageContext | null;
 }
 
 // Diagnosis agent configuration
 const DIAGNOSIS_MODEL = 'gemini-3.1-flash-lite';
 const DIAGNOSIS_TIMEOUT_MS = 10_000;
+
+// Markers used by perform_data_analysis to capture files the Gemini code-execution
+// sandbox produces. The sandbox filesystem is discarded after execution and Gemini
+// never returns arbitrary on-disk files (only inline images), so the model is told
+// to print a file's full contents to stdout between these markers. The backend then
+// extracts the content and uploads it to real, downloadable S3 storage.
+const DATA_ANALYSIS_FILE_START_PREFIX = '<<<AGENTWEB_FILE:';
+const DATA_ANALYSIS_FILE_MARKER_SUFFIX = '>>>';
+const DATA_ANALYSIS_FILE_END_MARKER = '<<<AGENTWEB_FILE_END>>>';
 
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'avif', 'heic', 'heif']);
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wmv', 'm4v', 'ogv', '3gp', 'ts']);
@@ -2015,7 +2026,8 @@ export class AgentModeService {
       tool_choice = null,
       max_completion_tokens = null,
       temperature = null,
-      response_format = { type: "text" }
+      response_format = { type: "text" },
+      usageContext = null
     } = options || {};
 
     const params: any = {
@@ -2078,6 +2090,33 @@ export class AgentModeService {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         const res = await client.chat.completions.create(params);
+        // Shadow usage metering (Ship 1): every client returned above (Azure
+        // OpenAI, Gemini OpenAI-compat, Bedrock Converse wrapper, Vertex
+        // wrapper) responds in OpenAI shape, so `res.usage` is the single
+        // observation point — including the Bedrock ConverseCommand path,
+        // whose cache metrics surface as cache_read/creation_input_tokens.
+        // Fire-and-forget + fail-open: never awaited, never throws.
+        try {
+          const usage: any = (res as any)?.usage;
+          if (usage) {
+            void recordUsage({
+              userId: usageContext?.userId,
+              sessionId: usageContext?.sessionId,
+              model,
+              provider: model.startsWith('gemini-') ? 'gemini'
+                : model.startsWith('anthropic.') ? 'bedrock'
+                : model.startsWith('claude-') ? 'vertex'
+                : 'azure-openai',
+              feature: usageContext?.feature || 'agent_task',
+              inputTokens: usage.prompt_tokens || 0,
+              outputTokens: usage.completion_tokens || 0,
+              cacheReadTokens: usage.cache_read_input_tokens || usage.prompt_tokens_details?.cached_tokens || 0,
+              cacheWriteTokens: usage.cache_creation_input_tokens || 0,
+            });
+          }
+        } catch {
+          // Metering must never break an LLM call.
+        }
         return res;
       } catch (error) {
         const isLastAttempt = attempt >= maxAttempts;
@@ -2313,7 +2352,7 @@ export class AgentModeService {
         let queryEmbedding: number[] | null | undefined;
         const getQueryEmbedding = async (): Promise<number[] | null> => {
           if (queryEmbedding === undefined) {
-            queryEmbedding = messageContent ? await embedText(messageContent) : null;
+            queryEmbedding = messageContent ? await embedText(messageContent, { userId, feature: 'agent_task' }) : null;
           }
           return queryEmbedding;
         };
@@ -2334,7 +2373,7 @@ export class AgentModeService {
           }
           for (const m of all) {
             if (!Array.isArray(m.embedding) || m.embedding.length === 0) {
-              const emb = await embedText(m.content);
+              const emb = await embedText(m.content, { userId, feature: 'agent_task' });
               if (emb) {
                 m.embedding = emb;
                 backfill(m.memoryId, emb);
@@ -2573,7 +2612,8 @@ export class AgentModeService {
             tools: filteredToolsCache,
             tool_choice: 'auto',
             max_completion_tokens: 12384,
-            temperature: 0.1
+            temperature: 0.1,
+            usageContext: { userId, sessionId, feature: 'agent_task' }
           });
         } catch (callError) {
           if (isTransientLLMError(callError) && !backupModelUsed) {
@@ -2594,7 +2634,8 @@ export class AgentModeService {
                 tools: filteredToolsCache,
                 tool_choice: 'auto',
                 max_completion_tokens: 12384,
-                temperature: 0.1
+                temperature: 0.1,
+                usageContext: { userId, sessionId, feature: 'agent_task' }
               });
             } else {
               throw callError;
@@ -2685,34 +2726,41 @@ export class AgentModeService {
         if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
           // No tool calls — check WHY the model stopped
 
-          if (finishReason === 'length' && maxTokensContinuations < MAX_TOKEN_CONTINUATIONS) {
-            // Model hit max_tokens and was truncated — ask it to continue
-            maxTokensContinuations++;
+          // Termination decision extracted into a PURE core module (strangler seam #1).
+          // The decision ladder (max_tokens continuation -> content-filter canned
+          // message -> empty-synthesis nudge -> final) lives in core/termination.ts;
+          // the loop here applies the returned counter deltas, inject messages, and
+          // canned content, preserving identical behavior (proven by the
+          // characterization harness). Logging is kept inline so log output is unchanged.
+          const termination = computeTermination({
+            finishReason,
+            stopReason,
+            content,
+            toolCallsSoFar: toolCalls.length,
+            maxTokensContinuations,
+            maxTokenContinuationsLimit: MAX_TOKEN_CONTINUATIONS,
+            emptySynthesisRetries,
+            maxEmptySynthesisRetries: MAX_EMPTY_SYNTHESIS_RETRIES,
+          });
+          maxTokensContinuations += termination.counterDelta.maxTokensContinuations;
+          emptySynthesisRetries += termination.counterDelta.emptySynthesisRetries;
+          if (termination.contentIfEmpty !== undefined && !content) {
+            content = termination.contentIfEmpty;
+          }
+
+          if (termination.reason === 'max_tokens_continuation') {
             console.warn(`AgentMode: Response truncated (max_tokens) in session ${sessionId}, continuation ${maxTokensContinuations}/${MAX_TOKEN_CONTINUATIONS}`);
-            (messages as any[]).push({
-              role: 'user',
-              content: '[SYSTEM] Your previous response was cut off because it exceeded the token limit. Please continue exactly where you left off.'
-            });
+            (messages as any[]).push({ role: 'user', content: termination.injectMessage });
             continue;
           }
 
           if (finishReason === 'content_filter' || stopReason === 'guardrail_intervened' || stopReason === 'content_filtered') {
             console.warn(`AgentMode: Response blocked by content filter in session ${sessionId}, reason: ${stopReason || finishReason}`);
-            if (!content) {
-              content = "I'm unable to complete this request due to content safety guidelines. Please try rephrasing your request.";
-            }
           }
 
-          // If the model returned empty text but tool calls ran earlier this session,
-          // it skipped the synthesis step (observed with Gemini extended-thinking on
-          // large contexts). Nudge it once to produce the final response.
-          if (!content && toolCalls.length > 0 && emptySynthesisRetries < MAX_EMPTY_SYNTHESIS_RETRIES) {
-            emptySynthesisRetries++;
+          if (termination.reason === 'empty_synthesis_retry') {
             console.warn(`AgentMode: Empty response after ${toolCalls.length} tool calls in session ${sessionId} — injecting synthesis prompt (retry ${emptySynthesisRetries}/${MAX_EMPTY_SYNTHESIS_RETRIES})`);
-            (messages as any[]).push({
-              role: 'user',
-              content: '[SYSTEM] You have gathered all the necessary data. Please now synthesize the information and provide your complete final response to the user.'
-            });
+            (messages as any[]).push({ role: 'user', content: termination.injectMessage });
             continue;
           }
 
@@ -2776,375 +2824,58 @@ export class AgentModeService {
           });
         }
 
-        // Execute tool calls in parallel for performance
-        // When the LLM returns multiple tool_calls in one response, they are independent
-        // and can run concurrently instead of sequentially.
-        const pendingCounterUpdates: Record<string, number> = {};
-        const failedCounterUpdates: Record<string, number> = {};
-
-        // Phase 1: Validate and prepare tool calls (synchronous)
-        const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision }> = [];
-        const preflightToolResults: Array<{ status: 'error'; toolCall: any; functionArgs: any; error: Error; duration: number; policyDecision?: AgentToolPolicyDecision }> = [];
-
-        const appendPreflightToolFailure = (
-          toolCall: any,
-          functionArgs: any,
-          errorMessage: string,
-          content: any,
-          policyDecision?: AgentToolPolicyDecision,
-        ) => {
-          const error = new Error(errorMessage);
-          (messages as any[]).push({
-            tool_call_id: toolCall.id,
-            role: 'tool',
-            name: toolCall.function.name,
-            content,
-            metadata: { timestamp: new Date().toISOString() }
-          });
-          toolCalls.push({
-            id: toolCall.id,
-            name: toolCall.function.name,
-            arguments: functionArgs ?? toolCall.function.arguments,
-            error: error.message,
-            duration: 0
-          });
-          failedCounterUpdates[toolCall.function.name] =
-            (failedCounterUpdates[toolCall.function.name] || 0) + 1;
-          preflightToolResults.push({
-            status: 'error',
-            toolCall,
-            functionArgs,
-            error,
-            duration: 0,
-            policyDecision,
-          });
-        };
-
-        for (const toolCall of responseMessage.tool_calls) {
-          try {
-            const functionArgs = JSON.parse(toolCall.function.arguments);
-
-            // Enforce skill-based tool access: reject calls to tools not in allowedToolNames.
-            // LLMs may hallucinate tool calls from conversation history even when the tool
-            // isn't in the current tools list. Return an error so the LLM learns to install skills first.
-            // Only enforce when:
-            //   1. The skills system is active (published skills exist), AND
-            //   2. The session was created with the skills system (has associatedSkills).
-            // Sessions created before the skills implementation have no associatedSkills
-            // and should retain access to all tools for backward compatibility.
-            // Block non-admin users from invoking admin-only tools, and block admin tools in shared sessions.
-            // hasAdminAccess is true for real admins or admin delegated access (never for iShare).
-            if (!hasAdminAccess && ADMIN_SKILL_TOOL_NAMES.includes(toolCall.function.name)) {
-              const errorMsg = isInteractiveShare
-                ? `Tool "${toolCall.function.name}" is not available in shared sessions. You can continue to use it in Agent Mode in your own session.`
-                : `Tool "${toolCall.function.name}" requires admin access. This session does not have admin privileges.`;
-              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
-              continue;
-            }
-
-            if (isInteractiveShare && toolCall.function.name === 'connect_account') {
-              const errorMsg = 'Account connections are not available in shared sessions. Tell the user they need to open Agent Mode in their own account to connect this account, then come back here.';
-              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
-              continue;
-            }
-
-            // Block context-restricted tools even if LLM hallucinates the call from history
-            if (excludeTools?.includes(toolCall.function.name)) {
-              const errorMsg = `Tool "${toolCall.function.name}" is not available in this context.`;
-              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
-              continue;
-            }
-
-            if (publishedSkills.length > 0 && sessionAssociatedSkillIds.length > 0 && !allowedToolNames.has(toolCall.function.name)) {
-              const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
-              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
-              continue;
-            }
-
-            // Check if we need to refresh skills for next iteration
-            if (toolCall.function.name === 'install_skills') {
-              skillsUpdated = true;
-            }
-
-            const initialPolicyDecision = evaluateAgentToolPolicy({
-              toolName: toolCall.function.name,
-              args: functionArgs,
-              isAdmin: hasAdminAccess,
-              isSharedSession: isInteractiveShare,
-              enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
-            });
-
-            const toolDefinition = this.toolRegistry.getTool(toolCall.function.name)?.definition;
-            const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.inputSchema;
-            const contractResult = validateAndRepairToolArgs({
-              toolName: toolCall.function.name,
-              args: functionArgs,
-              inputSchema,
-              effect: initialPolicyDecision.effect,
-            });
-
-            if (contractResult.status === 'invalid') {
-              const errorContent = this.formatToolError(toolCall.function.name, contractResult.modelMessage);
-              appendPreflightToolFailure(toolCall, functionArgs, contractResult.modelMessage, errorContent, initialPolicyDecision);
-              continue;
-            }
-
-            const preparedFunctionArgs = contractResult.args;
-            const policyDecision = evaluateAgentToolPolicy({
-              toolName: toolCall.function.name,
-              args: preparedFunctionArgs,
-              isAdmin: hasAdminAccess,
-              isSharedSession: isInteractiveShare,
-              enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
-            });
-
-            if (contractResult.status === 'repaired') {
-              policyDecision.flags.push({
-                code: 'args_repaired',
-                severity: 'info',
-                message: `Tool arguments were repaired before execution: ${contractResult.repairs.join(', ')}`,
-              });
-            }
-
-            if (!policyDecision.allowed) {
-              const errorMsg = `Tool "${toolCall.function.name}" was blocked by Agent Tool Gateway policy: ${policyDecision.flags.map((flag) => flag.message).join(' ')}`;
-              appendPreflightToolFailure(toolCall, preparedFunctionArgs, errorMsg, JSON.stringify({ error: errorMsg, policy: policyDecision }), policyDecision);
-              continue;
-            }
-
-            preparedCalls.push({ toolCall, functionArgs: preparedFunctionArgs, policyDecision });
-          } catch (error) {
-            // JSON parse failure — append error message for LLM
-            console.error(`AgentMode: Tool argument parse error for ${toolCall.function.name}:`, error);
-            const errMsg = error instanceof Error ? error.message : String(error);
-            const errorContent = this.formatToolError(toolCall.function.name, `Failed to parse arguments: ${errMsg}`);
-            appendPreflightToolFailure(toolCall, undefined, `Failed to parse arguments: ${errMsg}`, errorContent);
-          }
-        }
-
-        // Phase 2: Execute tools — sequential if wait_seconds is present, parallel otherwise.
-        // Sequential is required when wait_seconds is in the batch so the wait happens
-        // in the correct order relative to the tools before/after it.
-        // Also run sequentially when multiple generate_image or generate_video calls are batched
-        // together — these APIs (Gemini 3 Pro in particular) throttle under concurrent load.
-        const hasWaitTool = preparedCalls.some(({ toolCall }) => toolCall.function.name === 'wait_seconds');
-        const hasMultipleMediaGenTools = preparedCalls.length > 1 && preparedCalls.some(({ toolCall }) =>
-          toolCall.function.name === 'generate_image' || toolCall.function.name === 'generate_video' || toolCall.function.name === 'generate_voiceover'
-        );
-
-        let toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs: any; result?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>;
-
-        if (hasWaitTool || hasMultipleMediaGenTools) {
-          // Sequential execution — preserves ordering so wait_seconds acts as a pause between tools,
-          // and prevents rate-limit throttling when batching multiple image/video generation calls
-          toolResults = [];
-          for (const { toolCall, functionArgs, policyDecision } of preparedCalls) {
-            const outcome = await executeAgentToolThroughGateway({
-              toolName: toolCall.function.name,
-              args: functionArgs,
-              policyDecision,
-              execute: () => this.executePreparedAgentTool({
-                llmModel,
-                toolName: toolCall.function.name,
-                functionArgs,
-                userId,
-                sessionId,
-                mockMode,
-                socketEmit,
-                screenshotUrl,
-                isDelegatedAccess,
-              }),
-            });
-            if (outcome.status === 'success') {
-              toolResults.push({ status: 'success' as const, toolCall, functionArgs, result: outcome.result, duration: outcome.durationMs, policyDecision: outcome.policyDecision });
-            } else {
-              toolResults.push({ status: 'error' as const, toolCall, functionArgs, error: outcome.error, duration: outcome.durationMs, policyDecision: outcome.policyDecision });
-            }
-          }
-        } else {
-          // Parallel execution (default)
-          const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs, policyDecision }) => {
-            const outcome = await executeAgentToolThroughGateway({
-              toolName: toolCall.function.name,
-              args: functionArgs,
-              policyDecision,
-              execute: () => this.executePreparedAgentTool({
-                llmModel,
-                toolName: toolCall.function.name,
-                functionArgs,
-                userId,
-                sessionId,
-                mockMode,
-                socketEmit,
-                screenshotUrl,
-                isDelegatedAccess,
-              }),
-            });
-            if (outcome.status === 'success') {
-              return { status: 'success' as const, toolCall, functionArgs, result: outcome.result, duration: outcome.durationMs, policyDecision: outcome.policyDecision };
-            }
-            return { status: 'error' as const, toolCall, functionArgs, error: outcome.error, duration: outcome.durationMs, policyDecision: outcome.policyDecision };
-          });
-          toolResults = await Promise.all(toolPromises);
-        }
-
-        toolResults = toolResults.map((toolResult) => {
-          if (toolResult.status !== 'success') return toolResult;
-          const error = toolResultError(toolResult.result);
-          if (!error) return toolResult;
-          return {
-            status: 'error' as const,
-            toolCall: toolResult.toolCall,
-            functionArgs: toolResult.functionArgs,
-            error,
-            duration: toolResult.duration,
-            policyDecision: toolResult.policyDecision,
-          };
+        // Tool-dispatch boundary (core seam): validate/prepare tool calls,
+        // decide parallel-vs-sequential, execute through the gateway, classify
+        // tool-result errors, process results (screenshot S3, minimal-result, CRM
+        // socket emit, large-response S3 offload, truncation) and append tool
+        // messages + counter deltas. Extracted into core/toolDispatch.ts; the loop
+        // wires its entangled side-effects as injected ports. Behavior-preserving.
+        const dispatchResult = await executePreparedTools({
+          toolCalls: responseMessage.tool_calls,
+          messages: messages as any[],
+          toolCallsLedger: toolCalls,
+          iteration,
+          agentRuntimeRunId,
+          sessionId,
+          userId,
+          llmModel,
+          mockMode,
+          screenshotUrl,
+          isDelegatedAccess,
+          hasAdminAccess,
+          isInteractiveShare,
+          adminSkillToolNames: ADMIN_SKILL_TOOL_NAMES,
+          excludeTools,
+          publishedSkillsCount: publishedSkills.length,
+          sessionAssociatedSkillIdsCount: sessionAssociatedSkillIds.length,
+          allowedToolNames,
+          toolResponseS3Threshold: TOOL_RESPONSE_S3_THRESHOLD,
+          maxToolContentSize: MAX_TOOL_CONTENT_SIZE,
+          ports: {
+            evaluateAgentToolPolicy,
+            validateAndRepairToolArgs,
+            getToolInputSchema: (toolName: string) => {
+              const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
+              return toolDefinition?.function?.parameters || toolDefinition?.inputSchema;
+            },
+            executeAgentToolThroughGateway,
+            executePreparedAgentTool: (toolInput: any) => this.executePreparedAgentTool(toolInput),
+            toolResultError,
+            recordToolTelemetry: (telemetryToolResults) =>
+              recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults as any),
+            extractMinimalToolResult: (result: any, toolName: string) => this.extractMinimalToolResult(result, toolName),
+            extractToolContent,
+            formatToolError: (toolName: string, errorMessage: string) => this.formatToolError(toolName, errorMessage),
+            uploadScreenshotToS3,
+            uploadFileToS3WithPath,
+            buildCrmDataChangedPayload,
+            crmDataChangedEvent: CRM_DATA_CHANGED_EVENT,
+            socketEmit,
+          },
         });
-        const telemetryToolResults = [...preflightToolResults, ...toolResults];
-
-        // Runtime spine V0 telemetry: record this iteration's decision + each
-        // tool's invoked/succeeded/failed outcome into the shared LoopEvents
-        // table. Best-effort and non-blocking — the recorder swallows its own
-        // errors and is a no-op unless AGENT_RUNTIME_SPINE_ENABLED=true (or the
-        // legacy AGENT_MODE_LOOP_ENABLED=true). This is observability-only and
-        // must not affect tool execution, retries, streaming, or responses.
-        recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults);
-
-        // Phase 3: Process results in original order — append to messages, toolCalls, counters
-        for (const toolResult of toolResults) {
-          if (toolResult.status === 'success') {
-            const { toolCall, functionArgs, result, duration } = toolResult;
-
-            // For playwright screenshots, upload the base64 image to S3.
-            // This replaces the ~300KB base64 JSON payload with a lightweight URL,
-            // and makes the screenshot displayable in the frontend.
-            let processedResult = result;
-            if (toolCall.function.name === 'playwright_browser_take_screenshot') {
-              const imageContent = (result.raw?.content as any[])?.find((c: any) => c.type === 'image');
-              if (imageContent?.data) {
-                try {
-                  const dataUrl = `data:${imageContent.mimeType || 'image/png'};base64,${imageContent.data}`;
-                  const uploadResult = await uploadScreenshotToS3(dataUrl, userId);
-                  if (uploadResult) {
-                    // Keep dataUrl so the LLM can visually analyze the screenshot
-                    processedResult = { screenshotUrl: uploadResult.url, dataUrl, success: true };
-                  }
-                } catch (e) {
-                  console.error('AgentMode: Failed to upload playwright screenshot to S3:', e);
-                }
-              }
-            }
-
-            const minimalResult = this.extractMinimalToolResult(processedResult, toolCall.function.name);
-
-            toolCalls.push({
-              id: toolCall.id,
-              name: toolCall.function.name,
-              arguments: functionArgs,
-              result: minimalResult,
-              duration
-            });
-
-            // Notify the CRM page to refresh after a successful CRM-mutating tool.
-            // Enrichment / tech-stack tools broadcast their own completion events,
-            // so this covers the rest (update/status/email/delete/import/…). Emitted
-            // to the user's room so it reaches the CRM page regardless of which agent
-            // surface (full agent mode or Emma sidebar) ran the tool. Guard on a
-            // success flag so a tool that returned { success: false } doesn't trigger
-            // a spurious refresh.
-            if (socketEmit) {
-              const crmPayload = buildCrmDataChangedPayload(toolCall.function.name, functionArgs);
-              const toolSucceeded = !(processedResult && (processedResult as any).success === false);
-              if (crmPayload && toolSucceeded) {
-                socketEmit(`user:${userId}`, CRM_DATA_CHANGED_EVENT, crmPayload);
-              }
-            }
-
-            // For create_social_media_posts, count actual posts in the array (not function calls)
-            const counterIncrement = toolCall.function.name === 'create_social_media_posts'
-              ? ((functionArgs.posts as any[])?.length ?? 1)
-              : 1;
-            pendingCounterUpdates[toolCall.function.name] =
-              (pendingCounterUpdates[toolCall.function.name] || 0) + counterIncrement;
-
-            // For playwright screenshots, pass the image back to the LLM as a vision input
-            // so it can visually analyze the result (e.g. verify mobile layout, check for UI issues).
-            // The screenshot is also displayed to the user via the tool call card in the frontend.
-            // We use a text prefix to discourage embedding the raw URL in markdown responses.
-            let toolContent: any;
-            // Gemini's OpenAI-compat endpoint returns a silent 400 if tool-role messages contain image_url content.
-            // For Gemini, pass the S3 URL as text so the model can use describe_image on it if needed.
-            const isGeminiModel = llmModel.startsWith('gemini-');
-            if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).dataUrl && !isGeminiModel) {
-              toolContent = [
-                { type: 'text', text: 'Screenshot captured. Analyze the image below to verify the result visually. Do not include the raw image URL or data URI in your response to the user.' },
-                { type: 'image_url', image_url: { url: (processedResult as any).dataUrl, detail: 'high' } }
-              ];
-            } else if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).screenshotUrl && isGeminiModel) {
-              toolContent = `Screenshot captured. URL: ${(processedResult as any).screenshotUrl}\n\n${extractToolContent(result)}`;
-            } else {
-              toolContent = extractToolContent(result);
-            }
-
-            // When the response exceeds the S3 threshold: upload full content to S3 so the LLM
-            // can retrieve specific fields later via search_tool_response, then cap the in-memory
-            // copy at MAX_TOOL_CONTENT_SIZE to prevent worker OOM on sessions with many large tool
-            // calls (e.g. multiple read_page_source + search_web calls in a single work plan step).
-            const S3_IN_MEMORY_CAP = 20_000; // Keep only 20KB in memory after S3 upload
-            if (typeof toolContent === 'string' && toolContent.length > TOOL_RESPONSE_S3_THRESHOLD) {
-              try {
-                const uploadResult = await uploadFileToS3WithPath(
-                  toolContent,
-                  `${toolCall.id}.txt`,
-                  'text/plain',
-                  `tool-responses/${sessionId}`
-                );
-                if (uploadResult.success && uploadResult.key) {
-                  const header = `[Full response stored at S3 key: ${uploadResult.key} (${toolContent.length} chars) — use search_tool_response tool to find specific fields]\n\n`;
-                  const preview = toolContent.length > S3_IN_MEMORY_CAP
-                    ? toolContent.substring(0, S3_IN_MEMORY_CAP) + '\n\n[Content truncated — full response in S3]'
-                    : toolContent;
-                  toolContent = header + preview;
-                }
-              } catch (e) {
-                console.error('AgentMode: Failed to save large tool response to S3:', e);
-              }
-            }
-
-            const truncatedToolContent = typeof toolContent === 'string' && toolContent.length > MAX_TOOL_CONTENT_SIZE
-              ? toolContent.substring(0, MAX_TOOL_CONTENT_SIZE) + '\n\n[Content truncated for storage — original size: ' + toolContent.length + ' chars]'
-              : toolContent;
-            (messages as any[]).push({
-              tool_call_id: toolCall.id,
-              role: 'tool',
-              name: toolCall.function.name,
-              content: truncatedToolContent,
-              metadata: { timestamp: new Date().toISOString() }
-            });
-          } else {
-            const { toolCall, functionArgs, error, duration } = toolResult;
-            toolCalls.push({
-              id: toolCall.id,
-              name: toolCall.function.name,
-              arguments: functionArgs || toolCall.function.arguments,
-              error: error instanceof Error ? error.message : 'Unknown error',
-              duration
-            });
-
-            failedCounterUpdates[toolCall.function.name] =
-              (failedCounterUpdates[toolCall.function.name] || 0) + 1;
-
-            const errMsg = error instanceof Error ? error.message : String(error);
-            const errorContent = this.formatToolError(toolCall.function.name, errMsg);
-            messages.push({
-              tool_call_id: toolCall.id,
-              role: 'tool',
-              name: toolCall.function.name,
-              content: errorContent,
-              metadata: { timestamp: new Date().toISOString() }
-            });
-          }
+        const { pendingCounterUpdates, failedCounterUpdates } = dispatchResult;
+        if (dispatchResult.skillsUpdated) {
+          skillsUpdated = true;
         }
 
         // Send progress update after all tools complete.
@@ -3177,6 +2908,33 @@ export class AgentModeService {
             console.error('AgentMode: Failed to batch update function call counters:', counterError);
             // Don't fail the whole iteration if counter update fails
           }
+        }
+
+        // Human-in-the-loop confirmation gate: if a tool in this iteration requested
+        // explicit user confirmation (e.g. a Meta Ads publish/change/delete), STOP the
+        // autonomous loop and hand control back to the user. The model CANNOT self-approve
+        // — only a new user message restarts the turn, after which it re-calls the tool
+        // with confirm=true. This is the safety net for the wrong-campaign / wrong-asset
+        // class of mistake: the user sees the resolved target and must approve it.
+        // Post-refactor (core/toolDispatch), this iteration's results live on the
+        // toolCalls ledger (each entry carries .result = the minimal result, which
+        // preserves awaitingUserConfirmation). Re-shape the new slice for the seam.
+        const iterationResults = toolCalls
+          .slice(toolCallsLengthBeforeIteration)
+          .map((tc: any) => ({ status: tc.error ? 'error' as const : 'success' as const, result: tc.result }));
+        const confirmationPrompt = this.collectConfirmationPrompt(iterationResults);
+        if (confirmationPrompt) {
+          content = confirmationPrompt;
+          (messages as any[]).push({
+            role: 'assistant',
+            content: confirmationPrompt,
+            llm: llmModel,
+            metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true }
+          });
+          if (onProgress) {
+            onProgress({ iteration, status: 'complete', toolCalls: toolCalls.slice() });
+          }
+          break;
         }
 
         // Anti-loop detection: check if the LLM is repeating the same tool calls
@@ -3270,6 +3028,7 @@ export class AgentModeService {
         sessionId,
         toolCalls: toolCalls.length,
         failedToolCalls: countFailedToolCalls(toolCalls),
+        maxSameToolFailures: maxSameToolFailureCount(toolCalls),
       });
       return {
         content,
@@ -3334,6 +3093,7 @@ export class AgentModeService {
         sessionId,
         toolCalls: _toolCallsForTelemetry.length,
         failedToolCalls: countFailedToolCalls(_toolCallsForTelemetry),
+        maxSameToolFailures: maxSameToolFailureCount(_toolCallsForTelemetry),
       });
       throw wrappedError;
     }
@@ -3826,6 +3586,7 @@ export class AgentModeService {
     'list_connected_accounts', // Social/ads integration teaser
 
     'get_user_profile',         // Account info teaser
+    'get_account_status',       // Self account status (plan, usage, api-key count) — wraps /api/auth/me, no args
 
     // Account Memory (cross-session knowledge)
     'save_memory',
@@ -3883,6 +3644,21 @@ export class AgentModeService {
     'install_skills',
     'list_available_skills',
     'resolve_skill',
+    // S3 overflow retrieval is infrastructure, not a skill: whenever a tool result
+    // is offloaded to S3 the model is handed a "[Full response stored at S3 key: ...]"
+    // pointer and MUST be able to resolve it. A DB `foundation_tools` setting that
+    // omitted these made the tools "not available", which was the #2 production
+    // failure mode for search/read_tool_response. Force-merge them so no config can
+    // strip them.
+    'search_tool_response',
+    'read_tool_response',
+    // Self account-status: a no-arg tool wrapping /api/auth/me for the caller's
+    // OWN account. Force-merged (not just DEFAULT) for the same reason as the two
+    // above — a DB `foundation_tools` setting that omits it makes it "not
+    // available", so Emma has no self-status tool and falls back to
+    // assess_client_health (admin lookup BY EMAIL → the "asked for my email" bug).
+    // Always reachable so Emma can answer "what's my plan/usage" directly.
+    'get_account_status',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
@@ -4279,6 +4055,21 @@ export class AgentModeService {
   // Extract only the necessary data for the frontend to reduce storage size
   private extractMinimalToolResult(result: any, toolName: string): any {
     console.log('[DEBUG] extractMinimalToolResult called for:', toolName);
+
+    // Preserve confirmation-gate fields for ANY tool that halted for user approval
+    // (Meta writes, image edits, …). The gate returns no real artifact, and the
+    // per-tool minimizers below drop unknown fields — without this, the frontend
+    // (tool card "Awaiting your confirmation", panel teardown) never sees the flag.
+    if (result && result.awaitingUserConfirmation === true) {
+      return {
+        success: true,
+        requiresConfirmation: true,
+        awaitingUserConfirmation: true,
+        confirmationPrompt: result.confirmationPrompt,
+        confirmationDetail: result.confirmationDetail,
+        summary: result.summary,
+      };
+    }
 
     // For playwright screenshots, result has already been processed (base64 → S3 URL)
     if (toolName === 'playwright_browser_take_screenshot') {
@@ -5653,6 +5444,20 @@ export class AgentModeService {
     }
   }
 
+  /**
+   * Classify an S3 retrieve error as "the object/key is gone" (terminal-for-this-key)
+   * vs a real unexpected error. Checks both the AWS error code and the message text so
+   * variants like code `AccessDenied` / message "Access Denied" are both caught.
+   */
+  private isS3MissingError(error: unknown): boolean {
+    const code = (error as any)?.code || (error as any)?.name || '';
+    const msg = error instanceof Error ? error.message : String(error ?? '');
+    const terminal = ['NoSuchKey', 'NoSuchBucket', 'AccessDenied', 'AllAccessDisabled'];
+    if (terminal.includes(code)) return true;
+    const normalized = msg.replace(/\s+/g, '');
+    return terminal.some((t) => msg.includes(t) || normalized.includes(t));
+  }
+
   private async executeSearchToolResponse(args: {
     s3_key: string;
     query: string;
@@ -5672,7 +5477,18 @@ export class AgentModeService {
     try {
       const content = await getS3ObjectAsString(s3_key);
       if (!content) {
-        return { success: false, message: 'Empty response from S3' };
+        // Empty stored object is not an execution failure — return a graceful,
+        // model-actionable empty result so it isn't counted as a tool failure.
+        return {
+          success: true,
+          query,
+          total_matches_found: 0,
+          match_offset: matchOffset,
+          matches_returned: 0,
+          total_size: 0,
+          matches: [],
+          message: 'The stored tool response is empty. There is nothing to search; proceed using the in-context preview or re-run the source tool if you need the data.',
+        };
       }
 
       const queryLower = query.toLowerCase();
@@ -5701,18 +5517,29 @@ export class AgentModeService {
         match_offset: matchOffset,
         matches_returned: matches.length,
         total_size: content.length,
+        // Zero matches is a valid, non-error outcome — guide the model rather than
+        // letting it treat an empty match list as a failure.
+        ...(allOffsets.length === 0
+          ? { message: `No matches for "${query}" in the stored response (${content.length} chars). Try a different search term, or use read_tool_response to page through the raw content.` }
+          : {}),
         matches,
       };
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : 'Unknown error';
-      const isFatal = errMsg.includes('NoSuchBucket') || errMsg.includes('AccessDenied') || errMsg.includes('NoSuchKey');
-      if (isFatal) {
+      const isMissing = this.isS3MissingError(error);
+      if (isMissing) {
+        // The key is gone/expired. This is not a transient bug — surface it as a
+        // graceful, terminal-for-this-key signal (success: true so it is not counted
+        // as a tool failure) with a clear instruction to stop retrying this key.
         return {
-          success: false,
-          fatal: true,
-          message: `S3 access failed (${errMsg}). The tool-response data is no longer available. Do NOT retry search_tool_response or read_tool_response for this key. Summarize what you know from the in-context preview and proceed.`,
+          success: true,
+          not_found: true,
+          total_matches_found: 0,
+          matches: [],
+          message: `The tool-response data for this S3 key is no longer available (${errMsg}). Do NOT retry search_tool_response or read_tool_response for this key. Summarize what you know from the in-context preview, or re-run the original source tool to regenerate the data.`,
         };
       }
+      // Unexpected/transient error after retries exhausted — this IS a real failure.
       return {
         success: false,
         message: `Failed to search tool response: ${errMsg}`,
@@ -5736,7 +5563,17 @@ export class AgentModeService {
     try {
       const content = await getS3ObjectAsString(s3_key);
       if (!content) {
-        return { success: false, message: 'Empty response from S3' };
+        // Empty stored object is not an execution failure — graceful empty result.
+        return {
+          success: true,
+          char_offset: charOffset,
+          chars_returned: 0,
+          total_size: 0,
+          has_more: false,
+          next_offset: charOffset,
+          content: '',
+          message: 'The stored tool response is empty. There is nothing to read; proceed using the in-context preview or re-run the source tool if you need the data.',
+        };
       }
 
       const slice = content.slice(charOffset, charOffset + charLength);
@@ -5747,18 +5584,27 @@ export class AgentModeService {
         total_size: content.length,
         has_more: charOffset + charLength < content.length,
         next_offset: charOffset + slice.length,
+        // A char_offset past the end yields an empty slice — guide the model instead
+        // of returning a bare empty string it might misread as a failure.
+        ...(slice.length === 0
+          ? { message: `char_offset ${charOffset} is at or beyond the end of the response (total_size ${content.length}). The full content has already been read.` }
+          : {}),
         content: slice,
       };
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : 'Unknown error';
-      const isFatal = errMsg.includes('NoSuchBucket') || errMsg.includes('AccessDenied') || errMsg.includes('NoSuchKey');
-      if (isFatal) {
+      const isMissing = this.isS3MissingError(error);
+      if (isMissing) {
+        // Key gone/expired — graceful terminal-for-this-key signal, not a failure.
         return {
-          success: false,
-          fatal: true,
-          message: `S3 access failed (${errMsg}). The tool-response data is no longer available. Do NOT retry read_tool_response or search_tool_response for this key. Summarize what you know from the in-context preview and proceed.`,
+          success: true,
+          not_found: true,
+          chars_returned: 0,
+          content: '',
+          message: `The tool-response data for this S3 key is no longer available (${errMsg}). Do NOT retry read_tool_response or search_tool_response for this key. Summarize what you know from the in-context preview, or re-run the original source tool to regenerate the data.`,
         };
       }
+      // Unexpected/transient error after retries exhausted — this IS a real failure.
       return {
         success: false,
         message: `Failed to read tool response: ${errMsg}`,
@@ -5915,8 +5761,11 @@ export class AgentModeService {
         };
       }
 
-      const { GoogleGenAI } = await import('@google/genai');
-      aiClient = new GoogleGenAI({ apiKey: geminiApiKey.trim() });
+      // Metered Gemini client (Ship 1 shadow metering). describeVideo has no
+      // userId in its signature, so usage attributes to "system" for now —
+      // follow-up: thread userId from the tool-dispatch / emmaApi callers.
+      const { getGeminiClient } = await import('../utils/llmClients');
+      aiClient = await getGeminiClient({ feature: 'agent_task' }, geminiApiKey.trim());
 
       const modelName = 'gemini-3-flash-preview';
 
@@ -6177,6 +6026,79 @@ export class AgentModeService {
 
       await new Promise(resolve => setTimeout(resolve, delayMs));
     }
+  }
+
+  // Infer a sensible Content-Type for a file the analysis sandbox produced, based
+  // on its extension. Defaults to text/plain so downloads are always served as a
+  // viewable/saveable file rather than an opaque octet-stream.
+  private static contentTypeForFilename(filename: string): string {
+    const ext = (filename.split('.').pop() || '').toLowerCase();
+    switch (ext) {
+      case 'csv': return 'text/csv';
+      case 'json': return 'application/json';
+      case 'tsv': return 'text/tab-separated-values';
+      case 'md': return 'text/markdown';
+      case 'html': case 'htm': return 'text/html';
+      case 'xml': return 'application/xml';
+      case 'txt': return 'text/plain';
+      default: return 'text/plain';
+    }
+  }
+
+  // Scan code-execution stdout/text for files the model emitted between the
+  // AGENTWEB_FILE markers, upload each to S3, and return real download links plus
+  // the text with the marker blocks stripped out (so the raw file contents are not
+  // dumped into the chat). Gemini's sandbox discards on-disk files, so this
+  // print-between-markers protocol is the only reliable way to deliver a generated
+  // file to the user.
+  private async extractAndUploadAnalysisFiles(
+    text: string,
+    userId: string
+  ): Promise<{ cleanedText: string; links: string[] }> {
+    const links: string[] = [];
+    if (!text || !text.includes(DATA_ANALYSIS_FILE_START_PREFIX)) {
+      return { cleanedText: text, links };
+    }
+
+    // Match a start marker (capturing the filename), the body, and the end marker.
+    // [\s\S] so the body can span newlines; non-greedy so adjacent files don't merge.
+    const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(
+      `${escapeRegExp(DATA_ANALYSIS_FILE_START_PREFIX)}([^\\r\\n>]*?)${escapeRegExp(DATA_ANALYSIS_FILE_MARKER_SUFFIX)}\\r?\\n([\\s\\S]*?)\\r?\\n?${escapeRegExp(DATA_ANALYSIS_FILE_END_MARKER)}`,
+      'g'
+    );
+
+    const { uploadFileToS3 } = await import('../utils/s3Utils');
+    let cleanedText = text;
+    const matches = [...text.matchAll(pattern)];
+    let fallbackIndex = 0;
+    for (const match of matches) {
+      const rawName = (match[1] || '').trim();
+      const body = match[2] ?? '';
+      // Sanitize/default the filename so we never produce an unusable S3 key.
+      const safeName = rawName.replace(/[\r\n]/g, '').trim() || `analysis_output_${fallbackIndex++}.csv`;
+      try {
+        const uploadResult = await uploadFileToS3(
+          Buffer.from(body, 'utf-8'),
+          safeName,
+          userId,
+          AgentModeService.contentTypeForFilename(safeName)
+        );
+        if (uploadResult.success && uploadResult.url) {
+          links.push(`**File saved:** [${safeName}](${uploadResult.url})`);
+          // Replace the whole marker block with a concise reference instead of the raw contents.
+          cleanedText = cleanedText.replace(match[0], `[Generated file: ${safeName} — download link below]`);
+        } else {
+          console.error(`AgentMode: performDataAnalysis failed to upload generated file "${safeName}":`, uploadResult.error);
+          cleanedText = cleanedText.replace(match[0], `[Generated file: ${safeName} — upload failed]`);
+        }
+      } catch (error) {
+        console.error(`AgentMode: performDataAnalysis error uploading generated file "${safeName}":`, error);
+        cleanedText = cleanedText.replace(match[0], `[Generated file: ${safeName} — upload failed]`);
+      }
+    }
+
+    return { cleanedText, links };
   }
 
   public async performDataAnalysis(fileUrls: string[], analysisInstruction: string, userId: string): Promise<any> {
@@ -6442,7 +6364,7 @@ export class AgentModeService {
 
       // Add text part with analysis instruction so the model knows how to proceed with or without files
       parts.push({
-        text: `Please perform the following analysis task. ${fileGuidance}\n\n${analysisInstruction}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present.\n\nIMPORTANT: When generating charts or visualizations, you MUST use matplotlib or seaborn to produce rasterized PNG images. Do NOT use altair, vega, vega-lite, or any library that produces JSON specs instead of rendered images. Always call plt.savefig() or equivalent to emit the image as inline output, then call plt.close() to free memory.`
+        text: `Please perform the following analysis task. ${fileGuidance}\n\n${analysisInstruction}\n\nUse Python code execution to analyze the data and provide detailed insights. Do not ask questions as the user is not present.\n\nIMPORTANT: When generating charts or visualizations, you MUST use matplotlib or seaborn to produce rasterized PNG images. Do NOT use altair, vega, vega-lite, or any library that produces JSON specs instead of rendered images. Always call plt.savefig() or equivalent to emit the image as inline output, then call plt.close() to free memory.\n\nSAVING FILES FOR DOWNLOAD: If the task asks you to save, export, or otherwise produce a file the user should download (e.g. a CSV, JSON, or text file), you MUST print its COMPLETE contents to stdout with print(), wrapped EXACTLY in these markers, each on its own line:\n${DATA_ANALYSIS_FILE_START_PREFIX}<filename>${DATA_ANALYSIS_FILE_MARKER_SUFFIX}\n<full file contents>\n${DATA_ANALYSIS_FILE_END_MARKER}\nUse a short, descriptive filename with the correct extension (e.g. seed_audience.csv). The platform captures everything between these markers and saves it to real, downloadable storage, then returns a working download link to the user. Do NOT invent, guess, fabricate, or report any download URL, S3 key, or file path yourself (e.g. a bare filename, an "https://...s3..." URL, or a "sandbox:/..." path) — the sandbox filesystem is discarded after execution and ANY such path will fail to download. Printing the contents between the markers above is the ONLY way to deliver a file to the user.`
       });
 
       // Call Gemini API directly via REST to enable code execution
@@ -6465,6 +6387,26 @@ export class AgentModeService {
         }
       );
 
+      // Shadow usage metering (Ship 1): direct REST call, so observe the
+      // usageMetadata off the already-resolved response. Fire-and-forget +
+      // fail-open — never awaited, never throws.
+      try {
+        const usageMetadata = (apiResponse.data as any)?.usageMetadata;
+        if (usageMetadata) {
+          void recordUsage({
+            userId,
+            model: modelName,
+            provider: 'gemini',
+            feature: 'agent_task',
+            inputTokens: usageMetadata.promptTokenCount || 0,
+            outputTokens: usageMetadata.candidatesTokenCount || 0,
+            cacheReadTokens: usageMetadata.cachedContentTokenCount || 0,
+          });
+        }
+      } catch {
+        // Metering must never break the call.
+      }
+
       // Extract and format the response
       const candidates = (apiResponse.data as any).candidates;
 
@@ -6481,9 +6423,23 @@ export class AgentModeService {
       // Extract parts from response
       const responseParts = candidates[0].content.parts || [];
 
+      // Generated-file download links collected from marked stdout/text blocks.
+      const fileLinks: string[] = [];
+
       for (const part of responseParts) {
         if (part.text) {
-          resultParts.push(`**Analysis:** ${part.text}`);
+          const { cleanedText, links } = await this.extractAndUploadAnalysisFiles(part.text, userId);
+          fileLinks.push(...links);
+          resultParts.push(`**Analysis:** ${cleanedText}`);
+        }
+        // Capture files the model printed to stdout via code execution. Gemini returns
+        // executed-code output in a codeExecutionResult / code_execution_result part;
+        // the marker protocol means generated file contents arrive here, not on disk.
+        const execResult = (part as any).codeExecutionResult || (part as any).code_execution_result;
+        if (execResult && typeof execResult.output === 'string') {
+          codeExecuted = true;
+          const { links } = await this.extractAndUploadAnalysisFiles(execResult.output, userId);
+          fileLinks.push(...links);
         }
         // Handle inline data (images/charts from code execution) (handle both camelCase and snake_case)
         if ((part as any).inlineData && (part as any).inlineData.data) {
@@ -6550,6 +6506,11 @@ export class AgentModeService {
         }
       }
 
+      // Surface real, downloadable links for any files the model generated.
+      if (fileLinks.length > 0) {
+        resultParts.push(`**Generated Files:**\n${fileLinks.join('\n')}`);
+      }
+
       if (resultParts.length === 0) {
         return {
           success: false,
@@ -6565,7 +6526,8 @@ export class AgentModeService {
         message: 'Data analysis completed successfully',
         analysis: analysisResult,
         codeExecuted: codeExecuted,
-        formattedContent: analysisResult
+        formattedContent: analysisResult,
+        fileUrls: fileLinks.length > 0 ? fileLinks : undefined
       };
 
     } catch (error) {
@@ -8098,24 +8060,28 @@ export class AgentModeService {
   public async getLeadLists(userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const { listLandingPages, getLandingPageLiveUrl } = await import('./v0Service');
+      const { listLandingPages, resolveLandingPageLiveUrl } = await import('./v0Service');
 
       const [lists, landingPages] = await Promise.all([
         crmDb.getLeadListsForUser(userId),
         listLandingPages(userId).catch(() => [] as any[])
       ]);
 
-      // Build map: leadListId → landing page info
+      // Build map: leadListId → landing page info. Resolve each URL against the
+      // domain actually attached to the Vercel project so a stale stored
+      // subdomain isn't surfaced (AW-CustomDomains is the source of truth).
       const pageByListId = new Map<string, { pageId: string; name: string; url: string }>();
-      for (const page of landingPages) {
-        if (page.leadListId) {
-          pageByListId.set(page.leadListId, {
-            pageId: page.id,
-            name: page.name || '',
-            url: getLandingPageLiveUrl(page)
-          });
-        }
-      }
+      const pagesWithLists = landingPages.filter((page: any) => page.leadListId);
+      const resolvedUrls = await Promise.all(
+        pagesWithLists.map((page: any) => resolveLandingPageLiveUrl(page))
+      );
+      pagesWithLists.forEach((page: any, idx: number) => {
+        pageByListId.set(page.leadListId, {
+          pageId: page.id,
+          name: page.name || '',
+          url: resolvedUrls[idx]
+        });
+      });
 
       return {
         success: true,
@@ -8173,7 +8139,7 @@ export class AgentModeService {
     try {
       const { crmDb } = await import('./db');
 
-      // Verify list ownership
+      // Verify list access
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
         return {
@@ -8183,7 +8149,8 @@ export class AgentModeService {
         };
       }
 
-      if (list.userId !== userId) {
+      const hasAccessAddLeads = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccessAddLeads) {
         return {
           success: false,
           message: 'Access denied',
@@ -9089,7 +9056,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied' };
       }
 
@@ -9151,7 +9119,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to delete leads from this list' };
       }
 
@@ -9200,7 +9169,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to delete leads from this list' };
       }
 
@@ -9372,7 +9342,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to modify this list' };
       }
 
@@ -9486,7 +9457,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to view this list' };
       }
 
@@ -9525,7 +9497,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to modify this list' };
       }
 
@@ -9568,7 +9541,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to delete this list' };
       }
 
@@ -9599,7 +9573,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
       }
 
@@ -9657,7 +9632,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
       }
 
@@ -10216,7 +10192,7 @@ ${emailDraftFormat === 'text'
       // Create message draft optimised for LinkedIn connection invites. The char limit
       // depends on the sending account tier: 300 for Premium, 200 for free. Resolve the
       // account the same way the send-invite route does (list-assigned → user's own).
-      const { linkedInOutreachService } = await import('./linkedInOutreachService');
+      const { linkedInOutreachService, LinkedInOutreachService } = await import('./linkedInOutreachService');
       const inviteAccountId = (list as any)?.linkedInAccountId
         || await linkedInOutreachService.resolveUserOwnedAccountId(userId);
       const inviteCharLimit = inviteAccountId
@@ -10280,13 +10256,22 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         messageData = null;
       }
 
-      // Create message draft object if we got valid data — hard-cap at the account's
-      // LinkedIn invite limit (300 Premium / 200 free).
+      // Create message draft object if we got valid data — smart-trim to the account's
+      // LinkedIn invite limit (300 Premium / 200 free) on a word boundary (surrogate-safe),
+      // matching what sendInvitation does at send time — never a crude mid-word cut.
       let messageDraft = null;
       if (messageData && messageData.content) {
         const now = new Date().toISOString();
+        let noteText = String(messageData.content);
+        // Layer 2: if the draft exceeds the account limit, ask the model to rewrite it
+        // shorter (capped), then Layer 3 hard-trims on a sentence/word boundary as the
+        // guarantee — same trimInviteMessage() the inline send path uses, kept consistent.
+        if (noteText.length > inviteCharLimit) {
+          const { shortenInviteNoteToLimit } = await import('./inviteNoteShortener');
+          noteText = await shortenInviteNoteToLimit(geminiClient, noteText, inviteCharLimit, 2);
+        }
         messageDraft = {
-          content: String(messageData.content).slice(0, inviteCharLimit),
+          content: LinkedInOutreachService.trimInviteMessage(noteText, inviteCharLimit),
           createdAt: now,
           updatedAt: now,
           sessionId: sessionId
@@ -13782,6 +13767,188 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
+   * Mutating Meta Ads actions that publish, change, or destroy live entities and
+   * therefore require an explicit target confirmation before they execute.
+   * Read-only actions (LIST, SEARCH, GET_MATCH_QUALITY, UPLOAD_IMAGE/VIDEO) are excluded —
+   * they don't publish to a campaign or destroy anything.
+   */
+  private static META_WRITE_ACTIONS: Record<string, string[]> = {
+    CAMPAIGN: ['CREATE', 'UPDATE', 'DELETE'],
+    AD_SET: ['CREATE', 'UPDATE', 'DELETE'],
+    AD: ['CREATE', 'UPDATE', 'DELETE', 'COPY_AD'],
+    // Account-level assets. CREATE publishes a creative; UPLOAD_USERS pushes PII
+    // user data to Meta. UPLOAD_IMAGE/UPLOAD_VIDEO only stage assets (no publish),
+    // and LIST is read-only — none of those need confirmation.
+    AD_CREATIVE: ['CREATE'],
+    CUSTOM_AUDIENCE: ['CREATE', 'UPLOAD_USERS']
+  };
+
+  private static isMetaWriteAction(entity_type: string, action: string): boolean {
+    return (AgentModeService.META_WRITE_ACTIONS[entity_type] || []).includes(action);
+  }
+
+  /**
+   * Loop halt seam for the human-in-the-loop confirmation gate. Scans one iteration's
+   * tool results and returns the user-facing prompt to surface (or null to continue).
+   * Only tool results that set `awaitingUserConfirmation === true` halt the turn — this
+   * is a dedicated flag (NOT `requiresConfirmation`), so destructive flows that merely
+   * set `requiresConfirmation` (delete_leads_by_filter, work-plan replace) are unaffected.
+   * When the loop halts, control returns to the user; the model cannot self-approve.
+   */
+  private collectConfirmationPrompt(
+    toolResults: Array<{ status: 'success' | 'error'; result?: any }>
+  ): string | null {
+    const items: Array<{ prompt: string; detail: string }> = [];
+    for (const tr of toolResults) {
+      if (tr.status !== 'success') continue;
+      const r: any = tr.result;
+      if (r && r.awaitingUserConfirmation === true) {
+        items.push({
+          prompt: r.confirmationPrompt || r.summary || r.message || 'Please confirm this action before I proceed.',
+          // `confirmationDetail` is the per-item body (summary + any thumbnails) WITHOUT
+          // the intro/footer, so batched confirmations don't repeat the boilerplate.
+          detail: r.confirmationDetail || r.confirmationPrompt || r.summary || 'this action'
+        });
+      }
+    }
+    if (items.length === 0) return null;
+    // Single action: use its standalone prompt as-is.
+    if (items.length === 1) return items[0].prompt;
+    // Multiple actions batched in one turn (e.g. "edit these two images"): one intro,
+    // each target listed once, one footer — instead of repeating the full wrapper N times.
+    return `Based on your request, here are the ${items.length} changes I'm about to make — ` +
+      `please review each target before I proceed:\n\n` +
+      items.map((i, n) => `${n + 1}. ${i.detail}`).join('\n\n') +
+      `\n\nReply "yes" / "confirm" to proceed with all of these, or tell me what to change.`;
+  }
+
+  /**
+   * Resolve the exact target of a mutating Meta Ads action into a human-readable
+   * preview so the agent can echo it back and get explicit user confirmation
+   * BEFORE anything is published, changed, or deleted. This is the guardrail that
+   * stops the agent acting on an ambiguous target (e.g. publishing an ad into the
+   * wrong campaign). ID→name lookups degrade gracefully to the raw ID if Meta is
+   * unreachable — confirmation must still be required even when resolution fails.
+   */
+  private async buildMetaWriteConfirmation(
+    userId: string,
+    entity_type: string,
+    action: string,
+    account_id: string,
+    campaign_id: string | undefined,
+    ad_set_id: string | undefined,
+    ad_id: string | undefined,
+    params: any
+  ): Promise<{ summary: string; target: Record<string, any> }> {
+    let accessToken = '';
+    try {
+      ({ accessToken } = await this.getMetaCredentials(userId, account_id));
+    } catch {
+      // Credential failure surfaces during execution; still require confirmation here.
+    }
+
+    const target: Record<string, any> = { entity_type, action, account_id };
+    const lines: string[] = [];
+
+    // Best-effort resolvers — each guarded so a Meta lookup failure never blocks the gate.
+    const resolveCampaign = async (id?: string) => {
+      if (!id || !accessToken) return undefined;
+      try { return await metaService.getCampaign(account_id, accessToken, id); } catch { return undefined; }
+    };
+    const resolveAdSet = async (id?: string) => {
+      if (!id || !accessToken) return undefined;
+      try { return await metaService.getAdSet(accessToken, id); } catch { return undefined; }
+    };
+    const resolveAd = async (id?: string) => {
+      if (!id || !accessToken) return undefined;
+      try { return await metaService.getAd(accessToken, id); } catch { return undefined; }
+    };
+    const nameOf = (entity: any, id?: string) =>
+      entity?.name ? `"${entity.name}" (${entity.id || id})` : (id ? `ID ${id}` : 'unknown');
+
+    if (entity_type === 'CAMPAIGN') {
+      if (action === 'CREATE') {
+        target.campaign_name = params.name;
+        target.objective = params.objective;
+        lines.push(`Create a NEW campaign "${params.name}" (objective: ${params.objective || 'unspecified'}) in ad account ${account_id}.`);
+      } else {
+        const campaign = await resolveCampaign(campaign_id);
+        target.campaign = nameOf(campaign, campaign_id);
+        target.campaign_id = campaign_id;
+        lines.push(`${action} campaign ${target.campaign} in ad account ${account_id}.`);
+      }
+    } else if (entity_type === 'AD_SET') {
+      if (action === 'CREATE') {
+        const campaign = await resolveCampaign(campaign_id);
+        target.campaign = nameOf(campaign, campaign_id);
+        target.ad_set_name = params.name;
+        lines.push(`Create a NEW ad set "${params.name}" UNDER campaign ${target.campaign} (ad account ${account_id}).`);
+      } else {
+        const adSet = await resolveAdSet(ad_set_id);
+        const campaign = await resolveCampaign(adSet?.campaign_id);
+        target.ad_set = nameOf(adSet, ad_set_id);
+        target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
+        lines.push(`${action} ad set ${target.ad_set}${target.campaign ? ` (in campaign ${target.campaign})` : ''}.`);
+      }
+    } else if (entity_type === 'AD') {
+      if (action === 'CREATE') {
+        const adSet = await resolveAdSet(ad_set_id);
+        const campaign = await resolveCampaign(adSet?.campaign_id);
+        target.ad_name = params.name;
+        target.ad_set = nameOf(adSet, ad_set_id);
+        target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
+        lines.push(`Publish a NEW ad "${params.name}" into ad set ${target.ad_set}${target.campaign ? `, which belongs to campaign ${target.campaign}` : ''} (ad account ${account_id}).`);
+      } else if (action === 'COPY_AD') {
+        const sourceAd = await resolveAd(ad_id);
+        const targetAdSetId = params.adset_id || sourceAd?.adset_id;
+        const adSet = await resolveAdSet(targetAdSetId);
+        const campaign = await resolveCampaign(adSet?.campaign_id);
+        target.source_ad = nameOf(sourceAd, ad_id);
+        target.target_ad_set = nameOf(adSet, targetAdSetId);
+        target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
+        lines.push(`Copy ad ${target.source_ad} into ad set ${target.target_ad_set}${target.campaign ? `, which belongs to campaign ${target.campaign}` : ''}.`);
+      } else {
+        const ad = await resolveAd(ad_id);
+        const adSet = await resolveAdSet(ad?.adset_id);
+        const campaign = await resolveCampaign(ad?.campaign_id);
+        target.ad = nameOf(ad, ad_id);
+        target.ad_set = adSet ? nameOf(adSet, ad?.adset_id) : undefined;
+        target.campaign = campaign ? nameOf(campaign, ad?.campaign_id) : undefined;
+        const ctx = [
+          target.ad_set ? `ad set ${target.ad_set}` : undefined,
+          target.campaign ? `campaign ${target.campaign}` : undefined
+        ].filter(Boolean).join(', ');
+        lines.push(`${action} ad ${target.ad}${ctx ? ` (in ${ctx})` : ''}.`);
+      }
+    } else if (entity_type === 'AD_CREATIVE') {
+      // Account-level asset (CREATE only — uploads/list are not gated).
+      target.creative_name = params.name;
+      lines.push(`Create a NEW ad creative${params.name ? ` "${params.name}"` : ''} in ad account ${account_id}.`);
+    } else if (entity_type === 'CUSTOM_AUDIENCE') {
+      if (action === 'UPLOAD_USERS') {
+        target.audience_id = params.id;
+        lines.push(`Upload user data (PII) to custom audience ID ${params.id} in ad account ${account_id}.`);
+      } else {
+        target.audience_name = params.name;
+        target.subtype = params.subtype;
+        lines.push(`Create a NEW ${params.subtype ? `${params.subtype} ` : ''}custom audience "${params.name}" in ad account ${account_id}.`);
+      }
+    }
+
+    // Surface content/destination changes so the user can catch a wrong-asset edit.
+    const contentChanges: Record<string, any> = {};
+    for (const key of ['link_url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'status', 'daily_budget', 'lifetime_budget', 'creative_id', 'placement_assets']) {
+      if (params[key] !== undefined) contentChanges[key] = params[key];
+    }
+    if (Object.keys(contentChanges).length > 0) {
+      target.changes = contentChanges;
+      lines.push(`Changes: ${Object.keys(contentChanges).join(', ')}.`);
+    }
+
+    return { summary: lines.join(' '), target };
+  }
+
+  /**
    * Master method for calling Meta Marketing API.
    * Routes the request to the appropriate entity manager based on entity_type.
    */
@@ -13810,6 +13977,44 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         error: 'PARAM_VALIDATION_ERROR',
         hint: 'Fix the listed parameters and retry.'
       } as any;
+    }
+
+    // Target-confirmation guardrail for mutating actions (publish/change/delete).
+    // The agent must echo the resolved target back to the user and re-call with
+    // confirm=true. This prevents acting on an ambiguous target (e.g. publishing
+    // an ad into the wrong campaign or editing the wrong asset). `confirm` is a
+    // gate-only flag and is stripped before dispatch so it never reaches Meta.
+    const confirmed = params.confirm === true;
+    if (AgentModeService.isMetaWriteAction(entity_type, action) && !confirmed) {
+      const { summary, target } = await this.buildMetaWriteConfirmation(
+        userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
+      );
+      // `awaitingUserConfirmation` + `confirmationPrompt` are consumed by the agent loop
+      // (collectConfirmationPrompt) to HALT the turn and surface the prompt to the user.
+      // The turn cannot continue until a NEW human message arrives — the model cannot
+      // self-approve. `message` keeps the model-facing instructions for the resumed turn.
+      return {
+        success: true,
+        requiresConfirmation: true,
+        awaitingUserConfirmation: true,
+        summary,
+        confirmationPrompt:
+          `Based on your request, here's the exact Meta Ads change I'm about to make — ` +
+          `please check it's the right target before I proceed:\n\n${summary}\n\n` +
+          `Reply "yes" / "confirm" if this is correct, or tell me what to change ` +
+          `(for example, a different campaign, ad set, or asset).`,
+        // Per-item body (no intro/footer) used when several writes are batched in one turn.
+        confirmationDetail: summary,
+        message: `Confirm this Meta Ads ${entity_type} ${action} before it runs: ${summary} ` +
+          `Show the user the exact target above (campaign / ad set / asset) and get explicit approval. ` +
+          `If more than one campaign or asset could match the request, ask the user to disambiguate first. ` +
+          `Once approved, call call_meta_marketing_api again with the same arguments plus params.confirm=true.`,
+        target
+      } as any;
+    }
+    if ('confirm' in params) {
+      params = { ...params };
+      delete params.confirm;
     }
 
     switch (entity_type) {
@@ -16451,11 +16656,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   };
 
   trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
-    // Find indices of all tool-role messages
+    // Single linear scan: collect tool-role indices and map each tool_call_id to
+    // the index of its (first) resolving tool message. This map replaces the
+    // original per-assistant nested forward scan (O(n^2) per call) with O(1)
+    // lookups below, which was the originally-reported defect. The scan is
+    // recomputed every call against the live array, so it is correct on every
+    // path — including the install_skills splice/reorder in
+    // updateConversationContext, which mutates this same array reference in place.
     const toolIndices: number[] = [];
+    const toolIdToIndex = new Map<string, number>();
     for (let i = 0; i < messages.length; i++) {
       if (messages[i].role === 'tool') {
         toolIndices.push(i);
+        const tcid = messages[i].tool_call_id;
+        if (tcid !== undefined && !toolIdToIndex.has(tcid)) toolIdToIndex.set(tcid, i);
       }
     }
 
@@ -16464,21 +16678,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // Most recent N tool results: keep at full size
     const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
 
-    // Track which assistant messages are "old" (all their tool_calls have been resolved
-    // and are not in the preserve set). We identify these to trim large argument fields.
+    // Track which assistant messages are "old" (none of their tool_calls resolve
+    // to a preserved tool result after them). We trim large argument fields on these.
+    // The precomputed tool_call_id -> index map replaces the original per-assistant
+    // forward scan with O(1) lookups, eliminating the nested loop while preserving
+    // the exact predicate: a resolving tool result must exist, sit at an index > i,
+    // and be in preserveSet for the assistant to be considered "recent" (not old).
     const oldAssistantIndices = new Set<number>();
     for (let i = 0; i < messages.length; i++) {
       const msg = messages[i];
       if (msg.role === 'assistant' && msg.tool_calls?.length) {
-        // Find the tool result indices for this assistant message's tool calls
-        const toolCallIds = new Set(msg.tool_calls.map((tc: any) => tc.id));
         let allOld = true;
-        for (let j = i + 1; j < messages.length; j++) {
-          if (messages[j].role === 'tool' && toolCallIds.has(messages[j].tool_call_id)) {
-            if (preserveSet.has(j)) {
-              allOld = false;
-              break;
-            }
+        for (const tc of msg.tool_calls) {
+          const resolvedIdx = toolIdToIndex.get(tc.id);
+          if (resolvedIdx !== undefined && resolvedIdx > i && preserveSet.has(resolvedIdx)) {
+            allOld = false;
+            break;
           }
         }
         if (allOld) {
@@ -17327,8 +17542,42 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     userId: string,
     sessionId: string,
     imageModel?: string,
-    logoImage?: string
+    logoImage?: string,
+    confirm?: boolean
   ): Promise<any> {
+    // Human-in-the-loop gate for image EDITING (inputImages present). Editing the
+    // wrong source images is the wrong-set mistake from the satisfaction incident,
+    // so before regenerating/editing existing images we surface the exact source
+    // image(s) to the user (rendered as thumbnails via markdown) and wait for
+    // explicit approval. Text-to-image (no inputImages) is fresh creation and is
+    // NOT gated. The agent loop halts on `awaitingUserConfirmation`; on approval the
+    // model re-calls with confirm=true. `confirm` never reaches the image service.
+    if (Array.isArray(inputImages) && inputImages.length > 0 && confirm !== true) {
+      const thumbs = inputImages.map((url, i) => `![source image ${i + 1}](${url})`).join('\n');
+      const summary = `Edit/regenerate ${inputImages.length} existing image(s) and save the result as "${filename}".`;
+      return {
+        success: true,
+        requiresConfirmation: true,
+        awaitingUserConfirmation: true,
+        summary,
+        confirmationPrompt:
+          `Based on your request, here's the image edit I'm about to make — ` +
+          `please check these are the right source image(s) before I proceed:\n\n` +
+          `${summary}\n\n${thumbs}\n\n` +
+          `Reply "yes" / "confirm" to go ahead, or tell me which image(s) to use instead.`,
+        // Per-item body (no intro/footer) used when several edits are batched in one turn.
+        confirmationDetail: `${summary}\n\n${thumbs}`,
+        // Model-facing instruction for the resumed turn (mirrors the Meta gate): once
+        // the user approves the shown source image(s), re-call generate_image with the
+        // SAME arguments plus confirm=true. If the user names different images, edit
+        // those instead (which will re-confirm).
+        message: `Image edit requires user confirmation: ${summary} The source image(s) have been shown to the user. ` +
+          `Do NOT proceed until the user approves. Once approved, call generate_image again with the same arguments plus confirm=true. ` +
+          `If the user asks for different source images, use those instead.`,
+        target: { action: 'EDIT_IMAGE', filename, inputImages }
+      } as any;
+    }
+
     try {
       // Import the image generation service
       const { imageService } = await import('./imageGeneration');
@@ -17769,7 +18018,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       } else if (!finalFilename.endsWith('.png')) {
         // Ensure .png extension
-        const nameWithoutExt = finalFilename.substring(0, finalFilename.lastIndexOf('.') || finalFilename.length);
+        const dotIndex = finalFilename.lastIndexOf('.');
+        const nameWithoutExt = dotIndex > 0 ? finalFilename.substring(0, dotIndex) : finalFilename;
         finalFilename = `${nameWithoutExt}.png`;
       }
 
@@ -17810,6 +18060,174 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to remove C2PA metadata from image',
+        error: error.message
+      };
+    }
+  }
+
+  /**
+   * Remove a solid/near-solid background from an image, producing a genuine
+   * transparent-alpha PNG WITHOUT redrawing the artwork, and upload it to S3.
+   *
+   * This is the correct tool for "make this logo transparent" / "put this logo
+   * on a different colored background". It operates on the original pixels
+   * (edge-seeded flood fill), so the brand mark — its exact letters, shapes and
+   * colors — is preserved byte-for-byte; only the background becomes alpha=0.
+   *
+   * Optionally validates foreground/background contrast: if `surfaceColor`
+   * (the hex color of the surface the logo will sit on, e.g. a dark header) is
+   * provided, the result includes a WCAG contrast ratio and a warning when the
+   * logo would be hard to read on that surface (e.g. a dark wordmark on a dark
+   * header). This guards against the "black logo on dark purple" mistake.
+   */
+  public async removeImageBackground(
+    imageUrl: string,
+    filename?: string,
+    userId?: string,
+    options?: { tolerance?: number; surfaceColor?: string }
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Removing background from image:', imageUrl);
+
+      if (!imageUrl) {
+        return {
+          success: false,
+          message: 'Image URL is required',
+          error: 'missing_image_url'
+        };
+      }
+
+      const axios = require('axios');
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const { imageService, ImageService } = await import('./imageGeneration');
+
+      // Download the image (supports data URLs and HTTP(S) URLs).
+      let imageBuffer: Buffer;
+      if (imageUrl.startsWith('data:image/')) {
+        const base64Data = imageUrl.split(',')[1];
+        imageBuffer = Buffer.from(base64Data, 'base64');
+      } else {
+        const response = await axios.get(imageUrl, {
+          responseType: 'arraybuffer',
+          timeout: 30000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (compatible; AgentWeb/1.0)'
+          }
+        });
+        imageBuffer = Buffer.from(response.data);
+      }
+
+      const { buffer, detectedBackground, removedRatio } = await imageService.removeImageBackground(
+        imageBuffer,
+        { tolerance: options?.tolerance }
+      );
+
+      // Generate filename if not provided; always output PNG (alpha requires it).
+      let finalFilename = filename;
+      if (!finalFilename) {
+        try {
+          const urlObj = new URL(imageUrl);
+          const pathParts = urlObj.pathname.split('/');
+          const urlFilename = pathParts[pathParts.length - 1];
+          if (urlFilename && urlFilename.includes('.')) {
+            const nameWithoutExt = urlFilename.substring(0, urlFilename.lastIndexOf('.'));
+            finalFilename = `${nameWithoutExt}_transparent.png`;
+          } else {
+            finalFilename = `image_transparent_${Date.now()}.png`;
+          }
+        } catch {
+          finalFilename = `image_transparent_${Date.now()}.png`;
+        }
+      } else if (!finalFilename.endsWith('.png')) {
+        const dotIndex = finalFilename.lastIndexOf('.');
+        const nameWithoutExt = dotIndex > 0 ? finalFilename.substring(0, dotIndex) : finalFilename;
+        finalFilename = `${nameWithoutExt}.png`;
+      }
+
+      if (!userId) {
+        return {
+          success: false,
+          message: 'User ID is required for S3 upload',
+          error: 'missing_user_id'
+        };
+      }
+
+      const uploadResult = await uploadFileToS3(
+        buffer,
+        finalFilename,
+        userId,
+        'image/png'
+      );
+
+      if (!uploadResult.success || !uploadResult.url) {
+        return {
+          success: false,
+          message: uploadResult.error || 'Failed to upload transparent image to S3',
+          error: uploadResult.error || 's3_upload_failed'
+        };
+      }
+
+      // Optional foreground/background contrast check against the target surface.
+      let contrast: any = undefined;
+      if (options?.surfaceColor) {
+        const surface = ImageService.parseHexColor(options.surfaceColor);
+        if (!surface) {
+          contrast = {
+            surfaceColor: options.surfaceColor,
+            warning: `Could not parse surfaceColor "${options.surfaceColor}" as a hex color; skipped contrast check.`
+          };
+        } else {
+          // Re-read the transparent PNG's opaque pixels to estimate the logo's color.
+          // Wrapped in its own try/catch: the image was already uploaded
+          // successfully, so a failure here should only drop the contrast info,
+          // not fail the whole operation.
+          try {
+            const sharp = require('sharp');
+            const { data, info } = await sharp(buffer).raw().toBuffer({ resolveWithObject: true });
+            const fg = ImageService.averageOpaqueColor(data, (info as any).channels);
+            if (fg) {
+              const ratio = ImageService.contrastRatio(fg, surface);
+              const legible = ratio >= 3; // WCAG AA for large text / graphical objects
+              contrast = {
+                surfaceColor: options.surfaceColor,
+                foregroundColor: `rgb(${fg.r}, ${fg.g}, ${fg.b})`,
+                ratio: Math.round(ratio * 100) / 100,
+                legible,
+                ...(legible
+                  ? {}
+                  : {
+                      warning:
+                        `⚠️ Low contrast (${Math.round(ratio * 100) / 100}:1, below the 3:1 minimum): the logo's ` +
+                        `average color rgb(${fg.r}, ${fg.g}, ${fg.b}) may be hard to read on surface ${options.surfaceColor}. ` +
+                        `Consider an all-white or all-dark variant of the logo to match this surface.`
+                    })
+              };
+            }
+          } catch (contrastError: any) {
+            console.warn('AgentMode: contrast check failed (image still uploaded):', contrastError?.message);
+          }
+        }
+      }
+
+      return {
+        success: true,
+        message:
+          `✅ Background removed — genuine transparent-alpha PNG produced (original artwork preserved). ` +
+          `Detected background rgb(${detectedBackground.r}, ${detectedBackground.g}, ${detectedBackground.b}); ` +
+          `${Math.round(removedRatio * 100)}% of pixels made transparent.` +
+          (contrast?.warning ? ` ${contrast.warning}` : ''),
+        imageUrl: uploadResult.url,
+        filename: finalFilename,
+        originalUrl: imageUrl,
+        detectedBackground,
+        removedRatio,
+        ...(contrast ? { contrast } : {})
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error removing background from image:', error);
+      return {
+        success: false,
+        message: 'Failed to remove background from image',
         error: error.message
       };
     }
@@ -18227,514 +18645,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         bodyHtml = styleBlocks.join('\n') + '\n' + bodyHtml;
       }
 
-      // Extract image filename from URL
-      let imageFilename: string | undefined;
-      if (heroImageUrl) {
-        const urlParts = heroImageUrl.split('/');
-        imageFilename = urlParts[urlParts.length - 1];
-      }
-
-      // Step 3: Get user's CMS type
-      const { userDb } = await import('./db');
-      const user = await userDb.getUserById(userId);
-
-      if (!user) {
-        throw new Error('User not found');
-      }
-
-      const cmsType = user.cmsType;
-
-      if (!cmsType) {
-        return {
-          success: false,
-          message: 'CMS Type is not configured for this user. Please contact an administrator to set up CMS publishing.',
-          error: 'CMS Type not configured'
-        };
-      }
-
-      console.log('AgentMode: User CMS Type:', cmsType);
-
-      // Step 4: Publish to CMS
-      // Only Webflow is supported for publish_blog_article function
-      if (cmsType === 'Webflow') {
-        const { getWebflowConfig } = await import('../controllers/blog');
-        const { apiToken, siteId, collectionId, fieldMappings, categories: categoryMapping } = await getWebflowConfig(userId);
-
-        // Call Webflow publishing
-        const axios = (await import('axios')).default;
-        const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-
-        // Use different field names based on whether we're using live endpoint or draft endpoint
-        const cmsItemData: any = {
-          fieldData: {
-            name: title,
-            slug: slug,
-          }
-        };
-
-        // For draft endpoint, use _archived and _draft
-        // For live endpoint, use isArchived and isDraft
-        if (status === 'draft') {
-          cmsItemData.fieldData._archived = false;
-          cmsItemData.fieldData._draft = true;
-        } else {
-          cmsItemData.isArchived = false;
-          cmsItemData.isDraft = false;
-        }
-
-        // Use body HTML directly for Webflow
-        // Webflow API may strip HTML tags if newlines are present, so remove them
-        const cleanBodyHtml = bodyHtml.replace(/\n/g, '').replace(/\r/g, '');
-
-        if (fieldMappings?.summary) {
-          cmsItemData.fieldData[fieldMappings.summary] = description;
-        }
-
-        if (fieldMappings?.body) {
-          cmsItemData.fieldData[fieldMappings.body] = cleanBodyHtml;
-        }
-
-        if (heroImageUrl && fieldMappings?.image) {
-          cmsItemData.fieldData[fieldMappings.image] = heroImageUrl;
-        }
-
-        // Add author if provided (use fieldMapping or default to 'author')
-        if (author) {
-          const authorField = fieldMappings?.author || 'author';
-          cmsItemData.fieldData[authorField] = author;
-        }
-
-        // Add categories - use fieldMapping or default to 'categories'
-        // Detect if field is single reference (singular name) or multi-reference (plural name)
-        // Convert category names to IDs using the mapping from secrets manager
-        const categoryField = fieldMappings?.category || 'categories';
-
-        // Detect if this is a single reference or multi-reference field
-        // Single reference: field name is singular (e.g., "category", "tag")
-        // Multi-reference: field name is plural (e.g., "categories", "tags")
-        const isSingleReference = !categoryField.endsWith('ies') && !categoryField.endsWith('s');
-
-        console.log(`AgentMode: Category field "${categoryField}" detected as ${isSingleReference ? 'single reference' : 'multi-reference'}`);
-
-        let categoryIds: string[] = [];
-        const invalidCategories: string[] = [];
-
-        // Check if category mapping is required but not configured
-        if (categories && categories.length > 0 && !categoryMapping) {
-          const availableCategories: string[] = [];
-          return {
-            success: false,
-            message: 'Category mapping is not configured in secrets manager. Please configure the "categories" field in your Webflow secrets with category name-to-ID mappings.',
-            error: 'Categories mapping required but not configured',
-            invalidCategories: categories,
-            availableCategories: availableCategories
-          };
-        }
-
-        if (categories && categories.length > 0 && categoryMapping) {
-          // Map category names to IDs
-          categoryIds = categories
-            .map(name => {
-              const id = categoryMapping[name];
-              if (!id) {
-                console.warn(`AgentMode: Category name "${name}" not found in mapping, skipping`);
-                invalidCategories.push(name);
-                return null;
-              }
-              return id;
-            })
-            .filter((id): id is string => id !== null);
-
-          // If all provided categories are invalid, return error immediately
-          if (categories.length > 0 && categoryIds.length === 0) {
-            const availableCategories = Object.keys(categoryMapping);
-            return {
-              success: false,
-              message: `All provided category names are invalid: ${invalidCategories.join(', ')}. Available categories: ${availableCategories.join(', ')}`,
-              error: 'Invalid category names',
-              invalidCategories: invalidCategories,
-              availableCategories: availableCategories
-            };
-          }
-        }
-
-        // Set the field value based on reference type
-        if (isSingleReference) {
-          // Single reference: use only the first category ID
-          cmsItemData.fieldData[categoryField] = categoryIds.length > 0 ? categoryIds[0] : '';
-          if (categoryIds.length > 1) {
-            console.warn(`AgentMode: Field "${categoryField}" is a single reference but ${categoryIds.length} categories provided. Using only the first one: ${categoryIds[0]}`);
-          }
-        } else {
-          // Multi-reference: use array of category IDs
-          cmsItemData.fieldData[categoryField] = categoryIds;
-        }
-
-        // Log warning if some categories were invalid but others were valid
-        if (invalidCategories.length > 0 && categoryIds.length > 0) {
-          const availableCategories = categoryMapping ? Object.keys(categoryMapping) : [];
-          console.warn(`AgentMode: Some invalid categories were skipped: ${invalidCategories.join(', ')}. Valid categories: ${availableCategories.join(', ')}`);
-        }
-
-        // Validate: if status is published, categories cannot be empty
-        if (status === 'published' && categoryIds.length === 0) {
-          const availableCategories = categoryMapping ? Object.keys(categoryMapping) : [];
-
-          const fieldType = isSingleReference ? 'category (single reference)' : 'categories (multi-reference)';
-          let errorMessage = `Cannot publish article without ${fieldType}. Please provide at least one category when status is "published".`;
-
-          // If invalid categories were provided, mention them
-          if (invalidCategories.length > 0) {
-            errorMessage = `Invalid category names provided: ${invalidCategories.join(', ')}.`;
-          }
-
-          // Add available categories to the message
-          if (availableCategories.length > 0) {
-            errorMessage += ` Available categories: ${availableCategories.join(', ')}`;
-          } else {
-            errorMessage += ' No category mapping found in configuration.';
-          }
-
-          // Add note about single reference if applicable
-          if (isSingleReference && categories.length > 1) {
-            errorMessage += ` Note: Field "${categoryField}" is a single reference - only the first valid category will be used.`;
-          }
-
-          return {
-            success: false,
-            message: errorMessage,
-            error: 'Categories required for published articles',
-            invalidCategories: invalidCategories,
-            availableCategories: availableCategories,
-            fieldType: isSingleReference ? 'single-reference' : 'multi-reference'
-          };
-        }
-
-        const headers = {
-          Authorization: `Bearer ${apiToken}`,
-          'Content-Type': 'application/json',
-          'accept-version': '2.0.0'
-        };
-
-        // Use /items/live endpoint for published articles, /items for drafts
-        // Note: The live endpoint uses /collections/{id}/items/live (without /sites/ prefix)
-        // while the draft endpoint uses /sites/{siteId}/collections/{id}/items
-        const endpoint = status === 'published'
-          ? `https://api.webflow.com/v2/collections/${collectionId}/items/live?skipInvalidFiles=true`
-          : `https://api.webflow.com/v2/sites/${siteId}/collections/${collectionId}/items`;
-
-        console.log(`AgentMode: Publishing to Webflow ${status === 'published' ? 'live' : 'draft'} endpoint: ${endpoint}`);
-
-        // Publish to Payload CMS instead of Webflow
-        let payloadEndpoint = 'https://www.agentweb.pro/api/publish-post';
-        let payloadSecret: string | undefined;
-
-        try {
-          const env = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-          const payloadSecretJson = await getSecret(`${env}/AgentWeb/PayloadCMS`);
-          if (payloadSecretJson) {
-            const parsed = JSON.parse(payloadSecretJson);
-            payloadEndpoint = parsed.PAYLOAD_PUBLISH_ENDPOINT || payloadEndpoint;
-            payloadSecret = parsed.PAYLOAD_PUBLISH_SECRET;
-          }
-        } catch (secretErr) {
-          console.warn('AgentMode: Could not load PayloadCMS secret, falling back to Webflow:', secretErr);
-        }
-
-        if (!payloadSecret) {
-          console.warn('AgentMode: PAYLOAD_PUBLISH_SECRET not available, falling back to Webflow');
-        }
-
-        try {
-          if (payloadSecret) {
-            // Map Webflow categories to Payload categories
-            const categoryMap: Record<string, string> = {
-              'AI in Marketing': 'AI in Marketing',
-              'Founder Playbooks': 'Founder Playbooks',
-              'Growth Tips': 'Growth Tips',
-              'Thought Leadership': 'Thought Leadership',
-              'Other': 'Other',
-              'Alternatives': 'Alternatives',
-              'Listicles': 'Listicles',
-              'User Guide': 'User Guide',
-              'Case Studies': 'Case Studies',
-            };
-            const payloadCategory = categories.length > 0
-              ? (categoryMap[categories[0]] || 'Other')
-              : 'Other';
-
-            // Map author to Payload author slug
-            const authorSlug = author?.toLowerCase().includes('rui') ? 'rui'
-              : author?.toLowerCase().includes('harsha') ? 'harsha'
-              : author?.toLowerCase().includes('fangfang') ? 'fangfang'
-              : author?.toLowerCase().includes('matthew') ? 'matthew'
-              : 'emma';
-
-            const payloadResponse = await axios.post(
-              payloadEndpoint,
-              {
-                title,
-                slug,
-                summary: description,
-                bodyHtml: cleanBodyHtml,
-                category: payloadCategory,
-                author: authorSlug,
-                featuredImageUrl: heroImageUrl,
-                publishedAt: new Date().toISOString(),
-                status,
-              },
-              {
-                headers: { 'Authorization': `Bearer ${payloadSecret}` },
-                timeout: 30000,
-              }
-            );
-
-            console.log(`AgentMode: Blog article published successfully to Payload CMS as ${status}`);
-
-            return {
-              success: true,
-              message: `Blog article published successfully to Payload CMS as ${status}`,
-              data: {
-                title,
-                slug,
-                status,
-                cmsType: 'Payload',
-                url: `/blog/${slug}`,
-                cmsResponse: payloadResponse.data,
-              }
-            };
-          }
-
-          // Fallback to Webflow if no Payload secret
-          const response = await axios.post(
-            endpoint,
-            cmsItemData,
-            { headers }
-          );
-
-          console.log(`AgentMode: Blog article published successfully to Webflow as ${status} (fallback)`);
-
-          // Sanitize response to remove large content fields before sending to LLM
-          const responseData = response.data as any;
-          const sanitizedResponse = responseData && typeof responseData === 'object'
-            ? { ...responseData }
-            : responseData;
-
-          if (sanitizedResponse && sanitizedResponse.fieldData && typeof sanitizedResponse.fieldData === 'object') {
-            const sanitizedFieldData = { ...sanitizedResponse.fieldData };
-            delete sanitizedFieldData['post-body'];
-            delete sanitizedFieldData['body'];
-            sanitizedResponse.fieldData = sanitizedFieldData;
-          }
-
-          return {
-            success: true,
-            message: `Blog article published successfully to Webflow as ${status}`,
-            data: {
-              title,
-              status,
-              cmsType: 'Webflow',
-              cmsResponse: sanitizedResponse
-            }
-          };
-        } catch (webflowError: any) {
-          // Extract detailed error information
-          const errorInfo: any = {
-            status: webflowError.response?.status,
-            statusText: webflowError.response?.statusText,
-          };
-
-          if (webflowError.response?.data) {
-            const errorData = webflowError.response.data;
-
-            if (errorData.message) {
-              errorInfo.message = errorData.message;
-            }
-
-            // Extract validation error details
-            if (errorData.details && Array.isArray(errorData.details)) {
-              errorInfo.details = errorData.details;
-              const detailMessages = errorData.details
-                .map((d: any) => `${d.param}: ${d.description}`)
-                .join('; ');
-              if (detailMessages) {
-                errorInfo.message = `${errorInfo.message || 'Validation Error'}. ${detailMessages}`;
-              }
-            }
-          }
-
-          // Add available categories to error response so LLM knows what to use
-          const availableCategories = categoryMapping ? Object.keys(categoryMapping) : [];
-          if (availableCategories.length > 0) {
-            errorInfo.message = `${errorInfo.message || 'Webflow API error'}. Available categories: ${availableCategories.join(', ')}`;
-            errorInfo.availableCategories = availableCategories;
-          }
-
-          // If error is related to file size, suggest using repair_blog_article
-          if (errorInfo.message && (
-            errorInfo.message.includes('File size limit') ||
-            errorInfo.message.includes('failed to import') ||
-            errorInfo.message.includes('image') && errorInfo.message.includes('too large')
-          )) {
-            errorInfo.message += '. SUGGESTION: Use repair_blog_article function to fix image size issues before retrying.';
-            errorInfo.repairSuggested = true;
-          }
-
-          // Log concise error summary
-          if (errorInfo.details && errorInfo.details.length > 0) {
-            const errorDetails = errorInfo.details
-              .map((d: any) => `${d.param}: ${d.description}`)
-              .join(', ');
-            console.error(`AgentMode: Webflow API error (${errorInfo.status}): ${errorDetails}`);
-          } else {
-            console.error(`AgentMode: Webflow API error (${errorInfo.status}): ${errorInfo.message}`);
-          }
-
-          // Return error response with available categories so LLM can retry with correct values
-          return {
-            success: false,
-            message: errorInfo.message || `Webflow API error: ${errorInfo.status} ${errorInfo.statusText}`,
-            error: 'Webflow API validation error',
-            availableCategories: errorInfo.availableCategories || [],
-            repairSuggested: errorInfo.repairSuggested || false
-          };
-        }
-      } else if (cmsType === 'WordPress') {
-        const { getWordPressConfig } = await import('../controllers/blog');
-        const wpConfig = await getWordPressConfig(userId);
-
-        const authHeader = 'Basic ' + Buffer.from(`${wpConfig.username}:${wpConfig.applicationPassword}`).toString('base64');
-
-        // Upload featured image if provided
-        let featuredMediaId: number | undefined;
-        if (heroImageUrl) {
-          try {
-            console.log('AgentMode: Uploading featured image to WordPress...');
-            const imgResponse = await axios.get(heroImageUrl, {
-              responseType: 'arraybuffer',
-              timeout: 30000,
-            });
-            const imageBuffer = Buffer.from(imgResponse.data as ArrayBuffer);
-            const contentType = imgResponse.headers['content-type'] || 'image/png';
-            const ext = contentType.includes('jpeg') || contentType.includes('jpg') ? 'jpg' : 'png';
-            const filename = `blog-hero-${Date.now()}.${ext}`;
-
-            const mediaResponse = await axios.post(
-              `${wpConfig.siteUrl}/wp-json/wp/v2/media`,
-              imageBuffer,
-              {
-                headers: {
-                  Authorization: authHeader,
-                  'Content-Type': contentType,
-                  'Content-Disposition': `attachment; filename="${filename}"`,
-                },
-                timeout: 60000,
-              }
-            );
-            featuredMediaId = (mediaResponse.data as any).id;
-            console.log('AgentMode: Featured image uploaded, media ID:', featuredMediaId);
-          } catch (imgError: any) {
-            console.error('AgentMode: Failed to upload featured image to WordPress:', imgError.message);
-          }
-        }
-
-        // Map category names to WordPress category IDs
-        let wpCategoryIds: number[] = [];
-        const invalidCategories: string[] = [];
-        if (categories && categories.length > 0 && wpConfig.categories) {
-          for (const name of categories) {
-            const id = wpConfig.categories[name];
-            if (id) {
-              wpCategoryIds.push(id);
-            } else {
-              invalidCategories.push(name);
-            }
-          }
-        }
-
-        const wpStatus = status === 'published' ? 'publish' : 'draft';
-        const postData: any = {
-          title: title,
-          content: bodyHtml,
-          excerpt: description,
-          status: wpStatus,
-        };
-
-        if (featuredMediaId) {
-          postData.featured_media = featuredMediaId;
-        }
-
-        if (wpCategoryIds.length > 0) {
-          postData.categories = wpCategoryIds;
-        }
-
-        console.log(`AgentMode: Publishing to WordPress as ${wpStatus}...`);
-
-        try {
-          const response = await axios.post(
-            `${wpConfig.siteUrl}/wp-json/wp/v2/posts`,
-            postData,
-            {
-              headers: {
-                Authorization: authHeader,
-                'Content-Type': 'application/json',
-              },
-              timeout: 30000,
-            }
-          );
-
-          const responseData = response.data as any;
-          console.log(`AgentMode: Blog article published successfully to WordPress as ${wpStatus}`);
-
-          return {
-            success: true,
-            message: `Blog article published successfully to WordPress as ${status}`,
-            data: {
-              title,
-              status,
-              cmsType: 'WordPress',
-              postId: responseData.id,
-              postUrl: responseData.link,
-              ...(invalidCategories.length > 0 ? {
-                warning: `Some categories were not found: ${invalidCategories.join(', ')}`,
-                availableCategories: wpConfig.categories ? Object.keys(wpConfig.categories) : []
-              } : {})
-            }
-          };
-        } catch (wpError: any) {
-          const errorInfo: any = {
-            status: wpError.response?.status,
-            statusText: wpError.response?.statusText,
-          };
-          if (wpError.response?.data) {
-            errorInfo.message = wpError.response.data.message || wpError.message;
-            errorInfo.code = wpError.response.data.code;
-          } else {
-            errorInfo.message = wpError.message;
-          }
-
-          console.error(`AgentMode: WordPress API error (${errorInfo.status}): ${errorInfo.message}`);
-
-          return {
-            success: false,
-            message: errorInfo.message || `WordPress API error: ${errorInfo.status} ${errorInfo.statusText}`,
-            error: 'WordPress API error',
-            availableCategories: wpConfig.categories ? Object.keys(wpConfig.categories) : []
-          };
-        }
-      } else if (cmsType === 'Basehub') {
-        return {
-          success: false,
-          message: 'Basehub CMS is not supported for publish_blog_article function. Please use the Research Reports page to publish to Basehub.',
-          error: 'Basehub not supported'
-        };
-      } else {
-        return {
-          success: false,
-          message: `Unsupported CMS Type: ${cmsType}. Supported types are 'Basehub', 'Webflow', and 'WordPress'.`,
-          error: 'Unsupported CMS Type'
-        };
-      }
+      const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+      return await publishWithResolvedBlogPublisher(
+        {
+          title,
+          slug,
+          summary: description,
+          bodyHtml,
+          heroImageUrl,
+          author,
+          categories,
+          status: status === 'published' ? 'published' : 'draft',
+          publishedAt: new Date().toISOString(),
+        },
+        { userId, sessionId }
+      );
     } catch (error: any) {
       console.error('AgentMode: Error publishing blog article:', error);
 
@@ -20726,7 +20651,7 @@ Please generate a complete, professional HTML document that properly formats and
 
       // Generate HTML using LLMService
       console.log(`AgentMode: Generating HTML ${isEmail ? 'email' : 'file'} with LLMService (Claude model)`);
-      const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'));
+      const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
 
       if (!htmlContent || htmlContent.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
@@ -20818,6 +20743,28 @@ Please generate a complete, professional HTML document that properly formats and
         htmlContent = await response.text();
       }
 
+      // Documents large enough to risk truncation by the 16K output cap must NOT
+      // be round-tripped through generateHTML — it would drop base64 images and
+      // print CSS and regenerate a mangled doc. For those we ask the model for a
+      // small variable-map and apply it deterministically to the pristine source,
+      // preserving every byte. Small docs keep the existing full-rewrite path.
+      // ~50K chars ≈ the 16K output-token ceiling for HTML.
+      const LLM_REWRITE_MAX_CHARS = 50000;
+
+      let enhancedHtml: string;
+      let largeDocNote: string | undefined;
+
+      if (htmlContent.length > LLM_REWRITE_MAX_CHARS) {
+        const large = await this.parameterizeLargeHtml(
+          htmlContent,
+          subject,
+          additionalInstructions,
+          userId,
+          sessionId,
+        );
+        enhancedHtml = large.html;
+        largeDocNote = large.note;
+      } else {
       // Use Claude model to process/enhance the HTML based on instructions
       const defaultClaudeModel = 'anthropic.claude-sonnet-4-6';
 
@@ -20890,10 +20837,11 @@ Please:
 
       // Generate enhanced HTML template using LLMService
       console.log('AgentMode: Generating HTML email template with Claude model');
-      const enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'));
+      enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'), { userId, sessionId, feature: 'content_gen' });
 
       if (!enhancedHtml || enhancedHtml.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
+      }
       }
 
       // Extract variables from the enhanced HTML and subject
@@ -20981,7 +20929,9 @@ Please:
         variables: variables,
         arrayVariables: arrayVariables,
         message: `Template "${templateName}" created successfully with ${variables.length} variables and ${arrayVariables.length} array variables`,
-        preview_note: 'Template is now available in Templates section for editing and preview'
+        preview_note: largeDocNote
+          ? `${largeDocNote} Template is now available in Templates section for editing and preview.`
+          : 'Template is now available in Templates section for editing and preview'
       };
     } catch (error) {
       console.error('Error creating HTML template:', error);
@@ -20991,6 +20941,196 @@ Please:
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
+  }
+
+  /**
+   * Build a small {{variable}} map for an HTML document that is too large to
+   * safely round-trip through generateHTML (the 16K output cap would truncate it
+   * and drop base64 images / print CSS). The model only returns variable names
+   * and exact source anchors; the substitution is applied deterministically to
+   * the original bytes so fidelity is fully preserved.
+   */
+  private async parameterizeLargeHtml(
+    htmlContent: string,
+    subject: string,
+    additionalInstructions: string,
+    userId: string,
+    sessionId: string,
+  ): Promise<{ html: string; note: string }> {
+    const { createLLMService } = await import('../utils/llmService');
+    // Output is a compact JSON map, so a small token budget is plenty.
+    const llmService = createLLMService('anthropic.claude-sonnet-4-6', 0.2, 4096);
+
+    const strippedHtml = this.stripBase64ForLlm(htmlContent);
+
+    const systemPrompt = `You are an expert email-template engineer. You will be given an HTML document that is already complete and correctly styled. Do NOT rewrite, reformat, or return the HTML.
+
+Your ONLY job is to identify the dynamic content that should become reusable {{variable}} placeholders, and return them as JSON.
+
+Return a JSON object of this exact shape:
+{
+  "variables": [
+    { "name": "snake_case_variable_name", "anchor": "EXACT substring copied verbatim from the HTML that should be replaced", "isArray": false }
+  ]
+}
+
+Rules:
+- "anchor" MUST be an exact, contiguous substring copied character-for-character from the provided HTML (so it can be found and replaced programmatically). Never paraphrase it.
+- Pick anchors specific enough to be unambiguous (prefer the full value, e.g. a person's name, a date, a headline).
+- Use snake_case names (e.g. user_name, company_name, issue_date).
+- For repeating sections use the array pattern names: items_1_title, items_2_title, items_n_title (only _1, _2 and _n). Set "isArray": true for those.
+- Do NOT invent content. Only parameterize values that actually appear in the HTML.
+- Return ONLY the JSON object, no prose, no HTML.`;
+
+    const userPrompt = `Subject line: ${subject || '(none)'}
+
+Additional instructions: ${additionalInstructions || 'Identify the obvious dynamic fields (names, dates, titles, company info, repeating items).'}
+
+HTML document (base64 image data has been replaced with __BASE64_STRIPPED__ markers — ignore those):
+${strippedHtml}`;
+
+    let suggestions: Array<{ name?: string; anchor?: string; isArray?: boolean }> = [];
+    try {
+      const parsed = await llmService.generateJsonRobust<{ variables?: Array<{ name?: string; anchor?: string; isArray?: boolean }> }>(
+        systemPrompt,
+        userPrompt,
+        this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'),
+        { userId, sessionId, feature: 'content_gen' },
+      );
+      if (parsed && Array.isArray(parsed.variables)) {
+        suggestions = parsed.variables;
+      }
+    } catch (error) {
+      // Suggestion generation is best-effort. On any failure we still store the
+      // document verbatim — fidelity matters more than auto-parameterization.
+      console.warn('AgentMode: parameterizeLargeHtml suggestion call failed, storing verbatim:', error);
+    }
+
+    const { html, applied, skipped } = await this.applyVariableMap(htmlContent, suggestions);
+    const note = `Large document (${htmlContent.length.toLocaleString()} chars) stored with full fidelity; ${applied} variable(s) auto-detected${skipped > 0 ? `, ${skipped} suggestion(s) skipped (anchor not found in body text, ambiguous, or invalid name)` : ''}.`;
+    return { html, note };
+  }
+
+  /**
+   * Replace base64 data-URI payloads with a short marker so the model is not
+   * billed for (and cannot corrupt) embedded image blobs. Only the payload is
+   * stripped; the surrounding markup is untouched.
+   */
+  private stripBase64ForLlm(html: string): string {
+    return html.replace(
+      /(data:[\w.+-]+\/[\w.+-]+;base64,)[A-Za-z0-9+/=\s]+/gi,
+      '$1__BASE64_STRIPPED__',
+    );
+  }
+
+  /**
+   * Apply a variable map to the original HTML deterministically.
+   *
+   * Substitution is restricted to renderable text nodes (see
+   * computeSafeTextRanges): EVERY occurrence of an anchor that lies wholly
+   * inside body text and does not overlap an already-claimed range is replaced
+   * with {{name}}, so a repeated value (brand name, date) is parameterized
+   * consistently. Occurrences inside tags, attributes, <style>, <script>,
+   * <title> or comments are never touched, and the original bytes are spliced
+   * (no DOM reserialization), so fidelity is preserved.
+   *
+   * Safety guards: variable names must match /^[A-Za-z0-9_]+$/ (so {{name}} is
+   * always well-formed), and an anchor that matches nothing inside safe text is
+   * skipped rather than guessed.
+   *
+   * KNOWN COVERAGE LIMITS (intentional, fidelity-first — values matching these
+   * are left literal, not auto-parameterized):
+   *   - values living in attributes (e.g. href, alt, <meta content>),
+   *   - values split across element boundaries (e.g. "<b>John</b> Smith"),
+   *   - anchors that differ from the source by HTML entities or collapsed
+   *     whitespace,
+   *   - the subject line (parameterized only if it already contains {{...}}).
+   */
+  private async applyVariableMap(
+    html: string,
+    suggestions: Array<{ name?: string; anchor?: string; isArray?: boolean }>,
+  ): Promise<{ html: string; applied: number; skipped: number }> {
+    const safeRanges = await this.computeSafeTextRanges(html);
+    const isInsideSafeText = (start: number, end: number): boolean =>
+      safeRanges.some((r) => start >= r.start && end <= r.end);
+
+    const claimed: Array<{ start: number; end: number; name: string }> = [];
+    let applied = 0;
+    let skipped = 0;
+
+    for (const suggestion of suggestions) {
+      const name = (suggestion?.name || '').trim();
+      const anchor = typeof suggestion?.anchor === 'string' ? suggestion.anchor : '';
+
+      // Reject malformed variable names and empty anchors outright.
+      if (!/^[A-Za-z0-9_]+$/.test(name) || anchor.length === 0) {
+        skipped++;
+        continue;
+      }
+
+      // Replace every safe, non-overlapping occurrence (consistent repeats).
+      let matchedHere = 0;
+      let from = 0;
+      while (from <= html.length) {
+        const idx = html.indexOf(anchor, from);
+        if (idx === -1) break;
+        const end = idx + anchor.length;
+        const overlaps = claimed.some((c) => idx < c.end && end > c.start);
+        if (!overlaps && isInsideSafeText(idx, end)) {
+          claimed.push({ start: idx, end, name });
+          matchedHere++;
+        }
+        from = idx + 1;
+      }
+
+      if (matchedHere > 0) applied++;
+      else skipped++;
+    }
+
+    // Apply right-to-left so earlier indices stay valid while splicing.
+    claimed.sort((a, b) => b.start - a.start);
+    let out = html;
+    for (const c of claimed) {
+      out = out.slice(0, c.start) + `{{${c.name}}}` + out.slice(c.end);
+    }
+    return { html: out, applied, skipped };
+  }
+
+  /**
+   * Parse the HTML once and return the source-offset ranges of renderable text
+   * nodes, excluding <style>, <script>, <title>, comments, tags and attribute
+   * values. Restricting substitution to these ranges lets us replace ALL
+   * occurrences of a repeated value without corrupting CSS, scripts, attributes
+   * or markup. Offsets index the original string, so callers splice the
+   * original bytes and fidelity is preserved.
+   */
+  private async computeSafeTextRanges(html: string): Promise<Array<{ start: number; end: number }>> {
+    const { Parser } = await import('htmlparser2');
+    const ranges: Array<{ start: number; end: number }> = [];
+    const SKIP_TAGS = new Set(['style', 'script', 'title']);
+    let skipDepth = 0;
+    const parser = new Parser(
+      {
+        onopentag: (name: string) => {
+          if (SKIP_TAGS.has(name)) skipDepth++;
+        },
+        onclosetag: (name: string) => {
+          if (SKIP_TAGS.has(name) && skipDepth > 0) skipDepth--;
+        },
+        ontext: () => {
+          // htmlparser2 endIndex is inclusive; +1 for an exclusive slice end.
+          if (skipDepth === 0 && parser.startIndex >= 0 && parser.endIndex >= parser.startIndex) {
+            ranges.push({ start: parser.startIndex, end: parser.endIndex + 1 });
+          }
+        },
+      },
+      // withStartIndices/withEndIndices are honored at runtime but missing from
+      // htmlparser2's ParserOptions type, hence the cast.
+      { withStartIndices: true, withEndIndices: true } as any,
+    );
+    parser.write(html);
+    parser.end();
+    return ranges;
   }
 
   // Work Plan Management Methods
@@ -22000,7 +22140,7 @@ IMPORTANT:
 IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly.`}`;
 
       // Generate content using LangChain with appropriate format
-      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(userId, sessionId, 'generateBookContent'));
+      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(userId, sessionId, 'generateBookContent'), { userId, sessionId, feature: 'content_gen' });
 
       // Extract content from JSON
       if (!contentData.content) {

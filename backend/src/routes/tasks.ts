@@ -10,7 +10,7 @@ import { userDb } from '../services/db';
 import { canViewItem, canEditItem, isFeatureEffectivelyEnabled } from '../services/orgShareService';
 import { emailService } from '../services/emailService';
 import { Storage, Bucket } from '@google-cloud/storage';
-import OpenAI from 'openai';
+import { getAzureClient } from '../utils/llmClients';
 import axios from 'axios';
 import AWS from 'aws-sdk';
 import { dynamodb } from '../config/aws';
@@ -61,15 +61,6 @@ async function initializeStorage() {
   return storage;
 }
 
-// Initialize Azure OpenAI client
-const openai = new OpenAI({
-  apiKey: process.env.AZURE_OPENAI_API_KEY,
-  baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT}`,
-  defaultQuery: {
-    "api-version": process.env.AZURE_OPENAI_API_VERSION || "2024-08-01-preview",
-  },
-  defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
-});
 
 // Ensure bucket exists
 const BUCKET_NAME = process.env.GCS_BUCKET_NAME || 'agentweb-knowledge-base-dev';
@@ -1366,6 +1357,7 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
     Based on the above information, provide ONLY the updated markdown content for the knowledge base. Do not include any explanations, notes, or additional text. Output only the markdown content that should replace the current knowledge base content.`;
 
     // Call OpenAI to get the updated content
+    const openai = getAzureClient({ userId, feature: 'task_kb_update' }, process.env.AZURE_OPENAI_DEPLOYMENT);
     const completion = await openai.chat.completions.create({
       messages: [{ role: "user", content: prompt }],
       model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
@@ -1473,7 +1465,7 @@ router.post('/:taskId/knowledge-base/files', authenticateToken, upload.array('fi
       // Validate file type
       if (!isSupportedFileType(file.originalname, file.mimetype)) {
         return res.status(400).json({ 
-          message: `Unsupported file type: ${file.originalname}. Supported document types: TXT, PDF, HTML, DOCX, PPTX, XLSX, XLSM. Image types: JPG, JPEG, PNG, GIF, WEBP, BMP, SVG. Video types: MP4, MOV, WEBM, OGG, M4V, AVI.` 
+          message: `Unsupported file type: ${file.originalname}. Supported document types: TXT, PDF, HTML, DOCX, PPTX, XLSX, XLSM, CSV. Image types: JPG, JPEG, PNG, GIF, WEBP, BMP, SVG. Video types: MP4, MOV, WEBM, OGG, M4V, AVI.`
         });
       }
 

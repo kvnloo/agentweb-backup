@@ -396,6 +396,25 @@ describe('ExternalCrmSyncService', () => {
     });
   });
 
+  // ─── getDefaultMappings ─────────────────────────────────────────────────────
+
+  describe('getDefaultMappings', () => {
+    it('includes push-only listName/listId in the HubSpot custom mapping defaults', async () => {
+      const defaults = await service.getDefaultMappings('hubspot');
+      expect(defaults.customFieldMapping).toEqual(expect.arrayContaining([
+        expect.objectContaining({ agentwebField: 'listName', crmProperty: 'lead_list_name', direction: 'push', enabled: true }),
+        expect.objectContaining({ agentwebField: 'listId', crmProperty: 'lead_list_id', direction: 'push', enabled: true }),
+      ]));
+    });
+
+    it('does not add listName/listId to the Attio custom mapping defaults', async () => {
+      const defaults = await service.getDefaultMappings('attio');
+      const fields = defaults.customFieldMapping.map(m => m.agentwebField);
+      expect(fields).not.toContain('listName');
+      expect(fields).not.toContain('listId');
+    });
+  });
+
   // ─── testConnection ───────────────────────────────────────────────────────
 
   describe('testConnection', () => {
@@ -679,7 +698,13 @@ describe('ExternalCrmSyncService', () => {
 
       await service.pushAllLeads('user1', 'list1', 'hubspot');
 
-      expect(mockHubSpotServiceInstance.ensureContactProperty).not.toHaveBeenCalled();
+      // Standard contact properties are never pre-created. (The system
+      // list-identity properties are injected + ensured separately — see the
+      // hubspotAdapter.pushLeads tests — so we assert on the specific props here.)
+      const ensuredProps = mockHubSpotServiceInstance.ensureContactProperty.mock.calls.map(c => c[0]);
+      for (const standard of ['email', 'firstname', 'company', 'hs_linkedin_url']) {
+        expect(ensuredProps).not.toContain(standard);
+      }
     });
 
     it('ensures each non-standard property only once across contact and custom mappings', async () => {
@@ -732,7 +757,10 @@ describe('ExternalCrmSyncService', () => {
 
       await service.pushAllLeads('user1', 'list1', 'hubspot');
 
-      expect(mockHubSpotServiceInstance.ensureContactProperty).not.toHaveBeenCalled();
+      // The pull-only 'notes' property is not pre-created. (System list-identity
+      // properties are injected + ensured regardless — assert on 'notes' here.)
+      const ensuredProps = mockHubSpotServiceInstance.ensureContactProperty.mock.calls.map(c => c[0]);
+      expect(ensuredProps).not.toContain('notes');
     });
   });
 
@@ -906,6 +934,51 @@ describe('ExternalCrmSyncService', () => {
       await expect(
         service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com' }, 'hubspot', 'created')
       ).resolves.not.toThrow();
+    });
+
+    it('persists lastSyncStatus=error and lastSyncError when the push throws (e.g. revoked token)', async () => {
+      const config = makeConfig({ autoSyncEnabled: true });
+      mockListWithConfig(config);
+      // A revoked token throws out of pushLeads via the token resolution / first call.
+      mockHubSpotServiceInstance.ensureContactProperty.mockRejectedValue(
+        new Error('Authentication credentials not found')
+      );
+
+      await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com', notes: 'x' }, 'hubspot', 'created');
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1);
+      expect(call).toBeDefined();
+      const saved = call![2] as Record<string, any>;
+      expect(saved.lastSyncStatus).toBe('error');
+      expect(saved.lastSyncError).toContain('Authentication credentials not found');
+    });
+
+    it('persists lastSyncStatus=error when the adapter reports a per-lead error (errorCount>0)', async () => {
+      const config = makeConfig({ autoSyncEnabled: true });
+      mockListWithConfig(config);
+      // An invalid email is caught per-lead into result.errors (no throw), errorCount=1.
+      await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'not-an-email' }, 'hubspot', 'created');
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1);
+      expect(call).toBeDefined();
+      const saved = call![2] as Record<string, any>;
+      expect(saved.lastSyncStatus).toBe('error');
+      expect(saved.lastSyncError).toBeTruthy();
+    });
+
+    it('persists lastSyncStatus=success and clears lastSyncError on a healthy sync', async () => {
+      // Start from a previously-errored config to prove the error banner clears.
+      const config = makeConfig({ autoSyncEnabled: true, lastSyncStatus: 'error', lastSyncError: 'old failure' });
+      mockListWithConfig(config);
+
+      await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com', firstName: 'Ada' }, 'hubspot', 'created');
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1);
+      expect(call).toBeDefined();
+      const saved = call![2] as Record<string, any>;
+      expect(saved.lastSyncStatus).toBe('success');
+      expect(saved.lastSyncError).toBeUndefined();
+      expect(saved.lastPushSyncAt).toBeTruthy();
     });
   });
 

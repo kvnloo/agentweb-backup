@@ -10,7 +10,7 @@
  * Manual resync (per-lead or per-list) calls syncConnectionsForAccount() directly.
  */
 
-import OpenAI from 'openai';
+import { getAzureClient } from '../utils/llmClients';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { settingsService } from '../services/settingsService';
 import { dripSequenceDb } from '../services/dripSequenceDb';
@@ -31,12 +31,6 @@ import {
   UnipileSentInvitation,
 } from '../services/unipileSentInvitationsDb';
 
-const openai = new OpenAI({
-  apiKey: process.env.AZURE_OPENAI_API_KEY,
-  baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT}`,
-  defaultQuery: { 'api-version': process.env.AZURE_OPENAI_API_VERSION },
-  defaultHeaders: { 'api-key': process.env.AZURE_OPENAI_API_KEY },
-});
 
 const TAG = '[linkedInConnectionSync]';
 
@@ -379,6 +373,7 @@ Good: "Glad we connected, John. Still think your take on isolating the browser i
 
 Respond with JSON: {"content": "the message text"}`;
 
+  const openai = getAzureClient({ userId, feature: 'linkedin_cron' }, process.env.AZURE_OPENAI_DEPLOYMENT);
   const completion = await openai.chat.completions.create({
     model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
     messages: [

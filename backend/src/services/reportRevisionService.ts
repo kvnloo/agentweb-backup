@@ -1,6 +1,6 @@
 import AWS from 'aws-sdk';
 import { taskDb } from './db';
-import OpenAI from 'openai';
+import { getAzureClient } from '../utils/llmClients';
 import axios from 'axios';
 import { settingsService } from './settingsService';
 
@@ -18,7 +18,6 @@ const TABLE_PREFIX = process.env.NODE_ENV === 'production' ? '' : 'Dev-';
 
 export class ReportRevisionService {
   private s3: AWS.S3;
-  private openai: OpenAI;
 
   constructor() {
     this.s3 = new AWS.S3({
@@ -26,15 +25,19 @@ export class ReportRevisionService {
       accessKeyId: process.env.AWS_ACCESS_KEY_ID,
       secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
     });
+  }
 
-    this.openai = new OpenAI({
-      apiKey: process.env.AZURE_OPENAI_API_KEY,
-      baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2'}`,
-      defaultQuery: {
-        "api-version": process.env.AZURE_OPENAI_API_VERSION_AGENT_MODE || "2025-01-01-preview",
-      },
-      defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
-    });
+  /**
+   * Metered Azure client for report revision. Preserves the original bespoke
+   * deployment + api-version (AGENT_MODE env vars) so usage is recorded without
+   * changing which endpoint/version the calls hit.
+   */
+  private client(userId?: string) {
+    return getAzureClient(
+      { userId, feature: 'report_revision' },
+      process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
+      { apiVersion: process.env.AZURE_OPENAI_API_VERSION_AGENT_MODE || '2025-01-01-preview' }
+    );
   }
 
   /**
@@ -89,10 +92,11 @@ export class ReportRevisionService {
 
       // Generate the revised report using AI
       const { revisedContent, resultFile } = await this.generateRevisedReport(
-        originalReport, 
-        enhancedRevisionPrompt, 
-        taskId, 
-        executionId
+        originalReport,
+        enhancedRevisionPrompt,
+        taskId,
+        executionId,
+        userId
       );
 
       // Update execution with completion status and result files (using direct DynamoDB update)
@@ -273,7 +277,8 @@ You MUST use the write_revised_report function to provide the complete revised H
     originalReport: string,
     revisionPrompt: string,
     taskId: string,
-    executionId: string
+    executionId: string,
+    userId?: string
   ): Promise<{ revisedContent: string; resultFile: any }> {
     const systemPrompt = await this.getReportRevisionSystemInstruction();
 
@@ -321,7 +326,7 @@ You MUST use the write_revised_report function to provide the complete revised H
       try {
         console.log(`Attempt ${attempt} to generate revised report...`);
 
-        const response = await this.openai.chat.completions.create({
+        const response = await this.client(userId).chat.completions.create({
           model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
           messages,
           tools,

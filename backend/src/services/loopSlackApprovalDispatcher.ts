@@ -1,6 +1,11 @@
 import { WebClient } from '@slack/web-api';
 import { isDispatched, markDispatched } from './loopDispatchTracker';
 import { getNotionCredentials, getSprintTasksDatabaseId } from './notionService';
+import { getLearningStore, getLoopManifest, getRegisteredLoopIds } from '../loops/index';
+import {
+  recordLoopApproval,
+  type LoopApprovalStores,
+} from '../loops/core/learning/approvalPersistence';
 
 /** Harsha's Slack user ID. The only user the reaction handler dispatches for. */
 const LOOP_APPROVAL_USER_ID = process.env.LOOP_APPROVAL_SLACK_USER_ID || 'U08TM4QFQ1L';
@@ -41,6 +46,9 @@ interface LoopDispatchTask {
 }
 
 interface DispatchResult {
+  /** Digest item id (analyst slug / Notion page id) — links back to the
+   * learning record's proposal for approval persistence. */
+  id: string;
   title: string;
   ok: boolean;
   url?: string;
@@ -299,11 +307,11 @@ async function dispatchExistingNotionPages(pageIds: string[]): Promise<DispatchR
       title = page.title || pageId;
       const { text } = await getNotionPageContent(pageId);
       await launchEnvironment(pageId, title, text, SPRINT_TASKS_DATA_SOURCE);
-      results.push({ title, ok: true });
+      results.push({ id: pageId, title, ok: true });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`❌ loop approval reaction: launchEnvironment failed for ${pageId}:`, err);
-      results.push({ title, ok: false, error: message });
+      results.push({ id: pageId, title, ok: false, error: message });
     }
   }
 
@@ -319,11 +327,11 @@ async function dispatchCreatedTasks(tasks: LoopDispatchTask[]): Promise<Dispatch
     try {
       const page = await createLoopNotionTask(task);
       await launchEnvironment(page.pageId, task.title, task.body, dataSourceId);
-      results.push({ title: task.title, ok: true, url: page.notionUrl });
+      results.push({ id: task.id, title: task.title, ok: true, url: page.notionUrl });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`❌ loop approval reaction: dispatch failed for ${task.id}:`, err);
-      results.push({ title: task.title, ok: false, error: message });
+      results.push({ id: task.id, title: task.title, ok: false, error: message });
     }
   }
 
@@ -344,6 +352,55 @@ async function postThread(channel: string, ts: string, text: string): Promise<vo
   await slackClient.chat.postMessage({ channel, thread_ts: ts, text });
 }
 
+/** Learning stores for every registered loop, keyed for approval persistence. */
+function loopLearningStores(): LoopApprovalStores[] {
+  const stores: LoopApprovalStores[] = [];
+  for (const loopId of getRegisteredLoopIds()) {
+    try {
+      stores.push({ loopId, store: getLearningStore(getLoopManifest(loopId).learningImpl) });
+    } catch (err) {
+      console.warn(`⚠️ loop approval: no learning store resolvable for ${loopId}:`, err);
+    }
+  }
+  return stores;
+}
+
+/**
+ * Persist the human ✅ into the learning store (Layer-4→5 write). Best-effort:
+ * a persistence failure must never break the dispatch flow, but it is loudly
+ * logged and surfaced in the Slack thread because a silent miss here starves
+ * cooldown + attribution.
+ */
+async function persistApproval(
+  channel: string,
+  threadTs: string,
+  messageText: string,
+  approver: string,
+  results: DispatchResult[],
+): Promise<void> {
+  const runId = extractRunId(messageText);
+  try {
+    const outcome = await recordLoopApproval({
+      runId,
+      items: results.map((r) => ({ id: r.id, ok: r.ok, error: r.error })),
+      approver: `slack:${approver}`,
+      stores: loopLearningStores(),
+    });
+    if (outcome.loopId == null) {
+      console.warn(`⚠️ loop approval: no pending learning records for run ${runId} — approval not persisted`);
+      return;
+    }
+    await postThread(
+      channel,
+      threadTs,
+      `📒 Learning store: ${outcome.approved} approved, ${outcome.shipped} marked shipped (${outcome.loopId}).`,
+    );
+  } catch (err) {
+    console.error(`❌ loop approval: failed to persist approval for run ${runId}:`, err);
+    await postThread(channel, threadTs, `⚠️ Approval dispatched, but persisting it to the learning store failed — cooldown/attribution will not see this run.`).catch(() => undefined);
+  }
+}
+
 function formatSummary(loopTitle: string, results: DispatchResult[]): string {
   const successCount = results.filter((r) => r.ok).length;
   const lines = [`✅ Launched ${successCount}/${results.length} cloud-dev run${results.length === 1 ? '' : 's'} for ${loopTitle}:`];
@@ -361,7 +418,7 @@ export async function handleLoopApprovalReaction(event: ReactionAddedEvent): Pro
   if (!item || item.type !== 'message' || !item.channel || !item.ts) return;
   if (!item.channel.startsWith('D')) return;
 
-  if (isDispatched(item.ts)) {
+  if (await isDispatched(item.ts)) {
     console.log(`🔁 loop approval reaction: ${item.ts} already dispatched — skipping`);
     return;
   }
@@ -381,9 +438,10 @@ export async function handleLoopApprovalReaction(event: ReactionAddedEvent): Pro
 
   if (pageIds.length > 0) {
     await postThread(item.channel, item.ts, `🚀 Dispatching ${pageIds.length} cloud-dev run${pageIds.length === 1 ? '' : 's'} for ${loopTitle}...`);
-    markDispatched(item.ts, pageIds);
+    await markDispatched(item.ts, pageIds);
     const results = await dispatchExistingNotionPages(pageIds);
     await postThread(item.channel, item.ts, formatSummary(loopTitle, results));
+    await persistApproval(item.channel, item.ts, message.text, event.user, results);
     return;
   }
 
@@ -398,7 +456,8 @@ export async function handleLoopApprovalReaction(event: ReactionAddedEvent): Pro
   }
 
   await postThread(item.channel, item.ts, `🚀 Creating ${tasks.length} cloud-dev task${tasks.length === 1 ? '' : 's'} for ${loopTitle}...`);
-  markDispatched(item.ts, tasks.map((t) => t.id));
+  await markDispatched(item.ts, tasks.map((t) => t.id));
   const results = await dispatchCreatedTasks(tasks);
   await postThread(item.channel, item.ts, formatSummary(loopTitle, results));
+  await persistApproval(item.channel, item.ts, message.text, event.user, results);
 }

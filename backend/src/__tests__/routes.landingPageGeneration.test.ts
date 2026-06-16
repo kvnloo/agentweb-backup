@@ -52,6 +52,7 @@ const mockUpdateLeadList = jest.fn();
 jest.mock("../services/db", () => ({
   userDb: {
     getUserById: mockGetUserById,
+    setLandingSiteMode: jest.fn(async (_id: string, m: string) => m),
   },
   orgDb: {
     getOrgById: mockGetOrgById,
@@ -87,8 +88,17 @@ const mockTriggerVercelDeployment = jest.fn();
 const mockGetProjectEnvVars = jest.fn();
 const mockUpsertEnvVar = jest.fn();
 const mockDeleteEnvVar = jest.fn();
+const mockResolveLandingPageLiveUrl = jest.fn();
+const mockRecordLandingPagePublish = jest.fn();
 
 jest.mock("../services/v0Service", () => ({
+  // Real lock logic (pure) so the route resolves the mode correctly under test.
+  resolveLockedSiteMode: (saved: any, req: any) =>
+    saved === "unified" || saved === "separate"
+      ? { mode: saved, lockNow: false }
+      : req === "unified" || req === "separate"
+      ? { mode: req, lockNow: true }
+      : { mode: "unified", lockNow: false },
   generateLandingPage: (...args: any[]) => mockGenerateLandingPage(...args),
   deployLandingPage: (...args: any[]) => mockDeployLandingPage(...args),
   iterateLandingPage: (...args: any[]) => mockIterateLandingPage(...args),
@@ -110,6 +120,11 @@ jest.mock("../services/v0Service", () => ({
   extractTemplateOutline: jest.fn(),
   getDeploymentStatus: jest.fn(),
   getPreviewDeploymentUrl: jest.fn(),
+  resolveLandingPageLiveUrl: (...args: any[]) => mockResolveLandingPageLiveUrl(...args),
+  recordLandingPagePublish: (...args: any[]) => mockRecordLandingPagePublish(...args),
+  markLandingPagePublishReverted: jest.fn(),
+  // Owner fast-path returns true; non-owner cases aren't exercised by this suite.
+  canUserEditLandingPage: jest.fn().mockResolvedValue(true),
   BrandContext: {},
   INTEGRATIONS: {
     recaptcha: {
@@ -182,6 +197,8 @@ beforeEach(() => {
   mockGetProjectEnvVars.mockResolvedValue({});
   mockUpsertEnvVar.mockResolvedValue("env-id-1");
   mockDeleteEnvVar.mockResolvedValue(undefined);
+  mockResolveLandingPageLiveUrl.mockResolvedValue("https://everyio.agentwebforms.com");
+  mockRecordLandingPagePublish.mockResolvedValue(undefined);
   _resetRateLimitState();
 });
 
@@ -533,6 +550,68 @@ describe("POST /api/landing-pages/v0/generated/:id/iterate", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.iterations).toBe(1);
+  });
+});
+
+// =============================================================================
+// POST /generated/:id/publish — must report the LIVE (attached) domain, not a
+// stale stored subdomain. Regression guard for the everyio subdomain bug.
+// =============================================================================
+describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
+  const PAGE = {
+    id: "page-1",
+    userId: "test-user-id",
+    name: "Every.io Day Zero",
+    githubRepoUrl: "https://github.com/agentweb/test-repo",
+    vercelProjectId: "vercel-proj-123",
+    deployedUrl: "https://x.vercel.app",
+    customDomainUrl: "https://everyio-day-zero-founders.agentwebforms.com",
+  };
+
+  const stubGitHubMergeFlow = () => {
+    // GET pre-merge main ref → POST /merges → DELETE branch ref
+    mockAxios.get.mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } });
+    mockAxios.post.mockResolvedValueOnce({ data: { sha: "merge-sha" } });
+    mockAxios.delete.mockResolvedValueOnce({ data: {} });
+  };
+
+  it("FAIL: branch is 'main' → 400", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "main" });
+    expect(res.status).toBe(400);
+  });
+
+  it("FAIL: page has no githubRepoUrl → 400", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({ id: "page-1", userId: "test-user-id" });
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/abc" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/No GitHub repository/);
+  });
+
+  it("SUCCESS: returns the resolved live URL (attached domain), not the stale stored subdomain", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubGitHubMergeFlow();
+    // The resolver consults AW-CustomDomains and returns the attached subdomain.
+    mockResolveLandingPageLiveUrl.mockResolvedValueOnce("https://everyio.agentwebforms.com");
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/8060dd55-a8b7-4c" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.live_url).toBe("https://everyio.agentwebforms.com");
+    // Must NOT leak the stale stored subdomain.
+    expect(res.body.live_url).not.toContain("everyio-day-zero-founders");
+    expect(res.body.message).toContain("https://everyio.agentwebforms.com");
+    // The page record was passed to the resolver for correction.
+    expect(mockResolveLandingPageLiveUrl).toHaveBeenCalledWith(
+      expect.objectContaining({ vercelProjectId: "vercel-proj-123", userId: "test-user-id" })
+    );
   });
 });
 

@@ -363,6 +363,44 @@ export class LinkedInOutreachService {
     return LinkedInOutreachService.INVITE_MESSAGE_MAX_CHARS_FREE;
   }
 
+  /**
+   * Trim an invitation note to the per-account character limit, preferring a
+   * sentence boundary (dropping an incomplete trailing sentence), then a word
+   * boundary, so we never cut mid-word. Returns the message unchanged when it
+   * already fits. LinkedIn hard-rejects over-limit notes, so we trim deterministically
+   * here rather than throwing — the LLM cannot reliably count characters, and a throw
+   * just triggers a regenerate-and-retry loop (it produced 203/204/207/210-char notes
+   * in a real session). Trimming at the chokepoint guarantees the send never fails on
+   * length for either the agent path or the human CRM path.
+   */
+  static trimInviteMessage(message: string, maxChars: number): string {
+    if (message.length <= maxChars) return message;
+    let hardCut = message.slice(0, maxChars);
+    // slice() works on UTF-16 code units, so a cut can land between the two halves
+    // of a surrogate pair (e.g. an emoji), leaving a malformed lone surrogate. Drop a
+    // dangling high surrogate so we never emit invalid UTF-16 to LinkedIn.
+    const lastUnit = hardCut.charCodeAt(hardCut.length - 1);
+    if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) hardCut = hardCut.slice(0, -1);
+    // Threshold (60% of the budget) below which we won't honour a cut point — keeping
+    // it would throw away too much of the note (e.g. a tiny leading "Hi." sentence).
+    const minKeep = Math.floor(maxChars * 0.6);
+    // Prefer a sentence boundary so we drop an incomplete trailing sentence rather than
+    // cutting mid-sentence on a word. Find the last sentence-ending punctuation in budget.
+    const lastSentenceEnd = Math.max(
+      hardCut.lastIndexOf('.'),
+      hardCut.lastIndexOf('!'),
+      hardCut.lastIndexOf('?'),
+    );
+    if (lastSentenceEnd >= minKeep) {
+      return hardCut.slice(0, lastSentenceEnd + 1).replace(/\s+$/, '');
+    }
+    // No usable sentence end — fall back to the last whitespace so we keep whole words.
+    // Only honour it when it retains most of the budget; otherwise (one giant token) hard-cut.
+    const lastSpace = hardCut.lastIndexOf(' ');
+    const candidate = lastSpace >= minKeep ? hardCut.slice(0, lastSpace) : hardCut;
+    return candidate.replace(/\s+$/, '');
+  }
+
   async sendInvitation(
     account_id: string,
     profileUrlOrId: string,
@@ -370,10 +408,15 @@ export class LinkedInOutreachService {
     message?: string,
     maxChars: number = LinkedInOutreachService.INVITE_MESSAGE_MAX_CHARS
   ): Promise<any> {
-    if (message !== undefined && message.length > maxChars) {
-      throw new Error(
-        `Invitation message is too long (${message.length} characters). LinkedIn limits invitation notes to ${maxChars} characters for this account. Please shorten the message and retry.`
-      );
+    let outgoingMessage = message;
+    if (outgoingMessage !== undefined && outgoingMessage.length > maxChars) {
+      const trimmed = LinkedInOutreachService.trimInviteMessage(outgoingMessage, maxChars);
+      this.log(`Invitation note over limit — auto-trimmed`, {
+        originalLength: outgoingMessage.length,
+        trimmedLength: trimmed.length,
+        maxChars,
+      });
+      outgoingMessage = trimmed;
     }
     try {
       const provider_id = await this.resolveProviderId(profileUrlOrId, isUrl, account_id);
@@ -383,7 +426,7 @@ export class LinkedInOutreachService {
       const res = await client.users.sendInvitation({
         account_id,
         provider_id,
-        message
+        message: outgoingMessage
       });
       this.log(`Invitation sent successfully`, { account_id, provider_id });
       return res;

@@ -5,6 +5,7 @@ import {
   onPublicPageVisited,
 } from '../services/contactCaptureHooks';
 import { PUBLIC_LOGGABLE_EVENT_TYPES } from '../services/contactEventsDb';
+import { externalCrmSyncService } from '../services/externalCrmSyncService';
 
 const router = express.Router();
 
@@ -194,6 +195,16 @@ router.post('/leads/:listId', async (req: Request, res: Response) => {
     }
 
     const lead = await crmDb.createLead(listId, leadData as any);
+
+    // Real-time push to any connected external CRM (HubSpot / Attio). Without
+    // this, public-form leads only reached HubSpot on a manual push. Uses the
+    // list owner's userId since this endpoint is unauthenticated. Fire-and-forget
+    // — autoSyncLead swallows its own errors and no-ops when sync is off.
+    void externalCrmSyncService.autoSyncLead(list.userId, listId, lead, 'hubspot', 'created')
+      .catch((err) => console.error('[crmPublic] HubSpot auto-sync error:', err?.message ?? err));
+    void externalCrmSyncService.autoSyncLead(list.userId, listId, lead, 'attio', 'created')
+      .catch((err) => console.error('[crmPublic] Attio auto-sync error:', err?.message ?? err));
+
     return res.status(201).json({ leadId: (lead as any).leadId, success: true });
   } catch (error) {
     console.error('Error creating public lead:', error);

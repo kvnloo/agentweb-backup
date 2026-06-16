@@ -5,6 +5,7 @@ import { ChatPromptTemplate } from '@langchain/core/prompts';
 import { JsonOutputParser } from '@langchain/core/output_parsers';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { extractJson, JsonExtractError } from '../services/util/extractJson';
+import { recordUsage } from '../services/usageRecorderService';
 
 export type OutputFormat = 'json' | 'xml';
 
@@ -17,14 +18,28 @@ export interface LLMUsageData {
   outputTokens: number;
   totalTokens: number;
   model: string;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
 }
 
 export type OnUsageCallback = (usage: LLMUsageData) => void;
+
+/**
+ * Optional attribution context for shadow usage metering. When omitted, usage
+ * is still recorded under userId "system" / feature "unknown" so platform
+ * overhead stays visible.
+ */
+export interface LLMUsageContext {
+  userId?: string;
+  feature?: string;
+  sessionId?: string;
+}
 
 export class LLMService {
   private chatModel: AzureChatOpenAI | ChatBedrockConverse | null;
   private modelName: string;
   private isGemini: boolean;
+  private provider: string;
 
   constructor(modelName?: string, temperature: number = 0.8, maxTokens?: number) {
     const model = modelName || process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4';
@@ -33,10 +48,12 @@ export class LLMService {
 
     if (this.isGemini) {
       this.chatModel = null;
+      this.provider = 'gemini';
       return;
     }
 
     const isClaude = model.toLowerCase().includes('claude') || model.toLowerCase().includes('sonnet') || model.startsWith('anthropic.');
+    this.provider = isClaude ? 'bedrock' : 'azure-openai';
 
     if (isClaude) {
       const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
@@ -101,7 +118,34 @@ export class LLMService {
     const inputTokens = meta?.input_tokens || 0;
     const outputTokens = meta?.output_tokens || 0;
     const totalTokens = meta?.total_tokens || (inputTokens + outputTokens);
-    return { inputTokens, outputTokens, totalTokens, model: this.modelName };
+    // LangChain standardizes provider cache counters under input_token_details
+    // (Bedrock: cache_read/cache_creation; OpenAI: cache_read).
+    const details = meta?.input_token_details;
+    const cacheReadTokens = details?.cache_read || 0;
+    const cacheWriteTokens = details?.cache_creation || 0;
+    return { inputTokens, outputTokens, totalTokens, model: this.modelName, cacheReadTokens, cacheWriteTokens };
+  }
+
+  /**
+   * Shadow-meter a completed call. ALWAYS fired (regardless of onUsage), never
+   * awaited, never throws — metering can't fail or slow a response.
+   */
+  private meterUsage(usage: LLMUsageData, usageContext?: LLMUsageContext): void {
+    try {
+      void recordUsage({
+        userId: usageContext?.userId,
+        sessionId: usageContext?.sessionId,
+        model: usage.model,
+        provider: this.provider,
+        feature: usageContext?.feature || 'unknown',
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cacheReadTokens: usage.cacheReadTokens,
+        cacheWriteTokens: usage.cacheWriteTokens,
+      });
+    } catch {
+      // Usage analytics must never break the LLM path.
+    }
   }
 
   /**
@@ -114,7 +158,8 @@ export class LLMService {
   async generateContent(
     systemPrompt: string,
     userPrompt: string,
-    responseFormat?: 'json' | 'text'
+    responseFormat?: 'json' | 'text',
+    usageContext?: LLMUsageContext
   ): Promise<string> {
     try {
       const prompt = ChatPromptTemplate.fromMessages([
@@ -124,16 +169,18 @@ export class LLMService {
 
       const chain = prompt.pipe(this.requireChatModel());
 
+      // Invoke the model first (so usage_metadata is observable), then parse.
+      const response = await chain.invoke({}) as any;
+      this.meterUsage(this.extractUsage(response), usageContext);
+
       if (responseFormat === 'json') {
         // Use JSON output parser for structured responses
         const jsonParser = new JsonOutputParser();
-        const jsonChain = chain.pipe(jsonParser);
-        const result = await jsonChain.invoke({});
+        const result = await jsonParser.invoke(response);
         // Return as stringified JSON for consistency
         return typeof result === 'string' ? result : JSON.stringify(result);
       } else {
         // Regular text response
-        const response = await chain.invoke({}) as { content: string };
         return response.content;
       }
     } catch (error) {
@@ -172,7 +219,8 @@ export class LLMService {
     systemPrompt: string,
     userPrompt: string,
     format: OutputFormat = 'json',
-    onUsage?: OnUsageCallback
+    onUsage?: OnUsageCallback,
+    usageContext?: LLMUsageContext
   ): Promise<T> {
     try {
       // Invoke the model directly to capture usage_metadata before any parsing
@@ -183,8 +231,10 @@ export class LLMService {
       const response = await this.requireChatModel().invoke(messages) as any;
       const rawResponse = typeof response.content === 'string' ? response.content : String(response.content || '');
 
+      const usage = this.extractUsage(response);
+      this.meterUsage(usage, usageContext);
       if (onUsage) {
-        onUsage(this.extractUsage(response));
+        onUsage(usage);
       }
 
       if (format === 'xml') {
@@ -236,6 +286,7 @@ export class LLMService {
     systemPrompt: string,
     userPrompt: string,
     onUsage?: OnUsageCallback,
+    usageContext?: LLMUsageContext,
   ): Promise<T> {
     const callOnce = async (system: string): Promise<{ raw: string }> => {
       const messages = [
@@ -246,8 +297,10 @@ export class LLMService {
       const rawResponse = typeof response.content === 'string'
         ? response.content
         : String(response.content || '');
+      const usage = this.extractUsage(response);
+      this.meterUsage(usage, usageContext);
       if (onUsage) {
-        onUsage(this.extractUsage(response));
+        onUsage(usage);
       }
       return { raw: rawResponse };
     };
@@ -295,14 +348,17 @@ export class LLMService {
     systemPrompt: string,
     userPrompt: string,
     onUsage?: OnUsageCallback,
+    usageContext?: LLMUsageContext,
   ): Promise<string> {
     const messages = [
       new SystemMessage(systemPrompt),
       new HumanMessage(userPrompt),
     ];
     const response = await this.requireChatModel().invoke(messages) as any;
+    const usage = this.extractUsage(response);
+    this.meterUsage(usage, usageContext);
     if (onUsage) {
-      onUsage(this.extractUsage(response));
+      onUsage(usage);
     }
     return typeof response.content === 'string' ? response.content : String(response.content || '');
   }
@@ -317,7 +373,8 @@ export class LLMService {
   async generateHTML(
     systemPrompt: string,
     userPrompt: string,
-    onUsage?: OnUsageCallback
+    onUsage?: OnUsageCallback,
+    usageContext?: LLMUsageContext
   ): Promise<string> {
     try {
       const htmlSystemPrompt = `${systemPrompt}
@@ -339,8 +396,10 @@ The HTML must be a complete, well-formed HTML document with proper DOCTYPE, head
       const response = await this.requireChatModel().invoke(messages) as any;
       const rawResponse = typeof response.content === 'string' ? response.content : String(response.content || '');
 
+      const usage = this.extractUsage(response);
+      this.meterUsage(usage, usageContext);
       if (onUsage) {
-        onUsage(this.extractUsage(response));
+        onUsage(usage);
       }
 
       // Extract HTML from <actual_html_content> tags
@@ -381,6 +440,7 @@ The HTML must be a complete, well-formed HTML document with proper DOCTYPE, head
   async generateJSONContentWithWebSearch<T = any>(
     systemPrompt: string,
     userPrompt: string,
+    usageContext?: LLMUsageContext,
   ): Promise<T> {
     if (this.isGemini) {
       const { GoogleGenAI } = await import('@google/genai');
@@ -395,6 +455,16 @@ The HTML must be a complete, well-formed HTML document with proper DOCTYPE, head
           tools: [{ googleSearch: {} }],
         },
       });
+      const usageMeta = (response as any)?.usageMetadata;
+      const geminiIn = usageMeta?.promptTokenCount || 0;
+      const geminiOut = usageMeta?.candidatesTokenCount || 0;
+      this.meterUsage({
+        inputTokens: geminiIn,
+        outputTokens: geminiOut,
+        totalTokens: usageMeta?.totalTokenCount || (geminiIn + geminiOut),
+        model: this.modelName,
+        cacheReadTokens: usageMeta?.cachedContentTokenCount || 0,
+      }, usageContext);
       const text = response.text ?? '';
       return extractJson<T>(text);
     }
@@ -440,7 +510,15 @@ The HTML must be a complete, well-formed HTML document with proper DOCTYPE, head
     if (debug) {
       console.log('[llm.webSearch] ← body:', rawBody.slice(0, 800));
     }
-    const resp = JSON.parse(rawBody) as { output_text?: string; output?: Array<{ content?: Array<{ text?: string }> }> };
+    const resp = JSON.parse(rawBody) as { output_text?: string; output?: Array<{ content?: Array<{ text?: string }> }>; usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number } };
+    const respIn = resp.usage?.input_tokens || 0;
+    const respOut = resp.usage?.output_tokens || 0;
+    this.meterUsage({
+      inputTokens: respIn,
+      outputTokens: respOut,
+      totalTokens: resp.usage?.total_tokens || (respIn + respOut),
+      model: this.modelName,
+    }, usageContext);
     // Newer responses include `output_text`; older shape returns an `output`
     // array of items where each item's `content[*].text` carries the chunks.
     let text = resp.output_text ?? '';
