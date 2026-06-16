@@ -4337,6 +4337,21 @@ export class AgentModeService {
   private extractMinimalToolResult(result: any, toolName: string): any {
     console.log('[DEBUG] extractMinimalToolResult called for:', toolName);
 
+    // Preserve confirmation-gate fields for ANY tool that halted for user approval
+    // (Meta writes, image edits, …). The gate returns no real artifact, and the
+    // per-tool minimizers below drop unknown fields — without this, the frontend
+    // (tool card "Awaiting your confirmation", panel teardown) never sees the flag.
+    if (result && result.awaitingUserConfirmation === true) {
+      return {
+        success: true,
+        requiresConfirmation: true,
+        awaitingUserConfirmation: true,
+        confirmationPrompt: result.confirmationPrompt,
+        confirmationDetail: result.confirmationDetail,
+        summary: result.summary,
+      };
+    }
+
     // For playwright screenshots, result has already been processed (base64 → S3 URL)
     if (toolName === 'playwright_browser_take_screenshot') {
       return result.screenshotUrl ? { screenshotUrl: result.screenshotUrl, success: true } : { success: false };

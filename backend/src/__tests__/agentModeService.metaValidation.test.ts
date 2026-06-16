@@ -466,6 +466,43 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
     });
   });
 
+  // ==================== Minimal-result preserves the gate flag ====================
+  // The frontend tool card / panel teardown read result.awaitingUserConfirmation off
+  // the MINIMIZED result stored in toolCalls. extractMinimalToolResult must not strip it,
+  // or the "Awaiting your confirmation" UI never fires (regardless of tool name).
+  describe('extractMinimalToolResult preserves confirmation-gate fields', () => {
+    const gated = {
+      success: true,
+      requiresConfirmation: true,
+      awaitingUserConfirmation: true,
+      confirmationPrompt: 'Please confirm before I proceed...',
+      confirmationDetail: 'Publish ad into Maintenance Campaign',
+      summary: 'Publish ad into Maintenance Campaign',
+      target: { campaign: 'Maintenance Campaign' }
+    };
+
+    it('keeps awaitingUserConfirmation for call_meta_marketing_api (would otherwise hit default {})', () => {
+      const out = (service as any).extractMinimalToolResult(gated, 'call_meta_marketing_api');
+      expect(out.awaitingUserConfirmation).toBe(true);
+      expect(out.confirmationPrompt).toContain('confirm');
+    });
+
+    it('keeps awaitingUserConfirmation for generate_image (would otherwise drop it)', () => {
+      const out = (service as any).extractMinimalToolResult(gated, 'generate_image');
+      expect(out.awaitingUserConfirmation).toBe(true);
+      expect(out.confirmationDetail).toBeDefined();
+    });
+
+    it('does not add the flag to a normal (non-gated) result', () => {
+      const out = (service as any).extractMinimalToolResult(
+        { success: true, imageUrl: 'https://x/img.png', filename: 'a.png' },
+        'generate_image'
+      );
+      expect(out.awaitingUserConfirmation).toBeUndefined();
+      expect(out.imageUrl).toBe('https://x/img.png');
+    });
+  });
+
   // ==================== Agent-loop halt detection ====================
   // collectConfirmationPrompt is the seam the agent loop uses to decide whether to
   // STOP the autonomous turn and hand control back to the user. It scans the tool
