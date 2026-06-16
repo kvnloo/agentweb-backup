@@ -37,7 +37,7 @@ describe('userDb.incrementSessionVersion', () => {
     mockDynamoDB = new DocumentClient();
   });
 
-  it('atomically bumps sessionVersion via if_not_present and returns the new value', async () => {
+  it('atomically bumps sessionVersion via if_not_exists and returns the new value', async () => {
     // getUserById resolves email via the UserIdIndex query
     mockDynamoDB.query.mockReturnValue({
       promise: jest.fn().mockResolvedValue({
@@ -54,7 +54,7 @@ describe('userDb.incrementSessionVersion', () => {
     expect(mockDynamoDB.update).toHaveBeenCalledWith(
       expect.objectContaining({
         Key: { email: 'user@example.com' },
-        UpdateExpression: 'SET #sv = if_not_present(#sv, :zero) + :one',
+        UpdateExpression: 'SET #sv = if_not_exists(#sv, :zero) + :one',
         ExpressionAttributeNames: { '#sv': 'sessionVersion' },
         ExpressionAttributeValues: { ':zero': 0, ':one': 1 },
         ReturnValues: 'UPDATED_NEW',
