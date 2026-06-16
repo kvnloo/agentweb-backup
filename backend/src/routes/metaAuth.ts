@@ -240,15 +240,30 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
         // ── Flow: marketing ──────────────────────────────────────────────────
         if (flow === 'marketing') {
             let adAccounts: MetaAdAccount[] = [];
+            let adAccountsError = false;
             try {
                 adAccounts = await metaService.getAdAccounts(access_token);
                 console.log(`[Meta Finalize] Found ${adAccounts.length} ad account(s) for user ${userId}`);
             } catch (error: any) {
+                // Surface a flag (no details) so the frontend can distinguish "Meta call
+                // failed" from "user genuinely has zero ad accounts".
+                adAccountsError = true;
                 const structured = error?.structuredError;
-                console.warn(`[Meta Finalize] getAdAccounts failed — code=${structured?.code ?? 'n/a'} classification=${structured?.classification ?? 'n/a'} message=${error?.message ?? error}`);
+                console.error(`[Meta Finalize] getAdAccounts failed for user ${userId}`, {
+                    code: structured?.code ?? null,
+                    classification: structured?.classification ?? null,
+                    message: error?.message ?? String(error),
+                    fbtrace_id: structured?.fbtrace_id ?? null,
+                });
             }
 
-            return res.json({ success: true, flow, adAccounts: adAccounts.length > 0 ? adAccounts : undefined, tokenSessionId });
+            return res.json({
+                success: true,
+                flow,
+                adAccounts: adAccounts.length > 0 ? adAccounts : undefined,
+                adAccountsError: adAccountsError || undefined,
+                tokenSessionId
+            });
         }
 
         // ── Flow: instagram ───────────────────────────────────────────────────

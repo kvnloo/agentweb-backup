@@ -27,10 +27,22 @@ jest.mock('../services/contactEventsDb', () => ({
   PUBLIC_LOGGABLE_EVENT_TYPES: new Set(['form.submitted', 'page.visited']),
 }));
 
+jest.mock('../services/externalCrmSyncService', () => ({
+  externalCrmSyncService: {
+    autoSyncLead: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
 import express from 'express';
 import request from 'supertest';
 import publicRouter from '../routes/crmPublic';
 import { crmDb } from '../services/db';
+import { externalCrmSyncService } from '../services/externalCrmSyncService';
+
+const flushAsyncWork = async () => {
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+};
 
 const app = express();
 app.use(express.json());
@@ -97,5 +109,47 @@ describe('POST /leads/:listId — public lead creation', () => {
     const callArgs = (crmDb.createLead as jest.Mock).mock.calls[0][1];
     expect(callArgs).not.toHaveProperty('userId');
     expect(callArgs).not.toHaveProperty('isAdmin');
+  });
+
+  test('real-time syncs the new lead to HubSpot and Attio using the list owner userId', async () => {
+    const createdLead = { leadId: 'lead_new', ...validBody };
+    (crmDb.createLead as jest.Mock).mockResolvedValue(createdLead);
+
+    const res = await request(app).post('/leads/list_abc123').send(validBody);
+    expect(res.status).toBe(201);
+
+    await flushAsyncWork();
+
+    expect(externalCrmSyncService.autoSyncLead).toHaveBeenCalledWith(
+      'user_owner',
+      'list_abc123',
+      createdLead,
+      'hubspot',
+      'created',
+    );
+    expect(externalCrmSyncService.autoSyncLead).toHaveBeenCalledWith(
+      'user_owner',
+      'list_abc123',
+      createdLead,
+      'attio',
+      'created',
+    );
+  });
+
+  test('does not sync to any external CRM when the list rejects the request (403)', async () => {
+    (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ ...mockList, publicAccessEnabled: false });
+    const res = await request(app).post('/leads/list_abc123').send(validBody);
+    expect(res.status).toBe(403);
+
+    await flushAsyncWork();
+    expect(externalCrmSyncService.autoSyncLead).not.toHaveBeenCalled();
+  });
+
+  test('still returns 201 when external CRM sync rejects (fire-and-forget)', async () => {
+    (externalCrmSyncService.autoSyncLead as jest.Mock).mockRejectedValueOnce(new Error('hubspot down'));
+    const res = await request(app).post('/leads/list_abc123').send(validBody);
+    expect(res.status).toBe(201);
+    await flushAsyncWork();
+    expect(externalCrmSyncService.autoSyncLead).toHaveBeenCalled();
   });
 });

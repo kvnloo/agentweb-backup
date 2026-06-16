@@ -12,6 +12,7 @@ jest.mock("../services/db", () => ({
   userDb: {
     getUserById: jest.fn(),
     updateUser: jest.fn(),
+    incrementTokenUsageForMonth: jest.fn(),
   },
   orgDb: {
     getOrgById: jest.fn(),
@@ -31,6 +32,7 @@ import {
 
 const mockGetUserById = userDb.getUserById as jest.Mock;
 const mockUpdateUser = userDb.updateUser as jest.Mock;
+const mockIncrementTokenUsageForMonth = userDb.incrementTokenUsageForMonth as jest.Mock;
 const mockGetOrgById = orgDb.getOrgById as jest.Mock;
 const mockGetUserSubscriptionType = getUserSubscriptionType as jest.Mock;
 const mockGetSubscriptionTypeConfig = getSubscriptionTypeConfig as jest.Mock;
@@ -42,6 +44,7 @@ function currentMonth(): string {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockIncrementTokenUsageForMonth.mockResolvedValue({});
 });
 
 // ─── FAIL TESTS ──────────────────────────────────────────────────────────
@@ -348,19 +351,38 @@ describe("incrementUserTokenUsage", () => {
       email: "a@b.com",
       tokenUsage: { month: currentMonth(), totalTokens: 5000, totalCost: 0.5, resetDate: "2026-05-01T00:00:00.000Z" },
     });
-    mockUpdateUser.mockResolvedValue(undefined);
+    mockIncrementTokenUsageForMonth.mockResolvedValue({});
 
     await incrementUserTokenUsage("u1", 2000, 0.2);
 
-    expect(mockUpdateUser).toHaveBeenCalledWith("u1", expect.objectContaining({
+    expect(mockIncrementTokenUsageForMonth).toHaveBeenCalledWith(
+      "u1",
+      currentMonth(),
+      2000,
+      0.2,
+      "2026-05-01T00:00:00.000Z"
+    );
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+    // Should NOT clear bonus when incrementing within same month
+    expect(mockIncrementTokenUsageForMonth.mock.calls[0]).not.toContain("tokenAllowanceBonus");
+  });
+
+  it("does not use a read-computed total for same-month increments", async () => {
+    mockGetUserById.mockResolvedValue({
+      userId: "u1",
+      email: "a@b.com",
+      tokenUsage: { month: currentMonth(), totalTokens: 5000, totalCost: 0.5, resetDate: "2026-05-01T00:00:00.000Z" },
+    });
+    mockIncrementTokenUsageForMonth.mockResolvedValue({});
+
+    await incrementUserTokenUsage("u1", 2000, 0.2);
+
+    expect(mockUpdateUser).not.toHaveBeenCalledWith("u1", expect.objectContaining({
       tokenUsage: expect.objectContaining({
-        month: currentMonth(),
         totalTokens: 7000,
         totalCost: 0.7,
       }),
     }));
-    // Should NOT clear bonus when incrementing within same month
-    expect(mockUpdateUser.mock.calls[0][1]).not.toHaveProperty("tokenAllowanceBonus");
   });
 
   it("skips update when tokens and cost are zero", async () => {
@@ -503,17 +525,18 @@ describe("incrementUserTokenUsage - org member increments owner counter", () => 
         tokenUsage: { month: currentMonth(), totalTokens: 5000, totalCost: 0.5, resetDate: "2026-05-01T00:00:00.000Z" },
       }); // incrementUserTokenUsage reads owner
     mockGetOrgById.mockResolvedValue({ orgId: "org1", ownerUserId: "owner1", name: "Acme", maxMembers: 5, createdAt: "", updatedAt: "" });
-    mockUpdateUser.mockResolvedValue(undefined);
+    mockIncrementTokenUsageForMonth.mockResolvedValue({});
 
     await incrementUserTokenUsage("member1", 2000, 0.2);
 
-    // updateUser should be called with owner1, not member1
-    expect(mockUpdateUser).toHaveBeenCalledWith("owner1", expect.objectContaining({
-      tokenUsage: expect.objectContaining({
-        totalTokens: 7000,
-        totalCost: 0.7,
-      }),
-    }));
+    // Atomic increment should be applied to owner1, not member1
+    expect(mockIncrementTokenUsageForMonth).toHaveBeenCalledWith(
+      "owner1",
+      currentMonth(),
+      2000,
+      0.2,
+      "2026-05-01T00:00:00.000Z"
+    );
     expect(mockUpdateUser).not.toHaveBeenCalledWith("member1", expect.anything());
   });
 });

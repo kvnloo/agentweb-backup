@@ -19,6 +19,7 @@
 import AWS from 'aws-sdk';
 import { LOOP_EVENTS_TABLE } from '../loops/core/sensors/eventTableEventSource';
 import { LOOP_LEARNING_TABLE } from '../loops/core/learning/dynamoLearningStore';
+import { LOOP_DISPATCHES_TABLE } from './loopDispatchTracker';
 import { ONBOARDING_METRICS_TABLE, ONBOARDING_METRICS_STEP_INDEX } from './onboardingMetricsService';
 
 export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
@@ -44,6 +45,12 @@ export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
       { AttributeName: 'loopId', KeyType: 'HASH' },
       { AttributeName: 'sortKey', KeyType: 'RANGE' },
     ],
+    BillingMode: 'PAY_PER_REQUEST',
+  },
+  {
+    TableName: LOOP_DISPATCHES_TABLE,
+    AttributeDefinitions: [{ AttributeName: 'messageTs', AttributeType: 'S' }],
+    KeySchema: [{ AttributeName: 'messageTs', KeyType: 'HASH' }],
     BillingMode: 'PAY_PER_REQUEST',
   },
   {

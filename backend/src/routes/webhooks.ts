@@ -435,6 +435,28 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         changed = true;
       }
 
+      // Attribution merge (Lead UTM — mirrors the User schema contract).
+      // The new-lead path stamps firstTouch+lastTouch via createLead; the merge
+      // path previously dropped attribution entirely, leaving lastTouch DOA
+      // (lastTouch === firstTouch forever for any repeat-touch lead).
+      //   - lastTouch  : ALWAYS refreshed when this touch carries attribution.
+      //   - firstTouch : immutable — only backfilled if the lead has none yet.
+      //   - utmSource / utmMedium : denormalized from firstTouch — only
+      //     backfilled when absent, never overwritten.
+      if (touch) {
+        updates.lastTouch = touch;
+        changed = true;
+        if (!existingLead.firstTouch) {
+          updates.firstTouch = touch;
+          if (!existingLead.utmSource && touch.utm?.source) {
+            updates.utmSource = touch.utm.source;
+          }
+          if (!existingLead.utmMedium && touch.utm?.medium) {
+            updates.utmMedium = touch.utm.medium;
+          }
+        }
+      }
+
       if (changed) {
         await crmDb.updateLead(leadList.listId, existingLead.leadId, updates);
         isUpdated = true;
@@ -508,6 +530,18 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
     // After response is sent: auto-draft, auto-send, and alert (fire-and-forget, fully awaited internally)
     if (isNew || isUpdated) {
+      // Real-time push to any connected external CRM (HubSpot / Attio). The
+      // authenticated UI create/update routes do this inline; inbound capture
+      // (landing pages, lead-forward webhooks) did not, so form leads only ever
+      // reached HubSpot on a manual push. Use the list owner's userId since the
+      // webhook request is unauthenticated. Fire-and-forget — autoSyncLead
+      // swallows its own errors and no-ops when auto-sync is off / unconfigured.
+      const crmSyncEvent = isNew ? 'created' : 'updated';
+      void externalCrmSyncService.autoSyncLead(leadList.userId, leadList.listId, lead, 'hubspot', crmSyncEvent)
+        .catch((err) => console.error('[webhooks] HubSpot auto-sync error:', err?.message ?? err));
+      void externalCrmSyncService.autoSyncLead(leadList.userId, leadList.listId, lead, 'attio', crmSyncEvent)
+        .catch((err) => console.error('[webhooks] Attio auto-sync error:', err?.message ?? err));
+
       // Enroll the lead into any list-bound drip sequences (uses the list
       // owner's userId since the public webhook request is unauthenticated).
       void autoEnrollLeadInSequences(leadList.userId, leadList.listId, lead.leadId, lead.email);

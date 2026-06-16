@@ -279,7 +279,10 @@ describe('AgentModeService - generate_image function', () => {
         'medium',
         inputImages,
         'user123',
-        'session123'
+        'session123',
+        undefined, // imageModel
+        undefined, // logoImage
+        true       // confirm: bypass the image-edit confirmation gate
       );
 
       expect(mockImageService.generateImage).toHaveBeenCalledWith({
@@ -348,7 +351,9 @@ describe('AgentModeService - generate_image function', () => {
         inputImages,
         'user123',
         'session123',
-        'gemini-3-pro-image-preview'
+        'gemini-3-pro-image-preview',
+        undefined, // logoImage
+        true       // confirm: bypass the image-edit confirmation gate
       );
 
       expect(mockImageService.generateImage).toHaveBeenCalledWith({
@@ -389,7 +394,9 @@ describe('AgentModeService - generate_image function', () => {
           inputImages,
           'user123',
           'session123',
-          model
+          model,
+          undefined, // logoImage
+          true       // confirm: bypass the image-edit confirmation gate
         );
 
         expect(mockImageService.generateImage).toHaveBeenCalledWith(
@@ -603,7 +610,8 @@ describe('AgentModeService - generate_image function', () => {
         'user123',
         'session123',
         'gemini-3-pro-image-preview',
-        'https://example.com/logo.png'
+        'https://example.com/logo.png',
+        true // confirm: bypass the image-edit confirmation gate
       );
 
       expect(mockImageService.generateImage).toHaveBeenCalledWith({
