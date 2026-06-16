@@ -13,6 +13,7 @@ jest.mock('../services/db', () => ({
     getLeadsByEngagedFlag: jest.fn(),
     getLeadById: jest.fn(),
     updateLead: jest.fn(),
+    batchCreateLeads: jest.fn(),
     deleteLead: jest.fn(),
     updateLeadList: jest.fn(),
     deleteLeadList: jest.fn(),
@@ -85,6 +86,8 @@ describe('AgentModeService - CRM Tools', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     service = new AgentModeService();
+    // Default to org-aware access granted; deny tests override to false.
+    (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
   });
 
   // ─── getLeads ──────────────────────────────────────────────────────────
@@ -910,6 +913,78 @@ describe('AgentModeService - CRM Tools', () => {
 
   // ─── deleteLeads ───────────────────────────────────────────────────────
 
+  // ─── addLeadsToList ────────────────────────────────────────────────────
+
+  describe('addLeadsToList', () => {
+    const batchResult = {
+      successCount: 1,
+      newCount: 1,
+      mergedCount: 0,
+      errorCount: 0,
+      errors: [] as string[],
+    };
+
+    it('should add leads when caller owns the list', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.batchCreateLeads.mockResolvedValue(batchResult as any);
+
+      const result = await service.addLeadsToList(
+        listId,
+        [{ email: 'kyle@example.com', firstName: 'Kyle', lastName: 'Bimm' }],
+        userId
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.newCount).toBe(1);
+      expect(mockCrmDb.batchCreateLeads).toHaveBeenCalledTimes(1);
+    });
+
+    // Regression: an org member (not the owner) who can update leads on a
+    // shared list must also be able to add new leads to it.
+    it('should add leads when caller is an org member (not the owner)', async () => {
+      const orgMemberId = 'org-member-id';
+      mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'list-owner-id' } as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+      mockCrmDb.batchCreateLeads.mockResolvedValue(batchResult as any);
+
+      const result = await service.addLeadsToList(
+        listId,
+        [{ email: 'kyle@example.com', firstName: 'Kyle', lastName: 'Bimm' }],
+        orgMemberId
+      );
+
+      expect(result.success).toBe(true);
+      expect(mockCrmDb.canOrgMemberAccessList).toHaveBeenCalledWith(orgMemberId, expect.objectContaining({ userId: 'list-owner-id' }));
+      expect(mockCrmDb.batchCreateLeads).toHaveBeenCalledTimes(1);
+    });
+
+    it('should deny access for a non-owner, non-org-member', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other-user' } as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
+
+      const result = await service.addLeadsToList(
+        listId,
+        [{ email: 'kyle@example.com' }],
+        userId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Access denied');
+      expect(result.error).toContain('add leads');
+      expect(mockCrmDb.batchCreateLeads).not.toHaveBeenCalled();
+    });
+
+    it('should return not found for a missing list', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(null as any);
+
+      const result = await service.addLeadsToList(listId, [{ email: 'x@y.com' }], userId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Lead list not found');
+      expect(mockCrmDb.batchCreateLeads).not.toHaveBeenCalled();
+    });
+  });
+
   describe('deleteLeads', () => {
     it('should delete multiple leads', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
@@ -1043,6 +1118,7 @@ describe('AgentModeService - CRM Tools', () => {
 
     it('should deny access for wrong user', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other-user' } as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
 
       const result = await service.deleteLeadList(listId, userId);
 
@@ -1251,6 +1327,7 @@ describe('AgentModeService - CRM Tools', () => {
 
     it('should deny access for wrong user', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other-user' } as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
 
       const result = await service.addLeadEngagement(
         listId, leadId, 'custom.note', userId
@@ -1527,6 +1604,7 @@ describe('AgentModeService - CRM Tools', () => {
 
     it('updateLeadList denies access for wrong user', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other' } as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
       const result = await service.updateLeadList(listId, { name: 'X' }, userId);
       expect(result.success).toBe(false);
       expect(result.message).toBe('Access denied');
@@ -1795,6 +1873,7 @@ describe('AgentModeService - CRM Tools', () => {
 
     it('should reject when list not owned by user', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other-user' } as any);
+      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
 
       const result = await service.deleteLeadsByFilter(
         listId,
