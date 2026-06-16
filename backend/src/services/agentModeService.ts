@@ -17682,8 +17682,40 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     userId: string,
     sessionId: string,
     imageModel?: string,
-    logoImage?: string
+    logoImage?: string,
+    confirm?: boolean
   ): Promise<any> {
+    // Human-in-the-loop gate for image EDITING (inputImages present). Editing the
+    // wrong source images is the wrong-set mistake from the satisfaction incident,
+    // so before regenerating/editing existing images we surface the exact source
+    // image(s) to the user (rendered as thumbnails via markdown) and wait for
+    // explicit approval. Text-to-image (no inputImages) is fresh creation and is
+    // NOT gated. The agent loop halts on `awaitingUserConfirmation`; on approval the
+    // model re-calls with confirm=true. `confirm` never reaches the image service.
+    if (Array.isArray(inputImages) && inputImages.length > 0 && confirm !== true) {
+      const thumbs = inputImages.map((url, i) => `![source image ${i + 1}](${url})`).join('\n');
+      const summary = `Edit/regenerate ${inputImages.length} existing image(s) and save the result as "${filename}".`;
+      return {
+        success: true,
+        requiresConfirmation: true,
+        awaitingUserConfirmation: true,
+        summary,
+        confirmationPrompt:
+          `Based on your request, here's the image edit I'm about to make — ` +
+          `please check these are the right source image(s) before I proceed:\n\n` +
+          `${summary}\n\n${thumbs}\n\n` +
+          `Reply "yes" / "confirm" to go ahead, or tell me which image(s) to use instead.`,
+        // Model-facing instruction for the resumed turn (mirrors the Meta gate): once
+        // the user approves the shown source image(s), re-call generate_image with the
+        // SAME arguments plus confirm=true. If the user names different images, edit
+        // those instead (which will re-confirm).
+        message: `Image edit requires user confirmation: ${summary} The source image(s) have been shown to the user. ` +
+          `Do NOT proceed until the user approves. Once approved, call generate_image again with the same arguments plus confirm=true. ` +
+          `If the user asks for different source images, use those instead.`,
+        target: { action: 'EDIT_IMAGE', filename, inputImages }
+      } as any;
+    }
+
     try {
       // Import the image generation service
       const { imageService } = await import('./imageGeneration');

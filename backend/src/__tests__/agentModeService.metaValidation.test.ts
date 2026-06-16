@@ -326,6 +326,59 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(result.target.target_ad_set).toContain('Dest Ad Set');
     });
 
+    it('blocks CAMPAIGN DELETE without confirm and does not call metaService.deleteCampaign', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign' });
+
+      const result = await callApi(service, 'CAMPAIGN', 'DELETE', { campaign_id: 'camp_maint' });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.deleteCampaign).not.toHaveBeenCalled();
+      expect(result.confirmationPrompt).toContain('Maintenance Campaign');
+    });
+
+    it('blocks AD_SET CREATE without confirm and names the parent campaign', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign' });
+
+      const result = await callApi(service, 'AD_SET', 'CREATE', {
+        campaign_id: 'camp_maint',
+        params: { name: 'New Ad Set', daily_budget: 5000 }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.createAdSet).not.toHaveBeenCalled();
+      expect(result.confirmationPrompt).toContain('New Ad Set');
+      expect(result.confirmationPrompt).toContain('Maintenance Campaign');
+    });
+
+    it('blocks AD_SET UPDATE without confirm and does not call metaService.updateAdSet', async () => {
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_1', name: 'Maintenance Ad Set', campaign_id: 'camp_maint' });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign' });
+
+      const result = await callApi(service, 'AD_SET', 'UPDATE', {
+        ad_set_id: 'adset_1',
+        params: { daily_budget: 9000 }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.updateAdSet).not.toHaveBeenCalled();
+      expect(result.confirmationPrompt).toContain('Maintenance Ad Set');
+    });
+
+    it('blocks AD_SET DELETE without confirm and does not call metaService.deleteAdSet', async () => {
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_1', name: 'Maintenance Ad Set', campaign_id: 'camp_maint' });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign' });
+
+      const result = await callApi(service, 'AD_SET', 'DELETE', { ad_set_id: 'adset_1' });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.deleteAdSet).not.toHaveBeenCalled();
+      expect(result.confirmationPrompt).toContain('Maintenance Ad Set');
+    });
+
     it('blocks AD_CREATIVE CREATE without confirm and names the creative', async () => {
       const result = await callApi(service, 'AD_CREATIVE', 'CREATE', {
         params: { name: 'Spring Creative', page_id: 'p1', body: 'b', title: 't', link_url: 'https://x.com', image_hash: 'h1' }

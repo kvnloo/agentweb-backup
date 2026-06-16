@@ -4023,6 +4023,10 @@ emmaToolRegistry.register({
           type: 'string',
           description: 'Optional: Specific image generation model to use. Model guide: gemini-3.1-flash-image-preview (Google, BEST for logo compositing — renders logo most prominently, 4K output), gemini-3-pro-image-preview (Google, excellent for logo compositing, 4K output), gpt-image-2 (Azure, good for logo compositing — preserves logo faithfully, 1024×1024, may add extra design elements), gpt-image-1 (Azure, DO NOT USE for logo compositing — rewrites logo text instead of preserving it; fine for text-to-image with no logo), gemini-2.5-flash-image (Google, text-to-image only, no logo compositing), gen4_image (Runway, cinematic/photorealistic), gemini_2.5_flash (Runway). When logo_image is provided and no model is specified, gemini-3-pro-image-preview is the default.',
           enum: ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gpt-image-2', 'gemini-2.5-flash-image', 'gen4_image', 'gemini_2.5_flash']
+        },
+        confirm: {
+          type: 'boolean',
+          description: 'EDITING existing images only (when inputImages is set): on the first call, omit (or false) — the tool returns the source image(s) it will edit and asks the user to confirm. Set true ONLY after the user has seen those images and approved. Ignored for text-to-image (no inputImages), which never needs confirmation.'
         }
       },
       required: ['prompt', 'filename']
@@ -4040,7 +4044,8 @@ emmaToolRegistry.register({
       context?.userId,
       context?.sessionId,
       imageModel,
-      args.logo_image
+      args.logo_image,
+      args.confirm
     );
   }
 });
