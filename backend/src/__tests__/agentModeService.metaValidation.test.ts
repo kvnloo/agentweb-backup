@@ -20,6 +20,8 @@ jest.mock('../services/metaService', () => {
       deleteAdSet: jest.fn(),
       listAdSets: jest.fn(),
       getCampaign: jest.fn(),
+      getAdSet: jest.fn(),
+      getAd: jest.fn(),
       createAdCreative: jest.fn(),
       listAdCreatives: jest.fn(),
       createAd: jest.fn(),
@@ -189,12 +191,107 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
     it('passes validation and proceeds to API for valid CAMPAIGN CREATE', async () => {
       (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', name: 'Test' });
 
+      // confirm=true bypasses the target-confirmation gate so the action executes.
       const result = await callApi(service, 'CAMPAIGN', 'CREATE', {
-        params: { name: 'Test', objective: 'OUTCOME_TRAFFIC', special_ad_categories: ['NONE'] }
+        params: { name: 'Test', objective: 'OUTCOME_TRAFFIC', special_ad_categories: ['NONE'], confirm: true }
       });
 
       expect(result.success).toBe(true);
       expect(metaService.createCampaign).toHaveBeenCalled();
+    });
+  });
+
+  // ==================== Target-confirmation guardrail ====================
+  describe('callMetaMarketingApi target-confirmation gate', () => {
+    beforeEach(() => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+    });
+
+    it('blocks AD CREATE without confirm and returns the resolved campaign/ad set target', async () => {
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_1', name: 'Maintenance Ad Set', campaign_id: 'camp_maint' });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign', objective: 'OUTCOME_TRAFFIC' });
+
+      const result = await callApi(service, 'AD', 'CREATE', {
+        ad_set_id: 'adset_1',
+        params: { name: 'New Maintenance Ad', creative_id: 'creative_1' }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(metaService.createAd).not.toHaveBeenCalled();
+      // The resolved target must name the ad set AND the campaign it belongs to.
+      expect(result.message).toContain('Maintenance Ad Set');
+      expect(result.message).toContain('Maintenance Campaign');
+      expect(result.target.campaign).toContain('Maintenance Campaign');
+      expect(result.target.ad_set).toContain('Maintenance Ad Set');
+    });
+
+    it('executes AD CREATE when confirm=true and strips the flag before dispatch', async () => {
+      (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'ad_new', name: 'New Maintenance Ad' });
+
+      const result = await callApi(service, 'AD', 'CREATE', {
+        ad_set_id: 'adset_1',
+        params: { name: 'New Maintenance Ad', creative_id: 'creative_1', confirm: true }
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.requiresConfirmation).toBeUndefined();
+      expect(metaService.createAd).toHaveBeenCalledTimes(1);
+      // confirm must never leak into the params passed to metaService.
+      const paramsArg = (metaService.createAd as jest.Mock).mock.calls[0][2];
+      expect(paramsArg.confirm).toBeUndefined();
+    });
+
+    it('blocks AD DELETE without confirm and does not call metaService.deleteAd', async () => {
+      (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'ad_1', name: 'Old Ad', adset_id: 'adset_1', campaign_id: 'camp_maint' });
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_1', name: 'Maintenance Ad Set', campaign_id: 'camp_maint' });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign' });
+
+      const result = await callApi(service, 'AD', 'DELETE', { ad_id: 'ad_1' });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.message).toContain('Old Ad');
+      expect(metaService.deleteAd).not.toHaveBeenCalled();
+    });
+
+    it('still requires confirmation when target resolution fails (degrades to raw IDs)', async () => {
+      (metaService.getAdSet as jest.Mock).mockRejectedValue(new Error('Meta unreachable'));
+      (metaService.getCampaign as jest.Mock).mockRejectedValue(new Error('Meta unreachable'));
+
+      const result = await callApi(service, 'AD', 'CREATE', {
+        ad_set_id: 'adset_999',
+        params: { name: 'Ad', creative_id: 'creative_1' }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(metaService.createAd).not.toHaveBeenCalled();
+      // Falls back to the raw ad set ID in the summary.
+      expect(result.message).toContain('adset_999');
+    });
+
+    it('does NOT gate read-only AD LIST', async () => {
+      (metaService.listAds as jest.Mock).mockResolvedValue([]);
+
+      const result = await callApi(service, 'AD', 'LIST', { ad_set_id: 'adset_1' });
+
+      expect(result.requiresConfirmation).toBeUndefined();
+      expect(metaService.listAds).toHaveBeenCalled();
+    });
+
+    it('blocks AD COPY_AD without confirm and names source ad + destination campaign', async () => {
+      (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'ad_src', name: 'Source Ad', adset_id: 'adset_src', campaign_id: 'camp_a' });
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_dest', name: 'Dest Ad Set', campaign_id: 'camp_b' });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_b', name: 'Leasing Campaign' });
+
+      const result = await callApi(service, 'AD', 'COPY_AD', {
+        ad_id: 'ad_src',
+        params: { adset_id: 'adset_dest' }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.message).toContain('Source Ad');
+      expect(result.message).toContain('Dest Ad Set');
+      expect(result.message).toContain('Leasing Campaign');
+      expect(result.target.target_ad_set).toContain('Dest Ad Set');
     });
   });
 
