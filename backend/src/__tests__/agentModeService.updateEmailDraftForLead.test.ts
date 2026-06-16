@@ -1050,5 +1050,30 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       const userMsg = messageCall.messages.find((m: any) => m.role === 'user');
       expect(userMsg.content).not.toContain('Activity History');
     });
+
+    it('re-generates a shorter LinkedIn note when the message draft exceeds the limit, then trims', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue({ engagements: [] });
+      mockReadBrandGuidelines.mockResolvedValue(mockBrandGuidelines);
+      mockReadMarketStrategy.mockResolvedValue(mockMarketStrategy);
+      mockGetSenderForLead.mockResolvedValue(mockSenderInfo);
+      (crmDb.updateLead as jest.Mock).mockResolvedValue({});
+
+      const overLimitNote = 'x'.repeat(260); // > 200 free-account limit
+      const reworked = 'Jane, your Tech Corp platform work is the kind of thing I keep an eye on — wanted to be in your network.';
+      expect(reworked.length).toBeLessThanOrEqual(200);
+      mockCreate
+        .mockResolvedValueOnce(emailDraftResponse) // 1: email draft
+        .mockResolvedValueOnce({ choices: [{ message: { content: JSON.stringify({ content: overLimitNote }) } }] }) // 2: over-limit message draft
+        .mockResolvedValueOnce({ choices: [{ message: { content: JSON.stringify({ content: reworked }) } }] }); // 3: capped re-gen (fits)
+
+      await (agentModeService as any).updateEmailDraftForLead(listId, leadId, instruction, sessionId, userId, 'text');
+
+      // email + over-limit draft + one re-gen attempt that fits
+      expect(mockCreate).toHaveBeenCalledTimes(3);
+      const updateCall = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
+      expect(updateCall.messageDraft.content).toBe(reworked);
+    });
   });
 });

@@ -935,6 +935,51 @@ describe('ExternalCrmSyncService', () => {
         service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com' }, 'hubspot', 'created')
       ).resolves.not.toThrow();
     });
+
+    it('persists lastSyncStatus=error and lastSyncError when the push throws (e.g. revoked token)', async () => {
+      const config = makeConfig({ autoSyncEnabled: true });
+      mockListWithConfig(config);
+      // A revoked token throws out of pushLeads via the token resolution / first call.
+      mockHubSpotServiceInstance.ensureContactProperty.mockRejectedValue(
+        new Error('Authentication credentials not found')
+      );
+
+      await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com', notes: 'x' }, 'hubspot', 'created');
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1);
+      expect(call).toBeDefined();
+      const saved = call![2] as Record<string, any>;
+      expect(saved.lastSyncStatus).toBe('error');
+      expect(saved.lastSyncError).toContain('Authentication credentials not found');
+    });
+
+    it('persists lastSyncStatus=error when the adapter reports a per-lead error (errorCount>0)', async () => {
+      const config = makeConfig({ autoSyncEnabled: true });
+      mockListWithConfig(config);
+      // An invalid email is caught per-lead into result.errors (no throw), errorCount=1.
+      await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'not-an-email' }, 'hubspot', 'created');
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1);
+      expect(call).toBeDefined();
+      const saved = call![2] as Record<string, any>;
+      expect(saved.lastSyncStatus).toBe('error');
+      expect(saved.lastSyncError).toBeTruthy();
+    });
+
+    it('persists lastSyncStatus=success and clears lastSyncError on a healthy sync', async () => {
+      // Start from a previously-errored config to prove the error banner clears.
+      const config = makeConfig({ autoSyncEnabled: true, lastSyncStatus: 'error', lastSyncError: 'old failure' });
+      mockListWithConfig(config);
+
+      await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com', firstName: 'Ada' }, 'hubspot', 'created');
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1);
+      expect(call).toBeDefined();
+      const saved = call![2] as Record<string, any>;
+      expect(saved.lastSyncStatus).toBe('success');
+      expect(saved.lastSyncError).toBeUndefined();
+      expect(saved.lastPushSyncAt).toBeTruthy();
+    });
   });
 
   // ─── getExternalProperties ─────────────────────────────────────────────────

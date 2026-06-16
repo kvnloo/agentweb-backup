@@ -813,8 +813,9 @@ export class ExternalCrmSyncService {
     provider: 'hubspot' | 'attio',
     _eventType: 'created' | 'updated'
   ): Promise<void> {
+    let config: ExternalCrmSyncConfig | null = null;
     try {
-      const config = await this.getConfig(userId, listId, provider);
+      config = await this.getConfig(userId, listId, provider);
       if (!config?.autoSyncEnabled) return;
       if (!config.accountId && !config.apiKeyEncrypted) return;
 
@@ -822,11 +823,35 @@ export class ExternalCrmSyncService {
 
       const auth = this.resolveAuth(config);
       const adapter = getAdapter(provider);
-      await adapter.pushLeads(auth, [lead], config);
-      await this.saveUpdatedConfig(config).catch(() => { });
+      const result = await adapter.pushLeads(auth, [lead], config);
+
+      // The adapter catches per-lead failures (e.g. an invalid email) into
+      // result.errors rather than throwing. A real-time auth failure (revoked
+      // token) usually throws out of pushLeads, but treat any non-zero
+      // errorCount as a failed sync too, mirroring the manual-push semantics
+      // in runPush (errorCount === 0 ⇒ success).
+      if (result.errorCount > 0) {
+        const detail = result.errors[0] || 'Auto-sync reported an error';
+        console.error(`[ExternalCrmSync] Auto-sync error for lead ${lead.leadId} in list ${listId}:`, detail);
+        config.lastSyncError = detail;
+        await this.updateSyncTimestamp(config, 'push', false);
+        return;
+      }
+
+      // Success — persist the contact-id writeback the adapter made on `config`
+      // and record a healthy sync status so a previously-failed connection
+      // clears its error banner.
+      await this.updateSyncTimestamp(config, 'push', true);
     } catch (err: any) {
       const details = err.response?.data?.message || err.response?.data || err.message;
       console.error(`[ExternalCrmSync] Auto-sync failed for lead ${lead.leadId} in list ${listId}:`, details);
+      // Surface the failure on the config so the CRM UI can flag a connection
+      // that needs attention (e.g. a revoked HubSpot token). Without this,
+      // real-time failures are invisible because only manual push wrote status.
+      if (config) {
+        config.lastSyncError = typeof details === 'string' ? details : JSON.stringify(details);
+        await this.updateSyncTimestamp(config, 'push', false).catch(() => { });
+      }
     }
   }
 
