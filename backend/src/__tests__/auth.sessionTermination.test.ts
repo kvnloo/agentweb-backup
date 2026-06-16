@@ -216,6 +216,22 @@ describe('Session termination on password change', () => {
       expect(result.user?.userId).toBe('user-1');
     });
 
+    it('accepts a token whose sv is AHEAD of the stored value (eventually-consistent GSI lag after a fresh password change)', async () => {
+      // Regression: getUserById reads the eventually-consistent UserIdIndex GSI.
+      // Just after incrementSessionVersion bumps the base table 1→2 and the new
+      // token is signed with sv:2, the GSI replica may still return sessionVersion:1.
+      // The current device's brand-new token must NOT be rejected in that window.
+      (mockJwt.verify as jest.Mock).mockReturnValue({ userId: 'user-1', email: 'u@e.com', isAdmin: false, sv: 2 });
+      mockUserDb.getUserById.mockResolvedValue({
+        userId: 'user-1', email: 'u@e.com', isAdmin: false, sessionVersion: 1, roles: ['customer'],
+      } as any);
+
+      const result = await getUserFromToken(reqWithToken());
+
+      expect(result.user).not.toBeNull();
+      expect(result.user?.userId).toBe('user-1');
+    });
+
     it('accepts legacy tokens with no sv against a user with no sessionVersion (both default 0)', async () => {
       (mockJwt.verify as jest.Mock).mockReturnValue({ userId: 'user-1', email: 'u@e.com', isAdmin: false });
       mockUserDb.getUserById.mockResolvedValue({

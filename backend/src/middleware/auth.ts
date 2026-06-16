@@ -124,7 +124,15 @@ export async function getUserFromToken(req: Request): Promise<{
       // Reject tokens minted before the user's most recent password change.
       // A bumped sessionVersion invalidates every token carrying an older `sv`,
       // logging out all other devices. Both sides default to 0 for backward compat.
-      if ((user.sessionVersion ?? 0) !== (decoded.sv ?? 0)) {
+      //
+      // Use `<` (token behind server), NOT `!==`: getUserById reads the
+      // UserIdIndex GSI, which is eventually consistent. Right after a password
+      // change the GSI can still return the stale (lower) sessionVersion while
+      // the freshly-issued token already carries the new (higher) `sv`. A strict
+      // `!==` would then reject that brand-new token and log the user out of the
+      // very device they just used. A token's `sv` can only exceed the stored
+      // value because the server legitimately signed it, so accepting `>=` is safe.
+      if ((decoded.sv ?? 0) < (user.sessionVersion ?? 0)) {
         return { user: null };
       }
 

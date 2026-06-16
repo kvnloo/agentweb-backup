@@ -80,9 +80,13 @@ io.use(async (socket, next) => {
       // Enforce session versioning for normal user tokens so a password change
       // disconnects other devices' sockets too. Delegate/service tokens are
       // exempt (same policy as the HTTP auth middleware).
+      //
+      // Use `<` (token behind server), NOT `!==`: getUserById reads an
+      // eventually-consistent GSI, so a freshly-issued token (higher `sv`) must
+      // not be rejected just because the GSI replica still holds the old value.
       if (decoded.userId && !decoded.delegateAccess && !decoded._svc) {
         const user = await userDb.getUserById(decoded.userId);
-        if (!user || (user.sessionVersion ?? 0) !== (decoded.sv ?? 0)) {
+        if (!user || (decoded.sv ?? 0) < (user.sessionVersion ?? 0)) {
           return next(new Error('Authentication error'));
         }
       }
