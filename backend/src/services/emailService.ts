@@ -200,7 +200,7 @@ export const emailService = {
           
           <p style="color: #666; font-size: 14px; margin-top: 20px;">
             ${temporaryPassword
-        ? '<strong>Important:</strong> Please change your password after your first login for security reasons.'
+        ? '<strong>Important:</strong> Please change your password after your first login for security reasons. This temporary password expires in 1 month.'
         : ''
       }
           </p>
@@ -243,7 +243,7 @@ You now have access to our full suite of AI-powered marketing automation tools, 
 ` : ''}
 
 ${temporaryPassword
-        ? 'Important: Please change your password after your first login for security reasons.'
+        ? 'Important: Please change your password after your first login for security reasons. This temporary password expires in 1 month.'
         : ''
       }
 
