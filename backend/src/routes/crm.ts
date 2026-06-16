@@ -4457,7 +4457,7 @@ router.post('/lists/:listId/leads/:leadId/draft-invite-note', async (req: Reques
     // Resolve the LinkedIn account that will send this invite (same precedence as
     // send-linkedin-invite) so the note is drafted to the right char limit: 300 for
     // Premium accounts, 200 for free. Falls back to 200 when no account resolves.
-    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const { linkedInOutreachService, LinkedInOutreachService } = await import('../services/linkedInOutreachService');
     const { accountId: requestedAccountId } = req.body || {};
     const inviteAccountId = (requestedAccountId && typeof requestedAccountId === 'string')
       ? requestedAccountId
@@ -4532,13 +4532,18 @@ Reply with ONLY valid JSON, nothing else: {"content": "the note text"}`;
         if (val.startsWith('{') && val.includes('"content"')) {
           try { val = String(JSON.parse(val).content || val); } catch { /* keep val */ }
         }
-        content = val.slice(0, inviteCharLimit);
+        // Smart-trim to the account limit on a word boundary (surrogate-safe),
+        // matching what sendInvitation does at send time — never a crude mid-word cut.
+        content = LinkedInOutreachService.trimInviteMessage(val, inviteCharLimit);
       } catch {
         // Still can't parse — extract the text between the first " and last "
         const firstQ = cleaned.indexOf('"', cleaned.indexOf('"content"') + 10);
         const lastQ = cleaned.lastIndexOf('"');
         if (firstQ !== -1 && lastQ > firstQ) {
-          content = cleaned.slice(firstQ + 1, lastQ).replace(/\\"/g, '"').slice(0, inviteCharLimit);
+          content = LinkedInOutreachService.trimInviteMessage(
+            cleaned.slice(firstQ + 1, lastQ).replace(/\\"/g, '"'),
+            inviteCharLimit,
+          );
         }
       }
     }
