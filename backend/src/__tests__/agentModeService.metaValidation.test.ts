@@ -241,6 +241,38 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(paramsArg.confirm).toBeUndefined();
     });
 
+    it('blocks a VALID AD UPDATE without confirm and does not call metaService.updateAd', async () => {
+      (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'ad_1', name: 'Spring Promo', adset_id: 'adset_1', campaign_id: 'camp_maint' });
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_1', name: 'Maintenance Ad Set', campaign_id: 'camp_maint' });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign' });
+
+      const result = await callApi(service, 'AD', 'UPDATE', {
+        ad_id: 'ad_1',
+        params: { daily_budget: 5000 }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.updateAd).not.toHaveBeenCalled();
+      // The change being made must be surfaced so the user can catch a wrong edit.
+      expect(result.confirmationPrompt).toContain('Spring Promo');
+      expect(result.confirmationPrompt).toContain('Maintenance Campaign');
+    });
+
+    it('blocks a VALID CAMPAIGN UPDATE without confirm and does not call metaService.updateCampaign', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign' });
+
+      const result = await callApi(service, 'CAMPAIGN', 'UPDATE', {
+        campaign_id: 'camp_maint',
+        params: { status: 'PAUSED' }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.updateCampaign).not.toHaveBeenCalled();
+      expect(result.confirmationPrompt).toContain('Maintenance Campaign');
+    });
+
     it('blocks AD DELETE without confirm and does not call metaService.deleteAd', async () => {
       (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'ad_1', name: 'Old Ad', adset_id: 'adset_1', campaign_id: 'camp_maint' });
       (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_1', name: 'Maintenance Ad Set', campaign_id: 'camp_maint' });
@@ -292,6 +324,137 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(result.message).toContain('Dest Ad Set');
       expect(result.message).toContain('Leasing Campaign');
       expect(result.target.target_ad_set).toContain('Dest Ad Set');
+    });
+
+    it('blocks AD_CREATIVE CREATE without confirm and names the creative', async () => {
+      const result = await callApi(service, 'AD_CREATIVE', 'CREATE', {
+        params: { name: 'Spring Creative', page_id: 'p1', body: 'b', title: 't', link_url: 'https://x.com', image_hash: 'h1' }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.createAdCreative).not.toHaveBeenCalled();
+      expect(result.confirmationPrompt).toContain('Spring Creative');
+    });
+
+    it('blocks CUSTOM_AUDIENCE CREATE without confirm and names the audience', async () => {
+      const result = await callApi(service, 'CUSTOM_AUDIENCE', 'CREATE', {
+        params: { name: 'High Value Leads', subtype: 'CUSTOM', customer_file_source: 'USER_PROVIDED_ONLY' }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.createCustomAudience).not.toHaveBeenCalled();
+      expect(result.confirmationPrompt).toContain('High Value Leads');
+    });
+
+    it('blocks CUSTOM_AUDIENCE UPLOAD_USERS without confirm (PII upload) and names the audience ID', async () => {
+      const result = await callApi(service, 'CUSTOM_AUDIENCE', 'UPLOAD_USERS', {
+        params: { id: 'aud_123', schema: ['EMAIL'], payload: '[["a@b.com"]]' }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.uploadCustomAudienceUsers).not.toHaveBeenCalled();
+      expect(result.confirmationPrompt).toContain('aud_123');
+      expect(result.confirmationPrompt).toContain('PII');
+    });
+
+    it('does NOT gate read-only CUSTOM_AUDIENCE LIST', async () => {
+      (metaService.listCustomAudiences as jest.Mock).mockResolvedValue([]);
+
+      const result = await callApi(service, 'CUSTOM_AUDIENCE', 'LIST', {});
+
+      expect(result.requiresConfirmation).toBeUndefined();
+      expect(result.awaitingUserConfirmation).toBeUndefined();
+      expect(metaService.listCustomAudiences).toHaveBeenCalled();
+    });
+
+    // ---- Human-in-the-loop fields (consumed by the agent loop to halt the turn) ----
+    it('sets awaitingUserConfirmation + a user-facing confirmationPrompt on a gated write', async () => {
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_1', name: 'Maintenance Ad Set', campaign_id: 'camp_maint' });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign' });
+
+      const result = await callApi(service, 'AD', 'CREATE', {
+        ad_set_id: 'adset_1',
+        params: { name: 'New Maintenance Ad', creative_id: 'creative_1' }
+      });
+
+      // The dedicated flag the loop breaks on (distinct from requiresConfirmation,
+      // so only Meta writes halt the turn — not delete_leads / work-plan flows).
+      expect(result.awaitingUserConfirmation).toBe(true);
+      // The user-facing prompt must name the resolved target and ask for approval.
+      expect(typeof result.confirmationPrompt).toBe('string');
+      expect(result.confirmationPrompt).toContain('Maintenance Ad Set');
+      expect(result.confirmationPrompt).toContain('Maintenance Campaign');
+      expect(result.confirmationPrompt.toLowerCase()).toContain('confirm');
+    });
+
+    it('does NOT set awaitingUserConfirmation when confirm=true (gate bypassed, executes)', async () => {
+      (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'ad_new', name: 'New Maintenance Ad' });
+
+      const result = await callApi(service, 'AD', 'CREATE', {
+        ad_set_id: 'adset_1',
+        params: { name: 'New Maintenance Ad', creative_id: 'creative_1', confirm: true }
+      });
+
+      expect(result.awaitingUserConfirmation).toBeUndefined();
+      expect(result.confirmationPrompt).toBeUndefined();
+      expect(metaService.createAd).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT set awaitingUserConfirmation on read-only AD LIST', async () => {
+      (metaService.listAds as jest.Mock).mockResolvedValue([]);
+
+      const result = await callApi(service, 'AD', 'LIST', { ad_set_id: 'adset_1' });
+
+      expect(result.awaitingUserConfirmation).toBeUndefined();
+      expect(result.confirmationPrompt).toBeUndefined();
+    });
+  });
+
+  // ==================== Agent-loop halt detection ====================
+  // collectConfirmationPrompt is the seam the agent loop uses to decide whether to
+  // STOP the autonomous turn and hand control back to the user. It scans the tool
+  // results from one iteration and returns the user-facing prompt to surface (or null).
+  describe('collectConfirmationPrompt (loop halt seam)', () => {
+    const awaiting = (prompt: string) => ({
+      status: 'success' as const,
+      result: { success: true, awaitingUserConfirmation: true, confirmationPrompt: prompt }
+    });
+
+    it('returns null when no tool result requests user confirmation', () => {
+      const out = (service as any).collectConfirmationPrompt([
+        { status: 'success', result: { success: true, data: [] } },
+        { status: 'error', error: new Error('boom') }
+      ]);
+      expect(out).toBeNull();
+    });
+
+    it('returns the confirmationPrompt of a single gated write', () => {
+      const out = (service as any).collectConfirmationPrompt([
+        { status: 'success', result: { success: true } },
+        awaiting('Please confirm: publish ad into Maintenance Campaign?')
+      ]);
+      expect(out).toBe('Please confirm: publish ad into Maintenance Campaign?');
+    });
+
+    it('joins prompts when multiple writes are batched in one turn', () => {
+      const out = (service as any).collectConfirmationPrompt([
+        awaiting('Confirm A'),
+        awaiting('Confirm B')
+      ]);
+      expect(out).toContain('Confirm A');
+      expect(out).toContain('Confirm B');
+    });
+
+    it('ignores requiresConfirmation-only results (delete_leads / work-plan stay un-halted)', () => {
+      // A tool that sets requiresConfirmation but NOT awaitingUserConfirmation must not
+      // halt the loop — only the dedicated flag triggers the human gate.
+      const out = (service as any).collectConfirmationPrompt([
+        { status: 'success', result: { success: true, requiresConfirmation: true, message: 'Call again with confirm=true' } }
+      ]);
+      expect(out).toBeNull();
     });
   });
 

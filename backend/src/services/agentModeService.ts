@@ -3213,6 +3213,27 @@ export class AgentModeService {
           }
         }
 
+        // Human-in-the-loop confirmation gate: if a tool in this iteration requested
+        // explicit user confirmation (e.g. a Meta Ads publish/change/delete), STOP the
+        // autonomous loop and hand control back to the user. The model CANNOT self-approve
+        // — only a new user message restarts the turn, after which it re-calls the tool
+        // with confirm=true. This is the safety net for the wrong-campaign / wrong-asset
+        // class of mistake: the user sees the resolved target and must approve it.
+        const confirmationPrompt = this.collectConfirmationPrompt(toolResults);
+        if (confirmationPrompt) {
+          content = confirmationPrompt;
+          (messages as any[]).push({
+            role: 'assistant',
+            content: confirmationPrompt,
+            llm: llmModel,
+            metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true }
+          });
+          if (onProgress) {
+            onProgress({ iteration, status: 'complete', toolCalls: toolCalls.slice() });
+          }
+          break;
+        }
+
         // Anti-loop detection: check if the LLM is repeating the same tool calls
         const currentToolSignature = responseMessage.tool_calls
           ?.map((tc: any) => `${tc.function.name}:${tc.function.arguments}`)
@@ -13919,11 +13940,38 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   private static META_WRITE_ACTIONS: Record<string, string[]> = {
     CAMPAIGN: ['CREATE', 'UPDATE', 'DELETE'],
     AD_SET: ['CREATE', 'UPDATE', 'DELETE'],
-    AD: ['CREATE', 'UPDATE', 'DELETE', 'COPY_AD']
+    AD: ['CREATE', 'UPDATE', 'DELETE', 'COPY_AD'],
+    // Account-level assets. CREATE publishes a creative; UPLOAD_USERS pushes PII
+    // user data to Meta. UPLOAD_IMAGE/UPLOAD_VIDEO only stage assets (no publish),
+    // and LIST is read-only — none of those need confirmation.
+    AD_CREATIVE: ['CREATE'],
+    CUSTOM_AUDIENCE: ['CREATE', 'UPLOAD_USERS']
   };
 
   private static isMetaWriteAction(entity_type: string, action: string): boolean {
     return (AgentModeService.META_WRITE_ACTIONS[entity_type] || []).includes(action);
+  }
+
+  /**
+   * Loop halt seam for the human-in-the-loop confirmation gate. Scans one iteration's
+   * tool results and returns the user-facing prompt to surface (or null to continue).
+   * Only tool results that set `awaitingUserConfirmation === true` halt the turn — this
+   * is a dedicated flag (NOT `requiresConfirmation`), so destructive flows that merely
+   * set `requiresConfirmation` (delete_leads_by_filter, work-plan replace) are unaffected.
+   * When the loop halts, control returns to the user; the model cannot self-approve.
+   */
+  private collectConfirmationPrompt(
+    toolResults: Array<{ status: 'success' | 'error'; result?: any }>
+  ): string | null {
+    const prompts: string[] = [];
+    for (const tr of toolResults) {
+      if (tr.status !== 'success') continue;
+      const r: any = tr.result;
+      if (r && r.awaitingUserConfirmation === true) {
+        prompts.push(r.confirmationPrompt || r.summary || r.message || 'Please confirm this action before I proceed.');
+      }
+    }
+    return prompts.length > 0 ? prompts.join('\n\n') : null;
   }
 
   /**
@@ -14024,6 +14072,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ].filter(Boolean).join(', ');
         lines.push(`${action} ad ${target.ad}${ctx ? ` (in ${ctx})` : ''}.`);
       }
+    } else if (entity_type === 'AD_CREATIVE') {
+      // Account-level asset (CREATE only — uploads/list are not gated).
+      target.creative_name = params.name;
+      lines.push(`Create a NEW ad creative${params.name ? ` "${params.name}"` : ''} in ad account ${account_id}.`);
+    } else if (entity_type === 'CUSTOM_AUDIENCE') {
+      if (action === 'UPLOAD_USERS') {
+        target.audience_id = params.id;
+        lines.push(`Upload user data (PII) to custom audience ID ${params.id} in ad account ${account_id}.`);
+      } else {
+        target.audience_name = params.name;
+        target.subtype = params.subtype;
+        lines.push(`Create a NEW ${params.subtype ? `${params.subtype} ` : ''}custom audience "${params.name}" in ad account ${account_id}.`);
+      }
     }
 
     // Surface content/destination changes so the user can catch a wrong-asset edit.
@@ -14080,9 +14141,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const { summary, target } = await this.buildMetaWriteConfirmation(
         userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
       );
+      // `awaitingUserConfirmation` + `confirmationPrompt` are consumed by the agent loop
+      // (collectConfirmationPrompt) to HALT the turn and surface the prompt to the user.
+      // The turn cannot continue until a NEW human message arrives — the model cannot
+      // self-approve. `message` keeps the model-facing instructions for the resumed turn.
       return {
         success: true,
         requiresConfirmation: true,
+        awaitingUserConfirmation: true,
+        summary,
+        confirmationPrompt:
+          `Based on your request, here's the exact Meta Ads change I'm about to make — ` +
+          `please check it's the right target before I proceed:\n\n${summary}\n\n` +
+          `Reply "yes" / "confirm" if this is correct, or tell me what to change ` +
+          `(for example, a different campaign, ad set, or asset).`,
         message: `Confirm this Meta Ads ${entity_type} ${action} before it runs: ${summary} ` +
           `Show the user the exact target above (campaign / ad set / asset) and get explicit approval. ` +
           `If more than one campaign or asset could match the request, ask the user to disambiguate first. ` +
