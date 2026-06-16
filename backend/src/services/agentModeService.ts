@@ -8346,7 +8346,8 @@ export class AgentModeService {
         };
       }
 
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return {
           success: false,
           message: 'Access denied',
@@ -9252,7 +9253,7 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found' };
       }
-      if (list.userId !== userId) {
+      if (!(await crmDb.canOrgMemberAccessList(userId, list))) {
         return { success: false, message: 'Access denied' };
       }
 
@@ -9314,7 +9315,7 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      if (!(await crmDb.canOrgMemberAccessList(userId, list))) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to delete leads from this list' };
       }
 
@@ -9363,7 +9364,7 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      if (!(await crmDb.canOrgMemberAccessList(userId, list))) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to delete leads from this list' };
       }
 
@@ -9535,7 +9536,7 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      if (!(await crmDb.canOrgMemberAccessList(userId, list))) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to modify this list' };
       }
 
@@ -9649,7 +9650,7 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      if (!(await crmDb.canOrgMemberAccessList(userId, list))) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to view this list' };
       }
 
@@ -9688,7 +9689,7 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      if (!(await crmDb.canOrgMemberAccessList(userId, list))) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to modify this list' };
       }
 
@@ -9731,7 +9732,7 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      if (!(await crmDb.canOrgMemberAccessList(userId, list))) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to delete this list' };
       }
 
@@ -9762,7 +9763,7 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      if (!(await crmDb.canOrgMemberAccessList(userId, list))) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
       }
 
@@ -9820,7 +9821,7 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      if (!(await crmDb.canOrgMemberAccessList(userId, list))) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
       }
 
