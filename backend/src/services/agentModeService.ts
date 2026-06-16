@@ -2916,7 +2916,13 @@ export class AgentModeService {
         // — only a new user message restarts the turn, after which it re-calls the tool
         // with confirm=true. This is the safety net for the wrong-campaign / wrong-asset
         // class of mistake: the user sees the resolved target and must approve it.
-        const confirmationPrompt = this.collectConfirmationPrompt(toolResults);
+        // Post-refactor (core/toolDispatch), this iteration's results live on the
+        // toolCalls ledger (each entry carries .result = the minimal result, which
+        // preserves awaitingUserConfirmation). Re-shape the new slice for the seam.
+        const iterationResults = toolCalls
+          .slice(toolCallsLengthBeforeIteration)
+          .map((tc: any) => ({ status: tc.error ? 'error' as const : 'success' as const, result: tc.result }));
+        const confirmationPrompt = this.collectConfirmationPrompt(iterationResults);
         if (confirmationPrompt) {
           content = confirmationPrompt;
           (messages as any[]).push({
