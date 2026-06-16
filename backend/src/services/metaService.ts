@@ -443,7 +443,11 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const user = new User('me');
-      const fields = ['id', 'name', 'account_id', 'currency', 'account_status', 'owner', 'business'];
+      // Do NOT request 'owner' here: since ~June 2026 Meta silently omits every ad
+      // account the user does not personally own (business/shared accounts) from the
+      // response when 'owner' is in the field list, leaving most customers with an
+      // empty list. 'business' is unused downstream, so it is not requested either.
+      const fields = ['id', 'name', 'account_id', 'currency', 'account_status'];
 
       const adAccountsPath = await user.getAdAccounts(fields);
 
@@ -454,9 +458,7 @@ export class MetaService {
           name: account.name,
           account_id: account.account_id,
           currency: account.currency,
-          account_status: account.account_status,
-          owner: account.owner,
-          business: account.business
+          account_status: account.account_status
         }));
 
     } catch (error: any) {
@@ -480,7 +482,7 @@ export class MetaService {
       // Fetch pages (accounts edge on User)
       const pagesPath = await user.getAccounts(fields);
 
-      return pagesPath.map((page: any) => ({
+      const pages = pagesPath.map((page: any) => ({
         id: page.id || page._data?.id,
         name: page.name || page._data?.name,
         access_token: page.access_token || page._data?.access_token,
@@ -488,9 +490,64 @@ export class MetaService {
         tasks: page.tasks || page._data?.tasks
       }));
 
+      if (pages.length > 0) return pages;
+
+      // Meta quirk: tokens whose page access comes via Business Manager task
+      // assignment (Facebook Login for Business) return [] from /me/accounts even
+      // though the user opted those pages in during consent. The opted-in page IDs
+      // ARE present in debug_token granular_scopes, and direct per-page reads work.
+      return await this.getPagesFromGranularScopes(accessToken);
+
     } catch (error: any) {
       this.handleError(error);
       return []; // Unreachable
+    }
+  }
+
+  /**
+   * Best-effort fallback for getPages: enumerate the page IDs the user opted in
+   * during OAuth (debug_token granular_scopes → pages_show_list.target_ids) and
+   * read each page directly. Returns [] on any failure rather than throwing —
+   * callers treat "no pages" as a soft state.
+   */
+  private async getPagesFromGranularScopes(accessToken: string): Promise<MetaPage[]> {
+    try {
+      const { getMetaCredentials } = await import('../utils/secretsManager');
+      const creds = await getMetaCredentials();
+      const apiVersion = process.env.META_API_VERSION || 'v25.0';
+      const appToken = `${creds.clientId}|${creds.clientSecret}`;
+
+      const dbgRes = await fetch(
+        `https://graph.facebook.com/${apiVersion}/debug_token?input_token=${accessToken}&access_token=${appToken}`
+      );
+      const dbg: any = await dbgRes.json();
+      const granular: any[] = dbg?.data?.granular_scopes || [];
+      const pageIds: string[] = granular.find((g: any) => g.scope === 'pages_show_list')?.target_ids || [];
+      if (pageIds.length === 0) return [];
+
+      const pages: MetaPage[] = [];
+      for (const pageId of pageIds) {
+        const pageRes = await fetch(
+          `https://graph.facebook.com/${apiVersion}/${pageId}?fields=id,name,access_token,category&access_token=${accessToken}`
+        );
+        const page: any = await pageRes.json();
+        if (page?.error || !page?.id) {
+          console.warn(`[MetaService] getPages granular fallback: skipping page ${pageId}: ${page?.error?.message ?? 'no id in response'}`);
+          continue;
+        }
+        pages.push({
+          id: page.id,
+          name: page.name,
+          access_token: page.access_token,
+          category: page.category,
+          // tasks omitted — the field is not readable on business-task-assigned pages
+        });
+      }
+      this.log(`getPages granular fallback returned ${pages.length} page(s)`);
+      return pages;
+    } catch (error: any) {
+      console.warn(`[MetaService] getPages granular fallback failed: ${error?.message ?? error}`);
+      return [];
     }
   }
 

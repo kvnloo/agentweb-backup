@@ -4,12 +4,6 @@ export interface MetaAdAccount {
   account_id: string;
   currency: string;
   account_status: number;
-  owner?: string;
-  business?: {
-    id: string;
-    name: string;
-    [key: string]: any;
-  };
 }
 
 /**

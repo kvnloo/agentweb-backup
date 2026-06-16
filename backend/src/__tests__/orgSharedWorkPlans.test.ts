@@ -295,8 +295,8 @@ describe("DELETE /api/user-work-plans/:planId — org member cannot delete anoth
   });
 });
 
-describe("PUT /api/user-work-plans/:planId — editor-based PATCH permission", () => {
-  // App where authenticated user is the editor (user-3)
+describe("PUT /api/user-work-plans/:planId — work plans are owner-edit-only (no editor delegation)", () => {
+  // App where authenticated user is a listed editor (user-3)
   const editorApp = express();
   editorApp.use(express.json());
   editorApp.use("/api/user-work-plans", (req: any, _res: any, next: any) => {
@@ -308,7 +308,7 @@ describe("PUT /api/user-work-plans/:planId — editor-based PATCH permission", (
     jest.clearAllMocks();
   });
 
-  it("editor in shareSettings.workPlans.editors can PATCH another member's plan", async () => {
+  it("a listed workPlans editor CANNOT PATCH another member's plan (owner-only)", async () => {
     mockGetWorkPlan.mockResolvedValue(memberPlan); // owned by user-2
     mockGetUserById.mockImplementation((uid: string) => {
       if (uid === mockEditorId) return Promise.resolve({ userId: mockEditorId, orgId: mockOrgId, orgRole: "member" });
@@ -316,14 +316,13 @@ describe("PUT /api/user-work-plans/:planId — editor-based PATCH permission", (
       return Promise.resolve(null);
     });
     mockGetOrgById.mockResolvedValue(mockOrgWithEditor);
-    mockUpdateWorkPlan.mockResolvedValue(undefined);
 
     const res = await request(editorApp)
       .put("/api/user-work-plans/plan-2")
       .send({ title: "Editor Update" });
 
-    expect(res.status).toBe(200);
-    expect(mockUpdateWorkPlan).toHaveBeenCalled();
+    expect(res.status).toBe(403);
+    expect(mockUpdateWorkPlan).not.toHaveBeenCalled();
   });
 
   it("non-editor org member is rejected with 403 on PATCH", async () => {
@@ -344,7 +343,7 @@ describe("PUT /api/user-work-plans/:planId — editor-based PATCH permission", (
     expect(mockUpdateWorkPlan).not.toHaveBeenCalled();
   });
 
-  it("org owner (orgRole=owner) can PATCH any same-org member's plan regardless of editors", async () => {
+  it("org owner (orgRole=owner) can PATCH another same-org member's plan (admin override)", async () => {
     const orgOwnerUserId = "user-org-owner";
     const orgOwnerApp = express();
     orgOwnerApp.use(express.json());
@@ -359,7 +358,6 @@ describe("PUT /api/user-work-plans/:planId — editor-based PATCH permission", (
       if (uid === mockOrgMemberId) return Promise.resolve({ userId: mockOrgMemberId, orgId: mockOrgId, orgRole: "member" });
       return Promise.resolve(null);
     });
-    // Org with no editors — but org owner should still be allowed
     mockGetOrgById.mockResolvedValue(mockOrgNoEditors);
     mockUpdateWorkPlan.mockResolvedValue(undefined);
 
@@ -372,7 +370,7 @@ describe("PUT /api/user-work-plans/:planId — editor-based PATCH permission", (
   });
 });
 
-describe("DELETE /api/user-work-plans/:planId — editor-based DELETE restriction", () => {
+describe("DELETE /api/user-work-plans/:planId — owner or org-owner may delete; editors cannot", () => {
   // App where authenticated user is the editor (user-3)
   const editorApp = express();
   editorApp.use(express.json());
@@ -404,7 +402,7 @@ describe("DELETE /api/user-work-plans/:planId — editor-based DELETE restrictio
     expect(mockDeleteWorkPlan).not.toHaveBeenCalled();
   });
 
-  it("org owner (orgRole=owner) can DELETE another member's plan in same org", async () => {
+  it("org owner (orgRole=owner) can DELETE another same-org member's plan (admin override)", async () => {
     mockGetWorkPlan.mockResolvedValue(memberPlan); // owned by user-2
     mockGetUserById.mockImplementation((uid: string) => {
       if (uid === orgOwnerUserId) return Promise.resolve({ userId: orgOwnerUserId, orgId: mockOrgId, orgRole: "owner" });
@@ -463,7 +461,7 @@ describe("POST /api/user-work-plans — new plan gets orgId stamped", () => {
   });
 });
 
-describe("POST /api/user-work-plans — org-level create gating", () => {
+describe("POST /api/user-work-plans — any org member may create their own plan", () => {
   it("org owner can create regardless of toggle", async () => {
     mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "owner" });
     mockGetOrgById.mockResolvedValue({
@@ -480,34 +478,35 @@ describe("POST /api/user-work-plans — org-level create gating", () => {
     expect(mockCreateWorkPlan).toHaveBeenCalledTimes(1);
   });
 
-  it("listed editor can create (even when enabled=false)", async () => {
+  it("a plain org member can create even when sharing is disabled (work plans are member-owned)", async () => {
     mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "member" });
     mockGetOrgById.mockResolvedValue({
       orgId: mockOrgId,
-      shareSettings: { workPlans: { enabled: false, editors: [mockUserId] } },
+      shareSettings: { workPlans: { enabled: false, editors: [] } },
     });
-    mockCreateWorkPlan.mockResolvedValue({ ...myPlan, planId: "editor-plan" });
+    mockCreateWorkPlan.mockResolvedValue({ ...myPlan, planId: "member-plan" });
 
     const res = await request(app)
       .post("/api/user-work-plans")
-      .send({ title: "Editor Plan", steps: [{ title: "S" }] });
+      .send({ title: "Member Plan", steps: [{ title: "S" }] });
 
     expect(res.status).toBe(201);
     expect(mockCreateWorkPlan).toHaveBeenCalledTimes(1);
   });
 
-  it("non-editor org member gets 403 on create", async () => {
+  it("a plain org member can create when sharing is enabled (no editor list required)", async () => {
     mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId, orgRole: "member" });
     mockGetOrgById.mockResolvedValue({
       orgId: mockOrgId,
       shareSettings: { workPlans: { enabled: true, editors: [] } },
     });
+    mockCreateWorkPlan.mockResolvedValue({ ...myPlan, planId: "member-plan-2" });
 
     const res = await request(app)
       .post("/api/user-work-plans")
       .send({ title: "Member Attempt", steps: [{ title: "S" }] });
 
-    expect(res.status).toBe(403);
-    expect(mockCreateWorkPlan).not.toHaveBeenCalled();
+    expect(res.status).toBe(201);
+    expect(mockCreateWorkPlan).toHaveBeenCalledTimes(1);
   });
 });

@@ -215,7 +215,7 @@ Actions:
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
 - list-received-invitations: (exact action string: "list-received-invitations") List pending connection requests received from others. Returns paginated results with sender info.
-- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended. IMPORTANT: the invite note limit is 200 characters on free LinkedIn accounts and 300 on Premium. Unless you know the account is Premium, keep the message at 200 characters or fewer — LinkedIn rejects longer notes. Always count characters before sending; if over limit, trim the message first. Also: do not send-invite to someone you are already connected with (network_distance FIRST_DEGREE) — use send-message instead; check with get-profile or list-connections if unsure.
+- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended. IMPORTANT: the invite note limit is 200 characters on free LinkedIn accounts and 300 on Premium. Aim for 200 characters or fewer (target ~195) so the whole message — including your call-to-action — fits and reads well. The backend auto-trims an over-limit note to the account's limit on a word boundary before sending, so a send never fails on length; but a note you keep within the limit yourself stays complete and coherent. Also: do not send-invite to someone you are already connected with (network_distance FIRST_DEGREE) — use send-message instead; check with get-profile or list-connections if unsure.
 - send-message: Send a direct message. Requires profile_url or provider_id. message required. Only works for 1st-degree connections or open profiles. When sending to a CRM lead, always provide list_id and lead_id — the system enforces that update-conversation-history was called within the last 24 hours before allowing a send.
 - send-inmail: Send a LinkedIn InMail to any profile regardless of connection degree (2nd/3rd-degree connections). Requires profile_url or provider_id, message (body), and subject. Requires a LinkedIn Premium account with available InMail credits. Use this when send-message is not possible due to connection degree restrictions. list_id and lead_id are optional but recommended for CRM persistence.
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
@@ -249,7 +249,7 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         message: {
           type: 'string',
-          description: 'Message content. Required for send-message and send-inmail; recommended for send-invite. For send-invite: 200 characters max on free LinkedIn accounts, 300 on Premium — stay at 200 or fewer unless you know the account is Premium.'
+          description: 'Message content. Required for send-message and send-inmail; recommended for send-invite. For send-invite: aim for 200 characters or fewer (300 on Premium). The backend auto-trims an over-limit note on a word boundary before sending, so the send never fails on length — but a note you keep within the limit stays complete.'
         },
         subject: {
           type: 'string',
@@ -2036,6 +2036,7 @@ emmaToolRegistry.register({
       'jQuery-style selectors are supported: use :eq(n) (0-indexed) to select by position within matched set (e.g. ".step-block:eq(1)" for the 2nd .step-block), ' +
       ':contains("text") to match by text content (e.g. "h3:contains(\\"Step 2\\")"), and :has() for parent matching. ' +
       'IMPORTANT: Do NOT use :nth-of-type or :nth-child to target elements by class — these count by element type, not class. Use :eq(n) instead. ' +
+      'SELECTOR SCOPING: When the same brand word or element appears more than once (e.g. a wordmark in both the header and the footer), do NOT rely on :contains("Brand"):first / position alone — in DOM order the header usually matches first, so you can clobber the wrong element. Instead scope by the containing section\'s distinctive style, e.g. the header logo as \'td[style*="linear-gradient"] img[alt="Brand"]\' and the footer logo as \'td[style*="#1a1a2e"] img[alt="Brand"]\'. Targeting by container/section background (or another stable container attribute) is far more reliable than :contains + position. ' +
       'Operations that fail (no selector match) are skipped and reported; successful operations still apply. ' +
       'Full mode (update_type="full"): Replace entire file content using hash verification.',
     inputSchema: {
@@ -3960,7 +3961,9 @@ emmaToolRegistry.register({
   name: "remove_c2pa_from_image",
   definition: {
     name: "remove_c2pa_from_image",
-    description: 'Remove C2PA metadata from an image by downloading it from a URL, stripping metadata, and uploading the cleaned image to S3. Returns the new S3 URL.',
+    description: 'Remove C2PA (provenance) metadata from an image by downloading it, re-encoding it to strip ALL metadata, and uploading the cleaned image to S3. Returns the new S3 URL. ' +
+      'IMPORTANT: This ONLY strips metadata. It does NOT remove or change any pixels — it cannot remove a background, make a background transparent, or create an alpha channel. ' +
+      'To make a logo/image background transparent, use remove_image_background instead.',
     inputSchema: {
       type: "object",
       properties: {
@@ -3982,10 +3985,54 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
+  name: "remove_image_background",
+  definition: {
+    name: "remove_image_background",
+    description:
+      'Make the background of a logo/image transparent, producing a GENUINE transparent-alpha PNG. ' +
+      'This operates on the ORIGINAL pixels (edge-seeded flood fill) and does NOT redraw or regenerate the artwork — ' +
+      'the brand mark\'s exact letters, shapes, and colors are preserved byte-for-byte; only the background becomes transparent. ' +
+      'PREFER this tool over generate_image when a user wants a transparent background: generate_image redraws the logo and can drift the icon/letters/colors and cannot guarantee true alpha. ' +
+      'Note remove_c2pa_from_image does NOT do this — it only strips metadata. ' +
+      'Best for logos/marks on a solid or near-solid background; it is not a general subject-segmentation tool for busy photographic backgrounds. ' +
+      'If a transparent PNG already exists for the brand (e.g. the user supplied one, or brand guidelines include one), prefer using that directly via update_html_file rather than processing a JPEG. ' +
+      'Optionally pass surface_color (the hex color of the surface the logo will sit on, e.g. a dark header) to get a WCAG contrast check that warns when the logo would be illegible (e.g. a dark wordmark on a dark background).',
+    inputSchema: {
+      type: "object",
+      properties: {
+        image_url: {
+          type: 'string',
+          description: 'URL of the image to process (S3 URL, data URL, or any accessible image URL).'
+        },
+        filename: {
+          type: 'string',
+          description: 'Optional filename for the transparent image. Always saved as .png (alpha requires PNG).'
+        },
+        tolerance: {
+          type: 'number',
+          description: 'Optional color-match tolerance 0-255 (default 32). Higher removes more near-background colors (useful for JPEG noise / gradients); lower is stricter and preserves edge detail.'
+        },
+        surface_color: {
+          type: 'string',
+          description: 'Optional hex color (e.g. "#1a1a2e") of the surface the logo will be placed on. When provided, the result includes a WCAG fg/bg contrast ratio and warns if the logo would be hard to read on that surface.'
+        }
+      },
+      required: ["image_url"]
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.removeImageBackground(args.image_url, args.filename, context?.userId, {
+      tolerance: args.tolerance,
+      surfaceColor: args.surface_color
+    });
+  }
+});
+
+emmaToolRegistry.register({
   name: 'generate_image',
   definition: {
     name: 'generate_image',
-    description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images.\n\nLOGO COMPOSITING BEST PRACTICES (tested and confirmed):\n- When the user wants an image with their logo, ALWAYS use the logo_image parameter with the logo URL from their brand guidelines (read_brand_guidelines tool). Do NOT describe the logo in the prompt — pass the actual PNG URL.\n- For logo compositing, prefer gemini-3.1-flash-image-preview or gemini-3-pro-image-preview. Both successfully composite PNG logos with high fidelity. gemini-3.1-flash-image-preview renders the logo largest and most prominently. These models also produce 4096×4096 output.\n- gpt-image-2 also supports logo compositing via logo_image and works correctly, preserving the logo faithfully at 1024×1024 (may add unrequested design elements around it).\n- gpt-image-1 is NOT reliable for logo compositing — it rewrites the logo (e.g. replaces the actual text in the logo with the company name from the prompt). Avoid gpt-image-1 when logo fidelity matters.\n- NEVER tell the user that AI image generation cannot composite a real logo — gemini-3-pro-image-preview, gemini-3.1-flash-image-preview, and gpt-image-2 all handle it correctly when logo_image is provided.\n- NEVER switch the output format from image to HTML without explicit user approval.\n- Brand guideline PNG logos from the attachments array composite cleanly — use them directly.',
+    description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images.\n\nLOGO COMPOSITING BEST PRACTICES (tested and confirmed):\n- When the user wants an image with their logo, ALWAYS use the logo_image parameter with the logo URL from their brand guidelines (read_brand_guidelines tool). Do NOT describe the logo in the prompt — pass the actual PNG URL.\n- For logo compositing, prefer gemini-3.1-flash-image-preview or gemini-3-pro-image-preview. Both successfully composite PNG logos with high fidelity. gemini-3.1-flash-image-preview renders the logo largest and most prominently. These models also produce 4096×4096 output.\n- gpt-image-2 also supports logo compositing via logo_image and works correctly, preserving the logo faithfully at 1024×1024 (may add unrequested design elements around it).\n- gpt-image-1 is NOT reliable for logo compositing — it rewrites the logo (e.g. replaces the actual text in the logo with the company name from the prompt). Avoid gpt-image-1 when logo fidelity matters.\n- NEVER tell the user that AI image generation cannot composite a real logo — gemini-3-pro-image-preview, gemini-3.1-flash-image-preview, and gpt-image-2 all handle it correctly when logo_image is provided.\n- NEVER switch the output format from image to HTML without explicit user approval.\n- Brand guideline PNG logos from the attachments array composite cleanly — use them directly.\n\nTRANSPARENT BACKGROUNDS — DO NOT use generate_image to "redraw the logo on a transparent background". This model redraws the mark and can drift its icon/letters/colors, and it CANNOT guarantee a true alpha channel. To make an existing logo\'s background transparent, use the remove_image_background tool (it operates on the original pixels and outputs genuine alpha). If the user already has a transparent PNG of the logo, use that directly. Only fall back to generation if no source logo exists at all.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -5517,7 +5564,7 @@ emmaToolRegistry.register({
     // Embed at write time so the memory can later be retrieved by relevance, not just
     // recency. Best-effort: a failure must not block saving (read path falls back to recency).
     const { embedText } = await import('../utils/embeddings');
-    const embedding = (await embedText(args.content)) ?? undefined;
+    const embedding = (await embedText(args.content, { userId, feature: 'embeddings' })) ?? undefined;
     const memory = await accountMemoryDb.addMemory(
       userId,
       args.category,
@@ -5601,7 +5648,7 @@ emmaToolRegistry.register({
 
     // Embed at write time so the memory can later be retrieved by relevance (best-effort).
     const { embedText } = await import('../utils/embeddings');
-    const embedding = (await embedText(args.content)) ?? undefined;
+    const embedding = (await embedText(args.content, { userId, feature: 'embeddings' })) ?? undefined;
     const memory = await orgMemoryDb.addMemory(
       user.orgId,
       args.category,
@@ -6019,6 +6066,12 @@ const bridgedToolNames = [
   'revert_landing_page_publish',
   'update_landing_page_context',
   'resolve_skill',
+  // Self account status (no-arg; wraps /api/auth/me for the CALLER's own account).
+  // Bridged so the in-app loop can resolve the handler; also added to
+  // DEFAULT_FOUNDATION_TOOLS so the loop actually offers it. Without this, Emma
+  // had no self-status tool and fell back to assess_client_health (admin lookup
+  // by email) — the user-reported "asked me for my email" bug.
+  'get_account_status',
 ];
 
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
@@ -6178,29 +6231,12 @@ emmaToolRegistry.register({
     const toolNames: string[] = Array.isArray(rawTools) ? rawTools : [];
     const { skillService } = await import('../services/skillService');
 
-    // Mirror the REST route (POST /api/user-skills): org members may only
-    // create skills if they are the org owner or a listed skills editor, and
-    // the new skill must be stamped with the creator's orgId so it shows up in
-    // org-wide fanout (and editor/transfer logic). Without this, Emma-created
-    // skills were missing orgId and any plain member could create them.
-    const { userDb, orgDb } = await import('../services/db');
-    const { canManageOrgFeature } = await import('../services/orgShareService');
+    // Skills are member-owned: any org member may create their own. The new
+    // skill is stamped with the creator's orgId so that, when the org's skills
+    // sharing toggle is enabled, it shows up in org-wide fanout.
+    const { userDb } = await import('../services/db');
     const creator = await userDb.getUserById(userId);
     const orgId = creator?.orgId;
-    if (orgId) {
-      const org = await orgDb.getOrgById(orgId);
-      const allowed = canManageOrgFeature(
-        { userId, orgId, orgRole: creator?.orgRole as 'owner' | 'member' | undefined },
-        org,
-        'skills',
-      );
-      if (!allowed) {
-        return {
-          success: false,
-          error: 'Skills are managed by your org admin. Ask an org owner or a skills editor to create this skill.',
-        };
-      }
-    }
 
     const skill = await skillService.createSkill(
       args.name,
@@ -6560,6 +6596,17 @@ emmaToolRegistry.register({
     };
   }
 });
+
+// Bridge report_product_issues onto the EXTERNAL MCP registry so the claude.ai
+// Emma connector (api.agentweb.pro/mcp) can file bug reports directly — without
+// portal login. Without this it is only reachable by in-app Emma. The handler
+// reads context.userId (set to agentUserId for external clients) and
+// context.externalMcp (true only on the external server) for source tagging, so
+// the same handler works on both surfaces.
+const reportProductIssuesHandler = emmaToolRegistry.getTool('report_product_issues');
+if (reportProductIssuesHandler) {
+  mcpToolRegistry.register(reportProductIssuesHandler);
+}
 
 emmaToolRegistry.register({
   name: 'get_user_profile',

@@ -68,9 +68,16 @@ async function llmInferAliases(
       process.env.CRM_ENRICH_V3_ALIAS_MODEL || 'gpt-5-chat-2',
       0.0,
     );
+    // Shadow usage metering (Ship 1): no user in scope here (deps are built
+    // without request context), so usage attributes to "system". Follow-up:
+    // thread userId through ConfigServiceDeps builders if per-user enrichment
+    // attribution is needed.
     const result = await llm.generateJSONContent<Record<string, string | null>>(
       systemPrompt,
       userPrompt,
+      'json',
+      undefined,
+      { feature: 'enrichment' },
     );
     return result ?? {};
   } catch (err) {
@@ -101,6 +108,9 @@ async function llmClassifySmartFields(
     >(
       buildSmartFieldClassificationSystemPrompt(canonicalFieldList),
       buildSmartFieldClassificationUserPrompt(fields),
+      'json',
+      undefined,
+      { feature: 'enrichment' },
     );
     return result ?? {};
   } catch (err) {

@@ -67,6 +67,29 @@ export interface LoopHealth {
   lastOutcome: LoopHealthLastOutcome | null;
 }
 
+/** Stable identity for the proposal a record concerns. Used to tell whether a
+ * later record has superseded an earlier `pending` row for the same proposal. */
+function proposalKey(r: LearningRecord): string | null {
+  const p = r.proposal?.proposalId as string | undefined;
+  const m = r.mutation?.mutationId as string | undefined;
+  return p ?? m ?? null;
+}
+
+/** A record "resolves" its proposal once a human ✅ lands (approved /
+ * auto_shipped), the mutation ships (`shippedAt`), or attribution grades it
+ * (`verdict`). The learning store is append-only, so the original `pending`
+ * row for a proposal lives forever alongside its later approved/shipped/graded
+ * rows — without de-duping, a loop would report `pending_approval` even after
+ * the ✅ and even after a verdict landed, which is exactly the C2 stall. */
+function resolvesProposal(r: LearningRecord): boolean {
+  return (
+    r.decision?.status === 'approved'
+    || r.decision?.status === 'auto_shipped'
+    || !!r.shippedAt
+    || r.verdict != null
+  );
+}
+
 /** A record counts as "pending approval" when it carries a pending decision and
  * has not yet shipped. */
 function isPendingApproval(r: LearningRecord): boolean {
@@ -76,6 +99,12 @@ function isPendingApproval(r: LearningRecord): boolean {
 /** Shipped but not yet graded by attribution → in flight. */
 function isInFlight(r: LearningRecord): boolean {
   return !!r.shippedAt && r.verdict == null;
+}
+
+/** A graded verdict supersedes the earlier shipped-but-ungraded row for the
+ * same mutation: the same proposal can't be both `in_flight` and `learned`. */
+function isGraded(r: LearningRecord): boolean {
+  return r.verdict != null;
 }
 
 export function computeLoopHealth(
@@ -98,9 +127,29 @@ export function computeLoopHealth(
   let lastOutcome: LoopHealthLastOutcome | null = null;
   let lastOutcomeKey = '';
 
+  // The learning store is append-only: one logical proposal accumulates a
+  // pending row, then an approved+shipped row, then a graded row. To report the
+  // loop's CURRENT state we count each proposal by its furthest-progressed row
+  // only, otherwise an early row keeps the loop stuck on a stale state (the C2
+  // stall: `pending_approval` after the ✅, or `in_flight` after a verdict).
+  const resolvedProposals = new Set<string>(); // approved/shipped/graded exists
+  const gradedProposals = new Set<string>(); // a verdict exists
   for (const r of history) {
-    if (isPendingApproval(r)) counts.pendingApproval++;
-    if (isInFlight(r)) counts.inFlight++;
+    const key = proposalKey(r);
+    if (!key) continue;
+    if (resolvesProposal(r)) resolvedProposals.add(key);
+    if (isGraded(r)) gradedProposals.add(key);
+  }
+
+  for (const r of history) {
+    if (isPendingApproval(r)) {
+      const key = proposalKey(r);
+      if (!key || !resolvedProposals.has(key)) counts.pendingApproval++;
+    }
+    if (isInFlight(r)) {
+      const key = proposalKey(r);
+      if (!key || !gradedProposals.has(key)) counts.inFlight++;
+    }
     switch (r.verdict) {
       case 'improved':
         counts.improved++;

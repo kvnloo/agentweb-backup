@@ -19,6 +19,7 @@ import { TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
 import { isDoNotContact } from '../utils/leadContactStatus';
 import { normalizeAttribution } from '../types/attribution';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
+import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
 
@@ -303,6 +304,15 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
   // Get lead list and verify public access is enabled
   const leadList = await crmDb.getLeadListById(listId);
   if (!leadList) {
+    // A live lander is POSTing to a list that doesn't exist — record the drop
+    // so it surfaces instead of vanishing (the client swallows this 404).
+    void recordLeadCaptureFailure({
+      reason: 'list_not_found',
+      listId,
+      status: 404,
+      source: req.body?.source,
+      email: req.body?.email,
+    });
     return res.status(404).json({
       success: false,
       message: 'Lead list not found'
@@ -312,6 +322,14 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
   // Public access must be explicitly enabled (true)
   // Default behavior: disabled
   if (leadList.publicAccessEnabled !== true) {
+    void recordLeadCaptureFailure({
+      reason: 'public_access_disabled',
+      listId,
+      status: 403,
+      source: req.body?.source,
+      email: req.body?.email,
+      userId: leadList.userId,
+    });
     return res.status(403).json({
       success: false,
       message: 'Public access is not enabled for this lead list. Please enable it in the CRM settings.'
@@ -415,6 +433,28 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       if (JSON.stringify(existingCustomFields) !== JSON.stringify(mergedCf)) {
         updates.customFields = mergedCf;
         changed = true;
+      }
+
+      // Attribution merge (Lead UTM — mirrors the User schema contract).
+      // The new-lead path stamps firstTouch+lastTouch via createLead; the merge
+      // path previously dropped attribution entirely, leaving lastTouch DOA
+      // (lastTouch === firstTouch forever for any repeat-touch lead).
+      //   - lastTouch  : ALWAYS refreshed when this touch carries attribution.
+      //   - firstTouch : immutable — only backfilled if the lead has none yet.
+      //   - utmSource / utmMedium : denormalized from firstTouch — only
+      //     backfilled when absent, never overwritten.
+      if (touch) {
+        updates.lastTouch = touch;
+        changed = true;
+        if (!existingLead.firstTouch) {
+          updates.firstTouch = touch;
+          if (!existingLead.utmSource && touch.utm?.source) {
+            updates.utmSource = touch.utm.source;
+          }
+          if (!existingLead.utmMedium && touch.utm?.medium) {
+            updates.utmMedium = touch.utm.medium;
+          }
+        }
       }
 
       if (changed) {
