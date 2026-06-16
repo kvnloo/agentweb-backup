@@ -2910,6 +2910,33 @@ export class AgentModeService {
           }
         }
 
+        // Human-in-the-loop confirmation gate: if a tool in this iteration requested
+        // explicit user confirmation (e.g. a Meta Ads publish/change/delete), STOP the
+        // autonomous loop and hand control back to the user. The model CANNOT self-approve
+        // — only a new user message restarts the turn, after which it re-calls the tool
+        // with confirm=true. This is the safety net for the wrong-campaign / wrong-asset
+        // class of mistake: the user sees the resolved target and must approve it.
+        // Post-refactor (core/toolDispatch), this iteration's results live on the
+        // toolCalls ledger (each entry carries .result = the minimal result, which
+        // preserves awaitingUserConfirmation). Re-shape the new slice for the seam.
+        const iterationResults = toolCalls
+          .slice(toolCallsLengthBeforeIteration)
+          .map((tc: any) => ({ status: tc.error ? 'error' as const : 'success' as const, result: tc.result }));
+        const confirmationPrompt = this.collectConfirmationPrompt(iterationResults);
+        if (confirmationPrompt) {
+          content = confirmationPrompt;
+          (messages as any[]).push({
+            role: 'assistant',
+            content: confirmationPrompt,
+            llm: llmModel,
+            metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true }
+          });
+          if (onProgress) {
+            onProgress({ iteration, status: 'complete', toolCalls: toolCalls.slice() });
+          }
+          break;
+        }
+
         // Anti-loop detection: check if the LLM is repeating the same tool calls
         const currentToolSignature = responseMessage.tool_calls
           ?.map((tc: any) => `${tc.function.name}:${tc.function.arguments}`)
@@ -4028,6 +4055,21 @@ export class AgentModeService {
   // Extract only the necessary data for the frontend to reduce storage size
   private extractMinimalToolResult(result: any, toolName: string): any {
     console.log('[DEBUG] extractMinimalToolResult called for:', toolName);
+
+    // Preserve confirmation-gate fields for ANY tool that halted for user approval
+    // (Meta writes, image edits, …). The gate returns no real artifact, and the
+    // per-tool minimizers below drop unknown fields — without this, the frontend
+    // (tool card "Awaiting your confirmation", panel teardown) never sees the flag.
+    if (result && result.awaitingUserConfirmation === true) {
+      return {
+        success: true,
+        requiresConfirmation: true,
+        awaitingUserConfirmation: true,
+        confirmationPrompt: result.confirmationPrompt,
+        confirmationDetail: result.confirmationDetail,
+        summary: result.summary,
+      };
+    }
 
     // For playwright screenshots, result has already been processed (base64 → S3 URL)
     if (toolName === 'playwright_browser_take_screenshot') {
@@ -13725,6 +13767,188 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
+   * Mutating Meta Ads actions that publish, change, or destroy live entities and
+   * therefore require an explicit target confirmation before they execute.
+   * Read-only actions (LIST, SEARCH, GET_MATCH_QUALITY, UPLOAD_IMAGE/VIDEO) are excluded —
+   * they don't publish to a campaign or destroy anything.
+   */
+  private static META_WRITE_ACTIONS: Record<string, string[]> = {
+    CAMPAIGN: ['CREATE', 'UPDATE', 'DELETE'],
+    AD_SET: ['CREATE', 'UPDATE', 'DELETE'],
+    AD: ['CREATE', 'UPDATE', 'DELETE', 'COPY_AD'],
+    // Account-level assets. CREATE publishes a creative; UPLOAD_USERS pushes PII
+    // user data to Meta. UPLOAD_IMAGE/UPLOAD_VIDEO only stage assets (no publish),
+    // and LIST is read-only — none of those need confirmation.
+    AD_CREATIVE: ['CREATE'],
+    CUSTOM_AUDIENCE: ['CREATE', 'UPLOAD_USERS']
+  };
+
+  private static isMetaWriteAction(entity_type: string, action: string): boolean {
+    return (AgentModeService.META_WRITE_ACTIONS[entity_type] || []).includes(action);
+  }
+
+  /**
+   * Loop halt seam for the human-in-the-loop confirmation gate. Scans one iteration's
+   * tool results and returns the user-facing prompt to surface (or null to continue).
+   * Only tool results that set `awaitingUserConfirmation === true` halt the turn — this
+   * is a dedicated flag (NOT `requiresConfirmation`), so destructive flows that merely
+   * set `requiresConfirmation` (delete_leads_by_filter, work-plan replace) are unaffected.
+   * When the loop halts, control returns to the user; the model cannot self-approve.
+   */
+  private collectConfirmationPrompt(
+    toolResults: Array<{ status: 'success' | 'error'; result?: any }>
+  ): string | null {
+    const items: Array<{ prompt: string; detail: string }> = [];
+    for (const tr of toolResults) {
+      if (tr.status !== 'success') continue;
+      const r: any = tr.result;
+      if (r && r.awaitingUserConfirmation === true) {
+        items.push({
+          prompt: r.confirmationPrompt || r.summary || r.message || 'Please confirm this action before I proceed.',
+          // `confirmationDetail` is the per-item body (summary + any thumbnails) WITHOUT
+          // the intro/footer, so batched confirmations don't repeat the boilerplate.
+          detail: r.confirmationDetail || r.confirmationPrompt || r.summary || 'this action'
+        });
+      }
+    }
+    if (items.length === 0) return null;
+    // Single action: use its standalone prompt as-is.
+    if (items.length === 1) return items[0].prompt;
+    // Multiple actions batched in one turn (e.g. "edit these two images"): one intro,
+    // each target listed once, one footer — instead of repeating the full wrapper N times.
+    return `Based on your request, here are the ${items.length} changes I'm about to make — ` +
+      `please review each target before I proceed:\n\n` +
+      items.map((i, n) => `${n + 1}. ${i.detail}`).join('\n\n') +
+      `\n\nReply "yes" / "confirm" to proceed with all of these, or tell me what to change.`;
+  }
+
+  /**
+   * Resolve the exact target of a mutating Meta Ads action into a human-readable
+   * preview so the agent can echo it back and get explicit user confirmation
+   * BEFORE anything is published, changed, or deleted. This is the guardrail that
+   * stops the agent acting on an ambiguous target (e.g. publishing an ad into the
+   * wrong campaign). ID→name lookups degrade gracefully to the raw ID if Meta is
+   * unreachable — confirmation must still be required even when resolution fails.
+   */
+  private async buildMetaWriteConfirmation(
+    userId: string,
+    entity_type: string,
+    action: string,
+    account_id: string,
+    campaign_id: string | undefined,
+    ad_set_id: string | undefined,
+    ad_id: string | undefined,
+    params: any
+  ): Promise<{ summary: string; target: Record<string, any> }> {
+    let accessToken = '';
+    try {
+      ({ accessToken } = await this.getMetaCredentials(userId, account_id));
+    } catch {
+      // Credential failure surfaces during execution; still require confirmation here.
+    }
+
+    const target: Record<string, any> = { entity_type, action, account_id };
+    const lines: string[] = [];
+
+    // Best-effort resolvers — each guarded so a Meta lookup failure never blocks the gate.
+    const resolveCampaign = async (id?: string) => {
+      if (!id || !accessToken) return undefined;
+      try { return await metaService.getCampaign(account_id, accessToken, id); } catch { return undefined; }
+    };
+    const resolveAdSet = async (id?: string) => {
+      if (!id || !accessToken) return undefined;
+      try { return await metaService.getAdSet(accessToken, id); } catch { return undefined; }
+    };
+    const resolveAd = async (id?: string) => {
+      if (!id || !accessToken) return undefined;
+      try { return await metaService.getAd(accessToken, id); } catch { return undefined; }
+    };
+    const nameOf = (entity: any, id?: string) =>
+      entity?.name ? `"${entity.name}" (${entity.id || id})` : (id ? `ID ${id}` : 'unknown');
+
+    if (entity_type === 'CAMPAIGN') {
+      if (action === 'CREATE') {
+        target.campaign_name = params.name;
+        target.objective = params.objective;
+        lines.push(`Create a NEW campaign "${params.name}" (objective: ${params.objective || 'unspecified'}) in ad account ${account_id}.`);
+      } else {
+        const campaign = await resolveCampaign(campaign_id);
+        target.campaign = nameOf(campaign, campaign_id);
+        target.campaign_id = campaign_id;
+        lines.push(`${action} campaign ${target.campaign} in ad account ${account_id}.`);
+      }
+    } else if (entity_type === 'AD_SET') {
+      if (action === 'CREATE') {
+        const campaign = await resolveCampaign(campaign_id);
+        target.campaign = nameOf(campaign, campaign_id);
+        target.ad_set_name = params.name;
+        lines.push(`Create a NEW ad set "${params.name}" UNDER campaign ${target.campaign} (ad account ${account_id}).`);
+      } else {
+        const adSet = await resolveAdSet(ad_set_id);
+        const campaign = await resolveCampaign(adSet?.campaign_id);
+        target.ad_set = nameOf(adSet, ad_set_id);
+        target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
+        lines.push(`${action} ad set ${target.ad_set}${target.campaign ? ` (in campaign ${target.campaign})` : ''}.`);
+      }
+    } else if (entity_type === 'AD') {
+      if (action === 'CREATE') {
+        const adSet = await resolveAdSet(ad_set_id);
+        const campaign = await resolveCampaign(adSet?.campaign_id);
+        target.ad_name = params.name;
+        target.ad_set = nameOf(adSet, ad_set_id);
+        target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
+        lines.push(`Publish a NEW ad "${params.name}" into ad set ${target.ad_set}${target.campaign ? `, which belongs to campaign ${target.campaign}` : ''} (ad account ${account_id}).`);
+      } else if (action === 'COPY_AD') {
+        const sourceAd = await resolveAd(ad_id);
+        const targetAdSetId = params.adset_id || sourceAd?.adset_id;
+        const adSet = await resolveAdSet(targetAdSetId);
+        const campaign = await resolveCampaign(adSet?.campaign_id);
+        target.source_ad = nameOf(sourceAd, ad_id);
+        target.target_ad_set = nameOf(adSet, targetAdSetId);
+        target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
+        lines.push(`Copy ad ${target.source_ad} into ad set ${target.target_ad_set}${target.campaign ? `, which belongs to campaign ${target.campaign}` : ''}.`);
+      } else {
+        const ad = await resolveAd(ad_id);
+        const adSet = await resolveAdSet(ad?.adset_id);
+        const campaign = await resolveCampaign(ad?.campaign_id);
+        target.ad = nameOf(ad, ad_id);
+        target.ad_set = adSet ? nameOf(adSet, ad?.adset_id) : undefined;
+        target.campaign = campaign ? nameOf(campaign, ad?.campaign_id) : undefined;
+        const ctx = [
+          target.ad_set ? `ad set ${target.ad_set}` : undefined,
+          target.campaign ? `campaign ${target.campaign}` : undefined
+        ].filter(Boolean).join(', ');
+        lines.push(`${action} ad ${target.ad}${ctx ? ` (in ${ctx})` : ''}.`);
+      }
+    } else if (entity_type === 'AD_CREATIVE') {
+      // Account-level asset (CREATE only — uploads/list are not gated).
+      target.creative_name = params.name;
+      lines.push(`Create a NEW ad creative${params.name ? ` "${params.name}"` : ''} in ad account ${account_id}.`);
+    } else if (entity_type === 'CUSTOM_AUDIENCE') {
+      if (action === 'UPLOAD_USERS') {
+        target.audience_id = params.id;
+        lines.push(`Upload user data (PII) to custom audience ID ${params.id} in ad account ${account_id}.`);
+      } else {
+        target.audience_name = params.name;
+        target.subtype = params.subtype;
+        lines.push(`Create a NEW ${params.subtype ? `${params.subtype} ` : ''}custom audience "${params.name}" in ad account ${account_id}.`);
+      }
+    }
+
+    // Surface content/destination changes so the user can catch a wrong-asset edit.
+    const contentChanges: Record<string, any> = {};
+    for (const key of ['link_url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'status', 'daily_budget', 'lifetime_budget', 'creative_id', 'placement_assets']) {
+      if (params[key] !== undefined) contentChanges[key] = params[key];
+    }
+    if (Object.keys(contentChanges).length > 0) {
+      target.changes = contentChanges;
+      lines.push(`Changes: ${Object.keys(contentChanges).join(', ')}.`);
+    }
+
+    return { summary: lines.join(' '), target };
+  }
+
+  /**
    * Master method for calling Meta Marketing API.
    * Routes the request to the appropriate entity manager based on entity_type.
    */
@@ -13753,6 +13977,44 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         error: 'PARAM_VALIDATION_ERROR',
         hint: 'Fix the listed parameters and retry.'
       } as any;
+    }
+
+    // Target-confirmation guardrail for mutating actions (publish/change/delete).
+    // The agent must echo the resolved target back to the user and re-call with
+    // confirm=true. This prevents acting on an ambiguous target (e.g. publishing
+    // an ad into the wrong campaign or editing the wrong asset). `confirm` is a
+    // gate-only flag and is stripped before dispatch so it never reaches Meta.
+    const confirmed = params.confirm === true;
+    if (AgentModeService.isMetaWriteAction(entity_type, action) && !confirmed) {
+      const { summary, target } = await this.buildMetaWriteConfirmation(
+        userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
+      );
+      // `awaitingUserConfirmation` + `confirmationPrompt` are consumed by the agent loop
+      // (collectConfirmationPrompt) to HALT the turn and surface the prompt to the user.
+      // The turn cannot continue until a NEW human message arrives — the model cannot
+      // self-approve. `message` keeps the model-facing instructions for the resumed turn.
+      return {
+        success: true,
+        requiresConfirmation: true,
+        awaitingUserConfirmation: true,
+        summary,
+        confirmationPrompt:
+          `Based on your request, here's the exact Meta Ads change I'm about to make — ` +
+          `please check it's the right target before I proceed:\n\n${summary}\n\n` +
+          `Reply "yes" / "confirm" if this is correct, or tell me what to change ` +
+          `(for example, a different campaign, ad set, or asset).`,
+        // Per-item body (no intro/footer) used when several writes are batched in one turn.
+        confirmationDetail: summary,
+        message: `Confirm this Meta Ads ${entity_type} ${action} before it runs: ${summary} ` +
+          `Show the user the exact target above (campaign / ad set / asset) and get explicit approval. ` +
+          `If more than one campaign or asset could match the request, ask the user to disambiguate first. ` +
+          `Once approved, call call_meta_marketing_api again with the same arguments plus params.confirm=true.`,
+        target
+      } as any;
+    }
+    if ('confirm' in params) {
+      params = { ...params };
+      delete params.confirm;
     }
 
     switch (entity_type) {
@@ -17280,8 +17542,42 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     userId: string,
     sessionId: string,
     imageModel?: string,
-    logoImage?: string
+    logoImage?: string,
+    confirm?: boolean
   ): Promise<any> {
+    // Human-in-the-loop gate for image EDITING (inputImages present). Editing the
+    // wrong source images is the wrong-set mistake from the satisfaction incident,
+    // so before regenerating/editing existing images we surface the exact source
+    // image(s) to the user (rendered as thumbnails via markdown) and wait for
+    // explicit approval. Text-to-image (no inputImages) is fresh creation and is
+    // NOT gated. The agent loop halts on `awaitingUserConfirmation`; on approval the
+    // model re-calls with confirm=true. `confirm` never reaches the image service.
+    if (Array.isArray(inputImages) && inputImages.length > 0 && confirm !== true) {
+      const thumbs = inputImages.map((url, i) => `![source image ${i + 1}](${url})`).join('\n');
+      const summary = `Edit/regenerate ${inputImages.length} existing image(s) and save the result as "${filename}".`;
+      return {
+        success: true,
+        requiresConfirmation: true,
+        awaitingUserConfirmation: true,
+        summary,
+        confirmationPrompt:
+          `Based on your request, here's the image edit I'm about to make — ` +
+          `please check these are the right source image(s) before I proceed:\n\n` +
+          `${summary}\n\n${thumbs}\n\n` +
+          `Reply "yes" / "confirm" to go ahead, or tell me which image(s) to use instead.`,
+        // Per-item body (no intro/footer) used when several edits are batched in one turn.
+        confirmationDetail: `${summary}\n\n${thumbs}`,
+        // Model-facing instruction for the resumed turn (mirrors the Meta gate): once
+        // the user approves the shown source image(s), re-call generate_image with the
+        // SAME arguments plus confirm=true. If the user names different images, edit
+        // those instead (which will re-confirm).
+        message: `Image edit requires user confirmation: ${summary} The source image(s) have been shown to the user. ` +
+          `Do NOT proceed until the user approves. Once approved, call generate_image again with the same arguments plus confirm=true. ` +
+          `If the user asks for different source images, use those instead.`,
+        target: { action: 'EDIT_IMAGE', filename, inputImages }
+      } as any;
+    }
+
     try {
       // Import the image generation service
       const { imageService } = await import('./imageGeneration');
