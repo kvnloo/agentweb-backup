@@ -13963,15 +13963,28 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   private collectConfirmationPrompt(
     toolResults: Array<{ status: 'success' | 'error'; result?: any }>
   ): string | null {
-    const prompts: string[] = [];
+    const items: Array<{ prompt: string; detail: string }> = [];
     for (const tr of toolResults) {
       if (tr.status !== 'success') continue;
       const r: any = tr.result;
       if (r && r.awaitingUserConfirmation === true) {
-        prompts.push(r.confirmationPrompt || r.summary || r.message || 'Please confirm this action before I proceed.');
+        items.push({
+          prompt: r.confirmationPrompt || r.summary || r.message || 'Please confirm this action before I proceed.',
+          // `confirmationDetail` is the per-item body (summary + any thumbnails) WITHOUT
+          // the intro/footer, so batched confirmations don't repeat the boilerplate.
+          detail: r.confirmationDetail || r.confirmationPrompt || r.summary || 'this action'
+        });
       }
     }
-    return prompts.length > 0 ? prompts.join('\n\n') : null;
+    if (items.length === 0) return null;
+    // Single action: use its standalone prompt as-is.
+    if (items.length === 1) return items[0].prompt;
+    // Multiple actions batched in one turn (e.g. "edit these two images"): one intro,
+    // each target listed once, one footer — instead of repeating the full wrapper N times.
+    return `Based on your request, here are the ${items.length} changes I'm about to make — ` +
+      `please review each target before I proceed:\n\n` +
+      items.map((i, n) => `${n + 1}. ${i.detail}`).join('\n\n') +
+      `\n\nReply "yes" / "confirm" to proceed with all of these, or tell me what to change.`;
   }
 
   /**
@@ -14155,6 +14168,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           `please check it's the right target before I proceed:\n\n${summary}\n\n` +
           `Reply "yes" / "confirm" if this is correct, or tell me what to change ` +
           `(for example, a different campaign, ad set, or asset).`,
+        // Per-item body (no intro/footer) used when several writes are batched in one turn.
+        confirmationDetail: summary,
         message: `Confirm this Meta Ads ${entity_type} ${action} before it runs: ${summary} ` +
           `Show the user the exact target above (campaign / ad set / asset) and get explicit approval. ` +
           `If more than one campaign or asset could match the request, ask the user to disambiguate first. ` +
@@ -17705,6 +17720,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           `please check these are the right source image(s) before I proceed:\n\n` +
           `${summary}\n\n${thumbs}\n\n` +
           `Reply "yes" / "confirm" to go ahead, or tell me which image(s) to use instead.`,
+        // Per-item body (no intro/footer) used when several edits are batched in one turn.
+        confirmationDetail: `${summary}\n\n${thumbs}`,
         // Model-facing instruction for the resumed turn (mirrors the Meta gate): once
         // the user approves the shown source image(s), re-call generate_image with the
         // SAME arguments plus confirm=true. If the user names different images, edit

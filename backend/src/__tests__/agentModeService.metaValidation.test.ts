@@ -501,6 +501,28 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(out).toContain('Confirm B');
     });
 
+    it('batches multiple confirmations under ONE intro/footer using confirmationDetail', () => {
+      const detailItem = (detail: string, prompt: string) => ({
+        status: 'success' as const,
+        result: { success: true, awaitingUserConfirmation: true, confirmationPrompt: prompt, confirmationDetail: detail }
+      });
+      const out: string = (service as any).collectConfirmationPrompt([
+        detailItem('edit edited1.png\n![a](u1)', 'FULL PROMPT 1'),
+        detailItem('edit edited2.png\n![b](u2)', 'FULL PROMPT 2')
+      ]);
+
+      // Per-item details are present (incl. their thumbnails)...
+      expect(out).toContain('edited1.png');
+      expect(out).toContain('edited2.png');
+      expect(out).toContain('![a](u1)');
+      expect(out).toContain('![b](u2)');
+      // ...but the standalone per-item wrappers are NOT repeated.
+      expect(out).not.toContain('FULL PROMPT 1');
+      expect(out).not.toContain('FULL PROMPT 2');
+      // Footer appears exactly once.
+      expect(out.match(/Reply "yes" \/ "confirm"/g)?.length).toBe(1);
+    });
+
     it('ignores requiresConfirmation-only results (delete_leads / work-plan stay un-halted)', () => {
       // A tool that sets requiresConfirmation but NOT awaitingUserConfirmation must not
       // halt the loop — only the dedicated flag triggers the human gate.
