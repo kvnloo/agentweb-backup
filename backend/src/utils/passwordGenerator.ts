@@ -63,7 +63,7 @@ export function getInitialPasswordExpiry(): string {
  * parsed — callers treat "unknown" as "not expired" so a malformed field can
  * never lock a user out.
  */
-export function isInitialPasswordExpired(expiresAt?: string): boolean {
+export function isInitialPasswordExpired(expiresAt?: string | null): boolean {
   if (!expiresAt) return false;
   const expiryMs = new Date(expiresAt).getTime();
   if (Number.isNaN(expiryMs)) return false;

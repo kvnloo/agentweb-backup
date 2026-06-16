@@ -394,9 +394,10 @@ export interface User {
    * (e.g. admin creating a user from the waitlist). The user MUST set their own
    * password before this timestamp; the initial secret cannot become a
    * long-term password. Login is rejected once `Date.now()` passes this value
-   * (see the login controller). Cleared when the user resets their password.
+   * (see the login controller). Set to `null` to clear it when the user sets
+   * their own password (updateUser only persists `null`, it skips `undefined`).
    */
-  tempPasswordExpires?: string;
+  tempPasswordExpires?: string | null;
   /**
    * True while the account still holds its system-generated initial password.
    * Surfaced to the frontend (via /login and /me) to prompt an immediate
