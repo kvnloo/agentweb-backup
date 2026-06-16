@@ -20447,6 +20447,28 @@ Please generate a complete, professional HTML document that properly formats and
         htmlContent = await response.text();
       }
 
+      // Documents large enough to risk truncation by the 16K output cap must NOT
+      // be round-tripped through generateHTML — it would drop base64 images and
+      // print CSS and regenerate a mangled doc. For those we ask the model for a
+      // small variable-map and apply it deterministically to the pristine source,
+      // preserving every byte. Small docs keep the existing full-rewrite path.
+      // ~50K chars ≈ the 16K output-token ceiling for HTML.
+      const LLM_REWRITE_MAX_CHARS = 50000;
+
+      let enhancedHtml: string;
+      let largeDocNote: string | undefined;
+
+      if (htmlContent.length > LLM_REWRITE_MAX_CHARS) {
+        const large = await this.parameterizeLargeHtml(
+          htmlContent,
+          subject,
+          additionalInstructions,
+          userId,
+          sessionId,
+        );
+        enhancedHtml = large.html;
+        largeDocNote = large.note;
+      } else {
       // Use Claude model to process/enhance the HTML based on instructions
       const defaultClaudeModel = 'anthropic.claude-sonnet-4-6';
 
@@ -20519,10 +20541,11 @@ Please:
 
       // Generate enhanced HTML template using LLMService
       console.log('AgentMode: Generating HTML email template with Claude model');
-      const enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'), { userId, sessionId, feature: 'content_gen' });
+      enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'), { userId, sessionId, feature: 'content_gen' });
 
       if (!enhancedHtml || enhancedHtml.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
+      }
       }
 
       // Extract variables from the enhanced HTML and subject
@@ -20610,7 +20633,9 @@ Please:
         variables: variables,
         arrayVariables: arrayVariables,
         message: `Template "${templateName}" created successfully with ${variables.length} variables and ${arrayVariables.length} array variables`,
-        preview_note: 'Template is now available in Templates section for editing and preview'
+        preview_note: largeDocNote
+          ? `${largeDocNote} Template is now available in Templates section for editing and preview.`
+          : 'Template is now available in Templates section for editing and preview'
       };
     } catch (error) {
       console.error('Error creating HTML template:', error);
@@ -20620,6 +20645,196 @@ Please:
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
+  }
+
+  /**
+   * Build a small {{variable}} map for an HTML document that is too large to
+   * safely round-trip through generateHTML (the 16K output cap would truncate it
+   * and drop base64 images / print CSS). The model only returns variable names
+   * and exact source anchors; the substitution is applied deterministically to
+   * the original bytes so fidelity is fully preserved.
+   */
+  private async parameterizeLargeHtml(
+    htmlContent: string,
+    subject: string,
+    additionalInstructions: string,
+    userId: string,
+    sessionId: string,
+  ): Promise<{ html: string; note: string }> {
+    const { createLLMService } = await import('../utils/llmService');
+    // Output is a compact JSON map, so a small token budget is plenty.
+    const llmService = createLLMService('anthropic.claude-sonnet-4-6', 0.2, 4096);
+
+    const strippedHtml = this.stripBase64ForLlm(htmlContent);
+
+    const systemPrompt = `You are an expert email-template engineer. You will be given an HTML document that is already complete and correctly styled. Do NOT rewrite, reformat, or return the HTML.
+
+Your ONLY job is to identify the dynamic content that should become reusable {{variable}} placeholders, and return them as JSON.
+
+Return a JSON object of this exact shape:
+{
+  "variables": [
+    { "name": "snake_case_variable_name", "anchor": "EXACT substring copied verbatim from the HTML that should be replaced", "isArray": false }
+  ]
+}
+
+Rules:
+- "anchor" MUST be an exact, contiguous substring copied character-for-character from the provided HTML (so it can be found and replaced programmatically). Never paraphrase it.
+- Pick anchors specific enough to be unambiguous (prefer the full value, e.g. a person's name, a date, a headline).
+- Use snake_case names (e.g. user_name, company_name, issue_date).
+- For repeating sections use the array pattern names: items_1_title, items_2_title, items_n_title (only _1, _2 and _n). Set "isArray": true for those.
+- Do NOT invent content. Only parameterize values that actually appear in the HTML.
+- Return ONLY the JSON object, no prose, no HTML.`;
+
+    const userPrompt = `Subject line: ${subject || '(none)'}
+
+Additional instructions: ${additionalInstructions || 'Identify the obvious dynamic fields (names, dates, titles, company info, repeating items).'}
+
+HTML document (base64 image data has been replaced with __BASE64_STRIPPED__ markers — ignore those):
+${strippedHtml}`;
+
+    let suggestions: Array<{ name?: string; anchor?: string; isArray?: boolean }> = [];
+    try {
+      const parsed = await llmService.generateJsonRobust<{ variables?: Array<{ name?: string; anchor?: string; isArray?: boolean }> }>(
+        systemPrompt,
+        userPrompt,
+        this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'),
+        { userId, sessionId, feature: 'content_gen' },
+      );
+      if (parsed && Array.isArray(parsed.variables)) {
+        suggestions = parsed.variables;
+      }
+    } catch (error) {
+      // Suggestion generation is best-effort. On any failure we still store the
+      // document verbatim — fidelity matters more than auto-parameterization.
+      console.warn('AgentMode: parameterizeLargeHtml suggestion call failed, storing verbatim:', error);
+    }
+
+    const { html, applied, skipped } = await this.applyVariableMap(htmlContent, suggestions);
+    const note = `Large document (${htmlContent.length.toLocaleString()} chars) stored with full fidelity; ${applied} variable(s) auto-detected${skipped > 0 ? `, ${skipped} suggestion(s) skipped (anchor not found in body text, ambiguous, or invalid name)` : ''}.`;
+    return { html, note };
+  }
+
+  /**
+   * Replace base64 data-URI payloads with a short marker so the model is not
+   * billed for (and cannot corrupt) embedded image blobs. Only the payload is
+   * stripped; the surrounding markup is untouched.
+   */
+  private stripBase64ForLlm(html: string): string {
+    return html.replace(
+      /(data:[\w.+-]+\/[\w.+-]+;base64,)[A-Za-z0-9+/=\s]+/gi,
+      '$1__BASE64_STRIPPED__',
+    );
+  }
+
+  /**
+   * Apply a variable map to the original HTML deterministically.
+   *
+   * Substitution is restricted to renderable text nodes (see
+   * computeSafeTextRanges): EVERY occurrence of an anchor that lies wholly
+   * inside body text and does not overlap an already-claimed range is replaced
+   * with {{name}}, so a repeated value (brand name, date) is parameterized
+   * consistently. Occurrences inside tags, attributes, <style>, <script>,
+   * <title> or comments are never touched, and the original bytes are spliced
+   * (no DOM reserialization), so fidelity is preserved.
+   *
+   * Safety guards: variable names must match /^[A-Za-z0-9_]+$/ (so {{name}} is
+   * always well-formed), and an anchor that matches nothing inside safe text is
+   * skipped rather than guessed.
+   *
+   * KNOWN COVERAGE LIMITS (intentional, fidelity-first — values matching these
+   * are left literal, not auto-parameterized):
+   *   - values living in attributes (e.g. href, alt, <meta content>),
+   *   - values split across element boundaries (e.g. "<b>John</b> Smith"),
+   *   - anchors that differ from the source by HTML entities or collapsed
+   *     whitespace,
+   *   - the subject line (parameterized only if it already contains {{...}}).
+   */
+  private async applyVariableMap(
+    html: string,
+    suggestions: Array<{ name?: string; anchor?: string; isArray?: boolean }>,
+  ): Promise<{ html: string; applied: number; skipped: number }> {
+    const safeRanges = await this.computeSafeTextRanges(html);
+    const isInsideSafeText = (start: number, end: number): boolean =>
+      safeRanges.some((r) => start >= r.start && end <= r.end);
+
+    const claimed: Array<{ start: number; end: number; name: string }> = [];
+    let applied = 0;
+    let skipped = 0;
+
+    for (const suggestion of suggestions) {
+      const name = (suggestion?.name || '').trim();
+      const anchor = typeof suggestion?.anchor === 'string' ? suggestion.anchor : '';
+
+      // Reject malformed variable names and empty anchors outright.
+      if (!/^[A-Za-z0-9_]+$/.test(name) || anchor.length === 0) {
+        skipped++;
+        continue;
+      }
+
+      // Replace every safe, non-overlapping occurrence (consistent repeats).
+      let matchedHere = 0;
+      let from = 0;
+      while (from <= html.length) {
+        const idx = html.indexOf(anchor, from);
+        if (idx === -1) break;
+        const end = idx + anchor.length;
+        const overlaps = claimed.some((c) => idx < c.end && end > c.start);
+        if (!overlaps && isInsideSafeText(idx, end)) {
+          claimed.push({ start: idx, end, name });
+          matchedHere++;
+        }
+        from = idx + 1;
+      }
+
+      if (matchedHere > 0) applied++;
+      else skipped++;
+    }
+
+    // Apply right-to-left so earlier indices stay valid while splicing.
+    claimed.sort((a, b) => b.start - a.start);
+    let out = html;
+    for (const c of claimed) {
+      out = out.slice(0, c.start) + `{{${c.name}}}` + out.slice(c.end);
+    }
+    return { html: out, applied, skipped };
+  }
+
+  /**
+   * Parse the HTML once and return the source-offset ranges of renderable text
+   * nodes, excluding <style>, <script>, <title>, comments, tags and attribute
+   * values. Restricting substitution to these ranges lets us replace ALL
+   * occurrences of a repeated value without corrupting CSS, scripts, attributes
+   * or markup. Offsets index the original string, so callers splice the
+   * original bytes and fidelity is preserved.
+   */
+  private async computeSafeTextRanges(html: string): Promise<Array<{ start: number; end: number }>> {
+    const { Parser } = await import('htmlparser2');
+    const ranges: Array<{ start: number; end: number }> = [];
+    const SKIP_TAGS = new Set(['style', 'script', 'title']);
+    let skipDepth = 0;
+    const parser = new Parser(
+      {
+        onopentag: (name: string) => {
+          if (SKIP_TAGS.has(name)) skipDepth++;
+        },
+        onclosetag: (name: string) => {
+          if (SKIP_TAGS.has(name) && skipDepth > 0) skipDepth--;
+        },
+        ontext: () => {
+          // htmlparser2 endIndex is inclusive; +1 for an exclusive slice end.
+          if (skipDepth === 0 && parser.startIndex >= 0 && parser.endIndex >= parser.startIndex) {
+            ranges.push({ start: parser.startIndex, end: parser.endIndex + 1 });
+          }
+        },
+      },
+      // withStartIndices/withEndIndices are honored at runtime but missing from
+      // htmlparser2's ParserOptions type, hence the cast.
+      { withStartIndices: true, withEndIndices: true } as any,
+    );
+    parser.write(html);
+    parser.end();
+    return ranges;
   }
 
   // Work Plan Management Methods
