@@ -28,6 +28,12 @@
       "subnet": "73.170.32.0/24",
       "email": "ruiw@agentweb.pro",
       "addedAt": "2026-04-16T14:46:41.027Z"
+    },
+    {
+      "ip": "1.39.57.3",
+      "subnet": "1.39.57.0/24",
+      "email": "mvarma@argusoft.com",
+      "addedAt": "2026-06-16T06:26:36.424Z"
     }
   ]
 }
