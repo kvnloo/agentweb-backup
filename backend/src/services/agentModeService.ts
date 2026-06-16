@@ -13911,6 +13911,135 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
+   * Mutating Meta Ads actions that publish, change, or destroy live entities and
+   * therefore require an explicit target confirmation before they execute.
+   * Read-only actions (LIST, SEARCH, GET_MATCH_QUALITY, UPLOAD_IMAGE/VIDEO) are excluded —
+   * they don't publish to a campaign or destroy anything.
+   */
+  private static META_WRITE_ACTIONS: Record<string, string[]> = {
+    CAMPAIGN: ['CREATE', 'UPDATE', 'DELETE'],
+    AD_SET: ['CREATE', 'UPDATE', 'DELETE'],
+    AD: ['CREATE', 'UPDATE', 'DELETE', 'COPY_AD']
+  };
+
+  private static isMetaWriteAction(entity_type: string, action: string): boolean {
+    return (AgentModeService.META_WRITE_ACTIONS[entity_type] || []).includes(action);
+  }
+
+  /**
+   * Resolve the exact target of a mutating Meta Ads action into a human-readable
+   * preview so the agent can echo it back and get explicit user confirmation
+   * BEFORE anything is published, changed, or deleted. This is the guardrail that
+   * stops the agent acting on an ambiguous target (e.g. publishing an ad into the
+   * wrong campaign). ID→name lookups degrade gracefully to the raw ID if Meta is
+   * unreachable — confirmation must still be required even when resolution fails.
+   */
+  private async buildMetaWriteConfirmation(
+    userId: string,
+    entity_type: string,
+    action: string,
+    account_id: string,
+    campaign_id: string | undefined,
+    ad_set_id: string | undefined,
+    ad_id: string | undefined,
+    params: any
+  ): Promise<{ summary: string; target: Record<string, any> }> {
+    let accessToken = '';
+    try {
+      ({ accessToken } = await this.getMetaCredentials(userId, account_id));
+    } catch {
+      // Credential failure surfaces during execution; still require confirmation here.
+    }
+
+    const target: Record<string, any> = { entity_type, action, account_id };
+    const lines: string[] = [];
+
+    // Best-effort resolvers — each guarded so a Meta lookup failure never blocks the gate.
+    const resolveCampaign = async (id?: string) => {
+      if (!id || !accessToken) return undefined;
+      try { return await metaService.getCampaign(account_id, accessToken, id); } catch { return undefined; }
+    };
+    const resolveAdSet = async (id?: string) => {
+      if (!id || !accessToken) return undefined;
+      try { return await metaService.getAdSet(accessToken, id); } catch { return undefined; }
+    };
+    const resolveAd = async (id?: string) => {
+      if (!id || !accessToken) return undefined;
+      try { return await metaService.getAd(accessToken, id); } catch { return undefined; }
+    };
+    const nameOf = (entity: any, id?: string) =>
+      entity?.name ? `"${entity.name}" (${entity.id || id})` : (id ? `ID ${id}` : 'unknown');
+
+    if (entity_type === 'CAMPAIGN') {
+      if (action === 'CREATE') {
+        target.campaign_name = params.name;
+        target.objective = params.objective;
+        lines.push(`Create a NEW campaign "${params.name}" (objective: ${params.objective || 'unspecified'}) in ad account ${account_id}.`);
+      } else {
+        const campaign = await resolveCampaign(campaign_id);
+        target.campaign = nameOf(campaign, campaign_id);
+        target.campaign_id = campaign_id;
+        lines.push(`${action} campaign ${target.campaign} in ad account ${account_id}.`);
+      }
+    } else if (entity_type === 'AD_SET') {
+      if (action === 'CREATE') {
+        const campaign = await resolveCampaign(campaign_id);
+        target.campaign = nameOf(campaign, campaign_id);
+        target.ad_set_name = params.name;
+        lines.push(`Create a NEW ad set "${params.name}" UNDER campaign ${target.campaign} (ad account ${account_id}).`);
+      } else {
+        const adSet = await resolveAdSet(ad_set_id);
+        const campaign = await resolveCampaign(adSet?.campaign_id);
+        target.ad_set = nameOf(adSet, ad_set_id);
+        target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
+        lines.push(`${action} ad set ${target.ad_set}${target.campaign ? ` (in campaign ${target.campaign})` : ''}.`);
+      }
+    } else if (entity_type === 'AD') {
+      if (action === 'CREATE') {
+        const adSet = await resolveAdSet(ad_set_id);
+        const campaign = await resolveCampaign(adSet?.campaign_id);
+        target.ad_name = params.name;
+        target.ad_set = nameOf(adSet, ad_set_id);
+        target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
+        lines.push(`Publish a NEW ad "${params.name}" into ad set ${target.ad_set}${target.campaign ? `, which belongs to campaign ${target.campaign}` : ''} (ad account ${account_id}).`);
+      } else if (action === 'COPY_AD') {
+        const sourceAd = await resolveAd(ad_id);
+        const targetAdSetId = params.adset_id || sourceAd?.adset_id;
+        const adSet = await resolveAdSet(targetAdSetId);
+        const campaign = await resolveCampaign(adSet?.campaign_id);
+        target.source_ad = nameOf(sourceAd, ad_id);
+        target.target_ad_set = nameOf(adSet, targetAdSetId);
+        target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
+        lines.push(`Copy ad ${target.source_ad} into ad set ${target.target_ad_set}${target.campaign ? `, which belongs to campaign ${target.campaign}` : ''}.`);
+      } else {
+        const ad = await resolveAd(ad_id);
+        const adSet = await resolveAdSet(ad?.adset_id);
+        const campaign = await resolveCampaign(ad?.campaign_id);
+        target.ad = nameOf(ad, ad_id);
+        target.ad_set = adSet ? nameOf(adSet, ad?.adset_id) : undefined;
+        target.campaign = campaign ? nameOf(campaign, ad?.campaign_id) : undefined;
+        const ctx = [
+          target.ad_set ? `ad set ${target.ad_set}` : undefined,
+          target.campaign ? `campaign ${target.campaign}` : undefined
+        ].filter(Boolean).join(', ');
+        lines.push(`${action} ad ${target.ad}${ctx ? ` (in ${ctx})` : ''}.`);
+      }
+    }
+
+    // Surface content/destination changes so the user can catch a wrong-asset edit.
+    const contentChanges: Record<string, any> = {};
+    for (const key of ['link_url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'status', 'daily_budget', 'lifetime_budget', 'creative_id', 'placement_assets']) {
+      if (params[key] !== undefined) contentChanges[key] = params[key];
+    }
+    if (Object.keys(contentChanges).length > 0) {
+      target.changes = contentChanges;
+      lines.push(`Changes: ${Object.keys(contentChanges).join(', ')}.`);
+    }
+
+    return { summary: lines.join(' '), target };
+  }
+
+  /**
    * Master method for calling Meta Marketing API.
    * Routes the request to the appropriate entity manager based on entity_type.
    */
@@ -13939,6 +14068,31 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         error: 'PARAM_VALIDATION_ERROR',
         hint: 'Fix the listed parameters and retry.'
       } as any;
+    }
+
+    // Target-confirmation guardrail for mutating actions (publish/change/delete).
+    // The agent must echo the resolved target back to the user and re-call with
+    // confirm=true. This prevents acting on an ambiguous target (e.g. publishing
+    // an ad into the wrong campaign or editing the wrong asset). `confirm` is a
+    // gate-only flag and is stripped before dispatch so it never reaches Meta.
+    const confirmed = params.confirm === true;
+    if (AgentModeService.isMetaWriteAction(entity_type, action) && !confirmed) {
+      const { summary, target } = await this.buildMetaWriteConfirmation(
+        userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
+      );
+      return {
+        success: true,
+        requiresConfirmation: true,
+        message: `Confirm this Meta Ads ${entity_type} ${action} before it runs: ${summary} ` +
+          `Show the user the exact target above (campaign / ad set / asset) and get explicit approval. ` +
+          `If more than one campaign or asset could match the request, ask the user to disambiguate first. ` +
+          `Once approved, call call_meta_marketing_api again with the same arguments plus params.confirm=true.`,
+        target
+      } as any;
+    }
+    if ('confirm' in params) {
+      params = { ...params };
+      delete params.confirm;
     }
 
     switch (entity_type) {

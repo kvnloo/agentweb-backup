@@ -373,6 +373,19 @@ emmaToolRegistry.register({
     description:
       `Manage Meta Ads entities via the Marketing API. Requires account_id from list_connected_accounts(platform='meta').
 
+⚠️ MANDATORY TARGET CONFIRMATION (publish/change/delete actions):
+  CAMPAIGN/AD_SET/AD with CREATE, UPDATE, DELETE, or COPY_AD are write actions that publish, change, or
+  destroy live entities. For these, the API runs a two-phase confirmation:
+    1. Call normally (without params.confirm). The API does NOT execute — it returns requiresConfirmation:true
+       with a "target" object naming the exact campaign + ad set + asset that will be affected.
+    2. Show the user that resolved target verbatim (campaign name + ID, ad set name + ID, ad name, and any
+       content/budget/status changes) and get EXPLICIT approval before proceeding.
+    3. Only after the user approves, re-call with the SAME arguments plus params.confirm=true to execute.
+  If the user's request could map to MORE THAN ONE campaign, ad set, or asset, do NOT guess — list the
+  candidates and ask the user to disambiguate BEFORE calling. Never publish an ad into a campaign/ad set the
+  user did not explicitly name, and never regenerate/edit an asset set without confirming which assets.
+  (LIST/SEARCH/UPLOAD_IMAGE/UPLOAD_VIDEO are read/upload-only and need no confirmation.)
+
 ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
   AD_SET        → LIST, CREATE, UPDATE, DELETE
@@ -517,6 +530,9 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
           type: "object",
           description: "Action-specific parameters. Required fields depend on entity_type + action (see tool description for the full matrix).",
           properties: {
+            // --- Confirmation gate (write actions) ---
+            confirm: { type: "boolean", description: "Set to true ONLY after showing the user the resolved target (campaign/ad set/asset) returned by the first call and getting explicit approval. Required to actually execute CAMPAIGN/AD_SET/AD CREATE/UPDATE/DELETE/COPY_AD. Omit (or false) on the first call to preview the target." },
+
             // --- Common ---
             name: { type: "string", description: "Entity name." },
             status: { type: "string", enum: ["ACTIVE", "PAUSED", "ARCHIVED"], description: "Entity status." },
