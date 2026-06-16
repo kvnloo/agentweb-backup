@@ -158,9 +158,9 @@ export const register = async (req: Request, res: Response) => {
         .catch((err) => console.error("Failed to send team introduction email:", err));
     }
 
-    // JWT includes roles array
+    // JWT includes roles array. sv:0 — brand-new account, no password changes yet.
     const token = jwt.sign(
-      { userId, email, roles: finalRoles, isAdmin: false }, // Include isAdmin=false for clarity
+      { userId, email, roles: finalRoles, isAdmin: false, sv: 0 }, // Include isAdmin=false for clarity
       process.env.JWT_SECRET || "your-secret-key",
       { expiresIn: "90d" }
     );
