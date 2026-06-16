@@ -166,7 +166,8 @@ describe('AgentModeService - createHtmlTemplate', () => {
       expect(mockGenerateHTML).toHaveBeenCalledWith(
         expect.stringContaining('HTML email template designer'),
         expect.stringContaining('welcome_email'),
-        expect.any(Function)
+        expect.any(Function),
+        { userId: expect.any(String), sessionId: expect.any(String), feature: 'content_gen' }
       );
 
       // Verify template was saved

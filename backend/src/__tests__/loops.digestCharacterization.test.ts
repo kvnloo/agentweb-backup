@@ -94,10 +94,39 @@ describe('loop digest characterization (exact rendered text)', () => {
     _resetRegistryForTesting();
     agentModeInternal.resetForTesting();
     delete process.env.ONBOARDING_LOOP_V2;
+    delete process.env.AGENT_MODE_LOOP_DIGEST;
   });
 
   describe('agent-mode', () => {
-    it('renders the findings digest verbatim', async () => {
+    // Chirp kill (2026-06-14): the agent-mode reliability loop is silent by
+    // default — it DM'd Harsha on EVERY daily run, including the empty/quiet
+    // "healthy" windows, which was the only loop chirping in prod. The digest
+    // wire format is still pinned below, but only when explicitly re-enabled
+    // via AGENT_MODE_LOOP_DIGEST=true (set once the Slack approval gate makes
+    // the DM actionable). See dev.md 2026-06-14.
+    it('is silent by default — posts NO digest DM even when tools are failing', async () => {
+      delete process.env.AGENT_MODE_LOOP_DIGEST;
+      mockedRunLoop.mockResolvedValue(
+        fakeResult({
+          runId: 'run_agent_silent' as LoopRunResult['runId'],
+          eventsScanned: 42,
+          proposals: [
+            proposal('Tool `publish_blog_article` failed 6/9 calls (67%) — top error: Webflow 502', 'code_change'),
+          ],
+        }),
+      );
+
+      await runAgentModeLoopOnce();
+
+      expect(ports.slack.postMessage).not.toHaveBeenCalled();
+    });
+
+    describe('when AGENT_MODE_LOOP_DIGEST=true (digest explicitly re-enabled)', () => {
+      beforeEach(() => {
+        process.env.AGENT_MODE_LOOP_DIGEST = 'true';
+      });
+
+      it('renders the findings digest verbatim', async () => {
       mockedRunLoop.mockResolvedValue(
         fakeResult({
           runId: 'run_agent_1' as LoopRunResult['runId'],
@@ -162,6 +191,7 @@ describe('loop digest characterization (exact rendered text)', () => {
           FOOTER,
         ].join('\n'),
       );
+    });
     });
   });
 

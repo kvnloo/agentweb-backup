@@ -1,9 +1,9 @@
-// Verifies Emma's create_skill tool stamps org ownership and enforces the
-// same org create-permission gate as the REST route (POST /api/user-skills):
+// Verifies Emma's create_skill tool stamps org ownership, mirroring the REST
+// route (POST /api/user-skills). Skills are member-owned: any user may create
+// their own.
 //  - The new skill is stamped with ownerId, visibility='private', and the
-//    creator's orgId (so it participates in org fanout and editor/transfer logic).
-//  - Org owners and listed skills editors may create; plain org members are
-//    rejected ("Skills are managed by your org admin").
+//    creator's orgId (so it participates in org fanout when sharing is enabled).
+//  - Org owners, listed editors, and plain members may all create.
 //  - Solo users (no org) may always create; the skill carries no orgId.
 
 jest.mock('../services/db', () => ({
@@ -100,7 +100,7 @@ describe('Emma create_skill — org ownership stamping', () => {
     expect(mockUpdateSkill.mock.calls[0][0].orgId).toBe(ORG_ID);
   });
 
-  it('rejects a plain org member (no editor/owner role) without creating a skill', async () => {
+  it('allows a plain org member to create; skill is stamped with the org id', async () => {
     (userDb.getUserById as jest.Mock).mockResolvedValue(PLAIN_MEMBER);
     (orgDb.getOrgById as jest.Mock).mockResolvedValue(orgEnabledNoEditors);
 
@@ -109,10 +109,9 @@ describe('Emma create_skill — org ownership stamping', () => {
       { userId: PLAIN_MEMBER.userId },
     );
 
-    expect(res.success).toBe(false);
-    expect(String(res.error || res.message)).toMatch(/org admin|not authorized|permission/i);
-    expect(mockCreateSkill).not.toHaveBeenCalled();
-    expect(mockUpdateSkill).not.toHaveBeenCalled();
+    expect(res.success).toBe(true);
+    expect(mockUpdateSkill).toHaveBeenCalledTimes(1);
+    expect(mockUpdateSkill.mock.calls[0][0].orgId).toBe(ORG_ID);
   });
 
   it('allows a solo user (no org) to create; skill carries no orgId', async () => {

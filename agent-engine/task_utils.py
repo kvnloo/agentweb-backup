@@ -1171,8 +1171,8 @@ def check_new_information(previous_result, current_result):
             logger.info("Missing previous or current result for comparison")
             return False, None
             
-        # Use O1-mini model for comparison
-        llm = get_azure_openai_llm_o1('o1-mini')
+        # Use the current Azure GPT-5 deployment for comparison
+        llm = get_azure_openai_llm3('gpt-5-chat')
         
         # Prepare the prompt for the LLM
         prompt = f"""

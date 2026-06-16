@@ -3,6 +3,7 @@ import express from 'express';
 import webhookRouter from '../routes/webhooks';
 import { crmDb } from '../services/db';
 import { leadListAlertService } from '../services/leadListAlertService';
+import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { agentModeService } from '../services/agentModeService';
 import { resendService } from '../services/resendService';
 import { dripSequenceDb } from '../services/dripSequenceDb';
@@ -29,6 +30,10 @@ jest.mock('../services/leadListAlertService', () => ({
   leadListAlertService: {
     notifyLeadListOwnerIfConfigured: jest.fn(),
   },
+}));
+
+jest.mock('../services/leadCaptureFailureService', () => ({
+  recordLeadCaptureFailure: jest.fn(),
 }));
 
 jest.mock('../services/agentModeService', () => ({
@@ -161,6 +166,76 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
 
       expect(response.status).toBe(403);
       expect(response.body.success).toBe(false);
+    });
+
+    it('records a capture failure when the listId does not exist (404)', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(null);
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({
+          listId: 'list_nonexistent',
+          email: 'lead@acme.com',
+          source: 'demystifying_ai_lead_magnet',
+        });
+
+      expect(response.status).toBe(404);
+      expect(recordLeadCaptureFailure).toHaveBeenCalledTimes(1);
+      expect(recordLeadCaptureFailure).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: 'list_not_found',
+          listId: 'list_nonexistent',
+          status: 404,
+          source: 'demystifying_ai_lead_magnet',
+        })
+      );
+    });
+
+    it('records a capture failure when public access is disabled (403)', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+        ...mockLeadList,
+        publicAccessEnabled: false,
+      });
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({
+          listId: 'list_123',
+          email: 'lead@acme.com',
+          source: 'ai-readiness-roadmap',
+        });
+
+      expect(response.status).toBe(403);
+      expect(recordLeadCaptureFailure).toHaveBeenCalledTimes(1);
+      expect(recordLeadCaptureFailure).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: 'public_access_disabled',
+          listId: 'list_123',
+          status: 403,
+          source: 'ai-readiness-roadmap',
+          userId: mockLeadList.userId,
+        })
+      );
+    });
+
+    it('does not record a capture failure on a successful forward', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.createLead as jest.Mock).mockResolvedValue({
+        leadId: 'lead_ok',
+        listId: 'list_123',
+        email: 'lead@acme.com',
+      });
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({
+          listId: 'list_123',
+          email: 'lead@acme.com',
+          source: 'ai-readiness-roadmap',
+        });
+
+      expect(response.status).toBe(201);
+      expect(recordLeadCaptureFailure).not.toHaveBeenCalled();
     });
 
     it('should reject requests without email', async () => {
@@ -908,6 +983,143 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
         const call = (crmDb.createLead as jest.Mock).mock.calls[0][1];
         expect(call.firstTouch).toBeUndefined();
         expect(call.lastTouch).toBeUndefined();
+      });
+
+      // Regression: the existing-lead MERGE path used to drop attribution
+      // entirely — lastTouch was DOA for any lead that came through the webhook
+      // more than once (firstTouch === lastTouch forever). The merge whitelist
+      // previously only carried standardFields + customFields.
+      describe('existing-lead merge path (lastTouch refresh)', () => {
+        const firstTouch = {
+          timestamp: '2026-04-19T10:00:00.000Z',
+          utm: { source: 'linkedin', medium: 'social', campaign: 'first' },
+        };
+
+        it('refreshes lastTouch on a repeat touch, preserves firstTouch + utm denorm', async () => {
+          (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+            leadId: 'lead_repeat',
+            listId: 'list_123',
+            email: 'repeat@example.com',
+            firstName: 'Repeat',
+            firstTouch,
+            lastTouch: firstTouch,
+            utmSource: 'linkedin',
+            utmMedium: 'social',
+            customFields: { source: 'api' },
+          });
+
+          const response = await request(app)
+            .post('/api/webhooks/forward-lead')
+            .send({
+              listId: 'list_123',
+              email: 'repeat@example.com',
+              attribution: {
+                timestamp: '2026-04-20T10:00:00.000Z',
+                utm: { source: 'google', medium: 'cpc', campaign: 'second' },
+              },
+            });
+
+          expect(response.status).toBe(200);
+          expect(response.body.event).toBe('lead.updated');
+
+          const updates = (crmDb.updateLead as jest.Mock).mock.calls.find(
+            (c) => c[1] === 'lead_repeat'
+          )?.[2];
+          expect(updates).toBeDefined();
+          // lastTouch ALWAYS refreshes to the new touch
+          expect(updates.lastTouch).toEqual(
+            expect.objectContaining({
+              utm: expect.objectContaining({ source: 'google', medium: 'cpc' }),
+            })
+          );
+          // firstTouch must NEVER be in the update payload (immutable)
+          expect(updates.firstTouch).toBeUndefined();
+          // utmSource/utmMedium are denormalized from firstTouch — never overwritten
+          // once present, so they must not be in the update payload here.
+          expect(updates.utmSource).toBeUndefined();
+          expect(updates.utmMedium).toBeUndefined();
+        });
+
+        it('backfills firstTouch + utm denorm when an existing lead has none', async () => {
+          (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+            leadId: 'lead_noattr',
+            listId: 'list_123',
+            email: 'noattr@example.com',
+            firstName: 'NoAttr',
+            customFields: { source: 'manual' },
+            // no firstTouch / lastTouch / utmSource / utmMedium
+          });
+
+          const response = await request(app)
+            .post('/api/webhooks/forward-lead')
+            .send({
+              listId: 'list_123',
+              email: 'noattr@example.com',
+              attribution: {
+                timestamp: '2026-04-20T10:00:00.000Z',
+                utm: { source: 'twitter', medium: 'social', campaign: 'late' },
+              },
+            });
+
+          expect(response.status).toBe(200);
+          expect(response.body.event).toBe('lead.updated');
+
+          const updates = (crmDb.updateLead as jest.Mock).mock.calls.find(
+            (c) => c[1] === 'lead_noattr'
+          )?.[2];
+          expect(updates).toBeDefined();
+          // firstTouch backfilled (was absent) — only-if-absent
+          expect(updates.firstTouch).toEqual(
+            expect.objectContaining({
+              utm: expect.objectContaining({ source: 'twitter' }),
+            })
+          );
+          // lastTouch set too
+          expect(updates.lastTouch).toEqual(
+            expect.objectContaining({
+              utm: expect.objectContaining({ source: 'twitter' }),
+            })
+          );
+          // utm denorm backfilled from the new firstTouch
+          expect(updates.utmSource).toBe('twitter');
+          expect(updates.utmMedium).toBe('social');
+        });
+
+        it('does not touch attribution fields when the repeat touch carries none', async () => {
+          (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+            leadId: 'lead_noinc',
+            listId: 'list_123',
+            email: 'noinc@example.com',
+            firstName: 'Old',
+            firstTouch,
+            lastTouch: firstTouch,
+            utmSource: 'linkedin',
+            utmMedium: 'social',
+            customFields: { source: 'api' },
+          });
+
+          const response = await request(app)
+            .post('/api/webhooks/forward-lead')
+            .send({
+              listId: 'list_123',
+              email: 'noinc@example.com',
+              firstName: 'New', // forces a change so updateLead is called
+            });
+
+          expect(response.status).toBe(200);
+          expect(response.body.event).toBe('lead.updated');
+
+          const updates = (crmDb.updateLead as jest.Mock).mock.calls.find(
+            (c) => c[1] === 'lead_noinc'
+          )?.[2];
+          expect(updates).toBeDefined();
+          expect(updates.firstName).toBe('New');
+          // No incoming attribution → no attribution keys in the update
+          expect(updates.firstTouch).toBeUndefined();
+          expect(updates.lastTouch).toBeUndefined();
+          expect(updates.utmSource).toBeUndefined();
+          expect(updates.utmMedium).toBeUndefined();
+        });
       });
     });
 

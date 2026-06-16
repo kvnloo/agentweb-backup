@@ -323,6 +323,8 @@ describe('llmService', () => {
         outputTokens: 20,
         totalTokens: 30,
         model: 'gpt-4',
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
       });
     });
 
@@ -421,6 +423,8 @@ describe('llmService', () => {
         outputTokens: 200,
         totalTokens: 300,
         model: 'gpt-4',
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
       });
     });
 
@@ -437,6 +441,8 @@ describe('llmService', () => {
         outputTokens: 0,
         totalTokens: 0,
         model: 'gpt-4',
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
       });
     });
 

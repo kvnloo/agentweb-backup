@@ -9,6 +9,9 @@ import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
 import { rankMemoriesByRelevance } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
+import { toolResultError } from '../utils/toolResultError';
+import { computeTermination } from './agentMode/core/agentStep';
+import { executePreparedTools } from './agentMode/core/toolDispatch';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
@@ -26,7 +29,8 @@ import { extractVariables } from '../utils/templateParser';
 import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 import { incrementUserTokenUsage } from './tokenUsageService';
-import type { LLMUsageData } from '../utils/llmService';
+import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
+import { recordUsage } from './usageRecorderService';
 import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
 import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmMutationEvents';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
@@ -172,37 +176,6 @@ function recordAgentModeToolTelemetry(
   })();
 }
 
-function toolResultError(result: unknown): Error | null {
-  if (!result || typeof result !== 'object') return null;
-  const obj = result as Record<string, any>;
-
-  if (obj.isError === true) {
-    return new Error(extractToolResultMessage(obj) || 'Tool returned isError=true');
-  }
-
-  if (obj.success === false) {
-    return new Error(extractToolResultMessage(obj) || 'Tool returned success=false');
-  }
-
-  return null;
-}
-
-function extractToolResultMessage(obj: Record<string, any>): string {
-  if (typeof obj.error === 'string' && obj.error.trim()) return obj.error.trim();
-  if (typeof obj.message === 'string' && obj.message.trim()) return obj.message.trim();
-  if (typeof obj.content === 'string' && obj.content.trim()) return obj.content.trim();
-
-  if (Array.isArray(obj.content)) {
-    const text = obj.content
-      .map((part: any) => typeof part?.text === 'string' ? part.text : '')
-      .filter(Boolean)
-      .join('\n')
-      .trim();
-    if (text) return text;
-  }
-
-  return '';
-}
 
 function recordAgentModeRunStarted(
   runId: string,
@@ -430,6 +403,12 @@ interface LLMCallOptions {
   max_completion_tokens?: number | null;
   temperature?: number | null;
   response_format?: { type: 'text' | 'json_object' } | null;
+  /**
+   * Optional attribution for shadow usage metering (Ship 1). Recording is
+   * fire-and-forget and fail-open — it never changes the call's behavior.
+   * When omitted, usage is recorded under userId "system".
+   */
+  usageContext?: LLMUsageContext | null;
 }
 
 // Diagnosis agent configuration
@@ -2047,7 +2026,8 @@ export class AgentModeService {
       tool_choice = null,
       max_completion_tokens = null,
       temperature = null,
-      response_format = { type: "text" }
+      response_format = { type: "text" },
+      usageContext = null
     } = options || {};
 
     const params: any = {
@@ -2110,6 +2090,33 @@ export class AgentModeService {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         const res = await client.chat.completions.create(params);
+        // Shadow usage metering (Ship 1): every client returned above (Azure
+        // OpenAI, Gemini OpenAI-compat, Bedrock Converse wrapper, Vertex
+        // wrapper) responds in OpenAI shape, so `res.usage` is the single
+        // observation point — including the Bedrock ConverseCommand path,
+        // whose cache metrics surface as cache_read/creation_input_tokens.
+        // Fire-and-forget + fail-open: never awaited, never throws.
+        try {
+          const usage: any = (res as any)?.usage;
+          if (usage) {
+            void recordUsage({
+              userId: usageContext?.userId,
+              sessionId: usageContext?.sessionId,
+              model,
+              provider: model.startsWith('gemini-') ? 'gemini'
+                : model.startsWith('anthropic.') ? 'bedrock'
+                : model.startsWith('claude-') ? 'vertex'
+                : 'azure-openai',
+              feature: usageContext?.feature || 'agent_task',
+              inputTokens: usage.prompt_tokens || 0,
+              outputTokens: usage.completion_tokens || 0,
+              cacheReadTokens: usage.cache_read_input_tokens || usage.prompt_tokens_details?.cached_tokens || 0,
+              cacheWriteTokens: usage.cache_creation_input_tokens || 0,
+            });
+          }
+        } catch {
+          // Metering must never break an LLM call.
+        }
         return res;
       } catch (error) {
         const isLastAttempt = attempt >= maxAttempts;
@@ -2345,7 +2352,7 @@ export class AgentModeService {
         let queryEmbedding: number[] | null | undefined;
         const getQueryEmbedding = async (): Promise<number[] | null> => {
           if (queryEmbedding === undefined) {
-            queryEmbedding = messageContent ? await embedText(messageContent) : null;
+            queryEmbedding = messageContent ? await embedText(messageContent, { userId, feature: 'agent_task' }) : null;
           }
           return queryEmbedding;
         };
@@ -2366,7 +2373,7 @@ export class AgentModeService {
           }
           for (const m of all) {
             if (!Array.isArray(m.embedding) || m.embedding.length === 0) {
-              const emb = await embedText(m.content);
+              const emb = await embedText(m.content, { userId, feature: 'agent_task' });
               if (emb) {
                 m.embedding = emb;
                 backfill(m.memoryId, emb);
@@ -2605,7 +2612,8 @@ export class AgentModeService {
             tools: filteredToolsCache,
             tool_choice: 'auto',
             max_completion_tokens: 12384,
-            temperature: 0.1
+            temperature: 0.1,
+            usageContext: { userId, sessionId, feature: 'agent_task' }
           });
         } catch (callError) {
           if (isTransientLLMError(callError) && !backupModelUsed) {
@@ -2626,7 +2634,8 @@ export class AgentModeService {
                 tools: filteredToolsCache,
                 tool_choice: 'auto',
                 max_completion_tokens: 12384,
-                temperature: 0.1
+                temperature: 0.1,
+                usageContext: { userId, sessionId, feature: 'agent_task' }
               });
             } else {
               throw callError;
@@ -2717,34 +2726,41 @@ export class AgentModeService {
         if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
           // No tool calls — check WHY the model stopped
 
-          if (finishReason === 'length' && maxTokensContinuations < MAX_TOKEN_CONTINUATIONS) {
-            // Model hit max_tokens and was truncated — ask it to continue
-            maxTokensContinuations++;
+          // Termination decision extracted into a PURE core module (strangler seam #1).
+          // The decision ladder (max_tokens continuation -> content-filter canned
+          // message -> empty-synthesis nudge -> final) lives in core/termination.ts;
+          // the loop here applies the returned counter deltas, inject messages, and
+          // canned content, preserving identical behavior (proven by the
+          // characterization harness). Logging is kept inline so log output is unchanged.
+          const termination = computeTermination({
+            finishReason,
+            stopReason,
+            content,
+            toolCallsSoFar: toolCalls.length,
+            maxTokensContinuations,
+            maxTokenContinuationsLimit: MAX_TOKEN_CONTINUATIONS,
+            emptySynthesisRetries,
+            maxEmptySynthesisRetries: MAX_EMPTY_SYNTHESIS_RETRIES,
+          });
+          maxTokensContinuations += termination.counterDelta.maxTokensContinuations;
+          emptySynthesisRetries += termination.counterDelta.emptySynthesisRetries;
+          if (termination.contentIfEmpty !== undefined && !content) {
+            content = termination.contentIfEmpty;
+          }
+
+          if (termination.reason === 'max_tokens_continuation') {
             console.warn(`AgentMode: Response truncated (max_tokens) in session ${sessionId}, continuation ${maxTokensContinuations}/${MAX_TOKEN_CONTINUATIONS}`);
-            (messages as any[]).push({
-              role: 'user',
-              content: '[SYSTEM] Your previous response was cut off because it exceeded the token limit. Please continue exactly where you left off.'
-            });
+            (messages as any[]).push({ role: 'user', content: termination.injectMessage });
             continue;
           }
 
           if (finishReason === 'content_filter' || stopReason === 'guardrail_intervened' || stopReason === 'content_filtered') {
             console.warn(`AgentMode: Response blocked by content filter in session ${sessionId}, reason: ${stopReason || finishReason}`);
-            if (!content) {
-              content = "I'm unable to complete this request due to content safety guidelines. Please try rephrasing your request.";
-            }
           }
 
-          // If the model returned empty text but tool calls ran earlier this session,
-          // it skipped the synthesis step (observed with Gemini extended-thinking on
-          // large contexts). Nudge it once to produce the final response.
-          if (!content && toolCalls.length > 0 && emptySynthesisRetries < MAX_EMPTY_SYNTHESIS_RETRIES) {
-            emptySynthesisRetries++;
+          if (termination.reason === 'empty_synthesis_retry') {
             console.warn(`AgentMode: Empty response after ${toolCalls.length} tool calls in session ${sessionId} — injecting synthesis prompt (retry ${emptySynthesisRetries}/${MAX_EMPTY_SYNTHESIS_RETRIES})`);
-            (messages as any[]).push({
-              role: 'user',
-              content: '[SYSTEM] You have gathered all the necessary data. Please now synthesize the information and provide your complete final response to the user.'
-            });
+            (messages as any[]).push({ role: 'user', content: termination.injectMessage });
             continue;
           }
 
@@ -2808,377 +2824,58 @@ export class AgentModeService {
           });
         }
 
-        // Execute tool calls in parallel for performance
-        // When the LLM returns multiple tool_calls in one response, they are independent
-        // and can run concurrently instead of sequentially.
-        const pendingCounterUpdates: Record<string, number> = {};
-        const failedCounterUpdates: Record<string, number> = {};
-
-        // Phase 1: Validate and prepare tool calls (synchronous)
-        const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision }> = [];
-        const preflightToolResults: Array<{ status: 'error'; toolCall: any; functionArgs: any; error: Error; duration: number; policyDecision?: AgentToolPolicyDecision }> = [];
-
-        const appendPreflightToolFailure = (
-          toolCall: any,
-          functionArgs: any,
-          errorMessage: string,
-          content: any,
-          policyDecision?: AgentToolPolicyDecision,
-        ) => {
-          const error = new Error(errorMessage);
-          (messages as any[]).push({
-            tool_call_id: toolCall.id,
-            role: 'tool',
-            name: toolCall.function.name,
-            content,
-            metadata: { timestamp: new Date().toISOString() }
-          });
-          toolCalls.push({
-            id: toolCall.id,
-            name: toolCall.function.name,
-            arguments: functionArgs ?? toolCall.function.arguments,
-            error: error.message,
-            duration: 0
-          });
-          failedCounterUpdates[toolCall.function.name] =
-            (failedCounterUpdates[toolCall.function.name] || 0) + 1;
-          preflightToolResults.push({
-            status: 'error',
-            toolCall,
-            functionArgs,
-            error,
-            duration: 0,
-            policyDecision,
-          });
-        };
-
-        for (const toolCall of responseMessage.tool_calls) {
-          try {
-            const functionArgs = JSON.parse(toolCall.function.arguments);
-
-            // Enforce skill-based tool access: reject calls to tools not in allowedToolNames.
-            // LLMs may hallucinate tool calls from conversation history even when the tool
-            // isn't in the current tools list. Return an error so the LLM learns to install skills first.
-            // Only enforce when:
-            //   1. The skills system is active (published skills exist), AND
-            //   2. The session was created with the skills system (has associatedSkills).
-            // Sessions created before the skills implementation have no associatedSkills
-            // and should retain access to all tools for backward compatibility.
-            // Block non-admin users from invoking admin-only tools, and block admin tools in shared sessions.
-            // hasAdminAccess is true for real admins or admin delegated access (never for iShare).
-            if (!hasAdminAccess && ADMIN_SKILL_TOOL_NAMES.includes(toolCall.function.name)) {
-              const errorMsg = isInteractiveShare
-                ? `Tool "${toolCall.function.name}" is not available in shared sessions. You can continue to use it in Agent Mode in your own session.`
-                : `Tool "${toolCall.function.name}" requires admin access. This session does not have admin privileges.`;
-              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
-              continue;
-            }
-
-            if (isInteractiveShare && toolCall.function.name === 'connect_account') {
-              const errorMsg = 'Account connections are not available in shared sessions. Tell the user they need to open Agent Mode in their own account to connect this account, then come back here.';
-              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
-              continue;
-            }
-
-            // Block context-restricted tools even if LLM hallucinates the call from history
-            if (excludeTools?.includes(toolCall.function.name)) {
-              const errorMsg = `Tool "${toolCall.function.name}" is not available in this context.`;
-              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
-              continue;
-            }
-
-            if (publishedSkills.length > 0 && sessionAssociatedSkillIds.length > 0 && !allowedToolNames.has(toolCall.function.name)) {
-              const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
-              appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
-              continue;
-            }
-
-            // Check if we need to refresh skills for next iteration
-            if (toolCall.function.name === 'install_skills') {
-              skillsUpdated = true;
-            }
-
-            const initialPolicyDecision = evaluateAgentToolPolicy({
-              toolName: toolCall.function.name,
-              args: functionArgs,
-              isAdmin: hasAdminAccess,
-              isSharedSession: isInteractiveShare,
-              enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
-            });
-
-            const toolDefinition = this.toolRegistry.getTool(toolCall.function.name)?.definition;
-            const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.inputSchema;
-            const contractResult = validateAndRepairToolArgs({
-              toolName: toolCall.function.name,
-              args: functionArgs,
-              inputSchema,
-              effect: initialPolicyDecision.effect,
-            });
-
-            if (contractResult.status === 'invalid') {
-              const errorContent = this.formatToolError(toolCall.function.name, contractResult.modelMessage);
-              appendPreflightToolFailure(toolCall, functionArgs, contractResult.modelMessage, errorContent, initialPolicyDecision);
-              continue;
-            }
-
-            const preparedFunctionArgs = contractResult.args;
-            const policyDecision = evaluateAgentToolPolicy({
-              toolName: toolCall.function.name,
-              args: preparedFunctionArgs,
-              isAdmin: hasAdminAccess,
-              isSharedSession: isInteractiveShare,
-              enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
-            });
-
-            if (contractResult.status === 'repaired') {
-              policyDecision.flags.push({
-                code: 'args_repaired',
-                severity: 'info',
-                message: `Tool arguments were repaired before execution: ${contractResult.repairs.join(', ')}`,
-              });
-            }
-
-            if (!policyDecision.allowed) {
-              const errorMsg = `Tool "${toolCall.function.name}" was blocked by Agent Tool Gateway policy: ${policyDecision.flags.map((flag) => flag.message).join(' ')}`;
-              appendPreflightToolFailure(toolCall, preparedFunctionArgs, errorMsg, JSON.stringify({ error: errorMsg, policy: policyDecision }), policyDecision);
-              continue;
-            }
-
-            preparedCalls.push({ toolCall, functionArgs: preparedFunctionArgs, policyDecision });
-          } catch (error) {
-            // JSON parse failure — append error message for LLM
-            console.error(`AgentMode: Tool argument parse error for ${toolCall.function.name}:`, error);
-            const errMsg = error instanceof Error ? error.message : String(error);
-            const errorContent = this.formatToolError(toolCall.function.name, `Failed to parse arguments: ${errMsg}`);
-            appendPreflightToolFailure(toolCall, undefined, `Failed to parse arguments: ${errMsg}`, errorContent);
-          }
-        }
-
-        // Phase 2: Execute tools — sequential if wait_seconds is present, parallel otherwise.
-        // Sequential is required when wait_seconds is in the batch so the wait happens
-        // in the correct order relative to the tools before/after it.
-        // Also run sequentially when multiple generate_image or generate_video calls are batched
-        // together — these APIs (Gemini 3 Pro in particular) throttle under concurrent load.
-        const hasWaitTool = preparedCalls.some(({ toolCall }) => toolCall.function.name === 'wait_seconds');
-        const hasMultipleMediaGenTools = preparedCalls.length > 1 && preparedCalls.some(({ toolCall }) =>
-          toolCall.function.name === 'generate_image' || toolCall.function.name === 'generate_video' || toolCall.function.name === 'generate_voiceover'
-        );
-
-        let toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs: any; result?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>;
-
-        if (hasWaitTool || hasMultipleMediaGenTools) {
-          // Sequential execution — preserves ordering so wait_seconds acts as a pause between tools,
-          // and prevents rate-limit throttling when batching multiple image/video generation calls
-          toolResults = [];
-          for (const { toolCall, functionArgs, policyDecision } of preparedCalls) {
-            const outcome = await executeAgentToolThroughGateway({
-              toolName: toolCall.function.name,
-              args: functionArgs,
-              policyDecision,
-              runId: agentRuntimeRunId,
-              execute: () => this.executePreparedAgentTool({
-                llmModel,
-                toolName: toolCall.function.name,
-                functionArgs,
-                userId,
-                sessionId,
-                mockMode,
-                socketEmit,
-                screenshotUrl,
-                isDelegatedAccess,
-              }),
-            });
-            if (outcome.status === 'success') {
-              toolResults.push({ status: 'success' as const, toolCall, functionArgs, result: outcome.result, duration: outcome.durationMs, policyDecision: outcome.policyDecision });
-            } else {
-              toolResults.push({ status: 'error' as const, toolCall, functionArgs, error: outcome.error, duration: outcome.durationMs, policyDecision: outcome.policyDecision });
-            }
-          }
-        } else {
-          // Parallel execution (default)
-          const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs, policyDecision }) => {
-            const outcome = await executeAgentToolThroughGateway({
-              toolName: toolCall.function.name,
-              args: functionArgs,
-              policyDecision,
-              runId: agentRuntimeRunId,
-              execute: () => this.executePreparedAgentTool({
-                llmModel,
-                toolName: toolCall.function.name,
-                functionArgs,
-                userId,
-                sessionId,
-                mockMode,
-                socketEmit,
-                screenshotUrl,
-                isDelegatedAccess,
-              }),
-            });
-            if (outcome.status === 'success') {
-              return { status: 'success' as const, toolCall, functionArgs, result: outcome.result, duration: outcome.durationMs, policyDecision: outcome.policyDecision };
-            }
-            return { status: 'error' as const, toolCall, functionArgs, error: outcome.error, duration: outcome.durationMs, policyDecision: outcome.policyDecision };
-          });
-          toolResults = await Promise.all(toolPromises);
-        }
-
-        toolResults = toolResults.map((toolResult) => {
-          if (toolResult.status !== 'success') return toolResult;
-          const error = toolResultError(toolResult.result);
-          if (!error) return toolResult;
-          return {
-            status: 'error' as const,
-            toolCall: toolResult.toolCall,
-            functionArgs: toolResult.functionArgs,
-            error,
-            duration: toolResult.duration,
-            policyDecision: toolResult.policyDecision,
-          };
+        // Tool-dispatch boundary (core seam): validate/prepare tool calls,
+        // decide parallel-vs-sequential, execute through the gateway, classify
+        // tool-result errors, process results (screenshot S3, minimal-result, CRM
+        // socket emit, large-response S3 offload, truncation) and append tool
+        // messages + counter deltas. Extracted into core/toolDispatch.ts; the loop
+        // wires its entangled side-effects as injected ports. Behavior-preserving.
+        const dispatchResult = await executePreparedTools({
+          toolCalls: responseMessage.tool_calls,
+          messages: messages as any[],
+          toolCallsLedger: toolCalls,
+          iteration,
+          agentRuntimeRunId,
+          sessionId,
+          userId,
+          llmModel,
+          mockMode,
+          screenshotUrl,
+          isDelegatedAccess,
+          hasAdminAccess,
+          isInteractiveShare,
+          adminSkillToolNames: ADMIN_SKILL_TOOL_NAMES,
+          excludeTools,
+          publishedSkillsCount: publishedSkills.length,
+          sessionAssociatedSkillIdsCount: sessionAssociatedSkillIds.length,
+          allowedToolNames,
+          toolResponseS3Threshold: TOOL_RESPONSE_S3_THRESHOLD,
+          maxToolContentSize: MAX_TOOL_CONTENT_SIZE,
+          ports: {
+            evaluateAgentToolPolicy,
+            validateAndRepairToolArgs,
+            getToolInputSchema: (toolName: string) => {
+              const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
+              return toolDefinition?.function?.parameters || toolDefinition?.inputSchema;
+            },
+            executeAgentToolThroughGateway,
+            executePreparedAgentTool: (toolInput: any) => this.executePreparedAgentTool(toolInput),
+            toolResultError,
+            recordToolTelemetry: (telemetryToolResults) =>
+              recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults as any),
+            extractMinimalToolResult: (result: any, toolName: string) => this.extractMinimalToolResult(result, toolName),
+            extractToolContent,
+            formatToolError: (toolName: string, errorMessage: string) => this.formatToolError(toolName, errorMessage),
+            uploadScreenshotToS3,
+            uploadFileToS3WithPath,
+            buildCrmDataChangedPayload,
+            crmDataChangedEvent: CRM_DATA_CHANGED_EVENT,
+            socketEmit,
+          },
         });
-        const telemetryToolResults = [...preflightToolResults, ...toolResults];
-
-        // Runtime spine V0 telemetry: record this iteration's decision + each
-        // tool's invoked/succeeded/failed outcome into the shared LoopEvents
-        // table. Best-effort and non-blocking — the recorder swallows its own
-        // errors and is a no-op unless AGENT_RUNTIME_SPINE_ENABLED=true (or the
-        // legacy AGENT_MODE_LOOP_ENABLED=true). This is observability-only and
-        // must not affect tool execution, retries, streaming, or responses.
-        recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults);
-
-        // Phase 3: Process results in original order — append to messages, toolCalls, counters
-        for (const toolResult of toolResults) {
-          if (toolResult.status === 'success') {
-            const { toolCall, functionArgs, result, duration } = toolResult;
-
-            // For playwright screenshots, upload the base64 image to S3.
-            // This replaces the ~300KB base64 JSON payload with a lightweight URL,
-            // and makes the screenshot displayable in the frontend.
-            let processedResult = result;
-            if (toolCall.function.name === 'playwright_browser_take_screenshot') {
-              const imageContent = (result.raw?.content as any[])?.find((c: any) => c.type === 'image');
-              if (imageContent?.data) {
-                try {
-                  const dataUrl = `data:${imageContent.mimeType || 'image/png'};base64,${imageContent.data}`;
-                  const uploadResult = await uploadScreenshotToS3(dataUrl, userId);
-                  if (uploadResult) {
-                    // Keep dataUrl so the LLM can visually analyze the screenshot
-                    processedResult = { screenshotUrl: uploadResult.url, dataUrl, success: true };
-                  }
-                } catch (e) {
-                  console.error('AgentMode: Failed to upload playwright screenshot to S3:', e);
-                }
-              }
-            }
-
-            const minimalResult = this.extractMinimalToolResult(processedResult, toolCall.function.name);
-
-            toolCalls.push({
-              id: toolCall.id,
-              name: toolCall.function.name,
-              arguments: functionArgs,
-              result: minimalResult,
-              duration
-            });
-
-            // Notify the CRM page to refresh after a successful CRM-mutating tool.
-            // Enrichment / tech-stack tools broadcast their own completion events,
-            // so this covers the rest (update/status/email/delete/import/…). Emitted
-            // to the user's room so it reaches the CRM page regardless of which agent
-            // surface (full agent mode or Emma sidebar) ran the tool. Guard on a
-            // success flag so a tool that returned { success: false } doesn't trigger
-            // a spurious refresh.
-            if (socketEmit) {
-              const crmPayload = buildCrmDataChangedPayload(toolCall.function.name, functionArgs);
-              const toolSucceeded = !(processedResult && (processedResult as any).success === false);
-              if (crmPayload && toolSucceeded) {
-                socketEmit(`user:${userId}`, CRM_DATA_CHANGED_EVENT, crmPayload);
-              }
-            }
-
-            // For create_social_media_posts, count actual posts in the array (not function calls)
-            const counterIncrement = toolCall.function.name === 'create_social_media_posts'
-              ? ((functionArgs.posts as any[])?.length ?? 1)
-              : 1;
-            pendingCounterUpdates[toolCall.function.name] =
-              (pendingCounterUpdates[toolCall.function.name] || 0) + counterIncrement;
-
-            // For playwright screenshots, pass the image back to the LLM as a vision input
-            // so it can visually analyze the result (e.g. verify mobile layout, check for UI issues).
-            // The screenshot is also displayed to the user via the tool call card in the frontend.
-            // We use a text prefix to discourage embedding the raw URL in markdown responses.
-            let toolContent: any;
-            // Gemini's OpenAI-compat endpoint returns a silent 400 if tool-role messages contain image_url content.
-            // For Gemini, pass the S3 URL as text so the model can use describe_image on it if needed.
-            const isGeminiModel = llmModel.startsWith('gemini-');
-            if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).dataUrl && !isGeminiModel) {
-              toolContent = [
-                { type: 'text', text: 'Screenshot captured. Analyze the image below to verify the result visually. Do not include the raw image URL or data URI in your response to the user.' },
-                { type: 'image_url', image_url: { url: (processedResult as any).dataUrl, detail: 'high' } }
-              ];
-            } else if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).screenshotUrl && isGeminiModel) {
-              toolContent = `Screenshot captured. URL: ${(processedResult as any).screenshotUrl}\n\n${extractToolContent(result)}`;
-            } else {
-              toolContent = extractToolContent(result);
-            }
-
-            // When the response exceeds the S3 threshold: upload full content to S3 so the LLM
-            // can retrieve specific fields later via search_tool_response, then cap the in-memory
-            // copy at MAX_TOOL_CONTENT_SIZE to prevent worker OOM on sessions with many large tool
-            // calls (e.g. multiple read_page_source + search_web calls in a single work plan step).
-            const S3_IN_MEMORY_CAP = 20_000; // Keep only 20KB in memory after S3 upload
-            if (typeof toolContent === 'string' && toolContent.length > TOOL_RESPONSE_S3_THRESHOLD) {
-              try {
-                const uploadResult = await uploadFileToS3WithPath(
-                  toolContent,
-                  `${toolCall.id}.txt`,
-                  'text/plain',
-                  `tool-responses/${sessionId}`
-                );
-                if (uploadResult.success && uploadResult.key) {
-                  const header = `[Full response stored at S3 key: ${uploadResult.key} (${toolContent.length} chars) — use search_tool_response tool to find specific fields]\n\n`;
-                  const preview = toolContent.length > S3_IN_MEMORY_CAP
-                    ? toolContent.substring(0, S3_IN_MEMORY_CAP) + '\n\n[Content truncated — full response in S3]'
-                    : toolContent;
-                  toolContent = header + preview;
-                }
-              } catch (e) {
-                console.error('AgentMode: Failed to save large tool response to S3:', e);
-              }
-            }
-
-            const truncatedToolContent = typeof toolContent === 'string' && toolContent.length > MAX_TOOL_CONTENT_SIZE
-              ? toolContent.substring(0, MAX_TOOL_CONTENT_SIZE) + '\n\n[Content truncated for storage — original size: ' + toolContent.length + ' chars]'
-              : toolContent;
-            (messages as any[]).push({
-              tool_call_id: toolCall.id,
-              role: 'tool',
-              name: toolCall.function.name,
-              content: truncatedToolContent,
-              metadata: { timestamp: new Date().toISOString() }
-            });
-          } else {
-            const { toolCall, functionArgs, error, duration } = toolResult;
-            toolCalls.push({
-              id: toolCall.id,
-              name: toolCall.function.name,
-              arguments: functionArgs || toolCall.function.arguments,
-              error: error instanceof Error ? error.message : 'Unknown error',
-              duration
-            });
-
-            failedCounterUpdates[toolCall.function.name] =
-              (failedCounterUpdates[toolCall.function.name] || 0) + 1;
-
-            const errMsg = error instanceof Error ? error.message : String(error);
-            const errorContent = this.formatToolError(toolCall.function.name, errMsg);
-            messages.push({
-              tool_call_id: toolCall.id,
-              role: 'tool',
-              name: toolCall.function.name,
-              content: errorContent,
-              metadata: { timestamp: new Date().toISOString() }
-            });
-          }
+        const { pendingCounterUpdates, failedCounterUpdates } = dispatchResult;
+        if (dispatchResult.skillsUpdated) {
+          skillsUpdated = true;
         }
 
         // Send progress update after all tools complete.
@@ -3862,6 +3559,7 @@ export class AgentModeService {
     'list_connected_accounts', // Social/ads integration teaser
 
     'get_user_profile',         // Account info teaser
+    'get_account_status',       // Self account status (plan, usage, api-key count) — wraps /api/auth/me, no args
 
     // Account Memory (cross-session knowledge)
     'save_memory',
@@ -3919,6 +3617,21 @@ export class AgentModeService {
     'install_skills',
     'list_available_skills',
     'resolve_skill',
+    // S3 overflow retrieval is infrastructure, not a skill: whenever a tool result
+    // is offloaded to S3 the model is handed a "[Full response stored at S3 key: ...]"
+    // pointer and MUST be able to resolve it. A DB `foundation_tools` setting that
+    // omitted these made the tools "not available", which was the #2 production
+    // failure mode for search/read_tool_response. Force-merge them so no config can
+    // strip them.
+    'search_tool_response',
+    'read_tool_response',
+    // Self account-status: a no-arg tool wrapping /api/auth/me for the caller's
+    // OWN account. Force-merged (not just DEFAULT) for the same reason as the two
+    // above — a DB `foundation_tools` setting that omits it makes it "not
+    // available", so Emma has no self-status tool and falls back to
+    // assess_client_health (admin lookup BY EMAIL → the "asked for my email" bug).
+    // Always reachable so Emma can answer "what's my plan/usage" directly.
+    'get_account_status',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
@@ -5689,6 +5402,20 @@ export class AgentModeService {
     }
   }
 
+  /**
+   * Classify an S3 retrieve error as "the object/key is gone" (terminal-for-this-key)
+   * vs a real unexpected error. Checks both the AWS error code and the message text so
+   * variants like code `AccessDenied` / message "Access Denied" are both caught.
+   */
+  private isS3MissingError(error: unknown): boolean {
+    const code = (error as any)?.code || (error as any)?.name || '';
+    const msg = error instanceof Error ? error.message : String(error ?? '');
+    const terminal = ['NoSuchKey', 'NoSuchBucket', 'AccessDenied', 'AllAccessDisabled'];
+    if (terminal.includes(code)) return true;
+    const normalized = msg.replace(/\s+/g, '');
+    return terminal.some((t) => msg.includes(t) || normalized.includes(t));
+  }
+
   private async executeSearchToolResponse(args: {
     s3_key: string;
     query: string;
@@ -5708,7 +5435,18 @@ export class AgentModeService {
     try {
       const content = await getS3ObjectAsString(s3_key);
       if (!content) {
-        return { success: false, message: 'Empty response from S3' };
+        // Empty stored object is not an execution failure — return a graceful,
+        // model-actionable empty result so it isn't counted as a tool failure.
+        return {
+          success: true,
+          query,
+          total_matches_found: 0,
+          match_offset: matchOffset,
+          matches_returned: 0,
+          total_size: 0,
+          matches: [],
+          message: 'The stored tool response is empty. There is nothing to search; proceed using the in-context preview or re-run the source tool if you need the data.',
+        };
       }
 
       const queryLower = query.toLowerCase();
@@ -5737,18 +5475,29 @@ export class AgentModeService {
         match_offset: matchOffset,
         matches_returned: matches.length,
         total_size: content.length,
+        // Zero matches is a valid, non-error outcome — guide the model rather than
+        // letting it treat an empty match list as a failure.
+        ...(allOffsets.length === 0
+          ? { message: `No matches for "${query}" in the stored response (${content.length} chars). Try a different search term, or use read_tool_response to page through the raw content.` }
+          : {}),
         matches,
       };
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : 'Unknown error';
-      const isFatal = errMsg.includes('NoSuchBucket') || errMsg.includes('AccessDenied') || errMsg.includes('NoSuchKey');
-      if (isFatal) {
+      const isMissing = this.isS3MissingError(error);
+      if (isMissing) {
+        // The key is gone/expired. This is not a transient bug — surface it as a
+        // graceful, terminal-for-this-key signal (success: true so it is not counted
+        // as a tool failure) with a clear instruction to stop retrying this key.
         return {
-          success: false,
-          fatal: true,
-          message: `S3 access failed (${errMsg}). The tool-response data is no longer available. Do NOT retry search_tool_response or read_tool_response for this key. Summarize what you know from the in-context preview and proceed.`,
+          success: true,
+          not_found: true,
+          total_matches_found: 0,
+          matches: [],
+          message: `The tool-response data for this S3 key is no longer available (${errMsg}). Do NOT retry search_tool_response or read_tool_response for this key. Summarize what you know from the in-context preview, or re-run the original source tool to regenerate the data.`,
         };
       }
+      // Unexpected/transient error after retries exhausted — this IS a real failure.
       return {
         success: false,
         message: `Failed to search tool response: ${errMsg}`,
@@ -5772,7 +5521,17 @@ export class AgentModeService {
     try {
       const content = await getS3ObjectAsString(s3_key);
       if (!content) {
-        return { success: false, message: 'Empty response from S3' };
+        // Empty stored object is not an execution failure — graceful empty result.
+        return {
+          success: true,
+          char_offset: charOffset,
+          chars_returned: 0,
+          total_size: 0,
+          has_more: false,
+          next_offset: charOffset,
+          content: '',
+          message: 'The stored tool response is empty. There is nothing to read; proceed using the in-context preview or re-run the source tool if you need the data.',
+        };
       }
 
       const slice = content.slice(charOffset, charOffset + charLength);
@@ -5783,18 +5542,27 @@ export class AgentModeService {
         total_size: content.length,
         has_more: charOffset + charLength < content.length,
         next_offset: charOffset + slice.length,
+        // A char_offset past the end yields an empty slice — guide the model instead
+        // of returning a bare empty string it might misread as a failure.
+        ...(slice.length === 0
+          ? { message: `char_offset ${charOffset} is at or beyond the end of the response (total_size ${content.length}). The full content has already been read.` }
+          : {}),
         content: slice,
       };
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : 'Unknown error';
-      const isFatal = errMsg.includes('NoSuchBucket') || errMsg.includes('AccessDenied') || errMsg.includes('NoSuchKey');
-      if (isFatal) {
+      const isMissing = this.isS3MissingError(error);
+      if (isMissing) {
+        // Key gone/expired — graceful terminal-for-this-key signal, not a failure.
         return {
-          success: false,
-          fatal: true,
-          message: `S3 access failed (${errMsg}). The tool-response data is no longer available. Do NOT retry read_tool_response or search_tool_response for this key. Summarize what you know from the in-context preview and proceed.`,
+          success: true,
+          not_found: true,
+          chars_returned: 0,
+          content: '',
+          message: `The tool-response data for this S3 key is no longer available (${errMsg}). Do NOT retry read_tool_response or search_tool_response for this key. Summarize what you know from the in-context preview, or re-run the original source tool to regenerate the data.`,
         };
       }
+      // Unexpected/transient error after retries exhausted — this IS a real failure.
       return {
         success: false,
         message: `Failed to read tool response: ${errMsg}`,
@@ -5951,8 +5719,11 @@ export class AgentModeService {
         };
       }
 
-      const { GoogleGenAI } = await import('@google/genai');
-      aiClient = new GoogleGenAI({ apiKey: geminiApiKey.trim() });
+      // Metered Gemini client (Ship 1 shadow metering). describeVideo has no
+      // userId in its signature, so usage attributes to "system" for now —
+      // follow-up: thread userId from the tool-dispatch / emmaApi callers.
+      const { getGeminiClient } = await import('../utils/llmClients');
+      aiClient = await getGeminiClient({ feature: 'agent_task' }, geminiApiKey.trim());
 
       const modelName = 'gemini-3-flash-preview';
 
@@ -6573,6 +6344,26 @@ export class AgentModeService {
           timeout: 20 * 60 * 1000, // 20 minutes — code execution can be slow but must not hang indefinitely
         }
       );
+
+      // Shadow usage metering (Ship 1): direct REST call, so observe the
+      // usageMetadata off the already-resolved response. Fire-and-forget +
+      // fail-open — never awaited, never throws.
+      try {
+        const usageMetadata = (apiResponse.data as any)?.usageMetadata;
+        if (usageMetadata) {
+          void recordUsage({
+            userId,
+            model: modelName,
+            provider: 'gemini',
+            feature: 'agent_task',
+            inputTokens: usageMetadata.promptTokenCount || 0,
+            outputTokens: usageMetadata.candidatesTokenCount || 0,
+            cacheReadTokens: usageMetadata.cachedContentTokenCount || 0,
+          });
+        }
+      } catch {
+        // Metering must never break the call.
+      }
 
       // Extract and format the response
       const candidates = (apiResponse.data as any).candidates;
@@ -8227,24 +8018,28 @@ export class AgentModeService {
   public async getLeadLists(userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const { listLandingPages, getLandingPageLiveUrl } = await import('./v0Service');
+      const { listLandingPages, resolveLandingPageLiveUrl } = await import('./v0Service');
 
       const [lists, landingPages] = await Promise.all([
         crmDb.getLeadListsForUser(userId),
         listLandingPages(userId).catch(() => [] as any[])
       ]);
 
-      // Build map: leadListId → landing page info
+      // Build map: leadListId → landing page info. Resolve each URL against the
+      // domain actually attached to the Vercel project so a stale stored
+      // subdomain isn't surfaced (AW-CustomDomains is the source of truth).
       const pageByListId = new Map<string, { pageId: string; name: string; url: string }>();
-      for (const page of landingPages) {
-        if (page.leadListId) {
-          pageByListId.set(page.leadListId, {
-            pageId: page.id,
-            name: page.name || '',
-            url: getLandingPageLiveUrl(page)
-          });
-        }
-      }
+      const pagesWithLists = landingPages.filter((page: any) => page.leadListId);
+      const resolvedUrls = await Promise.all(
+        pagesWithLists.map((page: any) => resolveLandingPageLiveUrl(page))
+      );
+      pagesWithLists.forEach((page: any, idx: number) => {
+        pageByListId.set(page.leadListId, {
+          pageId: page.id,
+          name: page.name || '',
+          url: resolvedUrls[idx]
+        });
+      });
 
       return {
         success: true,
@@ -8302,7 +8097,7 @@ export class AgentModeService {
     try {
       const { crmDb } = await import('./db');
 
-      // Verify list ownership
+      // Verify list access
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
         return {
@@ -8312,7 +8107,8 @@ export class AgentModeService {
         };
       }
 
-      if (list.userId !== userId) {
+      const hasAccessAddLeads = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccessAddLeads) {
         return {
           success: false,
           message: 'Access denied',
@@ -9218,7 +9014,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied' };
       }
 
@@ -9280,7 +9077,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to delete leads from this list' };
       }
 
@@ -9329,7 +9127,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to delete leads from this list' };
       }
 
@@ -9501,7 +9300,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to modify this list' };
       }
 
@@ -9615,7 +9415,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to view this list' };
       }
 
@@ -9654,7 +9455,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to modify this list' };
       }
 
@@ -9697,7 +9499,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to delete this list' };
       }
 
@@ -9728,7 +9531,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
       }
 
@@ -9786,7 +9590,8 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      if (list.userId !== userId) {
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
         return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
       }
 
@@ -16580,11 +16385,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   };
 
   trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
-    // Find indices of all tool-role messages
+    // Single linear scan: collect tool-role indices and map each tool_call_id to
+    // the index of its (first) resolving tool message. This map replaces the
+    // original per-assistant nested forward scan (O(n^2) per call) with O(1)
+    // lookups below, which was the originally-reported defect. The scan is
+    // recomputed every call against the live array, so it is correct on every
+    // path — including the install_skills splice/reorder in
+    // updateConversationContext, which mutates this same array reference in place.
     const toolIndices: number[] = [];
+    const toolIdToIndex = new Map<string, number>();
     for (let i = 0; i < messages.length; i++) {
       if (messages[i].role === 'tool') {
         toolIndices.push(i);
+        const tcid = messages[i].tool_call_id;
+        if (tcid !== undefined && !toolIdToIndex.has(tcid)) toolIdToIndex.set(tcid, i);
       }
     }
 
@@ -16593,21 +16407,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // Most recent N tool results: keep at full size
     const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
 
-    // Track which assistant messages are "old" (all their tool_calls have been resolved
-    // and are not in the preserve set). We identify these to trim large argument fields.
+    // Track which assistant messages are "old" (none of their tool_calls resolve
+    // to a preserved tool result after them). We trim large argument fields on these.
+    // The precomputed tool_call_id -> index map replaces the original per-assistant
+    // forward scan with O(1) lookups, eliminating the nested loop while preserving
+    // the exact predicate: a resolving tool result must exist, sit at an index > i,
+    // and be in preserveSet for the assistant to be considered "recent" (not old).
     const oldAssistantIndices = new Set<number>();
     for (let i = 0; i < messages.length; i++) {
       const msg = messages[i];
       if (msg.role === 'assistant' && msg.tool_calls?.length) {
-        // Find the tool result indices for this assistant message's tool calls
-        const toolCallIds = new Set(msg.tool_calls.map((tc: any) => tc.id));
         let allOld = true;
-        for (let j = i + 1; j < messages.length; j++) {
-          if (messages[j].role === 'tool' && toolCallIds.has(messages[j].tool_call_id)) {
-            if (preserveSet.has(j)) {
-              allOld = false;
-              break;
-            }
+        for (const tc of msg.tool_calls) {
+          const resolvedIdx = toolIdToIndex.get(tc.id);
+          if (resolvedIdx !== undefined && resolvedIdx > i && preserveSet.has(resolvedIdx)) {
+            allOld = false;
+            break;
           }
         }
         if (allOld) {
@@ -17898,7 +17713,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       } else if (!finalFilename.endsWith('.png')) {
         // Ensure .png extension
-        const nameWithoutExt = finalFilename.substring(0, finalFilename.lastIndexOf('.') || finalFilename.length);
+        const dotIndex = finalFilename.lastIndexOf('.');
+        const nameWithoutExt = dotIndex > 0 ? finalFilename.substring(0, dotIndex) : finalFilename;
         finalFilename = `${nameWithoutExt}.png`;
       }
 
@@ -17939,6 +17755,174 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to remove C2PA metadata from image',
+        error: error.message
+      };
+    }
+  }
+
+  /**
+   * Remove a solid/near-solid background from an image, producing a genuine
+   * transparent-alpha PNG WITHOUT redrawing the artwork, and upload it to S3.
+   *
+   * This is the correct tool for "make this logo transparent" / "put this logo
+   * on a different colored background". It operates on the original pixels
+   * (edge-seeded flood fill), so the brand mark — its exact letters, shapes and
+   * colors — is preserved byte-for-byte; only the background becomes alpha=0.
+   *
+   * Optionally validates foreground/background contrast: if `surfaceColor`
+   * (the hex color of the surface the logo will sit on, e.g. a dark header) is
+   * provided, the result includes a WCAG contrast ratio and a warning when the
+   * logo would be hard to read on that surface (e.g. a dark wordmark on a dark
+   * header). This guards against the "black logo on dark purple" mistake.
+   */
+  public async removeImageBackground(
+    imageUrl: string,
+    filename?: string,
+    userId?: string,
+    options?: { tolerance?: number; surfaceColor?: string }
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Removing background from image:', imageUrl);
+
+      if (!imageUrl) {
+        return {
+          success: false,
+          message: 'Image URL is required',
+          error: 'missing_image_url'
+        };
+      }
+
+      const axios = require('axios');
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const { imageService, ImageService } = await import('./imageGeneration');
+
+      // Download the image (supports data URLs and HTTP(S) URLs).
+      let imageBuffer: Buffer;
+      if (imageUrl.startsWith('data:image/')) {
+        const base64Data = imageUrl.split(',')[1];
+        imageBuffer = Buffer.from(base64Data, 'base64');
+      } else {
+        const response = await axios.get(imageUrl, {
+          responseType: 'arraybuffer',
+          timeout: 30000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (compatible; AgentWeb/1.0)'
+          }
+        });
+        imageBuffer = Buffer.from(response.data);
+      }
+
+      const { buffer, detectedBackground, removedRatio } = await imageService.removeImageBackground(
+        imageBuffer,
+        { tolerance: options?.tolerance }
+      );
+
+      // Generate filename if not provided; always output PNG (alpha requires it).
+      let finalFilename = filename;
+      if (!finalFilename) {
+        try {
+          const urlObj = new URL(imageUrl);
+          const pathParts = urlObj.pathname.split('/');
+          const urlFilename = pathParts[pathParts.length - 1];
+          if (urlFilename && urlFilename.includes('.')) {
+            const nameWithoutExt = urlFilename.substring(0, urlFilename.lastIndexOf('.'));
+            finalFilename = `${nameWithoutExt}_transparent.png`;
+          } else {
+            finalFilename = `image_transparent_${Date.now()}.png`;
+          }
+        } catch {
+          finalFilename = `image_transparent_${Date.now()}.png`;
+        }
+      } else if (!finalFilename.endsWith('.png')) {
+        const dotIndex = finalFilename.lastIndexOf('.');
+        const nameWithoutExt = dotIndex > 0 ? finalFilename.substring(0, dotIndex) : finalFilename;
+        finalFilename = `${nameWithoutExt}.png`;
+      }
+
+      if (!userId) {
+        return {
+          success: false,
+          message: 'User ID is required for S3 upload',
+          error: 'missing_user_id'
+        };
+      }
+
+      const uploadResult = await uploadFileToS3(
+        buffer,
+        finalFilename,
+        userId,
+        'image/png'
+      );
+
+      if (!uploadResult.success || !uploadResult.url) {
+        return {
+          success: false,
+          message: uploadResult.error || 'Failed to upload transparent image to S3',
+          error: uploadResult.error || 's3_upload_failed'
+        };
+      }
+
+      // Optional foreground/background contrast check against the target surface.
+      let contrast: any = undefined;
+      if (options?.surfaceColor) {
+        const surface = ImageService.parseHexColor(options.surfaceColor);
+        if (!surface) {
+          contrast = {
+            surfaceColor: options.surfaceColor,
+            warning: `Could not parse surfaceColor "${options.surfaceColor}" as a hex color; skipped contrast check.`
+          };
+        } else {
+          // Re-read the transparent PNG's opaque pixels to estimate the logo's color.
+          // Wrapped in its own try/catch: the image was already uploaded
+          // successfully, so a failure here should only drop the contrast info,
+          // not fail the whole operation.
+          try {
+            const sharp = require('sharp');
+            const { data, info } = await sharp(buffer).raw().toBuffer({ resolveWithObject: true });
+            const fg = ImageService.averageOpaqueColor(data, (info as any).channels);
+            if (fg) {
+              const ratio = ImageService.contrastRatio(fg, surface);
+              const legible = ratio >= 3; // WCAG AA for large text / graphical objects
+              contrast = {
+                surfaceColor: options.surfaceColor,
+                foregroundColor: `rgb(${fg.r}, ${fg.g}, ${fg.b})`,
+                ratio: Math.round(ratio * 100) / 100,
+                legible,
+                ...(legible
+                  ? {}
+                  : {
+                      warning:
+                        `⚠️ Low contrast (${Math.round(ratio * 100) / 100}:1, below the 3:1 minimum): the logo's ` +
+                        `average color rgb(${fg.r}, ${fg.g}, ${fg.b}) may be hard to read on surface ${options.surfaceColor}. ` +
+                        `Consider an all-white or all-dark variant of the logo to match this surface.`
+                    })
+              };
+            }
+          } catch (contrastError: any) {
+            console.warn('AgentMode: contrast check failed (image still uploaded):', contrastError?.message);
+          }
+        }
+      }
+
+      return {
+        success: true,
+        message:
+          `✅ Background removed — genuine transparent-alpha PNG produced (original artwork preserved). ` +
+          `Detected background rgb(${detectedBackground.r}, ${detectedBackground.g}, ${detectedBackground.b}); ` +
+          `${Math.round(removedRatio * 100)}% of pixels made transparent.` +
+          (contrast?.warning ? ` ${contrast.warning}` : ''),
+        imageUrl: uploadResult.url,
+        filename: finalFilename,
+        originalUrl: imageUrl,
+        detectedBackground,
+        removedRatio,
+        ...(contrast ? { contrast } : {})
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error removing background from image:', error);
+      return {
+        success: false,
+        message: 'Failed to remove background from image',
         error: error.message
       };
     }
@@ -20362,7 +20346,7 @@ Please generate a complete, professional HTML document that properly formats and
 
       // Generate HTML using LLMService
       console.log(`AgentMode: Generating HTML ${isEmail ? 'email' : 'file'} with LLMService (Claude model)`);
-      const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'));
+      const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
 
       if (!htmlContent || htmlContent.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
@@ -20526,7 +20510,7 @@ Please:
 
       // Generate enhanced HTML template using LLMService
       console.log('AgentMode: Generating HTML email template with Claude model');
-      const enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'));
+      const enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'), { userId, sessionId, feature: 'content_gen' });
 
       if (!enhancedHtml || enhancedHtml.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
@@ -21636,7 +21620,7 @@ IMPORTANT:
 IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly.`}`;
 
       // Generate content using LangChain with appropriate format
-      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(userId, sessionId, 'generateBookContent'));
+      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(userId, sessionId, 'generateBookContent'), { userId, sessionId, feature: 'content_gen' });
 
       // Extract content from JSON
       if (!contentData.content) {
