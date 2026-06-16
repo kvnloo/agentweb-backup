@@ -10150,7 +10150,7 @@ ${emailDraftFormat === 'text'
       // Create message draft optimised for LinkedIn connection invites. The char limit
       // depends on the sending account tier: 300 for Premium, 200 for free. Resolve the
       // account the same way the send-invite route does (list-assigned → user's own).
-      const { linkedInOutreachService } = await import('./linkedInOutreachService');
+      const { linkedInOutreachService, LinkedInOutreachService } = await import('./linkedInOutreachService');
       const inviteAccountId = (list as any)?.linkedInAccountId
         || await linkedInOutreachService.resolveUserOwnedAccountId(userId);
       const inviteCharLimit = inviteAccountId
@@ -10214,13 +10214,22 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         messageData = null;
       }
 
-      // Create message draft object if we got valid data — hard-cap at the account's
-      // LinkedIn invite limit (300 Premium / 200 free).
+      // Create message draft object if we got valid data — smart-trim to the account's
+      // LinkedIn invite limit (300 Premium / 200 free) on a word boundary (surrogate-safe),
+      // matching what sendInvitation does at send time — never a crude mid-word cut.
       let messageDraft = null;
       if (messageData && messageData.content) {
         const now = new Date().toISOString();
+        let noteText = String(messageData.content);
+        // Layer 2: if the draft exceeds the account limit, ask the model to rewrite it
+        // shorter (capped), then Layer 3 hard-trims on a sentence/word boundary as the
+        // guarantee — same trimInviteMessage() the inline send path uses, kept consistent.
+        if (noteText.length > inviteCharLimit) {
+          const { shortenInviteNoteToLimit } = await import('./inviteNoteShortener');
+          noteText = await shortenInviteNoteToLimit(geminiClient, noteText, inviteCharLimit, 2);
+        }
         messageDraft = {
-          content: String(messageData.content).slice(0, inviteCharLimit),
+          content: LinkedInOutreachService.trimInviteMessage(noteText, inviteCharLimit),
           createdAt: now,
           updatedAt: now,
           sessionId: sessionId
