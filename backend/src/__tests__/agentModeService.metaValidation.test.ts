@@ -20,6 +20,8 @@ jest.mock('../services/metaService', () => {
       deleteAdSet: jest.fn(),
       listAdSets: jest.fn(),
       getCampaign: jest.fn(),
+      getAdSet: jest.fn(),
+      getAd: jest.fn(),
       createAdCreative: jest.fn(),
       listAdCreatives: jest.fn(),
       createAd: jest.fn(),
@@ -189,12 +191,382 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
     it('passes validation and proceeds to API for valid CAMPAIGN CREATE', async () => {
       (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', name: 'Test' });
 
+      // confirm=true bypasses the target-confirmation gate so the action executes.
       const result = await callApi(service, 'CAMPAIGN', 'CREATE', {
-        params: { name: 'Test', objective: 'OUTCOME_TRAFFIC', special_ad_categories: ['NONE'] }
+        params: { name: 'Test', objective: 'OUTCOME_TRAFFIC', special_ad_categories: ['NONE'], confirm: true }
       });
 
       expect(result.success).toBe(true);
       expect(metaService.createCampaign).toHaveBeenCalled();
+    });
+  });
+
+  // ==================== Target-confirmation guardrail ====================
+  describe('callMetaMarketingApi target-confirmation gate', () => {
+    beforeEach(() => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+    });
+
+    it('blocks AD CREATE without confirm and returns the resolved campaign/ad set target', async () => {
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_1', name: 'Maintenance Ad Set', campaign_id: 'camp_maint' });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign', objective: 'OUTCOME_TRAFFIC' });
+
+      const result = await callApi(service, 'AD', 'CREATE', {
+        ad_set_id: 'adset_1',
+        params: { name: 'New Maintenance Ad', creative_id: 'creative_1' }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(metaService.createAd).not.toHaveBeenCalled();
+      // The resolved target must name the ad set AND the campaign it belongs to.
+      expect(result.message).toContain('Maintenance Ad Set');
+      expect(result.message).toContain('Maintenance Campaign');
+      expect(result.target.campaign).toContain('Maintenance Campaign');
+      expect(result.target.ad_set).toContain('Maintenance Ad Set');
+    });
+
+    it('executes AD CREATE when confirm=true and strips the flag before dispatch', async () => {
+      (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'ad_new', name: 'New Maintenance Ad' });
+
+      const result = await callApi(service, 'AD', 'CREATE', {
+        ad_set_id: 'adset_1',
+        params: { name: 'New Maintenance Ad', creative_id: 'creative_1', confirm: true }
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.requiresConfirmation).toBeUndefined();
+      expect(metaService.createAd).toHaveBeenCalledTimes(1);
+      // confirm must never leak into the params passed to metaService.
+      const paramsArg = (metaService.createAd as jest.Mock).mock.calls[0][2];
+      expect(paramsArg.confirm).toBeUndefined();
+    });
+
+    it('blocks a VALID AD UPDATE without confirm and does not call metaService.updateAd', async () => {
+      (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'ad_1', name: 'Spring Promo', adset_id: 'adset_1', campaign_id: 'camp_maint' });
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_1', name: 'Maintenance Ad Set', campaign_id: 'camp_maint' });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign' });
+
+      const result = await callApi(service, 'AD', 'UPDATE', {
+        ad_id: 'ad_1',
+        params: { daily_budget: 5000 }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.updateAd).not.toHaveBeenCalled();
+      // The change being made must be surfaced so the user can catch a wrong edit.
+      expect(result.confirmationPrompt).toContain('Spring Promo');
+      expect(result.confirmationPrompt).toContain('Maintenance Campaign');
+    });
+
+    it('blocks a VALID CAMPAIGN UPDATE without confirm and does not call metaService.updateCampaign', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign' });
+
+      const result = await callApi(service, 'CAMPAIGN', 'UPDATE', {
+        campaign_id: 'camp_maint',
+        params: { status: 'PAUSED' }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.updateCampaign).not.toHaveBeenCalled();
+      expect(result.confirmationPrompt).toContain('Maintenance Campaign');
+    });
+
+    it('blocks AD DELETE without confirm and does not call metaService.deleteAd', async () => {
+      (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'ad_1', name: 'Old Ad', adset_id: 'adset_1', campaign_id: 'camp_maint' });
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_1', name: 'Maintenance Ad Set', campaign_id: 'camp_maint' });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign' });
+
+      const result = await callApi(service, 'AD', 'DELETE', { ad_id: 'ad_1' });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.message).toContain('Old Ad');
+      expect(metaService.deleteAd).not.toHaveBeenCalled();
+    });
+
+    it('still requires confirmation when target resolution fails (degrades to raw IDs)', async () => {
+      (metaService.getAdSet as jest.Mock).mockRejectedValue(new Error('Meta unreachable'));
+      (metaService.getCampaign as jest.Mock).mockRejectedValue(new Error('Meta unreachable'));
+
+      const result = await callApi(service, 'AD', 'CREATE', {
+        ad_set_id: 'adset_999',
+        params: { name: 'Ad', creative_id: 'creative_1' }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(metaService.createAd).not.toHaveBeenCalled();
+      // Falls back to the raw ad set ID in the summary.
+      expect(result.message).toContain('adset_999');
+    });
+
+    it('does NOT gate read-only AD LIST', async () => {
+      (metaService.listAds as jest.Mock).mockResolvedValue([]);
+
+      const result = await callApi(service, 'AD', 'LIST', { ad_set_id: 'adset_1' });
+
+      expect(result.requiresConfirmation).toBeUndefined();
+      expect(metaService.listAds).toHaveBeenCalled();
+    });
+
+    it('blocks AD COPY_AD without confirm and names source ad + destination campaign', async () => {
+      (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'ad_src', name: 'Source Ad', adset_id: 'adset_src', campaign_id: 'camp_a' });
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_dest', name: 'Dest Ad Set', campaign_id: 'camp_b' });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_b', name: 'Leasing Campaign' });
+
+      const result = await callApi(service, 'AD', 'COPY_AD', {
+        ad_id: 'ad_src',
+        params: { adset_id: 'adset_dest' }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.message).toContain('Source Ad');
+      expect(result.message).toContain('Dest Ad Set');
+      expect(result.message).toContain('Leasing Campaign');
+      expect(result.target.target_ad_set).toContain('Dest Ad Set');
+    });
+
+    it('blocks CAMPAIGN DELETE without confirm and does not call metaService.deleteCampaign', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign' });
+
+      const result = await callApi(service, 'CAMPAIGN', 'DELETE', { campaign_id: 'camp_maint' });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.deleteCampaign).not.toHaveBeenCalled();
+      expect(result.confirmationPrompt).toContain('Maintenance Campaign');
+    });
+
+    it('blocks AD_SET CREATE without confirm and names the parent campaign', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign' });
+
+      const result = await callApi(service, 'AD_SET', 'CREATE', {
+        campaign_id: 'camp_maint',
+        params: { name: 'New Ad Set', daily_budget: 5000 }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.createAdSet).not.toHaveBeenCalled();
+      expect(result.confirmationPrompt).toContain('New Ad Set');
+      expect(result.confirmationPrompt).toContain('Maintenance Campaign');
+    });
+
+    it('blocks AD_SET UPDATE without confirm and does not call metaService.updateAdSet', async () => {
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_1', name: 'Maintenance Ad Set', campaign_id: 'camp_maint' });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign' });
+
+      const result = await callApi(service, 'AD_SET', 'UPDATE', {
+        ad_set_id: 'adset_1',
+        params: { daily_budget: 9000 }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.updateAdSet).not.toHaveBeenCalled();
+      expect(result.confirmationPrompt).toContain('Maintenance Ad Set');
+    });
+
+    it('blocks AD_SET DELETE without confirm and does not call metaService.deleteAdSet', async () => {
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_1', name: 'Maintenance Ad Set', campaign_id: 'camp_maint' });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign' });
+
+      const result = await callApi(service, 'AD_SET', 'DELETE', { ad_set_id: 'adset_1' });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.deleteAdSet).not.toHaveBeenCalled();
+      expect(result.confirmationPrompt).toContain('Maintenance Ad Set');
+    });
+
+    it('blocks AD_CREATIVE CREATE without confirm and names the creative', async () => {
+      const result = await callApi(service, 'AD_CREATIVE', 'CREATE', {
+        params: { name: 'Spring Creative', page_id: 'p1', body: 'b', title: 't', link_url: 'https://x.com', image_hash: 'h1' }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.createAdCreative).not.toHaveBeenCalled();
+      expect(result.confirmationPrompt).toContain('Spring Creative');
+    });
+
+    it('blocks CUSTOM_AUDIENCE CREATE without confirm and names the audience', async () => {
+      const result = await callApi(service, 'CUSTOM_AUDIENCE', 'CREATE', {
+        params: { name: 'High Value Leads', subtype: 'CUSTOM', customer_file_source: 'USER_PROVIDED_ONLY' }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.createCustomAudience).not.toHaveBeenCalled();
+      expect(result.confirmationPrompt).toContain('High Value Leads');
+    });
+
+    it('blocks CUSTOM_AUDIENCE UPLOAD_USERS without confirm (PII upload) and names the audience ID', async () => {
+      const result = await callApi(service, 'CUSTOM_AUDIENCE', 'UPLOAD_USERS', {
+        params: { id: 'aud_123', schema: ['EMAIL'], payload: '[["a@b.com"]]' }
+      });
+
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.uploadCustomAudienceUsers).not.toHaveBeenCalled();
+      expect(result.confirmationPrompt).toContain('aud_123');
+      expect(result.confirmationPrompt).toContain('PII');
+    });
+
+    it('does NOT gate read-only CUSTOM_AUDIENCE LIST', async () => {
+      (metaService.listCustomAudiences as jest.Mock).mockResolvedValue([]);
+
+      const result = await callApi(service, 'CUSTOM_AUDIENCE', 'LIST', {});
+
+      expect(result.requiresConfirmation).toBeUndefined();
+      expect(result.awaitingUserConfirmation).toBeUndefined();
+      expect(metaService.listCustomAudiences).toHaveBeenCalled();
+    });
+
+    // ---- Human-in-the-loop fields (consumed by the agent loop to halt the turn) ----
+    it('sets awaitingUserConfirmation + a user-facing confirmationPrompt on a gated write', async () => {
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_1', name: 'Maintenance Ad Set', campaign_id: 'camp_maint' });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign' });
+
+      const result = await callApi(service, 'AD', 'CREATE', {
+        ad_set_id: 'adset_1',
+        params: { name: 'New Maintenance Ad', creative_id: 'creative_1' }
+      });
+
+      // The dedicated flag the loop breaks on (distinct from requiresConfirmation,
+      // so only Meta writes halt the turn — not delete_leads / work-plan flows).
+      expect(result.awaitingUserConfirmation).toBe(true);
+      // The user-facing prompt must name the resolved target and ask for approval.
+      expect(typeof result.confirmationPrompt).toBe('string');
+      expect(result.confirmationPrompt).toContain('Maintenance Ad Set');
+      expect(result.confirmationPrompt).toContain('Maintenance Campaign');
+      expect(result.confirmationPrompt.toLowerCase()).toContain('confirm');
+    });
+
+    it('does NOT set awaitingUserConfirmation when confirm=true (gate bypassed, executes)', async () => {
+      (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'ad_new', name: 'New Maintenance Ad' });
+
+      const result = await callApi(service, 'AD', 'CREATE', {
+        ad_set_id: 'adset_1',
+        params: { name: 'New Maintenance Ad', creative_id: 'creative_1', confirm: true }
+      });
+
+      expect(result.awaitingUserConfirmation).toBeUndefined();
+      expect(result.confirmationPrompt).toBeUndefined();
+      expect(metaService.createAd).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT set awaitingUserConfirmation on read-only AD LIST', async () => {
+      (metaService.listAds as jest.Mock).mockResolvedValue([]);
+
+      const result = await callApi(service, 'AD', 'LIST', { ad_set_id: 'adset_1' });
+
+      expect(result.awaitingUserConfirmation).toBeUndefined();
+      expect(result.confirmationPrompt).toBeUndefined();
+    });
+  });
+
+  // ==================== Minimal-result preserves the gate flag ====================
+  // The frontend tool card / panel teardown read result.awaitingUserConfirmation off
+  // the MINIMIZED result stored in toolCalls. extractMinimalToolResult must not strip it,
+  // or the "Awaiting your confirmation" UI never fires (regardless of tool name).
+  describe('extractMinimalToolResult preserves confirmation-gate fields', () => {
+    const gated = {
+      success: true,
+      requiresConfirmation: true,
+      awaitingUserConfirmation: true,
+      confirmationPrompt: 'Please confirm before I proceed...',
+      confirmationDetail: 'Publish ad into Maintenance Campaign',
+      summary: 'Publish ad into Maintenance Campaign',
+      target: { campaign: 'Maintenance Campaign' }
+    };
+
+    it('keeps awaitingUserConfirmation for call_meta_marketing_api (would otherwise hit default {})', () => {
+      const out = (service as any).extractMinimalToolResult(gated, 'call_meta_marketing_api');
+      expect(out.awaitingUserConfirmation).toBe(true);
+      expect(out.confirmationPrompt).toContain('confirm');
+    });
+
+    it('keeps awaitingUserConfirmation for generate_image (would otherwise drop it)', () => {
+      const out = (service as any).extractMinimalToolResult(gated, 'generate_image');
+      expect(out.awaitingUserConfirmation).toBe(true);
+      expect(out.confirmationDetail).toBeDefined();
+    });
+
+    it('does not add the flag to a normal (non-gated) result', () => {
+      const out = (service as any).extractMinimalToolResult(
+        { success: true, imageUrl: 'https://x/img.png', filename: 'a.png' },
+        'generate_image'
+      );
+      expect(out.awaitingUserConfirmation).toBeUndefined();
+      expect(out.imageUrl).toBe('https://x/img.png');
+    });
+  });
+
+  // ==================== Agent-loop halt detection ====================
+  // collectConfirmationPrompt is the seam the agent loop uses to decide whether to
+  // STOP the autonomous turn and hand control back to the user. It scans the tool
+  // results from one iteration and returns the user-facing prompt to surface (or null).
+  describe('collectConfirmationPrompt (loop halt seam)', () => {
+    const awaiting = (prompt: string) => ({
+      status: 'success' as const,
+      result: { success: true, awaitingUserConfirmation: true, confirmationPrompt: prompt }
+    });
+
+    it('returns null when no tool result requests user confirmation', () => {
+      const out = (service as any).collectConfirmationPrompt([
+        { status: 'success', result: { success: true, data: [] } },
+        { status: 'error', error: new Error('boom') }
+      ]);
+      expect(out).toBeNull();
+    });
+
+    it('returns the confirmationPrompt of a single gated write', () => {
+      const out = (service as any).collectConfirmationPrompt([
+        { status: 'success', result: { success: true } },
+        awaiting('Please confirm: publish ad into Maintenance Campaign?')
+      ]);
+      expect(out).toBe('Please confirm: publish ad into Maintenance Campaign?');
+    });
+
+    it('joins prompts when multiple writes are batched in one turn', () => {
+      const out = (service as any).collectConfirmationPrompt([
+        awaiting('Confirm A'),
+        awaiting('Confirm B')
+      ]);
+      expect(out).toContain('Confirm A');
+      expect(out).toContain('Confirm B');
+    });
+
+    it('batches multiple confirmations under ONE intro/footer using confirmationDetail', () => {
+      const detailItem = (detail: string, prompt: string) => ({
+        status: 'success' as const,
+        result: { success: true, awaitingUserConfirmation: true, confirmationPrompt: prompt, confirmationDetail: detail }
+      });
+      const out: string = (service as any).collectConfirmationPrompt([
+        detailItem('edit edited1.png\n![a](u1)', 'FULL PROMPT 1'),
+        detailItem('edit edited2.png\n![b](u2)', 'FULL PROMPT 2')
+      ]);
+
+      // Per-item details are present (incl. their thumbnails)...
+      expect(out).toContain('edited1.png');
+      expect(out).toContain('edited2.png');
+      expect(out).toContain('![a](u1)');
+      expect(out).toContain('![b](u2)');
+      // ...but the standalone per-item wrappers are NOT repeated.
+      expect(out).not.toContain('FULL PROMPT 1');
+      expect(out).not.toContain('FULL PROMPT 2');
+      // Footer appears exactly once.
+      expect(out.match(/Reply "yes" \/ "confirm"/g)?.length).toBe(1);
+    });
+
+    it('ignores requiresConfirmation-only results (delete_leads / work-plan stay un-halted)', () => {
+      // A tool that sets requiresConfirmation but NOT awaitingUserConfirmation must not
+      // halt the loop — only the dedicated flag triggers the human gate.
+      const out = (service as any).collectConfirmationPrompt([
+        { status: 'success', result: { success: true, requiresConfirmation: true, message: 'Call again with confirm=true' } }
+      ]);
+      expect(out).toBeNull();
     });
   });
 

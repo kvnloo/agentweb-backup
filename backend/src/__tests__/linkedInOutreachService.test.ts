@@ -243,21 +243,21 @@ describe('LinkedInOutreachService', () => {
       expect((thrown as any).structuredError).toBeDefined();
     });
 
-    it('should reject with a character-limit error when message exceeds 300 chars', async () => {
+    it('auto-trims an over-limit message to the default 300-char cap instead of failing', async () => {
       const longMessage = 'a'.repeat(301);
-      await expect(
-        linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, longMessage)
-      ).rejects.toThrow('too long');
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, longMessage);
 
-      // The Unipile API must never be called for an oversized message
-      expect(mockUnipileClient.users.sendInvitation).not.toHaveBeenCalled();
+      // The invite is still sent — never fail on length — but with a trimmed note.
+      expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+      const sent = (mockUnipileClient.users.sendInvitation as jest.Mock).mock.calls[0][0];
+      expect(sent.message.length).toBeLessThanOrEqual(300);
     });
 
-    it('should reject for a message of exactly 301 chars', async () => {
+    it('trims a 301-char single-token message to exactly the 300-char cap', async () => {
       const longMessage = 'a'.repeat(301);
-      await expect(
-        linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, longMessage)
-      ).rejects.toThrow('300 characters');
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, longMessage);
+      const sent = (mockUnipileClient.users.sendInvitation as jest.Mock).mock.calls[0][0];
+      expect(sent.message).toBe('a'.repeat(300));
     });
 
     it('should accept a message of exactly 300 chars', async () => {
@@ -280,15 +280,15 @@ describe('LinkedInOutreachService', () => {
     });
 
     // ─── Per-account char limit (free 200 / premium 300) ──────────────────────
-    it('rejects a 201-char message when maxChars is 200 (free account)', async () => {
+    it('auto-trims a 201-char message to within 200 chars when maxChars is 200 (free account)', async () => {
       const msg = 'a'.repeat(201);
-      await expect(
-        linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, msg, 200)
-      ).rejects.toThrow('200 characters');
-      expect(mockUnipileClient.users.sendInvitation).not.toHaveBeenCalled();
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, msg, 200);
+      expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+      const sent = (mockUnipileClient.users.sendInvitation as jest.Mock).mock.calls[0][0];
+      expect(sent.message.length).toBeLessThanOrEqual(200);
     });
 
-    it('accepts a 200-char message when maxChars is 200 (free account)', async () => {
+    it('accepts a 200-char message when maxChars is 200 (free account) unchanged', async () => {
       const msg = 'a'.repeat(200);
       await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, msg, 200);
       expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledWith(
@@ -296,10 +296,78 @@ describe('LinkedInOutreachService', () => {
       );
     });
 
-    it('accepts a 300-char message when maxChars is 300 (premium account)', async () => {
+    it('accepts a 300-char message when maxChars is 300 (premium account) unchanged', async () => {
       const msg = 'a'.repeat(300);
       await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, msg, 300);
-      expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalled();
+      expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledWith(
+        expect.objectContaining({ message: msg })
+      );
+    });
+
+    it('trims on a word boundary, preserving whole words and not cutting mid-word', async () => {
+      // 21 words of "word" (4 chars) + single spaces = build a >200-char message.
+      const words = Array.from({ length: 60 }, (_, i) => `word${i}`);
+      const msg = words.join(' '); // well over 200 chars
+      expect(msg.length).toBeGreaterThan(200);
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, msg, 200);
+      const sent = (mockUnipileClient.users.sendInvitation as jest.Mock).mock.calls[0][0];
+      expect(sent.message.length).toBeLessThanOrEqual(200);
+      // No partial trailing token: the trimmed note must be a whitespace-delimited
+      // prefix of the original (every retained token appears verbatim in the source).
+      expect(msg.startsWith(sent.message)).toBe(true);
+      expect(sent.message.endsWith(' ')).toBe(false);
+    });
+
+    it('does not trim a message that is exactly at the limit', async () => {
+      const msg = 'a'.repeat(200);
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, msg, 200);
+      const sent = (mockUnipileClient.users.sendInvitation as jest.Mock).mock.calls[0][0];
+      expect(sent.message).toBe(msg);
+    });
+
+    it('never leaves a dangling lone surrogate when the cut lands inside an emoji', async () => {
+      // 199 'a' + 😀 (a surrogate pair, 2 code units) = length 201; cutting at 200
+      // would split the emoji. The trimmed note must contain no lone surrogate.
+      const msg = 'a'.repeat(199) + '😀';
+      expect(msg.length).toBe(201);
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, msg, 200);
+      const sent = (mockUnipileClient.users.sendInvitation as jest.Mock).mock.calls[0][0];
+      expect(sent.message.length).toBeLessThanOrEqual(200);
+      const last = sent.message.charCodeAt(sent.message.length - 1);
+      expect(last >= 0xd800 && last <= 0xdbff).toBe(false);
+      // The whole emoji was dropped (it didn't fit), leaving the 199 'a's.
+      expect(sent.message).toBe('a'.repeat(199));
+    });
+
+    it('prefers a sentence boundary over a word boundary when it keeps >=60% of the limit', async () => {
+      // First sentence ends with a period inside the budget (>=120 of 200); the
+      // trailing sentence pushes the note over 200. Trim should drop the incomplete
+      // trailing sentence and keep whole sentence(s), not cut mid-sentence on a word.
+      const s1 = 'Ana, your activation-funnel work is the sharpest take I have seen all year and I genuinely keep coming back to re-read it.';
+      const s2 = ' Also wanted to add a long trailing tail that pushes us well past the limit so a trim must happen now.';
+      const msg = s1 + s2;
+      expect(s1.length).toBeGreaterThanOrEqual(Math.floor(200 * 0.6));
+      expect(s1.length).toBeLessThanOrEqual(200);
+      expect(msg.length).toBeGreaterThan(200);
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, msg, 200);
+      const sent = (mockUnipileClient.users.sendInvitation as jest.Mock).mock.calls[0][0];
+      expect(sent.message).toBe(s1);
+    });
+
+    it('falls back to a word boundary when the only sentence end is below the 60% threshold', async () => {
+      // A tiny leading sentence ("Hi.") sits far below 60% of the limit, so honouring
+      // it would throw away most of the note. Trim must ignore it and use the word boundary.
+      const tail = Array.from({ length: 60 }, (_, i) => `word${i}`).join(' ');
+      const msg = `Hi. ${tail}`;
+      expect(msg.length).toBeGreaterThan(200);
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, msg, 200);
+      const sent = (mockUnipileClient.users.sendInvitation as jest.Mock).mock.calls[0][0];
+      expect(sent.message.length).toBeLessThanOrEqual(200);
+      // Did NOT collapse to the early "Hi." sentence.
+      expect(sent.message.length).toBeGreaterThan(100);
+      // Still a clean whitespace-delimited prefix, no trailing space.
+      expect(msg.startsWith(sent.message)).toBe(true);
+      expect(sent.message.endsWith(' ')).toBe(false);
     });
   });
 

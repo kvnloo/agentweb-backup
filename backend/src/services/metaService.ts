@@ -807,6 +807,23 @@ export class MetaService {
   }
 
   /**
+   * Get a single ad set with the fields needed to confirm a write target
+   * (name + the campaign it belongs to).
+   */
+  public async getAdSet(accessToken: string, adSetId: string) {
+    try {
+      this.initApi(accessToken);
+      const adSet = new AdSet(adSetId);
+      const fields = ['id', 'name', 'status', 'campaign_id'];
+      this.log(`Fetching ad set: ${adSetId}`);
+      const result = await adSet.get(fields);
+      return result._data;
+    } catch (error) {
+      return this.handleError(error, 'getAdSet');
+    }
+  }
+
+  /**
    * Update ad set
    */
   public async updateAdSet(accessToken: string, adSetId: string, params: any) {

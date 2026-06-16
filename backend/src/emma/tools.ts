@@ -215,7 +215,7 @@ Actions:
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
 - list-received-invitations: (exact action string: "list-received-invitations") List pending connection requests received from others. Returns paginated results with sender info.
-- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended. IMPORTANT: the invite note limit is 200 characters on free LinkedIn accounts and 300 on Premium. Unless you know the account is Premium, keep the message at 200 characters or fewer — LinkedIn rejects longer notes. Always count characters before sending; if over limit, trim the message first. Also: do not send-invite to someone you are already connected with (network_distance FIRST_DEGREE) — use send-message instead; check with get-profile or list-connections if unsure.
+- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended. IMPORTANT: the invite note limit is 200 characters on free LinkedIn accounts and 300 on Premium. Aim for 200 characters or fewer (target ~195) so the whole message — including your call-to-action — fits and reads well. The backend auto-trims an over-limit note to the account's limit on a word boundary before sending, so a send never fails on length; but a note you keep within the limit yourself stays complete and coherent. Also: do not send-invite to someone you are already connected with (network_distance FIRST_DEGREE) — use send-message instead; check with get-profile or list-connections if unsure.
 - send-message: Send a direct message. Requires profile_url or provider_id. message required. Only works for 1st-degree connections or open profiles. When sending to a CRM lead, always provide list_id and lead_id — the system enforces that update-conversation-history was called within the last 24 hours before allowing a send.
 - send-inmail: Send a LinkedIn InMail to any profile regardless of connection degree (2nd/3rd-degree connections). Requires profile_url or provider_id, message (body), and subject. Requires a LinkedIn Premium account with available InMail credits. Use this when send-message is not possible due to connection degree restrictions. list_id and lead_id are optional but recommended for CRM persistence.
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
@@ -249,7 +249,7 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         message: {
           type: 'string',
-          description: 'Message content. Required for send-message and send-inmail; recommended for send-invite. For send-invite: 200 characters max on free LinkedIn accounts, 300 on Premium — stay at 200 or fewer unless you know the account is Premium.'
+          description: 'Message content. Required for send-message and send-inmail; recommended for send-invite. For send-invite: aim for 200 characters or fewer (300 on Premium). The backend auto-trims an over-limit note on a word boundary before sending, so the send never fails on length — but a note you keep within the limit stays complete.'
         },
         subject: {
           type: 'string',
@@ -372,6 +372,19 @@ emmaToolRegistry.register({
     name: "call_meta_marketing_api",
     description:
       `Manage Meta Ads entities via the Marketing API. Requires account_id from list_connected_accounts(platform='meta').
+
+⚠️ MANDATORY TARGET CONFIRMATION (publish/change/delete actions):
+  CAMPAIGN/AD_SET/AD with CREATE, UPDATE, DELETE, or COPY_AD are write actions that publish, change, or
+  destroy live entities. For these, the API runs a two-phase confirmation:
+    1. Call normally (without params.confirm). The API does NOT execute — it returns requiresConfirmation:true
+       with a "target" object naming the exact campaign + ad set + asset that will be affected.
+    2. Show the user that resolved target verbatim (campaign name + ID, ad set name + ID, ad name, and any
+       content/budget/status changes) and get EXPLICIT approval before proceeding.
+    3. Only after the user approves, re-call with the SAME arguments plus params.confirm=true to execute.
+  If the user's request could map to MORE THAN ONE campaign, ad set, or asset, do NOT guess — list the
+  candidates and ask the user to disambiguate BEFORE calling. Never publish an ad into a campaign/ad set the
+  user did not explicitly name, and never regenerate/edit an asset set without confirming which assets.
+  (LIST/SEARCH/UPLOAD_IMAGE/UPLOAD_VIDEO are read/upload-only and need no confirmation.)
 
 ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
@@ -517,6 +530,9 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
           type: "object",
           description: "Action-specific parameters. Required fields depend on entity_type + action (see tool description for the full matrix).",
           properties: {
+            // --- Confirmation gate (write actions) ---
+            confirm: { type: "boolean", description: "Set to true ONLY after showing the user the resolved target (campaign/ad set/asset) returned by the first call and getting explicit approval. Required to actually execute CAMPAIGN/AD_SET/AD CREATE/UPDATE/DELETE/COPY_AD. Omit (or false) on the first call to preview the target." },
+
             // --- Common ---
             name: { type: "string", description: "Entity name." },
             status: { type: "string", enum: ["ACTIVE", "PAUSED", "ARCHIVED"], description: "Entity status." },
@@ -4054,6 +4070,10 @@ emmaToolRegistry.register({
           type: 'string',
           description: 'Optional: Specific image generation model to use. Model guide: gemini-3.1-flash-image-preview (Google, BEST for logo compositing — renders logo most prominently, 4K output), gemini-3-pro-image-preview (Google, excellent for logo compositing, 4K output), gpt-image-2 (Azure, good for logo compositing — preserves logo faithfully, 1024×1024, may add extra design elements), gpt-image-1 (Azure, DO NOT USE for logo compositing — rewrites logo text instead of preserving it; fine for text-to-image with no logo), gemini-2.5-flash-image (Google, text-to-image only, no logo compositing), gen4_image (Runway, cinematic/photorealistic), gemini_2.5_flash (Runway). When logo_image is provided and no model is specified, gemini-3-pro-image-preview is the default.',
           enum: ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gpt-image-2', 'gemini-2.5-flash-image', 'gen4_image', 'gemini_2.5_flash']
+        },
+        confirm: {
+          type: 'boolean',
+          description: 'EDITING existing images only (when inputImages is set): on the first call, omit (or false) — the tool returns the source image(s) it will edit and asks the user to confirm. Set true ONLY after the user has seen those images and approved. Ignored for text-to-image (no inputImages), which never needs confirmation.'
         }
       },
       required: ['prompt', 'filename']
@@ -4071,7 +4091,8 @@ emmaToolRegistry.register({
       context?.userId,
       context?.sessionId,
       imageModel,
-      args.logo_image
+      args.logo_image,
+      args.confirm
     );
   }
 });

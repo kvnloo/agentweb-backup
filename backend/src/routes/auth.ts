@@ -23,6 +23,16 @@ const authRateLimiter = rateLimit({
   message: { message: 'Too many authentication attempts. Please try again later.' },
 });
 
+// Dedicated limiter for change-password so it has its OWN per-IP budget and
+// can't be exhausted by (or exhaust) login/register attempts from the same IP.
+const changePasswordRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many password change attempts. Please try again later.' },
+});
+
 // Define Frontend URLs based on environment or defaults
 const PARTNER_FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
@@ -230,6 +240,9 @@ router.post('/login', authRateLimiter, authController.login);
 // Password reset routes
 router.post('/forgot-password', authController.forgotPassword);
 router.post('/reset-password', authController.resetPassword);
+
+// Authenticated self-service password change (Settings → Change Password)
+router.put('/change-password', changePasswordRateLimiter, authenticateToken, authController.changePassword);
 
 // Google OAuth routes
 router.get('/google', (req: Request, res: Response, next: NextFunction) => {
