@@ -31,7 +31,15 @@ jest.mock('../services/db', () => ({
   userDb: {
     getUserById: jest.fn(),
     updateUser: jest.fn(),
+    // Admin password change now also terminates the target user's other
+    // sessions by bumping sessionVersion (see admin.ts).
+    incrementSessionVersion: jest.fn().mockResolvedValue(1),
   },
+}));
+
+// The admin password route sweeps the user's live sockets after the bump.
+jest.mock('../services/sessionSockets', () => ({
+  disconnectStaleUserSockets: jest.fn().mockResolvedValue(0),
 }));
 
 import { userDb } from '../services/db';

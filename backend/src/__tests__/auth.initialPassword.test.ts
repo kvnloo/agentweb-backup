@@ -23,10 +23,18 @@ jest.mock('../services/db', () => ({
     getUserByResetToken: (...args: any[]) => mockGetUserByResetToken(...args),
     getUserById: (...args: any[]) => mockGetUserById(...args),
     updateUser: (...args: any[]) => mockUpdateUser(...args),
+    // resetPassword and changePassword now terminate other sessions by bumping
+    // sessionVersion after persisting the new password.
+    incrementSessionVersion: jest.fn().mockResolvedValue(1),
   },
   orgDb: {},
   taskDb: {},
   subscriberDb: {},
+}));
+
+// Both flows sweep the user's live sockets after the bump.
+jest.mock('../services/sessionSockets', () => ({
+  disconnectStaleUserSockets: jest.fn().mockResolvedValue(0),
 }));
 
 jest.mock('../services/waitlistDb', () => ({

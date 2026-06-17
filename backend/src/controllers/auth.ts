@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { disconnectStaleUserSockets } from "../services/sessionSockets";
 import { userDb, orgDb } from "../services/db";
 import { Profile } from "passport-google-oauth20";
 import { waitlistDb } from "../services/waitlistDb";
@@ -164,9 +165,9 @@ export const register = async (req: Request, res: Response) => {
         .catch((err) => console.error("Failed to send team introduction email:", err));
     }
 
-    // JWT includes roles array
+    // JWT includes roles array. sv:0 — brand-new account, no password changes yet.
     const token = jwt.sign(
-      { userId, email, roles: finalRoles, isAdmin: false }, // Include isAdmin=false for clarity
+      { userId, email, roles: finalRoles, isAdmin: false, sv: 0 }, // Include isAdmin=false for clarity
       process.env.JWT_SECRET || "your-secret-key",
       { expiresIn: "90d" }
     );
@@ -249,6 +250,7 @@ export const login = async (req: Request, res: Response) => {
       email: user.email,
       roles: user.roles || [],
       isAdmin: user.isAdmin || false,
+      sv: user.sessionVersion ?? 0,
     };
     const token = jwt.sign(
       jwtPayload,
@@ -523,6 +525,7 @@ export const googleCallback = async (
       email: user.email,
       roles: userRoles,
       isAdmin: user.isAdmin || false,
+      sv: user.sessionVersion ?? 0,
     };
     const token = jwt.sign(
       tokenPayload,
@@ -693,6 +696,14 @@ export const resetPassword = async (req: Request, res: Response) => {
       tempPasswordExpires: null
     });
 
+    // Invalidate all existing sessions (every device) after the password reset.
+    // Recovery is exactly the case where logging out other sessions matters most:
+    // a recovered account may have had its old sessions opened by an attacker.
+    const newSessionVersion = await userDb.incrementSessionVersion(user.userId);
+    // The HTTP gate blocks stale tokens on the next request; also drop any live
+    // sockets still open on the old session so attacker streams stop immediately.
+    await disconnectStaleUserSockets(user.userId, newSessionVersion);
+
     res.json({ message: "Password has been reset successfully" });
   } catch (error) {
     console.error("Error in reset password:", error);
@@ -704,12 +715,20 @@ export const resetPassword = async (req: Request, res: Response) => {
 // the forced-change screen for temp-password users). This is the in-app path
 // for converting a system-generated initial password into the user's own
 // long-term password, so it MUST clear the temporary password lifecycle flags.
+// On success, all OTHER sessions are terminated and the caller receives a fresh
+// token minted with the new sessionVersion so the current device stays signed in.
 export const changePassword = async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     if (!userId) {
       return res.status(401).json({ message: "User not authenticated" });
+    }
+
+    // Delegated/contractor sessions act as the target user but must not be able
+    // to change that user's password (they never supplied the customer's password).
+    if (authReq.delegateInfo?.isDelegated) {
+      return res.status(403).json({ message: "Password change is not allowed in a delegated session" });
     }
 
     const { currentPassword, newPassword } = req.body || {};
@@ -746,7 +765,7 @@ export const changePassword = async (req: Request, res: Response) => {
 
     const isValidPassword = await bcrypt.compare(currentPassword, user.password);
     if (!isValidPassword) {
-      return res.status(401).json({ message: "Current password is incorrect" });
+      return res.status(401).json({ message: "Current password is incorrect", code: "invalid_current_password" });
     }
 
     const hashedPassword = await bcrypt.hash(newPassword, 10);
@@ -761,7 +780,26 @@ export const changePassword = async (req: Request, res: Response) => {
       tempPasswordExpires: null,
     });
 
-    res.json({ message: "Password has been changed successfully" });
+    // Terminate every other session by bumping sessionVersion, then re-issue a
+    // token for the current device carrying the new version so it stays logged in.
+    const newSessionVersion = await userDb.incrementSessionVersion(userId);
+    // Also drop live sockets still on the old session. The current device's
+    // socket reconnects with the fresh token below; other devices cannot.
+    await disconnectStaleUserSockets(userId, newSessionVersion);
+
+    const token = jwt.sign(
+      {
+        userId: user.userId,
+        email: user.email,
+        roles: user.roles || [],
+        isAdmin: user.isAdmin || false,
+        sv: newSessionVersion,
+      },
+      process.env.JWT_SECRET || "your-secret-key",
+      { expiresIn: "90d" }
+    );
+
+    res.json({ message: "Password has been changed successfully", token });
   } catch (error) {
     console.error("Error in change password:", error);
     res.status(500).json({ message: "Error changing password" });

@@ -22,6 +22,12 @@ export interface UserPayload {
   email: string;
   isAdmin: boolean;
   roles?: ('partner' | 'customer' | 'free')[];
+  /**
+   * Session version the token was minted with. Compared against the user's current
+   * `sessionVersion` in the DB; a mismatch means the password was changed after this
+   * token was issued, so the token is rejected (other-device logout). Absent = 0.
+   */
+  sv?: number;
   /** Marks short-lived service-to-service self-call tokens — isAdmin claim is trusted directly */
   _svc?: boolean;
   // Delegation fields
@@ -115,6 +121,21 @@ export async function getUserFromToken(req: Request): Promise<{
         return { user: null };
       }
 
+      // Reject tokens minted before the user's most recent password change.
+      // A bumped sessionVersion invalidates every token carrying an older `sv`,
+      // logging out all other devices. Both sides default to 0 for backward compat.
+      //
+      // Use `<` (token behind server), NOT `!==`: getUserById reads the
+      // UserIdIndex GSI, which is eventually consistent. Right after a password
+      // change the GSI can still return the stale (lower) sessionVersion while
+      // the freshly-issued token already carries the new (higher) `sv`. A strict
+      // `!==` would then reject that brand-new token and log the user out of the
+      // very device they just used. A token's `sv` can only exceed the stored
+      // value because the server legitimately signed it, so accepting `>=` is safe.
+      if ((decoded.sv ?? 0) < (user.sessionVersion ?? 0)) {
+        return { user: null };
+      }
+
       return {
         user: {
           userId: user.userId,
@@ -140,7 +161,11 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
     if (!token) {
       return res.status(401).json({ message: 'No token provided' });
     }
-    return res.status(401).json({ message: 'Invalid token' });
+    // `code` lets the frontend distinguish a dead app session (token expired,
+    // signature invalid, user gone, or session version bumped by a password
+    // change) from the many route-level 401s that signal a disconnected
+    // third-party integration. Only this code should trigger a global logout.
+    return res.status(401).json({ message: 'Invalid token', code: 'session_invalid' });
   }
 
   // Set user properties to the request object

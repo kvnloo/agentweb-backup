@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-12',
     changes: [
+      'Improved: Changing Your Password Now Signs You Out Everywhere Else',
+      '- When you change your password from Settings — or reset it through the "forgot password" email — every other device and browser that was signed in to your account is now signed out automatically',
+      '- This protects your account if a device was lost or someone else still had access: updating your password instantly cuts off all other active sessions',
+      '- The device you used to make the change stays signed in, so there is nothing extra you need to do',
+    ],
+  },
+  {
+    date: '2026-06-12',
+    changes: [
       'Updated: Passwords Now Require at Least 12 Characters',
       '- To better protect your account, any password you set now needs to be at least 12 characters long — this applies when you sign up, reset a forgotten password, or change your password in Settings',
       '- Your existing password keeps working; the new minimum only applies the next time you create or change a password',
