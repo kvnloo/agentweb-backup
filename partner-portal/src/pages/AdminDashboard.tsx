@@ -899,7 +899,7 @@ export default function AdminDashboard() {
   const [editWaitlistData, setEditWaitlistData] = useState<WaitlistEntry | null>(null);
   const [editWaitlistLoading, setEditWaitlistLoading] = useState(false);
 
-  const { token } = useAuth();
+  const { token, user, setToken } = useAuth();
 
   const {
     users: contextUsers,
@@ -3023,6 +3023,12 @@ export default function AdminDashboard() {
       );
 
       if (response.status === 200) {
+        // If an admin reset THEIR OWN password, changing it terminated all other
+        // sessions including this one's token. The backend returns a fresh token
+        // in that case — adopt it so this session stays signed in.
+        if (response.data?.token && passwordUserId === user?.userId) {
+          await setToken(response.data.token);
+        }
         setSuccess(`Password updated successfully for ${passwordUserEmail}`);
         setPasswordDialogOpen(false);
         setPasswordUserId(null);

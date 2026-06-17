@@ -161,6 +161,52 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     clearLoginError();
   }, [clearLoginError]);
 
+  // Global dead-session handler (parity with the customer portal). When the
+  // backend rejects a request because this tab's app session is no longer valid —
+  // token expired, account removed, or the password was changed elsewhere (a
+  // password change bumps the server-side session version, invalidating every
+  // older token) — it returns 401 with `code: "session_invalid"`. We log out,
+  // which flips `user` to null so the route guards redirect to /login on the next
+  // request (the initializeAuth effect already covers app-load/refresh).
+  //
+  // Two guards keep this precise:
+  //  • Key off the `session_invalid` code, NOT the 401 status alone — many routes
+  //    return 401 to mean "a connected third-party integration is disconnected",
+  //    which must NOT log the user out of the app.
+  //  • Only act when the token the FAILED request carried is still the token this
+  //    tab holds. If an older, already-rotated token 401s (e.g. an in-flight
+  //    request right after the user changed their OWN password here and we adopted
+  //    the new token), ignore it — this session is still valid. This also debounces
+  //    concurrent dead-session 401s, since the first logout() clears the token.
+  useEffect(() => {
+    const interceptorId = axios.interceptors.response.use(
+      (response) => response,
+      (error) => {
+        const status = error?.response?.status;
+        const code = error?.response?.data?.code;
+        const failedToken = String(error?.config?.headers?.Authorization ?? '')
+          .replace(/^Bearer\s+/i, '')
+          .trim();
+        const currentToken = localStorage.getItem('token');
+
+        if (
+          status === 401 &&
+          code === 'session_invalid' &&
+          currentToken &&
+          failedToken === currentToken
+        ) {
+          logout();
+        }
+
+        return Promise.reject(error);
+      }
+    );
+
+    return () => {
+      axios.interceptors.response.eject(interceptorId);
+    };
+  }, [logout]);
+
   const isAuthenticated = useCallback(() => !!token && !!user, [token, user]);
 
   const setToken = useCallback(async (newToken: string | null) => {
