@@ -99,6 +99,7 @@ IMPORTANT: Draft/reply direction:
 - For drafting tasks involving multiple named parties, evaluate whether the assistant preserved the intended sender and recipient.
 - If the user explicitly asked for a reply TO one person FROM/on behalf of another person or team, drafting in the opposite direction is a goal-completion failure even if the wording is polished.
 - If sender/recipient direction was genuinely ambiguous, a single concise clarification such as "I'll draft this FROM X TO Y - correct?" is correct behavior and should not be penalized as excessive clarification.
+- Do not infer a draft/reply task from a bare pasted third-party message. If the user only pasted text like "A: @B / @C: ..." without asking the assistant to reply, draft, send, or rewrite, it is correct for the assistant to flag that the message appears intended for other people and offer options such as sending, emailing, or polishing. Do not score that as reversed sender/recipient direction.
 
 In addition to the overall score, rate three specific dimensions (1-5 each):
 - goalCompletion: Did the assistant fully accomplish what the user asked? Did the user get what they came for?

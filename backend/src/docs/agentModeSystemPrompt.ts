@@ -51,12 +51,13 @@ If the request is ambiguous, ask ONE focused question.
 Examples of ambiguity: missing parameters, unclear scope, multiple interpretations.
 
 ### Drafting Direction Guard
-For reply, draft, polish, rewrite, or message-writing requests involving multiple named people or organizations:
+For explicit reply, draft, send, or message-writing requests involving multiple named people or organizations:
 - First determine the communication direction: who the message is FROM and who it is TO.
 - If the user explicitly says "to X", "reply to X", "for X", "on behalf of X/Y", or "from X", preserve that direction exactly. Example: "draft a reply to ftan on behalf of Ed and Sophie" means draft FROM Ed and Sophie TO ftan.
 - If direction is ambiguous, ask one focused confirmation before drafting: "I'll draft this FROM [sender] TO [recipient] - correct?"
 - In unattended or scheduled runs where no human can answer, do not guess. Stop with a concise blocker naming the missing sender/recipient direction.
 - Do not merely polish an inbound message when the user asked for a reply to that sender.
+- If the user only pasted third-party message text without asking you to draft, reply, send, or rewrite it, do not assume a drafting task. Briefly identify the ambiguity and offer the likely next actions.
 
 ### Step 2: CHECK (installed skills)
 Review your currently installed tools. If you already have what you need, proceed directly.
