@@ -31,7 +31,7 @@ import { skillService } from '../services/skillService';
 import { userDb, orgDb } from '../services/db';
 
 const ORG_ID = 'org-abc';
-const PLAIN_MEMBER = { userId: 'user-1', orgId: ORG_ID, orgRole: 'member', isAdmin: false };
+const PLAIN_MEMBER = { userId: 'member-1', orgId: ORG_ID, orgRole: 'member', isAdmin: false };
 const ORG_OWNER = { userId: 'user-1', orgId: ORG_ID, orgRole: 'owner', isAdmin: false };
 const EDITOR = { userId: 'editor-1', orgId: ORG_ID, orgRole: 'member', isAdmin: false };
 const NON_ORG_USER = { userId: 'user-1', isAdmin: false };
@@ -58,9 +58,9 @@ describe('Emma list_available_skills - org-sharing toggle gate', () => {
     (orgDb.getOrgById as jest.Mock).mockResolvedValue(orgWithSkillsEnabled);
 
     const tool = emmaToolRegistry.getTool('list_available_skills')!;
-    await tool.execute({}, { userId: 'user-1' });
+    await tool.execute({}, { userId: 'member-1' });
 
-    expect(skillService.getSkillsAvailableToUser).toHaveBeenCalledWith('user-1', ORG_ID);
+    expect(skillService.getSkillsAvailableToUser).toHaveBeenCalledWith('member-1', ORG_ID);
   });
 
   it('plain member + sharing disabled → orgId NOT passed (toggle hides org skills)', async () => {
@@ -68,9 +68,9 @@ describe('Emma list_available_skills - org-sharing toggle gate', () => {
     (orgDb.getOrgById as jest.Mock).mockResolvedValue(orgWithSkillsDisabled);
 
     const tool = emmaToolRegistry.getTool('list_available_skills')!;
-    await tool.execute({}, { userId: 'user-1' });
+    await tool.execute({}, { userId: 'member-1' });
 
-    expect(skillService.getSkillsAvailableToUser).toHaveBeenCalledWith('user-1', undefined);
+    expect(skillService.getSkillsAvailableToUser).toHaveBeenCalledWith('member-1', undefined);
   });
 
   it('editor + sharing disabled → orgId NOT passed (skills are pure-toggle, no editor override)', async () => {

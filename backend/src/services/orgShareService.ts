@@ -98,6 +98,7 @@ function enabledForMembers(org: OrgLike | null, f: Feature): boolean {
 
 function isEditorOrAdmin(user: UserLike, org: OrgLike | null, feature: Feature): boolean {
   if (!user.orgId || !org) return false;
+  if (org.ownerUserId === user.userId) return true;
   if (user.orgRole === "owner") return true;
   const cfg = configFor(org, feature);
   return Array.isArray(cfg?.editors) && cfg!.editors.includes(user.userId);
