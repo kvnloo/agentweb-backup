@@ -87,6 +87,7 @@ export interface ToolDispatchPorts {
     args: any;
     policyDecision: AgentToolPolicyDecision;
     runId: string;
+    budgetScopeId?: string;
     execute: () => Promise<any>;
   }) => Promise<ToolExecOutcome>;
   /** the leaf tool executor (the gateway's `execute` calls this) */
@@ -342,6 +343,7 @@ export async function executePreparedTools(
       args: functionArgs,
       policyDecision,
       runId: agentRuntimeRunId,
+      budgetScopeId: sessionId,
       execute: () => ports.executePreparedAgentTool({
         llmModel,
         toolName: toolCall.function.name,

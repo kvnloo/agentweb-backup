@@ -9,6 +9,11 @@
  */
 
 import {
+  evaluateAgentToolPolicy,
+  executeAgentToolThroughGateway,
+  validateAndRepairToolArgs,
+} from '../../../agentToolGatewayService';
+import {
   executePreparedTools,
   type ExecutePreparedToolsInput,
   type ToolDispatchPorts,
@@ -222,5 +227,91 @@ describe('executePreparedTools', () => {
     const input = makeInput([toolCall('a', 'update_lead', '{}')], ports);
     await executePreparedTools(input);
     expect(emit).toHaveBeenCalledWith('user:user-1', 'crm:data-changed', { changed: true });
+  });
+
+  it('blocks the actual overlong LinkedIn send-invite tool-call shape before gateway execution', async () => {
+    const executeAgentToolThroughGatewaySpy = jest.fn(executeAgentToolThroughGateway);
+    const ports = makePorts({
+      evaluateAgentToolPolicy,
+      validateAndRepairToolArgs,
+      getToolInputSchema: () => ({
+        type: 'object',
+        properties: {
+          action: { type: 'string' },
+          profile_url: { type: 'string' },
+          provider_id: { type: 'string' },
+          message: { type: 'string' },
+        },
+        required: ['action'],
+      }),
+      executeAgentToolThroughGateway: executeAgentToolThroughGatewaySpy,
+    });
+    const input = makeInput(
+      [
+        toolCall('li-1', 'linkedin_outreach', JSON.stringify({
+          action: 'send-invite',
+          profile_url: 'https://www.linkedin.com/in/example-person/',
+          message: 'x'.repeat(201),
+        })),
+      ],
+      ports,
+    );
+
+    const result = await executePreparedTools(input);
+
+    expect(executeAgentToolThroughGatewaySpy).not.toHaveBeenCalled();
+    expect(input.toolCallsLedger[0]).toMatchObject({
+      name: 'linkedin_outreach',
+      error: expect.stringContaining('200 characters or fewer'),
+    });
+    expect(input.messages[0]).toMatchObject({
+      role: 'tool',
+      name: 'linkedin_outreach',
+      content: expect.stringContaining('Rewrite it as a complete shorter note before retrying'),
+    });
+    expect(result.failedCounterUpdates).toEqual({ linkedin_outreach: 1 });
+  });
+
+  it('blocks the third actual generate_image call shape after two failed attempts in the same session', async () => {
+    const executePreparedAgentTool = jest.fn(async () => {
+      throw new Error('Google image generation timed out after 10 minutes');
+    });
+    const ports = makePorts({
+      evaluateAgentToolPolicy,
+      validateAndRepairToolArgs,
+      getToolInputSchema: () => ({
+        type: 'object',
+        properties: {
+          prompt: { type: 'string' },
+          style: { type: 'string' },
+        },
+        required: ['prompt'],
+      }),
+      executeAgentToolThroughGateway,
+      executePreparedAgentTool,
+    });
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const input = makeInput(
+        [
+          toolCall(`img-${attempt}`, 'generate_image', JSON.stringify({
+            prompt: `Create a paid social ad image, attempt ${attempt}`,
+            style: 'photorealistic',
+          })),
+        ],
+        ports,
+        { agentRuntimeRunId: 'run-image-retry-storm' },
+      );
+      await executePreparedTools(input);
+
+      if (attempt < 3) {
+        expect(input.toolCallsLedger[0].error).toContain('Google image generation timed out');
+      } else {
+        expect(input.toolCallsLedger[0].error).toContain('retry budget of 2');
+        expect(input.messages[0].content).toContain('Do not call it again in this session');
+      }
+    }
+
+    expect(executePreparedAgentTool).toHaveBeenCalledTimes(2);
   });
 });

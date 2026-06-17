@@ -64,6 +64,7 @@ describe('classifyToolErrorClass', () => {
   });
 
   it('classifies gateway errors by error name', () => {
+    expect(classifyToolErrorClass(err('budget exceeded', 'AgentToolBudgetExceededError'))).toBe('repeated_failure');
     expect(classifyToolErrorClass(err('blocked', 'AgentToolPolicyBlockedError'))).toBe('policy_blocked');
     expect(classifyToolErrorClass(err('failed 3 times', 'AgentToolRepeatedFailureError'))).toBe('repeated_failure');
     expect(classifyToolErrorClass(err('bad args', 'AgentToolContractValidationError'))).toBe('invalid_args');
