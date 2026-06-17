@@ -161,7 +161,11 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
     if (!token) {
       return res.status(401).json({ message: 'No token provided' });
     }
-    return res.status(401).json({ message: 'Invalid token' });
+    // `code` lets the frontend distinguish a dead app session (token expired,
+    // signature invalid, user gone, or session version bumped by a password
+    // change) from the many route-level 401s that signal a disconnected
+    // third-party integration. Only this code should trigger a global logout.
+    return res.status(401).json({ message: 'Invalid token', code: 'session_invalid' });
   }
 
   // Set user properties to the request object
