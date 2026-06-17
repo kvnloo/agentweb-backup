@@ -2866,7 +2866,10 @@ export class AgentModeService {
         // Snapshot the toolCalls length before executing this iteration so we can
         // send only the new calls (not cumulative history) in tool_executed below.
         const toolCallsLengthBeforeIteration = toolCalls.length;
-        if (onProgress) {
+        // Suppress progress for an abandoned run (manual stop OR wall-clock timeout):
+        // once cancelled, emitting executing_tools would re-open the optimistic
+        // "Generating image..." panel on a turn the user was already told had failed.
+        if (onProgress && !isCancelled?.()) {
           onProgress({
             iteration,
             status: 'executing_tools',
@@ -2933,7 +2936,11 @@ export class AgentModeService {
         // Only send tool calls added in this iteration — the frontend accumulates
         // completed cards across iterations, so sending the full history would
         // cause every prior tool to appear again as a duplicate completed card.
-        if (onProgress) {
+        // Suppress for an abandoned run (manual stop OR wall-clock timeout): a tool
+        // (e.g. generate_image) that finished in the same iteration the cancel arrived
+        // would otherwise emit tool_executed with a real imageUrl — surfacing a SECOND
+        // image on a turn the user already retried.
+        if (onProgress && !isCancelled?.()) {
           onProgress({
             iteration,
             status: 'tool_executed',
