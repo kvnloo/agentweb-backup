@@ -297,6 +297,17 @@ export async function triggerBrandBuildForUser(
   const user = await userDb.getUserById(userId);
   if (!user) return;
 
+  // WS2 telemetry — record brand-scrape lifecycle onto the onboarding loop so
+  // a flaky scrape / degraded LLM clusters on the health endpoint. Lazy-
+  // required to keep this module importable in tests without pulling the loop
+  // registry. Best-effort.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const brandTelemetry = require("./onboardingTelemetry");
+  void brandTelemetry.recordOnboardingEvent(
+    userId,
+    brandTelemetry.ONBOARDING_TELEMETRY_EVENTS.brandScrapeStarted,
+  );
+
   const companyUrl = pickCompanyUrl(user);
   if (!companyUrl) {
     await persistFailure(
@@ -309,6 +320,24 @@ export async function triggerBrandBuildForUser(
   }
   const companyName = pickCompanyName(user);
   const goal = pickGoal(user);
+
+  // WS3 (flag-gated via SLACK_CONNECT_ENABLED, OFF by default): provision a
+  // Slack Connect channel for this account. Best-effort + fire-and-forget —
+  // never blocks the brand build, and inert until the flag + a bot token with
+  // the conversations.connect scope are configured. See slackConnectService.
+  void (async () => {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { provisionOnboardingSlackConnect } = require("./slackConnectService");
+      await provisionOnboardingSlackConnect({
+        userId,
+        companyName,
+        companyEmail: (user as any).email ?? "",
+      });
+    } catch {
+      /* best-effort */
+    }
+  })();
 
   // Resolve deps lazily so importing this module in tests doesn't pull
   // agentModeController + chatbotService.
@@ -413,6 +442,18 @@ export async function triggerBrandBuildForUser(
       status: "ready",
     });
   }
+
+  // WS2 telemetry — successful brand-scrape.
+  void brandTelemetry.recordOnboardingEvent(
+    userId,
+    brandTelemetry.ONBOARDING_TELEMETRY_EVENTS.brandScrapeCompleted,
+    {
+      durationMs:
+        startedAt && completedAt
+          ? Math.max(0, Date.parse(completedAt) - Date.parse(startedAt))
+          : null,
+    },
+  );
 }
 
 async function persistFailure(
@@ -442,4 +483,14 @@ async function persistFailure(
     userId,
     message,
   });
+  // WS2 telemetry — brand-scrape failure with a semantic errorClass derived
+  // from the message. Best-effort.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const brandTelemetry = require("./onboardingTelemetry");
+  void brandTelemetry.recordOnboardingFailure(
+    userId,
+    brandTelemetry.ONBOARDING_TELEMETRY_EVENTS.brandScrapeFailed,
+    message,
+    { durationMs: patch.brandBuildDurationMs ?? 0 },
+  );
 }
