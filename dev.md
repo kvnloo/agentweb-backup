@@ -1,3 +1,43 @@
+## Landing-page builder reliability — telemetry-driven hardening of the GitHub commit path (2026-06-13)
+
+Scanned `AW-LandingPages` (prod) to ground "the builder is unreliable" in data rather than one anecdote.
+
+### What the telemetry says
+- **110 pages, 26 failed = 23.6% failure rate.**
+- Failure modes (clustered by errorMessage):
+  - **15 "fetch failed"** (58% of all failures) — a Node transient network error to an upstream (v0 / GitHub / Vercel) that was NOT retried.
+  - **6 × v0 HTTP 500** — v0 outage symptom.
+  - **2 × 422, 2 × 409** — GitHub ref-update conflicts (non-fast-forward).
+  - 1 stuck `generating` (the orphan/timeout-lie class — addressed separately by the durable-execution work).
+
+### Root cause of the dominant failures
+`withRetry` already covers `fetch failed`/5xx/429/ECONNRESET, and the **v0 calls** and the **first-page repo creation** (`createGitHubRepoAndPush`, ~line 1700) ARE wrapped. But the **sub-page commit path in `addPageToExistingRepo`** was **bare axios with no retry** — five sequential GitHub calls (get-ref → blobs → tree → commit → patch-ref). A transient blip on any one failed the whole build as "fetch failed". That path is exactly where the 15 "fetch failed" came from.
+
+Plus a **race**: the ref-update `patch` used a parent SHA read ~40 lines earlier. If another commit landed on `main` in between — which happens when two pages generate into the **same repo concurrently** — GitHub returns 422 "not a fast forward" (the 422/409s). **Unified multi-site makes this worse**, because it routes more pages into one repo.
+
+### The fix
+New `commitFilesToRepoMain(repoFullName, ghHeaders, files, message, maxAttempts=4)` wraps the commit sequence with retry + **rebase**: every attempt re-reads the current `main` SHA and bases the new commit on it, so a concurrent commit is rebased onto rather than rejected. `isRetryableGithubPushError` decides retry: non-fast-forward 422 / 409 (race) and transient 5xx/429/408/`fetch failed`/ECONNRESET/timeout → retry with backoff; 404/auth/validation → fail fast. `addPageToExistingRepo` now calls it instead of the inline axios sequence.
+
+This kills the dominant "fetch failed" class AND the concurrent-commit race in one move. Flag-independent — strictly more resilient, applies to `main` today. Branch `harsha/harden-landing-commit-retry`.
+
+### Duplicate/unnecessary builds — does retrying make it worse? (the right question)
+Telemetry says duplicate building ALREADY happens, independent of any retry: **18/110 orphaned failed records** (started, produced nothing), **11 `(repo,slug)` pairs built >1× (some 3×)**, **7 retry storms** (same user+page <10min apart). Source: users/Emma re-asking + orphaned/detached builds (the durable-reconnect work targets that class).
+
+The naive commit-retry would have ADDED a vector: if `patch-ref` succeeds on GitHub but the response is lost ("fetch failed" on the reply), a blind retry re-commits → a 2nd commit + 2nd Vercel build for the same page. Fixed with **idempotency**: `commitFilesToRepoMain` tracks the commit it tried to set and, on any failure, re-reads `main` — if it's already at our commit, the patch landed (lost response) → return success, never re-commit. A non-fast-forward 422 (patch rejected, main NOT at our commit) correctly falls through to rebase+retry. So retries can rebase and recover transient failures but can never double-build.
+
+### Route-level idempotency — kills the 11 duplicate builds at the source (DONE)
+A multi-agent audit + a fresh telemetry pass established the key fact: **all 11 duplicate `(repo,slug)` routes came from DIFFERENT chat sessions re-asking the same route** — not concurrency, not the same session. So the right key is **route identity (userId, slug)**, not a session lock or a serial writer. `generateLandingPage` now calls `findReusablePageForRoute(userId, slug)` in the existing-site branch: if a non-archived page at that slug is already `deployed`/`generating`/`deploying`, it's returned (reuse) instead of building a duplicate. Explicitly NOT `failed` (a retry after a failure must rebuild); legitimate refreshes go through the dedicated iterate endpoint. ~15 lines, no lock — the lightweight "idempotent entry" the design research endorsed as the simplest first step.
+
+### Design direction (research, separate doc) — platform-native, net-removes complexity
+Research (Webflow/Framer/Vercel/v0 + canonical patterns) concluded the simplest *target* is "repo is the source of truth, content-addressed, read live state": Vercel already returns the existing deployment for an already-seen commit SHA and cancels superseded builds (`autoJobCancellation`), so the duplicate/race/orphan problems are best solved by leaning on that + a `generationKey` idempotency on the v0 call, which would let us DELETE the orphan-sweep + redeploy poller + scattered guards rather than add more. The route-dedup above is the first, direction-agnostic step toward it.
+
+### Still open (audit-confirmed, safe, next)
+- **Vercel calls are bare axios** (createVercelProject/triggerVercelDeployment/poll/status) — wrap in `withRetry` (extend the classifier for axios `err.response.status`), the same gap as the GitHub commit path. High value (the 6 v0-500 + transient deploy failures).
+- **First-page push** (`createGitHubRepoAndPush` blob/tree/commit/ref-patch) is still bare — route it through `commitFilesToRepoMain`.
+- `generateFirstPage` put + `cleanupOrphanedFailedPages` could use conditional writes (compare-and-swap) to close the first-page concurrency race.
+- v0 HTTP 500s (6) are retried by `withRetry` but a sustained v0 outage still surfaces; consider a longer/again-later retry or a user-facing "v0 is down, try again" rather than a hard fail.
+- Vercel deploy 422 (1) — check `createVercelProject` / `triggerVercelDeployment` retry coverage next.
+
 ## Loop Slack egress gated to prod — fixes "Emma Dev yaps" class (2026-06-13)
 
 Root cause of the duplicate "Emma Dev" AI-readiness DMs: ≥2 stale test-env backends had AI_READINESS_LOOP_ENABLED=true set per-instance (not in the shared secret — verified: the shared `agentweb/test-env/backend-env` secret sets the emma_dev Slack token but NO loop flags), and the loop's Slack post was gated only by that per-loop flag. So any dev box with the flag flipped could DM the founder via the shared emma_dev bot. Only ai-readiness yapped because only that one flag was ever turned on in dev.
