@@ -31,6 +31,9 @@ import { DynamoDB } from 'aws-sdk';
 
 /** Default expiration for legacy interactive shares that don't have an expiresAt field (7 days from sharedAt). */
 const LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS = 7;
+const ZERO_ASSISTANT_REQUEUE_BASE_MS = 15 * 60 * 1000;
+const ZERO_ASSISTANT_REQUEUE_MAX_MS = 2 * 60 * 60 * 1000;
+const ZERO_ASSISTANT_MAX_REQUEUES = 3;
 
 /**
  * In-memory set of session IDs that are currently generating a response.
@@ -854,6 +857,12 @@ export async function runVerifiedChat(
         attachmentsForThisAttempt
       );
 
+      if (!hasAssistantOutput(response)) {
+        throw new ZeroAssistantOutputError(
+          `Scheduled/verified chat attempt ${attempt} produced zero assistant output for session ${sessionId}`
+        );
+      }
+
       // Update content
       if (response.content) {
         allContent += (allContent ? '\n\n' : '') + response.content;
@@ -942,6 +951,13 @@ export async function runVerifiedChat(
 
     } catch (error) {
       console.error(`Run verified chat attempt ${attempt} failed:`, error);
+      if (isZeroAssistantOutputError(error)) {
+        if (attempt === maxAttempts) {
+          throw error;
+        }
+        await waitForVerifiedChatRetry(attempt);
+        continue;
+      }
       if (isSessionLimitError(error)) {
         throw error;
       }
@@ -951,6 +967,7 @@ export async function runVerifiedChat(
       if (attempt === maxAttempts) {
         throw error;
       }
+      await waitForVerifiedChatRetry(attempt);
     }
   }
 
@@ -981,6 +998,62 @@ export async function runVerifiedChat(
     attempts: attempt,
     workPlanCompleted: false
   };
+}
+
+class ZeroAssistantOutputError extends Error {
+  code = 'ZERO_ASSISTANT_OUTPUT';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'ZeroAssistantOutputError';
+  }
+}
+
+function isZeroAssistantOutputError(error: unknown): boolean {
+  return error instanceof ZeroAssistantOutputError
+    || (typeof error === 'object' && error !== null && (error as any).code === 'ZERO_ASSISTANT_OUTPUT')
+    || (error instanceof Error && error.name === 'ZeroAssistantOutputError');
+}
+
+function hasAssistantOutput(response: {
+  content?: string;
+  toolCalls?: any[];
+  responseMessages?: any[];
+}): boolean {
+  const hasContent = typeof response.content === 'string' && response.content.trim().length > 0;
+  const hasToolCalls = Array.isArray(response.toolCalls) && response.toolCalls.length > 0;
+  const hasAssistantMessage = Array.isArray(response.responseMessages)
+    && response.responseMessages.some((message: any) => message?.role === 'assistant');
+
+  return hasContent || hasToolCalls || hasAssistantMessage;
+}
+
+async function waitForVerifiedChatRetry(attempt: number): Promise<void> {
+  if (process.env.NODE_ENV === 'test') return;
+
+  const delayMs = Math.min(30_000, 1_000 * Math.pow(2, Math.max(0, attempt - 1)));
+  await new Promise(resolve => setTimeout(resolve, delayMs));
+}
+
+async function sessionHasAssistantMessage(sessionId: string): Promise<boolean | undefined> {
+  try {
+    const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
+    if (!Array.isArray(messages)) return undefined;
+    return messages.some((message: any) => message?.role === 'assistant');
+  } catch (error) {
+    console.error(`Scheduled chat zero-output check failed for session ${sessionId}:`, error);
+    return undefined;
+  }
+}
+
+function getZeroAssistantRetryCount(schedule: any): number {
+  const rawCount = Number(schedule?.zeroAssistantRetryCount || 0);
+  return Number.isFinite(rawCount) && rawCount > 0 ? rawCount : 0;
+}
+
+function getZeroAssistantRequeueDelayMs(retryCount: number): number {
+  const exponent = Math.max(0, retryCount - 1);
+  return Math.min(ZERO_ASSISTANT_REQUEUE_MAX_MS, ZERO_ASSISTANT_REQUEUE_BASE_MS * Math.pow(2, exponent));
 }
 
 // Common function to run a scheduled chat (used by both test and actual execution)
@@ -1255,6 +1328,15 @@ export async function runScheduledChat(
       llmModel: schedule.llmModel || defaultModel
     });
 
+    if (!isTest && process.env.NODE_ENV !== 'test') {
+      const hasAssistantMessage = await sessionHasAssistantMessage(sessionId);
+      if (hasAssistantMessage === false) {
+        throw new ZeroAssistantOutputError(
+          `Scheduled chat produced zero persisted assistant messages for session ${sessionId}`
+        );
+      }
+    }
+
     // Generate a 2-3 word summary and update the session title
     try {
       const summary = await agentModeService.generateScheduledChatSummary(resolvedStartingMessage, result.content);
@@ -1371,6 +1453,19 @@ export async function runScheduledChat(
       console.error('AgentMode: Email campaign execution sync after run error:', err);
     }
 
+    if (!isTest && getZeroAssistantRetryCount(schedule) > 0) {
+      try {
+        await scheduleDb.updateSchedule(schedule.scheduleId, {
+          zeroAssistantRetryCount: 0,
+          lastZeroAssistantOutputAt: '',
+          lastZeroAssistantOutputSessionId: '',
+          updatedAt: new Date().toISOString(),
+        });
+      } catch (resetError) {
+        console.error(`Failed to reset zero-output retry tracking for schedule ${schedule.scheduleId}:`, resetError);
+      }
+    }
+
     return finalResult;
 
   } catch (error) {
@@ -1405,6 +1500,52 @@ export async function runScheduledChat(
       }
     }
 
+    let zeroAssistantOutput = isZeroAssistantOutputError(error);
+    if (!zeroAssistantOutput && sessionId) {
+      const hasAssistantMessage = await sessionHasAssistantMessage(sessionId);
+      zeroAssistantOutput = hasAssistantMessage === false;
+    }
+
+    let zeroAssistantRequeuedAt: string | undefined;
+    if (zeroAssistantOutput) {
+      console.error('Scheduled chat zero-assistant-output dead-man triggered:', {
+        scheduleId: schedule.scheduleId,
+        scheduleName: schedule.scheduleName,
+        userId,
+        sessionId: sessionId || 'N/A',
+        isTest,
+        retryCount: getZeroAssistantRetryCount(schedule),
+        errorMessage: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+        timestamp: new Date().toISOString(),
+      });
+
+      if (!isTest) {
+        const nextRetryCount = getZeroAssistantRetryCount(schedule) + 1;
+        if (nextRetryCount <= ZERO_ASSISTANT_MAX_REQUEUES) {
+          const retryAt = new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString();
+          zeroAssistantRequeuedAt = retryAt;
+
+          try {
+            await scheduleDb.updateSchedule(schedule.scheduleId, {
+              status: 'active',
+              nextRunTime: retryAt,
+              zeroAssistantRetryCount: nextRetryCount,
+              lastZeroAssistantOutputAt: new Date().toISOString(),
+              lastZeroAssistantOutputSessionId: sessionId || '',
+              updatedAt: new Date().toISOString(),
+            });
+          } catch (requeueError) {
+            console.error(`Failed to requeue zero-output scheduled chat ${schedule.scheduleId}:`, requeueError);
+          }
+        } else {
+          console.error(
+            `Scheduled chat ${schedule.scheduleId} exceeded zero-output requeue limit (${ZERO_ASSISTANT_MAX_REQUEUES}); alerting without requeue.`
+          );
+        }
+      }
+    }
+
     // Build error result
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorResult = {
@@ -1421,7 +1562,11 @@ export async function runScheduledChat(
       executionTime: Date.now() - now.getTime(),
       sessionId: sessionId || '',
       attempt: 0,
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      ...(zeroAssistantOutput ? {
+        zeroAssistantOutput: true,
+        ...(zeroAssistantRequeuedAt ? { requeuedAt: zeroAssistantRequeuedAt } : {}),
+      } : {}),
     };
 
     // Save the error result to database (without actualResponse to save space)
@@ -1437,14 +1582,20 @@ export async function runScheduledChat(
     // Send oncall alert and Notion ticket for scheduled chat exception (always, including test runs)
     const originalMessage = (error as any)?.originalMessage;
     sendAgentModeOncallAlert({
-      subject: `Scheduled Chat Error: ${schedule.scheduleName}`,
-      message: `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
+      subject: zeroAssistantOutput
+        ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
+        : `Scheduled Chat Error: ${schedule.scheduleName}`,
+      message: zeroAssistantOutput
+        ? `Scheduled chat "${schedule.scheduleName}" terminated with zero assistant messages.${zeroAssistantRequeuedAt ? ` It was requeued for ${zeroAssistantRequeuedAt}.` : ''}\n\nError: ${errorMessage}`
+        : `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
       sessionId: sessionId || undefined,
       context: {
         'Schedule ID': schedule.scheduleId,
         'Schedule Name': schedule.scheduleName,
         'User ID': userId,
         'Is Test Run': isTest ? 'Yes' : 'No',
+        'Zero Assistant Output': zeroAssistantOutput ? 'Yes' : 'No',
+        ...(zeroAssistantRequeuedAt ? { 'Requeued At': zeroAssistantRequeuedAt } : {}),
         'Error Message': errorMessage,
         ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
         'Error Stack': error instanceof Error ? (error.stack || 'No stack trace') : 'N/A',
@@ -1453,14 +1604,20 @@ export async function runScheduledChat(
       }
     }).catch(err => console.error('Failed to send oncall alert for scheduled chat error:', err));
     createOncallItem({
-      title: `Scheduled Chat Error: ${schedule.scheduleName}`,
-      description: `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}${originalMessage ? `\n\nOriginal API error: ${originalMessage}` : ''}`,
+      title: zeroAssistantOutput
+        ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
+        : `Scheduled Chat Error: ${schedule.scheduleName}`,
+      description: zeroAssistantOutput
+        ? `Scheduled chat "${schedule.scheduleName}" terminated with zero assistant messages.${zeroAssistantRequeuedAt ? ` It was requeued for ${zeroAssistantRequeuedAt}.` : ''}\n\nError: ${errorMessage}${originalMessage ? `\n\nOriginal API error: ${originalMessage}` : ''}`
+        : `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}${originalMessage ? `\n\nOriginal API error: ${originalMessage}` : ''}`,
       additionalTags: ['Scheduled Chat'],
       context: {
         'Schedule ID': schedule.scheduleId,
         'User ID': userId,
         'Session ID': sessionId || 'N/A',
         'Is Test Run': isTest ? 'Yes' : 'No',
+        'Zero Assistant Output': zeroAssistantOutput ? 'Yes' : 'No',
+        ...(zeroAssistantRequeuedAt ? { 'Requeued At': zeroAssistantRequeuedAt } : {}),
         'Error Message': errorMessage,
         ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
       }
