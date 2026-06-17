@@ -216,6 +216,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         return;
     }
     setLoading(true);
+    // Adopt the new token in storage BEFORE validating it. The dead-session
+    // interceptor only logs out when the FAILED request's token still equals
+    // localStorage's token; if we wrote the new token only after the /me round
+    // trip, an in-flight old-token 401 during that window would match the old
+    // token still in storage and wrongly log out this just-authenticated device.
+    // Every failure path below clears it again.
+    localStorage.setItem('token', newToken);
     try {
       const response = await axios.get(buildApiUrl('/api/auth/me'), {
         headers: { Authorization: `Bearer ${newToken}` }
@@ -240,8 +247,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           return;
         }
       }
-      
-      localStorage.setItem('token', newToken);
+
       setUser(userData);
       setTokenState(newToken);
     } catch (error) {

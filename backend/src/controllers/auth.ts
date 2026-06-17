@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { disconnectStaleUserSockets } from "../services/sessionSockets";
 import { userDb, orgDb } from "../services/db";
 import { Profile } from "passport-google-oauth20";
 import { waitlistDb } from "../services/waitlistDb";
@@ -676,7 +677,10 @@ export const resetPassword = async (req: Request, res: Response) => {
     // Invalidate all existing sessions (every device) after the password reset.
     // Recovery is exactly the case where logging out other sessions matters most:
     // a recovered account may have had its old sessions opened by an attacker.
-    await userDb.incrementSessionVersion(user.userId);
+    const newSessionVersion = await userDb.incrementSessionVersion(user.userId);
+    // The HTTP gate blocks stale tokens on the next request; also drop any live
+    // sockets still open on the old session so attacker streams stop immediately.
+    await disconnectStaleUserSockets(user.userId, newSessionVersion);
 
     res.json({ message: "Password has been reset successfully" });
   } catch (error) {
@@ -737,6 +741,9 @@ export const changePassword = async (req: Request, res: Response) => {
     // Terminate every other session by bumping sessionVersion, then re-issue a
     // token for the current device carrying the new version so it stays logged in.
     const newSessionVersion = await userDb.incrementSessionVersion(userId);
+    // Also drop live sockets still on the old session. The current device's
+    // socket reconnects with the fresh token below; other devices cannot.
+    await disconnectStaleUserSockets(userId, newSessionVersion);
 
     const token = jwt.sign(
       {

@@ -153,4 +153,37 @@ describe('Partner portal — global 401 session interceptor', () => {
     expect(tokenRemovals(removeItemSpy)).toBe(0);
     expect(screen.getByTestId('auth').textContent).toBe('true');
   });
+
+  it('adopts the new token in storage BEFORE /me resolves (closes self-logout race)', async () => {
+    // Regression for the setToken race: the new token must be written to
+    // localStorage before the /me round-trip, so a stale old-token 401 in flight
+    // during validation no longer matches the stored (current) token.
+    localStorage.setItem('token', 'old-token');
+
+    let tokenSeenAtMeCall: string | null = '<unset>';
+    let setTokenFn: (t: string) => Promise<void>;
+    const Capture = () => {
+      setTokenFn = useAuth().setToken;
+      return null;
+    };
+    mockedAxios.get.mockImplementation(async () => {
+      // Captured at the moment /me is invoked — must already be the new token.
+      tokenSeenAtMeCall = localStorage.getItem('token');
+      return {
+        data: { userId: 'u1', email: 'u1@example.com', roles: ['partner'], isAdmin: true },
+      };
+    });
+
+    render(
+      <AuthProvider>
+        <Capture />
+      </AuthProvider>
+    );
+
+    await waitFor(() => expect(setTokenFn).toBeDefined());
+    await setTokenFn!('new-token');
+
+    expect(tokenSeenAtMeCall).toBe('new-token');
+    expect(localStorage.getItem('token')).toBe('new-token');
+  });
 });

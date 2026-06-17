@@ -9,6 +9,7 @@ import jwt from 'jsonwebtoken';
 import { generateChatResponse, chatbotDb } from './services/chatbotService';
 import { checkTokenUsage } from './services/tokenUsageService';
 import { userDb } from './services/db';
+import { registerIo } from './services/sessionSockets';
 import {
   startLiveSession,
   sendAudioChunk,
@@ -61,6 +62,9 @@ const io = new Server(server, {
 
 // Export io instance for use in routes
 export { io };
+
+// Make io available to disconnectStaleUserSockets without a circular import.
+registerIo(io);
 
 // Middleware to authenticate WebSocket connections
 io.use(async (socket, next) => {

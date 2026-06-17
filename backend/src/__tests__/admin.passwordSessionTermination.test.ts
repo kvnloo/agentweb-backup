@@ -40,6 +40,10 @@ jest.mock('../middleware/admin', () => ({
   isAdmin: (_req: any, _res: any, next: any) => next(),
 }));
 
+jest.mock('../services/sessionSockets', () => ({
+  disconnectStaleUserSockets: jest.fn().mockResolvedValue(0),
+}));
+
 // Mock AWS SDK
 jest.mock('aws-sdk', () => ({
   default: {
@@ -63,8 +67,10 @@ jest.mock('aws-sdk', () => ({
 }));
 
 import { userDb } from '../services/db';
+import { disconnectStaleUserSockets } from '../services/sessionSockets';
 
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
+const mockDisconnect = disconnectStaleUserSockets as jest.Mock;
 
 const app = express();
 app.use(express.json());
@@ -146,6 +152,8 @@ describe('PUT /api/admin/users/:userId/password — session termination', () => 
     // ...and every active session for the target user was invalidated.
     expect(mockUserDb.incrementSessionVersion).toHaveBeenCalledWith('user-1');
     expect(mockUserDb.incrementSessionVersion).toHaveBeenCalledTimes(1);
+    // ...including live sockets, swept with the NEW session version.
+    expect(mockDisconnect).toHaveBeenCalledWith('user-1', 4);
     // Acting on SOMEONE ELSE's account → no fresh token is returned.
     expect(res.body.token).toBeUndefined();
   });
@@ -170,6 +178,7 @@ describe('PUT /api/admin/users/:userId/password — session termination', () => 
 
     expect(res.status).toBe(200);
     expect(mockUserDb.incrementSessionVersion).toHaveBeenCalledWith('admin-user-1');
+    expect(mockDisconnect).toHaveBeenCalledWith('admin-user-1', 2);
 
     // A fresh token is returned so the acting admin stays signed in...
     expect(typeof res.body.token).toBe('string');
@@ -190,6 +199,10 @@ describe('PUT /api/admin/users/:userId/password — session termination', () => 
       callOrder.push('incrementSessionVersion');
       return 1;
     });
+    mockDisconnect.mockImplementation(async () => {
+      callOrder.push('disconnectStaleUserSockets');
+      return 0;
+    });
 
     const res = await request(app)
       .put('/api/admin/users/user-1/password')
@@ -197,6 +210,11 @@ describe('PUT /api/admin/users/:userId/password — session termination', () => 
       .send({ password: 'newpass123' });
 
     expect(res.status).toBe(200);
-    expect(callOrder).toEqual(['updateUser', 'incrementSessionVersion']);
+    // Sockets are swept only after the bump, which is only after the write.
+    expect(callOrder).toEqual([
+      'updateUser',
+      'incrementSessionVersion',
+      'disconnectStaleUserSockets',
+    ]);
   });
 });

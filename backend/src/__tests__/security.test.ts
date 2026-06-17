@@ -11,7 +11,13 @@ jest.mock('../services/waitlistDb');
 jest.mock('bcryptjs');
 jest.mock('jsonwebtoken');
 jest.mock('../services/emailService');
+jest.mock('../services/sessionSockets', () => ({
+  disconnectStaleUserSockets: jest.fn().mockResolvedValue(0),
+}));
 
+import { disconnectStaleUserSockets } from '../services/sessionSockets';
+
+const mockDisconnect = disconnectStaleUserSockets as jest.Mock;
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockWaitlistDb = waitlistDb as jest.Mocked<typeof waitlistDb>;
 const mockBcryptHash = bcrypt.hash as jest.MockedFunction<typeof bcrypt.hash>;
@@ -714,6 +720,8 @@ describe('Security Tests', () => {
       }));
       // Recovery must invalidate all existing sessions (other devices)
       expect(mockUserDb.incrementSessionVersion).toHaveBeenCalledWith('user-1');
+      // ...and sweep live sockets with the new session version.
+      expect(mockDisconnect).toHaveBeenCalledWith('user-1', 1);
       expect(res.json).toHaveBeenCalledWith({ message: 'Password has been reset successfully' });
     });
   });

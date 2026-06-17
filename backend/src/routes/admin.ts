@@ -1,4 +1,5 @@
 import express from "express";
+import { disconnectStaleUserSockets } from "../services/sessionSockets";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import axios from "axios";
@@ -1423,6 +1424,10 @@ router.put("/users/:userId/password", async (req, res) => {
     // user's existing devices must be logged out. Bumping sessionVersion
     // invalidates every token carrying the prior `sv`.
     const newSessionVersion = await userDb.incrementSessionVersion(userId);
+    // Drop any live sockets still open on the user's old session so an
+    // admin-initiated reset (e.g. compromised account) cuts active streams now,
+    // not just on the next HTTP request.
+    await disconnectStaleUserSockets(userId, newSessionVersion);
 
     // Usually the admin is acting on someone else's account, so no token is
     // re-issued. But an admin can also reset their OWN password from this screen;

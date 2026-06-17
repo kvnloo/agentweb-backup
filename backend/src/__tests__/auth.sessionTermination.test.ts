@@ -7,7 +7,13 @@ import jwt from 'jsonwebtoken';
 jest.mock('../services/db');
 jest.mock('bcryptjs');
 jest.mock('jsonwebtoken');
+jest.mock('../services/sessionSockets', () => ({
+  disconnectStaleUserSockets: jest.fn().mockResolvedValue(0),
+}));
 
+import { disconnectStaleUserSockets } from '../services/sessionSockets';
+
+const mockDisconnect = disconnectStaleUserSockets as jest.Mock;
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockBcryptHash = bcrypt.hash as jest.MockedFunction<typeof bcrypt.hash>;
 const mockBcryptCompare = bcrypt.compare as jest.MockedFunction<typeof bcrypt.compare>;
@@ -164,6 +170,8 @@ describe('Session termination on password change', () => {
       expect(mockUserDb.updateUser).toHaveBeenCalledWith('user-1', { password: 'new-hashed' });
       // All other sessions terminated by bumping the session version
       expect(mockUserDb.incrementSessionVersion).toHaveBeenCalledWith('user-1');
+      // ...and live sockets on the old session are swept with the new version
+      expect(mockDisconnect).toHaveBeenCalledWith('user-1', 5);
       // Fresh token must carry the new session version so the current device stays signed in
       expect(mockJwt.sign).toHaveBeenCalledWith(
         expect.objectContaining({ userId: 'user-1', sv: 5 }),
