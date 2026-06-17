@@ -1413,17 +1413,31 @@ export class UserDB {
 
   async getUserByResetToken(resetToken: string): Promise<User | null> {
     try {
-      const params = {
-        TableName: this.tableName,
-        FilterExpression: "resetPasswordToken = :token AND NOT begins_with(userId, :tombstone)",
-        ExpressionAttributeValues: {
-          ":token": resetToken,
-          ":tombstone": "deleted_",
-        },
-      };
+      // The users table exceeds one 1MB scan page, so a single scan only sees
+      // the first page. Paginate via LastEvaluatedKey until the token is found
+      // or every page is exhausted — otherwise valid resets for users beyond
+      // page 1 falsely report "Invalid or expired reset token".
+      let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+      do {
+        const result = await this.docClient
+          .scan({
+            TableName: this.tableName,
+            FilterExpression: "resetPasswordToken = :token AND NOT begins_with(userId, :tombstone)",
+            ExpressionAttributeValues: {
+              ":token": resetToken,
+              ":tombstone": "deleted_",
+            },
+            ExclusiveStartKey: lastEvaluatedKey,
+          })
+          .promise();
 
-      const result = await this.docClient.scan(params).promise();
-      return result.Items && result.Items.length > 0 ? (result.Items[0] as User) : null;
+        if (result.Items && result.Items.length > 0) {
+          return result.Items[0] as User;
+        }
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } while (lastEvaluatedKey);
+
+      return null;
     } catch (error) {
       this.handleError(error, "getUserByResetToken");
       return null;
