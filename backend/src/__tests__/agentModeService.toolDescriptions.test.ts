@@ -173,6 +173,7 @@ describe('AgentModeService - Tool Descriptions', () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
       expect(systemPrompt).toContain('Drafting Direction Guard');
       expect(systemPrompt).toContain('who the message is FROM and who it is TO');
+      expect(systemPrompt).toContain('explicit reply, draft, send, or message-writing requests');
     });
 
     it('should preserve explicit to/on behalf of drafting direction', async () => {
@@ -188,6 +189,12 @@ describe('AgentModeService - Tool Descriptions', () => {
     it('should not polish inbound text when the user asked for a reply', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
       expect(systemPrompt).toContain('Do not merely polish an inbound message when the user asked for a reply');
+    });
+
+    it('should not assume a drafting task from pasted third-party text alone', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('only pasted third-party message text');
+      expect(systemPrompt).toContain('do not assume a drafting task');
     });
   });
 
