@@ -42,6 +42,7 @@
  */
 
 const GATEWAY_NAME_CLASSES: Record<string, string> = {
+  AgentToolBudgetExceededError: 'repeated_failure',
   AgentToolPolicyBlockedError: 'policy_blocked',
   AgentToolRepeatedFailureError: 'repeated_failure',
   AgentToolContractValidationError: 'invalid_args',

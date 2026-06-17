@@ -26,6 +26,8 @@ export interface AgentRunDecisionSummary {
   explanationSource?: string;
   toolPolicyFlags?: string;
   toolPolicySummary?: string;
+  argsRepairedCount?: number;
+  schemaErrorCount?: number;
 }
 
 export interface AgentRunToolOutcomeSummary {
@@ -36,6 +38,7 @@ export interface AgentRunToolOutcomeSummary {
   durationMs?: number;
   errorClass?: string;
   errorMessage?: string;
+  failureType?: string;
   /** Full args of a FAILED call (capped + redacted at write time) — root-cause material. */
   failedArgsJson?: string;
 }
@@ -182,6 +185,8 @@ function buildOneRunSummary(runId: string, events: AgentRunEventRow[]): AgentRun
       explanationSource: asString(e.dimensions?.explanationSource),
       toolPolicyFlags: asString(e.dimensions?.toolPolicyFlags),
       toolPolicySummary: asString(e.dimensions?.toolPolicySummary),
+      argsRepairedCount: asNumber(e.dimensions?.argsRepairedCount),
+      schemaErrorCount: asNumber(e.dimensions?.schemaErrorCount),
     }));
 
   const outcomes: AgentRunToolOutcomeSummary[] = sorted
@@ -198,6 +203,7 @@ function buildOneRunSummary(runId: string, events: AgentRunEventRow[]): AgentRun
       durationMs: asNumber(e.dimensions?.durationMs),
       errorClass: asString(e.dimensions?.errorClass),
       errorMessage: asString(e.dimensions?.errorMessage),
+      failureType: asString(e.dimensions?.failureType),
       failedArgsJson: asString(e.dimensions?.failedArgsJson),
     }));
 
@@ -262,6 +268,17 @@ function buildRunFlags(input: {
       code: 'failed_tool_calls',
       severity: 'critical',
       message: `${input.failedToolCalls} tool call(s) failed during this run.`,
+    });
+  }
+
+  for (const outcome of input.outcomes) {
+    if (outcome.errorClass !== 'repeated_failure') continue;
+    if (!outcome.errorMessage?.toLowerCase().includes('retry budget')) continue;
+    flags.push({
+      code: 'tool_retry_budget_exceeded',
+      severity: 'warning',
+      message: `${outcome.toolName ?? 'A tool'} hit its per-run retry budget.`,
+      evidence: outcome.toolName,
     });
   }
 

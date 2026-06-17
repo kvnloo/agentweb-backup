@@ -47,6 +47,8 @@ describe('agentRunInspectorService', () => {
           explanationSource: 'deterministic_tool_summary',
           toolPolicyFlags: 'save_memory:side_effecting_tool:info',
           toolPolicySummary: 'save_memory:session_state:low:observe',
+          argsRepairedCount: 1,
+          schemaErrorCount: 0,
           toolCount: 1,
         },
       },
@@ -86,6 +88,8 @@ describe('agentRunInspectorService', () => {
         explanationSource: 'deterministic_tool_summary',
         toolPolicyFlags: 'save_memory:side_effecting_tool:info',
         toolPolicySummary: 'save_memory:session_state:low:observe',
+        argsRepairedCount: 1,
+        schemaErrorCount: 0,
       },
     ]);
     expect(run.outcomes).toHaveLength(2);
@@ -116,6 +120,7 @@ describe('agentRunInspectorService', () => {
           durationMs: 123,
           errorClass: 'TimeoutError',
           errorMessage: 'tool timed out',
+          failureType: 'bug',
         },
       },
       {
@@ -144,6 +149,7 @@ describe('agentRunInspectorService', () => {
       durationMs: 123,
       errorClass: 'TimeoutError',
       errorMessage: 'tool timed out',
+      failureType: 'bug',
     });
   });
 
@@ -189,6 +195,45 @@ describe('agentRunInspectorService', () => {
       expect.objectContaining({ code: 'long_run', severity: 'info' }),
       expect.objectContaining({ code: 'repeated_tool', severity: 'warning', evidence: 'search_web' }),
       expect.objectContaining({ code: 'possible_task_tool_mismatch', severity: 'warning', evidence: 'create_gtm_plan' }),
+    ]));
+  });
+
+  it('flags tool retry budget failures for operator triage', () => {
+    const rows: AgentRunEventRow[] = [
+      {
+        eventType: EVT_RUN_STARTED,
+        subjectId: 'sess-budget:run:a',
+        ts: '2026-06-17T02:00:00.000Z',
+        dimensions: { sessionId: 'sess-budget', userId: 'user-budget' },
+      },
+      {
+        eventType: EVT_TOOL_FAILED,
+        subjectId: 'sess-budget:run:a',
+        ts: '2026-06-17T02:00:01.000Z',
+        dimensions: {
+          sessionId: 'sess-budget',
+          toolName: 'generate_image',
+          errorClass: 'repeated_failure',
+          errorMessage: 'Tool "generate_image" already failed 2 time(s) in this run, reaching its retry budget of 2.',
+          failureType: 'bug',
+        },
+      },
+      {
+        eventType: EVT_RUN_COMPLETED,
+        subjectId: 'sess-budget:run:a',
+        ts: '2026-06-17T02:00:02.000Z',
+        dimensions: { sessionId: 'sess-budget', toolCalls: 3, failedToolCalls: 1 },
+      },
+    ];
+
+    const [run] = buildAgentRunSummaries(rows);
+
+    expect(run.flags).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'tool_retry_budget_exceeded',
+        severity: 'warning',
+        evidence: 'generate_image',
+      }),
     ]));
   });
 

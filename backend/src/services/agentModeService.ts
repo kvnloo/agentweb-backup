@@ -2201,6 +2201,57 @@ export class AgentModeService {
     return pricing[model] ?? 0.04;
   }
 
+  private isRetryableMediaToolError(error: unknown): boolean {
+    if (!error) return false;
+    const message = error instanceof Error ? error.message : String(error);
+    const nonRetryablePatterns = [
+      /api key/i,
+      /auth/i,
+      /unauthori[sz]ed/i,
+      /forbidden/i,
+      /permission/i,
+      /invalid/i,
+      /unsupported/i,
+      /content.?filter/i,
+      /safety/i,
+      /policy/i,
+      /blocked/i,
+      /service is not available/i,
+    ];
+    if (nonRetryablePatterns.some((pattern) => pattern.test(message))) {
+      return false;
+    }
+
+    return isTransientLLMError(error) || /timed out|timeout|overloaded|upstream|network/i.test(message);
+  }
+
+  private getImageGenerationFallbackModel(
+    primaryModel: string | undefined,
+    inputImages: string[] | undefined,
+    logoImage: string | undefined
+  ): string | undefined {
+    // Keep generation fallback narrow. Telemetry showed the painful cases were
+    // product-fidelity workflows and explicit model choices; silently switching
+    // providers there changes output semantics. Only recover when the caller left
+    // model selection to us and the request is fresh text-to-image.
+    if (primaryModel) {
+      return undefined;
+    }
+
+    const editsExistingImage = (Array.isArray(inputImages) && inputImages.length > 0) || !!logoImage;
+    if (editsExistingImage) {
+      return undefined;
+    }
+
+    const fallbackOrder = ['gpt-image-2', 'gemini-3.1-flash-image-preview', 'gemini-2.5-flash-image'];
+    return fallbackOrder[0];
+  }
+
+  private getVisionFallbackModel(primaryModel: string): string | undefined {
+    const fallbackOrder = ['anthropic.claude-opus-4-8', 'gemini-3-flash-preview', 'gpt-5.4-nano'];
+    return fallbackOrder.find((model) => model !== primaryModel && this.llmModels[model]?.supportsVision === true);
+  }
+
   /** Cost per video generation in USD. Veo bills per 8s clip, so longer videos cost proportionally more. */
   private estimateVideoGenerationCost(model: string, durationSeconds?: number): number {
     const pricePerClip: Record<string, number> = {
@@ -5692,17 +5743,51 @@ export class AgentModeService {
         }
       ];
 
-      // Call LLM vision API using the same model as agent mode
-      const response = await this.callLLM(llmModel, messages, {
-        max_completion_tokens: 2000
-      });
+      let visionModelUsed = llmModel;
+      let fallbackUsed = false;
+      let primaryError: string | undefined;
+      let response: any;
+      try {
+        response = await this.callLLM(visionModelUsed, messages, {
+          max_completion_tokens: 2000
+        });
+      } catch (primaryFailure: any) {
+        primaryError = primaryFailure instanceof Error ? primaryFailure.message : String(primaryFailure);
+        const fallbackModel = this.getVisionFallbackModel(visionModelUsed);
+        if (!fallbackModel || !this.isRetryableMediaToolError(primaryFailure)) {
+          throw primaryFailure;
+        }
+
+        console.warn(
+          `AgentMode: describeImage with "${visionModelUsed}" failed with a retryable error; trying fallback "${fallbackModel}":`,
+          primaryError
+        );
+        try {
+          response = await this.callLLM(fallbackModel, messages, {
+            max_completion_tokens: 2000
+          });
+        } catch (fallbackFailure: any) {
+          const fallbackMessage = fallbackFailure instanceof Error ? fallbackFailure.message : String(fallbackFailure);
+          return {
+            success: false,
+            message: `Failed to analyze image after primary and fallback vision models: ${fallbackMessage}`,
+            error: fallbackMessage,
+            primaryError,
+            fallbackModel
+          };
+        }
+        visionModelUsed = fallbackModel;
+        fallbackUsed = true;
+      }
 
       const description = response.choices[0]?.message?.content || 'Unable to analyze image';
 
       return {
         success: true,
         description: description,
-        imageUrl: imageUrl
+        imageUrl: imageUrl,
+        model: visionModelUsed,
+        ...(fallbackUsed ? { fallbackUsed: true, primaryError } : {})
       };
 
     } catch (error) {
@@ -17592,21 +17677,96 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
-      // Generate the image
-      const result = await imageService.generateImage({
+      const inputImagesForRequest = inputImages || [];
+      const primaryRequest = {
         prompt,
         filename,
         size,
         quality,
-        inputImages: inputImages || [],
+        inputImages: inputImagesForRequest,
         logoImage,
         userId,
         imageModel
-      });
+      };
+
+      let result: any;
+      let imageModelUsed = imageModel || 'gemini-3-pro-image-preview';
+      let fallbackUsed = false;
+      let primaryError: string | undefined;
+
+      try {
+        result = await imageService.generateImage(primaryRequest);
+      } catch (primaryFailure: any) {
+        primaryError = primaryFailure instanceof Error ? primaryFailure.message : String(primaryFailure);
+        const fallbackModel = this.getImageGenerationFallbackModel(imageModel, inputImagesForRequest, logoImage);
+        if (!fallbackModel || !this.isRetryableMediaToolError(primaryError)) {
+          throw primaryFailure;
+        }
+
+        console.warn(
+          `AgentMode: Image generation with "${imageModelUsed}" threw a retryable error; trying fallback "${fallbackModel}":`,
+          primaryError
+        );
+        try {
+          const fallbackQuality = quality === 'high' ? 'medium' : quality;
+          result = await imageService.generateImage({
+            ...primaryRequest,
+            quality: fallbackQuality,
+            imageModel: fallbackModel
+          });
+          imageModelUsed = fallbackModel;
+          fallbackUsed = true;
+          if (result.success && result.imageUrl) {
+            quality = fallbackQuality;
+          }
+        } catch (fallbackError: any) {
+          const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+          return {
+            success: false,
+            message: `Image generation failed after primary and fallback attempts: ${fallbackMessage}`,
+            error: fallbackMessage,
+            primaryError,
+            fallbackModel
+          };
+        }
+      }
+
+      if (!(result.success && result.imageUrl) && !fallbackUsed) {
+        primaryError = result.error || 'Failed to generate image';
+        const fallbackModel = this.getImageGenerationFallbackModel(imageModel, inputImagesForRequest, logoImage);
+        if (fallbackModel && this.isRetryableMediaToolError(primaryError)) {
+          console.warn(
+            `AgentMode: Image generation with "${imageModelUsed}" failed with a retryable error; trying fallback "${fallbackModel}":`,
+            primaryError
+          );
+          try {
+            const fallbackQuality = quality === 'high' ? 'medium' : quality;
+            result = await imageService.generateImage({
+              ...primaryRequest,
+              quality: fallbackQuality,
+              imageModel: fallbackModel
+            });
+            imageModelUsed = fallbackModel;
+            fallbackUsed = true;
+            if (result.success && result.imageUrl) {
+              quality = fallbackQuality;
+            }
+          } catch (fallbackError: any) {
+            const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+            return {
+              success: false,
+              message: `Image generation failed after primary and fallback attempts: ${fallbackMessage}`,
+              error: fallbackMessage,
+              primaryError,
+              fallbackModel
+            };
+          }
+        }
+      }
 
       if (result.success && result.imageUrl) {
         // Track generation cost (image APIs are billed per generation, not per token)
-        const imageCost = this.estimateImageGenerationCost(imageModel || 'gemini-2.5-flash-image');
+        const imageCost = this.estimateImageGenerationCost(imageModelUsed);
         incrementUserTokenUsage(userId, 0, imageCost).catch((err) =>
           console.error('AgentMode: Failed to track token usage for generateImage:', err)
         );
@@ -17644,9 +17804,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           filename: result.filename,
           prompt: prompt,
           size: size,
-          quality: quality
+          quality: quality,
+          imageModel: imageModelUsed,
+          ...(fallbackUsed ? { fallbackUsed: true, primaryError } : {})
         };
       } else {
+        if (fallbackUsed) {
+          return {
+            success: false,
+            message: `Image generation failed after primary and fallback attempts: ${result.error || 'Fallback image generation failed'}`,
+            error: result.error,
+            primaryError
+          };
+        }
         return {
           success: false,
           message: result.error || 'Failed to generate image',
