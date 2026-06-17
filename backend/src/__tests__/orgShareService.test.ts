@@ -1,6 +1,6 @@
 import {
   canViewItem, canEditItem, canManageOrgFeature, isAlwaysOnFeature,
-  isFeatureEffectivelyEnabled,
+  isMemberOwnedFeature, isFeatureEffectivelyEnabled,
   defaultEnabledFor, defaultShareSettings,
   Feature,
   listOrgVisibleItems, MEMBER_FANOUT_CAP,
@@ -22,6 +22,7 @@ const orgA: Organization = {
 
 const owner   = { userId: "u-owner",  orgId: "org-A", orgRole: "member" as const };
 const admin   = { userId: "u-admin",  orgId: "org-A", orgRole: "owner"  as const };
+const staleAdmin = { userId: "u-admin", orgId: "org-A", orgRole: "member" as const };
 const editor  = { userId: "u-editor", orgId: "org-A", orgRole: "member" as const };
 const member  = { userId: "u-member", orgId: "org-A", orgRole: "member" as const };
 const other   = { userId: "u-other",  orgId: "org-B", orgRole: "member" as const };
@@ -67,6 +68,9 @@ describe("canViewItem", () => {
   it("org admin sees all items even when sharing is disabled", () => {
     expect(canViewItem(item, admin, orgA, ownerOrgId, "knowledgeBase")).toBe(true);
   });
+  it("canonical org owner sees all items even when user orgRole is stale", () => {
+    expect(canViewItem(item, staleAdmin, orgA, ownerOrgId, "landingPages")).toBe(true);
+  });
 });
 
 describe("canManageOrgFeature", () => {
@@ -77,12 +81,51 @@ describe("canManageOrgFeature", () => {
     const orgOff = { ...orgA, shareSettings: { ...orgA.shareSettings!, landingPages: { enabled: false, editors: [] } } };
     expect(canManageOrgFeature(admin, orgOff as any, "landingPages")).toBe(true);
   });
+  it("canonical org owner can manage even when user orgRole is stale", () => {
+    const orgOff = { ...orgA, shareSettings: { ...orgA.shareSettings!, landingPages: { enabled: false, editors: [] } } };
+    expect(canManageOrgFeature(staleAdmin, orgOff as any, "landingPages")).toBe(true);
+  });
   it("listed editor can manage even when feature.enabled=false", () => {
     const orgOff = { ...orgA, shareSettings: { ...orgA.shareSettings!, landingPages: { enabled: false, editors: ["u-editor"] } } };
     expect(canManageOrgFeature(editor, orgOff as any, "landingPages")).toBe(true);
   });
   it("non-editor org member blocked", () => {
     expect(canManageOrgFeature(member, orgA, "htmlTemplates")).toBe(false);
+  });
+});
+
+describe("member-owned features (skills, workPlans)", () => {
+  it("classifies skills and workPlans as member-owned, others not", () => {
+    expect(isMemberOwnedFeature("skills")).toBe(true);
+    expect(isMemberOwnedFeature("workPlans")).toBe(true);
+    expect(isMemberOwnedFeature("htmlTemplates")).toBe(false);
+    expect(isMemberOwnedFeature("brandGuidelines")).toBe(false);
+  });
+
+  it("any org member may create (manage) their own, regardless of toggle/editors", () => {
+    expect(canManageOrgFeature(member, orgA, "skills")).toBe(true);   // enabled=false in orgA
+    expect(canManageOrgFeature(member, orgA, "workPlans")).toBe(true); // enabled=true in orgA
+  });
+
+  it("the item owner or the org owner may edit — but not listed editors", () => {
+    expect(canEditItem(item, owner, orgA, ownerOrgId, "skills")).toBe(true);   // owns the item
+    expect(canEditItem(item, admin, orgA, ownerOrgId, "skills")).toBe(true);   // org owner admin override
+    expect(canEditItem(item, member, orgA, ownerOrgId, "workPlans")).toBe(false); // plain non-owner member cannot
+    // a user merely listed as an editor cannot edit another member's item
+    const orgWithSkillEditor = {
+      ...orgA,
+      shareSettings: { ...orgA.shareSettings!, skills: { enabled: true, editors: ["u-editor"] } },
+    };
+    expect(canEditItem(item, editor, orgWithSkillEditor as any, ownerOrgId, "skills")).toBe(false);
+  });
+
+  it("visibility follows the toggle only — no owner/editor override", () => {
+    // workPlans enabled=true → member sees; skills enabled=false → member does not
+    expect(isFeatureEffectivelyEnabled(member, orgA, "workPlans")).toBe(true);
+    expect(isFeatureEffectivelyEnabled(member, orgA, "skills")).toBe(false);
+    // admin/editor get no override for member-owned features when sharing is off
+    expect(isFeatureEffectivelyEnabled(admin, orgA, "skills")).toBe(false);
+    expect(canViewItem(item, admin, orgA, ownerOrgId, "skills")).toBe(false);
   });
 });
 
@@ -114,6 +157,9 @@ describe("canEditItem", () => {
   it("org admin always edits", () => {
     expect(canEditItem(item, admin, orgA, ownerOrgId, "knowledgeBase")).toBe(true);
     expect(canEditItem(item, admin, orgA, ownerOrgId, "brandGuidelines")).toBe(true);
+  });
+  it("canonical org owner edits even when user orgRole is stale", () => {
+    expect(canEditItem(item, staleAdmin, orgA, ownerOrgId, "landingPages")).toBe(true);
   });
   it("toggleable feature: editor allowed regardless of enabled toggle", () => {
     expect(canEditItem(item, editor, orgA, ownerOrgId, "htmlTemplates")).toBe(true);

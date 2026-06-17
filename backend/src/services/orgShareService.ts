@@ -14,6 +14,16 @@ const ALWAYS_ON: ReadonlySet<Feature> = new Set<Feature>(["brandGuidelines", "ma
 
 export function isAlwaysOnFeature(f: Feature): boolean { return ALWAYS_ON.has(f); }
 
+// Member-owned features: every org member may create their own items, and only
+// the item owner may edit or delete them — there is no editor-delegation. The
+// `enabled` toggle still governs visibility: when on, members' items fan out to
+// the whole org; when off, each member only sees their own. This makes
+// skills/workPlans behave as "personal items, optionally shared org-wide"
+// rather than "org-managed items gated to an editor list".
+const MEMBER_OWNED: ReadonlySet<Feature> = new Set<Feature>(["skills", "workPlans"]);
+
+export function isMemberOwnedFeature(f: Feature): boolean { return MEMBER_OWNED.has(f); }
+
 // Single source of truth for per-feature share defaults. Used both as the
 // runtime fallback when an org's shareSettings (or a specific feature key) is
 // absent, and to initialize shareSettings on org creation. `skills` and
@@ -88,6 +98,7 @@ function enabledForMembers(org: OrgLike | null, f: Feature): boolean {
 
 function isEditorOrAdmin(user: UserLike, org: OrgLike | null, feature: Feature): boolean {
   if (!user.orgId || !org) return false;
+  if (org.ownerUserId === user.userId) return true;
   if (user.orgRole === "owner") return true;
   const cfg = configFor(org, feature);
   return Array.isArray(cfg?.editors) && cfg!.editors.includes(user.userId);
@@ -100,6 +111,9 @@ export function canViewItem(
   if (!user.orgId || !org || !ownerOrgId) return false;
   if (ownerOrgId !== user.orgId) return false;
   if (isAlwaysOnFeature(feature)) return true;
+  // Member-owned features: visibility is purely the `enabled` toggle. When off,
+  // every member (owner included) sees only their own items.
+  if (isMemberOwnedFeature(feature)) return enabledForMembers(org, feature);
   if (isEditorOrAdmin(user, org, feature)) return true;       // editors/admin always see
   return enabledForMembers(org, feature);                      // plain members: when shared (explicit or default)
 }
@@ -110,6 +124,9 @@ export function canEditItem(
   if (item.userId && item.userId === user.userId) return true;
   if (!user.orgId || !org || !ownerOrgId) return false;
   if (ownerOrgId !== user.orgId) return false;
+  // Member-owned features (skills/workPlans): edited by the item owner (handled
+  // above) or the org owner as an admin override — but NOT listed editors.
+  if (isMemberOwnedFeature(feature)) return user.orgRole === "owner";
   return isEditorOrAdmin(user, org, feature);
 }
 
@@ -119,6 +136,9 @@ export function canEditItem(
 // - Everyone else → denied.
 export function canManageOrgFeature(user: UserLike, org: OrgLike | null, feature: Feature): boolean {
   if (!user.orgId) return true;
+  // Member-owned features (skills/workPlans): every org member may create their
+  // own items. Sharing/visibility is governed separately by the `enabled` toggle.
+  if (isMemberOwnedFeature(feature)) return true;
   if (!org) return false;
   return isEditorOrAdmin(user, org, feature);
 }
@@ -134,6 +154,9 @@ export function isFeatureEffectivelyEnabled(
 ): boolean {
   if (!org) return false;
   if (isAlwaysOnFeature(feature)) return true;
+  // Member-owned features: fanout is governed purely by the `enabled` toggle —
+  // no owner/editor override, so when off each member sees only their own items.
+  if (isMemberOwnedFeature(feature)) return enabledForMembers(org, feature);
   if (isEditorOrAdmin(user, org, feature)) return true;
   return enabledForMembers(org, feature);
 }

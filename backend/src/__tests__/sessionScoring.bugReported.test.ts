@@ -104,6 +104,26 @@ describe('SessionScoring - bug reported during session', () => {
     expect(DEFAULT_SCORING_SYSTEM_PROMPT).toContain('repeatedly refuses to produce ANY usable output');
   });
 
+  // Draft/reply direction clause: sender/recipient confusion is an intent failure
+
+  it('DEFAULT_SCORING_SYSTEM_PROMPT includes a draft/reply direction clause', () => {
+    expect(DEFAULT_SCORING_SYSTEM_PROMPT).toContain('Draft/reply direction');
+  });
+
+  it('DEFAULT_SCORING_SYSTEM_PROMPT treats reversed sender and recipient as goal-completion failure', () => {
+    expect(DEFAULT_SCORING_SYSTEM_PROMPT).toContain('drafting in the opposite direction is a goal-completion failure');
+  });
+
+  it('DEFAULT_SCORING_SYSTEM_PROMPT does not penalize one sender/recipient clarification', () => {
+    expect(DEFAULT_SCORING_SYSTEM_PROMPT).toContain('FROM X TO Y - correct?');
+    expect(DEFAULT_SCORING_SYSTEM_PROMPT).toContain('should not be penalized as excessive clarification');
+  });
+
+  it('DEFAULT_SCORING_SYSTEM_PROMPT does not infer drafting from pasted third-party text alone', () => {
+    expect(DEFAULT_SCORING_SYSTEM_PROMPT).toContain('Do not infer a draft/reply task from a bare pasted third-party message');
+    expect(DEFAULT_SCORING_SYSTEM_PROMPT).toContain('Do not score that as reversed sender/recipient direction');
+  });
+
   // SUCCESS: verify the tool call appears in the serialized conversation and prompt passes through
 
   it('serialized conversation text includes report_product_issues in called tools line', async () => {

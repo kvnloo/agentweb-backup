@@ -1,3 +1,201 @@
+## Landing-page builder reliability — telemetry-driven hardening of the GitHub commit path (2026-06-13)
+
+Scanned `AW-LandingPages` (prod) to ground "the builder is unreliable" in data rather than one anecdote.
+
+### What the telemetry says
+- **110 pages, 26 failed = 23.6% failure rate.**
+- Failure modes (clustered by errorMessage):
+  - **15 "fetch failed"** (58% of all failures) — a Node transient network error to an upstream (v0 / GitHub / Vercel) that was NOT retried.
+  - **6 × v0 HTTP 500** — v0 outage symptom.
+  - **2 × 422, 2 × 409** — GitHub ref-update conflicts (non-fast-forward).
+  - 1 stuck `generating` (the orphan/timeout-lie class — addressed separately by the durable-execution work).
+
+### Root cause of the dominant failures
+`withRetry` already covers `fetch failed`/5xx/429/ECONNRESET, and the **v0 calls** and the **first-page repo creation** (`createGitHubRepoAndPush`, ~line 1700) ARE wrapped. But the **sub-page commit path in `addPageToExistingRepo`** was **bare axios with no retry** — five sequential GitHub calls (get-ref → blobs → tree → commit → patch-ref). A transient blip on any one failed the whole build as "fetch failed". That path is exactly where the 15 "fetch failed" came from.
+
+Plus a **race**: the ref-update `patch` used a parent SHA read ~40 lines earlier. If another commit landed on `main` in between — which happens when two pages generate into the **same repo concurrently** — GitHub returns 422 "not a fast forward" (the 422/409s). **Unified multi-site makes this worse**, because it routes more pages into one repo.
+
+### The fix
+New `commitFilesToRepoMain(repoFullName, ghHeaders, files, message, maxAttempts=4)` wraps the commit sequence with retry + **rebase**: every attempt re-reads the current `main` SHA and bases the new commit on it, so a concurrent commit is rebased onto rather than rejected. `isRetryableGithubPushError` decides retry: non-fast-forward 422 / 409 (race) and transient 5xx/429/408/`fetch failed`/ECONNRESET/timeout → retry with backoff; 404/auth/validation → fail fast. `addPageToExistingRepo` now calls it instead of the inline axios sequence.
+
+This kills the dominant "fetch failed" class AND the concurrent-commit race in one move. Flag-independent — strictly more resilient, applies to `main` today. Branch `harsha/harden-landing-commit-retry`.
+
+### Duplicate/unnecessary builds — does retrying make it worse? (the right question)
+Telemetry says duplicate building ALREADY happens, independent of any retry: **18/110 orphaned failed records** (started, produced nothing), **11 `(repo,slug)` pairs built >1× (some 3×)**, **7 retry storms** (same user+page <10min apart). Source: users/Emma re-asking + orphaned/detached builds (the durable-reconnect work targets that class).
+
+The naive commit-retry would have ADDED a vector: if `patch-ref` succeeds on GitHub but the response is lost ("fetch failed" on the reply), a blind retry re-commits → a 2nd commit + 2nd Vercel build for the same page. Fixed with **idempotency**: `commitFilesToRepoMain` tracks the commit it tried to set and, on any failure, re-reads `main` — if it's already at our commit, the patch landed (lost response) → return success, never re-commit. A non-fast-forward 422 (patch rejected, main NOT at our commit) correctly falls through to rebase+retry. So retries can rebase and recover transient failures but can never double-build.
+
+### Route-level idempotency — kills the 11 duplicate builds at the source (DONE)
+A multi-agent audit + a fresh telemetry pass established the key fact: **all 11 duplicate `(repo,slug)` routes came from DIFFERENT chat sessions re-asking the same route** — not concurrency, not the same session. So the right key is **route identity (userId, slug)**, not a session lock or a serial writer. `generateLandingPage` now calls `findReusablePageForRoute(userId, slug)` in the existing-site branch: if a non-archived page at that slug is already `deployed`/`generating`/`deploying`, it's returned (reuse) instead of building a duplicate. Explicitly NOT `failed` (a retry after a failure must rebuild); legitimate refreshes go through the dedicated iterate endpoint. ~15 lines, no lock — the lightweight "idempotent entry" the design research endorsed as the simplest first step.
+
+### Design direction (research, separate doc) — platform-native, net-removes complexity
+Research (Webflow/Framer/Vercel/v0 + canonical patterns) concluded the simplest *target* is "repo is the source of truth, content-addressed, read live state": Vercel already returns the existing deployment for an already-seen commit SHA and cancels superseded builds (`autoJobCancellation`), so the duplicate/race/orphan problems are best solved by leaning on that + a `generationKey` idempotency on the v0 call, which would let us DELETE the orphan-sweep + redeploy poller + scattered guards rather than add more. The route-dedup above is the first, direction-agnostic step toward it.
+
+### Still open (audit-confirmed, safe, next)
+- **Vercel calls are bare axios** (createVercelProject/triggerVercelDeployment/poll/status) — wrap in `withRetry` (extend the classifier for axios `err.response.status`), the same gap as the GitHub commit path. High value (the 6 v0-500 + transient deploy failures).
+- **First-page push** (`createGitHubRepoAndPush` blob/tree/commit/ref-patch) is still bare — route it through `commitFilesToRepoMain`.
+- `generateFirstPage` put + `cleanupOrphanedFailedPages` could use conditional writes (compare-and-swap) to close the first-page concurrency race.
+- v0 HTTP 500s (6) are retried by `withRetry` but a sustained v0 outage still surfaces; consider a longer/again-later retry or a user-facing "v0 is down, try again" rather than a hard fail.
+- Vercel deploy 422 (1) — check `createVercelProject` / `triggerVercelDeployment` retry coverage next.
+
+## Loop Slack egress gated to prod — fixes "Emma Dev yaps" class (2026-06-13)
+
+Root cause of the duplicate "Emma Dev" AI-readiness DMs: ≥2 stale test-env backends had AI_READINESS_LOOP_ENABLED=true set per-instance (not in the shared secret — verified: the shared `agentweb/test-env/backend-env` secret sets the emma_dev Slack token but NO loop flags), and the loop's Slack post was gated only by that per-loop flag. So any dev box with the flag flipped could DM the founder via the shared emma_dev bot. Only ai-readiness yapped because only that one flag was ever turned on in dev.
+
+### Fix (this PR) — best-practice, defense-in-depth
+`shouldSuppressLoopSlackPost(env)` in `loops/adapters/awsAdapters.ts`, applied at the single Slack egress (`SlackPort.postMessage`) every loop uses (digest, attribution, dispatcher). Non-prod (`NODE_ENV !== 'production'`) suppresses the post and logs instead; overridable with `LOOP_SLACK_ALLOW_NONPROD=true` for intentional dev-channel testing. The per-loop enable flag controls behavior; this controls blast radius — they're separate concerns. emma_dev stays usable for everything else; only loop DMs are gated.
+
+### Note
+This prevents recurrence but does NOT stop already-running stale backends (their process is up). Those were stopped separately (see below / ops action 2026-06-13). The durable systemic fix beyond this is a TTL reaper on test-env instances (the real enabler was boxes living Feb→June) — filed as follow-up.
+
+### Assumptions to validate
+- After deploy, the prod readiness loop still DMs (NODE_ENV=production on prod EB → not suppressed). Falsified if prod stops posting — would mean prod env isn't NODE_ENV=production (it is, verified).
+- No other legit non-prod loop posting relied on the old behavior. If a dev/staging channel digest was wanted, set LOOP_SLACK_ALLOW_NONPROD=true there.
+
+## AgentMode B2 — session-generation claim made atomic (no double-proceed race) (2026-06-14)
+
+WS-B / B2 reliability increment. The `/generate` and the interactive-share `/generate`
+endpoints in `controllers/agentModeController.ts` each rejected concurrent requests for the
+same session via a hand-rolled `activeSessionGenerations.has(sessionId)` check followed by a
+separate `.add(sessionId)`. The two statements were duplicated at both call sites (re-grepped:
+the regular path was ~line 2185, the interactive-share path ~line 2980 on `harsha/swarm` at
+`187a06a9`).
+
+**Assumption validated:** the pair is race-free *today* only because nothing `await`s between
+the `has` and the `add` (Node's single thread won't interleave synchronous code). The fragility
+the spec names is structural — any future edit inserting an `await` between check and set
+(easy to do, since the two statements look independent and are separated by other request
+setup) re-opens a window where two near-simultaneous `/generate` calls both pass the check and
+both proceed, corrupting the single-flight guarantee.
+
+**Fix (behavior-preserving):** co-located check-and-set into one indivisible primitive,
+`tryClaimSessionGeneration(sessionId): boolean` (returns `true` for the winner, `false` for a
+busy session), plus a symmetric idempotent `releaseSessionGeneration(sessionId)`. Both call
+sites now call the primitive; an `await` can no longer be wedged between the check and the set,
+so the claim is atomic by construction. Single-request path is unchanged (same 409 SESSION_BUSY
+body, same lock lifecycle). No new tables/flags/branches; net moving parts ~flat (one helper
+pair added, two duplicated 2-statement blocks collapsed to one call each).
+
+**Tests:** `agentModeController.atomicClaim.test.ts` (5 cases) pins the contract — two
+back-to-back synchronous claims on one sessionId yield exactly one `true` + one `false`;
+cross-session independence; release-then-reclaim; idempotent release. Existing
+`agentModeController.concurrentRequests.test.ts` (6) + `errorHandling.test.ts` (24) +
+`delegatedCrmAccess.test.ts` (3) stay green unchanged → behavior preserved. `npx tsc` clean.
+
+---
+
+## AgentMode B3 review fix — trim WeakMap memo DROPPED after splice-path staleness found (2026-06-14)
+
+Independent review of PR #1878 found the B3 WeakMap memo unsafe — and it failed on exactly the assumption flagged below in "Assumptions to validate (a)": the append-only invariant does **not** hold. `updateConversationContext()` (agentModeService.ts ~:3411-3434) runs on the same `messages` array reference inside the loop (called ~:2547, before the trim call ~:2603) whenever the agent installs skills. Its install_skills path does `messages.splice(idx, 1)` (remove the prior skill-context message wherever it sits) then `messages.splice(1, 0, …)` (reinsert near the top) — a remove-then-reinsert that is **net-zero in length** but shifts every absolute index between the two positions. The memo's `cached.length <= messages.length` guard sees no growth, walks an empty tail, and serves STALE absolute indices (`toolIndices` / `toolIdToIndex`) against the shifted array → wrong `preserveSet` / `oldAssistantIndices` → trimmed output DIVERGES from the original algorithm. Not behavior-preserving; AC-breaking.
+
+**Fix:** removed the WeakMap memo entirely. Kept the `tool_call_id → index` Map — that alone kills the originally-reported per-call nested O(n²) scan (O(1) lookups) and is fully behavior-preserving on every path including splice/reorder, because the scan is recomputed against the live array each call and can never go stale. Net effect: fewer lines and less per-instance state than the merged PR, no correctness caveat.
+
+**Proof:** added a `splice/reorder safety` describe block to `agentModeService.trimToolContext.test.ts` with two cases (net-zero reorder that shifts the preserved tail + a length-changing reorder), each mutating the SAME array ref and asserting deep-equality against the golden oracle on the post-splice array. Both FAIL against the memo'd version (verified by reverting the service file) and PASS with the memo removed. Existing golden-oracle characterization + sub-quadratic perf tests retained and still pass (32/32 across trim + publishFixes suites; `npx tsc` clean).
+
+**Lesson:** a length-only memo guard cannot detect an in-place reorder that preserves length. The "Assumptions to validate (a)" note below correctly predicted this; the safe move was to not ship the memo at all, since the Map already solves the reported defect.
+
+---
+
+## AgentMode B3 — `trimToolMessagesForContext` made incremental, killing per-iteration O(n²) reprocessing (2026-06-14)
+
+`AgentModeService.trimToolMessagesForContext()` (agentModeService.ts ~:16612) is called once **per loop iteration** from the main agent loop (`while (iteration < maxIterations)` at :2501, call site :2603) on the full, monotonically-growing `messages` array. Old shape was O(n²) *per call*: the `oldAssistantIndices` pass ran a nested forward scan (for each assistant-with-tool_calls, scan all following messages looking for a preserved tool result). Across an N-iteration session that's O(N²)+ total reprocessing of the same history.
+
+**Fix (behavior-preserving, internal only):**
+1. Replaced the per-assistant nested forward scan with a single `tool_call_id → tool-message-index` map built in one linear pass, so the "is this assistant old?" predicate is O(1) lookups instead of an O(n) scan. A single call drops from O(n²) to O(n).
+2. Added a per-instance `WeakMap<messagesArray, {length, toolIndices, toolIdToIndex}>` memo. The agent loop only ever **appends** to `messages` (verified: the sole in-loop mutation is `messages.push` at :3181 — no splice/shift/reorder), so on repeat calls with the same array reference the scan only walks the appended tail. Amortized per-call cost is O(tail); a full session is O(n) total. The memo is validated by `cached.length <= messages.length`; any reference/shrink mismatch falls back to a full O(n) rebuild, so a stale memo can never corrupt output.
+
+**Exact predicate preserved:** the original flips `allOld=false` only when a resolving tool result exists at an index `> i` AND is in `preserveSet`. The map stores the first tool index per `tool_call_id` (ids are unique by construction), and the new check is `resolvedIdx !== undefined && resolvedIdx > i && preserveSet.has(resolvedIdx)` — identical semantics.
+
+**Proof:** new characterization test `agentModeService.trimToolContext.test.ts` carries a golden reference that replicates the original nested-loop algorithm and asserts deep-equality of production output on a long synthetic session AND across the real incremental (append-per-turn, same array ref) calling pattern. Validated TDD-style by stashing the fix: against the ORIGINAL code the 4 characterization tests pass (golden == original) and the 2 sub-quadratic tests fail (4×-session work ratio 14.1× ≈ quadratic; incremental case 15,750 `role` reads). With the fix all 6 pass (ratio < 6, linear). Existing 24 `publishFixes` trim tests unaffected.
+
+**Assumptions to validate:** (a) the in-loop append-only invariant holds for all code paths feeding this method — if a future change ever reorders/removes earlier messages on the same array reference *without* shrinking length, the memo could go stale; the `length`-only guard would not catch that. Mitigation if that ever happens: also stamp a cheap head-identity check. Today no such path exists. (b) `chatbotService.ts` has its own standalone copy of `trimToolMessagesForContext` (:3702) — NOT touched here; same optimization could be applied there in a follow-up.
+
+---
+
+## B5 — Dedupe/rate-limit context-limit oncall alerts (stop flooding) (2026-06-14)
+
+The context-limit error path in `controllers/agentModeController.ts` fires `sendAgentModeOncallAlert` (`utils/agentModeAlerts.ts`) on **every** occurrence. Two sites hit it: the regular `/generate` path (re-grepped to ~line 2453) and the shared/interactive-response path (~line 3111). On a high-concurrency day, one user repeatedly retrying a too-long session would generate one oncall email **per request** — pure noise.
+
+**Notion side was already deduped**: `autoReportContextLimitToNotion` sets a per-session `contextLimitReported` flag and skips if set, so Notion only ever files one issue per session. The flood risk was the **oncall email**, which had no dedupe at all.
+
+**Fix (contained, behavior-preserving):** added an opt-in `dedupeKey` + `dedupeWindowMs` (+ injectable `now` for tests) to `sendAgentModeOncallAlert`. When `dedupeKey` is set, an in-memory `Map<key, lastAlertTs>` suppresses repeat alerts inside the window (default 10 min); the map is lazily pruned past 1000 entries. When `dedupeKey` is absent, behavior is unchanged — every call fires (all other ~14 call sites untouched). The two context-limit sites now pass `context_limit:<userId|sessionId>` and `context_limit_shared:<userId|shareId>` respectively (distinct error classes key independently).
+
+**Assumptions to validate:**
+- In-memory dedupe is per-process. With multiple backend workers, the worst case is ~1 alert per worker per window (still a >N× reduction from per-occurrence). A shared store (Dynamo/Redis) would make it global but adds a moving part — deferred unless per-worker volume is still noisy in prod.
+- 10-min default window chosen to match a typical retry-storm; tune via `dedupeWindowMs` if oncall still sees clusters.
+- The user-facing 413 `CONTEXT_LIMIT_EXCEEDED` response is unchanged — dedupe only gates the alert email, never the HTTP response (existing `errorHandling` test 1026 still passes).
+
+---
+
+## Layer 4→5 closed: real Slack-reaction approval gate that stamps shippedAt (INCREMENT C1, 2026-06-14)
+
+The dev.md-named #1 learning-loop gap (2026-06-09): production `ApprovalGate` is `CaptureGate` (`loops/core/gates/captureGate.ts`), whose `pollDecision()` ALWAYS returns `pending` → `shippedAt` is never stamped → the attribution cron (`loops/core/learning/attribution.ts:143`, filter `decision.status in {approved,auto_shipped}` AND `shippedAt` set AND `verdict==null`) has nothing to grade → every loop sits at `pending_approval` forever.
+
+**Shipped:** `loops/core/gates/slackReactionGate.ts` — `SlackReactionGate implements ApprovalGate`. `requestApproval` posts the proposal DM via the injected `SlackPort` and returns a handle (`{channel, ts, approver}`). `pollDecision` reads reactions and resolves via the pure `resolveReactionDecision(reactions, approver, now)`: ✅ `white_check_mark` from the approver → `approved`; ❌ `x` → `denied`; none → `pending`. **Reject wins over approve** when both present (safety). Reactions from non-approvers ignored (matches the `slack.aiEvalReaction` handler convention + `awsAdapters.getReactions`). `settleDecision(store, loopId, mutation, decision)` performs the Layer-5 write: approved → appends a record with `decision=approved` + `shippedAt` stamped (the exact shape attribution grades); denied → record `decision=denied`, NO `shippedAt`; pending → no-op. Idempotent per proposal (in-process `settled` set) so a repeated poll never double-ships.
+
+**Assumptions to validate (NOT yet wired into the live runner):**
+- This PR ships the capability + tests, NOT a prod flip. `CaptureGate` is still the registered `agentModeGate`. The gate is gated behind `AGENT_MODE_SLACK_REACTION_GATE` (default OFF) via `buildAgentModeSlackReactionGate()` in `instances/agent-mode/index.ts`, which builds-but-does-not-register.
+- **Why deferred:** `createInstanceRunner` (`loops/core/instanceRunner.ts:48`) types its held `gate` as `CaptureGate` and `drain()`s it each tick to batch the digest DM. Promoting `SlackReactionGate` into the runner means restructuring that drain path — a separate, larger change with its own behavior-preserving proof. Doing it here would change the digest-batching behavior, which is out of C1's contained scope.
+- C2 (attribution reaches a verdict) depends on this gate's `settleDecision` actually running in prod, which depends on the runner-wiring PR above. Until then `shippedAt` is stamped only in tests.
+- Reaction polling is single-shot per `pollDecision` call; no long-poll. The watchdog cron cadence determines how fast an approval is observed — confirm the cron actually calls `pollDecision`+`settleDecision` once wired.
+
+---
+
+## C2 — approval→attribution→verdict path verified end-to-end; found + fixed a `computeLoopHealth` stall (2026-06-14)
+
+Verified WS-C2 ("attribution reaches a verdict"): drove the real Layer-4→5 approval write (`recordLoopApproval`, the C1 gate contract — stamps `decision=approved` + `shippedAt`) → elapsed the settle window → ran the generic `runAttribution`. The grading path itself works: a verdict (`improved`/`regressed`) is computed and appended to the learning store, and the dedup is idempotent (a second pass writes nothing). New end-to-end mocked test: `backend/src/__tests__/loops.c2.approvalToVerdict.test.ts` (in-memory learning store + fake sensor, zero network).
+
+**But the loop never visibly came off `pending_approval`, which is the AC.** Root cause = the learning store is **append-only**: one logical proposal accumulates a `pending` row → an `approved`+`shippedAt` row (from `recordLoopApproval`) → a graded `verdict` row. `computeLoopHealth` (`loops/core/health.ts`) counted EVERY matching row, so:
+- the original `pending` row kept counting as `pendingApproval` even after the ✅ → state stuck at `pending_approval` forever; and
+- the pre-verdict `approved`+`shippedAt` row kept counting as `inFlight` even after grading → state stuck at `in_flight`, never reaching `learned`.
+
+`GET /api/admin/loops/health` reads with no status filter (`loopHealthService` → `queryHistory({loopId})`), and both `InMemoryLearningStore` and `DynamoLearningStore` return all rows — so this misreport is real in prod, not a test artifact.
+
+**Fix (behavior-preserving, pure):** in `computeLoopHealth`, de-dup by proposal/mutation id — count a `pending` row only if no later row has resolved that proposal (approved/auto_shipped/shipped/graded), and count an `in_flight` row only if no graded verdict exists for it. Each logical proposal is now summarized by its furthest-progressed row. All 22 existing `loops.health.test.ts` cases stay green (single-row states are unaffected — there's no later row to supersede them).
+
+**Assumptions to validate:**
+- The attribution **scheduling** wasn't exercised here (this drives `runAttribution` directly); `loopAttributionCron` already iterates manifests + skips paused loops (covered by `loops.attributionCron.test.ts`). The settle-window gating is `runAttribution`'s own logic.
+- C1 (the Slack-reaction `ApprovalGate` that calls `recordLoopApproval` on a ✅) is **not yet landed on `harsha/swarm`** — production gate is still `CaptureGate` (`pollDecision` always `pending`). This test builds against the documented C1 contract (the persistence primitive `recordLoopApproval` that produces `approved`+`shippedAt`). Once C1 lands, its gate must call that primitive for the health transition to fire in prod.
+- The health de-dup keys on `proposalId ?? mutationId`, matching attribution's own `recordKey`. If a future loop emits rows with neither id, those rows can't be de-duped (they fall back to counting as-is) — acceptable since every current emitter sets a proposal.
+
+---
+
+---
+
+## AgentMode B1 — worker-crash session-lock leak: already-released on crash, but session→request map leaked (2026-06-14)
+
+Investigated WS-B1 (worker crash holds `activeSessionGenerations` until `GENERATION_TIMEOUT_MS`). Re-grepped the current sites:
+- The session-generation lock is `activeSessionGenerations` (`controllers/agentModeController.ts:40`), claimed at `:2192`/`:2987`, released in a `finally` at `:2356`/`:3032`. `GENERATION_TIMEOUT_MS` = 600s (`:56`).
+- `generateSessionResponse` (`:1592`) `await`s `generateMarketingResponseWorkerService.runInWorker` (`:1819`). The worker is a forked child (`services/generateMarketingResponseWorkerService.ts`).
+
+**Finding (assumption corrected):** the literal "lock only releases after the timeout on crash" is NO LONGER true. The worker `error`/`exit` handlers (worker service `:201`/`:216`, added Feb 2026 in the "Improved Agent Mode Response Speed" change) already reject every in-flight `pendingRequests` entry on worker death. That rejection unwinds through `runInWorker` → `generateSessionResponse` → the controller's `try/finally`, which deletes the lock **immediately**. Pinned by `agentModeController.workerCrashLockRelease.test.ts` (simulated worker death → next `/generate` for the same session is accepted, no timer advanced) — passes on the pre-fix code.
+
+**Real remaining defect in the same region (this is what the fix addresses):** both crash handlers (and `shutdown`) reject + `clear()` `pendingRequests` but never clear `sessionToRequestId`. So after a crash a dead session's `requestId` lingers — a later `cancelSession()` for that session mis-fires a `{type:'cancel'}` at the *fresh* worker, and the map grows unbounded across crashes. Fixed by a single `failAllPendingRequests(error)` helper that rejects pending requests and clears BOTH maps; `error`/`exit`/`shutdown` now call it (dedupes three near-identical handler bodies → net-negative branches). Behavior-preserving: the rejection path and error messages are unchanged; only the stale-mapping/leak is closed. Repro test: `generateMarketingResponseWorkerService.test.ts` "clears the session→request mapping when the worker crashes" (failed pre-fix: stale cancel fired; passes post-fix).
+
+Assumptions to validate: (a) no caller depends on `sessionToRequestId` surviving a crash (verified: only `cancelSession` reads it, and post-crash there's nothing to cancel); (b) the controller path remains the sole lock owner (verified: lock lives only in the controller, worker service has no reference to it).
+
+
+---
+
+## B4 — SSE zombie progress: worker death now clears progressStore at the source (2026-06-14)
+
+WS-B4 fragility fix. `progressStore` (`utils/sseProgress.ts`) is an in-memory `Map<sessionId, ProgressUpdate>` that backs the agent-mode progress SSE stream. The frontend treats a stored entry whose `status` is not `complete`/`suggestions` as "still generating" (`hasActiveProgress`, controller). Cleanup was entirely the controller's job: every terminal path calls `markProgressComplete(sessionId)` (emit `complete` → `progressStore.delete`).
+
+**Re-grepped the spec's line refs (the monolith moves):** `progressStore` is set only in `emitProgress` (`sseProgress.ts:45`); deleted in `cleanupProgress`, `markProgressComplete` (controller ~1545), and inline at controller ~2213/2992/5695/5749. The generation worker is `generateMarketingResponseWorkerService` (fork child process); on `worker.on('error')`/`worker.on('exit')` it rejected all `pendingRequests` but did **nothing** to `progressStore`.
+
+**The gap:** progressStore cleanup depended on the *awaiting* controller path reaching a `markProgressComplete`. The detached fire-and-forget plan-start path (controller ~5693, `.then().catch()`, not awaited by any HTTP handler) and any future caller that doesn't wrap in that exact catch leak a stale entry forever when the worker dies mid-iteration → frontend streams "Thinking…" indefinitely even after reload. This is the charter's "crash of a turn must not orphan a stream" invariant.
+
+**Fix (behavior-preserving, additive on the crash path only):**
+- New leaf helper `clearTerminalProgress(sessionId)` in `sseProgress.ts` — the single definition of terminal cleanup: emit `complete` *iff* a live entry exists (so it never resurrects an already-cleaned entry), then delete. Active SSE connections are intentionally left registered so a reconnecting client still gets `complete`.
+- `generateMarketingResponseWorkerService` now calls `clearProgressForInFlightSessions()` (iterates `sessionToRequestId`, best-effort `clearTerminalProgress` per session) inside both the `error` and `exit` handlers, before clearing the maps. Also clears the previously-leaked `sessionToRequestId` map on death.
+
+No change to chat outputs, tool selection, prompts, or model defaults — only guaranteed reliability cleanup on worker death.
+
+**Assumptions to validate:**
+- `sessionToRequestId` holds exactly the sessions with in-flight worker requests at death time — confirmed: set in `runInWorker`, deleted on the matching `message` response. A session whose request already settled is not in the map, so we don't touch its (possibly post-run `suggestions`) progress.
+- Importing `sseProgress` (a zero-dependency leaf util) into the worker service introduces no import cycle — confirmed (`sseProgress.ts` imports nothing).
+- The controller's happy/cancel paths are unchanged (`markProgressComplete` left intact), so this is purely a second, source-level safety net for the crash case.
+
 ## "Emma Dev" Slack chirping — agent-mode reliability loop DM'd Harsha on EVERY run, killed (2026-06-14)
 
 **Symptom:** a recurring "Emma Dev" Slack DM chirp that only ever came from the **AI Reliability loop** (the agent-mode tool-reliability loop), arriving at seemingly **random** times with no obvious source.
@@ -5165,3 +5363,28 @@ While PR #1752 (above) was in review (NOT deployed), a live flood of "invitation
 ### Root-cause fix (added to PR #1752)
 
 `runLinkedInConnectionSync` now checks the `__fullsync__` marker (`getFullSyncCompletedAt`) BEFORE syncing each account. If absent, this run is the one-time full backfill — covering **both empty AND partial caches** (the partial-cache path is what actually flooded) — so it caches the connections silently and skips BOTH `notifyNewConnections` and `enrollNewConnections`. Keying off the fullsync marker (not the watermark) is essential: the flood account had a non-null watermark, so a watermark-based check would have missed it. Combined with the sender-gate fix, this list would have sent **zero** emails. Covered by `linkedInConnectionSync.initialBackfillNoNotify.test.ts` (includes a partial-cache case).
+
+## POSTMORTEM — transparent-logo handling during newsletter HTML editing (2026-06-15)
+
+Session `eadb9fda-d255-479f-b122-356ae36cbc50` (user Aquila). Task: header logo = 3-color brand mark on a purple gradient (#3F51B5→#6E49BF); footer logo = all-white mark on dark navy (#1a1a2e). Both needed a transparent background. The agent made four mistakes before the user manually supplied transparent PNGs.
+
+### Mistakes & root causes
+
+1. **Used `remove_c2pa_from_image` expecting transparency.** It only re-encodes to strip metadata (`imageService.removeC2PAMetadata` → Sharp `withMetadata:false`); it never touches pixels, so it cannot remove a background or create an alpha channel. The tool name/description implied more than it does.
+2. **Used `generate_image` to "redraw the logo on a transparent background".** No real background-removal capability existed, so the only fallback was regenerating the mark — which risks icon/letter/color drift and cannot guarantee true alpha.
+3. **Selector `p:contains(AQUILA):first` clobbered the wrong element.** "AQUILA BRIEFING" in the header appears first in DOM order, so a `:contains + :first` selector aimed at the *footer* wordmark hit the *header*. Required a corrective pass.
+4. **Placed a black wordmark on the dark purple header** (illegible). No fg/bg contrast validation existed.
+
+### What worked
+User supplied real transparent PNGs (3-color for header, all-white for footer). Swapping `img src` via `update_html_file` CSS `setAttribute` preserved brand fidelity exactly, scoping by container background: header `td[style*="linear-gradient"] img[alt="Aquila"]`, footer `td[style*="#1a1a2e"] img[alt="Aquila"]`.
+
+### Fixes (this branch)
+
+- **New `remove_image_background` tool** (`imageGeneration.ts:removeImageBackground` + `agentModeService.removeImageBackground`, registered in `emma/tools.ts`). Edge-seeded flood fill over the original raw RGBA pixels via Sharp: detects the background color from the corner median, clears alpha on contiguous border-connected pixels within a tolerance. Produces a **genuine transparent-alpha PNG without redrawing the mark** — enclosed regions (e.g. a counter inside a letter) are preserved because the fill only follows border-connected pixels. Verified end-to-end: a real Google-logo PNG → 70.5% transparent / 26.4% opaque, `channels:4 hasAlpha:true`, foreground colors intact.
+- **Optional `surface_color` contrast check.** Computes the WCAG contrast ratio between the logo's average opaque color and the target surface; warns below 3:1 (the "black logo on dark purple" failure). E2E run reported 4.39:1 against #1a1a2e for the colored Google mark → legible.
+- **Description fixes.** `remove_c2pa_from_image` now states it does NOT remove backgrounds and points to the new tool. `generate_image` now forbids "redraw on transparent background" and routes such requests to `remove_image_background` / an existing transparent PNG.
+- **Selector guidance.** `update_html_file` now instructs scoping by container/section background (not `:contains + :first`) when a brand word appears multiple times, with the header/footer examples above.
+- **Bonus bug fix.** `removeC2PAFromImage`/`removeImageBackground` filename normalization truncated extension-less names (`"logo"` → `".png"`) because `lastIndexOf('.') || length` is dead code (`-1` is truthy). Fixed both to `dotIndex > 0 ? substring(0, dotIndex) : name`.
+
+### Tests
+`imageGeneration.backgroundRemoval.test.ts` (real Sharp — proves alpha, interior-counter preservation, tolerance, corner-median, WCAG helpers), `agentModeService.removeImageBackground.test.ts` (orchestration, filename, contrast, error paths), `remove_image_background.registration.test.ts` (tool registry + updated descriptions). 107 image-related tests pass; `npx tsc` clean.

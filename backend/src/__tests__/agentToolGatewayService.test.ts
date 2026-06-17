@@ -223,6 +223,126 @@ describe('agentToolGatewayService', () => {
       expect(result.repairs).toEqual([]);
     });
 
+    describe('scalar coercion (number/boolean string repair)', () => {
+      // Mirrors the real read_tool_response / search_tool_response schemas, which
+      // were the #1 production failure cluster: the model emits numeric args as
+      // strings ("0", "8000") and the type validator hard-rejected them.
+      const readToolResponseSchema = {
+        type: 'object',
+        properties: {
+          s3_key: { type: 'string' },
+          char_offset: { type: 'number' },
+          char_length: { type: 'number' },
+        },
+        required: ['s3_key'],
+      };
+      const searchToolResponseSchema = {
+        type: 'object',
+        properties: {
+          s3_key: { type: 'string' },
+          query: { type: 'string' },
+          match_offset: { type: 'number' },
+          max_matches: { type: 'number' },
+          context_chars: { type: 'number' },
+        },
+        required: ['s3_key', 'query'],
+      };
+
+      it('coerces stringified numbers for read_tool_response (repro: real failure mode)', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'read_tool_response',
+          args: { s3_key: 'tool-responses/abc', char_offset: '0', char_length: '8000' },
+          inputSchema: readToolResponseSchema,
+          effect: 'read',
+        });
+
+        expect(result.status).toBe('repaired');
+        expect(result.args).toEqual({ s3_key: 'tool-responses/abc', char_offset: 0, char_length: 8000 });
+        expect(result.repairs).toEqual(
+          expect.arrayContaining(['char_offset:scalar_coerce', 'char_length:scalar_coerce']),
+        );
+      });
+
+      it('coerces stringified match_offset for search_tool_response (repro: real failure mode)', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'search_tool_response',
+          args: { s3_key: 'tool-responses/abc', query: 'link_url', match_offset: '20' },
+          inputSchema: searchToolResponseSchema,
+          effect: 'read',
+        });
+
+        expect(result.status).toBe('repaired');
+        expect(result.args).toEqual({ s3_key: 'tool-responses/abc', query: 'link_url', match_offset: 20 });
+        expect(result.repairs).toEqual(expect.arrayContaining(['match_offset:scalar_coerce']));
+      });
+
+      it('coerces decimal and signed numbers', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'read_tool_response',
+          args: { s3_key: 'k', char_offset: '-5', char_length: '12.5' },
+          inputSchema: readToolResponseSchema,
+          effect: 'read',
+        });
+        expect(result.status).toBe('repaired');
+        expect(result.args).toEqual({ s3_key: 'k', char_offset: -5, char_length: 12.5 });
+      });
+
+      it('coerces stringified booleans', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'some_tool',
+          args: { enabled: 'true', disabled: 'FALSE' },
+          inputSchema: {
+            type: 'object',
+            properties: { enabled: { type: 'boolean' }, disabled: { type: 'boolean' } },
+            required: [],
+          },
+          effect: 'read',
+        });
+        expect(result.status).toBe('repaired');
+        expect(result.args).toEqual({ enabled: true, disabled: false });
+      });
+
+      it('does NOT coerce when the schema also accepts string (behavior preserved)', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'some_tool',
+          args: { val: '42' },
+          inputSchema: {
+            type: 'object',
+            properties: { val: { type: ['string', 'number'] } },
+            required: [],
+          },
+          effect: 'read',
+        });
+        expect(result.status).toBe('valid');
+        expect(result.args).toEqual({ val: '42' });
+      });
+
+      it('leaves already-correct numbers unchanged (success path behavior-preserving)', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'read_tool_response',
+          args: { s3_key: 'k', char_offset: 0, char_length: 8000 },
+          inputSchema: readToolResponseSchema,
+          effect: 'read',
+        });
+        expect(result.status).toBe('valid');
+        expect(result.args).toEqual({ s3_key: 'k', char_offset: 0, char_length: 8000 });
+        expect(result.repairs).toEqual([]);
+      });
+
+      it('still rejects a non-numeric string as a type mismatch (no silent NaN)', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'read_tool_response',
+          args: { s3_key: 'k', char_offset: 'beginning' },
+          inputSchema: readToolResponseSchema,
+          effect: 'read',
+        });
+        expect(result.status).toBe('invalid');
+        if (result.status === 'invalid') {
+          expect(result.issues.map((i) => i.code)).toContain('type_mismatch');
+        }
+      });
+    });
+
     it('repairs low-risk url alias drift before execution', () => {
       const result = validateAndRepairToolArgs({
         toolName: 'read_file_content',
@@ -418,10 +538,13 @@ describe('agentToolGatewayService', () => {
 
       const result = validateAndRepairToolArgs({
         toolName: 'read_metrics',
+        // 'yes' is not a coercible boolean (only 'true'/'false' coerce), so it must
+        // still surface as a type mismatch. 2.5 is not a valid integer; Infinity is
+        // not a finite number.
         args: {
           count: 2.5,
           ratio: Number.POSITIVE_INFINITY,
-          enabled: 'true',
+          enabled: 'yes',
           tags: 'a',
           options: ['compact'],
           maybe: false,

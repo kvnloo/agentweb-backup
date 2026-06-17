@@ -7,6 +7,7 @@ import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService'
 import { agentModeService } from '../services/agentModeService';
 import { resendService } from '../services/resendService';
 import { dripSequenceDb } from '../services/dripSequenceDb';
+import { externalCrmSyncService } from '../services/externalCrmSyncService';
 
 // Mock dependencies
 jest.mock('../services/db', () => ({
@@ -23,6 +24,12 @@ jest.mock('../services/dripSequenceDb', () => ({
   dripSequenceDb: {
     getSequencesByAutoEnrollList: jest.fn(),
     bulkEnroll: jest.fn(),
+  },
+}));
+
+jest.mock('../services/externalCrmSyncService', () => ({
+  externalCrmSyncService: {
+    autoSyncLead: jest.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -87,6 +94,7 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
     });
     (dripSequenceDb.getSequencesByAutoEnrollList as jest.Mock).mockResolvedValue([]);
     (dripSequenceDb.bulkEnroll as jest.Mock).mockResolvedValue(undefined);
+    (externalCrmSyncService.autoSyncLead as jest.Mock).mockResolvedValue(undefined);
   });
 
   describe('POST /api/webhooks/forward-lead', () => {
@@ -983,6 +991,232 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
         const call = (crmDb.createLead as jest.Mock).mock.calls[0][1];
         expect(call.firstTouch).toBeUndefined();
         expect(call.lastTouch).toBeUndefined();
+      });
+
+      // Regression: the existing-lead MERGE path used to drop attribution
+      // entirely — lastTouch was DOA for any lead that came through the webhook
+      // more than once (firstTouch === lastTouch forever). The merge whitelist
+      // previously only carried standardFields + customFields.
+      describe('existing-lead merge path (lastTouch refresh)', () => {
+        const firstTouch = {
+          timestamp: '2026-04-19T10:00:00.000Z',
+          utm: { source: 'linkedin', medium: 'social', campaign: 'first' },
+        };
+
+        it('refreshes lastTouch on a repeat touch, preserves firstTouch + utm denorm', async () => {
+          (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+            leadId: 'lead_repeat',
+            listId: 'list_123',
+            email: 'repeat@example.com',
+            firstName: 'Repeat',
+            firstTouch,
+            lastTouch: firstTouch,
+            utmSource: 'linkedin',
+            utmMedium: 'social',
+            customFields: { source: 'api' },
+          });
+
+          const response = await request(app)
+            .post('/api/webhooks/forward-lead')
+            .send({
+              listId: 'list_123',
+              email: 'repeat@example.com',
+              attribution: {
+                timestamp: '2026-04-20T10:00:00.000Z',
+                utm: { source: 'google', medium: 'cpc', campaign: 'second' },
+              },
+            });
+
+          expect(response.status).toBe(200);
+          expect(response.body.event).toBe('lead.updated');
+
+          const updates = (crmDb.updateLead as jest.Mock).mock.calls.find(
+            (c) => c[1] === 'lead_repeat'
+          )?.[2];
+          expect(updates).toBeDefined();
+          // lastTouch ALWAYS refreshes to the new touch
+          expect(updates.lastTouch).toEqual(
+            expect.objectContaining({
+              utm: expect.objectContaining({ source: 'google', medium: 'cpc' }),
+            })
+          );
+          // firstTouch must NEVER be in the update payload (immutable)
+          expect(updates.firstTouch).toBeUndefined();
+          // utmSource/utmMedium are denormalized from firstTouch — never overwritten
+          // once present, so they must not be in the update payload here.
+          expect(updates.utmSource).toBeUndefined();
+          expect(updates.utmMedium).toBeUndefined();
+        });
+
+        it('backfills firstTouch + utm denorm when an existing lead has none', async () => {
+          (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+            leadId: 'lead_noattr',
+            listId: 'list_123',
+            email: 'noattr@example.com',
+            firstName: 'NoAttr',
+            customFields: { source: 'manual' },
+            // no firstTouch / lastTouch / utmSource / utmMedium
+          });
+
+          const response = await request(app)
+            .post('/api/webhooks/forward-lead')
+            .send({
+              listId: 'list_123',
+              email: 'noattr@example.com',
+              attribution: {
+                timestamp: '2026-04-20T10:00:00.000Z',
+                utm: { source: 'twitter', medium: 'social', campaign: 'late' },
+              },
+            });
+
+          expect(response.status).toBe(200);
+          expect(response.body.event).toBe('lead.updated');
+
+          const updates = (crmDb.updateLead as jest.Mock).mock.calls.find(
+            (c) => c[1] === 'lead_noattr'
+          )?.[2];
+          expect(updates).toBeDefined();
+          // firstTouch backfilled (was absent) — only-if-absent
+          expect(updates.firstTouch).toEqual(
+            expect.objectContaining({
+              utm: expect.objectContaining({ source: 'twitter' }),
+            })
+          );
+          // lastTouch set too
+          expect(updates.lastTouch).toEqual(
+            expect.objectContaining({
+              utm: expect.objectContaining({ source: 'twitter' }),
+            })
+          );
+          // utm denorm backfilled from the new firstTouch
+          expect(updates.utmSource).toBe('twitter');
+          expect(updates.utmMedium).toBe('social');
+        });
+
+        it('does not touch attribution fields when the repeat touch carries none', async () => {
+          (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+            leadId: 'lead_noinc',
+            listId: 'list_123',
+            email: 'noinc@example.com',
+            firstName: 'Old',
+            firstTouch,
+            lastTouch: firstTouch,
+            utmSource: 'linkedin',
+            utmMedium: 'social',
+            customFields: { source: 'api' },
+          });
+
+          const response = await request(app)
+            .post('/api/webhooks/forward-lead')
+            .send({
+              listId: 'list_123',
+              email: 'noinc@example.com',
+              firstName: 'New', // forces a change so updateLead is called
+            });
+
+          expect(response.status).toBe(200);
+          expect(response.body.event).toBe('lead.updated');
+
+          const updates = (crmDb.updateLead as jest.Mock).mock.calls.find(
+            (c) => c[1] === 'lead_noinc'
+          )?.[2];
+          expect(updates).toBeDefined();
+          expect(updates.firstName).toBe('New');
+          // No incoming attribution → no attribution keys in the update
+          expect(updates.firstTouch).toBeUndefined();
+          expect(updates.lastTouch).toBeUndefined();
+          expect(updates.utmSource).toBeUndefined();
+          expect(updates.utmMedium).toBeUndefined();
+        });
+      });
+    });
+
+    describe('Real-time external CRM sync (HubSpot / Attio)', () => {
+      const syncLeadList = {
+        listId: 'list_123',
+        userId: 'owner_123',
+        name: 'Test List',
+        publicAccessEnabled: true,
+        autoDraftEnabled: false,
+      };
+
+      beforeEach(() => {
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue(syncLeadList);
+        (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+      });
+
+      it('pushes a newly created lead to HubSpot and Attio with event "created"', async () => {
+        const createdLead = { leadId: 'lead_sync_new', listId: 'list_123', email: 'sync@example.com' };
+        (crmDb.createLead as jest.Mock).mockResolvedValue(createdLead);
+
+        const response = await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({ listId: 'list_123', email: 'sync@example.com' });
+
+        expect(response.status).toBe(201);
+        await flushAsyncWork();
+
+        expect(externalCrmSyncService.autoSyncLead).toHaveBeenCalledWith(
+          'owner_123', 'list_123', createdLead, 'hubspot', 'created'
+        );
+        expect(externalCrmSyncService.autoSyncLead).toHaveBeenCalledWith(
+          'owner_123', 'list_123', createdLead, 'attio', 'created'
+        );
+      });
+
+      it('pushes an updated existing lead with event "updated"', async () => {
+        (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+          leadId: 'lead_sync_existing',
+          listId: 'list_123',
+          email: 'existing@example.com',
+          firstName: '',
+        });
+
+        const response = await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({ listId: 'list_123', email: 'existing@example.com', firstName: 'Updated' });
+
+        expect(response.status).toBe(200);
+        await flushAsyncWork();
+
+        expect(externalCrmSyncService.autoSyncLead).toHaveBeenCalledWith(
+          'owner_123', 'list_123', expect.objectContaining({ leadId: 'lead_sync_existing' }), 'hubspot', 'updated'
+        );
+      });
+
+      it('does not sync when the lead exists with no changes (unchanged)', async () => {
+        (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+          leadId: 'lead_sync_same',
+          listId: 'list_123',
+          email: 'same@example.com',
+          firstName: 'Same',
+          customFields: { source: 'api' },
+        });
+
+        const response = await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({ listId: 'list_123', email: 'same@example.com', firstName: 'Same' });
+
+        expect(response.status).toBe(200);
+        expect(response.body.event).toBe('lead.unchanged');
+        await flushAsyncWork();
+
+        expect(externalCrmSyncService.autoSyncLead).not.toHaveBeenCalled();
+      });
+
+      it('does not fail the request when external CRM sync throws', async () => {
+        (crmDb.createLead as jest.Mock).mockResolvedValue({
+          leadId: 'lead_sync_err', listId: 'list_123', email: 'err@example.com',
+        });
+        (externalCrmSyncService.autoSyncLead as jest.Mock).mockRejectedValue(new Error('hubspot down'));
+
+        const response = await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({ listId: 'list_123', email: 'err@example.com' });
+
+        expect(response.status).toBe(201);
+        await flushAsyncWork();
+        expect(externalCrmSyncService.autoSyncLead).toHaveBeenCalled();
       });
     });
 

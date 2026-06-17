@@ -564,4 +564,160 @@ describe('apiTools', () => {
     });
   });
 
+  // ─── get_account_status ───────────────────────────────────────────────
+  //
+  // Behavioral contract (from Notion spec — agent must satisfy these):
+  //  - Tool name: get_account_status
+  //  - Input: {} (no args)
+  //  - Output: { email, subscription_plan, subscription_status,
+  //              current_period_end, allowed_features, api_key_count }
+  //  - Wraps GET /api/auth/me (plan/status) + GET /api/v1/agent/api-keys (count)
+  //  - Registered + exposed to external MCP clients.
+
+  describe('get_account_status', () => {
+    const meResponse = {
+      userId: 'user-123',
+      email: 'jane@acme.com',
+      subscriptionType: 'Pro',
+      subscription_status: 'active',
+      current_period_end: '2026-07-01T00:00:00Z',
+      allowedPages: ['chat', 'crm', 'reports'],
+      // Extra raw fields that must NOT leak into the curated output:
+      password: 'should-never-appear',
+      stripe_customer_id: 'cus_secret',
+    };
+
+    it('should register get_account_status and expose it to external MCP clients', () => {
+      const allNames = mcpToolRegistry.getToolNames();
+      expect(allNames).toContain('get_account_status');
+
+      const externalNames = mcpToolRegistry.getToolDefinitions().map((d: any) => d.name);
+      expect(externalNames).toContain('get_account_status');
+    });
+
+    it('should declare a no-arg input schema (object with no required fields)', () => {
+      const def = mcpToolRegistry.getToolDefinitions().find((d: any) => d.name === 'get_account_status');
+      expect(def).toBeDefined();
+      expect(def!.inputSchema.type).toBe('object');
+      expect(def!.inputSchema.required ?? []).toEqual([]);
+    });
+
+    it('should call GET /api/auth/me and GET /api/v1/agent/api-keys with the caller context', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        if (opts.path === '/api/auth/me') return meResponse;
+        if (opts.path === '/api/v1/agent/api-keys') return { keys: [{ keyId: 'k1' }, { keyId: 'k2' }] };
+        throw new Error(`Unexpected path: ${opts.path}`);
+      });
+
+      await mcpToolRegistry.execute('get_account_status', {}, context);
+
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+        method: 'GET',
+        path: '/api/auth/me',
+        context: { userId: 'user-123', agentUserId: 'user-123' },
+      }));
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+        method: 'GET',
+        path: '/api/v1/agent/api-keys',
+        context: { userId: 'user-123', agentUserId: 'user-123' },
+      }));
+    });
+
+    it('should return exactly the curated output shape (mapping subscriptionType→plan, allowedPages→features, key count)', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        if (opts.path === '/api/auth/me') return meResponse;
+        if (opts.path === '/api/v1/agent/api-keys') return { keys: [{ keyId: 'k1' }, { keyId: 'k2' }, { keyId: 'k3' }] };
+        throw new Error(`Unexpected path: ${opts.path}`);
+      });
+
+      const result = await mcpToolRegistry.execute('get_account_status', {}, context);
+      const parsed = JSON.parse((result as any).content[0].text);
+
+      expect(parsed).toEqual({
+        email: 'jane@acme.com',
+        subscription_plan: 'Pro',
+        subscription_status: 'active',
+        current_period_end: '2026-07-01T00:00:00Z',
+        allowed_features: ['chat', 'crm', 'reports'],
+        api_key_count: 3,
+      });
+    });
+
+    it('should never leak sensitive raw fields (password, stripe_customer_id) into the output', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        if (opts.path === '/api/auth/me') return meResponse;
+        if (opts.path === '/api/v1/agent/api-keys') return { keys: [] };
+        throw new Error(`Unexpected path: ${opts.path}`);
+      });
+
+      const result = await mcpToolRegistry.execute('get_account_status', {}, context);
+      const text = (result as any).content[0].text;
+
+      expect(text).not.toContain('password');
+      expect(text).not.toContain('should-never-appear');
+      expect(text).not.toContain('stripe_customer_id');
+      expect(text).not.toContain('cus_secret');
+    });
+
+    it('should default missing plan/status fields to safe values and zero api keys', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        // Free user with no Stripe subscription and no allowedPages resolved.
+        if (opts.path === '/api/auth/me') return { email: 'free@acme.com' };
+        if (opts.path === '/api/v1/agent/api-keys') return { keys: [] };
+        throw new Error(`Unexpected path: ${opts.path}`);
+      });
+
+      const result = await mcpToolRegistry.execute('get_account_status', {}, context);
+      const parsed = JSON.parse((result as any).content[0].text);
+
+      expect(parsed).toEqual({
+        email: 'free@acme.com',
+        subscription_plan: 'Free',
+        subscription_status: 'inactive',
+        current_period_end: null,
+        allowed_features: [],
+        api_key_count: 0,
+      });
+    });
+
+    it('should treat a missing/non-array keys payload as zero api keys', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        if (opts.path === '/api/auth/me') return meResponse;
+        if (opts.path === '/api/v1/agent/api-keys') return {}; // no keys field
+        throw new Error(`Unexpected path: ${opts.path}`);
+      });
+
+      const result = await mcpToolRegistry.execute('get_account_status', {}, context);
+      const parsed = JSON.parse((result as any).content[0].text);
+
+      expect(parsed.api_key_count).toBe(0);
+    });
+
+    it('should still report account status even if the api-keys call fails (count falls back to 0)', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        if (opts.path === '/api/auth/me') return meResponse;
+        if (opts.path === '/api/v1/agent/api-keys') throw new Error('API error (500): keys unavailable');
+        throw new Error(`Unexpected path: ${opts.path}`);
+      });
+
+      const result = await mcpToolRegistry.execute('get_account_status', {}, context);
+      const parsed = JSON.parse((result as any).content[0].text);
+
+      expect(parsed.email).toBe('jane@acme.com');
+      expect(parsed.subscription_plan).toBe('Pro');
+      expect(parsed.api_key_count).toBe(0);
+    });
+
+    it('should propagate an auth error from the /me call (cannot resolve account)', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        if (opts.path === '/api/auth/me') throw new Error('API error (401): Unauthorized');
+        return { keys: [] };
+      });
+
+      await expect(
+        mcpToolRegistry.execute('get_account_status', {}, context)
+      ).rejects.toThrow('API error (401): Unauthorized');
+    });
+  });
+
 });

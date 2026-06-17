@@ -499,6 +499,26 @@ async function getV0Client() {
  * - If user ALREADY has a deployed landing page → add a new page route to the EXISTING
  *   GitHub repo via the GitHub Contents API. No v0 call, no new repo. Vercel auto-redeploys.
  */
+/**
+ * Find a page at the SAME route (slug) that is already live or being built, so a
+ * repeated "build the X page" reuses it instead of producing a duplicate. Matches
+ * non-archived pages (listLandingPages already excludes archived) on their effective
+ * slug, in a deployed/in-flight status — explicitly NOT `failed`, because a retry
+ * after a failed build must be allowed to rebuild. Legitimate content refreshes of
+ * an already-deployed page go through the dedicated iterate endpoint, not here.
+ */
+export async function findReusablePageForRoute(
+  userId: string,
+  slug: string
+): Promise<GeneratedLandingPage | null> {
+  const pages = await listLandingPages(userId);
+  const REUSE_STATUSES = ["deployed", "generating", "deploying"];
+  const match = pages.find(
+    (p) => (p.slug || buildPageSlug(p.name)) === slug && REUSE_STATUSES.includes(p.status)
+  );
+  return match || null;
+}
+
 export type LandingSiteMode = "unified" | "separate";
 
 /**
@@ -547,6 +567,35 @@ export interface GenerateLandingPageOptions {
   originatingSessionId?: string;
 }
 
+/**
+ * Add a page to an existing site. Picks the engine: with CODING_AGENT_SUBPAGES on,
+ * the coding agent writes the page into the repo (no v0 call — cheaper, matches the
+ * existing design); off, the v0 path (addPageToExistingRepo) is used unchanged.
+ * The coding-agent module is loaded via a dynamic import to break the
+ * v0Service <-> codingAgentService import cycle.
+ */
+async function addSubPage(
+  site: GeneratedLandingPage,
+  userId: string,
+  prompt: string,
+  name: string,
+  brandContext: BrandContext,
+  leadListId?: string,
+  templateHtml?: string,
+  originatingSessionId?: string
+): Promise<GeneratedLandingPage> {
+  if (process.env.CODING_AGENT_SUBPAGES === "true") {
+    const { addPageViaCodingAgent } = await import("./codingAgentSubpageService");
+    return addPageViaCodingAgent(site, userId, prompt, name, brandContext, {
+      leadListId,
+      originatingSessionId,
+    });
+  }
+  return addPageToExistingRepo(
+    site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
+  );
+}
+
 export async function generateLandingPage(
   userId: string,
   prompt: string,
@@ -565,7 +614,7 @@ export async function generateLandingPage(
     if (opts?.siteId) {
       const site = await findSiteById(opts.siteId, userId);
       if (site?.githubRepoUrl) {
-        return addPageToExistingRepo(
+        return addSubPage(
           site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
         );
       }
@@ -585,7 +634,7 @@ export async function generateLandingPage(
     //    under it. Falls back to creating the first site if none exists yet.
     const existing = await findUserSiteRecord(userId);
     if (existing?.githubRepoUrl) {
-      return addPageToExistingRepo(
+      return addSubPage(
         existing, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
       );
     }
@@ -603,6 +652,19 @@ export async function generateLandingPage(
   const siteRecord = await findUserSiteRecord(userId);
 
   if (siteRecord) {
+    // Route-level idempotency: if this user already has a live or in-flight page at
+    // this exact route (slug), reuse it instead of building a duplicate. Re-asking
+    // to "build the X page" must not produce a second build of X — the dedicated
+    // iterate endpoint handles legitimate content refreshes. Telemetry: 11 routes
+    // were built >1x, every one from a DIFFERENT chat session re-asking the same
+    // route — so route identity, not session, is the right key.
+    const slug = buildPageSlug(name);
+    const reuse = await findReusablePageForRoute(userId, slug);
+    if (reuse) {
+      console.log(`[V0 SERVICE] Route /${slug} is already ${reuse.status} (${reuse.id}) — reusing, skipping duplicate build`);
+      return reuse;
+    }
+    // ── Add new page route to existing repo (no v0 call) ──
     return addPageToExistingRepo(siteRecord, userId, prompt, name, brandContext, leadListId, templateHtml);
   }
 
@@ -817,6 +879,143 @@ async function generateFirstPage(
  * Calls v0 to generate a full-quality page, extracts files, and commits them
  * under app/<slug>/ in the existing repo. Vercel auto-redeploys.
  */
+/** A file to commit: repo-relative path + raw bytes. */
+interface RepoFileToCommit {
+  path: string;
+  content: Buffer;
+}
+
+/** Whether a GitHub-push error is worth retrying (transient network/server) or a
+ * fast-forward race (someone else committed to main between our read and write). */
+export function isRetryableGithubPushError(err: any): { retryable: boolean; reason: string } {
+  const status: number | undefined = err?.response?.status;
+  const body = (() => {
+    try { return JSON.stringify(err?.response?.data || ""); } catch { return ""; }
+  })();
+  // 422 "Update is not a fast forward" / 409 conflict = a concurrent commit landed.
+  if ((status === 422 && /fast[ -]?forward/i.test(body)) || status === 409) {
+    return { retryable: true, reason: "non-fast-forward race" };
+  }
+  if (status !== undefined && (status >= 500 || status === 429 || status === 408)) {
+    return { retryable: true, reason: `http ${status}` };
+  }
+  const msg = err?.message || "";
+  if (
+    err?.code === "ECONNRESET" || err?.code === "ECONNABORTED" || err?.code === "ETIMEDOUT" ||
+    /fetch failed|network error|socket hang up|timeout/i.test(msg)
+  ) {
+    return { retryable: true, reason: err?.code || "transient network" };
+  }
+  return { retryable: false, reason: status ? `http ${status}` : (err?.code || "non-retryable") };
+}
+
+/**
+ * Commit files to a repo's `main` and advance the ref, with retry + rebase.
+ *
+ * Every attempt re-reads the current `main` SHA and bases the new commit on it,
+ * so when two pages are generated into the SAME repo concurrently (the common
+ * case under unified multi-site), the second push rebases onto the first instead
+ * of failing as a non-fast-forward. Transient network/5xx failures are retried
+ * with backoff. This replaces the previous bare-axios sequence, which had no
+ * retry and was the dominant source of "fetch failed" generation failures.
+ *
+ * Returns the pushed commit SHA and the post-push timestamp (used to scope the
+ * Vercel deployment poll).
+ */
+export async function commitFilesToRepoMain(
+  repoFullName: string,
+  ghHeaders: Record<string, string>,
+  filesToCommit: RepoFileToCommit[],
+  commitMessage: string,
+  maxAttempts = 4
+): Promise<{ pushedCommitSha: string; pushTimestampMs: number }> {
+  const getMainSha = async (): Promise<string> => {
+    const refRes = await axios.get<any>(
+      `https://api.github.com/repos/${repoFullName}/git/ref/heads/main`,
+      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+    );
+    return refRes.data.object.sha;
+  };
+
+  let lastErr: any;
+  // The commit SHA we last tried to advance main to. The idempotency anchor: if a
+  // retry sees main already AT this SHA, our patch actually landed (we just lost the
+  // response) — we must NOT re-commit, or we'd build the same page twice.
+  let pendingCommitSha: string | undefined;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const latestCommitSha = await getMainSha();
+
+      // Idempotency: a prior attempt's patch already landed (lost-response case).
+      if (pendingCommitSha && latestCommitSha === pendingCommitSha) {
+        return { pushedCommitSha: pendingCommitSha, pushTimestampMs: Date.now() };
+      }
+
+      const treeItems = await Promise.all(
+        filesToCommit.map(async (file) => {
+          const blobRes = await axios.post<any>(
+            `https://api.github.com/repos/${repoFullName}/git/blobs`,
+            { content: file.content.toString("base64"), encoding: "base64" },
+            { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+          );
+          return { path: file.path, mode: "100644" as const, type: "blob" as const, sha: blobRes.data.sha };
+        })
+      );
+
+      const treeRes = await axios.post<any>(
+        `https://api.github.com/repos/${repoFullName}/git/trees`,
+        { base_tree: latestCommitSha, tree: treeItems },
+        { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+      );
+
+      const commitRes = await axios.post<any>(
+        `https://api.github.com/repos/${repoFullName}/git/commits`,
+        { message: commitMessage, tree: treeRes.data.sha, parents: [latestCommitSha] },
+        { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+      );
+      const pushedCommitSha: string = commitRes.data.sha;
+      // Mark BEFORE the mutating patch so the catch can tell if it landed.
+      pendingCommitSha = pushedCommitSha;
+
+      // The ref update is where a concurrent commit surfaces as a non-fast-forward.
+      await axios.patch<any>(
+        `https://api.github.com/repos/${repoFullName}/git/refs/heads/main`,
+        { sha: pushedCommitSha },
+        { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+      );
+
+      return { pushedCommitSha, pushTimestampMs: Date.now() };
+    } catch (err: any) {
+      lastErr = err;
+
+      // Did the patch actually land despite this error? (lost response after a
+      // successful write.) If main is already at our commit, STOP — re-committing
+      // would create a duplicate page build. Best-effort: a failed check just falls
+      // through to the normal retry decision.
+      if (pendingCommitSha) {
+        try {
+          if ((await getMainSha()) === pendingCommitSha) {
+            return { pushedCommitSha: pendingCommitSha, pushTimestampMs: Date.now() };
+          }
+        } catch {
+          // ignore — the next attempt's top-of-loop check will catch it too
+        }
+      }
+
+      const { retryable, reason } = isRetryableGithubPushError(err);
+      if (!retryable || attempt === maxAttempts) {
+        console.error(`[V0 SERVICE] commit to ${repoFullName} failed after ${attempt} attempt(s) (${reason}): ${err?.message}`);
+        throw err;
+      }
+      const delay = 800 * Math.pow(2, attempt - 1) + Math.random() * 400;
+      console.warn(`[V0 SERVICE] commit to ${repoFullName} attempt ${attempt} failed (${reason}); rebasing + retrying in ${Math.round(delay)}ms`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
+}
+
 async function addPageToExistingRepo(
   existingPage: GeneratedLandingPage,
   userId: string,
@@ -1017,59 +1216,17 @@ async function addPageToExistingRepo(
       Accept: "application/vnd.github.v3+json",
     };
 
-    // Get latest commit SHA
-    const refRes = await axios.get<any>(
-      `https://api.github.com/repos/${repoFullName}/git/ref/heads/main`,
-      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+    // Commit the new page's files to main with retry + rebase. Each attempt
+    // re-reads the latest main SHA, so a concurrent commit (another page being
+    // generated into the SAME repo) is rebased onto rather than rejected as a
+    // non-fast-forward. Transient network/5xx failures are retried too — this
+    // path was previously bare axios, the dominant source of "fetch failed".
+    const { pushedCommitSha, pushTimestampMs } = await commitFilesToRepoMain(
+      repoFullName,
+      ghHeaders,
+      filesToCommit,
+      `Add new page: ${name} (/${slug})`
     );
-    const latestCommitSha = refRes.data.object.sha;
-
-    // Create blobs for each file
-    const blobPromises = filesToCommit.map(async (file) => {
-      const blobRes = await axios.post<any>(
-        `https://api.github.com/repos/${repoFullName}/git/blobs`,
-        {
-          content: file.content.toString("base64"),
-          encoding: "base64",
-        },
-        { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
-      );
-      return {
-        path: file.path,
-        mode: "100644" as const,
-        type: "blob" as const,
-        sha: blobRes.data.sha,
-      };
-    });
-    const treeItems = await Promise.all(blobPromises);
-
-    // Create tree → commit → update ref
-    const treeRes = await axios.post<any>(
-      `https://api.github.com/repos/${repoFullName}/git/trees`,
-      { base_tree: latestCommitSha, tree: treeItems },
-      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
-    );
-
-    const commitRes = await axios.post<any>(
-      `https://api.github.com/repos/${repoFullName}/git/commits`,
-      {
-        message: `Add new page: ${name} (/${slug})`,
-        tree: treeRes.data.sha,
-        parents: [latestCommitSha],
-      },
-      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
-    );
-    const pushedCommitSha: string = commitRes.data.sha;
-
-    await axios.patch<any>(
-      `https://api.github.com/repos/${repoFullName}/git/refs/heads/main`,
-      { sha: pushedCommitSha },
-      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
-    );
-
-    // Capture timestamp after the ref push (Vercel webhook fires on push).
-    // pollVercelDeployment uses this to ignore pre-existing READY deployments.
-    const pushTimestampMs = Date.now();
 
     console.log(`[V0 SERVICE] Pushed ${filesToCommit.length} files for /${slug} to ${repoFullName} (${pushedCommitSha.substring(0, 7)}) — polling Vercel for build status`);
 

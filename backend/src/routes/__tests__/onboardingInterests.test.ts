@@ -30,6 +30,7 @@ jest.mock('../../controllers/auth', () => ({
   googleCallback: jest.fn(),
   forgotPassword: jest.fn((_req: any, res: any) => res.status(200).json({})),
   resetPassword: jest.fn((_req: any, res: any) => res.status(200).json({})),
+  changePassword: jest.fn((_req: any, res: any) => res.status(200).json({})),
 }));
 
 // Passport + google strategy stub (auth.ts imports but doesn't execute)

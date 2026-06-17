@@ -125,8 +125,10 @@ function httpRequest(
   });
 }
 
-// Keywords that indicate non-browser tasks — blocked for safety
-const BLOCKED_TASK_PATTERNS = [
+// HARD-BLOCK: truly dangerous intents — never allowed regardless of read-only
+// framing (shell/file/credential/transaction). These match a state-changing or
+// security-sensitive ACTION the agent would be asked to perform.
+const HARD_BLOCKED_TASK_PATTERNS = [
   /\becho\b/i,
   /\bls\b/,
   /\bcat\b/,
@@ -151,29 +153,52 @@ const BLOCKED_TASK_PATTERNS = [
   /\bterminal/i,
   /\bexecute.*command/i,
   /\bfile system/i,
-  /\bdelete\b/i,
   /\bpassword/i,
   /\bcredential/i,
   /\bprivate key/i,
   /\baccess token/i,
   /\bapi key/i,
   /\bsecret/i,
+  /\bpurchase/i,
+  /\bbuy\b/i,
+  /\bupload/i,
+  /\bdownload.*file/i,
+];
+
+// SOFT-WRITE: phrases that USUALLY mean a write action but very often appear as
+// read-only CONTEXT ("read the comments under this post", "find the text near the
+// login button", "summarize what happens after you click Sign in"). Telemetry
+// (Dev-AW-LoopEvents, June 2026) showed these regexes were the #1 source of
+// run_local_agent_task false-positive rejections — `post.*comment`, `click.*button`,
+// `log.*in` all fired on read-only tasks. We only treat them as blocking when the
+// task does NOT also carry clear read-only intent.
+const SOFT_WRITE_TASK_PATTERNS = [
   /\bsubmit.*form/i,
   /\bclick.*button/i,
   /\bfill.*form/i,
   /\blog.*in/i,
   /\bsign.*in/i,
-  /\bpurchase/i,
-  /\bbuy\b/i,
   /\bsend.*message/i,
   /\bpost.*comment/i,
   /\bwrite.*post/i,
-  /\bupload/i,
-  /\bdownload.*file/i,
+  /\bdelete\b/i,
   /\bmodif/i,
   /\bedit.*account/i,
   /\bchange.*setting/i,
   /\bupdate.*profile/i,
+];
+
+// Clear read-only intent — when present, the soft-write phrases above are treated
+// as descriptive context, not as an action the agent is being asked to perform.
+const READ_ONLY_INTENT_PATTERNS = [
+  /\b(read|reads|reading)\b/i,
+  /\b(extract|extracts|extracting)\b/i,
+  /\b(scrape|scrapes|scraping|crawl|crawling)\b/i,
+  /\b(summari[sz]e|summary)\b/i,
+  /\b(list|lists|listing)\b/i,
+  /\b(find|finds|finding|gather|collect)\b/i,
+  /\b(get|grab|capture|view|see|check|look\s+at)\b.*\b(text|content|data|title|info|details|posts?|comments?|profile)\b/i,
+  /\bwhat (does|is|are)\b/i,
 ];
 
 // Must mention a URL or web-browsing intent
@@ -196,10 +221,36 @@ const SCOPE_GUIDANCE =
   'Do not retry this task here — use coding_agent for code changes, perform_data_analysis for data analysis, ' +
   'search_web for research, or the dedicated tool for the action you need (e.g. linkedin_outreach, send_email).';
 
+function hasReadOnlyIntent(task: string): boolean {
+  return READ_ONLY_INTENT_PATTERNS.some((p) => p.test(task));
+}
+
+/**
+ * Validate that a task is in-scope (read-only browsing). Returns null when the
+ * task is allowed, otherwise a human-readable rejection reason that names the
+ * right alternative tool.
+ *
+ * Telemetry-driven (Dev-AW-LoopEvents, June 2026): scope-rejections were the #1
+ * run_local_agent_task failure cluster (~14/20, ~54% of failures), dominated by
+ * SOFT-WRITE false positives on read-only tasks. We now (1) hard-block only truly
+ * dangerous intents and (2) treat soft-write phrases as descriptive context when
+ * the task also has clear read-only intent — keeping the safety floor while cutting
+ * the false-positive rejections.
+ */
 export function validateBrowserTask(task: string): string | null {
-  for (const pattern of BLOCKED_TASK_PATTERNS) {
+  for (const pattern of HARD_BLOCKED_TASK_PATTERNS) {
     if (pattern.test(task)) {
       return `Task rejected (matched forbidden pattern "${pattern.source}"). ${SCOPE_GUIDANCE}`;
+    }
+  }
+  // Soft-write phrases only block when the task is NOT clearly read-only. A task
+  // like "read the comments under this LinkedIn post" should pass; "post a comment
+  // on this LinkedIn page" should not.
+  if (!hasReadOnlyIntent(task)) {
+    for (const pattern of SOFT_WRITE_TASK_PATTERNS) {
+      if (pattern.test(task)) {
+        return `Task rejected (matched forbidden pattern "${pattern.source}"). ${SCOPE_GUIDANCE}`;
+      }
     }
   }
   const isBrowserTask = BROWSER_TASK_PATTERNS.some((p) => p.test(task));
@@ -207,6 +258,46 @@ export function validateBrowserTask(task: string): string | null {
     return `Task rejected: no URL or web-browsing intent found in the task. ${SCOPE_GUIDANCE} If you do want a page read, restate the task with the specific URL to visit.`;
   }
   return null;
+}
+
+/**
+ * Pick the most relevant alternative tool name to route the model to, based on
+ * what the rejected task was trying to do. Used to make scope-rejections an
+ * actionable, model-correctable signal instead of a dead end.
+ */
+export function suggestAlternativeTool(task: string): string {
+  if (/\b(code|repo|repository|commit|deploy|build|script|function|bug|fix)\b/i.test(task)) return 'coding_agent';
+  if (/\b(analyz|analys|data analysis|metrics|chart|spreadsheet|csv|dataset)\b/i.test(task)) return 'perform_data_analysis';
+  if (/\b(post|comment|message|dm|connect|invite|outreach)\b/i.test(task) && /\blinkedin\b/i.test(task)) return 'linkedin_outreach';
+  if (/\b(send|email|reply)\b/i.test(task) && /\bemail\b/i.test(task)) return 'send_email';
+  return 'search_web';
+}
+
+/**
+ * Shape a scope-rejection as a GRACEFUL, model-correctable outcome rather than a
+ * hard tool failure. Telemetry (June 2026) showed these rejections being recorded
+ * as `agent_tool_failed` (downgraded from success=false), inflating the
+ * run_local_agent_task failure rate and feeding the repeated-failure circuit
+ * breaker — even though the validator did its job and the model just needs to pick
+ * a different tool. We return success=true with `rejected:true` + guidance so the
+ * dispatch layer does NOT count it as a failure, and the model gets a clear
+ * redirect. The legit success path is unchanged.
+ */
+export function buildScopeRejectionResult(reason: string, suggestedTool: string): {
+  success: true;
+  rejected: true;
+  guidance: string;
+  suggestedTool: string;
+  formattedContent: string;
+} {
+  const guidance = `${reason} Suggested next tool: ${suggestedTool}.`;
+  return {
+    success: true,
+    rejected: true,
+    guidance,
+    suggestedTool,
+    formattedContent: guidance,
+  };
 }
 
 emmaToolRegistry.register({
@@ -259,10 +350,16 @@ This tool is read-only, browser-only. If the user asks for anything outside web 
     const userId = context?.userId;
     if (!userId) throw new Error('Authentication required');
 
-    // Safety: validate task is browser-only before sending to relay
+    // Safety: validate task is browser-only before sending to relay.
+    // A scope-rejection is a GRACEFUL, model-correctable outcome (the validator
+    // worked; the model just needs a different tool), NOT a hard tool failure —
+    // return success=true + guidance so the dispatch layer does not record it as
+    // `agent_tool_failed` or trip the repeated-failure breaker. (Telemetry-driven,
+    // Dev-AW-LoopEvents June 2026: scope-rejections were ~54% of this tool's
+    // recorded failures.)
     const validationError = validateBrowserTask(args.task);
     if (validationError) {
-      return { success: false, error: validationError };
+      return buildScopeRejectionResult(validationError, suggestAlternativeTool(args.task));
     }
 
     const config = await getRelayConfig();

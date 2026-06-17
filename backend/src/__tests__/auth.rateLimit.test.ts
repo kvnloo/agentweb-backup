@@ -169,4 +169,49 @@ describe('Auth Rate Limiting', () => {
       expect(res.status).not.toBe(429);
     }
   });
+
+  // change-password is rate-limited. The limiter sits BEFORE authenticateToken,
+  // so unauthenticated attempts still count (401 first, then 429) — which is
+  // exactly the brute-force surface we're protecting (a stolen JWT trying the
+  // current password).
+  it('should return 429 after exceeding change-password rate limit', async () => {
+    const responses = [];
+    for (let i = 0; i < 11; i++) {
+      const res = await request(app)
+        .put('/api/auth/change-password')
+        .set('X-Forwarded-For', '10.0.0.6')
+        .send({ currentPassword: 'x', newPassword: 'yyyyyyyyyyyy' });
+      responses.push(res);
+    }
+
+    // First 10 are rejected by auth (401), not the limiter.
+    for (let i = 0; i < 10; i++) {
+      expect(responses[i].status).not.toBe(429);
+    }
+    // 11th is rate-limited.
+    expect(responses[10].status).toBe(429);
+    expect(responses[10].body.message).toContain('Too many');
+  });
+
+  // change-password has its OWN budget, separate from login/register. Exhausting
+  // the change-password limit from an IP must NOT rate-limit that IP's logins.
+  it('should keep change-password and login budgets independent', async () => {
+    mockGetUserByEmail.mockResolvedValue(null);
+
+    // Exhaust change-password for this IP (11 → last is 429).
+    for (let i = 0; i < 11; i++) {
+      await request(app)
+        .put('/api/auth/change-password')
+        .set('X-Forwarded-For', '10.0.0.7')
+        .send({ currentPassword: 'x', newPassword: 'yyyyyyyyyyyy' });
+    }
+
+    // Login from the SAME IP still has its own untouched budget → not 429.
+    const res = await request(app)
+      .post('/api/auth/login')
+      .set('X-Forwarded-For', '10.0.0.7')
+      .send({ email: 'someone@test.com', password: 'wrong' });
+
+    expect(res.status).not.toBe(429);
+  });
 });

@@ -2617,3 +2617,42 @@ mcpToolRegistry.register({
     return jsonResult(data);
   }
 });
+
+// ─── Account ─────────────────────────────────────────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'get_account_status',
+  definition: {
+    name: 'get_account_status',
+    description: "Get the current user's account status, subscription plan, and usage.",
+    inputSchema: { type: 'object', properties: {}, required: [] }
+  },
+  execute: async (_args: any, context: any) => {
+    const c = ctx(context);
+
+    // Plan/status comes from /api/auth/me. Let auth errors propagate — if we can't
+    // resolve the account, returning a fake "status" would be misleading.
+    const me = await mcpFetch({ method: 'GET', path: '/api/auth/me', context: c });
+
+    // API key count is best-effort: a failure to list keys must not block the
+    // account-status read, so it falls back to 0.
+    let apiKeyCount = 0;
+    try {
+      const keysResponse = await mcpFetch({ method: 'GET', path: '/api/v1/agent/api-keys', context: c });
+      apiKeyCount = Array.isArray(keysResponse?.keys) ? keysResponse.keys.length : 0;
+    } catch {
+      apiKeyCount = 0;
+    }
+
+    // Curate a stable, minimal shape. Never echo the raw /me payload — it carries
+    // sensitive fields (stripe ids, tokens, internal flags).
+    return jsonResult({
+      email: me?.email ?? null,
+      subscription_plan: me?.subscriptionType ?? 'Free',
+      subscription_status: me?.subscription_status ?? 'inactive',
+      current_period_end: me?.current_period_end ?? null,
+      allowed_features: Array.isArray(me?.allowedPages) ? me.allowedPages : [],
+      api_key_count: apiKeyCount,
+    });
+  }
+});
