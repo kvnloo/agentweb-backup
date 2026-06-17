@@ -84,7 +84,7 @@ describe('Security Tests', () => {
       await authenticateToken(req, res, next);
 
       expect(res.status).toHaveBeenCalledWith(401);
-      expect(res.json).toHaveBeenCalledWith({ message: 'Invalid token' });
+      expect(res.json).toHaveBeenCalledWith({ message: 'Invalid token', code: 'session_invalid' });
       expect(next).not.toHaveBeenCalled();
     });
 
@@ -102,7 +102,7 @@ describe('Security Tests', () => {
       await authenticateToken(req, res, next);
 
       expect(res.status).toHaveBeenCalledWith(401);
-      expect(res.json).toHaveBeenCalledWith({ message: 'Invalid token' });
+      expect(res.json).toHaveBeenCalledWith({ message: 'Invalid token', code: 'session_invalid' });
       expect(next).not.toHaveBeenCalled();
     });
 
@@ -121,7 +121,7 @@ describe('Security Tests', () => {
       await authenticateToken(req, res, next);
 
       expect(res.status).toHaveBeenCalledWith(401);
-      expect(res.json).toHaveBeenCalledWith({ message: 'Invalid token' });
+      expect(res.json).toHaveBeenCalledWith({ message: 'Invalid token', code: 'session_invalid' });
       expect(next).not.toHaveBeenCalled();
     });
 
@@ -149,7 +149,7 @@ describe('Security Tests', () => {
       await authenticateToken(req, res, next);
 
       expect(res.status).toHaveBeenCalledWith(401);
-      expect(res.json).toHaveBeenCalledWith({ message: 'Invalid token' });
+      expect(res.json).toHaveBeenCalledWith({ message: 'Invalid token', code: 'session_invalid' });
       expect(next).not.toHaveBeenCalled();
     });
 
@@ -175,7 +175,7 @@ describe('Security Tests', () => {
       await authenticateToken(req, res, next);
 
       expect(res.status).toHaveBeenCalledWith(401);
-      expect(res.json).toHaveBeenCalledWith({ message: 'Invalid token' });
+      expect(res.json).toHaveBeenCalledWith({ message: 'Invalid token', code: 'session_invalid' });
       expect(next).not.toHaveBeenCalled();
     });
 
