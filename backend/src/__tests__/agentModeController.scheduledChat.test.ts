@@ -34,6 +34,7 @@ jest.mock('../services/agentModeService', () => ({
     getMarketingSystemPrompt: jest.fn(),
     generateSessionTitle: jest.fn(),
     generateMarketingResponse: jest.fn(),
+    generateScheduledChatSummary: jest.fn(),
     installSkills: jest.fn().mockResolvedValue({ success: true, installedSkills: [] }),
     getSkillsForDisplay: jest.fn().mockResolvedValue([]),
     getFoundationToolNames: jest.fn().mockReturnValue(new Set([
@@ -100,6 +101,14 @@ jest.mock('../services/tokenUsageService', () => ({
     percentUsed: 10,
     month: '2026-04',
   })),
+}));
+
+jest.mock('../utils/agentModeAlerts', () => ({
+  sendAgentModeOncallAlert: jest.fn().mockResolvedValue(undefined),
+}));
+
+jest.mock('../services/notionService', () => ({
+  createOncallItem: jest.fn().mockResolvedValue(undefined),
 }));
 
 jest.mock('../services/skillService', () => ({
@@ -178,6 +187,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     mockChatbotDb.updateSessionLlmModel.mockResolvedValue(mockSession);
     mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
     mockAgentModeService.generateSessionTitle.mockResolvedValue('Generated Title');
+    mockAgentModeService.generateScheduledChatSummary.mockResolvedValue(null);
     // Use worker service instead of direct generateMarketingResponse
     mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(mockResponse);
     mockScheduleDb.addRunResult.mockResolvedValue(undefined);
@@ -434,6 +444,104 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           keywordMisses: [],
           functionCallMatches: [],
           functionCallMisses: [],
+        })
+      );
+    });
+
+    it('should fail and retry when the worker returns zero assistant output', async () => {
+      const simpleSchedule = {
+        ...baseSchedule,
+        keywords: [],
+        requiredFunctionCalls: [],
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: '',
+        toolCalls: [],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      const result = await runScheduledChat(simpleSchedule, mockUserId, true);
+
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
+      expect(result).toEqual(
+        expect.objectContaining({
+          status: 'failure',
+          passed: false,
+          actualResponse: expect.stringContaining('zero assistant output'),
+        })
+      );
+      expect(mockScheduleDb.addRunResult).toHaveBeenCalledWith(
+        simpleSchedule.scheduleId,
+        expect.objectContaining({
+          status: 'failure',
+          sessionId: 'test-session-123',
+        })
+      );
+    });
+
+    it('should requeue production scheduled chats with backoff after zero assistant output', async () => {
+      const simpleSchedule = {
+        ...baseSchedule,
+        keywords: [],
+        requiredFunctionCalls: [],
+        zeroAssistantRetryCount: 0,
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: '',
+        toolCalls: [],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      const beforeRun = Date.now();
+      const result = await runScheduledChat(simpleSchedule, mockUserId, false);
+
+      expect(result).toEqual(expect.objectContaining({ status: 'failure', passed: false }));
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        simpleSchedule.scheduleId,
+        expect.objectContaining({
+          status: 'active',
+          zeroAssistantRetryCount: 1,
+          lastZeroAssistantOutputAt: expect.any(String),
+          lastZeroAssistantOutputSessionId: 'test-session-123',
+          nextRunTime: expect.any(String),
+        })
+      );
+
+      const requeueCall = mockScheduleDb.updateSchedule.mock.calls.find((call: any[]) =>
+        call[1]?.zeroAssistantRetryCount === 1
+      );
+      const nextRunTime = requeueCall?.[1]?.nextRunTime;
+      expect(typeof nextRunTime).toBe('string');
+      const retryAt = new Date(nextRunTime as string).getTime();
+      expect(retryAt).toBeGreaterThanOrEqual(beforeRun + 14 * 60 * 1000);
+      expect(retryAt).toBeLessThanOrEqual(Date.now() + 16 * 60 * 1000);
+    });
+
+    it('should reset zero assistant retry tracking after a successful production run', async () => {
+      const recoveringSchedule = {
+        ...baseSchedule,
+        zeroAssistantRetryCount: 2,
+        lastZeroAssistantOutputAt: '2026-06-05T23:49:04.778Z',
+        lastZeroAssistantOutputSessionId: 'cf85e8f2-e1f9-4b67-887c-e24bf2fc361b',
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        ...mockResponse,
+        content: 'Here are some marketing strategy and tips for your business.',
+      });
+
+      const result = await runScheduledChat(recoveringSchedule, mockUserId, false);
+
+      expect(result).toEqual(expect.objectContaining({ status: 'success', passed: true }));
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        recoveringSchedule.scheduleId,
+        expect.objectContaining({
+          zeroAssistantRetryCount: 0,
+          lastZeroAssistantOutputAt: '',
+          lastZeroAssistantOutputSessionId: '',
         })
       );
     });
