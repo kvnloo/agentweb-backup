@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import axios from 'axios';
 import { buildApiUrl, CUSTOMER_FRONTEND_URL } from '../config';
 import { useAuth } from '../contexts/AuthContext';
@@ -167,15 +168,16 @@ function buildCustomerChatUrl(chat?: AgentRunChatContext): string | undefined {
 
 export default function AgentRunsInspector() {
   const { token, user } = useAuth();
+  const [searchParams] = useSearchParams();
   const [runs, setRuns] = useState<AgentRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [scannedEvents, setScannedEvents] = useState(0);
   const [filters, setFilters] = useState({
-    userId: '',
-    sessionId: '',
-    runId: '',
+    userId: searchParams.get('userId') ?? '',
+    sessionId: searchParams.get('sessionId') ?? '',
+    runId: searchParams.get('runId') ?? '',
     limit: 200,
   });
 

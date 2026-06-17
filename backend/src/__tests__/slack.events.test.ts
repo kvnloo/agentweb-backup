@@ -7,6 +7,8 @@ jest.mock('../services/db', () => ({
   userDb: {
     getAllUsers: jest.fn(),
     getUserById: jest.fn(),
+    getUserByEmail: jest.fn(),
+    updateUser: jest.fn(),
   },
 }));
 
@@ -14,6 +16,7 @@ jest.mock('../services/settingsService', () => ({
   settingsService: {
     getSetting: jest.fn(),
     setSetting: jest.fn(),
+    invalidateSlackChannelMappings: jest.fn(),
   },
 }));
 
@@ -53,6 +56,7 @@ jest.mock('../services/slackService', () => {
     postThinkingMessage: jest.fn().mockResolvedValue('thinking-msg-ts'),
     deleteSlackMessage: jest.fn().mockResolvedValue(undefined),
     getSlackUserDisplayName: jest.fn().mockResolvedValue('John Doe'),
+    getSlackUserEmail: jest.fn().mockResolvedValue('operator@agentweb.pro'),
     downloadSlackFile: jest.fn().mockResolvedValue(Buffer.from('file-content')),
   };
 });
@@ -74,7 +78,7 @@ const { userDb } = require('../services/db');
 const { settingsService } = require('../services/settingsService');
 const { chatbotDb } = require('../services/chatbotService');
 const { generateSessionResponse } = require('../controllers/agentModeController');
-const { postThreadResponse, postThinkingMessage, deleteSlackMessage, getSlackUserDisplayName } = require('../services/slackService');
+const { postThreadResponse, postThinkingMessage, deleteSlackMessage, getSlackUserDisplayName, getSlackUserEmail } = require('../services/slackService');
 
 describe('Slack Events API', () => {
   let app: express.Application;
@@ -383,6 +387,118 @@ describe('Slack Events API', () => {
           text: expect.stringContaining('couldn\'t find a user account linked'),
         })
       );
+    });
+
+    it('links the current Slack channel to the requested user account', async () => {
+      settingsService.getSetting.mockResolvedValue(null);
+      getSlackUserEmail.mockResolvedValue('operator@agentweb.pro');
+      userDb.getUserByEmail.mockResolvedValue({
+        userId: 'user-matthew',
+        email: 'matthew@agentweb.pro',
+        slackChannel: 'C_LEGACY',
+        slackChannels: ['C_EXISTING'],
+      });
+      userDb.updateUser.mockResolvedValue({
+        userId: 'user-matthew',
+        email: 'matthew@agentweb.pro',
+        slackChannels: ['C_EXISTING', 'C_LEGACY', 'C_MATTHEW'],
+      });
+
+      const response = await request(app)
+        .post('/api/slack/events')
+        .send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention',
+            user: 'U_OPERATOR',
+            text: '<@UEMMA123> for user <mailto:Matthew@agentweb.pro|Matthew@agentweb.pro> link to this channel',
+            channel: 'C_MATTHEW',
+            ts: '1234567890.123456',
+          },
+        });
+
+      expect(response.status).toBe(200);
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      expect(userDb.getUserByEmail).toHaveBeenCalledWith('matthew@agentweb.pro');
+      expect(settingsService.invalidateSlackChannelMappings).toHaveBeenCalledWith(
+        'user-matthew',
+        expect.arrayContaining(['C_EXISTING', 'C_LEGACY', 'C_MATTHEW'])
+      );
+      expect(userDb.updateUser).toHaveBeenCalledWith('user-matthew', {
+        slackChannels: ['C_EXISTING', 'C_LEGACY', 'C_MATTHEW'],
+      });
+      expect(settingsService.setSetting).toHaveBeenCalledWith(
+        'slack_channel_mapping_C_MATTHEW',
+        'user-matthew',
+        'Slack channel to userId mapping for channel C_MATTHEW',
+        'system'
+      );
+      expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+        channel: 'C_MATTHEW',
+        thread_ts: '1234567890.123456',
+        text: expect.stringContaining('Linked this channel to matthew@agentweb.pro'),
+      }));
+      expect(chatbotDb.createChatSession).not.toHaveBeenCalled();
+    });
+
+    it('does not fall through to channel lookup when link target user is missing', async () => {
+      settingsService.getSetting.mockResolvedValue(null);
+      getSlackUserEmail.mockResolvedValue('operator@agentweb.pro');
+      userDb.getUserByEmail.mockResolvedValue(undefined);
+
+      const response = await request(app)
+        .post('/api/slack/events')
+        .send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention',
+            user: 'U_OPERATOR',
+            text: '<@UEMMA123> for user missing@example.com link to this channel',
+            channel: 'C_MISSING',
+            ts: '1234567890.123456',
+          },
+        });
+
+      expect(response.status).toBe(200);
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      expect(userDb.getUserByEmail).toHaveBeenCalledWith('missing@example.com');
+      expect(userDb.getAllUsers).not.toHaveBeenCalled();
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+      expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+        channel: 'C_MISSING',
+        thread_ts: '1234567890.123456',
+        text: 'User not found: missing@example.com',
+      }));
+    });
+
+    it('rejects channel-link requests from unrelated Slack users', async () => {
+      getSlackUserEmail.mockResolvedValue('outsider@example.com');
+
+      const response = await request(app)
+        .post('/api/slack/events')
+        .send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention',
+            user: 'U_OUTSIDER',
+            text: '<@UEMMA123> for user matthew@agentweb.pro link to this channel',
+            channel: 'C_BLOCKED',
+            ts: '1234567890.123456',
+          },
+        });
+
+      expect(response.status).toBe(200);
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      expect(userDb.getUserByEmail).not.toHaveBeenCalled();
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+      expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+        channel: 'C_BLOCKED',
+        thread_ts: '1234567890.123456',
+        text: expect.stringContaining('Only AgentWeb admins or the target account owner can link'),
+      }));
     });
 
     describe('Thread message handling', () => {

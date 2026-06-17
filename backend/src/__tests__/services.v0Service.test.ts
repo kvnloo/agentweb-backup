@@ -155,6 +155,9 @@ import {
   getDeploymentStatus,
   isOrphanedFailedPage,
   cleanupOrphanedFailedPages,
+  commitFilesToRepoMain,
+  isRetryableGithubPushError,
+  findReusablePageForRoute,
   findSiteById,
   getLandingPageLiveUrl,
   resolveLandingPageLiveUrl,
@@ -448,6 +451,138 @@ describe("v0Service - generateLandingPage", () => {
 // =============================================================================
 // Orphaned failed page helpers (v0 outage cleanup)
 // =============================================================================
+describe("v0Service - findReusablePageForRoute (route-level idempotency, kills duplicate builds)", () => {
+  const items = (...arr: any[]) => mockQuery.mockReturnValue({ promise: () => Promise.resolve({ Items: arr }) });
+  const page = (over: any = {}) => ({ id: "p1", userId: "u1", name: "Pricing", slug: "pricing", status: "deployed", ...over });
+
+  beforeEach(() => mockQuery.mockReset());
+
+  it("reuses a deployed page at the same route", async () => {
+    items(page({ status: "deployed" }));
+    expect((await findReusablePageForRoute("u1", "pricing"))?.id).toBe("p1");
+  });
+
+  it("reuses an in-flight build at the same route (generating/deploying)", async () => {
+    items(page({ status: "generating" }));
+    expect((await findReusablePageForRoute("u1", "pricing"))?.status).toBe("generating");
+  });
+
+  it("does NOT reuse a FAILED page — a retry after a failure must rebuild", async () => {
+    items(page({ status: "failed" }));
+    expect(await findReusablePageForRoute("u1", "pricing")).toBeNull();
+  });
+
+  it("does NOT match a different route", async () => {
+    items(page({ slug: "about", status: "deployed" }));
+    expect(await findReusablePageForRoute("u1", "pricing")).toBeNull();
+  });
+
+  it("matches on the name-derived slug when the slug field is absent (legacy/root records)", async () => {
+    items(page({ slug: undefined, name: "Pricing", status: "deployed" }));
+    expect(await findReusablePageForRoute("u1", "pricing")).not.toBeNull();
+  });
+
+  it("returns null when the user has no matching page", async () => {
+    items();
+    expect(await findReusablePageForRoute("u1", "pricing")).toBeNull();
+  });
+});
+
+describe("v0Service - isRetryableGithubPushError", () => {
+  const r = (e: any) => isRetryableGithubPushError(e).retryable;
+  it("treats a non-fast-forward 422 as retryable (concurrent-commit race)", () => {
+    expect(r({ response: { status: 422, data: { message: "Update is not a fast forward" } } })).toBe(true);
+  });
+  it("treats 409 conflict as retryable", () => {
+    expect(r({ response: { status: 409, data: {} } })).toBe(true);
+  });
+  it("treats 5xx / 429 / 408 as retryable", () => {
+    expect(r({ response: { status: 502 } })).toBe(true);
+    expect(r({ response: { status: 429 } })).toBe(true);
+    expect(r({ response: { status: 408 } })).toBe(true);
+  });
+  it("treats transient network errors as retryable", () => {
+    expect(r({ message: "fetch failed" })).toBe(true);
+    expect(r({ code: "ECONNRESET" })).toBe(true);
+    expect(r({ message: "timeout of 60000ms exceeded" })).toBe(true);
+  });
+  it("does NOT retry a 404 or a plain 422 validation error", () => {
+    expect(r({ response: { status: 404, data: {} } })).toBe(false);
+    expect(r({ response: { status: 422, data: { message: "Invalid request" } } })).toBe(false);
+  });
+});
+
+describe("v0Service - commitFilesToRepoMain (retry + rebase)", () => {
+  const ref = { data: { object: { sha: "main-sha" } } };
+  const post = { data: { sha: "new-sha" } };
+  const files = [{ path: "app/pricing/page.tsx", content: Buffer.from("export default () => null") }];
+
+  beforeEach(() => {
+    mockAxiosGet.mockReset();
+    mockAxiosPost.mockReset();
+    mockAxiosPatch.mockReset();
+  });
+
+  it("commits in one attempt on the happy path (no re-read)", async () => {
+    mockAxiosGet.mockResolvedValue(ref);
+    mockAxiosPost.mockResolvedValue(post);
+    mockAxiosPatch.mockResolvedValue({ data: {} });
+
+    const res = await commitFilesToRepoMain("o/r", {}, files, "msg");
+    expect(res.pushedCommitSha).toBe("new-sha");
+    expect(mockAxiosGet).toHaveBeenCalledTimes(1); // no rebase needed
+  });
+
+  it("rebases and retries on a non-fast-forward 422 (concurrent commit landed)", async () => {
+    mockAxiosGet.mockResolvedValue(ref);
+    mockAxiosPost.mockResolvedValue(post);
+    mockAxiosPatch
+      .mockRejectedValueOnce({ response: { status: 422, data: { message: "Update is not a fast forward" } } })
+      .mockResolvedValueOnce({ data: {} });
+
+    const res = await commitFilesToRepoMain("o/r", {}, files, "msg", 2);
+    expect(res.pushedCommitSha).toBe("new-sha");
+    expect(mockAxiosGet.mock.calls.length).toBeGreaterThanOrEqual(2); // re-read main = rebase
+  });
+
+  it("is idempotent: a lost response after a successful patch does NOT build twice", async () => {
+    // attempt 1: read old main, create commit "new-sha", patch throws (response lost)
+    // — but the catch re-reads main and sees it's already at "new-sha" → success, no re-commit.
+    mockAxiosGet
+      .mockResolvedValueOnce({ data: { object: { sha: "old-sha" } } }) // initial read
+      .mockResolvedValueOnce({ data: { object: { sha: "new-sha" } } }); // catch re-check: our commit landed
+    mockAxiosPost.mockResolvedValue({ data: { sha: "new-sha" } }); // blob/tree/commit
+    mockAxiosPatch.mockRejectedValue(Object.assign(new Error("fetch failed"))); // lost response
+
+    const res = await commitFilesToRepoMain("o/r", {}, files, "msg", 4);
+    expect(res.pushedCommitSha).toBe("new-sha");
+    // one commit only (1 blob + 1 tree + 1 commit = 3 posts) — no duplicate build
+    expect(mockAxiosPost).toHaveBeenCalledTimes(3);
+  });
+
+  it("retries a transient 'fetch failed' then succeeds", async () => {
+    mockAxiosGet
+      .mockRejectedValueOnce(Object.assign(new Error("fetch failed")))
+      .mockResolvedValue(ref);
+    mockAxiosPost.mockResolvedValue(post);
+    mockAxiosPatch.mockResolvedValue({ data: {} });
+
+    const res = await commitFilesToRepoMain("o/r", {}, files, "msg", 2);
+    expect(res.pushedCommitSha).toBe("new-sha");
+  });
+
+  it("throws after exhausting retries on persistent transient failure", async () => {
+    mockAxiosGet.mockRejectedValue(Object.assign(new Error("fetch failed")));
+    await expect(commitFilesToRepoMain("o/r", {}, files, "msg", 2)).rejects.toThrow(/fetch failed/);
+  });
+
+  it("does NOT retry a non-retryable error (e.g. 404) — fails fast", async () => {
+    mockAxiosGet.mockRejectedValue({ response: { status: 404, data: {} }, message: "Not Found" });
+    await expect(commitFilesToRepoMain("o/r", {}, files, "msg")).rejects.toBeDefined();
+    expect(mockAxiosGet).toHaveBeenCalledTimes(1); // one attempt, no retry
+  });
+});
+
 describe("v0Service - multi-site routing (DURABLE_LANDING_GENERATION=on)", () => {
   const ORIG = process.env.DURABLE_LANDING_GENERATION;
   beforeEach(() => {
