@@ -29,6 +29,7 @@ import type { EventDimensions, NormalizedEvent } from '../../core/types';
 import { asSubjectId } from '../../core/types';
 import { eventToItem, LOOP_EVENTS_TABLE } from '../../core/sensors/eventTableEventSource';
 import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../../../utils/toolFailureType';
 import { AGENT_MODE_LOOP_ID } from './eventTypes';
 import {
   EVT_DECISION,
@@ -120,6 +121,8 @@ export class AgentRunRecorder {
       ...(info.explanationSource ? { explanationSource: info.explanationSource } : {}),
       ...(info.toolPolicyFlags ? { toolPolicyFlags: info.toolPolicyFlags } : {}),
       ...(info.toolPolicySummary ? { toolPolicySummary: info.toolPolicySummary } : {}),
+      ...(info.argsRepairedCount != null ? { argsRepairedCount: info.argsRepairedCount } : {}),
+      ...(info.schemaErrorCount != null ? { schemaErrorCount: info.schemaErrorCount } : {}),
     });
   }
 
@@ -142,12 +145,17 @@ export class AgentRunRecorder {
     info: { toolName: string; error: unknown; durationMs?: number; sessionId?: string; args?: unknown },
   ): Promise<void> {
     const failedArgsJson = serializeFailedArgs(info.args);
+    const errorClass = errorClassOf(info.error);
+    const errorMessage = errorMessageOf(info.error);
     await this.emit(runId, EVT_TOOL_FAILED, {
       toolName: info.toolName,
       ...(info.durationMs != null ? { durationMs: info.durationMs } : {}),
       ...(info.sessionId ? { sessionId: info.sessionId } : {}),
-      errorClass: errorClassOf(info.error),
-      errorMessage: errorMessageOf(info.error),
+      errorClass,
+      errorMessage,
+      // Decision-layer tag so the scorecard can separate real bugs from
+      // by-design rejections / uninstalled-tool calls / config issues.
+      failureType: classifyToolFailureType(errorClass, errorMessage),
       ...(failedArgsJson ? { failedArgsJson } : {}),
     });
   }

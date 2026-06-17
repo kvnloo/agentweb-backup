@@ -1,7 +1,8 @@
-import OpenAI from "openai";
 import axios from "axios";
 import { getSecret } from "../utils/secretsManager";
 import { uploadFileToS3 } from "../utils/s3Utils";
+import { getOpenAIClient, getGeminiClient } from "../utils/llmClients";
+import { recordUsage } from "./usageRecorderService";
 
 interface ImageGenerationResult {
   success: boolean;
@@ -92,6 +93,220 @@ export class ImageService {
       // This ensures the upload still works even if metadata removal fails
       return imageBuffer;
     }
+  }
+
+  /**
+   * Remove a solid/near-solid background from an image and output a genuine
+   * transparent-alpha PNG — WITHOUT redrawing or regenerating the artwork.
+   *
+   * This is the correct tool for "make this logo's background transparent".
+   * Unlike generate_image (which redraws and can drift the mark/colors) and
+   * removeC2PAMetadata (which only strips metadata and never touches pixels),
+   * this operates on the original pixels via an edge-seeded flood fill:
+   *   1. Detect the background color by sampling the four corners.
+   *   2. Flood-fill inward from every border pixel, clearing the alpha channel
+   *      of contiguous pixels whose color is within `tolerance` of the
+   *      background. Because the fill only follows pixels connected to the
+   *      border, enclosed regions of the mark (e.g. a counter inside a letter
+   *      that is itself the brand color) are preserved.
+   * The result is a real alpha channel; the foreground pixels are untouched.
+   *
+   * Best for logos/marks on a solid or near-solid background. It is NOT a
+   * general subject-segmentation tool for photographic backgrounds.
+   */
+  async removeImageBackground(
+    imageBuffer: Buffer,
+    options: { tolerance?: number; backgroundColor?: { r: number; g: number; b: number } } = {}
+  ): Promise<{
+    buffer: Buffer;
+    detectedBackground: { r: number; g: number; b: number };
+    removedRatio: number;
+  }> {
+    const sharp = require('sharp');
+
+    // Clamp tolerance to a sane range. Default 32 keeps anti-aliased edges
+    // crisp while still catching JPEG noise in a "solid" background.
+    const tolerance = Math.max(0, Math.min(255, options.tolerance ?? 32));
+
+    // Decode to raw RGBA pixels. ensureAlpha() guarantees 4 channels even for
+    // images that started as opaque JPEG/PNG.
+    const { data, info } = await sharp(imageBuffer)
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const { width, height, channels } = info as { width: number; height: number; channels: number };
+    const pixels = data as Buffer;
+
+    // Detect background color from the four corners unless the caller pinned it.
+    const bg = options.backgroundColor ?? ImageService.detectCornerColor(pixels, width, height, channels);
+
+    const tolSq = tolerance * tolerance;
+    const matches = (idx: number): boolean => {
+      const dr = pixels[idx] - bg.r;
+      const dg = pixels[idx + 1] - bg.g;
+      const db = pixels[idx + 2] - bg.b;
+      return dr * dr + dg * dg + db * db <= tolSq;
+    };
+
+    // Edge-seeded flood fill. We use an explicit stack of pixel indices (not
+    // recursion) to stay safe on large images, and a visited bitmap so each
+    // pixel is processed once — O(width*height).
+    const total = width * height;
+    const visited = new Uint8Array(total);
+    const stack: number[] = [];
+
+    const pushSeed = (x: number, y: number) => {
+      const p = y * width + x;
+      if (!visited[p] && matches(p * channels)) {
+        visited[p] = 1;
+        stack.push(p);
+      }
+    };
+
+    // Seed from all border pixels.
+    for (let x = 0; x < width; x++) {
+      pushSeed(x, 0);
+      pushSeed(x, height - 1);
+    }
+    for (let y = 0; y < height; y++) {
+      pushSeed(0, y);
+      pushSeed(width - 1, y);
+    }
+
+    let removed = 0;
+    while (stack.length > 0) {
+      const p = stack.pop() as number;
+      pixels[p * channels + 3] = 0; // clear alpha → transparent
+      removed++;
+
+      const x = p % width;
+      const y = (p - x) / width;
+      if (x > 0) {
+        const n = p - 1;
+        if (!visited[n] && matches(n * channels)) { visited[n] = 1; stack.push(n); }
+      }
+      if (x < width - 1) {
+        const n = p + 1;
+        if (!visited[n] && matches(n * channels)) { visited[n] = 1; stack.push(n); }
+      }
+      if (y > 0) {
+        const n = p - width;
+        if (!visited[n] && matches(n * channels)) { visited[n] = 1; stack.push(n); }
+      }
+      if (y < height - 1) {
+        const n = p + width;
+        if (!visited[n] && matches(n * channels)) { visited[n] = 1; stack.push(n); }
+      }
+    }
+
+    const buffer = await sharp(pixels, { raw: { width, height, channels } })
+      .png({ compressionLevel: 9 })
+      .toBuffer();
+
+    return { buffer, detectedBackground: bg, removedRatio: total > 0 ? removed / total : 0 };
+  }
+
+  /**
+   * Sample the four corner pixels and return their per-channel median. The
+   * median is robust to a single noisy/odd corner (e.g. a logo that bleeds
+   * into one corner), which a plain average is not.
+   */
+  static detectCornerColor(
+    pixels: Buffer,
+    width: number,
+    height: number,
+    channels: number
+  ): { r: number; g: number; b: number } {
+    const corners = [
+      0,
+      (width - 1),
+      (height - 1) * width,
+      (height - 1) * width + (width - 1),
+    ].map((p) => p * channels);
+    const median = (vals: number[]): number => {
+      const s = [...vals].sort((a, b) => a - b);
+      const mid = Math.floor(s.length / 2);
+      return s.length % 2 === 0 ? Math.round((s[mid - 1] + s[mid]) / 2) : s[mid];
+    };
+    return {
+      r: median(corners.map((c) => pixels[c])),
+      g: median(corners.map((c) => pixels[c + 1])),
+      b: median(corners.map((c) => pixels[c + 2])),
+    };
+  }
+
+  /**
+   * WCAG 2.1 relative luminance for an sRGB color (0-255 per channel).
+   */
+  static relativeLuminance(r: number, g: number, b: number): number {
+    const channel = (v: number): number => {
+      const s = v / 255;
+      return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b);
+  }
+
+  /**
+   * WCAG contrast ratio between two sRGB colors. Returns a value in [1, 21].
+   */
+  static contrastRatio(
+    c1: { r: number; g: number; b: number },
+    c2: { r: number; g: number; b: number }
+  ): number {
+    const l1 = ImageService.relativeLuminance(c1.r, c1.g, c1.b);
+    const l2 = ImageService.relativeLuminance(c2.r, c2.g, c2.b);
+    const lighter = Math.max(l1, l2);
+    const darker = Math.min(l1, l2);
+    return (lighter + 0.05) / (darker + 0.05);
+  }
+
+  /**
+   * Parse a hex color string ("#1a1a2e", "1a1a2e", "#fff") into RGB.
+   * Returns null if the string is not a valid 3- or 6-digit hex color.
+   */
+  static parseHexColor(hex: string): { r: number; g: number; b: number } | null {
+    if (typeof hex !== 'string') return null;
+    const m = hex.trim().replace(/^#/, '');
+    if (/^[0-9a-fA-F]{3}$/.test(m)) {
+      return {
+        r: parseInt(m[0] + m[0], 16),
+        g: parseInt(m[1] + m[1], 16),
+        b: parseInt(m[2] + m[2], 16),
+      };
+    }
+    if (/^[0-9a-fA-F]{6}$/.test(m)) {
+      return {
+        r: parseInt(m.slice(0, 2), 16),
+        g: parseInt(m.slice(2, 4), 16),
+        b: parseInt(m.slice(4, 6), 16),
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Average color of the opaque (non-transparent) pixels of an RGBA image.
+   * Used to judge how a (now transparent-background) logo will read against a
+   * surface color. Pixels with alpha below `alphaThreshold` are ignored.
+   */
+  static averageOpaqueColor(
+    pixels: Buffer,
+    channels: number,
+    alphaThreshold = 16
+  ): { r: number; g: number; b: number } | null {
+    let r = 0, g = 0, b = 0, count = 0;
+    for (let i = 0; i + channels - 1 < pixels.length; i += channels) {
+      const alpha = channels >= 4 ? pixels[i + 3] : 255;
+      if (alpha >= alphaThreshold) {
+        r += pixels[i];
+        g += pixels[i + 1];
+        b += pixels[i + 2];
+        count++;
+      }
+    }
+    if (count === 0) return null;
+    return { r: Math.round(r / count), g: Math.round(g / count), b: Math.round(b / count) };
   }
 
   /**
@@ -509,19 +724,25 @@ export class ImageService {
    */
   private async generateWithGoogleGemini(params: ImageGenerationParams): Promise<ImageGenerationResult> {
     try {
-      const { GoogleGenerativeAI } = require('@google/generative-ai');
       const axios = require('axios');
-      
-      const apiKey = await this.getApiKey("gemini-2.5-flash-image");
-      const genAI = new GoogleGenerativeAI(apiKey);
-      const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-image" });
+
+      const geminiModelId = "gemini-2.5-flash-image";
+      const apiKey = await this.getApiKey(geminiModelId);
+      // Metered Gemini client (shadow usage metering) — same @google/genai SDK
+      // family as generateWithGoogleGemini3Pro below; request/stream shapes are
+      // unchanged, metering only observes the stream.
+      const ai = await getGeminiClient(
+        { userId: params.userId, feature: "content_gen" },
+        apiKey
+      );
       
       const inputImageCount = params.inputImages ? params.inputImages.length : 0;
       
       if (inputImageCount === 0) {
         // Text-to-image generation - use streaming (with retry for transient 503/429 errors)
         const streamResult = await this.retryWithBackoff(
-          () => model.generateContentStream({
+          () => ai.models.generateContentStream({
+            model: geminiModelId,
             contents: [{
               role: "user",
               parts: [{
@@ -600,7 +821,8 @@ export class ImageService {
         
         // Use streaming for image generation (with retry for transient 503/429 errors)
         const streamResult = await this.retryWithBackoff(
-          () => model.generateContentStream({
+          () => ai.models.generateContentStream({
+            model: geminiModelId,
             contents: [
               {
                 role: "user",
@@ -706,7 +928,8 @@ export class ImageService {
         
         // Use streaming for image generation (with retry for transient 503/429 errors)
         const streamResult = await this.retryWithBackoff(
-          () => model.generateContentStream({
+          () => ai.models.generateContentStream({
+            model: geminiModelId,
             contents: [{
               role: "user",
               parts: parts
@@ -842,13 +1065,14 @@ export class ImageService {
    */
   private async generateWithGoogleGemini3Pro(params: ImageGenerationParams): Promise<ImageGenerationResult> {
     try {
-      const { GoogleGenAI } = require('@google/genai');
-      
       const modelId = params.imageModel || 'gemini-3-pro-image-preview';
       const apiKey = await this.getApiKey(modelId);
-      const ai = new GoogleGenAI({
-        apiKey: apiKey,
-      });
+      // Metered Gemini client (shadow usage metering) — wraps the same
+      // @google/genai GoogleGenAI client; the stream is passed through unchanged.
+      const ai = await getGeminiClient(
+        { userId: params.userId, feature: 'content_gen' },
+        apiKey
+      );
 
       const model = modelId;
       const inputImageCount = params.inputImages ? params.inputImages.length : 0;
@@ -1106,10 +1330,13 @@ export class ImageService {
   private async generateWithOpenAI(params: ImageGenerationParams, model: string): Promise<ImageGenerationResult> {
     const apiKey = await this.getApiKey(model);
     
-    // Create client with the fetched API key
-    const client = new OpenAI({
-      apiKey: apiKey
-    });
+    // Create metered client with the fetched API key (shadow usage metering).
+    // Note: the factory does not wrap images.generate, so the generation is
+    // recorded explicitly below (fire-and-forget, fail-open).
+    const client = getOpenAIClient(
+      { userId: params.userId, feature: 'content_gen' },
+      { apiKey }
+    );
 
     const result = await client.images.generate({
       model: model,
@@ -1117,6 +1344,22 @@ export class ImageService {
           size: params.size as any,
           quality: (params.quality || 'medium') as any,
         });
+
+        // Shadow-record the image generation. gpt-image models return token
+        // usage; DALL-E does not (records 0 tokens, call count still visible).
+        try {
+          const usage: any = (result as any)?.usage;
+          void recordUsage({
+            userId: params.userId,
+            model: model,
+            provider: 'openai',
+            feature: 'content_gen',
+            inputTokens: usage?.input_tokens || 0,
+            outputTokens: usage?.output_tokens || 0,
+          });
+        } catch {
+          // Metering must never break image generation.
+        }
 
         // Return the image URL directly from OpenAI
         if (result.data && result.data.length > 0) {

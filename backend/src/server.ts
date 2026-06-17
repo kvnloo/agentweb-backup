@@ -445,6 +445,14 @@ createTestAccount().then(async () => {
     console.log(`WebSocket server is ready`);
     console.log(`Test account email: ${process.env.TEST_EMAIL}`);
 
+    // Self-heal the telemetry/loop tables if missing — fire-and-forget, non-fatal.
+    // Prevents the silent-no-op class of bug where a writer swallows
+    // ResourceNotFound and a whole loop subsystem runs against a table that
+    // was never provisioned (see services/ensureCriticalTables.ts).
+    void import('./services/ensureCriticalTables')
+      .then(({ ensureCriticalTables }) => ensureCriticalTables())
+      .catch((err) => console.error('[startup] ensureCriticalTables failed (non-fatal):', err?.message || err));
+
     // Initialize Agent Mode tools in background - don't block server startup
     // This prevents health check timeouts during deployment (e.g. Elastic Beanstalk)
     console.log('Initializing Agent Mode Tools (non-blocking)...');
@@ -529,6 +537,15 @@ createTestAccount().then(async () => {
         console.log('[dripWorker] Initialized — running every 5 minutes');
       } catch (error) {
         console.error('[dripWorker] Failed to initialize:', error);
+      }
+
+      // Durable Landing-Page Poller — redeploy backstop for in-flight builds.
+      // No-op unless DURABLE_LANDING_GENERATION is on. Runs every 5 minutes.
+      try {
+        const { startDurableLandingPoller } = await import('./services/durableLandingPoller');
+        startDurableLandingPoller();
+      } catch (error) {
+        console.error('[durableLandingPoller] Failed to initialize:', error);
       }
 
       // LinkedIn Connection Sync — runs every 10 minutes
@@ -731,6 +748,40 @@ createTestAccount().then(async () => {
         }
       } else {
         console.log('[AgentModeLoop] Disabled (set AGENT_MODE_LOOP_ENABLED=true to enable)');
+      }
+
+      // Agent-mode daily reliability snapshot — daily at 17:45 UTC, between the
+      // agent-mode learning loop (17:30) and generic attribution (18:00) so it
+      // doesn't race them. Telemetry-only: reads the agent-mode events the
+      // recorder already wrote and persists a dated trend-line snapshot. Never
+      // touches the chat path. Gated by AGENT_RELIABILITY_SNAPSHOT_ENABLED.
+      if (process.env.AGENT_RELIABILITY_SNAPSHOT_ENABLED === 'true') {
+        try {
+          const SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
+          const { runAgentReliabilitySnapshot } = await import('./cron/agentReliabilitySnapshotCron');
+
+          const nowForSnapshot = new Date();
+          const nextSnapshotRun = new Date(nowForSnapshot);
+          nextSnapshotRun.setUTCHours(17, 45, 0, 0);
+          if (nextSnapshotRun <= nowForSnapshot) {
+            nextSnapshotRun.setUTCDate(nextSnapshotRun.getUTCDate() + 1);
+          }
+          const msUntilSnapshot = nextSnapshotRun.getTime() - nowForSnapshot.getTime();
+
+          console.log(
+            `[AgentReliabilitySnapshot] Initialized — first run at 17:45 UTC (in ${Math.round(msUntilSnapshot / 60000)} min)`,
+          );
+          setTimeout(() => {
+            runAgentReliabilitySnapshot().catch(e => console.error('[AgentReliabilitySnapshot] Error:', e));
+            setInterval(() => {
+              runAgentReliabilitySnapshot().catch(e => console.error('[AgentReliabilitySnapshot] Error:', e));
+            }, SNAPSHOT_INTERVAL_MS);
+          }, msUntilSnapshot);
+        } catch (error) {
+          console.error('[AgentReliabilitySnapshot] Failed to initialize:', error);
+        }
+      } else {
+        console.log('[AgentReliabilitySnapshot] Disabled (set AGENT_RELIABILITY_SNAPSHOT_ENABLED=true to enable)');
       }
 
       // Generic Layer-5 attribution — daily at 18:00 UTC, after the product

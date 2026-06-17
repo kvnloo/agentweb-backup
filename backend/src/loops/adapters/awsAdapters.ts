@@ -112,9 +112,30 @@ function getSlackClient(): WebClient {
   return slackClientSingleton;
 }
 
+/**
+ * Loop Slack egress gate. Side effects that leave the system (DMs to humans)
+ * must be structurally impossible outside prod, independent of the per-loop
+ * enable flag — a dev/test backend with a loop flag flipped on must NOT be able
+ * to DM real people via the shared bot token (the "Emma Dev yaps" incident,
+ * 2026-06-13). Overridable for intentional dev testing with
+ * LOOP_SLACK_ALLOW_NONPROD=true.
+ */
+export function shouldSuppressLoopSlackPost(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  if (env.NODE_ENV === 'production') return false;
+  return env.LOOP_SLACK_ALLOW_NONPROD !== 'true';
+}
+
 export function awsSlackAdapter(): SlackPort {
   return {
     async postMessage(channelOrUserId: string, markdown: string): Promise<SlackMessageHandle> {
+      if (shouldSuppressLoopSlackPost()) {
+        console.log(
+          `[loop-slack] suppressed post to ${channelOrUserId} (NODE_ENV=${process.env.NODE_ENV ?? 'unset'}; set LOOP_SLACK_ALLOW_NONPROD=true to allow non-prod loop DMs)`,
+        );
+        return { channel: channelOrUserId, ts: '' };
+      }
       const r = await getSlackClient().chat.postMessage({
         channel: channelOrUserId,
         text: markdown,

@@ -1,4 +1,5 @@
 import {
+  AgentToolBudgetExceededError,
   AgentToolPolicyBlockedError,
   AgentToolRepeatedFailureError,
   _resetAgentToolFailureBreaker,
@@ -223,6 +224,126 @@ describe('agentToolGatewayService', () => {
       expect(result.repairs).toEqual([]);
     });
 
+    describe('scalar coercion (number/boolean string repair)', () => {
+      // Mirrors the real read_tool_response / search_tool_response schemas, which
+      // were the #1 production failure cluster: the model emits numeric args as
+      // strings ("0", "8000") and the type validator hard-rejected them.
+      const readToolResponseSchema = {
+        type: 'object',
+        properties: {
+          s3_key: { type: 'string' },
+          char_offset: { type: 'number' },
+          char_length: { type: 'number' },
+        },
+        required: ['s3_key'],
+      };
+      const searchToolResponseSchema = {
+        type: 'object',
+        properties: {
+          s3_key: { type: 'string' },
+          query: { type: 'string' },
+          match_offset: { type: 'number' },
+          max_matches: { type: 'number' },
+          context_chars: { type: 'number' },
+        },
+        required: ['s3_key', 'query'],
+      };
+
+      it('coerces stringified numbers for read_tool_response (repro: real failure mode)', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'read_tool_response',
+          args: { s3_key: 'tool-responses/abc', char_offset: '0', char_length: '8000' },
+          inputSchema: readToolResponseSchema,
+          effect: 'read',
+        });
+
+        expect(result.status).toBe('repaired');
+        expect(result.args).toEqual({ s3_key: 'tool-responses/abc', char_offset: 0, char_length: 8000 });
+        expect(result.repairs).toEqual(
+          expect.arrayContaining(['char_offset:scalar_coerce', 'char_length:scalar_coerce']),
+        );
+      });
+
+      it('coerces stringified match_offset for search_tool_response (repro: real failure mode)', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'search_tool_response',
+          args: { s3_key: 'tool-responses/abc', query: 'link_url', match_offset: '20' },
+          inputSchema: searchToolResponseSchema,
+          effect: 'read',
+        });
+
+        expect(result.status).toBe('repaired');
+        expect(result.args).toEqual({ s3_key: 'tool-responses/abc', query: 'link_url', match_offset: 20 });
+        expect(result.repairs).toEqual(expect.arrayContaining(['match_offset:scalar_coerce']));
+      });
+
+      it('coerces decimal and signed numbers', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'read_tool_response',
+          args: { s3_key: 'k', char_offset: '-5', char_length: '12.5' },
+          inputSchema: readToolResponseSchema,
+          effect: 'read',
+        });
+        expect(result.status).toBe('repaired');
+        expect(result.args).toEqual({ s3_key: 'k', char_offset: -5, char_length: 12.5 });
+      });
+
+      it('coerces stringified booleans', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'some_tool',
+          args: { enabled: 'true', disabled: 'FALSE' },
+          inputSchema: {
+            type: 'object',
+            properties: { enabled: { type: 'boolean' }, disabled: { type: 'boolean' } },
+            required: [],
+          },
+          effect: 'read',
+        });
+        expect(result.status).toBe('repaired');
+        expect(result.args).toEqual({ enabled: true, disabled: false });
+      });
+
+      it('does NOT coerce when the schema also accepts string (behavior preserved)', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'some_tool',
+          args: { val: '42' },
+          inputSchema: {
+            type: 'object',
+            properties: { val: { type: ['string', 'number'] } },
+            required: [],
+          },
+          effect: 'read',
+        });
+        expect(result.status).toBe('valid');
+        expect(result.args).toEqual({ val: '42' });
+      });
+
+      it('leaves already-correct numbers unchanged (success path behavior-preserving)', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'read_tool_response',
+          args: { s3_key: 'k', char_offset: 0, char_length: 8000 },
+          inputSchema: readToolResponseSchema,
+          effect: 'read',
+        });
+        expect(result.status).toBe('valid');
+        expect(result.args).toEqual({ s3_key: 'k', char_offset: 0, char_length: 8000 });
+        expect(result.repairs).toEqual([]);
+      });
+
+      it('still rejects a non-numeric string as a type mismatch (no silent NaN)', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'read_tool_response',
+          args: { s3_key: 'k', char_offset: 'beginning' },
+          inputSchema: readToolResponseSchema,
+          effect: 'read',
+        });
+        expect(result.status).toBe('invalid');
+        if (result.status === 'invalid') {
+          expect(result.issues.map((i) => i.code)).toContain('type_mismatch');
+        }
+      });
+    });
+
     it('repairs low-risk url alias drift before execution', () => {
       const result = validateAndRepairToolArgs({
         toolName: 'read_file_content',
@@ -418,10 +539,13 @@ describe('agentToolGatewayService', () => {
 
       const result = validateAndRepairToolArgs({
         toolName: 'read_metrics',
+        // 'yes' is not a coercible boolean (only 'true'/'false' coerce), so it must
+        // still surface as a type mismatch. 2.5 is not a valid integer; Infinity is
+        // not a finite number.
         args: {
           count: 2.5,
           ratio: Number.POSITIVE_INFINITY,
-          enabled: 'true',
+          enabled: 'yes',
           tags: 'a',
           options: ['compact'],
           maybe: false,
@@ -741,6 +865,62 @@ describe('agentToolGatewayService', () => {
         ]));
       }
     });
+
+    it('rejects LinkedIn send-invite notes over the conservative 200 character agent limit before dispatch', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'linkedin_outreach',
+        args: {
+          action: 'send-invite',
+          profile_url: 'https://www.linkedin.com/in/example/',
+          message: 'x'.repeat(201),
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string' },
+            profile_url: { type: 'string' },
+            message: { type: 'string' },
+          },
+          required: ['action'],
+        },
+        effect: 'external_send',
+      });
+
+      expect(result.status).toBe('invalid');
+      if (result.status === 'invalid') {
+        expect(result.issues).toEqual(expect.arrayContaining([
+          expect.objectContaining({
+            code: 'invalid_args',
+            path: '$.message',
+          }),
+        ]));
+        expect(result.modelMessage).toContain('200 characters or fewer');
+        expect(result.modelMessage).toContain('201');
+      }
+    });
+
+    it('allows LinkedIn send-message bodies over 200 characters because the invite-note limit is action-specific', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'linkedin_outreach',
+        args: {
+          action: 'send-message',
+          profile_url: 'https://www.linkedin.com/in/example/',
+          message: 'x'.repeat(500),
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string' },
+            profile_url: { type: 'string' },
+            message: { type: 'string' },
+          },
+          required: ['action'],
+        },
+        effect: 'external_send',
+      });
+
+      expect(result.status).toBe('valid');
+    });
   });
 
   describe('repeated-failure circuit breaker', () => {
@@ -819,6 +999,74 @@ describe('agentToolGatewayService', () => {
         toolName: 'update_html_file',
         args: {},
         runId: 'run-c',
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('blocks expensive media tools after two failures even when the error messages differ', async () => {
+      await failNTimes('run-media', 'generate_image', 'Safety filter rejected image prompt', 1);
+      await failNTimes('run-media', 'generate_image', 'Google image generation timed out after 10 minutes', 1);
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'generate_image',
+        args: { prompt: 'try one more expensive generation' },
+        runId: 'run-media',
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolBudgetExceededError);
+        expect((outcome.error as Error).message).toContain('retry budget of 2');
+        expect((outcome.error as Error).message.toLowerCase()).toContain('do not call it again');
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('blocks expensive media retries across overlapping runs in the same session budget scope', async () => {
+      const sessionScope = 'session-bodylever-image-storm';
+      for (const runId of ['run-media-a', 'run-media-b']) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'generate_image',
+          args: { prompt: 'high-fidelity product ad' },
+          runId,
+          budgetScopeId: sessionScope,
+          execute: failingExecute('Gemini image generation timed out after 600 seconds'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'generate_image',
+        args: { prompt: 'one more overlapping attempt' },
+        runId: 'run-media-c',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolBudgetExceededError);
+        expect((outcome.error as Error).message).toContain('in this session');
+        expect((outcome.error as Error).message).toContain('retry budget of 2');
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('does not apply the expensive media budget to ordinary tools', async () => {
+      await failNTimes('run-non-media', 'search_web', '429 rate limit', 1);
+      await failNTimes('run-non-media', 'search_web', 'network timeout', 1);
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'search_web',
+        args: { query: 'fallback research' },
+        runId: 'run-non-media',
         execute,
       });
 

@@ -91,11 +91,11 @@ describe('PUT /api/admin/users/:userId/password — session termination', () => 
     expect(mockUserDb.incrementSessionVersion).not.toHaveBeenCalled();
   });
 
-  it('FAIL: password shorter than 6 chars → 400, no session termination', async () => {
+  it('FAIL: password shorter than 12 chars → 400, no session termination', async () => {
     const res = await request(app)
       .put('/api/admin/users/user-1/password')
       .set('Authorization', 'Bearer test-token')
-      .send({ password: 'abc' });
+      .send({ password: 'short' });
 
     expect(res.status).toBe(400);
     expect(mockUserDb.incrementSessionVersion).not.toHaveBeenCalled();
@@ -107,7 +107,7 @@ describe('PUT /api/admin/users/:userId/password — session termination', () => 
     const res = await request(app)
       .put('/api/admin/users/nonexistent/password')
       .set('Authorization', 'Bearer test-token')
-      .send({ password: 'newpass123' });
+      .send({ password: 'NewPassword123!' });
 
     expect(res.status).toBe(404);
     expect(mockUserDb.updateUser).not.toHaveBeenCalled();
@@ -122,7 +122,7 @@ describe('PUT /api/admin/users/:userId/password — session termination', () => 
     const res = await request(app)
       .put('/api/admin/users/user-1/password')
       .set('Authorization', 'Bearer test-token')
-      .send({ password: 'newpass123' });
+      .send({ password: 'NewPassword123!' });
 
     expect(res.status).toBe(500);
   });
@@ -139,7 +139,7 @@ describe('PUT /api/admin/users/:userId/password — session termination', () => 
     const res = await request(app)
       .put('/api/admin/users/user-1/password')
       .set('Authorization', 'Bearer test-token')
-      .send({ password: 'newpass123' });
+      .send({ password: 'NewPassword123!' });
 
     expect(res.status).toBe(200);
     expect(res.body.message).toBe('Password updated successfully');
@@ -174,7 +174,7 @@ describe('PUT /api/admin/users/:userId/password — session termination', () => 
     const res = await request(app)
       .put('/api/admin/users/admin-user-1/password')
       .set('Authorization', 'Bearer test-token')
-      .send({ password: 'newpass123' });
+      .send({ password: 'NewPassword123!' });
 
     expect(res.status).toBe(200);
     expect(mockUserDb.incrementSessionVersion).toHaveBeenCalledWith('admin-user-1');
@@ -207,7 +207,7 @@ describe('PUT /api/admin/users/:userId/password — session termination', () => 
     const res = await request(app)
       .put('/api/admin/users/user-1/password')
       .set('Authorization', 'Bearer test-token')
-      .send({ password: 'newpass123' });
+      .send({ password: 'NewPassword123!' });
 
     expect(res.status).toBe(200);
     // Sockets are swept only after the bump, which is only after the write.

@@ -13,6 +13,7 @@ import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
 import { normalizeAttribution } from "../types/attribution";
 import { onUserRegistered } from "../services/contactCaptureHooks";
 import { isCompanyEmail } from "../utils/validation";
+import { isInitialPasswordExpired } from "../utils/secureRandom";
 import { AuthenticatedRequest } from "../middleware/auth";
 
 export const register = async (req: Request, res: Response) => {
@@ -30,6 +31,11 @@ export const register = async (req: Request, res: Response) => {
       return res
         .status(400)
         .json({ message: "Email and password are required" });
+    }
+    if (password.length < 12) {
+      return res
+        .status(400)
+        .json({ message: "Password must be at least 12 characters long" });
     }
     email = email.toLowerCase();
 
@@ -214,6 +220,16 @@ export const login = async (req: Request, res: Response) => {
       return res.status(401).json({
         message: "Invalid credentials. Please check your email and password.",
         code: "invalid_credentials",
+      });
+    }
+
+    // A system-generated initial password must not become a long-term password.
+    // Once it expires, block login and direct the user to reset their password.
+    if (user.mustChangePassword && isInitialPasswordExpired(user.tempPasswordExpires)) {
+      return res.status(401).json({
+        message:
+          "Your temporary password has expired. Please reset your password to continue.",
+        code: "temp_password_expired",
       });
     }
 
@@ -649,8 +665,8 @@ export const resetPassword = async (req: Request, res: Response) => {
       return res.status(400).json({ message: "Token and password are required" });
     }
 
-    if (password.length < 6) {
-      return res.status(400).json({ message: "Password must be at least 6 characters long" });
+    if (password.length < 12) {
+      return res.status(400).json({ message: "Password must be at least 12 characters long" });
     }
 
     // Find user by reset token
@@ -667,11 +683,17 @@ export const resetPassword = async (req: Request, res: Response) => {
     // Hash new password
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Update user password and clear reset token
+    // Update user password and clear reset token. Also clear the initial /
+    // temporary password lifecycle fields — the user has now set their own
+    // long-term password.
     await userDb.updateUser(user.userId, {
       password: hashedPassword,
       resetPasswordToken: undefined,
-      resetPasswordExpires: undefined
+      resetPasswordExpires: undefined,
+      mustChangePassword: false,
+      // null (not undefined) — updateUser skips undefined, so a stale expiry
+      // timestamp would otherwise linger on the record.
+      tempPasswordExpires: null
     });
 
     // Invalidate all existing sessions (every device) after the password reset.
@@ -689,7 +711,10 @@ export const resetPassword = async (req: Request, res: Response) => {
   }
 };
 
-// Authenticated password change (user is logged in and supplies current password).
+// Authenticated self-service password change (Settings → Change Password, and
+// the forced-change screen for temp-password users). This is the in-app path
+// for converting a system-generated initial password into the user's own
+// long-term password, so it MUST clear the temporary password lifecycle flags.
 // On success, all OTHER sessions are terminated and the caller receives a fresh
 // token minted with the new sessionVersion so the current device stays signed in.
 export const changePassword = async (req: Request, res: Response) => {
@@ -706,14 +731,24 @@ export const changePassword = async (req: Request, res: Response) => {
       return res.status(403).json({ message: "Password change is not allowed in a delegated session" });
     }
 
-    const { currentPassword, newPassword } = req.body;
+    const { currentPassword, newPassword } = req.body || {};
 
     if (!currentPassword || !newPassword) {
-      return res.status(400).json({ message: "Current password and new password are required" });
+      return res
+        .status(400)
+        .json({ message: "Current and new passwords are required" });
     }
 
-    if (newPassword.length < 6) {
-      return res.status(400).json({ message: "New password must be at least 6 characters long" });
+    if (newPassword.length < 12) {
+      return res
+        .status(400)
+        .json({ message: "New password must be at least 12 characters long" });
+    }
+
+    if (newPassword === currentPassword) {
+      return res
+        .status(400)
+        .json({ message: "New password must be different from current password" });
     }
 
     const user = await userDb.getUserById(userId);
@@ -721,9 +756,11 @@ export const changePassword = async (req: Request, res: Response) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // OAuth-only accounts have a placeholder password and cannot change it here.
-    if (user.isOAuthUser) {
-      return res.status(400).json({ message: "Password change is not available for accounts that sign in with Google" });
+    // OAuth accounts have no real password to verify against.
+    if (user.isOAuthUser || user.googleId) {
+      return res.status(400).json({
+        message: "Password change is not available for accounts that sign in with Google.",
+      });
     }
 
     const isValidPassword = await bcrypt.compare(currentPassword, user.password);
@@ -731,12 +768,17 @@ export const changePassword = async (req: Request, res: Response) => {
       return res.status(401).json({ message: "Current password is incorrect", code: "invalid_current_password" });
     }
 
-    if (currentPassword === newPassword) {
-      return res.status(400).json({ message: "New password must be different from the current password" });
-    }
-
     const hashedPassword = await bcrypt.hash(newPassword, 10);
-    await userDb.updateUser(userId, { password: hashedPassword });
+
+    // Set the new long-term password and clear the temporary-password lifecycle
+    // flags — the initial secret can no longer become the long-term password
+    // once the user has chosen their own.
+    await userDb.updateUser(userId, {
+      password: hashedPassword,
+      mustChangePassword: false,
+      // null (not undefined) — updateUser skips undefined values.
+      tempPasswordExpires: null,
+    });
 
     // Terminate every other session by bumping sessionVersion, then re-issue a
     // token for the current device carrying the new version so it stays logged in.
@@ -757,7 +799,7 @@ export const changePassword = async (req: Request, res: Response) => {
       { expiresIn: "90d" }
     );
 
-    res.json({ message: "Password changed successfully", token });
+    res.json({ message: "Password has been changed successfully", token });
   } catch (error) {
     console.error("Error in change password:", error);
     res.status(500).json({ message: "Error changing password" });

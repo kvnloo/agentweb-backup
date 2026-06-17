@@ -95,6 +95,12 @@ IMPORTANT: Brand / topic mismatch:
 - Only lower the score for a mismatch if the assistant repeatedly refuses to produce ANY usable output after the user has clearly pushed back and asked it to proceed anyway. Flagging once (or flagging and then delivering a best-effort draft) should score as satisfied (score ≥ 4)
 - A brief flag followed by a usable deliverable is ideal; a flag with a clarifying question is acceptable and should not be treated as the user "having to repeat themselves"
 
+IMPORTANT: Draft/reply direction:
+- For drafting tasks involving multiple named parties, evaluate whether the assistant preserved the intended sender and recipient.
+- If the user explicitly asked for a reply TO one person FROM/on behalf of another person or team, drafting in the opposite direction is a goal-completion failure even if the wording is polished.
+- If sender/recipient direction was genuinely ambiguous, a single concise clarification such as "I'll draft this FROM X TO Y - correct?" is correct behavior and should not be penalized as excessive clarification.
+- Do not infer a draft/reply task from a bare pasted third-party message. If the user only pasted text like "A: @B / @C: ..." without asking the assistant to reply, draft, send, or rewrite, it is correct for the assistant to flag that the message appears intended for other people and offer options such as sending, emailing, or polishing. Do not score that as reversed sender/recipient direction.
+
 In addition to the overall score, rate three specific dimensions (1-5 each):
 - goalCompletion: Did the assistant fully accomplish what the user asked? Did the user get what they came for?
 - dataAccuracy: Did the output contain plausible, consistent, and factually coherent data? Penalize hallucinated facts, made-up numbers, or self-contradictions.
@@ -229,7 +235,8 @@ export async function scoreSession(
   messages: ChatMessage[],
   currentMessageCount: number,
   pageIdentifier?: string,
-  sessionType?: string
+  sessionType?: string,
+  usageContext?: { userId?: string; feature?: string; sessionId?: string }
 ): Promise<ScoringResult> {
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
   const baseConversationText = serializeMessagesForScoring(recentMessages);
@@ -253,6 +260,7 @@ export async function scoreSession(
       temperature: 0,
       max_completion_tokens: SCORING_MAX_COMPLETION_TOKENS,
       response_format: { type: "json_object" },
+      usageContext: { ...usageContext, feature: usageContext?.feature || "agent_task" },
     }
   );
 
@@ -287,7 +295,8 @@ export async function scoreSessionWithJudge(
   messages: ChatMessage[],
   currentMessageCount: number,
   judge: ScoringJudge,
-  sessionType?: string
+  sessionType?: string,
+  usageContext?: { userId?: string; feature?: string; sessionId?: string }
 ): Promise<ScoringResult> {
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
   const baseConversationText = serializeMessagesForScoring(recentMessages);
@@ -308,6 +317,7 @@ export async function scoreSessionWithJudge(
       temperature: 0,
       max_completion_tokens: SCORING_MAX_COMPLETION_TOKENS,
       response_format: { type: "json_object" },
+      usageContext: { ...usageContext, feature: usageContext?.feature || "agent_task" },
     }
   );
 
@@ -354,7 +364,10 @@ export async function scoreSessionWithJudgeIfNeeded(
     }
     result = buildFailedRunResult(messageCount);
   } else {
-    result = await scoreSessionWithJudge(session.messages || [], messageCount, judge, session.sessionType);
+    result = await scoreSessionWithJudge(session.messages || [], messageCount, judge, session.sessionType, {
+      userId: session.userId,
+      sessionId: session.sessionId,
+    });
   }
 
   const judgeScore = {
@@ -406,7 +419,10 @@ export async function scoreSessionIfNeeded(
     }
     result = buildFailedRunResult(messageCount);
   } else {
-    result = await scoreSession(session.messages || [], messageCount, session.pageIdentifier, session.sessionType);
+    result = await scoreSession(session.messages || [], messageCount, session.pageIdentifier, session.sessionType, {
+      userId: session.userId,
+      sessionId: session.sessionId,
+    });
   }
 
   const satisfactionScore: ChatSession["satisfactionScore"] = {

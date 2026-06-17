@@ -11,13 +11,38 @@
  * loop's failure clustering and the inspector UI, so renaming one is a
  * breaking change for historical queries:
  *   timeout | auth | rate_limit | invalid_args | not_found | network |
- *   upstream_5xx | policy_blocked | repeated_failure
+ *   upstream_5xx | policy_blocked | repeated_failure |
+ *   tool_unavailable | upstream_rejected | empty_result
+ *
+ * The three trailing classes were added 2026-06-14 after a 7-day production
+ * sweep of Dev-AW-LoopEvents `agent_tool_failed` events: re-classifying the
+ * 283 real failures with the prior patterns still left 63% in the generic
+ * `Error` fallback (dev.md target was <20%). The real residual clusters were:
+ *   - tool_unavailable  (~41) "Tool \"X\" is not available. You must install
+ *                        the required skill first using install_skills." — the
+ *                        model called an uninstalled skill; not a bug, a config
+ *                        gap. Largest single missed cluster.
+ *   - invalid_args      (~45 newly caught) "...arguments failed schema
+ *                        validation...", "has the wrong type", "Missing
+ *                        required argument/variable" — model emitted bad args.
+ *   - upstream_rejected (~28) LinkedIn business-rule refusals: "Cannot resend
+ *                        yet", "Should delay new invitation to this recipient",
+ *                        "not a 1st-degree connection". The provider accepted
+ *                        the call and deliberately refused the action —
+ *                        terminal + actionable, distinct from a 5xx or a bug.
+ *   - empty_result      (~9) "No search results found", "Unable to retrieve a
+ *                        Summarizer summary.", "No analysis results received
+ *                        from Gemini" — the call succeeded but yielded nothing.
+ * New fallback rate on the same 283-failure set: ~10%. The ~29 residual are
+ * genuinely idiosyncratic one-offs ("Unknown error", "success=false", file
+ * hash mismatch) that do not form a clusterable class.
  *
  * Unrecognized errors fall back to the legacy name-based class (explicit
  * `.name`, else constructor name) so named custom errors lose nothing.
  */
 
 const GATEWAY_NAME_CLASSES: Record<string, string> = {
+  AgentToolBudgetExceededError: 'repeated_failure',
   AgentToolPolicyBlockedError: 'policy_blocked',
   AgentToolRepeatedFailureError: 'repeated_failure',
   AgentToolContractValidationError: 'invalid_args',
@@ -45,13 +70,31 @@ function classFromMessage(message: string): string | null {
     if (byStatus) return byStatus;
   }
 
-  if (/etimedout|timed?\s*out|deadline exceeded/.test(m)) return 'timeout';
+  // Uninstalled-skill calls — checked first so "install the required skill"
+  // text never gets misread by a later branch. The model invoked a tool the
+  // user has not enabled; a config gap, not a failure of the tool itself.
+  if (/is not available\. you must install the required skill|install_skills/.test(m)) return 'tool_unavailable';
+
+  if (/etimedout|timed?\s*out|deadline exceeded|operation was aborted/.test(m)) return 'timeout';
   if (/too many requests|rate limit|quota exceeded/.test(m)) return 'rate_limit';
-  if (/unauthorized|forbidden|invalid (access |api )?token|invalid api key|authentication|missing credentials/.test(m)) return 'auth';
+
+  // Bad arguments the model emitted — schema-validation rejections (the
+  // contract layer rejects before execution) plus classic validation phrasing.
+  if (/arguments failed schema validation|has the wrong type|missing required (argument|variable)|invalid parameters?|invalid argument|validation (failed|error)|(is|are) required|must be|is too long|too long \(|is too short/.test(m)) return 'invalid_args';
+
+  if (/unauthorized|forbidden|invalid (access |api )?token|invalid api key|authentication|missing credentials|not authorized|do not have permission|permission to|no secrets configured|not a member of channel|account connected|account not configured/.test(m)) return 'auth';
   if (/enotfound|econnrefused|econnreset|eai_again|socket hang up|network error|fetch failed/.test(m)) return 'network';
-  if (/not found/.test(m)) return 'not_found';
-  if (/invalid parameters?|invalid argument|validation (failed|error)|is required|must be|is too long|too long \(|is too short/.test(m)) return 'invalid_args';
+  if (/does not exist|not found/.test(m)) return 'not_found';
   if (/internal server error|bad gateway|service unavailable|upstream/.test(m)) return 'upstream_5xx';
+
+  // Upstream accepted the call and deliberately refused the action (provider
+  // business rules — LinkedIn invite/message cadence + connection-degree
+  // gates). Terminal + actionable, distinct from a transport 5xx or a bug.
+  if (/cannot resend yet|should delay new invitation|recipient cannot be reached|already connected with this person|not a 1st-degree connection|not a \d.{0,4}degree connection|cannot send (invite|message)/.test(m)) return 'upstream_rejected';
+
+  // Call succeeded but produced nothing usable — distinct from a hard error;
+  // the model should broaden/retry the query rather than treat it as broken.
+  if (/no (search )?results? (found|received)|unable to retrieve|no analysis results|returned no results/.test(m)) return 'empty_result';
 
   return null;
 }

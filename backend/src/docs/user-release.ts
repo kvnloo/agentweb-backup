@@ -20,6 +20,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-12',
     changes: [
+      'Updated: Passwords Now Require at Least 12 Characters',
+      '- To better protect your account, any password you set now needs to be at least 12 characters long — this applies when you sign up, reset a forgotten password, or change your password in Settings',
+      '- Your existing password keeps working; the new minimum only applies the next time you create or change a password',
+    ],
+  },
+  {
+    date: '2026-06-12',
+    changes: [
       'New: Your Lead List Name and ID Now Sync to HubSpot for Easy Segmentation',
       '- When you push leads to HubSpot, each contact now carries the name and ID of the Emma lead list it came from (as the "lead_list_name" and "lead_list_id" properties), so you can filter, segment, and build lists in HubSpot by their source',
       '- This works for every list — including ones you connected before this update — with no need to reconnect or re-save; just push and the fields appear (HubSpot creates the two properties automatically on the first push)',

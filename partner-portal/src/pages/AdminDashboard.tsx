@@ -49,6 +49,7 @@ import { format } from "date-fns";
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl, CUSTOMER_FRONTEND_URL } from "../config";
+import { buildAgentRunInspectorUrl } from "../utils/agentRunLinks";
 import DOMPurify from "dompurify";
 import ImageModelsSettings from "../components/admin/ImageModelsSettings";
 import DefaultPromptsSettings from "../components/admin/DefaultPromptsSettings";
@@ -3012,6 +3013,11 @@ export default function AdminDashboard() {
       return;
     }
 
+    if (newPassword.length < 12) {
+      setError("Password must be at least 12 characters long");
+      return;
+    }
+
     try {
       setPasswordResetLoading(true);
       setError("");
@@ -5953,7 +5959,8 @@ export default function AdminDashboard() {
                             <Button
                               variant="outlined"
                               size="small"
-                              onClick={() => handleViewChat(session)}
+                              component={RouterLink}
+                              to={buildAgentRunInspectorUrl({ sessionId: session.sessionId })}
                             >
                               Debug Chat
                             </Button>
@@ -7593,7 +7600,7 @@ export default function AdminDashboard() {
             onChange={(e) => setNewPassword(e.target.value)}
             placeholder="Enter new password"
             disabled={passwordResetLoading}
-            helperText="Minimum 6 characters"
+            helperText="Minimum 12 characters"
           />
         </DialogContent>
         <DialogActions>
@@ -9762,4 +9769,3 @@ const AgentModeSettings = () => {
     </Box>
   );
 };
-

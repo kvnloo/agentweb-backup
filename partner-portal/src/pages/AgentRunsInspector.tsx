@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import axios from 'axios';
 import { buildApiUrl, CUSTOMER_FRONTEND_URL } from '../config';
 import { useAuth } from '../contexts/AuthContext';
@@ -52,6 +53,8 @@ interface AgentRunDecision {
   explanationSource?: string;
   toolPolicyFlags?: string;
   toolPolicySummary?: string;
+  argsRepairedCount?: number;
+  schemaErrorCount?: number;
 }
 
 interface AgentRunOutcome {
@@ -62,6 +65,7 @@ interface AgentRunOutcome {
   durationMs?: number;
   errorClass?: string;
   errorMessage?: string;
+  failureType?: string;
 }
 
 interface AgentRunChatContext {
@@ -167,15 +171,16 @@ function buildCustomerChatUrl(chat?: AgentRunChatContext): string | undefined {
 
 export default function AgentRunsInspector() {
   const { token, user } = useAuth();
+  const [searchParams] = useSearchParams();
   const [runs, setRuns] = useState<AgentRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [scannedEvents, setScannedEvents] = useState(0);
   const [filters, setFilters] = useState({
-    userId: '',
-    sessionId: '',
-    runId: '',
+    userId: searchParams.get('userId') ?? '',
+    sessionId: searchParams.get('sessionId') ?? '',
+    runId: searchParams.get('runId') ?? '',
     limit: 200,
   });
 
@@ -523,6 +528,16 @@ function RunDetail({ run }: { run: AgentRun | null }) {
                     </Box>
                   </Box>
                 )}
+                {(decision.argsRepairedCount || decision.schemaErrorCount) ? (
+                  <Box sx={{ display: 'flex', gap: 0.75, flexWrap: 'wrap', mt: 1 }}>
+                    {decision.argsRepairedCount ? (
+                      <Chip size="small" label={`${decision.argsRepairedCount} arg repair(s)`} color="info" variant="outlined" />
+                    ) : null}
+                    {decision.schemaErrorCount ? (
+                      <Chip size="small" label={`${decision.schemaErrorCount} schema reject(s)`} color="warning" variant="outlined" />
+                    ) : null}
+                  </Box>
+                ) : null}
               </Box>
             ))}
             {!run.decisions.length && (
@@ -547,6 +562,7 @@ function RunDetail({ run }: { run: AgentRun | null }) {
                   <TableCell>Event</TableCell>
                   <TableCell>Tool</TableCell>
                   <TableCell align="right">Duration</TableCell>
+                  <TableCell>Failure Type</TableCell>
                   <TableCell>Error</TableCell>
                 </TableRow>
               </TableHead>
@@ -559,6 +575,13 @@ function RunDetail({ run }: { run: AgentRun | null }) {
                     </TableCell>
                     <TableCell>{outcome.toolName || '-'}</TableCell>
                     <TableCell align="right">{formatDuration(outcome.durationMs)}</TableCell>
+                    <TableCell>
+                      {outcome.failureType ? (
+                        <Chip size="small" label={outcome.failureType} variant="outlined" />
+                      ) : (
+                        '-'
+                      )}
+                    </TableCell>
                     <TableCell>
                       {outcome.errorMessage ? (
                         <Tooltip title={outcome.errorMessage}>
@@ -574,7 +597,7 @@ function RunDetail({ run }: { run: AgentRun | null }) {
                 ))}
                 {!run.outcomes.length && (
                   <TableRow>
-                    <TableCell colSpan={5}>
+                    <TableCell colSpan={6}>
                       <Typography variant="body2" color="text.secondary" sx={{ py: 2, textAlign: 'center' }}>
                         No tool events recorded.
                       </Typography>

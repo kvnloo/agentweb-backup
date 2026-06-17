@@ -38,6 +38,11 @@ import { imageService as defaultImageService } from "./imageGeneration";
 import { reportUIError } from "../utils/errorReporter";
 import { userDb } from "./db";
 import {
+  DEFAULT_IMAGE_STYLE_SPEC,
+  DEFAULT_IMAGE_HARD_CONSTRAINTS,
+  type GlobalImageDirectives,
+} from "./imagePromptDefaults";
+import {
   adImageFailedPatch,
   adImageReadyPatch,
   adImageStartPatch,
@@ -242,7 +247,24 @@ export function buildSixLayerPromptForVariant(
     textBudget: string;
     name: string;
   },
+  /**
+   * Optional extras:
+   *  - negativeExamples: visual directions distilled from the user's recent
+   *    image rejects (♥/✕). Appended as a dedicated block so the model steers
+   *    away from disliked concepts. Empty (default) keeps the first run clean.
+   *  - globalDirectives: runtime-overridable style spec + hard constraints
+   *    (WS1a). Absent fields fall back to the DEFAULT_IMAGE_* constants so the
+   *    rendered prompt is byte-identical until the managed row is edited.
+   */
+  opts: {
+    negativeExamples?: string;
+    globalDirectives?: GlobalImageDirectives;
+  } = {},
 ): string {
+  const negativeExamples = opts.negativeExamples ?? "";
+  const styleSpec = opts.globalDirectives?.styleSpec ?? DEFAULT_IMAGE_STYLE_SPEC;
+  const hardConstraints =
+    opts.globalDirectives?.hardConstraints ?? DEFAULT_IMAGE_HARD_CONSTRAINTS;
   const { variantIndex, format, concept, copyAngle, formatArchetype, brand, persona } =
     inputs;
   const archetypeId: Archetype = resolveArchetype(formatArchetype, variantIndex);
@@ -343,30 +365,31 @@ export function buildSixLayerPromptForVariant(
   );
   lines.push(``);
 
-  // Layer 6 — STYLE SPECIFICATION
+  // Layer 6 — STYLE SPECIFICATION (lead from managed directives; the
+  // format-confirmation sentence stays dynamic).
   lines.push(`LAYER 6: STYLE SPECIFICATION`);
   lines.push(
-    `Photorealistic, premium editorial. Mood: confident, trustworthy. ` +
-      `What this should NOT look like: stock photography, cluttered collages, generic gradient backgrounds, AI-paragraph text walls rendered on the canvas. ` +
-      `Format confirmation: ${format} ${isFeed ? "square" : "vertical"} format.`,
+    `${styleSpec} Format confirmation: ${format} ${isFeed ? "square" : "vertical"} format.`,
   );
   lines.push(``);
 
+  // Negative examples — the user's recent rejects, distilled into visual
+  // directions to avoid. Placed just before HARD CONSTRAINTS so it carries
+  // weight without being buried mid-prompt. Skipped on the first run.
+  const trimmedNegatives = negativeExamples.trim();
+  if (trimmedNegatives) {
+    lines.push(``);
+    lines.push(trimmedNegatives);
+    lines.push(``);
+  }
+
   // Final reminder — Gemini sometimes ignores text-budget rules without
-  // an explicit re-statement. This catches the common failure mode.
+  // an explicit re-statement. This catches the common failure mode. The
+  // block comes from the managed directives (default = DEFAULT_IMAGE_HARD_
+  // CONSTRAINTS), pushed as one block — identical output to the prior
+  // four separate line pushes after lines.join("\n").
   lines.push(`HARD CONSTRAINTS:`);
-  lines.push(
-    `- Respect the TEXT BUDGET in Layer 4 EXACTLY. Count text elements before rendering. If the budget caps the headline at N words, the headline MUST be ≤ N words.`,
-  );
-  lines.push(
-    `- Do NOT render any sentence longer than the budget allows. If you need to fit more meaning, cut the sentence — do not over-write.`,
-  );
-  lines.push(
-    `- Every text element MUST be legible at thumbnail size (the ad will appear in a feed). If a text element wouldn't be legible, drop it rather than shrink it.`,
-  );
-  lines.push(
-    `- All UI text inside dashboards/screens must be coherent English. If you can't render coherent text at the chosen size, use abstract bars/lines/numbers without text — never lorem-ipsum or hallucinated placeholder strings.`,
-  );
+  lines.push(hardConstraints);
 
   return lines.join("\n");
 }
@@ -511,9 +534,46 @@ export async function generateAdImagesForUser(
       name: string;
       version: string;
     }>;
+    /**
+     * Negative visual directions distilled from the user's recent image
+     * rejects. Threaded into every variant's prompt so a regen steers
+     * away from disliked concepts. Empty on the first generation.
+     */
+    negativeExamples?: string;
+    /**
+     * Runtime-overridable global directives (style spec + hard constraints).
+     * If provided, used directly. If absent, loaded via loadGlobalDirectives
+     * (default = the managed store). A load failure degrades to the
+     * DEFAULT_IMAGE_* constants (byte-identical) — never blocks generation.
+     */
+    globalDirectives?: GlobalImageDirectives;
+    /** Inject the directives loader for tests. Defaults to the managed store. */
+    loadGlobalDirectives?: () => Promise<GlobalImageDirectives>;
   } = {}
 ): Promise<AdImageResult> {
   const gen = deps.imageGen ?? (defaultImageService as AdImageGeneratorDep);
+  const negativeExamples = deps.negativeExamples ?? "";
+  let globalDirectives = deps.globalDirectives;
+  if (!globalDirectives) {
+    try {
+      const loadGlobalDirectives =
+        deps.loadGlobalDirectives ??
+        (async () => {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const { getGlobalImageDirectives } = require("./promptTemplatesService");
+          const row = await getGlobalImageDirectives();
+          return { styleSpec: row.styleSpec, hardConstraints: row.hardConstraints };
+        });
+      globalDirectives = await loadGlobalDirectives();
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[onboardingAdImageService] global directives load failed; using constants",
+        { error: e instanceof Error ? e.message : String(e) },
+      );
+      globalDirectives = undefined; // builder falls back to DEFAULT_IMAGE_*
+    }
+  }
   const timeoutMs = deps.timeoutMs ?? PER_VARIANT_TIMEOUT_MS;
   const loadTemplate =
     deps.loadTemplate ??
@@ -581,11 +641,12 @@ export async function generateAdImagesForUser(
           persona,
         },
         template,
+        { negativeExamples, globalDirectives },
       );
       const filename = `ad-image-${userId}-${i + 1}-${Date.now()}.png`;
       const promptVersion =
         template?.version ?? PROMPT_BUILDER_VERSION;
-      return { prompt, filename, format, index: i, archetype, promptVersion };
+      return { prompt, filename, format, index: i, archetype, concept, promptVersion };
     }),
   );
 
@@ -610,6 +671,7 @@ export async function generateAdImagesForUser(
         // "same builder, edited template text" when iterating.
         promptVersion: `${PROMPT_BUILDER_VERSION}/${t.promptVersion}`,
         archetype: t.archetype,
+        concept: t.concept,
       };
       if (!r.success) {
         // eslint-disable-next-line no-console
@@ -676,13 +738,82 @@ export async function triggerAdImageGenerationForUser(
       : { concepts: [], copy_angles: [], format_archetypes: [] };
   const brand = extractAdImageBrandContext(u);
 
-  const result = await generateAdImagesForUser(
-    creativeDir,
-    brand,
-    personas,
-    userId,
-    deps
+  // Close the image feedback loop: if the user has rejected variants on a
+  // prior generation (♥/✕ swipe → adImageVariantsRated), distill those
+  // rejects into negative visual directions so this generation steers
+  // away from them. Empty on the first run (nothing rated yet). See
+  // adImageVariantRatingService.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { buildNegativeExamplesBlockForImages } = require("./adImageVariantRatingService");
+  const priorVariants: Array<{ id: string; concept?: string; archetype?: string }> =
+    Array.isArray(u.adImageResult?.variants) ? u.adImageResult.variants : [];
+  const negativeExamples: string = buildNegativeExamplesBlockForImages(
+    { adImageVariantsRated: u.adImageVariantsRated },
+    priorVariants.map((v) => ({
+      id: v.id,
+      conceptLabel: v.concept,
+      archetype: v.archetype,
+    })),
   );
+
+  // WS2 telemetry: record image-gen lifecycle onto the onboarding loop so a
+  // degraded model / timeout clusters on the health endpoint. Best-effort.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const {
+    recordOnboardingEvent,
+    recordOnboardingFailure,
+    ONBOARDING_TELEMETRY_EVENTS,
+  } = require("./onboardingTelemetry");
+  const isRegen = priorVariants.length > 0;
+  void recordOnboardingEvent(userId, ONBOARDING_TELEMETRY_EVENTS.imageGenStarted, {
+    regen: isRegen,
+  });
+  const genStartedAt = Date.now();
+
+  let result: AdImageResult;
+  try {
+    result = await generateAdImagesForUser(
+      creativeDir,
+      brand,
+      personas,
+      userId,
+      { ...deps, negativeExamples }
+    );
+  } catch (genErr) {
+    void recordOnboardingFailure(
+      userId,
+      ONBOARDING_TELEMETRY_EVENTS.imageGenFailed,
+      genErr,
+      { regen: isRegen, durationMs: Date.now() - genStartedAt },
+    );
+    throw genErr;
+  }
+
+  // generateAdImagesForUser swallows per-variant failures and substitutes a
+  // placeholder URL, so "completed" with liveCount < variantCount is a
+  // partial failure; liveCount === 0 is a full failure of the external model.
+  const variantCount = result.variants.length;
+  const liveCount = result.variants.filter(
+    (v) => typeof v.imageUrl === "string" && !v.imageUrl.includes("placeholder"),
+  ).length;
+  const durationMs = Date.now() - genStartedAt;
+  if (liveCount === 0 && variantCount > 0) {
+    void recordOnboardingFailure(
+      userId,
+      ONBOARDING_TELEMETRY_EVENTS.imageGenFailed,
+      new Error("all image variants failed (every URL is a placeholder)"),
+      { regen: isRegen, variantCount, liveCount, durationMs },
+    );
+  } else {
+    void recordOnboardingEvent(userId, ONBOARDING_TELEMETRY_EVENTS.imageGenCompleted, {
+      regen: isRegen,
+      variantCount,
+      liveCount,
+      failedCount: variantCount - liveCount,
+      durationMs,
+    });
+  }
+
   const current = await userDb.getUserById(userId);
   const patch = adImageReadyPatch(((current as any) || {}) as AdImageStatusFields, result);
   if (!patch) {

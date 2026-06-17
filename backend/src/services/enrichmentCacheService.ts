@@ -53,6 +53,36 @@ export function splitFieldsByGroup(
   return { byGroup, ungrouped };
 }
 
+/**
+ * Negative-result cache TTL (days). An EMPTY enrichment payload is cached for
+ * this long instead of the field group's full 90–180 day TTL, so a lead that
+ * couldn't be enriched once isn't locked out of re-enrichment for months once
+ * the data becomes findable. Still caches briefly so a single enrich run that
+ * touches the same lead twice doesn't re-hit providers. (WS4)
+ */
+export const NEGATIVE_CACHE_TTL_DAYS = 1;
+
+/** True when the cached payload carries no usable signal from any source. */
+export function isEmptyRawData(rawData: RawCacheData): boolean {
+  if (!rawData) return true;
+  const web = Array.isArray(rawData.webResults) ? rawData.webResults.length : 0;
+  const liCo = Array.isArray(rawData.linkedinCompanyResults)
+    ? rawData.linkedinCompanyResults.length
+    : 0;
+  const liData = rawData.linkedinData ? 1 : 0;
+  return web === 0 && liCo === 0 && liData === 0;
+}
+
+/**
+ * Choose the cache TTL for a payload: the short negative TTL for empty results
+ * (clamped so it never exceeds the group's base TTL), otherwise the full base.
+ */
+export function resolveCacheTtlDays(rawData: RawCacheData, baseTtlDays: number): number {
+  return isEmptyRawData(rawData)
+    ? Math.min(NEGATIVE_CACHE_TTL_DAYS, baseTtlDays)
+    : baseTtlDays;
+}
+
 export async function getRawDataFromCache(
   lead: LeadInfo,
   groupName: string,
@@ -123,7 +153,12 @@ export async function writeRawDataToCache(
       resultCount: rawData.webResults.length,
       schemaVersion: config.version,
       fetchedAt: new Date().toISOString(),
-      expiresAt: Math.floor(Date.now() / 1000) + config.ttlDays * 86400,
+      // Negative results (no signal) get a short TTL so the lead can be
+      // re-enriched soon; positive hits keep the full group TTL. (WS4)
+      negative: isEmptyRawData(rawData),
+      expiresAt:
+        Math.floor(Date.now() / 1000) +
+        resolveCacheTtlDays(rawData, config.ttlDays) * 86400,
     });
   } catch (err: any) {
     // Race condition: another worker wrote this entry first, ignore

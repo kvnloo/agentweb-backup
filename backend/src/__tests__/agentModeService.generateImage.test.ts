@@ -279,7 +279,10 @@ describe('AgentModeService - generate_image function', () => {
         'medium',
         inputImages,
         'user123',
-        'session123'
+        'session123',
+        undefined, // imageModel
+        undefined, // logoImage
+        true       // confirm: bypass the image-edit confirmation gate
       );
 
       expect(mockImageService.generateImage).toHaveBeenCalledWith({
@@ -348,7 +351,9 @@ describe('AgentModeService - generate_image function', () => {
         inputImages,
         'user123',
         'session123',
-        'gemini-3-pro-image-preview'
+        'gemini-3-pro-image-preview',
+        undefined, // logoImage
+        true       // confirm: bypass the image-edit confirmation gate
       );
 
       expect(mockImageService.generateImage).toHaveBeenCalledWith({
@@ -389,7 +394,9 @@ describe('AgentModeService - generate_image function', () => {
           inputImages,
           'user123',
           'session123',
-          model
+          model,
+          undefined, // logoImage
+          true       // confirm: bypass the image-edit confirmation gate
         );
 
         expect(mockImageService.generateImage).toHaveBeenCalledWith(
@@ -440,6 +447,136 @@ describe('AgentModeService - generate_image function', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toBe('Generation failed');
+    });
+
+    it('should retry fresh image generation timeouts with a fallback model only when no model was explicit', async () => {
+      mockImageService.generateImage
+        .mockResolvedValueOnce({
+          success: false,
+          error: 'Failed to generate image: Image generation with gemini-3-pro-image-preview timed out after 600 seconds'
+        })
+        .mockResolvedValueOnce({
+          success: true,
+          imageUrl: 'https://example.com/fallback-image.png',
+          filename: 'fallback.png'
+        });
+
+      const result = await (agentModeService as any).generateImage(
+        'A clean product launch graphic',
+        'launch.png',
+        '1024x1024',
+        'high',
+        [],
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.imageUrl).toBe('https://example.com/fallback-image.png');
+      expect(result.fallbackUsed).toBe(true);
+      expect(result.imageModel).toBe('gpt-image-2');
+      expect(result.quality).toBe('medium');
+      expect(mockImageService.generateImage).toHaveBeenCalledTimes(2);
+      expect(mockImageService.generateImage).toHaveBeenNthCalledWith(2, {
+        prompt: 'A clean product launch graphic',
+        filename: 'launch.png',
+        size: '1024x1024',
+        quality: 'medium',
+        inputImages: [],
+        logoImage: undefined,
+        userId: 'user123',
+        imageModel: 'gpt-image-2'
+      });
+    });
+
+    it('should not retry thrown transient image generation errors when the model was explicit', async () => {
+      mockImageService.generateImage
+        .mockRejectedValueOnce(new Error('gpt-image-2 API failed: 503 temporarily unavailable'));
+
+      const result = await (agentModeService as any).generateImage(
+        'A clean product launch graphic',
+        'launch.png',
+        '1024x1024',
+        'medium',
+        [],
+        'user123',
+        'session123',
+        'gpt-image-2'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('503 temporarily unavailable');
+      expect(mockImageService.generateImage).toHaveBeenCalledTimes(1);
+    });
+
+    it('should retry thrown transient image generation errors when model selection was implicit', async () => {
+      mockImageService.generateImage
+        .mockRejectedValueOnce(new Error('gemini-3-pro-image-preview API failed: 503 temporarily unavailable'))
+        .mockResolvedValueOnce({
+          success: true,
+          imageUrl: 'https://example.com/fallback-image.png',
+          filename: 'fallback.png'
+        });
+
+      const result = await (agentModeService as any).generateImage(
+        'A clean product launch graphic',
+        'launch.png',
+        '1024x1024',
+        'medium',
+        [],
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.fallbackUsed).toBe(true);
+      expect(result.imageModel).toBe('gpt-image-2');
+      expect(mockImageService.generateImage).toHaveBeenCalledTimes(2);
+    });
+
+    it('should not switch providers for confirmed image edits with source images', async () => {
+      mockImageService.generateImage.mockResolvedValue({
+        success: false,
+        error: 'Failed to generate image: Image generation with gemini-3-pro-image-preview timed out after 600 seconds'
+      });
+
+      const result = await (agentModeService as any).generateImage(
+        'Add this logo to the existing image',
+        'edited.png',
+        '1024x1024',
+        'medium',
+        ['https://example.com/source.png'],
+        'user123',
+        'session123',
+        'gemini-3-pro-image-preview',
+        undefined,
+        true
+      );
+
+      expect(result.success).toBe(false);
+      expect(mockImageService.generateImage).toHaveBeenCalledTimes(1);
+    });
+
+    it('should not retry non-retryable safety or policy failures', async () => {
+      mockImageService.generateImage.mockResolvedValue({
+        success: false,
+        error: 'Safety policy blocked this image prompt'
+      });
+
+      const result = await (agentModeService as any).generateImage(
+        'Unsafe prompt',
+        'blocked.png',
+        '1024x1024',
+        'medium',
+        [],
+        'user123',
+        'session123',
+        'gemini-3-pro-image-preview'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Safety policy blocked this image prompt');
+      expect(mockImageService.generateImage).toHaveBeenCalledTimes(1);
     });
 
     it('should handle imageService exceptions', async () => {
@@ -603,7 +740,8 @@ describe('AgentModeService - generate_image function', () => {
         'user123',
         'session123',
         'gemini-3-pro-image-preview',
-        'https://example.com/logo.png'
+        'https://example.com/logo.png',
+        true // confirm: bypass the image-edit confirmation gate
       );
 
       expect(mockImageService.generateImage).toHaveBeenCalledWith({
@@ -682,4 +820,3 @@ describe('AgentModeService - generate_image function', () => {
     });
   });
 });
-

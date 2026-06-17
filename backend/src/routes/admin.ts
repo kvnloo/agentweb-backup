@@ -20,6 +20,7 @@ import { workflowDb } from "../services/workflowDb";
 import { paginatedScan } from "../utils/dynamoPagination";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
+import { generateSecurePassword, getInitialPasswordExpiry } from "../utils/secureRandom";
 import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
 import { getRevenueMetrics } from "../services/revenueService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
@@ -1403,8 +1404,8 @@ router.put("/users/:userId/password", async (req, res) => {
     const { password } = req.body;
 
     // Validate password
-    if (!password || password.length < 6) {
-      return res.status(400).json({ message: "Password must be at least 6 characters long" });
+    if (!password || password.length < 12) {
+      return res.status(400).json({ message: "Password must be at least 12 characters long" });
     }
 
     // Check if user exists
@@ -1416,8 +1417,16 @@ router.put("/users/:userId/password", async (req, res) => {
     // Hash the new password
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Update the user's password
-    const updatedUser = await userDb.updateUser(userId, { password: hashedPassword });
+    // Update the user's password and clear any temporary-password lifecycle
+    // flags. Without this, an admin-set password on a waitlist-created user
+    // would still expire (and lock the user out) once tempPasswordExpires
+    // passed, even though the password is no longer system-generated.
+    const updatedUser = await userDb.updateUser(userId, {
+      password: hashedPassword,
+      mustChangePassword: false,
+      // null (not undefined) — updateUser skips undefined values.
+      tempPasswordExpires: null,
+    });
 
     // Terminate every active session for this user. An admin-initiated password
     // change is exactly the case (e.g. a compromised account) where all of the
@@ -1512,17 +1521,9 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
       // Send welcome email without password for existing user upgrade
       await emailService.sendWelcomeEmail(email);
     } else {
-      // Create new user with waitlist data
-      const generateRandomPassword = (length: number = 12) => {
-        const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*';
-        let password = '';
-        for (let i = 0; i < length; i++) {
-          password += charset.charAt(Math.floor(Math.random() * charset.length));
-        }
-        return password;
-      };
-
-      temporaryPassword = generateRandomPassword(16);
+      // Create new user with waitlist data. Use a CSPRNG for the temporary
+      // password — Math.random() is predictable and must never generate secrets.
+      temporaryPassword = generateSecurePassword(16);
       const hashedPassword = await bcrypt.hash(temporaryPassword, 10);
 
       const userId = require('uuid').v4();
@@ -1544,9 +1545,16 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
         return res.status(500).json({ message: "Failed to create user" });
       }
 
-      resultUser = await userDb.updateUser(userId, freeTierDefaults) || {
-        ...newUser,
+      // Mark the initial password as temporary + short-lived so it can't become
+      // the user's long-term password (expires in 1 month; login is blocked after).
+      const initialPasswordFields = {
         ...freeTierDefaults,
+        mustChangePassword: true,
+        tempPasswordExpires: getInitialPasswordExpiry(),
+      };
+      resultUser = await userDb.updateUser(userId, initialPasswordFields) || {
+        ...newUser,
+        ...initialPasswordFields,
       };
 
       // Auto-sync new user to CRM lead list (fire-and-forget)

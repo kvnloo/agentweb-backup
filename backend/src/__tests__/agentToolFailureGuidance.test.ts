@@ -2,7 +2,10 @@
  * Telemetry-driven tool guidance fixes (June 9–12 failure analysis):
  *  - linkedin_outreach schema must teach the real per-tier invite limits
  *    (200 free / 300 Premium) — the old "300 max" text caused 201–231 char
- *    invites that free accounts reject.
+ *    invites that free accounts reject. The schema now also documents that
+ *    over-limit notes are auto-trimmed on a word boundary at send time, so the
+ *    model never burns a retry counting characters (see linkedInOutreachService
+ *    .trimInviteMessage and crm.draftInviteNote.trim.test.ts).
  *  - run_local_agent_task rejections must tell the model what to use instead
  *    of just echoing the forbidden regex (55% observed failure rate).
  */
@@ -13,17 +16,22 @@ import { emmaToolRegistry } from '../emma/registry';
 describe('linkedin_outreach invite limit guidance', () => {
   const definition = emmaToolRegistry.getTool('linkedin_outreach')?.definition as any;
 
-  it('documents the 200-char free-tier limit in the tool description', () => {
+  it('documents the 200-char free-tier limit and the auto-trim safety net in the description', () => {
     expect(definition).toBeDefined();
     expect(definition.description).toContain('200 characters on free LinkedIn accounts');
     expect(definition.description).toContain('300 on Premium');
-    expect(definition.description.toLowerCase()).toContain('keep the message at 200 characters or fewer');
+    // The model is steered to aim short, and told over-limit notes are auto-trimmed
+    // on a word boundary (not rejected) — so it never burns a retry on length.
+    expect(definition.description.toLowerCase()).toContain('200 characters or fewer');
+    expect(definition.description.toLowerCase()).toContain('auto-trims');
+    expect(definition.description.toLowerCase()).toContain('word boundary');
   });
 
-  it('documents the per-tier limit on the message parameter itself', () => {
+  it('documents the per-tier limit and auto-trim on the message parameter itself', () => {
     const messageDescription: string = definition.inputSchema.properties.message.description;
-    expect(messageDescription).toContain('200 characters max on free LinkedIn accounts');
+    expect(messageDescription).toContain('200 characters or fewer');
     expect(messageDescription).toContain('300 on Premium');
+    expect(messageDescription.toLowerCase()).toContain('auto-trims');
   });
 
   it('warns against inviting already-connected profiles', () => {

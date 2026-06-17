@@ -478,8 +478,18 @@ describe('Security Tests', () => {
       expect(res.json).toHaveBeenCalledWith({ message: 'Email and password are required' });
     });
 
+    it('FAIL: short password (<12 chars) → 400', async () => {
+      const req: any = { body: { email: 'user@example.com', password: 'short123' } };
+      const res = createRes();
+
+      await register(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith({ message: 'Password must be at least 12 characters long' });
+    });
+
     it('FAIL: duplicate email → 400', async () => {
-      const req: any = { body: { email: 'existing@example.com', password: 'pass123' } };
+      const req: any = { body: { email: 'existing@example.com', password: 'ValidPass123!' } };
       const res = createRes();
 
       mockUserDb.getUserByEmail.mockResolvedValue({ userId: 'user-1' } as any);
@@ -491,7 +501,7 @@ describe('Security Tests', () => {
     });
 
     it('SUCCESS: non-free user not on waitlist → registers without gate', async () => {
-      const req: any = { body: { email: 'new@example.com', password: 'pass123', roles: ['customer'] } };
+      const req: any = { body: { email: 'new@example.com', password: 'ValidPass123!', roles: ['customer'] } };
       const res = createRes();
 
       mockUserDb.getUserByEmail.mockResolvedValue(undefined as any);
@@ -512,7 +522,7 @@ describe('Security Tests', () => {
     });
 
     it('SUCCESS: on waitlist but not invited → registers without gate', async () => {
-      const req: any = { body: { email: 'waiting@example.com', password: 'pass123', roles: ['customer'] } };
+      const req: any = { body: { email: 'waiting@example.com', password: 'ValidPass123!', roles: ['customer'] } };
       const res = createRes();
 
       mockUserDb.getUserByEmail.mockResolvedValue(undefined as any);
@@ -533,7 +543,7 @@ describe('Security Tests', () => {
     });
 
     it('SUCCESS: free user registers without waitlist check', async () => {
-      const req: any = { body: { email: 'free@example.com', password: 'pass123', roles: ['free'] } };
+      const req: any = { body: { email: 'free@example.com', password: 'ValidPass123!', roles: ['free'] } };
       const res = createRes();
 
       mockUserDb.getUserByEmail.mockResolvedValue(undefined as any);
@@ -554,7 +564,7 @@ describe('Security Tests', () => {
     });
 
     it('SUCCESS: invited user registers successfully', async () => {
-      const req: any = { body: { email: 'invited@example.com', password: 'pass123', roles: ['customer'] } };
+      const req: any = { body: { email: 'invited@example.com', password: 'ValidPass123!', roles: ['customer'] } };
       const res = createRes();
 
       mockUserDb.getUserByEmail.mockResolvedValue(undefined as any);
@@ -641,7 +651,7 @@ describe('Security Tests', () => {
 
   describe('resetPassword controller', () => {
     it('FAIL: missing token → 400', async () => {
-      const req: any = { body: { password: 'newpass123' } };
+      const req: any = { body: { password: 'NewValidPass123!' } };
       const res = createRes();
 
       await resetPassword(req, res);
@@ -660,18 +670,18 @@ describe('Security Tests', () => {
       expect(res.json).toHaveBeenCalledWith({ message: 'Token and password are required' });
     });
 
-    it('FAIL: short password (<6 chars) → 400', async () => {
-      const req: any = { body: { token: 'some-token', password: '12345' } };
+    it('FAIL: short password (<12 chars) → 400', async () => {
+      const req: any = { body: { token: 'some-token', password: 'short123' } };
       const res = createRes();
 
       await resetPassword(req, res);
 
       expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.json).toHaveBeenCalledWith({ message: 'Password must be at least 6 characters long' });
+      expect(res.json).toHaveBeenCalledWith({ message: 'Password must be at least 12 characters long' });
     });
 
     it('FAIL: invalid token (user not found) → 400', async () => {
-      const req: any = { body: { token: 'bad-token', password: 'newpass123' } };
+      const req: any = { body: { token: 'bad-token', password: 'NewValidPass123!' } };
       const res = createRes();
 
       mockUserDb.getUserByResetToken.mockResolvedValue(undefined as any);
@@ -683,7 +693,7 @@ describe('Security Tests', () => {
     });
 
     it('FAIL: expired token → 400', async () => {
-      const req: any = { body: { token: 'expired-token', password: 'newpass123' } };
+      const req: any = { body: { token: 'expired-token', password: 'NewValidPass123!' } };
       const res = createRes();
 
       mockUserDb.getUserByResetToken.mockResolvedValue({
@@ -699,7 +709,7 @@ describe('Security Tests', () => {
     });
 
     it('SUCCESS: valid token → password updated, token cleared', async () => {
-      const req: any = { body: { token: 'valid-token', password: 'newpass123' } };
+      const req: any = { body: { token: 'valid-token', password: 'NewValidPass123!' } };
       const res = createRes();
 
       mockUserDb.getUserByResetToken.mockResolvedValue({

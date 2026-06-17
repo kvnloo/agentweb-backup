@@ -36,6 +36,15 @@ export interface AdImageVariant {
    * 30% higher than archetype A on Stripe-like brands."
    */
   archetype?: string;
+  /**
+   * Creative-direction concept label (e.g. "VISCERAL MOMENT (VM)") that
+   * drove this variant's visual direction. Stored so the image feedback
+   * loop can describe a REJECTED variant's direction back to the next
+   * generation ("avoid this visual concept") — an image can't be pasted
+   * into a text prompt, so the concept label is the negative-example
+   * handle. Optional for backward compatibility.
+   */
+  concept?: string;
 }
 
 export interface AdImageResult {

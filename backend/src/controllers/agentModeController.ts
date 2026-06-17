@@ -16,6 +16,7 @@ import { generateMarketingResponseWorkerService } from '../services/generateMark
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
+import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
@@ -30,6 +31,9 @@ import { DynamoDB } from 'aws-sdk';
 
 /** Default expiration for legacy interactive shares that don't have an expiresAt field (7 days from sharedAt). */
 const LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS = 7;
+const ZERO_ASSISTANT_REQUEUE_BASE_MS = 15 * 60 * 1000;
+const ZERO_ASSISTANT_REQUEUE_MAX_MS = 2 * 60 * 60 * 1000;
+const ZERO_ASSISTANT_MAX_REQUEUES = 3;
 
 /**
  * In-memory set of session IDs that are currently generating a response.
@@ -37,6 +41,35 @@ const LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS = 7;
  * Exported so tests can inspect and reset it.
  */
 export const activeSessionGenerations = new Set<string>();
+
+/**
+ * Atomically claim the generation lock for a session.
+ *
+ * Replaces the previous hand-rolled `has()`-then-`add()` pattern that was
+ * duplicated at the /generate call sites. Those two statements were only
+ * race-free because nothing `await`ed between them; co-locating the
+ * check-and-set in a single synchronous function makes the claim atomic by
+ * construction — an `await` can never be inserted between the check and the
+ * set, so two near-simultaneous requests can never both proceed.
+ *
+ * @returns `true` if the caller claimed the lock (session was free),
+ *          `false` if the session is already generating (caller must reject).
+ */
+export function tryClaimSessionGeneration(sessionId: string): boolean {
+  if (activeSessionGenerations.has(sessionId)) {
+    return false;
+  }
+  activeSessionGenerations.add(sessionId);
+  return true;
+}
+
+/**
+ * Release a session's generation lock. Idempotent — safe to call in a
+ * `finally` block whether or not the claim succeeded.
+ */
+export function releaseSessionGeneration(sessionId: string): void {
+  activeSessionGenerations.delete(sessionId);
+}
 
 /**
  * Wall-clock timeout for a single agent-mode generation. Without this, a hung
@@ -64,10 +97,14 @@ async function withGenerationTimeout<T>(
   let timeoutHandle: NodeJS.Timeout | undefined;
   const timeoutPromise = new Promise<T>((_, reject) => {
     timeoutHandle = setTimeout(() => {
-      reject(new Error(
+      const err: any = new Error(
         `Generation timed out after ${GENERATION_TIMEOUT_MS}ms for session ${sessionId}. ` +
         `The lock has been released; the orphaned generation may still complete in the background.`
-      ));
+      );
+      // Tag so the durable-execution path can distinguish a run-timeout (where the
+      // detached work may still finish) from a genuine generation error.
+      err.isGenerationTimeout = true;
+      reject(err);
     }, GENERATION_TIMEOUT_MS);
   });
   try {
@@ -75,6 +112,46 @@ async function withGenerationTimeout<T>(
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle);
   }
+}
+
+/**
+ * Shown when a landing-page build outlives the run timeout but is still running.
+ * Replaces the old false "took longer than expected" failure for this case.
+ */
+const STILL_BUILDING_MESSAGE =
+  "🛠️ Your landing page is still building — this one's taking a little longer than usual. " +
+  "I'll drop the live link right here the moment it's ready, so there's no need to resend.";
+
+/**
+ * Attach a completion handler to a still-running landing-page generation whose run
+ * already timed out. When the detached generation finishes, its assistant response
+ * has already been persisted to the session by generateSessionResponse — so we only
+ * need to (a) claim the completion exactly once (vs the redeploy poller) and
+ * (b) push the result to the user's open session over Socket.IO. Best-effort:
+ * any failure is logged, never thrown (this runs detached).
+ */
+function attachInProcessCompletion(
+  genPromise: Promise<any>,
+  pageId: string,
+  userId: string,
+  sessionId: string
+): void {
+  genPromise
+    .then(async (resolved: any) => {
+      const claimed = await claimCompletion(pageId);
+      if (!claimed) return; // the poller already delivered this one
+      const { io } = await import('../server');
+      io.to(`user:${userId}`).emit('session-message-appended', {
+        sessionId,
+        message: {
+          role: 'assistant',
+          content: resolved?.content || '✅ Your landing page is ready.',
+        },
+      });
+    })
+    .catch((err: any) =>
+      console.error(`AgentMode: in-process completion hook failed for page ${pageId}:`, err)
+    );
 }
 
 /**
@@ -780,6 +857,12 @@ export async function runVerifiedChat(
         attachmentsForThisAttempt
       );
 
+      if (!hasAssistantOutput(response)) {
+        throw new ZeroAssistantOutputError(
+          `Scheduled/verified chat attempt ${attempt} produced zero assistant output for session ${sessionId}`
+        );
+      }
+
       // Update content
       if (response.content) {
         allContent += (allContent ? '\n\n' : '') + response.content;
@@ -868,6 +951,13 @@ export async function runVerifiedChat(
 
     } catch (error) {
       console.error(`Run verified chat attempt ${attempt} failed:`, error);
+      if (isZeroAssistantOutputError(error)) {
+        if (attempt === maxAttempts) {
+          throw error;
+        }
+        await waitForVerifiedChatRetry(attempt);
+        continue;
+      }
       if (isSessionLimitError(error)) {
         throw error;
       }
@@ -877,6 +967,7 @@ export async function runVerifiedChat(
       if (attempt === maxAttempts) {
         throw error;
       }
+      await waitForVerifiedChatRetry(attempt);
     }
   }
 
@@ -907,6 +998,62 @@ export async function runVerifiedChat(
     attempts: attempt,
     workPlanCompleted: false
   };
+}
+
+class ZeroAssistantOutputError extends Error {
+  code = 'ZERO_ASSISTANT_OUTPUT';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'ZeroAssistantOutputError';
+  }
+}
+
+function isZeroAssistantOutputError(error: unknown): boolean {
+  return error instanceof ZeroAssistantOutputError
+    || (typeof error === 'object' && error !== null && (error as any).code === 'ZERO_ASSISTANT_OUTPUT')
+    || (error instanceof Error && error.name === 'ZeroAssistantOutputError');
+}
+
+function hasAssistantOutput(response: {
+  content?: string;
+  toolCalls?: any[];
+  responseMessages?: any[];
+}): boolean {
+  const hasContent = typeof response.content === 'string' && response.content.trim().length > 0;
+  const hasToolCalls = Array.isArray(response.toolCalls) && response.toolCalls.length > 0;
+  const hasAssistantMessage = Array.isArray(response.responseMessages)
+    && response.responseMessages.some((message: any) => message?.role === 'assistant');
+
+  return hasContent || hasToolCalls || hasAssistantMessage;
+}
+
+async function waitForVerifiedChatRetry(attempt: number): Promise<void> {
+  if (process.env.NODE_ENV === 'test') return;
+
+  const delayMs = Math.min(30_000, 1_000 * Math.pow(2, Math.max(0, attempt - 1)));
+  await new Promise(resolve => setTimeout(resolve, delayMs));
+}
+
+async function sessionHasAssistantMessage(sessionId: string): Promise<boolean | undefined> {
+  try {
+    const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
+    if (!Array.isArray(messages)) return undefined;
+    return messages.some((message: any) => message?.role === 'assistant');
+  } catch (error) {
+    console.error(`Scheduled chat zero-output check failed for session ${sessionId}:`, error);
+    return undefined;
+  }
+}
+
+function getZeroAssistantRetryCount(schedule: any): number {
+  const rawCount = Number(schedule?.zeroAssistantRetryCount || 0);
+  return Number.isFinite(rawCount) && rawCount > 0 ? rawCount : 0;
+}
+
+function getZeroAssistantRequeueDelayMs(retryCount: number): number {
+  const exponent = Math.max(0, retryCount - 1);
+  return Math.min(ZERO_ASSISTANT_REQUEUE_MAX_MS, ZERO_ASSISTANT_REQUEUE_BASE_MS * Math.pow(2, exponent));
 }
 
 // Common function to run a scheduled chat (used by both test and actual execution)
@@ -1181,6 +1328,15 @@ export async function runScheduledChat(
       llmModel: schedule.llmModel || defaultModel
     });
 
+    if (!isTest && process.env.NODE_ENV !== 'test') {
+      const hasAssistantMessage = await sessionHasAssistantMessage(sessionId);
+      if (hasAssistantMessage === false) {
+        throw new ZeroAssistantOutputError(
+          `Scheduled chat produced zero persisted assistant messages for session ${sessionId}`
+        );
+      }
+    }
+
     // Generate a 2-3 word summary and update the session title
     try {
       const summary = await agentModeService.generateScheduledChatSummary(resolvedStartingMessage, result.content);
@@ -1297,6 +1453,19 @@ export async function runScheduledChat(
       console.error('AgentMode: Email campaign execution sync after run error:', err);
     }
 
+    if (!isTest && getZeroAssistantRetryCount(schedule) > 0) {
+      try {
+        await scheduleDb.updateSchedule(schedule.scheduleId, {
+          zeroAssistantRetryCount: 0,
+          lastZeroAssistantOutputAt: '',
+          lastZeroAssistantOutputSessionId: '',
+          updatedAt: new Date().toISOString(),
+        });
+      } catch (resetError) {
+        console.error(`Failed to reset zero-output retry tracking for schedule ${schedule.scheduleId}:`, resetError);
+      }
+    }
+
     return finalResult;
 
   } catch (error) {
@@ -1331,6 +1500,52 @@ export async function runScheduledChat(
       }
     }
 
+    let zeroAssistantOutput = isZeroAssistantOutputError(error);
+    if (!zeroAssistantOutput && sessionId) {
+      const hasAssistantMessage = await sessionHasAssistantMessage(sessionId);
+      zeroAssistantOutput = hasAssistantMessage === false;
+    }
+
+    let zeroAssistantRequeuedAt: string | undefined;
+    if (zeroAssistantOutput) {
+      console.error('Scheduled chat zero-assistant-output dead-man triggered:', {
+        scheduleId: schedule.scheduleId,
+        scheduleName: schedule.scheduleName,
+        userId,
+        sessionId: sessionId || 'N/A',
+        isTest,
+        retryCount: getZeroAssistantRetryCount(schedule),
+        errorMessage: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+        timestamp: new Date().toISOString(),
+      });
+
+      if (!isTest) {
+        const nextRetryCount = getZeroAssistantRetryCount(schedule) + 1;
+        if (nextRetryCount <= ZERO_ASSISTANT_MAX_REQUEUES) {
+          const retryAt = new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString();
+          zeroAssistantRequeuedAt = retryAt;
+
+          try {
+            await scheduleDb.updateSchedule(schedule.scheduleId, {
+              status: 'active',
+              nextRunTime: retryAt,
+              zeroAssistantRetryCount: nextRetryCount,
+              lastZeroAssistantOutputAt: new Date().toISOString(),
+              lastZeroAssistantOutputSessionId: sessionId || '',
+              updatedAt: new Date().toISOString(),
+            });
+          } catch (requeueError) {
+            console.error(`Failed to requeue zero-output scheduled chat ${schedule.scheduleId}:`, requeueError);
+          }
+        } else {
+          console.error(
+            `Scheduled chat ${schedule.scheduleId} exceeded zero-output requeue limit (${ZERO_ASSISTANT_MAX_REQUEUES}); alerting without requeue.`
+          );
+        }
+      }
+    }
+
     // Build error result
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorResult = {
@@ -1347,7 +1562,11 @@ export async function runScheduledChat(
       executionTime: Date.now() - now.getTime(),
       sessionId: sessionId || '',
       attempt: 0,
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      ...(zeroAssistantOutput ? {
+        zeroAssistantOutput: true,
+        ...(zeroAssistantRequeuedAt ? { requeuedAt: zeroAssistantRequeuedAt } : {}),
+      } : {}),
     };
 
     // Save the error result to database (without actualResponse to save space)
@@ -1363,14 +1582,20 @@ export async function runScheduledChat(
     // Send oncall alert and Notion ticket for scheduled chat exception (always, including test runs)
     const originalMessage = (error as any)?.originalMessage;
     sendAgentModeOncallAlert({
-      subject: `Scheduled Chat Error: ${schedule.scheduleName}`,
-      message: `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
+      subject: zeroAssistantOutput
+        ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
+        : `Scheduled Chat Error: ${schedule.scheduleName}`,
+      message: zeroAssistantOutput
+        ? `Scheduled chat "${schedule.scheduleName}" terminated with zero assistant messages.${zeroAssistantRequeuedAt ? ` It was requeued for ${zeroAssistantRequeuedAt}.` : ''}\n\nError: ${errorMessage}`
+        : `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
       sessionId: sessionId || undefined,
       context: {
         'Schedule ID': schedule.scheduleId,
         'Schedule Name': schedule.scheduleName,
         'User ID': userId,
         'Is Test Run': isTest ? 'Yes' : 'No',
+        'Zero Assistant Output': zeroAssistantOutput ? 'Yes' : 'No',
+        ...(zeroAssistantRequeuedAt ? { 'Requeued At': zeroAssistantRequeuedAt } : {}),
         'Error Message': errorMessage,
         ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
         'Error Stack': error instanceof Error ? (error.stack || 'No stack trace') : 'N/A',
@@ -1379,14 +1604,20 @@ export async function runScheduledChat(
       }
     }).catch(err => console.error('Failed to send oncall alert for scheduled chat error:', err));
     createOncallItem({
-      title: `Scheduled Chat Error: ${schedule.scheduleName}`,
-      description: `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}${originalMessage ? `\n\nOriginal API error: ${originalMessage}` : ''}`,
+      title: zeroAssistantOutput
+        ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
+        : `Scheduled Chat Error: ${schedule.scheduleName}`,
+      description: zeroAssistantOutput
+        ? `Scheduled chat "${schedule.scheduleName}" terminated with zero assistant messages.${zeroAssistantRequeuedAt ? ` It was requeued for ${zeroAssistantRequeuedAt}.` : ''}\n\nError: ${errorMessage}${originalMessage ? `\n\nOriginal API error: ${originalMessage}` : ''}`
+        : `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}${originalMessage ? `\n\nOriginal API error: ${originalMessage}` : ''}`,
       additionalTags: ['Scheduled Chat'],
       context: {
         'Schedule ID': schedule.scheduleId,
         'User ID': userId,
         'Session ID': sessionId || 'N/A',
         'Is Test Run': isTest ? 'Yes' : 'No',
+        'Zero Assistant Output': zeroAssistantOutput ? 'Yes' : 'No',
+        ...(zeroAssistantRequeuedAt ? { 'Requeued At': zeroAssistantRequeuedAt } : {}),
         'Error Message': errorMessage,
         ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
       }
@@ -2136,15 +2367,16 @@ export const agentModeController = {
         return res.status(400).json({ error: 'Session ID and user message are required' });
       }
 
-      // Reject concurrent requests for the same session (synchronous check before any await)
-      if (activeSessionGenerations.has(sessionId)) {
+      // Reject concurrent requests for the same session. The claim is atomic
+      // (check-and-set in one call) so two near-simultaneous requests can never
+      // both proceed — exactly one wins, the other gets 409 SESSION_BUSY.
+      if (!tryClaimSessionGeneration(sessionId)) {
         return res.status(409).json({
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
           code: 'SESSION_BUSY',
         });
       }
-      activeSessionGenerations.add(sessionId);
 
       try {
 
@@ -2196,19 +2428,67 @@ export const agentModeController = {
       // so the activeSessionGenerations lock always releases even if generation hangs).
       // Use session.userId (the account owner) — not user.userId (the requester) — so that
       // tool calls (e.g. get_lead_lists) query the correct user's data in delegated sessions.
-      const response = await withGenerationTimeout(
-        generateSessionResponse(
-          sessionId,
-          userMessage,
-          session.userId,
-          modelToUse,
-          attachments,
-          undefined, // isInteractiveShare
-          pageContext,
-          isDelegatedAccessForMessage
-        ),
-        sessionId
+      // Durable execution (landing pages): if a build spawned by THIS session is
+      // already in flight (a prior run timed out and detached), reconnect to it
+      // instead of starting a second build that would corrupt the single repo.
+      // Flag-gated + fail-open: any error here falls through to normal generation.
+      const durableLanding = process.env.DURABLE_LANDING_GENERATION === 'true';
+      if (durableLanding) {
+        try {
+          const inFlight = await findInFlightJobForSession(session.userId, sessionId);
+          if (inFlight) {
+            markProgressComplete(sessionId);
+            res.json({ content: STILL_BUILDING_MESSAGE, stillBuilding: true });
+            return;
+          }
+        } catch (reconnectErr) {
+          console.error('AgentMode: durable reconnect check failed (continuing normally):', reconnectErr);
+        }
+      }
+
+      // Capture the generation promise so the durable path can reattach to it if the
+      // run times out while the work is still going (it keeps running detached).
+      const genPromise = generateSessionResponse(
+        sessionId,
+        userMessage,
+        session.userId,
+        modelToUse,
+        attachments,
+        undefined, // isInteractiveShare
+        pageContext,
+        isDelegatedAccessForMessage
       );
+
+      let response: Awaited<ReturnType<typeof generateSessionResponse>>;
+      try {
+        response = await withGenerationTimeout(genPromise, sessionId);
+      } catch (genErr: any) {
+        // A long landing-page build outlived the run timeout but is still running.
+        // Don't report a false failure — tell the user it's still building and post
+        // the result back to this session when it finishes. Scoped to landing builds
+        // in flight; everything else re-throws to the existing error handling.
+        if (durableLanding && genErr?.isGenerationTimeout) {
+          try {
+            const inFlight = await findInFlightJobForSession(session.userId, sessionId);
+            if (inFlight) {
+              await markAwaitingReconnect(inFlight.id);
+              attachInProcessCompletion(genPromise, inFlight.id, session.userId, sessionId);
+              markProgressComplete(sessionId);
+              await chatbotDb.addMessageToSession(sessionId, {
+                role: 'assistant',
+                content: STILL_BUILDING_MESSAGE,
+                timestamp: new Date().toISOString(),
+                metadata: { timestamp: new Date().toISOString() },
+              }).catch(() => {});
+              res.json({ content: STILL_BUILDING_MESSAGE, stillBuilding: true });
+              return;
+            }
+          } catch (durErr) {
+            console.error('AgentMode: durable still-building handling failed (falling through):', durErr);
+          }
+        }
+        throw genErr; // not our case — preserve existing error handling
+      }
 
       markProgressComplete(sessionId);
 
@@ -2260,7 +2540,7 @@ export const agentModeController = {
         ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
       } finally {
-        activeSessionGenerations.delete(sessionId);
+        releaseSessionGeneration(sessionId);
       }
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
@@ -2361,6 +2641,9 @@ export const agentModeController = {
             subject: 'Agent Mode: Context limit exceeded',
             message: `The request exceeded the model context window.\n\nError: ${error.message || 'Unknown error'}`,
             sessionId,
+            // Dedupe per (user, errorClass) so a user repeatedly hitting the context
+            // limit on a busy day floods neither oncall email nor Notion (B5).
+            dedupeKey: `context_limit:${user?.userId || sessionId || 'unknown'}`,
             context: {
               'Error Message': error.message || 'Unknown error',
               'Error Stack': error.stack || 'No stack trace available',
@@ -2883,15 +3166,16 @@ export const agentModeController = {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
 
-      // Reject concurrent requests for the same session (synchronous check before any await)
-      if (activeSessionGenerations.has(session.sessionId)) {
+      // Reject concurrent requests for the same session. Atomic check-and-set
+      // (see tryClaimSessionGeneration) — two near-simultaneous requests can
+      // never both proceed; exactly one wins, the other gets 409 SESSION_BUSY.
+      if (!tryClaimSessionGeneration(session.sessionId)) {
         return res.status(409).json({
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
           code: 'SESSION_BUSY',
         });
       }
-      activeSessionGenerations.add(session.sessionId);
 
       try {
 
@@ -2936,7 +3220,7 @@ export const agentModeController = {
         ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
       } finally {
-        activeSessionGenerations.delete(session.sessionId);
+        releaseSessionGeneration(session.sessionId);
       }
     } catch (error) {
       console.error('AgentMode: Generate shared response error:', error);
@@ -3016,6 +3300,9 @@ export const agentModeController = {
             subject: 'Agent Mode: Context limit exceeded (shared response)',
             message: `The request exceeded the model context window.\n\nError: ${error.message || 'Unknown error'}`,
             sessionId: shareId,
+            // Dedupe per (user/share, errorClass) — the shared path is a distinct
+            // error class, so it keys independently from the regular path (B5).
+            dedupeKey: `context_limit_shared:${session?.userId || shareId || 'unknown'}`,
             context: {
               'Error Message': error.message || 'Unknown error',
               'Error Stack': error.stack || 'No stack trace available',

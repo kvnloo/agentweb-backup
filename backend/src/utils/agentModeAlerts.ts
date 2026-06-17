@@ -6,7 +6,47 @@ type AgentModeOncallAlertParams = {
   message: string;
   sessionId?: string;
   context?: Record<string, any>;
+  /**
+   * Optional dedupe key (e.g. `context_limit:<userId>`). When provided, at most one
+   * alert is sent per key per `dedupeWindowMs`; further calls inside the window are
+   * suppressed. When omitted, every call fires (backwards compatible).
+   */
+  dedupeKey?: string;
+  /** Dedupe window in ms. Defaults to 10 minutes. Only used when `dedupeKey` is set. */
+  dedupeWindowMs?: number;
+  /** Injectable clock for deterministic tests. Defaults to `Date.now()`. */
+  now?: number;
 };
+
+const DEFAULT_DEDUPE_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+
+// In-memory last-alert timestamp per dedupe key. Bounded by the number of distinct
+// (user, errorClass) keys in a window — pruned lazily to avoid unbounded growth.
+const lastAlertAtByKey = new Map<string, number>();
+
+/**
+ * Returns true if an alert for `dedupeKey` should be suppressed (already sent within
+ * the window), false if it should fire. Records the firing time when it fires.
+ */
+function shouldSuppressAlert(dedupeKey: string, windowMs: number, now: number): boolean {
+  const last = lastAlertAtByKey.get(dedupeKey);
+  if (last !== undefined && now - last < windowMs) {
+    return true;
+  }
+  lastAlertAtByKey.set(dedupeKey, now);
+  // Lazy prune: drop entries whose window has fully elapsed so the map can't grow forever.
+  if (lastAlertAtByKey.size > 1000) {
+    for (const [key, ts] of lastAlertAtByKey) {
+      if (now - ts >= windowMs) lastAlertAtByKey.delete(key);
+    }
+  }
+  return false;
+}
+
+/** Test-only: clears the dedupe state so each test starts from a clean slate. */
+export function __resetAgentModeAlertDedupeForTests(): void {
+  lastAlertAtByKey.clear();
+}
 
 function hasKey(obj: Record<string, any> | undefined, key: string): boolean {
   return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
@@ -15,7 +55,17 @@ function hasKey(obj: Record<string, any> | undefined, key: string): boolean {
 export async function sendAgentModeOncallAlert(
   params: AgentModeOncallAlertParams
 ): Promise<void> {
-  const { subject, message, sessionId, context } = params;
+  const { subject, message, sessionId, context, dedupeKey, dedupeWindowMs, now } = params;
+
+  // Rate-limit/dedupe: when a dedupeKey is supplied, only the first alert per
+  // (user, errorClass) window goes out — prevents Notion/oncall flooding on
+  // high-concurrency days when the same user repeatedly hits the context limit.
+  if (dedupeKey) {
+    const windowMs = dedupeWindowMs ?? DEFAULT_DEDUPE_WINDOW_MS;
+    if (shouldSuppressAlert(dedupeKey, windowMs, now ?? Date.now())) {
+      return;
+    }
+  }
 
   let ishareLink = '';
   if (sessionId) {

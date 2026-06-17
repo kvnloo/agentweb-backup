@@ -2179,7 +2179,8 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
 
     let variants;
     try {
-      variants = await extractIcpFiltersWithLlm(persona);
+      // userId is passed for shadow usage-metering attribution only.
+      variants = await extractIcpFiltersWithLlm(persona, { userId });
     } catch (llmError: any) {
       console.error('Error extracting ICP filters via LLM:', llmError);
       return res.status(503).json({
@@ -3620,7 +3621,10 @@ Please analyze each lead and return a JSON array with your assessment.`;
               isMatch: boolean;
               score: number;
               reason: string;
-            }>>(escapedSystemPrompt, escapedUserPrompt, 'json');
+            }>>(escapedSystemPrompt, escapedUserPrompt, 'json', undefined, {
+              userId,
+              feature: 'enrichment',
+            });
 
             // Update each lead with ICP match result
             for (const result of response) {
@@ -4453,7 +4457,7 @@ router.post('/lists/:listId/leads/:leadId/draft-invite-note', async (req: Reques
     // Resolve the LinkedIn account that will send this invite (same precedence as
     // send-linkedin-invite) so the note is drafted to the right char limit: 300 for
     // Premium accounts, 200 for free. Falls back to 200 when no account resolves.
-    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const { linkedInOutreachService, LinkedInOutreachService } = await import('../services/linkedInOutreachService');
     const { accountId: requestedAccountId } = req.body || {};
     const inviteAccountId = (requestedAccountId && typeof requestedAccountId === 'string')
       ? requestedAccountId
@@ -4510,7 +4514,7 @@ Reply with ONLY valid JSON, nothing else: {"content": "the note text"}`;
     });
 
     const raw = completion.choices[0].message.content || '';
-    let content = '';
+    let rawNote = '';
     // Strip markdown fences
     let cleaned = raw.replace(/```json\s*/g, '').replace(/\s*```/g, '').trim();
     // If truncated mid-JSON (ends with a quote but no closing brace), complete it
@@ -4528,16 +4532,29 @@ Reply with ONLY valid JSON, nothing else: {"content": "the note text"}`;
         if (val.startsWith('{') && val.includes('"content"')) {
           try { val = String(JSON.parse(val).content || val); } catch { /* keep val */ }
         }
-        content = val.slice(0, inviteCharLimit);
+        rawNote = val;
       } catch {
         // Still can't parse — extract the text between the first " and last "
         const firstQ = cleaned.indexOf('"', cleaned.indexOf('"content"') + 10);
         const lastQ = cleaned.lastIndexOf('"');
         if (firstQ !== -1 && lastQ > firstQ) {
-          content = cleaned.slice(firstQ + 1, lastQ).replace(/\\"/g, '"').slice(0, inviteCharLimit);
+          rawNote = cleaned.slice(firstQ + 1, lastQ).replace(/\\"/g, '"');
         }
       }
     }
+
+    if (!rawNote) {
+      return res.status(500).json({ message: 'Failed to generate invite note' });
+    }
+
+    // Layer 2: if the draft is over the limit, ask the model to rewrite it shorter (capped),
+    // then Layer 3: hard-trim on a sentence/word boundary (surrogate-safe) as the guarantee —
+    // the same trimInviteMessage() sendInvitation uses, so every invite-note path is consistent.
+    if (rawNote.length > inviteCharLimit) {
+      const { shortenInviteNoteToLimit } = await import('../services/inviteNoteShortener');
+      rawNote = await shortenInviteNoteToLimit(geminiClient, rawNote, inviteCharLimit, 2);
+    }
+    const content = LinkedInOutreachService.trimInviteMessage(rawNote, inviteCharLimit);
 
     if (!content) {
       return res.status(500).json({ message: 'Failed to generate invite note' });

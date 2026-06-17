@@ -69,26 +69,40 @@ describe('Session termination on password change', () => {
       await changePassword(req, res);
 
       expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.json).toHaveBeenCalledWith({ message: 'Current password and new password are required' });
+      expect(res.json).toHaveBeenCalledWith({ message: 'Current and new passwords are required' });
     });
 
-    it('FAIL: short new password (<6) → 400', async () => {
+    it('FAIL: short new password (<12) → 400', async () => {
       const req: any = {
         user: { userId: 'user-1', email: 'u@e.com', isAdmin: false },
-        body: { currentPassword: 'old', newPassword: '123' },
+        body: { currentPassword: 'oldpassword1', newPassword: 'short' },
       };
       const res = createRes();
 
       await changePassword(req, res);
 
       expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.json).toHaveBeenCalledWith({ message: 'New password must be at least 6 characters long' });
+      expect(res.json).toHaveBeenCalledWith({ message: 'New password must be at least 12 characters long' });
+    });
+
+    it('FAIL: new password equals current → 400', async () => {
+      const req: any = {
+        user: { userId: 'user-1', email: 'u@e.com', isAdmin: false },
+        body: { currentPassword: 'SamePassword1!', newPassword: 'SamePassword1!' },
+      };
+      const res = createRes();
+
+      await changePassword(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith({ message: 'New password must be different from current password' });
+      expect(mockUserDb.incrementSessionVersion).not.toHaveBeenCalled();
     });
 
     it('FAIL: user not found → 404', async () => {
       const req: any = {
         user: { userId: 'user-1', email: 'u@e.com', isAdmin: false },
-        body: { currentPassword: 'old', newPassword: 'newpass123' },
+        body: { currentPassword: 'OldPassword1!', newPassword: 'NewPassword123!' },
       };
       const res = createRes();
       mockUserDb.getUserById.mockResolvedValue(undefined as any);
@@ -101,7 +115,7 @@ describe('Session termination on password change', () => {
     it('FAIL: OAuth-only account → 400', async () => {
       const req: any = {
         user: { userId: 'user-1', email: 'u@e.com', isAdmin: false },
-        body: { currentPassword: 'old', newPassword: 'newpass123' },
+        body: { currentPassword: 'OldPassword1!', newPassword: 'NewPassword123!' },
       };
       const res = createRes();
       mockUserDb.getUserById.mockResolvedValue({
@@ -117,7 +131,7 @@ describe('Session termination on password change', () => {
     it('FAIL: wrong current password → 401', async () => {
       const req: any = {
         user: { userId: 'user-1', email: 'u@e.com', isAdmin: false },
-        body: { currentPassword: 'wrong', newPassword: 'newpass123' },
+        body: { currentPassword: 'WrongPassword1!', newPassword: 'NewPassword123!' },
       };
       const res = createRes();
       mockUserDb.getUserById.mockResolvedValue({
@@ -132,28 +146,10 @@ describe('Session termination on password change', () => {
       expect(mockUserDb.incrementSessionVersion).not.toHaveBeenCalled();
     });
 
-    it('FAIL: new password equals current → 400', async () => {
+    it('SUCCESS: valid change → password updated, temp flags cleared, sessions terminated, fresh token issued', async () => {
       const req: any = {
         user: { userId: 'user-1', email: 'u@e.com', isAdmin: false },
-        body: { currentPassword: 'samepass', newPassword: 'samepass' },
-      };
-      const res = createRes();
-      mockUserDb.getUserById.mockResolvedValue({
-        userId: 'user-1', email: 'u@e.com', password: 'hashed', isOAuthUser: false,
-      } as any);
-      (mockBcryptCompare as unknown as jest.Mock).mockResolvedValue(true);
-
-      await changePassword(req, res);
-
-      expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.json).toHaveBeenCalledWith({ message: 'New password must be different from the current password' });
-      expect(mockUserDb.incrementSessionVersion).not.toHaveBeenCalled();
-    });
-
-    it('SUCCESS: valid change → password updated, sessions terminated, fresh token issued', async () => {
-      const req: any = {
-        user: { userId: 'user-1', email: 'u@e.com', isAdmin: false },
-        body: { currentPassword: 'oldpass', newPassword: 'newpass123' },
+        body: { currentPassword: 'OldPassword1!', newPassword: 'NewPassword123!' },
       };
       const res = createRes();
       mockUserDb.getUserById.mockResolvedValue({
@@ -167,7 +163,12 @@ describe('Session termination on password change', () => {
 
       await changePassword(req, res);
 
-      expect(mockUserDb.updateUser).toHaveBeenCalledWith('user-1', { password: 'new-hashed' });
+      // Password persisted AND temp-password lifecycle flags cleared
+      expect(mockUserDb.updateUser).toHaveBeenCalledWith('user-1', {
+        password: 'new-hashed',
+        mustChangePassword: false,
+        tempPasswordExpires: null,
+      });
       // All other sessions terminated by bumping the session version
       expect(mockUserDb.incrementSessionVersion).toHaveBeenCalledWith('user-1');
       // ...and live sockets on the old session are swept with the new version
@@ -178,13 +179,13 @@ describe('Session termination on password change', () => {
         expect.any(String),
         { expiresIn: '90d' }
       );
-      expect(res.json).toHaveBeenCalledWith({ message: 'Password changed successfully', token: 'fresh-token' });
+      expect(res.json).toHaveBeenCalledWith({ message: 'Password has been changed successfully', token: 'fresh-token' });
     });
 
     it('FAIL: unexpected DB error → 500', async () => {
       const req: any = {
         user: { userId: 'user-1', email: 'u@e.com', isAdmin: false },
-        body: { currentPassword: 'oldpass', newPassword: 'newpass123' },
+        body: { currentPassword: 'OldPassword1!', newPassword: 'NewPassword123!' },
       };
       const res = createRes();
       mockUserDb.getUserById.mockRejectedValue(new Error('dynamo down'));

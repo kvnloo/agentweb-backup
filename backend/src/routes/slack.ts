@@ -34,6 +34,21 @@ function userMatchesChannel(u: any, channel: string): boolean {
   return (u.slackChannels && u.slackChannels.includes(channel)) || u.slackChannel === channel;
 }
 
+function extractChannelLinkIntent(rawMessage: string): { targetEmail: string } | null {
+  const match = rawMessage.match(
+    /\bfor\s+(?:user|account)\s+([^\s<>|]+@[^\s<>|]+)\s+(?:please\s+)?(?:link|connect)\s+(?:to\s+)?this\s+channel\b/i
+  );
+  const targetEmail = match?.[1]?.toLowerCase();
+  return targetEmail ? { targetEmail } : null;
+}
+
+function getUserSlackChannels(user: any): string[] {
+  return [...new Set([
+    ...((Array.isArray(user.slackChannels) ? user.slackChannels : []) as string[]),
+    ...(user.slackChannel ? [user.slackChannel] : []),
+  ].map(channel => String(channel).trim()).filter(Boolean))];
+}
+
 /**
  * Use Gemini to extract the target user email and task description from a
  * free-form admin channel message. Returns null if no email is found.
@@ -49,8 +64,10 @@ async function extractAdminMessageIntent(
       return null;
     }
 
-    const { GoogleGenAI } = await import('@google/genai');
-    const ai = new GoogleGenAI({ apiKey: apiKey.trim() });
+    // Metered factory client (shadow usage metering). System context — admin
+    // channel parsing has no single attributable user, so no userId is passed.
+    const { getGeminiClient } = await import('../utils/llmClients');
+    const ai = await getGeminiClient({ feature: 'other' }, apiKey);
 
     const prompt = `Extract the target user email address and task description from this admin Slack message.
 
@@ -636,6 +653,50 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
           let delegateInfo: { adminUserId: string; adminEmail: string; isDelegated: boolean } | undefined;
           let actualMessage = rawMessage;
           let pageIdentifier = 'slack-bot';
+
+          const channelLinkIntent = extractChannelLinkIntent(rawMessage);
+          if (channelLinkIntent) {
+            const requesterEmail = (await getSlackUserEmail(slackUserId))?.toLowerCase();
+            const targetEmail = channelLinkIntent.targetEmail;
+            const canLinkChannel = requesterEmail === targetEmail || requesterEmail?.endsWith('@agentweb.pro');
+
+            if (!canLinkChannel) {
+              await slackClient.chat.postMessage({
+                channel,
+                text: 'Only AgentWeb admins or the target account owner can link this channel.',
+                thread_ts: ts
+              });
+              return;
+            }
+
+            const targetUser = await userDb.getUserByEmail(targetEmail);
+            if (!targetUser) {
+              await slackClient.chat.postMessage({
+                channel,
+                text: `User not found: ${targetEmail}`,
+                thread_ts: ts
+              });
+              return;
+            }
+
+            const existingChannels = getUserSlackChannels(targetUser);
+            const nextChannels = [...new Set([...existingChannels, channel])];
+            await settingsService.invalidateSlackChannelMappings(targetUser.userId, nextChannels);
+            await userDb.updateUser(targetUser.userId, { slackChannels: nextChannels });
+            await settingsService.setSetting(
+              `slack_channel_mapping_${channel}`,
+              targetUser.userId,
+              `Slack channel to userId mapping for channel ${channel}`,
+              'system'
+            );
+
+            await slackClient.chat.postMessage({
+              channel,
+              text: `✅ Linked this channel to ${targetEmail}.`,
+              thread_ts: ts
+            });
+            return;
+          }
 
           if (isAdminChannel) {
             // Admin channel: use LLM to flexibly extract target email and task from any phrasing

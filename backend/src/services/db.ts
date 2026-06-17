@@ -322,6 +322,16 @@ export interface User {
     rating: "like" | "reject";
     ratedAt: string;
   }>;
+  /**
+   * How new landing pages are organized when the agent doesn't target a specific
+   * site. `unified` (default): add the page to the user's existing site as a route
+   * — cheap (no new repo/project, shares the subdomain). `separate`: each new
+   * campaign gets its OWN site/subdomain — more costly (a fresh v0 generation +
+   * repo + project). Cost-safe default is `unified`; users who want distinct
+   * campaign URLs (e.g. Empathia) opt into `separate`. The agent can still override
+   * per request. Only consulted when DURABLE_LANDING_GENERATION is on.
+   */
+  landingSiteMode?: "unified" | "separate";
   brandGuidelines?: {
     brandData: {
       brandName: string;
@@ -396,6 +406,21 @@ export interface User {
    * other devices — are rejected by the auth middleware. Absent = 0.
    */
   sessionVersion?: number;
+  /**
+   * Set when the account is created with a system-generated initial password
+   * (e.g. admin creating a user from the waitlist). The user MUST set their own
+   * password before this timestamp; the initial secret cannot become a
+   * long-term password. Login is rejected once `Date.now()` passes this value
+   * (see the login controller). Set to `null` to clear it when the user sets
+   * their own password (updateUser only persists `null`, it skips `undefined`).
+   */
+  tempPasswordExpires?: string | null;
+  /**
+   * True while the account still holds its system-generated initial password.
+   * Surfaced to the frontend (via /login and /me) so it can force an immediate
+   * password change. Cleared when the user sets their own password.
+   */
+  mustChangePassword?: boolean;
   subscriptionType?: string | null; // Subscription type for customer-portal users (defaults to "Free")
   tokenUsage?: {
     month: string;        // "YYYY-MM" format for current tracking month
@@ -1248,6 +1273,43 @@ export class UserDB {
     }
   }
 
+  /**
+   * Set the user's landing-site mode WRITE-ONCE. "single page" = unified, "multi
+   * page" = separate. Once chosen it cannot be switched — switching would require
+   * physically re-homing deployed pages across repos/projects/domains (broken
+   * URLs + SEO loss), so it's a deliberate migration, not a toggle. Returns the
+   * effective (locked) mode: the existing one if already set, else the new one.
+   */
+  async setLandingSiteMode(
+    userId: string,
+    mode: "unified" | "separate"
+  ): Promise<"unified" | "separate"> {
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) throw new Error(`User with ID '${userId}' not found.`);
+    if (user.landingSiteMode === "unified" || user.landingSiteMode === "separate") {
+      return user.landingSiteMode; // already locked — immutable
+    }
+    try {
+      await this.docClient
+        .update({
+          TableName: this.tableName,
+          Key: { email: user.email },
+          UpdateExpression: "SET landingSiteMode = :m",
+          ConditionExpression: "attribute_not_exists(landingSiteMode)",
+          ExpressionAttributeValues: { ":m": mode },
+        })
+        .promise();
+      return mode;
+    } catch (err: any) {
+      if (err?.code === "ConditionalCheckFailedException") {
+        // A concurrent request locked it first — return whatever is now stored.
+        const fresh = await this.getUserById(userId);
+        return (fresh?.landingSiteMode as "unified" | "separate") || mode;
+      }
+      throw err;
+    }
+  }
+
   async updateUser(userId: string, updates: Partial<User>) {
     // First, get the user by userId to ensure they exist and to get their email
     const user = await this.getUserById(userId);
@@ -1331,6 +1393,58 @@ export class UserDB {
       return (result.Attributes as { sessionVersion: number }).sessionVersion;
     } catch (error) {
       handleDynamoDbError(error, "incrementSessionVersion");
+      throw error;
+    }
+  }
+
+  async incrementTokenUsageForMonth(
+    userId: string,
+    month: string,
+    tokens: number,
+    cost: number,
+    resetDate: string
+  ): Promise<User | null> {
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) {
+      throw new Error(`User with ID '${userId}' not found or has no email.`);
+    }
+
+    const params: AWS.DynamoDB.DocumentClient.UpdateItemInput = {
+      TableName: this.tableName,
+      Key: { email: user.email },
+      UpdateExpression:
+        "SET #tokenUsage.#month = :month, " +
+        "#tokenUsage.#totalTokens = if_not_exists(#tokenUsage.#totalTokens, :zero) + :tokens, " +
+        "#tokenUsage.#totalCost = if_not_exists(#tokenUsage.#totalCost, :zero) + :cost, " +
+        "#tokenUsage.#resetDate = if_not_exists(#tokenUsage.#resetDate, :resetDate)",
+      ConditionExpression: "#userId = :userId AND #tokenUsage.#month = :month",
+      ExpressionAttributeNames: {
+        "#userId": "userId",
+        "#tokenUsage": "tokenUsage",
+        "#month": "month",
+        "#totalTokens": "totalTokens",
+        "#totalCost": "totalCost",
+        "#resetDate": "resetDate",
+      },
+      ExpressionAttributeValues: {
+        ":userId": userId,
+        ":month": month,
+        ":tokens": tokens,
+        ":cost": cost,
+        ":zero": 0,
+        ":resetDate": resetDate,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await this.docClient.update(params).promise();
+      return (result.Attributes as User) || null;
+    } catch (error: any) {
+      if (error?.code === "ConditionalCheckFailedException") {
+        return null;
+      }
+      handleDynamoDbError(error, "incrementTokenUsageForMonth");
       throw error;
     }
   }
@@ -2590,6 +2704,9 @@ export const scheduleDb = {
       variableRequestAccessTokenHash: string;
       variableRequestAccessTokenExpiresAt: string;
       variableRequestAccessTokenConsumedAt: string;
+      zeroAssistantRetryCount: number;
+      lastZeroAssistantOutputAt: string;
+      lastZeroAssistantOutputSessionId: string;
     }>
   ) {
     try {
@@ -5075,6 +5192,16 @@ export const crmDb = {
     accountOwnerUserId?: string | null;
     pocEmails?: string[] | null;
     syncMetadata?: Record<string, any>;
+    /**
+     * Lead UTM attribution (mirrors the User schema, see utils/leadSchema.ts).
+     * firstTouch is immutable once stamped; lastTouch is refreshed on any repeat
+     * touch (e.g. the public webhook merge path). utmSource / utmMedium are
+     * denormalized from firstTouch for cheap channel-attribution filter queries.
+     */
+    firstTouch?: AttributionTouch;
+    lastTouch?: AttributionTouch;
+    utmSource?: string;
+    utmMedium?: string;
     /** Enrichment metadata sidecar — keyed by field name (custom or standard). See utils/enrichedFieldValue.ts. */
     enrichmentMetadata?: Record<string, any>;
     /** ISO timestamp set when a LinkedIn connection invite is manually sent from the CRM. */
@@ -5406,6 +5533,29 @@ export const crmDb = {
       if (updates.syncMetadata !== undefined) {
         setExpressions.push('syncMetadata = :syncMetadata');
         expressionAttributeValues[':syncMetadata'] = updates.syncMetadata;
+      }
+
+      // Lead UTM attribution. firstTouch is immutable once stamped, but the
+      // public webhook merge path backfills it when a lead predates attribution
+      // and refreshes lastTouch on every repeat touch. utmSource / utmMedium
+      // are denormalized strings. Callers enforce the immutability contract
+      // (only-if-absent backfill for firstTouch/utm denorm); this layer just
+      // persists whatever the caller passes.
+      if (updates.firstTouch !== undefined) {
+        setExpressions.push('firstTouch = :firstTouch');
+        expressionAttributeValues[':firstTouch'] = updates.firstTouch;
+      }
+      if (updates.lastTouch !== undefined) {
+        setExpressions.push('lastTouch = :lastTouch');
+        expressionAttributeValues[':lastTouch'] = updates.lastTouch;
+      }
+      if (updates.utmSource !== undefined) {
+        setExpressions.push('utmSource = :utmSource');
+        expressionAttributeValues[':utmSource'] = updates.utmSource;
+      }
+      if (updates.utmMedium !== undefined) {
+        setExpressions.push('utmMedium = :utmMedium');
+        expressionAttributeValues[':utmMedium'] = updates.utmMedium;
       }
 
       // Always update updatedAt
@@ -6724,6 +6874,9 @@ export const crmDb = {
     // row as a field-group row (or vice versa). Note: this used to be optional
     // with a 'field_group' default — review C1 flagged that as fragile.
     cacheType: 'field_group' | 'enrichso' | 'unipile' | 'unipile_company' | 'unipile_search_param' | 'apollo';
+    // Marks a cached payload with no usable signal — written with a short
+    // negative TTL so it doesn't lock a lead out of re-enrichment. (WS4)
+    negative?: boolean;
   }, opts?: { force?: boolean }): Promise<void> {
     try {
       // `force: true` is set by callers that explicitly asked for a fresh API
