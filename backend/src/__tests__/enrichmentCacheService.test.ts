@@ -167,10 +167,13 @@ describe('writeRawDataToCache', () => {
     expect(call.expiresAt).toBeLessThanOrEqual(expectedMax);
   });
 
-  it('sets expiresAt ~30 days from now for intent_signals', async () => {
+  it('sets expiresAt ~30 days from now for intent_signals (positive hit)', async () => {
     mockPutEnrichmentCacheItem.mockResolvedValue(undefined);
     const before = nowSec();
-    await writeRawDataToCache(VALID_LEAD, 'intent_signals', { webResults: [], linkedinCompanyResults: null, linkedinData: null }, 'q', ['web_search']);
+    // Must be a NON-empty payload: empty results now get the short negative
+    // TTL (WS4), so the group's full TTL only applies to a real hit. The
+    // empty/negative case is covered in enrichmentCacheNegativeTtl.test.ts.
+    await writeRawDataToCache(VALID_LEAD, 'intent_signals', MOCK_RAW_DATA, 'q', ['web_search']);
     const after = nowSec();
 
     const call = mockPutEnrichmentCacheItem.mock.calls[0][0];
