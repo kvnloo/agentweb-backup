@@ -168,6 +168,27 @@ describe('AgentModeService - Tool Descriptions', () => {
       expect(systemPrompt).toContain('Emma');
       expect(systemPrompt).toContain('AI-marketing CMO persona');
     });
+
+    it('should include the drafting direction guard', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('Drafting Direction Guard');
+      expect(systemPrompt).toContain('who the message is FROM and who it is TO');
+    });
+
+    it('should preserve explicit to/on behalf of drafting direction', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('"draft a reply to ftan on behalf of Ed and Sophie" means draft FROM Ed and Sophie TO ftan');
+    });
+
+    it('should ask for confirmation before ambiguous multi-party drafting', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('"I\'ll draft this FROM [sender] TO [recipient] - correct?"');
+    });
+
+    it('should not polish inbound text when the user asked for a reply', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('Do not merely polish an inbound message when the user asked for a reply');
+    });
   });
 
 
