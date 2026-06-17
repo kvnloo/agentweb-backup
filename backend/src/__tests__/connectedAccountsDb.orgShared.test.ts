@@ -11,17 +11,19 @@
 
 let mockUsers: Record<string, any> = {};
 let mockOrgMembers: any[] = [];
+const mockUpdateUser = jest.fn();
 
 jest.mock('../services/db', () => ({
   userDb: {
     getUserById: jest.fn((id: string) => Promise.resolve(mockUsers[id] ?? null)),
+    updateUser: (...args: any[]) => mockUpdateUser(...args),
   },
   orgDb: {
     getOrgMembers: jest.fn((_orgId: string) => Promise.resolve(mockOrgMembers)),
   },
 }));
 
-import { getAccountsByUserIdIncludingOrgShared } from '../services/connectedAccountsDb';
+import { createAccount, getAccountsByUserIdIncludingOrgShared } from '../services/connectedAccountsDb';
 
 const ORG_ID = 'org-test-123';
 
@@ -39,6 +41,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockUsers = {};
   mockOrgMembers = [];
+  mockUpdateUser.mockResolvedValue(undefined);
 });
 
 describe('getAccountsByUserIdIncludingOrgShared', () => {
@@ -154,5 +157,162 @@ describe('getAccountsByUserIdIncludingOrgShared', () => {
     const result = await getAccountsByUserIdIncludingOrgShared('user-a');
     expect(result).toHaveLength(1);
     expect(result[0].account_id).toBe('acc-own');
+  });
+});
+
+describe('createAccount org sharing defaults', () => {
+  it('defaults LinkedIn Ads accounts to org-shared so teammates can use agency-created ad connections', async () => {
+    mockUsers['seth-user'] = {
+      userId: 'seth-user',
+      orgId: ORG_ID,
+      connected_accounts: [],
+    };
+
+    await createAccount('seth-user', 'linkedin_ads', {
+      account_id: 'urn:li:sponsoredAccount:111',
+      account_name: 'Sarah LinkedIn Ads',
+      config: {
+        account_type: 'ad_account',
+        currency: 'USD',
+        status: 'ACTIVE',
+        access_token: 'li-token',
+        token_expires_at: 9999999999999,
+      },
+    });
+
+    expect(mockUpdateUser).toHaveBeenCalledWith('seth-user', {
+      connected_accounts: [
+        expect.objectContaining({
+          platform: 'linkedin_ads',
+          account_id: 'urn:li:sponsoredAccount:111',
+          sharedWithOrg: true,
+        }),
+      ],
+    });
+  });
+
+  it('defaults Google Ads accounts to org-shared so the selected customer account is visible to org members', async () => {
+    mockUsers['seth-user'] = {
+      userId: 'seth-user',
+      orgId: ORG_ID,
+      connected_accounts: [],
+    };
+
+    await createAccount('seth-user', 'google_ads', {
+      account_id: '1234567890',
+      account_name: 'Sarah Google Ads',
+      config: {
+        account_type: 'google_ads',
+        customer_id: '1234567890',
+        currency: 'USD',
+        access_token: 'google-token',
+        token_expires_at: 9999999999999,
+      },
+    });
+
+    expect(mockUpdateUser).toHaveBeenCalledWith('seth-user', {
+      connected_accounts: [
+        expect.objectContaining({
+          platform: 'google_ads',
+          account_id: '1234567890',
+          sharedWithOrg: true,
+        }),
+      ],
+    });
+  });
+
+  it('defaults Meta ad accounts to org-shared while leaving non-ad Meta assets private', async () => {
+    mockUsers['seth-user'] = {
+      userId: 'seth-user',
+      orgId: ORG_ID,
+      connected_accounts: [],
+    };
+
+    await createAccount('seth-user', 'meta', {
+      account_id: 'act_123',
+      account_name: 'Sarah Meta Ads',
+      config: {
+        account_type: 'ad_account',
+        ad_account_id: 'act_123',
+        currency: 'USD',
+        access_token: 'meta-token',
+        token_expires_at: 9999999999999,
+      },
+    });
+
+    expect(mockUpdateUser).toHaveBeenCalledWith('seth-user', {
+      connected_accounts: [
+        expect.objectContaining({
+          platform: 'meta',
+          account_id: 'act_123',
+          sharedWithOrg: true,
+        }),
+      ],
+    });
+  });
+
+  it('keeps personal Gmail accounts private by default', async () => {
+    mockUsers['seth-user'] = {
+      userId: 'seth-user',
+      orgId: ORG_ID,
+      connected_accounts: [],
+    };
+
+    await createAccount('seth-user', 'gmail', {
+      account_id: 'seth@example.com',
+      account_name: 'Seth Gmail',
+      config: {
+        account_type: 'gmail',
+        email: 'seth@example.com',
+        access_token: 'gmail-token',
+        token_expires_at: 9999999999999,
+        granted_scopes: [],
+      },
+    });
+
+    expect(mockUpdateUser).toHaveBeenCalledWith('seth-user', {
+      connected_accounts: [
+        expect.objectContaining({
+          platform: 'gmail',
+          account_id: 'seth@example.com',
+          sharedWithOrg: false,
+        }),
+      ],
+    });
+  });
+
+  it('preserves an existing explicit private setting when refreshing an ads account', async () => {
+    const existing = {
+      ...makeAccount('urn:li:sponsoredAccount:111', 'linkedin_ads', false),
+      created_at: '2024-01-01T00:00:00.000Z',
+    };
+    mockUsers['seth-user'] = {
+      userId: 'seth-user',
+      orgId: ORG_ID,
+      connected_accounts: [existing],
+    };
+
+    await createAccount('seth-user', 'linkedin_ads', {
+      account_id: 'urn:li:sponsoredAccount:111',
+      account_name: 'Sarah LinkedIn Ads',
+      config: {
+        account_type: 'ad_account',
+        currency: 'USD',
+        status: 'ACTIVE',
+        access_token: 'new-token',
+        token_expires_at: 9999999999999,
+      },
+    });
+
+    expect(mockUpdateUser).toHaveBeenCalledWith('seth-user', {
+      connected_accounts: [
+        expect.objectContaining({
+          platform: 'linkedin_ads',
+          account_id: 'urn:li:sponsoredAccount:111',
+          sharedWithOrg: false,
+          created_at: '2024-01-01T00:00:00.000Z',
+        }),
+      ],
+    });
   });
 });

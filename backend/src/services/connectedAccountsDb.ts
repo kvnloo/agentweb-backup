@@ -232,6 +232,17 @@ export interface CreateAccountInput {
   account_id: string;
   account_name: string;
   config: PlatformConfig;
+  sharedWithOrg?: boolean;
+}
+
+const ORG_SHARED_BY_DEFAULT_PLATFORMS: ReadonlySet<PlatformType> = new Set([
+  'linkedin_ads',
+  'google_ads',
+]);
+
+function shouldDefaultShareWithOrg(platform: PlatformType, config: PlatformConfig): boolean {
+  if (ORG_SHARED_BY_DEFAULT_PLATFORMS.has(platform)) return true;
+  return platform === 'meta' && (config as any)?.account_type === 'ad_account';
 }
 
 /**
@@ -261,6 +272,7 @@ export const createAccount = async (
     account_id: input.account_id,
     account_name: input.account_name,
     config: input.config,
+    sharedWithOrg: input.sharedWithOrg ?? existingAccount?.sharedWithOrg ?? shouldDefaultShareWithOrg(platform, input.config),
     created_at: existingAccount?.created_at || now,
     updated_at: now,
   };
