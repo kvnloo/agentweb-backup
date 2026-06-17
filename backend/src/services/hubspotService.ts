@@ -58,6 +58,32 @@ if (_created) {
 const HUBSPOT_API_BASE = 'https://api.hubapi.com';
 
 
+// Recipient audience + send-schedule fields for a marketing email.
+export interface EmailAudienceOpts {
+  sendOnPublish?: boolean;       // true → send immediately on publish
+  publishDate?: string;          // ISO8601 → schedule send for this time
+  subscriptionId?: string;       // subscriptionDetails.subscriptionId (email type)
+  contactListsInclude?: string[]; // list IDs to send to
+  contactListsExclude?: string[]; // list IDs to suppress
+}
+
+// All writable fields for create/update of a marketing email.
+export interface EmailWriteOpts extends EmailAudienceOpts {
+  subject?: string;
+  fromName?: string;
+  fromEmail?: string;
+}
+
+// Flattened view of a single form field (from getFormFields).
+export interface FormFieldSummary {
+  name: string;
+  label?: string;
+  fieldType?: string;
+  required: boolean;
+  objectTypeId?: string;
+  options?: any;
+}
+
 export interface HubSpotContact {
   contactId: string;
   email?: string;
@@ -131,17 +157,25 @@ export class HubSpotService {
   private readonly _userId?: string;
   private readonly _accountId?: string;
   private _tokenExpiresAt?: number;
+  private readonly _portalId?: string;
 
   private constructor(
     token: string,
     userId?: string,
     accountId?: string,
     tokenExpiresAt?: number,
+    portalId?: string,
   ) {
     this._token = token;
     this._userId = userId;
     this._accountId = accountId;
     this._tokenExpiresAt = tokenExpiresAt;
+    this._portalId = portalId;
+  }
+
+  /** HubSpot portal (hub) ID for this connection. Needed for public form submission. */
+  get portalId(): string | undefined {
+    return this._portalId;
   }
 
   // ─── Factories ────────────────────────────────────────────────────────────
@@ -154,9 +188,10 @@ export class HubSpotService {
     const account = await resolveHubSpotAccount(userId, accountId);
     const config = account.config as any;
     const expiresAt: number = config.token_expires_at || 0;
+    const portalId: string | undefined = config.hub_id !== undefined ? String(config.hub_id) : account.account_id;
 
     if (expiresAt - Date.now() > TOKEN_REFRESH_BUFFER_MS) {
-      return new HubSpotService(config.access_token, userId, account.account_id, expiresAt);
+      return new HubSpotService(config.access_token, userId, account.account_id, expiresAt, portalId);
     }
 
     if (!config.refresh_token) {
@@ -164,7 +199,7 @@ export class HubSpotService {
     }
 
     // Token is expiring — create provisional instance, refresh, then return it.
-    const instance = new HubSpotService(config.access_token, userId, account.account_id, expiresAt);
+    const instance = new HubSpotService(config.access_token, userId, account.account_id, expiresAt, portalId);
     await instance.doRefresh(userId, account.account_id, config.refresh_token);
     return instance;
   }
@@ -1043,7 +1078,23 @@ export class HubSpotService {
     return res.data;
   }
 
-  async createEmail(name: string, opts?: { subject?: string; fromName?: string; fromEmail?: string }): Promise<any> {
+  // Apply recipient audience + send-schedule fields onto a marketing-email body.
+  // Used by both createEmail and updateEmail.
+  private applyEmailAudience(body: Record<string, any>, opts: EmailAudienceOpts): void {
+    if (opts.sendOnPublish !== undefined) body.sendOnPublish = opts.sendOnPublish;
+    if (opts.publishDate !== undefined) body.publishDate = opts.publishDate;
+    if (opts.subscriptionId !== undefined) {
+      body.subscriptionDetails = { subscriptionId: opts.subscriptionId };
+    }
+    if (opts.contactListsInclude !== undefined || opts.contactListsExclude !== undefined) {
+      const contactLists: Record<string, any> = {};
+      if (opts.contactListsInclude !== undefined) contactLists.include = opts.contactListsInclude;
+      if (opts.contactListsExclude !== undefined) contactLists.exclude = opts.contactListsExclude;
+      body.to = { contactLists };
+    }
+  }
+
+  async createEmail(name: string, opts?: EmailWriteOpts): Promise<any> {
     if (!name?.trim()) throw new Error('Email name is required');
     const body: Record<string, any> = { name: name.trim() };
     if (opts?.subject) body.subject = opts.subject;
@@ -1052,6 +1103,7 @@ export class HubSpotService {
       if (opts?.fromName) body.from.name = opts.fromName;
       if (opts?.fromEmail) body.from.email = opts.fromEmail;
     }
+    if (opts) this.applyEmailAudience(body, opts);
     const res = await axiosInstance.post(
       `${HUBSPOT_API_BASE}/marketing/v3/emails`,
       body,
@@ -1062,7 +1114,7 @@ export class HubSpotService {
 
   async updateEmail(
     emailId: string,
-    props: { name?: string; subject?: string; fromName?: string; fromEmail?: string }
+    props: EmailWriteOpts & { name?: string }
   ): Promise<any> {
     const body: Record<string, any> = {};
     if (props.name !== undefined) body.name = props.name;
@@ -1072,9 +1124,43 @@ export class HubSpotService {
       if (props.fromName !== undefined) body.from.name = props.fromName;
       if (props.fromEmail !== undefined) body.from.email = props.fromEmail;
     }
+    this.applyEmailAudience(body, props);
     const res = await axiosInstance.patch(
       `${HUBSPOT_API_BASE}/marketing/v3/emails/${emailId}`,
       body,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  // Publish (send/schedule) a marketing email. Whether it sends immediately or
+  // schedules is controlled by sendOnPublish / publishDate set via create/update.
+  // Requires Marketing Hub Enterprise or the transactional email add-on.
+  async publishEmail(emailId: string): Promise<void> {
+    if (!emailId?.trim()) throw new Error('emailId is required');
+    await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/marketing/v3/emails/${emailId}/publish`,
+      {},
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  // Unpublish an email / cancel a scheduled send. Already-sending emails may not
+  // be cancellable.
+  async unpublishEmail(emailId: string): Promise<void> {
+    if (!emailId?.trim()) throw new Error('emailId is required');
+    await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/marketing/v3/emails/${emailId}/unpublish`,
+      {},
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  // List the account's subscription types (email types). The id is needed for
+  // subscriptionDetails.subscriptionId when creating a sendable marketing email.
+  async listSubscriptionTypes(): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/communication-preferences/v3/definitions`,
       { headers: await this.authHeaders() }
     );
     return res.data;
@@ -1238,6 +1324,49 @@ export class HubSpotService {
     return res.data;
   }
 
+  // Read a form's fields as a flat list — flattens the nested fieldGroups[].fields[]
+  // structure so callers can see what to submit without parsing the full schema.
+  async getFormFields(formId: string): Promise<{ formId: string; fields: FormFieldSummary[] }> {
+    if (!formId?.trim()) throw new Error('formId is required');
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/marketing/v3/forms/${formId}`,
+      { headers: await this.authHeaders() }
+    );
+    const fieldGroups: any[] = (res.data as any)?.fieldGroups ?? [];
+    const fields: FormFieldSummary[] = fieldGroups.flatMap((g: any) => (g?.fields ?? []).map((f: any) => ({
+      name: f.name,
+      label: f.label,
+      fieldType: f.fieldType,
+      required: !!f.required,
+      objectTypeId: f.objectTypeId,
+      options: f.options,
+    })));
+    return { formId, fields };
+  }
+
+  // Submit data INTO a HubSpot form via the public Forms Submission API.
+  // This endpoint lives on a different host (api.hsforms.com) and is keyed by
+  // portalId + formGuid; it does not use the OAuth bearer token.
+  async submitForm(
+    portalId: string,
+    formGuid: string,
+    fields: Array<{ name: string; value: any; objectTypeId?: string }>,
+    opts?: { context?: Record<string, any>; legalConsentOptions?: Record<string, any> }
+  ): Promise<any> {
+    if (!portalId?.trim()) throw new Error('portalId is required to submit a form');
+    if (!formGuid?.trim()) throw new Error('formGuid is required');
+    if (!fields?.length) throw new Error('fields array must not be empty');
+    const body: Record<string, any> = { fields };
+    if (opts?.context) body.context = opts.context;
+    if (opts?.legalConsentOptions) body.legalConsentOptions = opts.legalConsentOptions;
+    const res = await axiosInstance.post(
+      `https://api.hsforms.com/submissions/v3/integration/submit/${portalId}/${formGuid}`,
+      body,
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+    return res.data;
+  }
+
   // ─── Landing Pages ────────────────────────────────────────────────────────
   // Scope: content
 
@@ -1388,6 +1517,26 @@ export class HubSpotService {
       `${HUBSPOT_API_BASE}/automation/v4/flows/${workflowId}`,
       { headers: await this.authHeaders() }
     );
+  }
+
+  // Enable or disable a workflow. The v4 flows API has no partial PATCH — update
+  // is a full-object PUT requiring revisionId (optimistic concurrency). So we
+  // GET the current flow, flip isEnabled, and PUT the whole object back.
+  // Requires Marketing/Sales/Service/etc. Hub Professional+.
+  async setWorkflowEnabled(workflowId: string, enabled: boolean): Promise<any> {
+    if (!workflowId?.trim()) throw new Error('workflowId is required');
+    const headers = await this.authHeaders();
+    const current = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/automation/v4/flows/${workflowId}`,
+      { headers }
+    );
+    const flow = { ...(current.data as any), isEnabled: enabled };
+    const res = await axiosInstance.put(
+      `${HUBSPOT_API_BASE}/automation/v4/flows/${workflowId}`,
+      flow,
+      { headers }
+    );
+    return res.data;
   }
 
   async getWorkflowPerformance(

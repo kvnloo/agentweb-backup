@@ -7505,15 +7505,26 @@ ENTITY_TYPE + ACTION MATRIX:
              Requires Marketing Hub Professional+. asset_type: MARKETING_EMAIL, LANDING_PAGE, BLOG_POST, FORM, WEB_INTERACTIVE, CTA, SOCIAL_BROADCAST, WORKFLOW.
 
   EMAIL      → LIST (cursor?) | GET (email_id) | GET_STATS (email_ids[], start_timestamp?, end_timestamp?)
-             → CREATE (name; subject?, from_name?, from_email?) | UPDATE (email_id) | CLONE (email_id, name)
+             → CREATE (name; subject?, from_name?, from_email?, subscription_id?, contact_lists_include[]?, contact_lists_exclude[]?, send_on_publish?, publish_date?)
+             → UPDATE (email_id; same optional fields as CREATE) | CLONE (email_id, name)
+             → PUBLISH (email_id) | UNPUBLISH (email_id) | LIST_SUBSCRIPTION_TYPES
              → DELETE (email_id)
-             Requires "content" OAuth scope.
+             Requires "content" OAuth scope. PUBLISH/UNPUBLISH require Marketing Hub Enterprise or the transactional email add-on.
+             SENDING A MARKETING EMAIL — set audience + schedule on CREATE/UPDATE, then PUBLISH:
+               1. LIST_SUBSCRIPTION_TYPES → pick a subscription_id (email type).
+               2. Ensure recipients are IN the target contact list(s): use CONTACT_LIST LIST to get list IDs, CONTACT_LIST ADD_CONTACTS to populate. (Leads synced from AgentWeb land in HubSpot's contact DB, NOT automatically in a list.)
+               3. CREATE/UPDATE with subscription_id + contact_lists_include[] (+ contact_lists_exclude[]).
+                  send_on_publish=true → send immediately on PUBLISH; publish_date (ISO8601) → schedule for that time.
+               4. PUBLISH (email_id) to send/schedule. UNPUBLISH cancels a scheduled send (already-sending emails may not be cancellable).
 
-  FORM       → LIST (cursor?) | GET (form_id) | GET_SUBMISSIONS (form_id; cursor?)
+  FORM       → LIST (cursor?) | GET (form_id) | GET_SUBMISSIONS (form_id; cursor?) | GET_FORM_FIELDS (form_id)
              → CREATE (name, formType="hubspot", fieldGroups=[], configuration={}, displayOptions={}, legalConsentOptions={type:"none"})
              → UPDATE (form_id; name?, fieldGroups?, configuration?, displayOptions?, legalConsentOptions?)
+             → SUBMIT (form_id, fields[{name,value}]; submission_context?, legal_consent_options?)
              → DELETE (form_id)
              Requires "forms" OAuth scope. CREATE: formType must be "hubspot" (only valid value). All 6 fields required by HubSpot schema. Pass minimum: formType="hubspot", fieldGroups=[], configuration={}, displayOptions={}, legalConsentOptions={type:"none"}.
+             GET_FORM_FIELDS: returns a flat list of the form's fields ({name,label,fieldType,required,objectTypeId,options}) — use it to discover what to pass to SUBMIT instead of parsing the nested fieldGroups schema.
+             SUBMIT: pushes a submission INTO the form (lead capture) via HubSpot's public submission API. fields = [{ name, value }] using the field "name" from GET_FORM_FIELDS. form_id is the form GUID. submission_context (e.g. { pageUri, pageName }) and legal_consent_options are optional.
              DELETE is a soft-delete (archive); permanently purged after 3 months.
 
   LANDING_PAGE → LIST (cursor?) | GET (page_id) | CREATE (name; template_path?, slug?, meta_description?)
@@ -7527,7 +7538,9 @@ ENTITY_TYPE + ACTION MATRIX:
              Requires "content" scope. Get content_group_id from LIST.
 
   WORKFLOW   → LIST | GET (workflow_id) | DELETE (workflow_id) | GET_PERFORMANCE (workflow_id, start, end, bucket)
+             → ENABLE (workflow_id) | DISABLE (workflow_id)
              Requires "automation" scope + Marketing Hub Professional+.
+             ENABLE/DISABLE toggle a workflow on/off (v4 flows read-modify-write PUT). ENABLE turns automation live — it will enroll contacts and run actions.
              Enrollment stats in contactListIds.enrolled / contactListIds.active.
              GET_PERFORMANCE: start/end = epoch ms, bucket = DAY|WEEK|MONTH. Returns ENROLLED/UNENROLLED/COMPLETED counts per bucket.
              WARNING: DELETE is irreversible via API — deleted workflow can only be restored by HubSpot Support.
@@ -7574,10 +7587,18 @@ TYPICAL WORKFLOW:
         subject:          { type: 'string', description: 'Email subject line. EMAIL CREATE/UPDATE.' },
         from_name:        { type: 'string', description: 'Sender display name. EMAIL CREATE/UPDATE.' },
         from_email:       { type: 'string', description: 'Sender email address. EMAIL CREATE/UPDATE.' },
+        subscription_id:  { type: 'string', description: 'HubSpot subscription type ID (email type). From EMAIL LIST_SUBSCRIPTION_TYPES. Set on EMAIL CREATE/UPDATE before a marketing email can be sent.' },
+        contact_lists_include: { type: 'array', items: { type: 'string' }, description: 'Contact list IDs to send to. EMAIL CREATE/UPDATE. Get IDs from CONTACT_LIST LIST.' },
+        contact_lists_exclude: { type: 'array', items: { type: 'string' }, description: 'Contact list IDs to suppress. EMAIL CREATE/UPDATE.' },
+        send_on_publish:  { type: 'boolean', description: 'EMAIL CREATE/UPDATE. true → email sends immediately when PUBLISHed.' },
+        publish_date:     { type: 'string', description: 'ISO8601 datetime. EMAIL CREATE/UPDATE. Schedules the send for this time on PUBLISH.' },
         start_timestamp:  { type: 'string', description: 'Start of date range (string). Filter EMAIL GET_STATS.' },
         end_timestamp:    { type: 'string', description: 'End of date range (string). Filter EMAIL GET_STATS.' },
         // FORM
-        form_id:          { type: 'string', description: 'Form ID. Required for FORM GET/GET_SUBMISSIONS/UPDATE/DELETE.' },
+        form_id:          { type: 'string', description: 'Form ID (GUID). Required for FORM GET/GET_SUBMISSIONS/GET_FORM_FIELDS/UPDATE/DELETE/SUBMIT.' },
+        fields:           { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, value: {}, objectTypeId: { type: 'string' } }, required: ['name', 'value'] }, description: 'Submission values for FORM SUBMIT: [{ name, value }]. Use field "name" from FORM GET_FORM_FIELDS.' },
+        submission_context: { type: 'object', description: 'Optional context for FORM SUBMIT (e.g. { pageUri, pageName, hutk }).' },
+        legal_consent_options: { type: 'object', description: 'Optional GDPR consent object for FORM SUBMIT.' },
         // LANDING_PAGE
         page_id:          { type: 'string', description: 'Landing page ID. Required for LANDING_PAGE GET/PUBLISH/UPDATE/DELETE.' },
         template_path:    { type: 'string', description: 'HubSpot template path (no leading slash). LANDING_PAGE CREATE.' },

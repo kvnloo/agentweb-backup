@@ -24700,12 +24700,40 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           case 'CREATE': {
             const name: string = args?.name ?? '';
             if (!name.trim()) return { success: false, error: 'name is required for EMAIL CREATE.' };
-            const data = await svc.createEmail(name, { subject: args?.subject, fromName: args?.from_name, fromEmail: args?.from_email });
+            const data = await svc.createEmail(name, {
+              subject: args?.subject, fromName: args?.from_name, fromEmail: args?.from_email,
+              subscriptionId: args?.subscription_id,
+              contactListsInclude: args?.contact_lists_include,
+              contactListsExclude: args?.contact_lists_exclude,
+              sendOnPublish: args?.send_on_publish,
+              publishDate: args?.publish_date,
+            });
             return { success: true, ...data };
           }
           case 'UPDATE': {
             if (!args?.email_id) return { success: false, error: 'email_id is required for EMAIL UPDATE.' };
-            const data = await svc.updateEmail(args.email_id, { name: args?.name, subject: args?.subject, fromName: args?.from_name, fromEmail: args?.from_email });
+            const data = await svc.updateEmail(args.email_id, {
+              name: args?.name, subject: args?.subject, fromName: args?.from_name, fromEmail: args?.from_email,
+              subscriptionId: args?.subscription_id,
+              contactListsInclude: args?.contact_lists_include,
+              contactListsExclude: args?.contact_lists_exclude,
+              sendOnPublish: args?.send_on_publish,
+              publishDate: args?.publish_date,
+            });
+            return { success: true, ...data };
+          }
+          case 'PUBLISH': {
+            if (!args?.email_id) return { success: false, error: 'email_id is required for EMAIL PUBLISH.' };
+            await svc.publishEmail(args.email_id);
+            return { success: true, published: args.email_id };
+          }
+          case 'UNPUBLISH': {
+            if (!args?.email_id) return { success: false, error: 'email_id is required for EMAIL UNPUBLISH.' };
+            await svc.unpublishEmail(args.email_id);
+            return { success: true, unpublished: args.email_id };
+          }
+          case 'LIST_SUBSCRIPTION_TYPES': {
+            const data = await svc.listSubscriptionTypes();
             return { success: true, ...data };
           }
           case 'CLONE': {
@@ -24721,7 +24749,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             return { success: true, deleted: args.email_id };
           }
           default:
-            return { success: false, error: `Unknown action "${action}" for EMAIL. Valid: LIST, GET, GET_STATS, CREATE, UPDATE, CLONE, DELETE.` };
+            return { success: false, error: `Unknown action "${action}" for EMAIL. Valid: LIST, GET, GET_STATS, CREATE, UPDATE, PUBLISH, UNPUBLISH, LIST_SUBSCRIPTION_TYPES, CLONE, DELETE.` };
         }
       }
 
@@ -24765,8 +24793,27 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             await svc.deleteForm(args.form_id);
             return { success: true, deleted: args.form_id };
           }
+          case 'GET_FORM_FIELDS': {
+            if (!args?.form_id) return { success: false, error: 'form_id is required for FORM GET_FORM_FIELDS.' };
+            const data = await svc.getFormFields(args.form_id);
+            return { success: true, ...data };
+          }
+          case 'SUBMIT': {
+            if (!args?.form_id) return { success: false, error: 'form_id is required for FORM SUBMIT (the form GUID).' };
+            const fields = args?.fields;
+            if (!Array.isArray(fields) || fields.length === 0) {
+              return { success: false, error: 'fields (array of { name, value }) is required for FORM SUBMIT.' };
+            }
+            const portalId = svc.portalId;
+            if (!portalId) return { success: false, error: 'Cannot submit form: HubSpot portal ID unavailable for this connection. Reconnect the account via OAuth.' };
+            const data = await svc.submitForm(portalId, args.form_id, fields, {
+              context: args?.submission_context,
+              legalConsentOptions: args?.legal_consent_options,
+            });
+            return { success: true, ...data };
+          }
           default:
-            return { success: false, error: `Unknown action "${action}" for FORM. Valid: LIST, GET, GET_SUBMISSIONS, CREATE, UPDATE, DELETE.` };
+            return { success: false, error: `Unknown action "${action}" for FORM. Valid: LIST, GET, GET_SUBMISSIONS, GET_FORM_FIELDS, CREATE, UPDATE, DELETE, SUBMIT.` };
         }
       }
 
@@ -24885,8 +24932,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             const data = await svc.getWorkflowPerformance(args.workflow_id, args.start, args.end, args.bucket);
             return { success: true, performance: data };
           }
+          case 'ENABLE': {
+            if (!args?.workflow_id) return { success: false, error: 'workflow_id is required for WORKFLOW ENABLE.' };
+            const data = await svc.setWorkflowEnabled(args.workflow_id, true);
+            return { success: true, ...data };
+          }
+          case 'DISABLE': {
+            if (!args?.workflow_id) return { success: false, error: 'workflow_id is required for WORKFLOW DISABLE.' };
+            const data = await svc.setWorkflowEnabled(args.workflow_id, false);
+            return { success: true, ...data };
+          }
           default:
-            return { success: false, error: `Unknown action "${action}" for WORKFLOW. Valid: LIST, GET, DELETE, GET_PERFORMANCE.` };
+            return { success: false, error: `Unknown action "${action}" for WORKFLOW. Valid: LIST, GET, DELETE, GET_PERFORMANCE, ENABLE, DISABLE.` };
         }
       }
 

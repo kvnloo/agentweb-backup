@@ -222,6 +222,88 @@ describe('deleteEmail', () => {
   });
 });
 
+describe('publishEmail', () => {
+  it('POSTs to /marketing/v3/emails/{id}/publish and resolves on 204', async () => {
+    mockPost.mockResolvedValue({ status: 204, data: null });
+    const svc = makeSvc();
+    await expect(svc.publishEmail('e1')).resolves.toBeUndefined();
+    expect(mockPost.mock.calls[0][0]).toContain('/marketing/v3/emails/e1/publish');
+  });
+
+  it('throws if emailId is empty or nullish', async () => {
+    const svc = makeSvc();
+    await expect(svc.publishEmail('')).rejects.toThrow(/emailId/i);
+    await expect(svc.publishEmail(undefined as any)).rejects.toThrow(/emailId/i);
+  });
+
+  it('throws on API error', async () => {
+    mockPost.mockRejectedValue(Object.assign(new Error('Forbidden'), { response: { status: 403 } }));
+    const svc = makeSvc();
+    await expect(svc.publishEmail('e1')).rejects.toThrow();
+  });
+});
+
+describe('unpublishEmail', () => {
+  it('POSTs to /marketing/v3/emails/{id}/unpublish and resolves on 204', async () => {
+    mockPost.mockResolvedValue({ status: 204, data: null });
+    const svc = makeSvc();
+    await expect(svc.unpublishEmail('e1')).resolves.toBeUndefined();
+    expect(mockPost.mock.calls[0][0]).toContain('/marketing/v3/emails/e1/unpublish');
+  });
+
+  it('throws if emailId is empty or nullish', async () => {
+    const svc = makeSvc();
+    await expect(svc.unpublishEmail('')).rejects.toThrow(/emailId/i);
+    await expect(svc.unpublishEmail(undefined as any)).rejects.toThrow(/emailId/i);
+  });
+});
+
+describe('listSubscriptionTypes', () => {
+  it('GETs /communication-preferences/v3/definitions and returns data', async () => {
+    const data = { results: [{ id: '123', name: 'Marketing Information' }] };
+    mockGet.mockResolvedValue({ data });
+    const svc = makeSvc();
+    const result = await svc.listSubscriptionTypes();
+    expect(result).toEqual(data);
+    expect(mockGet.mock.calls[0][0]).toContain('/communication-preferences/v3/definitions');
+  });
+
+  it('throws on API error', async () => {
+    mockGet.mockRejectedValue(Object.assign(new Error('Forbidden'), { response: { status: 403 } }));
+    const svc = makeSvc();
+    await expect(svc.listSubscriptionTypes()).rejects.toThrow();
+  });
+});
+
+describe('createEmail recipients/schedule', () => {
+  it('builds to.contactLists and subscriptionDetails from opts', async () => {
+    mockPost.mockResolvedValue({ data: { id: 'e9' } });
+    const svc = makeSvc();
+    await svc.createEmail('Newsletter', {
+      subscriptionId: '555',
+      contactListsInclude: ['101', '102'],
+      contactListsExclude: ['201'],
+      sendOnPublish: true,
+      publishDate: '2026-07-01T10:00:00Z',
+    });
+    const body = mockPost.mock.calls[0][1];
+    expect(body.to.contactLists.include).toEqual(['101', '102']);
+    expect(body.to.contactLists.exclude).toEqual(['201']);
+    expect(body.subscriptionDetails.subscriptionId).toBe('555');
+    expect(body.sendOnPublish).toBe(true);
+    expect(body.publishDate).toBe('2026-07-01T10:00:00Z');
+  });
+
+  it('omits to/subscriptionDetails when no recipient opts given', async () => {
+    mockPost.mockResolvedValue({ data: { id: 'e9' } });
+    const svc = makeSvc();
+    await svc.createEmail('Plain');
+    const body = mockPost.mock.calls[0][1];
+    expect(body.to).toBeUndefined();
+    expect(body.subscriptionDetails).toBeUndefined();
+  });
+});
+
 // ─── Forms ────────────────────────────────────────────────────────────────────
 
 describe('listForms', () => {
@@ -261,6 +343,117 @@ describe('getFormSubmissions', () => {
     const svc = makeSvc();
     await svc.getFormSubmissions('f1', 'cursor-xyz');
     expect(mockGet.mock.calls[0][0]).toContain('cursor-xyz');
+  });
+});
+
+describe('getFormFields', () => {
+  it('flattens fieldGroups[].fields[] into a field list', async () => {
+    mockGet.mockResolvedValue({
+      data: {
+        id: 'f1', name: 'Lead form',
+        fieldGroups: [
+          { fields: [
+            { objectTypeId: '0-1', name: 'email', label: 'Email', fieldType: 'email', required: true },
+            { objectTypeId: '0-1', name: 'firstname', label: 'First name', fieldType: 'single_line_text', required: false },
+          ] },
+          { fields: [
+            { objectTypeId: '0-1', name: 'tier', label: 'Tier', fieldType: 'dropdown', required: false, options: [{ label: 'A', value: 'a' }] },
+          ] },
+        ],
+      },
+    });
+    const svc = makeSvc();
+    const result = await svc.getFormFields('f1');
+    expect(mockGet.mock.calls[0][0]).toContain('/marketing/v3/forms/f1');
+    expect(result.formId).toBe('f1');
+    expect(result.fields).toHaveLength(3);
+    expect(result.fields[0]).toEqual({ name: 'email', label: 'Email', fieldType: 'email', required: true, objectTypeId: '0-1', options: undefined });
+    expect(result.fields[2].options).toEqual([{ label: 'A', value: 'a' }]);
+  });
+
+  it('returns empty fields array when form has no fieldGroups', async () => {
+    mockGet.mockResolvedValue({ data: { id: 'f1', name: 'Empty' } });
+    const svc = makeSvc();
+    const result = await svc.getFormFields('f1');
+    expect(result.fields).toEqual([]);
+  });
+
+  it('returns empty fields array when response data is null', async () => {
+    mockGet.mockResolvedValue({ data: null });
+    const svc = makeSvc();
+    const result = await svc.getFormFields('f1');
+    expect(result.fields).toEqual([]);
+  });
+
+  it('skips null/empty fieldGroup entries', async () => {
+    mockGet.mockResolvedValue({ data: { fieldGroups: [null, { fields: [{ name: 'email', label: 'E', fieldType: 'email', required: true }] }] } });
+    const svc = makeSvc();
+    const result = await svc.getFormFields('f1');
+    expect(result.fields).toHaveLength(1);
+    expect(result.fields[0].name).toBe('email');
+  });
+
+  it('throws if formId is empty or nullish', async () => {
+    const svc = makeSvc();
+    await expect(svc.getFormFields('')).rejects.toThrow(/formId/i);
+    await expect(svc.getFormFields(undefined as any)).rejects.toThrow(/formId/i);
+  });
+
+  it('treats a fieldGroup with no fields as empty', async () => {
+    mockGet.mockResolvedValue({ data: { id: 'f1', fieldGroups: [{}, { fields: [{ name: 'email', label: 'E', fieldType: 'email', required: true }] }] } });
+    const svc = makeSvc();
+    const result = await svc.getFormFields('f1');
+    expect(result.fields).toHaveLength(1);
+    expect(result.fields[0].name).toBe('email');
+  });
+});
+
+describe('submitForm', () => {
+  it('POSTs to hsforms integration submit endpoint with fields', async () => {
+    mockPost.mockResolvedValue({ data: { inlineMessage: 'Thanks!' } });
+    const svc = makeSvc();
+    const result = await svc.submitForm('portal-123', 'guid-9', [
+      { name: 'email', value: 'a@b.com' },
+      { name: 'firstname', value: 'Jane' },
+    ]);
+    expect(result).toEqual({ inlineMessage: 'Thanks!' });
+    const url = mockPost.mock.calls[0][0];
+    expect(url).toContain('https://api.hsforms.com/submissions/v3/integration/submit/portal-123/guid-9');
+    const body = mockPost.mock.calls[0][1];
+    expect(body.fields).toEqual([
+      { name: 'email', value: 'a@b.com' },
+      { name: 'firstname', value: 'Jane' },
+    ]);
+  });
+
+  it('includes context and legalConsentOptions when provided', async () => {
+    mockPost.mockResolvedValue({ data: {} });
+    const svc = makeSvc();
+    await svc.submitForm('portal-123', 'guid-9', [{ name: 'email', value: 'a@b.com' }], {
+      context: { pageUri: 'https://x.com', pageName: 'Home' },
+      legalConsentOptions: { consent: { consentToProcess: true } },
+    });
+    const body = mockPost.mock.calls[0][1];
+    expect(body.context.pageUri).toBe('https://x.com');
+    expect(body.legalConsentOptions.consent.consentToProcess).toBe(true);
+  });
+
+  it('throws if portalId is empty or nullish', async () => {
+    const svc = makeSvc();
+    await expect(svc.submitForm('', 'guid-9', [{ name: 'email', value: 'a@b.com' }])).rejects.toThrow(/portalId/i);
+    await expect(svc.submitForm(undefined as any, 'guid-9', [{ name: 'email', value: 'a@b.com' }])).rejects.toThrow(/portalId/i);
+  });
+
+  it('throws if formGuid is empty or nullish', async () => {
+    const svc = makeSvc();
+    await expect(svc.submitForm('portal-123', '', [{ name: 'email', value: 'a@b.com' }])).rejects.toThrow(/formGuid/i);
+    await expect(svc.submitForm('portal-123', undefined as any, [{ name: 'email', value: 'a@b.com' }])).rejects.toThrow(/formGuid/i);
+  });
+
+  it('throws if fields array is empty or nullish', async () => {
+    const svc = makeSvc();
+    await expect(svc.submitForm('portal-123', 'guid-9', [])).rejects.toThrow(/fields/i);
+    await expect(svc.submitForm('portal-123', 'guid-9', undefined as any)).rejects.toThrow(/fields/i);
   });
 });
 
@@ -625,6 +818,48 @@ describe('deleteWorkflow', () => {
   it('throws if workflowId empty', async () => {
     const svc = makeSvc();
     await expect(svc.deleteWorkflow('')).rejects.toThrow(/workflowId/i);
+  });
+});
+
+describe('setWorkflowEnabled', () => {
+  const FLOW = {
+    id: 'wf1', type: 'CONTACT_FLOW', revisionId: 'rev-7', isEnabled: false,
+    name: 'Nurture', actions: [{ actionId: '1' }], blockedDates: [],
+    canEnrollFromSalesforce: false, customProperties: {}, suppressionListIds: [], timeWindows: [],
+  };
+
+  it('GETs the v4 flow then PUTs it back with isEnabled=true, preserving revisionId + fields', async () => {
+    mockGet.mockResolvedValue({ data: { ...FLOW } });
+    mockPut.mockResolvedValue({ data: { ...FLOW, isEnabled: true, revisionId: 'rev-8' } });
+    const svc = makeSvc();
+    const result = await svc.setWorkflowEnabled('wf1', true);
+    expect(mockGet.mock.calls[0][0]).toContain('/automation/v4/flows/wf1');
+    const [putUrl, putBody] = mockPut.mock.calls[0];
+    expect(putUrl).toContain('/automation/v4/flows/wf1');
+    expect(putBody.isEnabled).toBe(true);
+    expect(putBody.revisionId).toBe('rev-7');
+    expect(putBody.type).toBe('CONTACT_FLOW');
+    expect(putBody.actions).toEqual([{ actionId: '1' }]);
+    expect(result.isEnabled).toBe(true);
+  });
+
+  it('PUTs isEnabled=false when disabling', async () => {
+    mockGet.mockResolvedValue({ data: { ...FLOW, isEnabled: true } });
+    mockPut.mockResolvedValue({ data: { ...FLOW, isEnabled: false } });
+    const svc = makeSvc();
+    await svc.setWorkflowEnabled('wf1', false);
+    expect(mockPut.mock.calls[0][1].isEnabled).toBe(false);
+  });
+
+  it('throws if workflowId empty', async () => {
+    const svc = makeSvc();
+    await expect(svc.setWorkflowEnabled('', true)).rejects.toThrow(/workflowId/i);
+  });
+
+  it('throws on API error from GET', async () => {
+    mockGet.mockRejectedValue(Object.assign(new Error('Not found'), { response: { status: 404 } }));
+    const svc = makeSvc();
+    await expect(svc.setWorkflowEnabled('wf1', true)).rejects.toThrow();
   });
 });
 

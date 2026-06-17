@@ -87,6 +87,24 @@ describe('HubSpotService — create() factory and token caching', () => {
     expect(mockGetAccountsByUserId).toHaveBeenCalledTimes(1);
   });
 
+  it('create() exposes portalId from config.hub_id', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([MOCK_ACCOUNT]);
+    const svc = await HubSpotService.create('user-1');
+    expect(svc.portalId).toBe('12345');
+  });
+
+  it('create() falls back to account_id for portalId when hub_id absent', async () => {
+    const noHubId = { ...MOCK_ACCOUNT, config: { ...MOCK_ACCOUNT.config, hub_id: undefined } };
+    mockGetAccountsByUserId.mockResolvedValue([noHubId]);
+    const svc = await HubSpotService.create('user-1');
+    expect(svc.portalId).toBe('12345');
+  });
+
+  it('fromToken() has no portalId', () => {
+    const svc = HubSpotService.fromToken('direct-api-key');
+    expect(svc.portalId).toBeUndefined();
+  });
+
   it('service methods use cached token without extra DB reads after create()', async () => {
     mockGetAccountsByUserId.mockResolvedValue([MOCK_ACCOUNT]);
     mockAxiosGet.mockResolvedValue({ data: { results: [] } });

@@ -9,14 +9,27 @@ process.env.JWT_SECRET = 'test-secret';
 // ── Mock HubSpotService before imports ────────────────────────────────────────
 
 const mockDeleteEmail = jest.fn();
+const mockPublishEmail = jest.fn();
+const mockUnpublishEmail = jest.fn();
+const mockListSubscriptionTypes = jest.fn();
+const mockCreateEmail = jest.fn();
+const mockUpdateEmail = jest.fn();
 const mockUpdateLandingPage = jest.fn();
 const mockDeleteLandingPage = jest.fn();
+const mockPublishLandingPage = jest.fn();
 const mockUpdateBlogPost = jest.fn();
 const mockDeleteBlogPost = jest.fn();
+const mockPublishBlogPost = jest.fn();
+const mockSetWorkflowEnabled = jest.fn();
 const mockDeleteSocialBroadcast = jest.fn();
+const mockCreateSocialBroadcast = jest.fn();
+const mockListSocialChannels = jest.fn();
+const mockListSocialBroadcasts = jest.fn();
 const mockCreateForm = jest.fn();
 const mockUpdateForm = jest.fn();
 const mockDeleteForm = jest.fn();
+const mockGetFormFields = jest.fn();
+const mockSubmitForm = jest.fn();
 const mockListContactLists = jest.fn();
 const mockGetContactList = jest.fn();
 const mockCreateContactList = jest.fn();
@@ -26,14 +39,28 @@ const mockDeleteContactList = jest.fn();
 
 const mockSvcInstance = {
   deleteEmail: mockDeleteEmail,
+  publishEmail: mockPublishEmail,
+  unpublishEmail: mockUnpublishEmail,
+  listSubscriptionTypes: mockListSubscriptionTypes,
+  createEmail: mockCreateEmail,
+  updateEmail: mockUpdateEmail,
   updateLandingPage: mockUpdateLandingPage,
   deleteLandingPage: mockDeleteLandingPage,
+  publishLandingPage: mockPublishLandingPage,
   updateBlogPost: mockUpdateBlogPost,
   deleteBlogPost: mockDeleteBlogPost,
+  publishBlogPost: mockPublishBlogPost,
+  setWorkflowEnabled: mockSetWorkflowEnabled,
   deleteSocialBroadcast: mockDeleteSocialBroadcast,
+  createSocialBroadcast: mockCreateSocialBroadcast,
+  listSocialChannels: mockListSocialChannels,
+  listSocialBroadcasts: mockListSocialBroadcasts,
   createForm: mockCreateForm,
   updateForm: mockUpdateForm,
   deleteForm: mockDeleteForm,
+  getFormFields: mockGetFormFields,
+  submitForm: mockSubmitForm,
+  portalId: 'portal-123',
   listContactLists: mockListContactLists,
   getContactList: mockGetContactList,
   createContactList: mockCreateContactList,
@@ -149,6 +176,121 @@ describe('EMAIL DELETE', () => {
   });
 });
 
+// ─── EMAIL PUBLISH ────────────────────────────────────────────────────────────
+
+describe('EMAIL PUBLISH', () => {
+  it('returns error when email_id missing', async () => {
+    const result = await hs({ entity_type: 'EMAIL', action: 'PUBLISH' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/email_id/i);
+    expect(mockPublishEmail).not.toHaveBeenCalled();
+  });
+
+  it('calls publishEmail and returns published id', async () => {
+    mockPublishEmail.mockResolvedValue(undefined);
+    const result = await hs({ entity_type: 'EMAIL', action: 'PUBLISH', email_id: EMAIL_ID });
+    expect(mockPublishEmail).toHaveBeenCalledWith(EMAIL_ID);
+    expect(result.success).toBe(true);
+    expect(result.published).toBe(EMAIL_ID);
+  });
+});
+
+// ─── EMAIL UNPUBLISH ──────────────────────────────────────────────────────────
+
+describe('EMAIL UNPUBLISH', () => {
+  it('returns error when email_id missing', async () => {
+    const result = await hs({ entity_type: 'EMAIL', action: 'UNPUBLISH' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/email_id/i);
+    expect(mockUnpublishEmail).not.toHaveBeenCalled();
+  });
+
+  it('calls unpublishEmail and returns unpublished id', async () => {
+    mockUnpublishEmail.mockResolvedValue(undefined);
+    const result = await hs({ entity_type: 'EMAIL', action: 'UNPUBLISH', email_id: EMAIL_ID });
+    expect(mockUnpublishEmail).toHaveBeenCalledWith(EMAIL_ID);
+    expect(result.success).toBe(true);
+    expect(result.unpublished).toBe(EMAIL_ID);
+  });
+});
+
+// ─── EMAIL LIST_SUBSCRIPTION_TYPES ────────────────────────────────────────────
+
+describe('EMAIL LIST_SUBSCRIPTION_TYPES', () => {
+  it('calls listSubscriptionTypes and returns data', async () => {
+    mockListSubscriptionTypes.mockResolvedValue({ results: [{ id: '7', name: 'Marketing' }] });
+    const result = await hs({ entity_type: 'EMAIL', action: 'LIST_SUBSCRIPTION_TYPES' });
+    expect(mockListSubscriptionTypes).toHaveBeenCalled();
+    expect(result.success).toBe(true);
+    expect(result.results[0].id).toBe('7');
+  });
+});
+
+// ─── EMAIL CREATE (recipients/schedule) ───────────────────────────────────────
+
+describe('EMAIL CREATE recipients', () => {
+  it('returns error when name missing', async () => {
+    const result = await hs({ entity_type: 'EMAIL', action: 'CREATE' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/name/i);
+    expect(mockCreateEmail).not.toHaveBeenCalled();
+  });
+
+  it('passes recipient + schedule opts to createEmail', async () => {
+    mockCreateEmail.mockResolvedValue({ id: 'e9' });
+    const result = await hs({
+      entity_type: 'EMAIL', action: 'CREATE', name: 'Newsletter',
+      subject: 'Hi', subscription_id: '555',
+      contact_lists_include: ['101'], contact_lists_exclude: ['201'],
+      send_on_publish: true, publish_date: '2026-07-01T10:00:00Z',
+    });
+    expect(result.success).toBe(true);
+    const [name, opts] = mockCreateEmail.mock.calls[0];
+    expect(name).toBe('Newsletter');
+    expect(opts.subscriptionId).toBe('555');
+    expect(opts.contactListsInclude).toEqual(['101']);
+    expect(opts.contactListsExclude).toEqual(['201']);
+    expect(opts.sendOnPublish).toBe(true);
+    expect(opts.publishDate).toBe('2026-07-01T10:00:00Z');
+  });
+});
+
+// ─── EMAIL UPDATE (recipients/schedule) ───────────────────────────────────────
+
+describe('EMAIL UPDATE recipients', () => {
+  it('returns error when email_id missing', async () => {
+    const result = await hs({ entity_type: 'EMAIL', action: 'UPDATE', subject: 'X' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/email_id/i);
+    expect(mockUpdateEmail).not.toHaveBeenCalled();
+  });
+
+  it('passes recipient + schedule opts to updateEmail', async () => {
+    mockUpdateEmail.mockResolvedValue({ id: EMAIL_ID });
+    await hs({
+      entity_type: 'EMAIL', action: 'UPDATE', email_id: EMAIL_ID,
+      subscription_id: '555', contact_lists_include: ['101'], send_on_publish: false,
+    });
+    const [id, props] = mockUpdateEmail.mock.calls[0];
+    expect(id).toBe(EMAIL_ID);
+    expect(props.subscriptionId).toBe('555');
+    expect(props.contactListsInclude).toEqual(['101']);
+    expect(props.sendOnPublish).toBe(false);
+  });
+});
+
+// ─── EMAIL unknown action ─────────────────────────────────────────────────────
+
+describe('EMAIL unknown action', () => {
+  it('lists PUBLISH/UNPUBLISH/LIST_SUBSCRIPTION_TYPES in valid actions', async () => {
+    const result = await hs({ entity_type: 'EMAIL', action: 'BOGUS' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/PUBLISH/);
+    expect(result.error).toMatch(/UNPUBLISH/);
+    expect(result.error).toMatch(/LIST_SUBSCRIPTION_TYPES/);
+  });
+});
+
 // ─── LANDING_PAGE UPDATE ──────────────────────────────────────────────────────
 
 describe('LANDING_PAGE UPDATE', () => {
@@ -226,6 +368,25 @@ describe('LANDING_PAGE DELETE', () => {
   });
 });
 
+// ─── LANDING_PAGE PUBLISH ─────────────────────────────────────────────────────
+
+describe('LANDING_PAGE PUBLISH', () => {
+  it('returns error when page_id missing', async () => {
+    const result = await hs({ entity_type: 'LANDING_PAGE', action: 'PUBLISH' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/page_id/i);
+    expect(mockPublishLandingPage).not.toHaveBeenCalled();
+  });
+
+  it('calls publishLandingPage and spreads result', async () => {
+    mockPublishLandingPage.mockResolvedValue({ id: PAGE_ID, state: 'PUBLISHED' });
+    const result = await hs({ entity_type: 'LANDING_PAGE', action: 'PUBLISH', page_id: PAGE_ID });
+    expect(mockPublishLandingPage).toHaveBeenCalledWith(PAGE_ID);
+    expect(result.success).toBe(true);
+    expect(result.state).toBe('PUBLISHED');
+  });
+});
+
 // ─── BLOG_POST UPDATE ─────────────────────────────────────────────────────────
 
 describe('BLOG_POST UPDATE', () => {
@@ -299,6 +460,25 @@ describe('BLOG_POST DELETE', () => {
     expect(mockDeleteBlogPost).toHaveBeenCalledWith(POST_ID);
     expect(result.success).toBe(true);
     expect(result.deleted).toBe(POST_ID);
+  });
+});
+
+// ─── BLOG_POST PUBLISH ────────────────────────────────────────────────────────
+
+describe('BLOG_POST PUBLISH', () => {
+  it('returns error when post_id missing', async () => {
+    const result = await hs({ entity_type: 'BLOG_POST', action: 'PUBLISH' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/post_id/i);
+    expect(mockPublishBlogPost).not.toHaveBeenCalled();
+  });
+
+  it('calls publishBlogPost and returns published id', async () => {
+    mockPublishBlogPost.mockResolvedValue(undefined);
+    const result = await hs({ entity_type: 'BLOG_POST', action: 'PUBLISH', post_id: POST_ID });
+    expect(mockPublishBlogPost).toHaveBeenCalledWith(POST_ID);
+    expect(result.success).toBe(true);
+    expect(result.published).toBe(POST_ID);
   });
 });
 
@@ -415,6 +595,128 @@ describe('FORM DELETE', () => {
   });
 });
 
+// ─── FORM GET_FORM_FIELDS ─────────────────────────────────────────────────────
+
+describe('FORM GET_FORM_FIELDS', () => {
+  it('returns error when form_id missing', async () => {
+    const result = await hs({ entity_type: 'FORM', action: 'GET_FORM_FIELDS' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/form_id/i);
+    expect(mockGetFormFields).not.toHaveBeenCalled();
+  });
+
+  it('calls getFormFields and returns fields', async () => {
+    mockGetFormFields.mockResolvedValue({ formId: FORM_ID, fields: [{ name: 'email', fieldType: 'email', required: true }] });
+    const result = await hs({ entity_type: 'FORM', action: 'GET_FORM_FIELDS', form_id: FORM_ID });
+    expect(mockGetFormFields).toHaveBeenCalledWith(FORM_ID);
+    expect(result.success).toBe(true);
+    expect(result.fields[0].name).toBe('email');
+  });
+});
+
+// ─── FORM SUBMIT ──────────────────────────────────────────────────────────────
+
+describe('FORM SUBMIT', () => {
+  it('returns error when form_id missing', async () => {
+    const result = await hs({ entity_type: 'FORM', action: 'SUBMIT', fields: [{ name: 'email', value: 'a@b.com' }] });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/form_id/i);
+    expect(mockSubmitForm).not.toHaveBeenCalled();
+  });
+
+  it('returns error when fields missing', async () => {
+    const result = await hs({ entity_type: 'FORM', action: 'SUBMIT', form_id: FORM_ID });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/fields/i);
+    expect(mockSubmitForm).not.toHaveBeenCalled();
+  });
+
+  it('calls submitForm with portalId, guid, fields and passes context/consent', async () => {
+    mockSubmitForm.mockResolvedValue({ inlineMessage: 'Thanks!' });
+    const fields = [{ name: 'email', value: 'a@b.com' }];
+    const result = await hs({
+      entity_type: 'FORM', action: 'SUBMIT', form_id: FORM_ID, fields,
+      submission_context: { pageUri: 'https://x.com' },
+      legal_consent_options: { consent: { consentToProcess: true } },
+    });
+    expect(mockSubmitForm).toHaveBeenCalledWith('portal-123', FORM_ID, fields, {
+      context: { pageUri: 'https://x.com' },
+      legalConsentOptions: { consent: { consentToProcess: true } },
+    });
+    expect(result.success).toBe(true);
+    expect(result.inlineMessage).toBe('Thanks!');
+  });
+
+  it('returns error when portal ID is unavailable on the connection', async () => {
+    const prev = mockSvcInstance.portalId;
+    (mockSvcInstance as any).portalId = undefined;
+    try {
+      const result = await hs({ entity_type: 'FORM', action: 'SUBMIT', form_id: FORM_ID, fields: [{ name: 'email', value: 'a@b.com' }] });
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/portal ID/i);
+      expect(mockSubmitForm).not.toHaveBeenCalled();
+    } finally {
+      (mockSvcInstance as any).portalId = prev;
+    }
+  });
+});
+
+// ─── FORM unknown action ──────────────────────────────────────────────────────
+
+describe('FORM unknown action', () => {
+  it('lists GET_FORM_FIELDS and SUBMIT in valid actions', async () => {
+    const result = await hs({ entity_type: 'FORM', action: 'BOGUS' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/GET_FORM_FIELDS/);
+    expect(result.error).toMatch(/SUBMIT/);
+  });
+});
+
+// ─── WORKFLOW ENABLE / DISABLE ────────────────────────────────────────────────
+
+describe('WORKFLOW ENABLE', () => {
+  it('returns error when workflow_id missing', async () => {
+    const result = await hs({ entity_type: 'WORKFLOW', action: 'ENABLE' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/workflow_id/i);
+    expect(mockSetWorkflowEnabled).not.toHaveBeenCalled();
+  });
+
+  it('calls setWorkflowEnabled(id, true) and spreads result', async () => {
+    mockSetWorkflowEnabled.mockResolvedValue({ id: 'wf1', isEnabled: true });
+    const result = await hs({ entity_type: 'WORKFLOW', action: 'ENABLE', workflow_id: 'wf1' });
+    expect(mockSetWorkflowEnabled).toHaveBeenCalledWith('wf1', true);
+    expect(result.success).toBe(true);
+    expect(result.isEnabled).toBe(true);
+  });
+});
+
+describe('WORKFLOW DISABLE', () => {
+  it('returns error when workflow_id missing', async () => {
+    const result = await hs({ entity_type: 'WORKFLOW', action: 'DISABLE' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/workflow_id/i);
+    expect(mockSetWorkflowEnabled).not.toHaveBeenCalled();
+  });
+
+  it('calls setWorkflowEnabled(id, false) and spreads result', async () => {
+    mockSetWorkflowEnabled.mockResolvedValue({ id: 'wf1', isEnabled: false });
+    const result = await hs({ entity_type: 'WORKFLOW', action: 'DISABLE', workflow_id: 'wf1' });
+    expect(mockSetWorkflowEnabled).toHaveBeenCalledWith('wf1', false);
+    expect(result.success).toBe(true);
+    expect(result.isEnabled).toBe(false);
+  });
+});
+
+describe('WORKFLOW unknown action', () => {
+  it('lists ENABLE and DISABLE in valid actions', async () => {
+    const result = await hs({ entity_type: 'WORKFLOW', action: 'BOGUS' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/ENABLE/);
+    expect(result.error).toMatch(/DISABLE/);
+  });
+});
+
 // ─── SOCIAL DELETE_BROADCAST ──────────────────────────────────────────────────
 
 describe('SOCIAL DELETE_BROADCAST', () => {
@@ -431,6 +733,62 @@ describe('SOCIAL DELETE_BROADCAST', () => {
     expect(mockDeleteSocialBroadcast).toHaveBeenCalledWith(BROADCAST_GUID);
     expect(result.success).toBe(true);
     expect(result.deleted).toBe(BROADCAST_GUID);
+  });
+});
+
+// ─── SOCIAL LIST_CHANNELS ─────────────────────────────────────────────────────
+
+describe('SOCIAL LIST_CHANNELS', () => {
+  it('calls listSocialChannels and spreads result', async () => {
+    mockListSocialChannels.mockResolvedValue({ results: [{ channelKey: 'Twitter:1' }] });
+    const result = await hs({ entity_type: 'SOCIAL', action: 'LIST_CHANNELS' });
+    expect(mockListSocialChannels).toHaveBeenCalled();
+    expect(result.success).toBe(true);
+    expect(result.results[0].channelKey).toBe('Twitter:1');
+  });
+});
+
+// ─── SOCIAL LIST_BROADCASTS ───────────────────────────────────────────────────
+
+describe('SOCIAL LIST_BROADCASTS', () => {
+  it('calls listSocialBroadcasts and spreads result', async () => {
+    mockListSocialBroadcasts.mockResolvedValue({ results: [{ broadcastGuid: 'b1' }] });
+    const result = await hs({ entity_type: 'SOCIAL', action: 'LIST_BROADCASTS' });
+    expect(mockListSocialBroadcasts).toHaveBeenCalled();
+    expect(result.success).toBe(true);
+    expect(result.results[0].broadcastGuid).toBe('b1');
+  });
+});
+
+// ─── SOCIAL CREATE_BROADCAST ──────────────────────────────────────────────────
+
+describe('SOCIAL CREATE_BROADCAST', () => {
+  it('returns error when channel_key missing', async () => {
+    const result = await hs({ entity_type: 'SOCIAL', action: 'CREATE_BROADCAST', body: 'Hello' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/channel_key/i);
+    expect(mockCreateSocialBroadcast).not.toHaveBeenCalled();
+  });
+
+  it('returns error when body missing', async () => {
+    const result = await hs({ entity_type: 'SOCIAL', action: 'CREATE_BROADCAST', channel_key: 'Twitter:1' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/body/i);
+    expect(mockCreateSocialBroadcast).not.toHaveBeenCalled();
+  });
+
+  it('calls createSocialBroadcast with trigger_at and spreads result', async () => {
+    mockCreateSocialBroadcast.mockResolvedValue({ broadcastGuid: 'b9' });
+    const result = await hs({ entity_type: 'SOCIAL', action: 'CREATE_BROADCAST', channel_key: 'Twitter:1', body: 'Hello', trigger_at: 1750000000000 });
+    expect(mockCreateSocialBroadcast).toHaveBeenCalledWith('Twitter:1', 'Hello', { triggerAt: 1750000000000 });
+    expect(result.success).toBe(true);
+    expect(result.broadcastGuid).toBe('b9');
+  });
+
+  it('posts immediately when trigger_at omitted (triggerAt undefined)', async () => {
+    mockCreateSocialBroadcast.mockResolvedValue({ broadcastGuid: 'b10' });
+    await hs({ entity_type: 'SOCIAL', action: 'CREATE_BROADCAST', channel_key: 'Twitter:1', body: 'Now' });
+    expect(mockCreateSocialBroadcast).toHaveBeenCalledWith('Twitter:1', 'Now', { triggerAt: undefined });
   });
 });
 
