@@ -52,7 +52,7 @@ import hubspotAuthRoutes from "./routes/hubspotAuth";
 import attioAuthRoutes from "./routes/attioAuth";
 import crmSyncRoutes from "./routes/crmSync";
 import crmWebhookRoutes from "./routes/crmWebhook";
-import mcpServersRoutes from "./routes/mcpServers";
+import mcpServersRoutes, { mcpOAuthPublicRouter } from "./routes/mcpServers";
 import skillRoutes from "./routes/skillRoutes";
 import userSkillRoutes from "./routes/userSkillRoutes";
 import userWorkPlanRoutes from "./routes/userWorkPlanRoutes";
@@ -319,6 +319,9 @@ app.use("/api/crm-sync", crmSyncRoutes);
 app.use("/api/oauth/clickup", clickupAuthRoutes);
 app.use("/api/oauth/foreplay", foreplayAuthRoutes);
 app.use("/api/oauth", connectedAccountsRoutes);
+// Public OAuth redirect callback for outbound MCP server connections (no auth —
+// the browser is redirected here by the OAuth provider with no JWT).
+app.use("/api/mcp-oauth", mcpOAuthPublicRouter);
 app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
 app.use("/api/admin/lead-magnets", authenticateToken, isAdmin, leadMagnetAdminRoutes);
 app.use("/api/admin/onboarding-loop", authenticateToken, isAdmin, onboardingLoopAdminRoutes);

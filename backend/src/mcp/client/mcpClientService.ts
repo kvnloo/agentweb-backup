@@ -8,13 +8,24 @@ import { settingsService } from "../../services/settingsService";
 import { userDb } from "../../services/db";
 import { decryptPassword } from "../../utils/crypto";
 import { internalMcpServers } from "./mcp_config";
+import { McpOAuthClientProvider } from "./mcpOAuthClientProvider";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { spawn } from "child_process";
 
+// OAuth fields shared by HTTP-based transports (sse / streamable-http / legacy).
+// Present when the remote MCP server authenticates via OAuth (e.g. Higgsfield).
+export interface HttpOAuthFields {
+  authType?: "none" | "bearer" | "oauth";
+  /** Encrypted JSON of the dynamically-registered OAuth client information. */
+  oauthClientInfo?: string;
+  /** Encrypted JSON of the stored OAuth tokens. */
+  oauthTokens?: string;
+}
+
 // SSE transport configuration
-export interface SseTransportConfig {
+export interface SseTransportConfig extends HttpOAuthFields {
   transport: "sse";
   url: string;
   accessToken?: string;
@@ -31,7 +42,7 @@ export interface StdioTransportConfig {
 }
 
 // Streamable HTTP transport configuration (modern standard)
-export interface StreamableHttpTransportConfig {
+export interface StreamableHttpTransportConfig extends HttpOAuthFields {
   transport: "streamable-http";
   url: string;
   accessToken?: string;
@@ -39,7 +50,7 @@ export interface StreamableHttpTransportConfig {
 }
 
 // Legacy config without explicit transport (defaults to SSE for backward compatibility)
-export interface LegacyConfig {
+export interface LegacyConfig extends HttpOAuthFields {
   url: string;
   accessToken?: string;
   isInternal?: boolean;
@@ -757,13 +768,19 @@ export class McpClientService {
     }
     
     console.log(`MCP: Creating SSE transport for ${name} at ${resolvedUrl}`);
-    
-    const transportOptions: { 
+
+    const transportOptions: {
       eventSourceInit?: { fetch: typeof fetch };
       requestInit?: RequestInit;
+      authProvider?: McpOAuthClientProvider;
     } = {};
-    
-    if (resolvedToken) {
+
+    // OAuth-authenticated servers use an authProvider that loads/refreshes stored
+    // tokens. Token-based servers keep using the static Bearer header below.
+    if ('authType' in config && config.authType === 'oauth') {
+      transportOptions.authProvider = new McpOAuthClientProvider({ serverName: name });
+      console.log(`MCP: Using OAuth authentication for ${name}`);
+    } else if (resolvedToken) {
       const authFetch = (url: string | URL | Request, init?: RequestInit) => {
         const headers = new Headers(init?.headers);
         headers.set('Authorization', `Bearer ${resolvedToken}`);
@@ -922,8 +939,17 @@ export class McpClientService {
     console.log(`MCP: Creating Streamable HTTP transport for ${name} at ${resolvedUrl}`);
     
     const requestInit: RequestInit = {};
-    
-    if (resolvedToken) {
+
+    // OAuth-authenticated servers attach an authProvider (loads/refreshes stored
+    // tokens). Token-based servers keep using the static Bearer header.
+    const oauthProvider =
+      'authType' in config && config.authType === 'oauth'
+        ? new McpOAuthClientProvider({ serverName: name })
+        : undefined;
+
+    if (oauthProvider) {
+      console.log(`MCP: Using OAuth authentication for ${name}`);
+    } else if (resolvedToken) {
       requestInit.headers = {
         'Authorization': `Bearer ${resolvedToken}`
       };
@@ -983,9 +1009,10 @@ export class McpClientService {
     };
     
     // Pass custom fetch to transport
-    return new StreamableHTTPClientTransport(new URL(resolvedUrl), { 
-      requestInit, 
-      fetch: axiosFetch as any // Cast explicitly to match expected type
+    return new StreamableHTTPClientTransport(new URL(resolvedUrl), {
+      requestInit,
+      fetch: axiosFetch as any, // Cast explicitly to match expected type
+      ...(oauthProvider ? { authProvider: oauthProvider } : {}),
     });
   }
 
