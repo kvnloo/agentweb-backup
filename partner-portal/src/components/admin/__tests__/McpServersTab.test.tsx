@@ -110,7 +110,8 @@ describe('McpServersTab', () => {
         render(<McpServersTab />);
 
         await waitFor(() => expect(screen.getByText('oauth-server')).toBeInTheDocument());
-        expect(screen.getByText(/Auto-refresh in/i)).toBeInTheDocument();
+        // Full status is exposed via aria-label/tooltip; the chip shows a short countdown.
+        expect(screen.getByLabelText(/Auto-refresh in/i)).toBeInTheDocument();
     });
 
     it('shows "Refreshing…" inside the refresh lead window', async () => {

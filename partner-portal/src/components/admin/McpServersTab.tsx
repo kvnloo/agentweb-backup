@@ -24,6 +24,7 @@ import {
   Chip,
   IconButton,
   Collapse,
+  Tooltip,
 } from "@mui/material";
 import {
   Add as AddIcon,
@@ -33,6 +34,7 @@ import {
   ExpandMore as ExpandMoreIcon,
   ExpandLess as ExpandLessIcon,
   VpnKey as KeyIcon,
+  Autorenew as AutorenewIcon,
 } from "@mui/icons-material";
 import axios from "axios";
 import { useAuth } from "../../contexts/AuthContext";
@@ -113,7 +115,9 @@ interface McpServer {
   oauthHasRefreshToken?: boolean;
 }
 
-// Renders a live "auto-refresh in …" countdown for an OAuth server.
+// Renders a compact, live "auto-refresh" countdown chip for an OAuth server.
+// The chip stays narrow (short label) with the full status in a tooltip, so it
+// doesn't widen the table column; aria-label carries the full text.
 const OAuthCountdown: React.FC<{ expiresAt: number; canRefresh?: boolean; now: number }> = ({
   expiresAt,
   canRefresh,
@@ -122,23 +126,50 @@ const OAuthCountdown: React.FC<{ expiresAt: number; canRefresh?: boolean; now: n
   const nextRefreshIn = expiresAt - OAUTH_REFRESH_LEAD_MS - now;
   const expiresIn = expiresAt - now;
 
-  let label: string;
+  let short: string;
+  let full: string;
   let color: "success" | "warning" | "error";
   if (!canRefresh && expiresIn <= 0) {
-    label = "Token expired — re-authorize";
+    short = "Re-authorize";
+    full = "Token expired — click the key icon to re-authorize";
     color = "error";
   } else if (nextRefreshIn > 0) {
-    label = `Auto-refresh in ${formatDuration(nextRefreshIn)}`;
+    short = formatDuration(nextRefreshIn);
+    full = `Auto-refresh in ${short}`;
     color = "success";
   } else if (expiresIn > 0) {
-    label = "Refreshing…";
+    short = "Refreshing…";
+    full = "Refreshing token…";
+    color = "warning";
+  } else if (canRefresh) {
+    short = "Refreshing…";
+    full = "Refreshing token…";
     color = "warning";
   } else {
-    label = canRefresh ? "Refreshing…" : "Token expired";
-    color = canRefresh ? "warning" : "error";
+    short = "Expired";
+    full = "Token expired — click the key icon to re-authorize";
+    color = "error";
   }
 
-  return <Chip label={label} size="small" variant="outlined" color={color} sx={{ mt: 0.5 }} />;
+  return (
+    <Tooltip title={full}>
+      <Chip
+        aria-label={full}
+        icon={<AutorenewIcon sx={{ fontSize: 14 }} />}
+        label={short}
+        size="small"
+        variant="outlined"
+        color={color}
+        sx={{
+          mt: 0.5,
+          height: 22,
+          maxWidth: "100%",
+          "& .MuiChip-label": { px: 0.75, fontSize: "0.7rem" },
+          "& .MuiChip-icon": { ml: 0.5, mr: -0.25 },
+        }}
+      />
+    </Tooltip>
+  );
 };
 
 interface OAuthFlowResult {
@@ -667,33 +698,35 @@ const McpServersTab: React.FC = () => {
                       </Button>
                     </TableCell>
 
-                    <TableCell>
-                      {(server.transport === "streamable-http" || server.transport === "sse") && (
+                    <TableCell align="right" sx={{ whiteSpace: "nowrap", width: 1 }}>
+                      <Box display="flex" flexWrap="nowrap" justifyContent="flex-end" alignItems="center">
+                        {(server.transport === "streamable-http" || server.transport === "sse") && (
+                          <IconButton
+                            size="small"
+                            onClick={() => handleAuthorize(server)}
+                            title={server.authType === "oauth" ? "Re-authorize (OAuth)" : "Authorize / connect"}
+                            color={server.authType === "oauth" ? "success" : "default"}
+                            disabled={authorizingServer === server.name}
+                          >
+                            {authorizingServer === server.name ? <CircularProgress size={16} /> : <KeyIcon />}
+                          </IconButton>
+                        )}
                         <IconButton
                           size="small"
-                          onClick={() => handleAuthorize(server)}
-                          title={server.authType === "oauth" ? "Re-authorize (OAuth)" : "Authorize / connect"}
-                          color={server.authType === "oauth" ? "success" : "default"}
-                          disabled={authorizingServer === server.name}
+                          onClick={() => openEditDialog(server)}
+                          title="Edit"
                         >
-                          {authorizingServer === server.name ? <CircularProgress size={16} /> : <KeyIcon />}
+                          <EditIcon />
                         </IconButton>
-                      )}
-                      <IconButton
-                        size="small"
-                        onClick={() => openEditDialog(server)}
-                        title="Edit"
-                      >
-                        <EditIcon />
-                      </IconButton>
-                      <IconButton
-                        size="small"
-                        onClick={() => openDeleteDialog(server.name)}
-                        title="Delete"
-                        color="error"
-                      >
-                        <DeleteIcon />
-                      </IconButton>
+                        <IconButton
+                          size="small"
+                          onClick={() => openDeleteDialog(server.name)}
+                          title="Delete"
+                          color="error"
+                        >
+                          <DeleteIcon />
+                        </IconButton>
+                      </Box>
                     </TableCell>
                   </TableRow>
                   <TableRow>
