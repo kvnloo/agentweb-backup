@@ -47,6 +47,8 @@ describe('agentRunInspectorService', () => {
           explanationSource: 'deterministic_tool_summary',
           toolPolicyFlags: 'save_memory:side_effecting_tool:info',
           toolPolicySummary: 'save_memory:session_state:low:observe',
+          argsRepairedCount: 1,
+          schemaErrorCount: 0,
           toolCount: 1,
         },
       },
@@ -86,6 +88,8 @@ describe('agentRunInspectorService', () => {
         explanationSource: 'deterministic_tool_summary',
         toolPolicyFlags: 'save_memory:side_effecting_tool:info',
         toolPolicySummary: 'save_memory:session_state:low:observe',
+        argsRepairedCount: 1,
+        schemaErrorCount: 0,
       },
     ]);
     expect(run.outcomes).toHaveLength(2);
@@ -116,6 +120,8 @@ describe('agentRunInspectorService', () => {
           durationMs: 123,
           errorClass: 'TimeoutError',
           errorMessage: 'tool timed out',
+          failureType: 'bug',
+          failedArgsJson: '{"query":"slow"}',
         },
       },
       {
@@ -138,12 +144,17 @@ describe('agentRunInspectorService', () => {
     expect(run.toolCalls).toBe(1);
     expect(run.failedToolCalls).toBe(1);
     expect(run.flags.map((flag) => flag.code)).toEqual(['run_failed', 'failed_tool_calls']);
+    expect(run.failureBreakdown).toEqual([
+      { failureType: 'bug', count: 1, tools: ['search_web'] },
+    ]);
     expect(run.outcomes[0]).toMatchObject({
       eventType: EVT_TOOL_FAILED,
       toolName: 'search_web',
       durationMs: 123,
       errorClass: 'TimeoutError',
       errorMessage: 'tool timed out',
+      failureType: 'bug',
+      failedArgsJson: '{"query":"slow"}',
     });
   });
 

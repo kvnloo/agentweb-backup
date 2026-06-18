@@ -52,6 +52,8 @@ interface AgentRunDecision {
   explanationSource?: string;
   toolPolicyFlags?: string;
   toolPolicySummary?: string;
+  argsRepairedCount?: number;
+  schemaErrorCount?: number;
 }
 
 interface AgentRunOutcome {
@@ -62,6 +64,14 @@ interface AgentRunOutcome {
   durationMs?: number;
   errorClass?: string;
   errorMessage?: string;
+  failureType?: string;
+  failedArgsJson?: string;
+}
+
+interface AgentRunFailureBreakdown {
+  failureType: string;
+  count: number;
+  tools: string[];
 }
 
 interface AgentRunChatContext {
@@ -92,6 +102,7 @@ interface AgentRun {
   toolCalls: number;
   failedToolCalls: number;
   durationMs?: number;
+  failureBreakdown: AgentRunFailureBreakdown[];
   flags: AgentRunFlag[];
   decisions: AgentRunDecision[];
   outcomes: AgentRunOutcome[];
@@ -145,6 +156,20 @@ function shortId(value?: string, head = 12): string {
 function parsePolicySummary(summary?: string): string[] {
   if (!summary) return [];
   return summary.split(',').map((entry) => entry.trim()).filter(Boolean);
+}
+
+function formatFailureBreakdown(run: AgentRun): string {
+  if (!run.failureBreakdown?.length) return run.failedToolCalls > 0 ? 'unclassified' : '-';
+  return run.failureBreakdown
+    .map((entry) => `${entry.failureType}: ${entry.count}`)
+    .join(', ');
+}
+
+function failureTypeColor(failureType?: string): 'default' | 'info' | 'warning' | 'error' {
+  if (!failureType) return 'default';
+  if (failureType === 'by_design' || failureType === 'model_uninstalled_tool') return 'info';
+  if (failureType === 'schema_reject' || failureType === 'config') return 'warning';
+  return 'error';
 }
 
 function runChatLabel(run: AgentRun): string {
@@ -447,6 +472,7 @@ function RunDetail({ run }: { run: AgentRun | null }) {
             <Metric label="Duration" value={formatDuration(run.durationMs)} />
             <Metric label="Model" value={run.llmModel || '-'} />
             <Metric label="Tools" value={`${run.toolCalls} total / ${run.failedToolCalls} failed`} />
+            <Metric label="Failure mix" value={formatFailureBreakdown(run)} />
           </Grid>
         </CardContent>
       </Card>
@@ -523,6 +549,16 @@ function RunDetail({ run }: { run: AgentRun | null }) {
                     </Box>
                   </Box>
                 )}
+                {((decision.argsRepairedCount ?? 0) > 0 || (decision.schemaErrorCount ?? 0) > 0) && (
+                  <Box sx={{ display: 'flex', gap: 0.75, flexWrap: 'wrap', mt: 1 }}>
+                    {(decision.argsRepairedCount ?? 0) > 0 && (
+                      <Chip size="small" color="warning" label={`${decision.argsRepairedCount} arg repair(s)`} />
+                    )}
+                    {(decision.schemaErrorCount ?? 0) > 0 && (
+                      <Chip size="small" color="error" label={`${decision.schemaErrorCount} schema reject(s)`} />
+                    )}
+                  </Box>
+                )}
               </Box>
             ))}
             {!run.decisions.length && (
@@ -561,10 +597,15 @@ function RunDetail({ run }: { run: AgentRun | null }) {
                     <TableCell align="right">{formatDuration(outcome.durationMs)}</TableCell>
                     <TableCell>
                       {outcome.errorMessage ? (
-                        <Tooltip title={outcome.errorMessage}>
-                          <Typography variant="body2" color="error.main">
-                            {outcome.errorClass || 'Error'}
-                          </Typography>
+                        <Tooltip title={[outcome.errorMessage, outcome.failedArgsJson ? `args: ${outcome.failedArgsJson}` : ''].filter(Boolean).join('\n\n')}>
+                          <Box sx={{ display: 'flex', gap: 0.75, alignItems: 'center', flexWrap: 'wrap' }}>
+                            <Typography variant="body2" color="error.main">
+                              {outcome.errorClass || 'Error'}
+                            </Typography>
+                            {outcome.failureType && (
+                              <Chip size="small" label={outcome.failureType} color={failureTypeColor(outcome.failureType)} />
+                            )}
+                          </Box>
                         </Tooltip>
                       ) : (
                         '-'

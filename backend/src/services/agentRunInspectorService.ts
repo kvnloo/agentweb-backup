@@ -26,6 +26,8 @@ export interface AgentRunDecisionSummary {
   explanationSource?: string;
   toolPolicyFlags?: string;
   toolPolicySummary?: string;
+  argsRepairedCount?: number;
+  schemaErrorCount?: number;
 }
 
 export interface AgentRunToolOutcomeSummary {
@@ -36,8 +38,15 @@ export interface AgentRunToolOutcomeSummary {
   durationMs?: number;
   errorClass?: string;
   errorMessage?: string;
+  failureType?: string;
   /** Full args of a FAILED call (capped + redacted at write time) — root-cause material. */
   failedArgsJson?: string;
+}
+
+export interface AgentRunFailureBreakdown {
+  failureType: string;
+  count: number;
+  tools: string[];
 }
 
 export interface AgentRunChatContext {
@@ -92,6 +101,7 @@ export interface AgentRunSummary {
   /** Durable outcome verdict from the agent_run_verdict spine event. */
   outcomeVerdict?: 'ok' | 'degraded' | 'failed';
   outcomeReasons?: string;
+  failureBreakdown: AgentRunFailureBreakdown[];
   flags: AgentRunFlagSummary[];
   decisions: AgentRunDecisionSummary[];
   outcomes: AgentRunToolOutcomeSummary[];
@@ -182,6 +192,8 @@ function buildOneRunSummary(runId: string, events: AgentRunEventRow[]): AgentRun
       explanationSource: asString(e.dimensions?.explanationSource),
       toolPolicyFlags: asString(e.dimensions?.toolPolicyFlags),
       toolPolicySummary: asString(e.dimensions?.toolPolicySummary),
+      argsRepairedCount: asNumber(e.dimensions?.argsRepairedCount),
+      schemaErrorCount: asNumber(e.dimensions?.schemaErrorCount),
     }));
 
   const outcomes: AgentRunToolOutcomeSummary[] = sorted
@@ -198,6 +210,7 @@ function buildOneRunSummary(runId: string, events: AgentRunEventRow[]): AgentRun
       durationMs: asNumber(e.dimensions?.durationMs),
       errorClass: asString(e.dimensions?.errorClass),
       errorMessage: asString(e.dimensions?.errorMessage),
+      failureType: asString(e.dimensions?.failureType),
       failedArgsJson: asString(e.dimensions?.failedArgsJson),
     }));
 
@@ -222,6 +235,7 @@ function buildOneRunSummary(runId: string, events: AgentRunEventRow[]): AgentRun
     durationMs,
     outcomeVerdict,
     outcomeReasons,
+    failureBreakdown: buildFailureBreakdown(outcomes),
     flags: buildRunFlags({ status, toolCalls, failedToolCalls, durationMs, decisions, outcomes, outcomeVerdict, outcomeReasons }),
     decisions,
     outcomes,
@@ -314,6 +328,25 @@ function toolInvocationCounts(outcomes: AgentRunToolOutcomeSummary[]): Map<strin
     counts.set(outcome.toolName, (counts.get(outcome.toolName) ?? 0) + 1);
   }
   return counts;
+}
+
+function buildFailureBreakdown(outcomes: AgentRunToolOutcomeSummary[]): AgentRunFailureBreakdown[] {
+  const byType = new Map<string, { count: number; tools: Set<string> }>();
+  for (const outcome of outcomes) {
+    if (outcome.eventType !== EVT_TOOL_FAILED) continue;
+    const failureType = outcome.failureType || 'unknown';
+    const entry = byType.get(failureType) ?? { count: 0, tools: new Set<string>() };
+    entry.count += 1;
+    if (outcome.toolName) entry.tools.add(outcome.toolName);
+    byType.set(failureType, entry);
+  }
+  return [...byType.entries()]
+    .map(([failureType, entry]) => ({
+      failureType,
+      count: entry.count,
+      tools: [...entry.tools].sort(),
+    }))
+    .sort((a, b) => b.count - a.count || a.failureType.localeCompare(b.failureType));
 }
 
 function parsePolicyFlags(raw: string | undefined): Array<{ toolName: string; code: string; severity: AgentRunFlagSummary['severity'] }> {

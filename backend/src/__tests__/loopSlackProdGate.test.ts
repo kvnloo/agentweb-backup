@@ -6,15 +6,21 @@
  * Side effects that leave the system must be structurally impossible outside
  * prod, not merely gated by a per-loop flag someone has to remember to unset.
  *
- * This gates the loops' Slack egress on a positive prod signal, overridable for
- * intentional dev testing via LOOP_SLACK_ALLOW_NONPROD=true.
+ * This gates the loops' Slack egress on a positive prod Slack target, not on
+ * NODE_ENV alone. Dev EC2s often run NODE_ENV=production for optimized Node
+ * behavior, and that must not be enough to DM humans from Emma Dev.
  */
 
 import { shouldSuppressLoopSlackPost } from '../loops/adapters/awsAdapters';
 
 describe('shouldSuppressLoopSlackPost', () => {
-  it('allows posting in production', () => {
-    expect(shouldSuppressLoopSlackPost({ NODE_ENV: 'production' })).toBe(false);
+  it('suppresses even NODE_ENV=production without an explicit prod Slack target', () => {
+    expect(shouldSuppressLoopSlackPost({ NODE_ENV: 'production' })).toBe(true);
+  });
+
+  it('allows posting only with the explicit prod Slack target', () => {
+    expect(shouldSuppressLoopSlackPost({ NODE_ENV: 'production', LOOP_SLACK_EGRESS_TARGET: 'prod' })).toBe(false);
+    expect(shouldSuppressLoopSlackPost({ NODE_ENV: 'production', LOOP_SLACK_EGRESS_TARGET: 'production' })).toBe(false);
   });
 
   it('suppresses in development by default', () => {
@@ -27,12 +33,13 @@ describe('shouldSuppressLoopSlackPost', () => {
     expect(shouldSuppressLoopSlackPost({})).toBe(true);
   });
 
-  it('allows non-prod posting only with the explicit override', () => {
+  it('allows non-prod posting only with the explicit testing override', () => {
     expect(shouldSuppressLoopSlackPost({ NODE_ENV: 'development', LOOP_SLACK_ALLOW_NONPROD: 'true' })).toBe(false);
   });
 
-  it('the override does nothing in prod (already allowed)', () => {
-    expect(shouldSuppressLoopSlackPost({ NODE_ENV: 'production', LOOP_SLACK_ALLOW_NONPROD: 'true' })).toBe(false);
+  it('suppresses non-prod targets unless the testing override is set', () => {
+    expect(shouldSuppressLoopSlackPost({ NODE_ENV: 'production', LOOP_SLACK_EGRESS_TARGET: 'dev' })).toBe(true);
+    expect(shouldSuppressLoopSlackPost({ NODE_ENV: 'production', LOOP_SLACK_TARGET: 'staging' })).toBe(true);
   });
 
   it('treats any non-"true" override value as off', () => {

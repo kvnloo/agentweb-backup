@@ -123,8 +123,10 @@ function getSlackClient(): WebClient {
 export function shouldSuppressLoopSlackPost(
   env: Record<string, string | undefined> = process.env,
 ): boolean {
-  if (env.NODE_ENV === 'production') return false;
-  return env.LOOP_SLACK_ALLOW_NONPROD !== 'true';
+  if (env.LOOP_SLACK_ALLOW_NONPROD === 'true') return false;
+
+  const target = (env.LOOP_SLACK_EGRESS_TARGET ?? env.LOOP_SLACK_TARGET ?? '').trim().toLowerCase();
+  return target !== 'prod' && target !== 'production';
 }
 
 export function awsSlackAdapter(): SlackPort {
@@ -132,7 +134,7 @@ export function awsSlackAdapter(): SlackPort {
     async postMessage(channelOrUserId: string, markdown: string): Promise<SlackMessageHandle> {
       if (shouldSuppressLoopSlackPost()) {
         console.log(
-          `[loop-slack] suppressed post to ${channelOrUserId} (NODE_ENV=${process.env.NODE_ENV ?? 'unset'}; set LOOP_SLACK_ALLOW_NONPROD=true to allow non-prod loop DMs)`,
+          `[loop-slack] suppressed post to ${channelOrUserId} (NODE_ENV=${process.env.NODE_ENV ?? 'unset'}; LOOP_SLACK_EGRESS_TARGET=${process.env.LOOP_SLACK_EGRESS_TARGET ?? process.env.LOOP_SLACK_TARGET ?? 'unset'}; set LOOP_SLACK_EGRESS_TARGET=prod for production loop DMs or LOOP_SLACK_ALLOW_NONPROD=true for intentional dev testing)`,
         );
         return { channel: channelOrUserId, ts: '' };
       }
