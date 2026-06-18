@@ -181,6 +181,12 @@ export interface GoogleAdsConfig extends BaseOAuthConfig {
   account_type: 'google_ads';
   customer_id: string;
   currency: string;
+  /**
+   * The manager (MCC) account id to send as `login-customer-id` on every Google Ads
+   * API call for this account. Set when the account is a leaf reached through a manager
+   * the user has access to. Omitted/equal to customer_id for standalone/direct accounts.
+   */
+  login_customer_id?: string;
 }
 
 export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig; // | TwitterConfig

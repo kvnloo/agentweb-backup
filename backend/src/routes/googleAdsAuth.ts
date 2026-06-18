@@ -3,8 +3,9 @@ import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getGoogleAdsConfig } from '../config/integrations';
-import { createAccount } from '../services/connectedAccountsDb';
+import { createAccount, getAccountsByUserId } from '../services/connectedAccountsDb';
 import { googleAdsService } from '../services/googleAdsService';
+import type { GoogleAdsAccountNode, GoogleAdLeaf } from '../services/googleAdsService';
 import { authenticateToken } from '../middleware/auth';
 
 const router = express.Router();
@@ -35,7 +36,9 @@ const verifyState = (state: string, userId: string): StatePayload | null => {
 
 interface TokenSession {
   tokens: { access_token: string; refresh_token?: string; expires_in: number; };
-  adAccounts: { customerId: string; name: string; currency: string; }[];
+  // Flat list of every connectable leaf across the tree — the trusted source for /connect
+  // validation (the client only sends customerIds; name/currency/loginCustomerId come from here).
+  connectableLeaves: GoogleAdLeaf[];
   userId: string;
   expires: number;
 }
@@ -49,9 +52,9 @@ setInterval(() => {
   }
 }, SESSION_CLEANUP_INTERVAL_MS).unref();
 
-const storeTokenSession = (userId: string, tokens: TokenSession['tokens'], adAccounts: TokenSession['adAccounts']): string => {
+const storeTokenSession = (userId: string, tokens: TokenSession['tokens'], connectableLeaves: GoogleAdLeaf[]): string => {
   const sessionId = crypto.randomBytes(32).toString('hex');
-  tokenSessions.set(sessionId, { tokens, adAccounts, userId, expires: Date.now() + TOKEN_SESSION_TTL_MS });
+  tokenSessions.set(sessionId, { tokens, connectableLeaves, userId, expires: Date.now() + TOKEN_SESSION_TTL_MS });
   return sessionId;
 };
 
@@ -105,8 +108,10 @@ router.get('/callback', (req, res) => {
 
 /**
  * POST /api/oauth/google-ads/finalize
- * Exchange the OAuth code for tokens and list the user's ad accounts.
- * Returns { adAccounts, tokenSessionId } — the frontend picks an account and calls /connect.
+ * Exchange the OAuth code for tokens and build the user's account-selection tree.
+ * Returns { accountTree, tokenSessionId } — the frontend picks one or more leaf accounts
+ * and calls /connect. The tree has 2 levels: standalone/direct leaves and managers at the
+ * top, managed leaves nested under their manager.
  */
 router.post('/finalize', authenticateToken, async (req: any, res) => {
   const { code, state } = req.body;
@@ -145,10 +150,23 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
       expires_in: number;
     };
 
-    const adAccounts = await googleAdsService.listAccessibleAccounts(access_token);
-    const tokenSessionId = storeTokenSession(userId, { access_token, refresh_token, expires_in }, adAccounts);
+    const accountTree = await googleAdsService.listAccountHierarchy(access_token);
 
-    res.json({ success: true, adAccounts, tokenSessionId });
+    // Mark leaves the user has already connected so the modal can disable them.
+    const existing = await getAccountsByUserId(userId);
+    const connectedIds = new Set(
+      existing.filter(a => a.platform === 'google_ads').map(a => a.account_id)
+    );
+    const markedTree: GoogleAdsAccountNode[] = accountTree.map(node =>
+      node.type === 'leaf'
+        ? { ...node, alreadyConnected: connectedIds.has(node.customerId) }
+        : { ...node, children: node.children.map(c => ({ ...c, alreadyConnected: connectedIds.has(c.customerId) })) }
+    );
+
+    const connectableLeaves = googleAdsService.flattenConnectableLeaves(markedTree);
+    const tokenSessionId = storeTokenSession(userId, { access_token, refresh_token, expires_in }, connectableLeaves);
+
+    res.json({ success: true, accountTree: markedTree, tokenSessionId });
   } catch (error: any) {
     console.error('[Google Ads OAuth /finalize]', error);
     const details = IS_PRODUCTION ? undefined : error.message;
@@ -158,15 +176,17 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
 
 /**
  * POST /api/oauth/google-ads/connect
- * Save the selected ad account as a connected_account with platform='google_ads'.
- * Body: { tokenSessionId, customerId, accountName, currency }
+ * Save one or more selected leaf ad accounts as connected_accounts (platform='google_ads').
+ * Body: { tokenSessionId, customerIds: string[] }
+ * Account metadata (name, currency, login-customer-id) is taken from the trusted server-side
+ * session, not the client — the client only chooses which customerIds to connect.
  */
 router.post('/connect', authenticateToken, async (req: any, res) => {
-  const { tokenSessionId, customerId, accountName, currency } = req.body;
+  const { tokenSessionId, customerIds } = req.body;
   const userId = req.user.userId;
 
-  if (!tokenSessionId || !customerId) {
-    return res.status(400).json({ error: 'Missing tokenSessionId or customerId' });
+  if (!tokenSessionId || !Array.isArray(customerIds) || customerIds.length === 0) {
+    return res.status(400).json({ error: 'Missing tokenSessionId or customerIds' });
   }
 
   const session = retrieveTokenSession(tokenSessionId, userId);
@@ -174,26 +194,34 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
     return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
   }
 
-  const accountInSession = session.adAccounts.find(a => a.customerId === customerId);
-  if (!accountInSession) {
-    return res.status(400).json({ error: 'Account not found in your authorized accounts' });
+  // Resolve every requested id against the session; reject the whole request if any is unknown.
+  const selected: GoogleAdLeaf[] = [];
+  for (const id of customerIds) {
+    const leaf = session.connectableLeaves.find(l => l.customerId === id);
+    if (!leaf) {
+      return res.status(400).json({ error: `Account ${id} not found in your authorized accounts` });
+    }
+    selected.push(leaf);
   }
 
   try {
     const tokenExpiresAt = Date.now() + session.tokens.expires_in * 1000;
-    await createAccount(userId, 'google_ads', {
-      account_id: customerId,
-      account_name: accountName || customerId,
-      config: {
-        account_type: 'google_ads',
-        customer_id: customerId,
-        currency: currency || 'USD',
-        access_token: session.tokens.access_token,
-        refresh_token: session.tokens.refresh_token,
-        token_expires_at: tokenExpiresAt,
-      },
-    });
-    res.json({ success: true });
+    for (const leaf of selected) {
+      await createAccount(userId, 'google_ads', {
+        account_id: leaf.customerId,
+        account_name: leaf.name || leaf.customerId,
+        config: {
+          account_type: 'google_ads',
+          customer_id: leaf.customerId,
+          currency: leaf.currency || 'USD',
+          login_customer_id: leaf.loginCustomerId,
+          access_token: session.tokens.access_token,
+          refresh_token: session.tokens.refresh_token,
+          token_expires_at: tokenExpiresAt,
+        },
+      });
+    }
+    res.json({ success: true, connected: selected.length });
   } catch (error: any) {
     console.error('[Google Ads OAuth /connect]', error);
     res.status(500).json({ error: 'Failed to save Google Ads account' });
