@@ -698,35 +698,33 @@ const McpServersTab: React.FC = () => {
                       </Button>
                     </TableCell>
 
-                    <TableCell align="right" sx={{ whiteSpace: "nowrap", width: 1 }}>
-                      <Box display="flex" flexWrap="nowrap" justifyContent="flex-end" alignItems="center">
-                        {(server.transport === "streamable-http" || server.transport === "sse") && (
-                          <IconButton
-                            size="small"
-                            onClick={() => handleAuthorize(server)}
-                            title={server.authType === "oauth" ? "Re-authorize (OAuth)" : "Authorize / connect"}
-                            color={server.authType === "oauth" ? "success" : "default"}
-                            disabled={authorizingServer === server.name}
-                          >
-                            {authorizingServer === server.name ? <CircularProgress size={16} /> : <KeyIcon />}
-                          </IconButton>
-                        )}
+                    <TableCell sx={{ whiteSpace: "nowrap" }}>
+                      {(server.transport === "streamable-http" || server.transport === "sse") && (
                         <IconButton
                           size="small"
-                          onClick={() => openEditDialog(server)}
-                          title="Edit"
+                          onClick={() => handleAuthorize(server)}
+                          title={server.authType === "oauth" ? "Re-authorize (OAuth)" : "Authorize / connect"}
+                          color={server.authType === "oauth" ? "success" : "default"}
+                          disabled={authorizingServer === server.name}
                         >
-                          <EditIcon />
+                          {authorizingServer === server.name ? <CircularProgress size={16} /> : <KeyIcon />}
                         </IconButton>
-                        <IconButton
-                          size="small"
-                          onClick={() => openDeleteDialog(server.name)}
-                          title="Delete"
-                          color="error"
-                        >
-                          <DeleteIcon />
-                        </IconButton>
-                      </Box>
+                      )}
+                      <IconButton
+                        size="small"
+                        onClick={() => openEditDialog(server)}
+                        title="Edit"
+                      >
+                        <EditIcon />
+                      </IconButton>
+                      <IconButton
+                        size="small"
+                        onClick={() => openDeleteDialog(server.name)}
+                        title="Delete"
+                        color="error"
+                      >
+                        <DeleteIcon />
+                      </IconButton>
                     </TableCell>
                   </TableRow>
                   <TableRow>
