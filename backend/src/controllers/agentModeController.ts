@@ -2487,7 +2487,19 @@ export const agentModeController = {
             console.error('AgentMode: durable still-building handling failed (falling through):', durErr);
           }
         }
-        throw genErr; // not our case — preserve existing error handling
+        // Wall-clock timeout (non-durable): the generation is being abandoned. Mirror the
+        // manual-stop path so the orphaned worker generation actually STOPS instead of
+        // running detached — otherwise it (a) burns compute + writes a duplicate image and
+        // (b) keeps emitting executing_tools/tool_executed on the shared SSE stream, which
+        // re-opens the "Generating image..." panel the user was told had failed and can even
+        // surface a second image after they retried. requestCancel + cancelSession make the
+        // worker break out of its loop and discard the response (response.cancelled).
+        if (genErr?.isGenerationTimeout) {
+          console.log(`AgentMode: generation timed out for session ${sessionId} — cancelling orphaned worker run`);
+          requestCancel(sessionId);
+          generateMarketingResponseWorkerService.cancelSession(sessionId);
+        }
+        throw genErr; // preserve existing error handling (returns 504 GENERATION_TIMEOUT)
       }
 
       markProgressComplete(sessionId);
@@ -3228,6 +3240,14 @@ export const agentModeController = {
       // Clean up progress store on error so session doesn't appear stuck in generating state
       const shareId = req.params?.shareId;
       if (shareId) {
+        // Wall-clock timeout: cancel the orphaned worker run (same as manual stop) so it
+        // stops burning compute and stops emitting orphan progress that would re-open the
+        // "Generating image..." panel. Mirrors the regular /generate timeout handling.
+        if ((error as any)?.isGenerationTimeout) {
+          console.log(`AgentMode: shared generation timed out for session ${shareId} — cancelling orphaned worker run`);
+          requestCancel(shareId);
+          generateMarketingResponseWorkerService.cancelSession(shareId);
+        }
         markProgressComplete(shareId);
       }
 
