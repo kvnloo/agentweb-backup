@@ -34,6 +34,10 @@ export interface McpServerOAuthFields {
   oauthClientInfo?: string;
   /** Encrypted JSON of OAuthTokens. */
   oauthTokens?: string;
+  /** Absolute epoch-ms at which the current access token expires (non-secret; used for UI + refresh). */
+  oauthExpiresAt?: number;
+  /** Whether the stored tokens include a refresh_token (so the token can be auto-refreshed). */
+  oauthHasRefreshToken?: boolean;
   [key: string]: any;
 }
 
@@ -75,6 +79,11 @@ async function saveServers(servers: McpServerOAuthFields[], updatedBy: string): 
 export async function getServerConfig(name: string): Promise<McpServerOAuthFields | undefined> {
   const servers = await loadServers();
   return servers.find((s) => s.name === name);
+}
+
+/** All configured MCP servers (used by the proactive OAuth refresh scheduler). */
+export async function listMcpServers(): Promise<McpServerOAuthFields[]> {
+  return loadServers();
 }
 
 async function mutateServerConfig(
@@ -246,11 +255,21 @@ export class McpOAuthClientProvider implements OAuthClientProvider {
   }
 
   async saveTokens(tokens: OAuthTokens): Promise<void> {
+    // expires_in is seconds-from-now; convert to an absolute timestamp for the UI
+    // countdown and the proactive refresh scheduler. Non-secret, stored in clear.
+    const expiresAt =
+      typeof tokens.expires_in === "number" ? Date.now() + tokens.expires_in * 1000 : undefined;
     await mutateServerConfig(
       this.serverName,
       (server) => {
         server.oauthTokens = encryptPassword(JSON.stringify(tokens), this.updatedBy);
         server.authType = "oauth";
+        server.oauthHasRefreshToken = !!tokens.refresh_token;
+        if (expiresAt !== undefined) {
+          server.oauthExpiresAt = expiresAt;
+        } else {
+          delete server.oauthExpiresAt;
+        }
       },
       this.updatedBy
     );

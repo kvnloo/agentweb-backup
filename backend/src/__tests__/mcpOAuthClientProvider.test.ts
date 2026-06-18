@@ -84,6 +84,32 @@ describe("McpOAuthClientProvider token & client storage", () => {
     expect(server?.oauthTokens).toBeDefined();
   });
 
+  it("records expiry metadata (oauthExpiresAt + oauthHasRefreshToken) on saveTokens", async () => {
+    const provider = new McpOAuthClientProvider({ serverName: SERVER });
+    const before = Date.now();
+    await provider.saveTokens({
+      access_token: "a",
+      token_type: "Bearer",
+      expires_in: 3600,
+      refresh_token: "r",
+    } as any);
+
+    const server = await getServerConfig(SERVER);
+    expect(server?.oauthHasRefreshToken).toBe(true);
+    expect(typeof server?.oauthExpiresAt).toBe("number");
+    // ~1h in the future (allow a few seconds of slack).
+    expect(server!.oauthExpiresAt!).toBeGreaterThanOrEqual(before + 3600 * 1000 - 2000);
+    expect(server!.oauthExpiresAt!).toBeLessThanOrEqual(Date.now() + 3600 * 1000 + 2000);
+  });
+
+  it("omits oauthExpiresAt when the token has no expires_in, and flags no refresh token", async () => {
+    const provider = new McpOAuthClientProvider({ serverName: SERVER });
+    await provider.saveTokens({ access_token: "a", token_type: "Bearer" } as any);
+    const server = await getServerConfig(SERVER);
+    expect(server?.oauthExpiresAt).toBeUndefined();
+    expect(server?.oauthHasRefreshToken).toBe(false);
+  });
+
   it("round-trips dynamic client information encrypted at rest", async () => {
     const provider = new McpOAuthClientProvider({ serverName: SERVER });
     expect(await provider.clientInformation()).toBeUndefined();

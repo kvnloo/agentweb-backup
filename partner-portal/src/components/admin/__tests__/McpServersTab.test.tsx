@@ -94,6 +94,59 @@ describe('McpServersTab', () => {
         });
     });
 
+    it('shows a live auto-refresh countdown for OAuth servers', async () => {
+        mockedAxios.get.mockResolvedValue({
+            data: [{
+                name: 'oauth-server',
+                transport: 'streamable-http',
+                url: 'https://mcp.example/mcp',
+                authType: 'oauth',
+                oauthHasRefreshToken: true,
+                oauthExpiresAt: Date.now() + 30 * 60 * 1000, // 30 min out → ~25 min to refresh
+                discoveredTools: [],
+            }],
+        });
+
+        render(<McpServersTab />);
+
+        await waitFor(() => expect(screen.getByText('oauth-server')).toBeInTheDocument());
+        expect(screen.getByText(/Auto-refresh in/i)).toBeInTheDocument();
+    });
+
+    it('shows "Refreshing…" inside the refresh lead window', async () => {
+        mockedAxios.get.mockResolvedValue({
+            data: [{
+                name: 'oauth-server',
+                transport: 'streamable-http',
+                url: 'https://mcp.example/mcp',
+                authType: 'oauth',
+                oauthHasRefreshToken: true,
+                oauthExpiresAt: Date.now() + 2 * 60 * 1000, // 2 min left (< 5 min lead) → refreshing
+                discoveredTools: [],
+            }],
+        });
+        render(<McpServersTab />);
+        await waitFor(() => expect(screen.getByText('oauth-server')).toBeInTheDocument());
+        expect(screen.getByText(/Refreshing/i)).toBeInTheDocument();
+    });
+
+    it('prompts re-authorization when an OAuth token is expired with no refresh token', async () => {
+        mockedAxios.get.mockResolvedValue({
+            data: [{
+                name: 'oauth-server',
+                transport: 'streamable-http',
+                url: 'https://mcp.example/mcp',
+                authType: 'oauth',
+                oauthHasRefreshToken: false,
+                oauthExpiresAt: Date.now() - 60 * 1000, // already expired, cannot refresh
+                discoveredTools: [],
+            }],
+        });
+        render(<McpServersTab />);
+        await waitFor(() => expect(screen.getByText('oauth-server')).toBeInTheDocument());
+        expect(screen.getByText(/re-authorize/i)).toBeInTheDocument();
+    });
+
     it('handles load failure', async () => {
         mockedAxios.get.mockRejectedValueOnce({ 
             response: { data: { message: 'Failed to fetch' } } 
