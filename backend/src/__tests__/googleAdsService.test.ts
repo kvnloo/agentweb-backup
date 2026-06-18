@@ -38,6 +38,16 @@ jest.mock('../services/db', () => ({
 jest.mock('../services/connectedAccountsDb', () => ({
   updateAccountTokens: jest.fn().mockResolvedValue(undefined),
   // normalizeAccounts is NOT exported — do not mock it here
+  // getAccountCredentials now sources accounts via the org-aware helper. The mock
+  // delegates to the same userDb.getUserById the tests drive, tagging each account
+  // with the caller's userId (owner, for these single-user scenarios).
+  getAccountsWithOwnerIncludingOrgShared: jest.fn(async (userId: string) => {
+    const { userDb } = require('../services/db');
+    const user = await userDb.getUserById(userId);
+    if (!user) return [];
+    const accounts = Array.isArray(user.connected_accounts) ? user.connected_accounts : [];
+    return accounts.map((a: any) => ({ ...a, userId: user.userId ?? userId }));
+  }),
 }));
 
 const mockAssertPublicHostname = jest.fn();
@@ -399,11 +409,14 @@ describe('getAccountCredentials — token refresh', () => {
     );
   });
 
-  it('throws if user not found', async () => {
+  it('throws when no accessible account (e.g. user not found)', async () => {
+    // getAccountCredentials now resolves accounts via the org-aware helper, which
+    // returns an empty list when the user doesn't exist — so the caller sees the
+    // "account not found" path rather than a distinct "User not found".
     const { userDb } = require('../services/db');
     (userDb.getUserById as jest.Mock).mockResolvedValueOnce(null);
     await expect(service.getAccountCredentials('user-123', '1234567890'))
-      .rejects.toThrow('User not found');
+      .rejects.toThrow('Google Ads account not found');
   });
 
   it('throws if no access token after refresh attempt', async () => {
