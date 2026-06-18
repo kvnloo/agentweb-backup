@@ -60,6 +60,16 @@ jest.mock('../config/integrations', () => ({
 
 jest.mock('../services/connectedAccountsDb', () => ({
   updateAccountTokens: jest.fn().mockResolvedValue(undefined),
+  // getLinkedInAdsCredentials now sources accounts via the org-aware helper. The mock
+  // delegates to the same userDb.getUserById the tests already drive, tagging each
+  // account with the caller's userId (the owner, for these single-user scenarios).
+  getAccountsWithOwnerIncludingOrgShared: jest.fn(async (userId: string) => {
+    const { userDb } = require('../services/db');
+    const user = await userDb.getUserById(userId);
+    if (!user) return [];
+    const accounts = Array.isArray(user.connected_accounts) ? user.connected_accounts : [];
+    return accounts.map((a: any) => ({ ...a, userId }));
+  }),
 }));
 
 import { AgentModeService } from '../services/agentModeService';
@@ -145,11 +155,13 @@ describe('getLinkedInAdsCredentials (via callLinkedInMarketingApi)', () => {
     ).rejects.toThrow('LinkedIn Ads account not connected');
   });
 
-  it('throws when user not found', async () => {
+  it('throws when user not found (no accessible accounts)', async () => {
+    // Credentials now resolve via the org-aware helper, which returns an empty
+    // list when the user doesn't exist — so this surfaces as "not connected".
     (userDb.getUserById as jest.Mock).mockResolvedValue(null);
     await expect(
       service.callLinkedInMarketingApi(USER_ID, 'AD_ACCOUNT', 'LIST', ACCOUNT_ID)
-    ).rejects.toThrow('User not found');
+    ).rejects.toThrow('LinkedIn Ads account not connected');
   });
 
   it('throws when specified account_id not found', async () => {
