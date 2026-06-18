@@ -17,13 +17,25 @@ jest.mock('axios', () => ({
 
 jest.mock('../services/connectedAccountsDb', () => ({
   createAccount: jest.fn().mockResolvedValue({ platform: 'google_ads', account_id: '1234567890' }),
+  getAccountsByUserId: jest.fn().mockResolvedValue([]),
 }));
 
 jest.mock('../services/googleAdsService', () => ({
   googleAdsService: {
-    listAccessibleAccounts: jest.fn().mockResolvedValue([
-      { customerId: '1234567890', name: 'Test Account', currency: 'USD' },
+    listAccountHierarchy: jest.fn().mockResolvedValue([
+      { type: 'leaf', customerId: '1234567890', name: 'Test Account', currency: 'USD', loginCustomerId: '1234567890' },
+      { type: 'manager', customerId: '999', name: 'MCC', children: [
+        { customerId: '222', name: 'Child A', currency: 'USD', loginCustomerId: '999' },
+      ] },
     ]),
+    flattenConnectableLeaves: jest.fn((nodes: any[]) => {
+      const out: any[] = [];
+      for (const n of nodes) {
+        if (n.type === 'leaf') out.push({ customerId: n.customerId, name: n.name, currency: n.currency, loginCustomerId: n.loginCustomerId });
+        else out.push(...n.children);
+      }
+      return out;
+    }),
   },
 }));
 
@@ -84,15 +96,32 @@ describe('GET /callback', () => {
 });
 
 describe('POST /finalize', () => {
-  it('returns adAccounts and tokenSessionId on valid code + state', async () => {
+  it('returns accountTree and tokenSessionId on valid code + state', async () => {
     const state = makeState('user-123');
     const res = await request(app)
       .post('/finalize')
       .send({ code: 'auth-code', state })
       .expect(200);
     expect(res.body.success).toBe(true);
-    expect(res.body.adAccounts).toHaveLength(1);
+    expect(res.body.accountTree).toHaveLength(2);
+    expect(res.body.accountTree[0]).toMatchObject({ type: 'leaf', customerId: '1234567890', alreadyConnected: false });
+    expect(res.body.accountTree[1]).toMatchObject({ type: 'manager', customerId: '999' });
+    expect(res.body.accountTree[1].children[0]).toMatchObject({ customerId: '222', alreadyConnected: false });
     expect(res.body.tokenSessionId).toBeDefined();
+  });
+
+  it('marks already-connected leaves', async () => {
+    const { getAccountsByUserId } = require('../services/connectedAccountsDb');
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      { platform: 'google_ads', account_id: '222' },
+    ]);
+    const state = makeState('user-123');
+    const res = await request(app)
+      .post('/finalize')
+      .send({ code: 'auth-code', state })
+      .expect(200);
+    expect(res.body.accountTree[0].alreadyConnected).toBe(false); // 1234567890 not connected
+    expect(res.body.accountTree[1].children[0].alreadyConnected).toBe(true); // 222 connected
   });
 
   it('returns 403 for invalid state', async () => {
@@ -110,7 +139,7 @@ describe('POST /finalize', () => {
 });
 
 describe('POST /connect', () => {
-  it('stores selected account and returns success', async () => {
+  it('stores multiple selected leaves (standalone + managed) and returns the count', async () => {
     const state = makeState('user-123');
     const finalizeRes = await request(app)
       .post('/finalize')
@@ -121,27 +150,48 @@ describe('POST /connect', () => {
       .post('/connect')
       .send({
         tokenSessionId: finalizeRes.body.tokenSessionId,
-        customerId: '1234567890',
-        accountName: 'Test Account',
-        currency: 'USD',
+        customerIds: ['1234567890', '222'],
       })
       .expect(200);
 
     expect(res.body.success).toBe(true);
+    expect(res.body.connected).toBe(2);
+    expect(createAccount).toHaveBeenCalledTimes(2);
+    // standalone leaf: login_customer_id equals its own id
     expect(createAccount).toHaveBeenCalledWith('user-123', 'google_ads', expect.objectContaining({
       account_id: '1234567890',
+      config: expect.objectContaining({ customer_id: '1234567890', login_customer_id: '1234567890' }),
     }));
+    // managed leaf: login_customer_id is the manager id
+    expect(createAccount).toHaveBeenCalledWith('user-123', 'google_ads', expect.objectContaining({
+      account_id: '222',
+      config: expect.objectContaining({ customer_id: '222', login_customer_id: '999' }),
+    }));
+  });
+
+  it('returns 400 when customerIds is missing or empty', async () => {
+    const state = makeState('user-123');
+    const finalizeRes = await request(app)
+      .post('/finalize')
+      .send({ code: 'auth-code', state })
+      .expect(200);
+
+    await request(app)
+      .post('/connect')
+      .send({ tokenSessionId: finalizeRes.body.tokenSessionId, customerIds: [] })
+      .expect(400);
+    expect(createAccount).not.toHaveBeenCalled();
   });
 
   it('returns 401 for expired or invalid tokenSessionId', async () => {
     const res = await request(app)
       .post('/connect')
-      .send({ tokenSessionId: 'bad-session', customerId: '123' })
+      .send({ tokenSessionId: 'bad-session', customerIds: ['123'] })
       .expect(401);
     expect(res.body.error).toMatch(/invalid or expired/i);
   });
 
-  it('returns 400 when customerId is not in the session adAccounts', async () => {
+  it('returns 400 (and saves nothing) when any customerId is not in the session', async () => {
     const state = makeState('user-123');
     const finalizeRes = await request(app)
       .post('/finalize')
@@ -152,9 +202,7 @@ describe('POST /connect', () => {
       .post('/connect')
       .send({
         tokenSessionId: finalizeRes.body.tokenSessionId,
-        customerId: '9999999999', // not in mocked adAccounts
-        accountName: 'Ghost Account',
-        currency: 'USD',
+        customerIds: ['1234567890', '9999999999'], // second one is a ghost
       })
       .expect(400);
 
@@ -179,7 +227,7 @@ describe('Cross-user session-theft blocked', () => {
     mockAuthUserId = 'user-456';
     const res = await request(app)
       .post('/connect')
-      .send({ tokenSessionId, customerId: '1234567890', accountName: 'Test Account', currency: 'USD' })
+      .send({ tokenSessionId, customerIds: ['1234567890'] })
       .expect(401);
     expect(res.body.error).toMatch(/invalid or expired/i);
   });
