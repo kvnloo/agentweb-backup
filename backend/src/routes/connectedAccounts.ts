@@ -1,6 +1,6 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
-import { getAccountsByUserId, getAccountsByUserIdIncludingOrgShared, deleteAccount, deleteAccountById, getAccountByPlatform, updateAccountConfig, FathomConfig } from '../services/connectedAccountsDb';
+import { getAccountsByUserId, getAccountsWithOwnerIncludingOrgShared, deleteAccount, deleteAccountById, getAccountByPlatform, updateAccountConfig, FathomConfig } from '../services/connectedAccountsDb';
 import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { FathomApiService } from '../services/fathomApiService';
@@ -17,7 +17,10 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
   const userId = req.user.userId;
 
   try {
-    const accounts = await getAccountsByUserIdIncludingOrgShared(userId);
+    // Owner-aware variant: each account carries the userId of the member who owns
+    // it, so we can tell the frontend which rows the caller owns (own rows get the
+    // Share/Disconnect controls; teammates' org-shared rows are read-only).
+    const accounts = await getAccountsWithOwnerIncludingOrgShared(userId);
 
     // Check real connection status for Unipile accounts in a single paginated call
     const unipileAccountIds = accounts
@@ -80,6 +83,10 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         follower_count: (acc.config as any).follower_count,
         created_at: acc.created_at,
         sharedWithOrg: (acc as any).sharedWithOrg ?? false,
+        // True when the caller owns this account; false when it's a teammate's
+        // account shared with the org. The frontend uses this to show owner-only
+        // controls (Share/Stop sharing/Disconnect) on owned rows only.
+        owned: acc.userId === userId,
         // LinkedIn Outreach (unipile) only: Premium accounts allow 300-char invites.
         is_premium: acc.platform === 'unipile' ? ((acc.config as any).is_premium === true) : undefined,
         // Status fields
