@@ -129,12 +129,15 @@ describe('McpServersTab', () => {
         fireEvent.change(screen.getByLabelText(/URL/i), { target: { value: 'http://new-mcp' } });
 
         // Mock add response
-        mockedAxios.post.mockResolvedValueOnce({}); 
-        // Mock discover response (called after add)
+        mockedAxios.post.mockResolvedValueOnce({});
+        // Mock OAuth initiate (HTTP servers are probed for OAuth before discovery).
+        // No OAuth required here → proceed straight to discovery.
+        mockedAxios.post.mockResolvedValueOnce({ data: { authorizationRequired: false } });
+        // Mock discover response (called after the OAuth probe)
         mockedAxios.post.mockResolvedValueOnce({ data: { count: 5 } });
         // Mock reload (called after discover)
-        mockedAxios.get.mockResolvedValueOnce({ 
-            data: [{ name: 'new-server', transport: 'streamable-http', url: 'http://new-mcp', discoveredTools: ['t1'] }] 
+        mockedAxios.get.mockResolvedValueOnce({
+            data: [{ name: 'new-server', transport: 'streamable-http', url: 'http://new-mcp', discoveredTools: ['t1'] }]
         });
 
         // Submit
@@ -144,10 +147,10 @@ describe('McpServersTab', () => {
             expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
         });
 
-        // Verify API calls
-        expect(mockedAxios.post).toHaveBeenCalledTimes(2); // Add + Discover
-        expect(mockedAxios.post).toHaveBeenNthCalledWith(1, 
-            'http://localhost:3000/api/admin/mcp-servers', 
+        // Verify API calls: Add + OAuth-probe + Discover
+        await waitFor(() => expect(mockedAxios.post).toHaveBeenCalledTimes(3));
+        expect(mockedAxios.post).toHaveBeenNthCalledWith(1,
+            'http://localhost:3000/api/admin/mcp-servers',
             expect.objectContaining({
                 name: 'new-server',
                 transport: 'streamable-http',
@@ -155,14 +158,67 @@ describe('McpServersTab', () => {
             }),
             expect.any(Object)
         );
-        expect(mockedAxios.post).toHaveBeenNthCalledWith(2, 
-            'http://localhost:3000/api/admin/mcp-servers/new-server/discover-tools', 
+        expect(mockedAxios.post).toHaveBeenNthCalledWith(2,
+            'http://localhost:3000/api/admin/mcp-servers/new-server/oauth/initiate',
+            {},
+            expect.any(Object)
+        );
+        expect(mockedAxios.post).toHaveBeenNthCalledWith(3,
+            'http://localhost:3000/api/admin/mcp-servers/new-server/discover-tools',
             {},
             expect.any(Object)
         );
 
         // Verify loaded
         expect(mockedAxios.get).toHaveBeenCalledTimes(2);
+    });
+
+    it('runs the OAuth popup flow when the server requires authorization', async () => {
+        mockedAxios.get.mockResolvedValueOnce({ data: [] }); // Initial load
+
+        render(<McpServersTab />);
+        await waitFor(() => expect(screen.queryByRole('progressbar')).not.toBeInTheDocument());
+
+        fireEvent.click(screen.getByText('Add Server'));
+        fireEvent.change(screen.getByLabelText(/Server Name/i), { target: { value: 'oauth-srv' } });
+        fireEvent.mouseDown(screen.getByRole('combobox'));
+        fireEvent.click(within(screen.getByRole('listbox')).getByText('Streamable HTTP'));
+        fireEvent.change(screen.getByLabelText(/URL/i), { target: { value: 'https://oauth-mcp' } });
+
+        // add → ok; initiate → OAuth required (returns authorization URL)
+        mockedAxios.post.mockResolvedValueOnce({});
+        mockedAxios.post.mockResolvedValueOnce({
+            data: { authorizationRequired: true, authorizationUrl: 'https://auth.example/authorize?x=1' },
+        });
+        // discover (after popup success) + reload
+        mockedAxios.post.mockResolvedValueOnce({ data: { count: 2 } });
+        mockedAxios.get.mockResolvedValueOnce({
+            data: [{ name: 'oauth-srv', transport: 'streamable-http', url: 'https://oauth-mcp', authType: 'oauth', discoveredTools: ['a', 'b'] }],
+        });
+
+        const popup = { closed: false } as any;
+        const openSpy = jest.spyOn(window, 'open').mockReturnValue(popup);
+
+        fireEvent.click(screen.getByRole('button', { name: 'Add' }));
+
+        // The provider login page should be opened in a popup.
+        await waitFor(() =>
+            expect(openSpy).toHaveBeenCalledWith('https://auth.example/authorize?x=1', 'mcp-oauth', expect.any(String))
+        );
+
+        // Simulate the backend callback posting a success message back to the opener.
+        window.dispatchEvent(new MessageEvent('message', { data: { source: 'mcp-oauth', success: true } }));
+
+        // After success, tool discovery runs for the newly-authorized server.
+        await waitFor(() =>
+            expect(mockedAxios.post).toHaveBeenCalledWith(
+                'http://localhost:3000/api/admin/mcp-servers/oauth-srv/discover-tools',
+                {},
+                expect.any(Object)
+            )
+        );
+
+        openSpy.mockRestore();
     });
 
     it('can add a stdio server with command, args, and env', async () => {

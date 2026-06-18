@@ -32,6 +32,7 @@ import {
   Refresh as RefreshIcon,
   ExpandMore as ExpandMoreIcon,
   ExpandLess as ExpandLessIcon,
+  VpnKey as KeyIcon,
 } from "@mui/icons-material";
 import axios from "axios";
 import { useAuth } from "../../contexts/AuthContext";
@@ -90,6 +91,13 @@ interface McpServer {
   accessToken?: string;
   isInternal?: boolean;
   discoveredTools?: string[];
+  authType?: "none" | "bearer" | "oauth";
+}
+
+interface OAuthFlowResult {
+  ok: boolean;
+  skipped?: boolean;
+  error?: string;
 }
 
 
@@ -123,9 +131,74 @@ const McpServersTab: React.FC = () => {
   // Tool discovery state
   const [discoveryLoading, setDiscoveryLoading] = useState<string | null>(null);
   const [expandedServer, setExpandedServer] = useState<string | null>(null);
-  // unused state removed
-  
+  // OAuth authorization state (server name currently being authorized)
+  const [authorizingServer, setAuthorizingServer] = useState<string | null>(null);
+
   const { token } = useAuth();
+
+  // Opens the OAuth provider's login page in a popup and resolves once the
+  // backend callback posts a result message back (or the popup is closed).
+  const openOAuthPopup = (authorizationUrl: string): Promise<OAuthFlowResult> =>
+    new Promise((resolve) => {
+      const popup = window.open(authorizationUrl, "mcp-oauth", "width=600,height=720");
+      if (!popup) {
+        resolve({ ok: false, error: "Popup blocked. Allow popups and try again." });
+        return;
+      }
+      const cleanup = () => {
+        window.removeEventListener("message", onMessage);
+        clearInterval(timer);
+      };
+      const onMessage = (event: MessageEvent) => {
+        if (event.data && event.data.source === "mcp-oauth") {
+          cleanup();
+          resolve({ ok: !!event.data.success, error: event.data.error });
+        }
+      };
+      window.addEventListener("message", onMessage);
+      const timer = setInterval(() => {
+        if (popup.closed) {
+          cleanup();
+          resolve({ ok: false, error: "Authorization window was closed before completing." });
+        }
+      }, 800);
+    });
+
+  // Asks the backend whether the server needs OAuth; if so, runs the popup flow.
+  // Returns skipped:true when the server connects without interactive auth.
+  const runOAuthFlow = async (serverName: string): Promise<OAuthFlowResult> => {
+    const response = await axios.post(
+      buildApiUrl(`/api/admin/mcp-servers/${encodeURIComponent(serverName)}/oauth/initiate`),
+      {},
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!response.data?.authorizationRequired) {
+      return { ok: true, skipped: true };
+    }
+    return openOAuthPopup(response.data.authorizationUrl);
+  };
+
+  const handleAuthorize = async (server: McpServer) => {
+    try {
+      setAuthorizingServer(server.name);
+      setError("");
+      setSuccess("");
+      const result = await runOAuthFlow(server.name);
+      if (result.skipped) {
+        setSuccess(`${server.name} connected — no OAuth required.`);
+        await handleDiscoverTools(server.name);
+      } else if (result.ok) {
+        setSuccess(`Authorized ${server.name} successfully.`);
+        await handleDiscoverTools(server.name);
+      } else {
+        setError(`Authorization failed: ${result.error || "Unknown error"}`);
+      }
+    } catch (err: any) {
+      setError(err.response?.data?.message || "Failed to start authorization");
+    } finally {
+      setAuthorizingServer(null);
+    }
+  };
 
   const isHttpTransport =
     formData.transport === "streamable-http" || formData.transport === "sse";
@@ -227,20 +300,46 @@ const McpServersTab: React.FC = () => {
         headers: { Authorization: `Bearer ${token}` },
       });
       // Don't set success message here yet, wait for discovery
-      // setSuccess("Server added successfully"); 
+      // setSuccess("Server added successfully");
       setAddDialogOpen(false);
       const newServerName = formData.name!; // Name is required in form
+      const isHttpServer = formData.transport !== "stdio";
       resetForm();
-      
+
       // Auto-discover tools
       // We keep formLoading true while discovering? Or maybe separate loading state?
       // existing handleDiscoverTools sets discoveryLoading
       setFormLoading(false); // Valid to clear form loading as dialog is closed
-      
+
+      // For HTTP servers, detect whether the server needs OAuth. If it does, run
+      // the login popup before discovering tools. The system decides based on the
+      // server's own response — no manual auth-type selection needed.
+      if (isHttpServer) {
+        try {
+          const result = await runOAuthFlow(newServerName);
+          if (!result.ok && !result.skipped) {
+            setError(
+              `Server added, but authorization failed: ${result.error || "Unknown error"}. Use the key icon to retry.`
+            );
+            loadServers();
+            return;
+          }
+          if (result.ok && !result.skipped) {
+            setSuccess(`Authorized ${newServerName} successfully.`);
+          }
+        } catch (err: any) {
+          setError(
+            `Server added, but the authorization check failed: ${err.response?.data?.message || err.message}. Use the key icon to retry.`
+          );
+          loadServers();
+          return;
+        }
+      }
+
       await handleDiscoverTools(newServerName);
-      
+
       // loadServers is called inside handleDiscoverTools
-    
+
     } catch (err: any) {
       setError(err.response?.data?.message || "Failed to add server");
       setFormLoading(false);
@@ -499,6 +598,17 @@ const McpServersTab: React.FC = () => {
                     </TableCell>
 
                     <TableCell>
+                      {(server.transport === "streamable-http" || server.transport === "sse") && (
+                        <IconButton
+                          size="small"
+                          onClick={() => handleAuthorize(server)}
+                          title={server.authType === "oauth" ? "Re-authorize (OAuth)" : "Authorize / connect"}
+                          color={server.authType === "oauth" ? "success" : "default"}
+                          disabled={authorizingServer === server.name}
+                        >
+                          {authorizingServer === server.name ? <CircularProgress size={16} /> : <KeyIcon />}
+                        </IconButton>
+                      )}
                       <IconButton
                         size="small"
                         onClick={() => openEditDialog(server)}
@@ -644,6 +754,7 @@ const McpServersTab: React.FC = () => {
                 fullWidth
                 type="password"
                 placeholder="${MCP_ACCESS_TOKEN}"
+                helperText="Leave blank for servers that use OAuth — after adding, a login window opens automatically if the server requires it."
               />
             )}
 

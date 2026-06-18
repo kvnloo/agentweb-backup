@@ -3,10 +3,63 @@ import { settingsService } from "../services/settingsService";
 import { encryptPassword, decryptPassword } from "./config";
 import { McpClientService } from "../mcp/client/mcpClientService";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
+import {
+  McpOAuthClientProvider,
+  getServerConfig,
+  getPendingSession,
+  deletePendingSession,
+} from "../mcp/client/mcpOAuthClientProvider";
 import { agentModeService } from "../services/agentModeService";
 import { generateMarketingResponseWorkerService } from "../services/generateMarketingResponseWorkerService";
 
 const router = express.Router();
+
+/** Resolve ${VAR} placeholders in a server URL. */
+const resolveUrlEnv = (value: string): string =>
+  value.replace(/\$\{(\w+)\}/g, (_, varName) => {
+    const envValue = process.env[varName];
+    if (envValue) return envValue;
+    if (varName === "BACKEND_URL") {
+      return process.env.BACKEND_URL || `http://localhost:${process.env.PORT || "3001"}`;
+    }
+    return "";
+  });
+
+/** Build an OAuth-capable transport for an HTTP MCP server. */
+const buildOAuthTransport = (
+  server: McpServerConfig,
+  provider: McpOAuthClientProvider
+): StreamableHTTPClientTransport | SSEClientTransport => {
+  const url = new URL(resolveUrlEnv(server.url || ""));
+  if (server.transport === "sse") {
+    return new SSEClientTransport(url, { authProvider: provider });
+  }
+  return new StreamableHTTPClientTransport(url, { authProvider: provider });
+};
+
+/** Escape a string for safe interpolation into an HTML body. */
+const escapeHtml = (value: string): string =>
+  value.replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string)
+  );
+
+/** Render the popup-closing HTML returned by the OAuth callback. */
+const renderCallbackHtml = (payload: { success: boolean; error?: string; serverName?: string }): string => {
+  const message = JSON.stringify({ source: "mcp-oauth", ...payload }).replace(/</g, "\\u003c");
+  const text = payload.success
+    ? "Authorization successful. You can close this window."
+    : `Authorization failed: ${escapeHtml(payload.error || "Unknown error")}`;
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>MCP Authorization</title></head>
+<body style="font-family: system-ui, sans-serif; padding: 2rem; color: #333;">
+<p>${text}</p>
+<script>
+  try { if (window.opener) window.opener.postMessage(${message}, "*"); } catch (e) {}
+  setTimeout(function () { window.close(); }, 800);
+</script>
+</body></html>`;
+};
 
 /**
  * Keep worker and main process MCP registries in sync after config changes.
@@ -51,7 +104,19 @@ interface McpServerConfig {
   accessToken?: string;
   isInternal?: boolean;
   discoveredTools?: string[];
+  // OAuth fields (HTTP transports). authType drives how the runtime transport authenticates.
+  authType?: 'none' | 'bearer' | 'oauth';
+  oauthClientInfo?: string; // encrypted dynamic-registration result
+  oauthTokens?: string; // encrypted OAuth tokens
 }
+
+// Strip OAuth secret blobs before returning to the client. accessToken is left
+// as-is to preserve the existing edit round-trip; authType is exposed so the UI
+// can show how a server authenticates.
+const stripOAuthSecrets = (server: McpServerConfig): McpServerConfig => {
+  const { oauthClientInfo, oauthTokens, ...rest } = server;
+  return rest;
+};
 
 // Get all MCP servers
 router.get("/", async (req, res) => {
@@ -61,7 +126,8 @@ router.get("/", async (req, res) => {
       return res.json([]);
     }
     try {
-      return res.json(JSON.parse(setting.settingValue));
+      const servers: McpServerConfig[] = JSON.parse(setting.settingValue);
+      return res.json(Array.isArray(servers) ? servers.map(stripOAuthSecrets) : []);
     } catch {
       return res.json([]);
     }
@@ -121,6 +187,9 @@ router.post("/", async (req, res) => {
       ...(transport === 'stdio' && env && { env }),
       ...(transport !== 'stdio' && url && { url }),
       ...(transport !== 'stdio' && accessToken && { accessToken: encryptPassword(accessToken, (req as any).user?.userId || "admin") }),
+      // Initial auth type: bearer if a static token was provided, else none.
+      // OAuth is detected/promoted later via the /oauth/initiate + /callback flow.
+      ...(transport !== 'stdio' && { authType: accessToken ? 'bearer' : 'none' }),
       ...(typeof isInternal === 'boolean' && { isInternal }),
     };
     servers.push(newServer);
@@ -212,6 +281,10 @@ router.put("/:name", async (req, res) => {
           }),
       ...(typeof isInternal === 'boolean' && { isInternal }),
       discoveredTools: servers[serverIndex].discoveredTools,
+      // Preserve OAuth state across edits — the rebuild above would otherwise drop it.
+      ...(effectiveTransport !== 'stdio' && servers[serverIndex].authType && { authType: servers[serverIndex].authType }),
+      ...(effectiveTransport !== 'stdio' && servers[serverIndex].oauthClientInfo && { oauthClientInfo: servers[serverIndex].oauthClientInfo }),
+      ...(effectiveTransport !== 'stdio' && servers[serverIndex].oauthTokens && { oauthTokens: servers[serverIndex].oauthTokens }),
     };
     servers[serverIndex] = updatedServer;
     
@@ -405,4 +478,111 @@ router.post("/:name/discover-tools", async (req, res) => {
   }
 });
 
+// Initiate OAuth for an MCP server. Probes the connection; if the server requires
+// OAuth, returns the authorization URL for the admin's browser to open. If the
+// server connects without interactive auth (no-auth or static token), reports it.
+router.post("/:name/oauth/initiate", async (req, res) => {
+  try {
+    const { name } = req.params;
+
+    const server = await getServerConfig(name);
+    if (!server) {
+      return res.status(404).json({ message: "Server not found" });
+    }
+    if (server.transport !== "sse" && server.transport !== "streamable-http") {
+      return res.status(400).json({ message: "OAuth is only supported for HTTP transports" });
+    }
+    if (!server.url) {
+      return res.status(400).json({ message: "Server has no URL configured" });
+    }
+
+    const updatedBy = (req as any).user?.userId || "admin";
+    const provider = new McpOAuthClientProvider({ serverName: name, updatedBy });
+    const transport = buildOAuthTransport(server as McpServerConfig, provider);
+    const client = new Client({ name: "AgentWeb-Admin", version: "1.0.0" }, { capabilities: {} });
+
+    try {
+      const connectPromise = client.connect(transport);
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Connection timeout")), 30000)
+      );
+      await Promise.race([connectPromise, timeoutPromise]);
+
+      // Connected without needing an interactive OAuth redirect.
+      await client.close().catch(() => {});
+      return res.json({ authorizationRequired: false, connected: true });
+    } catch (err: any) {
+      // If the OAuth flow produced an authorization URL, the server requires login.
+      if (provider.authorizationUrl) {
+        return res.json({
+          authorizationRequired: true,
+          authorizationUrl: provider.authorizationUrl.toString(),
+          state: provider.stateValue,
+        });
+      }
+      console.error(`Error initiating OAuth for MCP server "${name}":`, err);
+      return res.status(502).json({
+        message: `Failed to connect to MCP server: ${err?.message || "Connection failed"}`,
+      });
+    }
+  } catch (error) {
+    console.error("Error in oauth/initiate endpoint:", error);
+    res.status(500).json({ message: "Error initiating OAuth" });
+  }
+});
+
 export default router;
+
+/**
+ * Public router for the OAuth redirect callback. Mounted WITHOUT auth middleware
+ * because the OAuth provider redirects the browser here with no JWT. It correlates
+ * the request via the short-lived, server-side pending session (keyed by `state`).
+ */
+export const mcpOAuthPublicRouter = express.Router();
+
+mcpOAuthPublicRouter.get("/callback", async (req, res) => {
+  const respond = (payload: { success: boolean; error?: string; serverName?: string }) =>
+    res.set("Content-Type", "text/html").send(renderCallbackHtml(payload));
+
+  const { code, state, error, error_description } = req.query;
+
+  if (error) {
+    return respond({ success: false, error: String(error_description || error) });
+  }
+  if (typeof code !== "string" || typeof state !== "string" || !code || !state) {
+    return respond({ success: false, error: "Missing authorization code or state" });
+  }
+
+  try {
+    const pending = await getPendingSession(state);
+    if (!pending) {
+      return respond({ success: false, error: "Authorization session expired. Please try again." });
+    }
+
+    const server = await getServerConfig(pending.serverName);
+    if (!server || !server.url) {
+      return respond({ success: false, error: "MCP server no longer exists" });
+    }
+
+    const provider = new McpOAuthClientProvider({
+      serverName: pending.serverName,
+      codeVerifier: pending.codeVerifier,
+      state,
+    });
+    const transport = buildOAuthTransport(server as McpServerConfig, provider);
+
+    // Exchanges the authorization code for tokens (via PKCE verifier) and persists
+    // them onto the server config, flipping authType to 'oauth'.
+    await transport.finishAuth(code);
+    await transport.close().catch(() => {});
+    await deletePendingSession(state);
+
+    // Re-init MCP tools and recycle the worker so the new server is usable.
+    syncMcpAndRecycleWorker();
+
+    return respond({ success: true, serverName: pending.serverName });
+  } catch (err: any) {
+    console.error("Error completing MCP OAuth callback:", err);
+    return respond({ success: false, error: err?.message || "Token exchange failed" });
+  }
+});
