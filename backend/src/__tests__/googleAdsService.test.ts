@@ -202,6 +202,61 @@ describe('listAccountHierarchy', () => {
       { type: 'leaf', customerId: '333', name: 'Reachable', currency: 'USD', loginCustomerId: '333' },
     ]);
   });
+
+  it('keeps a manager visible (with no children) when its child enumeration fails', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/999'] } });
+    mockAxiosPost
+      // probe succeeds and identifies 999 as a manager
+      .mockResolvedValueOnce({ data: { results: [{ customer: { id: '999', descriptiveName: 'My MCC', manager: true } }] } })
+      // listManagerLeaves child enumeration then fails (e.g. transient RESOURCE_EXHAUSTED)
+      .mockRejectedValueOnce(new Error('RESOURCE_EXHAUSTED'));
+
+    const tree = await service.listAccountHierarchy('test-access-token');
+
+    // The manager must still be surfaced — not silently dropped into a fake "no accounts" state.
+    expect(tree).toEqual([{ type: 'manager', customerId: '999', name: 'My MCC', children: [] }]);
+    warnSpy.mockRestore();
+    errSpy.mockRestore();
+  });
+
+  it('logs a warning identifying the manager when its child enumeration fails', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/999'] } });
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [{ customer: { id: '999', descriptiveName: 'My MCC', manager: true } }] } })
+      .mockRejectedValueOnce(new Error('RESOURCE_EXHAUSTED'));
+
+    await service.listAccountHierarchy('test-access-token');
+
+    expect(warnSpy).toHaveBeenCalled();
+    expect(warnSpy.mock.calls.some(args => args.some((a: any) => String(a).includes('999')))).toBe(true);
+    warnSpy.mockRestore();
+    errSpy.mockRestore();
+  });
+
+  it('a manager whose children fail to load does not hide other accessible accounts', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/999', 'customers/111'] } });
+    mockAxiosPost
+      // 999 is a manager whose children fail to enumerate
+      .mockResolvedValueOnce({ data: { results: [{ customer: { id: '999', descriptiveName: 'My MCC', manager: true } }] } })
+      .mockRejectedValueOnce(new Error('RESOURCE_EXHAUSTED'))
+      // 111 is a separate, reachable standalone leaf
+      .mockResolvedValueOnce({ data: { results: [{ customer: { id: '111', descriptiveName: 'Standalone', currencyCode: 'USD', manager: false } }] } });
+
+    const tree = await service.listAccountHierarchy('test-access-token');
+
+    expect(tree).toEqual([
+      { type: 'leaf', customerId: '111', name: 'Standalone', currency: 'USD', loginCustomerId: '111' },
+      { type: 'manager', customerId: '999', name: 'My MCC', children: [] },
+    ]);
+    warnSpy.mockRestore();
+    errSpy.mockRestore();
+  });
 });
 
 describe('flattenConnectableLeaves', () => {
