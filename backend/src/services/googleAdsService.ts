@@ -1,7 +1,6 @@
 import axios from 'axios';
 import { getGoogleAdsCredentials } from '../utils/secretsManager';
 import { assertPublicHostname } from '../utils/ssrfGuard';
-import { userDb } from './db';                          // sibling in services/
 import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
 
 const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
@@ -147,22 +146,22 @@ export class GoogleAdsService {
   // ── Account credentials + ownership validation ───────────────────────────
 
   async getAccountCredentials(userId: string, customerId: string): Promise<GoogleAdsAccountCredentials> {
-    const user = await userDb.getUserById(userId);
-    if (!user) throw this.makeAuthError('User not found');
-
-    const accounts: any[] = Array.isArray(user.connected_accounts)
-      ? user.connected_accounts
-      : user.connected_accounts ? [user.connected_accounts] : [];
+    // Source accounts from the org-shared set so a teammate's Google Ads account
+    // shared with the org (sharedWithOrg=true) is usable, not just visible. Each
+    // account carries its owner userId so a token refresh updates the owner's record.
+    const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+    const accounts = await getAccountsWithOwnerIncludingOrgShared(userId);
 
     const account = accounts.find(
       (a: any) => a.platform === 'google_ads' && a.config?.customer_id === customerId
     );
     if (!account) throw this.makeAuthError('Google Ads account not found in your connected accounts. Connect it in Settings.');
 
-    let accessToken = account.config.access_token;
-    const isExpired = account.config.token_expires_at && Date.now() > account.config.token_expires_at - 60_000;
-    if (isExpired && account.config.refresh_token) {
-      accessToken = await this.refreshAccessToken(userId, account.account_id, account.config.refresh_token);
+    const cfg = account.config as any;
+    let accessToken = cfg.access_token;
+    const isExpired = cfg.token_expires_at && Date.now() > cfg.token_expires_at - 60_000;
+    if (isExpired && cfg.refresh_token) {
+      accessToken = await this.refreshAccessToken(account.userId, account.account_id, cfg.refresh_token);
     }
 
     if (!accessToken) {
@@ -172,8 +171,8 @@ export class GoogleAdsService {
     return {
       accessToken,
       customerId,
-      currency: account.config.currency || 'USD',
-      loginCustomerId: account.config.login_customer_id || customerId,
+      currency: cfg.currency || 'USD',
+      loginCustomerId: cfg.login_customer_id || customerId,
     };
   }
 

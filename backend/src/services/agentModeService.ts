@@ -12120,10 +12120,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const user = await userDb.getUserById(userId);
     if (!user) throw this.makeMetaAuthError('User not found');
 
-    const connectedAccounts = user.connected_accounts || [];
-    if (!Array.isArray(connectedAccounts)) {
-      throw this.makeMetaAuthError('Invalid user account data');
-    }
+    // Source ad accounts from the org-shared set so a teammate's Meta ad account
+    // shared with the org (sharedWithOrg=true) is usable, not just visible. The
+    // legacy `user.adAccount` fallback below intentionally stays caller-scoped.
+    const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+    const connectedAccounts = await getAccountsWithOwnerIncludingOrgShared(userId);
 
     // Helper to strip 'act_' prefix
     const clean = (id: string) => (id || '').replace('act_', '');
@@ -12131,7 +12132,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // 1. Filter for valid Meta Ad Accounts
     // Check both 'facebook' and 'meta' for backward compatibility with accounts
     // created before the platform name was standardized to 'meta'.
-    const fbAccounts = connectedAccounts.filter((acc: any) =>
+    const fbAccounts = (connectedAccounts as any[]).filter((acc: any) =>
       (acc.platform === 'facebook' || acc.platform === 'meta') &&
       acc.config?.account_type === 'ad_account' &&
       acc.config?.access_token
@@ -23923,36 +23924,37 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   // --- LinkedIn Ads ---
 
   private async getLinkedInAdsCredentials(userId: string, accountId?: string): Promise<{ accountId: string; accessToken: string; organizationUrn?: string; personUrn?: string }> {
-    const { userDb } = await import('./db');
-    const user = await userDb.getUserById(userId);
-    if (!user) throw new Error('User not found');
-
-    const connectedAccounts = user.connected_accounts || [];
-    const adsAccounts = (connectedAccounts as any[]).filter(
-      (acc: any) =>
+    const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+    // Include org-shared accounts so a teammate's LinkedIn Ads account that was
+    // shared with the org (sharedWithOrg=true) is usable, not just visible. Each
+    // account carries its owner userId so token refreshes hit the owner's record.
+    const allAccounts = await getAccountsWithOwnerIncludingOrgShared(userId);
+    const adsAccounts = allAccounts.filter(
+      (acc) =>
         acc.platform === 'linkedin_ads' &&
-        acc.config?.account_type === 'ad_account' &&
-        acc.config?.access_token
+        (acc.config as any)?.account_type === 'ad_account' &&
+        (acc.config as any)?.access_token
     );
 
     if (adsAccounts.length === 0) {
       throw new Error('LinkedIn Ads account not connected. Please connect your LinkedIn Ads account in settings.');
     }
 
-    let selected: any;
+    let selected: typeof adsAccounts[number];
     if (accountId) {
-      selected = adsAccounts.find((acc: any) => acc.account_id === accountId);
-      if (!selected) {
+      const match = adsAccounts.find((acc) => acc.account_id === accountId);
+      if (!match) {
         throw new Error(`LinkedIn Ads account "${accountId}" not found. Check your connected accounts.`);
       }
+      selected = match;
     } else if (adsAccounts.length > 1) {
-      const list = adsAccounts.map((a: any) => `${a.account_name} (ID: ${a.account_id})`).join(', ');
+      const list = adsAccounts.map((a) => `${a.account_name} (ID: ${a.account_id})`).join(', ');
       throw new Error(`Multiple LinkedIn Ads accounts found: [${list}]. Specify account_id.`);
     } else {
       selected = adsAccounts[0];
     }
 
-    const cfg = selected.config;
+    const cfg = selected.config as any;
     const now = Date.now();
     const bufferMs = 5 * 60 * 1000;
 
@@ -23974,12 +23976,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       oauthConfig.clientSecret
     );
 
+    // Write refreshed tokens back to the OWNER's record (selected.userId), not the
+    // caller's — for org-shared accounts these differ. Scope the update to the
+    // specific account_id so we don't clobber a different linkedin_ads account.
     const { updateAccountTokens } = await import('./connectedAccountsDb');
-    await updateAccountTokens(userId, 'linkedin_ads' as any, {
+    await updateAccountTokens(selected.userId, 'linkedin_ads' as any, {
       access_token: newTokens.access_token,
       refresh_token: newTokens.refresh_token,
       token_expires_at: Date.now() + newTokens.expires_in * 1000,
-    });
+    }, selected.account_id);
 
     return { accountId: selected.account_id, accessToken: newTokens.access_token, organizationUrn: cfg.organization_urn, personUrn: cfg.person_urn };
   }
