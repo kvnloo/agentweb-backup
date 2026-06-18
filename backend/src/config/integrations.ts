@@ -150,6 +150,8 @@ export const INTEGRATION_CONFIG = {
       'automation',
       'forms',
       'communication_preferences.read',
+      'social',
+      'marketing-email',
     ] as const,
     get marketingScopes() { return [...this.scopes, ...this.marketingOnlyScopes]; },
   },

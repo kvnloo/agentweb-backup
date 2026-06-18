@@ -1167,10 +1167,13 @@ export class HubSpotService {
   }
 
   async cloneEmail(emailId: string, name: string): Promise<any> {
+    if (!emailId?.trim()) throw new Error('emailId is required');
     if (!name?.trim()) throw new Error('Email name is required');
+    // Clone is a collection-level endpoint: POST /marketing/v3/emails/clone
+    // with { id, cloneName } — NOT /emails/{id}/clone.
     const res = await axiosInstance.post(
-      `${HUBSPOT_API_BASE}/marketing/v3/emails/${emailId}/clone`,
-      { name: name.trim() },
+      `${HUBSPOT_API_BASE}/marketing/v3/emails/clone`,
+      { id: emailId.trim(), cloneName: name.trim() },
       { headers: await this.authHeaders() }
     );
     return res.data;
@@ -1291,9 +1294,19 @@ export class HubSpotService {
 
   async createForm(props: Record<string, any>): Promise<any> {
     if (!props?.name?.trim()) throw new Error('name is required for form creation');
+    // HubSpot's v3 forms POST reuses the full form schema and rejects the request
+    // with "required fields were not set: [createdAt]" unless these are present —
+    // even though they're server-managed. Inject sane defaults when absent.
+    const now = new Date().toISOString();
+    const body = {
+      archived: false,
+      createdAt: now,
+      updatedAt: now,
+      ...props,
+    };
     const res = await axiosInstance.post(
       `${HUBSPOT_API_BASE}/marketing/v3/forms`,
-      props,
+      body,
       { headers: await this.authHeaders() }
     );
     return res.data;

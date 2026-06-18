@@ -160,14 +160,22 @@ describe('updateEmail', () => {
 });
 
 describe('cloneEmail', () => {
-  it('POSTs clone with name', async () => {
+  it('POSTs to /marketing/v3/emails/clone with id + cloneName', async () => {
     const data = { id: 'e3', name: 'Clone' };
     mockPost.mockResolvedValue({ data });
     const svc = makeSvc();
     const result = await svc.cloneEmail('e1', 'Clone');
     expect(result).toEqual(data);
-    const body = mockPost.mock.calls[0][1];
-    expect(body.name).toBe('Clone');
+    const [url, body] = mockPost.mock.calls[0];
+    // Must be the collection-level clone endpoint, NOT /emails/{id}/clone
+    expect(url).toMatch(/\/marketing\/v3\/emails\/clone$/);
+    expect(body.id).toBe('e1');
+    expect(body.cloneName).toBe('Clone');
+  });
+
+  it('throws if emailId is empty', async () => {
+    const svc = makeSvc();
+    await expect(svc.cloneEmail('', 'Clone')).rejects.toThrow(/emailId/i);
   });
 
   it('throws if name is empty', async () => {
@@ -602,6 +610,25 @@ describe('createForm', () => {
   it('throws if name is empty string', async () => {
     const svc = makeSvc();
     await expect(svc.createForm({ name: '', formType: 'hubspot' })).rejects.toThrow(/name/i);
+  });
+
+  it('injects createdAt/updatedAt/archived defaults when missing (HubSpot requires them on create)', async () => {
+    mockPost.mockResolvedValue({ data: { id: 'f9' } });
+    const svc = makeSvc();
+    await svc.createForm({ name: 'New form', formType: 'hubspot', fieldGroups: [] });
+    const body = mockPost.mock.calls[0][1];
+    expect(typeof body.createdAt).toBe('string');
+    expect(typeof body.updatedAt).toBe('string');
+    expect(body.archived).toBe(false);
+  });
+
+  it('does not overwrite caller-provided createdAt/archived', async () => {
+    mockPost.mockResolvedValue({ data: { id: 'f9' } });
+    const svc = makeSvc();
+    await svc.createForm({ name: 'X', formType: 'hubspot', fieldGroups: [], createdAt: '2020-01-01T00:00:00Z', archived: true });
+    const body = mockPost.mock.calls[0][1];
+    expect(body.createdAt).toBe('2020-01-01T00:00:00Z');
+    expect(body.archived).toBe(true);
   });
 });
 
