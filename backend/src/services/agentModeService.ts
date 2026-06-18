@@ -18271,10 +18271,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     compose?: boolean,
     composeParams?: Record<string, any>,
     durationSeconds?: number,
-    useKeyframes?: boolean
+    useKeyframes?: boolean,
+    aspectRatio?: string,
+    resolution?: string
   ): Promise<any> {
     try {
-      console.log('AgentMode: Generating video with prompt:', prompt, 'filename:', filename, 'videoModel:', videoModel, 'startFrame:', startFrame ? 'provided' : 'none', 'endFrame:', endFrame ? 'provided' : 'none', 'compose:', compose ?? false, 'durationSeconds:', durationSeconds, 'useKeyframes:', useKeyframes ?? false, 'userId:', userId, 'sessionId:', sessionId);
+      console.log('AgentMode: Generating video with prompt:', prompt, 'filename:', filename, 'videoModel:', videoModel, 'startFrame:', startFrame ? 'provided' : 'none', 'endFrame:', endFrame ? 'provided' : 'none', 'compose:', compose ?? false, 'durationSeconds:', durationSeconds, 'useKeyframes:', useKeyframes ?? false, 'aspectRatio:', aspectRatio, 'resolution:', resolution, 'userId:', userId, 'sessionId:', sessionId);
 
       // Import the video generation service
       const { videoService } = await import('./videoGeneration');
@@ -18301,6 +18303,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         useKeyframes,
         compose,
         composeParams: composeParams as any,
+        aspectRatio,
+        resolution,
       });
 
       if (result.success && result.videoUrl) {

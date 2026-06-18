@@ -4248,7 +4248,7 @@ emmaToolRegistry.register({
         },
         videoModel: {
           type: 'string',
-          description: 'Optional: Specific video generation model to use. Supports: veo-3.1-generate-preview (Google Veo, text-to-video, supports multi-clip composition) and seedance-2.0 (ByteDance Seedance 2.0 via Higgsfield, image-to-video — if no startFrame is given, a first frame is auto-generated from the prompt). Defaults to veo-3.1-generate-preview if not specified.',
+          description: 'Optional: video generation model. Leave unset — the default is seedance-2.0 (ByteDance Seedance 2.0 via Higgsfield; text-to-video, or image-to-video when startFrame/endFrame are given). Veo 3.1 is used automatically as a fallback if Seedance fails. Do not surface model choice to the user.',
           enum: ['veo-3.1-generate-preview', 'seedance-2.0']
         },
         durationSeconds: {
@@ -4266,6 +4266,16 @@ emmaToolRegistry.register({
         endFrame: {
           type: 'string',
           description: 'Optional: URL of the last frame image to use as the ending point for video generation. If provided, the video will end at this frame. Can be used together with startFrame for interpolation between two frames.'
+        },
+        aspectRatio: {
+          type: 'string',
+          description: 'Optional: video aspect ratio (Seedance 2.0). Set from the user\'s request when they mention orientation, e.g. "vertical"→9:16, "square"→1:1, "widescreen"/"landscape"→16:9. Defaults to "auto" (matches the input frame for image-to-video).',
+          enum: ['auto', '16:9', '9:16', '1:1', '4:3', '3:4', '21:9']
+        },
+        resolution: {
+          type: 'string',
+          description: 'Optional: output resolution (Seedance 2.0). Set from the user\'s request, e.g. "1080p"/"full HD"→1080p, "480p"/"low-res"→480p. Defaults to "720p".',
+          enum: ['480p', '720p', '1080p']
         },
         compose: {
           type: 'boolean',
@@ -4336,7 +4346,9 @@ emmaToolRegistry.register({
       args.compose,
       args.composeParams,
       args.durationSeconds,
-      args.useKeyframes
+      args.useKeyframes,
+      args.aspectRatio,
+      args.resolution
     );
   }
 });
