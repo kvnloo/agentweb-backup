@@ -8749,6 +8749,7 @@ export class AgentModeService {
   public async getLeadDetails(listId: string, leadId: string, userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
+      const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
 
       // Verify list ownership (org members can access lists owned by other org members)
       const list = await crmDb.getLeadListById(listId);
@@ -8764,6 +8765,15 @@ export class AgentModeService {
       if (!lead) {
         return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
       }
+
+      // Per-field provenance sidecar — lets the agent answer "where does this
+      // value come from?" (e.g. funding_stage / ARR) with a real source,
+      // provider, URL, confidence and freshness instead of guessing. Sanitized
+      // so cross-tenant CRM-history lineage (sibling IDs) never reaches the
+      // customer — mirrors what the customer-portal REST routes already expose.
+      const sanitizedEnrichmentMetadata = sanitizeEnrichmentMetadataForResponse(
+        lead.enrichmentMetadata as Record<string, any> | undefined,
+      );
 
       // Check LinkedIn connection status from cache (non-blocking, swallows errors)
       let linkedInConnectionStatus: {
@@ -8825,6 +8835,7 @@ export class AgentModeService {
           linkedin: lead.linkedin || '',
           linkedInConnectionStatus,
           customFields: lead.customFields || {},
+          ...(sanitizedEnrichmentMetadata ? { enrichmentMetadata: sanitizedEnrichmentMetadata } : {}),
           icpMatch: lead.icpMatch || null,
           isEngaged: lead.isEngaged || false,
           emailDraft: emailDraftPreview,
