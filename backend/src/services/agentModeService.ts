@@ -12546,6 +12546,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const existingSpec = creativeData.object_story_spec;
       const pageId = existingSpec.page_id;
       const newLinkUrl = params.link_url || params.destination || params.url;
+      // Carry over UTM/tracking append rules from the source creative unless overridden.
+      const carriedUrlTags = params.url_tags !== undefined ? params.url_tags : creativeData.url_tags;
 
       let newCreativeParams: any;
 
@@ -12568,6 +12570,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           title: params.title || vd.title || creativeData.title || '',
           link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
           call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
+          url_tags: carriedUrlTags,
         };
       } else if (existingSpec.link_data?.child_attachments) {
         const ld = existingSpec.link_data;
@@ -12596,6 +12599,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           link_url: newLinkUrl || ld.link || '',
           carousel_cards: updatedCards,
           call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
+          url_tags: carriedUrlTags,
         };
       } else if (existingSpec.link_data) {
         const ld = existingSpec.link_data;
@@ -12615,6 +12619,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           title: params.title || ld.name || creativeData.title || '',
           link_url: newLinkUrl || ld.link || '',
           call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
+          url_tags: carriedUrlTags,
         };
       } else {
         return {
@@ -13263,10 +13268,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           await metaService.updateAd(accessToken, adId, adLevelParams);
         }
 
+        // The same silent-success trap applies here: POST /{ad-id} can return 200 while the
+        // ad keeps its old creative. Read back the ad to confirm the swap actually took.
+        const verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId);
+        if (!verification.attached) {
+          return {
+            success: false,
+            message: `Ad ${adId} did not switch to creative ${newCreativeId} — it still references `
+              + `${verification.liveCreativeId || 'its previous creative'}. This is usually a transient `
+              + `Meta propagation issue; retry the AD UPDATE with the same creative_id.`,
+            error: 'SWAP_NOT_REFLECTED',
+            new_creative_id: newCreativeId,
+            live_creative_id: verification.liveCreativeId,
+          };
+        }
+
         return {
           success: true,
           message: `Ad updated successfully. Swapped in creative ${newCreativeId}.`,
-          new_creative_id: newCreativeId
+          new_creative_id: newCreativeId,
+          verified: verification.verified,
         };
       }
 
@@ -13342,6 +13363,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // Normalize destination param names → link_url
     const newLinkUrl = params.link_url || params.destination || params.url;
 
+    // Carry over UTM/tracking append rules unless the caller explicitly overrides them.
+    // Without this, every link_url swap silently strips the ad's existing url_tags.
+    const carriedUrlTags = params.url_tags !== undefined ? params.url_tags : creativeData.url_tags;
+
     // Determine current creative type and extract existing fields
     let newCreativeParams: any;
 
@@ -13359,6 +13384,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         title: params.title || ld.name || vd.title || creativeData.title || '',
         link_url: newLinkUrl || ld.link || vd.call_to_action?.value?.link || '',
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || vd.call_to_action?.type,
+        url_tags: carriedUrlTags,
       };
     } else if (existingSpec.video_data) {
       // Video creative
@@ -13373,6 +13399,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         title: params.title || vd.title || creativeData.title || '',
         link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
         call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
+        url_tags: carriedUrlTags,
       };
     } else if (existingSpec.link_data?.child_attachments) {
       // Carousel creative – update the main link and optionally per-card links
@@ -13393,6 +13420,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         link_url: newLinkUrl || ld.link || '',
         carousel_cards: updatedCards,
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
+        url_tags: carriedUrlTags,
       };
     } else if (existingSpec.link_data) {
       // Single image creative
@@ -13406,6 +13434,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         title: params.title || ld.name || creativeData.title || '',
         link_url: newLinkUrl || ld.link || '',
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
+        url_tags: carriedUrlTags,
       };
     } else {
       return {
@@ -13435,10 +13464,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     console.log(`AgentMode: New creative ${newCreativeId} created. Updating ad ${adId} to use it.`);
 
-    // Step 4: Update the ad to use the new creative
-    await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } });
-
-    // Also apply any ad-level params (status, name) that were provided alongside creative content
+    // Step 4: Apply any ad-level params (status, name) provided alongside creative content. These
+    // are independent of the creative swap, so apply them once up front.
     const adLevelParams: any = {};
     for (const key of Object.keys(params)) {
       if (!AgentModeService.CREATIVE_CONTENT_KEYS.includes(key) && key !== 'name') {
@@ -13449,12 +13476,199 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       await metaService.updateAd(accessToken, adId, adLevelParams);
     }
 
+    // Step 5: Attach the new creative, then read back to VERIFY it took effect. Meta's POST /{ad-id}
+    // can return success while leaving the ad on its old creative (documented silent-success trap)
+    // because the just-created creative isn't yet consistent across Meta's backend. This is usually
+    // transient, so re-attach + re-verify up to SWAP_VERIFY_ATTEMPTS times with a short backoff
+    // before giving up. A 200 from updateAd is NOT proof the destination changed.
+    const SWAP_VERIFY_ATTEMPTS = 3;
+    const SWAP_VERIFY_BACKOFF_MS = 3000;
+    let verification: Awaited<ReturnType<AgentModeService['verifyCreativeSwap']>> | undefined;
+
+    for (let attempt = 1; attempt <= SWAP_VERIFY_ATTEMPTS; attempt++) {
+      await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } });
+      verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId, newLinkUrl);
+
+      const destinationOk = !newLinkUrl || !verification.liveLinkUrl
+        || this.linkUrlMatches(verification.liveLinkUrl, newLinkUrl);
+      // Stop early on a confirmed swap. Also stop if the read-back itself failed (verified:false):
+      // we can't prove anything, and retrying a failing read is pointless — treat as unverified.
+      if (!verification.verified || (verification.attached && destinationOk)) {
+        break;
+      }
+
+      if (attempt < SWAP_VERIFY_ATTEMPTS) {
+        console.log(`AgentMode: swap verification for ad ${adId} not yet reflected `
+          + `(attempt ${attempt}/${SWAP_VERIFY_ATTEMPTS}, attached=${verification.attached}, `
+          + `liveUrl=${verification.liveLinkUrl}). Retrying in ${SWAP_VERIFY_BACKOFF_MS}ms.`);
+        await this.sleep(SWAP_VERIFY_BACKOFF_MS);
+      }
+    }
+
+    const v = verification!;
+    const reviewNote = v.effectiveStatus
+      ? ` Ad review status: ${v.effectiveStatus}${v.reviewFeedback ? ` (${v.reviewFeedback})` : ''}.`
+      : '';
+
+    // The read-back never succeeded — we can't prove the swap took effect. Don't claim it did:
+    // report success (the attach API calls returned 200) but verified:false so callers don't lie.
+    if (!v.verified) {
+      return {
+        success: true,
+        message: `Ad updated. Created new creative (${newCreativeId}) with updated ${creativeKeys.join(', ')} `
+          + `and attached it to ad ${adId}. NOTE: the confirmation read-back failed, so the swap could not be `
+          + `verified — re-check the ad in Ads Manager.`,
+        old_creative_id: oldCreativeId,
+        new_creative_id: newCreativeId,
+        verified: false,
+        live_link_url: v.liveLinkUrl,
+      };
+    }
+
+    // After all attempts: the ad never switched creatives. Treat as PENDING (not a hard error) —
+    // Meta likely just hasn't propagated yet and it should reflect shortly.
+    if (!v.attached) {
+      return {
+        success: false,
+        pending: true,
+        message: `The new creative (${newCreativeId}) was created and attached to ad ${adId}, but after `
+          + `${SWAP_VERIFY_ATTEMPTS} checks the ad still shows the previous creative `
+          + `(${v.liveCreativeId || oldCreativeId}). This is typically Meta still propagating the change — `
+          + `it should reflect within a few minutes. No further action is needed; re-check shortly to confirm.`
+          + reviewNote,
+        error: 'SWAP_PENDING',
+        old_creative_id: oldCreativeId,
+        new_creative_id: newCreativeId,
+        live_creative_id: v.liveCreativeId,
+        effective_status: v.effectiveStatus,
+        review_feedback: v.reviewFeedback,
+      };
+    }
+
+    // New creative attached, but the live destination URL doesn't match what was requested. Also
+    // PENDING — Meta may still be settling the creative's link, or it's under review.
+    if (newLinkUrl && v.liveLinkUrl && !this.linkUrlMatches(v.liveLinkUrl, newLinkUrl)) {
+      return {
+        success: false,
+        pending: true,
+        message: `Ad ${adId} switched to the new creative (${newCreativeId}), but after `
+          + `${SWAP_VERIFY_ATTEMPTS} checks its live destination URL still reads "${v.liveLinkUrl}" `
+          + `instead of the requested "${newLinkUrl}". This is usually Meta still propagating — it should `
+          + `reflect shortly. Re-check in a few minutes to confirm.` + reviewNote,
+        error: 'DESTINATION_PENDING',
+        old_creative_id: oldCreativeId,
+        new_creative_id: newCreativeId,
+        requested_link_url: newLinkUrl,
+        live_link_url: v.liveLinkUrl,
+        effective_status: v.effectiveStatus,
+        review_feedback: v.reviewFeedback,
+      };
+    }
+
     return {
       success: true,
-      message: `Ad updated successfully. Created new creative (${newCreativeId}) with updated ${creativeKeys.join(', ')} and swapped it in for the old creative (${oldCreativeId}).`,
+      message: `Ad updated successfully. Created new creative (${newCreativeId}) with updated ${creativeKeys.join(', ')} `
+        + `and swapped it in for the old creative (${oldCreativeId})`
+        + (v.liveLinkUrl ? `. Verified live destination URL: ${v.liveLinkUrl}` : '.')
+        + reviewNote,
       old_creative_id: oldCreativeId,
       new_creative_id: newCreativeId,
+      verified: true,
+      live_link_url: v.liveLinkUrl,
+      effective_status: v.effectiveStatus,
+      review_feedback: v.reviewFeedback,
     };
+  }
+
+  /**
+   * Re-fetch an ad after a creative swap and report whether the new creative is actually
+   * attached and what destination URL the ad now serves. Used to catch Meta's silent-success
+   * case where POST /{ad-id} returns 200 but the ad keeps its old creative.
+   */
+  private async verifyCreativeSwap(
+    accessToken: string,
+    adId: string,
+    newCreativeId: string,
+    expectedLinkUrl?: string
+  ): Promise<{ attached: boolean; verified: boolean; liveCreativeId?: string; liveLinkUrl?: string; effectiveStatus?: string; reviewFeedback?: string }> {
+    try {
+      const ad = await metaService.getAd(accessToken, adId);
+      const liveCreativeId = ad?.creative?.creative_id || ad?.creative?.id;
+      const attached = String(liveCreativeId) === String(newCreativeId);
+
+      // Prefer the destination URL from the live creative's spec. getAd already returns the
+      // creative's object_story_spec; fall back to a dedicated creative fetch only if needed.
+      let liveLinkUrl = this.extractDestinationUrl(ad?.creative?.object_story_spec);
+      if (!liveLinkUrl && expectedLinkUrl && liveCreativeId) {
+        const liveCreative = await metaService.getAdCreative(accessToken, liveCreativeId);
+        liveLinkUrl = this.extractDestinationUrl(liveCreative?.object_story_spec, liveCreative?.asset_feed_spec)
+          || liveCreative?.link_url;
+      }
+
+      // Surface Meta's async review state (informational): effective_status tells us if the ad is
+      // still PENDING_REVIEW / DISAPPROVED, and ad_review_feedback carries the human-readable reason.
+      const effectiveStatus = ad?.effective_status;
+      const feedback = ad?.ad_review_feedback;
+      let reviewFeedback: string | undefined;
+      if (feedback && typeof feedback === 'object') {
+        const reasons = [
+          ...Object.values(feedback.global || {}),
+          ...Object.values(feedback.placement_specific || {}).flatMap((p: any) => Object.values(p || {})),
+        ].filter(Boolean);
+        if (reasons.length) reviewFeedback = reasons.join('; ');
+      }
+
+      return { attached, verified: true, liveCreativeId, liveLinkUrl, effectiveStatus, reviewFeedback };
+    } catch (err: any) {
+      // Verification is best-effort. If the read-back itself fails we can't prove the swap
+      // failed, so don't block — treat the swap as successful but flag verified:false so the
+      // caller never claims a confirmation that didn't happen.
+      console.warn(`AgentMode: creative-swap verification read-back failed for ad ${adId}:`, err?.message);
+      return { attached: true, verified: false, liveCreativeId: newCreativeId };
+    }
+  }
+
+  /**
+   * Extract the destination URL from a creative's object_story_spec (single image / video /
+   * carousel) or asset_feed_spec (placement-customized). Returns undefined if none found.
+   */
+  private extractDestinationUrl(objectStorySpec?: any, assetFeedSpec?: any): string | undefined {
+    if (objectStorySpec) {
+      const ld = objectStorySpec.link_data;
+      const vd = objectStorySpec.video_data;
+      const fromSpec =
+        ld?.link ||
+        ld?.call_to_action?.value?.link ||
+        ld?.child_attachments?.[0]?.link ||
+        vd?.call_to_action?.value?.link;
+      if (fromSpec) return fromSpec;
+    }
+    if (assetFeedSpec?.link_urls?.length) {
+      return assetFeedSpec.link_urls[0]?.website_url || assetFeedSpec.link_urls[0]?.display_url;
+    }
+    return undefined;
+  }
+
+  /**
+   * Compare the live destination URL against the requested one, tolerating only Meta's
+   * normalizations: host case, a trailing slash, and query parameters (Meta appends the
+   * creative's url_tags to the link at delivery time). The origin and path must match
+   * exactly — prefix matches (e.g. a bare domain, or /icp1 vs /icp10) are NOT a reflected
+   * destination.
+   */
+  private linkUrlMatches(liveUrl: string, requestedUrl: string): boolean {
+    const stripTrailingSlash = (s: string) => s.replace(/\/+$/, '');
+    try {
+      const live = new URL(liveUrl.trim());
+      const requested = new URL(requestedUrl.trim());
+      // URL lowercases protocol and host, so origin comparison is already case-insensitive.
+      return live.origin === requested.origin
+        && stripTrailingSlash(live.pathname) === stripTrailingSlash(requested.pathname);
+    } catch {
+      // Not parseable as absolute URLs — fall back to a strict normalized string comparison.
+      const normalize = (u: string) => stripTrailingSlash(u.trim()).toLowerCase();
+      return normalize(liveUrl) === normalize(requestedUrl);
+    }
   }
 
   public async deleteMetaAdsAd(userId: string, adId: string, account_id?: string): Promise<any> {
