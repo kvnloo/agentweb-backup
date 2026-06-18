@@ -588,92 +588,86 @@ export class VideoService {
         aspect_ratio: aspectRatio,
       };
 
-      // Image-to-video: register start/end frames with Higgsfield (URL import is
-      // single-step → returns a ready media_id) and pass them as medias references.
-      // `medias[].value` must be a media_id, never a raw URL.
-      const medias: Array<{ value: string; role: string }> = [];
-      if (params.startFrame) {
-        medias.push({ value: await this.importHiggsfieldMedia(params.startFrame), role: "start_image" });
-      }
-      if (params.endFrame) {
-        medias.push({ value: await this.importHiggsfieldMedia(params.endFrame), role: "end_image" });
-      }
-      if (medias.length) {
-        seedanceParams.medias = medias;
-      }
-
-      // Submit — returns a job id (async). 2-minute timeout for the submit itself.
-      const submitRaw = await mcp.callToolDirect(
-        HIGGSFIELD_MCP_SERVER,
-        "generate_video",
-        { params: seedanceParams },
-        { timeoutMs: 120000 }
-      );
-      // The job id is `generation.id` (same key in every tool's payload).
-      const submitGen = extractGeneration(submitRaw);
-      const jobId = submitGen?.id;
-      if (!jobId) {
-        console.error("Seedance generate_video returned no job id; raw:", JSON.stringify(submitRaw)?.slice(0, 2000));
-        return { success: false, error: "Seedance did not return a job id (check credits/auth)" };
-      }
-
-      // Poll job_status until terminal. completed = done; failed/canceled/nsfw =
-      // terminal failure; ip_detected = gated (treated as failure → Veo fallback).
-      const maxPollAttempts = 120; // ~20 min cap with 10s default backoff
-      const failStates = new Set(["failed", "canceled", "nsfw"]);
-      let status = (submitGen?.status || "").toString().toLowerCase();
-      let resultUrl: string | undefined = extractVideoUrl(submitGen);
-      let backoffMs = 10000;
-
-      for (let attempt = 0; attempt < maxPollAttempts; attempt++) {
-        if (status === "completed" || status === "ip_detected" || failStates.has(status)) break;
-        await new Promise((resolve) => setTimeout(resolve, backoffMs));
-        const statusRaw = await mcp.callToolDirect(
-          HIGGSFIELD_MCP_SERVER,
-          "job_status",
-          { job_id: jobId, id: jobId },
-          { timeoutMs: 60000 }
-        );
-        const statusSc = parseMcpResult(statusRaw);
-        const gen = extractGeneration(statusRaw);
-        status = (gen?.status || "").toString().toLowerCase();
-        resultUrl = extractVideoUrl(gen) || resultUrl;
-        // Respect server-provided backoff (poll_after_seconds), clamped to 2–30s.
-        if (typeof statusSc?.poll_after_seconds === "number" && statusSc.poll_after_seconds > 0) {
-          backoffMs = Math.max(2000, Math.min(30000, statusSc.poll_after_seconds * 1000));
+      // Run the entire job over ONE MCP session (media import → submit → poll →
+      // display) so the streamable-HTTP connection + OAuth isn't re-established per
+      // call (which previously caused reconnect/abort loops and the 600s timeout).
+      const outcome = await mcp.withServerSession(HIGGSFIELD_MCP_SERVER, async (callTool) => {
+        // Image-to-video: register start/end frames with Higgsfield (URL import is
+        // single-step → returns a ready media_id) and pass them as medias references.
+        // `medias[].value` must be a media_id, never a raw URL.
+        const medias: Array<{ value: string; role: string }> = [];
+        if (params.startFrame) {
+          medias.push({ value: await this.importHiggsfieldMedia(callTool, params.startFrame), role: "start_image" });
         }
+        if (params.endFrame) {
+          medias.push({ value: await this.importHiggsfieldMedia(callTool, params.endFrame), role: "end_image" });
+        }
+        if (medias.length) {
+          seedanceParams.medias = medias;
+        }
+
+        // Submit — returns a job id (async).
+        const submitRaw = await callTool("generate_video", { params: seedanceParams }, { timeoutMs: 120000 });
+        // The job id is `generation.id` (same key in every tool's payload).
+        const submitGen = extractGeneration(submitRaw);
+        const jobId = submitGen?.id;
+        if (!jobId) {
+          console.error("Seedance generate_video returned no job id; raw:", JSON.stringify(submitRaw)?.slice(0, 2000));
+          return { ok: false as const, error: "Seedance did not return a job id (check credits/auth)" };
+        }
+
+        // Poll job_status until terminal. completed = done; failed/canceled/nsfw =
+        // terminal failure; ip_detected = gated (treated as failure → Veo fallback).
+        const maxPollAttempts = 120; // ~20 min cap with 10s default backoff
+        const failStates = new Set(["failed", "canceled", "nsfw"]);
+        let status = (submitGen?.status || "").toString().toLowerCase();
+        let resultUrl: string | undefined = extractVideoUrl(submitGen);
+        let backoffMs = 10000;
+
+        for (let attempt = 0; attempt < maxPollAttempts; attempt++) {
+          if (status === "completed" || status === "ip_detected" || failStates.has(status)) break;
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+          const statusRaw = await callTool("job_status", { job_id: jobId, id: jobId }, { timeoutMs: 60000 });
+          const statusSc = parseMcpResult(statusRaw);
+          const gen = extractGeneration(statusRaw);
+          status = (gen?.status || "").toString().toLowerCase();
+          resultUrl = extractVideoUrl(gen) || resultUrl;
+          // Respect server-provided backoff (poll_after_seconds), clamped to 2–30s.
+          if (typeof statusSc?.poll_after_seconds === "number" && statusSc.poll_after_seconds > 0) {
+            backoffMs = Math.max(2000, Math.min(30000, statusSc.poll_after_seconds * 1000));
+          }
+        }
+
+        if (failStates.has(status)) {
+          return {
+            ok: false as const,
+            error:
+              status === "nsfw"
+                ? "Video generation was blocked by content policies (NSFW)"
+                : "Seedance video generation failed",
+          };
+        }
+        if (status === "ip_detected") {
+          return { ok: false as const, error: "Seedance generation is gated by IP detection and needs manual review" };
+        }
+
+        // Pull the final URL via job_display if job_status didn't include it.
+        if (!resultUrl) {
+          const displayRaw = await callTool("job_display", { job_id: jobId, id: jobId }, { timeoutMs: 60000 });
+          resultUrl = extractVideoUrl(extractGeneration(displayRaw));
+        }
+        if (!resultUrl) {
+          return { ok: false as const, error: "Seedance generation did not return a video URL (or timed out)" };
+        }
+        return { ok: true as const, url: resultUrl };
+      });
+
+      if (!outcome.ok) {
+        return { success: false, error: outcome.error };
       }
 
-      if (failStates.has(status)) {
-        return {
-          success: false,
-          error:
-            status === "nsfw"
-              ? "Video generation was blocked by content policies (NSFW)"
-              : "Seedance video generation failed",
-        };
-      }
-      if (status === "ip_detected") {
-        return { success: false, error: "Seedance generation is gated by IP detection and needs manual review" };
-      }
-
-      // Pull the final URL via job_display if job_status didn't include it.
-      if (!resultUrl) {
-        const displayRaw = await mcp.callToolDirect(
-          HIGGSFIELD_MCP_SERVER,
-          "job_display",
-          { job_id: jobId, id: jobId },
-          { timeoutMs: 60000 }
-        );
-        resultUrl = extractVideoUrl(extractGeneration(displayRaw));
-      }
-
-      if (!resultUrl) {
-        return { success: false, error: "Seedance generation did not return a video URL (or timed out)" };
-      }
-
-      // Download the hosted video and re-upload to our S3 bucket.
-      const uploadResult = await this.downloadUrlAndUploadVideo(resultUrl, params.filename, params.userId);
+      // Download the hosted video and re-upload to our S3 bucket (outside the MCP session).
+      const uploadResult = await this.downloadUrlAndUploadVideo(outcome.url, params.filename, params.userId);
       if (!uploadResult.success || !uploadResult.url) {
         return { success: false, error: uploadResult.error || "Failed to upload video to S3" };
       }
@@ -688,16 +682,15 @@ export class VideoService {
   }
 
   /**
-   * Import an image URL into Higgsfield via the MCP `media_import_url` tool.
-   * URL import is single-step (no media_confirm needed) and returns a ready media_id.
+   * Import an image URL into Higgsfield via the MCP `media_import_url` tool, using
+   * the caller's open session. URL import is single-step (no media_confirm needed)
+   * and returns a ready media_id.
    */
-  private async importHiggsfieldMedia(url: string): Promise<string> {
-    const raw = await getMcpClient().callToolDirect(
-      HIGGSFIELD_MCP_SERVER,
-      "media_import_url",
-      { url, type: "image" },
-      { timeoutMs: 120000 }
-    );
+  private async importHiggsfieldMedia(
+    callTool: (toolName: string, args: Record<string, any>, opts?: { timeoutMs?: number }) => Promise<any>,
+    url: string
+  ): Promise<string> {
+    const raw = await callTool("media_import_url", { url, type: "image" }, { timeoutMs: 120000 });
     const data = parseMcpResult(raw);
     const mediaId = data?.media_id || data?.id;
     if (!mediaId) {

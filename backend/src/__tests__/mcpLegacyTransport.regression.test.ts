@@ -45,6 +45,8 @@ describe("legacy MCP transport behavior is unchanged (additive OAuth)", () => {
     expect(transport).toBeInstanceOf(StreamableHTTPClientTransport);
     expect(transport._authProvider).toBeUndefined();
     expect(getAuthHeader(transport._requestInit)).toBe("Bearer plain-token-abc");
+    // Token-based streamable server keeps the axios shim (custom fetch).
+    expect(transport._fetch).toBeDefined();
   });
 
   it("streamable-http with authType 'bearer': still Bearer header, NO authProvider", async () => {
@@ -78,6 +80,9 @@ describe("legacy MCP transport behavior is unchanged (additive OAuth)", () => {
 
     expect(transport._authProvider).toBeDefined();
     expect(getAuthHeader(transport._requestInit)).toBeUndefined();
+    // OAuth streamable server MUST use native streaming fetch (no axios buffering
+    // shim) — otherwise the MCP SSE stream is buffered and reconnect-loops.
+    expect(transport._fetch).toBeUndefined();
   });
 
   it("sse with a static token: Bearer header, NO authProvider", async () => {
