@@ -89,3 +89,37 @@ describe("callToolDirect", () => {
     expect(mockClose).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("withServerSession", () => {
+  it("runs multiple tool calls over ONE connected client, then closes", async () => {
+    mockCallTool.mockResolvedValue({ structuredContent: { ok: true } });
+
+    const results = await service.withServerSession("higgsfield", async (callTool) => {
+      const a = await callTool("generate_video", { x: 1 });
+      const b = await callTool("job_status", { id: "j" });
+      return [a, b];
+    });
+
+    expect(mockConnect).toHaveBeenCalledTimes(1); // single session for both calls
+    expect(mockCallTool).toHaveBeenCalledTimes(2);
+    expect(mockClose).toHaveBeenCalledTimes(1);
+    expect(results).toHaveLength(2);
+    // Each call passes a timeout + abort signal.
+    expect(mockCallTool.mock.calls[0][2]).toEqual(expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  });
+
+  it("hard-aborts (rejects) a tool call that hangs past its timeout", async () => {
+    jest.useFakeTimers();
+    mockCallTool.mockReturnValue(new Promise(() => {})); // never resolves
+
+    const p = service.withServerSession("higgsfield", (callTool) =>
+      callTool("generate_video", {}, { timeoutMs: 1000 })
+    );
+    const expectation = expect(p).rejects.toThrow(/timed out after 1000ms/);
+    await jest.advanceTimersByTimeAsync(1100);
+    await expectation;
+
+    expect(mockClose).toHaveBeenCalledTimes(1); // session still cleaned up
+    jest.useRealTimers();
+  });
+});
