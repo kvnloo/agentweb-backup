@@ -84,6 +84,8 @@ describe("GET /api/admin/mcp-servers — secret stripping", () => {
           accessToken: "enc-token",
           oauthClientInfo: "enc-client",
           oauthTokens: "enc-tokens",
+          oauthExpiresAt: 1893456000000,
+          oauthHasRefreshToken: true,
         },
       ])
     );
@@ -94,6 +96,9 @@ describe("GET /api/admin/mcp-servers — secret stripping", () => {
     expect(s.accessToken).toBe("enc-token");
     expect(s.oauthClientInfo).toBeUndefined();
     expect(s.oauthTokens).toBeUndefined();
+    // Non-secret expiry metadata IS exposed (drives the UI countdown).
+    expect(s.oauthExpiresAt).toBe(1893456000000);
+    expect(s.oauthHasRefreshToken).toBe(true);
   });
 });
 
@@ -109,6 +114,8 @@ describe("PUT /api/admin/mcp-servers/:name — OAuth field preservation", () => 
           authType: "oauth",
           oauthClientInfo: "enc-client",
           oauthTokens: "enc-tokens",
+          oauthExpiresAt: 1893456000000,
+          oauthHasRefreshToken: true,
         },
       ])
     );
@@ -121,6 +128,9 @@ describe("PUT /api/admin/mcp-servers/:name — OAuth field preservation", () => 
     expect(stored.authType).toBe("oauth");
     expect(stored.oauthClientInfo).toBe("enc-client");
     expect(stored.oauthTokens).toBe("enc-tokens");
+    // Expiry metadata must survive edits too (rebuild would otherwise drop it).
+    expect(stored.oauthExpiresAt).toBe(1893456000000);
+    expect(stored.oauthHasRefreshToken).toBe(true);
   });
 
   it("does not inject authType/oauth fields when editing a legacy server", async () => {

@@ -38,6 +38,23 @@ import axios from "axios";
 import { useAuth } from "../../contexts/AuthContext";
 import { buildApiUrl } from "../../config";
 
+// Tokens are proactively refreshed once they're within this window of expiry
+// (must match OAUTH_REFRESH_LEAD_MS on the backend).
+const OAUTH_REFRESH_LEAD_MS = 5 * 60 * 1000;
+// How often to silently re-fetch servers so the countdown reflects refreshed tokens.
+const SERVER_POLL_MS = 30 * 1000;
+
+// Format a millisecond duration as a compact countdown, e.g. "1h 4m", "4m 12s", "9s".
+const formatDuration = (ms: number): string => {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+};
+
 // Validation constants
 const NAME_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
 const isValidServerName = (name: string): boolean => NAME_REGEX.test(name);
@@ -92,7 +109,37 @@ interface McpServer {
   isInternal?: boolean;
   discoveredTools?: string[];
   authType?: "none" | "bearer" | "oauth";
+  oauthExpiresAt?: number;
+  oauthHasRefreshToken?: boolean;
 }
+
+// Renders a live "auto-refresh in …" countdown for an OAuth server.
+const OAuthCountdown: React.FC<{ expiresAt: number; canRefresh?: boolean; now: number }> = ({
+  expiresAt,
+  canRefresh,
+  now,
+}) => {
+  const nextRefreshIn = expiresAt - OAUTH_REFRESH_LEAD_MS - now;
+  const expiresIn = expiresAt - now;
+
+  let label: string;
+  let color: "success" | "warning" | "error";
+  if (!canRefresh && expiresIn <= 0) {
+    label = "Token expired — re-authorize";
+    color = "error";
+  } else if (nextRefreshIn > 0) {
+    label = `Auto-refresh in ${formatDuration(nextRefreshIn)}`;
+    color = "success";
+  } else if (expiresIn > 0) {
+    label = "Refreshing…";
+    color = "warning";
+  } else {
+    label = canRefresh ? "Refreshing…" : "Token expired";
+    color = canRefresh ? "warning" : "error";
+  }
+
+  return <Chip label={label} size="small" variant="outlined" color={color} sx={{ mt: 0.5 }} />;
+};
 
 interface OAuthFlowResult {
   ok: boolean;
@@ -133,6 +180,8 @@ const McpServersTab: React.FC = () => {
   const [expandedServer, setExpandedServer] = useState<string | null>(null);
   // OAuth authorization state (server name currently being authorized)
   const [authorizingServer, setAuthorizingServer] = useState<string | null>(null);
+  // Ticking clock that drives the live OAuth countdowns.
+  const [now, setNow] = useState<number>(() => Date.now());
 
   const { token } = useAuth();
 
@@ -218,18 +267,30 @@ const McpServersTab: React.FC = () => {
     loadServers();
   }, []);
 
-  const loadServers = async () => {
+  // Tick every second so OAuth countdowns stay live.
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Silently re-fetch servers periodically so refreshed token expiries show up.
+  useEffect(() => {
+    const id = setInterval(() => loadServers(true), SERVER_POLL_MS);
+    return () => clearInterval(id);
+  }, []);
+
+  const loadServers = async (silent = false) => {
     try {
-      setLoading(true);
-      setError("");
+      if (!silent) setLoading(true);
+      if (!silent) setError("");
       const response = await axios.get(buildApiUrl("/api/admin/mcp-servers"), {
         headers: { Authorization: `Bearer ${token}` },
       });
       setServers(response.data);
     } catch (err: any) {
-      setError(err.response?.data?.message || "Failed to load MCP servers");
+      if (!silent) setError(err.response?.data?.message || "Failed to load MCP servers");
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
@@ -486,7 +547,7 @@ const McpServersTab: React.FC = () => {
           <Button
             variant="outlined"
             startIcon={<RefreshIcon />}
-            onClick={loadServers}
+            onClick={() => loadServers()}
             sx={{ mr: 1 }}
           >
             Refresh
@@ -560,19 +621,28 @@ const McpServersTab: React.FC = () => {
                       </Box>
                     </TableCell>
                     <TableCell>
-                      <Chip
-                        label={server.transport}
-                        size="small"
-                        color={
-                          server.transport === "streamable-http"
-                            ? "primary"
-                            : server.transport === "sse"
-                            ? "secondary"
-                            : server.transport === "stdio"
-                            ? "success"
-                            : "default"
-                        }
-                      />
+                      <Box display="flex" flexDirection="column" alignItems="flex-start">
+                        <Chip
+                          label={server.transport}
+                          size="small"
+                          color={
+                            server.transport === "streamable-http"
+                              ? "primary"
+                              : server.transport === "sse"
+                              ? "secondary"
+                              : server.transport === "stdio"
+                              ? "success"
+                              : "default"
+                          }
+                        />
+                        {server.authType === "oauth" && typeof server.oauthExpiresAt === "number" && (
+                          <OAuthCountdown
+                            expiresAt={server.oauthExpiresAt}
+                            canRefresh={server.oauthHasRefreshToken}
+                            now={now}
+                          />
+                        )}
+                      </Box>
                     </TableCell>
                     <TableCell>
                       <Typography variant="body2" sx={{ maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis" }}>

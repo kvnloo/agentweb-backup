@@ -108,6 +108,8 @@ interface McpServerConfig {
   authType?: 'none' | 'bearer' | 'oauth';
   oauthClientInfo?: string; // encrypted dynamic-registration result
   oauthTokens?: string; // encrypted OAuth tokens
+  oauthExpiresAt?: number; // absolute epoch-ms of access-token expiry (non-secret)
+  oauthHasRefreshToken?: boolean; // whether tokens can be auto-refreshed
 }
 
 // Strip OAuth secret blobs before returning to the client. accessToken is left
@@ -285,6 +287,8 @@ router.put("/:name", async (req, res) => {
       ...(effectiveTransport !== 'stdio' && servers[serverIndex].authType && { authType: servers[serverIndex].authType }),
       ...(effectiveTransport !== 'stdio' && servers[serverIndex].oauthClientInfo && { oauthClientInfo: servers[serverIndex].oauthClientInfo }),
       ...(effectiveTransport !== 'stdio' && servers[serverIndex].oauthTokens && { oauthTokens: servers[serverIndex].oauthTokens }),
+      ...(effectiveTransport !== 'stdio' && servers[serverIndex].oauthExpiresAt && { oauthExpiresAt: servers[serverIndex].oauthExpiresAt }),
+      ...(effectiveTransport !== 'stdio' && servers[serverIndex].oauthHasRefreshToken && { oauthHasRefreshToken: servers[serverIndex].oauthHasRefreshToken }),
     };
     servers[serverIndex] = updatedServer;
     

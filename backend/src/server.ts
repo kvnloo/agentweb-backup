@@ -331,6 +331,14 @@ process.on('unhandledRejection', (reason: unknown, promise: Promise<unknown>) =>
 const gracefulShutdown = async (signal: string) => {
   console.log(`\n${signal} received. Shutting down gracefully...`);
 
+  // Stop the proactive MCP OAuth refresh scheduler
+  try {
+    const { stopMcpOAuthRefreshScheduler } = await import('./mcp/client/mcpOAuthRefreshService');
+    stopMcpOAuthRefreshScheduler();
+  } catch {
+    // ignore — scheduler may not have started
+  }
+
   // Shutdown Agent Mode services (closes MCP clients)
   await agentModeService.shutdown();
 
@@ -452,6 +460,11 @@ createTestAccount().then(async () => {
     void import('./services/ensureCriticalTables')
       .then(({ ensureCriticalTables }) => ensureCriticalTables())
       .catch((err) => console.error('[startup] ensureCriticalTables failed (non-fatal):', err?.message || err));
+
+    // Proactively refresh OAuth tokens for outbound MCP servers before they expire.
+    import('./mcp/client/mcpOAuthRefreshService')
+      .then(({ startMcpOAuthRefreshScheduler }) => startMcpOAuthRefreshScheduler())
+      .catch((error) => console.error('Failed to start MCP OAuth refresh scheduler:', error));
 
     // Initialize Agent Mode tools in background - don't block server startup
     // This prevents health check timeouts during deployment (e.g. Elastic Beanstalk)

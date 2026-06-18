@@ -22,6 +22,10 @@ export interface HttpOAuthFields {
   oauthClientInfo?: string;
   /** Encrypted JSON of the stored OAuth tokens. */
   oauthTokens?: string;
+  /** Absolute epoch-ms the current access token expires (non-secret). */
+  oauthExpiresAt?: number;
+  /** Whether stored tokens include a refresh_token. */
+  oauthHasRefreshToken?: boolean;
 }
 
 // SSE transport configuration
