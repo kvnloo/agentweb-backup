@@ -116,6 +116,15 @@ beforeEach(() => {
           created_at: '2024-01-01T00:00:00.000Z',
           updated_at: '2024-01-01T00:00:00.000Z',
         },
+        {
+          platform: 'google_ads',
+          account_id: 'google-ads-001',
+          account_name: 'Member Google Ads',
+          config: { account_type: 'ad_account', access_token: 'tok4', token_expires_at: 9999999999, scopes: [] },
+          sharedWithOrg: false,
+          created_at: '2024-01-01T00:00:00.000Z',
+          updated_at: '2024-01-01T00:00:00.000Z',
+        },
       ],
     },
   };
@@ -160,6 +169,34 @@ describe('GET /org/:orgId/connected-accounts — privacy model', () => {
     expect(res.status).toBe(200);
     const ids = res.body.data.map((a: any) => a.account_id);
     expect(ids).toContain('ig-org-001');
+  });
+
+  it('lets the org owner see private member-owned ad accounts with connector metadata', async () => {
+    mockCurrentUser = mockUsers['user-owner'];
+
+    const res = await request(app).get(`/org/${ORG_ID}/connected-accounts`);
+
+    expect(res.status).toBe(200);
+    const memberAdAccount = res.body.data.find((a: any) => a.account_id === 'google-ads-001');
+    expect(memberAdAccount).toEqual(expect.objectContaining({
+      account_id: 'google-ads-001',
+      platform: 'google_ads',
+      sharedWithOrg: false,
+      addedBy: 'user-member',
+      addedByName: 'Member',
+      canManageSharing: true,
+    }));
+    expect(memberAdAccount.config.access_token).toBeUndefined();
+  });
+
+  it('lets the org owner see private member-owned non-ad accounts too', async () => {
+    mockCurrentUser = mockUsers['user-owner'];
+
+    const res = await request(app).get(`/org/${ORG_ID}/connected-accounts`);
+
+    expect(res.status).toBe(200);
+    const ids = res.body.data.map((a: any) => a.account_id);
+    expect(ids).toContain('tw-001');
   });
 
   it('returns 403 if requester is not an org member', async () => {
@@ -218,5 +255,49 @@ describe('PATCH /org/connected-accounts/:platform/:accountId/share', () => {
       .patch('/org/connected-accounts/linkedin/li-001/share')
       .send({ sharedWithOrg: true });
     expect(res.status).toBe(403);
+  });
+
+  it('lets the org owner share a member-owned business ad account', async () => {
+    mockCurrentUser = mockUsers['user-owner'];
+
+    const res = await request(app)
+      .patch('/org/connected-accounts/google_ads/google-ads-001/share')
+      .send({ sharedWithOrg: true });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(expect.objectContaining({
+      sharedWithOrg: true,
+      ownerUserId: 'user-member',
+      adminManaged: true,
+    }));
+    const memberAdAccount = mockUsers['user-member'].connected_accounts.find((a: any) => a.account_id === 'google-ads-001');
+    expect(memberAdAccount.sharedWithOrg).toBe(true);
+  });
+
+  it('lets the org owner share a member-owned personal account', async () => {
+    mockCurrentUser = mockUsers['user-owner'];
+
+    const res = await request(app)
+      .patch('/org/connected-accounts/twitter/tw-001/share')
+      .send({ sharedWithOrg: true });
+
+    expect(res.status).toBe(200);
+    expect(mockUsers['user-member'].connected_accounts[0].sharedWithOrg).toBe(true);
+  });
+
+  it('does not let an org member unshare an admin-managed business ad account', async () => {
+    mockCurrentUser = mockUsers['user-owner'];
+    await request(app)
+      .patch('/org/connected-accounts/google_ads/google-ads-001/share')
+      .send({ sharedWithOrg: true });
+
+    mockCurrentUser = mockUsers['user-member'];
+    const res = await request(app)
+      .patch('/org/connected-accounts/google_ads/google-ads-001/share')
+      .send({ sharedWithOrg: false });
+
+    expect(res.status).toBe(403);
+    const memberAdAccount = mockUsers['user-member'].connected_accounts.find((a: any) => a.account_id === 'google-ads-001');
+    expect(memberAdAccount.sharedWithOrg).toBe(true);
   });
 });

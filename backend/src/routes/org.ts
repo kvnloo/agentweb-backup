@@ -10,6 +10,32 @@ const router = Router();
 // All org routes require authentication
 router.use(authenticateToken);
 
+function isOrgOwner(user: any, org: Organization): boolean {
+  return org.ownerUserId === user.userId || user.orgRole === "owner";
+}
+
+function sanitizeConnectedAccountForOrgResponse(account: any): any {
+  const safeConfig: Record<string, any> = {};
+  for (const [key, value] of Object.entries(account.config || {})) {
+    const normalizedKey = key.toLowerCase();
+    const looksCredentialLike =
+      normalizedKey === "token" ||
+      normalizedKey.endsWith("_token") ||
+      normalizedKey.endsWith("token") ||
+      normalizedKey.includes("secret") ||
+      normalizedKey === "api_key" ||
+      normalizedKey === "apikey";
+    if (!looksCredentialLike) {
+      safeConfig[key] = value;
+    }
+  }
+
+  return {
+    ...account,
+    config: safeConfig,
+  };
+}
+
 // Create organization
 router.post("/", async (req: Request, res: Response) => {
   try {
@@ -440,7 +466,7 @@ router.get("/:orgId/connected-accounts", async (req: Request, res: Response) => 
     if (org.connected_accounts) {
       for (const account of org.connected_accounts) {
         allAccounts.push({
-          ...account,
+          ...sanitizeConnectedAccountForOrgResponse(account),
           addedBy: "organization",
           addedByName: org.name,
           isOrgLevel: true,
@@ -448,16 +474,22 @@ router.get("/:orgId/connected-accounts", async (req: Request, res: Response) => 
       }
     }
 
-    // Member personal accounts — only those the member has explicitly shared with the org
+    const ownerCanManageOrgAccounts = isOrgOwner(user, org);
+
+    // Member personal accounts. Members only see accounts explicitly shared with the org.
+    // Org owners see all member-connected accounts so they can decide what becomes an
+    // org resource without copying credentials between users.
     for (const member of members) {
       if (member.connected_accounts) {
         for (const account of member.connected_accounts) {
-          if (!account.sharedWithOrg) continue;
+          if (!account.sharedWithOrg && !ownerCanManageOrgAccounts) continue;
           allAccounts.push({
-            ...account,
+            ...sanitizeConnectedAccountForOrgResponse(account),
             addedBy: member.userId,
             addedByName: member.displayName || member.email,
             isOrgLevel: false,
+            canManageSharing: ownerCanManageOrgAccounts,
+            adminManaged: !!account.sharedWithOrg,
           });
         }
       }
@@ -487,19 +519,57 @@ router.patch("/connected-accounts/:platform/:accountId/share", async (req: Reque
       return res.status(400).json({ error: "sharedWithOrg must be a boolean" });
     }
 
-    const accounts = user.connected_accounts || [];
-    const idx = accounts.findIndex(
+    const org = await orgDb.getOrgById(user.orgId);
+    if (!org) {
+      return res.status(404).json({ error: "Organization not found" });
+    }
+
+    const requesterIsOwner = isOrgOwner(user, org);
+    let accountOwner = user;
+    let accounts = user.connected_accounts || [];
+    let idx = accounts.findIndex(
       (a: any) => a.platform === platform && a.account_id === accountId
     );
+
+    if (idx === -1 && requesterIsOwner) {
+      const members = await orgDb.getOrgMembers(user.orgId);
+      for (const member of members) {
+        const memberAccounts = member.connected_accounts || [];
+        const memberIdx = memberAccounts.findIndex(
+          (a: any) => a.platform === platform && a.account_id === accountId
+        );
+        if (memberIdx !== -1) {
+          accountOwner = member;
+          accounts = memberAccounts;
+          idx = memberIdx;
+          break;
+        }
+      }
+    }
+
     if (idx === -1) {
       return res.status(404).json({ error: "Connected account not found" });
     }
 
+    if (accountOwner.userId !== userId && !requesterIsOwner) {
+      return res.status(403).json({ error: "Only the org owner can manage another member's connected accounts" });
+    }
+
+    const existingAccount = accounts[idx];
+    if (existingAccount.sharedWithOrg && sharedWithOrg === false && !requesterIsOwner) {
+      return res.status(403).json({ error: "Only the org owner can unshare an org-shared connected account" });
+    }
+
     const updated = [...accounts];
     updated[idx] = { ...updated[idx], sharedWithOrg };
-    await userDb.updateUser(userId, { connected_accounts: updated } as any);
+    await userDb.updateUser(accountOwner.userId, { connected_accounts: updated } as any);
 
-    return res.json({ success: true, sharedWithOrg });
+    return res.json({
+      success: true,
+      sharedWithOrg,
+      ownerUserId: accountOwner.userId,
+      adminManaged: requesterIsOwner,
+    });
   } catch (error) {
     console.error("Error toggling connected account org sharing:", error);
     return res.status(500).json({ error: "Internal server error" });
