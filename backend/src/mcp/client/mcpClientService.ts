@@ -1012,11 +1012,21 @@ export class McpClientService {
       }
     };
     
+    // OAuth servers (e.g. Higgsfield) must use the native streaming fetch: the axios
+    // shim buffers the whole response (responseType:'arraybuffer'), which breaks the
+    // MCP SSE response stream and causes reconnect/abort loops on long jobs. The
+    // internal token-based server keeps the axios shim for its long-timeout behavior.
+    if (oauthProvider) {
+      return new StreamableHTTPClientTransport(new URL(resolvedUrl), {
+        requestInit,
+        authProvider: oauthProvider,
+      });
+    }
+
     // Pass custom fetch to transport
     return new StreamableHTTPClientTransport(new URL(resolvedUrl), {
       requestInit,
       fetch: axiosFetch as any, // Cast explicitly to match expected type
-      ...(oauthProvider ? { authProvider: oauthProvider } : {}),
     });
   }
 
@@ -1253,6 +1263,45 @@ export class McpClientService {
         undefined,
         { timeout: options?.timeoutMs ?? 3600000 }
       );
+    } finally {
+      await client.close().catch(() => {});
+    }
+  }
+
+  /**
+   * Open ONE connected client to a named server, run a sequence of tool calls on
+   * it, then close. Use this for multi-call workflows (e.g. video generation:
+   * media import → generate → poll → display) so the whole job runs over a single
+   * MCP session instead of reconnecting (and re-doing OAuth) per call.
+   */
+  public async withServerSession<T>(
+    serverName: string,
+    fn: (
+      callTool: (toolName: string, args: Record<string, any>, opts?: { timeoutMs?: number }) => Promise<any>
+    ) => Promise<T>
+  ): Promise<T> {
+    const config = await getServerConfig(serverName);
+    if (!config) {
+      throw new Error(`MCP server not found: ${serverName}`);
+    }
+
+    const transport = await this.createTransport(serverName, config as any);
+    const client = new Client(
+      { name: "AgentWeb-Backend", version: "1.0.0" },
+      { capabilities: {} }
+    );
+
+    try {
+      const connectPromise = client.connect(transport);
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("MCP connection timeout")), 60000)
+      );
+      await Promise.race([connectPromise, timeoutPromise]);
+
+      const callTool = (toolName: string, args: Record<string, any>, opts?: { timeoutMs?: number }) =>
+        client.callTool({ name: toolName, arguments: args }, undefined, { timeout: opts?.timeoutMs ?? 3600000 });
+
+      return await fn(callTool);
     } finally {
       await client.close().catch(() => {});
     }

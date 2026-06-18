@@ -1074,8 +1074,10 @@ export class AgentModeService {
     } catch (error) {
       console.error('AgentMode: Error getting video API default model setting:', error);
     }
-    // Return undefined to let the video generation service use its own hardcoded default
-    return undefined;
+    // Seedance 2.0 is the product default for all video generation (Veo is an
+    // automatic fallback inside the video service). Return it explicitly so the
+    // model is never undefined in logs / cost estimation.
+    return 'seedance-2.0';
   }
 
   async getVideoGenerationDefaultModel(): Promise<string> {

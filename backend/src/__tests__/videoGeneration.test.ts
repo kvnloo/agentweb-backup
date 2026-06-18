@@ -15,10 +15,14 @@ jest.mock('../services/imageGeneration', () => ({
 jest.mock('axios');
 jest.mock('@google/genai');
 
-// Seedance 2.0 runs via the Higgsfield MCP server; mock the one-off client.
-const mockCallToolDirect = jest.fn();
+// Seedance 2.0 runs over ONE MCP session (withServerSession). The mock invokes the
+// session callback with a routing callTool(toolName, args, opts).
+const mockCallTool = jest.fn();
+const mockWithServerSession = jest.fn(async (_server: string, fn: any) => fn(mockCallTool));
 jest.mock('../mcp/client/mcpClientService', () => ({
-  McpClientService: jest.fn().mockImplementation(() => ({ callToolDirect: mockCallToolDirect })),
+  McpClientService: jest.fn().mockImplementation(() => ({
+    withServerSession: mockWithServerSession,
+  })),
 }));
 
 describe('VideoService', () => {
@@ -143,7 +147,7 @@ describe('VideoService', () => {
     // Canned MCP tool results matching the confirmed outputSchema shapes:
     // generate_video/job_display wrap in `results[]`; job_status wraps in `generation`.
     const routeTools = (overrides: Record<string, any> = {}) => {
-      mockCallToolDirect.mockImplementation(async (_server: string, tool: string) => {
+      mockCallTool.mockImplementation(async (tool: string) => {
         if (tool === 'media_import_url') return overrides.media_import_url ?? { structuredContent: { media_id: 'media-123' } };
         if (tool === 'generate_video') return overrides.generate_video ?? {
           structuredContent: { results: [{ id: 'job-1', type: 'video', status: 'queued', model: 'seedance_2_0', params: {}, results: {} }] },
@@ -159,8 +163,8 @@ describe('VideoService', () => {
     };
 
     const callArgsFor = (tool: string): any => {
-      const call = (mockCallToolDirect.mock.calls as any[]).find((c) => c[1] === tool);
-      return call ? call[2] : undefined;
+      const call = (mockCallTool.mock.calls as any[]).find((c) => c[0] === tool);
+      return call ? call[1] : undefined;
     };
 
     beforeEach(() => {
@@ -192,7 +196,7 @@ describe('VideoService', () => {
         aspect_ratio: 'auto',
       });
       expect(args.params.medias).toBeUndefined();
-      expect((mockCallToolDirect.mock.calls as any[]).some((c) => c[1] === 'media_import_url')).toBe(false);
+      expect((mockCallTool.mock.calls as any[]).some((c) => c[0] === 'media_import_url')).toBe(false);
     });
 
     it('image-to-video: imports the start frame and passes it as a media reference', async () => {
@@ -243,12 +247,12 @@ describe('VideoService', () => {
       const result = await (videoService as any).generateWithHiggsfield({ ...baseParams });
       expect(result.success).toBe(true);
       // job_status was polled with the id returned by generate_video's results[0].id
-      const statusCall = (mockCallToolDirect.mock.calls as any[]).find((c) => c[1] === 'job_status');
-      expect(statusCall[2]).toMatchObject({ job_id: 'job-1' });
+      const statusCall = (mockCallTool.mock.calls as any[]).find((c) => c[0] === 'job_status');
+      expect(statusCall[1]).toMatchObject({ job_id: 'job-1' });
     });
 
     it('returns an error when the MCP call throws (auth/credits)', async () => {
-      mockCallToolDirect.mockRejectedValue(new Error('Unauthorized'));
+      mockCallTool.mockRejectedValue(new Error('Unauthorized'));
       const result = await (videoService as any).generateWithHiggsfield({ ...baseParams });
       expect(result.success).toBe(false);
       expect(result.error).toMatch(/Seedance.*failed/i);
@@ -258,21 +262,64 @@ describe('VideoService', () => {
       routeTools();
       const result = await videoService.generateVideo({ prompt: 'a sunrise', filename: 'd.mp4', userId: 'u' });
       expect(result.success).toBe(true);
-      const genCall = (mockCallToolDirect.mock.calls as any[]).find((c) => c[1] === 'generate_video');
+      const genCall = (mockCallTool.mock.calls as any[]).find((c) => c[0] === 'generate_video');
       expect(genCall).toBeDefined();
-      expect(genCall[2].params.model).toBe('seedance_2_0');
+      expect(genCall[1].params.model).toBe('seedance_2_0');
     });
 
-    it('falls back to Veo when Seedance fails', async () => {
-      mockCallToolDirect.mockRejectedValue(new Error('no credits'));
+    it('falls back to Veo when Seedance THROWS (auth/credits/stream error)', async () => {
+      mockCallTool.mockRejectedValue(new Error('no credits'));
       const veoSpy = jest
         .spyOn(videoService as any, 'generateWithVeo31')
         .mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/veo.mp4', filename: 'promo.mp4' });
 
       const result = await videoService.generateVideo({ ...baseParams });
 
-      expect(veoSpy).toHaveBeenCalled();
+      expect(veoSpy).toHaveBeenCalledTimes(1);
       expect(result.success).toBe(true);
+      expect(result.videoUrl).toBe('https://s3.example.com/veo.mp4');
+      veoSpy.mockRestore();
+    });
+
+    it('falls back to Veo when Seedance returns a non-throw failure (job failed)', async () => {
+      routeTools({ job_status: { structuredContent: { generation: { id: 'job-1', status: 'failed' } } } });
+      const veoSpy = jest
+        .spyOn(videoService as any, 'generateWithVeo31')
+        .mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/veo.mp4', filename: 'promo.mp4' });
+
+      const result = await videoService.generateVideo({ ...baseParams });
+
+      expect(veoSpy).toHaveBeenCalledTimes(1);
+      expect(result.success).toBe(true);
+      expect(result.videoUrl).toBe('https://s3.example.com/veo.mp4');
+      veoSpy.mockRestore();
+    });
+
+    it('falls back to Veo on nsfw and ip_detected failures', async () => {
+      const veoSpy = jest
+        .spyOn(videoService as any, 'generateWithVeo31')
+        .mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/veo.mp4', filename: 'promo.mp4' });
+
+      routeTools({ job_status: { structuredContent: { generation: { id: 'job-1', status: 'nsfw' } } } });
+      expect((await videoService.generateVideo({ ...baseParams })).success).toBe(true);
+
+      routeTools({ job_status: { structuredContent: { generation: { id: 'job-1', status: 'ip_detected' } } } });
+      expect((await videoService.generateVideo({ ...baseParams })).success).toBe(true);
+
+      expect(veoSpy).toHaveBeenCalledTimes(2);
+      veoSpy.mockRestore();
+    });
+
+    it('returns a clean failure (no loop, Veo tried once) when BOTH Seedance and Veo fail', async () => {
+      mockCallTool.mockRejectedValue(new Error('no credits'));
+      const veoSpy = jest
+        .spyOn(videoService as any, 'generateWithVeo31')
+        .mockResolvedValue({ success: false, error: 'veo down' });
+
+      const result = await videoService.generateVideo({ ...baseParams });
+
+      expect(veoSpy).toHaveBeenCalledTimes(1); // Veo tried exactly once — no re-entry into Seedance
+      expect(result.success).toBe(false);
       veoSpy.mockRestore();
     });
   });
