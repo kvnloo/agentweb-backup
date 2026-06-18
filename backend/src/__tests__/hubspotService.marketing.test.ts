@@ -43,7 +43,10 @@ describe('addCampaignAsset', () => {
     const svc = makeSvc();
     await expect(svc.addCampaignAsset('camp-1', 'MARKETING_EMAIL', 'email-99')).resolves.toBeUndefined();
     const url = mockPut.mock.calls[0][0];
-    expect(url).toContain('/marketing/v3/campaigns/camp-1/assets/MARKETING_EMAIL/email-99');
+    // Must use the 2026-03 campaigns API (same version as the asset read);
+    // the /marketing/v3/campaigns path returns 500 INTERNAL_ERROR for some asset types.
+    expect(url).toContain('/marketing/campaigns/2026-03/camp-1/assets/MARKETING_EMAIL/email-99');
+    expect(url).not.toContain('/marketing/v3/campaigns/');
   });
 
   it('throws on API error', async () => {
@@ -69,7 +72,8 @@ describe('removeCampaignAsset', () => {
     const svc = makeSvc();
     await expect(svc.removeCampaignAsset('camp-1', 'MARKETING_EMAIL', 'email-99')).resolves.toBeUndefined();
     const url = mockDelete.mock.calls[0][0];
-    expect(url).toContain('/marketing/v3/campaigns/camp-1/assets/MARKETING_EMAIL/email-99');
+    expect(url).toContain('/marketing/campaigns/2026-03/camp-1/assets/MARKETING_EMAIL/email-99');
+    expect(url).not.toContain('/marketing/v3/campaigns/');
   });
 
   it('throws on API error', async () => {
@@ -200,8 +204,28 @@ describe('getEmailStatistics', () => {
     const svc = makeSvc();
     await svc.getEmailStatistics(['id1'], { startTimestamp: '2025-01-01T00:00:00Z', endTimestamp: '2025-12-31T23:59:59Z' });
     const url = mockGet.mock.calls[0][0];
-    expect(url).toContain('startTimestamp=');
-    expect(url).toContain('endTimestamp=');
+    expect(url).toContain('startTimestamp=' + encodeURIComponent('2025-01-01T00:00:00Z'));
+    expect(url).toContain('endTimestamp=' + encodeURIComponent('2025-12-31T23:59:59Z'));
+  });
+
+  it('always sends an ISO timestamp range even when none provided (HubSpot requires it)', async () => {
+    mockGet.mockResolvedValue({ data: {} });
+    const svc = makeSvc();
+    await svc.getEmailStatistics(['id1']);
+    const url = decodeURIComponent(mockGet.mock.calls[0][0]);
+    expect(url).toMatch(/startTimestamp=\d{4}-\d{2}-\d{2}T/);
+    expect(url).toMatch(/endTimestamp=\d{4}-\d{2}-\d{2}T/);
+    expect(url).not.toContain('undefined');
+  });
+
+  it('converts epoch-ms timestamps to ISO (HubSpot rejects raw epoch)', async () => {
+    mockGet.mockResolvedValue({ data: {} });
+    const svc = makeSvc();
+    await svc.getEmailStatistics(['id1'], { startTimestamp: '1735689600000', endTimestamp: '1767225600000' });
+    const url = decodeURIComponent(mockGet.mock.calls[0][0]);
+    expect(url).toContain('startTimestamp=' + new Date(1735689600000).toISOString());
+    expect(url).toContain('endTimestamp=' + new Date(1767225600000).toISOString());
+    expect(url).not.toContain('1735689600000');
   });
 
   it('throws if emailIds empty', async () => {

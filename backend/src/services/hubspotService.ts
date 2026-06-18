@@ -1043,8 +1043,10 @@ export class HubSpotService {
     if (!guid?.trim()) throw new Error('Campaign guid is required');
     if (!assetType?.trim()) throw new Error('assetType is required');
     if (!assetId?.trim()) throw new Error('assetId is required');
+    // Use the 2026-03 campaigns API (same version as the asset read). The
+    // /marketing/v3/campaigns path returns 500 INTERNAL_ERROR for some asset types.
     await axiosInstance.put(
-      `${HUBSPOT_API_BASE}/marketing/v3/campaigns/${guid}/assets/${assetType}/${assetId}`,
+      `${HUBSPOT_API_BASE}/marketing/campaigns/2026-03/${guid}/assets/${assetType}/${assetId}`,
       {},
       { headers: await this.authHeaders() }
     );
@@ -1055,7 +1057,7 @@ export class HubSpotService {
     if (!assetType?.trim()) throw new Error('assetType is required');
     if (!assetId?.trim()) throw new Error('assetId is required');
     await axiosInstance.delete(
-      `${HUBSPOT_API_BASE}/marketing/v3/campaigns/${guid}/assets/${assetType}/${assetId}`,
+      `${HUBSPOT_API_BASE}/marketing/campaigns/2026-03/${guid}/assets/${assetType}/${assetId}`,
       { headers: await this.authHeaders() }
     );
   }
@@ -1184,9 +1186,17 @@ export class HubSpotService {
     opts?: { startTimestamp?: string; endTimestamp?: string }
   ): Promise<any> {
     if (!emailIds?.length) throw new Error('emailIds array must not be empty');
+    // HubSpot requires an ISO-8601 start/end range and rejects raw epoch-ms or a
+    // missing value ("Unable to parse value for query parameter: startTimestamp").
+    // Accept epoch-ms for convenience and default to the last year when omitted.
+    const toIso = (v: string): string => (/^\d+$/.test(v) ? new Date(Number(v)).toISOString() : v);
+    const end = opts?.endTimestamp ? toIso(opts.endTimestamp) : new Date().toISOString();
+    const start = opts?.startTimestamp
+      ? toIso(opts.startTimestamp)
+      : new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString();
     const params: string[] = emailIds.map(id => `emailIds=${encodeURIComponent(id)}`);
-    if (opts?.startTimestamp) params.push(`startTimestamp=${encodeURIComponent(opts.startTimestamp)}`);
-    if (opts?.endTimestamp) params.push(`endTimestamp=${encodeURIComponent(opts.endTimestamp)}`);
+    params.push(`startTimestamp=${encodeURIComponent(start)}`);
+    params.push(`endTimestamp=${encodeURIComponent(end)}`);
     const url = `${HUBSPOT_API_BASE}/marketing/v3/emails/statistics/list?${params.join('&')}`;
     const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
     return res.data;
