@@ -3300,8 +3300,13 @@ export class AgentModeService {
    *   required functions, and auto-installed skills, plus autocomplete guidance when enabled.
    *
    * Returns an empty array when there is no work plan or it has no steps.
+   *
+   * `generatedImageFilenames` (optional) lists images already produced this session;
+   * when provided for an active plan it is rendered as an "already-generated assets"
+   * section so the model generates only what's missing instead of regenerating from
+   * scratch after a run timeout.
    */
-  public static buildWorkPlanContextMessages(workPlan?: any): any[] {
+  public static buildWorkPlanContextMessages(workPlan?: any, generatedImageFilenames?: string[]): any[] {
     if (!workPlan || !Array.isArray(workPlan.steps) || workPlan.steps.length === 0) {
       return [];
     }
@@ -3331,9 +3336,30 @@ export class AgentModeService {
 
     workPlanContent += `You MUST continue working with this existing plan. DO NOT create a new work plan. Use modify_work_plan if you need to add or change steps.\n\n`;
 
+    // Explicit progression rule. Without this, non-autocomplete plans gave the model
+    // no instruction on when to advance, so a step could sit pending indefinitely
+    // (the model would re-ask or regenerate instead of calling set_work_plan_status).
+    workPlanContent += `⚠️ STEP PROGRESSION: Work through steps in order. After you finish the work for the current pending step, call set_work_plan_status to mark it completed, then move to the next step. Do NOT re-do or restart a step whose work is already finished. If you are waiting on the user to approve before completing a step, complete it as soon as they approve.\n\n`;
+
+    // Batched / multi-intent guidance. A single user message may stack several
+    // instructions (e.g. "keep 3 per hook / restart / generate the report / proceed").
+    // Tell the model to resolve them in plan order rather than stalling on the conflict.
+    workPlanContent += `⚠️ HANDLING MESSAGES WITH MULTIPLE INSTRUCTIONS: If a single user message bundles several stacked or seemingly conflicting instructions, do NOT stall or ask which one to do first. Briefly acknowledge what you understood, then act on them in work-plan order: finish the current step's remaining work first, then proceed to the next step. Only ask a clarifying question if an instruction is genuinely impossible to interpret.\n\n`;
+
     // If autocomplete is enabled, add instruction to auto-complete steps
     if (workPlan.autocomplete) {
       workPlanContent += `⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.\n\n`;
+    }
+
+    // Asset-awareness: list images already generated this session so the model
+    // generates only what's still missing instead of regenerating from scratch
+    // after a run timeout (the expensive, non-converging loop this fixes).
+    if (Array.isArray(generatedImageFilenames) && generatedImageFilenames.length > 0) {
+      workPlanContent += `⚠️ ALREADY-GENERATED ASSETS (${generatedImageFilenames.length}): these images already exist in this session and are saved — DO NOT regenerate them. Only generate the images that are still missing.\n`;
+      for (const filename of generatedImageFilenames) {
+        workPlanContent += `   - ${filename}\n`;
+      }
+      workPlanContent += `\n`;
     }
 
     workPlan.steps.forEach((step: any) => {
@@ -3359,6 +3385,34 @@ export class AgentModeService {
     });
 
     return [{ role: 'assistant', content: workPlanContent.trim() }];
+  }
+
+  /**
+   * Extract the filenames of images already generated in this session by scanning
+   * the "Image generated: <filename>" system messages that generateImage persists
+   * (see generateImage -> addMessageToSession). De-duplicated, order-preserving.
+   *
+   * Used to make the work-plan context asset-aware: when a long image-generation
+   * step (e.g. "generate 18 images") outlives the run timeout and the user nudges
+   * the agent to continue, the model would otherwise re-render the still-pending
+   * step with no memory of what it already produced and regenerate everything from
+   * scratch — an expensive, non-converging loop. Surfacing the existing filenames
+   * lets the model generate only what's missing and then advance the step.
+   */
+  public static extractGeneratedImageFilenames(sessionHistory?: any[]): string[] {
+    if (!Array.isArray(sessionHistory)) return [];
+    const seen = new Set<string>();
+    const filenames: string[] = [];
+    for (const msg of sessionHistory) {
+      if (!msg || msg.role !== 'system' || typeof msg.content !== 'string') continue;
+      const match = msg.content.match(/^Image generated:\s*(.+?)\s*$/);
+      if (!match) continue;
+      const filename = match[1].trim();
+      if (!filename || seen.has(filename)) continue;
+      seen.add(filename);
+      filenames.push(filename);
+    }
+    return filenames;
   }
 
   private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string): any[] {
@@ -3517,9 +3571,13 @@ export class AgentModeService {
     }
     messages.push({ role: 'assistant', content: statusesContent });
 
-    // Insert work plan status as an assistant message if exists
+    // Insert work plan status as an assistant message if exists. Pass the set of
+    // images already generated this session (scanned from full history, not the
+    // 10-message window) so a still-pending image step doesn't trigger a
+    // regenerate-from-scratch loop after a run timeout.
     if (workPlan) {
-      messages.push(...AgentModeService.buildWorkPlanContextMessages(workPlan));
+      const generatedImageFilenames = AgentModeService.extractGeneratedImageFilenames(sessionHistory);
+      messages.push(...AgentModeService.buildWorkPlanContextMessages(workPlan, generatedImageFilenames));
     }
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)
