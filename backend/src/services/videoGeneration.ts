@@ -43,6 +43,12 @@ const SEEDANCE_MIN_DURATION = 4;
 const SEEDANCE_MAX_DURATION = 15;
 const DEFAULT_VIDEO_MODEL = "seedance-2.0";
 
+// Keep the whole video job safely under the agent-mode generation cap
+// (AGENT_MODE_GENERATION_TIMEOUT_MS, default 600s). If Seedance can't finish within
+// this budget we fail fast → Veo fallback, rather than stalling the agent turn until
+// the app-level 10-min timeout fires (which orphans the generation).
+const SEEDANCE_POLL_BUDGET_MS = parseInt(process.env.SEEDANCE_POLL_BUDGET_MS || "480000", 10); // 8 min
+
 // Lazy singleton MCP client for backend tool calls (createTransport attaches the
 // OAuth authProvider + auto-refresh for the "higgsfield" server automatically).
 let mcpClientSingleton: McpClientService | null = null;
@@ -618,14 +624,21 @@ export class VideoService {
 
         // Poll job_status until terminal. completed = done; failed/canceled/nsfw =
         // terminal failure; ip_detected = gated (treated as failure → Veo fallback).
-        const maxPollAttempts = 120; // ~20 min cap with 10s default backoff
+        // Bounded by a wall-clock budget that stays under the agent-mode cap.
+        const maxPollAttempts = 240; // safety cap; the real bound is the time budget
         const failStates = new Set(["failed", "canceled", "nsfw"]);
+        const deadline = Date.now() + SEEDANCE_POLL_BUDGET_MS;
         let status = (submitGen?.status || "").toString().toLowerCase();
         let resultUrl: string | undefined = extractVideoUrl(submitGen);
         let backoffMs = 10000;
+        let timedOut = false;
 
         for (let attempt = 0; attempt < maxPollAttempts; attempt++) {
           if (status === "completed" || status === "ip_detected" || failStates.has(status)) break;
+          if (Date.now() >= deadline) {
+            timedOut = true;
+            break;
+          }
           await new Promise((resolve) => setTimeout(resolve, backoffMs));
           const statusRaw = await callTool("job_status", { job_id: jobId, id: jobId }, { timeoutMs: 60000 });
           const statusSc = parseMcpResult(statusRaw);
@@ -636,6 +649,13 @@ export class VideoService {
           if (typeof statusSc?.poll_after_seconds === "number" && statusSc.poll_after_seconds > 0) {
             backoffMs = Math.max(2000, Math.min(30000, statusSc.poll_after_seconds * 1000));
           }
+        }
+
+        if (timedOut && status !== "completed") {
+          return {
+            ok: false as const,
+            error: `Seedance generation exceeded the ${Math.round(SEEDANCE_POLL_BUDGET_MS / 1000)}s budget`,
+          };
         }
 
         if (failStates.has(status)) {

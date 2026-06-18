@@ -1298,8 +1298,32 @@ export class McpClientService {
       );
       await Promise.race([connectPromise, timeoutPromise]);
 
-      const callTool = (toolName: string, args: Record<string, any>, opts?: { timeoutMs?: number }) =>
-        client.callTool({ name: toolName, arguments: args }, undefined, { timeout: opts?.timeoutMs ?? 3600000 });
+      // Hard-abort wrapper: a half-aborted streamable-HTTP stream can leave the
+      // SDK's callTool pending past its own `timeout`, hanging until the caller's
+      // app-level cap. We race against our own timer that both aborts the request
+      // (via signal) AND rejects, so a dead/aborted stream fails deterministically.
+      const callTool = async (toolName: string, args: Record<string, any>, opts?: { timeoutMs?: number }) => {
+        const timeoutMs = opts?.timeoutMs ?? 3600000;
+        const controller = new AbortController();
+        let timer: NodeJS.Timeout | undefined;
+        const hardTimeout = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new Error(`MCP tool '${toolName}' on '${serverName}' timed out after ${timeoutMs}ms`));
+          }, timeoutMs);
+        });
+        try {
+          return await Promise.race([
+            client.callTool({ name: toolName, arguments: args }, undefined, {
+              timeout: timeoutMs,
+              signal: controller.signal,
+            }),
+            hardTimeout,
+          ]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      };
 
       return await fn(callTool);
     } finally {
