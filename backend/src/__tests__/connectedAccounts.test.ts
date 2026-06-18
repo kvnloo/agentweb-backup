@@ -2,9 +2,18 @@ import request from 'supertest';
 import express from 'express';
 import connectedAccountsRouter from '../routes/connectedAccounts';
 import * as connectedAccountsDb from '../services/connectedAccountsDb';
+import { userDb, orgDb } from '../services/db';
 
 // Mock dependencies
 jest.mock('../services/connectedAccountsDb');
+jest.mock('../services/db', () => ({
+    userDb: {
+        getUserById: jest.fn(),
+    },
+    orgDb: {
+        getOrgById: jest.fn(),
+    },
+}));
 jest.mock('../middleware/auth', () => ({
     authenticateToken: (req: any, res: any, next: any) => {
         req.user = { userId: 'test_user_id' };
@@ -38,6 +47,8 @@ app.use('/api/oauth', connectedAccountsRouter);
 describe('Connected Accounts Routes', () => {
     beforeEach(() => {
         jest.clearAllMocks();
+        (userDb.getUserById as jest.Mock).mockResolvedValue(null);
+        (orgDb.getOrgById as jest.Mock).mockResolvedValue(null);
     });
 
     describe('GET /connected-accounts', () => {
@@ -420,6 +431,32 @@ describe('Connected Accounts Routes', () => {
 
             const response = await request(app).delete('/api/oauth/connected-accounts/gmail/user@gmail.com');
             expect(response.status).toBe(500);
+        });
+
+        it('blocks a non-owner org member from disconnecting an org-shared business ad account', async () => {
+            (connectedAccountsDb.deleteAccountById as jest.Mock).mockResolvedValue(undefined);
+            (userDb.getUserById as jest.Mock).mockResolvedValue({
+                userId: 'test_user_id',
+                orgId: 'org-1',
+                orgRole: 'member',
+                connected_accounts: [{
+                    platform: 'google_ads',
+                    account_id: '1234567890',
+                    account_name: 'Agency Google Ads',
+                    sharedWithOrg: true,
+                    config: { account_type: 'ad_account' },
+                }],
+            });
+            (orgDb.getOrgById as jest.Mock).mockResolvedValue({
+                orgId: 'org-1',
+                ownerUserId: 'owner-user-id',
+            });
+
+            const response = await request(app).delete('/api/oauth/connected-accounts/google_ads/1234567890');
+
+            expect(response.status).toBe(403);
+            expect(response.body.error).toContain('Only the org owner');
+            expect(connectedAccountsDb.deleteAccountById).not.toHaveBeenCalled();
         });
     });
 

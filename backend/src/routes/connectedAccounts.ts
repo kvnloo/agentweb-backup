@@ -5,8 +5,37 @@ import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { FathomApiService } from '../services/fathomApiService';
 import { getAllowedConnectedAccounts } from '../services/subscriptionService';
+import { userDb, orgDb } from '../services/db';
 
 const router = express.Router();
+
+async function canCallerDisconnectAccount(userId: string, platform: string, accountId?: string): Promise<{ allowed: boolean; error?: string }> {
+  const user = await userDb.getUserById(userId);
+  if (!user?.orgId) {
+    return { allowed: true };
+  }
+
+  const matchingAccounts = (user.connected_accounts || []).filter((account: any) => {
+    if (account.platform !== platform) return false;
+    return accountId ? account.account_id === accountId : true;
+  });
+
+  const hasOrgSharedAccount = matchingAccounts.some((account: any) => account.sharedWithOrg === true);
+  if (!hasOrgSharedAccount) {
+    return { allowed: true };
+  }
+
+  const org = await orgDb.getOrgById(user.orgId);
+  const isOrgOwner = org?.ownerUserId === userId || user.orgRole === 'owner';
+  if (isOrgOwner) {
+    return { allowed: true };
+  }
+
+  return {
+    allowed: false,
+    error: 'Only the org owner can disconnect an org-shared connected account. Unshare it from the organization first.',
+  };
+}
 
 // ============================================
 // Connected Accounts Management
@@ -141,6 +170,11 @@ router.delete('/connected-accounts/:platform', authenticateToken, async (req: an
   const { platform } = req.params;
 
   try {
+    const disconnectGuard = await canCallerDisconnectAccount(userId, platform);
+    if (!disconnectGuard.allowed) {
+      return res.status(403).json({ error: disconnectGuard.error });
+    }
+
     await deleteAccount(userId, platform);
     res.json({ success: true, message: `${platform} account(s) disconnected` });
   } catch (error) {
@@ -155,6 +189,11 @@ router.delete('/connected-accounts/:platform/:accountId', authenticateToken, asy
   const { platform, accountId } = req.params;
 
   try {
+    const disconnectGuard = await canCallerDisconnectAccount(userId, platform, accountId);
+    if (!disconnectGuard.allowed) {
+      return res.status(403).json({ error: disconnectGuard.error });
+    }
+
     // For LinkedIn Outreach accounts, also delete from Unipile so the
     // connection is fully revoked — not just removed from our DB.
     if (platform === 'unipile') {
