@@ -210,7 +210,16 @@ export class GoogleAdsService {
         const c = results[0].customer;
         const id = String(c.id);
         if (c.manager === true) {
-          const children = await this.listManagerLeaves(id, accessToken);
+          // A failure enumerating a manager's children must NOT drop the whole manager —
+          // otherwise an MCC-only user (whose accounts are all under one manager) is shown a
+          // fake "no accounts" state. Surface the manager with whatever resolved (possibly no
+          // children) and log the gap so a transient/partial failure is diagnosable.
+          let children: GoogleAdLeaf[] = [];
+          try {
+            children = await this.listManagerLeaves(id, accessToken);
+          } catch (err: any) {
+            console.warn(`[GoogleAds] listAccountHierarchy: could not load child accounts for manager ${id}:`, err?.message || err);
+          }
           children.forEach(ch => managedLeafIds.add(ch.customerId));
           managers.push({ customerId: id, name: c.descriptiveName || customerId, children });
         } else {
@@ -221,8 +230,9 @@ export class GoogleAdsService {
             loginCustomerId: id,
           });
         }
-      } catch {
-        // Skip accounts we can't query
+      } catch (err: any) {
+        // Couldn't even identify this account — skip it, but log so the drop isn't silent.
+        console.warn(`[GoogleAds] listAccountHierarchy: skipping customer ${customerId} (probe failed):`, err?.message || err);
       }
     }
 
