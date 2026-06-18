@@ -8,7 +8,7 @@ import { settingsService } from "../../services/settingsService";
 import { userDb } from "../../services/db";
 import { decryptPassword } from "../../utils/crypto";
 import { internalMcpServers } from "./mcp_config";
-import { McpOAuthClientProvider } from "./mcpOAuthClientProvider";
+import { McpOAuthClientProvider, getServerConfig } from "./mcpOAuthClientProvider";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -1215,6 +1215,47 @@ export class McpClientService {
     }
 
     return discoveredCount;
+  }
+
+  /**
+   * Call a single tool on a named, already-registered MCP server (e.g. an OAuth
+   * server like "higgsfield"). Creates a one-off client/transport — for
+   * authType:'oauth' servers the OAuth authProvider + auto-refresh are attached
+   * automatically by createTransport. Not session-pooled; intended for backend
+   * service calls (e.g. video generation), not agent tool routing.
+   */
+  public async callToolDirect(
+    serverName: string,
+    toolName: string,
+    args: Record<string, any>,
+    options?: { timeoutMs?: number }
+  ): Promise<any> {
+    const config = await getServerConfig(serverName);
+    if (!config) {
+      throw new Error(`MCP server not found: ${serverName}`);
+    }
+
+    const transport = await this.createTransport(serverName, config as any);
+    const client = new Client(
+      { name: "AgentWeb-Backend", version: "1.0.0" },
+      { capabilities: {} }
+    );
+
+    try {
+      const connectPromise = client.connect(transport);
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("MCP connection timeout")), 60000)
+      );
+      await Promise.race([connectPromise, timeoutPromise]);
+
+      return await client.callTool(
+        { name: toolName, arguments: args },
+        undefined,
+        { timeout: options?.timeoutMs ?? 3600000 }
+      );
+    } finally {
+      await client.close().catch(() => {});
+    }
   }
 
   /**

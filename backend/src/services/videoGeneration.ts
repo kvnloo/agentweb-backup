@@ -3,6 +3,7 @@ import { getSecret } from "../utils/secretsManager";
 import { uploadFileToS3 } from "../utils/s3Utils";
 import { remotionService, RemotionComposeParams } from "./remotionService";
 import { imageService } from "./imageGeneration";
+import { McpClientService } from "../mcp/client/mcpClientService";
 
 interface VideoGenerationResult {
   success: boolean;
@@ -22,22 +23,74 @@ const SUPPORTED_MODELS = [
 
 type SupportedModel = typeof SUPPORTED_MODELS[number];
 
-// Higgsfield platform base URL for video generation
-const HIGGSFIELD_BASE_URL = "https://platform.higgsfield.ai";
+// Seedance 2.0 is served only through Higgsfield's hosted MCP server (registered in
+// the admin MCP Servers tab as "higgsfield", OAuth). The name is overridable via env.
+const HIGGSFIELD_MCP_SERVER = process.env.HIGGSFIELD_MCP_SERVER_NAME || "higgsfield";
 
-/**
- * Maps our internal video model identifiers to Higgsfield platform model paths.
- * Higgsfield's path convention is `bytedance/seedance/v{N}/pro/image-to-video`.
- * NOTE: The exact path for Seedance 2.0 is unverified against a live API key (Higgsfield
- * auth runs before routing, so endpoint probing can't confirm it). Update this single
- * constant if Higgsfield exposes a different identifier.
- */
-const HIGGSFIELD_MODEL_PATHS: Record<string, string> = {
-  "seedance-2.0": "bytedance/seedance/v2/pro/image-to-video",
+// Maps our internal model id → the Higgsfield MCP catalog id (from models_explore).
+const HIGGSFIELD_MODEL_IDS: Record<string, string> = {
+  "seedance-2.0": "seedance_2_0",
 };
 
 const isHiggsfieldModel = (model: string): boolean =>
-  Object.prototype.hasOwnProperty.call(HIGGSFIELD_MODEL_PATHS, model);
+  Object.prototype.hasOwnProperty.call(HIGGSFIELD_MODEL_IDS, model);
+
+// Seedance 2.0 capability sets (confirmed via models_explore). The UI dropdowns and
+// backend validation both source these so they can't drift.
+export const SEEDANCE_RESOLUTIONS = ["480p", "720p", "1080p"] as const;
+export const SEEDANCE_ASPECT_RATIOS = ["auto", "16:9", "9:16", "1:1", "4:3", "3:4", "21:9"] as const;
+const SEEDANCE_MIN_DURATION = 4;
+const SEEDANCE_MAX_DURATION = 15;
+const DEFAULT_VIDEO_MODEL = "seedance-2.0";
+
+// Lazy singleton MCP client for backend tool calls (createTransport attaches the
+// OAuth authProvider + auto-refresh for the "higgsfield" server automatically).
+let mcpClientSingleton: McpClientService | null = null;
+const getMcpClient = (): McpClientService => {
+  if (!mcpClientSingleton) mcpClientSingleton = new McpClientService();
+  return mcpClientSingleton;
+};
+
+// Extract the JSON payload from an MCP tool result (prefers structuredContent,
+// falls back to parsing the first text content block).
+const parseMcpResult = (result: any): any => {
+  if (!result) return undefined;
+  if (result.structuredContent !== undefined) return result.structuredContent;
+  const text = Array.isArray(result.content)
+    ? result.content.find((c: any) => c?.type === "text")?.text
+    : undefined;
+  if (typeof text === "string") {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { text };
+    }
+  }
+  return undefined;
+};
+
+// Pull the single "generation" object from a Higgsfield tool result. The success
+// wrapper differs by tool (confirmed via outputSchema):
+//   generate_video / job_display → structuredContent.results (ARRAY) → take [0]
+//   job_status                   → structuredContent.generation (single OBJECT)
+const extractGeneration = (result: any): any => {
+  const sc = parseMcpResult(result);
+  if (!sc || typeof sc !== "object") return undefined;
+  if (Array.isArray(sc.results)) return sc.results[0];
+  if (sc.generation) return sc.generation;
+  return undefined;
+};
+
+// The finished video URL lives on the generation's inner `results` object.
+// rawUrl is the full-res file (confirmed primary); minUrl/thumbnailUrl are fallbacks.
+const extractVideoUrl = (generation: any): string | undefined => {
+  const r = generation?.results;
+  if (!r || typeof r !== "object") return undefined;
+  return r.rawUrl || r.minUrl || r.thumbnailUrl;
+};
+
+const clampDuration = (seconds: number): number =>
+  Math.max(SEEDANCE_MIN_DURATION, Math.min(SEEDANCE_MAX_DURATION, Math.round(seconds)));
 
 interface VideoGenerationParams {
   prompt: string;
@@ -58,6 +111,10 @@ interface VideoGenerationParams {
   compose?: boolean;
   /** Brand overlay params — required when compose is true */
   composeParams?: Omit<RemotionComposeParams, "clipUrl" | "filename" | "userId">;
+  /** Seedance aspect ratio (one of SEEDANCE_ASPECT_RATIOS). Defaults to "auto". */
+  aspectRatio?: string;
+  /** Seedance output resolution (one of SEEDANCE_RESOLUTIONS). Defaults to "720p". */
+  resolution?: string;
 }
 
 export class VideoService {
@@ -71,14 +128,8 @@ export class VideoService {
   private async getApiKey(model: string): Promise<string> {
     try {
       let secretName: string;
-      
-      if (isHiggsfieldModel(model)) {
-        // Higgsfield platform (Seedance, etc.). The secret stores the credential pair
-        // in Higgsfield's "key:secret" format used directly in the Authorization header.
-        secretName = process.env.NODE_ENV === "development"
-          ? "dev/AgentWeb/Higgsfield/Video"
-          : "prod/AgentWeb/Higgsfield/Video";
-      } else if (model === "veo-3.1-generate-preview" || model === "veo-3.1-fast-generate-preview") {
+
+      if (model === "veo-3.1-generate-preview" || model === "veo-3.1-fast-generate-preview") {
         // Google Veo (both standard and fast models use the same API key)
         secretName = process.env.NODE_ENV === "development"
           ? "dev/AgentWeb/Google/Video"
@@ -511,120 +562,148 @@ export class VideoService {
     params: VideoGenerationParams
   ): Promise<VideoGenerationResult> {
     try {
-      const model = params.videoModel || "seedance-2.0";
-      const modelPath = HIGGSFIELD_MODEL_PATHS[model];
-      if (!modelPath) {
-        return { success: false, error: `No Higgsfield model path configured for '${model}'` };
+      const model = params.videoModel || DEFAULT_VIDEO_MODEL;
+      const modelId = HIGGSFIELD_MODEL_IDS[model];
+      if (!modelId) {
+        return { success: false, error: `No Higgsfield MCP model id configured for '${model}'` };
       }
 
-      // Credential is stored as Higgsfield's "key:secret" pair, used directly in the header.
-      const apiCredential = await this.getApiKey(model);
-      const authHeader = `Key ${apiCredential}`;
+      const mcp = getMcpClient();
 
-      // Seedance is image-to-video — ensure we have a source image.
-      let imageUrl = params.startFrame;
-      if (!imageUrl) {
-        console.log("VideoService: No startFrame for Higgsfield model; generating a first frame from the prompt");
-        const filenameBase = params.filename.replace(/\.mp4$/i, "");
-        const frameResult = await imageService.generateImage({
-          prompt: `Opening frame of a video scene: ${params.prompt}. Cinematic still frame, 16:9 aspect ratio, photorealistic.`,
-          filename: `${filenameBase}_frame.png`,
-          size: "16:9",
-          userId: params.userId,
-        });
-        if (!frameResult.success || !frameResult.imageUrl) {
-          return {
-            success: false,
-            error: `Failed to generate a source frame for Higgsfield video: ${frameResult.error || "unknown error"}`,
-          };
-        }
-        imageUrl = frameResult.imageUrl;
-      }
+      // Build the generate_video params (all args nest under a single `params` object;
+      // only `model` is required). Resolution/aspect ratio come from the user; defaults
+      // match Seedance's own (720p / auto) when unset.
+      const resolution = SEEDANCE_RESOLUTIONS.includes(params.resolution as any)
+        ? (params.resolution as string)
+        : "720p";
+      const aspectRatio = SEEDANCE_ASPECT_RATIOS.includes(params.aspectRatio as any)
+        ? (params.aspectRatio as string)
+        : "auto";
 
-      // Submit the generation request.
-      const requestBody: Record<string, any> = {
-        image_url: imageUrl,
+      const seedanceParams: Record<string, any> = {
+        model: modelId,
         prompt: params.prompt,
+        duration: clampDuration(params.durationSeconds ?? 8),
+        resolution,
+        aspect_ratio: aspectRatio,
       };
-      if (params.durationSeconds) {
-        requestBody.duration = Math.round(params.durationSeconds);
+
+      // Image-to-video: register start/end frames with Higgsfield (URL import is
+      // single-step → returns a ready media_id) and pass them as medias references.
+      // `medias[].value` must be a media_id, never a raw URL.
+      const medias: Array<{ value: string; role: string }> = [];
+      if (params.startFrame) {
+        medias.push({ value: await this.importHiggsfieldMedia(params.startFrame), role: "start_image" });
+      }
+      if (params.endFrame) {
+        medias.push({ value: await this.importHiggsfieldMedia(params.endFrame), role: "end_image" });
+      }
+      if (medias.length) {
+        seedanceParams.medias = medias;
       }
 
-      const submitResponse = await axios.post(
-        `${HIGGSFIELD_BASE_URL}/${modelPath}`,
-        requestBody,
-        {
-          headers: {
-            Authorization: authHeader,
-            "Content-Type": "application/json",
-            Accept: "application/json",
-          },
-          timeout: 60000,
-        }
+      // Submit — returns a job id (async). 2-minute timeout for the submit itself.
+      const submitRaw = await mcp.callToolDirect(
+        HIGGSFIELD_MCP_SERVER,
+        "generate_video",
+        { params: seedanceParams },
+        { timeoutMs: 120000 }
       );
+      // The job id is `generation.id` (same key in every tool's payload).
+      const submitGen = extractGeneration(submitRaw);
+      const jobId = submitGen?.id;
+      if (!jobId) {
+        console.error("Seedance generate_video returned no job id; raw:", JSON.stringify(submitRaw)?.slice(0, 2000));
+        return { success: false, error: "Seedance did not return a job id (check credits/auth)" };
+      }
 
-      const submitData: any = submitResponse.data;
-      let statusUrl: string | undefined = submitData?.status_url;
-      let status: string | undefined = submitData?.status;
-      let videoNode: any = submitData?.video;
+      // Poll job_status until terminal. completed = done; failed/canceled/nsfw =
+      // terminal failure; ip_detected = gated (treated as failure → Veo fallback).
+      const maxPollAttempts = 120; // ~20 min cap with 10s default backoff
+      const failStates = new Set(["failed", "canceled", "nsfw"]);
+      let status = (submitGen?.status || "").toString().toLowerCase();
+      let resultUrl: string | undefined = extractVideoUrl(submitGen);
+      let backoffMs = 10000;
 
-      if (!statusUrl && !videoNode) {
+      for (let attempt = 0; attempt < maxPollAttempts; attempt++) {
+        if (status === "completed" || status === "ip_detected" || failStates.has(status)) break;
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        const statusRaw = await mcp.callToolDirect(
+          HIGGSFIELD_MCP_SERVER,
+          "job_status",
+          { job_id: jobId, id: jobId },
+          { timeoutMs: 60000 }
+        );
+        const statusSc = parseMcpResult(statusRaw);
+        const gen = extractGeneration(statusRaw);
+        status = (gen?.status || "").toString().toLowerCase();
+        resultUrl = extractVideoUrl(gen) || resultUrl;
+        // Respect server-provided backoff (poll_after_seconds), clamped to 2–30s.
+        if (typeof statusSc?.poll_after_seconds === "number" && statusSc.poll_after_seconds > 0) {
+          backoffMs = Math.max(2000, Math.min(30000, statusSc.poll_after_seconds * 1000));
+        }
+      }
+
+      if (failStates.has(status)) {
         return {
           success: false,
-          error: `Higgsfield did not return a status_url or video (status: ${status ?? "unknown"})`,
+          error:
+            status === "nsfw"
+              ? "Video generation was blocked by content policies (NSFW)"
+              : "Seedance video generation failed",
         };
       }
-
-      // Poll the status endpoint until a terminal state is reached.
-      const maxPollAttempts = 120; // 20 minutes max (120 * 10s)
-      let pollAttempts = 0;
-      const terminalStates = new Set(["completed", "failed", "nsfw"]);
-
-      while (statusUrl && !terminalStates.has(status || "") && pollAttempts < maxPollAttempts) {
-        await new Promise((resolve) => setTimeout(resolve, 10000)); // 10s
-        console.log(`Waiting for Higgsfield video... (attempt ${pollAttempts + 1}/${maxPollAttempts})`);
-
-        const statusResponse = await axios.get(statusUrl, {
-          headers: { Authorization: authHeader, Accept: "application/json" },
-          timeout: 60000,
-        });
-        const statusData: any = statusResponse.data;
-        status = statusData?.status;
-        videoNode = statusData?.video ?? videoNode;
-        pollAttempts++;
+      if (status === "ip_detected") {
+        return { success: false, error: "Seedance generation is gated by IP detection and needs manual review" };
       }
 
-      if (status === "failed") {
-        return { success: false, error: `Higgsfield video generation failed` };
-      }
-      if (status === "nsfw") {
-        return { success: false, error: `Video generation was blocked by content policies (NSFW)` };
-      }
-      if (status !== "completed" && !videoNode?.url) {
-        return { success: false, error: "Higgsfield video generation timed out after 20 minutes" };
+      // Pull the final URL via job_display if job_status didn't include it.
+      if (!resultUrl) {
+        const displayRaw = await mcp.callToolDirect(
+          HIGGSFIELD_MCP_SERVER,
+          "job_display",
+          { job_id: jobId, id: jobId },
+          { timeoutMs: 60000 }
+        );
+        resultUrl = extractVideoUrl(extractGeneration(displayRaw));
       }
 
-      const resultVideoUrl: string | undefined = videoNode?.url;
-      if (!resultVideoUrl) {
-        return { success: false, error: "Higgsfield reported completion but returned no video URL" };
+      if (!resultUrl) {
+        return { success: false, error: "Seedance generation did not return a video URL (or timed out)" };
       }
 
       // Download the hosted video and re-upload to our S3 bucket.
-      const uploadResult = await this.downloadUrlAndUploadVideo(
-        resultVideoUrl,
-        params.filename,
-        params.userId
-      );
+      const uploadResult = await this.downloadUrlAndUploadVideo(resultUrl, params.filename, params.userId);
       if (!uploadResult.success || !uploadResult.url) {
         return { success: false, error: uploadResult.error || "Failed to upload video to S3" };
       }
 
       return { success: true, videoUrl: uploadResult.url, filename: params.filename };
     } catch (error: any) {
-      const detail = error.response?.data?.detail || error.response?.data || error.message;
-      console.error("❌ Error generating video with Higgsfield:", detail);
-      return { success: false, error: `Higgsfield video generation failed: ${typeof detail === "string" ? detail : JSON.stringify(detail)}` };
+      const detail = error?.message || String(error);
+      console.error("❌ Error generating video with Seedance (Higgsfield MCP):", detail);
+      // Surface auth/credit problems clearly so the Veo fallback can engage.
+      return { success: false, error: `Seedance (Higgsfield MCP) failed: ${detail}` };
     }
+  }
+
+  /**
+   * Import an image URL into Higgsfield via the MCP `media_import_url` tool.
+   * URL import is single-step (no media_confirm needed) and returns a ready media_id.
+   */
+  private async importHiggsfieldMedia(url: string): Promise<string> {
+    const raw = await getMcpClient().callToolDirect(
+      HIGGSFIELD_MCP_SERVER,
+      "media_import_url",
+      { url, type: "image" },
+      { timeoutMs: 120000 }
+    );
+    const data = parseMcpResult(raw);
+    const mediaId = data?.media_id || data?.id;
+    if (!mediaId) {
+      throw new Error("media_import_url did not return a media_id");
+    }
+    return mediaId;
   }
 
   /**
@@ -694,10 +773,11 @@ export class VideoService {
     params: VideoGenerationParams
   ): Promise<VideoGenerationResult> {
     try {
-      // Determine which model to use before validation
-      // If model not defined, use veo-3.1-generate-preview as default
+      // Determine which model to use before validation.
+      // Seedance 2.0 is the default for all video generation; Veo 3.1 is an
+      // automatic fallback if Seedance fails (see the generation branch below).
       if (!params.videoModel) {
-        params.videoModel = "veo-3.1-generate-preview";
+        params.videoModel = DEFAULT_VIDEO_MODEL;
       }
       
       // Validate the provided model
@@ -757,10 +837,18 @@ export class VideoService {
         let clipUrls: string[] = [];
 
         if (isHiggsfieldModel(modelToUse)) {
-          // Higgsfield (Seedance) generates a single clip per request and handles its own
-          // duration; multi-clip Veo composition does not apply here.
+          // Seedance (Higgsfield MCP) generates a single clip per request and handles its
+          // own duration; multi-clip Veo composition does not apply here.
           result = await this.generateWithHiggsfield({ ...params, durationSeconds: requestedDuration });
-          if (result.success && result.videoUrl) {
+          if (!result.success) {
+            // Automatic fallback: if Seedance fails (auth/credits/job error/timeout),
+            // regenerate with Veo 3.1 so video generation still succeeds.
+            console.warn(
+              `VideoService: Seedance generation failed (${result.error}); falling back to Veo 3.1`
+            );
+            return await this.generateVideo({ ...params, videoModel: "veo-3.1-generate-preview" });
+          }
+          if (result.videoUrl) {
             clipUrls = [result.videoUrl];
           }
         } else if (modelToUse === "veo-3.1-generate-preview") {
