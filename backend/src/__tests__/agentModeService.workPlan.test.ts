@@ -818,7 +818,10 @@ describe('AgentModeService - Work Plan', () => {
 
       expect(workPlanMessage).toBeDefined();
       expect(workPlanMessage.content).not.toContain('AUTOCOMPLETE MODE');
-      expect(workPlanMessage.content).not.toContain('set_work_plan_status');
+      // Step-progression guidance (which mentions set_work_plan_status) is added for
+      // ALL active plans regardless of autocomplete — only the AUTOCOMPLETE MODE block
+      // is gated. Assert that the autocomplete-specific phrasing is what's absent.
+      expect(workPlanMessage.content).not.toContain('DO NOT ask the user whether you should complete the step');
     });
 
     it('should not include autocomplete instruction when autocomplete is undefined', () => {
@@ -845,7 +848,9 @@ describe('AgentModeService - Work Plan', () => {
 
       expect(workPlanMessage).toBeDefined();
       expect(workPlanMessage.content).not.toContain('AUTOCOMPLETE MODE');
-      expect(workPlanMessage.content).not.toContain('set_work_plan_status');
+      // See note above: step-progression guidance is intentionally present for active
+      // plans; only the autocomplete-specific instruction must be absent here.
+      expect(workPlanMessage.content).not.toContain('DO NOT ask the user whether you should complete the step');
     });
   });
 
