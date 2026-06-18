@@ -151,7 +151,7 @@ export const INTEGRATION_CONFIG = {
       'forms',
       'communication_preferences.read',
       'social',
-      'marketing-email',
+      // 'marketing-email',
     ] as const,
     get marketingScopes() { return [...this.scopes, ...this.marketingOnlyScopes]; },
   },

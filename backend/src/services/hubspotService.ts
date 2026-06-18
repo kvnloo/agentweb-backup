@@ -1331,7 +1331,10 @@ export class HubSpotService {
   }
 
   async getFormSubmissions(formId: string, cursor?: string): Promise<any> {
-    let url = `${HUBSPOT_API_BASE}/marketing/v3/forms/${formId}/submissions?limit=50`;
+    if (!formId?.trim()) throw new Error('formId is required');
+    // Submissions live on the legacy Form Integrations API, NOT the v3 forms API.
+    // `/marketing/v3/forms/{id}/submissions` does not exist → 404.
+    let url = `${HUBSPOT_API_BASE}/form-integrations/v1/submissions/forms/${formId}?limit=50`;
     if (cursor) url += `&after=${encodeURIComponent(cursor)}`;
     const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
     return res.data;

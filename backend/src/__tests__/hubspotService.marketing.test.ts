@@ -337,13 +337,15 @@ describe('getForm', () => {
 });
 
 describe('getFormSubmissions', () => {
-  it('GETs submissions for a form', async () => {
+  it('GETs submissions from the form-integrations endpoint (NOT /marketing/v3/forms/{id}/submissions, which 404s)', async () => {
     const data = { results: [], paging: null };
     mockGet.mockResolvedValue({ data });
     const svc = makeSvc();
     const result = await svc.getFormSubmissions('f1');
     expect(result).toEqual(data);
-    expect(mockGet.mock.calls[0][0]).toContain('f1');
+    const url = mockGet.mock.calls[0][0];
+    expect(url).toContain('/form-integrations/v1/submissions/forms/f1');
+    expect(url).not.toContain('/marketing/v3/forms/f1/submissions');
   });
 
   it('appends cursor when provided', async () => {
@@ -351,6 +353,11 @@ describe('getFormSubmissions', () => {
     const svc = makeSvc();
     await svc.getFormSubmissions('f1', 'cursor-xyz');
     expect(mockGet.mock.calls[0][0]).toContain('cursor-xyz');
+  });
+
+  it('throws if formId is empty', async () => {
+    const svc = makeSvc();
+    await expect(svc.getFormSubmissions('')).rejects.toThrow(/formId/i);
   });
 });
 
