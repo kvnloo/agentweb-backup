@@ -66,12 +66,26 @@ describe("slugifyForSlackChannel", () => {
 describe("provisionOnboardingSlackConnect", () => {
   it("is a no-op when the feature flag is disabled", async () => {
     const { client } = fakeClient();
+    const persisted: any[] = [];
     const res = await provisionOnboardingSlackConnect(baseInput, {
       client,
       enabled: false,
+      persist: async (userId, patch) => {
+        persisted.push({ userId, patch });
+      },
+      now: () => new Date("2026-06-14T00:00:00Z"),
     });
     expect(res.status).toBe("disabled");
     expect(client.conversations.create).not.toHaveBeenCalled();
+    expect(persisted).toEqual([
+      {
+        userId: "user-1",
+        patch: {
+          slackConnectStatus: "disabled",
+          slackConnectAttemptedAt: "2026-06-14T00:00:00.000Z",
+        },
+      },
+    ]);
   });
 
   it("skips when no usable email", async () => {
@@ -85,11 +99,36 @@ describe("provisionOnboardingSlackConnect", () => {
   });
 
   it("skips when no slack client is available", async () => {
+    const persisted: any[] = [];
     const res = await provisionOnboardingSlackConnect(baseInput, {
       client: null as any,
       enabled: true,
+      persist: async (userId, patch) => {
+        persisted.push({ userId, patch });
+      },
+      now: () => new Date("2026-06-14T00:00:00Z"),
     });
     expect(res.status).toBe("skipped");
+    expect(persisted[0]).toEqual({
+      userId: "user-1",
+      patch: {
+        slackConnectStatus: "skipped",
+        slackConnectAttemptedAt: "2026-06-14T00:00:00.000Z",
+        slackConnectInviteEmail: "founder@acme.com",
+        slackConnectError: "no slack client (token missing)",
+      },
+    });
+  });
+
+  it("does not create a duplicate channel when one is already linked", async () => {
+    const { client } = fakeClient();
+    const res = await provisionOnboardingSlackConnect(
+      { ...baseInput, existingChannelId: "CEXISTING" },
+      { client, enabled: true },
+    );
+    expect(res.status).toBe("created");
+    expect(res.channelId).toBe("CEXISTING");
+    expect(client.conversations.create).not.toHaveBeenCalled();
   });
 
   it("happy path: creates channel, invites team, inviteShared, posts, persists", async () => {
@@ -112,7 +151,11 @@ describe("provisionOnboardingSlackConnect", () => {
     expect(calls.inviteShared[0].emails).toEqual(["founder@acme.com"]);
     expect(calls.postMessage.length).toBe(1);
     expect(persisted[0].userId).toBe("user-1");
+    expect(persisted[0].patch.slackConnectStatus).toBe("created");
     expect(persisted[0].patch.slackConnectChannelId).toBe("C123");
+    expect(persisted[0].patch.slackConnectInviteEmail).toBe("founder@acme.com");
+    expect(persisted[0].patch.slackConnectInviteId).toBe("I999");
+    expect(persisted[0].patch.slackConnectError).toBeNull();
   });
 
   it("derives the slug from the email domain when companyName is blank", async () => {
@@ -126,6 +169,7 @@ describe("provisionOnboardingSlackConnect", () => {
   });
 
   it("returns failed when channel creation fails", async () => {
+    const persisted: any[] = [];
     const { client } = fakeClient({
       conversations: {
         create: jest.fn(async () => ({ ok: false, error: "name_taken" })),
@@ -133,9 +177,18 @@ describe("provisionOnboardingSlackConnect", () => {
         inviteShared: jest.fn(),
       },
     });
-    const res = await provisionOnboardingSlackConnect(baseInput, { client, enabled: true });
+    const res = await provisionOnboardingSlackConnect(baseInput, {
+      client,
+      enabled: true,
+      persist: async (userId, patch) => {
+        persisted.push({ userId, patch });
+      },
+      now: () => new Date("2026-06-14T00:00:00Z"),
+    });
     expect(res.status).toBe("failed");
     expect(res.reason).toMatch(/name_taken|create/i);
+    expect(persisted[0].patch.slackConnectStatus).toBe("failed");
+    expect(persisted[0].patch.slackConnectError).toMatch(/name_taken/);
   });
 
   it("returns failed when the Slack Connect invite fails", async () => {

@@ -57,6 +57,8 @@ export interface ProvisionInput {
   companyName?: string;
   /** The account/company email the Connect invite is sent to. */
   companyEmail: string;
+  /** Existing linked Connect channel. When present, provisioning is idempotent. */
+  existingChannelId?: string;
 }
 
 export interface ProvisionDeps {
@@ -113,26 +115,66 @@ export async function provisionOnboardingSlackConnect(
   input: ProvisionInput,
   deps: ProvisionDeps = {},
 ): Promise<SlackConnectResult> {
+  const persist: (userId: string, patch: Record<string, unknown>) => Promise<void> =
+    deps.persist ??
+    (async (userId, patch) => {
+      await userDb.updateUser(userId, patch as any);
+    });
+  const now = deps.now ?? (() => new Date());
+
+  if (input.existingChannelId) {
+    return {
+      status: "created",
+      channelId: input.existingChannelId,
+      reason: "slack connect channel already linked",
+    };
+  }
+
   const enabled = deps.enabled ?? process.env.SLACK_CONNECT_ENABLED === "true";
-  if (!enabled) return { status: "disabled" };
+  if (!enabled) {
+    await persistAttempt(persist, input.userId, {
+      slackConnectStatus: "disabled",
+      slackConnectAttemptedAt: now().toISOString(),
+    });
+    return { status: "disabled" };
+  }
 
   const email = (input.companyEmail || "").trim();
   if (!EMAIL_RE.test(email)) {
+    await persistAttempt(persist, input.userId, {
+      slackConnectStatus: "skipped",
+      slackConnectAttemptedAt: now().toISOString(),
+      slackConnectError: "no usable company email",
+    });
     return { status: "skipped", reason: "no usable company email" };
   }
 
   const slug =
     slugifyForSlackChannel(input.companyName ?? "") || domainSlugFromEmail(email);
-  if (!slug) return { status: "skipped", reason: "could not derive a channel slug" };
+  if (!slug) {
+    await persistAttempt(persist, input.userId, {
+      slackConnectStatus: "skipped",
+      slackConnectAttemptedAt: now().toISOString(),
+      slackConnectInviteEmail: email,
+      slackConnectError: "could not derive a channel slug",
+    });
+    return { status: "skipped", reason: "could not derive a channel slug" };
+  }
 
   const client = deps.client !== undefined ? deps.client : defaultClient();
-  if (!client) return { status: "skipped", reason: "no slack client (token missing)" };
+  if (!client) {
+    await persistAttempt(persist, input.userId, {
+      slackConnectStatus: "skipped",
+      slackConnectAttemptedAt: now().toISOString(),
+      slackConnectInviteEmail: email,
+      slackConnectError: "no slack client (token missing)",
+    });
+    return { status: "skipped", reason: "no slack client (token missing)" };
+  }
 
   const channelName = `${slug}-agentweb`.slice(0, 80);
   const teamUserIds = deps.teamUserIds ?? envTeamUserIds();
-  const persist =
-    deps.persist ?? ((userId, patch) => userDb.updateUser(userId, patch as any));
-  const now = deps.now ?? (() => new Date());
+  const attemptedAt = now().toISOString();
 
   try {
     // 1. Create the private channel.
@@ -142,7 +184,14 @@ export async function provisionOnboardingSlackConnect(
     });
     const channelId = created?.channel?.id;
     if (!created?.ok || !channelId) {
-      return { status: "failed", reason: `create failed: ${created?.error ?? "unknown"}` };
+      const reason = `create failed: ${created?.error ?? "unknown"}`;
+      await persistAttempt(persist, input.userId, {
+        slackConnectStatus: "failed",
+        slackConnectAttemptedAt: attemptedAt,
+        slackConnectInviteEmail: email,
+        slackConnectError: reason,
+      });
+      return { status: "failed", reason };
     }
 
     // 2. Pre-seed the team (non-fatal — a populated channel is nicer but an
@@ -162,10 +211,17 @@ export async function provisionOnboardingSlackConnect(
       emails: [email],
     });
     if (!shared?.ok) {
+      const reason = `inviteShared failed: ${shared?.error ?? "unknown"}`;
+      await persistAttempt(persist, input.userId, {
+        slackConnectStatus: "failed",
+        slackConnectAttemptedAt: attemptedAt,
+        slackConnectInviteEmail: email,
+        slackConnectError: reason,
+      });
       return {
         status: "failed",
         channelId,
-        reason: `inviteShared failed: ${shared?.error ?? "unknown"}`,
+        reason,
       };
     }
 
@@ -182,8 +238,13 @@ export async function provisionOnboardingSlackConnect(
     // 5. Link the channel to the account.
     try {
       await persist(input.userId, {
+        slackConnectStatus: "created",
         slackConnectChannelId: channelId,
         slackConnectInvitedAt: now().toISOString(),
+        slackConnectAttemptedAt: attemptedAt,
+        slackConnectInviteEmail: email,
+        ...(shared.invite_id ? { slackConnectInviteId: shared.invite_id } : {}),
+        slackConnectError: null,
       });
     } catch {
       /* non-fatal — the channel exists even if the stamp write blips */
@@ -191,10 +252,29 @@ export async function provisionOnboardingSlackConnect(
 
     return { status: "created", channelId, inviteId: shared.invite_id };
   } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    await persistAttempt(persist, input.userId, {
+      slackConnectStatus: "failed",
+      slackConnectAttemptedAt: attemptedAt,
+      slackConnectInviteEmail: email,
+      slackConnectError: reason,
+    });
     return {
       status: "failed",
-      reason: err instanceof Error ? err.message : String(err),
+      reason,
     };
+  }
+}
+
+async function persistAttempt(
+  persist: (userId: string, patch: Record<string, unknown>) => Promise<void>,
+  userId: string,
+  patch: Record<string, unknown>,
+): Promise<void> {
+  try {
+    await persist(userId, patch);
+  } catch {
+    /* best-effort: Slack status must not block onboarding */
   }
 }
 
