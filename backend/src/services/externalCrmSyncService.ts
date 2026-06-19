@@ -763,6 +763,33 @@ export class ExternalCrmSyncService {
       .catch((err: any) => console.error(`[ExternalCrmSync] failed to persist push job ${job.jobId}:`, this.formatError(err)));
   }
 
+  // ─── Per-list push serialization ──────────────────────────────────────────────
+
+  /**
+   * In-process per-list lock. Ensures only ONE push operation (full push or
+   * single-lead auto-sync) runs for a given list at a time, so two concurrent
+   * pushes can't both create a deal for the same lead before either has written
+   * its deal id back (the duplicate-deal race). Serializes within this process
+   * only — cross-instance serialization would require a distributed lock.
+   */
+  private listPushLocks = new Map<string, Promise<unknown>>();
+
+  private async withListPushLock<T>(listId: string, fn: () => Promise<T>): Promise<T> {
+    // Wait for any in-progress push on this list to finish before claiming the lock.
+    while (this.listPushLocks.has(listId)) {
+      try { await this.listPushLocks.get(listId); } catch { /* prior push's failure is its own concern */ }
+    }
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    this.listPushLocks.set(listId, held);
+    try {
+      return await fn();
+    } finally {
+      this.listPushLocks.delete(listId);
+      release();
+    }
+  }
+
   /** Core push loop, operating on an already-resolved config. */
   private async runPush(config: ExternalCrmSyncConfig, listId: string, provider: string): Promise<SyncResult> {
     // Attach the human-readable list name so adapters can use it when naming external lists
@@ -771,48 +798,53 @@ export class ExternalCrmSyncService {
       if (list?.name) config.listName = list.name;
     }
 
-    try {
-      await this.syncHubSpotStatusOptions(config, 'push');
-    } catch (err) {
-      console.warn('[ExternalCrmSync] syncHubSpotStatusOptions failed, continuing sync:', (err as Error).message);
-    }
-
-    const auth = this.resolveAuth(config);
-    const adapter = getAdapter(provider);
-
-    const totalResult: SyncResult = { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
-    let lastKey: any = undefined;
-    let hasLeads = false;
-
-    do {
-      const page = await crmDb.getLeadsByListId(listId, 500, lastKey);
-      const chunk = page.items as any[];
-      lastKey = page.lastEvaluatedKey;
-
-      if (chunk.length > 0) {
-        hasLeads = true;
-        const chunkResult = await adapter.pushLeads(auth, chunk, config);
-
-        // Accumulate results
-        totalResult.successCount += chunkResult.successCount;
-        totalResult.newCount += chunkResult.newCount;
-        totalResult.updatedCount += chunkResult.updatedCount;
-        totalResult.errorCount += chunkResult.errorCount;
-        if (chunkResult.errors?.length > 0) {
-          totalResult.errors.push(...chunkResult.errors);
-        }
+    // Serialize all pushes for this list (full push + single-lead auto-sync) so two
+    // concurrent runs can't both create a deal for the same lead before either has
+    // written its deal id back (the duplicate-deal race).
+    return this.withListPushLock(listId, async () => {
+      try {
+        await this.syncHubSpotStatusOptions(config, 'push');
+      } catch (err) {
+        console.warn('[ExternalCrmSync] syncHubSpotStatusOptions failed, continuing sync:', (err as Error).message);
       }
-    } while (lastKey);
 
-    if (!hasLeads) {
-      return { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
-    }
+      const auth = this.resolveAuth(config);
+      const adapter = getAdapter(provider);
 
-    // Persist updated externalPeopleListId if the adapter set it
-    await this.saveUpdatedConfig(config);
-    await this.updateSyncTimestamp(config, 'push', totalResult.errorCount === 0);
+      const totalResult: SyncResult = { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
+      let lastKey: any = undefined;
+      let hasLeads = false;
 
-    return totalResult;
+      do {
+        const page = await crmDb.getLeadsByListId(listId, 500, lastKey);
+        const chunk = page.items as any[];
+        lastKey = page.lastEvaluatedKey;
+
+        if (chunk.length > 0) {
+          hasLeads = true;
+          const chunkResult = await adapter.pushLeads(auth, chunk, config);
+
+          // Accumulate results
+          totalResult.successCount += chunkResult.successCount;
+          totalResult.newCount += chunkResult.newCount;
+          totalResult.updatedCount += chunkResult.updatedCount;
+          totalResult.errorCount += chunkResult.errorCount;
+          if (chunkResult.errors?.length > 0) {
+            totalResult.errors.push(...chunkResult.errors);
+          }
+        }
+      } while (lastKey);
+
+      if (!hasLeads) {
+        return { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
+      }
+
+      // Persist updated externalPeopleListId if the adapter set it
+      await this.saveUpdatedConfig(config);
+      await this.updateSyncTimestamp(config, 'push', totalResult.errorCount === 0);
+
+      return totalResult;
+    });
   }
 
   // ─── Pull: CRM → all leads ────────────────────────────────────────────────────
@@ -907,12 +939,24 @@ export class ExternalCrmSyncService {
       config = await this.getConfig(userId, listId, provider);
       if (!config?.autoSyncEnabled) return;
       if (!config.accountId && !config.apiKeyEncrypted) return;
+      // Capture the non-null config so the narrowing flows into the lock closure
+      // below (the reassignable `config` would widen back to `… | null` inside it).
+      const cfg = config;
 
-      await this.syncHubSpotStatusOptions(config, 'push');
-
-      const auth = this.resolveAuth(config);
+      const auth = this.resolveAuth(cfg);
       const adapter = getAdapter(provider);
-      const result = await adapter.pushLeads(auth, [lead], config);
+      // Serialize with any concurrent push for this list, and re-read the lead
+      // inside the lock so a deal id written by a just-finished push is seen here
+      // (update instead of creating a duplicate deal).
+      const result = await this.withListPushLock(listId, async () => {
+        await this.syncHubSpotStatusOptions(cfg, 'push');
+        // Re-read inside the lock so a deal id written by a just-finished push is
+        // seen here (update instead of creating a duplicate deal). Defensive: a
+        // transient read error shouldn't fail the whole auto-sync — fall back to
+        // the in-hand lead.
+        const fresh = await this.reReadLead(listId, lead);
+        return adapter.pushLeads(auth, [fresh], cfg);
+      });
 
       // The adapter catches per-lead failures (e.g. an invalid email) into
       // result.errors rather than throwing. A real-time auth failure (revoked
@@ -945,6 +989,20 @@ export class ExternalCrmSyncService {
   }
 
   // ─── Private helpers ──────────────────────────────────────────────────────────
+
+  /**
+   * Re-reads a lead by id (used inside the per-list push lock so a deal id a
+   * just-finished push wrote back is visible here). Falls back to the in-hand
+   * lead on any error — a transient read failure shouldn't abort the auto-sync.
+   */
+  private async reReadLead(listId: string, lead: any): Promise<any> {
+    try {
+      const fresh = await crmDb.getLeadById(listId, lead.leadId);
+      return fresh ?? lead;
+    } catch {
+      return lead;
+    }
+  }
 
   private async saveUpdatedConfig(config: ExternalCrmSyncConfig): Promise<void> {
     await crmDb.setLeadListCrmSyncConfig(config.listId, config.provider, config as any)
