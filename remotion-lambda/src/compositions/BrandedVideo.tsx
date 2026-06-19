@@ -348,17 +348,21 @@ export const BrandedVideo: React.FC<BrandedVideoProps> = ({
         );
       })}
 
-      {/* Intro brand overlay */}
-      <Sequence from={0} durationInFrames={safeIntroDuration}>
-        <IntroOverlay
-          brandName={brandName}
-          tagline={tagline}
-          primaryColor={primaryColor}
-          secondaryColor={secondaryColor}
-          logoUrl={logoUrl}
-          durationFrames={safeIntroDuration}
-        />
-      </Sequence>
+      {/* Intro brand overlay — only when branding is provided. Without a brandName the
+          composition acts as a plain concatenator (used to stitch multi-clip Veo videos
+          for >8s requests that have no brand overlay). */}
+      {brandName && (
+        <Sequence from={0} durationInFrames={safeIntroDuration}>
+          <IntroOverlay
+            brandName={brandName}
+            tagline={tagline}
+            primaryColor={primaryColor}
+            secondaryColor={secondaryColor}
+            logoUrl={logoUrl}
+            durationFrames={safeIntroDuration}
+          />
+        </Sequence>
+      )}
 
       {/* Outro CTA overlay */}
       {hasOutro && ctaText && (
