@@ -96,6 +96,22 @@ describe('AgentModeService.buildWorkPlanContextMessages', () => {
     expect(messages[0].content).toContain('AUTOCOMPLETE MODE');
   });
 
+  it('autocomplete mode never tells the agent to pause/ask, and omits the interactive complete-guard (no-stall for unattended onboarding)', () => {
+    const messages = AgentModeService.buildWorkPlanContextMessages({
+      ...activeWorkPlan,
+      autocomplete: true,
+    });
+    const content: string = messages[0].content;
+    // Hands-off language: never pause for approval, proceed with defaults instead of blocking
+    expect(content).toMatch(/do NOT pause to ask the user to approve or confirm/i);
+    expect(content).toMatch(/reasonable defaults rather than blocking/i);
+    expect(content).toContain('set_work_plan_status');
+    // The interactive "don't complete until finished/approved" guard would be a stall
+    // trigger here, so it must NOT appear in autocomplete mode.
+    expect(content).not.toMatch(/Do NOT mark a step completed before its work is actually finished/i);
+    expect(content).not.toContain('STEP COMPLETION');
+  });
+
   it('includes step-progression and batched-intent guidance for active plans', () => {
     const messages = AgentModeService.buildWorkPlanContextMessages(activeWorkPlan);
     const content: string = messages[0].content;
@@ -114,7 +130,7 @@ describe('AgentModeService.buildWorkPlanContextMessages', () => {
     expect(content).toMatch(/before the user approves/i);
   });
 
-  it('always includes progression and multi-intent guidance for active plans (both agent mode and Emma)', () => {
+  it('includes progression and multi-intent guidance for agent mode (default includeResumeGuidance)', () => {
     const messages = AgentModeService.buildWorkPlanContextMessages(activeWorkPlan);
     const content: string = messages[0].content;
     expect(content).toContain('STEP PROGRESSION');
@@ -126,6 +142,34 @@ describe('AgentModeService.buildWorkPlanContextMessages', () => {
     const content: string = messages[0].content;
     // Carve-out: the no-regenerate guard yields to an explicit user request
     expect(content).toMatch(/UNLESS the user explicitly asks to regenerate/i);
+  });
+
+  describe('Emma production-parity (includeResumeGuidance=false)', () => {
+    it('emits the plan + steps but NONE of the image-resume hardening blocks', () => {
+      // Pass filenames too, to prove the asset block is gated off (not just absent for lack of input)
+      const messages = AgentModeService.buildWorkPlanContextMessages(activeWorkPlan, ['a.png', 'b.png'], false);
+      const content: string = messages[0].content;
+      // Still shows the plan and its steps (unchanged from production)
+      expect(content).toContain('A WORK PLAN ALREADY EXISTS');
+      expect(content).toContain('Client Onboarding');
+      expect(content).toContain('2. ○ Update brand guidelines (pending)');
+      // None of the agent-mode hardening leaks into Emma's context
+      expect(content).not.toContain('STEP PROGRESSION');
+      expect(content).not.toContain('HANDLING MESSAGES WITH MULTIPLE INSTRUCTIONS');
+      expect(content).not.toContain('STEP COMPLETION');
+      expect(content).not.toContain('ALREADY-GENERATED ASSETS');
+      expect(content).not.toContain('a.png');
+    });
+
+    it('uses the ORIGINAL autocomplete wording (no drift from production)', () => {
+      const messages = AgentModeService.buildWorkPlanContextMessages(
+        { ...activeWorkPlan, autocomplete: true }, undefined, false,
+      );
+      const content: string = messages[0].content;
+      expect(content).toContain('After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.');
+      // Not the new agent-mode hands-off wording
+      expect(content).not.toMatch(/do NOT pause to ask the user to approve or confirm/i);
+    });
   });
 
   it('lists already-generated asset filenames and instructs not to regenerate them', () => {

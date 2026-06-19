@@ -791,7 +791,13 @@ describe('AgentModeService - Work Plan', () => {
       );
 
       expect(workPlanMessage).toBeDefined();
-      expect(workPlanMessage.content).toContain('⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.');
+      // Autocomplete plans run hands-off — the guidance must forbid pausing for approval
+      // and instruct best-effort completion, never the interactive "don't complete until
+      // approved" guard (which would contradict the autocomplete contract).
+      expect(workPlanMessage.content).toContain('⚠️ AUTOCOMPLETE MODE');
+      expect(workPlanMessage.content).toMatch(/do NOT pause to ask the user to approve or confirm/i);
+      expect(workPlanMessage.content).toMatch(/reasonable defaults rather than blocking/i);
+      expect(workPlanMessage.content).not.toContain('STEP COMPLETION');
     });
 
     it('should not include autocomplete instruction when autocomplete is false', () => {
