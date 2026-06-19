@@ -865,12 +865,27 @@ describe('deleteBlogPost', () => {
 
 // ─── Workflows ────────────────────────────────────────────────────────────────
 
+// v3 workflowId -> v4 flowId mapping response
+const MAP_RESP = { data: { status: 'COMPLETE', results: [{ workflowId: 'wf1', flowId: 9001 }] } };
+
 describe('deleteWorkflow', () => {
-  it('DELETEs /automation/v4/flows/{id}', async () => {
+  it('maps the v3 workflowId to a v4 flowId, then DELETEs /automation/v4/flows/{flowId}', async () => {
+    mockPost.mockResolvedValueOnce(MAP_RESP); // mapping
     mockDelete.mockResolvedValue({ status: 204, data: null });
     const svc = makeSvc();
     await expect(svc.deleteWorkflow('wf1')).resolves.toBeUndefined();
-    expect(mockDelete.mock.calls[0][0]).toContain('/automation/v4/flows/wf1');
+    const [mapUrl, mapBody] = mockPost.mock.calls[0];
+    expect(mapUrl).toContain('/automation/v4/workflow-id-mappings/batch/read');
+    expect(mapBody.inputs[0]).toEqual({ type: 'WORKFLOW_ID', workflowId: 'wf1' });
+    // must DELETE the mapped flowId (9001), NOT the v3 id (wf1)
+    expect(mockDelete.mock.calls[0][0]).toContain('/automation/v4/flows/9001');
+    expect(mockDelete.mock.calls[0][0]).not.toContain('/flows/wf1');
+  });
+
+  it('throws if the workflowId cannot be mapped to a flowId', async () => {
+    mockPost.mockResolvedValueOnce({ data: { status: 'COMPLETE', results: [] } });
+    const svc = makeSvc();
+    await expect(svc.deleteWorkflow('wf1')).rejects.toThrow(/map/i);
   });
 
   it('throws if workflowId empty', async () => {
@@ -881,43 +896,53 @@ describe('deleteWorkflow', () => {
 
 describe('setWorkflowEnabled', () => {
   const FLOW = {
-    id: 'wf1', type: 'CONTACT_FLOW', revisionId: 'rev-7', isEnabled: false,
+    id: '9001', type: 'CONTACT_FLOW', revisionId: 'rev-7', isEnabled: false,
     name: 'Nurture', actions: [{ actionId: '1' }], blockedDates: [],
-    canEnrollFromSalesforce: false, customProperties: {}, suppressionListIds: [], timeWindows: [],
+    createdAt: '2020-01-01T00:00:00Z', updatedAt: '2020-02-01T00:00:00Z', dataSources: { a: 1 },
   };
+  const batchRead = (flow: any) => ({ data: { status: 'COMPLETE', results: [flow] } });
 
-  it('GETs the v4 flow then PUTs it back with isEnabled=true, preserving revisionId + fields', async () => {
-    mockGet.mockResolvedValue({ data: { ...FLOW } });
+  it('maps v3->v4, batch-reads the flow, PUTs it back to /flows/{flowId} with isEnabled=true', async () => {
+    mockPost.mockResolvedValueOnce(MAP_RESP)            // mapping
+            .mockResolvedValueOnce(batchRead({ ...FLOW })); // batch read
     mockPut.mockResolvedValue({ data: { ...FLOW, isEnabled: true, revisionId: 'rev-8' } });
     const svc = makeSvc();
     const result = await svc.setWorkflowEnabled('wf1', true);
-    expect(mockGet.mock.calls[0][0]).toContain('/automation/v4/flows/wf1');
+    // mapping + batch-read endpoints
+    expect(mockPost.mock.calls[0][0]).toContain('/automation/v4/workflow-id-mappings/batch/read');
+    expect(mockPost.mock.calls[1][0]).toContain('/automation/v4/flows/batch/read');
+    expect(mockPost.mock.calls[1][1].inputs[0]).toEqual({ type: 'FLOW_ID', flowId: '9001' });
     const [putUrl, putBody] = mockPut.mock.calls[0];
-    expect(putUrl).toContain('/automation/v4/flows/wf1');
+    expect(putUrl).toContain('/automation/v4/flows/9001');
     expect(putBody.isEnabled).toBe(true);
     expect(putBody.revisionId).toBe('rev-7');
     expect(putBody.type).toBe('CONTACT_FLOW');
     expect(putBody.actions).toEqual([{ actionId: '1' }]);
+    // server-managed fields stripped from the full-replace PUT
+    expect(putBody.createdAt).toBeUndefined();
+    expect(putBody.updatedAt).toBeUndefined();
+    expect(putBody.dataSources).toBeUndefined();
     expect(result.isEnabled).toBe(true);
   });
 
   it('PUTs isEnabled=false when disabling', async () => {
-    mockGet.mockResolvedValue({ data: { ...FLOW, isEnabled: true } });
+    mockPost.mockResolvedValueOnce(MAP_RESP).mockResolvedValueOnce(batchRead({ ...FLOW, isEnabled: true }));
     mockPut.mockResolvedValue({ data: { ...FLOW, isEnabled: false } });
     const svc = makeSvc();
     await svc.setWorkflowEnabled('wf1', false);
     expect(mockPut.mock.calls[0][1].isEnabled).toBe(false);
   });
 
+  it('throws with the HubSpot error when the flow is not readable (e.g. missing sensitive scopes)', async () => {
+    mockPost.mockResolvedValueOnce(MAP_RESP)
+            .mockResolvedValueOnce({ data: { status: 'COMPLETE', results: [], errors: [{ message: 'sensitive data scopes must be provided' }] } });
+    const svc = makeSvc();
+    await expect(svc.setWorkflowEnabled('wf1', true)).rejects.toThrow(/sensitive data scopes/i);
+  });
+
   it('throws if workflowId empty', async () => {
     const svc = makeSvc();
     await expect(svc.setWorkflowEnabled('', true)).rejects.toThrow(/workflowId/i);
-  });
-
-  it('throws on API error from GET', async () => {
-    mockGet.mockRejectedValue(Object.assign(new Error('Not found'), { response: { status: 404 } }));
-    const svc = makeSvc();
-    await expect(svc.setWorkflowEnabled('wf1', true)).rejects.toThrow();
   });
 });
 

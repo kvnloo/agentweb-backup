@@ -1537,30 +1537,66 @@ export class HubSpotService {
     return res.data;
   }
 
+  // The v3 workflows API (list/get/performance) and the v4 flows API (enable/
+  // disable/delete) use DIFFERENT id spaces. A v3 workflowId is invalid on v4
+  // (404). Convert it via the mapping endpoint before any v4 call.
+  private async resolveFlowId(workflowId: string): Promise<string> {
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/automation/v4/workflow-id-mappings/batch/read`,
+      { inputs: [{ type: 'WORKFLOW_ID', workflowId }] },
+      { headers: await this.authHeaders() }
+    );
+    const flowId = (res.data as any)?.results?.[0]?.flowId;
+    if (flowId === undefined || flowId === null) {
+      throw new Error(`Could not map workflowId "${workflowId}" to a v4 flowId`);
+    }
+    return String(flowId);
+  }
+
+  // Read a v4 flow by flowId. GET /automation/v4/flows/{flowId} 404s on this API;
+  // the batch-read endpoint is the working path and surfaces clear errors (e.g.
+  // missing crm.objects.contacts.sensitive.* scopes for contact flows).
+  private async readFlow(flowId: string): Promise<any> {
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/automation/v4/flows/batch/read`,
+      { inputs: [{ type: 'FLOW_ID', flowId }] },
+      { headers: await this.authHeaders() }
+    );
+    const flow = (res.data as any)?.results?.[0];
+    if (!flow) {
+      const err = (res.data as any)?.errors?.[0]?.message;
+      throw new Error(`Could not read v4 flow "${flowId}"${err ? ': ' + err : ''}`);
+    }
+    return flow;
+  }
+
   async deleteWorkflow(workflowId: string): Promise<void> {
     if (!workflowId?.trim()) throw new Error('workflowId is required');
+    const flowId = await this.resolveFlowId(workflowId.trim());
     await axiosInstance.delete(
-      `${HUBSPOT_API_BASE}/automation/v4/flows/${workflowId}`,
+      `${HUBSPOT_API_BASE}/automation/v4/flows/${flowId}`,
       { headers: await this.authHeaders() }
     );
   }
 
   // Enable or disable a workflow. The v4 flows API has no partial PATCH — update
-  // is a full-object PUT requiring revisionId (optimistic concurrency). So we
-  // GET the current flow, flip isEnabled, and PUT the whole object back.
-  // Requires Marketing/Sales/Service/etc. Hub Professional+.
+  // is a full-object PUT requiring revisionId (optimistic concurrency). So we map
+  // the v3 id → v4 flowId, batch-read the current flow, flip isEnabled, strip the
+  // server-managed fields, and PUT the whole object back.
+  // Requires Marketing/Sales/Service/etc. Hub Professional+ and (for contact
+  // flows) crm.objects.contacts.sensitive.read/write.
   async setWorkflowEnabled(workflowId: string, enabled: boolean): Promise<any> {
     if (!workflowId?.trim()) throw new Error('workflowId is required');
-    const headers = await this.authHeaders();
-    const current = await axiosInstance.get(
-      `${HUBSPOT_API_BASE}/automation/v4/flows/${workflowId}`,
-      { headers }
-    );
-    const flow = { ...(current.data as any), isEnabled: enabled };
+    const flowId = await this.resolveFlowId(workflowId.trim());
+    const flow = await this.readFlow(flowId);
+    const body: Record<string, any> = { ...flow, isEnabled: enabled };
+    delete body.createdAt;
+    delete body.updatedAt;
+    delete body.dataSources;
     const res = await axiosInstance.put(
-      `${HUBSPOT_API_BASE}/automation/v4/flows/${workflowId}`,
-      flow,
-      { headers }
+      `${HUBSPOT_API_BASE}/automation/v4/flows/${flowId}`,
+      body,
+      { headers: await this.authHeaders() }
     );
     return res.data;
   }
