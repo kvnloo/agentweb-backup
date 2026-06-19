@@ -7591,7 +7591,7 @@ TYPICAL WORKFLOW:
         contact_lists_include: { type: 'array', items: { type: 'string' }, description: 'Contact list IDs to send to. EMAIL CREATE/UPDATE. Get IDs from CONTACT_LIST LIST.' },
         contact_lists_exclude: { type: 'array', items: { type: 'string' }, description: 'Contact list IDs to suppress. EMAIL CREATE/UPDATE.' },
         send_on_publish:  { type: 'boolean', description: 'EMAIL CREATE/UPDATE. true → email sends immediately when PUBLISHed.' },
-        publish_date:     { type: 'string', description: 'ISO8601 datetime. EMAIL CREATE/UPDATE. Schedules the send for this time on PUBLISH.' },
+        publish_date:     { type: 'string', description: 'ISO8601 datetime — MUST be in the future; compute from the actual current date/time (correct current year). EMAIL CREATE/UPDATE. Schedules the send for this time on PUBLISH.' },
         start_timestamp:  { type: 'string', description: 'Start of date range (string). Filter EMAIL GET_STATS.' },
         end_timestamp:    { type: 'string', description: 'End of date range (string). Filter EMAIL GET_STATS.' },
         // FORM
@@ -7621,7 +7621,7 @@ TYPICAL WORKFLOW:
         // SOCIAL
         channel_key:      { type: 'string', description: 'Social channel key (e.g. "Twitter:403551555"). From SOCIAL LIST_CHANNELS. Required for CREATE_BROADCAST.' },
         body:             { type: 'string', description: 'Post text. Required for SOCIAL CREATE_BROADCAST.' },
-        trigger_at:       { type: 'number', description: 'Scheduled time as Unix epoch ms. Omit to post immediately. SOCIAL CREATE_BROADCAST.' },
+        trigger_at:       { type: 'number', description: 'Scheduled time as Unix epoch ms — MUST be in the future. Compute it from the actual current date/time (use the correct current year); a past value posts immediately. Omit to post immediately. SOCIAL CREATE_BROADCAST.' },
         broadcast_guid:   { type: 'string', description: 'Broadcast GUID. Required for SOCIAL DELETE_BROADCAST.' },
         // CONTACT_LIST
         list_id:          { type: 'string', description: 'ILS list ID. Required for CONTACT_LIST GET/ADD_CONTACTS/REMOVE_CONTACTS/DELETE.' },
