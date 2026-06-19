@@ -3,6 +3,7 @@ import { ExternalCrmSyncConfig, FieldMapping, SyncResult } from '../externalCrmS
 import { HubSpotService } from '../hubspotService';
 import { crmDb } from '../db';
 import { validateEmail } from '../../utils/validation';
+import { splitAndRetry } from '../../utils/hubspotBatchRetry';
 
 /**
  * System list-identity mappings: the source lead list's name and id, pushed to
@@ -57,6 +58,15 @@ export class HubspotAdapter implements CrmAdapter {
             || err?.response?.data?.error
             || err?.message
             || 'Unknown error';
+    }
+
+    /**
+     * Flag gate: pushLeads uses the HubSpot batch APIs by DEFAULT. Set
+     * HUBSPOT_BATCH_PUSH_ENABLED='false' to fall back to the per-lead path
+     * (kill switch). Any other value (unset, 'true', etc.) → batched.
+     */
+    private batchEnabled(): boolean {
+        return process.env.HUBSPOT_BATCH_PUSH_ENABLED !== 'false';
     }
 
     // ─── Auth ──────────────────────────────────────────────────────────────────
@@ -156,7 +166,38 @@ export class HubspotAdapter implements CrmAdapter {
             }
         }
 
-        // ── 3. Sync each lead ────────────────────────────────────────────────────
+        // ── 3. Sync leads — batched or per-lead, depending on the feature flag ───
+        if (!this.batchEnabled()) {
+            await this.pushLeadsPerLead(
+                svc, leads, config, result,
+                effectiveCustomMapping, listIdentityProps, resolvedListName,
+            );
+        } else {
+            await this.pushLeadsBatched(
+                svc, leads, config, result, dealMappings,
+                effectiveCustomMapping, listIdentityProps, resolvedListName,
+            );
+        }
+
+        return result;
+    }
+
+    /**
+     * Per-lead push path (the original sequential loop). Each lead is upserted /
+     * created / updated and its deal synced one at a time. Used when the batch
+     * flag is off, and as the path for email-less leads in the batched path
+     * (they cannot upsert-by-email).
+     */
+    private async pushLeadsPerLead(
+        svc: HubSpotService,
+        leads: any[],
+        config: ExternalCrmSyncConfig,
+        result: SyncResult,
+        effectiveCustomMapping: FieldMapping[],
+        listIdentityProps: Set<string>,
+        resolvedListName: string | undefined,
+    ): Promise<void> {
+        const dealMappings = config.dealFieldMapping.filter(m => m.enabled && m.direction !== 'pull');
         for (const lead of leads) {
             try {
                 const email = typeof lead.email === 'string' ? lead.email.trim() : '';
@@ -252,8 +293,302 @@ export class HubspotAdapter implements CrmAdapter {
                 result.errors.push(`${lead.email || lead.leadId}: ${msg}`);
             }
         }
+    }
 
-        return result;
+    /**
+     * Batched push path (flag-gated). Upserts contacts, creates/updates/associates
+     * deals through the HubSpot batch APIs, isolating bad items via splitAndRetry.
+     * Email-bearing leads go through batch upsert-by-email; email-less leads (which
+     * cannot dedup by email) are delegated to the per-lead path. Mirrors every
+     * behavior of the per-lead path: invalid-email skip, skip-empty guard,
+     * new/updated counting, and contact-id-before-deal idempotent writeback.
+     */
+    private async pushLeadsBatched(
+        svc: HubSpotService,
+        leads: any[],
+        config: ExternalCrmSyncConfig,
+        result: SyncResult,
+        dealMappings: FieldMapping[],
+        effectiveCustomMapping: FieldMapping[],
+        listIdentityProps: Set<string>,
+        resolvedListName: string | undefined,
+    ): Promise<void> {
+        const t0 = Date.now();
+
+        // ── Stage 1: partition leads into email-bearing vs email-less ──────────
+        interface PreppedLead {
+            lead: any;
+            emailLower: string;            // '' for email-less
+            allContactProps: Record<string, string>;
+        }
+        const emailLeads: PreppedLead[] = [];
+        const emaillessLeads: any[] = [];
+
+        for (const lead of leads) {
+            const email = typeof lead.email === 'string' ? lead.email.trim() : '';
+
+            // Invalid-email guard (mirror per-lead path): skip with a clear error.
+            if (email && !validateEmail(email)) {
+                result.errorCount++;
+                const msg = `Invalid email "${email}" — skipped (not a valid email address)`;
+                console.warn(`[HubspotAdapter] ${msg} for lead=${lead.leadId}`);
+                result.errors.push(`${email}: ${msg}`);
+                continue;
+            }
+
+            // Enrich with source list identity so listName/listId mappings resolve.
+            const enrichedLead = {
+                ...lead,
+                listId: lead.listId ?? config.listId,
+                listName: lead.listName ?? resolvedListName,
+            };
+
+            const allContactProps = {
+                ...this.buildHubSpotProps(enrichedLead, config.contactFieldMapping),
+                ...this.buildHubSpotProps(enrichedLead, effectiveCustomMapping),
+            };
+
+            // Skip-empty guard: a lead carrying ONLY list-identity props has nothing
+            // worth syncing — pushing it would create a junk contact tagged with a list.
+            const hasRealProps = Object.keys(allContactProps).some(k => !listIdentityProps.has(k));
+            if (!hasRealProps) continue;
+
+            if (email) {
+                emailLeads.push({ lead, emailLower: email.toLowerCase(), allContactProps });
+            } else {
+                // Email-less leads cannot upsert-by-email; route to per-lead path (Stage 5).
+                emaillessLeads.push(lead);
+            }
+        }
+
+        // ── Stage 2: batch-upsert contacts for email leads ─────────────────────
+        // Multiple DB leads may share one email; HubSpot upserts by email, so we
+        // must send exactly ONE input per unique email (a duplicate input 409s and
+        // produces phantom processing). leadByEmail keeps the FIRST prepped lead per
+        // email purely to source the contact props for that single input.
+        const leadByEmail = new Map<string, PreppedLead>();
+        for (const p of emailLeads) {
+            if (!leadByEmail.has(p.emailLower)) leadByEmail.set(p.emailLower, p);
+        }
+        // ALWAYS force properties.email so the upsert response echoes it for mapping.
+        const upsertInputs = Array.from(leadByEmail.values()).map(p => ({
+            email: p.emailLower,
+            properties: { ...p.allContactProps, email: p.emailLower },
+        }));
+        const contactResults = new Map<string, { email: string; contactId: string; isNew: boolean }>();
+
+        const upsertOutcome = await splitAndRetry(
+            upsertInputs,
+            async (batch) => {
+                const res = await svc.batchUpsertContacts(batch);
+                for (const r of res) contactResults.set(r.email, r);
+            },
+            {
+                maxBatchSize: 100,
+                onSplit: (n, e) => console.log(`[HubspotAdapter] batch contact upsert of ${n} failed, splitting: ${this.formatError(e)}`),
+            },
+        );
+
+        // Tally successes (new/updated) and contact ids for the deal stage.
+        // Iterate ALL emailLeads (not the de-duped inputs) so EVERY DB lead sharing
+        // an email is counted once, written back, and routed into the deal stage.
+        const contactIdByLead = new Map<any, string>();      // lead → contactId
+        const succeededEmailLeads: any[] = [];
+        for (const p of emailLeads) {
+            const r = contactResults.get(p.emailLower);
+            if (!r) continue; // failed leads are handled below + excluded from deals
+            result.successCount++;
+            if (r.isNew) result.newCount++; else result.updatedCount++;
+            contactIdByLead.set(p.lead, r.contactId);
+            succeededEmailLeads.push(p.lead);
+        }
+        // Failed upserts → errors, excluded from deals.
+        for (const f of upsertOutcome.failed) {
+            result.errorCount++;
+            result.errors.push(`${f.item.email}: ${this.formatError(f.error)}`);
+        }
+
+        // ── Stage 3: write back contact ids BEFORE deals (idempotency) ─────────
+        await Promise.all(
+            succeededEmailLeads.map(lead =>
+                crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
+                    syncMetadata: { ...(lead.syncMetadata || {}), hubspot_contact_id: contactIdByLead.get(lead) },
+                }).catch((err: any) => {
+                    console.error(`[HubspotAdapter] failed to persist hubspot_contact_id for ${lead.email}: ${this.formatError(err)}`);
+                })
+            )
+        );
+
+        // ── Stage 4: deals (only if deal mappings configured) ──────────────────
+        if (dealMappings.length > 0 && succeededEmailLeads.length > 0) {
+            await this.pushDealsBatched(svc, succeededEmailLeads, contactIdByLead, config, result);
+        }
+
+        // ── Stage 5: email-less leads via per-lead path ────────────────────────
+        if (emaillessLeads.length > 0) {
+            await this.pushLeadsPerLead(
+                svc, emaillessLeads, config, result,
+                effectiveCustomMapping, listIdentityProps, resolvedListName,
+            );
+        }
+
+        // ── Stage 6: completion log ────────────────────────────────────────────
+        console.log('[HubspotAdapter] batch push complete', {
+            listId: config.listId,
+            leads: leads.length,
+            newCount: result.newCount,
+            updatedCount: result.updatedCount,
+            errorCount: result.errorCount,
+            durationMs: Date.now() - t0,
+        });
+    }
+
+    /**
+     * Deal stage of the batched push. Partitions succeeded leads into deal
+     * updates (existing hubspot_deal_id) and creates, runs each through the batch
+     * APIs via splitAndRetry, reclassifies 404 updates into creates (the deal was
+     * deleted in HubSpot — mirrors the per-lead fallback), associates created
+     * deals, and writes back hubspot_deal_id.
+     */
+    private async pushDealsBatched(
+        svc: HubSpotService,
+        succeededLeads: any[],
+        contactIdByLead: Map<any, string>,
+        config: ExternalCrmSyncConfig,
+        result: SyncResult,
+    ): Promise<void> {
+        interface UpdateItem { lead: any; dealId: string; properties: Record<string, string>; }
+        interface CreateItem { lead: any; contactId: string; traceId: string; properties: Record<string, string>; }
+
+        const updateSet: UpdateItem[] = [];
+        const createSet: CreateItem[] = [];
+
+        for (const lead of succeededLeads) {
+            const dealProps = this.applyHubSpotDealStageMapping(
+                this.buildHubSpotProps(lead, config.dealFieldMapping),
+                config,
+                lead,
+            );
+            if (Object.keys(dealProps).length === 0) continue;
+
+            const contactId = contactIdByLead.get(lead)!;
+            const existingDealId: string | undefined =
+                lead.syncMetadata?.hubspot_deal_id || lead.customFields?.hubspot_deal_id;
+
+            if (existingDealId) {
+                updateSet.push({ lead, dealId: existingDealId, properties: dealProps });
+            } else {
+                createSet.push(this.buildDealCreateItem(lead, contactId, dealProps, config));
+            }
+        }
+
+        // ── Batch UPDATE existing deals ────────────────────────────────────────
+        // Leads whose stale deal 404'd and were recreated: their stale dealId must
+        // NOT be written back (it would race/clobber the new recreated id).
+        const recreatedLeads = new Set<any>();
+        if (updateSet.length > 0) {
+            const updateOutcome = await splitAndRetry(
+                updateSet,
+                (batch) => svc.batchUpdateDeals(batch.map(x => ({ dealId: x.dealId, properties: x.properties }))),
+                { maxBatchSize: 100 },
+            );
+            for (const f of updateOutcome.failed) {
+                const status = (f.error as any)?.response?.status;
+                if (status === 404) {
+                    // Deal was deleted in HubSpot — recreate it (mirror per-lead fallback).
+                    const item = f.item;
+                    recreatedLeads.add(item.lead);
+                    const dealProps = this.applyHubSpotDealStageMapping(
+                        this.buildHubSpotProps(item.lead, config.dealFieldMapping),
+                        config,
+                        item.lead,
+                    );
+                    createSet.push(this.buildDealCreateItem(
+                        item.lead, contactIdByLead.get(item.lead)!, dealProps, config,
+                    ));
+                    console.log(`[HubspotAdapter] deal ${item.dealId} gone (404), recreating for lead=${item.lead.email || item.lead.leadId}`);
+                } else {
+                    result.errorCount++;
+                    result.errors.push(`${f.item.lead.email || f.item.lead.leadId}: ${this.formatError(f.error)}`);
+                }
+            }
+        }
+
+        // ── Batch CREATE new deals ─────────────────────────────────────────────
+        const dealIdByTrace = new Map<string, string>();
+        if (createSet.length > 0) {
+            const createOutcome = await splitAndRetry(
+                createSet,
+                async (batch) => {
+                    const res = await svc.batchCreateDeals(batch.map(x => ({ traceId: x.traceId, properties: x.properties })));
+                    for (const r of res) dealIdByTrace.set(r.traceId, r.dealId);
+                },
+                { maxBatchSize: 100 },
+            );
+            for (const f of createOutcome.failed) {
+                result.errorCount++;
+                result.errors.push(`${f.item.lead.email || f.item.lead.leadId}: ${this.formatError(f.error)}`);
+            }
+        }
+
+        // ── Associate created deals to their contacts ──────────────────────────
+        const pairs = createSet
+            .filter(item => dealIdByTrace.has(item.traceId))
+            .map(item => ({ contactId: item.contactId, dealId: dealIdByTrace.get(item.traceId)! }));
+        if (pairs.length > 0) {
+            const assocOutcome = await splitAndRetry(
+                pairs,
+                (batch) => svc.batchAssociateContactsToDeals(batch),
+                { maxBatchSize: 100 },
+            );
+            for (const f of assocOutcome.failed) {
+                result.errorCount++;
+                result.errors.push(`deal ${f.item.dealId}: ${this.formatError(f.error)}`);
+            }
+        }
+
+        // ── Write back hubspot_deal_id (created by trace + updated) ─────────────
+        const writebacks: Array<Promise<any>> = [];
+        for (const item of createSet) {
+            const dealId = dealIdByTrace.get(item.traceId);
+            if (!dealId) continue;
+            writebacks.push(this.writebackDealId(item.lead, dealId, config));
+        }
+        for (const item of updateSet) {
+            // Skip leads whose stale deal 404'd and was recreated above — writing
+            // back the stale dealId would clobber the new recreated id.
+            if (recreatedLeads.has(item.lead)) continue;
+            writebacks.push(this.writebackDealId(item.lead, item.dealId, config));
+        }
+        await Promise.all(writebacks);
+    }
+
+    /**
+     * Builds a deal-create item with a guaranteed dealname (falling back to
+     * buildDealName) and the configured pipeline injected — mirrors syncDeal.
+     */
+    private buildDealCreateItem(
+        lead: any,
+        contactId: string,
+        dealProps: Record<string, string>,
+        config: ExternalCrmSyncConfig,
+    ): { lead: any; contactId: string; traceId: string; properties: Record<string, string> } {
+        let propsWithName = dealProps.dealname
+            ? dealProps
+            : { ...dealProps, dealname: this.buildDealName(lead) };
+        if (config.externalPipelineId) {
+            propsWithName = { ...propsWithName, pipeline: config.externalPipelineId };
+        }
+        return { lead, contactId, traceId: lead.leadId, properties: propsWithName };
+    }
+
+    /** Persists hubspot_deal_id back to our DB (non-critical, logs on failure). */
+    private writebackDealId(lead: any, dealId: string, config: ExternalCrmSyncConfig): Promise<any> {
+        return crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
+            syncMetadata: { ...(lead.syncMetadata || {}), hubspot_deal_id: dealId },
+        }).catch((err: any) => {
+            console.error(`[HubspotAdapter] failed to persist hubspot_deal_id for lead=${lead.email || lead.leadId}: ${this.formatError(err)}`);
+        });
     }
 
     // ─── pullContacts ────────────────────────────────────────────────────────────
