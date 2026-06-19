@@ -3304,7 +3304,8 @@ export class AgentModeService {
    * `generatedImageFilenames` (optional) lists images already produced this session;
    * when provided for an active plan it is rendered as an "already-generated assets"
    * section so the model generates only what's missing instead of regenerating from
-   * scratch after a run timeout.
+   * scratch after a run timeout. Both agent mode and Emma pass this so neither can
+   * fall into the regenerate-from-scratch loop.
    */
   public static buildWorkPlanContextMessages(workPlan?: any, generatedImageFilenames?: string[]): any[] {
     if (!workPlan || !Array.isArray(workPlan.steps) || workPlan.steps.length === 0) {
@@ -3339,7 +3340,8 @@ export class AgentModeService {
     // Explicit progression rule. Without this, non-autocomplete plans gave the model
     // no instruction on when to advance, so a step could sit pending indefinitely
     // (the model would re-ask or regenerate instead of calling set_work_plan_status).
-    workPlanContent += `⚠️ STEP PROGRESSION: Work through steps in order. After you finish the work for the current pending step, call set_work_plan_status to mark it completed, then move to the next step. Do NOT re-do or restart a step whose work is already finished. If you are waiting on the user to approve before completing a step, complete it as soon as they approve.\n\n`;
+    // Applied for both agent mode and Emma so neither path can stall on a pending step.
+    workPlanContent += `⚠️ STEP PROGRESSION: Work through steps in order. After you finish the work for the current pending step, call set_work_plan_status to mark it completed, then move to the next step. Do NOT re-do or restart a step whose work is already finished. Do NOT mark a step completed before its work is actually finished, or before the user approves when approval was requested. If you are waiting on the user to approve before completing a step, complete it as soon as they approve.\n\n`;
 
     // Batched / multi-intent guidance. A single user message may stack several
     // instructions (e.g. "keep 3 per hook / restart / generate the report / proceed").
@@ -3355,7 +3357,7 @@ export class AgentModeService {
     // generates only what's still missing instead of regenerating from scratch
     // after a run timeout (the expensive, non-converging loop this fixes).
     if (Array.isArray(generatedImageFilenames) && generatedImageFilenames.length > 0) {
-      workPlanContent += `⚠️ ALREADY-GENERATED ASSETS (${generatedImageFilenames.length}): these images already exist in this session and are saved — DO NOT regenerate them. Only generate the images that are still missing.\n`;
+      workPlanContent += `⚠️ ALREADY-GENERATED ASSETS (${generatedImageFilenames.length}): these images already exist in this session and are saved — DO NOT regenerate them UNLESS the user explicitly asks to regenerate, restart, redo, or change them. Otherwise only generate the images that are still missing.\n`;
       for (const filename of generatedImageFilenames) {
         workPlanContent += `   - ${filename}\n`;
       }
@@ -3404,10 +3406,16 @@ export class AgentModeService {
     const seen = new Set<string>();
     const filenames: string[] = [];
     for (const msg of sessionHistory) {
-      if (!msg || msg.role !== 'system' || typeof msg.content !== 'string') continue;
-      const match = msg.content.match(/^Image generated:\s*(.+?)\s*$/);
-      if (!match) continue;
-      const filename = match[1].trim();
+      if (!msg || msg.role !== 'system') continue;
+      // Prefer the structured marker (newer messages); fall back to the legacy
+      // content-string format so older / in-flight sessions are still detected.
+      let filename: string | undefined;
+      if (msg.metadata && msg.metadata.kind === 'image-generated' && typeof msg.metadata.imageFilename === 'string') {
+        filename = msg.metadata.imageFilename.trim();
+      } else if (typeof msg.content === 'string') {
+        const match = msg.content.match(/^Image generated:\s*(.+?)\s*$/);
+        if (match) filename = match[1].trim();
+      }
       if (!filename || seen.has(filename)) continue;
       seen.add(filename);
       filenames.push(filename);
@@ -18081,7 +18089,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             role: 'system',
             content: `Image generated: ${result.filename}`,
             metadata: {
-              timestamp: new Date().toISOString()
+              timestamp: new Date().toISOString(),
+              // Stable marker so extractGeneratedImageFilenames can detect generated
+              // images without relying solely on the content-string format.
+              kind: 'image-generated',
+              imageFilename: result.filename
             }
           });
         } catch (error) {

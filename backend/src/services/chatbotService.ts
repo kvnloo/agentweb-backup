@@ -132,6 +132,8 @@ export interface ChatMessage {
       ip?: string;
       userAgent?: string;
     };
+    kind?: string;                      // Stable marker for system messages (e.g. 'image-generated')
+    imageFilename?: string;             // Filename when kind === 'image-generated'
   };
 }
 
@@ -3932,7 +3934,11 @@ export async function generateChatResponse(
     // existing one — she won't continue it or update step statuses. Insert right before the
     // final user message so it reads as the most recent context.
     if (session.workPlan) {
-      const workPlanMessages = AgentModeService.buildWorkPlanContextMessages(session.workPlan);
+      // Mirror agent mode: surface already-generated image filenames so Emma also avoids
+      // the regenerate-from-scratch loop on a pending image step, and gets the same
+      // step-progression / multi-intent guidance.
+      const generatedImageFilenames = AgentModeService.extractGeneratedImageFilenames(session.messages);
+      const workPlanMessages = AgentModeService.buildWorkPlanContextMessages(session.workPlan, generatedImageFilenames);
       if (workPlanMessages.length > 0) {
         const lastUserMsgIndex = messages.map((m) => m.role).lastIndexOf("user");
         const insertAt = lastUserMsgIndex >= 0 ? lastUserMsgIndex : messages.length;
