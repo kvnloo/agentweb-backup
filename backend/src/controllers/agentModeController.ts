@@ -17,6 +17,7 @@ import { emitProgress, registerProgressCallback, getLatestProgress, progressStor
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
+import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
@@ -1820,25 +1821,7 @@ export async function generateSessionResponse(
   // Process attachments and include URLs in message content for LLM
   let messageContent = userMessage;
   if (attachments && attachments.length > 0) {
-    const IMAGE_MIMETYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp', 'image/svg+xml']);
-    const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg']);
-    const VIDEO_MIMETYPES = new Set(['video/mp4', 'video/quicktime', 'video/webm', 'video/avi', 'video/x-msvideo']);
-    const VIDEO_EXTS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv']);
-    const attachmentUrls = attachments.map((attachment: any) => {
-      const mimetype = (attachment.mimetype || '').toLowerCase();
-      const ext = (attachment.filename || '').split('.').pop()?.toLowerCase() || '';
-      const isImage = IMAGE_MIMETYPES.has(mimetype) || IMAGE_EXTS.has(ext);
-      const isVideo = VIDEO_MIMETYPES.has(mimetype) || VIDEO_EXTS.has(ext);
-      let hint: string;
-      if (isImage) {
-        hint = ' (image — use describe_image tool to analyze)';
-      } else if (isVideo) {
-        hint = ' (video — use describe_video tool to analyze)';
-      } else {
-        hint = ' (document — use read_file_content tool to read its contents)';
-      }
-      return `[${attachment.filename || 'Attachment'}](${attachment.url})${hint}`;
-    }).join('\n');
+    const attachmentUrls = formatAttachmentUrls(attachments);
     messageContent = `${userMessage}\n\n**Attached Files:**\n${attachmentUrls}`;
   }
 

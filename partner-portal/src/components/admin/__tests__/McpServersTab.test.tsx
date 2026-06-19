@@ -227,6 +227,37 @@ describe('McpServersTab', () => {
         expect(mockedAxios.get).toHaveBeenCalledTimes(2);
     });
 
+    it('sends excludeFromAgent:true when the "Hide from agent" toggle is on', async () => {
+        mockedAxios.get.mockResolvedValueOnce({ data: [] }); // Initial load
+
+        render(<McpServersTab />);
+        await waitFor(() => expect(screen.queryByRole('progressbar')).not.toBeInTheDocument());
+
+        fireEvent.click(screen.getByText('Add Server'));
+        fireEvent.change(screen.getByLabelText(/Server Name/i), { target: { value: 'hidden-srv' } });
+        fireEvent.mouseDown(screen.getByRole('combobox'));
+        fireEvent.click(within(screen.getByRole('listbox')).getByText('Streamable HTTP'));
+        fireEvent.change(screen.getByLabelText(/URL/i), { target: { value: 'http://hidden-mcp' } });
+
+        // Flip the toggle ON
+        fireEvent.click(screen.getByLabelText(/Hide from agent/i));
+
+        mockedAxios.post.mockResolvedValueOnce({});
+        mockedAxios.post.mockResolvedValueOnce({ data: { authorizationRequired: false } });
+        mockedAxios.post.mockResolvedValueOnce({ data: { count: 0 } });
+        mockedAxios.get.mockResolvedValueOnce({ data: [{ name: 'hidden-srv', transport: 'streamable-http', url: 'http://hidden-mcp', excludeFromAgent: true }] });
+
+        fireEvent.click(screen.getByRole('button', { name: 'Add' }));
+
+        await waitFor(() => {
+            expect(mockedAxios.post).toHaveBeenNthCalledWith(1,
+                'http://localhost:3000/api/admin/mcp-servers',
+                expect.objectContaining({ name: 'hidden-srv', excludeFromAgent: true }),
+                expect.any(Object)
+            );
+        });
+    });
+
     it('runs the OAuth popup flow when the server requires authorization', async () => {
         mockedAxios.get.mockResolvedValueOnce({ data: [] }); // Initial load
 

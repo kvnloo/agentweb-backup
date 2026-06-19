@@ -241,6 +241,80 @@ describe('MCP Servers Routes - Validation', () => {
     });
   });
 
+  describe('excludeFromAgent (hide from agent / backend-only)', () => {
+    const lastSavedServers = () => {
+      const calls = (settingsService.setSetting as jest.Mock).mock.calls;
+      return JSON.parse(calls[calls.length - 1][1]);
+    };
+
+    it('POST persists excludeFromAgent:true', async () => {
+      const res = await request(app)
+        .post('/api/admin/mcp-servers')
+        .send({
+          name: 'backend-only-srv',
+          transport: 'streamable-http',
+          url: 'https://x.com/mcp',
+          excludeFromAgent: true,
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.excludeFromAgent).toBe(true);
+      expect(lastSavedServers()[0].excludeFromAgent).toBe(true);
+    });
+
+    it('PUT preserves excludeFromAgent when the field is not in the request body', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([
+          { name: 'hf', transport: 'streamable-http', url: 'https://x.com/mcp', excludeFromAgent: true },
+        ]),
+      });
+
+      const res = await request(app)
+        .put('/api/admin/mcp-servers/hf')
+        .send({ url: 'https://y.com/mcp' }); // unrelated edit, no excludeFromAgent
+
+      expect(res.status).toBe(200);
+      expect(lastSavedServers()[0].excludeFromAgent).toBe(true);
+    });
+
+    it('GET returns excludeFromAgent so the edit UI can reflect it (and never leaks oauth secrets)', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([
+          {
+            name: 'hf',
+            transport: 'streamable-http',
+            url: 'https://x.com/mcp',
+            excludeFromAgent: true,
+            oauthTokens: 'ENCRYPTED_SECRET',
+            oauthClientInfo: 'ENCRYPTED_CLIENT',
+          },
+        ]),
+      });
+
+      const res = await request(app).get('/api/admin/mcp-servers');
+      expect(res.status).toBe(200);
+      expect(res.body[0].excludeFromAgent).toBe(true);
+      // secrets must still be stripped
+      expect(res.body[0].oauthTokens).toBeUndefined();
+      expect(res.body[0].oauthClientInfo).toBeUndefined();
+    });
+
+    it('PUT can clear excludeFromAgent when explicitly set false', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([
+          { name: 'hf', transport: 'streamable-http', url: 'https://x.com/mcp', excludeFromAgent: true },
+        ]),
+      });
+
+      const res = await request(app)
+        .put('/api/admin/mcp-servers/hf')
+        .send({ excludeFromAgent: false });
+
+      expect(res.status).toBe(200);
+      expect(lastSavedServers()[0].excludeFromAgent).toBeUndefined();
+    });
+  });
+
   describe('DELETE /api/admin/mcp-servers/:name - Worker Recycle', () => {
     beforeEach(() => {
       (settingsService.getSetting as jest.Mock).mockResolvedValue({

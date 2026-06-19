@@ -26,6 +26,12 @@ export interface HttpOAuthFields {
   oauthExpiresAt?: number;
   /** Whether stored tokens include a refresh_token. */
   oauthHasRefreshToken?: boolean;
+  /**
+   * When true, the server is connected/used ONLY by backend services (e.g. the video
+   * service calls Higgsfield directly via its own client + getServerConfig). Its tools
+   * are NOT registered into the agent (Emma) toolset.
+   */
+  excludeFromAgent?: boolean;
 }
 
 // SSE transport configuration
@@ -43,6 +49,8 @@ export interface StdioTransportConfig {
   args?: string[];
   env?: Record<string, string>;
   isInternal?: boolean;
+  /** See HttpOAuthFields.excludeFromAgent — backend-only server, tools hidden from the agent. */
+  excludeFromAgent?: boolean;
 }
 
 // Streamable HTTP transport configuration (modern standard)
@@ -314,6 +322,15 @@ export class McpClientService {
 
   private async safeConnectToServer(serverName: string, serverConfig: McpServerConfig, toolPrefix?: string) {
       try {
+          // Backend-only servers (e.g. Higgsfield, used directly by the video service via
+          // its own client + getServerConfig) are never connected here and never have their
+          // tools registered into the agent toolset. Skip entirely — don't even store the
+          // config, so no late/per-session discovery path can expose them to the agent.
+          if ('excludeFromAgent' in serverConfig && (serverConfig as any).excludeFromAgent) {
+            console.log(`MCP: Server "${serverName}" is backend-only (excludeFromAgent) — not exposing its tools to the agent`);
+            return;
+          }
+
           // Store config for creating session-specific clients later
           this.serverConfigs.set(serverName, { config: serverConfig, toolPrefix });
 

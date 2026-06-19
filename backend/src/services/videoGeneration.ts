@@ -49,6 +49,37 @@ const DEFAULT_VIDEO_MODEL = "seedance-2.0";
 // the app-level 10-min timeout fires (which orphans the generation).
 const SEEDANCE_POLL_BUDGET_MS = parseInt(process.env.SEEDANCE_POLL_BUDGET_MS || "480000", 10); // 8 min
 
+// Hard wall-clock budget for the ENTIRE video op (Seedance attempt + Veo fallback +
+// download/upload), kept under the agent-mode turn cap (600s) with ~60s of margin.
+// Without this, a Seedance HANG can burn its full poll budget and then a Veo fallback
+// runs past the turn cap → the turn is killed mid-Veo, orphaning a generation that
+// completes but is never surfaced. We instead deadline the whole op below the cap.
+export const VIDEO_TOTAL_BUDGET_MS = parseInt(process.env.VIDEO_TOTAL_BUDGET_MS || "540000", 10); // 9 min
+// Time reserved before the deadline for the Veo fallback, so a Seedance hang can't
+// consume the whole budget and starve the fallback. With VIDEO_TOTAL_BUDGET_MS=540s
+// this leaves Seedance ~360s (it's the cheaper, preferred model, so it gets the larger
+// slice) and reserves 180s for Veo.
+export const VEO_FALLBACK_RESERVE_MS = parseInt(process.env.VEO_FALLBACK_RESERVE_MS || "180000", 10); // 3 min
+
+/**
+ * Poll budget (ms) to grant the Seedance attempt: bounded by its own max AND by what
+ * can be spent while still reserving `reserveMs` for the Veo fallback before `deadlineMs`.
+ * Returns 0 (skip polling → straight to Veo) when no time is left after the reserve.
+ */
+export function seedancePollBudgetMs(
+  now: number,
+  deadlineMs: number,
+  maxBudgetMs: number = SEEDANCE_POLL_BUDGET_MS,
+  reserveMs: number = VEO_FALLBACK_RESERVE_MS
+): number {
+  return Math.max(0, Math.min(maxBudgetMs, deadlineMs - now - reserveMs));
+}
+
+/** Time (ms) left until `deadlineMs`, floored at 0. */
+export function remainingBudgetMs(now: number, deadlineMs: number): number {
+  return Math.max(0, deadlineMs - now);
+}
+
 // Lazy singleton MCP client for backend tool calls (createTransport attaches the
 // OAuth authProvider + auto-refresh for the "higgsfield" server automatically).
 let mcpClientSingleton: McpClientService | null = null;
@@ -121,6 +152,12 @@ interface VideoGenerationParams {
   aspectRatio?: string;
   /** Seedance output resolution (one of SEEDANCE_RESOLUTIONS). Defaults to "720p". */
   resolution?: string;
+  /**
+   * Internal: absolute epoch-ms hard stop for the WHOLE video op (Seedance + Veo
+   * fallback). Set once by generateVideo and propagated through the Seedance attempt
+   * and the Veo fallback so their combined wall-clock stays under the turn cap.
+   */
+  deadlineMs?: number;
 }
 
 export class VideoService {
@@ -428,25 +465,36 @@ export class VideoService {
         }
       }
       
-      // Poll the operation status until the video is ready
+      // Poll the operation status until the video is ready.
+      // Bound by the whole-op deadline (shared with any Seedance attempt that ran
+      // first) so the turn never overruns the agent-mode cap; the attempt count is a
+      // secondary safety cap. When called standalone (no deadline) fall back to 20 min.
       const maxPollAttempts = 120; // 20 minutes max (120 * 10 seconds)
+      const deadlineMs = params.deadlineMs ?? (Date.now() + VIDEO_TOTAL_BUDGET_MS);
       let pollAttempts = 0;
-      
-      while (!operation.done && pollAttempts < maxPollAttempts) {
+
+      while (!operation.done && pollAttempts < maxPollAttempts && Date.now() < deadlineMs) {
         console.log(`Waiting for video generation to complete... (attempt ${pollAttempts + 1}/${maxPollAttempts})`);
         await new Promise((resolve) => setTimeout(resolve, 10000)); // Wait 10 seconds
-        
+
         operation = await ai.operations.getVideosOperation({
           operation: operation,
         });
-        
+
         pollAttempts++;
       }
 
       if (!operation.done) {
+        const budgetExceeded = Date.now() >= deadlineMs;
+        console.warn(
+          `VideoService: Veo generation did not finish — ${budgetExceeded ? 'exceeded its time budget' : 'timed out after 20 minutes'} ` +
+          `(${pollAttempts} poll attempts)`
+        );
         return {
           success: false,
-          error: 'Video generation timed out after 20 minutes'
+          error: budgetExceeded
+            ? 'Video generation exceeded its time budget'
+            : 'Video generation timed out after 20 minutes'
         };
       }
 
@@ -627,7 +675,13 @@ export class VideoService {
         // Bounded by a wall-clock budget that stays under the agent-mode cap.
         const maxPollAttempts = 240; // safety cap; the real bound is the time budget
         const failStates = new Set(["failed", "canceled", "nsfw"]);
-        const deadline = Date.now() + SEEDANCE_POLL_BUDGET_MS;
+        // Grant Seedance only what we can spend while still reserving time for a Veo
+        // fallback before the whole-op deadline — so a Seedance hang can't starve Veo.
+        const pollBudgetMs = params.deadlineMs !== undefined
+          ? seedancePollBudgetMs(Date.now(), params.deadlineMs)
+          : SEEDANCE_POLL_BUDGET_MS;
+        const deadline = Date.now() + pollBudgetMs;
+        console.log(`VideoService: Seedance job ${jobId} polling with a ${Math.round(pollBudgetMs / 1000)}s budget`);
         let status = (submitGen?.status || "").toString().toLowerCase();
         let resultUrl: string | undefined = extractVideoUrl(submitGen);
         let backoffMs = 10000;
@@ -652,9 +706,14 @@ export class VideoService {
         }
 
         if (timedOut && status !== "completed") {
+          const remainingForVeo = params.deadlineMs !== undefined ? remainingBudgetMs(Date.now(), params.deadlineMs) : 0;
+          console.warn(
+            `VideoService: Seedance job ${jobId} exceeded its ${Math.round(pollBudgetMs / 1000)}s budget ` +
+            `(last status "${status}") — failing over to Veo with ~${Math.round(remainingForVeo / 1000)}s left`
+          );
           return {
             ok: false as const,
-            error: `Seedance generation exceeded the ${Math.round(SEEDANCE_POLL_BUDGET_MS / 1000)}s budget`,
+            error: `Seedance generation exceeded the ${Math.round(pollBudgetMs / 1000)}s budget`,
           };
         }
 
@@ -792,7 +851,19 @@ export class VideoService {
       if (!params.videoModel) {
         params.videoModel = DEFAULT_VIDEO_MODEL;
       }
-      
+
+      // Establish the whole-op deadline ONCE, on the first (Seedance) call. The Veo
+      // fallback re-enters generateVideo with the same params, so this carries over —
+      // Seedance + Veo together are bounded by VIDEO_TOTAL_BUDGET_MS (< the turn cap).
+      if (params.deadlineMs === undefined) {
+        params.deadlineMs = Date.now() + VIDEO_TOTAL_BUDGET_MS;
+        console.log(
+          `VideoService: video op budget=${Math.round(VIDEO_TOTAL_BUDGET_MS / 1000)}s ` +
+          `(Seedance up to ~${Math.round((VIDEO_TOTAL_BUDGET_MS - VEO_FALLBACK_RESERVE_MS) / 1000)}s, ` +
+          `~${Math.round(VEO_FALLBACK_RESERVE_MS / 1000)}s reserved for Veo fallback)`
+        );
+      }
+
       // Validate the provided model
       if (!SUPPORTED_MODELS.includes(params.videoModel as SupportedModel)) {
         return {

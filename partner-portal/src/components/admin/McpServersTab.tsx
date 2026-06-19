@@ -25,6 +25,8 @@ import {
   IconButton,
   Collapse,
   Tooltip,
+  Switch,
+  FormControlLabel,
 } from "@mui/material";
 import {
   Add as AddIcon,
@@ -109,6 +111,8 @@ interface McpServer {
   env?: Record<string, string>;
   accessToken?: string;
   isInternal?: boolean;
+  // Backend-only: server is used by backend services but its tools are hidden from the agent (Emma).
+  excludeFromAgent?: boolean;
   discoveredTools?: string[];
   authType?: "none" | "bearer" | "oauth";
   oauthExpiresAt?: number;
@@ -201,6 +205,7 @@ const McpServersTab: React.FC = () => {
     command: "",
     accessToken: "",
     isInternal: false,
+    excludeFromAgent: false,
   });
   const [argsInput, setArgsInput] = useState("");
   const [configInput, setConfigInput] = useState("");
@@ -378,6 +383,7 @@ const McpServersTab: React.FC = () => {
             command: formData.command,
             args: parsedArgs,
             isInternal: formData.isInternal,
+            excludeFromAgent: formData.excludeFromAgent,
           }
         : {
             ...parsedConfig,
@@ -386,6 +392,7 @@ const McpServersTab: React.FC = () => {
             url: formData.url,
             accessToken: formData.accessToken,
             isInternal: formData.isInternal,
+            excludeFromAgent: formData.excludeFromAgent,
           };
 
       await axios.post(buildApiUrl("/api/admin/mcp-servers"), finalPayload, {
@@ -467,6 +474,7 @@ const McpServersTab: React.FC = () => {
             command: formData.command,
             args: parsedArgs,
             isInternal: formData.isInternal,
+            excludeFromAgent: formData.excludeFromAgent,
           }
         : {
             ...parsedConfig,
@@ -475,6 +483,7 @@ const McpServersTab: React.FC = () => {
             url: formData.url,
             accessToken: formData.accessToken,
             isInternal: formData.isInternal,
+            excludeFromAgent: formData.excludeFromAgent,
           };
 
       await axios.put(
@@ -523,6 +532,7 @@ const McpServersTab: React.FC = () => {
       command: "",
       accessToken: "",
       isInternal: false,
+      excludeFromAgent: false,
     });
     setArgsInput("");
     setConfigInput("");
@@ -538,6 +548,7 @@ const McpServersTab: React.FC = () => {
       command: server.command || "",
       accessToken: server.accessToken || "",
       isInternal: server.isInternal || false,
+      excludeFromAgent: server.excludeFromAgent || false,
     });
     setArgsInput(server.args ? server.args.join('\n') : "");
     
@@ -858,6 +869,18 @@ const McpServersTab: React.FC = () => {
                 helperText="Leave blank for servers that use OAuth — after adding, a login window opens automatically if the server requires it."
               />
             )}
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={!!formData.excludeFromAgent}
+                  onChange={(e) => setFormData({ ...formData, excludeFromAgent: e.target.checked })}
+                />
+              }
+              label="Hide from agent (backend-only)"
+            />
+            <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+              When on, this server is connected for backend services only — its tools are not exposed to the agent.
+            </Typography>
 
           </Box>
         </DialogContent>
@@ -965,6 +988,18 @@ const McpServersTab: React.FC = () => {
                 type="password"
               />
             )}
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={!!formData.excludeFromAgent}
+                  onChange={(e) => setFormData({ ...formData, excludeFromAgent: e.target.checked })}
+                />
+              }
+              label="Hide from agent (backend-only)"
+            />
+            <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+              When on, this server is connected for backend services only — its tools are not exposed to the agent.
+            </Typography>
 
           </Box>
         </DialogContent>
