@@ -104,8 +104,14 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
     const backendUrl = process.env.BACKEND_URL || 'http://localhost:3001';
     // Post-disconnect: config record exists but credential cleared → not configured.
     const hasCredential = !!(config.accountId || config.apiKeyEncrypted);
+    // Link preserved but unresolvable (account disconnected/removed/expired): the
+    // stored accountId no longer maps to a connected account, so sync would fail
+    // with a cryptic "account not found". Surface a reconnect-needed state instead
+    // of looking healthy — we keep accountId so reconnecting restores the list.
+    const needsReconnect = hasCredential && !(await externalCrmSyncService.isAccountConnected(config));
     res.json({
       configured: hasCredential,
+      needsReconnect,
       provider: config.provider,
       accountId: config.accountId,
       hasManualToken: !!config.apiKeyEncrypted,

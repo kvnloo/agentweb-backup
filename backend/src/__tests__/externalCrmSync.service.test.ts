@@ -77,6 +77,11 @@ jest.mock('../services/attioService', () => ({
   },
 }));
 
+const mockGetAccountById = jest.fn();
+jest.mock('../services/connectedAccountsDb', () => ({
+  getAccountById: (...a: any[]) => mockGetAccountById(...a),
+}));
+
 jest.mock('axios');
 const axios = require('axios');
 
@@ -553,6 +558,41 @@ describe('ExternalCrmSyncService', () => {
 
       const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2];
       expect(saved).not.toBeNull();
+    });
+  });
+
+  // ─── isAccountConnected ───────────────────────────────────────────────────────
+
+  describe('isAccountConnected', () => {
+    it('returns false when config has no credential (accountId nor token)', async () => {
+      const cfg = makeConfig({ accountId: undefined, apiKeyEncrypted: undefined });
+      expect(await service.isAccountConnected(cfg)).toBe(false);
+      expect(mockGetAccountById).not.toHaveBeenCalled();
+    });
+
+    it('returns true for token auth without resolving an OAuth account', async () => {
+      const cfg = makeConfig({ accountId: undefined, apiKeyEncrypted: 'enc:key' });
+      expect(await service.isAccountConnected(cfg)).toBe(true);
+      expect(mockGetAccountById).not.toHaveBeenCalled();
+    });
+
+    it('returns false when the OAuth account no longer resolves (disconnected/removed)', async () => {
+      mockGetAccountById.mockResolvedValue(null);
+      const cfg = makeConfig({ accountId: 'acct1', apiKeyEncrypted: undefined });
+      expect(await service.isAccountConnected(cfg)).toBe(false);
+      expect(mockGetAccountById).toHaveBeenCalledWith('acct1', 'user1');
+    });
+
+    it('returns true when the OAuth account resolves', async () => {
+      mockGetAccountById.mockResolvedValue({ account_id: 'acct1', platform: 'hubspot', userId: 'user1' });
+      const cfg = makeConfig({ accountId: 'acct1', apiKeyEncrypted: undefined });
+      expect(await service.isAccountConnected(cfg)).toBe(true);
+    });
+
+    it('returns false when account resolution throws', async () => {
+      mockGetAccountById.mockRejectedValue(new Error('db down'));
+      const cfg = makeConfig({ accountId: 'acct1', apiKeyEncrypted: undefined });
+      expect(await service.isAccountConnected(cfg)).toBe(false);
     });
   });
 

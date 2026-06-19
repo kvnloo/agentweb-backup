@@ -30,6 +30,7 @@ jest.mock('../services/externalCrmSyncService', () => ({
   externalCrmSyncService: {
     getDefaultMappings: jest.fn().mockResolvedValue({ contactFieldMapping: [], dealFieldMapping: [], customFieldMapping: [] }),
     getConfig: jest.fn().mockResolvedValue(null),
+    isAccountConnected: jest.fn().mockResolvedValue(true),
     saveConfig: jest.fn().mockResolvedValue({
       provider: 'attio',
       listId: 'list-1',
@@ -456,6 +457,39 @@ describe('Org-aware access control on CRM sync routes', () => {
       .expect(200);
 
     expect(res.body.configured).toBe(true);
+  });
+});
+
+describe('GET /api/crm-sync/config/:listId/:provider — needsReconnect state', () => {
+  const { crmDb, userDb } = require('../services/db');
+  const { externalCrmSyncService } = require('../services/externalCrmSyncService');
+
+  const configWithAccount = {
+    provider: 'hubspot', listId: 'list-1', userId: 'user-1', accountId: 'acct-1',
+    autoSyncEnabled: true, contactFieldMapping: [], dealFieldMapping: [], customFieldMapping: [],
+    deleteOnPush: false, deleteOnPull: false, webhookEnabled: true, webhookSecret: 'abc',
+    createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' });
+    userDb.getUserById.mockResolvedValue({ userId: 'user-1' });
+    externalCrmSyncService.getConfig.mockResolvedValue(configWithAccount);
+  });
+
+  it('reports needsReconnect=true when accountId is set but the account no longer resolves', async () => {
+    externalCrmSyncService.isAccountConnected.mockResolvedValue(false);
+    const res = await request(app).get('/api/crm-sync/config/list-1/hubspot').expect(200);
+    expect(res.body.configured).toBe(true);     // link preserved
+    expect(res.body.needsReconnect).toBe(true);  // but flagged for reconnect
+  });
+
+  it('reports needsReconnect=false when the account resolves', async () => {
+    externalCrmSyncService.isAccountConnected.mockResolvedValue(true);
+    const res = await request(app).get('/api/crm-sync/config/list-1/hubspot').expect(200);
+    expect(res.body.configured).toBe(true);
+    expect(res.body.needsReconnect).toBe(false);
   });
 });
 

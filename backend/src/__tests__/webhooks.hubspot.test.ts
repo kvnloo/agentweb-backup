@@ -84,8 +84,14 @@ jest.mock('../services/hubspotService', () => ({
 }));
 
 const CLIENT_SECRET = 'test-client-secret';
+const MANAGED_APP_ID = 42057552;
 jest.mock('../config/integrations', () => ({
   getHubSpotConfig: jest.fn().mockResolvedValue({ clientSecret: CLIENT_SECRET }),
+  // Mirrors the real resolver: secret for our managed app (or no appId), null otherwise.
+  getHubSpotClientSecretForAppId: jest.fn(async (appId?: string | number | null) => {
+    if (appId === undefined || appId === null || appId === '') return CLIENT_SECRET;
+    return String(appId) === String(MANAGED_APP_ID) ? CLIENT_SECRET : null;
+  }),
   getAttioConfig: jest.fn(),
 }));
 
@@ -157,6 +163,59 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
       .send(body);
 
     await flushPromises();
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
+  it('ignores events from an app we do not manage (appId mismatch) even with an otherwise-valid signature', async () => {
+    // Signature is valid under OUR secret, but the event is from a different app.
+    // We must not process events from apps we don't manage.
+    const body = [{ subscriptionType: 'contact.propertyChange', portalId: PORTAL_ID, appId: 99999999, objectId: '1', propertyName: 'firstname', propertyValue: 'Mallory' }];
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .set('x-hubspot-signature', makeSignature(body))
+      .send(body);
+
+    await flushPromises();
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
+  it('processes events from the managed app (appId match) with a valid signature', async () => {
+    const body = [
+      { subscriptionType: 'contact.propertyChange', portalId: PORTAL_ID, appId: MANAGED_APP_ID, objectId: '1', propertyName: 'firstname', propertyValue: 'Alice2' },
+      { subscriptionType: 'contact.propertyChange', portalId: PORTAL_ID, appId: MANAGED_APP_ID, objectId: '1', propertyName: 'email', propertyValue: 'alice@example.com' },
+    ];
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .set('x-hubspot-signature', makeSignature(body))
+      .send(body);
+
+    await flushPromises();
+    expect(mockUpdateLead).toHaveBeenCalled();
+  });
+
+  it('recovers a contact.propertyChange when email resolution fails once then succeeds (retry)', async () => {
+    // firstname-only change → no email in payload → must resolve via API.
+    // First call throws a transient error, retry (fresh token) succeeds.
+    mockGetContactEmailById
+      .mockRejectedValueOnce({ response: { status: 400 }, message: 'transient' })
+      .mockResolvedValueOnce('alice@example.com');
+    const body = [{ subscriptionType: 'contact.propertyChange', portalId: PORTAL_ID, objectId: '1', propertyName: 'firstname', propertyValue: 'Alice2' }];
+    await request(app).post('/api/webhooks/hubspot').send(body);
+
+    await flushPromises();
+    await flushPromises();
+    expect(mockGetContactEmailById).toHaveBeenCalledTimes(2);
+    expect(mockUpdateLead).toHaveBeenCalled();
+  });
+
+  it('skips (does not throw) when email resolution fails on both attempts', async () => {
+    mockGetContactEmailById.mockRejectedValue({ response: { status: 400 }, message: 'down' });
+    const body = [{ subscriptionType: 'contact.propertyChange', portalId: PORTAL_ID, objectId: '1', propertyName: 'firstname', propertyValue: 'Alice2' }];
+    await request(app).post('/api/webhooks/hubspot').send(body);
+
+    await flushPromises();
+    await flushPromises();
+    expect(mockGetContactEmailById).toHaveBeenCalledTimes(2);
     expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 
