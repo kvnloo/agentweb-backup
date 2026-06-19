@@ -766,6 +766,17 @@ export class ExternalCrmSyncService {
       .catch((err: any) => console.error(`[ExternalCrmSync] failed to persist push job ${job.jobId}:`, this.formatError(err)));
   }
 
+  /** Writes live push progress onto the running job (no-op for the synchronous
+   *  pushAllLeads path, which runs runPush without a job). Cheap: one config
+   *  write per 500-lead chunk. */
+  private async reportPushProgress(config: ExternalCrmSyncConfig, processed: number, total?: number): Promise<void> {
+    const job = config.pushJob;
+    if (!job || job.status !== 'running') return;
+    job.processedCount = processed;
+    if (total !== undefined) job.totalCount = total;
+    await this.persistPushJob(config, job);
+  }
+
   // ─── Per-list push serialization ──────────────────────────────────────────────
 
   /**
@@ -795,10 +806,13 @@ export class ExternalCrmSyncService {
 
   /** Core push loop, operating on an already-resolved config. */
   private async runPush(config: ExternalCrmSyncConfig, listId: string, provider: string): Promise<SyncResult> {
-    // Attach the human-readable list name so adapters can use it when naming external lists
-    if (!config.listName) {
+    // Attach the human-readable list name + seed the progress denominator from the
+    // maintained leadCount (best-effort; used only for the % in the progress card).
+    let totalCount: number | undefined;
+    {
       const list = await crmDb.getLeadListById(listId);
-      if (list?.name) config.listName = list.name;
+      if (list?.name && !config.listName) config.listName = list.name;
+      if (typeof (list as any)?.leadCount === 'number') totalCount = (list as any).leadCount;
     }
 
     // Serialize all pushes for this list (full push + single-lead auto-sync) so two
@@ -818,6 +832,9 @@ export class ExternalCrmSyncService {
       let lastKey: any = undefined;
       let hasLeads = false;
 
+      let processed = 0;
+      await this.reportPushProgress(config, 0, totalCount);
+
       do {
         const page = await crmDb.getLeadsByListId(listId, 500, lastKey);
         const chunk = page.items as any[];
@@ -835,6 +852,9 @@ export class ExternalCrmSyncService {
           if (chunkResult.errors?.length > 0) {
             totalResult.errors.push(...chunkResult.errors);
           }
+
+          processed += chunk.length;
+          await this.reportPushProgress(config, processed, totalCount);
         }
       } while (lastKey);
 
