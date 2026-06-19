@@ -1646,4 +1646,130 @@ export class HubSpotService {
 
     return results;
   }
+
+  // ─── Batch operations ───────────────────────────────────────────────────────
+  //
+  // Each method below processes a SINGLE batch of at most 100 inputs and THROWS
+  // on any non-2xx response (whole-batch failure). Chunking and split-and-retry
+  // are handled by the caller, so these methods do NOT chunk internally — they
+  // throw if more than 100 inputs are supplied.
+
+  /**
+   * Batch upsert contacts by email (idProperty = 'email').
+   * POST /crm/v3/objects/contacts/batch/upsert
+   * Maps each result back via the email returned in result.properties.email
+   * (lowercased). isNew is derived from the HubSpot `new` flag on each result.
+   */
+  async batchUpsertContacts(
+    inputs: Array<{ email: string; properties: Record<string, string> }>
+  ): Promise<Array<{ email: string; contactId: string; isNew: boolean }>> {
+    if (inputs.length > 100) {
+      throw new Error(`batchUpsertContacts accepts at most 100 inputs per batch, got ${inputs.length}`);
+    }
+
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/batch/upsert`,
+      {
+        inputs: inputs.map((i) => ({
+          idProperty: 'email',
+          id: i.email.toLowerCase(),
+          properties: i.properties,
+        })),
+      },
+      { headers: await this.authHeaders() }
+    );
+
+    return ((res.data as any)?.results ?? []).map((r: any) => ({
+      email: String(r?.properties?.email ?? '').toLowerCase(),
+      contactId: String(r.id),
+      isNew: r?.new === true,
+    }));
+  }
+
+  /**
+   * Batch create deals.
+   * POST /crm/v3/objects/deals/batch/create
+   * Each input carries a unique objectWriteTraceId (the caller passes leadId) so
+   * results — which may NOT preserve input order — can be mapped back reliably.
+   */
+  async batchCreateDeals(
+    inputs: Array<{ traceId: string; properties: Record<string, string> }>
+  ): Promise<Array<{ traceId: string; dealId: string }>> {
+    if (inputs.length > 100) {
+      throw new Error(`batchCreateDeals accepts at most 100 inputs per batch, got ${inputs.length}`);
+    }
+
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/crm/v3/objects/deals/batch/create`,
+      {
+        inputs: inputs.map((i) => ({
+          properties: i.properties,
+          objectWriteTraceId: i.traceId,
+        })),
+      },
+      { headers: await this.authHeaders() }
+    );
+
+    const results = (res.data as any)?.results ?? [];
+
+    // Primary path: map back by the echoed objectWriteTraceId (order-independent).
+    const allEchoed = results.every((r: any) => r?.objectWriteTraceId !== undefined && r?.objectWriteTraceId !== null);
+    if (allEchoed) {
+      const dealByTrace = new Map<string, string>();
+      for (const r of results) {
+        dealByTrace.set(String(r.objectWriteTraceId), String(r.id));
+      }
+      return inputs.map((i) => ({ traceId: i.traceId, dealId: dealByTrace.get(i.traceId) as string }));
+    }
+
+    // FALLBACK: without echoed trace IDs, positional mapping is only safe when it
+    // is UNAMBIGUOUS — a single input and a single real result. Anything else
+    // (multi-item batch, or a short/incomplete response) risks pairing deals with
+    // the wrong lead or emitting the literal string 'undefined', so we THROW and
+    // let splitAndRetry isolate the batch down to size 1 (where positional is safe).
+    if (inputs.length === 1 && results.length === 1 && results[0]?.id != null) {
+      return [{ traceId: inputs[0].traceId, dealId: String(results[0].id) }];
+    }
+    throw new Error('batchCreateDeals: cannot map results to inputs (objectWriteTraceId not echoed and response is ambiguous or incomplete)');
+  }
+
+  /**
+   * Batch update deals by id.
+   * POST /crm/v3/objects/deals/batch/update
+   */
+  async batchUpdateDeals(
+    inputs: Array<{ dealId: string; properties: Record<string, string> }>
+  ): Promise<void> {
+    if (inputs.length > 100) {
+      throw new Error(`batchUpdateDeals accepts at most 100 inputs per batch, got ${inputs.length}`);
+    }
+
+    await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/crm/v3/objects/deals/batch/update`,
+      {
+        inputs: inputs.map((i) => ({ id: i.dealId, properties: i.properties })),
+      },
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  /**
+   * Batch create DEFAULT contact→deal associations.
+   * POST /crm/v4/associations/contact/deal/batch/create/default
+   */
+  async batchAssociateContactsToDeals(
+    pairs: Array<{ contactId: string; dealId: string }>
+  ): Promise<void> {
+    if (pairs.length > 100) {
+      throw new Error(`batchAssociateContactsToDeals accepts at most 100 pairs per batch, got ${pairs.length}`);
+    }
+
+    await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/crm/v4/associations/contact/deal/batch/create/default`,
+      {
+        inputs: pairs.map((p) => ({ from: { id: p.contactId }, to: { id: p.dealId } })),
+      },
+      { headers: await this.authHeaders() }
+    );
+  }
 }
