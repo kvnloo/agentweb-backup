@@ -43,6 +43,9 @@ export interface PushJob {
   finishedAt?: string;
   result?: SyncResult;
   error?: string;
+  // Live progress, written per 500-lead chunk while running (push-only).
+  processedCount?: number;  // leads pushed so far (authoritative — sum of real chunk sizes)
+  totalCount?: number;      // best-effort denominator from list.leadCount (may drift)
 }
 
 export interface ExternalCrmSyncConfig {
