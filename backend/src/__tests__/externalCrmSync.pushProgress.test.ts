@@ -109,3 +109,40 @@ describe('ExternalCrmSyncService push progress', () => {
     expect(persistedPushJobs.length).toBe(0); // pushAllLeads sets no pushJob, so no progress writes
   });
 });
+
+describe('ExternalCrmSyncService.getRunningPushJobForList', () => {
+  let service: ExternalCrmSyncService;
+  beforeEach(() => { jest.clearAllMocks(); service = new ExternalCrmSyncService(); });
+
+  it('returns the provider + job when a list has a running, non-stale push job', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({
+      listId: 'listA', userId: 'user1', name: 'List A',
+      externalCrmSyncConfigs: {
+        hubspot: makeConfig({
+          pushJob: { jobId: 'j1', status: 'running', startedAt: new Date().toISOString(), processedCount: 2, totalCount: 5 },
+        } as any),
+      },
+    } as any);
+    const res = await service.getRunningPushJobForList('user1', 'listA');
+    expect(res).not.toBeNull();
+    expect(res!.provider).toBe('hubspot');
+    expect(res!.job.jobId).toBe('j1');
+  });
+
+  it('returns null when no config has a running job', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({
+      listId: 'listA', userId: 'user1', name: 'List A',
+      externalCrmSyncConfigs: { hubspot: makeConfig({ pushJob: { jobId: 'j1', status: 'completed', startedAt: new Date().toISOString() } } as any) },
+    } as any);
+    expect(await service.getRunningPushJobForList('user1', 'listA')).toBeNull();
+  });
+
+  it('returns null when the running job is stale (process likely died)', async () => {
+    const old = new Date(Date.now() - 21 * 60 * 1000).toISOString(); // > STALE_PUSH_JOB_MS (20m)
+    mockCrmDb.getLeadListById.mockResolvedValue({
+      listId: 'listA', userId: 'user1', name: 'List A',
+      externalCrmSyncConfigs: { hubspot: makeConfig({ pushJob: { jobId: 'j1', status: 'running', startedAt: old } } as any) },
+    } as any);
+    expect(await service.getRunningPushJobForList('user1', 'listA')).toBeNull();
+  });
+});

@@ -752,6 +752,26 @@ export class ExternalCrmSyncService {
     return config?.pushJob ?? null;
   }
 
+  /** Provider-agnostic lookup: returns the first configured provider on the list
+   *  whose push job is currently running (and not stale), for refresh-resume of
+   *  the progress card. Returns null when none. Access-checked like getConfig. */
+  async getRunningPushJobForList(
+    userId: string,
+    listId: string
+  ): Promise<{ provider: string; job: PushJob } | null> {
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return null;
+    const configs = (list as any).externalCrmSyncConfigs as Record<string, ExternalCrmSyncConfig> | undefined;
+    if (!configs) return null;
+    for (const [provider, config] of Object.entries(configs)) {
+      const job = config?.pushJob;
+      if (!job || job.status !== 'running' || this.isPushJobStale(job)) continue;
+      if (!(await this.canAccessConfig(userId, config.userId))) continue;
+      return { provider, job };
+    }
+    return null;
+  }
+
   private isPushJobStale(job: PushJob): boolean {
     const started = Date.parse(job.startedAt);
     if (Number.isNaN(started)) return true;

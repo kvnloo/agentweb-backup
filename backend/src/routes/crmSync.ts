@@ -440,6 +440,27 @@ router.get('/push/:listId/:provider/status', async (req: any, res) => {
   }
 });
 
+// GET /api/crm-sync/push/:listId/status
+// Provider-agnostic: returns the running push job + its provider for the list, so
+// the CRM page can re-mount the progress card after a refresh without knowing the
+// provider. Returns { status: 'idle' } when nothing is running.
+router.get('/push/:listId/status', async (req: any, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { listId } = req.params;
+    const ownership = await verifyListOwnership(userId, listId);
+    if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
+
+    const running = await externalCrmSyncService.getRunningPushJobForList(userId, listId);
+    if (!running) return res.json({ status: 'idle' });
+    res.json({ status: 'running', provider: running.provider, job: running.job });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to get push status' });
+  }
+});
+
 // POST /api/crm-sync/pull/:listId/:provider
 router.post('/pull/:listId/:provider', async (req: any, res) => {
   try {
