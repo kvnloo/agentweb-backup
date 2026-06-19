@@ -3300,8 +3300,21 @@ export class AgentModeService {
    *   required functions, and auto-installed skills, plus autocomplete guidance when enabled.
    *
    * Returns an empty array when there is no work plan or it has no steps.
+   *
+   * `generatedImageFilenames` (optional) lists images already produced this session;
+   * when provided for an active plan it is rendered as an "already-generated assets"
+   * section so the model generates only what's missing instead of regenerating from
+   * scratch after a run timeout.
+   *
+   * `includeResumeGuidance` (default true) gates ALL of the image-resume hardening —
+   * step-progression, multi-intent handling, the interactive completion guard, the
+   * hands-off autocomplete wording, and the already-generated-assets section. The
+   * reported bug was agent-mode-only, so agent mode passes true; Emma passes false to
+   * stay byte-for-byte identical to current production behavior (header + step list +
+   * the ORIGINAL autocomplete wording, nothing else). This keeps Emma's surface
+   * unchanged while still fixing the agent-mode loop.
    */
-  public static buildWorkPlanContextMessages(workPlan?: any): any[] {
+  public static buildWorkPlanContextMessages(workPlan?: any, generatedImageFilenames?: string[], includeResumeGuidance: boolean = true): any[] {
     if (!workPlan || !Array.isArray(workPlan.steps) || workPlan.steps.length === 0) {
       return [];
     }
@@ -3331,9 +3344,69 @@ export class AgentModeService {
 
     workPlanContent += `You MUST continue working with this existing plan. DO NOT create a new work plan. Use modify_work_plan if you need to add or change steps.\n\n`;
 
-    // If autocomplete is enabled, add instruction to auto-complete steps
+    // All of the blocks below are the image-resume hardening, gated to agent mode
+    // (includeResumeGuidance). Emma passes false → none of this is emitted and her
+    // output stays identical to current production (only the original autocomplete
+    // wording is kept, below). The reported bug was agent-mode-only, so this is safe.
+    if (includeResumeGuidance) {
+      // Explicit progression rule. Without this, non-autocomplete plans gave the model
+      // no instruction on when to advance, so a step could sit pending indefinitely
+      // (the model would re-ask or regenerate instead of calling set_work_plan_status).
+      //
+      // Investigation counter: an earlier hypothesis blamed a gate at set_work_plan_status
+      // for the stuck step. Disproven — the gate was satisfied; the model simply never
+      // converged on the step (kept redoing work), so the fix is convergence guidance here,
+      // not a gate change.
+      workPlanContent += `⚠️ STEP PROGRESSION: Work through steps in order. After you finish the work for the current pending step, call set_work_plan_status to mark it completed, then move to the next step. Do NOT re-do or restart a step whose work is already finished.\n\n`;
+
+      // Batched / multi-intent guidance. A single user message may stack several
+      // instructions (e.g. "keep 3 per hook / restart / generate the report / proceed").
+      // Tell the model to resolve them in plan order rather than stalling on the conflict.
+      workPlanContent += `⚠️ HANDLING MESSAGES WITH MULTIPLE INSTRUCTIONS: If a single user message bundles several stacked or seemingly conflicting instructions, do NOT stall or ask which one to do first. Briefly acknowledge what you understood, then act on them in work-plan order: finish the current step's remaining work first, then proceed to the next step. Only ask a clarifying question if an instruction is genuinely impossible to interpret.\n\n`;
+    }
+
     if (workPlan.autocomplete) {
-      workPlanContent += `⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.\n\n`;
+      if (includeResumeGuidance) {
+        // Autocomplete plans are meant to run hands-off: the agent completes each step
+        // without asking the user to approve it (autocomplete is copied onto the session
+        // work plan at agentModeController.ts ~5826, defaulting false). Giving such a plan
+        // the interactive "don't complete until the user approves" guard below would be a
+        // direct contradiction and could make the agent pause for an approval the
+        // autocomplete contract says it should never wait for. So instead: never pause/ask,
+        // recover missing info from tools or earlier session content, else proceed with
+        // sensible defaults, and always complete + advance.
+        //
+        // Investigation counter: this autocomplete branch is NOT the new-user onboarding
+        // flow at /onboarding/v2. That flow is a separate brand-build status machine (a
+        // "regular" session with NO work plan) and never reaches this code. An earlier
+        // hypothesis that this guard could stall onboarding was based on that wrong premise.
+        workPlanContent += `⚠️ AUTOCOMPLETE MODE: This plan runs hands-off — do NOT pause to ask the user to approve or confirm a step. After performing a step's work, immediately call set_work_plan_status to complete it and move on. If information is missing, recover it using your tools (e.g. read_brand_guidelines, read_market_strategy) or earlier session content; if it is still missing, proceed with reasonable defaults rather than blocking. Never leave a step pending waiting on the user.\n\n`;
+      } else {
+        // Production-parity path (Emma): the ORIGINAL autocomplete wording, unchanged
+        // from origin/main, so Emma's output does not drift.
+        workPlanContent += `⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.\n\n`;
+      }
+    } else if (includeResumeGuidance) {
+      // Interactive plans: protect per-step correctness and any approval checkpoint.
+      // Safe here because the user CAN respond, so a deliberate pause is recoverable.
+      workPlanContent += `⚠️ STEP COMPLETION: Do NOT mark a step completed before its work is actually finished, or before the user approves when approval was requested. If you are waiting on the user to approve before completing a step, complete it as soon as they approve.\n\n`;
+    }
+
+    // Asset-awareness: list images already generated this session so the model
+    // generates only what's still missing instead of regenerating from scratch
+    // after a run timeout (the expensive, non-converging loop this fixes).
+    //
+    // Investigation counter: the original report blamed a "batched multi-intent message"
+    // (e.g. "keep 3 per hook / restart / generate the report / go"). That was a symptom,
+    // not the cause — the user was nudging a flow that kept looping. The real driver was
+    // this regenerate-from-scratch-after-timeout loop; surfacing already-made assets is
+    // what actually breaks it.
+    if (includeResumeGuidance && Array.isArray(generatedImageFilenames) && generatedImageFilenames.length > 0) {
+      workPlanContent += `⚠️ ALREADY-GENERATED ASSETS (${generatedImageFilenames.length}): these images already exist in this session and are saved — DO NOT regenerate them UNLESS the user explicitly asks to regenerate, restart, redo, or change them. Otherwise only generate the images that are still missing.\n`;
+      for (const filename of generatedImageFilenames) {
+        workPlanContent += `   - ${filename}\n`;
+      }
+      workPlanContent += `\n`;
     }
 
     workPlan.steps.forEach((step: any) => {
@@ -3359,6 +3432,40 @@ export class AgentModeService {
     });
 
     return [{ role: 'assistant', content: workPlanContent.trim() }];
+  }
+
+  /**
+   * Extract the filenames of images already generated in this session by scanning
+   * the "Image generated: <filename>" system messages that generateImage persists
+   * (see generateImage -> addMessageToSession). De-duplicated, order-preserving.
+   *
+   * Used to make the work-plan context asset-aware: when a long image-generation
+   * step (e.g. "generate 18 images") outlives the run timeout and the user nudges
+   * the agent to continue, the model would otherwise re-render the still-pending
+   * step with no memory of what it already produced and regenerate everything from
+   * scratch — an expensive, non-converging loop. Surfacing the existing filenames
+   * lets the model generate only what's missing and then advance the step.
+   */
+  public static extractGeneratedImageFilenames(sessionHistory?: any[]): string[] {
+    if (!Array.isArray(sessionHistory)) return [];
+    const seen = new Set<string>();
+    const filenames: string[] = [];
+    for (const msg of sessionHistory) {
+      if (!msg || msg.role !== 'system') continue;
+      // Prefer the structured marker (newer messages); fall back to the legacy
+      // content-string format so older / in-flight sessions are still detected.
+      let filename: string | undefined;
+      if (msg.metadata && msg.metadata.kind === 'image-generated' && typeof msg.metadata.imageFilename === 'string') {
+        filename = msg.metadata.imageFilename.trim();
+      } else if (typeof msg.content === 'string') {
+        const match = msg.content.match(/^Image generated:\s*(.+?)\s*$/);
+        if (match) filename = match[1].trim();
+      }
+      if (!filename || seen.has(filename)) continue;
+      seen.add(filename);
+      filenames.push(filename);
+    }
+    return filenames;
   }
 
   private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string): any[] {
@@ -3517,9 +3624,13 @@ export class AgentModeService {
     }
     messages.push({ role: 'assistant', content: statusesContent });
 
-    // Insert work plan status as an assistant message if exists
+    // Insert work plan status as an assistant message if exists. Pass the set of
+    // images already generated this session (scanned from full history, not the
+    // 10-message window) so a still-pending image step doesn't trigger a
+    // regenerate-from-scratch loop after a run timeout.
     if (workPlan) {
-      messages.push(...AgentModeService.buildWorkPlanContextMessages(workPlan));
+      const generatedImageFilenames = AgentModeService.extractGeneratedImageFilenames(sessionHistory);
+      messages.push(...AgentModeService.buildWorkPlanContextMessages(workPlan, generatedImageFilenames));
     }
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)
@@ -18023,7 +18134,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             role: 'system',
             content: `Image generated: ${result.filename}`,
             metadata: {
-              timestamp: new Date().toISOString()
+              timestamp: new Date().toISOString(),
+              // Stable marker so extractGeneratedImageFilenames can detect generated
+              // images without relying solely on the content-string format.
+              kind: 'image-generated',
+              imageFilename: result.filename
             }
           });
         } catch (error) {

@@ -791,7 +791,13 @@ describe('AgentModeService - Work Plan', () => {
       );
 
       expect(workPlanMessage).toBeDefined();
-      expect(workPlanMessage.content).toContain('⚠️ AUTOCOMPLETE MODE: After performing the work of a step, DO NOT ask the user whether you should complete the step. Simply call set_work_plan_status to complete the step.');
+      // Autocomplete plans run hands-off — the guidance must forbid pausing for approval
+      // and instruct best-effort completion, never the interactive "don't complete until
+      // approved" guard (which would contradict the autocomplete contract).
+      expect(workPlanMessage.content).toContain('⚠️ AUTOCOMPLETE MODE');
+      expect(workPlanMessage.content).toMatch(/do NOT pause to ask the user to approve or confirm/i);
+      expect(workPlanMessage.content).toMatch(/reasonable defaults rather than blocking/i);
+      expect(workPlanMessage.content).not.toContain('STEP COMPLETION');
     });
 
     it('should not include autocomplete instruction when autocomplete is false', () => {
@@ -818,7 +824,10 @@ describe('AgentModeService - Work Plan', () => {
 
       expect(workPlanMessage).toBeDefined();
       expect(workPlanMessage.content).not.toContain('AUTOCOMPLETE MODE');
-      expect(workPlanMessage.content).not.toContain('set_work_plan_status');
+      // Step-progression guidance (which mentions set_work_plan_status) is added for
+      // ALL active plans regardless of autocomplete — only the AUTOCOMPLETE MODE block
+      // is gated. Assert that the autocomplete-specific phrasing is what's absent.
+      expect(workPlanMessage.content).not.toContain('DO NOT ask the user whether you should complete the step');
     });
 
     it('should not include autocomplete instruction when autocomplete is undefined', () => {
@@ -845,7 +854,9 @@ describe('AgentModeService - Work Plan', () => {
 
       expect(workPlanMessage).toBeDefined();
       expect(workPlanMessage.content).not.toContain('AUTOCOMPLETE MODE');
-      expect(workPlanMessage.content).not.toContain('set_work_plan_status');
+      // See note above: step-progression guidance is intentionally present for active
+      // plans; only the autocomplete-specific instruction must be absent here.
+      expect(workPlanMessage.content).not.toContain('DO NOT ask the user whether you should complete the step');
     });
   });
 

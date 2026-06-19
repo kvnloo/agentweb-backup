@@ -713,6 +713,84 @@ describe('AgentModeService - buildMarketingContext with Attachments', () => {
         expect(workPlanMsg).toBeDefined();
         expect(workPlanMsg.content).toContain('AUTOCOMPLETE MODE');
       });
+
+      // Regression for the LinkedIn Ads "Generate 3 Images Per Hook" stall: a long
+      // image step times out mid-run; on the user's nudge the still-pending step was
+      // re-rendered with no memory of the images already produced, so the model
+      // regenerated from scratch and never advanced. The fix scans the session's
+      // "Image generated: X" system messages and surfaces them in the work-plan
+      // context so the model generates only what's missing.
+      describe('image-generation work plan resumption (asset awareness)', () => {
+        const imageStepWorkPlan = {
+          title: 'LinkedIn Ads Campaign generator',
+          steps: [
+            { stepCount: 1, title: 'Collect Campaign Inputs', status: 'completed' },
+            { stepCount: 2, title: 'Write 6 Hooks & Ad Copy', status: 'completed' },
+            {
+              stepCount: 3,
+              title: 'Generate 3 Images Per Hook',
+              status: 'pending',
+              requiredFunctionCalls: ['generate_image'],
+            },
+            { stepCount: 4, title: 'Generate Creative Hub Report', status: 'pending' },
+          ],
+        };
+
+        it('surfaces already-generated image filenames so the model does not regenerate them', () => {
+          const sessionHistory: ChatMessage[] = [
+            { role: 'system', content: 'You are a helpful assistant', timestamp: '2025-01-01T00:00:00.000Z' },
+            { role: 'user', content: 'generate', timestamp: '2025-01-01T00:01:00.000Z' },
+            { role: 'system', content: 'Image generated: xcures_h1_typographic.png', timestamp: '2025-01-01T00:02:00.000Z' },
+            { role: 'system', content: 'Image generated: xcures_h1_dataclarity.png', timestamp: '2025-01-01T00:03:00.000Z' },
+            { role: 'system', content: 'Image generated: xcures_h2_typographic.png', timestamp: '2025-01-01T00:04:00.000Z' },
+            // Duplicate from a prior timed-out run must not be double-counted
+            { role: 'system', content: 'Image generated: xcures_h1_typographic.png', timestamp: '2025-01-01T00:05:00.000Z' },
+          ];
+
+          const result = (agentModeService as any).buildMarketingContext(
+            'go',
+            sessionHistory,
+            [],
+            imageStepWorkPlan
+          );
+
+          const workPlanMsg = result.find(
+            (msg: any) => msg.role === 'assistant' && msg.content.includes('WORK PLAN')
+          );
+          expect(workPlanMsg).toBeDefined();
+          // Asset-awareness section present with the de-duplicated filenames
+          expect(workPlanMsg.content).toContain('ALREADY-GENERATED ASSETS (3)');
+          expect(workPlanMsg.content).toContain('xcures_h1_typographic.png');
+          expect(workPlanMsg.content).toContain('xcures_h1_dataclarity.png');
+          expect(workPlanMsg.content).toContain('xcures_h2_typographic.png');
+          expect(workPlanMsg.content).toMatch(/DO NOT regenerate/i);
+          // Progression guidance so the step actually advances
+          expect(workPlanMsg.content).toContain('STEP PROGRESSION');
+          expect(workPlanMsg.content).toContain('set_work_plan_status');
+        });
+
+        it('omits the asset section when no images have been generated yet', () => {
+          const sessionHistory: ChatMessage[] = [
+            { role: 'system', content: 'You are a helpful assistant', timestamp: '2025-01-01T00:00:00.000Z' },
+            { role: 'user', content: 'start', timestamp: '2025-01-01T00:01:00.000Z' },
+          ];
+
+          const result = (agentModeService as any).buildMarketingContext(
+            'go',
+            sessionHistory,
+            [],
+            imageStepWorkPlan
+          );
+
+          const workPlanMsg = result.find(
+            (msg: any) => msg.role === 'assistant' && msg.content.includes('WORK PLAN')
+          );
+          expect(workPlanMsg).toBeDefined();
+          expect(workPlanMsg.content).not.toContain('ALREADY-GENERATED ASSETS');
+          // Progression guidance still present
+          expect(workPlanMsg.content).toContain('STEP PROGRESSION');
+        });
+      });
     });
   });
 });
