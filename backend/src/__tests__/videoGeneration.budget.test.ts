@@ -1,41 +1,73 @@
 import {
   seedancePollBudgetMs,
   remainingBudgetMs,
-  VIDEO_TOTAL_BUDGET_MS,
-  VEO_FALLBACK_RESERVE_MS,
+  videoTotalBudgetMs,
+  veoFallbackReserveMs,
+  closestVeoAspectRatio,
 } from '../services/videoGeneration';
 
-describe('video generation time-budget helpers (option C: fit seedance+veo inside the turn cap)', () => {
-  it('total video budget stays safely under the 600s turn cap', () => {
-    expect(VIDEO_TOTAL_BUDGET_MS).toBeLessThan(600000);
+describe('closestVeoAspectRatio (map Seedance aspect ratios to Veo-supported for fallback)', () => {
+  it('passes Veo-native ratios through unchanged', () => {
+    expect(closestVeoAspectRatio('16:9')).toBe('16:9');
+    expect(closestVeoAspectRatio('9:16')).toBe('9:16');
+  });
+
+  it('keeps auto as auto (and treats missing as auto)', () => {
+    expect(closestVeoAspectRatio('auto')).toBe('auto');
+    expect(closestVeoAspectRatio(undefined)).toBe('auto');
+  });
+
+  it('maps Seedance-only ratios to the nearest Veo ratio', () => {
+    expect(closestVeoAspectRatio('21:9')).toBe('16:9'); // 2.33 → landscape
+    expect(closestVeoAspectRatio('4:3')).toBe('16:9');  // 1.33 closer to 1.78 than 0.56
+    expect(closestVeoAspectRatio('3:4')).toBe('9:16');  // 0.75 closer to 0.56
+    expect(closestVeoAspectRatio('1:1')).toBe('9:16');  // 1.0 closer to 0.56 than 1.78
+  });
+
+  it('falls back to auto for unparseable input', () => {
+    expect(closestVeoAspectRatio('weird')).toBe('auto');
+  });
+});
+
+describe('length-driven video time budgets', () => {
+  describe('veoFallbackReserveMs (scales with Veo clip count)', () => {
+    it('reserves 150s per clip; ≤8s = 1 clip, >8s = ceil(secs/8) clips', () => {
+      expect(veoFallbackReserveMs(4)).toBe(150_000);   // 1 clip
+      expect(veoFallbackReserveMs(8)).toBe(150_000);   // 1 clip
+      expect(veoFallbackReserveMs(9)).toBe(300_000);   // 2 clips
+      expect(veoFallbackReserveMs(15)).toBe(300_000);  // 2 clips
+    });
+    it('clamps duration to 4–15 and defaults to 8', () => {
+      expect(veoFallbackReserveMs(undefined)).toBe(150_000); // 8s
+      expect(veoFallbackReserveMs(99)).toBe(300_000);        // clamp 15 → 2 clips
+    });
+  });
+
+  describe('videoTotalBudgetMs (longer videos get more time)', () => {
+    it('grows with requested length', () => {
+      // seedance = 150 + 45*secs, + veo reserve
+      expect(videoTotalBudgetMs(4)).toBe((150 + 45 * 4) * 1000 + 150_000);  // 330 + 150 = 480s
+      expect(videoTotalBudgetMs(8)).toBe((150 + 45 * 8) * 1000 + 150_000);  // 510 + 150 = 660s
+      expect(videoTotalBudgetMs(15)).toBe((150 + 45 * 15) * 1000 + 300_000); // 825 + 300 = 1125s
+    });
+    it('a 14s video gets far more than the old flat ~352s seedance budget', () => {
+      const total = videoTotalBudgetMs(14);
+      const seedance = total - veoFallbackReserveMs(14);
+      expect(seedance).toBeGreaterThan(700_000); // ≫ 352s — the 14s case that wrongly failed over
+    });
   });
 
   describe('seedancePollBudgetMs', () => {
-    it('reserves Veo time: seedance gets (remaining - reserve) when that is the binding constraint', () => {
-      // deadline 540s away, reserve 300s, max 480s → seedance capped at 240s so 300s remains for Veo
-      expect(seedancePollBudgetMs(0, 540000, 480000, 300000)).toBe(240000);
+    it('grants whatever remains before the deadline after the length-scaled Veo reserve', () => {
+      const deadline = videoTotalBudgetMs(8); // fresh 8s budget from t=0
+      expect(seedancePollBudgetMs(0, deadline, 8)).toBe(deadline - veoFallbackReserveMs(8));
     });
-
-    it('caps at the seedance max when there is ample time', () => {
-      expect(seedancePollBudgetMs(0, 2000000, 480000, 300000)).toBe(480000);
+    it('accounts for elapsed time', () => {
+      const deadline = videoTotalBudgetMs(8);
+      expect(seedancePollBudgetMs(100_000, deadline, 8)).toBe(deadline - 100_000 - veoFallbackReserveMs(8));
     });
-
-    it('shrinks under tight deadlines', () => {
-      expect(seedancePollBudgetMs(0, 350000, 480000, 300000)).toBe(50000);
-    });
-
-    it('never goes negative — when no time is left, seedance gets 0 (straight to Veo)', () => {
-      expect(seedancePollBudgetMs(0, 200000, 480000, 300000)).toBe(0);
-    });
-
-    it('with the configured defaults, a fresh call grants Seedance 360s (reserving 180s for Veo)', () => {
-      expect(seedancePollBudgetMs(0, VIDEO_TOTAL_BUDGET_MS)).toBe(360000);
-      expect(VIDEO_TOTAL_BUDGET_MS - VEO_FALLBACK_RESERVE_MS).toBe(360000);
-    });
-
-    it('accounts for elapsed time (now > 0)', () => {
-      // 540s deadline, 100s already elapsed → 440s remain, minus 300s reserve = 140s
-      expect(seedancePollBudgetMs(100000, 540000, 480000, 300000)).toBe(140000);
+    it('never goes negative — no time left → 0 (straight to Veo)', () => {
+      expect(seedancePollBudgetMs(0, 100_000, 8)).toBe(0); // reserve 150s > 100s deadline
     });
   });
 

@@ -5,6 +5,7 @@ import * as secretsManager from '../utils/secretsManager';
 import * as s3Utils from '../utils/s3Utils';
 import { imageService } from '../services/imageGeneration';
 import axios from 'axios';
+import { remotionService } from '../services/remotionService';
 
 // Mock dependencies
 jest.mock('../utils/secretsManager');
@@ -14,6 +15,9 @@ jest.mock('../services/imageGeneration', () => ({
 }));
 jest.mock('axios');
 jest.mock('@google/genai');
+jest.mock('../services/remotionService', () => ({
+  remotionService: { compose: jest.fn() },
+}));
 
 // Seedance 2.0 runs over ONE MCP session (withServerSession). The mock invokes the
 // session callback with a routing callTool(toolName, args, opts).
@@ -248,7 +252,7 @@ describe('VideoService', () => {
       expect(result.success).toBe(true);
       // job_status was polled with the id returned by generate_video's results[0].id
       const statusCall = (mockCallTool.mock.calls as any[]).find((c) => c[0] === 'job_status');
-      expect(statusCall[1]).toMatchObject({ job_id: 'job-1' });
+      expect(statusCall[1]).toMatchObject({ jobId: 'job-1' });
     });
 
     it('returns an error when the MCP call throws (auth/credits)', async () => {
@@ -321,6 +325,49 @@ describe('VideoService', () => {
       expect(veoSpy).toHaveBeenCalledTimes(1); // Veo tried exactly once — no re-entry into Seedance
       expect(result.success).toBe(false);
       veoSpy.mockRestore();
+    });
+  });
+
+  // Option B: a multi-clip Veo result (>8s) must be stitched even with no brand overlay,
+  // or the video is silently truncated to the first 8s clip.
+  describe('multi-clip Veo stitching (option B)', () => {
+    const mockedCompose = remotionService.compose as jest.Mock;
+
+    beforeEach(() => {
+      jest.spyOn(global, 'setTimeout').mockImplementation(((cb: any) => { cb(); return 0 as any; }) as any);
+      mockedUpload.mockResolvedValue({ success: true, url: 'https://s3.example.com/raw.mp4' });
+      mockedAxios.get.mockResolvedValue({ data: Buffer.from('x') } as any);
+      // Seedance fails immediately so we exercise the Veo fallback.
+      mockCallTool.mockImplementation(async (tool: string) => {
+        if (tool === 'generate_video') return { structuredContent: { results: [{ id: 'job-1', status: 'failed' }] } };
+        if (tool === 'job_status') return { structuredContent: { generation: { id: 'job-1', status: 'failed' } } };
+        return {};
+      });
+    });
+
+    afterEach(() => jest.restoreAllMocks());
+
+    it('stitches a >8s Veo fallback even when compose is not requested (no truncation to 8s)', async () => {
+      // Each Veo clip "succeeds"
+      jest.spyOn(VideoService.prototype as any, 'generateWithVeo31').mockImplementation(async (p: any) => ({
+        success: true, videoUrl: `https://s3.example.com/${p.filename}`, filename: p.filename,
+      }));
+      mockedCompose.mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/stitched.mp4', filename: 'shoe.mp4' });
+
+      const result = await videoService.generateVideo({
+        prompt: 'x', filename: 'shoe.mp4', userId: 'u', videoModel: 'seedance-2.0',
+        durationSeconds: 14, // → 2 Veo clips
+        compose: false,      // no branding
+      });
+
+      // Remotion was used to concatenate the 2 clips...
+      expect(mockedCompose).toHaveBeenCalledTimes(1);
+      const arg = mockedCompose.mock.calls[0][0];
+      expect(arg.extraClipUrls.length).toBe(1); // clip1 + 1 extra = 2 clips
+      expect(arg.brandName).toBe('');           // plain concat, no overlay
+      // ...and the stitched video is returned, not the first 8s clip.
+      expect(result.success).toBe(true);
+      expect(result.videoUrl).toBe('https://s3.example.com/stitched.mp4');
     });
   });
 

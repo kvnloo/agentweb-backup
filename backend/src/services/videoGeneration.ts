@@ -43,41 +43,72 @@ const SEEDANCE_MIN_DURATION = 4;
 const SEEDANCE_MAX_DURATION = 15;
 const DEFAULT_VIDEO_MODEL = "seedance-2.0";
 
-// Keep the whole video job safely under the agent-mode generation cap
-// (AGENT_MODE_GENERATION_TIMEOUT_MS, default 600s). If Seedance can't finish within
-// this budget we fail fast → Veo fallback, rather than stalling the agent turn until
-// the app-level 10-min timeout fires (which orphans the generation).
-const SEEDANCE_POLL_BUDGET_MS = parseInt(process.env.SEEDANCE_POLL_BUDGET_MS || "480000", 10); // 8 min
+// Time budgets are LENGTH-DRIVEN — generation time scales with output length (more
+// frames = more compute), so the budget does too. No env knobs: duration is the only
+// input. Generous on purpose (image-to-video, references, and queue wait add overhead
+// on top of raw length); calibrate from the fat logs rather than guessing tighter.
+//
+// Applies to both surfaces (Emma chat + /videos) since both run through generateVideo.
+// /videos has no turn cap (45-min worker limit), so long budgets run free there; Emma
+// chat's 600s turn cap still bounds a turn independently if a long video runs there.
 
-// Hard wall-clock budget for the ENTIRE video op (Seedance attempt + Veo fallback +
-// download/upload), kept under the agent-mode turn cap (600s) with ~60s of margin.
-// Without this, a Seedance HANG can burn its full poll budget and then a Veo fallback
-// runs past the turn cap → the turn is killed mid-Veo, orphaning a generation that
-// completes but is never surfaced. We instead deadline the whole op below the cap.
-export const VIDEO_TOTAL_BUDGET_MS = parseInt(process.env.VIDEO_TOTAL_BUDGET_MS || "540000", 10); // 9 min
-// Time reserved before the deadline for the Veo fallback, so a Seedance hang can't
-// consume the whole budget and starve the fallback. With VIDEO_TOTAL_BUDGET_MS=540s
-// this leaves Seedance ~360s (it's the cheaper, preferred model, so it gets the larger
-// slice) and reserves 180s for Veo.
-export const VEO_FALLBACK_RESERVE_MS = parseInt(process.env.VEO_FALLBACK_RESERVE_MS || "180000", 10); // 3 min
+/** Clamp to Seedance's supported 4–15s range (also what we ever request). */
+const budgetSeconds = (durationSeconds?: number): number =>
+  Math.max(SEEDANCE_MIN_DURATION, Math.min(SEEDANCE_MAX_DURATION, Math.round(durationSeconds ?? 8)));
+
+/** Veo fallback reserve (ms): scales with clip count (Veo caps at 8s/clip → ceil(secs/8) clips). */
+export function veoFallbackReserveMs(durationSeconds?: number): number {
+  const secs = budgetSeconds(durationSeconds);
+  const clips = secs > 8 ? Math.ceil(secs / 8) : 1;
+  return clips * 150_000; // ~150s per Veo clip (generate + poll)
+}
+
+/** Whole-op wall-clock budget (ms): generous Seedance allowance (base + per-second) plus the Veo reserve. */
+export function videoTotalBudgetMs(durationSeconds?: number): number {
+  const secs = budgetSeconds(durationSeconds);
+  const seedance = 150_000 + secs * 45_000; // base overhead + generous per output-second
+  return seedance + veoFallbackReserveMs(secs);
+}
 
 /**
- * Poll budget (ms) to grant the Seedance attempt: bounded by its own max AND by what
- * can be spent while still reserving `reserveMs` for the Veo fallback before `deadlineMs`.
- * Returns 0 (skip polling → straight to Veo) when no time is left after the reserve.
+ * Poll budget (ms) for the Seedance attempt: whatever's left before the deadline after
+ * reserving the (length-scaled) Veo fallback time. Returns 0 → skip polling, go to Veo.
  */
-export function seedancePollBudgetMs(
-  now: number,
-  deadlineMs: number,
-  maxBudgetMs: number = SEEDANCE_POLL_BUDGET_MS,
-  reserveMs: number = VEO_FALLBACK_RESERVE_MS
-): number {
-  return Math.max(0, Math.min(maxBudgetMs, deadlineMs - now - reserveMs));
+export function seedancePollBudgetMs(now: number, deadlineMs: number, durationSeconds?: number): number {
+  return Math.max(0, deadlineMs - now - veoFallbackReserveMs(durationSeconds));
 }
 
 /** Time (ms) left until `deadlineMs`, floored at 0. */
 export function remainingBudgetMs(now: number, deadlineMs: number): number {
   return Math.max(0, deadlineMs - now);
+}
+
+// Veo 3.1 only supports a subset of Seedance's aspect ratios (auto / 16:9 / 9:16).
+// The UI offers the full Seedance set; when Seedance fails and we fall back to Veo,
+// map the chosen ratio to the closest Veo-supported one so orientation is preserved.
+export const VEO_ASPECT_RATIOS = ["auto", "16:9", "9:16"] as const;
+
+const aspectToNumber = (a: string): number => {
+  const [w, h] = a.split(":").map(Number);
+  return w && h ? w / h : NaN;
+};
+
+/** Map any Seedance aspect ratio to the nearest Veo-supported ratio (auto/16:9/9:16). */
+export function closestVeoAspectRatio(aspect?: string): string {
+  if (!aspect || aspect === "auto") return "auto";
+  if ((VEO_ASPECT_RATIOS as readonly string[]).includes(aspect)) return aspect;
+  const target = aspectToNumber(aspect);
+  if (!isFinite(target)) return "auto";
+  let best = "16:9";
+  let bestDiff = Infinity;
+  for (const c of ["16:9", "9:16"]) {
+    const diff = Math.abs(aspectToNumber(c) - target);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = c;
+    }
+  }
+  return best;
 }
 
 // Lazy singleton MCP client for backend tool calls (createTransport attaches the
@@ -419,6 +450,15 @@ export class VideoService {
         config.lastFrame = lastFrameImage;
       }
 
+      // Honor the requested aspect ratio, mapped to the nearest Veo-supported value
+      // (the UI offers the full Seedance set; Veo only does 16:9/9:16). 'auto' is left
+      // unset so Veo defaults / matches the input frame.
+      const veoAspect = closestVeoAspectRatio(params.aspectRatio);
+      if (veoAspect === "16:9" || veoAspect === "9:16") {
+        config.aspectRatio = veoAspect;
+        console.log(`VideoService: Veo aspect ratio set to ${veoAspect} (from requested "${params.aspectRatio ?? "auto"}")`);
+      }
+
       // Add duration if provided (Veo supports 5–8 seconds)
       if (params.durationSeconds) {
         config.durationSeconds = Math.min(8, Math.max(5, params.durationSeconds));
@@ -470,7 +510,7 @@ export class VideoService {
       // first) so the turn never overruns the agent-mode cap; the attempt count is a
       // secondary safety cap. When called standalone (no deadline) fall back to 20 min.
       const maxPollAttempts = 120; // 20 minutes max (120 * 10 seconds)
-      const deadlineMs = params.deadlineMs ?? (Date.now() + VIDEO_TOTAL_BUDGET_MS);
+      const deadlineMs = params.deadlineMs ?? (Date.now() + videoTotalBudgetMs(params.durationSeconds));
       let pollAttempts = 0;
 
       while (!operation.done && pollAttempts < maxPollAttempts && Date.now() < deadlineMs) {
@@ -678,10 +718,10 @@ export class VideoService {
         // Grant Seedance only what we can spend while still reserving time for a Veo
         // fallback before the whole-op deadline — so a Seedance hang can't starve Veo.
         const pollBudgetMs = params.deadlineMs !== undefined
-          ? seedancePollBudgetMs(Date.now(), params.deadlineMs)
-          : SEEDANCE_POLL_BUDGET_MS;
+          ? seedancePollBudgetMs(Date.now(), params.deadlineMs, params.durationSeconds)
+          : (videoTotalBudgetMs(params.durationSeconds) - veoFallbackReserveMs(params.durationSeconds));
         const deadline = Date.now() + pollBudgetMs;
-        console.log(`VideoService: Seedance job ${jobId} polling with a ${Math.round(pollBudgetMs / 1000)}s budget`);
+        console.log(`VideoService: Seedance job ${jobId} polling with a ${Math.round(pollBudgetMs / 1000)}s budget (requested ${params.durationSeconds ?? 8}s video)`);
         let status = (submitGen?.status || "").toString().toLowerCase();
         let resultUrl: string | undefined = extractVideoUrl(submitGen);
         let backoffMs = 10000;
@@ -694,7 +734,9 @@ export class VideoService {
             break;
           }
           await new Promise((resolve) => setTimeout(resolve, backoffMs));
-          const statusRaw = await callTool("job_status", { job_id: jobId, id: jobId }, { timeoutMs: 60000 });
+          // job_status requires the camelCase `jobId` (confirmed against the live MCP
+          // schema). Sending `job_id` fails validation → empty status → spurious timeout.
+          const statusRaw = await callTool("job_status", { jobId }, { timeoutMs: 60000 });
           const statusSc = parseMcpResult(statusRaw);
           const gen = extractGeneration(statusRaw);
           status = (gen?.status || "").toString().toLowerCase();
@@ -732,7 +774,8 @@ export class VideoService {
 
         // Pull the final URL via job_display if job_status didn't include it.
         if (!resultUrl) {
-          const displayRaw = await callTool("job_display", { job_id: jobId, id: jobId }, { timeoutMs: 60000 });
+          // job_display requires `id` (confirmed against the live MCP schema).
+          const displayRaw = await callTool("job_display", { id: jobId }, { timeoutMs: 60000 });
           resultUrl = extractVideoUrl(extractGeneration(displayRaw));
         }
         if (!resultUrl) {
@@ -856,11 +899,14 @@ export class VideoService {
       // fallback re-enters generateVideo with the same params, so this carries over —
       // Seedance + Veo together are bounded by VIDEO_TOTAL_BUDGET_MS (< the turn cap).
       if (params.deadlineMs === undefined) {
-        params.deadlineMs = Date.now() + VIDEO_TOTAL_BUDGET_MS;
+        const total = videoTotalBudgetMs(params.durationSeconds);
+        const veoReserve = veoFallbackReserveMs(params.durationSeconds);
+        params.deadlineMs = Date.now() + total;
         console.log(
-          `VideoService: video op budget=${Math.round(VIDEO_TOTAL_BUDGET_MS / 1000)}s ` +
-          `(Seedance up to ~${Math.round((VIDEO_TOTAL_BUDGET_MS - VEO_FALLBACK_RESERVE_MS) / 1000)}s, ` +
-          `~${Math.round(VEO_FALLBACK_RESERVE_MS / 1000)}s reserved for Veo fallback)`
+          `VideoService: length-driven budget for ${params.durationSeconds ?? 8}s video → ` +
+          `total=${Math.round(total / 1000)}s ` +
+          `(Seedance up to ~${Math.round((total - veoReserve) / 1000)}s, ` +
+          `~${Math.round(veoReserve / 1000)}s reserved for Veo fallback)`
         );
       }
 
@@ -979,11 +1025,19 @@ export class VideoService {
           };
         }
 
-        // Post-process with Remotion if requested and Veo succeeded
-        if (result.success && clipUrls.length > 0 && params.compose && params.composeParams) {
-          console.log(`VideoService: Composing ${clipUrls.length} clip(s) with Remotion...`);
+        // Stitch/compose with Remotion when needed:
+        //  - branded composition when compose+composeParams are supplied, OR
+        //  - a plain concatenation whenever there is >1 clip (e.g. a >8s Veo fallback),
+        //    so multi-clip videos aren't silently truncated to the first 8s clip.
+        // For the plain-concat case we pass empty branding; the composition skips the
+        // intro overlay when brandName is empty (acts as a pure concatenator).
+        const needsBranding = !!(params.compose && params.composeParams);
+        const needsConcat = clipUrls.length > 1;
+        if (result.success && clipUrls.length > 0 && (needsBranding || needsConcat)) {
+          const composeArgs = params.composeParams ?? { brandName: "", primaryColor: "#000000", secondaryColor: "#000000" };
+          console.log(`VideoService: ${needsBranding ? "Composing" : "Stitching"} ${clipUrls.length} clip(s) with Remotion...`);
           const composeResult = await remotionService.compose({
-            ...params.composeParams,
+            ...composeArgs,
             clipUrl: clipUrls[0],
             extraClipUrls: clipUrls.slice(1),
             // Pass per-clip playback durations so Remotion places each clip exactly
