@@ -407,7 +407,15 @@ export class HubspotAdapter implements CrmAdapter {
 
         if (existingDealId) {
             try {
-                await svc.updateDeal(existingDealId, dealProps);
+                // Include the configured pipeline on update too (not just create) so an
+                // existing deal MOVES when the list's pipeline changes. The stage-mapped
+                // dealstage in dealProps is valid for that pipeline (stage map is rebuilt
+                // for the pipeline before the push), satisfying HubSpot's rule that a
+                // deal's stage must belong to its pipeline.
+                const updateProps = config.externalPipelineId
+                    ? { ...dealProps, pipeline: config.externalPipelineId }
+                    : dealProps;
+                await svc.updateDeal(existingDealId, updateProps);
                 dealId = existingDealId;
                 console.log(`[HubspotAdapter] updated HubSpot deal ${existingDealId} for lead=${lead.email || lead.leadId}`);
             } catch (err: any) {

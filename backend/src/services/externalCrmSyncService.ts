@@ -301,6 +301,30 @@ export class ExternalCrmSyncService {
       config.accountId = undefined;
     }
 
+    // Reconnecting an OAuth account: a preserved pipeline/stage/sync state belongs to
+    // the PREVIOUSLY connected account. If the new account doesn't contain that pipeline,
+    // it's stale (a different account was connected) — drop the account-specific state so
+    // the user can pick a valid pipeline. Field mappings are account-agnostic and kept.
+    // On the same account the pipeline still exists, so everything is preserved.
+    if (isHubspot && updates.accountId && config.externalPipelineId) {
+      try {
+        const svc = await HubSpotService.create(userId, updates.accountId);
+        const pipelines = await svc.listDealPipelines();
+        const stillValid = pipelines.some(p => p.id === config.externalPipelineId);
+        if (!stillValid) {
+          config.externalPipelineId = undefined;
+          config.hubspotDealStageMap = undefined;
+          config.lastPushSyncAt = undefined;
+          config.lastPullSyncAt = undefined;
+          config.lastSyncStatus = undefined;
+          config.lastSyncError = undefined;
+        }
+      } catch {
+        // Can't reach HubSpot to validate — leave state intact rather than wiping on a
+        // transient error.
+      }
+    }
+
     await crmDb.setLeadListCrmSyncConfig(listId, provider, config as any);
     return config;
   }
@@ -457,6 +481,49 @@ export class ExternalCrmSyncService {
         : await AttioService.create(auth.userId!, auth.accountId!);
       return svc.getAllLists();
     }
+  }
+
+  // Re-points a HubSpot list's sync config to a different deal pipeline AFTER the
+  // first sync (the normal saveConfig path locks the pipeline once synced). Clears
+  // the stage map so the next push rebuilds it for the new pipeline. Migration of
+  // existing deals is performed by re-pushing the list (the caller triggers the
+  // push job); the adapter moves each existing deal to config.externalPipelineId.
+  async changePipeline(
+    userId: string,
+    listId: string,
+    provider: string,
+    newPipelineId: string
+  ): Promise<ExternalCrmSyncConfig> {
+    if (provider !== 'hubspot') {
+      throw new Error('Changing the deal pipeline is only supported for HubSpot.');
+    }
+    if (!newPipelineId) {
+      throw new Error('A target pipeline is required.');
+    }
+
+    const config = await this.getConfig(userId, listId, provider);
+    if (!config) throw new Error('No sync configuration found for this list.');
+    if (!config.accountId && !config.apiKeyEncrypted) {
+      throw new Error('No authentication configured for this list.');
+    }
+
+    // Validate the target pipeline exists in the connected HubSpot account.
+    const svc = await this.getHubSpotService(this.resolveAuth(config));
+    const pipelines = await svc.listDealPipelines();
+    if (!pipelines.some(p => p.id === newPipelineId)) {
+      throw new Error(`Pipeline not found in HubSpot: ${newPipelineId}`);
+    }
+
+    // Bypass the saveConfig "locked after sync" guard: write the new pipeline and
+    // clear the stale stage map so the next push recomputes it for the new pipeline.
+    const updated: ExternalCrmSyncConfig = {
+      ...config,
+      externalPipelineId: newPipelineId,
+      hubspotDealStageMap: undefined,
+      updatedAt: new Date().toISOString(),
+    };
+    await crmDb.setLeadListCrmSyncConfig(listId, provider, updated as any);
+    return updated;
   }
 
   // ─── External property discovery ─────────────────────────────────────────────

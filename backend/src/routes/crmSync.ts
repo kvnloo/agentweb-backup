@@ -318,6 +318,35 @@ router.get('/external-pipelines/:listId/:provider', async (req: any, res) => {
   }
 });
 
+// PUT /api/crm-sync/config/:listId/:provider/pipeline
+// Re-points a HubSpot list to a different deal pipeline AFTER the first sync
+// (the normal config save locks the pipeline once synced). The client then
+// triggers a push (POST /push/...) to migrate existing deals into the new pipeline.
+router.put('/config/:listId/:provider/pipeline', async (req: any, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { listId, provider } = req.params;
+    if (provider !== 'hubspot') {
+      return res.status(400).json({ error: 'Changing the deal pipeline is only supported for HubSpot.' });
+    }
+
+    const ownership = await verifyListOwnership(userId, listId);
+    if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
+
+    const { externalPipelineId } = req.body as { externalPipelineId?: string };
+    if (!externalPipelineId) {
+      return res.status(400).json({ error: 'externalPipelineId is required.' });
+    }
+
+    const config = await externalCrmSyncService.changePipeline(userId, listId, provider, externalPipelineId);
+    res.json({ config });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to change pipeline' });
+  }
+});
+
 // ─── Test connection ──────────────────────────────────────────────────────────
 
 // POST /api/crm-sync/test/:listId/:provider
