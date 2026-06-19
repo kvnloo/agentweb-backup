@@ -107,6 +107,27 @@ describe('AgentModeService.buildWorkPlanContextMessages', () => {
     expect(content).toMatch(/multiple instructions|bundles|stacked/i);
   });
 
+  it('guards against marking a step completed before its work is done or approved', () => {
+    const messages = AgentModeService.buildWorkPlanContextMessages(activeWorkPlan);
+    const content: string = messages[0].content;
+    expect(content).toMatch(/Do NOT mark a step completed before its work is actually finished/i);
+    expect(content).toMatch(/before the user approves/i);
+  });
+
+  it('always includes progression and multi-intent guidance for active plans (both agent mode and Emma)', () => {
+    const messages = AgentModeService.buildWorkPlanContextMessages(activeWorkPlan);
+    const content: string = messages[0].content;
+    expect(content).toContain('STEP PROGRESSION');
+    expect(content).toContain('HANDLING MESSAGES WITH MULTIPLE INSTRUCTIONS');
+  });
+
+  it('allows regeneration in the asset block when the user explicitly asks', () => {
+    const messages = AgentModeService.buildWorkPlanContextMessages(activeWorkPlan, ['a.png']);
+    const content: string = messages[0].content;
+    // Carve-out: the no-regenerate guard yields to an explicit user request
+    expect(content).toMatch(/UNLESS the user explicitly asks to regenerate/i);
+  });
+
   it('lists already-generated asset filenames and instructs not to regenerate them', () => {
     const messages = AgentModeService.buildWorkPlanContextMessages(activeWorkPlan, [
       'xcures_h1_typographic.png',
@@ -195,6 +216,23 @@ describe('AgentModeService.buildWorkPlanContextMessages', () => {
         { role: 'system', content: 'Image generated: ok.png' },
       ];
       expect(AgentModeService.extractGeneratedImageFilenames(history as any)).toEqual(['ok.png']);
+    });
+
+    it('extracts filenames from the structured metadata marker', () => {
+      const history = [
+        { role: 'system', content: 'Image generated: a.png', metadata: { kind: 'image-generated', imageFilename: 'a.png' } },
+        { role: 'system', content: 'unrelated', metadata: { kind: 'image-generated', imageFilename: 'b.png' } },
+      ];
+      // Second entry has a non-matching content string but a valid marker -> still detected
+      expect(AgentModeService.extractGeneratedImageFilenames(history as any)).toEqual(['a.png', 'b.png']);
+    });
+
+    it('de-duplicates across the marker and the legacy string form', () => {
+      const history = [
+        { role: 'system', content: 'Image generated: a.png' },
+        { role: 'system', content: 'Image generated: a.png', metadata: { kind: 'image-generated', imageFilename: 'a.png' } },
+      ];
+      expect(AgentModeService.extractGeneratedImageFilenames(history as any)).toEqual(['a.png']);
     });
   });
 
