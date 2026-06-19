@@ -36,6 +36,7 @@ const mockHubSpotServiceInstance = {
   getDeal: jest.fn().mockResolvedValue(null),
   getDealPipelineStages: jest.fn().mockResolvedValue([]),
   createDealStage: jest.fn().mockResolvedValue({ id: 'stage_1', label: 'Stage 1', displayOrder: 0, metadata: { probability: 0.1 } }),
+  listDealPipelines: jest.fn().mockResolvedValue([]),
   listContactProperties: jest.fn().mockResolvedValue([]),
   listDealProperties: jest.fn().mockResolvedValue([]),
   deleteContact: jest.fn().mockResolvedValue(undefined),
@@ -161,8 +162,105 @@ describe('ExternalCrmSyncService', () => {
     mockHubSpotServiceInstance.getDeal.mockResolvedValue(null);
     mockHubSpotServiceInstance.getDealPipelineStages.mockResolvedValue([]);
     mockHubSpotServiceInstance.createDealStage.mockResolvedValue({ id: 'stage_1', label: 'Stage 1', displayOrder: 0, metadata: { probability: 0.1 } });
+    mockHubSpotServiceInstance.listDealPipelines.mockResolvedValue([]);
     mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
     service = new ExternalCrmSyncService();
+  });
+
+  // ─── saveConfig — reconnect pipeline validation ────────────────────────────
+  describe('saveConfig reconnect pipeline validation', () => {
+    it('clears a stale pipeline + stage map + sync timestamps when reconnecting a DIFFERENT account', async () => {
+      // Disconnected config (accountId cleared) that still carries the old account's
+      // pipeline/stage/sync state; the new account does NOT contain that pipeline.
+      mockListWithConfig(makeConfig({
+        accountId: undefined,
+        externalPipelineId: 'old_pipe',
+        hubspotDealStageMap: { lead: 'old_stage' },
+        lastPushSyncAt: '2024-02-01T00:00:00.000Z',
+      }));
+      mockHubSpotServiceInstance.listDealPipelines.mockResolvedValue([
+        { id: 'different_pipe', label: 'Other', displayOrder: 0, stages: [] },
+      ]);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', { accountId: 'new_acct' });
+
+      const persisted = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as ExternalCrmSyncConfig;
+      expect(persisted.externalPipelineId).toBeUndefined();
+      expect(persisted.hubspotDealStageMap).toBeUndefined();
+      expect(persisted.lastPushSyncAt).toBeUndefined();
+      // Field mappings are account-agnostic and must be preserved.
+      expect(persisted.contactFieldMapping.length).toBeGreaterThan(0);
+    });
+
+    it('keeps the pipeline when reconnecting the SAME account (pipeline still exists)', async () => {
+      mockListWithConfig(makeConfig({
+        accountId: undefined,
+        externalPipelineId: 'keep_pipe',
+        hubspotDealStageMap: { lead: 'stage_1' },
+        lastPushSyncAt: '2024-02-01T00:00:00.000Z',
+      }));
+      mockHubSpotServiceInstance.listDealPipelines.mockResolvedValue([
+        { id: 'keep_pipe', label: 'Sales', displayOrder: 0, stages: [] },
+      ]);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', { accountId: 'same_acct' });
+
+      const persisted = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as ExternalCrmSyncConfig;
+      expect(persisted.externalPipelineId).toBe('keep_pipe');
+      expect(persisted.lastPushSyncAt).toBe('2024-02-01T00:00:00.000Z');
+    });
+
+    it('does not destroy pipeline state if HubSpot validation fails (transient error)', async () => {
+      mockListWithConfig(makeConfig({
+        accountId: undefined,
+        externalPipelineId: 'old_pipe',
+        lastPushSyncAt: '2024-02-01T00:00:00.000Z',
+      }));
+      mockHubSpotServiceInstance.listDealPipelines.mockRejectedValue(new Error('HubSpot down'));
+
+      await service.saveConfig('user1', 'list1', 'hubspot', { accountId: 'new_acct' });
+
+      const persisted = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as ExternalCrmSyncConfig;
+      expect(persisted.externalPipelineId).toBe('old_pipe');
+    });
+  });
+
+  // ─── changePipeline ───────────────────────────────────────────────────────
+  describe('changePipeline', () => {
+    it('throws for a non-hubspot provider', async () => {
+      mockListWithConfig(makeConfig({ provider: 'attio' as any }), 'attio');
+      await expect(service.changePipeline('user1', 'list1', 'attio', 'p1')).rejects.toThrow(/hubspot/i);
+    });
+
+    it('throws when no sync configuration exists', async () => {
+      mockNoConfig();
+      await expect(service.changePipeline('user1', 'list1', 'hubspot', 'p1')).rejects.toThrow(/configuration/i);
+    });
+
+    it('throws when the target pipeline does not exist in HubSpot', async () => {
+      mockListWithConfig(makeConfig({ lastPushSyncAt: '2024-02-01T00:00:00.000Z', externalPipelineId: 'old' }));
+      mockHubSpotServiceInstance.listDealPipelines.mockResolvedValue([{ id: '123', label: 'Sales', displayOrder: 0, stages: [] }]);
+      await expect(service.changePipeline('user1', 'list1', 'hubspot', '999')).rejects.toThrow(/not found/i);
+    });
+
+    it('updates externalPipelineId and clears the stage map even after a sync (lock bypass)', async () => {
+      mockListWithConfig(makeConfig({
+        lastPushSyncAt: '2024-02-01T00:00:00.000Z',
+        externalPipelineId: 'old',
+        hubspotDealStageMap: { lead: 'old_stage_1' },
+      }));
+      mockHubSpotServiceInstance.listDealPipelines.mockResolvedValue([
+        { id: 'new123', label: 'Partnerships', displayOrder: 0, stages: [] },
+      ]);
+
+      const result = await service.changePipeline('user1', 'list1', 'hubspot', 'new123');
+
+      expect(mockCrmDb.setLeadListCrmSyncConfig).toHaveBeenCalledTimes(1);
+      const persisted = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as ExternalCrmSyncConfig;
+      expect(persisted.externalPipelineId).toBe('new123');
+      expect(persisted.hubspotDealStageMap).toBeUndefined();
+      expect(result.externalPipelineId).toBe('new123');
+    });
   });
 
   // ─── getConfig ────────────────────────────────────────────────────────────

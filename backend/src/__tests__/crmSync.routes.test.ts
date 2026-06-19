@@ -55,6 +55,20 @@ jest.mock('../services/externalCrmSyncService', () => ({
     pullAllContacts: jest.fn().mockResolvedValue({ successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] }),
     getExternalProperties: jest.fn().mockResolvedValue({ properties: [] }),
     getExternalPipelines: jest.fn().mockResolvedValue([]),
+    changePipeline: jest.fn().mockResolvedValue({
+      provider: 'hubspot',
+      listId: 'list-1',
+      userId: 'user-1',
+      accountId: 'acct-1',
+      externalPipelineId: 'new-pipe',
+      autoSyncEnabled: true,
+      contactFieldMapping: [],
+      dealFieldMapping: [],
+      customFieldMapping: [],
+      webhookEnabled: true,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-02T00:00:00.000Z',
+    }),
     deleteLeadFromCrm: jest.fn().mockResolvedValue(undefined),
     ensureWebhookSecret: jest.fn().mockResolvedValue(undefined),
   },
@@ -63,6 +77,44 @@ jest.mock('../services/externalCrmSyncService', () => ({
 const app = express();
 app.use(express.json());
 app.use('/api/crm-sync', crmSyncRoutes);
+
+describe('PUT /api/crm-sync/config/:listId/:provider/pipeline — change pipeline', () => {
+  const { externalCrmSyncService } = require('../services/externalCrmSyncService');
+
+  it('rejects a non-hubspot provider with 400', async () => {
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/attio/pipeline')
+      .send({ externalPipelineId: 'p1' })
+      .expect(400);
+    expect(res.body.error).toMatch(/only supported for HubSpot/i);
+  });
+
+  it('rejects a missing externalPipelineId with 400', async () => {
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot/pipeline')
+      .send({})
+      .expect(400);
+    expect(res.body.error).toMatch(/externalPipelineId is required/i);
+  });
+
+  it('changes the pipeline and returns the updated config', async () => {
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot/pipeline')
+      .send({ externalPipelineId: 'new-pipe' })
+      .expect(200);
+    expect(externalCrmSyncService.changePipeline).toHaveBeenCalledWith('user-1', 'list-1', 'hubspot', 'new-pipe');
+    expect(res.body.config.externalPipelineId).toBe('new-pipe');
+  });
+
+  it('surfaces service errors as 500', async () => {
+    externalCrmSyncService.changePipeline.mockRejectedValueOnce(new Error('Pipeline not found in HubSpot: nope'));
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot/pipeline')
+      .send({ externalPipelineId: 'nope' })
+      .expect(500);
+    expect(res.body.error).toMatch(/not found/i);
+  });
+});
 
 describe('PUT /api/crm-sync/config/:listId/:provider — Attio API key validation', () => {
   it('rejects an Attio API key shorter than 64 characters', async () => {
