@@ -68,6 +68,11 @@ function makeConfig(): ExternalCrmSyncConfig {
   };
 }
 
+// Batch push is ON by default now; these suites exercise the per-lead path, so
+// pin the kill switch off for the whole file.
+beforeAll(() => { process.env.HUBSPOT_BATCH_PUSH_ENABLED = 'false'; });
+afterAll(() => { delete process.env.HUBSPOT_BATCH_PUSH_ENABLED; });
+
 describe('HubspotAdapter.pushLeads — email validation', () => {
   let adapter: HubspotAdapter;
 

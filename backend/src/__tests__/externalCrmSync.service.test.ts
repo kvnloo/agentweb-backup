@@ -139,6 +139,11 @@ function makeConfig(overrides: Partial<ExternalCrmSyncConfig> = {}): ExternalCrm
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
+// Batch push is ON by default; these service tests assert on the per-lead path,
+// so pin the kill switch off for the whole file.
+beforeAll(() => { process.env.HUBSPOT_BATCH_PUSH_ENABLED = 'false'; });
+afterAll(() => { delete process.env.HUBSPOT_BATCH_PUSH_ENABLED; });
+
 describe('ExternalCrmSyncService', () => {
   let service: ExternalCrmSyncService;
 
