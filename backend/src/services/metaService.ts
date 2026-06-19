@@ -63,6 +63,10 @@ export interface MetaAdsAdCreativeParams {
   title: string;
   link_url: string;
   call_to_action_type?: string;
+  // URL append rules (UTM parameters). Stored on the creative as `url_tags` and applied by Meta to
+  // the destination link at delivery time. Must be carried over on a creative swap, otherwise a
+  // link_url update silently strips the ad's tracking parameters.
+  url_tags?: string;
 }
 
 export interface MetaAdsAdParams {
@@ -984,6 +988,10 @@ export class MetaService {
         [AdCreative.Fields.name]: params.name,
         [AdCreative.Fields.object_story_spec]: objectStorySpec
       };
+      // Preserve UTM/tracking append rules so a link_url swap doesn't strip them.
+      if (params.url_tags) {
+        creativeParams.url_tags = params.url_tags;
+      }
 
       this.log(`Creating ad creative in account: ${adAccountId}`, creativeParams);
       const creative = await account.createAdCreative([], creativeParams);
@@ -1089,6 +1097,10 @@ export class MetaService {
       [AdCreative.Fields.object_story_spec]: objectStorySpec,
       asset_feed_spec: assetFeedSpec,
     };
+    // Preserve UTM/tracking append rules so a link_url swap doesn't strip them.
+    if (params.url_tags) {
+      creativeParams.url_tags = params.url_tags;
+    }
 
     this.log(`Creating placement-customized ad creative in account: ${adAccountId}`, creativeParams);
     const creative = await account.createAdCreative([], creativeParams);
@@ -1153,8 +1165,11 @@ export class MetaService {
       this.initApi(accessToken);
       const ad = new Ad(adId);
       const fields = [
-        'id', 'name', 'status', 'adset_id', 'campaign_id',
-        'creative{id,name,body,title,image_url,thumbnail_url,object_story_spec}'
+        'id', 'name', 'status', 'effective_status', 'adset_id', 'campaign_id',
+        // ad_review_feedback + the creative's own status surface Meta's async policy/technical
+        // review verdict, so a post-swap read-back can report PENDING/rejected creatives.
+        'ad_review_feedback',
+        'creative{id,name,body,title,image_url,thumbnail_url,object_story_spec,status}'
       ];
       this.log(`Fetching ad: ${adId}`);
       const result = await ad.get(fields);
@@ -1173,7 +1188,7 @@ export class MetaService {
       const creative = new AdCreative(creativeId);
       const fields = [
         'id', 'name', 'body', 'title', 'image_url', 'thumbnail_url',
-        'object_type', 'link_url', 'object_story_spec', 'url_tags'
+        'object_type', 'link_url', 'object_story_spec', 'asset_feed_spec', 'url_tags'
       ];
       this.log(`Fetching ad creative: ${creativeId}`);
       const result = await creative.get(fields);

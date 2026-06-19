@@ -1,12 +1,41 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
-import { getAccountsByUserId, getAccountsByUserIdIncludingOrgShared, deleteAccount, deleteAccountById, getAccountByPlatform, updateAccountConfig, FathomConfig } from '../services/connectedAccountsDb';
+import { getAccountsByUserId, getAccountsWithOwnerIncludingOrgShared, deleteAccount, deleteAccountById, getAccountByPlatform, updateAccountConfig, FathomConfig } from '../services/connectedAccountsDb';
 import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { FathomApiService } from '../services/fathomApiService';
 import { getAllowedConnectedAccounts } from '../services/subscriptionService';
+import { userDb, orgDb } from '../services/db';
 
 const router = express.Router();
+
+async function canCallerDisconnectAccount(userId: string, platform: string, accountId?: string): Promise<{ allowed: boolean; error?: string }> {
+  const user = await userDb.getUserById(userId);
+  if (!user?.orgId) {
+    return { allowed: true };
+  }
+
+  const matchingAccounts = (user.connected_accounts || []).filter((account: any) => {
+    if (account.platform !== platform) return false;
+    return accountId ? account.account_id === accountId : true;
+  });
+
+  const hasOrgSharedAccount = matchingAccounts.some((account: any) => account.sharedWithOrg === true);
+  if (!hasOrgSharedAccount) {
+    return { allowed: true };
+  }
+
+  const org = await orgDb.getOrgById(user.orgId);
+  const isOrgOwner = org?.ownerUserId === userId || user.orgRole === 'owner';
+  if (isOrgOwner) {
+    return { allowed: true };
+  }
+
+  return {
+    allowed: false,
+    error: 'Only the org owner can disconnect an org-shared connected account. Unshare it from the organization first.',
+  };
+}
 
 // ============================================
 // Connected Accounts Management
@@ -17,7 +46,10 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
   const userId = req.user.userId;
 
   try {
-    const accounts = await getAccountsByUserIdIncludingOrgShared(userId);
+    // Owner-aware variant: each account carries the userId of the member who owns
+    // it, so we can tell the frontend which rows the caller owns (own rows get the
+    // Share/Disconnect controls; teammates' org-shared rows are read-only).
+    const accounts = await getAccountsWithOwnerIncludingOrgShared(userId);
 
     // Check real connection status for Unipile accounts in a single paginated call
     const unipileAccountIds = accounts
@@ -80,6 +112,10 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         follower_count: (acc.config as any).follower_count,
         created_at: acc.created_at,
         sharedWithOrg: (acc as any).sharedWithOrg ?? false,
+        // True when the caller owns this account; false when it's a teammate's
+        // account shared with the org. The frontend uses this to show owner-only
+        // controls (Share/Stop sharing/Disconnect) on owned rows only.
+        owned: acc.userId === userId,
         // LinkedIn Outreach (unipile) only: Premium accounts allow 300-char invites.
         is_premium: acc.platform === 'unipile' ? ((acc.config as any).is_premium === true) : undefined,
         // Status fields
@@ -134,6 +170,11 @@ router.delete('/connected-accounts/:platform', authenticateToken, async (req: an
   const { platform } = req.params;
 
   try {
+    const disconnectGuard = await canCallerDisconnectAccount(userId, platform);
+    if (!disconnectGuard.allowed) {
+      return res.status(403).json({ error: disconnectGuard.error });
+    }
+
     await deleteAccount(userId, platform);
     res.json({ success: true, message: `${platform} account(s) disconnected` });
   } catch (error) {
@@ -148,6 +189,11 @@ router.delete('/connected-accounts/:platform/:accountId', authenticateToken, asy
   const { platform, accountId } = req.params;
 
   try {
+    const disconnectGuard = await canCallerDisconnectAccount(userId, platform, accountId);
+    if (!disconnectGuard.allowed) {
+      return res.status(403).json({ error: disconnectGuard.error });
+    }
+
     // For LinkedIn Outreach accounts, also delete from Unipile so the
     // connection is fully revoked — not just removed from our DB.
     if (platform === 'unipile') {

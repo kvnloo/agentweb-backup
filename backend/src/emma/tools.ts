@@ -430,8 +430,14 @@ COPY_AD WORKFLOW (clone an existing ad with optional overrides):
 CHANGING AN AD'S CREATIVE/IMAGE (AD UPDATE):
   Meta ads cannot mutate a creative in place — you must point the ad at a different creative.
   - To swap to a creative you already built: AD UPDATE with params.creative_id (the system nests it correctly; a top-level creative_id is silently dropped by Meta and the old image keeps showing).
-  - To change copy/destination/image content: AD UPDATE with link_url / body / title / image_hash / image_url — the system auto-builds a new creative from the old one and swaps it in.
+  - To change copy/destination/image content: AD UPDATE with link_url / body / title / image_hash / image_url — the system auto-builds a new creative from the old one (preserving existing UTM/url_tags unless you override them) and swaps it in.
   Either way the change is reflected on the SAME ad_id; deleting and recreating the ad is NOT required.
+  VERIFICATION: after ANY creative swap the system re-fetches the ad to confirm the new creative actually attached, and for link_url/destination changes that the live URL matches what you requested. Behavior depends on which path:
+    - params.creative_id (direct swap): a single read-back. If it returns error SWAP_NOT_REFLECTED the change did NOT take effect (usually transient Meta propagation) — retry the AD UPDATE with the same params.creative_id (the creative already exists, don't rebuild it).
+    - auto-built swap (link_url / body / title / image_hash / image_url): the system re-attaches and re-verifies up to 3 times before giving up. Outcomes:
+        - verified:true → confirmed live; the user will see the new URL in Ads Manager. (May also include effective_status / review_feedback, e.g. PENDING_REVIEW, as informational — Meta's ad review can take up to ~24h but the destination is already set.)
+        - pending:true with error SWAP_PENDING or DESTINATION_PENDING → after 3 checks Meta had not yet reflected the change. This is almost always transient propagation, NOT a failure: tell the user the update is applied on Meta's side and will reflect within a few minutes; do NOT keep retrying in a tight loop. Re-check after a short wait if confirmation is needed.
+    - success with verified:false (either path) → the swap was sent but the confirmation read-back itself failed; re-check the ad before telling the user it's done.
 
 CAMPAIGN OBJECTIVES (valid values for 'objective'):
   OUTCOME_TRAFFIC, OUTCOME_AWARENESS, OUTCOME_ENGAGEMENT, OUTCOME_SALES, OUTCOME_LEADS, OUTCOME_APP_PROMOTION
@@ -2971,7 +2977,7 @@ emmaToolRegistry.register({
   name: 'get_lead_details',
   definition: {
     name: 'get_lead_details',
-    description: 'Get full details for a single lead including all fields, ICP match info, email drafts, and recent engagement history. Also returns `lead.linkedInConnectionStatus`: if the lead has a LinkedIn URL, this field indicates whether they are a 1st-degree connection (`isConnected: true/false`), and if connected, when they connected (`connectedAt` ISO string, `connectedAtTimestamp` UNIX seconds). Returns `null` if the lead has no LinkedIn URL. Use this to decide whether to send a connection invite vs. a direct message.',
+    description: 'Get full details for a single lead including all fields, ICP match info, email drafts, and recent engagement history. Also returns `lead.enrichmentMetadata`: a per-field provenance map (keyed by field name, including custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) describing where each enriched value came from — `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile), `sourceUrl` and `sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt` (ISO timestamp). USE THIS to answer "where does this data come from / how accurate is it?" — cite the provider, source URL, and confidence rather than guessing. Fields with no entry in enrichmentMetadata were entered manually or imported, not enriched. Also returns `lead.linkedInConnectionStatus`: if the lead has a LinkedIn URL, this field indicates whether they are a 1st-degree connection (`isConnected: true/false`), and if connected, when they connected (`connectedAt` ISO string, `connectedAtTimestamp` UNIX seconds). Returns `null` if the lead has no LinkedIn URL. Use this to decide whether to send a connection invite vs. a direct message.',
     inputSchema: {
       type: 'object',
       properties: {

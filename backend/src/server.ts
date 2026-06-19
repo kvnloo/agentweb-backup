@@ -9,6 +9,7 @@ import jwt from 'jsonwebtoken';
 import { generateChatResponse, chatbotDb } from './services/chatbotService';
 import { checkTokenUsage } from './services/tokenUsageService';
 import { userDb } from './services/db';
+import { registerIo } from './services/sessionSockets';
 import {
   startLiveSession,
   sendAudioChunk,
@@ -62,6 +63,9 @@ const io = new Server(server, {
 // Export io instance for use in routes
 export { io };
 
+// Make io available to disconnectStaleUserSockets without a circular import.
+registerIo(io);
+
 // Middleware to authenticate WebSocket connections
 io.use(async (socket, next) => {
   const token = socket.handshake.auth.token;
@@ -70,7 +74,27 @@ io.use(async (socket, next) => {
 
   if (token) {
     try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key') as {
+        userId?: string;
+        sv?: number;
+        delegateAccess?: unknown;
+        _svc?: boolean;
+      };
+
+      // Enforce session versioning for normal user tokens so a password change
+      // disconnects other devices' sockets too. Delegate/service tokens are
+      // exempt (same policy as the HTTP auth middleware).
+      //
+      // Use `<` (token behind server), NOT `!==`: getUserById reads an
+      // eventually-consistent GSI, so a freshly-issued token (higher `sv`) must
+      // not be rejected just because the GSI replica still holds the old value.
+      if (decoded.userId && !decoded.delegateAccess && !decoded._svc) {
+        const user = await userDb.getUserById(decoded.userId);
+        if (!user || (decoded.sv ?? 0) < (user.sessionVersion ?? 0)) {
+          return next(new Error('Authentication error'));
+        }
+      }
+
       socket.data.user = decoded;
       return next();
     } catch {

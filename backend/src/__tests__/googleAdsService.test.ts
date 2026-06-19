@@ -38,6 +38,16 @@ jest.mock('../services/db', () => ({
 jest.mock('../services/connectedAccountsDb', () => ({
   updateAccountTokens: jest.fn().mockResolvedValue(undefined),
   // normalizeAccounts is NOT exported — do not mock it here
+  // getAccountCredentials now sources accounts via the org-aware helper. The mock
+  // delegates to the same userDb.getUserById the tests drive, tagging each account
+  // with the caller's userId (owner, for these single-user scenarios).
+  getAccountsWithOwnerIncludingOrgShared: jest.fn(async (userId: string) => {
+    const { userDb } = require('../services/db');
+    const user = await userDb.getUserById(userId);
+    if (!user) return [];
+    const accounts = Array.isArray(user.connected_accounts) ? user.connected_accounts : [];
+    return accounts.map((a: any) => ({ ...a, userId: user.userId ?? userId }));
+  }),
 }));
 
 const mockAssertPublicHostname = jest.fn();
@@ -64,7 +74,7 @@ beforeEach(() => {
 describe('API version', () => {
   it('uses Google Ads API v24 base URL', async () => {
     mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: [] } });
-    await service.listAccessibleAccounts('test-access-token');
+    await service.listAccountHierarchy('test-access-token');
     expect(mockAxiosGet).toHaveBeenCalledWith(
       expect.stringContaining('googleads.googleapis.com/v24'),
       expect.anything()
@@ -102,44 +112,248 @@ describe('search — pagination', () => {
   });
 });
 
-describe('listAccessibleAccounts', () => {
-  it('calls listAccessibleCustomers and returns parsed accounts', async () => {
-    mockAxiosGet.mockResolvedValueOnce({
-      data: { resourceNames: ['customers/1234567890'] },
-    });
+describe('listAccountHierarchy', () => {
+  it('returns a standalone/direct leaf as a top-level leaf node', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/1234567890'] } });
     mockAxiosPost.mockResolvedValueOnce({
-      data: {
-        results: [{
-          customer: { id: '1234567890', descriptiveName: 'Test Account', currencyCode: 'USD' },
-        }],
-      },
+      data: { results: [{ customer: { id: '1234567890', descriptiveName: 'Test Account', currencyCode: 'USD', manager: false } }] },
     });
 
-    const accounts = await service.listAccessibleAccounts('test-access-token');
-    expect(accounts).toHaveLength(1);
-    expect(accounts[0]).toEqual({ customerId: '1234567890', name: 'Test Account', currency: 'USD' });
+    const tree = await service.listAccountHierarchy('test-access-token');
+    expect(tree).toEqual([
+      { type: 'leaf', customerId: '1234567890', name: 'Test Account', currency: 'USD', loginCustomerId: '1234567890' },
+    ]);
   });
 
   it('returns empty array if no accessible customers', async () => {
     mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: [] } });
-    const accounts = await service.listAccessibleAccounts('test-access-token');
-    expect(accounts).toHaveLength(0);
+    const tree = await service.listAccountHierarchy('test-access-token');
+    expect(tree).toHaveLength(0);
   });
 
-  it('skips manager accounts', async () => {
-    mockAxiosGet.mockResolvedValueOnce({
-      data: { resourceNames: ['customers/9999999999'] },
-    });
-    mockAxiosPost.mockResolvedValueOnce({
-      data: {
-        results: [{
-          customer: { id: '9999999999', descriptiveName: 'MCC Account', currencyCode: 'USD', manager: true },
-        }],
-      },
-    });
+  it('expands a manager into a manager node with its leaf children flattened', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/9999999999'] } });
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [{ customer: { id: '9999999999', descriptiveName: 'MCC Account', currencyCode: 'USD', manager: true } }] } })
+      .mockResolvedValueOnce({ data: { results: [
+        { customerClient: { id: '222', descriptiveName: 'Child A', currencyCode: 'USD', manager: false, status: 'ENABLED' } },
+        { customerClient: { id: '333', descriptiveName: 'Child B', currencyCode: 'EUR', manager: false, status: 'ENABLED' } },
+      ] } });
 
-    const accounts = await service.listAccessibleAccounts('test-access-token');
-    expect(accounts).toHaveLength(0);
+    const tree = await service.listAccountHierarchy('test-access-token');
+    expect(tree).toEqual([
+      { type: 'manager', customerId: '9999999999', name: 'MCC Account', children: [
+        { customerId: '222', name: 'Child A', currency: 'USD', loginCustomerId: '9999999999' },
+        { customerId: '333', name: 'Child B', currency: 'EUR', loginCustomerId: '9999999999' },
+      ] },
+    ]);
+    // the customer_client enumeration must run with the manager as login-customer-id
+    const childQueryHeaders = mockAxiosPost.mock.calls[1][2].headers;
+    expect(childQueryHeaders['login-customer-id']).toBe('9999999999');
+    expect(mockAxiosPost.mock.calls[1][1].query).toContain('customer_client');
+  });
+
+  it('excludes sub-managers from a manager\'s children but keeps their (deep) leaves flattened', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/999'] } });
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [{ customer: { id: '999', descriptiveName: 'Top MCC', manager: true } }] } })
+      // customer_client returns descendants at any depth: a sub-manager (manager:true) and a deep leaf.
+      // The query filters to manager=false, but assert the service also drops any manager row defensively.
+      .mockResolvedValueOnce({ data: { results: [
+        { customerClient: { id: '888', descriptiveName: 'Sub MCC', manager: true, status: 'ENABLED' } },
+        { customerClient: { id: '444', descriptiveName: 'Deep Leaf', currencyCode: 'USD', manager: false, status: 'ENABLED' } },
+      ] } });
+
+    const tree = await service.listAccountHierarchy('test-access-token');
+    expect(tree).toEqual([
+      { type: 'manager', customerId: '999', name: 'Top MCC', children: [
+        { customerId: '444', name: 'Deep Leaf', currency: 'USD', loginCustomerId: '999' },
+      ] },
+    ]);
+  });
+
+  it('shows a manager with no enabled leaves as an empty manager node', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/9999999999'] } });
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [{ customer: { id: '9999999999', descriptiveName: 'Empty MCC', manager: true } }] } })
+      .mockResolvedValueOnce({ data: { results: [] } });
+
+    const tree = await service.listAccountHierarchy('test-access-token');
+    expect(tree).toEqual([{ type: 'manager', customerId: '9999999999', name: 'Empty MCC', children: [] }]);
+  });
+
+  it('dedupes a leaf accessible both directly and via a manager — shown only under the manager', async () => {
+    // user has direct access to leaf 222 AND to manager 999 which also manages 222
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/222', 'customers/999'] } });
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [{ customer: { id: '222', descriptiveName: 'My Leaf', currencyCode: 'USD', manager: false } }] } }) // direct leaf
+      .mockResolvedValueOnce({ data: { results: [{ customer: { id: '999', descriptiveName: 'My MCC', manager: true } }] } }) // manager
+      .mockResolvedValueOnce({ data: { results: [
+        { customerClient: { id: '222', descriptiveName: 'My Leaf', currencyCode: 'USD', manager: false, status: 'ENABLED' } },
+      ] } }); // manager's children include 222
+
+    const tree = await service.listAccountHierarchy('test-access-token');
+    // 222 must NOT appear as a top-level leaf; only the manager node carries it
+    expect(tree).toEqual([
+      { type: 'manager', customerId: '999', name: 'My MCC', children: [
+        { customerId: '222', name: 'My Leaf', currency: 'USD', loginCustomerId: '999' },
+      ] },
+    ]);
+  });
+
+  it('ignores accounts whose customer query throws', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/222', 'customers/333'] } });
+    mockAxiosPost
+      .mockRejectedValueOnce(new Error('PERMISSION_DENIED'))
+      .mockResolvedValueOnce({ data: { results: [{ customer: { id: '333', descriptiveName: 'Reachable', currencyCode: 'USD', manager: false } }] } });
+
+    const tree = await service.listAccountHierarchy('test-access-token');
+    expect(tree).toEqual([
+      { type: 'leaf', customerId: '333', name: 'Reachable', currency: 'USD', loginCustomerId: '333' },
+    ]);
+  });
+
+  it('keeps a manager visible (with no children) when its child enumeration fails', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/999'] } });
+    mockAxiosPost
+      // probe succeeds and identifies 999 as a manager
+      .mockResolvedValueOnce({ data: { results: [{ customer: { id: '999', descriptiveName: 'My MCC', manager: true } }] } })
+      // listManagerLeaves child enumeration then fails (e.g. transient RESOURCE_EXHAUSTED)
+      .mockRejectedValueOnce(new Error('RESOURCE_EXHAUSTED'));
+
+    const tree = await service.listAccountHierarchy('test-access-token');
+
+    // The manager must still be surfaced — not silently dropped into a fake "no accounts" state.
+    expect(tree).toEqual([{ type: 'manager', customerId: '999', name: 'My MCC', children: [] }]);
+    warnSpy.mockRestore();
+    errSpy.mockRestore();
+  });
+
+  it('logs a warning identifying the manager when its child enumeration fails', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/999'] } });
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [{ customer: { id: '999', descriptiveName: 'My MCC', manager: true } }] } })
+      .mockRejectedValueOnce(new Error('RESOURCE_EXHAUSTED'));
+
+    await service.listAccountHierarchy('test-access-token');
+
+    expect(warnSpy).toHaveBeenCalled();
+    expect(warnSpy.mock.calls.some(args => args.some((a: any) => String(a).includes('999')))).toBe(true);
+    warnSpy.mockRestore();
+    errSpy.mockRestore();
+  });
+
+  it('a manager whose children fail to load does not hide other accessible accounts', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/999', 'customers/111'] } });
+    mockAxiosPost
+      // 999 is a manager whose children fail to enumerate
+      .mockResolvedValueOnce({ data: { results: [{ customer: { id: '999', descriptiveName: 'My MCC', manager: true } }] } })
+      .mockRejectedValueOnce(new Error('RESOURCE_EXHAUSTED'))
+      // 111 is a separate, reachable standalone leaf
+      .mockResolvedValueOnce({ data: { results: [{ customer: { id: '111', descriptiveName: 'Standalone', currencyCode: 'USD', manager: false } }] } });
+
+    const tree = await service.listAccountHierarchy('test-access-token');
+
+    expect(tree).toEqual([
+      { type: 'leaf', customerId: '111', name: 'Standalone', currency: 'USD', loginCustomerId: '111' },
+      { type: 'manager', customerId: '999', name: 'My MCC', children: [] },
+    ]);
+    warnSpy.mockRestore();
+    errSpy.mockRestore();
+  });
+});
+
+describe('flattenConnectableLeaves', () => {
+  it('flattens leaves and manager children into a single connectable list', () => {
+    const flat = service.flattenConnectableLeaves([
+      { type: 'leaf', customerId: '111', name: 'Standalone', currency: 'USD', loginCustomerId: '111' },
+      { type: 'manager', customerId: '999', name: 'MCC', children: [
+        { customerId: '222', name: 'Child', currency: 'USD', loginCustomerId: '999' },
+      ] },
+    ]);
+    expect(flat).toEqual([
+      { customerId: '111', name: 'Standalone', currency: 'USD', loginCustomerId: '111' },
+      { customerId: '222', name: 'Child', currency: 'USD', loginCustomerId: '999' },
+    ]);
+  });
+});
+
+describe('login-customer-id for managed leaves', () => {
+  it('search uses an explicit login-customer-id override when provided', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
+    await service.search('222', 'test-access-token', 'SELECT campaign.id FROM campaign', '999');
+    expect(mockAxiosPost.mock.calls[0][2].headers['login-customer-id']).toBe('999');
+    // path still targets the leaf account itself
+    expect(mockAxiosPost.mock.calls[0][0]).toContain('/customers/222/');
+  });
+
+  it('getAccountCredentials returns config.login_customer_id when set', async () => {
+    const { userDb } = require('../services/db');
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: 'user-123',
+      connected_accounts: [{
+        platform: 'google_ads', account_id: '222', account_name: 'Managed Leaf',
+        config: { customer_id: '222', currency: 'USD', login_customer_id: '999', access_token: 'valid-token', token_expires_at: Date.now() + 3600_000 },
+      }],
+    });
+    const creds = await service.getAccountCredentials('user-123', '222');
+    expect(creds.loginCustomerId).toBe('999');
+  });
+
+  it('falls back to the customerId as login-customer-id when no manager is stored', async () => {
+    const creds = await service.getAccountCredentials('user-123', '1234567890');
+    expect(creds.loginCustomerId).toBe('1234567890');
+  });
+
+  it('downstream API calls for a managed leaf send the manager as login-customer-id', async () => {
+    const { userDb } = require('../services/db');
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: 'user-123',
+      connected_accounts: [{
+        platform: 'google_ads', account_id: '222', account_name: 'Managed Leaf',
+        config: { customer_id: '222', currency: 'USD', login_customer_id: '999', access_token: 'valid-token', token_expires_at: Date.now() + 3600_000 },
+      }],
+    });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
+    await service.listCampaigns('user-123', '222');
+    expect(mockAxiosPost.mock.calls[0][0]).toContain('/customers/222/');
+    expect(mockAxiosPost.mock.calls[0][2].headers['login-customer-id']).toBe('999');
+  });
+
+  it('mutate calls for a managed leaf send the manager as login-customer-id', async () => {
+    const { userDb } = require('../services/db');
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: 'user-123',
+      connected_accounts: [{
+        platform: 'google_ads', account_id: '222', account_name: 'Managed Leaf',
+        config: { customer_id: '222', currency: 'USD', login_customer_id: '999', access_token: 'valid-token', token_expires_at: Date.now() + 3600_000 },
+      }],
+    });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/222/campaignBudgets/1' }] } });
+    await service.createBudget('user-123', '222', { name: 'B', amountMicros: 1_000_000 });
+    // mutate path targets the leaf but authenticates through the manager
+    expect(mockAxiosPost.mock.calls[0][0]).toContain('/customers/222/');
+    expect(mockAxiosPost.mock.calls[0][2].headers['login-customer-id']).toBe('999');
+  });
+
+  it('searchLocations for a managed leaf sends the manager as login-customer-id', async () => {
+    const { userDb } = require('../services/db');
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: 'user-123',
+      connected_accounts: [{
+        platform: 'google_ads', account_id: '222', account_name: 'Managed Leaf',
+        config: { customer_id: '222', currency: 'USD', login_customer_id: '999', access_token: 'valid-token', token_expires_at: Date.now() + 3600_000 },
+      }],
+    });
+    mockAxiosPost.mockResolvedValueOnce({ data: { geoTargetConstantSuggestions: [] } });
+    await service.searchLocations('user-123', '222', 'United States', 'en');
+    expect(mockAxiosPost.mock.calls[0][2].headers['login-customer-id']).toBe('999');
   });
 });
 
@@ -195,11 +409,14 @@ describe('getAccountCredentials — token refresh', () => {
     );
   });
 
-  it('throws if user not found', async () => {
+  it('throws when no accessible account (e.g. user not found)', async () => {
+    // getAccountCredentials now resolves accounts via the org-aware helper, which
+    // returns an empty list when the user doesn't exist — so the caller sees the
+    // "account not found" path rather than a distinct "User not found".
     const { userDb } = require('../services/db');
     (userDb.getUserById as jest.Mock).mockResolvedValueOnce(null);
     await expect(service.getAccountCredentials('user-123', '1234567890'))
-      .rejects.toThrow('User not found');
+      .rejects.toThrow('Google Ads account not found');
   });
 
   it('throws if no access token after refresh attempt', async () => {

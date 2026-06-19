@@ -121,6 +121,8 @@ export class AgentRunRecorder {
       ...(info.explanationSource ? { explanationSource: info.explanationSource } : {}),
       ...(info.toolPolicyFlags ? { toolPolicyFlags: info.toolPolicyFlags } : {}),
       ...(info.toolPolicySummary ? { toolPolicySummary: info.toolPolicySummary } : {}),
+      ...(info.argsRepairedCount != null ? { argsRepairedCount: info.argsRepairedCount } : {}),
+      ...(info.schemaErrorCount != null ? { schemaErrorCount: info.schemaErrorCount } : {}),
     });
   }
 

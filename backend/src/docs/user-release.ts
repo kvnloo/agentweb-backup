@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-12',
     changes: [
+      'Improved: Changing Your Password Now Signs You Out Everywhere Else',
+      '- When you change your password from Settings — or reset it through the "forgot password" email — every other device and browser that was signed in to your account is now signed out automatically',
+      '- This protects your account if a device was lost or someone else still had access: updating your password instantly cuts off all other active sessions',
+      '- The device you used to make the change stays signed in, so there is nothing extra you need to do',
+    ],
+  },
+  {
+    date: '2026-06-12',
+    changes: [
       'Updated: Passwords Now Require at Least 12 Characters',
       '- To better protect your account, any password you set now needs to be at least 12 characters long — this applies when you sign up, reset a forgotten password, or change your password in Settings',
       '- Your existing password keeps working; the new minimum only applies the next time you create or change a password',
@@ -68,6 +77,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- A skill created by one member of your organization is now visible to every other member in their skills catalog (Settings > Skills and when Emma lists available skills), so teammates can reuse each other\'s skills',
       '- Previously a new skill was only visible to the person who created it, even though work plans and other org resources were already shared org-wide',
       '- Skills and work plans are shared with your whole org by default; an org owner can still turn sharing off for either from Settings > Organization',
+    ],
+  },
+  {
+    date: '2026-06-10',
+    changes: [
+      'Fixed: Updating a Meta Ad\'s Destination URL Now Reliably Takes Effect',
+      '- When you asked Emma to change a Meta ad\'s destination link, she would build a new ad creative and report success — but in some cases the ad kept pointing at the old URL, so the change never showed up in Ads Manager',
+      '- Emma now double-checks her own work after every destination-URL change: she re-reads the ad to confirm the new creative actually attached and that the live URL matches what you asked for, automatically retrying a few times to ride out Meta\'s usual propagation delay',
+      '- If Meta still hasn\'t reflected the change after those retries, Emma tells you it\'s applied and pending on Meta\'s side (it will show up shortly) instead of falsely reporting it as done — and surfaces Meta\'s ad-review status when relevant',
+      '- Your existing tracking parameters (UTM tags) are now carried over automatically when the destination changes, instead of being silently dropped',
     ],
   },
   {

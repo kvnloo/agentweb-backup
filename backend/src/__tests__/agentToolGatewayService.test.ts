@@ -1,4 +1,5 @@
 import {
+  AgentToolBudgetExceededError,
   AgentToolPolicyBlockedError,
   AgentToolRepeatedFailureError,
   _resetAgentToolFailureBreaker,
@@ -864,6 +865,62 @@ describe('agentToolGatewayService', () => {
         ]));
       }
     });
+
+    it('rejects LinkedIn send-invite notes over the conservative 200 character agent limit before dispatch', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'linkedin_outreach',
+        args: {
+          action: 'send-invite',
+          profile_url: 'https://www.linkedin.com/in/example/',
+          message: 'x'.repeat(201),
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string' },
+            profile_url: { type: 'string' },
+            message: { type: 'string' },
+          },
+          required: ['action'],
+        },
+        effect: 'external_send',
+      });
+
+      expect(result.status).toBe('invalid');
+      if (result.status === 'invalid') {
+        expect(result.issues).toEqual(expect.arrayContaining([
+          expect.objectContaining({
+            code: 'invalid_args',
+            path: '$.message',
+          }),
+        ]));
+        expect(result.modelMessage).toContain('200 characters or fewer');
+        expect(result.modelMessage).toContain('201');
+      }
+    });
+
+    it('allows LinkedIn send-message bodies over 200 characters because the invite-note limit is action-specific', () => {
+      const result = validateAndRepairToolArgs({
+        toolName: 'linkedin_outreach',
+        args: {
+          action: 'send-message',
+          profile_url: 'https://www.linkedin.com/in/example/',
+          message: 'x'.repeat(500),
+        },
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string' },
+            profile_url: { type: 'string' },
+            message: { type: 'string' },
+          },
+          required: ['action'],
+        },
+        effect: 'external_send',
+      });
+
+      expect(result.status).toBe('valid');
+    });
   });
 
   describe('call_hubspot_api effect classification', () => {
@@ -970,6 +1027,74 @@ describe('agentToolGatewayService', () => {
         toolName: 'update_html_file',
         args: {},
         runId: 'run-c',
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('blocks expensive media tools after two failures even when the error messages differ', async () => {
+      await failNTimes('run-media', 'generate_image', 'Safety filter rejected image prompt', 1);
+      await failNTimes('run-media', 'generate_image', 'Google image generation timed out after 10 minutes', 1);
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'generate_image',
+        args: { prompt: 'try one more expensive generation' },
+        runId: 'run-media',
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolBudgetExceededError);
+        expect((outcome.error as Error).message).toContain('retry budget of 2');
+        expect((outcome.error as Error).message.toLowerCase()).toContain('do not call it again');
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('blocks expensive media retries across overlapping runs in the same session budget scope', async () => {
+      const sessionScope = 'session-bodylever-image-storm';
+      for (const runId of ['run-media-a', 'run-media-b']) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'generate_image',
+          args: { prompt: 'high-fidelity product ad' },
+          runId,
+          budgetScopeId: sessionScope,
+          execute: failingExecute('Gemini image generation timed out after 600 seconds'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'generate_image',
+        args: { prompt: 'one more overlapping attempt' },
+        runId: 'run-media-c',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolBudgetExceededError);
+        expect((outcome.error as Error).message).toContain('in this session');
+        expect((outcome.error as Error).message).toContain('retry budget of 2');
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('does not apply the expensive media budget to ordinary tools', async () => {
+      await failNTimes('run-non-media', 'search_web', '429 rate limit', 1);
+      await failNTimes('run-non-media', 'search_web', 'network timeout', 1);
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'search_web',
+        args: { query: 'fallback research' },
+        runId: 'run-non-media',
         execute,
       });
 

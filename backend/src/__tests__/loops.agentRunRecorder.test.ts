@@ -70,6 +70,8 @@ describe('AgentRunRecorder', () => {
       explanationSource: 'deterministic_tool_summary',
       toolPolicyFlags: 'send_email:confirmation_recommended:critical',
       toolPolicySummary: 'send_email:external_send:high:observe',
+      argsRepairedCount: 1,
+      schemaErrorCount: 2,
     });
 
     const item = puts[0].item as any;
@@ -83,6 +85,8 @@ describe('AgentRunRecorder', () => {
     expect(item.dimensions.explanationSource).toBe('deterministic_tool_summary');
     expect(item.dimensions.toolPolicyFlags).toBe('send_email:confirmation_recommended:critical');
     expect(item.dimensions.toolPolicySummary).toBe('send_email:external_send:high:observe');
+    expect(item.dimensions.argsRepairedCount).toBe(1);
+    expect(item.dimensions.schemaErrorCount).toBe(2);
   });
 
   it('records tool invoked + succeeded with toolName + duration', async () => {

@@ -1,7 +1,6 @@
 import axios from 'axios';
 import { getGoogleAdsCredentials } from '../utils/secretsManager';
 import { assertPublicHostname } from '../utils/ssrfGuard';
-import { userDb } from './db';                          // sibling in services/
 import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
 
 const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
@@ -17,7 +16,28 @@ export interface GoogleAdsAccountCredentials {
   accessToken: string;
   customerId: string;
   currency: string;
+  /**
+   * The `login-customer-id` to use for API calls. Equals the manager (MCC) id when the
+   * account is a leaf reached through a manager; otherwise equals customerId.
+   */
+  loginCustomerId: string;
 }
+
+/** A leaf (non-manager) Google Ads account the user can connect. */
+export interface GoogleAdLeaf {
+  customerId: string;
+  name: string;
+  currency: string;
+  /** Manager id to send as login-customer-id, or the account's own id when standalone. */
+  loginCustomerId: string;
+  /** True if this customerId is already a connected google_ads account for the user. */
+  alreadyConnected?: boolean;
+}
+
+/** A node in the account-selection tree returned during OAuth finalize. */
+export type GoogleAdsAccountNode =
+  | { type: 'leaf'; customerId: string; name: string; currency: string; loginCustomerId: string; alreadyConnected?: boolean }
+  | { type: 'manager'; customerId: string; name: string; children: GoogleAdLeaf[] };
 
 export class GoogleAdsService {
   // Single-flight refresh guard: userId:accountId → in-flight promise
@@ -30,9 +50,13 @@ export class GoogleAdsService {
     path: string,
     accessToken: string,
     body?: any,
+    loginCustomerIdOverride?: string,
   ): Promise<any> {
     const secrets = await getGoogleAdsCredentials();
-    const loginCustomerId = path.match(/\/customers\/(\d+)\//)?.[1];
+    // For leaf accounts reached through a manager, the API requires login-customer-id to be
+    // the manager id, not the (path) customer id. Callers pass that via the override; standalone
+    // accounts fall back to the path customer id (login == customer).
+    const loginCustomerId = loginCustomerIdOverride || path.match(/\/customers\/(\d+)\//)?.[1];
     if (!loginCustomerId) throw new Error('Could not determine login-customer-id for Google Ads API call');
     const headers = {
       Authorization: `Bearer ${accessToken}`,
@@ -59,7 +83,7 @@ export class GoogleAdsService {
     }
   }
 
-  async search(customerId: string, accessToken: string, query: string): Promise<any[]> {
+  async search(customerId: string, accessToken: string, query: string, loginCustomerId?: string): Promise<any[]> {
     const MAX_PAGES = 50; // safety cap (~500k rows at the default page size) to avoid a runaway loop
     const all: any[] = [];
     let pageToken: string | undefined;
@@ -67,7 +91,7 @@ export class GoogleAdsService {
     do {
       const body: any = { query };
       if (pageToken) body.pageToken = pageToken;
-      const data = await this.callApi('POST', `/customers/${customerId}/googleAds:search`, accessToken, body);
+      const data = await this.callApi('POST', `/customers/${customerId}/googleAds:search`, accessToken, body, loginCustomerId);
       if (data.results) all.push(...data.results);
       pageToken = data.nextPageToken;
       pages++;
@@ -75,12 +99,12 @@ export class GoogleAdsService {
     return all;
   }
 
-  async mutate(customerId: string, accessToken: string, resource: string, operations: any[]): Promise<any> {
-    return this.callApi('POST', `/customers/${customerId}/${resource}:mutate`, accessToken, { operations });
+  async mutate(customerId: string, accessToken: string, resource: string, operations: any[], loginCustomerId?: string): Promise<any> {
+    return this.callApi('POST', `/customers/${customerId}/${resource}:mutate`, accessToken, { operations }, loginCustomerId);
   }
 
-  async batchMutate(customerId: string, accessToken: string, mutateOperations: any[]): Promise<any> {
-    return this.callApi('POST', `/customers/${customerId}/googleAds:mutate`, accessToken, { mutateOperations });
+  async batchMutate(customerId: string, accessToken: string, mutateOperations: any[], loginCustomerId?: string): Promise<any> {
+    return this.callApi('POST', `/customers/${customerId}/googleAds:mutate`, accessToken, { mutateOperations }, loginCustomerId);
   }
 
   makeAuthError(message: string): Error {
@@ -122,22 +146,22 @@ export class GoogleAdsService {
   // ── Account credentials + ownership validation ───────────────────────────
 
   async getAccountCredentials(userId: string, customerId: string): Promise<GoogleAdsAccountCredentials> {
-    const user = await userDb.getUserById(userId);
-    if (!user) throw this.makeAuthError('User not found');
-
-    const accounts: any[] = Array.isArray(user.connected_accounts)
-      ? user.connected_accounts
-      : user.connected_accounts ? [user.connected_accounts] : [];
+    // Source accounts from the org-shared set so a teammate's Google Ads account
+    // shared with the org (sharedWithOrg=true) is usable, not just visible. Each
+    // account carries its owner userId so a token refresh updates the owner's record.
+    const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+    const accounts = await getAccountsWithOwnerIncludingOrgShared(userId);
 
     const account = accounts.find(
       (a: any) => a.platform === 'google_ads' && a.config?.customer_id === customerId
     );
     if (!account) throw this.makeAuthError('Google Ads account not found in your connected accounts. Connect it in Settings.');
 
-    let accessToken = account.config.access_token;
-    const isExpired = account.config.token_expires_at && Date.now() > account.config.token_expires_at - 60_000;
-    if (isExpired && account.config.refresh_token) {
-      accessToken = await this.refreshAccessToken(userId, account.account_id, account.config.refresh_token);
+    const cfg = account.config as any;
+    let accessToken = cfg.access_token;
+    const isExpired = cfg.token_expires_at && Date.now() > cfg.token_expires_at - 60_000;
+    if (isExpired && cfg.refresh_token) {
+      accessToken = await this.refreshAccessToken(account.userId, account.account_id, cfg.refresh_token);
     }
 
     if (!accessToken) {
@@ -147,15 +171,19 @@ export class GoogleAdsService {
     return {
       accessToken,
       customerId,
-      currency: account.config.currency || 'USD',
+      currency: cfg.currency || 'USD',
+      loginCustomerId: cfg.login_customer_id || customerId,
     };
   }
 
   // ── Account listing (used during OAuth finalize) ─────────────────────────
-  // MCC/manager accounts are intentionally unsupported — only standard (leaf) customer
-  // accounts are exposed. Same approach as the Meta Ads implementation.
+  // Builds a 2-level selection tree:
+  //   level 0 — standalone/direct leaf accounts AND manager (MCC) accounts the user can access
+  //   level 1 — leaf accounts managed under a level-0 manager (descendants flattened to one list)
+  // A leaf the user can access both directly and through a discovered manager is shown only
+  // under the manager (deduped out of the top level). Managers themselves are not connectable.
 
-  async listAccessibleAccounts(accessToken: string): Promise<GoogleAdAccount[]> {
+  async listAccountHierarchy(accessToken: string): Promise<GoogleAdsAccountNode[]> {
     const secrets = await getGoogleAdsCredentials();
     const response = await axios.get(`${GOOGLE_ADS_API_BASE}/customers:listAccessibleCustomers`, {
       headers: {
@@ -167,8 +195,9 @@ export class GoogleAdsService {
     const resourceNames: string[] = (response.data as { resourceNames?: string[] }).resourceNames || [];
     if (resourceNames.length === 0) return [];
 
-    const accounts: GoogleAdAccount[] = [];
-    const seenIds = new Set<string>();
+    const directLeaves = new Map<string, GoogleAdLeaf>(); // customerId → level-0 direct/standalone leaf
+    const managers: { customerId: string; name: string; children: GoogleAdLeaf[] }[] = [];
+    const managedLeafIds = new Set<string>(); // ids appearing under any manager (for dedupe)
 
     for (const resourceName of resourceNames) {
       const customerId = resourceName.replace('customers/', '');
@@ -178,17 +207,84 @@ export class GoogleAdsService {
         );
         if (results.length === 0) continue;
         const c = results[0].customer;
-        const isManager = c.manager === true;
-
-        if (!isManager && !seenIds.has(String(c.id))) {
-          seenIds.add(String(c.id));
-          accounts.push({ customerId: String(c.id), name: c.descriptiveName || customerId, currency: c.currencyCode || 'USD' });
+        const id = String(c.id);
+        if (c.manager === true) {
+          // A failure enumerating a manager's children must NOT drop the whole manager —
+          // otherwise an MCC-only user (whose accounts are all under one manager) is shown a
+          // fake "no accounts" state. Surface the manager with whatever resolved (possibly no
+          // children) and log the gap so a transient/partial failure is diagnosable.
+          let children: GoogleAdLeaf[] = [];
+          try {
+            children = await this.listManagerLeaves(id, accessToken);
+          } catch (err: any) {
+            console.warn(`[GoogleAds] listAccountHierarchy: could not load child accounts for manager ${id}:`, err?.message || err);
+          }
+          children.forEach(ch => managedLeafIds.add(ch.customerId));
+          managers.push({ customerId: id, name: c.descriptiveName || customerId, children });
+        } else {
+          directLeaves.set(id, {
+            customerId: id,
+            name: c.descriptiveName || customerId,
+            currency: c.currencyCode || 'USD',
+            loginCustomerId: id,
+          });
         }
-      } catch {
-        // Skip accounts we can't query
+      } catch (err: any) {
+        // Couldn't even identify this account — skip it, but log so the drop isn't silent.
+        console.warn(`[GoogleAds] listAccountHierarchy: skipping customer ${customerId} (probe failed):`, err?.message || err);
       }
     }
-    return accounts;
+
+    const nodes: GoogleAdsAccountNode[] = [];
+    // Top-level leaves first (those not also managed by a discovered manager), then managers.
+    for (const [id, leaf] of directLeaves) {
+      if (!managedLeafIds.has(id)) {
+        nodes.push({ type: 'leaf', customerId: leaf.customerId, name: leaf.name, currency: leaf.currency, loginCustomerId: leaf.loginCustomerId });
+      }
+    }
+    for (const m of managers) {
+      nodes.push({ type: 'manager', customerId: m.customerId, name: m.name, children: m.children });
+    }
+    return nodes;
+  }
+
+  // Enumerate every enabled non-manager leaf under a manager (descendants at any depth,
+  // flattened). login-customer-id must be the manager id for these queries and for all
+  // later API calls against these leaves.
+  private async listManagerLeaves(managerId: string, accessToken: string): Promise<GoogleAdLeaf[]> {
+    const results = await this.search(managerId, accessToken,
+      "SELECT customer_client.id, customer_client.descriptive_name, customer_client.currency_code, customer_client.manager, customer_client.status FROM customer_client WHERE customer_client.manager = false AND customer_client.status = 'ENABLED'",
+      managerId,
+    );
+    const leaves: GoogleAdLeaf[] = [];
+    const seen = new Set<string>();
+    for (const r of results) {
+      const cc = r.customerClient;
+      if (!cc || cc.manager === true) continue;
+      const id = String(cc.id);
+      if (id === managerId || seen.has(id)) continue;
+      seen.add(id);
+      leaves.push({
+        customerId: id,
+        name: cc.descriptiveName || id,
+        currency: cc.currencyCode || 'USD',
+        loginCustomerId: managerId,
+      });
+    }
+    return leaves;
+  }
+
+  // Flatten the selection tree to the list of connectable leaves (used to validate /connect).
+  flattenConnectableLeaves(nodes: GoogleAdsAccountNode[]): GoogleAdLeaf[] {
+    const out: GoogleAdLeaf[] = [];
+    for (const n of nodes) {
+      if (n.type === 'leaf') {
+        out.push({ customerId: n.customerId, name: n.name, currency: n.currency, loginCustomerId: n.loginCustomerId });
+      } else {
+        out.push(...n.children);
+      }
+    }
+    return out;
   }
 
   // ── Budgets ──────────────────────────────────────────────────────────────
@@ -198,7 +294,7 @@ export class GoogleAdsService {
     amountMicros: number;
     explicitlyShared?: boolean;
   }): Promise<{ resourceName: string }> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const data = await this.mutate(customerId, accessToken, 'campaignBudgets', [{
       create: {
         name: params.name,
@@ -206,27 +302,28 @@ export class GoogleAdsService {
         deliveryMethod: 'STANDARD',
         explicitlyShared: params.explicitlyShared ?? false,
       },
-    }]);
+    }], loginCustomerId);
     return { resourceName: data.results[0].resourceName };
   }
 
   async updateBudget(userId: string, customerId: string, budgetResourceName: string, amountMicros: number): Promise<void> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     await this.mutate(customerId, accessToken, 'campaignBudgets', [{
       update: { resourceName: budgetResourceName, amountMicros: String(amountMicros) },
       updateMask: 'amount_micros',
-    }]);
+    }], loginCustomerId);
   }
 
   async removeBudget(userId: string, customerId: string, budgetResourceName: string): Promise<void> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
-    await this.mutate(customerId, accessToken, 'campaignBudgets', [{ remove: budgetResourceName }]);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'campaignBudgets', [{ remove: budgetResourceName }], loginCustomerId);
   }
 
   async listBudgets(userId: string, customerId: string): Promise<{ resourceName: string; name: string; amountMicros: string; explicitlyShared: boolean; referenceCount: number }[]> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const results = await this.search(customerId, accessToken,
-      'SELECT campaign_budget.resource_name, campaign_budget.name, campaign_budget.amount_micros, campaign_budget.explicitly_shared, campaign_budget.reference_count FROM campaign_budget ORDER BY campaign_budget.name'
+      'SELECT campaign_budget.resource_name, campaign_budget.name, campaign_budget.amount_micros, campaign_budget.explicitly_shared, campaign_budget.reference_count FROM campaign_budget ORDER BY campaign_budget.name',
+      loginCustomerId,
     );
     return results.map((r: any) => ({
       resourceName: r.campaignBudget.resourceName,
@@ -240,9 +337,10 @@ export class GoogleAdsService {
   // ── Campaigns ────────────────────────────────────────────────────────────
 
   async listCampaigns(userId: string, customerId: string): Promise<{ resourceName: string; id: string; name: string; status: string; type: string }[]> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const results = await this.search(customerId, accessToken,
       'SELECT campaign.resource_name, campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type FROM campaign ORDER BY campaign.id',
+      loginCustomerId,
     );
     return results.map((r: any) => ({
       resourceName: r.campaign.resourceName,
@@ -265,7 +363,7 @@ export class GoogleAdsService {
     brandBusinessName?: string;
     brandLogoAssetResourceName?: string;
   }): Promise<{ resourceName: string }> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
 
     // DISPLAY campaigns cannot use MAXIMIZE_CONVERSIONS with a shared budget
     if (params.type === 'DISPLAY' && params.biddingStrategy === 'MAXIMIZE_CONVERSIONS') {
@@ -331,11 +429,11 @@ export class GoogleAdsService {
         });
       }
 
-      const batchResult = await this.batchMutate(customerId, accessToken, mutateOps);
+      const batchResult = await this.batchMutate(customerId, accessToken, mutateOps, loginCustomerId);
       const campaignOpIndex = params.brandBusinessName ? 1 : 0;
       campaignResourceName = batchResult.mutateOperationResponses[campaignOpIndex].campaignResult.resourceName;
     } else {
-      const data = await this.mutate(customerId, accessToken, 'campaigns', [{ create: campaignCreate }]);
+      const data = await this.mutate(customerId, accessToken, 'campaigns', [{ create: campaignCreate }], loginCustomerId);
       campaignResourceName = data.results[0].resourceName;
     }
 
@@ -345,7 +443,7 @@ export class GoogleAdsService {
           campaign: campaignResourceName,
           location: { geoTargetConstant: `geoTargetConstants/${id}` },
         },
-      })));
+      })), loginCustomerId);
     }
 
     return { resourceName: campaignResourceName };
@@ -359,7 +457,7 @@ export class GoogleAdsService {
     cpcBidCeilingMicros?: number;
     budgetResourceName?: string;
   }): Promise<void> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const updateMask: string[] = [];
     const update: any = { resourceName: campaignResourceName };
     if (params.name) { update.name = params.name; updateMask.push('name'); }
@@ -391,7 +489,7 @@ export class GoogleAdsService {
       }
     }
     if (updateMask.length === 0) return;
-    await this.mutate(customerId, accessToken, 'campaigns', [{ update, updateMask: updateMask.join(',') }]);
+    await this.mutate(customerId, accessToken, 'campaigns', [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
   }
 
   async pauseCampaign(userId: string, customerId: string, campaignResourceName: string): Promise<void> {
@@ -403,14 +501,14 @@ export class GoogleAdsService {
   }
 
   async removeCampaign(userId: string, customerId: string, campaignResourceName: string): Promise<void> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
-    await this.mutate(customerId, accessToken, 'campaigns', [{ remove: campaignResourceName }]);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'campaigns', [{ remove: campaignResourceName }], loginCustomerId);
   }
 
   // ── Location search ───────────────────────────────────────────────────────
 
   async searchLocations(userId: string, customerId: string, query: string, locale: string = 'en'): Promise<{ id: string; name: string; countryCode: string; targetType: string }[]> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const secrets = await getGoogleAdsCredentials();
     let response;
     try {
@@ -418,7 +516,7 @@ export class GoogleAdsService {
         headers: {
           Authorization: `Bearer ${accessToken}`,
           'developer-token': secrets.developerToken,
-          'login-customer-id': customerId,
+          'login-customer-id': loginCustomerId,
         },
       });
     } catch (err: any) {
@@ -437,9 +535,10 @@ export class GoogleAdsService {
   // ── Ad Groups ────────────────────────────────────────────────────────────
 
   async listAdGroups(userId: string, customerId: string, campaignResourceName: string): Promise<any[]> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const results = await this.search(customerId, accessToken,
       `SELECT ad_group.resource_name, ad_group.id, ad_group.name, ad_group.status, ad_group.type FROM ad_group WHERE ad_group.campaign = '${campaignResourceName}'`,
+      loginCustomerId,
     );
     return results.map((r: any) => ({
       resourceName: r.adGroup.resourceName,
@@ -456,7 +555,7 @@ export class GoogleAdsService {
     type: 'SEARCH_STANDARD' | 'DISPLAY_STANDARD';
     cpcBidMicros?: number;
   }): Promise<{ resourceName: string }> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const data = await this.mutate(customerId, accessToken, 'adGroups', [{
       create: {
         name: params.name,
@@ -465,7 +564,7 @@ export class GoogleAdsService {
         type: params.type,
         ...(params.cpcBidMicros !== undefined && { cpcBidMicros: String(params.cpcBidMicros) }),
       },
-    }]);
+    }], loginCustomerId);
     return { resourceName: data.results[0].resourceName };
   }
 
@@ -477,7 +576,7 @@ export class GoogleAdsService {
     targetCpaMicros?: number;
     targetRoas?: number;
   }): Promise<void> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const updateMask: string[] = [];
     const update: any = { resourceName: adGroupResourceName };
     if (params.name) { update.name = params.name; updateMask.push('name'); }
@@ -487,12 +586,12 @@ export class GoogleAdsService {
     if (params.targetCpaMicros !== undefined) { update.targetCpaMicros = String(params.targetCpaMicros); updateMask.push('target_cpa_micros'); }
     if (params.targetRoas !== undefined) { update.targetRoas = params.targetRoas; updateMask.push('target_roas'); }
     if (updateMask.length === 0) return;
-    await this.mutate(customerId, accessToken, 'adGroups', [{ update, updateMask: updateMask.join(',') }]);
+    await this.mutate(customerId, accessToken, 'adGroups', [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
   }
 
   async removeAdGroup(userId: string, customerId: string, adGroupResourceName: string): Promise<void> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
-    await this.mutate(customerId, accessToken, 'adGroups', [{ remove: adGroupResourceName }]);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'adGroups', [{ remove: adGroupResourceName }], loginCustomerId);
   }
 
   // ── Keywords ─────────────────────────────────────────────────────────────
@@ -501,14 +600,14 @@ export class GoogleAdsService {
     text: string;
     matchType: 'BROAD' | 'PHRASE' | 'EXACT';
   }[]): Promise<void> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     await this.mutate(customerId, accessToken, 'adGroupCriteria', keywords.map(kw => ({
       create: {
         adGroup: adGroupResourceName,
         status: 'ENABLED',
         keyword: { text: kw.text, matchType: kw.matchType },
       },
-    })));
+    })), loginCustomerId);
   }
 
   async addNegativeKeywords(userId: string, customerId: string, target: {
@@ -518,7 +617,7 @@ export class GoogleAdsService {
     if (!target.campaignResourceName && !target.adGroupResourceName) {
       throw new Error('addNegativeKeywords requires either campaignResourceName or adGroupResourceName');
     }
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     if (target.campaignResourceName) {
       await this.mutate(customerId, accessToken, 'campaignCriteria', keywords.map(kw => ({
         create: {
@@ -526,7 +625,7 @@ export class GoogleAdsService {
           negative: true,
           keyword: { text: kw.text, matchType: kw.matchType },
         },
-      })));
+      })), loginCustomerId);
     } else if (target.adGroupResourceName) {
       await this.mutate(customerId, accessToken, 'adGroupCriteria', keywords.map(kw => ({
         create: {
@@ -534,14 +633,14 @@ export class GoogleAdsService {
           negative: true,
           keyword: { text: kw.text, matchType: kw.matchType },
         },
-      })));
+      })), loginCustomerId);
     }
   }
 
   async listKeywords(userId: string, customerId: string, adGroupResourceName: string): Promise<any[]> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const query = `SELECT ad_group_criterion.resource_name, ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, ad_group_criterion.status, ad_group_criterion.negative FROM ad_group_criterion WHERE ad_group_criterion.ad_group = '${adGroupResourceName}' AND ad_group_criterion.type = 'KEYWORD'`;
-    const results = await this.search(customerId, accessToken, query);
+    const results = await this.search(customerId, accessToken, query, loginCustomerId);
     return results.map((r: any) => ({
       resourceName: r.adGroupCriterion.resourceName,
       text: r.adGroupCriterion.keyword?.text,
@@ -555,26 +654,27 @@ export class GoogleAdsService {
     status?: 'ENABLED' | 'PAUSED';
     cpcBidMicros?: number;
   }): Promise<void> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const updateMask: string[] = [];
     const update: any = { resourceName: criterionResourceName };
     if (params.status) { update.status = params.status; updateMask.push('status'); }
     if (params.cpcBidMicros !== undefined) { update.cpcBidMicros = String(params.cpcBidMicros); updateMask.push('cpc_bid_micros'); }
     if (updateMask.length === 0) return;
-    await this.mutate(customerId, accessToken, 'adGroupCriteria', [{ update, updateMask: updateMask.join(',') }]);
+    await this.mutate(customerId, accessToken, 'adGroupCriteria', [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
   }
 
   async removeKeyword(userId: string, customerId: string, criterionResourceName: string): Promise<void> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
-    await this.mutate(customerId, accessToken, 'adGroupCriteria', [{ remove: criterionResourceName }]);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'adGroupCriteria', [{ remove: criterionResourceName }], loginCustomerId);
   }
 
   // ── Ads ──────────────────────────────────────────────────────────────────
 
   async listAds(userId: string, customerId: string, adGroupResourceName: string): Promise<any[]> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const results = await this.search(customerId, accessToken,
       `SELECT ad_group_ad.resource_name, ad_group_ad.status, ad_group_ad.ad.id, ad_group_ad.ad.type, ad_group_ad.ad.final_urls, ad_group_ad.ad.responsive_search_ad.headlines, ad_group_ad.ad.responsive_search_ad.descriptions, ad_group_ad.ad.responsive_display_ad.headlines, ad_group_ad.ad.responsive_display_ad.descriptions FROM ad_group_ad WHERE ad_group_ad.ad_group = '${adGroupResourceName}'`,
+      loginCustomerId,
     );
     return results.map((r: any) => ({
       resourceName: r.adGroupAd.resourceName,
@@ -595,7 +695,7 @@ export class GoogleAdsService {
     finalUrl: string;
     imageAssetResourceNames?: string[];
   }): Promise<{ resourceName: string }> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
 
     let adContent: any;
     if (params.type === 'RESPONSIVE_SEARCH_AD') {
@@ -627,24 +727,24 @@ export class GoogleAdsService {
         status: 'ENABLED',
         ad: { ...adContent, finalUrls: [params.finalUrl] },
       },
-    }]);
+    }], loginCustomerId);
     return { resourceName: data.results[0].resourceName };
   }
 
   async updateAd(userId: string, customerId: string, adGroupAdResourceName: string, params: {
     status?: 'ENABLED' | 'PAUSED';
   }): Promise<void> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const updateMask: string[] = [];
     const update: any = { resourceName: adGroupAdResourceName };
     if (params.status) { update.status = params.status; updateMask.push('status'); }
     if (updateMask.length === 0) return;
-    await this.mutate(customerId, accessToken, 'adGroupAds', [{ update, updateMask: updateMask.join(',') }]);
+    await this.mutate(customerId, accessToken, 'adGroupAds', [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
   }
 
   async removeAd(userId: string, customerId: string, adGroupAdResourceName: string): Promise<void> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
-    await this.mutate(customerId, accessToken, 'adGroupAds', [{ remove: adGroupAdResourceName }]);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'adGroupAds', [{ remove: adGroupAdResourceName }], loginCustomerId);
   }
 
   // ── Assets ───────────────────────────────────────────────────────────────
@@ -654,7 +754,7 @@ export class GoogleAdsService {
     name: string;
     data: Buffer | string;
   }): Promise<string> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
 
     const assetContent: any = {};
     if (asset.type === 'IMAGE' || asset.type === 'LOGO') {
@@ -698,7 +798,7 @@ export class GoogleAdsService {
     const assetType = asset.type === 'LOGO' ? 'IMAGE' : asset.type === 'VIDEO' ? 'YOUTUBE_VIDEO' : 'IMAGE';
     const data = await this.mutate(customerId, accessToken, 'assets', [{
       create: { name: asset.name, type: assetType, ...assetContent },
-    }]);
+    }], loginCustomerId);
     return data.results[0].resourceName;
   }
 
@@ -707,14 +807,14 @@ export class GoogleAdsService {
     assetResourceName?: string;
     text?: string;
   }[]): Promise<void> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const operations: any[] = [];
     for (const asset of assets) {
       let assetResourceName = asset.assetResourceName;
       if (!assetResourceName && asset.text) {
         const textData = await this.mutate(customerId, accessToken, 'assets', [{
           create: { name: asset.text.substring(0, 50), type: 'TEXT', textAsset: { text: asset.text } },
-        }]);
+        }], loginCustomerId);
         assetResourceName = textData.results[0].resourceName;
       }
       if (!assetResourceName) {
@@ -722,7 +822,7 @@ export class GoogleAdsService {
       }
       operations.push({ create: { campaign: campaignResourceName, asset: assetResourceName, fieldType: asset.fieldType } });
     }
-    await this.mutate(customerId, accessToken, 'campaignAssets', operations);
+    await this.mutate(customerId, accessToken, 'campaignAssets', operations, loginCustomerId);
   }
 
   // ── Asset Groups (PMax) ───────────────────────────────────────────────────
@@ -746,7 +846,7 @@ export class GoogleAdsService {
     videoAssets?: string[];
     finalUrl: string;
   }): Promise<{ resourceName: string }> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
 
     // Build everything as a single batch mutate — order: assets first, then asset group, then links
     const assetOps: any[] = [];
@@ -807,14 +907,14 @@ export class GoogleAdsService {
     let mutateOps = [...assetOps, assetGroupOp, ...linkOps];
     let batchResult: any;
     try {
-      batchResult = await this.batchMutate(customerId, accessToken, mutateOps);
+      batchResult = await this.batchMutate(customerId, accessToken, mutateOps, loginCustomerId);
     } catch (err: any) {
       // If brand guidelines enforced: logo must not be in asset group — retry without LOGO links
       const errStr = JSON.stringify(err?.response?.data || err?.message || '');
       if (errStr.includes('BRAND_ASSETS_NOT_LINKED_AT_CAMPAIGN_LEVEL') && errStr.includes('LOGO')) {
         const linkOpsNoLogo = linkOps.filter((op: any) => op.assetGroupAssetOperation?.create?.fieldType !== 'LOGO');
         mutateOps = [...assetOps, assetGroupOp, ...linkOpsNoLogo];
-        batchResult = await this.batchMutate(customerId, accessToken, mutateOps);
+        batchResult = await this.batchMutate(customerId, accessToken, mutateOps, loginCustomerId);
       } else {
         throw err;
       }
@@ -828,22 +928,22 @@ export class GoogleAdsService {
   // ── Reporting ─────────────────────────────────────────────────────────────
 
   async queryReporting(userId: string, customerId: string, gaqlQuery: string): Promise<any[]> {
-    const { accessToken } = await this.getAccountCredentials(userId, customerId);
-    return this.search(customerId, accessToken, gaqlQuery);
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    return this.search(customerId, accessToken, gaqlQuery, loginCustomerId);
   }
 
   async getQuickMetrics(userId: string, customerId: string, options: {
     campaignIds?: string[];
     datePreset?: string;
   }): Promise<{ campaigns: any[]; totals: any; currency: string }> {
-    const { accessToken, currency } = await this.getAccountCredentials(userId, customerId);
+    const { accessToken, currency, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const dateClause = options.datePreset ? `DURING ${options.datePreset}` : 'DURING LAST_30_DAYS';
     const whereClause = options.campaignIds?.length
       ? `WHERE campaign.id IN (${options.campaignIds.join(',')}) AND segments.date ${dateClause}`
       : `WHERE segments.date ${dateClause}`;
 
     const query = `SELECT campaign.id, campaign.name, campaign.status, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions, metrics.ctr, metrics.average_cpc FROM campaign ${whereClause} ORDER BY metrics.cost_micros DESC`;
-    const results = await this.search(customerId, accessToken, query);
+    const results = await this.search(customerId, accessToken, query, loginCustomerId);
 
     const campaigns = results.map((r: any) => {
       const m = r.metrics;

@@ -768,6 +768,90 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.message).toBe('Lead not found');
     });
 
+    it('should expose enrichmentMetadata provenance so the agent can cite data sources', async () => {
+      // Mirrors the real bug: a user asks "where does funding_stage / ARR come
+      // from?" The agent needs the per-field provenance sidecar to answer.
+      const leadWithMeta = {
+        ...mockLead,
+        customFields: { funding_stage: 'Seed', arr: '$1.2M' },
+        enrichmentMetadata: {
+          funding_stage: {
+            source: 'web_search',
+            provider: 'llm_web_search',
+            confidence: 'medium',
+            sourceUrl: 'https://techcrunch.com/acme-seed',
+            sourceQuote: 'Acme closed a $1.2M seed round',
+            enrichedAt: '2026-06-17T00:00:00.000Z',
+          },
+          arr: {
+            source: 'api',
+            provider: 'apollo',
+            confidence: 'low',
+            enrichedAt: '2026-06-17T00:00:00.000Z',
+          },
+        },
+      };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(leadWithMeta as any);
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(true);
+      expect(result.lead.enrichmentMetadata).toBeDefined();
+      expect(result.lead.enrichmentMetadata.funding_stage.provider).toBe('llm_web_search');
+      expect(result.lead.enrichmentMetadata.funding_stage.sourceUrl).toBe('https://techcrunch.com/acme-seed');
+      expect(result.lead.enrichmentMetadata.funding_stage.confidence).toBe('medium');
+      expect(result.lead.enrichmentMetadata.arr.provider).toBe('apollo');
+      expect(result.lead.enrichmentMetadata.arr.confidence).toBe('low');
+    });
+
+    it('should sanitize cross-tenant lineage from enrichmentMetadata before returning', async () => {
+      // crm-history fills carry sibling lineage that must never reach the
+      // customer; sanitizeEnrichmentMetadataForResponse rewrites source and
+      // strips sibling IDs.
+      const leadWithSibling = {
+        ...mockLead,
+        customFields: { funding_stage: 'Series A' },
+        enrichmentMetadata: {
+          funding_stage: {
+            source: 'crm-history',
+            siblingLeadId: 'other-lead-999',
+            siblingListId: 'other-list-888',
+            siblingUserId: 'other-user-777',
+            confidence: 'high',
+            enrichedAt: '2026-06-17T00:00:00.000Z',
+          },
+        },
+      };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(leadWithSibling as any);
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(true);
+      const meta = result.lead.enrichmentMetadata.funding_stage;
+      expect(meta.source).toBe('agentweb');           // rewritten from crm-history
+      expect(meta.siblingLeadId).toBeUndefined();
+      expect(meta.siblingListId).toBeUndefined();
+      expect(meta.siblingUserId).toBeUndefined();
+    });
+
+    it('omits enrichmentMetadata when the lead has none (manual/legacy lead)', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue({ ...mockLead, enrichmentMetadata: undefined } as any);
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(true);
+      expect(result.lead.enrichmentMetadata).toBeUndefined();
+    });
+
     it('should handle emailContent object in recent engagements', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadById.mockResolvedValue(mockLead as any);

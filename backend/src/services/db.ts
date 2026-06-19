@@ -400,6 +400,13 @@ export interface User {
   resetPasswordToken?: string;
   resetPasswordExpires?: string;
   /**
+   * Monotonic session generation counter. Embedded as `sv` in every issued JWT.
+   * Incremented on any successful password change (authenticated change-password
+   * or reset-via-token) so that all previously-issued tokens — i.e. sessions on
+   * other devices — are rejected by the auth middleware. Absent = 0.
+   */
+  sessionVersion?: number;
+  /**
    * Set when the account is created with a system-generated initial password
    * (e.g. admin creating a user from the waitlist). The user MUST set their own
    * password before this timestamp; the initial secret cannot become a
@@ -1358,6 +1365,38 @@ export class UserDB {
     }
   }
 
+  /**
+   * Atomically increment a user's sessionVersion, invalidating all tokens issued
+   * with the prior value. Used after a password change so that every other active
+   * session (other devices) is logged out. Returns the new sessionVersion.
+   *
+   * Uses a DynamoDB SET ... if_not_exists expression so records that predate the
+   * field (sessionVersion absent) are treated as 0 and bumped to 1.
+   */
+  async incrementSessionVersion(userId: string): Promise<number> {
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) {
+      throw new Error(`User with ID '${userId}' not found or has no email.`);
+    }
+
+    const params = {
+      TableName: this.tableName,
+      Key: { email: user.email },
+      UpdateExpression: "SET #sv = if_not_exists(#sv, :zero) + :one",
+      ExpressionAttributeNames: { "#sv": "sessionVersion" },
+      ExpressionAttributeValues: { ":zero": 0, ":one": 1 },
+      ReturnValues: "UPDATED_NEW",
+    };
+
+    try {
+      const result = await this.docClient.update(params).promise();
+      return (result.Attributes as { sessionVersion: number }).sessionVersion;
+    } catch (error) {
+      handleDynamoDbError(error, "incrementSessionVersion");
+      throw error;
+    }
+  }
+
   async incrementTokenUsageForMonth(
     userId: string,
     month: string,
@@ -1488,17 +1527,31 @@ export class UserDB {
 
   async getUserByResetToken(resetToken: string): Promise<User | null> {
     try {
-      const params = {
-        TableName: this.tableName,
-        FilterExpression: "resetPasswordToken = :token AND NOT begins_with(userId, :tombstone)",
-        ExpressionAttributeValues: {
-          ":token": resetToken,
-          ":tombstone": "deleted_",
-        },
-      };
+      // The users table exceeds one 1MB scan page, so a single scan only sees
+      // the first page. Paginate via LastEvaluatedKey until the token is found
+      // or every page is exhausted — otherwise valid resets for users beyond
+      // page 1 falsely report "Invalid or expired reset token".
+      let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+      do {
+        const result = await this.docClient
+          .scan({
+            TableName: this.tableName,
+            FilterExpression: "resetPasswordToken = :token AND NOT begins_with(userId, :tombstone)",
+            ExpressionAttributeValues: {
+              ":token": resetToken,
+              ":tombstone": "deleted_",
+            },
+            ExclusiveStartKey: lastEvaluatedKey,
+          })
+          .promise();
 
-      const result = await this.docClient.scan(params).promise();
-      return result.Items && result.Items.length > 0 ? (result.Items[0] as User) : null;
+        if (result.Items && result.Items.length > 0) {
+          return result.Items[0] as User;
+        }
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } while (lastEvaluatedKey);
+
+      return null;
     } catch (error) {
       this.handleError(error, "getUserByResetToken");
       return null;

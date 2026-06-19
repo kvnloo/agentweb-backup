@@ -1,4 +1,5 @@
 import express from "express";
+import { disconnectStaleUserSockets } from "../services/sessionSockets";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import axios from "axios";
@@ -1426,7 +1427,43 @@ router.put("/users/:userId/password", async (req, res) => {
       // null (not undefined) — updateUser skips undefined values.
       tempPasswordExpires: null,
     });
-    res.json({ message: "Password updated successfully" });
+
+    // Terminate every active session for this user. An admin-initiated password
+    // change is exactly the case (e.g. a compromised account) where all of the
+    // user's existing devices must be logged out. Bumping sessionVersion
+    // invalidates every token carrying the prior `sv`.
+    const newSessionVersion = await userDb.incrementSessionVersion(userId);
+    // Drop any live sockets still open on the user's old session so an
+    // admin-initiated reset (e.g. compromised account) cuts active streams now,
+    // not just on the next HTTP request.
+    await disconnectStaleUserSockets(userId, newSessionVersion);
+
+    // Usually the admin is acting on someone else's account, so no token is
+    // re-issued. But an admin can also reset their OWN password from this screen;
+    // in that case the token this very request was made with is now stale, so we
+    // mint a fresh one (carrying the new session version) and return it for the
+    // caller to adopt — mirroring the self-service change-password flow so the
+    // acting admin stays signed in while their other sessions are terminated.
+    const actingUserId = (req as any).user?.userId;
+    let token: string | undefined;
+    if (actingUserId && actingUserId === userId) {
+      token = jwt.sign(
+        {
+          userId: user.userId,
+          email: user.email,
+          roles: user.roles || [],
+          isAdmin: user.isAdmin || false,
+          sv: newSessionVersion,
+        },
+        process.env.JWT_SECRET || "your-secret-key",
+        { expiresIn: "90d" }
+      );
+    }
+
+    res.json({
+      message: "Password updated successfully",
+      ...(token ? { token } : {}),
+    });
   } catch (error) {
     console.error("Error updating user password:", error);
     res.status(500).json({ message: "Error updating password" });

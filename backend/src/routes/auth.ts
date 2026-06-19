@@ -241,7 +241,8 @@ router.post('/login', authRateLimiter, authController.login);
 router.post('/forgot-password', authController.forgotPassword);
 router.post('/reset-password', authController.resetPassword);
 
-// Authenticated self-service password change (Settings → Change Password)
+// Authenticated self-service password change (Settings → Change Password).
+// Rate-limited, and terminates all other sessions on success.
 router.put('/change-password', changePasswordRateLimiter, authenticateToken, authController.changePassword);
 
 // Google OAuth routes

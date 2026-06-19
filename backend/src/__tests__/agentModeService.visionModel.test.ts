@@ -122,5 +122,34 @@ describe('AgentModeService - vision model (describe_image)', () => {
       // describeImage forwards the resolved vision model to callLLM
       expect(callLLMSpy.mock.calls[0][0]).toBe('gemini-3-flash-preview');
     });
+
+    it('retries transient describe_image failures with a fallback vision model', async () => {
+      const transientError = Object.assign(new Error('503 temporarily unavailable'), { status: 503 });
+      const callLLMSpy = jest
+        .spyOn(service, 'callLLM')
+        .mockRejectedValueOnce(transientError)
+        .mockResolvedValueOnce({ choices: [{ message: { content: 'fallback description' } }] } as any);
+
+      const result = await service.describeImage('gemini-3-flash-preview', 'data:image/png;base64,iVBORw0KGgo=');
+
+      expect(result.success).toBe(true);
+      expect(result.description).toBe('fallback description');
+      expect(result.fallbackUsed).toBe(true);
+      expect(result.model).toBe('anthropic.claude-opus-4-8');
+      expect(callLLMSpy).toHaveBeenCalledTimes(2);
+      expect(callLLMSpy.mock.calls[1][0]).toBe('anthropic.claude-opus-4-8');
+    });
+
+    it('does not retry non-retryable describe_image policy failures', async () => {
+      const callLLMSpy = jest
+        .spyOn(service, 'callLLM')
+        .mockRejectedValue(new Error('content filter blocked this image'));
+
+      const result = await service.describeImage('gemini-3-flash-preview', 'data:image/png;base64,iVBORw0KGgo=');
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('content filter blocked this image');
+      expect(callLLMSpy).toHaveBeenCalledTimes(1);
+    });
   });
 });

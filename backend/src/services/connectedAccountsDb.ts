@@ -183,6 +183,12 @@ export interface GoogleAdsConfig extends BaseOAuthConfig {
   account_type: 'google_ads';
   customer_id: string;
   currency: string;
+  /**
+   * The manager (MCC) account id to send as `login-customer-id` on every Google Ads
+   * API call for this account. Set when the account is a leaf reached through a manager
+   * the user has access to. Omitted/equal to customer_id for standalone/direct accounts.
+   */
+  login_customer_id?: string;
 }
 
 export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig; // | TwitterConfig
@@ -298,19 +304,30 @@ export const getAccountsByUserId = async (userId: string): Promise<ConnectedAcco
 };
 
 /**
- * Get connected accounts for a user, including org-shared accounts from other members.
- * Own accounts are always returned. Org members' accounts are included only when
- * sharedWithOrg === true. Deduplication is by account_id — own account wins on conflict.
+ * Get connected accounts for a user, including org-shared accounts from other
+ * members, each tagged with the userId of the member who OWNS it. The owner id
+ * is essential for consumption paths: when a token is refreshed it must be
+ * written back to the owner's record (updateAccountTokens(ownerUserId, ...)),
+ * not the caller's — otherwise the caller would silently grow a copy of a
+ * teammate's account and the owner's stale token would never update.
+ *
+ * Own accounts are always returned (ownerUserId === callerUserId). Other
+ * members' accounts are included only when sharedWithOrg === true.
+ * Deduplication is by account_id — the caller's own account wins on conflict.
  */
-export const getAccountsByUserIdIncludingOrgShared = async (userId: string): Promise<ConnectedAccount[]> => {
+export const getAccountsWithOwnerIncludingOrgShared = async (
+  callerUserId: string
+): Promise<ConnectedAccountWithUser[]> => {
   const { orgDb } = await import('./db');
 
-  const user = await userDb.getUserById(userId);
+  const user = await userDb.getUserById(callerUserId);
   if (!user) {
     return [];
   }
 
-  const ownAccounts = normalizeAccounts((user as User).connected_accounts);
+  const ownAccounts: ConnectedAccountWithUser[] = normalizeAccounts(
+    (user as User).connected_accounts
+  ).map(acc => ({ ...acc, userId: callerUserId }));
 
   if (!(user as User).orgId) {
     return ownAccounts;
@@ -318,20 +335,32 @@ export const getAccountsByUserIdIncludingOrgShared = async (userId: string): Pro
 
   const members = await orgDb.getOrgMembers((user as User).orgId!);
   const seen = new Set(ownAccounts.map(a => a.account_id));
-  const sharedAccounts: ConnectedAccount[] = [];
+  const sharedAccounts: ConnectedAccountWithUser[] = [];
 
   for (const member of members) {
-    if (member.userId === userId) continue;
+    if (member.userId === callerUserId) continue;
     const memberAccounts = normalizeAccounts(member.connected_accounts);
     for (const account of memberAccounts) {
       if (account.sharedWithOrg && !seen.has(account.account_id)) {
         seen.add(account.account_id);
-        sharedAccounts.push(account);
+        sharedAccounts.push({ ...account, userId: member.userId });
       }
     }
   }
 
   return [...ownAccounts, ...sharedAccounts];
+};
+
+/**
+ * Get connected accounts for a user, including org-shared accounts from other members.
+ * Own accounts are always returned. Org members' accounts are included only when
+ * sharedWithOrg === true. Deduplication is by account_id — own account wins on conflict.
+ *
+ * Thin wrapper over getAccountsWithOwnerIncludingOrgShared for callers (display/list
+ * endpoints) that don't need the owner userId.
+ */
+export const getAccountsByUserIdIncludingOrgShared = async (userId: string): Promise<ConnectedAccount[]> => {
+  return getAccountsWithOwnerIncludingOrgShared(userId);
 };
 
 /**
