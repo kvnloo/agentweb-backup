@@ -103,6 +103,9 @@ interface McpServerConfig {
   env?: Record<string, string>;
   accessToken?: string;
   isInternal?: boolean;
+  // When true, the server is backend-only: connected/used by backend services (e.g. the
+  // video service calls Higgsfield directly) but its tools are hidden from the agent (Emma).
+  excludeFromAgent?: boolean;
   discoveredTools?: string[];
   // OAuth fields (HTTP transports). authType drives how the runtime transport authenticates.
   authType?: 'none' | 'bearer' | 'oauth';
@@ -142,8 +145,8 @@ router.get("/", async (req, res) => {
 // Add new MCP server
 router.post("/", async (req, res) => {
   try {
-    const { name, transport, url, command, args, env, accessToken, isInternal } = req.body;
-    
+    const { name, transport, url, command, args, env, accessToken, isInternal, excludeFromAgent } = req.body;
+
     // Validate required fields
     if (!name || typeof name !== 'string') {
       return res.status(400).json({ message: "Server name is required" });
@@ -193,6 +196,7 @@ router.post("/", async (req, res) => {
       // OAuth is detected/promoted later via the /oauth/initiate + /callback flow.
       ...(transport !== 'stdio' && { authType: accessToken ? 'bearer' : 'none' }),
       ...(typeof isInternal === 'boolean' && { isInternal }),
+      ...(excludeFromAgent === true && { excludeFromAgent: true }),
     };
     servers.push(newServer);
     
@@ -218,7 +222,7 @@ router.post("/", async (req, res) => {
 router.put("/:name", async (req, res) => {
   try {
     const { name: serverName } = req.params;
-    const { transport, url, command, args, env, accessToken, isInternal, name: newName } = req.body;
+    const { transport, url, command, args, env, accessToken, isInternal, excludeFromAgent, name: newName } = req.body;
     
     // Get existing servers
     const setting = await settingsService.getSetting("mcp_servers");
@@ -282,6 +286,11 @@ router.put("/:name", async (req, res) => {
             })()),
           }),
       ...(typeof isInternal === 'boolean' && { isInternal }),
+      // Carry excludeFromAgent across the rebuild (like the OAuth fields below): use the
+      // request value when provided, otherwise preserve the existing flag. Only persist
+      // when true so clearing it (false) drops the field.
+      ...((excludeFromAgent !== undefined ? excludeFromAgent : servers[serverIndex].excludeFromAgent) === true
+        && { excludeFromAgent: true }),
       discoveredTools: servers[serverIndex].discoveredTools,
       // Preserve OAuth state across edits — the rebuild above would otherwise drop it.
       ...(effectiveTransport !== 'stdio' && servers[serverIndex].authType && { authType: servers[serverIndex].authType }),

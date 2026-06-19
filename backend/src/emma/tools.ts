@@ -4046,7 +4046,7 @@ emmaToolRegistry.register({
   name: 'generate_video',
   definition: {
     name: 'generate_video',
-    description: 'Generate videos using AI video generation models. Supports text-to-video generation and video generation with optional start and end frames for interpolation. Can optionally post-process the generated clip with Remotion to add brand overlays (headline, tagline, logo, CTA). IMPORTANT: For multi-clip videos (e.g. 24s = 3 clips), ALWAYS use a single generate_video call with durationSeconds=24 and compose=true — do NOT generate clips separately and stitch later. To stitch already-generated clips, use compose_video instead.',
+    description: 'Generate videos using AI video generation models. Supports text-to-video generation and video generation with optional start and end frames for interpolation. Can optionally post-process the generated clip with Remotion to add brand overlays (headline, tagline, logo, CTA). IMPORTANT: For multi-clip videos (e.g. 24s = 3 clips), ALWAYS use a single generate_video call with durationSeconds=24 and compose=true — do NOT generate clips separately and stitch later. To stitch already-generated clips, use compose_video instead. REFERENCE IMAGES: When the user provides image(s) to base the video on, ALWAYS pass the actual image(s) as frames — never use a text description in place of the image. Recommended flow: (1) call describe_image on each reference image so you understand what it depicts (this grounds your motion prompt; it does NOT replace the frame); (2) pass the image URL(s) as frames — ONE image → set startFrame to its URL and leave endFrame unset (do NOT invent or duplicate a second frame); TWO images → startFrame = the opening/first image, endFrame = the closing/last image (only set endFrame when the user actually intends an end frame); (3) write a prompt that describes the MOTION/transition you want (informed by the descriptions) rather than restating the static contents the frame already carries. You may skip describe_image (step 1) when the user has already given a clear, detailed prompt and just wants the exact image animated. The default model (seedance-2.0 via Higgsfield) and the Veo fallback BOTH accept a single reference frame or two frames natively, so the actual image(s) are used. Only if a generation explicitly fails because a reference frame could not be loaded/imported should you fall back to describing the image(s) with describe_image and adding that to the prompt as text. ASPECT RATIO: infer the aspect ratio from the user\'s intent (e.g. a reel/short → vertical 9:16); if the user gives no orientation/format cue AND no reference frame to match, ASK them for the orientation before generating. Never ask about resolution — infer it or use the default.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4073,15 +4073,15 @@ emmaToolRegistry.register({
         },
         startFrame: {
           type: 'string',
-          description: 'Optional: URL of the first frame image to use as the starting point for video generation. If provided, the video will start from this frame.'
+          description: 'Optional: URL of the first frame image to use as the starting point for video generation. If provided, the video will start from this frame. When the user uploads/provides a reference image for the video, put its URL here (do NOT describe it into the prompt).'
         },
         endFrame: {
           type: 'string',
-          description: 'Optional: URL of the last frame image to use as the ending point for video generation. If provided, the video will end at this frame. Can be used together with startFrame for interpolation between two frames.'
+          description: 'Optional: URL of the last frame image to use as the ending point for video generation. If provided, the video will end at this frame. Can be used together with startFrame for interpolation between two frames. When the user provides a SECOND reference image, put its URL here.'
         },
         aspectRatio: {
           type: 'string',
-          description: 'Optional: video aspect ratio (Seedance 2.0). Set from the user\'s request when they mention orientation, e.g. "vertical"→9:16, "square"→1:1, "widescreen"/"landscape"→16:9. Defaults to "auto" (matches the input frame for image-to-video).',
+          description: 'Video aspect ratio (Seedance 2.0). INFER it from the user\'s intent/format cues whenever possible — e.g. reel/short/story/TikTok/"vertical" → 9:16; "square"/feed post → 1:1; YouTube/"widescreen"/"landscape" → 16:9; cinematic → 21:9. If the user gives NO orientation or format cue, ASK them which orientation/aspect ratio they want BEFORE calling this tool — do not silently default. Exception: when a reference start frame is provided, "auto" (match the frame) is an acceptable no-ask default. (Resolution is the opposite — never ask; just infer or use the 720p default.)',
           enum: ['auto', '16:9', '9:16', '1:1', '4:3', '3:4', '21:9']
         },
         resolution: {

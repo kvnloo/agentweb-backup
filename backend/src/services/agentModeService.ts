@@ -15,6 +15,7 @@ import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
 import { settingsService } from './settingsService';
 import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
+import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { createWriteStream, promises as fs, default as fsSync } from 'fs';
 import os from 'os';
 import path from 'path';
@@ -3594,15 +3595,7 @@ export class AgentModeService {
       // This matches how generateSessionResponse processes attachments (lines 495-502 in agentModeController)
       if (msg.role === 'user' && (msg as any).metadata?.attachments?.length > 0) {
         const attachments = (msg as any).metadata.attachments;
-        const IMAGE_MIMETYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp', 'image/svg+xml']);
-        const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg']);
-        const attachmentUrls = attachments.map((attachment: any) => {
-          const mimetype = (attachment.mimetype || '').toLowerCase();
-          const ext = (attachment.filename || '').split('.').pop()?.toLowerCase() || '';
-          const isImage = IMAGE_MIMETYPES.has(mimetype) || IMAGE_EXTS.has(ext);
-          const hint = isImage ? ' (image — use describe_image tool to analyze)' : '';
-          return `[${attachment.filename || 'Attachment'}](${attachment.url})${hint}`;
-        }).join('\n');
+        const attachmentUrls = formatAttachmentUrls(attachments);
         // Ensure content is a string before concatenating
         let contentStr = '';
         if (Array.isArray(content)) {

@@ -323,5 +323,67 @@ describe('VideoService', () => {
       veoSpy.mockRestore();
     });
   });
+
+  // Option C: the whole video op (Seedance attempt + Veo fallback) is bounded by a
+  // single deadline that stays under the agent-mode turn cap, so the fallback can't be
+  // killed mid-run. These cover the deadline-enforcement branches specifically.
+  describe('time-budget enforcement (option C)', () => {
+    let setTimeoutSpy: jest.SpyInstance;
+    beforeEach(() => {
+      setTimeoutSpy = jest.spyOn(global, 'setTimeout').mockImplementation(((cb: any) => { cb(); return 0 as any; }) as any);
+      mockedUpload.mockResolvedValue({ success: true, url: 'https://s3.example.com/p.mp4' });
+    });
+    afterEach(() => setTimeoutSpy.mockRestore());
+
+    it('Seedance returns a budget error when polling never reaches a terminal state in time', async () => {
+      // Job stays "queued"; with the deadline already at hand the poll budget is 0, so
+      // Seedance gives up immediately with the budget message (→ Veo fallback upstream).
+      mockCallTool.mockImplementation(async (tool: string) => {
+        if (tool === 'generate_video') return { structuredContent: { results: [{ id: 'job-1', status: 'queued', results: {} }] } };
+        if (tool === 'job_status') return { structuredContent: { generation: { id: 'job-1', status: 'queued', results: {} } } };
+        return {};
+      });
+
+      const result = await (videoService as any).generateWithHiggsfield({
+        prompt: 'x', filename: 'p.mp4', userId: 'u', videoModel: 'seedance-2.0',
+        deadlineMs: Date.now(), // no budget left after the Veo reserve
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/budget/i);
+    });
+
+    it('carries the SAME whole-op deadline into the Veo fallback (does not reset it)', async () => {
+      let hfDeadline: number | undefined;
+      let veoDeadline: number | undefined;
+      const hfSpy = jest.spyOn(videoService as any, 'generateWithHiggsfield')
+        .mockImplementation(async (p: any) => { hfDeadline = p.deadlineMs; return { success: false, error: 'seedance down' }; });
+      const veoSpy = jest.spyOn(videoService as any, 'generateWithVeo31')
+        .mockImplementation(async (p: any) => { veoDeadline = p.deadlineMs; return { success: true, videoUrl: 'https://s3.example.com/veo.mp4', filename: 'p.mp4' }; });
+
+      await videoService.generateVideo({ prompt: 'x', filename: 'p.mp4', userId: 'u', videoModel: 'seedance-2.0' });
+
+      expect(typeof hfDeadline).toBe('number');
+      expect(veoDeadline).toBe(hfDeadline); // one deadline, propagated through the fallback
+      hfSpy.mockRestore();
+      veoSpy.mockRestore();
+    });
+
+    it('Veo returns a time-budget error when the deadline has already passed', async () => {
+      mockedGetSecret.mockResolvedValue('fake-key');
+      const genai = require('@google/genai');
+      (genai.GoogleGenAI as jest.Mock).mockImplementation(() => ({
+        models: { generateVideos: jest.fn().mockResolvedValue({ done: false }) },
+        operations: { getVideosOperation: jest.fn().mockResolvedValue({ done: false }) },
+      }));
+
+      const result = await (videoService as any).generateWithVeo31({
+        prompt: 'x', filename: 'p.mp4', userId: 'u', deadlineMs: Date.now() - 1, // already past
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/time budget/i);
+    });
+  });
 });
 
