@@ -13,6 +13,7 @@ import { mcpFetch } from '../mcp/server/httpClient';
 import { agentModeService } from './agentModeService';
 import { getSecret } from '../utils/secretsManager';
 import { getLandingPageById, getLandingPagesByOwner, canUserEditLandingPage, GeneratedLandingPage } from './v0Service';
+import { AcceptanceCheck, AcceptanceStatus, AcceptanceVerificationResult, verifyAcceptanceChecks } from './codingAgentAcceptance';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -52,6 +53,19 @@ export interface CodingAgentContext {
    * that turn's usage. Used by the eval harness to measure real cost through the
    * production path; unset in normal operation (no behavior change). */
   onUsage?: (usage: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }) => void;
+  /** Deterministic post-run checks. The coding agent edits; this verifier judges. */
+  acceptanceChecks?: AcceptanceCheck[];
+}
+
+export interface CodingAgentResult {
+  success: boolean;
+  message: string;
+  iterations: number;
+  previewUrl?: string;
+  branch?: string;
+  notAuthorized?: boolean;
+  acceptanceStatus?: AcceptanceStatus;
+  acceptance?: AcceptanceVerificationResult;
 }
 
 interface SearchReplaceEdit {
@@ -70,6 +84,30 @@ interface ApplyResult {
   result: string;
   appliedCount: number;
   errors: string[];
+}
+
+async function refreshPreviewUrlForDraftBranch(
+  result: CodingAgentResult,
+  context: CodingAgentContext
+): Promise<CodingAgentResult> {
+  if (!result.success || !result.branch || result.branch === 'main') return result;
+
+  try {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/landing-pages/v0/generated/${context.pageId}/preview-url`,
+      queryParams: { branch: result.branch },
+      context: { userId: context.userId },
+    });
+
+    if (data?.previewUrl && data.previewUrl !== result.previewUrl) {
+      return { ...result, previewUrl: data.previewUrl };
+    }
+  } catch (error) {
+    console.warn('[CODING AGENT] Could not refresh draft preview URL; using agent-reported URL:', error);
+  }
+
+  return result;
 }
 
 /**
@@ -135,7 +173,7 @@ The tool will create the file if it doesn't exist. No need to read it first.
 - Only browse_page to verify when visual correctness matters for the task.
 - Do not make changes the user did not ask for.
 - Before your first edit, note the current commit SHA (via list_commits) so you can revert if needed.
-- When done, check_deployment once, then call report_to_user with a summary and the preview URL.
+- When done, check_deployment once, then call report_to_user with a summary and the preview URL. The platform may run deterministic acceptance checks after you finish; do not claim success unless the build/deployment information you saw supports it.
 
 ## Adding images and logos
 - Always use a direct URL in <img src="..."> — never try to upload or embed binary files.
@@ -1520,7 +1558,7 @@ async function runCodingAgentInternal(
   context: CodingAgentContext,
   maxIterations: number,
   model: string
-): Promise<{ success: boolean; message: string; iterations: number; previewUrl?: string; branch?: string; notAuthorized?: boolean }> {
+): Promise<CodingAgentResult> {
 
   const client = await getClientForModel(model);
   const tools = getToolDefinitions();
@@ -1619,7 +1657,7 @@ async function runCodingAgentInternal(
         if (fnName === 'report_to_user') {
           const status = fnArgs.status || 'success';
           return {
-            success: status !== 'error',
+            success: status === 'success',
             message: fnArgs.message || 'Done.',
             iterations: iteration,
             previewUrl: fnArgs.preview_url,
@@ -1705,7 +1743,7 @@ export async function runCodingAgent(
   taskDescription: string,
   context: CodingAgentContext,
   maxIterations: number = DEFAULT_MAX_ITERATIONS
-): Promise<{ success: boolean; message: string; iterations: number; previewUrl?: string; branch?: string; notAuthorized?: boolean }> {
+): Promise<CodingAgentResult> {
 
   // Preflight authorization. The page may be org-visible (so the agent could
   // see and select it) yet not editable by this caller — a plain member can
@@ -1733,17 +1771,19 @@ export async function runCodingAgent(
     model = DEFAULT_CODING_AGENT_MODEL;
   }
 
-  const timeoutPromise = new Promise<{ success: boolean; message: string; iterations: number; previewUrl?: string; branch?: string }>((resolve) => {
-    setTimeout(() => {
+  const timeoutPromise = new Promise<CodingAgentResult>((resolve) => {
+    const timer = setTimeout(() => {
       resolve({
         success: false,
         message: 'Coding agent timed out after 10 minutes. The task may be partially complete — check the deployment for any changes that were made.',
-        iterations: -1
+        iterations: -1,
+        acceptanceStatus: context.acceptanceChecks?.length ? 'not_run' : undefined,
       });
     }, AGENT_TIMEOUT_MS);
+    timer.unref?.();
   });
 
-  return Promise.race([
+  const rawResult: CodingAgentResult = await Promise.race<CodingAgentResult>([
     runCodingAgentInternal(taskDescription, context, maxIterations, model).catch((error) => {
       if (is403Error(error)) {
         return {
@@ -1751,10 +1791,48 @@ export async function runCodingAgent(
           message: NOT_AUTHORIZED_MESSAGE,
           iterations: 0,
           notAuthorized: true,
-        };
+          acceptanceStatus: context.acceptanceChecks?.length ? 'not_run' : undefined,
+        } satisfies CodingAgentResult;
       }
       throw error;
     }),
     timeoutPromise
   ]);
+
+  const result = await refreshPreviewUrlForDraftBranch(rawResult, context);
+
+  if (!context.acceptanceChecks?.length) {
+    return result;
+  }
+
+  if (!result.success) {
+    return { ...result, acceptanceStatus: result.acceptanceStatus ?? 'not_run' };
+  }
+
+  const acceptance = await verifyAcceptanceChecks({
+    checks: context.acceptanceChecks,
+    previewUrl: result.previewUrl,
+    executeMcpTool: context.executeMcpTool,
+  });
+
+  if (acceptance.status !== 'passed') {
+    const failedLines = acceptance.checks
+      .filter((check) => check.status !== 'passed')
+      .map((check) => `- ${check.label}: ${check.message}`)
+      .join('\n');
+    return {
+      ...result,
+      success: false,
+      acceptanceStatus: acceptance.status,
+      acceptance,
+      message: `${result.message}\n\n${acceptance.summary}${failedLines ? `\n${failedLines}` : ''}`,
+    };
+  }
+
+  return {
+    ...result,
+    acceptanceStatus: 'passed',
+    acceptance,
+    message: `${result.message}\n\n${acceptance.summary}`,
+  };
 }

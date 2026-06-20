@@ -162,6 +162,7 @@ describe('executePreparedTools', () => {
     // for the ledger entry (behavior-preserving: toolResultError returns a string,
     // not an Error instance). The tool message content uses String(error).
     expect(input.toolCallsLedger[0].error).toBe('Unknown error');
+    expect(input.toolCallsLedger[0].result).toEqual({ bad: true });
     expect(input.messages[0].content).toBe('ERR: flagged error');
     expect(result.failedCounterUpdates).toEqual({ read_brand_guidelines: 1 });
     expect(result.pendingCounterUpdates).toEqual({});

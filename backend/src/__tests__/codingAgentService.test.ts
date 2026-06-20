@@ -377,6 +377,153 @@ describe('runCodingAgent', () => {
     expect(mockCreate).toHaveBeenCalledTimes(1);
   });
 
+  test('runs acceptance checks after a simple landing-page update before returning success', async () => {
+    const mockExecuteMcpTool = jest
+      .fn()
+      .mockResolvedValueOnce({ content: 'navigated' })
+      .mockResolvedValueOnce({ result: true });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        {
+          type: 'tool_use',
+          id: 'tu_1',
+          name: 'report_to_user',
+          input: {
+            message: 'Updated the hero headline to Launch Faster.',
+            status: 'success',
+            preview_url: 'https://preview.example',
+          },
+        },
+      ],
+      stop_reason: 'tool_use',
+    });
+
+    const result = await runCodingAgent('Change the hero headline to Launch Faster', {
+      ...mockContext,
+      executeMcpTool: mockExecuteMcpTool,
+      acceptanceChecks: [{
+        type: 'browser_eval',
+        label: 'Hero headline changed',
+        script: 'return document.body.innerText.includes("Launch Faster");',
+      }],
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.acceptanceStatus).toBe('passed');
+    expect(result.message).toContain('Acceptance passed');
+    expect(mockExecuteMcpTool).toHaveBeenCalledWith('playwright_browser_navigate', { url: 'https://preview.example' });
+    expect(mockExecuteMcpTool).toHaveBeenCalledWith('playwright_browser_evaluate', {
+      function: expect.stringContaining('Launch Faster'),
+    });
+  });
+
+  test('refreshes a stale draft preview URL before running acceptance checks', async () => {
+    mockedMcpFetch
+      .mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 1000 }] })
+      .mockResolvedValueOnce({
+        buildStatus: 'success',
+        previewUrl: 'https://new-preview.example',
+      });
+    const mockExecuteMcpTool = jest
+      .fn()
+      .mockResolvedValueOnce({ content: 'navigated' })
+      .mockResolvedValueOnce({ result: true });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        {
+          type: 'tool_use',
+          id: 'tu_1',
+          name: 'report_to_user',
+          input: {
+            message: 'Updated the live smoke page.',
+            status: 'success',
+            preview_url: 'https://old-preview.example',
+          },
+        },
+      ],
+      stop_reason: 'tool_use',
+    });
+
+    const result = await runCodingAgent('Change the smoke page', {
+      ...mockContext,
+      draftBranch: 'draft/session-789',
+      executeMcpTool: mockExecuteMcpTool,
+      acceptanceChecks: [{
+        type: 'browser_eval',
+        label: 'Smoke phrase visible',
+        script: 'return document.body.innerText.includes("Live verifier pass");',
+      }],
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.previewUrl).toBe('https://new-preview.example');
+    expect(mockedMcpFetch).toHaveBeenLastCalledWith(expect.objectContaining({
+      method: 'GET',
+      path: '/api/landing-pages/v0/generated/test-page-123/preview-url',
+      queryParams: { branch: 'draft/session-789' },
+      context: { userId: 'user-456' },
+    }));
+    expect(mockExecuteMcpTool).toHaveBeenCalledWith('playwright_browser_navigate', {
+      url: 'https://new-preview.example',
+    });
+  });
+
+  test('fails the coding agent result when landing-page acceptance checks fail', async () => {
+    const mockExecuteMcpTool = jest
+      .fn()
+      .mockResolvedValueOnce({ content: 'navigated' })
+      .mockResolvedValueOnce({ result: false });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        {
+          type: 'tool_use',
+          id: 'tu_1',
+          name: 'report_to_user',
+          input: {
+            message: 'Updated the hero headline to Launch Faster.',
+            status: 'success',
+            preview_url: 'https://preview.example',
+          },
+        },
+      ],
+      stop_reason: 'tool_use',
+    });
+
+    const result = await runCodingAgent('Change the hero headline to Launch Faster', {
+      ...mockContext,
+      executeMcpTool: mockExecuteMcpTool,
+      acceptanceChecks: [{
+        type: 'browser_eval',
+        label: 'Hero headline changed',
+        script: 'return document.body.innerText.includes("Launch Faster");',
+      }],
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.acceptanceStatus).toBe('failed');
+    expect(result.acceptance?.checks[0]).toMatchObject({
+      label: 'Hero headline changed',
+      status: 'failed',
+      actual: false,
+      expected: true,
+    });
+    expect(result.message).toContain('Acceptance failed');
+  });
+
+  test('treats model-reported partial completion as unsuccessful', async () => {
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'One item still needs work.', status: 'partial' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    const result = await runCodingAgent('fix multiple issues', mockContext);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toBe('One item still needs work.');
+  });
+
   test('multi-iteration: read_file then edit_file then report_to_user', async () => {
     // Iteration 1: LLM calls read_file
     mockCreate.mockResolvedValueOnce({
@@ -1011,17 +1158,22 @@ describe('runCodingAgent', () => {
         stop_reason: 'tool_use'
       });
 
-    // Pre-fetch file listing, then two check_deployment polls
+    // Pre-fetch file listing, two check_deployment polls, then final authoritative preview refresh.
     mockedMcpFetch
       .mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 2000 }] })
       .mockResolvedValueOnce({ buildStatus: 'building' })
+      .mockResolvedValueOnce({ buildStatus: 'success', previewUrl: 'https://test.vercel.app' })
       .mockResolvedValueOnce({ buildStatus: 'success', previewUrl: 'https://test.vercel.app' });
 
     await runCodingAgent('update logo', draftContext);
 
-    // Verify polling happened: mcpFetch called 3 times (pre-fetch + 2 check_deployment polls)
-    expect(mockedMcpFetch).toHaveBeenCalledTimes(3);
+    // Verify polling happened and the final branch preview was refreshed.
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(4);
     expect(mockedMcpFetch).toHaveBeenNthCalledWith(3, expect.objectContaining({
+      method: 'GET',
+      path: expect.stringContaining('/preview-url'),
+    }));
+    expect(mockedMcpFetch).toHaveBeenNthCalledWith(4, expect.objectContaining({
       method: 'GET',
       path: expect.stringContaining('/preview-url'),
     }));
@@ -1039,15 +1191,16 @@ describe('runCodingAgent', () => {
         stop_reason: 'tool_use'
       });
 
-    // Pre-fetch + single check_deployment call (success — no retry)
+    // Pre-fetch, single check_deployment call (success — no retry), final preview refresh.
     mockedMcpFetch
       .mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 2000 }] })
+      .mockResolvedValueOnce({ buildStatus: 'success', previewUrl: 'https://test.vercel.app' })
       .mockResolvedValueOnce({ buildStatus: 'success', previewUrl: 'https://test.vercel.app' });
 
     await runCodingAgent('update logo', draftContext);
 
-    // Success state: no retry, mcpFetch called twice (pre-fetch + check_deployment)
-    expect(mockedMcpFetch).toHaveBeenCalledTimes(2);
+    // Success state: no retry, with a final authoritative preview refresh.
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(3);
   });
 
   test('check_deployment stops immediately on error without retrying', async () => {

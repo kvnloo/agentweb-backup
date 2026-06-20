@@ -389,6 +389,7 @@ export async function executePreparedTools(
       status: 'error' as const,
       toolCall: toolResult.toolCall,
       functionArgs: toolResult.functionArgs,
+      result: toolResult.result,
       error,
       duration: toolResult.duration,
       policyDecision: toolResult.policyDecision,
@@ -502,6 +503,9 @@ export async function executePreparedTools(
         name: toolCall.function.name,
         arguments: functionArgs || toolCall.function.arguments,
         error: error instanceof Error ? error.message : 'Unknown error',
+        ...(toolResult.result !== undefined
+          ? { result: ports.extractMinimalToolResult(toolResult.result, toolCall.function.name) }
+          : {}),
         duration,
       });
 
