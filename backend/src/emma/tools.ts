@@ -6115,7 +6115,7 @@ emmaToolRegistry.register({
   name: 'coding_agent',
   definition: {
     name: 'coding_agent',
-    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to a STAGING draft branch (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code. IMPORTANT: After coding_agent returns, trust its result — do NOT attempt to verify by reading or listing landing page files yourself (e.g. list_landing_page_files, get_file_contents, read_landing_page_file). The coding agent already verified the changes. If it failed, call coding_agent again with a clearer task_description. Only call coding_agent ONCE per user request unless it explicitly fails. LOGO TIP: Always pass logo URLs directly in the task_description — the coding agent will use them in <img src="..."> tags. For public company logos use Google\'s favicon service (https://www.google.com/s2/favicons?domain={domain}&sz=128). For the user\'s own brand logo, look it up with read_brand_guidelines first and include the URL in the task.',
+    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to a STAGING draft branch (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code. For user-visible landing-page changes, pass acceptance_checks that prove the requested behavior on the preview page; the backend verifier runs them after the coding agent finishes and fails the tool if they do not pass. If the tool fails because acceptance failed, report the failed checks and ask for the missing input or run a narrower follow-up. Only call coding_agent ONCE per user request unless it explicitly fails. LOGO TIP: Always pass logo URLs directly in the task_description — the coding agent will use them in <img src="..."> tags. For public company logos use Google\'s favicon service (https://www.google.com/s2/favicons?domain={domain}&sz=128). For the user\'s own brand logo, look it up with read_brand_guidelines first and include the URL in the task.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -6128,6 +6128,31 @@ emmaToolRegistry.register({
           type: 'string',
           'x-aliases': ['instructions'],
           description: 'Detailed description of what code changes to make. Include specific requirements, file paths if known, and any context about the desired outcome. Be as specific as possible.'
+        },
+        acceptance_checks: {
+          type: 'array',
+          description: 'Optional deterministic checks to run against the staging preview after the coding agent finishes. Use these for landing-page edits so success means the requested behavior actually passed.',
+          maxItems: 10,
+          items: {
+            type: 'object',
+            properties: {
+              type: {
+                type: 'string',
+                enum: ['http_status', 'browser_eval', 'dom_text', 'console_errors'],
+                description: 'http_status checks a URL status. browser_eval runs JavaScript in Playwright and compares the returned value. dom_text checks text under a selector. console_errors fails on console errors.'
+              },
+              label: { type: 'string', description: 'Human-readable check name, e.g. "Hero headline updated" or "Neue Montreal loads".' },
+              url: { type: 'string', description: 'Check URL. For browser checks, omit this to use the preview URL, or use {{previewUrl}} as a placeholder.' },
+              method: { type: 'string', enum: ['GET', 'HEAD'], description: 'HTTP method for http_status checks.' },
+              expectStatus: { type: 'number', description: 'Expected HTTP status for http_status checks. Defaults to 200.' },
+              script: { type: 'string', description: 'JavaScript body for browser_eval. Return the value to compare, e.g. return document.body.innerText.includes("New headline");' },
+              expect: { description: 'Expected browser_eval return value. Defaults to true when omitted.' },
+              selector: { type: 'string', description: 'CSS selector for dom_text checks. Defaults to body.' },
+              text: { type: 'string', description: 'Expected text for dom_text checks.' },
+              allowPatterns: { type: 'array', items: { type: 'string' }, description: 'Regex patterns for console_errors messages that should be ignored.' }
+            },
+            required: ['type']
+          }
         }
       },
       required: ['page_id', 'task_description']
@@ -6161,6 +6186,7 @@ emmaToolRegistry.register({
         socketEmit: context?.socketEmit,
         executeMcpTool,
         draftBranch,
+        acceptanceChecks: Array.isArray(args.acceptance_checks) ? args.acceptance_checks : undefined,
       }
     );
     if (result.success) {
@@ -6170,6 +6196,8 @@ emmaToolRegistry.register({
         iterations: result.iterations,
         previewUrl: result.previewUrl,
         branch: result.branch,
+        acceptanceStatus: result.acceptanceStatus,
+        acceptance: result.acceptance,
         is_staging: !!result.branch && result.branch !== 'main',
         note: result.branch && result.branch !== 'main'
           ? `Changes are on staging branch "${result.branch}". The user must review the preview URL and ask to publish before changes go live.`
@@ -6182,6 +6210,8 @@ emmaToolRegistry.register({
         iterations: result.iterations,
         previewUrl: result.previewUrl,
         branch: result.branch,
+        acceptanceStatus: result.acceptanceStatus,
+        acceptance: result.acceptance,
         is_staging: !!result.branch && result.branch !== 'main',
         // Authorization denials are not retryable — the caller lacks edit rights
         // on this page. Signal the parent agent to surface the message and stop

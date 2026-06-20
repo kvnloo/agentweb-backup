@@ -4503,6 +4503,7 @@ export class AgentModeService {
         branch: actualResult.branch,
         previewUrl: actualResult.previewUrl,
         error: actualResult.error,
+        acceptanceStatus: actualResult.acceptanceStatus,
       }));
       return {
         success: actualResult.success,
@@ -4511,6 +4512,8 @@ export class AgentModeService {
         branch: actualResult.branch,
         previewUrl: actualResult.previewUrl,
         error: actualResult.error,
+        acceptanceStatus: actualResult.acceptanceStatus,
+        acceptance: actualResult.acceptance,
       };
     }
 
