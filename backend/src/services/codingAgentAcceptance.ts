@@ -74,30 +74,37 @@ function valuesEqual(actual: unknown, expected: unknown): boolean {
   return JSON.stringify(actual) === JSON.stringify(expected);
 }
 
+function parseTextValue(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed) return '';
+
+  const resultMatch = trimmed.match(/### Result\s*\n([\s\S]*?)(?:\n### |\n```|$)/);
+  const valueText = (resultMatch?.[1] || trimmed).trim();
+  if (valueText === 'true') return true;
+  if (valueText === 'false') return false;
+  if (valueText === 'null') return null;
+  if (/^-?\d+(\.\d+)?$/.test(valueText)) return Number(valueText);
+
+  try {
+    return JSON.parse(valueText);
+  } catch {
+    return valueText;
+  }
+}
+
 function unwrapToolValue(result: any): unknown {
   if (result == null) return result;
   if (typeof result !== 'object') return result;
   if ('result' in result) return result.result;
   if ('value' in result) return result.value;
   if (typeof result.content === 'string') {
-    const trimmed = result.content.trim();
-    if (!trimmed) return '';
-    try {
-      return JSON.parse(trimmed);
-    } catch {
-      return trimmed;
-    }
+    return parseTextValue(result.content);
   }
   const textBlock = Array.isArray(result.raw?.content)
     ? result.raw.content.find((c: any) => c?.type === 'text' && typeof c.text === 'string')
     : undefined;
   if (textBlock) {
-    const trimmed = textBlock.text.trim();
-    try {
-      return JSON.parse(trimmed);
-    } catch {
-      return trimmed;
-    }
+    return parseTextValue(textBlock.text);
   }
   return result;
 }
@@ -137,7 +144,7 @@ async function runConsoleErrorsCheck(
   allowPatterns: string[] | undefined
 ): Promise<unknown> {
   await executeMcpTool('playwright_browser_navigate', { url });
-  const result = await executeMcpTool('playwright_browser_console_messages', {});
+  const result = await executeMcpTool('playwright_browser_console_messages', { level: 'error' });
   const value = unwrapToolValue(result);
   const text = typeof value === 'string' ? value : JSON.stringify(value);
   const allow = (allowPatterns || []).map((p) => new RegExp(p, 'i'));
