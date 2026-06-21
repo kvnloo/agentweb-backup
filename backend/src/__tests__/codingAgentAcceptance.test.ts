@@ -18,6 +18,19 @@ describe('verifyAcceptanceChecks', () => {
     });
   });
 
+  test('resolves preview URL placeholders for HTTP status checks', async () => {
+    const fetchImpl = jest.fn().mockResolvedValue({ status: 200 });
+
+    const result = await verifyAcceptanceChecks({
+      previewUrl: 'https://preview.example',
+      checks: [{ type: 'http_status', label: 'preview is live', url: '{{previewUrl}}' }],
+      fetchImpl: fetchImpl as any,
+    });
+
+    expect(result.status).toBe('passed');
+    expect(fetchImpl).toHaveBeenCalledWith('https://preview.example', { method: 'GET' });
+  });
+
   test('fails an HTTP status check when an external asset is missing', async () => {
     const fetchImpl = jest.fn().mockResolvedValue({ status: 404 });
 

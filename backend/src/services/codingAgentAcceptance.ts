@@ -186,7 +186,9 @@ async function verifyOne(
     if (check.type === 'http_status') {
       const fetcher = options.fetchImpl || fetch;
       if (!fetcher) return block('HTTP checks require fetch support.');
-      const response = await fetcher(check.url, { method: check.method || 'GET' });
+      const url = resolveUrl(check, options.previewUrl);
+      if (!url) return block('This check requires a preview URL or an explicit check URL.');
+      const response = await fetcher(url, { method: check.method || 'GET' });
       const expected = check.expectStatus ?? 200;
       return response.status === expected
         ? pass(`HTTP ${response.status} matched expected status.`, response.status, expected)
