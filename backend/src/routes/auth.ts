@@ -422,7 +422,7 @@ router.patch('/onboarding-interests', authenticateToken, async (req, res) => {
       return res.status(401).json({ message: 'User not authenticated' });
     }
 
-    const { interests } = req.body ?? {};
+    const { interests, companyName, companyUrl } = req.body ?? {};
     if (!Array.isArray(interests)) {
       return res.status(400).json({ message: 'interests must be an array of strings' });
     }
@@ -435,10 +435,18 @@ router.patch('/onboarding-interests', authenticateToken, async (req, res) => {
     }
     // Dedup while preserving order
     const deduped = Array.from(new Set<string>(interests as string[]));
+    const companyPatch: Record<string, unknown> = {};
+    if (typeof companyName === 'string' && companyName.trim()) {
+      companyPatch.companyName = companyName.trim();
+    }
+    if (typeof companyUrl === 'string' && companyUrl.trim()) {
+      companyPatch.productDomain = companyUrl.trim();
+    }
 
     const updated = await userDb.updateUser(userId, {
       emmaHelpInterests: deduped,
       emmaHelpInterestsSetAt: new Date().toISOString(),
+      ...companyPatch,
     } as any);
 
     if (!updated) {
@@ -448,6 +456,8 @@ router.patch('/onboarding-interests', authenticateToken, async (req, res) => {
     return res.json({
       emmaHelpInterests: deduped,
       emmaHelpInterestsSetAt: (updated as any).emmaHelpInterestsSetAt,
+      ...(companyPatch.companyName ? { companyName: companyPatch.companyName } : {}),
+      ...(companyPatch.productDomain ? { productDomain: companyPatch.productDomain } : {}),
     });
   } catch (error) {
     console.error('Error saving onboarding interests:', error);
@@ -455,4 +465,4 @@ router.patch('/onboarding-interests', authenticateToken, async (req, res) => {
   }
 });
 
-export default router; 
+export default router;
