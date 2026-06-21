@@ -71,6 +71,58 @@ describe('verifyAcceptanceChecks', () => {
     });
   });
 
+  test('parses Playwright markdown result blocks for browser assertions', async () => {
+    const executeMcpTool = jest
+      .fn()
+      .mockResolvedValueOnce({ content: 'navigated' })
+      .mockResolvedValueOnce({
+        content: [
+          '### Result',
+          'true',
+          '### Ran Playwright code',
+          '```js',
+          "await page.evaluate('async () => true')",
+          '```',
+        ].join('\n'),
+      });
+
+    const result = await verifyAcceptanceChecks({
+      previewUrl: 'https://preview.example',
+      executeMcpTool,
+      checks: [{
+        type: 'browser_eval',
+        label: 'headline changed',
+        script: 'return true;',
+      }],
+    });
+
+    expect(result.status).toBe('passed');
+    expect(result.checks[0]).toMatchObject({
+      actual: true,
+      expected: true,
+      status: 'passed',
+    });
+  });
+
+  test('requests error-level console messages for console checks', async () => {
+    const executeMcpTool = jest
+      .fn()
+      .mockResolvedValueOnce({ content: 'navigated' })
+      .mockResolvedValueOnce({ result: [] });
+
+    const result = await verifyAcceptanceChecks({
+      previewUrl: 'https://preview.example',
+      executeMcpTool,
+      checks: [{
+        type: 'console_errors',
+        label: 'no console errors',
+      }],
+    });
+
+    expect(result.status).toBe('passed');
+    expect(executeMcpTool).toHaveBeenNthCalledWith(2, 'playwright_browser_console_messages', { level: 'error' });
+  });
+
   test('blocks browser checks when no Playwright executor is available', async () => {
     const result = await verifyAcceptanceChecks({
       previewUrl: 'https://preview.example',
