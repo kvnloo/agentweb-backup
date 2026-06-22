@@ -109,6 +109,12 @@ export interface RunEnrichmentInput {
    *  `leadId` is in this set get enriched. Used by the bulk-action bar
    *  "Enrichment" button to scope a run to the user's selection. */
   leadIds?: string[];
+  /** Optional list-level disambiguation context (the lead list's name, and
+   *  optionally its description). Forwarded to identity resolution so a
+   *  name-only lead with no company can still be resolved via a contextual
+   *  LinkedIn search (e.g. a "YC Poker Night" list disambiguates common
+   *  names by shared affiliation). See enrichmentIdentityResolver Tier 2.7. */
+  listContext?: string;
 }
 
 interface TierCount {
@@ -163,6 +169,9 @@ export interface OrchestratorDeps {
     needsPersonFields: boolean;
     needsCompanyFields: boolean;
     mode: 'preview' | 'enrich';
+    /** List-level disambiguation context forwarded from RunEnrichmentInput
+     *  for Tier 2.7 name-only contextual LinkedIn search. */
+    listContext?: string;
     /** Forwarded to enable Tier 0a (CRM-history) per-field bypass. */
     refreshFields?: Set<string>;
     /** Standard identity fields the user deselected — resolved in-memory but
@@ -490,6 +499,7 @@ async function processLead(
       needsPersonFields: needsPerson,
       needsCompanyFields: needsCompany,
       mode: input.mode,
+      listContext: input.listContext,
       refreshFields: refreshSet,
       excludePersistFields,
     });

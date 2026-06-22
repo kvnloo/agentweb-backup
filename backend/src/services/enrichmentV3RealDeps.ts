@@ -161,8 +161,8 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
       }
     },
 
-    findLinkedInUrl: ({ firstName, lastName, company }) =>
-      findLinkedInUrlImpl(userId, firstName, lastName, company),
+    findLinkedInUrl: ({ firstName, lastName, company, listContext }) =>
+      findLinkedInUrlImpl(userId, firstName, lastName, company, listContext),
 
     findUnipileProfileByUrl: ({ linkedinUrl }) =>
       findUnipileProfileByUrlImpl(userId, linkedinUrl),
@@ -700,27 +700,65 @@ export async function findLinkedInUrlImpl(
   firstName: string | undefined,
   lastName: string | undefined,
   company: string | undefined,
+  listContext?: string,
 ): Promise<string | null> {
   const { linkedInOutreachService } = await import('./linkedInOutreachService');
   let accountId: string | null = null;
   try {
     accountId = await linkedInOutreachService.resolveAccountIdForEnrichment(userId);
     if (!accountId) return null;
-    const keywords = [firstName, lastName].filter(Boolean).join(' ');
-    if (!keywords) return null;
-    console.log(`[v3 linkedin-search] name="${keywords}" company="${company ?? '∅'}"`);
+    const name = [firstName, lastName].filter(Boolean).join(' ');
+    if (!name) return null;
+    // IMPORTANT: keywords stay NAME-ONLY. LinkedIn keyword search matches the
+    // FULL profile text, so appending a company or list-context phrase (e.g.
+    // "YC Poker Night — YC alumni…") collapses a 10-hit name search to zero.
+    // The company filter is sent as the structured `company` param (its own
+    // field), and list context is applied AFTER the fetch as a re-ranking
+    // signal over the candidates' headline/location/industry — never folded
+    // into the query string. (Verified empirically: name → 10 hits,
+    // name+context → 0 hits.)
+    const ctx = (listContext || '').trim();
+    console.log(`[v3 linkedin-search] name="${name}" company="${company ?? '∅'}" context="${ctx || '∅'}"`);
     const result = await linkedInOutreachService.searchPeople(accountId, {
-      keywords,
+      keywords: name,
       company: company || undefined,
     });
     const candidates = result?.items ?? [];
-    const first = candidates[0];
-    console.log(`[v3 linkedin-search] got ${candidates.length} result(s) first=${first?.public_identifier ?? 'none'}`);
-    if (!first?.public_identifier) return null;
-    const nameOk = unipileNameMatches(first, firstName, lastName);
-    console.log(`[v3 linkedin-search] nameMatch=${nameOk} → ${nameOk ? `HIT url=https://www.linkedin.com/in/${first.public_identifier}` : 'MISS name mismatch'}`);
-    if (!nameOk) return null;
-    return `https://www.linkedin.com/in/${first.public_identifier}`;
+    console.log(`[v3 linkedin-search] got ${candidates.length} result(s)`);
+    // Keep only candidates whose name actually matches the lead — guards the
+    // whole selection, not just the first item.
+    const nameMatched = candidates.filter((c: any) => unipileNameMatches(c, firstName, lastName));
+    if (nameMatched.length === 0) {
+      console.log(`[v3 linkedin-search] MISS no name match among ${candidates.length} result(s)`);
+      return null;
+    }
+
+    let chosen: any;
+    if (!company && ctx && nameMatched.length > 1) {
+      // Name-only + list-context path with MULTIPLE same-name people: a bare
+      // name can return many distinct profiles, so taking candidates[0] would
+      // risk attaching the wrong person. Ask a cheap LLM which candidate's
+      // profile best fits the list context (e.g. "YC alumni" → "Founder at Y
+      // Combinator"). The LLM bridges semantic gaps token overlap can't
+      // (YC ↔ Y Combinator) and may answer "none" to refuse a wrong guess.
+      const idx = await pickCandidateByContextLLM(ctx, name, nameMatched, userId);
+      if (idx == null) {
+        console.log(`[v3 linkedin-search] MISS LLM found no confident context match among ${nameMatched.length} same-name candidate(s) for context="${ctx}"`);
+        return null;
+      }
+      chosen = nameMatched[idx];
+      console.log(`[v3 linkedin-search] context-picked idx=${idx} headline="${(chosen.headline || '').slice(0, 60)}"`);
+    } else {
+      // Company-known, no-context, or single-candidate path: take the first
+      // name-matched candidate. With company present the structured filter
+      // already narrowed server-side; with a single candidate there is nothing
+      // to disambiguate.
+      chosen = nameMatched[0];
+    }
+
+    if (!chosen?.public_identifier) return null;
+    console.log(`[v3 linkedin-search] HIT url=https://www.linkedin.com/in/${chosen.public_identifier}`);
+    return `https://www.linkedin.com/in/${chosen.public_identifier}`;
   } catch (err) {
     // Any failure after accountId was resolved — purge both caches so next call
     // re-resolves to a live account (covers NOT_FOUND + newly-connected replacements).
@@ -792,6 +830,58 @@ export async function findUnipileProfileByUrlImpl(
   }
   console.warn(`${tag} all accounts rate-limited (tried ${triedAccounts.size})`);
   return null;
+}
+
+/**
+ * Disambiguate among multiple same-name LinkedIn candidates using the list
+ * context. Asks a cheap extraction LLM to pick the 0-based index of the
+ * candidate whose profile (headline / location / industry) best fits the
+ * context, or to answer "none" when no candidate confidently matches.
+ *
+ * Returns the chosen index, or null when the LLM declines / errors / returns
+ * an out-of-range answer — callers treat null as "refuse" so a low-confidence
+ * guess never attaches the wrong person to a lead.
+ *
+ * Exported for unit testing.
+ */
+export async function pickCandidateByContextLLM(
+  listContext: string,
+  name: string,
+  candidates: any[],
+  userId: string,
+): Promise<number | null> {
+  try {
+    const profiles = candidates.map((c: any, i: number) => {
+      const parts = [c?.headline, c?.location, c?.industry]
+        .filter((s: unknown): s is string => typeof s === 'string' && s.trim().length > 0)
+        .map((s: string) => s.trim());
+      return `${i}: ${parts.join(' — ') || '(no profile details)'}`;
+    }).join('\n');
+
+    const systemPrompt =
+      'You disambiguate between multiple LinkedIn profiles that share the same ' +
+      'name. Given a piece of list context describing a group the target person ' +
+      'belongs to, pick the ONE candidate profile that best fits that context. ' +
+      'Use real-world knowledge to bridge synonyms (e.g. "YC" means "Y ' +
+      'Combinator"). If NO candidate is a confident match for the context, ' +
+      'answer with index -1. Respond ONLY with JSON: {"index": <number>}.';
+    const userPrompt =
+      `List context: "${listContext}"\n` +
+      `Person name: "${name}"\n\n` +
+      `Candidates (index: profile):\n${profiles}\n\n` +
+      `Which index best matches the list context? Use -1 if none confidently match.`;
+
+    const llm = createLLMService(EXTRACT_MODEL, 0.0);
+    const parsed = await llm.generateJSONContent<{ index?: number }>(
+      systemPrompt, userPrompt, 'json', undefined, { userId, feature: 'enrichment' },
+    );
+    const idx = typeof parsed?.index === 'number' ? parsed.index : Number(parsed?.index);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= candidates.length) return null;
+    return idx;
+  } catch (err) {
+    console.warn('[v3 linkedin-search] context LLM pick failed:', (err as Error).message);
+    return null;
+  }
 }
 
 // ─── Orchestrator deps ────────────────────────────────────────────────────────
