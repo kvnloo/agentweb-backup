@@ -2829,22 +2829,36 @@ router.post("/announcements/load-from-url", async (req, res) => {
   }
 });
 
+// Days a review ishare link stays valid. Bounded (not indefinite) on purpose:
+// this endpoint auto-mints anonymous conversable tokens on ANY session an admin
+// browses — customer AND internal — so a permanent token would leave anonymous
+// access sitting on every session forever. 45d covers the review cycle while
+// keeping exposure time-capped; an expired link is re-minted on the next admin
+// load. (The old default was 7d, which 410'd shared reviewer links after a week.)
+const REVIEW_ISHARE_EXPIRATION_DAYS = 45;
+
 // Ensures every session has an ishare link for reviewer access.
-// Creates a 7-day interactive share on first load; once stored, the token is reused indefinitely.
+// Creates a 45-day interactive share on first load; the stored token is reused
+// until it expires, then regenerated. These links are shared out to reviewers,
+// so the window must outlast the review cycle — but stays bounded because the
+// session may be internal, not customer-shared (see REVIEW_ISHARE_EXPIRATION_DAYS).
 async function ensureIshareLinkForReview(sessions: any[]): Promise<void> {
   await Promise.all(
     sessions.map(async (session) => {
       const meta = session.interactiveShareMetadata;
       if (meta?.isActive && meta?.token) return;
       try {
-        const ishareUrl = await chatbotDb.createOrReuseInteractiveShare(session.sessionId, 7);
+        const ishareUrl = await chatbotDb.createOrReuseInteractiveShare(
+          session.sessionId,
+          REVIEW_ISHARE_EXPIRATION_DAYS
+        );
         const token = new URL(ishareUrl).searchParams.get("conversable");
         if (token) {
           session.interactiveShareMetadata = {
             isActive: true,
             token,
             sharedAt: new Date().toISOString(),
-            expiresAt: new Date(Date.now() + 7 * 86400000).toISOString(),
+            expiresAt: new Date(Date.now() + REVIEW_ISHARE_EXPIRATION_DAYS * 86400000).toISOString(),
           };
         }
       } catch (err) {

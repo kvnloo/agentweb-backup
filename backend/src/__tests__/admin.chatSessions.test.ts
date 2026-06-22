@@ -464,11 +464,15 @@ describe("Admin chat sessions endpoint", () => {
 
       const res = await request(app).get("/api/admin/chat-sessions").expect(200);
 
-      expect(mockChatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith("no-share-session", 7);
+      // Reviewer links get a bounded 45-day window (not the old 7d, not indefinite).
+      expect(mockChatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith("no-share-session", 45);
       expect(res.body.sessions[0].interactiveShareMetadata).toMatchObject({
         isActive: true,
         token: "newtoken123",
       });
+      const reviewExpiry = new Date(res.body.sessions[0].interactiveShareMetadata.expiresAt).getTime();
+      const expected = Date.now() + 45 * 86400000;
+      expect(Math.abs(reviewExpiry - expected)).toBeLessThan(60000);
     });
 
     it("reuses an existing token even if it is expired (token persists indefinitely once stored)", async () => {
@@ -551,7 +555,7 @@ describe("Admin chat sessions endpoint", () => {
         .get("/api/admin/chat-sessions?sessionId=search-session")
         .expect(200);
 
-      expect(mockChatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith("search-session", 7);
+      expect(mockChatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith("search-session", 45);
       expect(res.body.sessions[0].interactiveShareMetadata.token).toBe("searchtok");
     });
   });
