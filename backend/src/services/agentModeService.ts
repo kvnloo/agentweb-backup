@@ -8685,6 +8685,7 @@ export class AgentModeService {
   ): Promise<any> {
     try {
       const { crmDb } = await import('./db');
+      const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
 
       if (!filters || filters.length === 0) {
@@ -8826,20 +8827,31 @@ export class AgentModeService {
       return {
         success: true,
         message: `Found ${matchingLeads.length} matching lead(s)`,
-        leads: matchingLeads.map((entry) => ({
-          leadId: entry.lead.leadId,
-          ...(isMultiList ? { listId: entry.listId, listName: entry.listName } : {}),
-          email: entry.lead.email || '',
-          firstName: entry.lead.firstName || '',
-          lastName: entry.lead.lastName || '',
-          company: entry.lead.company || '',
-          title: entry.lead.title || '',
-          icpMatch: entry.lead.icpMatch?.isMatch || false,
-          icpScore: entry.lead.icpMatch?.score || null,
-          engagementCount: entry.lead.engagementCount || 0,
-          isEngaged: entry.lead.isEngaged || false,
-          customFields: entry.lead.customFields || {}
-        })),
+        leads: matchingLeads.map((entry) => {
+          // Per-field provenance sidecar — lets the agent cite source, provider,
+          // URL and confidence per field for list-wide queries (e.g. "funding
+          // stage for each lead"), instead of reporting bare values. Sanitized so
+          // cross-tenant CRM-history lineage (sibling IDs) never reaches the
+          // customer — mirrors get_lead_details and the customer-portal REST path.
+          const sanitizedEnrichmentMetadata = sanitizeEnrichmentMetadataForResponse(
+            entry.lead.enrichmentMetadata as Record<string, any> | undefined,
+          );
+          return {
+            leadId: entry.lead.leadId,
+            ...(isMultiList ? { listId: entry.listId, listName: entry.listName } : {}),
+            email: entry.lead.email || '',
+            firstName: entry.lead.firstName || '',
+            lastName: entry.lead.lastName || '',
+            company: entry.lead.company || '',
+            title: entry.lead.title || '',
+            icpMatch: entry.lead.icpMatch?.isMatch || false,
+            icpScore: entry.lead.icpMatch?.score || null,
+            engagementCount: entry.lead.engagementCount || 0,
+            isEngaged: entry.lead.isEngaged || false,
+            customFields: entry.lead.customFields || {},
+            ...(sanitizedEnrichmentMetadata ? { enrichmentMetadata: sanitizedEnrichmentMetadata } : {}),
+          };
+        }),
         matchCount: matchingLeads.length,
         ...(!isMultiList && firstResolved ? { listName: firstResolved.list.name } : {}),
         ...(isMultiList ? {
