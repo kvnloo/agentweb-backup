@@ -167,9 +167,11 @@ import {
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig } from "../services/v0Service";
+import { _resetV0UsageGuardForTest } from "../services/v0UsageGuard";
 
 beforeEach(() => {
   jest.clearAllMocks();
+  _resetV0UsageGuardForTest();
   mockGetV0ApiKey.mockResolvedValue("test-v0-api-key");
   // Use zero-delay poll intervals in tests to avoid waiting ~2.5 min
   setV0PollIntervals([0, 0, 0, 0, 0]);
