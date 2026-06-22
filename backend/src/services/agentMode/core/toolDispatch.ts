@@ -27,6 +27,20 @@
 
 import type { AgentToolPolicyDecision } from '../../agentToolGatewayService';
 
+/**
+ * Media-generation tools whose batches must run sequentially (rate limits) AND are
+ * subject to the per-run time budget (see `mediaGenerationDeadlineMs`). A single
+ * call to one of these can take minutes; an 18-image work-plan step (LinkedIn Ads
+ * "Generate 3 Images Per Hook") can exceed the run's 10-min wall clock, get killed
+ * mid-step, and never reach set_work_plan_status. The budget lets each run do a
+ * bounded chunk and stop gracefully so the batch converges across turns.
+ */
+export const MEDIA_GEN_TOOLS = new Set<string>([
+  'generate_image',
+  'generate_video',
+  'generate_voiceover',
+]);
+
 /** A tool-result outcome from the gateway, normalized into the loop's union shape. */
 export interface ToolExecOutcome {
   status: 'success' | 'error';
@@ -36,9 +50,14 @@ export interface ToolExecOutcome {
   policyDecision?: AgentToolPolicyDecision;
 }
 
-/** Internal per-call result the dispatcher tracks (success/error + the call context). */
+/**
+ * Internal per-call result the dispatcher tracks. `deferred` means a media-gen call
+ * was NOT executed because the run's time budget was already spent — it is neither a
+ * success (no asset, no counter increment) nor a failure (no error, does not trip the
+ * gateway breaker); the model is told to stop and ask the user to continue.
+ */
 export interface DispatchToolResult {
-  status: 'success' | 'error';
+  status: 'success' | 'error' | 'deferred';
   toolCall: any;
   functionArgs: any;
   result?: any;
@@ -147,6 +166,22 @@ export interface ExecutePreparedToolsInput {
   // ---- limits ----
   toolResponseS3Threshold: number;
   maxToolContentSize: number;
+  /**
+   * Wall-clock deadline (epoch ms, from Date.now()) past which NEW media-generation
+   * calls (generate_image/video/voiceover) in this run are gracefully deferred
+   * instead of executed — so a long image batch stops short of the run's hard
+   * timeout and asks the user to continue, rather than being killed mid-step.
+   * Undefined disables the budget entirely (env AGENT_MODE_MEDIA_BUDGET_MS=0, and the
+   * unit tests), preserving exact prior behavior.
+   */
+  mediaGenerationDeadlineMs?: number;
+  /**
+   * Count of media assets already produced in this run before this iteration. The
+   * budget only defers once at least one asset exists this run, so a run that is
+   * already over budget when it starts still produces (and persists) at least one
+   * image before stopping — guaranteeing forward progress every turn.
+   */
+  mediaAssetsProducedThisRun?: number;
   // ---- ports ----
   ports: ToolDispatchPorts;
 }
@@ -159,6 +194,10 @@ export interface ExecutePreparedToolsResult {
   failedCounterUpdates: Record<string, number>;
   /** true if an install_skills call ran (loop refreshes skills next iteration) */
   skillsUpdated: boolean;
+  /** number of media-gen assets successfully produced this iteration (for run-budget tracking) */
+  mediaAssetsProduced: number;
+  /** true if one or more media-gen calls were deferred this iteration due to the time budget */
+  mediaBudgetDeferred: boolean;
 }
 
 /**
@@ -192,12 +231,16 @@ export async function executePreparedTools(
     allowedToolNames,
     toolResponseS3Threshold,
     maxToolContentSize,
+    mediaGenerationDeadlineMs,
+    mediaAssetsProducedThisRun = 0,
     ports,
   } = input;
 
   const pendingCounterUpdates: Record<string, number> = {};
   const failedCounterUpdates: Record<string, number> = {};
   let skillsUpdated = false;
+  let mediaAssetsProduced = 0;
+  let mediaBudgetDeferred = false;
 
   // Phase 1: Validate and prepare tool calls (synchronous)
   const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision }> = [];
@@ -366,16 +409,54 @@ export async function executePreparedTools(
       ? { status: 'success', toolCall, functionArgs, result: outcome.result, duration: outcome.durationMs, policyDecision: outcome.policyDecision }
       : { status: 'error', toolCall, functionArgs, error: outcome.error, duration: outcome.durationMs, policyDecision: outcome.policyDecision };
 
+  // Per-run media-generation time budget. Once the run is over its deadline AND has
+  // already produced at least one asset (this run, including earlier calls in this
+  // same batch), further media-gen calls are DEFERRED rather than executed — so a
+  // long image batch stops short of the run's hard wall-clock timeout and asks the
+  // user to continue, instead of being killed mid-step with nothing persisted. The
+  // "≥1 asset" gate guarantees a run that starts already-over-budget still makes one
+  // unit of forward progress before stopping. Disabled entirely when no deadline is
+  // supplied (env AGENT_MODE_MEDIA_BUDGET_MS=0, and the unit tests), preserving prior
+  // behavior byte-for-byte.
+  let assetsThisBatch = 0;
+  const isMediaGenTool = (toolCall: any) => MEDIA_GEN_TOOLS.has(toolCall.function.name);
+  const shouldDeferMedia = (toolCall: any): boolean =>
+    mediaGenerationDeadlineMs != null
+    && isMediaGenTool(toolCall)
+    && Date.now() > mediaGenerationDeadlineMs
+    && (mediaAssetsProducedThisRun + assetsThisBatch) >= 1;
+  const makeDeferred = (toolCall: any, functionArgs: any, policyDecision: AgentToolPolicyDecision): DispatchToolResult => {
+    mediaBudgetDeferred = true;
+    return { status: 'deferred', toolCall, functionArgs, duration: 0, policyDecision };
+  };
+  // A genuine media asset (gateway success that isn't an encoded {success:false}).
+  const countsAsAsset = (dr: DispatchToolResult): boolean =>
+    dr.status === 'success' && isMediaGenTool(dr.toolCall) && !ports.toolResultError(dr.result);
+
   if (hasWaitTool || hasMultipleMediaGenTools) {
     toolResults = [];
     for (const { toolCall, functionArgs, policyDecision } of preparedCalls) {
+      if (shouldDeferMedia(toolCall)) {
+        toolResults.push(makeDeferred(toolCall, functionArgs, policyDecision));
+        continue;
+      }
       const outcome = await runOne(toolCall, functionArgs, policyDecision);
-      toolResults.push(toDispatchResult(outcome, toolCall, functionArgs));
+      const dr = toDispatchResult(outcome, toolCall, functionArgs);
+      if (countsAsAsset(dr)) assetsThisBatch++;
+      toolResults.push(dr);
     }
   } else {
+    // Parallel path carries at most one media-gen call (a solo call; any media call
+    // batched with other tools forces the sequential path above), so a single
+    // pre-launch deferral check is race-free.
     const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs, policyDecision }) => {
+      if (shouldDeferMedia(toolCall)) {
+        return makeDeferred(toolCall, functionArgs, policyDecision);
+      }
       const outcome = await runOne(toolCall, functionArgs, policyDecision);
-      return toDispatchResult(outcome, toolCall, functionArgs);
+      const dr = toDispatchResult(outcome, toolCall, functionArgs);
+      if (countsAsAsset(dr)) assetsThisBatch++;
+      return dr;
     });
     toolResults = await Promise.all(toolPromises);
   }
@@ -395,7 +476,11 @@ export async function executePreparedTools(
       policyDecision: toolResult.policyDecision,
     };
   });
-  const telemetryToolResults: Array<DispatchToolResult | PreflightToolResult> = [...preflightToolResults, ...toolResults];
+  // Deferred calls never executed, so they carry no success/error telemetry signal.
+  const telemetryToolResults: Array<DispatchToolResult | PreflightToolResult> = [
+    ...preflightToolResults,
+    ...toolResults.filter((r) => r.status !== 'deferred'),
+  ];
 
   // Runtime-spine telemetry (best-effort, observability-only).
   ports.recordToolTelemetry(telemetryToolResults);
@@ -449,6 +534,12 @@ export async function executePreparedTools(
       pendingCounterUpdates[toolCall.function.name] =
         (pendingCounterUpdates[toolCall.function.name] || 0) + counterIncrement;
 
+      // Track media assets produced this iteration so the loop can carry a running
+      // per-run total into the next call's time-budget decision.
+      if (MEDIA_GEN_TOOLS.has(toolCall.function.name)) {
+        mediaAssetsProduced += 1;
+      }
+
       // For playwright screenshots, pass the image back to the LLM as a vision input.
       let toolContent: any;
       const isGeminiModel = llmModel.startsWith('gemini-');
@@ -496,6 +587,35 @@ export async function executePreparedTools(
         content: truncatedToolContent,
         metadata: { timestamp: new Date().toISOString() },
       });
+    } else if (toolResult.status === 'deferred') {
+      // Budget deferral: the media-gen call was NOT executed. It is neither a success
+      // (no asset, no pending counter — so set_work_plan_status's requiredFunctionCalls
+      // gate is unaffected) nor a failure (no error, no failed counter, does not feed
+      // the gateway's repeated-failure breaker). We still MUST append a tool-role
+      // message for this tool_call_id, or the next LLM turn rejects the orphaned call.
+      // The content tells the model to stop generating now, summarize what's done, and
+      // ask the user to reply "continue" — the asset-awareness block then resumes the
+      // batch on the next turn without regenerating the already-saved images.
+      const { toolCall, functionArgs } = toolResult;
+      const deferContent =
+        `⚠️ Media generation paused for this turn — the assistant has been working on this batch for a while and is approaching the per-response time limit. `
+        + `The image(s) already generated this session are saved. `
+        + `Do NOT call ${toolCall.function.name} again right now. Instead: briefly tell the user how many assets are done versus still remaining, then ask them to reply "continue" to generate the rest. `
+        + `When they continue, generate ONLY the still-missing assets (see the already-generated assets list), then mark the step complete.`;
+      toolCalls.push({
+        id: toolCall.id,
+        name: toolCall.function.name,
+        arguments: functionArgs || toolCall.function.arguments,
+        result: { deferred: true, reason: 'media_generation_time_budget' },
+        duration: 0,
+      });
+      messages.push({
+        tool_call_id: toolCall.id,
+        role: 'tool',
+        name: toolCall.function.name,
+        content: deferContent,
+        metadata: { timestamp: new Date().toISOString(), mediaBudgetDeferred: true },
+      });
     } else {
       const { toolCall, functionArgs, error, duration } = toolResult;
       toolCalls.push({
@@ -524,5 +644,5 @@ export async function executePreparedTools(
     }
   }
 
-  return { pendingCounterUpdates, failedCounterUpdates, skillsUpdated };
+  return { pendingCounterUpdates, failedCounterUpdates, skillsUpdated, mediaAssetsProduced, mediaBudgetDeferred };
 }
