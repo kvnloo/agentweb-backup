@@ -57,6 +57,29 @@ if (_created) {
 
 const HUBSPOT_API_BASE = 'https://api.hubapi.com';
 
+/**
+ * HubSpot batch write endpoints return a 207 Multi-Status when SOME (not all)
+ * inputs failed: successes land in `results`, failures in `errors` (keyed by
+ * objectWriteTraceId for creates, or object id for updates). axios treats 207
+ * as success (status < 300), so without this check a partial failure would be
+ * silently counted as success. Convert a 207 into a throw that carries the raw
+ * response, so callers' split-and-retry isolates the bad record(s) down to a
+ * single-item batch and can inspect per-record error categories (e.g.
+ * OBJECT_NOT_FOUND) on the attached `error.response`.
+ */
+function throwIfBatchPartialFailure(res: any): void {
+  if (res?.status !== 207) return;
+  const data = res.data ?? {};
+  const errs: any[] = Array.isArray(data.errors) ? data.errors : [];
+  const first = errs[0] ?? {};
+  const err: any = new Error(
+    `HubSpot batch partial failure (207 Multi-Status): ${data.numErrors ?? errs.length} error(s)` +
+      (first.category ? ` — ${first.category}: ${first.message ?? ''}` : '')
+  );
+  err.response = res;
+  throw err;
+}
+
 
 // Recipient audience + send-schedule fields for a marketing email.
 export interface EmailAudienceOpts {
@@ -158,6 +181,12 @@ export class HubSpotService {
   private readonly _accountId?: string;
   private _tokenExpiresAt?: number;
   private readonly _portalId?: string;
+  // Per-instance caches of properties already ensured this connection, so a
+  // multi-chunk push (which reuses one instance) ensures each property once
+  // instead of issuing a redundant GET per 500-lead chunk. Instance-scoped so a
+  // fresh push picks up any properties deleted in HubSpot since.
+  private readonly _ensuredContactProps = new Set<string>();
+  private readonly _ensuredDealProps = new Set<string>();
 
   private constructor(
     token: string,
@@ -804,11 +833,13 @@ export class HubSpotService {
 
   async ensureContactProperty(key: string, label: string): Promise<string> {
     const propertyName = key.toLowerCase().replace(/[^a-z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+    if (this._ensuredContactProps.has(propertyName)) return propertyName;
     try {
       await axiosInstance.get(
         `${HUBSPOT_API_BASE}/crm/v3/properties/contacts/${propertyName}`,
         { headers: await this.authHeaders() }
       );
+      this._ensuredContactProps.add(propertyName);
       return propertyName;
     } catch (err: any) {
       if (err?.response?.status === 404) {
@@ -823,6 +854,7 @@ export class HubSpotService {
           },
           { headers: await this.authHeaders() }
         );
+        this._ensuredContactProps.add(propertyName);
         return propertyName;
       }
       throw err;
@@ -835,11 +867,13 @@ export class HubSpotService {
    */
   async ensureDealProperty(key: string, label: string): Promise<string> {
     const propertyName = key.toLowerCase().replace(/[^a-z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+    if (this._ensuredDealProps.has(propertyName)) return propertyName;
     try {
       await axiosInstance.get(
         `${HUBSPOT_API_BASE}/crm/v3/properties/deals/${propertyName}`,
         { headers: await this.authHeaders() }
       );
+      this._ensuredDealProps.add(propertyName);
       return propertyName;
     } catch (err: any) {
       if (err?.response?.status === 404) {
@@ -854,6 +888,7 @@ export class HubSpotService {
           },
           { headers: await this.authHeaders() }
         );
+        this._ensuredDealProps.add(propertyName);
         return propertyName;
       }
       throw err;
@@ -1699,9 +1734,11 @@ export class HubSpotService {
   // ─── Batch operations ───────────────────────────────────────────────────────
   //
   // Each method below processes a SINGLE batch of at most 100 inputs and THROWS
-  // on any non-2xx response (whole-batch failure). Chunking and split-and-retry
-  // are handled by the caller, so these methods do NOT chunk internally — they
-  // throw if more than 100 inputs are supplied.
+  // on failure — both a non-2xx response (whole-batch failure) AND a 207
+  // Multi-Status (partial failure: some inputs failed), which axios would
+  // otherwise treat as success. See throwIfBatchPartialFailure. Chunking and
+  // split-and-retry are handled by the caller, so these methods do NOT chunk
+  // internally — they throw if more than 100 inputs are supplied.
 
   /**
    * Batch upsert contacts by email (idProperty = 'email').
@@ -1727,6 +1764,11 @@ export class HubSpotService {
       },
       { headers: await this.authHeaders() }
     );
+
+    // A 207 means some upserts failed — surface it so the caller's split-and-retry
+    // isolates the bad input(s) and reports them, rather than silently returning
+    // only the successes (the failures would be dropped from both counts).
+    throwIfBatchPartialFailure(res);
 
     return ((res.data as any)?.results ?? []).map((r: any) => ({
       email: String(r?.properties?.email ?? '').toLowerCase(),
@@ -1758,6 +1800,11 @@ export class HubSpotService {
       },
       { headers: await this.authHeaders() }
     );
+
+    // A 207 means some creates failed — surface it so the caller's split-and-retry
+    // isolates the bad input(s) instead of silently dropping them (failed creates
+    // are absent from `results` and would otherwise map to an undefined dealId).
+    throwIfBatchPartialFailure(res);
 
     const results = (res.data as any)?.results ?? [];
 
@@ -1793,13 +1840,18 @@ export class HubSpotService {
       throw new Error(`batchUpdateDeals accepts at most 100 inputs per batch, got ${inputs.length}`);
     }
 
-    await axiosInstance.post(
+    const res = await axiosInstance.post(
       `${HUBSPOT_API_BASE}/crm/v3/objects/deals/batch/update`,
       {
         inputs: inputs.map((i) => ({ id: i.dealId, properties: i.properties })),
       },
       { headers: await this.authHeaders() }
     );
+
+    // A failed update (e.g. the deal was deleted) comes back as a 207 per-record
+    // error, NOT a top-level non-2xx — surface it so the caller can isolate and
+    // recreate/report it instead of treating the whole batch as a success.
+    throwIfBatchPartialFailure(res);
   }
 
   /**
@@ -1813,12 +1865,15 @@ export class HubSpotService {
       throw new Error(`batchAssociateContactsToDeals accepts at most 100 pairs per batch, got ${pairs.length}`);
     }
 
-    await axiosInstance.post(
+    const res = await axiosInstance.post(
       `${HUBSPOT_API_BASE}/crm/v4/associations/contact/deal/batch/create/default`,
       {
         inputs: pairs.map((p) => ({ from: { id: p.contactId }, to: { id: p.dealId } })),
       },
       { headers: await this.authHeaders() }
     );
+
+    // Surface a 207 partial failure rather than silently treating it as success.
+    throwIfBatchPartialFailure(res);
   }
 }
