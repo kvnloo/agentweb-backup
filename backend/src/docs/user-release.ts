@@ -18,6 +18,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-06-22',
+    changes: [
+      'Improved: Emma Now Flags Unverified Company Details in Lead Enrichment',
+      '- When Emma enriches your leads, some company details (like funding stage) come from web search rather than a verified data provider — and occasionally the web gets it wrong, such as labeling a small startup with the wrong funding round',
+      '- Emma now marks these lower-confidence values as "unverified" in the enrichment preview and caveats them when she shares them, instead of stating them as established fact',
+      '- Details that come from trusted sources or pass Emma\'s built-in fact-check are shown plainly as before — only the uncertain ones are flagged, so you know which values to double-check',
+    ],
+  },
+  {
     date: '2026-06-12',
     changes: [
       'Improved: Changing Your Password Now Signs You Out Everywhere Else',
