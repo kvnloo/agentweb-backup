@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-22',
     changes: [
+      'New: Emma Can Tell You Which Leads Signed Up or Became Paying Customers',
+      '- You can now ask Emma whether a set of leads — for example everyone who came in through a landing or audit page — has registered for an account and which of them are on a paid or trial plan',
+      '- Emma matches the lead emails against your AgentWeb accounts and reports, per lead, whether they signed up and whether they are premium, plus a quick summary count, so you can see how a campaign actually converts down the funnel',
+      '- This reads account status only — it does not change any lead or user data',
+    ],
+  },
+  {
+    date: '2026-06-22',
+    changes: [
       'Improved: Large Image Batches No Longer Stall Mid-Way',
       '- When you ask Emma to generate many images at once (for example a campaign with several ad images per hook), she now works through them in manageable groups instead of trying to finish the whole batch in one go and timing out',
       '- If a batch is too large to complete in a single response, Emma saves the images she has already created, tells you how many are done versus still remaining, and asks you to reply "continue" to generate the rest',
