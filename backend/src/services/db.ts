@@ -143,6 +143,13 @@ export interface User {
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folder IDs
   cmsType?: "Basehub" | "Webflow" | "WordPress"; // CMS Type for blog publishing
   companyName?: string;
+  slackConnectStatus?: "disabled" | "skipped" | "created" | "failed";
+  slackConnectChannelId?: string;
+  slackConnectInvitedAt?: string;
+  slackConnectAttemptedAt?: string;
+  slackConnectInviteEmail?: string;
+  slackConnectInviteId?: string;
+  slackConnectError?: string | null;
   memoryEnabled?: boolean; // Whether Emma's long-term memory is enabled (default: true)
   useCaseCategories?: string[];
   emmaHelpInterests?: string[]; // Onboarding multi-select: what user wants Emma to help with (e.g., "brand", "paid_ads", "founder_led_sales")

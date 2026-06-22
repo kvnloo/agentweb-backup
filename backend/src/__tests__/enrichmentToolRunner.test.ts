@@ -81,8 +81,16 @@ describe('runEmmaEnrichment', () => {
       tierFillBreakdown: {},
       durationMs: 50,
       preview: [
-        { leadId: 'l1', extractedFields: { industry: 'Tech' }, meta: {} },
-        { leadId: 'l2', extractedFields: { industry: 'Finance' }, meta: {} },
+        {
+          leadId: 'l1',
+          extractedFields: { industry: 'Tech' },
+          meta: { industry: { source: 'api', confidence: 'high', enrichedAt: 'x' } },
+        },
+        {
+          leadId: 'l2',
+          extractedFields: { industry: 'Finance' },
+          meta: { industry: { source: 'api', confidence: 'high', enrichedAt: 'x' } },
+        },
       ],
     });
     const summary = await runEmmaEnrichment({
@@ -94,9 +102,68 @@ describe('runEmmaEnrichment', () => {
     });
     expect(summary.mode).toBe('preview');
     expect(summary.samples).toEqual([
-      { leadId: 'l1', enrichedFields: { industry: 'Tech' } },
-      { leadId: 'l2', enrichedFields: { industry: 'Finance' } },
+      { leadId: 'l1', enrichedFields: { industry: 'Tech' }, unverifiedFields: [] },
+      { leadId: 'l2', enrichedFields: { industry: 'Finance' }, unverifiedFields: [] },
     ]);
+  });
+
+  it('flags web-sourced / low-confidence preview fields as unverified (the Slashy funding_stage bug)', async () => {
+    (runEnrichment as jest.Mock).mockResolvedValue({
+      runId: 'run-unverified',
+      processed: 1,
+      failed: { identityResolutionFailed: 0, apolloFailed: 0, llmOrParseFailed: 0, updateFailed: 0, searchWebFailed: 0 },
+      tierFillBreakdown: {},
+      durationMs: 50,
+      preview: [
+        {
+          leadId: 'slashy-1',
+          extractedFields: { industry: 'SaaS', funding_stage: 'Series C', employee_count: '50' },
+          meta: {
+            // Apollo high-confidence factual field → verified
+            industry: { source: 'api', provider: 'apollo', confidence: 'high', enrichedAt: 'x' },
+            // Web-sourced LLM guess → medium → unverified (the bug: "Slashy = Series C")
+            funding_stage: { source: 'web_search', provider: 'llm_web_search', confidence: 'medium', enrichedAt: 'x' },
+            // Critic-supported web field → verified
+            employee_count: { source: 'web_search', confidence: 'medium', criticView: 'high', enrichedAt: 'x' },
+          },
+        },
+      ],
+    });
+    const summary = await runEmmaEnrichment({
+      listId: 'list-1',
+      userId: 'user-1',
+      outputFields: [{ name: 'funding_stage', instruction: 'find funding stage' }],
+      mode: 'preview',
+      leadIds: ['slashy-1'],
+    });
+    expect(summary.samples).toEqual([
+      {
+        leadId: 'slashy-1',
+        enrichedFields: { industry: 'SaaS', funding_stage: 'Series C', employee_count: '50' },
+        unverifiedFields: ['funding_stage'],
+      },
+    ]);
+  });
+
+  it('treats a preview sample with no meta as fully unverified', async () => {
+    (runEnrichment as jest.Mock).mockResolvedValue({
+      runId: 'run-nometa',
+      processed: 1,
+      failed: { identityResolutionFailed: 0, apolloFailed: 0, llmOrParseFailed: 0, updateFailed: 0, searchWebFailed: 0 },
+      tierFillBreakdown: {},
+      durationMs: 50,
+      preview: [
+        { leadId: 'l1', extractedFields: { funding_stage: 'Series C' }, meta: {} },
+      ],
+    });
+    const summary = await runEmmaEnrichment({
+      listId: 'list-1',
+      userId: 'user-1',
+      outputFields: [{ name: 'funding_stage', instruction: 'find funding stage' }],
+      mode: 'preview',
+      leadIds: ['l1'],
+    });
+    expect(summary.samples?.[0].unverifiedFields).toEqual(['funding_stage']);
   });
 
   it('surfaces config-processing warnings', async () => {

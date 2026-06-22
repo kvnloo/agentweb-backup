@@ -162,6 +162,7 @@ describe('executePreparedTools', () => {
     // for the ledger entry (behavior-preserving: toolResultError returns a string,
     // not an Error instance). The tool message content uses String(error).
     expect(input.toolCallsLedger[0].error).toBe('Unknown error');
+    expect(input.toolCallsLedger[0].result).toEqual({ bad: true });
     expect(input.messages[0].content).toBe('ERR: flagged error');
     expect(result.failedCounterUpdates).toEqual({ read_brand_guidelines: 1 });
     expect(result.pendingCounterUpdates).toEqual({});
@@ -313,5 +314,119 @@ describe('executePreparedTools', () => {
     }
 
     expect(executePreparedAgentTool).toHaveBeenCalledTimes(2);
+  });
+
+  describe('media-generation time budget', () => {
+    // A gateway fake that resolves to success with a unique asset result; records
+    // which tools it actually executed so we can prove deferral skips the leaf call.
+    function mediaPorts() {
+      const executed: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          executed.push(i.toolName);
+          const result = await i.execute();
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+        executePreparedAgentTool: async (i: any) => ({ success: true, imageUrl: `https://s3/${i.toolName}.png` }),
+      });
+      return { ports, executed };
+    }
+
+    it('does NOT defer when no deadline is supplied (prior behavior preserved)', async () => {
+      const { ports, executed } = mediaPorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'generate_image', '{"prompt":"1"}'),
+          toolCall('b', 'generate_image', '{"prompt":"2"}'),
+        ],
+        ports,
+        { mediaGenerationDeadlineMs: undefined, mediaAssetsProducedThisRun: 5 },
+      );
+      const result = await executePreparedTools(input);
+
+      expect(executed).toEqual(['generate_image', 'generate_image']);
+      expect(result.mediaBudgetDeferred).toBe(false);
+      expect(result.mediaAssetsProduced).toBe(2);
+      expect(result.pendingCounterUpdates).toEqual({ generate_image: 2 });
+    });
+
+    it('defers a media-gen call once the deadline has passed and ≥1 asset already exists this run', async () => {
+      const { ports, executed } = mediaPorts();
+      const input = makeInput(
+        [toolCall('a', 'generate_image', '{"prompt":"x"}')],
+        ports,
+        { mediaGenerationDeadlineMs: Date.now() - 1, mediaAssetsProducedThisRun: 1 },
+      );
+      const result = await executePreparedTools(input);
+
+      // The leaf tool was never executed.
+      expect(executed).toEqual([]);
+      expect(result.mediaBudgetDeferred).toBe(true);
+      expect(result.mediaAssetsProduced).toBe(0);
+      // Deferral is neither a success (no pending counter — work-plan gate untouched)
+      // nor a failure (no failed counter — gateway breaker untouched).
+      expect(result.pendingCounterUpdates).toEqual({});
+      expect(result.failedCounterUpdates).toEqual({});
+      // A tool-role message MUST still exist for the orphaned tool_call_id.
+      expect(input.messages).toHaveLength(1);
+      expect(input.messages[0]).toMatchObject({ tool_call_id: 'a', role: 'tool', name: 'generate_image' });
+      expect(input.messages[0].content).toMatch(/paused|continue/i);
+      expect(input.toolCallsLedger[0].result).toEqual({ deferred: true, reason: 'media_generation_time_budget' });
+    });
+
+    it('still produces one asset when over budget but nothing has been generated yet (forward progress)', async () => {
+      const { ports, executed } = mediaPorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'generate_image', '{"prompt":"1"}'),
+          toolCall('b', 'generate_image', '{"prompt":"2"}'),
+          toolCall('c', 'generate_image', '{"prompt":"3"}'),
+        ],
+        ports,
+        { mediaGenerationDeadlineMs: Date.now() - 1, mediaAssetsProducedThisRun: 0 },
+      );
+      const result = await executePreparedTools(input);
+
+      // First call runs (no asset existed yet); the remaining two defer.
+      expect(executed).toEqual(['generate_image']);
+      expect(result.mediaAssetsProduced).toBe(1);
+      expect(result.mediaBudgetDeferred).toBe(true);
+      expect(result.pendingCounterUpdates).toEqual({ generate_image: 1 });
+      expect(input.messages.map((m: any) => m.content)).toEqual([
+        expect.stringContaining('https://s3/generate_image.png'),
+        expect.stringMatching(/paused|continue/i),
+        expect.stringMatching(/paused|continue/i),
+      ]);
+    });
+
+    it('does NOT defer non-media tools even when over budget', async () => {
+      const { ports, executed } = mediaPorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'read_brand_guidelines', '{}'),
+          toolCall('b', 'generate_image', '{"prompt":"x"}'),
+        ],
+        ports,
+        { mediaGenerationDeadlineMs: Date.now() - 1, mediaAssetsProducedThisRun: 3 },
+      );
+      await executePreparedTools(input);
+
+      // The read tool runs; only the media-gen call defers.
+      expect(executed).toEqual(['read_brand_guidelines']);
+    });
+
+    it('a deferred call that did not run does not count as a produced asset', async () => {
+      // Over budget with an asset already produced: a soft {success:false} would never
+      // be reached because we defer BEFORE executing. Proves deferral short-circuits.
+      const { ports } = mediaPorts();
+      const input = makeInput(
+        [toolCall('a', 'generate_image', '{"prompt":"x"}')],
+        ports,
+        { mediaGenerationDeadlineMs: Date.now() - 1, mediaAssetsProducedThisRun: 2 },
+      );
+      const result = await executePreparedTools(input);
+      expect(result.mediaAssetsProduced).toBe(0);
+      expect(result.mediaBudgetDeferred).toBe(true);
+    });
   });
 });

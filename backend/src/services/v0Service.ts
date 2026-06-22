@@ -9,6 +9,7 @@ import { canEditItem } from "./orgShareService";
 import { addSubdomain, generateSubdomain, listDomains, SUBDOMAIN_BASE } from "./customDomainService";
 import { settingsService } from "./settingsService";
 import { paginatedQuery } from "../utils/dynamoPagination";
+import { guardedV0ChatCreate, guardedV0CorrectionMessage } from "./v0UsageGuard";
 
 // Note: global fetch (undici) timeouts are managed by httpClient.ts (15 min headersTimeout/bodyTimeout).
 // No setGlobalDispatcher call here — duplicate calls cause the last-loaded config to win unpredictably.
@@ -812,10 +813,16 @@ async function generateFirstPage(
   try {
     const v0 = await getV0Client();
 
-    const chatResponse = await withRetry(
-      () => v0.chats.create({ message: enrichedPrompt }),
-      "v0 chat creation"
-    );
+    const chatResponse = await guardedV0ChatCreate({
+      userId,
+      operation: "first_page_chat_create",
+      scopeId: id,
+      prompt: enrichedPrompt,
+      create: () => withRetry(
+        () => v0.chats.create({ message: enrichedPrompt }),
+        "v0 chat creation"
+      ),
+    });
 
     if (!("id" in chatResponse) || !chatResponse.id) {
       throw new Error("v0 chat creation did not return a ChatDetail with an id");
@@ -1086,10 +1093,17 @@ async function addPageToExistingRepo(
     const v0 = await getV0Client();
 
     console.log(`[V0 SERVICE] Creating v0 chat for additional page /${slug}...`);
-    const chatResponse = await withRetry(
-      () => v0.chats.create({ message: enrichedPrompt }),
-      "v0 chat creation (additional page)"
-    );
+    const chatResponse = await guardedV0ChatCreate({
+      userId,
+      operation: "additional_page_chat_create",
+      scopeId: existingPage.siteId ?? existingPage.id,
+      slug,
+      prompt: enrichedPrompt,
+      create: () => withRetry(
+        () => v0.chats.create({ message: enrichedPrompt }),
+        "v0 chat creation (additional page)"
+      ),
+    });
 
     if (!("id" in chatResponse) || !chatResponse.id) {
       throw new Error("v0 chat creation did not return a ChatDetail with an id");
@@ -1175,17 +1189,22 @@ async function addPageToExistingRepo(
         if (valErr instanceof V0OutputValidationError && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
           console.warn(`[V0 SERVICE] v0 output validation failed for /${slug} (attempt ${validationAttempt + 1}): ${valErr.reason}`);
 
-          await withRetry(
-            () => v0.chats.sendMessage({
-              chatId,
-              message:
-                "The previous output was not valid code. Please generate actual React/Next.js code — " +
-                "not markdown, not a prompt description, not empty files. " +
-                "Output must include .tsx files with real React components using export and function/const. " +
-                `Issue: ${valErr.reason}`,
-            }),
-            "v0 correction message (additional page)"
-          );
+          await guardedV0CorrectionMessage({
+            userId,
+            scopeId: existingPage.siteId ?? existingPage.id,
+            chatId,
+            send: () => withRetry(
+              () => v0.chats.sendMessage({
+                chatId,
+                message:
+                  "The previous output was not valid code. Please generate actual React/Next.js code — " +
+                  "not markdown, not a prompt description, not empty files. " +
+                  "Output must include .tsx files with real React components using export and function/const. " +
+                  `Issue: ${valErr.reason}`,
+              }),
+              "v0 correction message (additional page)"
+            ),
+          });
 
           await new Promise((resolve) => setTimeout(resolve, 5000));
 
@@ -1571,17 +1590,22 @@ export async function deployLandingPage(
           console.warn(`[V0 SERVICE] v0 output validation failed (attempt ${validationAttempt + 1}): ${valErr.reason}`);
 
           // Send correction message to v0 and re-download
-          await withRetry(
-            () => v0.chats.sendMessage({
-              chatId: record.v0ChatId!,
-              message:
-                "The previous output was not valid code. Please generate actual React/Next.js code — " +
-                "not markdown, not a prompt description, not empty files. " +
-                "Output must include .tsx files with real React components using export and function/const. " +
-                `Issue: ${valErr.reason}`,
-            }),
-            "v0 correction message"
-          );
+          await guardedV0CorrectionMessage({
+            userId,
+            scopeId: record.siteId ?? record.id,
+            chatId: record.v0ChatId!,
+            send: () => withRetry(
+              () => v0.chats.sendMessage({
+                chatId: record.v0ChatId!,
+                message:
+                  "The previous output was not valid code. Please generate actual React/Next.js code — " +
+                  "not markdown, not a prompt description, not empty files. " +
+                  "Output must include .tsx files with real React components using export and function/const. " +
+                  `Issue: ${valErr.reason}`,
+              }),
+              "v0 correction message"
+            ),
+          });
 
           // Wait for v0 to process the correction
           await new Promise((resolve) => setTimeout(resolve, 5000));

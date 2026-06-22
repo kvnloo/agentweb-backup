@@ -333,6 +333,7 @@ export async function triggerBrandBuildForUser(
         userId,
         companyName,
         companyEmail: (user as any).email ?? "",
+        existingChannelId: (user as any).slackConnectChannelId,
       });
     } catch {
       /* best-effort */

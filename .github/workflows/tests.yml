@@ -234,6 +234,28 @@ jobs:
             --environment-name ${{ vars.EB_BACKEND_STAGING_ENVIRONMENT_NAME }} \
             --version-label "$VERSION_LABEL" || echo "⚠️  Environment update failed (may be updating), but AWS deployment likely succeeded"
 
+      - name: Wait for staging backend readiness
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          for attempt in {1..60}; do
+            STATUS=$(aws elasticbeanstalk describe-environments \
+              --environment-names "${{ vars.EB_BACKEND_STAGING_ENVIRONMENT_NAME }}" \
+              --query 'Environments[0].Status' \
+              --output text)
+            HEALTH=$(aws elasticbeanstalk describe-environments \
+              --environment-names "${{ vars.EB_BACKEND_STAGING_ENVIRONMENT_NAME }}" \
+              --query 'Environments[0].Health' \
+              --output text)
+            echo "Staging status=$STATUS health=$HEALTH attempt=$attempt"
+            if [ "$STATUS" = "Ready" ] && [ "$HEALTH" != "Grey" ]; then
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "Staging backend did not become ready before smoke test."
+          exit 1
+
       - name: Backend Staging Deployment Status
         run: |
           DATE=$(date +%Y%m%d)
@@ -242,6 +264,52 @@ jobs:
           echo "📊 Check deployment status: https://${{ env.AWS_REGION }}.console.aws.amazon.com/elasticbeanstalk/home?region=${{ env.AWS_REGION }}#/environments"
           echo "✅ Deployed: backend-${DATE}-pr${PR_NUMBER}"
           echo "🔗 Staging URL: https://api-stage.agentweb.pro"
+
+      - name: Coding agent staging smoke
+        working-directory: backend
+        timeout-minutes: 15
+        env:
+          STAGING_API_URL: https://api-stage.agentweb.pro
+          STAGING_SMOKE_AUTH_TOKEN: ${{ secrets.STAGING_SMOKE_AUTH_TOKEN }}
+          STAGING_SMOKE_USER_ID: ${{ vars.STAGING_SMOKE_USER_ID }}
+          STAGING_SMOKE_USER_EMAIL: ${{ vars.STAGING_SMOKE_USER_EMAIL }}
+          STAGING_SMOKE_USER_SESSION_VERSION: ${{ vars.STAGING_SMOKE_USER_SESSION_VERSION || '0' }}
+          STAGING_SMOKE_PAGE_ID: ${{ vars.STAGING_SMOKE_PAGE_ID }}
+          STAGING_SMOKE_CONSOLE_ALLOW_PATTERNS: ${{ vars.STAGING_SMOKE_CONSOLE_ALLOW_PATTERNS }}
+          V0_USAGE_TABLE_NAME: Dev-AW-V0Usage
+        run: |
+          mkdir -p smoke-artifacts
+          if [ -z "${STAGING_SMOKE_AUTH_TOKEN:-}" ]; then
+            if [ -z "${STAGING_SMOKE_USER_ID:-}" ] || [ -z "${STAGING_SMOKE_USER_EMAIL:-}" ]; then
+              echo "Set STAGING_SMOKE_AUTH_TOKEN or STAGING_SMOKE_USER_ID/STAGING_SMOKE_USER_EMAIL for staging smoke."
+              exit 1
+            fi
+            JWT_SECRET=$(aws elasticbeanstalk describe-configuration-settings \
+              --application-name "${{ vars.EB_BACKEND_STAGING_APPLICATION_NAME }}" \
+              --environment-name "${{ vars.EB_BACKEND_STAGING_ENVIRONMENT_NAME }}" \
+              --query "ConfigurationSettings[0].OptionSettings[?Namespace=='aws:elasticbeanstalk:application:environment' && OptionName=='JWT_SECRET'].Value | [0]" \
+              --output text)
+            export STAGING_SMOKE_AUTH_TOKEN=$(JWT_SECRET="$JWT_SECRET" node - <<'NODE'
+          const jwt = require('jsonwebtoken');
+          const token = jwt.sign({
+            userId: process.env.STAGING_SMOKE_USER_ID,
+            email: process.env.STAGING_SMOKE_USER_EMAIL,
+            isAdmin: false,
+            roles: ['customer'],
+            sv: Number(process.env.STAGING_SMOKE_USER_SESSION_VERSION || 0),
+          }, process.env.JWT_SECRET, { expiresIn: '2h' });
+          process.stdout.write(token);
+          NODE
+          )
+          fi
+          npx ts-node src/scripts/coding-agent-staging-smoke.ts | tee smoke-artifacts/coding-agent-staging-smoke.json
+
+      - name: Upload coding agent smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coding-agent-staging-smoke
+          path: backend/smoke-artifacts/
 
   partner-tests:
     name: Partner portal tests
