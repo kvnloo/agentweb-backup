@@ -819,4 +819,18 @@ describe('AgentModeService - generate_image function', () => {
       expect(result.success).toBe(true);
     });
   });
+
+  describe('GA image-model migration (IMAGE_API_MODELS + pricing)', () => {
+    it('IMAGE_API_MODELS lists the GA id and retains the preview id as an alias', () => {
+      expect(AgentModeService.IMAGE_API_MODELS).toContain('gemini-3.1-flash-image');
+      // preview retained so persisted settings/sessions still validate
+      expect(AgentModeService.IMAGE_API_MODELS).toContain('gemini-3.1-flash-image-preview');
+    });
+
+    it('prices the GA id (and its preview alias) at 0.039 per image', () => {
+      const cost = (agentModeService as any).estimateImageGenerationCost.bind(agentModeService);
+      expect(cost('gemini-3.1-flash-image')).toBe(0.039);
+      expect(cost('gemini-3.1-flash-image-preview')).toBe(0.039);
+    });
+  });
 });

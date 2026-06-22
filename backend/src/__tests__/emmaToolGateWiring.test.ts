@@ -100,4 +100,11 @@ describe('emma tool handlers wire args into the confirmation gate', () => {
     expect(result.awaitingUserConfirmation).toBe(true);
     expect(result.confirmationPrompt).toContain('![source image 1](https://cdn.example.com/a.png)');
   });
+
+  it('generate_image: image_model enum offers the GA id and no longer offers the preview id', () => {
+    const def: any = emmaToolRegistry.getTool('generate_image')?.definition;
+    const modelEnum: string[] = def?.inputSchema?.properties?.imageModel?.enum ?? [];
+    expect(modelEnum).toContain('gemini-3.1-flash-image'); // GA id selectable
+    expect(modelEnum).not.toContain('gemini-3.1-flash-image-preview'); // preview dropped from the menu
+  });
 });

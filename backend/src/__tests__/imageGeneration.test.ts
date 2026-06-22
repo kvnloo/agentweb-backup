@@ -1,6 +1,6 @@
 // Unit tests for imageGeneration service
 
-import { ImageService } from '../services/imageGeneration';
+import { ImageService, normalizeImageModel } from '../services/imageGeneration';
 import * as secretsManager from '../utils/secretsManager';
 import * as s3Utils from '../utils/s3Utils';
 
@@ -1696,6 +1696,26 @@ describe('ImageService', () => {
 
       expect(callCount).toBe(2);
       expect(result.success).toBe(true);
+    });
+  });
+
+  describe('normalizeImageModel (GA migration alias)', () => {
+    it('maps the legacy preview id to the GA id', () => {
+      expect(normalizeImageModel('gemini-3.1-flash-image-preview')).toBe('gemini-3.1-flash-image');
+    });
+
+    it('passes the GA id through unchanged', () => {
+      expect(normalizeImageModel('gemini-3.1-flash-image')).toBe('gemini-3.1-flash-image');
+    });
+
+    it('passes other known models through unchanged', () => {
+      expect(normalizeImageModel('gemini-3-pro-image-preview')).toBe('gemini-3-pro-image-preview');
+      expect(normalizeImageModel('gpt-image-1')).toBe('gpt-image-1');
+    });
+
+    it('passes unknown ids and undefined through unchanged', () => {
+      expect(normalizeImageModel('totally-made-up')).toBe('totally-made-up');
+      expect(normalizeImageModel(undefined)).toBeUndefined();
     });
   });
 });
