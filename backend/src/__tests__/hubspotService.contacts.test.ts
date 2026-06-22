@@ -450,6 +450,13 @@ describe('HubSpotService — ensureDealProperty', () => {
     const name = await svc.ensureDealProperty('My Custom Field!', 'My Custom Field');
     expect(name).toBe('my_custom_field');
   });
+
+  it('caches an ensured deal property so a repeat call skips the GET', async () => {
+    mockAxiosGet.mockResolvedValue({ data: { name: 'custom_score' } });
+    await svc.ensureDealProperty('custom_score', 'Custom Score');
+    await svc.ensureDealProperty('custom_score', 'Custom Score');
+    expect(mockAxiosGet).toHaveBeenCalledTimes(1);
+  });
 });
 
 // ─── getDealPipelineStages ────────────────────────────────────────────────────
@@ -547,6 +554,30 @@ describe('HubSpotService — ensureContactProperty', () => {
       expect.objectContaining({ name: 'new_prop' }),
       expect.any(Object)
     );
+  });
+
+  it('caches the result and does not GET the same property twice on one instance', async () => {
+    mockAxiosGet.mockResolvedValue({ data: { name: 'cached_prop' } });
+    await svc.ensureContactProperty('cached_prop', 'Cached Prop');
+    await svc.ensureContactProperty('cached_prop', 'Cached Prop');
+    expect(mockAxiosGet).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not re-create a 404 property on the second call (cached after create)', async () => {
+    mockAxiosGet.mockRejectedValue({ response: { status: 404 } });
+    mockAxiosPost.mockResolvedValue({ data: { name: 'made_prop' } });
+    await svc.ensureContactProperty('made_prop', 'Made Prop');
+    await svc.ensureContactProperty('made_prop', 'Made Prop');
+    expect(mockAxiosGet).toHaveBeenCalledTimes(1);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not share the property cache across instances', async () => {
+    mockAxiosGet.mockResolvedValue({ data: { name: 'shared_prop' } });
+    await svc.ensureContactProperty('shared_prop', 'Shared Prop');
+    const svc2 = HubSpotService.fromToken('valid-token');
+    await svc2.ensureContactProperty('shared_prop', 'Shared Prop');
+    expect(mockAxiosGet).toHaveBeenCalledTimes(2);
   });
 });
 

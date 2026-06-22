@@ -118,6 +118,24 @@ describe('HubSpotService — batchUpsertContacts', () => {
       svc.batchUpsertContacts([{ email: 'x@acme.com', properties: {} }])
     ).rejects.toBeDefined();
   });
+
+  it('THROWS on a 207 Multi-Status partial-failure response (does not silently drop failed upserts)', async () => {
+    mockAxiosPost.mockResolvedValue({
+      status: 207,
+      data: {
+        status: 'COMPLETE',
+        numErrors: 1,
+        results: [{ id: 'c-ok', properties: { email: 'ok@acme.com' }, new: true }],
+        errors: [{ status: 'error', category: 'VALIDATION_ERROR', message: 'bad email' }],
+      },
+    });
+    await expect(
+      svc.batchUpsertContacts([
+        { email: 'ok@acme.com', properties: {} },
+        { email: 'bad@acme.com', properties: {} },
+      ])
+    ).rejects.toThrow(/207|partial|VALIDATION_ERROR/i);
+  });
 });
 
 // ─── batchCreateDeals ─────────────────────────────────────────────────────────
@@ -239,6 +257,38 @@ describe('HubSpotService — batchCreateDeals', () => {
       svc.batchCreateDeals([{ traceId: 'lead-1', properties: {} }])
     ).rejects.toBeDefined();
   });
+
+  it('THROWS on a 207 Multi-Status partial-failure response (does not silently drop failed creates)', async () => {
+    mockAxiosPost.mockResolvedValue({
+      status: 207,
+      data: {
+        status: 'COMPLETE',
+        numErrors: 1,
+        results: [{ id: 'd-ok', objectWriteTraceId: 'lead-ok' }],
+        errors: [{ status: 'error', category: 'VALIDATION_ERROR', message: 'bad deal', context: { objectWriteTraceId: ['lead-bad'] } }],
+      },
+    });
+    await expect(
+      svc.batchCreateDeals([
+        { traceId: 'lead-ok', properties: {} },
+        { traceId: 'lead-bad', properties: {} },
+      ])
+    ).rejects.toThrow(/207|partial|VALIDATION_ERROR/i);
+  });
+
+  it('attaches the 207 response to the thrown error so callers can inspect per-record errors', async () => {
+    mockAxiosPost.mockResolvedValue({
+      status: 207,
+      data: { numErrors: 1, results: [], errors: [{ category: 'VALIDATION_ERROR', message: 'bad' }] },
+    });
+    await svc.batchCreateDeals([{ traceId: 'lead-bad', properties: {} }]).then(
+      () => { throw new Error('expected rejection'); },
+      (err: any) => {
+        expect(err.response?.status).toBe(207);
+        expect(err.response?.data?.errors?.[0]?.category).toBe('VALIDATION_ERROR');
+      }
+    );
+  });
 });
 
 // ─── batchUpdateDeals ─────────────────────────────────────────────────────────
@@ -287,6 +337,24 @@ describe('HubSpotService — batchUpdateDeals', () => {
       svc.batchUpdateDeals([{ dealId: 'd-1', properties: { amount: '1' } }])
     ).rejects.toBeDefined();
   });
+
+  it('THROWS on a 207 Multi-Status partial-failure response (does not silently count failures as success)', async () => {
+    mockAxiosPost.mockResolvedValue({
+      status: 207,
+      data: {
+        status: 'COMPLETE',
+        numErrors: 1,
+        results: [{ id: 'd-1' }],
+        errors: [{ status: 'error', category: 'OBJECT_NOT_FOUND', message: 'deal gone', context: { ids: ['d-2'] } }],
+      },
+    });
+    await expect(
+      svc.batchUpdateDeals([
+        { dealId: 'd-1', properties: { amount: '1' } },
+        { dealId: 'd-2', properties: { amount: '2' } },
+      ])
+    ).rejects.toThrow(/207|partial|OBJECT_NOT_FOUND/i);
+  });
 });
 
 // ─── batchAssociateContactsToDeals ────────────────────────────────────────────
@@ -332,5 +400,23 @@ describe('HubSpotService — batchAssociateContactsToDeals', () => {
     await expect(
       svc.batchAssociateContactsToDeals([{ contactId: 'c-1', dealId: 'd-1' }])
     ).rejects.toBeDefined();
+  });
+
+  it('THROWS on a 207 Multi-Status partial-failure response (does not silently count failures as success)', async () => {
+    mockAxiosPost.mockResolvedValue({
+      status: 207,
+      data: {
+        status: 'COMPLETE',
+        numErrors: 1,
+        results: [],
+        errors: [{ status: 'error', category: 'VALIDATION_ERROR', message: 'bad assoc' }],
+      },
+    });
+    await expect(
+      svc.batchAssociateContactsToDeals([
+        { contactId: 'c-1', dealId: 'd-1' },
+        { contactId: 'c-2', dealId: 'd-2' },
+      ])
+    ).rejects.toThrow(/207|partial|VALIDATION_ERROR/i);
   });
 });

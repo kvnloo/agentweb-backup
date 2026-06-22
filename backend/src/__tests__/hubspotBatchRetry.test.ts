@@ -149,6 +149,68 @@ describe('splitAndRetry', () => {
     ]);
   });
 
+  // ─── Concurrency (opt-in; default stays sequential) ──────────────────────────
+  it('runs up to `concurrency` top-level batches at once', async () => {
+    const items = Array.from({ length: 500 }, (_, i) => i); // 5 chunks of 100
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const runBatch = jest.fn(async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight -= 1;
+    });
+
+    await splitAndRetry(items, runBatch, { maxBatchSize: 100, concurrency: 3 });
+
+    expect(runBatch).toHaveBeenCalledTimes(5);
+    expect(maxInFlight).toBe(3); // 5 chunks, limit 3 → peaks at 3
+  });
+
+  it('caps concurrency at the number of chunks', async () => {
+    const items = Array.from({ length: 200 }, (_, i) => i); // 2 chunks
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const runBatch = jest.fn(async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight -= 1;
+    });
+
+    await splitAndRetry(items, runBatch, { maxBatchSize: 100, concurrency: 10 });
+
+    expect(maxInFlight).toBe(2);
+  });
+
+  it('still isolates a bad item correctly when running concurrently', async () => {
+    const items = Array.from({ length: 300 }, (_, i) => i); // 3 chunks
+    const bad = 150;
+    const runBatch = jest.fn(async (batch: number[]) => {
+      if (batch.includes(bad)) throw new Error('bad');
+    });
+
+    const result = await splitAndRetry(items, runBatch, { maxBatchSize: 100, concurrency: 3 });
+
+    expect(result.failed.map((f) => f.item)).toEqual([bad]);
+  });
+
+  it('processes sequentially when concurrency is omitted (default 1)', async () => {
+    const items = Array.from({ length: 300 }, (_, i) => i);
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const runBatch = jest.fn(async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      inFlight -= 1;
+    });
+
+    await splitAndRetry(items, runBatch, { maxBatchSize: 100 });
+
+    expect(maxInFlight).toBe(1);
+  });
+
   it('splits an odd-sized failing batch using floor(n/2)', async () => {
     // A 3-item batch that fails should split into halves of size floor(3/2)=1 and 2.
     const items = [10, 20, 30];

@@ -1,5 +1,12 @@
 export interface SplitAndRetryOptions {
   maxBatchSize: number;
+  /**
+   * Max number of top-level batches to run at once (default 1 = sequential).
+   * Only the initial maxBatchSize chunks are parallelised; a failed batch's
+   * bisection retries always run sequentially within that batch's subtree.
+   * Keep this modest to stay within the provider's rate limits.
+   */
+  concurrency?: number;
   /** Called whenever a multi-item batch fails and is about to be split, for logging. */
   onSplit?: (failedBatchSize: number, error: unknown) => void;
 }
@@ -43,11 +50,24 @@ export async function splitAndRetry<T>(
     }
   };
 
-  // Split items into consecutive chunks of maxBatchSize and process sequentially.
+  // Split items into consecutive chunks of maxBatchSize.
+  const chunks: T[][] = [];
   for (let i = 0; i < items.length; i += options.maxBatchSize) {
-    const chunk = items.slice(i, i + options.maxBatchSize);
-    await processChunk(chunk);
+    chunks.push(items.slice(i, i + options.maxBatchSize));
   }
+
+  // Process the top-level chunks with bounded concurrency (default 1 =
+  // sequential). Workers pull from a shared cursor so at most `limit` chunks
+  // are in flight at once; processChunk itself awaits its (sequential) bisection.
+  const limit = Math.max(1, Math.min(options.concurrency ?? 1, chunks.length));
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    while (cursor < chunks.length) {
+      const chunk = chunks[cursor++];
+      await processChunk(chunk);
+    }
+  };
+  await Promise.all(Array.from({ length: limit }, () => worker()));
 
   return { failed };
 }

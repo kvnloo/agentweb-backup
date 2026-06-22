@@ -1,9 +1,18 @@
-import { CrmAdapter, CrmAuth } from './crmAdapterTypes';
+import { CrmAdapter, CrmAuth, PushContext } from './crmAdapterTypes';
 import { ExternalCrmSyncConfig, FieldMapping, SyncResult } from '../externalCrmSyncService';
 import { HubSpotService } from '../hubspotService';
 import { crmDb } from '../db';
 import { validateEmail } from '../../utils/validation';
 import { splitAndRetry } from '../../utils/hubspotBatchRetry';
+import { buildSyncedMetadata, buildFailedMetadata } from '../../utils/leadSyncStatus';
+
+/**
+ * How many 100-record batches to send to HubSpot at once during a push. The
+ * batch endpoints are otherwise issued one-at-a-time, which dominates the wall
+ * clock on large lists. Kept modest (and env-overridable) to stay within
+ * HubSpot's rate limits; the 429-retry interceptor absorbs occasional overage.
+ */
+const PUSH_BATCH_CONCURRENCY = Math.max(1, Number(process.env.HUBSPOT_PUSH_CONCURRENCY) || 6);
 
 /**
  * System list-identity mappings: the source lead list's name and id, pushed to
@@ -93,10 +102,18 @@ export class HubspotAdapter implements CrmAdapter {
     async pushLeads(
         auth: CrmAuth,
         leads: any[],
-        config: ExternalCrmSyncConfig
+        config: ExternalCrmSyncConfig,
+        ctx?: PushContext
     ): Promise<SyncResult> {
         const result: SyncResult = { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
-        const svc = await this.getSvc(auth); // token resolved ONCE here
+        // Reuse one service across all chunks of a push (via the shared ctx) so the
+        // token is resolved once and per-instance property-ensure caching kicks in —
+        // otherwise each 500-lead chunk re-resolves auth and re-GETs every property.
+        let svc = ctx?.svc as HubSpotService | undefined;
+        if (!svc) {
+            svc = await this.getSvc(auth);
+            if (ctx) ctx.svc = svc;
+        }
 
         // Resolve the source list's display name once so leads can be enriched with
         // listName/listId before mapping. Leads carry listId natively but not the
@@ -212,6 +229,7 @@ export class HubspotAdapter implements CrmAdapter {
                     const msg = `Invalid email "${email}" — skipped (not a valid email address)`;
                     console.warn(`[HubspotAdapter] ${msg} for lead=${lead.leadId}`);
                     result.errors.push(`${email}: ${msg}`);
+                    await this.persistSyncMetadata(lead, config.listId, buildFailedMetadata(lead.syncMetadata, msg));
                     continue;
                 }
 
@@ -268,12 +286,11 @@ export class HubspotAdapter implements CrmAdapter {
 
                 result.successCount++;
 
-                // Persist HubSpot contact ID back to our DB
-                await crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
-                    syncMetadata: { ...(lead.syncMetadata || {}), hubspot_contact_id: contactId },
-                }).catch((err) => {
-                    console.error(`[HubspotAdapter] failed to persist hubspot_contact_id for ${lead.email}: ${this.formatError(err)}`);
-                });
+                // Persist HubSpot contact ID + synced status back to our DB.
+                await this.persistSyncMetadata(
+                    lead, config.listId,
+                    buildSyncedMetadata(lead.syncMetadata, contactId, new Date().toISOString()),
+                );
 
                 // ── 4. Deal sync (non-critical) ────────────────────────────────────
                 if (dealMappings.length > 0) {
@@ -291,6 +308,7 @@ export class HubspotAdapter implements CrmAdapter {
                 const msg = this.formatError(err);
                 console.error(`[HubspotAdapter] lead sync failed for ${lead.email || lead.leadId}: ${msg}`);
                 result.errors.push(`${lead.email || lead.leadId}: ${msg}`);
+                await this.persistSyncMetadata(lead, config.listId, buildFailedMetadata(lead.syncMetadata, msg));
             }
         }
     }
@@ -333,6 +351,7 @@ export class HubspotAdapter implements CrmAdapter {
                 const msg = `Invalid email "${email}" — skipped (not a valid email address)`;
                 console.warn(`[HubspotAdapter] ${msg} for lead=${lead.leadId}`);
                 result.errors.push(`${email}: ${msg}`);
+                await this.persistSyncMetadata(lead, config.listId, buildFailedMetadata(lead.syncMetadata, msg));
                 continue;
             }
 
@@ -376,52 +395,81 @@ export class HubspotAdapter implements CrmAdapter {
             properties: { ...p.allContactProps, email: p.emailLower },
         }));
         const contactResults = new Map<string, { email: string; contactId: string; isNew: boolean }>();
+        // Emails HubSpot rejected as invalid (e.g. a bad TLD that passed our local
+        // format check). Collected here and reported as errors after the stage.
+        const invalidEmails: string[] = [];
 
         const upsertOutcome = await splitAndRetry(
             upsertInputs,
-            async (batch) => {
-                const res = await svc.batchUpsertContacts(batch);
-                for (const r of res) contactResults.set(r.email, r);
-            },
+            (batch) => this.upsertBatchDroppingInvalid(svc, batch, contactResults, invalidEmails),
             {
                 maxBatchSize: 100,
+                concurrency: PUSH_BATCH_CONCURRENCY,
                 onSplit: (n, e) => console.log(`[HubspotAdapter] batch contact upsert of ${n} failed, splitting: ${this.formatError(e)}`),
             },
         );
 
-        // Tally successes (new/updated) and contact ids for the deal stage.
-        // Iterate ALL emailLeads (not the de-duped inputs) so EVERY DB lead sharing
-        // an email is counted once, written back, and routed into the deal stage.
-        const contactIdByLead = new Map<any, string>();      // lead → contactId
-        const succeededEmailLeads: any[] = [];
-        for (const p of emailLeads) {
-            const r = contactResults.get(p.emailLower);
-            if (!r) continue; // failed leads are handled below + excluded from deals
-            result.successCount++;
-            if (r.isNew) result.newCount++; else result.updatedCount++;
-            contactIdByLead.set(p.lead, r.contactId);
-            succeededEmailLeads.push(p.lead);
-        }
-        // Failed upserts → errors, excluded from deals.
+        // Map each failed email to a reason (invalid-email drop, or other upsert
+        // failure). Keyed by lowercased email to match emailLower below.
+        const failureReason = new Map<string, string>();
         for (const f of upsertOutcome.failed) {
-            result.errorCount++;
-            result.errors.push(`${f.item.email}: ${this.formatError(f.error)}`);
+            failureReason.set(f.item.email.toLowerCase(), this.formatError(f.error));
+        }
+        for (const email of invalidEmails) {
+            failureReason.set(email.toLowerCase(), 'invalid email (rejected by HubSpot)');
         }
 
-        // ── Stage 3: write back contact ids BEFORE deals (idempotency) ─────────
-        await Promise.all(
-            succeededEmailLeads.map(lead =>
-                crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
-                    syncMetadata: { ...(lead.syncMetadata || {}), hubspot_contact_id: contactIdByLead.get(lead) },
-                }).catch((err: any) => {
-                    console.error(`[HubspotAdapter] failed to persist hubspot_contact_id for ${lead.email}: ${this.formatError(err)}`);
-                })
-            )
-        );
+        // Reconcile PER LEAD (not per de-duped email) so successCount + errorCount
+        // always equals the number of email leads attempted — every lead is either
+        // a success (its email upserted) or an error (its email failed/invalid),
+        // counted exactly once. Iterating emailLeads also means leads sharing one
+        // email are each counted and (on success) routed into the deal stage.
+        const contactIdByLead = new Map<any, string>();      // lead → contactId
+        const isNewByLead = new Map<any, boolean>();          // lead → isNew (for demotion)
+        const succeededEmailLeads: any[] = [];
+        const failedEmailLeads: Array<{ lead: any; reason: string }> = [];
+        for (const p of emailLeads) {
+            const r = contactResults.get(p.emailLower);
+            if (r) {
+                result.successCount++;
+                if (r.isNew) result.newCount++; else result.updatedCount++;
+                contactIdByLead.set(p.lead, r.contactId);
+                isNewByLead.set(p.lead, r.isNew);
+                succeededEmailLeads.push(p.lead);
+            } else {
+                result.errorCount++;
+                const reason = failureReason.get(p.emailLower) || 'contact upsert failed';
+                result.errors.push(`${p.emailLower}: ${reason}`);
+                failedEmailLeads.push({ lead: p.lead, reason });
+            }
+        }
+
+        // ── Stage 3: write back contact ids + synced status BEFORE deals ───────
+        const stage3Now = new Date().toISOString();
+        await Promise.all([
+            ...succeededEmailLeads.map(lead =>
+                this.persistSyncMetadata(
+                    lead, config.listId,
+                    buildSyncedMetadata(lead.syncMetadata, contactIdByLead.get(lead)!, stage3Now),
+                )
+            ),
+            ...failedEmailLeads.map(({ lead, reason }) =>
+                this.persistSyncMetadata(lead, config.listId, buildFailedMetadata(lead.syncMetadata, reason))
+            ),
+        ]);
 
         // ── Stage 4: deals (only if deal mappings configured) ──────────────────
         if (dealMappings.length > 0 && succeededEmailLeads.length > 0) {
-            await this.pushDealsBatched(svc, succeededEmailLeads, contactIdByLead, config, result);
+            // A lead's contact synced but its deal failed is NOT a clean success:
+            // demote it from success → error so successCount + errorCount still
+            // equals the leads attempted (pushDealsBatched records the error +
+            // collects the lead here). Counts each lead exactly once.
+            const dealFailedLeads = new Set<any>();
+            await this.pushDealsBatched(svc, succeededEmailLeads, contactIdByLead, config, result, dealFailedLeads);
+            for (const lead of dealFailedLeads) {
+                result.successCount--;
+                if (isNewByLead.get(lead)) result.newCount--; else result.updatedCount--;
+            }
         }
 
         // ── Stage 5: email-less leads via per-lead path ────────────────────────
@@ -444,11 +492,79 @@ export class HubspotAdapter implements CrmAdapter {
     }
 
     /**
+     * Upsert one contact batch, but instead of letting an invalid-email 400 fall
+     * through to expensive binary-split bisection, parse the offending emails out
+     * of HubSpot's error, drop them, and retry the remainder in a single call.
+     * HubSpot lists every invalid email per 400, so this normally resolves in one
+     * extra call; the loop guards against partial reporting and the no-shrink
+     * check prevents any spin. Non-invalid-email failures rethrow so splitAndRetry
+     * still bisects them. Dropped emails are recorded in `invalidEmails`.
+     */
+    private async upsertBatchDroppingInvalid(
+        svc: HubSpotService,
+        batch: Array<{ email: string; properties: Record<string, string> }>,
+        contactResults: Map<string, { email: string; contactId: string; isNew: boolean }>,
+        invalidEmails: string[],
+    ): Promise<void> {
+        let current = batch;
+        for (;;) {
+            try {
+                const res = await svc.batchUpsertContacts(current);
+                for (const r of res) contactResults.set(r.email, r);
+                return;
+            } catch (err: any) {
+                const invalid = this.extractInvalidEmails(err);
+                if (invalid.length === 0) throw err; // not an invalid-email failure → bisect
+                const invalidSet = new Set(invalid);
+                const before = current.length;
+                current = current.filter(i => !invalidSet.has(i.email.toLowerCase()));
+                // Record only those actually present in this batch.
+                for (const i of batch) {
+                    if (invalidSet.has(i.email.toLowerCase()) && !invalidEmails.includes(i.email)) {
+                        invalidEmails.push(i.email);
+                    }
+                }
+                if (current.length === before) throw err; // couldn't drop any → bisect
+                if (current.length === 0) return;          // nothing left to send
+                // loop: retry the cleaned batch
+            }
+        }
+    }
+
+    /**
+     * Extract the email addresses HubSpot flagged as invalid from a 400 batch
+     * error. HubSpot embeds them as "Email address <x> is invalid" in the error
+     * body; we scan the stringified body so we catch them regardless of nesting.
+     */
+    private extractInvalidEmails(error: any): string[] {
+        if (error?.response?.status !== 400) return [];
+        const data = error.response.data;
+        const blob = typeof data === 'string' ? data : JSON.stringify(data ?? '');
+        const emails = new Set<string>();
+        const re = /Email address (\S+) is invalid/gi;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(blob)) !== null) emails.add(m[1].toLowerCase());
+        return [...emails];
+    }
+
+    /**
+     * A deal update that fails because the deal no longer exists surfaces either
+     * as a top-level 404 (whole-batch throw) or a 207 Multi-Status per-record
+     * OBJECT_NOT_FOUND (HubSpot's partial-failure shape, isolated to size 1 by
+     * splitAndRetry). Both mean the same thing: recreate the deal.
+     */
+    private isDealNotFoundError(error: any): boolean {
+        if (error?.response?.status === 404) return true;
+        const errs = error?.response?.data?.errors;
+        return Array.isArray(errs) && errs.some((e: any) => /NOT_FOUND/i.test(e?.category || ''));
+    }
+
+    /**
      * Deal stage of the batched push. Partitions succeeded leads into deal
      * updates (existing hubspot_deal_id) and creates, runs each through the batch
-     * APIs via splitAndRetry, reclassifies 404 updates into creates (the deal was
-     * deleted in HubSpot — mirrors the per-lead fallback), associates created
-     * deals, and writes back hubspot_deal_id.
+     * APIs via splitAndRetry, reclassifies not-found updates into creates (the
+     * deal was deleted in HubSpot — mirrors the per-lead fallback), associates
+     * created deals, and writes back hubspot_deal_id.
      */
     private async pushDealsBatched(
         svc: HubSpotService,
@@ -456,6 +572,7 @@ export class HubspotAdapter implements CrmAdapter {
         contactIdByLead: Map<any, string>,
         config: ExternalCrmSyncConfig,
         result: SyncResult,
+        dealFailedLeads: Set<any>,
     ): Promise<void> {
         interface UpdateItem { lead: any; dealId: string; properties: Record<string, string>; }
         interface CreateItem { lead: any; contactId: string; traceId: string; properties: Record<string, string>; }
@@ -490,11 +607,10 @@ export class HubspotAdapter implements CrmAdapter {
             const updateOutcome = await splitAndRetry(
                 updateSet,
                 (batch) => svc.batchUpdateDeals(batch.map(x => ({ dealId: x.dealId, properties: x.properties }))),
-                { maxBatchSize: 100 },
+                { maxBatchSize: 100, concurrency: PUSH_BATCH_CONCURRENCY },
             );
             for (const f of updateOutcome.failed) {
-                const status = (f.error as any)?.response?.status;
-                if (status === 404) {
+                if (this.isDealNotFoundError(f.error)) {
                     // Deal was deleted in HubSpot — recreate it (mirror per-lead fallback).
                     const item = f.item;
                     recreatedLeads.add(item.lead);
@@ -510,6 +626,7 @@ export class HubspotAdapter implements CrmAdapter {
                 } else {
                     result.errorCount++;
                     result.errors.push(`${f.item.lead.email || f.item.lead.leadId}: ${this.formatError(f.error)}`);
+                    dealFailedLeads.add(f.item.lead);
                 }
             }
         }
@@ -523,15 +640,23 @@ export class HubspotAdapter implements CrmAdapter {
                     const res = await svc.batchCreateDeals(batch.map(x => ({ traceId: x.traceId, properties: x.properties })));
                     for (const r of res) dealIdByTrace.set(r.traceId, r.dealId);
                 },
-                { maxBatchSize: 100 },
+                { maxBatchSize: 100, concurrency: PUSH_BATCH_CONCURRENCY },
             );
             for (const f of createOutcome.failed) {
                 result.errorCount++;
                 result.errors.push(`${f.item.lead.email || f.item.lead.leadId}: ${this.formatError(f.error)}`);
+                dealFailedLeads.add(f.item.lead);
             }
         }
 
         // ── Associate created deals to their contacts ──────────────────────────
+        // Map each created deal back to its lead so an association failure can
+        // demote the right lead.
+        const leadByDealId = new Map<string, any>();
+        for (const item of createSet) {
+            const dealId = dealIdByTrace.get(item.traceId);
+            if (dealId) leadByDealId.set(dealId, item.lead);
+        }
         const pairs = createSet
             .filter(item => dealIdByTrace.has(item.traceId))
             .map(item => ({ contactId: item.contactId, dealId: dealIdByTrace.get(item.traceId)! }));
@@ -539,11 +664,13 @@ export class HubspotAdapter implements CrmAdapter {
             const assocOutcome = await splitAndRetry(
                 pairs,
                 (batch) => svc.batchAssociateContactsToDeals(batch),
-                { maxBatchSize: 100 },
+                { maxBatchSize: 100, concurrency: PUSH_BATCH_CONCURRENCY },
             );
             for (const f of assocOutcome.failed) {
                 result.errorCount++;
                 result.errors.push(`deal ${f.item.dealId}: ${this.formatError(f.error)}`);
+                const lead = leadByDealId.get(f.item.dealId);
+                if (lead) dealFailedLeads.add(lead);
             }
         }
 
@@ -582,12 +709,27 @@ export class HubspotAdapter implements CrmAdapter {
         return { lead, contactId, traceId: lead.leadId, properties: propsWithName };
     }
 
+    /**
+     * Persist a syncMetadata map for a lead AND update the in-memory lead so
+     * later writebacks in the SAME push spread the latest value instead of a
+     * stale snapshot (updateLead replaces the whole map). Non-critical: logs on
+     * failure, never throws.
+     */
+    private async persistSyncMetadata(lead: any, listId: string, meta: Record<string, any>): Promise<void> {
+        lead.syncMetadata = meta;
+        await crmDb.updateLead(lead.listId || listId, lead.leadId, { syncMetadata: meta })
+            .catch((err: any) => {
+                console.error(`[HubspotAdapter] failed to persist syncMetadata for ${lead.email || lead.leadId}: ${this.formatError(err)}`);
+            });
+    }
+
     /** Persists hubspot_deal_id back to our DB (non-critical, logs on failure). */
     private writebackDealId(lead: any, dealId: string, config: ExternalCrmSyncConfig): Promise<any> {
-        return crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
-            syncMetadata: { ...(lead.syncMetadata || {}), hubspot_deal_id: dealId },
-        }).catch((err: any) => {
-            console.error(`[HubspotAdapter] failed to persist hubspot_deal_id for lead=${lead.email || lead.leadId}: ${this.formatError(err)}`);
+        // Merge onto the latest in-memory syncMetadata (set by Stage 3's synced
+        // writeback) so we don't clobber hubspot_contact_id / syncStatus.
+        return this.persistSyncMetadata(lead, config.listId, {
+            ...(lead.syncMetadata || {}),
+            hubspot_deal_id: dealId,
         });
     }
 
@@ -827,7 +969,16 @@ export class HubspotAdapter implements CrmAdapter {
         const stageValue = dealProps.dealstage;
         if (!stageValue) return dealProps;
 
-        const mappedStageValue = config.hubspotDealStageMap?.[stageValue] || stageValue;
+        const mappedStageValue = config.hubspotDealStageMap?.[stageValue];
+        if (mappedStageValue === undefined) {
+            // No mapping for this AgentWeb status → DON'T send the raw value as a
+            // dealstage; HubSpot rejects unknown stages with INVALID_OPTION and
+            // fails the whole deal. Omit it so the deal syncs on the pipeline's
+            // default stage instead.
+            const { dealstage, ...rest } = dealProps;
+            console.log(`[HubspotAdapter] no dealstage mapping for status "${stageValue}", omitting dealstage for lead=${lead.email || lead.leadId}`);
+            return rest;
+        }
         if (mappedStageValue !== stageValue) {
             console.log(
                 `[HubspotAdapter] mapped AgentWeb status "${stageValue}" to HubSpot dealstage "${mappedStageValue}" for lead=${lead.email || lead.leadId}`
