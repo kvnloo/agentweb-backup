@@ -832,5 +832,17 @@ describe('AgentModeService - generate_image function', () => {
       expect(cost('gemini-3.1-flash-image')).toBe(0.039);
       expect(cost('gemini-3.1-flash-image-preview')).toBe(0.039);
     });
+
+    it('text-to-image fallback returns gpt-image-2 and never references the legacy preview id', () => {
+      const fb = (agentModeService as any).getImageGenerationFallbackModel.bind(agentModeService);
+      // No model specified + fresh text-to-image → fallback used (gpt-image-2).
+      expect(fb(undefined, [], undefined)).toBe('gpt-image-2');
+      // The legacy preview id must never be the fallback (regression guard for the 2249 swap).
+      expect(fb(undefined, [], undefined)).not.toBe('gemini-3.1-flash-image-preview');
+      // No fallback when the caller picked a model, or when editing / compositing a logo.
+      expect(fb('gemini-3.1-flash-image', [], undefined)).toBeUndefined();
+      expect(fb(undefined, ['https://x/a.png'], undefined)).toBeUndefined();
+      expect(fb(undefined, [], 'https://x/logo.png')).toBeUndefined();
+    });
   });
 });
