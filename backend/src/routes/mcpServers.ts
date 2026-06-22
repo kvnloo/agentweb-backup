@@ -292,8 +292,15 @@ router.put("/:name", async (req, res) => {
       ...((excludeFromAgent !== undefined ? excludeFromAgent : servers[serverIndex].excludeFromAgent) === true
         && { excludeFromAgent: true }),
       discoveredTools: servers[serverIndex].discoveredTools,
-      // Preserve OAuth state across edits — the rebuild above would otherwise drop it.
-      ...(effectiveTransport !== 'stdio' && servers[serverIndex].authType && { authType: servers[serverIndex].authType }),
+      // Recompute authType from the edited token so the badge isn't stale: an OAuth server
+      // stays 'oauth' (its tokens live in the oauth* fields, not accessToken); otherwise it's
+      // 'bearer' when a token is present (new value if supplied, else the existing one) or
+      // 'none' when cleared. The OAuth blobs themselves are preserved on the lines below.
+      ...(effectiveTransport !== 'stdio' && (() => {
+        if (servers[serverIndex].authType === 'oauth') return { authType: 'oauth' as const };
+        const effectiveToken = accessToken !== undefined ? accessToken : servers[serverIndex].accessToken;
+        return { authType: effectiveToken ? ('bearer' as const) : ('none' as const) };
+      })()),
       ...(effectiveTransport !== 'stdio' && servers[serverIndex].oauthClientInfo && { oauthClientInfo: servers[serverIndex].oauthClientInfo }),
       ...(effectiveTransport !== 'stdio' && servers[serverIndex].oauthTokens && { oauthTokens: servers[serverIndex].oauthTokens }),
       ...(effectiveTransport !== 'stdio' && servers[serverIndex].oauthExpiresAt && { oauthExpiresAt: servers[serverIndex].oauthExpiresAt }),
@@ -522,10 +529,11 @@ router.post("/:name/oauth/initiate", async (req, res) => {
       await Promise.race([connectPromise, timeoutPromise]);
 
       // Connected without needing an interactive OAuth redirect.
-      await client.close().catch(() => {});
       return res.json({ authorizationRequired: false, connected: true });
     } catch (err: any) {
       // If the OAuth flow produced an authorization URL, the server requires login.
+      // The authorizationUrl/state are already captured on the provider; the interactive
+      // flow finishes via a separate callback with a fresh transport, so closing here is safe.
       if (provider.authorizationUrl) {
         return res.json({
           authorizationRequired: true,
@@ -537,6 +545,10 @@ router.post("/:name/oauth/initiate", async (req, res) => {
       return res.status(502).json({
         message: `Failed to connect to MCP server: ${err?.message || "Connection failed"}`,
       });
+    } finally {
+      // Always release the client + its underlying transport (EventSource). Without this,
+      // the common "authorization required" and error paths leak an open connection.
+      await client.close().catch(() => {});
     }
   } catch (error) {
     console.error("Error in oauth/initiate endpoint:", error);

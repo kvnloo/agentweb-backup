@@ -262,6 +262,38 @@ describe('VideoService', () => {
       expect(result.error).toMatch(/Seedance.*failed/i);
     });
 
+    // M2: Seedance already succeeded (paid). A transient S3 upload blip must NOT discard
+    // the paid clip and trigger a full Veo regen — retry the download/upload instead.
+    it('retries a transient S3 upload failure instead of falling back to Veo (no double spend)', async () => {
+      routeTools();
+      mockedUpload
+        .mockResolvedValueOnce({ success: false, error: 'transient S3 error' })
+        .mockResolvedValueOnce({ success: true, url: 'https://s3.example.com/retried.mp4' });
+      const veoSpy = jest.spyOn(videoService as any, 'generateWithVeo31');
+
+      const result = await videoService.generateVideo({ ...baseParams });
+
+      expect(result.success).toBe(true);
+      expect(result.videoUrl).toBe('https://s3.example.com/retried.mp4');
+      expect(mockedUpload).toHaveBeenCalledTimes(2); // first failed, retry succeeded
+      expect(veoSpy).not.toHaveBeenCalled();          // paid Seedance clip reused, not regenerated
+      veoSpy.mockRestore();
+    });
+
+    it('falls back to Veo only after the upload retries are exhausted', async () => {
+      routeTools();
+      mockedUpload.mockResolvedValue({ success: false, error: 'S3 down' });
+      const veoSpy = jest.spyOn(videoService as any, 'generateWithVeo31')
+        .mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/veo.mp4', filename: 'promo.mp4' });
+
+      const result = await videoService.generateVideo({ ...baseParams });
+
+      expect(mockedUpload.mock.calls.length).toBeGreaterThanOrEqual(3); // retried before giving up
+      expect(veoSpy).toHaveBeenCalledTimes(1);
+      expect(result.videoUrl).toBe('https://s3.example.com/veo.mp4');
+      veoSpy.mockRestore();
+    });
+
     it('defaults to Seedance 2.0 (MCP) when no videoModel is specified', async () => {
       routeTools();
       const result = await videoService.generateVideo({ prompt: 'a sunrise', filename: 'd.mp4', userId: 'u' });
@@ -325,6 +357,48 @@ describe('VideoService', () => {
       expect(veoSpy).toHaveBeenCalledTimes(1); // Veo tried exactly once — no re-entry into Seedance
       expect(result.success).toBe(false);
       veoSpy.mockRestore();
+    });
+  });
+
+  // H1: a branded Seedance video >8s is ONE real clip of the full length. The compose
+  // call must place it at its true duration, not the Veo per-8s-clip split — otherwise
+  // Remotion renders only the first 8s and the rest of the paid clip is discarded.
+  describe('branded Seedance composition (H1)', () => {
+    const mockedCompose = remotionService.compose as jest.Mock;
+    const VIDEO_URL = 'https://video.higgsfield.ai/job-1.mp4';
+
+    beforeEach(() => {
+      jest.spyOn(global, 'setTimeout').mockImplementation(((cb: any) => { cb(); return 0 as any; }) as any);
+      mockedUpload.mockResolvedValue({ success: true, url: 'https://s3.example.com/raw.mp4' });
+      mockedAxios.get.mockResolvedValue({ data: Buffer.from('x') } as any);
+      mockCallTool.mockImplementation(async (tool: string) => {
+        if (tool === 'generate_video') return { structuredContent: { results: [{ id: 'job-1', status: 'queued', results: {} }] } };
+        if (tool === 'job_status') return { structuredContent: { generation: { id: 'job-1', status: 'completed', results: { rawUrl: VIDEO_URL, minUrl: VIDEO_URL } } } };
+        return {};
+      });
+      mockedCompose.mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/branded.mp4', filename: 'promo.mp4' });
+    });
+
+    afterEach(() => jest.restoreAllMocks());
+
+    it('composes the single full-length Seedance clip at its true duration (not the Veo [8,6] split)', async () => {
+      const result = await videoService.generateVideo({
+        prompt: 'x', filename: 'promo.mp4', userId: 'u', videoModel: 'seedance-2.0',
+        durationSeconds: 14,
+        compose: true,
+        composeParams: { brandName: 'Acme', primaryColor: '#111111', secondaryColor: '#222222' },
+      });
+
+      expect(mockedCompose).toHaveBeenCalledTimes(1);
+      const arg = mockedCompose.mock.calls[0][0];
+      // ONE clip, no Veo-style extras, full 14s playback — NOT [8,6]
+      expect(arg.clipUrl).toBe('https://s3.example.com/raw.mp4'); // Seedance clip after S3 upload
+      expect(arg.extraClipUrls ?? []).toEqual([]);
+      expect(arg.clipDurationsSeconds).toEqual([14]);
+      // Seedance clips can be up to 15s, so the 8s Veo clamp must not apply here.
+      expect(arg.maxClipSeconds).toBe(15);
+      expect(result.success).toBe(true);
+      expect(result.videoUrl).toBe('https://s3.example.com/branded.mp4');
     });
   });
 

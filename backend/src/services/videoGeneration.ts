@@ -625,21 +625,35 @@ export class VideoService {
     filename: string,
     userId: string
   ): Promise<{ success: boolean; url?: string; error?: string }> {
-    try {
-      const downloadResponse = await axios.get(videoUrl, {
-        responseType: "arraybuffer",
-        timeout: 300000, // 5 minutes for large video downloads
-      });
-      const buffer = Buffer.from(downloadResponse.data as ArrayBuffer);
-      const uploadResult = await uploadFileToS3(buffer, filename, userId, "video/mp4");
-      if (uploadResult.success && uploadResult.url) {
-        return { success: true, url: uploadResult.url };
+    // The source clip is already generated (and, for Seedance, already PAID for) by the
+    // time we get here. A transient download/S3 hiccup must not bubble up as a generation
+    // failure — that would trigger a full Veo regen and double-charge. Retry a few times
+    // with backoff so only a persistent failure surfaces.
+    const MAX_ATTEMPTS = 3;
+    let lastError = "Failed to download video to S3";
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        const downloadResponse = await axios.get(videoUrl, {
+          responseType: "arraybuffer",
+          timeout: 300000, // 5 minutes for large video downloads
+        });
+        const buffer = Buffer.from(downloadResponse.data as ArrayBuffer);
+        const uploadResult = await uploadFileToS3(buffer, filename, userId, "video/mp4");
+        if (uploadResult.success && uploadResult.url) {
+          return { success: true, url: uploadResult.url };
+        }
+        lastError = uploadResult.error || "Failed to upload video to S3";
+      } catch (error: any) {
+        lastError = `Failed to download video: ${error.message}`;
+        console.error(`❌ Failed to download and upload video from URL (attempt ${attempt}/${MAX_ATTEMPTS}):`, error.message);
       }
-      return { success: false, error: uploadResult.error || "Failed to upload video to S3" };
-    } catch (error: any) {
-      console.error("❌ Failed to download and upload video from URL:", error.message);
-      return { success: false, error: `Failed to download video: ${error.message}` };
+      if (attempt < MAX_ATTEMPTS) {
+        console.warn(`VideoService: download/upload attempt ${attempt}/${MAX_ATTEMPTS} failed (${lastError}); retrying`);
+        await new Promise((resolve) => setTimeout(resolve, 1000 * attempt)); // 1s, 2s backoff
+      }
     }
+    console.error(`❌ Download/upload to S3 failed after ${MAX_ATTEMPTS} attempts: ${lastError}`);
+    return { success: false, error: lastError };
   }
 
   /**
@@ -965,6 +979,11 @@ export class VideoService {
       let result: VideoGenerationResult;
       try {
         let clipUrls: string[] = [];
+        // Per-clip playback durations + the max-clip cap passed to Remotion.
+        // Default to the Veo per-8s-clip model; Seedance overrides both below since it
+        // returns ONE clip of the full (≤15s) length.
+        let composeClipDurations: number[] = clipPlaybackDurations;
+        let composeMaxClipSeconds = VEO_MAX_SECONDS;
 
         if (isHiggsfieldModel(modelToUse)) {
           // Seedance (Higgsfield MCP) generates a single clip per request and handles its
@@ -980,6 +999,11 @@ export class VideoService {
           }
           if (result.videoUrl) {
             clipUrls = [result.videoUrl];
+            // ONE real clip of the full requested length (clamped to Seedance's range).
+            // Override the Veo [8,6]-style split so compose renders all paid seconds,
+            // and lift the 8s clip cap to Seedance's 15s max.
+            composeClipDurations = [budgetSeconds(requestedDuration)];
+            composeMaxClipSeconds = SEEDANCE_MAX_DURATION;
           }
         } else if (modelToUse === "veo-3.1-generate-preview") {
           if (clipCount === 1) {
@@ -1041,8 +1065,10 @@ export class VideoService {
             clipUrl: clipUrls[0],
             extraClipUrls: clipUrls.slice(1),
             // Pass per-clip playback durations so Remotion places each clip exactly
-            // (e.g. [8,8,8,6] for a 30s video — last clip plays only 6s of its 8s footage)
-            clipDurationsSeconds: clipPlaybackDurations,
+            // (e.g. [8,8,8,6] for a 30s Veo video; [14] for a single 14s Seedance clip)
+            clipDurationsSeconds: composeClipDurations,
+            // Max single-clip length (Veo=8s, Seedance=15s) so Remotion's clamp matches the provider
+            maxClipSeconds: composeMaxClipSeconds,
             filename: params.filename,
             userId: params.userId,
           });

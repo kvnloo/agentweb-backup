@@ -355,6 +355,8 @@ export class McpClientService {
     this.cleanupInterval = setInterval(() => {
       this.cleanupStaleSessions();
     }, this.SESSION_TIMEOUT_MS);
+    // Don't let this periodic timer keep the process (or a test run) alive on its own.
+    this.cleanupInterval.unref?.();
   }
 
   /**
@@ -1268,11 +1270,12 @@ export class McpClientService {
       { capabilities: {} }
     );
 
+    let connectTimer: NodeJS.Timeout | undefined;
     try {
       const connectPromise = client.connect(transport);
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("MCP connection timeout")), 60000)
-      );
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        connectTimer = setTimeout(() => reject(new Error("MCP connection timeout")), 60000);
+      });
       await Promise.race([connectPromise, timeoutPromise]);
 
       return await client.callTool(
@@ -1281,6 +1284,7 @@ export class McpClientService {
         { timeout: options?.timeoutMs ?? 3600000 }
       );
     } finally {
+      if (connectTimer) clearTimeout(connectTimer); // don't leave a 60s timer pending on success
       await client.close().catch(() => {});
     }
   }
@@ -1308,12 +1312,14 @@ export class McpClientService {
       { capabilities: {} }
     );
 
+    let connectTimer: NodeJS.Timeout | undefined;
     try {
       const connectPromise = client.connect(transport);
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("MCP connection timeout")), 60000)
-      );
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        connectTimer = setTimeout(() => reject(new Error("MCP connection timeout")), 60000);
+      });
       await Promise.race([connectPromise, timeoutPromise]);
+      if (connectTimer) clearTimeout(connectTimer); // connected — cancel the pending timeout
 
       // Hard-abort wrapper: a half-aborted streamable-HTTP stream can leave the
       // SDK's callTool pending past its own `timeout`, hanging until the caller's
@@ -1344,6 +1350,7 @@ export class McpClientService {
 
       return await fn(callTool);
     } finally {
+      if (connectTimer) clearTimeout(connectTimer); // also covers the connect-throw path
       await client.close().catch(() => {});
     }
   }

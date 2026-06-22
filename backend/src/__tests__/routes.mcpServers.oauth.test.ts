@@ -133,7 +133,7 @@ describe("PUT /api/admin/mcp-servers/:name — OAuth field preservation", () => 
     expect(stored.oauthHasRefreshToken).toBe(true);
   });
 
-  it("does not inject authType/oauth fields when editing a legacy server", async () => {
+  it("recomputes authType to 'none' for a legacy token-less server (no oauth fields injected)", async () => {
     store.set(
       "mcp_servers",
       JSON.stringify([{ name: "legacy", transport: "streamable-http", url: "https://old/mcp" }])
@@ -143,9 +143,23 @@ describe("PUT /api/admin/mcp-servers/:name — OAuth field preservation", () => 
       .send({ url: "https://new/mcp" });
     expect(res.status).toBe(200);
     const stored = readStored()[0];
-    expect(stored.authType).toBeUndefined();
+    // No token → 'none' (accurate badge), and no OAuth blobs fabricated.
+    expect(stored.authType).toBe("none");
     expect(stored.oauthClientInfo).toBeUndefined();
     expect(stored.oauthTokens).toBeUndefined();
+  });
+
+  it("recomputes authType to 'bearer' when an access token is added via edit", async () => {
+    store.set(
+      "mcp_servers",
+      JSON.stringify([{ name: "legacy", transport: "streamable-http", url: "https://old/mcp" }])
+    );
+    const res = await request(app)
+      .put("/api/admin/mcp-servers/legacy")
+      .send({ url: "https://new/mcp", accessToken: "plaintext-secret" });
+    expect(res.status).toBe(200);
+    const stored = readStored()[0];
+    expect(stored.authType).toBe("bearer");
   });
 });
 

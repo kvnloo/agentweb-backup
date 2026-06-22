@@ -45,6 +45,12 @@ export interface RemotionComposeParams {
    * trim guard (e.g. exactly 30s when clips sum to 30s anyway).
    */
   targetDurationSeconds?: number;
+  /**
+   * Maximum length (seconds) of a single source clip, used to clamp stale/incorrect
+   * per-clip durations. Defaults to 8 (Veo clip cap). Seedance returns one clip up to
+   * 15s, so callers pass 15 there to avoid truncating the paid clip to 8s.
+   */
+  maxClipSeconds?: number;
   /** Optional S3 URL of an MP3 voiceover to overlay on the composed video */
   audioUrl?: string;
   /** Voiceover volume (0.0–1.0, default 1.0) */
@@ -210,11 +216,13 @@ export class RemotionService {
       const clipCount = allClipUrls.length;
 
       // Resolve per-clip durations (seconds). Variable lengths take priority over uniform.
-      const MAX_VEO_CLIP_SECONDS = 8;
-      const uniformSeconds = Math.min((params.clipDurationSeconds || MAX_VEO_CLIP_SECONDS), MAX_VEO_CLIP_SECONDS);
+      // Default cap is 8s (Veo per-clip max). Seedance produces one clip up to 15s and
+      // passes maxClipSeconds=15 so the full paid clip isn't truncated to 8s.
+      const maxClipSeconds = params.maxClipSeconds ?? 8;
+      const uniformSeconds = Math.min((params.clipDurationSeconds || maxClipSeconds), maxClipSeconds);
       const perClipSeconds: number[] = allClipUrls.map((_, i) =>
         params.clipDurationsSeconds?.[i] != null
-          ? Math.min(params.clipDurationsSeconds[i], MAX_VEO_CLIP_SECONDS)
+          ? Math.min(params.clipDurationsSeconds[i], maxClipSeconds)
           : uniformSeconds
       );
 

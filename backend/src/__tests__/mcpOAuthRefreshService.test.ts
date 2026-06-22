@@ -32,6 +32,9 @@ import { getServerConfig } from "../mcp/client/mcpOAuthClientProvider";
 let mockServer: http.Server;
 let mockBase: string;
 let tokenCalls = 0;
+// When true, the mock /token endpoint rejects the refresh (simulates a rotated/expired
+// refresh_token) so the failure path can be exercised.
+let tokenFailMode = false;
 
 const buildMockAuthServer = (): Promise<void> =>
   new Promise((resolve) => {
@@ -55,6 +58,9 @@ const buildMockAuthServer = (): Promise<void> =>
     );
     app.post("/token", (_req, res) => {
       tokenCalls++;
+      if (tokenFailMode) {
+        return res.status(400).json({ error: "invalid_grant", error_description: "refresh token expired" });
+      }
       res.json({
         access_token: "refreshed-access-token",
         token_type: "Bearer",
@@ -101,6 +107,7 @@ afterAll((done) => {
 });
 beforeEach(() => {
   tokenCalls = 0;
+  tokenFailMode = false;
 });
 
 describe("refreshExpiringOAuthTokens", () => {
@@ -136,6 +143,31 @@ describe("refreshExpiringOAuthTokens", () => {
     const result = await refreshExpiringOAuthTokens(now);
     expect(result.refreshed).toEqual([]);
     expect(tokenCalls).toBe(0);
+  });
+
+  it("marks a server as failed (needs re-auth) when the refresh token is rejected", async () => {
+    const now = Date.now();
+    seedServer({ oauthExpiresAt: now + 60 * 1000 }); // due
+    tokenFailMode = true; // /token returns 400 invalid_grant
+
+    const result = await refreshExpiringOAuthTokens(now);
+
+    expect(result.refreshed).toEqual([]);
+    expect(result.failed).toEqual(["oauthsrv"]);
+    expect(tokenCalls).toBeGreaterThanOrEqual(1);
+    // The valid stored tokens are NOT overwritten by a failed refresh.
+    const server = await getServerConfig("oauthsrv");
+    const persisted = JSON.parse(decryptPassword(server!.oauthTokens!).password);
+    expect(persisted.access_token).toBe("old");
+  });
+
+  it("returns empty (no throw) when the server list cannot be loaded", async () => {
+    const getSetting = require("../services/settingsService").settingsService.getSetting as jest.Mock;
+    getSetting.mockRejectedValueOnce(new Error("dynamo down"));
+
+    const result = await refreshExpiringOAuthTokens(Date.now());
+
+    expect(result).toEqual({ refreshed: [], failed: [] });
   });
 
   it("ignores non-oauth servers entirely", async () => {

@@ -27,6 +27,7 @@ import {
   Tooltip,
   Switch,
   FormControlLabel,
+  Backdrop,
 } from "@mui/material";
 import {
   Add as AddIcon,
@@ -145,14 +146,12 @@ const OAuthCountdown: React.FC<{ expiresAt: number; canRefresh?: boolean; now: n
     short = "Refreshing…";
     full = "Refreshing token…";
     color = "warning";
-  } else if (canRefresh) {
+  } else {
+    // Reached only when the token is at/just past expiry but a refresh is still possible
+    // (canRefresh is necessarily true here — the !canRefresh+expired case is handled above).
     short = "Refreshing…";
     full = "Refreshing token…";
     color = "warning";
-  } else {
-    short = "Expired";
-    full = "Token expired — click the key icon to re-authorize";
-    color = "error";
   }
 
   return (
@@ -216,6 +215,9 @@ const McpServersTab: React.FC = () => {
   const [expandedServer, setExpandedServer] = useState<string | null>(null);
   // OAuth authorization state (server name currently being authorized)
   const [authorizingServer, setAuthorizingServer] = useState<string | null>(null);
+  // Server name we're currently contacting to start OAuth (initiate round-trip). Drives a
+  // blocking loader because the backend connection can take a few seconds before the popup opens.
+  const [oauthConnecting, setOauthConnecting] = useState<string | null>(null);
   // Ticking clock that drives the live OAuth countdowns.
   const [now, setNow] = useState<number>(() => Date.now());
 
@@ -252,11 +254,20 @@ const McpServersTab: React.FC = () => {
   // Asks the backend whether the server needs OAuth; if so, runs the popup flow.
   // Returns skipped:true when the server connects without interactive auth.
   const runOAuthFlow = async (serverName: string): Promise<OAuthFlowResult> => {
-    const response = await axios.post(
-      buildApiUrl(`/api/admin/mcp-servers/${encodeURIComponent(serverName)}/oauth/initiate`),
-      {},
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
+    // Show a loader while the backend connects to the server to start OAuth — this
+    // initiate round-trip is the delay before the popup opens. Cleared once we have a
+    // response (popup opens immediately after, or the server skipped interactive auth).
+    setOauthConnecting(serverName);
+    let response;
+    try {
+      response = await axios.post(
+        buildApiUrl(`/api/admin/mcp-servers/${encodeURIComponent(serverName)}/oauth/initiate`),
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+    } finally {
+      setOauthConnecting(null);
+    }
     if (!response.data?.authorizationRequired) {
       return { ok: true, skipped: true };
     }
@@ -310,10 +321,12 @@ const McpServersTab: React.FC = () => {
   }, []);
 
   // Silently re-fetch servers periodically so refreshed token expiries show up.
+  // Depend on token so the interval re-binds to the current token (a stale closure would
+  // keep polling with the token captured at mount after re-auth / delegation).
   useEffect(() => {
     const id = setInterval(() => loadServers(true), SERVER_POLL_MS);
     return () => clearInterval(id);
-  }, []);
+  }, [token]);
 
   const loadServers = async (silent = false) => {
     try {
@@ -583,6 +596,14 @@ const McpServersTab: React.FC = () => {
 
   return (
     <Box>
+      {/* Blocking loader while we contact the server to start OAuth (initiate round-trip),
+          so the gap before the login popup opens isn't a dead click. */}
+      <Backdrop open={!!oauthConnecting} sx={{ color: "#fff", zIndex: (theme) => theme.zIndex.modal + 1, backdropFilter: "blur(4px)", backgroundColor: "rgba(0,0,0,0.4)" }}>
+        <Box display="flex" flexDirection="column" alignItems="center" gap={2}>
+          <CircularProgress color="inherit" />
+          <Typography>Connecting to {oauthConnecting} for authorization…</Typography>
+        </Box>
+      </Backdrop>
       <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
         <Typography variant="h6">MCP Servers</Typography>
         <Box>
