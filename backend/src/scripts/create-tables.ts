@@ -2162,6 +2162,29 @@ const createLoopDispatchesTable = async () => {
   }
 };
 
+const createHumanEvalQueueTable = async () => {
+  const params = {
+    TableName: `${TABLE_PREFIX}AW-HumanEvalQueue`,
+    KeySchema: [
+      { AttributeName: 'candidateId', KeyType: 'HASH' },
+    ],
+    AttributeDefinitions: [
+      { AttributeName: 'candidateId', AttributeType: 'S' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log('Human eval queue table created:', result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log('Human eval queue table already exists');
+    } else {
+      throw error;
+    }
+  }
+};
+
 const main = async () => {
   try {
     console.log(`Creating tables for environment: ${process.env.NODE_ENV || 'production'}`);
@@ -2221,6 +2244,7 @@ const main = async () => {
     await createLoopEventsTable();
     await createLoopLearningTable();
     await createLoopDispatchesTable();
+    await createHumanEvalQueueTable();
     await createCharactersTable();
     await createCRMCompaniesTable();
     await createCodingAgentRunsTable();

@@ -859,12 +859,27 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
       // Skip messages that @mention Emma — those trigger an app_mention event that Emma handles
       // directly, so processing them here too would cause Emma to answer twice.
       if (event.type === 'message' && event.thread_ts && !event.bot_id && (!event.subtype || event.subtype === 'file_share')) {
-        const { text, user: slackUserId, channel, thread_ts: threadTs, files } = event;
+        const { text, user: slackUserId, channel, thread_ts: threadTs, ts: messageTs, files } = event;
 
         if (text) {
           const botId = await getEmmaBotUserId();
           if (botId && text.includes(`<@${botId}>`)) {
             console.log('📨 Skipping thread message handler for Emma @mention (app_mention handler will process):', { channel, threadTs, user: slackUserId });
+            return;
+          }
+        }
+
+        if (text) {
+          const { humanEvalService } = await import('../services/humanEvalService');
+          const handledHumanEvalReply = await humanEvalService.handleSlackThreadReply({
+            channel,
+            threadTs,
+            messageTs,
+            slackUserId,
+            text,
+          });
+          if (handledHumanEvalReply) {
+            console.log('🧪 [human-eval] captured Slack thread feedback:', { channel, threadTs, messageTs, slackUserId });
             return;
           }
         }

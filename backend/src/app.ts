@@ -87,6 +87,7 @@ import testAccountsRoutes from "./routes/testAccounts";
 import onboardingEventsRoutes from "./routes/onboardingEvents";
 import onboardingVariantsRoutes from "./routes/onboardingVariants";
 import loopEventsRoutes from "./routes/loopEvents";
+import humanEvalRoutes from "./routes/humanEval";
 import { registerAiEvalFunnelForProduction } from "./loops/instances/ai-eval-funnel";
 import { registerAiReadinessFunnel } from "./loops/instances/ai-readiness-funnel";
 import { registerAgentModeLoop } from "./loops/instances/agent-mode";
@@ -344,6 +345,7 @@ app.use("/api/test-accounts", testAccountsRoutes);
 app.use("/api/onboarding", onboardingEventsRoutes);
 app.use("/api/onboarding", onboardingVariantsRoutes);
 app.use("/api/loop-events", loopEventsRoutes);
+app.use("/api/human-eval", humanEvalRoutes);
 
 // Register closed-loop instances with production impls. The route handlers
 // look up loop manifests from LOOP_REGISTRY; the cron in server.ts invokes
