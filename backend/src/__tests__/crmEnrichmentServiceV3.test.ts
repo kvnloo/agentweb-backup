@@ -130,6 +130,32 @@ describe('runEnrichment — empty list', () => {
 // when set, paginated Query otherwise). The orchestrator's job is to pass it
 // through faithfully and process whatever the dep returns.
 
+describe('runEnrichment — listContext forwarding', () => {
+  it('forwards input.listContext into every resolveIdentity call', async () => {
+    const loadLeads = jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]);
+    const resolveIdentity = jest.fn().mockResolvedValue({ ok: true, resolved: {}, siblings: [] });
+    const deps = makeDeps({ loadLeads, resolveIdentity });
+
+    await runEnrichment(makeInput({ listContext: 'YC Poker Night — YC alumni' }), deps);
+
+    expect(resolveIdentity).toHaveBeenCalledWith(
+      expect.objectContaining({ listContext: 'YC Poker Night — YC alumni' }),
+    );
+  });
+
+  it('forwards listContext=undefined when not provided', async () => {
+    const loadLeads = jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]);
+    const resolveIdentity = jest.fn().mockResolvedValue({ ok: true, resolved: {}, siblings: [] });
+    const deps = makeDeps({ loadLeads, resolveIdentity });
+
+    await runEnrichment(makeInput(), deps);
+
+    expect(resolveIdentity).toHaveBeenCalledWith(
+      expect.objectContaining({ listContext: undefined }),
+    );
+  });
+});
+
 describe('runEnrichment — leadIds filter', () => {
   it('passes input.leadIds through to deps.loadLeads when set', async () => {
     const loadLeads = jest.fn().mockResolvedValue([

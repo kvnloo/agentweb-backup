@@ -5,6 +5,7 @@
 
 import { findLinkedInUrlImpl } from '../services/enrichmentV3RealDeps';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
+import { createLLMService } from '../utils/llmService';
 
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
@@ -13,6 +14,13 @@ jest.mock('../services/linkedInOutreachService', () => ({
     invalidateResolvedAccount: jest.fn(),
     clearStatusCache: jest.fn(),
   },
+}));
+
+// The name-only contextual-disambiguation path asks an LLM to pick among
+// same-name candidates. Mock it so tests control the choice deterministically.
+const mockGenerateJSONContent = jest.fn();
+jest.mock('../utils/llmService', () => ({
+  createLLMService: jest.fn(() => ({ generateJSONContent: mockGenerateJSONContent })),
 }));
 
 const svc = linkedInOutreachService as unknown as {
@@ -25,6 +33,7 @@ const svc = linkedInOutreachService as unknown as {
 beforeEach(() => {
   jest.clearAllMocks();
   svc.resolveAccountIdForEnrichment.mockResolvedValue('acct-1');
+  (createLLMService as jest.Mock).mockReturnValue({ generateJSONContent: mockGenerateJSONContent });
 });
 
 describe('findLinkedInUrlImpl — cache invalidation on error', () => {
@@ -70,5 +79,122 @@ describe('findLinkedInUrlImpl — cache invalidation on error', () => {
 
     expect(svc.invalidateResolvedAccount).not.toHaveBeenCalled();
     expect(svc.clearStatusCache).not.toHaveBeenCalled();
+  });
+});
+
+describe('findLinkedInUrlImpl — name-only keywords (never folds context into the query)', () => {
+  it('always searches with name-only keywords even when listContext is provided', async () => {
+    // Empirically, folding context into the keyword string collapses a name
+    // search to zero LinkedIn hits. Context must NEVER reach the query — it is
+    // only used to re-rank candidates after the fetch.
+    svc.searchPeople.mockResolvedValue({
+      items: [{ public_identifier: 'jane-doe-yc', first_name: 'Jane', last_name: 'Doe' }],
+    });
+
+    const url = await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', undefined, 'YC Poker Night');
+
+    // Single name-matched candidate → no LLM disambiguation needed, accepted directly.
+    expect(url).toBe('https://www.linkedin.com/in/jane-doe-yc');
+    expect(svc.searchPeople).toHaveBeenCalledWith(
+      'acct-1',
+      expect.objectContaining({ keywords: 'Jane Doe', company: undefined }),
+    );
+    expect(mockGenerateJSONContent).not.toHaveBeenCalled();
+  });
+
+  it('keeps keywords name-only and uses the company filter when company is present', async () => {
+    svc.searchPeople.mockResolvedValue({
+      items: [{ public_identifier: 'jane-acme', first_name: 'Jane', last_name: 'Doe' }],
+    });
+
+    await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', 'Acme', 'YC Poker Night');
+
+    expect(svc.searchPeople).toHaveBeenCalledWith(
+      'acct-1',
+      expect.objectContaining({ keywords: 'Jane Doe', company: 'Acme' }),
+    );
+  });
+
+  it('searches by name only when neither company nor listContext is provided', async () => {
+    svc.searchPeople.mockResolvedValue({
+      items: [{ public_identifier: 'jane-doe', first_name: 'Jane', last_name: 'Doe' }],
+    });
+
+    await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', undefined, undefined);
+
+    expect(svc.searchPeople).toHaveBeenCalledWith(
+      'acct-1',
+      expect.objectContaining({ keywords: 'Jane Doe', company: undefined }),
+    );
+  });
+});
+
+describe('findLinkedInUrlImpl — LLM context disambiguation among same-name candidates', () => {
+  const sameNameCandidates = {
+    items: [
+      { public_identifier: 'jane-wrong-1', name: 'Jane Doe', headline: 'Dentist' },
+      { public_identifier: 'jane-right', name: 'Jane Doe', headline: 'Founder at Y Combinator' },
+      { public_identifier: 'jane-wrong-2', name: 'Jane Doe', headline: 'Barista' },
+    ],
+  };
+
+  it('uses the LLM-chosen index when multiple same-name candidates exist and context is provided', async () => {
+    svc.searchPeople.mockResolvedValue(sameNameCandidates);
+    mockGenerateJSONContent.mockResolvedValue({ index: 1 });
+
+    const url = await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', undefined, 'YC alumni');
+
+    expect(url).toBe('https://www.linkedin.com/in/jane-right');
+    expect(mockGenerateJSONContent).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses (returns null) when the LLM declines with index -1', async () => {
+    svc.searchPeople.mockResolvedValue(sameNameCandidates);
+    mockGenerateJSONContent.mockResolvedValue({ index: -1 });
+
+    const url = await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', undefined, 'Acme Dentists');
+
+    expect(url).toBeNull();
+  });
+
+  it('refuses when the LLM returns an out-of-range index', async () => {
+    svc.searchPeople.mockResolvedValue(sameNameCandidates);
+    mockGenerateJSONContent.mockResolvedValue({ index: 99 });
+
+    const url = await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', undefined, 'YC alumni');
+
+    expect(url).toBeNull();
+  });
+
+  it('refuses when the LLM call throws (fail-soft, no wrong-person guess)', async () => {
+    svc.searchPeople.mockResolvedValue(sameNameCandidates);
+    mockGenerateJSONContent.mockRejectedValue(new Error('LLM down'));
+
+    const url = await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', undefined, 'YC alumni');
+
+    expect(url).toBeNull();
+  });
+
+  it('does NOT call the LLM when company is present (server-side filter already narrowed)', async () => {
+    svc.searchPeople.mockResolvedValue(sameNameCandidates);
+
+    const url = await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', 'Acme', 'YC alumni');
+
+    // First name-matched candidate is taken directly.
+    expect(url).toBe('https://www.linkedin.com/in/jane-wrong-1');
+    expect(mockGenerateJSONContent).not.toHaveBeenCalled();
+  });
+
+  it('rejects candidates whose name does not match before LLM disambiguation', async () => {
+    svc.searchPeople.mockResolvedValue({
+      items: [
+        { public_identifier: 'someone-else', name: 'John Smith', headline: 'Founder at Y Combinator' },
+      ],
+    });
+
+    const url = await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', undefined, 'YC alumni');
+
+    expect(url).toBeNull();
+    expect(mockGenerateJSONContent).not.toHaveBeenCalled();
   });
 });

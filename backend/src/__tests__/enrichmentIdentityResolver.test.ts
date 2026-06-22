@@ -88,6 +88,110 @@ describe('resolveIdentity — name-based path (no email / no linkedin)', () => {
   });
 });
 
+// ─── Name + list-context LinkedIn search (YC Poker Night bug) ─────────────────
+
+describe('resolveIdentity — name-only lead resolved via list-context LinkedIn search', () => {
+  it('fires Unipile LinkedIn search with name + listContext when company is unknown and company fields are requested', async () => {
+    // Repro of the YC Poker Night bug: a name-only lead (no email, no
+    // linkedin, no company) on a list described as "YC alumni" should fall
+    // back to a contextual LinkedIn search rather than failing identity
+    // resolution outright. The list context disambiguates a common name.
+    const findLinkedInUrl = jest
+      .fn()
+      .mockResolvedValue('https://www.linkedin.com/in/jane-doe-yc');
+    const apolloPeopleMatch = jest
+      .fn()
+      .mockResolvedValue({ company: 'Acme YC Co', website: 'acme.com' });
+    const deps = makeDeps({ findLinkedInUrl, apolloPeopleMatch });
+
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe' },
+        needsPersonFields: false,
+        needsCompanyFields: true,
+        listContext: 'YC Poker Night',
+      }),
+      deps,
+    );
+
+    // Search fired with name + context (company empty).
+    expect(findLinkedInUrl).toHaveBeenCalledWith(
+      expect.objectContaining({
+        firstName: 'Jane',
+        lastName: 'Doe',
+        company: '',
+        listContext: 'YC Poker Night',
+      }),
+    );
+    // Found URL flows into Apollo and unblocks the company gate.
+    expect(apolloPeopleMatch).toHaveBeenCalledWith(
+      expect.objectContaining({ linkedinUrl: 'https://www.linkedin.com/in/jane-doe-yc' }),
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it('does NOT fire the contextual search for a name-only lead when no listContext is available', async () => {
+    // Without any disambiguating context, a bare name-only search risks
+    // matching the wrong person — so we leave the prior behavior (skip) intact.
+    const findLinkedInUrl = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({ findLinkedInUrl });
+
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe' },
+        needsPersonFields: false,
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(findLinkedInUrl).not.toHaveBeenCalled();
+    expect(result.ok).toBe(false);
+  });
+
+  it('still resolves the name-only lead when the contextual search misses but does not crash', async () => {
+    // Search miss → no URL → company gate still fails, but cleanly (not a throw).
+    const findLinkedInUrl = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({ findLinkedInUrl });
+
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe' },
+        needsPersonFields: false,
+        needsCompanyFields: true,
+        listContext: 'YC Poker Night',
+      }),
+      deps,
+    );
+
+    expect(findLinkedInUrl).toHaveBeenCalled();
+    expect(result.ok).toBe(false);
+  });
+
+  it('prefers the known company over listContext when the lead already has a company', async () => {
+    // When company is known, the existing tier-2.7 behavior is unchanged:
+    // search by name + company, listContext is not used as the company value.
+    const findLinkedInUrl = jest
+      .fn()
+      .mockResolvedValue('https://www.linkedin.com/in/jane-acme');
+    const deps = makeDeps({ findLinkedInUrl });
+
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', company: 'Acme' },
+        needsPersonFields: true,
+        needsCompanyFields: false,
+        listContext: 'YC Poker Night',
+      }),
+      deps,
+    );
+
+    expect(findLinkedInUrl).toHaveBeenCalledWith(
+      expect.objectContaining({ company: 'Acme', listContext: 'YC Poker Night' }),
+    );
+  });
+});
+
 // ─── LinkedIn-URL-only identity (Unipile getProfile path) ────────────────────
 
 describe('resolveIdentity — LinkedIn-URL-only path (Unipile getProfile)', () => {
