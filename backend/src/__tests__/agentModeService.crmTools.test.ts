@@ -707,6 +707,100 @@ describe('AgentModeService - CRM Tools', () => {
 
       expect(result.leads.length).toBeLessThanOrEqual(100);
     });
+
+    it('should expose sanitized enrichmentMetadata so the agent can cite per-field provenance for list-wide queries', async () => {
+      // Regression: list-wide "what is the funding stage for each lead?" routes
+      // through search_leads, which returned customFields (values) but dropped
+      // enrichmentMetadata — leaving Emma blind to source/confidence so it
+      // reported bare values. get_lead_details already exposes it; search_leads
+      // must too.
+      const enrichedLead = {
+        ...mockLead,
+        customFields: { funding_stage: 'Series C', industry: 'Tech' },
+        enrichmentMetadata: {
+          funding_stage: {
+            source: 'web_search',
+            provider: 'llm_web_search',
+            confidence: 'medium',
+            sourceUrl: 'https://example.com/slashy',
+            sourceQuote: 'Slashy raised a round',
+            enrichedAt: '2026-06-18T00:00:00.000Z',
+          },
+          industry: {
+            source: 'api',
+            provider: 'apollo',
+            confidence: 'high',
+            enrichedAt: '2026-06-18T00:00:00.000Z',
+          },
+        },
+      };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [enrichedLead],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'funding_stage', operator: 'is_not_empty' }
+      ], userId);
+
+      expect(result.success).toBe(true);
+      expect(result.leads).toHaveLength(1);
+      expect(result.leads[0].enrichmentMetadata).toBeDefined();
+      expect(result.leads[0].enrichmentMetadata.funding_stage.provider).toBe('llm_web_search');
+      expect(result.leads[0].enrichmentMetadata.funding_stage.confidence).toBe('medium');
+      expect(result.leads[0].enrichmentMetadata.industry.provider).toBe('apollo');
+      expect(result.leads[0].enrichmentMetadata.industry.confidence).toBe('high');
+    });
+
+    it('should strip cross-tenant CRM-history lineage from enrichmentMetadata in search_leads results', async () => {
+      // Mirrors the get_lead_details sanitization guarantee: sibling IDs and the
+      // internal 'crm-history' source must never reach the customer.
+      const siblingEnrichedLead = {
+        ...mockLead,
+        customFields: { funding_stage: 'Seed' },
+        enrichmentMetadata: {
+          funding_stage: {
+            source: 'crm-history',
+            provider: 'agentweb',
+            confidence: 'medium',
+            siblingLeadId: 'other-tenant-lead',
+            siblingListId: 'other-tenant-list',
+            siblingUserId: 'other-tenant-user',
+            enrichedAt: '2026-06-18T00:00:00.000Z',
+          },
+        },
+      };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [siblingEnrichedLead],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'funding_stage', operator: 'is_not_empty' }
+      ], userId);
+
+      const meta = result.leads[0].enrichmentMetadata.funding_stage;
+      expect(meta.source).toBe('agentweb');          // rewritten from 'crm-history'
+      expect(meta.siblingLeadId).toBeUndefined();
+      expect(meta.siblingListId).toBeUndefined();
+      expect(meta.siblingUserId).toBeUndefined();
+    });
+
+    it('omits enrichmentMetadata for leads that were never enriched', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [{ ...mockLead, customFields: { industry: 'Tech' }, enrichmentMetadata: undefined }],
+        lastEvaluatedKey: undefined,
+      } as any);
+
+      const result = await service.searchLeads(listId, [
+        { field: 'industry', operator: 'is_not_empty' }
+      ], userId);
+
+      expect(result.leads[0].enrichmentMetadata).toBeUndefined();
+    });
   });
 
   // ─── getLeadDetails ────────────────────────────────────────────────────

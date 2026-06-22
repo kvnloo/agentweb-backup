@@ -9,6 +9,7 @@ import { buildOrchestratorDeps } from '../services/enrichmentV3RealDeps';
 import type { SocketEmitFn } from '../services/crmEnrichmentService';
 import { buildRawEnrichmentConfig, type EmmaEnrichmentOutputField } from './enrichmentToolConfig';
 import { normalizeOutputFields, type FieldRemap } from './enrichmentFieldNormalizer';
+import { fieldVerificationStatus } from '../utils/enrichedFieldValue';
 
 /** Emma-facing summary of a V3 enrichment run. */
 export interface EmmaEnrichmentSummary {
@@ -19,7 +20,14 @@ export interface EmmaEnrichmentSummary {
   failureBreakdown: RunEnrichmentResult['failed'];
   durationMs: number;
   warnings: string[];
-  samples?: Array<{ leadId: string; enrichedFields: Record<string, string> }>;
+  samples?: Array<{
+    leadId: string;
+    enrichedFields: Record<string, string>;
+    /** Fields whose value is low-confidence / unverified (web-sourced or
+     *  critic-flagged) and should be caveated rather than stated as fact.
+     *  Empty array means every populated field is high-confidence/verified. */
+    unverifiedFields: string[];
+  }>;
   /** Field renames applied before building the config (synonym/alias normalization). */
   fieldRemaps?: FieldRemap[];
 }
@@ -103,6 +111,11 @@ export async function runEmmaEnrichment(
     summary.samples = result.preview.map(p => ({
       leadId: p.leadId,
       enrichedFields: p.extractedFields,
+      // Flag each populated field that is low-confidence / unverified so Emma
+      // can caveat it (the Slashy funding_stage bug) instead of asserting it.
+      unverifiedFields: Object.keys(p.extractedFields).filter(
+        field => fieldVerificationStatus(p.meta?.[field]) === 'unverified',
+      ),
     }));
   }
   if (remaps.length > 0) {

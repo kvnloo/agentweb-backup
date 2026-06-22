@@ -1,4 +1,9 @@
-import { trimQuote, mergeMeta, EnrichedFieldMeta } from '../utils/enrichedFieldValue';
+import {
+  trimQuote,
+  mergeMeta,
+  fieldVerificationStatus,
+  EnrichedFieldMeta,
+} from '../utils/enrichedFieldValue';
 
 describe('trimQuote', () => {
   it('returns undefined for non-string input', () => {
@@ -64,5 +69,98 @@ describe('mergeMeta', () => {
     };
     const out = mergeMeta(base, { confidence: 'high' });
     expect(out.verifiedBy).toEqual({ userId: 'u1', at: '2026-02-01' });
+  });
+});
+
+describe('fieldVerificationStatus', () => {
+  const at = '2026-01-01T00:00:00Z';
+
+  it('treats absent meta as unverified', () => {
+    expect(fieldVerificationStatus(undefined)).toBe('unverified');
+  });
+
+  // ── The Slashy bug: web-sourced funding_stage gets confidence 'medium' ──
+  it('treats a web-search medium-confidence field (the Slashy funding_stage case) as unverified', () => {
+    const meta: EnrichedFieldMeta = {
+      source: 'web_search',
+      provider: 'llm_web_search',
+      confidence: 'medium',
+      enrichedAt: at,
+    };
+    expect(fieldVerificationStatus(meta)).toBe('unverified');
+  });
+
+  it('treats low confidence as unverified', () => {
+    expect(fieldVerificationStatus({ source: 'api', confidence: 'low', enrichedAt: at })).toBe('unverified');
+  });
+
+  it('treats missing confidence as unverified', () => {
+    expect(fieldVerificationStatus({ source: 'api', enrichedAt: at })).toBe('unverified');
+  });
+
+  it('treats high confidence (e.g. Apollo funding_stage) as verified', () => {
+    const meta: EnrichedFieldMeta = {
+      source: 'api',
+      provider: 'apollo',
+      confidence: 'high',
+      enrichedAt: at,
+    };
+    expect(fieldVerificationStatus(meta)).toBe('verified');
+  });
+
+  // ── User actions take precedence over confidence/critic ──
+  it('treats a user-verified field as verified even when confidence is medium', () => {
+    const meta: EnrichedFieldMeta = {
+      source: 'web_search',
+      confidence: 'medium',
+      enrichedAt: at,
+      verifiedBy: { userId: 'u1', at },
+    };
+    expect(fieldVerificationStatus(meta)).toBe('verified');
+  });
+
+  it('treats a user-rejected field as unverified even when confidence is high', () => {
+    const meta: EnrichedFieldMeta = {
+      source: 'api',
+      confidence: 'high',
+      enrichedAt: at,
+      rejectedReason: 'wrong stage',
+      rejectedAt: at,
+    };
+    expect(fieldVerificationStatus(meta)).toBe('unverified');
+  });
+
+  // ── Critic verdict (web tier) takes precedence over raw confidence ──
+  it('treats a critic-supported (criticView high) field as verified despite medium confidence', () => {
+    const meta: EnrichedFieldMeta = {
+      source: 'web_search',
+      confidence: 'medium',
+      criticView: 'high',
+      criticVerdict: 'supported',
+      enrichedAt: at,
+    };
+    expect(fieldVerificationStatus(meta)).toBe('verified');
+  });
+
+  it('treats a critic-flagged (criticView low) field as unverified', () => {
+    const meta: EnrichedFieldMeta = {
+      source: 'web_search',
+      confidence: 'medium',
+      criticView: 'low',
+      criticVerdict: 'unsupported',
+      enrichedAt: at,
+    };
+    expect(fieldVerificationStatus(meta)).toBe('unverified');
+  });
+
+  it('treats a critic-contradicted (criticView drop) field as unverified', () => {
+    const meta: EnrichedFieldMeta = {
+      source: 'web_search',
+      confidence: 'medium',
+      criticView: 'drop',
+      criticVerdict: 'contradicted',
+      enrichedAt: at,
+    };
+    expect(fieldVerificationStatus(meta)).toBe('unverified');
   });
 });

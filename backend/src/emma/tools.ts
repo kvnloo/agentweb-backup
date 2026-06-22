@@ -2830,7 +2830,7 @@ emmaToolRegistry.register({
   name: 'search_leads',
   definition: {
     name: 'search_leads',
-    description: 'Find leads matching structured field-level criteria within one or more lead lists. Pass list_id for a single list (legacy) or list_ids for up to 5 lists at once — each returned lead carries its listId/listName so you can attribute results. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields. For cross-CRM strategic questions ("who should I reach out to?"), prefer ask_crm.',
+    description: 'Find leads matching structured field-level criteria within one or more lead lists. Pass list_id for a single list (legacy) or list_ids for up to 5 lists at once — each returned lead carries its listId/listName so you can attribute results. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields. For cross-CRM strategic questions ("who should I reach out to?"), prefer ask_crm. Each returned lead also carries `enrichmentMetadata`: a per-field provenance map (keyed by field name, including enriched custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) with `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile), `sourceUrl`/`sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt`. When the user asks about enriched values across leads (e.g. "what is the funding stage for each lead?"), USE THIS to report the source and confidence per value — present a table with the value alongside its provider/source and confidence rather than stating values as bare fact, and explicitly caveat medium/low-confidence or web-sourced values. A field with no entry in enrichmentMetadata was entered manually or imported, not enriched.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -5829,7 +5829,9 @@ emmaToolRegistry.register({
     name: 'enrich_leads_preview',
     description: `Preview a CRM lead enrichment job before running the full batch. Runs the V3 enrichment engine in preview mode on 2 sample leads and returns what it would produce.
 
-Returns: runId, processedCount (the 2 sampled leads), and samples — each with leadId and enrichedFields. In enrichedFields a missing value means nothing was found; tell the user "not found" rather than showing null. Show the samples and ask the user to confirm before calling enrich_leads_execute.
+Returns: runId, processedCount (the 2 sampled leads), and samples — each with leadId, enrichedFields, and unverifiedFields. In enrichedFields a missing value means nothing was found; tell the user "not found" rather than showing null. Show the samples and ask the user to confirm before calling enrich_leads_execute.
+
+IMPORTANT — data accuracy / unverifiedFields: unverifiedFields lists the fields in this sample whose value is low-confidence or unverified (typically pulled from web search rather than a structured provider, and not confirmed by the fact-check critic). These values may be wrong — for example a small company's funding_stage guessed from the web. Do NOT state unverified values as established fact. When you present them, caveat them explicitly (e.g. "funding_stage: Series C (unverified — from web search, please confirm)"). Fields NOT in unverifiedFields are high-confidence and can be stated plainly. If the user questions or corrects an unverified value, accept the correction gracefully and explain it came from a low-confidence source.
 
 IMPORTANT — identity resolution failures: If processedCount is 0 and failureBreakdown.identityResolutionFailed > 0, the sampled leads lack sufficient identifying information (no email address, no LinkedIn URL, and no full name). This list cannot be enriched — tell the user clearly that the list is unenrichable due to missing identity data (email/LinkedIn/name required) and do NOT call enrich_leads_execute for it. Skip it and continue with the other lists.
 
@@ -5960,7 +5962,7 @@ emmaToolRegistry.register({
     name: 'enrich_lead_custom',
     description: `Enrich a single CRM lead with custom fields on demand, without running a whole-list job.
 
-Use this when the user wants specific missing information filled on one lead (e.g. "find this person's LinkedIn headline and company size"). It runs the V3 enrichment engine on a batch of one. The response includes enrichedValues — a map of field name to the found value (null if nothing was found). Values are also persisted to the lead. Always show enrichedValues to the user; if a value is null, say nothing was found for that field.
+Use this when the user wants specific missing information filled on one lead (e.g. "find this person's LinkedIn headline and company size"). It runs the V3 enrichment engine on a batch of one. The response includes enrichedValues — a map of field name to the found value (null if nothing was found). Values are also persisted to the lead. Always show enrichedValues to the user; if a value is null, say nothing was found for that field. The response also includes enrichmentMetadata — a per-field provenance map (source, provider, sourceUrl/sourceQuote, confidence high/medium/low, enrichedAt). Cite the source and confidence for each value, and explicitly caveat web-sourced or medium/low-confidence values (e.g. a funding stage found via web search) rather than stating them as established fact.
 
 output_fields: one entry per field to populate, each with a snake_case "name", an "instruction" describing what to find, and an optional "overwrite_policy" (defaults to fill_if_empty; use always_overwrite to refresh a field that already has a value). If the result includes fieldRemaps, tell the user which requested fields were mapped onto existing CRM columns to avoid duplicates.`,
     inputSchema: {
@@ -6008,13 +6010,31 @@ output_fields: one entry per field to populate, each with a snake_case "name", a
     // Read the lead back so we can return the actual enriched values.
     // V3 writes standard columns top-level and custom names into customFields.
     const enrichedValues: Record<string, string | null> = {};
+    // Per-field provenance for the just-enriched fields — lets the agent cite
+    // source/provider/confidence (and caveat web-sourced/low-confidence values)
+    // instead of stating bare values. Sanitized so cross-tenant CRM-history
+    // lineage never reaches the customer — mirrors get_lead_details/search_leads.
+    let enrichmentMetadata: Record<string, any> | undefined;
     if (summary.processedCount > 0) {
       try {
         const { crmDb } = await import('../services/db');
+        const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
         const lead: any = await crmDb.getLeadById(args.list_id, args.lead_id);
         const customFields = (lead?.customFields ?? {}) as Record<string, string>;
-        for (const f of (args.output_fields as Array<{ name: string }>)) {
-          enrichedValues[f.name] = customFields[f.name] ?? lead?.[f.name] ?? null;
+        const requestedNames = (args.output_fields as Array<{ name: string }>).map(f => f.name);
+        for (const name of requestedNames) {
+          enrichedValues[name] = customFields[name] ?? lead?.[name] ?? null;
+        }
+        const sanitized = sanitizeEnrichmentMetadataForResponse(
+          lead?.enrichmentMetadata as Record<string, any> | undefined,
+        );
+        if (sanitized) {
+          // Only surface metadata for the fields this call enriched.
+          const scoped: Record<string, any> = {};
+          for (const name of requestedNames) {
+            if (sanitized[name] !== undefined) scoped[name] = sanitized[name];
+          }
+          if (Object.keys(scoped).length > 0) enrichmentMetadata = scoped;
         }
       } catch {
         // Non-fatal — enrichment succeeded, values are in the DB.
@@ -6025,6 +6045,7 @@ output_fields: one entry per field to populate, each with a snake_case "name", a
       leadId: args.lead_id,
       listId: args.list_id,
       enrichedValues,
+      ...(enrichmentMetadata ? { enrichmentMetadata } : {}),
       runId: summary.runId,
       processedCount: summary.processedCount,
       failedCount: summary.failedCount,
