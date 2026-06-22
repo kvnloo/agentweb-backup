@@ -171,8 +171,10 @@ export interface ExecutePreparedToolsInput {
    * calls (generate_image/video/voiceover) in this run are gracefully deferred
    * instead of executed — so a long image batch stops short of the run's hard
    * timeout and asks the user to continue, rather than being killed mid-step.
-   * Undefined disables the budget entirely (env AGENT_MODE_MEDIA_BUDGET_MS=0, and the
-   * unit tests), preserving exact prior behavior.
+   * ON by default in production: the caller supplies a 7-min deadline unless
+   * AGENT_MODE_MEDIA_BUDGET_MS=0. It is undefined only when explicitly disabled
+   * (AGENT_MODE_MEDIA_BUDGET_MS=0) or in unit tests — in that case the budget is off
+   * and prior behavior is preserved. (NOT opt-in: unset env means the 7-min default.)
    */
   mediaGenerationDeadlineMs?: number;
   /**
@@ -415,9 +417,10 @@ export async function executePreparedTools(
   // long image batch stops short of the run's hard wall-clock timeout and asks the
   // user to continue, instead of being killed mid-step with nothing persisted. The
   // "≥1 asset" gate guarantees a run that starts already-over-budget still makes one
-  // unit of forward progress before stopping. Disabled entirely when no deadline is
-  // supplied (env AGENT_MODE_MEDIA_BUDGET_MS=0, and the unit tests), preserving prior
-  // behavior byte-for-byte.
+  // unit of forward progress before stopping. The budget is ON by default in
+  // production (caller passes a 7-min deadline); it is only disabled when no deadline
+  // is supplied (AGENT_MODE_MEDIA_BUDGET_MS=0, and the unit tests), which preserves
+  // prior behavior. It is NOT opt-in — an unset env var still applies the 7-min default.
   let assetsThisBatch = 0;
   const isMediaGenTool = (toolCall: any) => MEDIA_GEN_TOOLS.has(toolCall.function.name);
   const shouldDeferMedia = (toolCall: any): boolean =>
