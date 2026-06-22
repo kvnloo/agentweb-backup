@@ -1249,6 +1249,50 @@ HubSpot, then verify in the CRM UI:
 
 ---
 
+## Parallel execution plan (subagent orchestration)
+
+The 10 tasks split into four **file-disjoint** domains. `customer-portal/` is a
+separate nested git repo, so the frontend lane shares no git state with the
+backend at all.
+
+**Lanes**
+- **Foundation:** Task 1 (`leadSyncStatus.ts` + test). New files; everything
+  backend imports it. Must land first.
+- **Lane A — adapter:** Tasks 2, 3. Files: `hubspotAdapter.ts`,
+  `hubspotAdapter.pushLeads.batch.test.ts`, `externalCrmSync.service.test.ts`.
+- **Lane B — routes:** Tasks 4, 5, 6. Files: `crm.ts`,
+  `crm.leads.syncStatus.test.ts`. Sequential within the lane (one file).
+- **Lane C — frontend:** Tasks 7, 8, 9. File: `customer-portal/src/pages/CRM.tsx`.
+  Sequential within the lane (one file). Depends only on the GET-leads response
+  contract (`hubspotConnected`, per-lead `syncStatus`, `syncStatus` query param),
+  which is fully specified here — so it runs independently from t0.
+
+**File-conflict matrix:** no two lanes write the same file. Lanes A and B share
+the backend git index, so run them in **git worktrees** branched off the Task-1
+commit; their disjoint file sets merge with zero conflicts.
+
+**Waves**
+1. **Wave 0 (parallel):** start Lane C (frontend, separate repo) + implement
+   Task 1 in the main backend tree and commit it.
+2. **Wave 1 (parallel):** after Task 1 is committed, dispatch Lane A and Lane B
+   as worktree agents off that commit. Lane C continues.
+3. **Wave 2 (integration):** merge Lane A and Lane B branches, then run Task 10 —
+   backend `npx tsc` + `npm test` on the merged tree; frontend `npx tsc --noEmit`
+   + `npm run build`. Fix any cross-cutting issues (none expected — disjoint
+   files, shared only by the read-only Task-1 util).
+
+**Peak concurrency:** 3 agents (Lane A + Lane B + Lane C). Critical path is
+Task 1 → max(Lane A, Lane B) → Task 10, with Lane C overlapped.
+
+**Agent constraints (put in each prompt):** edit ONLY this lane's files; import
+the Task-1 helpers, don't redefine them; use the EXACT status strings
+(`synced`/`sync_pending`/`update_pending`/`sync_failed`); follow TDD (write the
+failing test, see it fail, implement, see it pass); run `npx tsc` after each
+`.ts` edit; commit per task with scoped `git add`; return a summary of files
+changed + test results.
+
+---
+
 ## Self-review notes (coverage check)
 
 - Spec "data model" → Task 1 (`syncMetadata.syncStatus/lastSyncedAt/syncError`).
