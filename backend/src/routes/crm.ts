@@ -59,6 +59,7 @@ import { buildConfigServiceDeps } from '../services/enrichmentConfigDeps';
 import { runEnrichment as svcRunEnrichmentV3 } from '../services/crmEnrichmentServiceV3';
 import { buildOrchestratorDeps as buildV3OrchestratorDeps } from '../services/enrichmentV3RealDeps';
 import { sanitizeLeadForResponse } from '../utils/enrichmentMetadataPresentation';
+import { getHubspotConnection, getMappedAgentwebFields, mappedFieldChanged, resolveSyncStatus } from '../utils/leadSyncStatus';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
 
@@ -1939,6 +1940,14 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
 
     if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Stamp an initial per-lead sync status when this list is connected to
+    // HubSpot. If auto-sync is on, the subsequent autoSyncLead push overwrites
+    // this with 'synced'/'sync_failed' via the adapter.
+    const hsConn = getHubspotConnection(list);
+    if (hsConn.connected) {
+      leadData.syncMetadata = { ...(leadData.syncMetadata || {}), syncStatus: 'sync_pending' };
     }
 
     const lead = await crmDb.createLead(listId, leadData);
