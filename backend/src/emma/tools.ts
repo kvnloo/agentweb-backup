@@ -5962,7 +5962,7 @@ emmaToolRegistry.register({
     name: 'enrich_lead_custom',
     description: `Enrich a single CRM lead with custom fields on demand, without running a whole-list job.
 
-Use this when the user wants specific missing information filled on one lead (e.g. "find this person's LinkedIn headline and company size"). It runs the V3 enrichment engine on a batch of one. The response includes enrichedValues — a map of field name to the found value (null if nothing was found). Values are also persisted to the lead. Always show enrichedValues to the user; if a value is null, say nothing was found for that field.
+Use this when the user wants specific missing information filled on one lead (e.g. "find this person's LinkedIn headline and company size"). It runs the V3 enrichment engine on a batch of one. The response includes enrichedValues — a map of field name to the found value (null if nothing was found). Values are also persisted to the lead. Always show enrichedValues to the user; if a value is null, say nothing was found for that field. The response also includes enrichmentMetadata — a per-field provenance map (source, provider, sourceUrl/sourceQuote, confidence high/medium/low, enrichedAt). Cite the source and confidence for each value, and explicitly caveat web-sourced or medium/low-confidence values (e.g. a funding stage found via web search) rather than stating them as established fact.
 
 output_fields: one entry per field to populate, each with a snake_case "name", an "instruction" describing what to find, and an optional "overwrite_policy" (defaults to fill_if_empty; use always_overwrite to refresh a field that already has a value). If the result includes fieldRemaps, tell the user which requested fields were mapped onto existing CRM columns to avoid duplicates.`,
     inputSchema: {
@@ -6010,13 +6010,31 @@ output_fields: one entry per field to populate, each with a snake_case "name", a
     // Read the lead back so we can return the actual enriched values.
     // V3 writes standard columns top-level and custom names into customFields.
     const enrichedValues: Record<string, string | null> = {};
+    // Per-field provenance for the just-enriched fields — lets the agent cite
+    // source/provider/confidence (and caveat web-sourced/low-confidence values)
+    // instead of stating bare values. Sanitized so cross-tenant CRM-history
+    // lineage never reaches the customer — mirrors get_lead_details/search_leads.
+    let enrichmentMetadata: Record<string, any> | undefined;
     if (summary.processedCount > 0) {
       try {
         const { crmDb } = await import('../services/db');
+        const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
         const lead: any = await crmDb.getLeadById(args.list_id, args.lead_id);
         const customFields = (lead?.customFields ?? {}) as Record<string, string>;
-        for (const f of (args.output_fields as Array<{ name: string }>)) {
-          enrichedValues[f.name] = customFields[f.name] ?? lead?.[f.name] ?? null;
+        const requestedNames = (args.output_fields as Array<{ name: string }>).map(f => f.name);
+        for (const name of requestedNames) {
+          enrichedValues[name] = customFields[name] ?? lead?.[name] ?? null;
+        }
+        const sanitized = sanitizeEnrichmentMetadataForResponse(
+          lead?.enrichmentMetadata as Record<string, any> | undefined,
+        );
+        if (sanitized) {
+          // Only surface metadata for the fields this call enriched.
+          const scoped: Record<string, any> = {};
+          for (const name of requestedNames) {
+            if (sanitized[name] !== undefined) scoped[name] = sanitized[name];
+          }
+          if (Object.keys(scoped).length > 0) enrichmentMetadata = scoped;
         }
       } catch {
         // Non-fatal — enrichment succeeded, values are in the DB.
@@ -6027,6 +6045,7 @@ output_fields: one entry per field to populate, each with a snake_case "name", a
       leadId: args.lead_id,
       listId: args.list_id,
       enrichedValues,
+      ...(enrichmentMetadata ? { enrichmentMetadata } : {}),
       runId: summary.runId,
       processedCount: summary.processedCount,
       failedCount: summary.failedCount,
