@@ -20,6 +20,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-22',
     changes: [
+      'Improved: Emma Now Shows the Source and Confidence When You Ask About Enriched Data Across Leads',
+      '- When you ask Emma about an enriched value for many leads at once (for example "what is the funding stage for each lead in this list?"), she now lays out where each value came from — the data provider or source link and a confidence level — in a table, instead of just listing the values',
+      '- Web-sourced or lower-confidence values are flagged so you know which ones to double-check, matching what Emma already did when you asked about a single lead',
+    ],
+  },
+  {
+    date: '2026-06-22',
+    changes: [
       'Improved: Emma Now Flags Unverified Company Details in Lead Enrichment',
       '- When Emma enriches your leads, some company details (like funding stage) come from web search rather than a verified data provider — and occasionally the web gets it wrong, such as labeling a small startup with the wrong funding round',
       '- Emma now marks these lower-confidence values as "unverified" in the enrichment preview and caveats them when she shares them, instead of stating them as established fact',
