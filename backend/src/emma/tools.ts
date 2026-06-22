@@ -9,12 +9,78 @@ import { contactEventsDb, normalizeContactId } from '../services/contactEventsDb
 import { chatbotDb } from '../services/chatbotService';
 import { getExecutionsWithAssets } from '../routes/tasks';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
+import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
 
 // Register email lookup / find tool (provider-agnostic)
 import './emailLookupTool';
+
+emmaToolRegistry.register({
+  name: 'enqueue_human_eval',
+  definition: {
+    name: 'enqueue_human_eval',
+    description:
+      'Send a finished output to the AgentWeb human eval Slack channel. Use only for creative images, landing pages, or lead enrichment outputs. ' +
+      'Matt reviews creative images and landing pages. Fangfang reviews lead enrichment. Reviewers reply in the Slack thread with free-form feedback.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        review_type: {
+          type: 'string',
+          enum: ['creative_image', 'landing_page', 'lead_enrichment'],
+          description: 'The narrow v0 eval route. creative_image and landing_page go to Matt; lead_enrichment goes to Fangfang.'
+        },
+        output_summary: {
+          type: 'string',
+          description: 'Short description of the output and what the reviewer should inspect.'
+        },
+        artifact_url: {
+          type: 'string',
+          description: 'Optional URL to the image, landing page, HTML file, report, or lead enrichment artifact.'
+        },
+        chat_url: {
+          type: 'string',
+          description: 'Optional direct URL to the associated Agent Mode or iShare chat. If omitted, the current session link is used.'
+        },
+        original_request: {
+          type: 'string',
+          description: 'Optional original user ask or prompt that produced the output.'
+        },
+        agent_run_id: {
+          type: 'string',
+          description: 'Optional AgentRun ID if available.'
+        }
+      },
+      required: ['review_type', 'output_summary']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    const sessionId = context?.sessionId;
+
+    const candidate = await humanEvalService.createCandidate({
+      reviewType: args.review_type as HumanEvalReviewType,
+      outputSummary: args.output_summary,
+      artifactUrl: args.artifact_url,
+      chatUrl: args.chat_url,
+      originalRequest: args.original_request,
+      agentRunId: args.agent_run_id,
+      userId,
+      sessionId,
+    });
+
+    return {
+      success: true,
+      message: `Sent ${candidate.reviewType} output to ${candidate.reviewer} for human eval.`,
+      candidateId: candidate.candidateId,
+      reviewer: candidate.reviewer,
+      slackChannel: candidate.slackChannel,
+      slackMessageTs: candidate.slackMessageTs,
+    };
+  }
+});
 
 emmaToolRegistry.register({
   name: 'install_skills',
