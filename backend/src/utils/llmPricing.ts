@@ -118,6 +118,16 @@ export function getModelPrice(model: string): ModelPrice | null {
   const price = MODEL_PRICING[model];
   if (price) return price;
 
+  // Image and video models are intentionally NOT token-priced — they are billed
+  // per-image / per-clip via IMAGE_GENERATION_PRICING_USD and
+  // VIDEO_GENERATION_PRICING_USD_PER_CLIP. The shadow token recorder still calls
+  // getModelPrice for them (the metered client records token usage on every
+  // call), so treat them as a known "no token price" case (cost 0) rather than
+  // warning about a missing entry.
+  if (model in IMAGE_GENERATION_PRICING_USD || model in VIDEO_GENERATION_PRICING_USD_PER_CLIP) {
+    return null;
+  }
+
   if (!warnedUnknownModels.has(model)) {
     warnedUnknownModels.add(model);
     console.warn(
