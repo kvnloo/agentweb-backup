@@ -235,7 +235,11 @@ describe('Interactive Share Expiration', () => {
       expect(res.status).toHaveBeenCalledWith(200);
     });
 
-    it('should expire legacy shares without expiresAt if sharedAt is older than 7 days', async () => {
+    it('should NOT expire active shares without expiresAt even if sharedAt is older than 7 days', async () => {
+      // Regression: every public plan/ishare link is created with sharedAt only
+      // (no expiresAt). The old "sharedAt + 7 days" rule silently 410'd all of
+      // them a week after creation. A share with no expiresAt must stay live
+      // while isActive is true, regardless of how old sharedAt is.
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
         sessionId: 'session-1',
         userId: 'user-1',
@@ -244,8 +248,8 @@ describe('Interactive Share Expiration', () => {
         interactiveShareMetadata: {
           isActive: true,
           token: 'valid-token',
-          sharedAt: new Date(Date.now() - 8 * 86400000).toISOString(),
-          // no expiresAt — legacy share, but sharedAt is 8 days ago
+          sharedAt: new Date(Date.now() - 200 * 86400000).toISOString(),
+          // no expiresAt — must NOT auto-expire
         },
       });
 
@@ -257,11 +261,11 @@ describe('Interactive Share Expiration', () => {
 
       await agentModeController.getSharedConversation(req, res);
 
-      expect(res.status).toHaveBeenCalledWith(410);
-      expect(res.json).toHaveBeenCalledWith({ error: 'Interactive share link has expired' });
+      expect(res.status).toHaveBeenCalledWith(200);
+      expect(chatbotDb.updateSessionInteractiveShareMetadata).not.toHaveBeenCalled();
     });
 
-    it('should allow legacy shares without expiresAt if sharedAt is within 7 days', async () => {
+    it('should allow active shares without expiresAt if sharedAt is recent', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
         sessionId: 'session-1',
         userId: 'user-1',
@@ -271,7 +275,7 @@ describe('Interactive Share Expiration', () => {
           isActive: true,
           token: 'valid-token',
           sharedAt: new Date(Date.now() - 3 * 86400000).toISOString(),
-          // no expiresAt — legacy share, but sharedAt is only 3 days ago
+          // no expiresAt
         },
       });
 
@@ -286,7 +290,7 @@ describe('Interactive Share Expiration', () => {
       expect(res.status).toHaveBeenCalledWith(200);
     });
 
-    it('should expire legacy shares without expiresAt or sharedAt', async () => {
+    it('should NOT expire active shares with neither expiresAt nor sharedAt', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
         sessionId: 'session-1',
         userId: 'user-1',
@@ -295,7 +299,7 @@ describe('Interactive Share Expiration', () => {
         interactiveShareMetadata: {
           isActive: true,
           token: 'valid-token',
-          // no expiresAt, no sharedAt — very old legacy share
+          // no expiresAt, no sharedAt — very old legacy share, still active
         },
       });
 
@@ -307,8 +311,7 @@ describe('Interactive Share Expiration', () => {
 
       await agentModeController.getSharedConversation(req, res);
 
-      expect(res.status).toHaveBeenCalledWith(410);
-      expect(res.json).toHaveBeenCalledWith({ error: 'Interactive share link has expired' });
+      expect(res.status).toHaveBeenCalledWith(200);
     });
   });
 
