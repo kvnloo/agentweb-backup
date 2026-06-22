@@ -1,17 +1,17 @@
-import { verifyAcceptanceChecks } from '../services/codingAgentAcceptance';
+import { normalizeBrowserToolValue, verifyAcceptanceChecks } from '../services/codingAgentAcceptance';
 
 describe('verifyAcceptanceChecks', () => {
   test('passes an HTTP status check when the expected status matches', async () => {
     const fetchImpl = jest.fn().mockResolvedValue({ status: 200 });
 
     const result = await verifyAcceptanceChecks({
-      checks: [{ type: 'http_status', label: 'font asset exists', url: 'https://cdn.example/font.woff2' }],
+      checks: [{ type: 'http_status', label: 'preview is live', url: 'https://preview.example' }],
       fetchImpl: fetchImpl as any,
     });
 
     expect(result.status).toBe('passed');
     expect(result.checks[0]).toMatchObject({
-      label: 'font asset exists',
+      label: 'preview is live',
       status: 'passed',
       actual: 200,
       expected: 200,
@@ -28,7 +28,7 @@ describe('verifyAcceptanceChecks', () => {
     });
 
     expect(result.status).toBe('passed');
-    expect(fetchImpl).toHaveBeenCalledWith('https://preview.example', { method: 'GET' });
+    expect(fetchImpl).toHaveBeenCalledWith('https://preview.example', expect.objectContaining({ method: 'GET' }));
   });
 
   test('fails an HTTP status check when an external asset is missing', async () => {
@@ -48,7 +48,7 @@ describe('verifyAcceptanceChecks', () => {
     });
   });
 
-  test('runs a browser assertion against the preview URL', async () => {
+  test('runs a typed text_present check against the preview URL', async () => {
     const executeMcpTool = jest
       .fn()
       .mockResolvedValueOnce({ content: 'navigated' })
@@ -58,53 +58,35 @@ describe('verifyAcceptanceChecks', () => {
       previewUrl: 'https://preview.example',
       executeMcpTool,
       checks: [{
-        type: 'browser_eval',
-        label: 'headline changed',
-        script: 'return document.body.innerText.includes("Launch Faster");',
+        type: 'text_present',
+        label: 'token visible',
+        text: 'aw_smoke_abc123',
       }],
     });
 
     expect(result.status).toBe('passed');
     expect(executeMcpTool).toHaveBeenNthCalledWith(1, 'playwright_browser_navigate', { url: 'https://preview.example' });
     expect(executeMcpTool).toHaveBeenNthCalledWith(2, 'playwright_browser_evaluate', {
-      function: expect.stringContaining('Launch Faster'),
+      function: expect.stringContaining('aw_smoke_abc123'),
     });
   });
 
-  test('parses Playwright markdown result blocks for browser assertions', async () => {
-    const executeMcpTool = jest
-      .fn()
-      .mockResolvedValueOnce({ content: 'navigated' })
-      .mockResolvedValueOnce({
-        content: [
-          '### Result',
-          'true',
-          '### Ran Playwright code',
-          '```js',
-          "await page.evaluate('async () => true')",
-          '```',
-        ].join('\n'),
-      });
-
-    const result = await verifyAcceptanceChecks({
-      previewUrl: 'https://preview.example',
-      executeMcpTool,
-      checks: [{
-        type: 'browser_eval',
-        label: 'headline changed',
-        script: 'return true;',
-      }],
+  test('normalizes Playwright markdown result blocks inside the browser adapter', () => {
+    const value = normalizeBrowserToolValue({
+      content: [
+        '### Result',
+        'true',
+        '### Ran Playwright code',
+        '```js',
+        "await page.evaluate('async () => true')",
+        '```',
+      ].join('\n'),
     });
 
-    expect(result.status).toBe('passed');
-    expect(result.checks[0]).toMatchObject({
-      actual: true,
-      expected: true,
-      status: 'passed',
-    });
+    expect(value).toBe(true);
   });
 
-  test('requests error-level console messages for console checks', async () => {
+  test('requests error-level console messages for no_console_errors checks', async () => {
     const executeMcpTool = jest
       .fn()
       .mockResolvedValueOnce({ content: 'navigated' })
@@ -114,7 +96,7 @@ describe('verifyAcceptanceChecks', () => {
       previewUrl: 'https://preview.example',
       executeMcpTool,
       checks: [{
-        type: 'console_errors',
+        type: 'no_console_errors',
         label: 'no console errors',
       }],
     });
@@ -123,11 +105,30 @@ describe('verifyAcceptanceChecks', () => {
     expect(executeMcpTool).toHaveBeenNthCalledWith(2, 'playwright_browser_console_messages', { level: 'error' });
   });
 
+  test('detects disallowed external hosts with no_external_hosts', async () => {
+    const executeMcpTool = jest
+      .fn()
+      .mockResolvedValueOnce({ content: 'navigated' })
+      .mockResolvedValueOnce({ result: ['preview.example', 'fonts.googleapis.com'] });
+
+    const result = await verifyAcceptanceChecks({
+      previewUrl: 'https://preview.example',
+      executeMcpTool,
+      checks: [{
+        type: 'no_external_hosts',
+        label: 'no external font hosts',
+      }],
+    });
+
+    expect(result.status).toBe('failed');
+    expect(result.checks[0].actual).toEqual(['fonts.googleapis.com']);
+  });
+
   test('blocks browser checks when no Playwright executor is available', async () => {
     const result = await verifyAcceptanceChecks({
       previewUrl: 'https://preview.example',
       checks: [{
-        type: 'dom_text',
+        type: 'text_present',
         label: 'headline visible',
         text: 'Launch Faster',
       }],
@@ -135,5 +136,23 @@ describe('verifyAcceptanceChecks', () => {
 
     expect(result.status).toBe('blocked');
     expect(result.checks[0].message).toContain('Playwright');
+  });
+
+  test('blocks checks that exceed the per-check timeout', async () => {
+    const executeMcpTool = jest.fn().mockReturnValue(new Promise(() => undefined));
+
+    const result = await verifyAcceptanceChecks({
+      previewUrl: 'https://preview.example',
+      executeMcpTool,
+      checkTimeoutMs: 1,
+      checks: [{
+        type: 'selector_exists',
+        label: 'cta exists',
+        selector: '[data-testid="cta"]',
+      }],
+    });
+
+    expect(result.status).toBe('blocked');
+    expect(result.checks[0].message).toContain('timed out');
   });
 });

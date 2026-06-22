@@ -6115,7 +6115,7 @@ emmaToolRegistry.register({
   name: 'coding_agent',
   definition: {
     name: 'coding_agent',
-    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to a STAGING draft branch (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code. For user-visible landing-page changes, pass acceptance_checks that prove the requested behavior on the preview page; the backend verifier runs them after the coding agent finishes and fails the tool if they do not pass. If the tool fails because acceptance failed, report the failed checks and ask for the missing input or run a narrower follow-up. Only call coding_agent ONCE per user request unless it explicitly fails. LOGO TIP: Always pass logo URLs directly in the task_description — the coding agent will use them in <img src="..."> tags. For public company logos use Google\'s favicon service (https://www.google.com/s2/favicons?domain={domain}&sz=128). For the user\'s own brand logo, look it up with read_brand_guidelines first and include the URL in the task.',
+    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to a STAGING draft branch (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code. For user-visible landing-page changes, pass typed acceptance_checks that prove the requested behavior on the preview page; the backend verifier runs them after the coding agent finishes and fails or blocks the tool if they do not pass. Do not use hard-coded human-looking benchmark copy; use user-requested content or opaque tokens where a test marker is needed. If the tool fails because acceptance failed, report the failed checks and ask for the missing input or run a narrower follow-up. Only call coding_agent ONCE per user request unless it explicitly fails. LOGO TIP: Always pass logo URLs directly in the task_description — the coding agent will use them in <img src="..."> tags. For public company logos use Google\'s favicon service (https://www.google.com/s2/favicons?domain={domain}&sz=128). For the user\'s own brand logo, look it up with read_brand_guidelines first and include the URL in the task.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -6138,18 +6138,18 @@ emmaToolRegistry.register({
             properties: {
               type: {
                 type: 'string',
-                enum: ['http_status', 'browser_eval', 'dom_text', 'console_errors'],
-                description: 'http_status checks a URL status. browser_eval runs JavaScript in Playwright and compares the returned value. dom_text checks text under a selector. console_errors fails on console errors.'
+                enum: ['http_status', 'text_present', 'selector_exists', 'no_console_errors', 'no_external_hosts'],
+                description: 'Typed verifier check. http_status checks URL status. text_present checks text under a selector. selector_exists checks for an element. no_console_errors fails on console errors. no_external_hosts fails on disallowed external asset hosts.'
               },
-              label: { type: 'string', description: 'Human-readable check name, e.g. "Hero headline updated" or "Neue Montreal loads".' },
+              label: { type: 'string', description: 'Short check name, e.g. "requested headline visible" or "no external font hosts".' },
               url: { type: 'string', description: 'Check URL. For browser checks, omit this to use the preview URL, or use {{previewUrl}} as a placeholder.' },
               method: { type: 'string', enum: ['GET', 'HEAD'], description: 'HTTP method for http_status checks.' },
               expectStatus: { type: 'number', description: 'Expected HTTP status for http_status checks. Defaults to 200.' },
-              script: { type: 'string', description: 'JavaScript body for browser_eval. Return the value to compare, e.g. return document.body.innerText.includes("New headline");' },
-              expect: { description: 'Expected browser_eval return value. Defaults to true when omitted.' },
-              selector: { type: 'string', description: 'CSS selector for dom_text checks. Defaults to body.' },
-              text: { type: 'string', description: 'Expected text for dom_text checks.' },
-              allowPatterns: { type: 'array', items: { type: 'string' }, description: 'Regex patterns for console_errors messages that should be ignored.' }
+              selector: { type: 'string', description: 'CSS selector for text_present or selector_exists checks. text_present defaults to body.' },
+              text: { type: 'string', description: 'Expected text for text_present checks.' },
+              allowPatterns: { type: 'array', items: { type: 'string' }, description: 'Regex patterns for no_console_errors messages that should be ignored.' },
+              allowHosts: { type: 'array', items: { type: 'string' }, description: 'Allowed hostnames for no_external_hosts. Preview host is allowed automatically.' },
+              denyPatterns: { type: 'array', items: { type: 'string' }, description: 'Regex hostname patterns for no_external_hosts. Defaults catch common external font/CDN hosts.' }
             },
             required: ['type']
           }
@@ -6196,8 +6196,13 @@ emmaToolRegistry.register({
         iterations: result.iterations,
         previewUrl: result.previewUrl,
         branch: result.branch,
+        runId: result.runId,
+        state: result.state,
         acceptanceStatus: result.acceptanceStatus,
         acceptance: result.acceptance,
+        verification: result.verification,
+        recovery: result.recovery,
+        retryable: result.retryable,
         is_staging: !!result.branch && result.branch !== 'main',
         note: result.branch && result.branch !== 'main'
           ? `Changes are on staging branch "${result.branch}". The user must review the preview URL and ask to publish before changes go live.`
@@ -6210,8 +6215,13 @@ emmaToolRegistry.register({
         iterations: result.iterations,
         previewUrl: result.previewUrl,
         branch: result.branch,
+        runId: result.runId,
+        state: result.state,
         acceptanceStatus: result.acceptanceStatus,
         acceptance: result.acceptance,
+        verification: result.verification,
+        recovery: result.recovery,
+        retryable: result.retryable,
         is_staging: !!result.branch && result.branch !== 'main',
         // Authorization denials are not retryable — the caller lacks edit rights
         // on this page. Signal the parent agent to surface the message and stop

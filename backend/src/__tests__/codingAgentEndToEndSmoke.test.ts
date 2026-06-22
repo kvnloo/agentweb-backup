@@ -80,10 +80,24 @@ describe('coding_agent acceptance end-to-end smoke', () => {
     mockedRunCodingAgent.mockReset();
   });
 
+  it('does not expose browser_eval in the public coding_agent acceptance schema', () => {
+    const schema = emmaToolRegistry.getTool('coding_agent')?.definition?.inputSchema as any;
+    const typeEnum = schema?.properties?.acceptance_checks?.items?.properties?.type?.enum;
+    expect(typeEnum).toEqual([
+      'http_status',
+      'text_present',
+      'selector_exists',
+      'no_console_errors',
+      'no_external_hosts',
+    ]);
+    expect(typeEnum).not.toContain('browser_eval');
+  });
+
   it('passes acceptance checks through the registered tool and records verified success', async () => {
+    const token = 'aw_smoke_6f3a91c2';
     mockedRunCodingAgent.mockResolvedValue({
       success: true,
-      message: 'Updated the simple landing page headline.\n\nAcceptance passed (1/1 checks).',
+      message: `Updated the simple landing page token.\n\nAcceptance passed (1/1 checks).`,
       iterations: 2,
       previewUrl: 'https://preview.example',
       branch: 'draft/session-smoke-12',
@@ -93,26 +107,26 @@ describe('coding_agent acceptance end-to-end smoke', () => {
         summary: 'Acceptance passed (1/1 checks).',
         checks: [{
           id: 'check_1',
-          type: 'browser_eval',
-          label: 'Hero headline changed',
+          type: 'text_present',
+          label: 'Opaque token visible',
           status: 'passed',
           expected: true,
           actual: true,
-          message: 'Browser assertion passed.',
+          message: `Found expected text "${token}".`,
         }],
       },
     });
 
     const acceptanceChecks = [{
-      type: 'browser_eval',
-      label: 'Hero headline changed',
-      script: 'return document.body.innerText.includes("Launch Faster");',
+      type: 'text_present',
+      label: 'Opaque token visible',
+      text: token,
     }];
     const ports = makePorts({ userId: 'user-smoke', sessionId: 'session-smoke-1234567890' });
     const input = makeInput([
       toolCall('call-1', {
         page_id: 'lp_smoke',
-        task_description: 'Change the hero headline to Launch Faster.',
+        task_description: `Add opaque verification token ${token} to the requested landing page content.`,
         acceptance_checks: acceptanceChecks,
       }),
     ], ports);
@@ -120,7 +134,7 @@ describe('coding_agent acceptance end-to-end smoke', () => {
     const result = await executePreparedTools(input);
 
     expect(mockedRunCodingAgent).toHaveBeenCalledWith(
-      'Change the hero headline to Launch Faster.',
+      `Add opaque verification token ${token} to the requested landing page content.`,
       expect.objectContaining({
         pageId: 'lp_smoke',
         userId: 'user-smoke',
@@ -145,9 +159,10 @@ describe('coding_agent acceptance end-to-end smoke', () => {
   });
 
   it('turns failed acceptance into a failed tool call while preserving check details for the UI', async () => {
+    const token = 'aw_smoke_b51d72ae';
     mockedRunCodingAgent.mockResolvedValue({
       success: false,
-      message: 'Updated the simple landing page headline.\n\nAcceptance failed (1/1 checks failed).\n- Hero headline changed: Browser assertion failed.',
+      message: `Updated the simple landing page token.\n\nAcceptance failed (1/1 checks failed).\n- Opaque token visible: Did not find expected text "${token}".`,
       iterations: 2,
       previewUrl: 'https://preview.example',
       branch: 'draft/session-smoke-12',
@@ -157,12 +172,12 @@ describe('coding_agent acceptance end-to-end smoke', () => {
         summary: 'Acceptance failed (1/1 checks failed).',
         checks: [{
           id: 'check_1',
-          type: 'browser_eval',
-          label: 'Hero headline changed',
+          type: 'text_present',
+          label: 'Opaque token visible',
           status: 'failed',
           expected: true,
           actual: false,
-          message: 'Browser assertion failed.',
+          message: `Did not find expected text "${token}".`,
         }],
       },
     });
@@ -171,11 +186,11 @@ describe('coding_agent acceptance end-to-end smoke', () => {
     const input = makeInput([
       toolCall('call-1', {
         page_id: 'lp_smoke',
-        task_description: 'Change the hero headline to Launch Faster.',
+        task_description: `Add opaque verification token ${token} to the requested landing page content.`,
         acceptance_checks: [{
-          type: 'browser_eval',
-          label: 'Hero headline changed',
-          script: 'return document.body.innerText.includes("Launch Faster");',
+          type: 'text_present',
+          label: 'Opaque token visible',
+          text: token,
         }],
       }),
     ], ports);
@@ -194,13 +209,13 @@ describe('coding_agent acceptance end-to-end smoke', () => {
         acceptance: {
           summary: 'Acceptance failed (1/1 checks failed).',
           checks: [expect.objectContaining({
-            label: 'Hero headline changed',
+            label: 'Opaque token visible',
             status: 'failed',
-            message: 'Browser assertion failed.',
+            message: `Did not find expected text "${token}".`,
           })],
         },
       },
     });
-    expect(input.messages[0].content).toContain('ERR: Updated the simple landing page headline.');
+    expect(input.messages[0].content).toContain('ERR: Updated the simple landing page token.');
   });
 });

@@ -3828,6 +3828,10 @@ export class AgentModeService {
     // assess_client_health (admin lookup BY EMAIL → the "asked for my email" bug).
     // Always reachable so Emma can answer "what's my plan/usage" directly.
     'get_account_status',
+    // Coding agent is infrastructure for customer landing-page edits. If the
+    // DB foundation_tools setting is stale and omits it, Matt-style edit flows
+    // fail before the reliability layer can even create a run.
+    'coding_agent',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
@@ -4500,6 +4504,8 @@ export class AgentModeService {
         success: actualResult.success,
         message: actualResult.message,
         iterations: actualResult.iterations,
+        runId: actualResult.runId,
+        state: actualResult.state,
         branch: actualResult.branch,
         previewUrl: actualResult.previewUrl,
         error: actualResult.error,
@@ -4509,11 +4515,16 @@ export class AgentModeService {
         success: actualResult.success,
         message: actualResult.message,
         iterations: actualResult.iterations,
+        runId: actualResult.runId,
+        state: actualResult.state,
         branch: actualResult.branch,
         previewUrl: actualResult.previewUrl,
         error: actualResult.error,
         acceptanceStatus: actualResult.acceptanceStatus,
         acceptance: actualResult.acceptance,
+        verification: actualResult.verification,
+        recovery: actualResult.recovery,
+        retryable: actualResult.retryable,
       };
     }
 
