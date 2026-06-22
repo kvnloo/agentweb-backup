@@ -86,6 +86,29 @@ describe('PATCH /api/auth/onboarding-interests', () => {
     expect(mockUpdateUser.mock.calls[0][1].emmaHelpInterestsSetAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
+  it('persists company name and website from the first brand submit', async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .patch('/api/auth/onboarding-interests')
+      .send({
+        interests: ['brand'],
+        companyName: 'Acme Labs',
+        companyUrl: 'https://acme.example',
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.companyName).toBe('Acme Labs');
+    expect(res.body.productDomain).toBe('https://acme.example');
+    expect(mockUpdateUser).toHaveBeenCalledWith(
+      'user-123',
+      expect.objectContaining({
+        emmaHelpInterests: ['brand'],
+        companyName: 'Acme Labs',
+        productDomain: 'https://acme.example',
+      })
+    );
+  });
+
   it('accepts an empty array (user skipped)', async () => {
     const app = makeApp();
     const res = await request(app)

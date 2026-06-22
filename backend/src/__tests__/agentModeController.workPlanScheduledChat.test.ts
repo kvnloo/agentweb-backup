@@ -223,6 +223,58 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       );
     });
 
+    it('auto-converges an unattended run when a deferred (pending) step finishes on a later attempt', async () => {
+      // Models the media-generation time-budget deferral on a scheduled (unattended) run:
+      // a long image step leaves step 2 pending for the first couple of attempts (budget
+      // deferred mid-batch), then completes once the remaining images are generated. The
+      // existing runVerifiedChat retry loop must carry it to completion WITHOUT a human —
+      // i.e. no new orchestration is needed for the deferral fix on unattended runs.
+      const now = new Date().toISOString();
+      const pendingPlan = {
+        title: 'Image Batch Plan',
+        steps: [
+          { stepCount: 1, title: 'Step 1', status: 'completed' as const },
+          { stepCount: 2, title: 'Generate images', status: 'pending' as const },
+        ],
+        createdAt: now,
+        updatedAt: now,
+      };
+      const donePlan = {
+        ...pendingPlan,
+        steps: [
+          { stepCount: 1, title: 'Step 1', status: 'completed' as const },
+          { stepCount: 2, title: 'Generate images', status: 'completed' as const },
+        ],
+      };
+      // No keyword / function requirements so success hinges only on the work plan.
+      const sched = { ...baseSchedule, keywords: [], requiredFunctionCalls: [] };
+      mockScheduleDb.getScheduleById.mockResolvedValue(sched);
+
+      // Pending for the first two attempts (budget deferred mid-batch), completed on the
+      // third. The plan status is read back via getChatSession (generateSessionResponse
+      // overlays finalSession.workPlan), so drive both the worker and the session off the
+      // same counter.
+      let call = 0;
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(() => {
+        call++;
+        return Promise.resolve({ ...mockResponse, toolCalls: [], workPlan: call >= 3 ? donePlan : pendingPlan });
+      });
+      mockChatbotDb.getChatSession.mockImplementation(() =>
+        Promise.resolve({ ...mockSession, workPlan: call >= 3 ? donePlan : pendingPlan })
+      );
+
+      const result = await runScheduledChat(sched, mockUserId, true);
+
+      // Converged on attempt 3 — did NOT exhaust the 20-attempt cap, and no human "continue" was needed.
+      expect(call).toBe(3);
+      expect(result).toEqual(
+        expect.objectContaining({ scheduleId: mockScheduleId, status: 'success', passed: true })
+      );
+      // Retries used the pending-step continuation message (the unattended auto-continue).
+      const calls = mockGenerateMarketingResponseWorkerService.runInWorker.mock.calls;
+      expect(calls[1][0].messageContent).toContain('Please perform the work on pending steps');
+    });
+
     it('should check keywords and function calls after work plan is completed', async () => {
       const workPlan = {
         title: 'Onboarding Plan',

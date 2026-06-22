@@ -132,6 +132,8 @@ export interface ChatMessage {
       ip?: string;
       userAgent?: string;
     };
+    kind?: string;                      // Stable marker for system messages (e.g. 'image-generated')
+    imageFilename?: string;             // Filename when kind === 'image-generated'
   };
 }
 
@@ -3932,7 +3934,11 @@ export async function generateChatResponse(
     // existing one — she won't continue it or update step statuses. Insert right before the
     // final user message so it reads as the most recent context.
     if (session.workPlan) {
-      const workPlanMessages = AgentModeService.buildWorkPlanContextMessages(session.workPlan);
+      // Emma stays on current production behavior: pass includeResumeGuidance=false so
+      // none of the agent-mode image-resume hardening (progression / multi-intent /
+      // completion guard / asset-awareness / hands-off autocomplete wording) is emitted.
+      // The reported bug was agent-mode-only, so Emma needs no change here.
+      const workPlanMessages = AgentModeService.buildWorkPlanContextMessages(session.workPlan, undefined, false);
       if (workPlanMessages.length > 0) {
         const lastUserMsgIndex = messages.map((m) => m.role).lastIndexOf("user");
         const insertAt = lastUserMsgIndex >= 0 ? lastUserMsgIndex : messages.length;

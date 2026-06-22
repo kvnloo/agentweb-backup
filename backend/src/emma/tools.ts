@@ -2830,7 +2830,7 @@ emmaToolRegistry.register({
   name: 'search_leads',
   definition: {
     name: 'search_leads',
-    description: 'Find leads matching structured field-level criteria within one or more lead lists. Pass list_id for a single list (legacy) or list_ids for up to 5 lists at once — each returned lead carries its listId/listName so you can attribute results. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields. For cross-CRM strategic questions ("who should I reach out to?"), prefer ask_crm.',
+    description: 'Find leads matching structured field-level criteria within one or more lead lists. Pass list_id for a single list (legacy) or list_ids for up to 5 lists at once — each returned lead carries its listId/listName so you can attribute results. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields. For cross-CRM strategic questions ("who should I reach out to?"), prefer ask_crm. Each returned lead also carries `enrichmentMetadata`: a per-field provenance map (keyed by field name, including enriched custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) with `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile), `sourceUrl`/`sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt`. When the user asks about enriched values across leads (e.g. "what is the funding stage for each lead?"), USE THIS to report the source and confidence per value — present a table with the value alongside its provider/source and confidence rather than stating values as bare fact, and explicitly caveat medium/low-confidence or web-sourced values. A field with no entry in enrichmentMetadata was entered manually or imported, not enriched.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -5829,7 +5829,9 @@ emmaToolRegistry.register({
     name: 'enrich_leads_preview',
     description: `Preview a CRM lead enrichment job before running the full batch. Runs the V3 enrichment engine in preview mode on 2 sample leads and returns what it would produce.
 
-Returns: runId, processedCount (the 2 sampled leads), and samples — each with leadId and enrichedFields. In enrichedFields a missing value means nothing was found; tell the user "not found" rather than showing null. Show the samples and ask the user to confirm before calling enrich_leads_execute.
+Returns: runId, processedCount (the 2 sampled leads), and samples — each with leadId, enrichedFields, and unverifiedFields. In enrichedFields a missing value means nothing was found; tell the user "not found" rather than showing null. Show the samples and ask the user to confirm before calling enrich_leads_execute.
+
+IMPORTANT — data accuracy / unverifiedFields: unverifiedFields lists the fields in this sample whose value is low-confidence or unverified (typically pulled from web search rather than a structured provider, and not confirmed by the fact-check critic). These values may be wrong — for example a small company's funding_stage guessed from the web. Do NOT state unverified values as established fact. When you present them, caveat them explicitly (e.g. "funding_stage: Series C (unverified — from web search, please confirm)"). Fields NOT in unverifiedFields are high-confidence and can be stated plainly. If the user questions or corrects an unverified value, accept the correction gracefully and explain it came from a low-confidence source.
 
 IMPORTANT — identity resolution failures: If processedCount is 0 and failureBreakdown.identityResolutionFailed > 0, the sampled leads lack sufficient identifying information (no email address, no LinkedIn URL, and no full name). This list cannot be enriched — tell the user clearly that the list is unenrichable due to missing identity data (email/LinkedIn/name required) and do NOT call enrich_leads_execute for it. Skip it and continue with the other lists.
 
@@ -5960,7 +5962,7 @@ emmaToolRegistry.register({
     name: 'enrich_lead_custom',
     description: `Enrich a single CRM lead with custom fields on demand, without running a whole-list job.
 
-Use this when the user wants specific missing information filled on one lead (e.g. "find this person's LinkedIn headline and company size"). It runs the V3 enrichment engine on a batch of one. The response includes enrichedValues — a map of field name to the found value (null if nothing was found). Values are also persisted to the lead. Always show enrichedValues to the user; if a value is null, say nothing was found for that field.
+Use this when the user wants specific missing information filled on one lead (e.g. "find this person's LinkedIn headline and company size"). It runs the V3 enrichment engine on a batch of one. The response includes enrichedValues — a map of field name to the found value (null if nothing was found). Values are also persisted to the lead. Always show enrichedValues to the user; if a value is null, say nothing was found for that field. The response also includes enrichmentMetadata — a per-field provenance map (source, provider, sourceUrl/sourceQuote, confidence high/medium/low, enrichedAt). Cite the source and confidence for each value, and explicitly caveat web-sourced or medium/low-confidence values (e.g. a funding stage found via web search) rather than stating them as established fact.
 
 output_fields: one entry per field to populate, each with a snake_case "name", an "instruction" describing what to find, and an optional "overwrite_policy" (defaults to fill_if_empty; use always_overwrite to refresh a field that already has a value). If the result includes fieldRemaps, tell the user which requested fields were mapped onto existing CRM columns to avoid duplicates.`,
     inputSchema: {
@@ -6008,13 +6010,31 @@ output_fields: one entry per field to populate, each with a snake_case "name", a
     // Read the lead back so we can return the actual enriched values.
     // V3 writes standard columns top-level and custom names into customFields.
     const enrichedValues: Record<string, string | null> = {};
+    // Per-field provenance for the just-enriched fields — lets the agent cite
+    // source/provider/confidence (and caveat web-sourced/low-confidence values)
+    // instead of stating bare values. Sanitized so cross-tenant CRM-history
+    // lineage never reaches the customer — mirrors get_lead_details/search_leads.
+    let enrichmentMetadata: Record<string, any> | undefined;
     if (summary.processedCount > 0) {
       try {
         const { crmDb } = await import('../services/db');
+        const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
         const lead: any = await crmDb.getLeadById(args.list_id, args.lead_id);
         const customFields = (lead?.customFields ?? {}) as Record<string, string>;
-        for (const f of (args.output_fields as Array<{ name: string }>)) {
-          enrichedValues[f.name] = customFields[f.name] ?? lead?.[f.name] ?? null;
+        const requestedNames = (args.output_fields as Array<{ name: string }>).map(f => f.name);
+        for (const name of requestedNames) {
+          enrichedValues[name] = customFields[name] ?? lead?.[name] ?? null;
+        }
+        const sanitized = sanitizeEnrichmentMetadataForResponse(
+          lead?.enrichmentMetadata as Record<string, any> | undefined,
+        );
+        if (sanitized) {
+          // Only surface metadata for the fields this call enriched.
+          const scoped: Record<string, any> = {};
+          for (const name of requestedNames) {
+            if (sanitized[name] !== undefined) scoped[name] = sanitized[name];
+          }
+          if (Object.keys(scoped).length > 0) enrichmentMetadata = scoped;
         }
       } catch {
         // Non-fatal — enrichment succeeded, values are in the DB.
@@ -6025,6 +6045,7 @@ output_fields: one entry per field to populate, each with a snake_case "name", a
       leadId: args.lead_id,
       listId: args.list_id,
       enrichedValues,
+      ...(enrichmentMetadata ? { enrichmentMetadata } : {}),
       runId: summary.runId,
       processedCount: summary.processedCount,
       failedCount: summary.failedCount,
@@ -6115,7 +6136,7 @@ emmaToolRegistry.register({
   name: 'coding_agent',
   definition: {
     name: 'coding_agent',
-    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to a STAGING draft branch (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code. IMPORTANT: After coding_agent returns, trust its result — do NOT attempt to verify by reading or listing landing page files yourself (e.g. list_landing_page_files, get_file_contents, read_landing_page_file). The coding agent already verified the changes. If it failed, call coding_agent again with a clearer task_description. Only call coding_agent ONCE per user request unless it explicitly fails. LOGO TIP: Always pass logo URLs directly in the task_description — the coding agent will use them in <img src="..."> tags. For public company logos use Google\'s favicon service (https://www.google.com/s2/favicons?domain={domain}&sz=128). For the user\'s own brand logo, look it up with read_brand_guidelines first and include the URL in the task.',
+    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to a STAGING draft branch (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code. For user-visible landing-page changes, pass typed acceptance_checks that prove the requested behavior on the preview page; the backend verifier runs them after the coding agent finishes and fails or blocks the tool if they do not pass. Do not use hard-coded human-looking benchmark copy; use user-requested content or opaque tokens where a test marker is needed. If the tool fails because acceptance failed, report the failed checks and ask for the missing input or run a narrower follow-up. Only call coding_agent ONCE per user request unless it explicitly fails. LOGO TIP: Always pass logo URLs directly in the task_description — the coding agent will use them in <img src="..."> tags. For public company logos use Google\'s favicon service (https://www.google.com/s2/favicons?domain={domain}&sz=128). For the user\'s own brand logo, look it up with read_brand_guidelines first and include the URL in the task.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -6128,6 +6149,31 @@ emmaToolRegistry.register({
           type: 'string',
           'x-aliases': ['instructions'],
           description: 'Detailed description of what code changes to make. Include specific requirements, file paths if known, and any context about the desired outcome. Be as specific as possible.'
+        },
+        acceptance_checks: {
+          type: 'array',
+          description: 'Optional deterministic checks to run against the staging preview after the coding agent finishes. Use these for landing-page edits so success means the requested behavior actually passed.',
+          maxItems: 10,
+          items: {
+            type: 'object',
+            properties: {
+              type: {
+                type: 'string',
+                enum: ['http_status', 'text_present', 'selector_exists', 'no_console_errors', 'no_external_hosts'],
+                description: 'Typed verifier check. http_status checks URL status. text_present checks text under a selector. selector_exists checks for an element. no_console_errors fails on console errors. no_external_hosts fails on disallowed external asset hosts.'
+              },
+              label: { type: 'string', description: 'Short check name, e.g. "requested headline visible" or "no external font hosts".' },
+              url: { type: 'string', description: 'Check URL. For browser checks, omit this to use the preview URL, or use {{previewUrl}} as a placeholder.' },
+              method: { type: 'string', enum: ['GET', 'HEAD'], description: 'HTTP method for http_status checks.' },
+              expectStatus: { type: 'number', description: 'Expected HTTP status for http_status checks. Defaults to 200.' },
+              selector: { type: 'string', description: 'CSS selector for text_present or selector_exists checks. text_present defaults to body.' },
+              text: { type: 'string', description: 'Expected text for text_present checks.' },
+              allowPatterns: { type: 'array', items: { type: 'string' }, description: 'Regex patterns for no_console_errors messages that should be ignored.' },
+              allowHosts: { type: 'array', items: { type: 'string' }, description: 'Allowed hostnames for no_external_hosts. Preview host is allowed automatically.' },
+              denyPatterns: { type: 'array', items: { type: 'string' }, description: 'Regex hostname patterns for no_external_hosts. Defaults catch common external font/CDN hosts.' }
+            },
+            required: ['type']
+          }
         }
       },
       required: ['page_id', 'task_description']
@@ -6161,6 +6207,7 @@ emmaToolRegistry.register({
         socketEmit: context?.socketEmit,
         executeMcpTool,
         draftBranch,
+        acceptanceChecks: Array.isArray(args.acceptance_checks) ? args.acceptance_checks : undefined,
       }
     );
     if (result.success) {
@@ -6170,6 +6217,13 @@ emmaToolRegistry.register({
         iterations: result.iterations,
         previewUrl: result.previewUrl,
         branch: result.branch,
+        runId: result.runId,
+        state: result.state,
+        acceptanceStatus: result.acceptanceStatus,
+        acceptance: result.acceptance,
+        verification: result.verification,
+        recovery: result.recovery,
+        retryable: result.retryable,
         is_staging: !!result.branch && result.branch !== 'main',
         note: result.branch && result.branch !== 'main'
           ? `Changes are on staging branch "${result.branch}". The user must review the preview URL and ask to publish before changes go live.`
@@ -6182,6 +6236,13 @@ emmaToolRegistry.register({
         iterations: result.iterations,
         previewUrl: result.previewUrl,
         branch: result.branch,
+        runId: result.runId,
+        state: result.state,
+        acceptanceStatus: result.acceptanceStatus,
+        acceptance: result.acceptance,
+        verification: result.verification,
+        recovery: result.recovery,
+        retryable: result.retryable,
         is_staging: !!result.branch && result.branch !== 'main',
         // Authorization denials are not retryable — the caller lacks edit rights
         // on this page. Signal the parent agent to surface the message and stop

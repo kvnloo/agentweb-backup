@@ -195,6 +195,88 @@ describe('enrich_lead_custom', () => {
     expect(result.enrichedValues).toEqual({ company_size: '200', title: 'CTO' });
   });
 
+  it('returns sanitized per-field enrichmentMetadata so the agent can cite source/confidence', async () => {
+    (runEmmaEnrichment as jest.Mock).mockResolvedValue({ ...SUMMARY, processedCount: 1 });
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+      leadId: 'lead-7',
+      customFields: { funding_stage: 'Series C' },
+      enrichmentMetadata: {
+        funding_stage: {
+          source: 'web_search',
+          provider: 'llm_web_search',
+          confidence: 'medium',
+          sourceUrl: 'https://example.com/slashy',
+          enrichedAt: '2026-06-22T00:00:00.000Z',
+        },
+      },
+    });
+    const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+    const result = await tool.execute(
+      {
+        list_id: 'list-abc',
+        lead_id: 'lead-7',
+        output_fields: [{ name: 'funding_stage', instruction: 'find funding stage' }],
+      },
+      { userId: 'user1' },
+    );
+    expect(result.enrichedValues).toEqual({ funding_stage: 'Series C' });
+    expect(result.enrichmentMetadata).toBeDefined();
+    expect(result.enrichmentMetadata.funding_stage.provider).toBe('llm_web_search');
+    expect(result.enrichmentMetadata.funding_stage.confidence).toBe('medium');
+  });
+
+  it('strips cross-tenant CRM-history lineage from enrich_lead_custom enrichmentMetadata', async () => {
+    (runEmmaEnrichment as jest.Mock).mockResolvedValue({ ...SUMMARY, processedCount: 1 });
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+      leadId: 'lead-7',
+      customFields: { funding_stage: 'Seed' },
+      enrichmentMetadata: {
+        funding_stage: {
+          source: 'crm-history',
+          provider: 'agentweb',
+          confidence: 'medium',
+          siblingLeadId: 'other-tenant-lead',
+          siblingListId: 'other-tenant-list',
+          siblingUserId: 'other-tenant-user',
+          enrichedAt: '2026-06-22T00:00:00.000Z',
+        },
+      },
+    });
+    const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+    const result = await tool.execute(
+      {
+        list_id: 'list-abc',
+        lead_id: 'lead-7',
+        output_fields: [{ name: 'funding_stage', instruction: 'find funding stage' }],
+      },
+      { userId: 'user1' },
+    );
+    const meta = result.enrichmentMetadata.funding_stage;
+    expect(meta.source).toBe('agentweb');            // rewritten from 'crm-history'
+    expect(meta.siblingLeadId).toBeUndefined();
+    expect(meta.siblingListId).toBeUndefined();
+    expect(meta.siblingUserId).toBeUndefined();
+  });
+
+  it('omits enrichmentMetadata when the enriched lead has none', async () => {
+    (runEmmaEnrichment as jest.Mock).mockResolvedValue({ ...SUMMARY, processedCount: 1 });
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+      leadId: 'lead-7',
+      customFields: { company_size: '200' },
+      title: 'CTO',
+    });
+    const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+    const result = await tool.execute(
+      {
+        list_id: 'list-abc',
+        lead_id: 'lead-7',
+        output_fields: [{ name: 'company_size', instruction: 'find headcount' }],
+      },
+      { userId: 'user1' },
+    );
+    expect(result.enrichmentMetadata).toBeUndefined();
+  });
+
   it('rejects when output_fields is empty (via buildRawEnrichmentConfig)', async () => {
     (runEmmaEnrichment as jest.Mock).mockRejectedValue(new Error('output_fields must be a non-empty array'));
     const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
