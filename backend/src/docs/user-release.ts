@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-06-12
+// Last updated: 2026-06-22
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,15 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-06-22',
+    changes: [
+      'Improved: Large Image Batches No Longer Stall Mid-Way',
+      '- When you ask Emma to generate many images at once (for example a campaign with several ad images per hook), she now works through them in manageable groups instead of trying to finish the whole batch in one go and timing out',
+      '- If a batch is too large to complete in a single response, Emma saves the images she has already created, tells you how many are done versus still remaining, and asks you to reply "continue" to generate the rest',
+      '- When you continue, she generates only the images that are still missing — she never re-creates the ones already saved — so a large batch finishes reliably over a few steps instead of getting stuck',
+    ],
+  },
   {
     date: '2026-06-12',
     changes: [

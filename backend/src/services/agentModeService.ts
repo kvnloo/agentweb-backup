@@ -2524,6 +2524,20 @@ export class AgentModeService {
       _messages = messages;
       _initialMessageCount = initialMessageCount;
 
+      // Per-run media-generation time budget. A work-plan step that generates many
+      // images (e.g. LinkedIn Ads "Generate 3 Images Per Hook" = 18 images) runs them
+      // sequentially and can exceed the controller's hard wall-clock timeout
+      // (AGENT_MODE_GENERATION_TIMEOUT_MS, default 10 min), getting killed mid-step so
+      // set_work_plan_status never fires. We set a softer deadline here; once it passes
+      // and ≥1 asset has been produced this run, the tool-dispatch boundary defers
+      // further media-gen calls and asks the user to continue, so the batch converges
+      // across turns (paired with the already-generated-assets context that prevents
+      // regeneration). Default 7 min leaves headroom under the 10-min hard timeout.
+      // Set AGENT_MODE_MEDIA_BUDGET_MS=0 to disable.
+      const mediaBudgetMs = parseInt(process.env.AGENT_MODE_MEDIA_BUDGET_MS || '420000', 10);
+      const mediaGenerationDeadlineMs = mediaBudgetMs > 0 ? Date.now() + mediaBudgetMs : undefined;
+      let mediaAssetsProducedThisRun = 0;
+
       // Single loop for LLM calls and tool execution
       let maxIterations = 40; // Prevent infinite loops
       let iteration = 0;
@@ -2905,6 +2919,8 @@ export class AgentModeService {
           allowedToolNames,
           toolResponseS3Threshold: TOOL_RESPONSE_S3_THRESHOLD,
           maxToolContentSize: MAX_TOOL_CONTENT_SIZE,
+          mediaGenerationDeadlineMs,
+          mediaAssetsProducedThisRun,
           ports: {
             evaluateAgentToolPolicy,
             validateAndRepairToolArgs,
@@ -2931,6 +2947,9 @@ export class AgentModeService {
         if (dispatchResult.skillsUpdated) {
           skillsUpdated = true;
         }
+        // Carry the running per-run media-asset total forward so the next iteration's
+        // budget decision knows whether this run has already produced ≥1 asset.
+        mediaAssetsProducedThisRun += dispatchResult.mediaAssetsProduced;
 
         // Send progress update after all tools complete.
         // Only send tool calls added in this iteration — the frontend accumulates
