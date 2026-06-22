@@ -2453,6 +2453,19 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
       updates.selectedSenderId = normalizedSenderId;
     }
 
+    // When this list is connected to HubSpot with auto-sync OFF, a change to a
+    // HubSpot-mapped field on an already-synced lead means it needs re-pushing —
+    // surface that as update_pending so it shows in the sync filter. With
+    // auto-sync ON the adapter sets synced/sync_failed instead, so we skip.
+    const hsConnUpd = getHubspotConnection(list);
+    if (hsConnUpd.connected && !hsConnUpd.autoSyncEnabled) {
+      const existingForSync = await crmDb.getLeadById(listId, leadId);
+      if (existingForSync && resolveSyncStatus(existingForSync, true) === 'synced'
+          && mappedFieldChanged(existingForSync, updates, getMappedAgentwebFields(hsConnUpd.config))) {
+        updates.syncMetadata = { ...(existingForSync.syncMetadata || {}), syncStatus: 'update_pending' };
+      }
+    }
+
     const updateData = updates;
 
     // Auto-create status change engagement if status changed
