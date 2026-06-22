@@ -45,11 +45,13 @@ jest.mock('../utils/leadContactStatus', () => ({ isDoNotContact: jest.fn().mockR
 const mockGetLeadListsByUserId = jest.fn();
 const mockGetLeadByEmail = jest.fn();
 const mockUpdateLead = jest.fn();
+const mockCreateLead = jest.fn();
 jest.mock('../services/db', () => ({
   crmDb: {
     getLeadListsByUserId: (...a: any[]) => mockGetLeadListsByUserId(...a),
     getLeadByEmail: (...a: any[]) => mockGetLeadByEmail(...a),
     updateLead: (...a: any[]) => mockUpdateLead(...a),
+    createLead: (...a: any[]) => mockCreateLead(...a),
     getLeadListById: jest.fn(),
   },
   userDb: { getUserById: jest.fn(), getUserByEmail: jest.fn() },
@@ -136,6 +138,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
     mockGetLeadListsByUserId.mockResolvedValue([mockList]);
     mockGetLeadByEmail.mockResolvedValue(mockLead);
     mockUpdateLead.mockResolvedValue(undefined);
+    mockCreateLead.mockResolvedValue(undefined);
     mockGetContactById.mockResolvedValue({});
     mockGetContactEmailById.mockResolvedValue(null);
     mockGetDealContactAssociations.mockResolvedValue([]);
@@ -216,6 +219,34 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
     await flushPromises();
     await flushPromises();
     expect(mockGetContactEmailById).toHaveBeenCalledTimes(2);
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
+  it('creates a lead on contact.creation when the contact is not yet in the list', async () => {
+    mockGetLeadByEmail.mockResolvedValue(null); // not in list yet
+    mockGetContactById.mockResolvedValue({ email: 'new@example.com', firstname: 'New', lastname: 'Person' });
+    const body = [{ subscriptionType: 'contact.creation', portalId: PORTAL_ID, objectId: '777' }];
+    await request(app).post('/api/webhooks/hubspot').send(body);
+
+    await flushPromises();
+    await flushPromises();
+    expect(mockCreateLead).toHaveBeenCalled();
+    const [listId, fields] = mockCreateLead.mock.calls[0];
+    expect(listId).toBe(LIST_ID);
+    expect(fields.email).toBe('new@example.com');
+    expect(fields.firstName).toBe('New');
+    expect(fields.syncMetadata).toEqual({ hubspot_contact_id: '777' });
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
+  it('does NOT create a lead on contact.propertyChange for a contact not in the list', async () => {
+    mockGetLeadByEmail.mockResolvedValue(null);
+    const body = [{ subscriptionType: 'contact.propertyChange', portalId: PORTAL_ID, objectId: '888', propertyName: 'email', propertyValue: 'stranger@example.com' }];
+    await request(app).post('/api/webhooks/hubspot').send(body);
+
+    await flushPromises();
+    await flushPromises();
+    expect(mockCreateLead).not.toHaveBeenCalled();
     expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 

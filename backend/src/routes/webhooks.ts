@@ -993,9 +993,10 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
           }
 
           const lead = await crmDb.getLeadByEmail(list.listId, email.toLowerCase());
-          if (!lead) continue;
 
+          // Deletion: flag an existing lead as CRM-removed (nothing to do if absent).
           if (data.isDeleted) {
+            if (!lead) continue;
             await crmDb.updateLead(list.listId, lead.leadId, {
               syncMetadata: { ...(lead.syncMetadata || {}), crmRemovedAt: new Date().toISOString() },
             });
@@ -1003,20 +1004,21 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
             continue;
           }
 
-          const updates: any = {};
-          if (data.properties.firstname       !== undefined) updates.firstName = data.properties.firstname;
-          if (data.properties.lastname        !== undefined) updates.lastName  = data.properties.lastname;
-          if (data.properties.phone           !== undefined) updates.phone     = data.properties.phone;
-          if (data.properties.jobtitle        !== undefined) updates.title     = data.properties.jobtitle;
-          if (data.properties.company         !== undefined) updates.company   = data.properties.company;
-          if (data.properties.hs_linkedin_url !== undefined) updates.linkedin  = data.properties.hs_linkedin_url;
+          // Map standard HubSpot properties → lead fields (shared by create + update).
+          const fields: any = {};
+          if (data.properties.firstname       !== undefined) fields.firstName = data.properties.firstname;
+          if (data.properties.lastname        !== undefined) fields.lastName  = data.properties.lastname;
+          if (data.properties.phone           !== undefined) fields.phone     = data.properties.phone;
+          if (data.properties.jobtitle        !== undefined) fields.title     = data.properties.jobtitle;
+          if (data.properties.company         !== undefined) fields.company   = data.properties.company;
+          if (data.properties.hs_linkedin_url !== undefined) fields.linkedin  = data.properties.hs_linkedin_url;
 
           const standardHubspotProps = ['email', 'firstname', 'lastname', 'phone', 'jobtitle', 'company', 'hs_linkedin_url'];
           const customFieldUpdates: any = {};
           Object.entries(data.properties).forEach(([key, val]) => {
             if (standardHubspotProps.includes(key)) return;
             let matchedKey = key;
-            if (lead.customFields) {
+            if (lead?.customFields) {
               const found = Object.keys(lead.customFields).find(
                 k => k.toLowerCase().replace(/[^a-z0-9]/g, '_') === key
               );
@@ -1025,6 +1027,18 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
             customFieldUpdates[matchedKey] = val;
           });
 
+          if (!lead) {
+            // New contact in HubSpot → create the lead. Only on creation events:
+            // a property change to a contact we've never seen isn't ours to add.
+            if (!data.isCreation) continue;
+            const newLead: any = { email: email.toLowerCase(), ...fields, syncMetadata: { hubspot_contact_id: objectId } };
+            if (Object.keys(customFieldUpdates).length > 0) newLead.customFields = customFieldUpdates;
+            await crmDb.createLead(list.listId, newLead);
+            console.log(`[HubSpot Webhook] Created lead for ${email} in list ${list.listId}`);
+            continue;
+          }
+
+          const updates: any = { ...fields };
           if (Object.keys(customFieldUpdates).length > 0) {
             updates.customFields = mergeCustomFields(
               lead.customFields,
