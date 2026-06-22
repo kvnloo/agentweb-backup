@@ -7,6 +7,7 @@ jest.mock('../services/db', () => ({
     getLeadListById: jest.fn(),
     getLeadsByListId: jest.fn(),
     updateLead: jest.fn(),
+    updateLeadList: jest.fn().mockResolvedValue(undefined),
     batchCreateLeads: jest.fn(),
     setLeadListCrmSyncConfig: jest.fn().mockResolvedValue(undefined),
   },
@@ -36,6 +37,7 @@ const mockHubSpotServiceInstance = {
   getDeal: jest.fn().mockResolvedValue(null),
   getDealPipelineStages: jest.fn().mockResolvedValue([]),
   createDealStage: jest.fn().mockResolvedValue({ id: 'stage_1', label: 'Stage 1', displayOrder: 0, metadata: { probability: 0.1 } }),
+  createDealPipeline: jest.fn().mockResolvedValue({ id: 'new_pipe', label: 'Test List', displayOrder: 0, stages: [] }),
   listDealPipelines: jest.fn().mockResolvedValue([]),
   listContactProperties: jest.fn().mockResolvedValue([]),
   listDealProperties: jest.fn().mockResolvedValue([]),
@@ -172,8 +174,10 @@ describe('ExternalCrmSyncService', () => {
     mockHubSpotServiceInstance.getDeal.mockResolvedValue(null);
     mockHubSpotServiceInstance.getDealPipelineStages.mockResolvedValue([]);
     mockHubSpotServiceInstance.createDealStage.mockResolvedValue({ id: 'stage_1', label: 'Stage 1', displayOrder: 0, metadata: { probability: 0.1 } });
+    mockHubSpotServiceInstance.createDealPipeline.mockResolvedValue({ id: 'new_pipe', label: 'Test List', displayOrder: 0, stages: [] });
     mockHubSpotServiceInstance.listDealPipelines.mockResolvedValue([]);
     mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+    (mockCrmDb as any).updateLeadList?.mockResolvedValue?.(undefined);
     service = new ExternalCrmSyncService();
   });
 
@@ -270,6 +274,92 @@ describe('ExternalCrmSyncService', () => {
       expect(persisted.externalPipelineId).toBe('new123');
       expect(persisted.hubspotDealStageMap).toBeUndefined();
       expect(result.externalPipelineId).toBe('new123');
+    });
+  });
+
+  // ─── syncHubSpotStatusOptions — pipeline resolution (fix B + C) ─────────────
+
+  describe('syncHubSpotStatusOptions pipeline resolution', () => {
+    const STAGE_MAPPING: FieldMapping = { agentwebField: 'status', crmProperty: 'dealstage', direction: 'both', enabled: true };
+    const RESERVED = ['appointmentscheduled', 'qualifiedtobuy', 'presentationscheduled', 'decisionmakerboughtin', 'contractsent', 'closedwon', 'closedlost'];
+    const statusConfig = [
+      { value: 'appointmentscheduled', label: 'Appointment Scheduled', color: '#fff', type: 'active' },
+      { value: 'mylead', label: 'My Lead', color: '#000', type: 'active' },
+    ];
+
+    function persistedConfig(): any {
+      const calls = mockCrmDb.setLeadListCrmSyncConfig.mock.calls;
+      return calls.length ? (calls[calls.length - 1][2] as any) : null;
+    }
+
+    it('persists the resolved pipeline id so later syncs skip discovery (fix C)', async () => {
+      const config = makeConfig({ dealFieldMapping: [STAGE_MAPPING], externalPipelineId: undefined });
+      mockListWithConfig(config, 'hubspot', { statusConfig });
+      mockHubSpotServiceInstance.listDealPipelines.mockResolvedValue([]);
+      mockHubSpotServiceInstance.createDealPipeline.mockResolvedValue({ id: 'new_pipe', label: 'Test List', displayOrder: 0, stages: [] });
+      mockHubSpotServiceInstance.getDealPipelineStages.mockResolvedValue([]);
+
+      await service.pullAllContacts('user1', 'list1', 'hubspot');
+
+      expect(persistedConfig()?.externalPipelineId).toBe('new_pipe');
+    });
+
+    it('falls back to "default" and persists it when pipeline creation fails (fix C)', async () => {
+      const config = makeConfig({ dealFieldMapping: [STAGE_MAPPING], externalPipelineId: undefined });
+      mockListWithConfig(config, 'hubspot', { statusConfig });
+      mockHubSpotServiceInstance.listDealPipelines.mockResolvedValue([]);
+      mockHubSpotServiceInstance.createDealPipeline.mockRejectedValue(new Error('You have reached your limit of 1 deal pipelines.'));
+      mockHubSpotServiceInstance.getDealPipelineStages.mockResolvedValue([]);
+
+      await service.pullAllContacts('user1', 'list1', 'hubspot');
+
+      expect(persistedConfig()?.externalPipelineId).toBe('default');
+    });
+
+    it('does not discover or create a pipeline when one is already selected (fix C)', async () => {
+      const config = makeConfig({ dealFieldMapping: [STAGE_MAPPING], externalPipelineId: 'default' });
+      mockListWithConfig(config, 'hubspot', { statusConfig });
+      mockHubSpotServiceInstance.getDealPipelineStages.mockResolvedValue([]);
+
+      await service.pullAllContacts('user1', 'list1', 'hubspot');
+
+      expect(mockHubSpotServiceInstance.listDealPipelines).not.toHaveBeenCalled();
+      expect(mockHubSpotServiceInstance.createDealPipeline).not.toHaveBeenCalled();
+    });
+
+    it('never reuses HubSpot reserved default stage ids when creating a pipeline (fix B)', async () => {
+      const config = makeConfig({ dealFieldMapping: [STAGE_MAPPING], externalPipelineId: undefined });
+      mockListWithConfig(config, 'hubspot', { statusConfig });
+      mockHubSpotServiceInstance.listDealPipelines.mockResolvedValue([]);
+      mockHubSpotServiceInstance.getDealPipelineStages.mockResolvedValue([]);
+
+      await service.pullAllContacts('user1', 'list1', 'hubspot');
+
+      expect(mockHubSpotServiceInstance.createDealPipeline).toHaveBeenCalled();
+      const stages = mockHubSpotServiceInstance.createDealPipeline.mock.calls[0][1] as Array<{ stageId: string; label: string }>;
+      for (const s of stages) expect(RESERVED).not.toContain(s.stageId);
+      // labels preserved so later label-matching still resolves the stage map
+      expect(stages.some(s => s.label === 'Appointment Scheduled')).toBe(true);
+    });
+
+    it('never reuses reserved default stage ids when ADDING a stage to a pipeline (fix B)', async () => {
+      // A status that matches no existing stage (by id or label) → createDealStage.
+      // Its value is a reserved slug; the requested stageId must be namespaced.
+      const config = makeConfig({ dealFieldMapping: [STAGE_MAPPING], externalPipelineId: 'default' });
+      mockListWithConfig(config, 'hubspot', {
+        statusConfig: [{ value: 'closedwon', label: 'Won Deal', color: '#0f0', type: 'won' }],
+      });
+      mockHubSpotServiceInstance.getDealPipelineStages.mockResolvedValue([
+        { id: '111', label: 'Some Other Stage', displayOrder: 0, metadata: {} },
+      ]);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: undefined } as any);
+
+      await service.pushAllLeads('user1', 'list1', 'hubspot');
+
+      expect(mockHubSpotServiceInstance.createDealStage).toHaveBeenCalled();
+      const arg = mockHubSpotServiceInstance.createDealStage.mock.calls[0][1] as { stageId: string; label: string };
+      expect(RESERVED).not.toContain(arg.stageId);
+      expect(arg.label).toBe('Won Deal');
     });
   });
 

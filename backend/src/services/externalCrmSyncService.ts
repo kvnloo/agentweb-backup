@@ -1139,8 +1139,12 @@ export class ExternalCrmSyncService {
       } else {
         // Prepare initial stages for the new pipeline
         const statusConfig = this.normalizeStatusConfig(list.statusConfig);
+        // Namespace stage ids: HubSpot reserves the default pipeline's stage slugs
+        // (appointmentscheduled, closedwon, …) and rejects a custom pipeline that
+        // reuses them. Prefixing guarantees no collision; the label is preserved so
+        // the later label-match still resolves the stage map.
         const initialStages = statusConfig.map((s, idx) => ({
-          stageId: s.value,
+          stageId: `aw_${s.value}`,
           label: s.label,
           displayOrder: idx,
           probability: this.statusToProbability(s, statusConfig)
@@ -1162,6 +1166,13 @@ export class ExternalCrmSyncService {
           pipelineId = 'default';
         }
       }
+    }
+
+    // Persist the resolved pipeline so subsequent syncs take the pre-selected
+    // branch above instead of re-running discovery/creation every time (which,
+    // on free tier or after a fallback, repeats a doomed createDealPipeline call).
+    if (!config.externalPipelineId) {
+      config.externalPipelineId = pipelineId;
     }
 
     let stages: HubSpotPipelineStage[];
@@ -1200,7 +1211,12 @@ export class ExternalCrmSyncService {
           const probability = this.statusToProbability(status, statusConfig);
           try {
             const createdStage = await svc.createDealStage(pipelineId, {
-              stageId: status.value,
+              // Namespaced for the same reason as initialStages above: a custom
+              // pipeline rejects HubSpot's reserved default stage slugs. On the
+              // default pipeline HubSpot assigns its own id regardless, so the
+              // requested id is harmless there; the stage map keys off the
+              // returned id + label match either way.
+              stageId: `aw_${status.value}`,
               label: status.label,
               displayOrder: nextDisplayOrder++,
               probability,
