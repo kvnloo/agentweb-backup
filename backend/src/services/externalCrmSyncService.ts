@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { crmDb, userDb } from './db';
+import { getAccountById } from './connectedAccountsDb';
 import { decryptPassword, encryptPassword } from '../utils/crypto';
 import { CrmAuth, CrmAdapter } from './adapters/crmAdapterTypes';
 import { AttioAdapter } from './adapters/attioAdapter';
@@ -404,6 +405,25 @@ export class ExternalCrmSyncService {
     const config = await this.getConfig(userId, listId, provider);
     if (!config) throw new Error(`No sync configuration found for list ${listId} / ${provider}`);
     return this.resolveAuth(config);
+  }
+
+  /**
+   * True when the config's stored credential is currently usable:
+   * - token auth (apiKeyEncrypted) is self-contained → always connected
+   * - OAuth (accountId) → only if the account still resolves to a connected
+   *   account (a disconnected/removed/expired account leaves `accountId` set but
+   *   unresolvable). Mirrors the resolution push uses (getAccountById), so this
+   *   is true exactly when a sync would actually authenticate.
+   *
+   * We deliberately keep `accountId` after a disconnect (so reconnecting restores
+   * the list), so the UI can't tell from `accountId` alone that the connection is
+   * dead — this lets it surface a "reconnect needed" state instead.
+   */
+  async isAccountConnected(config: ExternalCrmSyncConfig): Promise<boolean> {
+    if (config.apiKeyEncrypted) return true;
+    if (!config.accountId) return false;
+    const account = await getAccountById(config.accountId, config.userId).catch(() => null);
+    return !!account;
   }
 
   async testConnection(
