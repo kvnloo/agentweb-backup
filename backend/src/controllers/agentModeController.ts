@@ -29,8 +29,6 @@ import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
 import { DynamoDB } from 'aws-sdk';
 
-/** Default expiration for legacy interactive shares that don't have an expiresAt field (7 days from sharedAt). */
-const LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS = 7;
 const ZERO_ASSISTANT_REQUEUE_BASE_MS = 15 * 60 * 1000;
 const ZERO_ASSISTANT_REQUEUE_MAX_MS = 2 * 60 * 60 * 1000;
 const ZERO_ASSISTANT_MAX_REQUEUES = 3;
@@ -156,13 +154,17 @@ function attachInProcessCompletion(
 
 /**
  * Returns the effective expiration date for an interactive share.
- * If expiresAt is set, use it. Otherwise, default to sharedAt + 7 days.
- * If neither is set, returns a date in the past (treat as expired).
+ *
+ * Only an explicit `expiresAt` causes expiry. Shares created without one —
+ * every public plan/ishare link (createSessionWithPlan sets `sharedAt` only)
+ * and all legacy shares — never expire on a timer; their availability is
+ * governed solely by the `isActive` flag. (Previously, a missing `expiresAt`
+ * was treated as "sharedAt + 7 days", which silently 410'd every such link a
+ * week after creation and broke all ishare links.)
  */
 function getInteractiveShareExpiresAt(share: { expiresAt?: string; sharedAt?: string }): Date {
   if (share.expiresAt) return new Date(share.expiresAt);
-  if (share.sharedAt) return new Date(new Date(share.sharedAt).getTime() + LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS * 86400000);
-  return new Date(0); // No dates at all — treat as expired
+  return new Date(8640000000000000); // No expiresAt — never expires
 }
 
 /**
