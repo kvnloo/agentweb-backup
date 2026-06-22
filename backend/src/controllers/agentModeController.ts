@@ -2974,6 +2974,17 @@ export const agentModeController = {
       const urlParams = new URL(conversableUrl).searchParams;
       const conversableToken = urlParams.get('conversable') || '';
 
+      // KNOWN LIMITATION: this echoes the requested window, not the stored value.
+      // createOrReuseInteractiveShare REUSES an existing active share untouched,
+      // so when one already exists this expiresAt can differ from what's actually
+      // in the DB — most notably, re-sharing a session that already has a
+      // no-expiry token (e.g. one first minted by a machine/email path) shows an
+      // "Expires" date in the UI while the link is in fact permanent. This is a
+      // display mismatch only: it grants no extra access (the token was already
+      // live) and is reversible. Changing an active share's expiry requires
+      // revoke (stopConversableShare) + reshare. A true fix needs per-purpose
+      // tokens (see the on-demand-minting redesign) rather than one shared token
+      // per session, so it is intentionally out of scope here.
       const expiresAt = new Date(Date.now() + expirationDays * 86400000).toISOString();
 
       res.status(200).json({

@@ -2975,7 +2975,25 @@ export class ChatbotDB {
   }
 
   // Common function to create or reuse interactive share for a session
-  async createOrReuseInteractiveShare(sessionId: string, expirationDays: number = 7): Promise<string> {
+  /**
+   * Create (or reuse an existing active) interactive share for a session.
+   *
+   * `expirationDays` is only honored when a caller explicitly opts into a timed
+   * expiry — currently just the human "share" dialog (createConversableShare),
+   * which surfaces the 1–365 day dropdown. Machine-generated shares
+   * (scheduled-chat, slack, email/CRM, alerts, revisions, result endpoints)
+   * call this with no argument and must NOT get an expiry: they are
+   * notification/report links a recipient may open days later, and the old
+   * 7-day default silently 410'd thousands of them a week after creation.
+   * Omitting `expiresAt` leaves the share governed solely by `isActive`
+   * (see getInteractiveShareExpiresAt).
+   *
+   * No-expiry callers also strip an expiry off a reused token (one share/token
+   * per session, first-writer-wins): if an admin review link (45d) or a legacy
+   * 7d link was minted first, a later external send clears its `expiresAt` so the
+   * mailed/posted link can never expire.
+   */
+  async createOrReuseInteractiveShare(sessionId: string, expirationDays?: number | null): Promise<string> {
     try {
       // First, get the current session to check if it already has an interactive share
       const session = await this.getChatSession(sessionId);
@@ -2983,8 +3001,31 @@ export class ChatbotDB {
         throw new Error(`Session ${sessionId} not found`);
       }
 
+      // Treat only a positive expirationDays as a timed expiry. null/undefined
+      // means "no expiry"; 0 or negative is also coerced to no-expiry rather than
+      // minting an already-/instantly-expired link (which would silently 410 — the
+      // exact outage this whole fix exists to prevent) if a future caller ever
+      // wires a falsy value through.
+      const hasTimedExpiry = expirationDays != null && expirationDays > 0;
+
       // Check if there's already an active interactive share
       if (session.interactiveShareMetadata?.isActive && session.interactiveShareMetadata?.token) {
+        // If this caller wants no timed expiry but the stored token carries one —
+        // e.g. an admin review link (45d) or a legacy 7d link — strip it. Links
+        // shared out via email/slack/oncall must never expire regardless of who
+        // minted the token first.
+        if (!hasTimedExpiry && session.interactiveShareMetadata.expiresAt) {
+          // Best-effort: a failed strip must not lose the working ishare link
+          // (the outer catch would otherwise downgrade it to a login-required
+          // /agent-mode URL). Worst case the link keeps its existing expiry and
+          // a later send strips it.
+          try {
+            const { expiresAt, ...withoutExpiry } = session.interactiveShareMetadata;
+            await this.updateSessionInteractiveShareMetadata(sessionId, withoutExpiry);
+          } catch (stripError) {
+            console.error(`Error stripping expiry from reused interactive share for session ${sessionId}:`, stripError);
+          }
+        }
         const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
         return `${customerFrontendUrl}/ishare/${sessionId}?conversable=${session.interactiveShareMetadata.token}`;
       }
@@ -2992,15 +3033,17 @@ export class ChatbotDB {
       // Create a new interactive share
       const crypto = require('crypto');
       const conversableToken = crypto.randomBytes(32).toString('hex');
-      
-      const expiresAt = new Date(Date.now() + expirationDays * 86400000).toISOString();
-      const interactiveShareMetadata = {
+
+      // Only write expiresAt when the caller explicitly requested a timed expiry.
+      const interactiveShareMetadata: { isActive: boolean; token: string; sharedAt: string; expiresAt?: string } = {
         isActive: true,
         token: conversableToken,
         sharedAt: new Date().toISOString(),
-        expiresAt
       };
-      
+      if (hasTimedExpiry) {
+        interactiveShareMetadata.expiresAt = new Date(Date.now() + (expirationDays as number) * 86400000).toISOString();
+      }
+
       await this.updateSessionInteractiveShareMetadata(sessionId, interactiveShareMetadata);
       
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
