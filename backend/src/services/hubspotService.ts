@@ -7,6 +7,24 @@ import { getAccountsByUserId, getAccountById, updateAccountTokens } from './conn
 const _created = axios.create?.({ timeout: 15000 });
 const axiosInstance: typeof axios = (_created ?? axios) as typeof axios;
 
+// Retry once on 429 — respect Retry-After header, default 10s.
+if (_created) {
+  _created.interceptors.response.use(
+    (res) => res,
+    async (err) => {
+      const config = err?.config as any;
+      if (err?.response?.status === 429 && config && !config.__hubspotRetried) {
+        config.__hubspotRetried = true;
+        const parsed = parseInt(err.response.headers?.['retry-after'] ?? '10', 10);
+        const retryAfter = Math.min(isNaN(parsed) ? 10 : parsed, 60);
+        await new Promise(r => setTimeout(r, retryAfter * 1000));
+        return _created.request(config);
+      }
+      throw err;
+    }
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // HUBSPOT WEBHOOK EVENTS
 //
@@ -38,6 +56,56 @@ const axiosInstance: typeof axios = (_created ?? axios) as typeof axios;
 
 
 const HUBSPOT_API_BASE = 'https://api.hubapi.com';
+
+/**
+ * HubSpot batch write endpoints return a 207 Multi-Status when SOME (not all)
+ * inputs failed: successes land in `results`, failures in `errors` (keyed by
+ * objectWriteTraceId for creates, or object id for updates). axios treats 207
+ * as success (status < 300), so without this check a partial failure would be
+ * silently counted as success. Convert a 207 into a throw that carries the raw
+ * response, so callers' split-and-retry isolates the bad record(s) down to a
+ * single-item batch and can inspect per-record error categories (e.g.
+ * OBJECT_NOT_FOUND) on the attached `error.response`.
+ */
+function throwIfBatchPartialFailure(res: any): void {
+  if (res?.status !== 207) return;
+  const data = res.data ?? {};
+  const errs: any[] = Array.isArray(data.errors) ? data.errors : [];
+  const first = errs[0] ?? {};
+  const err: any = new Error(
+    `HubSpot batch partial failure (207 Multi-Status): ${data.numErrors ?? errs.length} error(s)` +
+      (first.category ? ` — ${first.category}: ${first.message ?? ''}` : '')
+  );
+  err.response = res;
+  throw err;
+}
+
+
+// Recipient audience + send-schedule fields for a marketing email.
+export interface EmailAudienceOpts {
+  sendOnPublish?: boolean;       // true → send immediately on publish
+  publishDate?: string;          // ISO8601 → schedule send for this time
+  subscriptionId?: string;       // subscriptionDetails.subscriptionId (email type)
+  contactListsInclude?: string[]; // list IDs to send to
+  contactListsExclude?: string[]; // list IDs to suppress
+}
+
+// All writable fields for create/update of a marketing email.
+export interface EmailWriteOpts extends EmailAudienceOpts {
+  subject?: string;
+  fromName?: string;
+  fromEmail?: string;
+}
+
+// Flattened view of a single form field (from getFormFields).
+export interface FormFieldSummary {
+  name: string;
+  label?: string;
+  fieldType?: string;
+  required: boolean;
+  objectTypeId?: string;
+  options?: any;
+}
 
 export interface HubSpotContact {
   contactId: string;
@@ -112,17 +180,31 @@ export class HubSpotService {
   private readonly _userId?: string;
   private readonly _accountId?: string;
   private _tokenExpiresAt?: number;
+  private readonly _portalId?: string;
+  // Per-instance caches of properties already ensured this connection, so a
+  // multi-chunk push (which reuses one instance) ensures each property once
+  // instead of issuing a redundant GET per 500-lead chunk. Instance-scoped so a
+  // fresh push picks up any properties deleted in HubSpot since.
+  private readonly _ensuredContactProps = new Set<string>();
+  private readonly _ensuredDealProps = new Set<string>();
 
   private constructor(
     token: string,
     userId?: string,
     accountId?: string,
     tokenExpiresAt?: number,
+    portalId?: string,
   ) {
     this._token = token;
     this._userId = userId;
     this._accountId = accountId;
     this._tokenExpiresAt = tokenExpiresAt;
+    this._portalId = portalId;
+  }
+
+  /** HubSpot portal (hub) ID for this connection. Needed for public form submission. */
+  get portalId(): string | undefined {
+    return this._portalId;
   }
 
   // ─── Factories ────────────────────────────────────────────────────────────
@@ -135,9 +217,10 @@ export class HubSpotService {
     const account = await resolveHubSpotAccount(userId, accountId);
     const config = account.config as any;
     const expiresAt: number = config.token_expires_at || 0;
+    const portalId: string | undefined = config.hub_id !== undefined ? String(config.hub_id) : account.account_id;
 
     if (expiresAt - Date.now() > TOKEN_REFRESH_BUFFER_MS) {
-      return new HubSpotService(config.access_token, userId, account.account_id, expiresAt);
+      return new HubSpotService(config.access_token, userId, account.account_id, expiresAt, portalId);
     }
 
     if (!config.refresh_token) {
@@ -145,7 +228,7 @@ export class HubSpotService {
     }
 
     // Token is expiring — create provisional instance, refresh, then return it.
-    const instance = new HubSpotService(config.access_token, userId, account.account_id, expiresAt);
+    const instance = new HubSpotService(config.access_token, userId, account.account_id, expiresAt, portalId);
     await instance.doRefresh(userId, account.account_id, config.refresh_token);
     return instance;
   }
@@ -414,6 +497,34 @@ export class HubSpotService {
   }
 
   /**
+   * Batch-fetch emails for up to 100 contact IDs per request.
+   * Returns a Map of contactId → email; contacts with no email are omitted.
+   * Chunk size is 100 (HubSpot batch/read limit). Partial chunk failures are
+   * logged and skipped so the rest of the batch still resolves.
+   */
+  async getContactEmailsByIds(contactIds: string[]): Promise<Map<string, string>> {
+    const CHUNK_SIZE = 100;
+    const emailMap = new Map<string, string>();
+    for (let i = 0; i < contactIds.length; i += CHUNK_SIZE) {
+      const chunk = contactIds.slice(i, i + CHUNK_SIZE);
+      try {
+        const res = await axiosInstance.post(
+          `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/batch/read`,
+          { properties: ['email'], inputs: chunk.map((id) => ({ id })) },
+          { headers: await this.authHeaders() },
+        );
+        for (const contact of (res.data as any)?.results ?? []) {
+          const email: string | undefined = contact?.properties?.email;
+          if (email) emailMap.set(String(contact.id), email);
+        }
+      } catch (e: any) {
+        console.warn(`[HubSpot] getContactEmailsByIds batch failed for chunk starting at ${i}:`, e?.message);
+      }
+    }
+    return emailMap;
+  }
+
+  /**
    * Fetches a contact by ID and returns all its property values as a flat map.
    * Pass specific propertyNames to request only those fields; omit to fetch
    * the standard set (email, name, phone, jobtitle, company, linkedin).
@@ -522,6 +633,33 @@ export class HubSpotService {
       { headers: await this.authHeaders() }
     );
     return ((res.data as any)?.results ?? []).map((r: any) => r.id as string);
+  }
+
+  /**
+   * Get the IDs of all contacts associated with a deal.
+   * Follows pagination cursors to return all contacts, not just the first 100.
+   */
+  async getDealContactAssociations(dealId: string): Promise<string[]> {
+    const allIds: string[] = [];
+    let after: string | undefined;
+    let pages = 0;
+    const MAX_PAGES = 20;
+    do {
+      if (pages++ >= MAX_PAGES) {
+        console.warn(`[HubSpot] getDealContactAssociations hit ${MAX_PAGES}-page cap for deal ${dealId}`);
+        break;
+      }
+      const params: Record<string, string> = {};
+      if (after) params.after = after;
+      const res = await axiosInstance.get(
+        `${HUBSPOT_API_BASE}/crm/v3/objects/deals/${dealId}/associations/contacts`,
+        { headers: await this.authHeaders(), params }
+      );
+      const data = res.data as any;
+      allIds.push(...((data?.results ?? []).map((r: any) => r.id as string)));
+      after = data?.paging?.next?.after;
+    } while (after);
+    return allIds;
   }
 
   /**
@@ -695,11 +833,13 @@ export class HubSpotService {
 
   async ensureContactProperty(key: string, label: string): Promise<string> {
     const propertyName = key.toLowerCase().replace(/[^a-z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+    if (this._ensuredContactProps.has(propertyName)) return propertyName;
     try {
       await axiosInstance.get(
         `${HUBSPOT_API_BASE}/crm/v3/properties/contacts/${propertyName}`,
         { headers: await this.authHeaders() }
       );
+      this._ensuredContactProps.add(propertyName);
       return propertyName;
     } catch (err: any) {
       if (err?.response?.status === 404) {
@@ -714,6 +854,7 @@ export class HubSpotService {
           },
           { headers: await this.authHeaders() }
         );
+        this._ensuredContactProps.add(propertyName);
         return propertyName;
       }
       throw err;
@@ -726,11 +867,13 @@ export class HubSpotService {
    */
   async ensureDealProperty(key: string, label: string): Promise<string> {
     const propertyName = key.toLowerCase().replace(/[^a-z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+    if (this._ensuredDealProps.has(propertyName)) return propertyName;
     try {
       await axiosInstance.get(
         `${HUBSPOT_API_BASE}/crm/v3/properties/deals/${propertyName}`,
         { headers: await this.authHeaders() }
       );
+      this._ensuredDealProps.add(propertyName);
       return propertyName;
     } catch (err: any) {
       if (err?.response?.status === 404) {
@@ -745,6 +888,7 @@ export class HubSpotService {
           },
           { headers: await this.authHeaders() }
         );
+        this._ensuredDealProps.add(propertyName);
         return propertyName;
       }
       throw err;
@@ -792,10 +936,757 @@ export class HubSpotService {
     return this.createList(name);
   }
 
-  async addContactToList(listId: string, contactIds: string[]): Promise<void> {
+  async addContactToList(listId: string, contactIds: string[]): Promise<{ addedCount: number; failedChunks: number[] }> {
+    const CHUNK_SIZE = 100;
+    let addedCount = 0;
+    const failedChunks: number[] = [];
+
+    for (let i = 0; i < contactIds.length; i += CHUNK_SIZE) {
+      const chunk = contactIds.slice(i, i + CHUNK_SIZE);
+      try {
+        await axiosInstance.put(
+          `${HUBSPOT_API_BASE}/crm/v3/lists/${listId}/memberships/add`,
+          chunk,
+          { headers: await this.authHeaders() }
+        );
+        addedCount += chunk.length;
+      } catch (err: any) {
+        console.error(`[HubSpotService] addContactToList chunk ${i}–${i + chunk.length - 1} failed:`, err?.response?.data ?? err?.message);
+        failedChunks.push(i);
+      }
+    }
+
+    return { addedCount, failedChunks };
+  }
+
+  // ─── Campaigns ───────────────────────────────────────────────────────────────
+  // Requires Marketing Hub Professional+
+  // Scopes: marketing.campaigns.read, marketing.campaigns.write
+
+  async listCampaigns(cursor?: string): Promise<any> {
+    const CAMPAIGN_PROPS = 'hs_name,hs_start_date,hs_end_date,hs_notes,hs_utm,hs_campaign_status';
+    let url = `${HUBSPOT_API_BASE}/marketing/v3/campaigns?properties=${CAMPAIGN_PROPS}`;
+    if (cursor) url += `&after=${encodeURIComponent(cursor)}`;
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
+    return res.data;
+  }
+
+  async getCampaign(guid: string): Promise<any> {
+    if (!guid?.trim()) throw new Error('Campaign guid is required');
+    const CAMPAIGN_PROPS = 'hs_name,hs_start_date,hs_end_date,hs_notes,hs_utm,hs_campaign_status';
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/marketing/v3/campaigns/${guid}?properties=${CAMPAIGN_PROPS}`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async createCampaign(
+    name: string,
+    opts?: { startDate?: string; notes?: string; utm?: string }
+  ): Promise<any> {
+    if (!name || !name.trim()) throw new Error('Campaign name is required');
+
+    const properties: Record<string, string> = { hs_name: name.trim() };
+    if (opts?.startDate) properties.hs_start_date = opts.startDate;
+    if (opts?.notes) properties.hs_notes = opts.notes;
+    if (opts?.utm) properties.hs_utm = opts.utm;
+
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/marketing/v3/campaigns`,
+      { properties },
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async updateCampaign(
+    guid: string,
+    props: { name?: string; startDate?: string; notes?: string; utm?: string }
+  ): Promise<any> {
+    const properties: Record<string, string> = {};
+    if (props.name !== undefined) properties.hs_name = props.name;
+    if (props.startDate !== undefined) properties.hs_start_date = props.startDate;
+    if (props.notes !== undefined) properties.hs_notes = props.notes;
+    if (props.utm !== undefined) properties.hs_utm = props.utm;
+
+    const res = await axiosInstance.patch(
+      `${HUBSPOT_API_BASE}/marketing/v3/campaigns/${guid}`,
+      { properties },
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async deleteCampaign(guid: string): Promise<void> {
+    if (!guid?.trim()) throw new Error('Campaign guid is required');
+    await axiosInstance.delete(
+      `${HUBSPOT_API_BASE}/marketing/v3/campaigns/${guid}`,
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  async getCampaignMetrics(guid: string): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/marketing/v3/campaigns/${guid}/reports/metrics`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  static readonly CAMPAIGN_ASSET_TYPES = [
+    'MARKETING_EMAIL', 'LANDING_PAGE', 'BLOG_POST', 'FORM',
+    'WEB_INTERACTIVE', 'CTA', 'SOCIAL_BROADCAST', 'WORKFLOW',
+  ] as const;
+
+  async listCampaignAssets(
+    guid: string,
+    assetType?: string,
+    opts?: { startDate?: string; endDate?: string; cursor?: string }
+  ): Promise<any> {
+    if (assetType) {
+      return this._fetchAssetType(guid, assetType, opts);
+    }
+    const results = await Promise.allSettled(
+      HubSpotService.CAMPAIGN_ASSET_TYPES.map(t => this._fetchAssetType(guid, t, opts))
+    );
+    const byType: Record<string, any> = {};
+    HubSpotService.CAMPAIGN_ASSET_TYPES.forEach((t, i) => {
+      const r = results[i];
+      byType[t] = r.status === 'fulfilled' ? r.value : { error: (r as PromiseRejectedResult).reason?.message };
+    });
+    return { byType };
+  }
+
+  private async _fetchAssetType(
+    guid: string,
+    assetType: string,
+    opts?: { startDate?: string; endDate?: string; cursor?: string }
+  ): Promise<any> {
+    const params: string[] = ['limit=100'];
+    if (opts?.startDate) params.push(`startDate=${encodeURIComponent(opts.startDate)}`);
+    if (opts?.endDate) params.push(`endDate=${encodeURIComponent(opts.endDate)}`);
+    if (opts?.cursor) params.push(`after=${encodeURIComponent(opts.cursor)}`);
+    const url = `${HUBSPOT_API_BASE}/marketing/campaigns/2026-03/${guid}/assets/${assetType}?${params.join('&')}`;
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
+    return res.data;
+  }
+
+  // ─── Campaign Asset Association ───────────────────────────────────────────
+
+  async addCampaignAsset(guid: string, assetType: string, assetId: string): Promise<void> {
+    if (!guid?.trim()) throw new Error('Campaign guid is required');
+    if (!assetType?.trim()) throw new Error('assetType is required');
+    if (!assetId?.trim()) throw new Error('assetId is required');
+    // Use the 2026-03 campaigns API (same version as the asset read). The
+    // /marketing/v3/campaigns path returns 500 INTERNAL_ERROR for some asset types.
     await axiosInstance.put(
-      `${HUBSPOT_API_BASE}/crm/v3/lists/${listId}/memberships/add`,
-      contactIds,
+      `${HUBSPOT_API_BASE}/marketing/campaigns/2026-03/${guid}/assets/${assetType}/${assetId}`,
+      {},
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  async removeCampaignAsset(guid: string, assetType: string, assetId: string): Promise<void> {
+    if (!guid?.trim()) throw new Error('Campaign guid is required');
+    if (!assetType?.trim()) throw new Error('assetType is required');
+    if (!assetId?.trim()) throw new Error('assetId is required');
+    await axiosInstance.delete(
+      `${HUBSPOT_API_BASE}/marketing/campaigns/2026-03/${guid}/assets/${assetType}/${assetId}`,
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  // ─── Marketing Emails ─────────────────────────────────────────────────────
+  // Scope: content
+
+  async listEmails(cursor?: string): Promise<any> {
+    let url = `${HUBSPOT_API_BASE}/marketing/v3/emails?limit=50`;
+    if (cursor) url += `&after=${encodeURIComponent(cursor)}`;
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
+    return res.data;
+  }
+
+  async getEmail(emailId: string): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/marketing/v3/emails/${emailId}`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  // Apply recipient audience + send-schedule fields onto a marketing-email body.
+  // Used by both createEmail and updateEmail.
+  private applyEmailAudience(body: Record<string, any>, opts: EmailAudienceOpts): void {
+    if (opts.sendOnPublish !== undefined) body.sendOnPublish = opts.sendOnPublish;
+    if (opts.publishDate !== undefined) body.publishDate = opts.publishDate;
+    if (opts.subscriptionId !== undefined) {
+      body.subscriptionDetails = { subscriptionId: opts.subscriptionId };
+    }
+    if (opts.contactListsInclude !== undefined || opts.contactListsExclude !== undefined) {
+      const contactLists: Record<string, any> = {};
+      if (opts.contactListsInclude !== undefined) contactLists.include = opts.contactListsInclude;
+      if (opts.contactListsExclude !== undefined) contactLists.exclude = opts.contactListsExclude;
+      body.to = { contactLists };
+    }
+  }
+
+  async createEmail(name: string, opts?: EmailWriteOpts): Promise<any> {
+    if (!name?.trim()) throw new Error('Email name is required');
+    const body: Record<string, any> = { name: name.trim() };
+    if (opts?.subject) body.subject = opts.subject;
+    if (opts?.fromName !== undefined || opts?.fromEmail !== undefined) {
+      body.from = {};
+      if (opts?.fromName) body.from.name = opts.fromName;
+      if (opts?.fromEmail) body.from.email = opts.fromEmail;
+    }
+    if (opts) this.applyEmailAudience(body, opts);
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/marketing/v3/emails`,
+      body,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async updateEmail(
+    emailId: string,
+    props: EmailWriteOpts & { name?: string }
+  ): Promise<any> {
+    const body: Record<string, any> = {};
+    if (props.name !== undefined) body.name = props.name;
+    if (props.subject !== undefined) body.subject = props.subject;
+    if (props.fromName !== undefined || props.fromEmail !== undefined) {
+      body.from = {};
+      if (props.fromName !== undefined) body.from.name = props.fromName;
+      if (props.fromEmail !== undefined) body.from.email = props.fromEmail;
+    }
+    this.applyEmailAudience(body, props);
+    const res = await axiosInstance.patch(
+      `${HUBSPOT_API_BASE}/marketing/v3/emails/${emailId}`,
+      body,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  // Publish (send/schedule) a marketing email. Whether it sends immediately or
+  // schedules is controlled by sendOnPublish / publishDate set via create/update.
+  // Requires Marketing Hub Enterprise or the transactional email add-on.
+  async publishEmail(emailId: string): Promise<void> {
+    if (!emailId?.trim()) throw new Error('emailId is required');
+    await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/marketing/v3/emails/${emailId}/publish`,
+      {},
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  // Unpublish an email / cancel a scheduled send. Already-sending emails may not
+  // be cancellable.
+  async unpublishEmail(emailId: string): Promise<void> {
+    if (!emailId?.trim()) throw new Error('emailId is required');
+    await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/marketing/v3/emails/${emailId}/unpublish`,
+      {},
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  // List the account's subscription types (email types). The id is needed for
+  // subscriptionDetails.subscriptionId when creating a sendable marketing email.
+  async listSubscriptionTypes(): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/communication-preferences/v3/definitions`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async cloneEmail(emailId: string, name: string): Promise<any> {
+    if (!emailId?.trim()) throw new Error('emailId is required');
+    if (!name?.trim()) throw new Error('Email name is required');
+    // Clone is a collection-level endpoint: POST /marketing/v3/emails/clone
+    // with { id, cloneName } — NOT /emails/{id}/clone.
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/marketing/v3/emails/clone`,
+      { id: emailId.trim(), cloneName: name.trim() },
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async getEmailStatistics(
+    emailIds: string[],
+    opts?: { startTimestamp?: string; endTimestamp?: string }
+  ): Promise<any> {
+    if (!emailIds?.length) throw new Error('emailIds array must not be empty');
+    // HubSpot requires an ISO-8601 start/end range and rejects raw epoch-ms or a
+    // missing value ("Unable to parse value for query parameter: startTimestamp").
+    // Accept epoch-ms for convenience and default to the last year when omitted.
+    const toIso = (v: string): string => (/^\d+$/.test(v) ? new Date(Number(v)).toISOString() : v);
+    const end = opts?.endTimestamp ? toIso(opts.endTimestamp) : new Date().toISOString();
+    const start = opts?.startTimestamp
+      ? toIso(opts.startTimestamp)
+      : new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString();
+    const params: string[] = emailIds.map(id => `emailIds=${encodeURIComponent(id)}`);
+    params.push(`startTimestamp=${encodeURIComponent(start)}`);
+    params.push(`endTimestamp=${encodeURIComponent(end)}`);
+    const url = `${HUBSPOT_API_BASE}/marketing/v3/emails/statistics/list?${params.join('&')}`;
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
+    return res.data;
+  }
+
+  // ─── Contact Lists (2026-03 API) ─────────────────────────────────────────
+
+  async listContactLists(opts?: { query?: string; cursor?: string; count?: number }): Promise<any> {
+    const body: Record<string, any> = { objectTypeId: '0-1', count: opts?.count ?? 50 };
+    if (opts?.query) body.query = opts.query;
+    if (opts?.cursor) body.after = opts.cursor;
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/crm/lists/2026-03/search`,
+      body,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async getContactList(listId: string): Promise<any> {
+    if (!listId?.trim()) throw new Error('listId is required');
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/crm/lists/2026-03/${listId}`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async createContactList(
+    name: string,
+    processingType: string,
+    opts?: { objectTypeId?: string; filterBranch?: any }
+  ): Promise<any> {
+    if (!name?.trim()) throw new Error('name is required');
+    if (!processingType?.trim()) throw new Error('processingType is required');
+    const body: Record<string, any> = {
+      name: name.trim(),
+      processingType: processingType.trim(),
+      objectTypeId: opts?.objectTypeId ?? '0-1',
+    };
+    if (opts?.filterBranch) body.filterBranch = opts.filterBranch;
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/crm/lists/2026-03`,
+      body,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async addContactsToList(listId: string, recordIds: string[]): Promise<any> {
+    if (!listId?.trim()) throw new Error('listId is required');
+    if (!recordIds?.length) throw new Error('recordIds array must not be empty');
+    const res = await axiosInstance.put(
+      `${HUBSPOT_API_BASE}/crm/lists/2026-03/${listId}/memberships/add`,
+      recordIds,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async removeContactsFromList(listId: string, recordIds: string[]): Promise<any> {
+    if (!listId?.trim()) throw new Error('listId is required');
+    if (!recordIds?.length) throw new Error('recordIds array must not be empty');
+    const res = await axiosInstance.put(
+      `${HUBSPOT_API_BASE}/crm/lists/2026-03/${listId}/memberships/remove`,
+      recordIds,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async deleteContactList(listId: string): Promise<void> {
+    if (!listId?.trim()) throw new Error('listId is required');
+    await axiosInstance.delete(
+      `${HUBSPOT_API_BASE}/crm/lists/2026-03/${listId}`,
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  async deleteEmail(emailId: string): Promise<void> {
+    if (!emailId?.trim()) throw new Error('emailId is required');
+    await axiosInstance.delete(
+      `${HUBSPOT_API_BASE}/marketing/v3/emails/${emailId}`,
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  // ─── Forms ────────────────────────────────────────────────────────────────
+  // Scope: forms
+
+  async listForms(cursor?: string): Promise<any> {
+    let url = `${HUBSPOT_API_BASE}/marketing/v3/forms?limit=50`;
+    if (cursor) url += `&after=${encodeURIComponent(cursor)}`;
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
+    return res.data;
+  }
+
+  async getForm(formId: string): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/marketing/v3/forms/${formId}`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async createForm(props: Record<string, any>): Promise<any> {
+    if (!props?.name?.trim()) throw new Error('name is required for form creation');
+    // HubSpot's v3 forms POST reuses the full form schema and rejects the request
+    // with "required fields were not set: [createdAt]" unless these are present —
+    // even though they're server-managed. Inject sane defaults when absent.
+    const now = new Date().toISOString();
+    const body = {
+      archived: false,
+      createdAt: now,
+      updatedAt: now,
+      ...props,
+    };
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/marketing/v3/forms`,
+      body,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async updateForm(formId: string, props: Record<string, any>): Promise<any> {
+    if (!formId?.trim()) throw new Error('formId is required');
+    const res = await axiosInstance.patch(
+      `${HUBSPOT_API_BASE}/marketing/v3/forms/${formId}`,
+      props,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async deleteForm(formId: string): Promise<void> {
+    if (!formId?.trim()) throw new Error('formId is required');
+    await axiosInstance.delete(
+      `${HUBSPOT_API_BASE}/marketing/v3/forms/${formId}`,
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  async getFormSubmissions(formId: string, cursor?: string): Promise<any> {
+    if (!formId?.trim()) throw new Error('formId is required');
+    // Submissions live on the legacy Form Integrations API, NOT the v3 forms API.
+    // `/marketing/v3/forms/{id}/submissions` does not exist → 404.
+    let url = `${HUBSPOT_API_BASE}/form-integrations/v1/submissions/forms/${formId}?limit=50`;
+    if (cursor) url += `&after=${encodeURIComponent(cursor)}`;
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
+    return res.data;
+  }
+
+  // Read a form's fields as a flat list — flattens the nested fieldGroups[].fields[]
+  // structure so callers can see what to submit without parsing the full schema.
+  async getFormFields(formId: string): Promise<{ formId: string; fields: FormFieldSummary[] }> {
+    if (!formId?.trim()) throw new Error('formId is required');
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/marketing/v3/forms/${formId}`,
+      { headers: await this.authHeaders() }
+    );
+    const fieldGroups: any[] = (res.data as any)?.fieldGroups ?? [];
+    const fields: FormFieldSummary[] = fieldGroups.flatMap((g: any) => (g?.fields ?? []).map((f: any) => ({
+      name: f.name,
+      label: f.label,
+      fieldType: f.fieldType,
+      required: !!f.required,
+      objectTypeId: f.objectTypeId,
+      options: f.options,
+    })));
+    return { formId, fields };
+  }
+
+  // Submit data INTO a HubSpot form via the public Forms Submission API.
+  // This endpoint lives on a different host (api.hsforms.com) and is keyed by
+  // portalId + formGuid; it does not use the OAuth bearer token.
+  async submitForm(
+    portalId: string,
+    formGuid: string,
+    fields: Array<{ name: string; value: any; objectTypeId?: string }>,
+    opts?: { context?: Record<string, any>; legalConsentOptions?: Record<string, any> }
+  ): Promise<any> {
+    if (!portalId?.trim()) throw new Error('portalId is required to submit a form');
+    if (!formGuid?.trim()) throw new Error('formGuid is required');
+    if (!fields?.length) throw new Error('fields array must not be empty');
+    const body: Record<string, any> = { fields };
+    if (opts?.context) body.context = opts.context;
+    if (opts?.legalConsentOptions) body.legalConsentOptions = opts.legalConsentOptions;
+    const res = await axiosInstance.post(
+      `https://api.hsforms.com/submissions/v3/integration/submit/${portalId}/${formGuid}`,
+      body,
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+    return res.data;
+  }
+
+  // ─── Landing Pages ────────────────────────────────────────────────────────
+  // Scope: content
+
+  async listLandingPages(cursor?: string): Promise<any> {
+    let url = `${HUBSPOT_API_BASE}/cms/v3/pages/landing-pages?limit=50`;
+    if (cursor) url += `&after=${encodeURIComponent(cursor)}`;
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
+    return res.data;
+  }
+
+  async getLandingPage(pageId: string): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/cms/v3/pages/landing-pages/${pageId}`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async createLandingPage(
+    name: string,
+    opts?: { templatePath?: string; slug?: string; metaDescription?: string }
+  ): Promise<any> {
+    if (!name?.trim()) throw new Error('Landing page name is required');
+    const body: Record<string, any> = { name: name.trim() };
+    if (opts?.templatePath) body.templatePath = opts.templatePath;
+    if (opts?.slug) body.slug = opts.slug;
+    if (opts?.metaDescription) body.metaDescription = opts.metaDescription;
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/cms/v3/pages/landing-pages`,
+      body,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async publishLandingPage(pageId: string): Promise<any> {
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/cms/v3/pages/landing-pages/${pageId}/draft/push-live`,
+      {},
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async updateLandingPage(pageId: string, props: Record<string, any>): Promise<any> {
+    if (!pageId?.trim()) throw new Error('pageId is required');
+    const res = await axiosInstance.patch(
+      `${HUBSPOT_API_BASE}/cms/v3/pages/landing-pages/${pageId}`,
+      props,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async deleteLandingPage(pageId: string): Promise<void> {
+    if (!pageId?.trim()) throw new Error('pageId is required');
+    await axiosInstance.delete(
+      `${HUBSPOT_API_BASE}/cms/v3/pages/landing-pages/${pageId}`,
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  // ─── Blog Posts ───────────────────────────────────────────────────────────
+  // Scope: content
+
+  async listBlogPosts(cursor?: string): Promise<any> {
+    let url = `${HUBSPOT_API_BASE}/cms/v3/blogs/posts?limit=50`;
+    if (cursor) url += `&after=${encodeURIComponent(cursor)}`;
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
+    return res.data;
+  }
+
+  async getBlogPost(postId: string): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/cms/v3/blogs/posts/${postId}`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async createBlogPost(
+    name: string,
+    contentGroupId: string,
+    opts?: { slug?: string; metaDescription?: string; postBody?: string }
+  ): Promise<any> {
+    if (!name?.trim()) throw new Error('Blog post name is required');
+    if (!contentGroupId?.trim()) throw new Error('contentGroupId (blog ID) is required');
+    const body: Record<string, any> = { name: name.trim(), contentGroupId: contentGroupId.trim() };
+    if (opts?.slug) body.slug = opts.slug;
+    if (opts?.metaDescription) body.metaDescription = opts.metaDescription;
+    if (opts?.postBody) body.postBody = opts.postBody;
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/cms/v3/blogs/posts`,
+      body,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async publishBlogPost(postId: string): Promise<void> {
+    await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/cms/blogs/2026-03/posts/${postId}/draft/push-live`,
+      {},
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  async updateBlogPost(postId: string, props: Record<string, any>): Promise<any> {
+    if (!postId?.trim()) throw new Error('postId is required');
+    const res = await axiosInstance.patch(
+      `${HUBSPOT_API_BASE}/cms/v3/blogs/posts/${postId}`,
+      props,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async deleteBlogPost(postId: string): Promise<void> {
+    if (!postId?.trim()) throw new Error('postId is required');
+    await axiosInstance.delete(
+      `${HUBSPOT_API_BASE}/cms/v3/blogs/posts/${postId}`,
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  // ─── Workflows ────────────────────────────────────────────────────────────
+  // Scope: automation
+
+  async listWorkflows(): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/automation/v3/workflows`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async getWorkflow(workflowId: string): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/automation/v3/workflows/${workflowId}`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  // The v3 workflows API (list/get/performance) and the v4 flows API (enable/
+  // disable/delete) use DIFFERENT id spaces. A v3 workflowId is invalid on v4
+  // (404). Convert it via the mapping endpoint before any v4 call.
+  private async resolveFlowId(workflowId: string): Promise<string> {
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/automation/v4/workflow-id-mappings/batch/read`,
+      { inputs: [{ type: 'WORKFLOW_ID', workflowId }] },
+      { headers: await this.authHeaders() }
+    );
+    const flowId = (res.data as any)?.results?.[0]?.flowId;
+    if (flowId === undefined || flowId === null) {
+      throw new Error(`Could not map workflowId "${workflowId}" to a v4 flowId`);
+    }
+    return String(flowId);
+  }
+
+  // Read a v4 flow by flowId. GET /automation/v4/flows/{flowId} 404s on this API;
+  // the batch-read endpoint is the working path and surfaces clear errors (e.g.
+  // missing crm.objects.contacts.sensitive.* scopes for contact flows).
+  private async readFlow(flowId: string): Promise<any> {
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/automation/v4/flows/batch/read`,
+      { inputs: [{ type: 'FLOW_ID', flowId }] },
+      { headers: await this.authHeaders() }
+    );
+    const flow = (res.data as any)?.results?.[0];
+    if (!flow) {
+      const err = (res.data as any)?.errors?.[0]?.message;
+      throw new Error(`Could not read v4 flow "${flowId}"${err ? ': ' + err : ''}`);
+    }
+    return flow;
+  }
+
+  async deleteWorkflow(workflowId: string): Promise<void> {
+    if (!workflowId?.trim()) throw new Error('workflowId is required');
+    const flowId = await this.resolveFlowId(workflowId.trim());
+    await axiosInstance.delete(
+      `${HUBSPOT_API_BASE}/automation/v4/flows/${flowId}`,
+      { headers: await this.authHeaders() }
+    );
+  }
+
+  // Enable or disable a workflow. The v4 flows API has no partial PATCH — update
+  // is a full-object PUT requiring revisionId (optimistic concurrency). So we map
+  // the v3 id → v4 flowId, batch-read the current flow, flip isEnabled, strip the
+  // server-managed fields, and PUT the whole object back.
+  // Requires Marketing/Sales/Service/etc. Hub Professional+ and (for contact
+  // flows) crm.objects.contacts.sensitive.read/write.
+  async setWorkflowEnabled(workflowId: string, enabled: boolean): Promise<any> {
+    if (!workflowId?.trim()) throw new Error('workflowId is required');
+    const flowId = await this.resolveFlowId(workflowId.trim());
+    const flow = await this.readFlow(flowId);
+    const body: Record<string, any> = { ...flow, isEnabled: enabled };
+    delete body.createdAt;
+    delete body.updatedAt;
+    delete body.dataSources;
+    const res = await axiosInstance.put(
+      `${HUBSPOT_API_BASE}/automation/v4/flows/${flowId}`,
+      body,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async getWorkflowPerformance(
+    workflowId: string,
+    start: number,
+    end: number,
+    bucket: 'DAY' | 'WEEK' | 'MONTH'
+  ): Promise<any> {
+    if (!workflowId?.trim()) throw new Error('workflowId is required');
+    const url = `${HUBSPOT_API_BASE}/automation/v3/performance/workflow/${workflowId}?start=${start}&end=${end}&bucket=${bucket}`;
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
+    return res.data;
+  }
+
+  // ─── Social Broadcasts (deprecated v1, still functional) ─────────────────
+
+  async listSocialChannels(): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/broadcast/v1/channels/setting/publish/current`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async listSocialBroadcasts(): Promise<any> {
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/broadcast/v1/broadcasts`,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async createSocialBroadcast(
+    channelKey: string,
+    body: string,
+    opts?: { triggerAt?: number }
+  ): Promise<any> {
+    if (!channelKey?.trim()) throw new Error('channelKey is required');
+    if (!body?.trim()) throw new Error('broadcast body is required');
+    const payload: Record<string, any> = { channelKey, content: { body } };
+    if (opts?.triggerAt) payload.triggerAt = opts.triggerAt;
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/broadcast/v1/broadcasts`,
+      payload,
+      { headers: await this.authHeaders() }
+    );
+    return res.data;
+  }
+
+  async deleteSocialBroadcast(broadcastGuid: string): Promise<void> {
+    if (!broadcastGuid?.trim()) throw new Error('broadcastGuid is required');
+    await axiosInstance.delete(
+      `${HUBSPOT_API_BASE}/broadcast/v1/broadcasts/${broadcastGuid}`,
       { headers: await this.authHeaders() }
     );
   }
@@ -803,8 +1694,14 @@ export class HubSpotService {
   async getAllLists(query?: string): Promise<Array<{ id: string; name: string }>> {
     const results: Array<{ id: string; name: string }> = [];
     let after: string | undefined;
+    let pages = 0;
+    const MAX_PAGES = 50;
 
     do {
+      if (pages++ >= MAX_PAGES) {
+        console.warn(`[HubSpot] getAllLists hit ${MAX_PAGES}-page cap`);
+        break;
+      }
       const body: Record<string, any> = {
         processingTypes: ['MANUAL', 'SNAPSHOT', 'DYNAMIC'],
         count: 200,
@@ -832,5 +1729,151 @@ export class HubSpotService {
     } while (after);
 
     return results;
+  }
+
+  // ─── Batch operations ───────────────────────────────────────────────────────
+  //
+  // Each method below processes a SINGLE batch of at most 100 inputs and THROWS
+  // on failure — both a non-2xx response (whole-batch failure) AND a 207
+  // Multi-Status (partial failure: some inputs failed), which axios would
+  // otherwise treat as success. See throwIfBatchPartialFailure. Chunking and
+  // split-and-retry are handled by the caller, so these methods do NOT chunk
+  // internally — they throw if more than 100 inputs are supplied.
+
+  /**
+   * Batch upsert contacts by email (idProperty = 'email').
+   * POST /crm/v3/objects/contacts/batch/upsert
+   * Maps each result back via the email returned in result.properties.email
+   * (lowercased). isNew is derived from the HubSpot `new` flag on each result.
+   */
+  async batchUpsertContacts(
+    inputs: Array<{ email: string; properties: Record<string, string> }>
+  ): Promise<Array<{ email: string; contactId: string; isNew: boolean }>> {
+    if (inputs.length > 100) {
+      throw new Error(`batchUpsertContacts accepts at most 100 inputs per batch, got ${inputs.length}`);
+    }
+
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/batch/upsert`,
+      {
+        inputs: inputs.map((i) => ({
+          idProperty: 'email',
+          id: i.email.toLowerCase(),
+          properties: i.properties,
+        })),
+      },
+      { headers: await this.authHeaders() }
+    );
+
+    // A 207 means some upserts failed — surface it so the caller's split-and-retry
+    // isolates the bad input(s) and reports them, rather than silently returning
+    // only the successes (the failures would be dropped from both counts).
+    throwIfBatchPartialFailure(res);
+
+    return ((res.data as any)?.results ?? []).map((r: any) => ({
+      email: String(r?.properties?.email ?? '').toLowerCase(),
+      contactId: String(r.id),
+      isNew: r?.new === true,
+    }));
+  }
+
+  /**
+   * Batch create deals.
+   * POST /crm/v3/objects/deals/batch/create
+   * Each input carries a unique objectWriteTraceId (the caller passes leadId) so
+   * results — which may NOT preserve input order — can be mapped back reliably.
+   */
+  async batchCreateDeals(
+    inputs: Array<{ traceId: string; properties: Record<string, string> }>
+  ): Promise<Array<{ traceId: string; dealId: string }>> {
+    if (inputs.length > 100) {
+      throw new Error(`batchCreateDeals accepts at most 100 inputs per batch, got ${inputs.length}`);
+    }
+
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/crm/v3/objects/deals/batch/create`,
+      {
+        inputs: inputs.map((i) => ({
+          properties: i.properties,
+          objectWriteTraceId: i.traceId,
+        })),
+      },
+      { headers: await this.authHeaders() }
+    );
+
+    // A 207 means some creates failed — surface it so the caller's split-and-retry
+    // isolates the bad input(s) instead of silently dropping them (failed creates
+    // are absent from `results` and would otherwise map to an undefined dealId).
+    throwIfBatchPartialFailure(res);
+
+    const results = (res.data as any)?.results ?? [];
+
+    // Primary path: map back by the echoed objectWriteTraceId (order-independent).
+    const allEchoed = results.every((r: any) => r?.objectWriteTraceId !== undefined && r?.objectWriteTraceId !== null);
+    if (allEchoed) {
+      const dealByTrace = new Map<string, string>();
+      for (const r of results) {
+        dealByTrace.set(String(r.objectWriteTraceId), String(r.id));
+      }
+      return inputs.map((i) => ({ traceId: i.traceId, dealId: dealByTrace.get(i.traceId) as string }));
+    }
+
+    // FALLBACK: without echoed trace IDs, positional mapping is only safe when it
+    // is UNAMBIGUOUS — a single input and a single real result. Anything else
+    // (multi-item batch, or a short/incomplete response) risks pairing deals with
+    // the wrong lead or emitting the literal string 'undefined', so we THROW and
+    // let splitAndRetry isolate the batch down to size 1 (where positional is safe).
+    if (inputs.length === 1 && results.length === 1 && results[0]?.id != null) {
+      return [{ traceId: inputs[0].traceId, dealId: String(results[0].id) }];
+    }
+    throw new Error('batchCreateDeals: cannot map results to inputs (objectWriteTraceId not echoed and response is ambiguous or incomplete)');
+  }
+
+  /**
+   * Batch update deals by id.
+   * POST /crm/v3/objects/deals/batch/update
+   */
+  async batchUpdateDeals(
+    inputs: Array<{ dealId: string; properties: Record<string, string> }>
+  ): Promise<void> {
+    if (inputs.length > 100) {
+      throw new Error(`batchUpdateDeals accepts at most 100 inputs per batch, got ${inputs.length}`);
+    }
+
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/crm/v3/objects/deals/batch/update`,
+      {
+        inputs: inputs.map((i) => ({ id: i.dealId, properties: i.properties })),
+      },
+      { headers: await this.authHeaders() }
+    );
+
+    // A failed update (e.g. the deal was deleted) comes back as a 207 per-record
+    // error, NOT a top-level non-2xx — surface it so the caller can isolate and
+    // recreate/report it instead of treating the whole batch as a success.
+    throwIfBatchPartialFailure(res);
+  }
+
+  /**
+   * Batch create DEFAULT contact→deal associations.
+   * POST /crm/v4/associations/contact/deal/batch/create/default
+   */
+  async batchAssociateContactsToDeals(
+    pairs: Array<{ contactId: string; dealId: string }>
+  ): Promise<void> {
+    if (pairs.length > 100) {
+      throw new Error(`batchAssociateContactsToDeals accepts at most 100 pairs per batch, got ${pairs.length}`);
+    }
+
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/crm/v4/associations/contact/deal/batch/create/default`,
+      {
+        inputs: pairs.map((p) => ({ from: { id: p.contactId }, to: { id: p.dealId } })),
+      },
+      { headers: await this.authHeaders() }
+    );
+
+    // Surface a 207 partial failure rather than silently treating it as success.
+    throwIfBatchPartialFailure(res);
   }
 }

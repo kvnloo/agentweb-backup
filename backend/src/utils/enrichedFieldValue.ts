@@ -61,6 +61,34 @@ export interface EnrichedFieldMeta {
   normalized?: string | number | { min: number; max: number } | null;
 }
 
+/**
+ * Classify how trustworthy an enriched field value is, for caveating in UX.
+ *
+ * Returns 'verified' when the value is safe to state as fact, 'unverified'
+ * when it should be hedged ("unverified", "per web search", low confidence).
+ *
+ * The Slashy bug: a small company's funding_stage isn't in Apollo, so it's
+ * filled by the web-search/LLM tier (`metaWeb` → confidence 'medium'). The LLM
+ * can return a plausible-but-wrong stage ("Series C"). Treating 'medium'/'low'/
+ * unknown confidence as unverified lets the assistant caveat it instead of
+ * asserting it.
+ *
+ * Precedence (first match wins):
+ *  1. User action — `verifiedBy` ⇒ verified; `rejectedReason`/`rejectedAt` ⇒ unverified.
+ *  2. Critic verdict (web-tier only) — `criticView` 'high' ⇒ verified; 'low'/'drop' ⇒ unverified.
+ *  3. Confidence — 'high' ⇒ verified; 'medium'/'low'/absent ⇒ unverified.
+ */
+export function fieldVerificationStatus(
+  meta: EnrichedFieldMeta | undefined,
+): 'verified' | 'unverified' {
+  if (!meta) return 'unverified';
+  if (meta.verifiedBy) return 'verified';
+  if (meta.rejectedReason || meta.rejectedAt) return 'unverified';
+  if (meta.criticView === 'high') return 'verified';
+  if (meta.criticView === 'low' || meta.criticView === 'drop') return 'unverified';
+  return meta.confidence === 'high' ? 'verified' : 'unverified';
+}
+
 /** Trim a quote to a reasonable size to bound row growth in DynamoDB. */
 const MAX_QUOTE_CHARS = 240;
 

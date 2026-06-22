@@ -2896,7 +2896,7 @@ emmaToolRegistry.register({
   name: 'search_leads',
   definition: {
     name: 'search_leads',
-    description: 'Find leads matching structured field-level criteria within one or more lead lists. Pass list_id for a single list (legacy) or list_ids for up to 5 lists at once — each returned lead carries its listId/listName so you can attribute results. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields. For cross-CRM strategic questions ("who should I reach out to?"), prefer ask_crm.',
+    description: 'Find leads matching structured field-level criteria within one or more lead lists. Pass list_id for a single list (legacy) or list_ids for up to 5 lists at once — each returned lead carries its listId/listName so you can attribute results. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields. For cross-CRM strategic questions ("who should I reach out to?"), prefer ask_crm. Each returned lead also carries `enrichmentMetadata`: a per-field provenance map (keyed by field name, including enriched custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) with `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile), `sourceUrl`/`sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt`. When the user asks about enriched values across leads (e.g. "what is the funding stage for each lead?"), USE THIS to report the source and confidence per value — present a table with the value alongside its provider/source and confidence rather than stating values as bare fact, and explicitly caveat medium/low-confidence or web-sourced values. A field with no entry in enrichmentMetadata was entered manually or imported, not enriched.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -5895,7 +5895,9 @@ emmaToolRegistry.register({
     name: 'enrich_leads_preview',
     description: `Preview a CRM lead enrichment job before running the full batch. Runs the V3 enrichment engine in preview mode on 2 sample leads and returns what it would produce.
 
-Returns: runId, processedCount (the 2 sampled leads), and samples — each with leadId and enrichedFields. In enrichedFields a missing value means nothing was found; tell the user "not found" rather than showing null. Show the samples and ask the user to confirm before calling enrich_leads_execute.
+Returns: runId, processedCount (the 2 sampled leads), and samples — each with leadId, enrichedFields, and unverifiedFields. In enrichedFields a missing value means nothing was found; tell the user "not found" rather than showing null. Show the samples and ask the user to confirm before calling enrich_leads_execute.
+
+IMPORTANT — data accuracy / unverifiedFields: unverifiedFields lists the fields in this sample whose value is low-confidence or unverified (typically pulled from web search rather than a structured provider, and not confirmed by the fact-check critic). These values may be wrong — for example a small company's funding_stage guessed from the web. Do NOT state unverified values as established fact. When you present them, caveat them explicitly (e.g. "funding_stage: Series C (unverified — from web search, please confirm)"). Fields NOT in unverifiedFields are high-confidence and can be stated plainly. If the user questions or corrects an unverified value, accept the correction gracefully and explain it came from a low-confidence source.
 
 IMPORTANT — identity resolution failures: If processedCount is 0 and failureBreakdown.identityResolutionFailed > 0, the sampled leads lack sufficient identifying information (no email address, no LinkedIn URL, and no full name). This list cannot be enriched — tell the user clearly that the list is unenrichable due to missing identity data (email/LinkedIn/name required) and do NOT call enrich_leads_execute for it. Skip it and continue with the other lists.
 
@@ -6026,7 +6028,7 @@ emmaToolRegistry.register({
     name: 'enrich_lead_custom',
     description: `Enrich a single CRM lead with custom fields on demand, without running a whole-list job.
 
-Use this when the user wants specific missing information filled on one lead (e.g. "find this person's LinkedIn headline and company size"). It runs the V3 enrichment engine on a batch of one. The response includes enrichedValues — a map of field name to the found value (null if nothing was found). Values are also persisted to the lead. Always show enrichedValues to the user; if a value is null, say nothing was found for that field.
+Use this when the user wants specific missing information filled on one lead (e.g. "find this person's LinkedIn headline and company size"). It runs the V3 enrichment engine on a batch of one. The response includes enrichedValues — a map of field name to the found value (null if nothing was found). Values are also persisted to the lead. Always show enrichedValues to the user; if a value is null, say nothing was found for that field. The response also includes enrichmentMetadata — a per-field provenance map (source, provider, sourceUrl/sourceQuote, confidence high/medium/low, enrichedAt). Cite the source and confidence for each value, and explicitly caveat web-sourced or medium/low-confidence values (e.g. a funding stage found via web search) rather than stating them as established fact.
 
 output_fields: one entry per field to populate, each with a snake_case "name", an "instruction" describing what to find, and an optional "overwrite_policy" (defaults to fill_if_empty; use always_overwrite to refresh a field that already has a value). If the result includes fieldRemaps, tell the user which requested fields were mapped onto existing CRM columns to avoid duplicates.`,
     inputSchema: {
@@ -6074,13 +6076,31 @@ output_fields: one entry per field to populate, each with a snake_case "name", a
     // Read the lead back so we can return the actual enriched values.
     // V3 writes standard columns top-level and custom names into customFields.
     const enrichedValues: Record<string, string | null> = {};
+    // Per-field provenance for the just-enriched fields — lets the agent cite
+    // source/provider/confidence (and caveat web-sourced/low-confidence values)
+    // instead of stating bare values. Sanitized so cross-tenant CRM-history
+    // lineage never reaches the customer — mirrors get_lead_details/search_leads.
+    let enrichmentMetadata: Record<string, any> | undefined;
     if (summary.processedCount > 0) {
       try {
         const { crmDb } = await import('../services/db');
+        const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
         const lead: any = await crmDb.getLeadById(args.list_id, args.lead_id);
         const customFields = (lead?.customFields ?? {}) as Record<string, string>;
-        for (const f of (args.output_fields as Array<{ name: string }>)) {
-          enrichedValues[f.name] = customFields[f.name] ?? lead?.[f.name] ?? null;
+        const requestedNames = (args.output_fields as Array<{ name: string }>).map(f => f.name);
+        for (const name of requestedNames) {
+          enrichedValues[name] = customFields[name] ?? lead?.[name] ?? null;
+        }
+        const sanitized = sanitizeEnrichmentMetadataForResponse(
+          lead?.enrichmentMetadata as Record<string, any> | undefined,
+        );
+        if (sanitized) {
+          // Only surface metadata for the fields this call enriched.
+          const scoped: Record<string, any> = {};
+          for (const name of requestedNames) {
+            if (sanitized[name] !== undefined) scoped[name] = sanitized[name];
+          }
+          if (Object.keys(scoped).length > 0) enrichmentMetadata = scoped;
         }
       } catch {
         // Non-fatal — enrichment succeeded, values are in the DB.
@@ -6091,6 +6111,7 @@ output_fields: one entry per field to populate, each with a snake_case "name", a
       leadId: args.lead_id,
       listId: args.list_id,
       enrichedValues,
+      ...(enrichmentMetadata ? { enrichmentMetadata } : {}),
       runId: summary.runId,
       processedCount: summary.processedCount,
       failedCount: summary.failedCount,
@@ -7597,5 +7618,160 @@ GAQL EXAMPLES:
   },
   execute: async (args: any, context: any) => {
     return await agentModeService.handleCallGoogleAdsReportingApi(context?.userId || context?.agentUserId, args);
+  },
+});
+
+// ─── HubSpot ──────────────────────────────────────────────────────────────────
+
+emmaToolRegistry.register({
+  name: 'call_hubspot_api',
+  definition: {
+    name: 'call_hubspot_api',
+    description: `Manage HubSpot marketing assets and data via a single unified tool.
+Use entity_type to select the resource, action to select the operation.
+
+ENTITY_TYPE + ACTION MATRIX:
+
+  CAMPAIGN   → LIST | GET (guid) | CREATE (name) | UPDATE (guid) | DELETE (guid) | GET_METRICS (guid)
+             → LIST_ASSETS (guid; optional: asset_type, start_date, end_date, cursor)
+             → ADD_ASSET (guid, asset_type, asset_id) | REMOVE_ASSET (guid, asset_type, asset_id)
+             Requires Marketing Hub Professional+. asset_type: MARKETING_EMAIL, LANDING_PAGE, BLOG_POST, FORM, WEB_INTERACTIVE, CTA, SOCIAL_BROADCAST, WORKFLOW.
+
+  EMAIL      → LIST (cursor?) | GET (email_id) | GET_STATS (email_ids[], start_timestamp?, end_timestamp?)
+             → CREATE (name; subject?, from_name?, from_email?, subscription_id?, contact_lists_include[]?, contact_lists_exclude[]?, send_on_publish?, publish_date?)
+             → UPDATE (email_id; same optional fields as CREATE) | CLONE (email_id, name)
+             → PUBLISH (email_id) | UNPUBLISH (email_id) | LIST_SUBSCRIPTION_TYPES
+             → DELETE (email_id)
+             Requires "content" OAuth scope. PUBLISH/UNPUBLISH require Marketing Hub Enterprise or the transactional email add-on.
+             SENDING A MARKETING EMAIL — set audience + schedule on CREATE/UPDATE, then PUBLISH:
+               1. LIST_SUBSCRIPTION_TYPES → pick a subscription_id (email type).
+               2. Ensure recipients are IN the target contact list(s): use CONTACT_LIST LIST to get list IDs, CONTACT_LIST ADD_CONTACTS to populate. (Leads synced from AgentWeb land in HubSpot's contact DB, NOT automatically in a list.)
+               3. CREATE/UPDATE with subscription_id + contact_lists_include[] (+ contact_lists_exclude[]).
+                  send_on_publish=true → send immediately on PUBLISH; publish_date (ISO8601) → schedule for that time.
+               4. PUBLISH (email_id) to send/schedule. UNPUBLISH cancels a scheduled send (already-sending emails may not be cancellable).
+
+  FORM       → LIST (cursor?) | GET (form_id) | GET_SUBMISSIONS (form_id; cursor?) | GET_FORM_FIELDS (form_id)
+             → CREATE (name, formType="hubspot", fieldGroups=[], configuration={}, displayOptions={}, legalConsentOptions={type:"none"})
+             → UPDATE (form_id; name?, fieldGroups?, configuration?, displayOptions?, legalConsentOptions?)
+             → SUBMIT (form_id, fields[{name,value}]; submission_context?, legal_consent_options?)
+             → DELETE (form_id)
+             Requires "forms" OAuth scope. CREATE: formType must be "hubspot" (only valid value). All 6 fields required by HubSpot schema. Pass minimum: formType="hubspot", fieldGroups=[], configuration={}, displayOptions={}, legalConsentOptions={type:"none"}.
+             GET_FORM_FIELDS: returns a flat list of the form's fields ({name,label,fieldType,required,objectTypeId,options}) — use it to discover what to pass to SUBMIT instead of parsing the nested fieldGroups schema.
+             SUBMIT: pushes a submission INTO the form (lead capture) via HubSpot's public submission API. fields = [{ name, value }] using the field "name" from GET_FORM_FIELDS. form_id is the form GUID. submission_context (e.g. { pageUri, pageName }) and legal_consent_options are optional.
+             DELETE is a soft-delete (archive); permanently purged after 3 months.
+
+  LANDING_PAGE → LIST (cursor?) | GET (page_id) | CREATE (name; template_path?, slug?, meta_description?)
+               → PUBLISH (page_id) | UPDATE (page_id; name?, html_title?, meta_description?, slug?, ...)
+               → DELETE (page_id)
+               Requires "content" scope + CMS Hub.
+
+  BLOG_POST  → LIST (cursor?) | GET (post_id) | CREATE (name, content_group_id; slug?, meta_description?, post_body?)
+             → PUBLISH (post_id) | UPDATE (post_id; name?, html_title?, meta_description?, slug?, ...)
+             → DELETE (post_id)
+             Requires "content" scope. Get content_group_id from LIST.
+
+  WORKFLOW   → LIST | GET (workflow_id) | DELETE (workflow_id) | GET_PERFORMANCE (workflow_id, start, end, bucket)
+             → ENABLE (workflow_id) | DISABLE (workflow_id)
+             Requires "automation" scope + Marketing Hub Professional+.
+             ENABLE/DISABLE toggle a workflow on/off (v4 flows read-modify-write PUT). ENABLE turns automation live — it will enroll contacts and run actions.
+             Enrollment stats in contactListIds.enrolled / contactListIds.active.
+             GET_PERFORMANCE: start/end = epoch ms, bucket = DAY|WEEK|MONTH. Returns ENROLLED/UNENROLLED/COMPLETED counts per bucket.
+             WARNING: DELETE is irreversible via API — deleted workflow can only be restored by HubSpot Support.
+
+  SOCIAL     → LIST_CHANNELS | LIST_BROADCASTS | CREATE_BROADCAST (channel_key, body; trigger_at?)
+             → DELETE_BROADCAST (broadcast_guid)
+             channel_key format: "Twitter:403551555". trigger_at: epoch ms.
+             NOTE: DELETE_BROADCAST only cancels pending/scheduled broadcasts — already-published ones are not retracted.
+
+ASSET METRICS (CAMPAIGN LIST_ASSETS):
+  MARKETING_EMAIL → opens, clicks, bounces, unsubscribes
+  FORM → views, submissions, conversion_rate
+  LANDING_PAGE → views, conversions  |  BLOG_POST → views
+  WORKFLOW → enrolled, active, completed counts
+  SOCIAL_BROADCAST → facebook_clicks, linkedin_clicks, twitter_clicks
+
+  CONTACT_LIST → LIST (query?, cursor?, count?) | GET (list_id) | CREATE (name, processing_type; object_type_id?)
+               → ADD_CONTACTS (list_id, record_ids[]) | REMOVE_CONTACTS (list_id, record_ids[])
+               → DELETE (list_id)
+               processing_type: MANUAL (static, edit via API) | DYNAMIC (auto-filters) | SNAPSHOT (filter once, then static).
+               ADD_CONTACTS/REMOVE_CONTACTS only work on MANUAL or SNAPSHOT lists.
+               DELETE is soft-delete — recoverable within 90 days. Scopes: crm.lists.read / crm.lists.write.
+
+NOT AVAILABLE VIA API: Ad metrics (Google/Meta — use those tools), social engagement counts.
+
+TYPICAL WORKFLOW:
+  1. CAMPAIGN LIST → get guid
+  2. CAMPAIGN LIST_ASSETS (guid, asset_type?) → see assets + per-asset metrics
+  3. CAMPAIGN GET_METRICS (guid) → campaign roll-up`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        entity_type:      { type: 'string', enum: ['CAMPAIGN', 'EMAIL', 'FORM', 'LANDING_PAGE', 'BLOG_POST', 'WORKFLOW', 'SOCIAL', 'CONTACT_LIST'], description: 'HubSpot resource to operate on.' },
+        action:           { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
+        // CAMPAIGN
+        guid:             { type: 'string', description: 'Campaign guid. Required for CAMPAIGN GET/UPDATE/DELETE/GET_METRICS/LIST_ASSETS/ADD_ASSET/REMOVE_ASSET.' },
+        asset_type:       { type: 'string', description: 'Asset type for CAMPAIGN LIST_ASSETS/ADD_ASSET/REMOVE_ASSET. One of: MARKETING_EMAIL, LANDING_PAGE, BLOG_POST, FORM, WEB_INTERACTIVE, CTA, SOCIAL_BROADCAST, WORKFLOW.' },
+        asset_id:         { type: 'string', description: 'Asset ID for CAMPAIGN ADD_ASSET/REMOVE_ASSET.' },
+        utm:              { type: 'string', description: 'UTM campaign value. CAMPAIGN CREATE/UPDATE.' },
+        notes:            { type: 'string', description: 'Internal notes. CAMPAIGN CREATE/UPDATE.' },
+        // EMAIL
+        email_id:         { type: 'string', description: 'Email ID. Required for EMAIL GET/UPDATE/CLONE/DELETE.' },
+        email_ids:        { type: 'array', items: { type: 'string' }, description: 'Email IDs for EMAIL GET_STATS.' },
+        subject:          { type: 'string', description: 'Email subject line. EMAIL CREATE/UPDATE.' },
+        from_name:        { type: 'string', description: 'Sender display name. EMAIL CREATE/UPDATE.' },
+        from_email:       { type: 'string', description: 'Sender email address. EMAIL CREATE/UPDATE.' },
+        subscription_id:  { type: 'string', description: 'HubSpot subscription type ID (email type). From EMAIL LIST_SUBSCRIPTION_TYPES. Set on EMAIL CREATE/UPDATE before a marketing email can be sent.' },
+        contact_lists_include: { type: 'array', items: { type: 'string' }, description: 'Contact list IDs to send to. EMAIL CREATE/UPDATE. Get IDs from CONTACT_LIST LIST.' },
+        contact_lists_exclude: { type: 'array', items: { type: 'string' }, description: 'Contact list IDs to suppress. EMAIL CREATE/UPDATE.' },
+        send_on_publish:  { type: 'boolean', description: 'EMAIL CREATE/UPDATE. true → email sends immediately when PUBLISHed.' },
+        publish_date:     { type: 'string', description: 'ISO8601 datetime — MUST be in the future; compute from the actual current date/time (correct current year). EMAIL CREATE/UPDATE. Schedules the send for this time on PUBLISH.' },
+        start_timestamp:  { type: 'string', description: 'Start of date range (string). Filter EMAIL GET_STATS.' },
+        end_timestamp:    { type: 'string', description: 'End of date range (string). Filter EMAIL GET_STATS.' },
+        // FORM
+        form_id:          { type: 'string', description: 'Form ID (GUID). Required for FORM GET/GET_SUBMISSIONS/GET_FORM_FIELDS/UPDATE/DELETE/SUBMIT.' },
+        fields:           { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, value: {}, objectTypeId: { type: 'string' } }, required: ['name', 'value'] }, description: 'Submission values for FORM SUBMIT: [{ name, value }]. Use field "name" from FORM GET_FORM_FIELDS.' },
+        submission_context: { type: 'object', description: 'Optional context for FORM SUBMIT (e.g. { pageUri, pageName, hutk }).' },
+        legal_consent_options: { type: 'object', description: 'Optional GDPR consent object for FORM SUBMIT.' },
+        // LANDING_PAGE
+        page_id:          { type: 'string', description: 'Landing page ID. Required for LANDING_PAGE GET/PUBLISH/UPDATE/DELETE.' },
+        template_path:    { type: 'string', description: 'HubSpot template path (no leading slash). LANDING_PAGE CREATE.' },
+        // BLOG_POST
+        post_id:          { type: 'string', description: 'Blog post ID. Required for BLOG_POST GET/PUBLISH/UPDATE/DELETE.' },
+        content_group_id: { type: 'string', description: 'Blog ID (contentGroupId). Required for BLOG_POST CREATE.' },
+        post_body:        { type: 'string', description: 'HTML body. BLOG_POST CREATE.' },
+        // shared
+        name:             { type: 'string', description: 'Name/title. Required for CAMPAIGN CREATE, EMAIL CREATE/CLONE, LANDING_PAGE CREATE, BLOG_POST CREATE.' },
+        start_date:       { type: 'string', description: 'YYYY-MM-DD. CAMPAIGN CREATE/UPDATE; metrics window start for LIST_ASSETS.' },
+        end_date:         { type: 'string', description: 'YYYY-MM-DD. Metrics window end for CAMPAIGN LIST_ASSETS.' },
+        slug:             { type: 'string', description: 'URL slug. LANDING_PAGE/BLOG_POST CREATE.' },
+        meta_description: { type: 'string', description: 'SEO meta description. LANDING_PAGE/BLOG_POST CREATE.' },
+        cursor:           { type: 'string', description: 'Pagination cursor for LIST actions.' },
+        // WORKFLOW
+        workflow_id:      { type: 'string', description: 'Workflow ID. Required for WORKFLOW GET, DELETE, GET_PERFORMANCE.' },
+        start:            { type: 'number', description: 'Start time as Unix epoch milliseconds. Required for WORKFLOW GET_PERFORMANCE.' },
+        end:              { type: 'number', description: 'End time as Unix epoch milliseconds. Required for WORKFLOW GET_PERFORMANCE.' },
+        bucket:           { type: 'string', enum: ['DAY', 'WEEK', 'MONTH'], description: 'Time bucket granularity. Required for WORKFLOW GET_PERFORMANCE.' },
+        // SOCIAL
+        channel_key:      { type: 'string', description: 'Social channel key (e.g. "Twitter:403551555"). From SOCIAL LIST_CHANNELS. Required for CREATE_BROADCAST.' },
+        body:             { type: 'string', description: 'Post text. Required for SOCIAL CREATE_BROADCAST.' },
+        trigger_at:       { type: 'number', description: 'Scheduled time as Unix epoch ms — MUST be in the future. Compute it from the actual current date/time (use the correct current year); a past value posts immediately. Omit to post immediately. SOCIAL CREATE_BROADCAST.' },
+        broadcast_guid:   { type: 'string', description: 'Broadcast GUID. Required for SOCIAL DELETE_BROADCAST.' },
+        // CONTACT_LIST
+        list_id:          { type: 'string', description: 'ILS list ID. Required for CONTACT_LIST GET/ADD_CONTACTS/REMOVE_CONTACTS/DELETE.' },
+        processing_type:  { type: 'string', enum: ['MANUAL', 'SNAPSHOT', 'DYNAMIC'], description: 'List type. Required for CONTACT_LIST CREATE.' },
+        object_type_id:   { type: 'string', description: 'HubSpot object type ID. Defaults to "0-1" (contacts). CONTACT_LIST CREATE.' },
+        record_ids:       { type: 'array', items: { type: 'string' }, description: 'Contact record IDs. Required for CONTACT_LIST ADD_CONTACTS/REMOVE_CONTACTS.' },
+        query:            { type: 'string', description: 'Search query for CONTACT_LIST LIST.' },
+        count:            { type: 'number', description: 'Page size for CONTACT_LIST LIST. Default 50, max 500.' },
+        filter_branch:    { type: 'object', description: 'Filter criteria for DYNAMIC/SNAPSHOT CONTACT_LIST CREATE.' },
+        account_id:       { type: 'string', description: 'HubSpot account ID. Required when the user has multiple HubSpot accounts connected — the error message will list them; ask the user which to use.' },
+      },
+      required: ['entity_type', 'action'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId;
+    if (!userId) return { success: false, error: 'Authentication required: no user context.' };
+    return agentModeService.handleHubspotApi(userId, args);
   },
 });

@@ -75,6 +75,7 @@ import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, Me
 import { linkedInOutreachService } from './linkedInOutreachService';
 import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
+import { HubSpotService } from './hubspotService';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
@@ -2524,6 +2525,20 @@ export class AgentModeService {
       _messages = messages;
       _initialMessageCount = initialMessageCount;
 
+      // Per-run media-generation time budget. A work-plan step that generates many
+      // images (e.g. LinkedIn Ads "Generate 3 Images Per Hook" = 18 images) runs them
+      // sequentially and can exceed the controller's hard wall-clock timeout
+      // (AGENT_MODE_GENERATION_TIMEOUT_MS, default 10 min), getting killed mid-step so
+      // set_work_plan_status never fires. We set a softer deadline here; once it passes
+      // and ≥1 asset has been produced this run, the tool-dispatch boundary defers
+      // further media-gen calls and asks the user to continue, so the batch converges
+      // across turns (paired with the already-generated-assets context that prevents
+      // regeneration). Default 7 min leaves headroom under the 10-min hard timeout.
+      // Set AGENT_MODE_MEDIA_BUDGET_MS=0 to disable.
+      const mediaBudgetMs = parseInt(process.env.AGENT_MODE_MEDIA_BUDGET_MS || '420000', 10);
+      const mediaGenerationDeadlineMs = mediaBudgetMs > 0 ? Date.now() + mediaBudgetMs : undefined;
+      let mediaAssetsProducedThisRun = 0;
+
       // Single loop for LLM calls and tool execution
       let maxIterations = 40; // Prevent infinite loops
       let iteration = 0;
@@ -2905,6 +2920,8 @@ export class AgentModeService {
           allowedToolNames,
           toolResponseS3Threshold: TOOL_RESPONSE_S3_THRESHOLD,
           maxToolContentSize: MAX_TOOL_CONTENT_SIZE,
+          mediaGenerationDeadlineMs,
+          mediaAssetsProducedThisRun,
           ports: {
             evaluateAgentToolPolicy,
             validateAndRepairToolArgs,
@@ -2931,6 +2948,9 @@ export class AgentModeService {
         if (dispatchResult.skillsUpdated) {
           skillsUpdated = true;
         }
+        // Carry the running per-run media-asset total forward so the next iteration's
+        // budget decision knows whether this run has already produced ≥1 asset.
+        mediaAssetsProducedThisRun += dispatchResult.mediaAssetsProduced;
 
         // Send progress update after all tools complete.
         // Only send tool calls added in this iteration — the frontend accumulates
@@ -8666,6 +8686,7 @@ export class AgentModeService {
   ): Promise<any> {
     try {
       const { crmDb } = await import('./db');
+      const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
 
       if (!filters || filters.length === 0) {
@@ -8807,20 +8828,31 @@ export class AgentModeService {
       return {
         success: true,
         message: `Found ${matchingLeads.length} matching lead(s)`,
-        leads: matchingLeads.map((entry) => ({
-          leadId: entry.lead.leadId,
-          ...(isMultiList ? { listId: entry.listId, listName: entry.listName } : {}),
-          email: entry.lead.email || '',
-          firstName: entry.lead.firstName || '',
-          lastName: entry.lead.lastName || '',
-          company: entry.lead.company || '',
-          title: entry.lead.title || '',
-          icpMatch: entry.lead.icpMatch?.isMatch || false,
-          icpScore: entry.lead.icpMatch?.score || null,
-          engagementCount: entry.lead.engagementCount || 0,
-          isEngaged: entry.lead.isEngaged || false,
-          customFields: entry.lead.customFields || {}
-        })),
+        leads: matchingLeads.map((entry) => {
+          // Per-field provenance sidecar — lets the agent cite source, provider,
+          // URL and confidence per field for list-wide queries (e.g. "funding
+          // stage for each lead"), instead of reporting bare values. Sanitized so
+          // cross-tenant CRM-history lineage (sibling IDs) never reaches the
+          // customer — mirrors get_lead_details and the customer-portal REST path.
+          const sanitizedEnrichmentMetadata = sanitizeEnrichmentMetadataForResponse(
+            entry.lead.enrichmentMetadata as Record<string, any> | undefined,
+          );
+          return {
+            leadId: entry.lead.leadId,
+            ...(isMultiList ? { listId: entry.listId, listName: entry.listName } : {}),
+            email: entry.lead.email || '',
+            firstName: entry.lead.firstName || '',
+            lastName: entry.lead.lastName || '',
+            company: entry.lead.company || '',
+            title: entry.lead.title || '',
+            icpMatch: entry.lead.icpMatch?.isMatch || false,
+            icpScore: entry.lead.icpMatch?.score || null,
+            engagementCount: entry.lead.engagementCount || 0,
+            isEngaged: entry.lead.isEngaged || false,
+            customFields: entry.lead.customFields || {},
+            ...(sanitizedEnrichmentMetadata ? { enrichmentMetadata: sanitizedEnrichmentMetadata } : {}),
+          };
+        }),
         matchCount: matchingLeads.length,
         ...(!isMultiList && firstResolved ? { listName: firstResolved.list.name } : {}),
         ...(isMultiList ? {
@@ -25071,6 +25103,465 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       return { success: false, error: gadsError || error.message || 'Unknown error' };
     }
   }
+
+  // ─── HubSpot Campaigns ──────────────────────────────────────────────────────
+
+  private async resolveHubSpotService(userId: string, accountId?: string): Promise<HubSpotService> {
+    try {
+      return await HubSpotService.create(userId, accountId);
+    } catch (err: any) {
+      // An explicit account_id or a multi-account ambiguity is actionable by the
+      // caller — surface it instead of silently falling back to token-paste.
+      if (accountId || /multiple hubspot accounts/i.test(err?.message ?? '')) throw err;
+      // Fall back to token-paste: scan lead lists for HubSpot apiKeyEncrypted
+    }
+    const { crmDb } = await import('./db');
+    const lists = await crmDb.getLeadListsByUserId(userId);
+    for (const list of lists as any[]) {
+      const hubspotConfig = list?.externalCrmSyncConfigs?.hubspot;
+      if (hubspotConfig?.apiKeyEncrypted) {
+        const { decryptPassword } = await import('../utils/crypto');
+        const { password } = decryptPassword(hubspotConfig.apiKeyEncrypted);
+        return HubSpotService.fromToken(password);
+      }
+    }
+    throw new Error('No HubSpot account connected. Please connect HubSpot in Settings → External CRM Sync or via OAuth in Connected Accounts.');
+  }
+
+  public async handleHubspotApi(userId: string, args: any): Promise<any> {
+    const entityType: string = (args?.entity_type ?? '').toUpperCase();
+    const action: string = (args?.action ?? '').toUpperCase();
+    try {
+      const svc = await this.resolveHubSpotService(userId, args?.account_id);
+
+      // ─── CONTACT_LIST ──────────────────────────────────────────────────────
+      if (entityType === 'CONTACT_LIST') {
+        switch (action) {
+          case 'LIST': {
+            const data = await svc.listContactLists({ query: args?.query, cursor: args?.cursor, count: args?.count });
+            return { success: true, ...data };
+          }
+          case 'GET': {
+            if (!args?.list_id) return { success: false, error: 'list_id is required for CONTACT_LIST GET.' };
+            const data = await svc.getContactList(args.list_id);
+            return { success: true, ...data };
+          }
+          case 'CREATE': {
+            const name: string = args?.name ?? '';
+            if (!name.trim()) return { success: false, error: 'name is required for CONTACT_LIST CREATE.' };
+            const processingType: string = args?.processing_type ?? '';
+            if (!processingType.trim()) return { success: false, error: 'processing_type (MANUAL|SNAPSHOT|DYNAMIC) is required for CONTACT_LIST CREATE.' };
+            const data = await svc.createContactList(name, processingType, { objectTypeId: args?.object_type_id, filterBranch: args?.filter_branch });
+            return { success: true, ...data };
+          }
+          case 'ADD_CONTACTS': {
+            if (!args?.list_id) return { success: false, error: 'list_id is required for CONTACT_LIST ADD_CONTACTS.' };
+            const recordIds: string[] = args?.record_ids ?? [];
+            if (!recordIds.length) return { success: false, error: 'record_ids array is required for CONTACT_LIST ADD_CONTACTS.' };
+            const data = await svc.addContactsToList(args.list_id, recordIds);
+            return { success: true, ...data };
+          }
+          case 'REMOVE_CONTACTS': {
+            if (!args?.list_id) return { success: false, error: 'list_id is required for CONTACT_LIST REMOVE_CONTACTS.' };
+            const recordIds: string[] = args?.record_ids ?? [];
+            if (!recordIds.length) return { success: false, error: 'record_ids array is required for CONTACT_LIST REMOVE_CONTACTS.' };
+            const data = await svc.removeContactsFromList(args.list_id, recordIds);
+            return { success: true, ...data };
+          }
+          case 'DELETE': {
+            if (!args?.list_id) return { success: false, error: 'list_id is required for CONTACT_LIST DELETE.' };
+            await svc.deleteContactList(args.list_id);
+            return { success: true, deleted: args.list_id };
+          }
+          default:
+            return { success: false, error: `Unknown action "${action}" for CONTACT_LIST. Valid: LIST, GET, CREATE, ADD_CONTACTS, REMOVE_CONTACTS, DELETE.` };
+        }
+      }
+
+      // ─── CAMPAIGN ──────────────────────────────────────────────────────────
+      if (entityType === 'CAMPAIGN') {
+        const guid: string | undefined = args?.guid;
+        switch (action) {
+          case 'LIST': {
+            const data = await svc.listCampaigns(args?.cursor);
+            return { success: true, ...data };
+          }
+          case 'GET': {
+            if (!guid) return { success: false, error: 'guid is required for CAMPAIGN GET.' };
+            const [campaign, metrics] = await Promise.allSettled([
+              svc.getCampaign(guid),
+              svc.getCampaignMetrics(guid),
+            ]);
+            if (campaign.status === 'rejected') {
+              return { success: false, error: (campaign as PromiseRejectedResult).reason?.message ?? 'Failed to fetch campaign.' };
+            }
+            return {
+              success: true,
+              campaign: campaign.value,
+              metrics: metrics.status === 'fulfilled' ? metrics.value : { error: (metrics as PromiseRejectedResult).reason?.message },
+            };
+          }
+          case 'CREATE': {
+            const name: string = args?.name ?? '';
+            if (!name.trim()) return { success: false, error: 'name is required for CAMPAIGN CREATE.' };
+            const data = await svc.createCampaign(name, { startDate: args?.start_date, notes: args?.notes, utm: args?.utm });
+            return { success: true, ...data };
+          }
+          case 'UPDATE': {
+            if (!guid) return { success: false, error: 'guid is required for CAMPAIGN UPDATE.' };
+            const data = await svc.updateCampaign(guid, { name: args?.name, startDate: args?.start_date, notes: args?.notes, utm: args?.utm });
+            return { success: true, ...data };
+          }
+          case 'DELETE': {
+            if (!guid) return { success: false, error: 'guid is required for CAMPAIGN DELETE.' };
+            await svc.deleteCampaign(guid);
+            return { success: true, deleted: guid };
+          }
+          case 'GET_METRICS': {
+            if (!guid) return { success: false, error: 'guid is required for CAMPAIGN GET_METRICS.' };
+            const data = await svc.getCampaignMetrics(guid);
+            return { success: true, ...data };
+          }
+          case 'LIST_ASSETS': {
+            if (!guid) return { success: false, error: 'guid is required for CAMPAIGN LIST_ASSETS.' };
+            const data = await svc.listCampaignAssets(guid, args?.asset_type, { startDate: args?.start_date, endDate: args?.end_date, cursor: args?.cursor });
+            return { success: true, ...data };
+          }
+          case 'ADD_ASSET': {
+            if (!guid) return { success: false, error: 'guid is required for CAMPAIGN ADD_ASSET.' };
+            if (!args?.asset_type) return { success: false, error: 'asset_type is required for CAMPAIGN ADD_ASSET.' };
+            if (!args?.asset_id) return { success: false, error: 'asset_id is required for CAMPAIGN ADD_ASSET.' };
+            await svc.addCampaignAsset(guid, args.asset_type, args.asset_id);
+            return { success: true, added: { guid, assetType: args.asset_type, assetId: args.asset_id } };
+          }
+          case 'REMOVE_ASSET': {
+            if (!guid) return { success: false, error: 'guid is required for CAMPAIGN REMOVE_ASSET.' };
+            if (!args?.asset_type) return { success: false, error: 'asset_type is required for CAMPAIGN REMOVE_ASSET.' };
+            if (!args?.asset_id) return { success: false, error: 'asset_id is required for CAMPAIGN REMOVE_ASSET.' };
+            await svc.removeCampaignAsset(guid, args.asset_type, args.asset_id);
+            return { success: true, removed: { guid, assetType: args.asset_type, assetId: args.asset_id } };
+          }
+          default:
+            return { success: false, error: `Unknown action "${action}" for CAMPAIGN. Valid: LIST, GET, CREATE, UPDATE, DELETE, GET_METRICS, LIST_ASSETS, ADD_ASSET, REMOVE_ASSET.` };
+        }
+      }
+
+      // ─── EMAIL ─────────────────────────────────────────────────────────────
+      if (entityType === 'EMAIL') {
+        switch (action) {
+          case 'LIST': {
+            const data = await svc.listEmails(args?.cursor);
+            return { success: true, ...data };
+          }
+          case 'GET': {
+            if (!args?.email_id) return { success: false, error: 'email_id is required for EMAIL GET.' };
+            const data = await svc.getEmail(args.email_id);
+            return { success: true, ...data };
+          }
+          case 'GET_STATS': {
+            const emailIds: string[] = args?.email_ids ?? [];
+            if (!emailIds.length) return { success: false, error: 'email_ids array is required for EMAIL GET_STATS.' };
+            const data = await svc.getEmailStatistics(emailIds, { startTimestamp: args?.start_timestamp, endTimestamp: args?.end_timestamp });
+            return { success: true, ...data };
+          }
+          case 'CREATE': {
+            const name: string = args?.name ?? '';
+            if (!name.trim()) return { success: false, error: 'name is required for EMAIL CREATE.' };
+            const data = await svc.createEmail(name, {
+              subject: args?.subject, fromName: args?.from_name, fromEmail: args?.from_email,
+              subscriptionId: args?.subscription_id,
+              contactListsInclude: args?.contact_lists_include,
+              contactListsExclude: args?.contact_lists_exclude,
+              sendOnPublish: args?.send_on_publish,
+              publishDate: args?.publish_date,
+            });
+            return { success: true, ...data };
+          }
+          case 'UPDATE': {
+            if (!args?.email_id) return { success: false, error: 'email_id is required for EMAIL UPDATE.' };
+            const data = await svc.updateEmail(args.email_id, {
+              name: args?.name, subject: args?.subject, fromName: args?.from_name, fromEmail: args?.from_email,
+              subscriptionId: args?.subscription_id,
+              contactListsInclude: args?.contact_lists_include,
+              contactListsExclude: args?.contact_lists_exclude,
+              sendOnPublish: args?.send_on_publish,
+              publishDate: args?.publish_date,
+            });
+            return { success: true, ...data };
+          }
+          case 'PUBLISH': {
+            if (!args?.email_id) return { success: false, error: 'email_id is required for EMAIL PUBLISH.' };
+            await svc.publishEmail(args.email_id);
+            return { success: true, published: args.email_id };
+          }
+          case 'UNPUBLISH': {
+            if (!args?.email_id) return { success: false, error: 'email_id is required for EMAIL UNPUBLISH.' };
+            await svc.unpublishEmail(args.email_id);
+            return { success: true, unpublished: args.email_id };
+          }
+          case 'LIST_SUBSCRIPTION_TYPES': {
+            const data = await svc.listSubscriptionTypes();
+            return { success: true, ...data };
+          }
+          case 'CLONE': {
+            if (!args?.email_id) return { success: false, error: 'email_id is required for EMAIL CLONE.' };
+            const name: string = args?.name ?? '';
+            if (!name.trim()) return { success: false, error: 'name is required for EMAIL CLONE.' };
+            const data = await svc.cloneEmail(args.email_id, name);
+            return { success: true, ...data };
+          }
+          case 'DELETE': {
+            if (!args?.email_id) return { success: false, error: 'email_id is required for EMAIL DELETE.' };
+            await svc.deleteEmail(args.email_id);
+            return { success: true, deleted: args.email_id };
+          }
+          default:
+            return { success: false, error: `Unknown action "${action}" for EMAIL. Valid: LIST, GET, GET_STATS, CREATE, UPDATE, PUBLISH, UNPUBLISH, LIST_SUBSCRIPTION_TYPES, CLONE, DELETE.` };
+        }
+      }
+
+      // ─── FORM ──────────────────────────────────────────────────────────────
+      if (entityType === 'FORM') {
+        switch (action) {
+          case 'LIST': {
+            const data = await svc.listForms(args?.cursor);
+            return { success: true, ...data };
+          }
+          case 'GET': {
+            if (!args?.form_id) return { success: false, error: 'form_id is required for FORM GET.' };
+            const data = await svc.getForm(args.form_id);
+            return { success: true, ...data };
+          }
+          case 'GET_SUBMISSIONS': {
+            if (!args?.form_id) return { success: false, error: 'form_id is required for FORM GET_SUBMISSIONS.' };
+            const data = await svc.getFormSubmissions(args.form_id, args?.cursor);
+            return { success: true, ...data };
+          }
+          case 'CREATE': {
+            if (!args?.name?.trim()) return { success: false, error: 'name is required for FORM CREATE.' };
+            const formCreateProps: Record<string, any> = {};
+            for (const f of ['name', 'formType', 'fieldGroups', 'configuration', 'displayOptions', 'legalConsentOptions'] as const) {
+              if (args[f] !== undefined) formCreateProps[f] = args[f];
+            }
+            const data = await svc.createForm(formCreateProps);
+            return { success: true, ...data };
+          }
+          case 'UPDATE': {
+            if (!args?.form_id) return { success: false, error: 'form_id is required for FORM UPDATE.' };
+            const formUpdateProps: Record<string, any> = {};
+            for (const f of ['name', 'fieldGroups', 'configuration', 'displayOptions', 'legalConsentOptions'] as const) {
+              if (args[f] !== undefined) formUpdateProps[f] = args[f];
+            }
+            const data = await svc.updateForm(args.form_id, formUpdateProps);
+            return { success: true, ...data };
+          }
+          case 'DELETE': {
+            if (!args?.form_id) return { success: false, error: 'form_id is required for FORM DELETE.' };
+            await svc.deleteForm(args.form_id);
+            return { success: true, deleted: args.form_id };
+          }
+          case 'GET_FORM_FIELDS': {
+            if (!args?.form_id) return { success: false, error: 'form_id is required for FORM GET_FORM_FIELDS.' };
+            const data = await svc.getFormFields(args.form_id);
+            return { success: true, ...data };
+          }
+          case 'SUBMIT': {
+            if (!args?.form_id) return { success: false, error: 'form_id is required for FORM SUBMIT (the form GUID).' };
+            const fields = args?.fields;
+            if (!Array.isArray(fields) || fields.length === 0) {
+              return { success: false, error: 'fields (array of { name, value }) is required for FORM SUBMIT.' };
+            }
+            const portalId = svc.portalId;
+            if (!portalId) return { success: false, error: 'Cannot submit form: HubSpot portal ID unavailable for this connection. Reconnect the account via OAuth.' };
+            const data = await svc.submitForm(portalId, args.form_id, fields, {
+              context: args?.submission_context,
+              legalConsentOptions: args?.legal_consent_options,
+            });
+            return { success: true, ...data };
+          }
+          default:
+            return { success: false, error: `Unknown action "${action}" for FORM. Valid: LIST, GET, GET_SUBMISSIONS, GET_FORM_FIELDS, CREATE, UPDATE, DELETE, SUBMIT.` };
+        }
+      }
+
+      // ─── LANDING_PAGE ──────────────────────────────────────────────────────
+      if (entityType === 'LANDING_PAGE') {
+        switch (action) {
+          case 'LIST': {
+            const data = await svc.listLandingPages(args?.cursor);
+            return { success: true, ...data };
+          }
+          case 'GET': {
+            if (!args?.page_id) return { success: false, error: 'page_id is required for LANDING_PAGE GET.' };
+            const data = await svc.getLandingPage(args.page_id);
+            return { success: true, ...data };
+          }
+          case 'CREATE': {
+            const name: string = args?.name ?? '';
+            if (!name.trim()) return { success: false, error: 'name is required for LANDING_PAGE CREATE.' };
+            const data = await svc.createLandingPage(name, { templatePath: args?.template_path, slug: args?.slug, metaDescription: args?.meta_description });
+            return { success: true, ...data };
+          }
+          case 'PUBLISH': {
+            if (!args?.page_id) return { success: false, error: 'page_id is required for LANDING_PAGE PUBLISH.' };
+            const data = await svc.publishLandingPage(args.page_id);
+            return { success: true, ...data };
+          }
+          case 'UPDATE': {
+            if (!args?.page_id) return { success: false, error: 'page_id is required for LANDING_PAGE UPDATE.' };
+            const { page_id, entity_type: _et1, action: _a1, ...rawProps } = args;
+            const FRAMEWORK_FIELDS = new Set(['form_id', 'email_id', 'guid', 'cursor', 'asset_type', 'start_date', 'end_date', 'count', 'query', 'broadcast_id', 'list_id', 'record_ids', 'content_group_id', 'template_path', 'post_id']);
+            const props: Record<string, any> = {};
+            for (const [k, v] of Object.entries(rawProps)) {
+              if (!FRAMEWORK_FIELDS.has(k)) props[k.replace(/_([a-z])/g, (_, c) => c.toUpperCase())] = v;
+            }
+            const data = await svc.updateLandingPage(page_id, props);
+            return { success: true, ...data };
+          }
+          case 'DELETE': {
+            if (!args?.page_id) return { success: false, error: 'page_id is required for LANDING_PAGE DELETE.' };
+            await svc.deleteLandingPage(args.page_id);
+            return { success: true, deleted: args.page_id };
+          }
+          default:
+            return { success: false, error: `Unknown action "${action}" for LANDING_PAGE. Valid: LIST, GET, CREATE, PUBLISH, UPDATE, DELETE.` };
+        }
+      }
+
+      // ─── BLOG_POST ─────────────────────────────────────────────────────────
+      if (entityType === 'BLOG_POST') {
+        switch (action) {
+          case 'LIST': {
+            const data = await svc.listBlogPosts(args?.cursor);
+            return { success: true, ...data };
+          }
+          case 'GET': {
+            if (!args?.post_id) return { success: false, error: 'post_id is required for BLOG_POST GET.' };
+            const data = await svc.getBlogPost(args.post_id);
+            return { success: true, ...data };
+          }
+          case 'CREATE': {
+            const name: string = args?.name ?? '';
+            if (!name.trim()) return { success: false, error: 'name is required for BLOG_POST CREATE.' };
+            const contentGroupId: string = args?.content_group_id ?? '';
+            if (!contentGroupId.trim()) return { success: false, error: 'content_group_id (blog ID) is required for BLOG_POST CREATE.' };
+            const data = await svc.createBlogPost(name, contentGroupId, { slug: args?.slug, metaDescription: args?.meta_description, postBody: args?.post_body });
+            return { success: true, ...data };
+          }
+          case 'PUBLISH': {
+            if (!args?.post_id) return { success: false, error: 'post_id is required for BLOG_POST PUBLISH.' };
+            await svc.publishBlogPost(args.post_id);
+            return { success: true, published: args.post_id };
+          }
+          case 'UPDATE': {
+            if (!args?.post_id) return { success: false, error: 'post_id is required for BLOG_POST UPDATE.' };
+            const { post_id, entity_type: _et2, action: _a2, ...rawProps } = args;
+            const FRAMEWORK_FIELDS = new Set(['form_id', 'email_id', 'guid', 'cursor', 'asset_type', 'start_date', 'end_date', 'count', 'query', 'broadcast_id', 'list_id', 'record_ids', 'content_group_id', 'template_path', 'page_id']);
+            const props: Record<string, any> = {};
+            for (const [k, v] of Object.entries(rawProps)) {
+              if (!FRAMEWORK_FIELDS.has(k)) props[k.replace(/_([a-z])/g, (_, c) => c.toUpperCase())] = v;
+            }
+            const data = await svc.updateBlogPost(post_id, props);
+            return { success: true, ...data };
+          }
+          case 'DELETE': {
+            if (!args?.post_id) return { success: false, error: 'post_id is required for BLOG_POST DELETE.' };
+            await svc.deleteBlogPost(args.post_id);
+            return { success: true, deleted: args.post_id };
+          }
+          default:
+            return { success: false, error: `Unknown action "${action}" for BLOG_POST. Valid: LIST, GET, CREATE, PUBLISH, UPDATE, DELETE.` };
+        }
+      }
+
+      // ─── WORKFLOW ──────────────────────────────────────────────────────────
+      if (entityType === 'WORKFLOW') {
+        switch (action) {
+          case 'LIST': {
+            const data = await svc.listWorkflows();
+            return { success: true, ...data };
+          }
+          case 'GET': {
+            if (!args?.workflow_id) return { success: false, error: 'workflow_id is required for WORKFLOW GET.' };
+            const data = await svc.getWorkflow(args.workflow_id);
+            return { success: true, ...data };
+          }
+          case 'DELETE': {
+            if (!args?.workflow_id) return { success: false, error: 'workflow_id is required for WORKFLOW DELETE.' };
+            await svc.deleteWorkflow(args.workflow_id);
+            return { success: true, deleted: args.workflow_id };
+          }
+          case 'GET_PERFORMANCE': {
+            if (!args?.workflow_id) return { success: false, error: 'workflow_id is required for WORKFLOW GET_PERFORMANCE.' };
+            if (!args?.start) return { success: false, error: 'start (epoch ms) is required for WORKFLOW GET_PERFORMANCE.' };
+            if (!args?.end) return { success: false, error: 'end (epoch ms) is required for WORKFLOW GET_PERFORMANCE.' };
+            if (!args?.bucket) return { success: false, error: 'bucket (DAY|WEEK|MONTH) is required for WORKFLOW GET_PERFORMANCE.' };
+            const data = await svc.getWorkflowPerformance(args.workflow_id, args.start, args.end, args.bucket);
+            return { success: true, performance: data };
+          }
+          case 'ENABLE': {
+            if (!args?.workflow_id) return { success: false, error: 'workflow_id is required for WORKFLOW ENABLE.' };
+            const data = await svc.setWorkflowEnabled(args.workflow_id, true);
+            return { success: true, ...data };
+          }
+          case 'DISABLE': {
+            if (!args?.workflow_id) return { success: false, error: 'workflow_id is required for WORKFLOW DISABLE.' };
+            const data = await svc.setWorkflowEnabled(args.workflow_id, false);
+            return { success: true, ...data };
+          }
+          default:
+            return { success: false, error: `Unknown action "${action}" for WORKFLOW. Valid: LIST, GET, DELETE, GET_PERFORMANCE, ENABLE, DISABLE.` };
+        }
+      }
+
+      // ─── SOCIAL ────────────────────────────────────────────────────────────
+      if (entityType === 'SOCIAL') {
+        switch (action) {
+          case 'LIST_CHANNELS': {
+            const data = await svc.listSocialChannels();
+            return { success: true, ...data };
+          }
+          case 'LIST_BROADCASTS': {
+            const data = await svc.listSocialBroadcasts();
+            return { success: true, ...data };
+          }
+          case 'CREATE_BROADCAST': {
+            const channelKey: string = args?.channel_key ?? '';
+            if (!channelKey.trim()) return { success: false, error: 'channel_key is required for SOCIAL CREATE_BROADCAST.' };
+            const body: string = args?.body ?? '';
+            if (!body.trim()) return { success: false, error: 'body is required for SOCIAL CREATE_BROADCAST.' };
+            const data = await svc.createSocialBroadcast(channelKey, body, { triggerAt: args?.trigger_at });
+            return { success: true, ...data };
+          }
+          case 'DELETE_BROADCAST': {
+            if (!args?.broadcast_guid) return { success: false, error: 'broadcast_guid is required for SOCIAL DELETE_BROADCAST.' };
+            await svc.deleteSocialBroadcast(args.broadcast_guid);
+            return { success: true, deleted: args.broadcast_guid };
+          }
+          default:
+            return { success: false, error: `Unknown action "${action}" for SOCIAL. Valid: LIST_CHANNELS, LIST_BROADCASTS, CREATE_BROADCAST, DELETE_BROADCAST.` };
+        }
+      }
+
+      return { success: false, error: `Unknown entity_type "${entityType}". Valid: CONTACT_LIST, CAMPAIGN, EMAIL, FORM, LANDING_PAGE, BLOG_POST, WORKFLOW, SOCIAL.` };
+    } catch (err: any) {
+      if (err?.response?.status === 403) {
+        // HubSpot returns 403 both for tier/scope limits and for tokens granted
+        // before newer scopes were added to the app — distinguish them.
+        const missingScopes = err?.response?.data?.category === 'MISSING_SCOPES';
+        return {
+          success: false,
+          error: missingScopes
+            ? 'Your HubSpot connection is missing the required permissions. Please reconnect your HubSpot account in Settings → Connected Accounts to grant them.'
+            : 'HubSpot API access denied. Check your HubSpot subscription tier and OAuth scopes (content, automation required for some entity types).',
+          hubspotError: err?.response?.data ?? null,
+          status: 403,
+        };
+      }
+      return { success: false, error: err?.message ?? 'HubSpot API call failed.', hubspotError: err?.response?.data ?? null, status: err?.response?.status ?? null };
+    }
+  }
+
 }
 
 /**

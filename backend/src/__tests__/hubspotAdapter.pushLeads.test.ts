@@ -21,12 +21,18 @@ const mockCreateContact = jest.fn();
 const mockUpdateContact = jest.fn();
 const mockEnsureContactProperty = jest.fn().mockResolvedValue('prop');
 const mockEnsureDealProperty = jest.fn().mockResolvedValue('prop');
+const mockCreateDeal = jest.fn();
+const mockUpdateDeal = jest.fn();
+const mockAssociateContactToDeal = jest.fn();
 const mockSvc = {
   upsertContact: mockUpsertContact,
   createContact: mockCreateContact,
   updateContact: mockUpdateContact,
   ensureContactProperty: mockEnsureContactProperty,
   ensureDealProperty: mockEnsureDealProperty,
+  createDeal: mockCreateDeal,
+  updateDeal: mockUpdateDeal,
+  associateContactToDeal: mockAssociateContactToDeal,
 };
 jest.mock('../services/hubspotService', () => ({
   HubSpotService: {
@@ -62,6 +68,11 @@ function makeConfig(): ExternalCrmSyncConfig {
   };
 }
 
+// Batch push is ON by default now; these suites exercise the per-lead path, so
+// pin the kill switch off for the whole file.
+beforeAll(() => { process.env.HUBSPOT_BATCH_PUSH_ENABLED = 'false'; });
+afterAll(() => { delete process.env.HUBSPOT_BATCH_PUSH_ENABLED; });
+
 describe('HubspotAdapter.pushLeads — email validation', () => {
   let adapter: HubspotAdapter;
 
@@ -70,6 +81,9 @@ describe('HubspotAdapter.pushLeads — email validation', () => {
     mockUpsertContact.mockResolvedValue({ contactId: 'c1', isNew: true });
     mockCreateContact.mockResolvedValue({ contactId: 'c1' });
     mockUpdateContact.mockResolvedValue({ contactId: 'c1' });
+    mockCreateDeal.mockResolvedValue('deal_new');
+    mockUpdateDeal.mockResolvedValue(undefined);
+    mockAssociateContactToDeal.mockResolvedValue(undefined);
     adapter = new HubspotAdapter();
   });
 
@@ -359,5 +373,61 @@ describe('HubspotAdapter.pushLeads — lead list name/id enrichment', () => {
     expect(call.customFields?.lead_list_name).toBeUndefined();
     // listId has no explicit entry, so it is still injected.
     expect(call.customFields?.lead_list_id).toBe('list_1');
+  });
+});
+
+describe('HubspotAdapter.pushLeads — pipeline migration on deal update', () => {
+  let adapter: HubspotAdapter;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockUpsertContact.mockResolvedValue({ contactId: 'c1', isNew: false });
+    mockCreateDeal.mockResolvedValue('deal_new');
+    mockUpdateDeal.mockResolvedValue(undefined);
+    mockAssociateContactToDeal.mockResolvedValue(undefined);
+    adapter = new HubspotAdapter();
+  });
+
+  it('sends the configured pipeline when UPDATING an existing deal (so it migrates)', async () => {
+    const config: ExternalCrmSyncConfig = {
+      ...makeConfig(),
+      externalPipelineId: 'pipe_new',
+      dealFieldMapping: [
+        { agentwebField: 'dealValue', crmProperty: 'amount', direction: 'both', enabled: true },
+      ],
+    };
+    const leads = [
+      {
+        leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A', dealValue: '100',
+        syncMetadata: { hubspot_contact_id: 'c1', hubspot_deal_id: 'deal_existing' },
+      },
+    ];
+
+    await adapter.pushLeads(auth, leads, config);
+
+    expect(mockUpdateDeal).toHaveBeenCalledTimes(1);
+    expect(mockUpdateDeal).toHaveBeenCalledWith('deal_existing', expect.objectContaining({ pipeline: 'pipe_new' }));
+    expect(mockCreateDeal).not.toHaveBeenCalled();
+  });
+
+  it('does not inject a pipeline on update when none is configured', async () => {
+    const config: ExternalCrmSyncConfig = {
+      ...makeConfig(),
+      dealFieldMapping: [
+        { agentwebField: 'dealValue', crmProperty: 'amount', direction: 'both', enabled: true },
+      ],
+    };
+    const leads = [
+      {
+        leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A', dealValue: '100',
+        syncMetadata: { hubspot_contact_id: 'c1', hubspot_deal_id: 'deal_existing' },
+      },
+    ];
+
+    await adapter.pushLeads(auth, leads, config);
+
+    expect(mockUpdateDeal).toHaveBeenCalledTimes(1);
+    const props = mockUpdateDeal.mock.calls[0][1];
+    expect(props.pipeline).toBeUndefined();
   });
 });

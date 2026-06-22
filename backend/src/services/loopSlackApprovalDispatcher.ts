@@ -437,8 +437,8 @@ export async function handleLoopApprovalReaction(event: ReactionAddedEvent): Pro
   const pageIds = extractNotionPageIds(message.text);
 
   if (pageIds.length > 0) {
-    await postThread(item.channel, item.ts, `🚀 Dispatching ${pageIds.length} cloud-dev run${pageIds.length === 1 ? '' : 's'} for ${loopTitle}...`);
     await markDispatched(item.ts, pageIds);
+    await postThread(item.channel, item.ts, `🚀 Dispatching ${pageIds.length} cloud-dev run${pageIds.length === 1 ? '' : 's'} for ${loopTitle}...`);
     const results = await dispatchExistingNotionPages(pageIds);
     await postThread(item.channel, item.ts, formatSummary(loopTitle, results));
     await persistApproval(item.channel, item.ts, message.text, event.user, results);
@@ -455,8 +455,8 @@ export async function handleLoopApprovalReaction(event: ReactionAddedEvent): Pro
     return;
   }
 
-  await postThread(item.channel, item.ts, `🚀 Creating ${tasks.length} cloud-dev task${tasks.length === 1 ? '' : 's'} for ${loopTitle}...`);
   await markDispatched(item.ts, tasks.map((t) => t.id));
+  await postThread(item.channel, item.ts, `🚀 Creating ${tasks.length} cloud-dev task${tasks.length === 1 ? '' : 's'} for ${loopTitle}...`);
   const results = await dispatchCreatedTasks(tasks);
   await postThread(item.channel, item.ts, formatSummary(loopTitle, results));
   await persistApproval(item.channel, item.ts, message.text, event.user, results);

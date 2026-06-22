@@ -5,6 +5,7 @@ import { ExternalCrmSyncService, ExternalCrmSyncConfig, FieldMapping } from '../
 jest.mock('../services/db', () => ({
   crmDb: {
     getLeadListById: jest.fn(),
+    getLeadById: jest.fn(),
     getLeadsByListId: jest.fn(),
     updateLead: jest.fn(),
     batchCreateLeads: jest.fn(),
@@ -36,6 +37,7 @@ const mockHubSpotServiceInstance = {
   getDeal: jest.fn().mockResolvedValue(null),
   getDealPipelineStages: jest.fn().mockResolvedValue([]),
   createDealStage: jest.fn().mockResolvedValue({ id: 'stage_1', label: 'Stage 1', displayOrder: 0, metadata: { probability: 0.1 } }),
+  listDealPipelines: jest.fn().mockResolvedValue([]),
   listContactProperties: jest.fn().mockResolvedValue([]),
   listDealProperties: jest.fn().mockResolvedValue([]),
   deleteContact: jest.fn().mockResolvedValue(undefined),
@@ -74,6 +76,11 @@ jest.mock('../services/attioService', () => ({
     create: jest.fn(),
     fromToken: jest.fn(),
   },
+}));
+
+const mockGetAccountById = jest.fn();
+jest.mock('../services/connectedAccountsDb', () => ({
+  getAccountById: (...a: any[]) => mockGetAccountById(...a),
 }));
 
 jest.mock('axios');
@@ -138,6 +145,11 @@ function makeConfig(overrides: Partial<ExternalCrmSyncConfig> = {}): ExternalCrm
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
+// Batch push is ON by default; these service tests assert on the per-lead path,
+// so pin the kill switch off for the whole file.
+beforeAll(() => { process.env.HUBSPOT_BATCH_PUSH_ENABLED = 'false'; });
+afterAll(() => { delete process.env.HUBSPOT_BATCH_PUSH_ENABLED; });
+
 describe('ExternalCrmSyncService', () => {
   let service: ExternalCrmSyncService;
 
@@ -161,8 +173,109 @@ describe('ExternalCrmSyncService', () => {
     mockHubSpotServiceInstance.getDeal.mockResolvedValue(null);
     mockHubSpotServiceInstance.getDealPipelineStages.mockResolvedValue([]);
     mockHubSpotServiceInstance.createDealStage.mockResolvedValue({ id: 'stage_1', label: 'Stage 1', displayOrder: 0, metadata: { probability: 0.1 } });
+    mockHubSpotServiceInstance.listDealPipelines.mockResolvedValue([]);
     mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+    // Default: re-read returns nothing so reReadLead falls back to the in-hand
+    // lead (preserves existing tests). The propagation tests below override this.
+    mockCrmDb.getLeadById.mockResolvedValue(undefined as any);
+    mockCrmDb.updateLead.mockResolvedValue(undefined as any);
     service = new ExternalCrmSyncService();
+  });
+
+  // ─── saveConfig — reconnect pipeline validation ────────────────────────────
+  describe('saveConfig reconnect pipeline validation', () => {
+    it('clears a stale pipeline + stage map + sync timestamps when reconnecting a DIFFERENT account', async () => {
+      // Disconnected config (accountId cleared) that still carries the old account's
+      // pipeline/stage/sync state; the new account does NOT contain that pipeline.
+      mockListWithConfig(makeConfig({
+        accountId: undefined,
+        externalPipelineId: 'old_pipe',
+        hubspotDealStageMap: { lead: 'old_stage' },
+        lastPushSyncAt: '2024-02-01T00:00:00.000Z',
+      }));
+      mockHubSpotServiceInstance.listDealPipelines.mockResolvedValue([
+        { id: 'different_pipe', label: 'Other', displayOrder: 0, stages: [] },
+      ]);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', { accountId: 'new_acct' });
+
+      const persisted = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as ExternalCrmSyncConfig;
+      expect(persisted.externalPipelineId).toBeUndefined();
+      expect(persisted.hubspotDealStageMap).toBeUndefined();
+      expect(persisted.lastPushSyncAt).toBeUndefined();
+      // Field mappings are account-agnostic and must be preserved.
+      expect(persisted.contactFieldMapping.length).toBeGreaterThan(0);
+    });
+
+    it('keeps the pipeline when reconnecting the SAME account (pipeline still exists)', async () => {
+      mockListWithConfig(makeConfig({
+        accountId: undefined,
+        externalPipelineId: 'keep_pipe',
+        hubspotDealStageMap: { lead: 'stage_1' },
+        lastPushSyncAt: '2024-02-01T00:00:00.000Z',
+      }));
+      mockHubSpotServiceInstance.listDealPipelines.mockResolvedValue([
+        { id: 'keep_pipe', label: 'Sales', displayOrder: 0, stages: [] },
+      ]);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', { accountId: 'same_acct' });
+
+      const persisted = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as ExternalCrmSyncConfig;
+      expect(persisted.externalPipelineId).toBe('keep_pipe');
+      expect(persisted.lastPushSyncAt).toBe('2024-02-01T00:00:00.000Z');
+    });
+
+    it('does not destroy pipeline state if HubSpot validation fails (transient error)', async () => {
+      mockListWithConfig(makeConfig({
+        accountId: undefined,
+        externalPipelineId: 'old_pipe',
+        lastPushSyncAt: '2024-02-01T00:00:00.000Z',
+      }));
+      mockHubSpotServiceInstance.listDealPipelines.mockRejectedValue(new Error('HubSpot down'));
+
+      await service.saveConfig('user1', 'list1', 'hubspot', { accountId: 'new_acct' });
+
+      const persisted = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as ExternalCrmSyncConfig;
+      expect(persisted.externalPipelineId).toBe('old_pipe');
+    });
+  });
+
+  // ─── changePipeline ───────────────────────────────────────────────────────
+  describe('changePipeline', () => {
+    it('throws for a non-hubspot provider', async () => {
+      mockListWithConfig(makeConfig({ provider: 'attio' as any }), 'attio');
+      await expect(service.changePipeline('user1', 'list1', 'attio', 'p1')).rejects.toThrow(/hubspot/i);
+    });
+
+    it('throws when no sync configuration exists', async () => {
+      mockNoConfig();
+      await expect(service.changePipeline('user1', 'list1', 'hubspot', 'p1')).rejects.toThrow(/configuration/i);
+    });
+
+    it('throws when the target pipeline does not exist in HubSpot', async () => {
+      mockListWithConfig(makeConfig({ lastPushSyncAt: '2024-02-01T00:00:00.000Z', externalPipelineId: 'old' }));
+      mockHubSpotServiceInstance.listDealPipelines.mockResolvedValue([{ id: '123', label: 'Sales', displayOrder: 0, stages: [] }]);
+      await expect(service.changePipeline('user1', 'list1', 'hubspot', '999')).rejects.toThrow(/not found/i);
+    });
+
+    it('updates externalPipelineId and clears the stage map even after a sync (lock bypass)', async () => {
+      mockListWithConfig(makeConfig({
+        lastPushSyncAt: '2024-02-01T00:00:00.000Z',
+        externalPipelineId: 'old',
+        hubspotDealStageMap: { lead: 'old_stage_1' },
+      }));
+      mockHubSpotServiceInstance.listDealPipelines.mockResolvedValue([
+        { id: 'new123', label: 'Partnerships', displayOrder: 0, stages: [] },
+      ]);
+
+      const result = await service.changePipeline('user1', 'list1', 'hubspot', 'new123');
+
+      expect(mockCrmDb.setLeadListCrmSyncConfig).toHaveBeenCalledTimes(1);
+      const persisted = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as ExternalCrmSyncConfig;
+      expect(persisted.externalPipelineId).toBe('new123');
+      expect(persisted.hubspotDealStageMap).toBeUndefined();
+      expect(result.externalPipelineId).toBe('new123');
+    });
   });
 
   // ─── getConfig ────────────────────────────────────────────────────────────
@@ -396,6 +509,98 @@ describe('ExternalCrmSyncService', () => {
     });
   });
 
+  // ─── disconnectAccount ────────────────────────────────────────────────────
+
+  describe('disconnectAccount', () => {
+    it('does nothing when no config exists', async () => {
+      mockNoConfig();
+      await service.disconnectAccount('user1', 'list1', 'hubspot');
+      expect(mockCrmDb.setLeadListCrmSyncConfig).not.toHaveBeenCalled();
+    });
+
+    it('clears accountId, apiKeyEncrypted, and webhookSecret', async () => {
+      mockListWithConfig(makeConfig({ accountId: 'acct1', apiKeyEncrypted: 'enc:key', webhookSecret: 'secret123' }));
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.disconnectAccount('user1', 'list1', 'hubspot');
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as ExternalCrmSyncConfig;
+      expect(saved.accountId).toBeUndefined();
+      expect(saved.apiKeyEncrypted).toBeUndefined();
+      expect(saved.webhookSecret).toBeUndefined();
+    });
+
+    it('preserves field mappings', async () => {
+      const config = makeConfig({ accountId: 'acct1' });
+      mockListWithConfig(config);
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.disconnectAccount('user1', 'list1', 'hubspot');
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as ExternalCrmSyncConfig;
+      expect(saved.contactFieldMapping).toEqual(config.contactFieldMapping);
+      expect(saved.dealFieldMapping).toEqual(config.dealFieldMapping);
+      expect(saved.customFieldMapping).toEqual(config.customFieldMapping);
+    });
+
+    it('disables autoSyncEnabled on disconnect but preserves webhookEnabled', async () => {
+      mockListWithConfig(makeConfig({ accountId: 'acct1', autoSyncEnabled: true, webhookEnabled: true }));
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.disconnectAccount('user1', 'list1', 'hubspot');
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as ExternalCrmSyncConfig;
+      expect(saved.autoSyncEnabled).toBe(false);
+      expect(saved.webhookEnabled).toBe(true);
+    });
+
+    it('does NOT set config to null (unlike deleteConfig)', async () => {
+      mockListWithConfig(makeConfig({ accountId: 'acct1' }));
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.disconnectAccount('user1', 'list1', 'hubspot');
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2];
+      expect(saved).not.toBeNull();
+    });
+  });
+
+  // ─── isAccountConnected ───────────────────────────────────────────────────────
+
+  describe('isAccountConnected', () => {
+    it('returns false when config has no credential (accountId nor token)', async () => {
+      const cfg = makeConfig({ accountId: undefined, apiKeyEncrypted: undefined });
+      expect(await service.isAccountConnected(cfg)).toBe(false);
+      expect(mockGetAccountById).not.toHaveBeenCalled();
+    });
+
+    it('returns true for token auth without resolving an OAuth account', async () => {
+      const cfg = makeConfig({ accountId: undefined, apiKeyEncrypted: 'enc:key' });
+      expect(await service.isAccountConnected(cfg)).toBe(true);
+      expect(mockGetAccountById).not.toHaveBeenCalled();
+    });
+
+    it('returns false when the OAuth account no longer resolves (disconnected/removed)', async () => {
+      mockGetAccountById.mockResolvedValue(null);
+      const cfg = makeConfig({ accountId: 'acct1', apiKeyEncrypted: undefined });
+      expect(await service.isAccountConnected(cfg)).toBe(false);
+      expect(mockGetAccountById).toHaveBeenCalledWith('acct1', 'user1');
+    });
+
+    it('returns true when the OAuth account resolves', async () => {
+      mockGetAccountById.mockResolvedValue({ account_id: 'acct1', platform: 'hubspot', userId: 'user1' });
+      const cfg = makeConfig({ accountId: 'acct1', apiKeyEncrypted: undefined });
+      expect(await service.isAccountConnected(cfg)).toBe(true);
+    });
+
+    it('returns false when account resolution throws', async () => {
+      mockGetAccountById.mockRejectedValue(new Error('db down'));
+      const cfg = makeConfig({ accountId: 'acct1', apiKeyEncrypted: undefined });
+      expect(await service.isAccountConnected(cfg)).toBe(false);
+    });
+  });
+
   // ─── getDefaultMappings ─────────────────────────────────────────────────────
 
   describe('getDefaultMappings', () => {
@@ -556,6 +761,20 @@ describe('ExternalCrmSyncService', () => {
       const result = await service.pushAllLeads('user1', 'list1', 'hubspot');
       expect(result.errorCount).toBe(0);
       expect(result.successCount).toBe(0);
+    });
+
+    it('resolves the HubSpot service once for a multi-chunk push, not per chunk', async () => {
+      mockListWithConfig(makeConfig());
+      mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+      mockCrmDb.updateLead.mockResolvedValue(undefined as any);
+      mockCrmDb.getLeadsByListId
+        .mockResolvedValueOnce({ items: [{ leadId: 'l1', email: 'a@b.com' }], lastEvaluatedKey: { leadId: 'l1' } as any, hasMore: true })
+        .mockResolvedValueOnce({ items: [{ leadId: 'l2', email: 'c@d.com' }], lastEvaluatedKey: null, hasMore: false });
+
+      await service.pushAllLeads('user1', 'list1', 'hubspot');
+
+      expect(mockCrmDb.getLeadsByListId).toHaveBeenCalledTimes(2); // two chunks processed
+      expect(mockHubSpotCreate).toHaveBeenCalledTimes(1);          // one service reused across both
     });
 
     it('creates (not upserts) a contact for leads without email when pushing to HubSpot', async () => {
@@ -979,6 +1198,59 @@ describe('ExternalCrmSyncService', () => {
       expect(saved.lastSyncStatus).toBe('success');
       expect(saved.lastSyncError).toBeUndefined();
       expect(saved.lastPushSyncAt).toBeTruthy();
+    });
+
+    // ─── per-lead status propagation (Task 2 supplies the behaviour) ──────────
+    describe('autoSyncLead — per-lead status propagation', () => {
+      it('forwards the re-read lead to the adapter and marks it synced on success', async () => {
+        const config = makeConfig({ autoSyncEnabled: true });
+        mockListWithConfig(config);
+        // The lock re-reads the lead by id before pushing; return a fresh copy so
+        // we can verify the re-read object (not the in-hand one) is forwarded.
+        const fresh = { leadId: 'l1', listId: 'list1', email: 'a@b.com', firstName: 'Ada' };
+        mockCrmDb.getLeadById.mockResolvedValue(fresh as any);
+
+        await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com' }, 'hubspot', 'updated');
+
+        // The re-read lead was used (looked up by listId + leadId).
+        expect(mockCrmDb.getLeadById).toHaveBeenCalledWith('list1', 'l1');
+        // The adapter's per-lead success writeback marks the re-read lead synced.
+        const meta = mockCrmDb.updateLead.mock.calls.at(-1)?.[2]?.syncMetadata as Record<string, any> | undefined;
+        expect(meta?.syncStatus).toBe('synced');
+        expect(meta?.hubspot_contact_id).toBeTruthy();
+        expect(typeof meta?.lastSyncedAt).toBe('string');
+      });
+
+      it('marks the lead sync_failed when the adapter reports a per-lead error', async () => {
+        const config = makeConfig({ autoSyncEnabled: true });
+        mockListWithConfig(config);
+        // An invalid email is caught per-lead into result.errors (no throw); the
+        // adapter writes sync_failed for that lead before returning.
+        mockCrmDb.getLeadById.mockResolvedValue(
+          { leadId: 'l1', listId: 'list1', email: 'not-an-email' } as any,
+        );
+
+        await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'not-an-email' }, 'hubspot', 'created');
+
+        const failedWriteback = mockCrmDb.updateLead.mock.calls.find(
+          (c) => (c[2] as any)?.syncMetadata?.syncStatus === 'sync_failed',
+        );
+        expect(failedWriteback).toBeDefined();
+        expect((failedWriteback![2] as any).syncMetadata.syncError).toBeTruthy();
+      });
+
+      it('does nothing per-lead (no adapter push, no status write) when auto-sync is disabled', async () => {
+        const config = makeConfig({ autoSyncEnabled: false });
+        mockListWithConfig(config);
+
+        await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com' }, 'hubspot', 'updated');
+
+        // Auto-sync returns before resolving the adapter / HubSpot service, so no
+        // push happens and no per-lead sync status is written.
+        expect(mockHubSpotCreate).not.toHaveBeenCalled();
+        expect(mockHubSpotFromToken).not.toHaveBeenCalled();
+        expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+      });
     });
   });
 

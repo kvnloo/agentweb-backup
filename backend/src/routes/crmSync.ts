@@ -4,6 +4,7 @@ import { crmDb, userDb } from '../services/db';
 import {
   externalCrmSyncService,
 } from '../services/externalCrmSyncService';
+import { ensureWebhookSubscriptions } from '../utils/hubspotWebhookSubscriptions';
 
 const router = express.Router();
 router.use(authenticateToken);
@@ -101,8 +102,16 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
     }
 
     const backendUrl = process.env.BACKEND_URL || 'http://localhost:3001';
+    // Post-disconnect: config record exists but credential cleared → not configured.
+    const hasCredential = !!(config.accountId || config.apiKeyEncrypted);
+    // Link preserved but unresolvable (account disconnected/removed/expired): the
+    // stored accountId no longer maps to a connected account, so sync would fail
+    // with a cryptic "account not found". Surface a reconnect-needed state instead
+    // of looking healthy — we keep accountId so reconnecting restores the list.
+    const needsReconnect = hasCredential && !(await externalCrmSyncService.isAccountConnected(config));
     res.json({
-      configured: true,
+      configured: hasCredential,
+      needsReconnect,
       provider: config.provider,
       accountId: config.accountId,
       hasManualToken: !!config.apiKeyEncrypted,
@@ -159,12 +168,38 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       });
     }
 
+    // Enforce one-account-per-list: reject if another list already uses this accountId.
+    // Uses org-aware query so two team members can't independently bind the same portal.
+    if (accountId) {
+      const allLists = await crmDb.getLeadListsForUser(userId);
+      const conflict = (allLists || []).find((l: any) => {
+        if (l.listId === listId) return false;
+        const cfg = l.externalCrmSyncConfigs?.[provider];
+        return cfg?.accountId === accountId;
+      });
+      if (conflict) {
+        return res.status(409).json({
+          error: `This account is already linked to another list ("${(conflict as any).name || conflict.listId}"). Disconnect it there first.`,
+        });
+      }
+    }
+
     const config = await externalCrmSyncService.saveConfig(userId, listId, provider, {
       accountId, apiKey, autoSyncEnabled,
       contactFieldMapping, dealFieldMapping, customFieldMapping,
       deleteOnPush, deleteOnPull, webhookEnabled,
       externalPipelineId, listName,
     });
+
+    // Fire-and-forget: register webhook subscriptions for any custom HubSpot
+    // properties in the mapping that aren't already subscribed in the public app.
+    // Only for HubSpot OAuth connections — manual token users use per-list webhooks.
+    if (provider === 'hubspot' && (accountId || config.accountId)) {
+      void ensureWebhookSubscriptions(
+        contactFieldMapping ?? config.contactFieldMapping ?? [],
+        customFieldMapping ?? config.customFieldMapping ?? [],
+      );
+    }
 
     res.json({
       configured: true,
@@ -189,6 +224,28 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to save config' });
+  }
+});
+
+// DELETE /api/crm-sync/config/:listId/:provider/account
+// Disconnects the OAuth account from this list (clears accountId + credentials)
+// while preserving field mappings and other settings.
+// Only the user's explicit action in the CRM sync dialog triggers this — OAuth
+// revocation from the settings page does NOT call this route, so the account
+// remains "used" and blocked from linking to other lists unless manually disconnected.
+router.delete('/config/:listId/:provider/account', async (req: any, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { listId, provider } = req.params;
+    const ownership = await verifyListOwnership(userId, listId);
+    if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
+
+    await externalCrmSyncService.disconnectAccount(userId, listId, provider);
+    res.json({ message: 'Account disconnected' });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to disconnect account' });
   }
 });
 
@@ -257,7 +314,42 @@ router.get('/external-pipelines/:listId/:provider', async (req: any, res) => {
     const pipelines = await externalCrmSyncService.getExternalPipelines(userId, listId, provider, { accountId, apiKey });
     res.json({ pipelines });
   } catch (err: any) {
+    const axiosData = err.response?.data;
+    console.error('[external-pipelines] error', {
+      message: err.message,
+      status: err.response?.status,
+      data: axiosData,
+    });
     res.status(500).json({ error: err.message || 'Failed to fetch external pipelines' });
+  }
+});
+
+// PUT /api/crm-sync/config/:listId/:provider/pipeline
+// Re-points a HubSpot list to a different deal pipeline AFTER the first sync
+// (the normal config save locks the pipeline once synced). The client then
+// triggers a push (POST /push/...) to migrate existing deals into the new pipeline.
+router.put('/config/:listId/:provider/pipeline', async (req: any, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { listId, provider } = req.params;
+    if (provider !== 'hubspot') {
+      return res.status(400).json({ error: 'Changing the deal pipeline is only supported for HubSpot.' });
+    }
+
+    const ownership = await verifyListOwnership(userId, listId);
+    if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
+
+    const { externalPipelineId } = req.body as { externalPipelineId?: string };
+    if (!externalPipelineId) {
+      return res.status(400).json({ error: 'externalPipelineId is required.' });
+    }
+
+    const config = await externalCrmSyncService.changePipeline(userId, listId, provider, externalPipelineId);
+    res.json({ config });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to change pipeline' });
   }
 });
 
@@ -282,6 +374,19 @@ router.post('/test/:listId/:provider', async (req: any, res) => {
     // webhookSecret is generated immediately and the webhook URL can be copied without
     // requiring a separate Save step.
     if (result.valid && (apiKey || accountId)) {
+      if (accountId) {
+        const allLists = await crmDb.getLeadListsForUser(userId);
+        const conflict = (allLists || []).find((l: any) => {
+          if (l.listId === listId) return false;
+          const cfg = l.externalCrmSyncConfigs?.[provider];
+          return cfg?.accountId === accountId;
+        });
+        if (conflict) {
+          return res.status(409).json({
+            error: `This account is already linked to another list ("${(conflict as any).name || conflict.listId}"). Disconnect it there first.`,
+          });
+        }
+      }
       const saved = await externalCrmSyncService.saveConfig(userId, listId, provider, { apiKey, accountId });
       const backendUrl = process.env.BACKEND_URL || 'http://localhost:3001';
       const webhookUrl = saved.webhookSecret
@@ -341,6 +446,27 @@ router.get('/push/:listId/:provider/status', async (req: any, res) => {
   }
 });
 
+// GET /api/crm-sync/push/:listId/status
+// Provider-agnostic: returns the running push job + its provider for the list, so
+// the CRM page can re-mount the progress card after a refresh without knowing the
+// provider. Returns { status: 'idle' } when nothing is running.
+router.get('/push/:listId/status', async (req: any, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { listId } = req.params;
+    const ownership = await verifyListOwnership(userId, listId);
+    if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
+
+    const running = await externalCrmSyncService.getRunningPushJobForList(userId, listId);
+    if (!running) return res.json({ status: 'idle' });
+    res.json({ status: 'running', provider: running.provider, job: running.job });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to get push status' });
+  }
+});
+
 // POST /api/crm-sync/pull/:listId/:provider
 router.post('/pull/:listId/:provider', async (req: any, res) => {
   try {
@@ -356,6 +482,40 @@ router.post('/pull/:listId/:provider', async (req: any, res) => {
   } catch (err: any) {
     console.error(`[crmSync] Pull error for provider ${req.params?.provider}:`, err.response?.data || err);
     res.status(500).json({ error: err.response?.data?.message || err.message || 'Failed to pull contacts' });
+  }
+});
+
+// ─── Used accounts ────────────────────────────────────────────────────────────
+
+// GET /api/crm-sync/used-accounts
+// Returns all connected account IDs that are already linked to a lead list for
+// this user, so the UI can disable those accounts in the selector.
+router.get('/used-accounts', async (req: any, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const lists = await crmDb.getLeadListsByUserId(userId);
+    const used: Array<{ accountId: string; listId: string; listName: string; provider: string }> = [];
+
+    for (const list of (lists || [])) {
+      const configs = (list as any).externalCrmSyncConfigs as Record<string, any> | undefined;
+      if (!configs) continue;
+      for (const [provider, config] of Object.entries(configs)) {
+        if (config?.accountId) {
+          used.push({
+            accountId: config.accountId,
+            listId: list.listId,
+            listName: (list as any).name || list.listId,
+            provider,
+          });
+        }
+      }
+    }
+
+    res.json({ used });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to fetch used accounts' });
   }
 });
 

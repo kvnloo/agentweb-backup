@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-06-12
+// Last updated: 2026-06-22
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,32 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-06-22',
+    changes: [
+      'Improved: Large Image Batches No Longer Stall Mid-Way',
+      '- When you ask Emma to generate many images at once (for example a campaign with several ad images per hook), she now works through them in manageable groups instead of trying to finish the whole batch in one go and timing out',
+      '- If a batch is too large to complete in a single response, Emma saves the images she has already created, tells you how many are done versus still remaining, and asks you to reply "continue" to generate the rest',
+      '- When you continue, she generates only the images that are still missing — she never re-creates the ones already saved — so a large batch finishes reliably over a few steps instead of getting stuck',
+    ],
+  },
+  {
+    date: '2026-06-22',
+    changes: [
+      'Improved: Emma Now Shows the Source and Confidence When You Ask About Enriched Data Across Leads',
+      '- When you ask Emma about an enriched value for many leads at once (for example "what is the funding stage for each lead in this list?"), she now lays out where each value came from — the data provider or source link and a confidence level — in a table, instead of just listing the values',
+      '- Web-sourced or lower-confidence values are flagged so you know which ones to double-check, matching what Emma already did when you asked about a single lead',
+    ],
+  },
+  {
+    date: '2026-06-22',
+    changes: [
+      'Improved: Emma Now Flags Unverified Company Details in Lead Enrichment',
+      '- When Emma enriches your leads, some company details (like funding stage) come from web search rather than a verified data provider — and occasionally the web gets it wrong, such as labeling a small startup with the wrong funding round',
+      '- Emma now marks these lower-confidence values as "unverified" in the enrichment preview and caveats them when she shares them, instead of stating them as established fact',
+      '- Details that come from trusted sources or pass Emma\'s built-in fact-check are shown plainly as before — only the uncertain ones are flagged, so you know which values to double-check',
+    ],
+  },
   {
     date: '2026-06-12',
     changes: [

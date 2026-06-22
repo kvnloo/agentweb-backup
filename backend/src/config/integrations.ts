@@ -141,7 +141,19 @@ export const INTEGRATION_CONFIG = {
       'crm.schemas.contacts.write',
       'crm.schemas.deals.read',
       'crm.schemas.deals.write',
-    ],
+    ] as const,
+    marketingOnlyScopes: [
+      'marketing.campaigns.read',
+      'marketing.campaigns.revenue.read',
+      'marketing.campaigns.write',
+      'content',
+      'automation',
+      'forms',
+      'communication_preferences.read',
+      'social',
+      // 'marketing-email',
+    ] as const,
+    get marketingScopes() { return [...this.scopes, ...this.marketingOnlyScopes]; },
   },
 
   clickup: {
@@ -479,6 +491,8 @@ export interface HubSpotOAuthConfig {
   clientSecret: string;
   redirectUri: string;
   scopes: string[];
+  marketingOnlyScopes: string[];
+  marketingScopes: string[];
   authorizationUrl: string;
   tokenUrl: string;
   tokenInfoUrl: string;
@@ -497,13 +511,41 @@ export async function getHubSpotConfig(): Promise<HubSpotOAuthConfig> {
     clientId: credentials.clientId,
     clientSecret: credentials.clientSecret,
     redirectUri: INTEGRATION_CONFIG.hubspot.redirectUri,
-    scopes: INTEGRATION_CONFIG.hubspot.scopes,
+    scopes: [...INTEGRATION_CONFIG.hubspot.scopes],
+    marketingOnlyScopes: [...INTEGRATION_CONFIG.hubspot.marketingOnlyScopes],
+    marketingScopes: INTEGRATION_CONFIG.hubspot.marketingScopes,
     authorizationUrl: INTEGRATION_CONFIG.hubspot.authorizationUrl,
     tokenUrl: INTEGRATION_CONFIG.hubspot.tokenUrl,
     tokenInfoUrl: INTEGRATION_CONFIG.hubspot.tokenInfoUrl,
   };
   hubspotConfigCacheExpiresAt = Date.now() + HUBSPOT_CONFIG_CACHE_TTL_MS;
   return cachedHubSpotConfig;
+}
+
+/**
+ * Resolve the client secret used to verify a HubSpot webhook signature, keyed by
+ * the `appId` carried in the event payload. HubSpot signs each webhook with the
+ * secret of the app that owns the subscription — so an endpoint that receives
+ * events from more than one app (e.g. an app migration, or stray deliveries from
+ * a different app pointed at the same URL) must verify each event with THAT app's
+ * secret, not a single global one.
+ *
+ * Returns the secret when `appId` matches the configured app (or when `appId` is
+ * absent — legacy/test payloads fall back to the configured app's secret). Returns
+ * null for events from an app we don't manage, so the caller can ignore them
+ * instead of failing them as "signature mismatch".
+ */
+export async function getHubSpotClientSecretForAppId(
+  appId?: string | number | null
+): Promise<string | null> {
+  const credentials = await getHubSpotCredentials();
+  // No appId on the event (legacy/test) → fall back to the configured app's secret.
+  if (appId === undefined || appId === null || appId === '') {
+    return credentials.clientSecret;
+  }
+  return String(appId) === String(credentials.hubspotAppId)
+    ? credentials.clientSecret
+    : null;
 }
 
 export interface AttioOAuthConfig {
