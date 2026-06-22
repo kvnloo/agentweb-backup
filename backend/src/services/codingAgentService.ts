@@ -14,6 +14,12 @@ import { agentModeService } from './agentModeService';
 import { getSecret } from '../utils/secretsManager';
 import { getLandingPageById, getLandingPagesByOwner, canUserEditLandingPage, GeneratedLandingPage } from './v0Service';
 import { AcceptanceCheck, AcceptanceStatus, AcceptanceVerificationResult, verifyAcceptanceChecks } from './codingAgentAcceptance';
+import {
+  CodingAgentRecoveryState,
+  CodingAgentRunState,
+  createCodingAgentRun,
+  updateCodingAgentRun,
+} from './codingAgentRunService';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -55,17 +61,29 @@ export interface CodingAgentContext {
   onUsage?: (usage: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }) => void;
   /** Deterministic post-run checks. The coding agent edits; this verifier judges. */
   acceptanceChecks?: AcceptanceCheck[];
+  /** Internal cancellation signal for this run. */
+  abortSignal?: AbortSignal;
+  /** Persisted run id for telemetry/recovery. */
+  runId?: string;
 }
 
 export interface CodingAgentResult {
   success: boolean;
   message: string;
   iterations: number;
+  runId?: string;
+  state?: CodingAgentRunState;
   previewUrl?: string;
   branch?: string;
   notAuthorized?: boolean;
   acceptanceStatus?: AcceptanceStatus;
   acceptance?: AcceptanceVerificationResult;
+  verification?: AcceptanceVerificationResult;
+  recovery?: CodingAgentRecoveryState;
+  retryable?: boolean;
+  baseCommitSha?: string;
+  latestCommitSha?: string;
+  editedFiles?: string[];
 }
 
 interface SearchReplaceEdit {
@@ -86,11 +104,11 @@ interface ApplyResult {
   errors: string[];
 }
 
-async function refreshPreviewUrlForDraftBranch(
+async function refreshPreviewUrlForDraftBranchStrict(
   result: CodingAgentResult,
   context: CodingAgentContext
-): Promise<CodingAgentResult> {
-  if (!result.success || !result.branch || result.branch === 'main') return result;
+): Promise<{ result: CodingAgentResult; blockedReason?: string }> {
+  if (!result.success || !result.branch || result.branch === 'main') return { result };
 
   try {
     const data = await mcpFetch({
@@ -101,13 +119,93 @@ async function refreshPreviewUrlForDraftBranch(
     });
 
     if (data?.previewUrl && data.previewUrl !== result.previewUrl) {
-      return { ...result, previewUrl: data.previewUrl };
+      return { result: { ...result, previewUrl: data.previewUrl } };
     }
+    return { result };
   } catch (error) {
-    console.warn('[CODING AGENT] Could not refresh draft preview URL; using agent-reported URL:', error);
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn('[CODING AGENT] Could not refresh draft preview URL:', error);
+    return { result, blockedReason: `Could not refresh draft preview URL: ${message}` };
+  }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const err: any = new Error('Coding agent run was cancelled.');
+  err.name = 'AbortError';
+  throw err;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && (error.name === 'AbortError' || /cancelled|aborted/i.test(error.message));
+}
+
+function isBuildOrDeploymentFailure(result: CodingAgentResult): boolean {
+  const text = `${result.message || ''} ${result.acceptance?.summary || ''}`.toLowerCase();
+  return /build failed|vercel build failed|deployment failed|buildstatus["']?\s*:\s*["']?error|failed to deploy/.test(text);
+}
+
+async function getCurrentCommitSha(context: CodingAgentContext): Promise<string | undefined> {
+  try {
+    const branch = context.draftBranch || 'main';
+    const queryParams: Record<string, string> = branch !== 'main' ? { branch } : {};
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/landing-pages/v0/generated/${context.pageId}/commits`,
+      queryParams,
+      context: { userId: context.userId },
+    });
+    const sha = data?.commits?.[0]?.sha;
+    return typeof sha === 'string' && sha ? sha : undefined;
+  } catch (error) {
+    console.warn('[CODING AGENT] Could not capture base commit SHA:', error);
+    return undefined;
+  }
+}
+
+async function rollbackEditedFiles(input: {
+  context: CodingAgentContext;
+  baseCommitSha?: string;
+  editedFiles?: string[];
+}): Promise<CodingAgentRecoveryState> {
+  const files = Array.from(new Set(input.editedFiles || [])).filter(Boolean);
+  if (!input.baseCommitSha || files.length === 0) {
+    return {
+      attempted: false,
+      status: 'not_needed',
+      reason: !input.baseCommitSha ? 'No base commit SHA was captured.' : 'No edited files were tracked.',
+      baseCommitSha: input.baseCommitSha,
+    };
   }
 
-  return result;
+  const failures: string[] = [];
+  for (const filePath of files) {
+    try {
+      await executeTool('revert_file', {
+        file_path: filePath,
+        commit_sha: input.baseCommitSha,
+        commit_message: `Rollback ${filePath} after failed coding-agent run`,
+      }, input.context);
+    } catch (error) {
+      failures.push(`${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  if (failures.length > 0) {
+    return {
+      attempted: true,
+      status: 'failed',
+      reason: failures.join('; '),
+      baseCommitSha: input.baseCommitSha,
+    };
+  }
+
+  return {
+    attempted: true,
+    status: 'succeeded',
+    reason: 'Rolled back edited files to the captured base commit after a broken build/deploy.',
+    baseCommitSha: input.baseCommitSha,
+  };
 }
 
 /**
@@ -621,6 +719,7 @@ async function executeTool(
   args: any,
   context: CodingAgentContext
 ): Promise<string | ToolImageResult> {
+  throwIfAborted(context.abortSignal);
   const basePath = `/api/landing-pages/v0/generated/${context.pageId}`;
   const branch = context.draftBranch || "main";
   const branchQuery: Record<string, string> = branch !== "main" ? { branch } : {};
@@ -891,7 +990,9 @@ async function executeTool(
           // Still building — wait and retry (unless this is the last attempt)
           if (attempt < MAX_POLL_ATTEMPTS) {
             console.log(`[CODING AGENT] check_deployment: branch="${branch}" status="${lastData.buildStatus}" (attempt ${attempt}/${MAX_POLL_ATTEMPTS}), retrying in ${POLL_INTERVAL_MS / 1000}s...`);
+            throwIfAborted(context.abortSignal);
             await _sleepFn(POLL_INTERVAL_MS);
+            throwIfAborted(context.abortSignal);
           }
         }
         // Timed out — return with a note so the LLM can inform the user
@@ -1597,9 +1698,11 @@ async function runCodingAgentInternal(
   ];
 
   let iteration = 0;
+  const editedFiles = new Set<string>();
 
   try {
     while (iteration < maxIterations) {
+      throwIfAborted(context.abortSignal);
       iteration++;
 
       // Trim older messages every 5 iterations to prevent context bloat
@@ -1624,6 +1727,7 @@ async function runCodingAgentInternal(
         tools,
         messages,
       });
+      throwIfAborted(context.abortSignal);
 
       // Report this turn's token usage if a consumer is listening (eval harness).
       if (context.onUsage && response.usage) {
@@ -1662,13 +1766,18 @@ async function runCodingAgentInternal(
             iterations: iteration,
             previewUrl: fnArgs.preview_url,
             branch: context.draftBranch,
+            editedFiles: Array.from(editedFiles),
           };
         }
 
         // Execute the tool
         let toolResult: string | ToolImageResult;
         try {
+          throwIfAborted(context.abortSignal);
           toolResult = await executeTool(fnName, fnArgs, scopedContext);
+          if (fnName === 'edit_file' && fnArgs.file_path && typeof toolResult === 'string' && !/^Failed to apply edits|^Error:/i.test(toolResult)) {
+            editedFiles.add(fnArgs.file_path);
+          }
 
           // Emit progress about tool execution
           if (context.socketEmit) {
@@ -1681,6 +1790,7 @@ async function runCodingAgentInternal(
           }
         } catch (error) {
           if (is403Error(error)) throw error; // Authorization failure — exit loop immediately
+          if (isAbortError(error)) throw error;
           toolResult = `Error executing ${fnName}: ${error instanceof Error ? error.message : String(error)}`;
         }
 
@@ -1716,21 +1826,34 @@ async function runCodingAgentInternal(
       iterations: iteration,
       previewUrl: summary.previewUrl,
       branch: context.draftBranch,
+      editedFiles: Array.from(editedFiles),
     };
 
   } catch (error) {
+    if (isAbortError(error)) {
+      return {
+        success: false,
+        message: 'Coding agent run was cancelled before completion.',
+        iterations: iteration,
+        branch: context.draftBranch,
+        editedFiles: Array.from(editedFiles),
+      };
+    }
     if (is403Error(error)) {
       return {
         success: false,
         message: NOT_AUTHORIZED_MESSAGE,
         iterations: iteration,
         notAuthorized: true,
+        editedFiles: Array.from(editedFiles),
       };
     }
     return {
       success: false,
       message: `Coding agent encountered an error: ${error instanceof Error ? error.message : String(error)}`,
-      iterations: iteration
+      iterations: iteration,
+      branch: context.draftBranch,
+      editedFiles: Array.from(editedFiles),
     };
   }
 }
@@ -1744,6 +1867,25 @@ export async function runCodingAgent(
   context: CodingAgentContext,
   maxIterations: number = DEFAULT_MAX_ITERATIONS
 ): Promise<CodingAgentResult> {
+  const run = await createCodingAgentRun({
+    sessionId: context.sessionId,
+    pageId: context.pageId,
+    userId: context.userId,
+    branch: context.draftBranch,
+  });
+  const abortController = new AbortController();
+  const runContext: CodingAgentContext = {
+    ...context,
+    runId: run.runId,
+    abortSignal: abortController.signal,
+  };
+
+  const withRun = (result: CodingAgentResult, state?: CodingAgentRunState): CodingAgentResult => ({
+    ...result,
+    runId: run.runId,
+    state: state || result.state,
+    branch: result.branch ?? context.draftBranch,
+  });
 
   // Preflight authorization. The page may be org-visible (so the agent could
   // see and select it) yet not editable by this caller — a plain member can
@@ -1754,13 +1896,34 @@ export async function runCodingAgent(
   // Best-effort: if the page record is missing we skip the check and let the
   // edit path enforce authorization as before.
   try {
+    await updateCodingAgentRun(run.runId, { state: 'authorizing' });
     const page = await getLandingPageById(context.pageId);
     if (page && !(await canUserEditLandingPage(page, context.userId))) {
-      return { success: false, message: NOT_AUTHORIZED_MESSAGE, iterations: 0, notAuthorized: true };
+      await updateCodingAgentRun(run.runId, {
+        state: 'failed',
+        failureReason: NOT_AUTHORIZED_MESSAGE,
+        transitionReason: 'authorization_denied',
+      });
+      return withRun({
+        success: false,
+        message: NOT_AUTHORIZED_MESSAGE,
+        iterations: 0,
+        notAuthorized: true,
+        retryable: false,
+      }, 'failed');
     }
   } catch (e) {
     console.warn('[CODING AGENT] Preflight authorization check failed; proceeding to edit path:', e);
   }
+
+  const shouldCaptureBaseCommit =
+    process.env.NODE_ENV !== 'test' || process.env.CODING_AGENT_CAPTURE_BASE_COMMIT_TEST === 'true';
+  const baseCommitSha = shouldCaptureBaseCommit ? await getCurrentCommitSha(runContext) : undefined;
+  await updateCodingAgentRun(run.runId, {
+    state: 'editing',
+    baseCommitSha,
+    recovery: { status: 'not_needed', baseCommitSha },
+  });
 
   // Fetch the coding agent model from settings (defaults to Sonnet 4.6)
   let model: string;
@@ -1771,48 +1934,158 @@ export async function runCodingAgent(
     model = DEFAULT_CODING_AGENT_MODEL;
   }
 
+  let timeoutTimer: NodeJS.Timeout | undefined;
   const timeoutPromise = new Promise<CodingAgentResult>((resolve) => {
-    const timer = setTimeout(() => {
+    timeoutTimer = setTimeout(() => {
+      abortController.abort();
       resolve({
         success: false,
-        message: 'Coding agent timed out after 10 minutes. The task may be partially complete — check the deployment for any changes that were made.',
+        message: 'Coding agent timed out after 10 minutes. The run was cancelled; check the recorded draft branch for any recoverable partial work.',
         iterations: -1,
+        runId: run.runId,
+        state: 'timed_out',
+        branch: context.draftBranch,
+        baseCommitSha,
         acceptanceStatus: context.acceptanceChecks?.length ? 'not_run' : undefined,
+        retryable: true,
       });
     }, AGENT_TIMEOUT_MS);
-    timer.unref?.();
+    timeoutTimer.unref?.();
   });
 
-  const rawResult: CodingAgentResult = await Promise.race<CodingAgentResult>([
-    runCodingAgentInternal(taskDescription, context, maxIterations, model).catch((error) => {
-      if (is403Error(error)) {
-        return {
-          success: false,
-          message: NOT_AUTHORIZED_MESSAGE,
-          iterations: 0,
-          notAuthorized: true,
-          acceptanceStatus: context.acceptanceChecks?.length ? 'not_run' : undefined,
-        } satisfies CodingAgentResult;
-      }
-      throw error;
-    }),
-    timeoutPromise
-  ]);
+  let rawResult: CodingAgentResult;
+  try {
+    rawResult = await Promise.race<CodingAgentResult>([
+      runCodingAgentInternal(taskDescription, runContext, maxIterations, model).catch((error) => {
+        if (is403Error(error)) {
+          return {
+            success: false,
+            message: NOT_AUTHORIZED_MESSAGE,
+            iterations: 0,
+            notAuthorized: true,
+            acceptanceStatus: context.acceptanceChecks?.length ? 'not_run' : undefined,
+            retryable: false,
+          } satisfies CodingAgentResult;
+        }
+        if (isAbortError(error)) {
+          return {
+            success: false,
+            message: 'Coding agent run was cancelled.',
+            iterations: 0,
+            state: abortController.signal.aborted ? 'timed_out' : 'cancelled',
+            acceptanceStatus: context.acceptanceChecks?.length ? 'not_run' : undefined,
+            retryable: true,
+          } satisfies CodingAgentResult;
+        }
+        throw error;
+      }),
+      timeoutPromise
+    ]);
+  } finally {
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+  }
 
-  const result = await refreshPreviewUrlForDraftBranch(rawResult, context);
+  if (rawResult.state === 'timed_out') {
+    await updateCodingAgentRun(run.runId, {
+      state: 'timed_out',
+      failureReason: rawResult.message,
+      recovery: {
+        attempted: false,
+        status: 'not_needed',
+        reason: 'Run timed out and was cancelled before a stable successful result.',
+        baseCommitSha,
+      },
+      transitionReason: 'timeout',
+    });
+    return withRun(rawResult, 'timed_out');
+  }
+
+  let result = withRun({ ...rawResult, baseCommitSha }, rawResult.success ? 'deploying' : 'failed');
+  await updateCodingAgentRun(run.runId, {
+    state: result.success ? 'deploying' : 'failed',
+    previewUrl: result.previewUrl,
+    failureReason: result.success ? undefined : result.message,
+    transitionReason: result.success ? 'agent_reported_success' : 'agent_reported_failure',
+  });
+
+  const refresh = await refreshPreviewUrlForDraftBranchStrict(result, runContext);
+  result = refresh.result;
+  if (refresh.blockedReason && context.acceptanceChecks?.length) {
+    const blocked: AcceptanceVerificationResult = {
+      status: 'blocked',
+      checks: [{
+        id: 'preview_refresh',
+        type: 'http_status',
+        label: 'Preview URL refresh',
+        status: 'blocked',
+        message: refresh.blockedReason,
+      }],
+      summary: 'Acceptance blocked (1/1 checks could not run).',
+    };
+    await updateCodingAgentRun(run.runId, {
+      state: 'blocked',
+      previewUrl: result.previewUrl,
+      verification: blocked,
+      failureReason: refresh.blockedReason,
+      transitionReason: 'preview_refresh_failed',
+    });
+    return withRun({
+      ...result,
+      success: false,
+      state: 'blocked',
+      acceptanceStatus: 'blocked',
+      acceptance: blocked,
+      verification: blocked,
+      retryable: true,
+      message: `${result.message}\n\n${blocked.summary}\n- Preview URL refresh: ${refresh.blockedReason}`,
+    }, 'blocked');
+  }
 
   if (!context.acceptanceChecks?.length) {
-    return result;
+    const state: CodingAgentRunState = result.success ? 'passed' : 'failed';
+    await updateCodingAgentRun(run.runId, {
+      state,
+      previewUrl: result.previewUrl,
+      failureReason: result.success ? undefined : result.message,
+      recovery: { status: 'not_needed', baseCommitSha },
+      transitionReason: 'no_acceptance_checks',
+    });
+    return withRun({ ...result, recovery: { status: 'not_needed', baseCommitSha } }, state);
   }
 
   if (!result.success) {
-    return { ...result, acceptanceStatus: result.acceptanceStatus ?? 'not_run' };
+    let recovery: CodingAgentRecoveryState = { status: 'not_needed', baseCommitSha };
+    let state: CodingAgentRunState = 'failed';
+    if (isBuildOrDeploymentFailure(result)) {
+      recovery = await rollbackEditedFiles({
+        context: runContext,
+        baseCommitSha,
+        editedFiles: result.editedFiles,
+      });
+      if (recovery.status === 'succeeded') state = 'rolled_back';
+    }
+    await updateCodingAgentRun(run.runId, {
+      state,
+      previewUrl: result.previewUrl,
+      failureReason: result.message,
+      recovery,
+      transitionReason: state === 'rolled_back' ? 'build_failure_rolled_back' : 'agent_failed',
+    });
+    return withRun({
+      ...result,
+      state,
+      acceptanceStatus: result.acceptanceStatus ?? 'not_run',
+      recovery,
+      retryable: !result.notAuthorized,
+    }, state);
   }
 
+  await updateCodingAgentRun(run.runId, { state: 'verifying', previewUrl: result.previewUrl });
   const acceptance = await verifyAcceptanceChecks({
     checks: context.acceptanceChecks,
     previewUrl: result.previewUrl,
     executeMcpTool: context.executeMcpTool,
+    signal: abortController.signal,
   });
 
   if (acceptance.status !== 'passed') {
@@ -1820,19 +2093,50 @@ export async function runCodingAgent(
       .filter((check) => check.status !== 'passed')
       .map((check) => `- ${check.label}: ${check.message}`)
       .join('\n');
-    return {
+    const state: CodingAgentRunState = acceptance.status === 'blocked' ? 'blocked' : 'failed';
+    const recovery: CodingAgentRecoveryState = {
+      attempted: false,
+      status: 'not_needed',
+      reason: 'Draft preview is recoverable; acceptance failure does not auto-rollback.',
+      baseCommitSha,
+    };
+    await updateCodingAgentRun(run.runId, {
+      state,
+      previewUrl: result.previewUrl,
+      verification: acceptance,
+      failureReason: acceptance.summary,
+      recovery,
+      transitionReason: acceptance.status === 'blocked' ? 'verification_blocked' : 'verification_failed',
+    });
+    return withRun({
       ...result,
       success: false,
+      state,
       acceptanceStatus: acceptance.status,
       acceptance,
+      verification: acceptance,
+      recovery,
+      retryable: true,
       message: `${result.message}\n\n${acceptance.summary}${failedLines ? `\n${failedLines}` : ''}`,
-    };
+    }, state);
   }
 
-  return {
+  const recovery: CodingAgentRecoveryState = { status: 'not_needed', baseCommitSha };
+  await updateCodingAgentRun(run.runId, {
+    state: 'passed',
+    previewUrl: result.previewUrl,
+    verification: acceptance,
+    recovery,
+    transitionReason: 'verification_passed',
+  });
+  return withRun({
     ...result,
+    state: 'passed',
     acceptanceStatus: 'passed',
     acceptance,
+    verification: acceptance,
+    recovery,
+    retryable: false,
     message: `${result.message}\n\n${acceptance.summary}`,
-  };
+  }, 'passed');
 }

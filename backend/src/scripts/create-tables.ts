@@ -2223,6 +2223,8 @@ const main = async () => {
     await createLoopDispatchesTable();
     await createCharactersTable();
     await createCRMCompaniesTable();
+    await createCodingAgentRunsTable();
+    await createV0UsageTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -2781,6 +2783,54 @@ const createCRMCompaniesTable = async () => {
       },
     ],
     ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 },
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+const createCodingAgentRunsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-CodingAgentRuns`,
+    AttributeDefinitions: [
+      { AttributeName: 'runId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'runId', KeyType: 'HASH' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+const createV0UsageTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-V0Usage`,
+    AttributeDefinitions: [
+      { AttributeName: 'idempotencyKey', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'idempotencyKey', KeyType: 'HASH' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
   };
 
   try {

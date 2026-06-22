@@ -402,9 +402,9 @@ describe('runCodingAgent', () => {
       ...mockContext,
       executeMcpTool: mockExecuteMcpTool,
       acceptanceChecks: [{
-        type: 'browser_eval',
+        type: 'text_present',
         label: 'Hero headline changed',
-        script: 'return document.body.innerText.includes("Launch Faster");',
+        text: 'Launch Faster',
       }],
     });
 
@@ -449,9 +449,9 @@ describe('runCodingAgent', () => {
       draftBranch: 'draft/session-789',
       executeMcpTool: mockExecuteMcpTool,
       acceptanceChecks: [{
-        type: 'browser_eval',
+        type: 'text_present',
         label: 'Smoke phrase visible',
-        script: 'return document.body.innerText.includes("Live verifier pass");',
+        text: 'Live verifier pass',
       }],
     });
 
@@ -493,9 +493,9 @@ describe('runCodingAgent', () => {
       ...mockContext,
       executeMcpTool: mockExecuteMcpTool,
       acceptanceChecks: [{
-        type: 'browser_eval',
+        type: 'text_present',
         label: 'Hero headline changed',
-        script: 'return document.body.innerText.includes("Launch Faster");',
+        text: 'Launch Faster',
       }],
     });
 
