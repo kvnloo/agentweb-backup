@@ -164,6 +164,12 @@ This file captures patterns and mistakes to avoid. Updated after corrections fro
 
 ## Code Patterns
 
+### Missing Expiration Must Not Mean Default Expiration for Public Links
+- **Lesson:** For public share links, only enforce expiration when an explicit `expiresAt` exists.
+- **Why:** iShare/public plan links created without `expiresAt` were treated as `sharedAt + 7 days`, so active anonymous links started returning 410 after a week even though they were never meant to expire on a timer.
+- **Fix:** Treat missing `expiresAt` as no timer-based expiry and rely on the explicit active/revoked flag. Add regression tests for old links with no `expiresAt`.
+- **Date:** 2026-06-22
+
 ### DynamoDB Queries
 - **Lesson:** Use GSI queries instead of scans
   - **Why:** Scans are slow and expensive on large tables
