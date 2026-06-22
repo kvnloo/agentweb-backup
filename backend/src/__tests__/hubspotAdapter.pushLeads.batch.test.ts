@@ -56,6 +56,9 @@ import { HubspotAdapter } from '../services/adapters/hubspotAdapter';
 import { ExternalCrmSyncConfig, FieldMapping } from '../services/externalCrmSyncService';
 import { CrmAuth } from '../services/adapters/crmAdapterTypes';
 import { crmDb } from '../services/db';
+import { HubSpotService } from '../services/hubspotService';
+
+const mockFromToken = HubSpotService.fromToken as jest.Mock;
 
 const auth: CrmAuth = { type: 'token', apiKey: 'pat-test' };
 
@@ -165,6 +168,35 @@ describe('HubspotAdapter.pushLeads — batched push path', () => {
     expect((crmDb.updateLead as jest.Mock)).toHaveBeenCalledTimes(250);
     const sample = (crmDb.updateLead as jest.Mock).mock.calls[0];
     expect(sample[2].syncMetadata.hubspot_contact_id).toMatch(/^c_/);
+  });
+
+  // ── 2a. concurrency: the 3 upsert batches overlap end-to-end ───────────────
+  it('runs the contact-upsert batches concurrently through the real push path', async () => {
+    enableBatch();
+    const leads = Array.from({ length: 250 }, (_, i) => ({
+      leadId: `l${i}`,
+      listId: 'list_1',
+      email: `user${i}@example.com`,
+      firstName: `User${i}`,
+    }));
+    // Track how many upsert calls are in flight at once. With default
+    // concurrency (6) and 3 batches, all 3 should overlap → peak 3.
+    let inFlight = 0;
+    let maxInFlight = 0;
+    mockBatchUpsertContacts.mockImplementation(async (inputs: any[]) => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      inFlight -= 1;
+      return inputs.map((i) => ({ email: i.email, contactId: `c_${i.email}`, isNew: true }));
+    });
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    expect(mockBatchUpsertContacts).toHaveBeenCalledTimes(3);
+    expect(maxInFlight).toBe(3); // all three batches in flight at once (was 1 before)
+    expect(result.successCount).toBe(250);
+    expect(result.errorCount).toBe(0);
   });
 
   // ── 2b. BUG 2: two leads sharing one email → one upsert input, both counted ─
@@ -302,6 +334,94 @@ describe('HubspotAdapter.pushLeads — batched push path', () => {
     expect(createdTraces).not.toContain('l2');
   });
 
+  // ── 6b. 400 INVALID_EMAIL → parse + drop + single retry (NOT bisection) ─────
+  function invalidEmail400(...emails: string[]) {
+    const arr = emails.map((e) => ({ isValid: false, message: `Email address ${e} is invalid`, error: 'INVALID_EMAIL', name: 'email' }));
+    const err: any = new Error('Property values were not valid');
+    err.response = { status: 400, data: { message: `Property values were not valid: ${JSON.stringify(arr)}` } };
+    return err;
+  }
+
+  it('drops a HubSpot-rejected invalid email and retries the rest in ONE call (no bisection)', async () => {
+    enableBatch();
+    const leads = [
+      { leadId: 'l1', listId: 'list_1', email: 'good1@b.com', firstName: 'A' },
+      { leadId: 'l2', listId: 'list_1', email: 'bad@x.yc', firstName: 'B' },
+      { leadId: 'l3', listId: 'list_1', email: 'good2@b.com', firstName: 'C' },
+    ];
+    mockBatchUpsertContacts.mockImplementation(async (inputs: any[]) => {
+      if (inputs.some((i) => i.email === 'bad@x.yc')) throw invalidEmail400('bad@x.yc');
+      return inputs.map((i) => ({ email: i.email, contactId: `c_${i.email}`, isNew: true }));
+    });
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    // Original (400) + ONE cleaned retry = 2. Bisection would be 5+.
+    expect(mockBatchUpsertContacts).toHaveBeenCalledTimes(2);
+    expect(result.successCount).toBe(2);
+    expect(result.errorCount).toBe(1);
+    expect(result.errors.join(' ')).toMatch(/bad@x\.yc/);
+  });
+
+  it('drops ALL invalid emails named in a single 400 in one retry', async () => {
+    enableBatch();
+    const leads = Array.from({ length: 5 }, (_, i) => ({
+      leadId: `l${i}`, listId: 'list_1', email: i < 3 ? `bad${i}@x.yc` : `good${i}@b.com`, firstName: 'A',
+    }));
+    mockBatchUpsertContacts.mockImplementation(async (inputs: any[]) => {
+      const bad = inputs.filter((i) => i.email.endsWith('.yc')).map((i) => i.email);
+      if (bad.length) throw invalidEmail400(...bad);
+      return inputs.map((i) => ({ email: i.email, contactId: `c_${i.email}`, isNew: true }));
+    });
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    expect(mockBatchUpsertContacts).toHaveBeenCalledTimes(2); // one 400 listing all 3 + one cleaned retry
+    expect(result.successCount).toBe(2);
+    expect(result.errorCount).toBe(3);
+  });
+
+  it('counts BOTH leads sharing an invalid email as errors (per-lead tally)', async () => {
+    enableBatch();
+    const leads = [
+      { leadId: 'l1', listId: 'list_1', email: 'dup@x.yc', firstName: 'A' },
+      { leadId: 'l2', listId: 'list_1', email: 'dup@x.yc', firstName: 'B' },
+      { leadId: 'l3', listId: 'list_1', email: 'good@b.com', firstName: 'C' },
+    ];
+    mockBatchUpsertContacts.mockImplementation(async (inputs: any[]) => {
+      if (inputs.some((i) => i.email === 'dup@x.yc')) throw invalidEmail400('dup@x.yc');
+      return inputs.map((i) => ({ email: i.email, contactId: `c_${i.email}`, isNew: true }));
+    });
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    expect(result.successCount).toBe(1);          // good@b.com
+    expect(result.errorCount).toBe(2);            // BOTH l1 and l2, not 1
+    expect(result.successCount + result.errorCount).toBe(3); // == leads attempted
+  });
+
+  it('keeps successCount + errorCount equal to leads attempted (mixed valid/invalid/dup)', async () => {
+    enableBatch();
+    const leads = [
+      { leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A' },
+      { leadId: 'l2', listId: 'list_1', email: 'bad1@x.yc', firstName: 'B' },
+      { leadId: 'l3', listId: 'list_1', email: 'a@b.com', firstName: 'A2' },   // dup valid
+      { leadId: 'l4', listId: 'list_1', email: 'bad1@x.yc', firstName: 'B2' }, // dup invalid
+      { leadId: 'l5', listId: 'list_1', email: 'c@b.com', firstName: 'C' },
+    ];
+    mockBatchUpsertContacts.mockImplementation(async (inputs: any[]) => {
+      const bad = inputs.filter((i) => i.email.endsWith('.yc')).map((i) => i.email);
+      if (bad.length) throw invalidEmail400(...bad);
+      return inputs.map((i) => ({ email: i.email, contactId: `c_${i.email}`, isNew: true }));
+    });
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    expect(result.successCount).toBe(3);  // a@b.com x2 + c@b.com
+    expect(result.errorCount).toBe(2);    // bad1@x.yc x2
+    expect(result.successCount + result.errorCount).toBe(5);
+  });
+
   // ── 7. New deals → create + associate + writeback ──────────────────────────
   it('creates new deals via batchCreateDeals, associates them, and writes back hubspot_deal_id', async () => {
     enableBatch();
@@ -327,6 +447,44 @@ describe('HubspotAdapter.pushLeads — batched push path', () => {
     expect(dealWritebacks).toHaveLength(2);
     expect(dealWritebacks[0][2].syncMetadata.hubspot_deal_id).toMatch(/^deal_/);
     expect(result.errorCount).toBe(0);
+  });
+
+  // ── 7b. dealstage omitted when status has no valid mapping (no INVALID_OPTION) ─
+  it('omits dealstage when the AgentWeb status has no mapping (avoids invalid stage)', async () => {
+    enableBatch();
+    const leads = [
+      { leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A', status: 'prospect', dealValue: '100' },
+    ];
+    const stageDealMapping: FieldMapping[] = [
+      { agentwebField: 'dealValue', crmProperty: 'amount', direction: 'both', enabled: true },
+      { agentwebField: 'status', crmProperty: 'dealstage', direction: 'both', enabled: true },
+    ];
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig({ dealFieldMapping: stageDealMapping }));
+
+    expect(mockBatchCreateDeals).toHaveBeenCalledTimes(1);
+    const props = mockBatchCreateDeals.mock.calls[0][0][0].properties;
+    expect(props.dealstage).toBeUndefined(); // 'prospect' was unmapped → omitted, not sent raw
+    expect(props.amount).toBe('100');
+    expect(result.errorCount).toBe(0);
+  });
+
+  // ── 7c. tally: contact OK + deal fails → ONE error, not success+error ───────
+  it('counts a lead as a single error (not success+error) when its deal create fails', async () => {
+    enableBatch();
+    const leads = [
+      { leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A', dealValue: '100' },
+    ];
+    mockBatchCreateDeals.mockRejectedValue(
+      Object.assign(new Error('deal boom'), { response: { status: 400, data: { message: 'bad deal' } } })
+    );
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig({ dealFieldMapping: dealMapping }));
+
+    expect(result.successCount).toBe(0);                       // contact ok but deal failed → demoted
+    expect(result.errorCount).toBe(1);
+    expect(result.successCount + result.errorCount).toBe(1);   // counted once
+    expect(result.newCount).toBe(0);
   });
 
   // ── 8. Existing deal → update (not create) ─────────────────────────────────
@@ -412,6 +570,79 @@ describe('HubspotAdapter.pushLeads — batched push path', () => {
     );
     expect(wroteStaleInDealStage).toBe(false);
     expect(result.errorCount).toBe(0);
+  });
+
+  // ── 9c. 207 OBJECT_NOT_FOUND update → reclassified into create ──────────────
+  it('reclassifies a 207 OBJECT_NOT_FOUND deal-update into a create', async () => {
+    enableBatch();
+    const leads = [
+      {
+        leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A', dealValue: '100',
+        syncMetadata: { hubspot_contact_id: 'c1', hubspot_deal_id: 'deal_gone' },
+      },
+    ];
+    // A deleted deal surfaces as a 207 per-record OBJECT_NOT_FOUND, NOT a top-level 404.
+    const err207: any = new Error('partial');
+    err207.response = { status: 207, data: { numErrors: 1, errors: [{ category: 'OBJECT_NOT_FOUND', message: 'gone' }] } };
+    mockBatchUpdateDeals.mockRejectedValue(err207);
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig({ dealFieldMapping: dealMapping }));
+
+    // The deleted deal is recreated and associated — same as the 404 path.
+    expect(mockBatchCreateDeals).toHaveBeenCalledTimes(1);
+    expect(mockBatchCreateDeals.mock.calls[0][0][0].traceId).toBe('l1');
+    expect(mockBatchAssociateContactsToDeals).toHaveBeenCalledTimes(1);
+    expect(result.errorCount).toBe(0);
+  });
+
+  // ── 9d. 207 partial CREATE failure → reported, never silently dropped ───────
+  it('records a 207 partial deal-create failure as an error and skips its association', async () => {
+    enableBatch();
+    const leads = [
+      { leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A', dealValue: '100' },
+    ];
+    const err207: any = new Error('partial');
+    err207.response = { status: 207, data: { numErrors: 1, errors: [{ category: 'VALIDATION_ERROR', message: 'bad deal' }] } };
+    mockBatchCreateDeals.mockRejectedValue(err207);
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig({ dealFieldMapping: dealMapping }));
+
+    expect(result.errorCount).toBeGreaterThan(0);
+    expect(result.errors.join(' ')).toMatch(/a@b\.com/);
+    // A deal that never got created must not be associated.
+    expect(mockBatchAssociateContactsToDeals).not.toHaveBeenCalled();
+  });
+
+  // ── 9e. 207 partial ASSOCIATION failure → reported ─────────────────────────
+  it('records a 207 partial association failure as an error', async () => {
+    enableBatch();
+    const leads = [
+      { leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A', dealValue: '100' },
+    ];
+    const err207: any = new Error('partial');
+    err207.response = { status: 207, data: { numErrors: 1, errors: [{ category: 'VALIDATION_ERROR', message: 'bad assoc' }] } };
+    mockBatchAssociateContactsToDeals.mockRejectedValue(err207);
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig({ dealFieldMapping: dealMapping }));
+
+    expect(result.errorCount).toBeGreaterThan(0);
+    expect(result.errors.join(' ')).toMatch(/deal/i);
+  });
+
+  // ── 9f. ctx reuses one service across chunks (perf: ensure props once) ─────
+  it('reuses a single HubSpotService across calls that share one ctx', async () => {
+    enableBatch();
+    const ctx: Record<string, any> = {};
+    await adapter.pushLeads(auth, [{ leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A' }], makeConfig(), ctx);
+    await adapter.pushLeads(auth, [{ leadId: 'l2', listId: 'list_1', email: 'c@d.com', firstName: 'C' }], makeConfig(), ctx);
+    expect(mockFromToken).toHaveBeenCalledTimes(1);
+  });
+
+  it('resolves a fresh HubSpotService per call when no ctx is supplied', async () => {
+    enableBatch();
+    await adapter.pushLeads(auth, [{ leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A' }], makeConfig());
+    await adapter.pushLeads(auth, [{ leadId: 'l2', listId: 'list_1', email: 'c@d.com', firstName: 'C' }], makeConfig());
+    expect(mockFromToken).toHaveBeenCalledTimes(2);
   });
 
   // ── 10. Completion log ─────────────────────────────────────────────────────

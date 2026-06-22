@@ -718,6 +718,20 @@ describe('ExternalCrmSyncService', () => {
       expect(result.successCount).toBe(0);
     });
 
+    it('resolves the HubSpot service once for a multi-chunk push, not per chunk', async () => {
+      mockListWithConfig(makeConfig());
+      mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+      mockCrmDb.updateLead.mockResolvedValue(undefined as any);
+      mockCrmDb.getLeadsByListId
+        .mockResolvedValueOnce({ items: [{ leadId: 'l1', email: 'a@b.com' }], lastEvaluatedKey: { leadId: 'l1' } as any, hasMore: true })
+        .mockResolvedValueOnce({ items: [{ leadId: 'l2', email: 'c@d.com' }], lastEvaluatedKey: null, hasMore: false });
+
+      await service.pushAllLeads('user1', 'list1', 'hubspot');
+
+      expect(mockCrmDb.getLeadsByListId).toHaveBeenCalledTimes(2); // two chunks processed
+      expect(mockHubSpotCreate).toHaveBeenCalledTimes(1);          // one service reused across both
+    });
+
     it('creates (not upserts) a contact for leads without email when pushing to HubSpot', async () => {
       const config = makeConfig();
       mockListWithConfig(config);
