@@ -42,6 +42,10 @@ describe('resolveSyncStatus', () => {
     expect(resolveSyncStatus({ syncMetadata: { hubspot_contact_id: '123' } }, true)).toBe('synced');
   });
 
+  it('derives synced for a legacy lead with only a hubspot_deal_id (no contact id)', () => {
+    expect(resolveSyncStatus({ syncMetadata: { hubspot_deal_id: 'd1' } }, true)).toBe('synced');
+  });
+
   it('derives sync_pending for a connected lead never pushed', () => {
     expect(resolveSyncStatus({ syncMetadata: {} }, true)).toBe('sync_pending');
     expect(resolveSyncStatus({}, true)).toBe('sync_pending');

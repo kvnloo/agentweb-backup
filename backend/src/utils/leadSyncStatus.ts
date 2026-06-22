@@ -32,14 +32,18 @@ export function getHubspotConnection(list: any): HubspotConnection {
 /**
  * Resolve a lead's sync status for display/filtering. Authoritative when the
  * persisted field is present; otherwise derives a value for legacy leads:
- *   hubspot_contact_id present -> 'synced', else 'sync_pending'.
+ *   any HubSpot id (contact OR deal) present -> 'synced', else 'sync_pending'.
+ * The deal-id fallback matters for leads synced before contact-id writeback was
+ * reliable (e.g. the old deal-writeback clobber) — they're in HubSpot, so they
+ * must not read as 'sync_pending'.
  * Returns null when the list isn't connected (no chip / no filter).
  */
 export function resolveSyncStatus(lead: any, connected: boolean): LeadSyncStatus | null {
   if (!connected) return null;
-  const persisted = lead?.syncMetadata?.syncStatus as LeadSyncStatus | undefined;
+  const sm = lead?.syncMetadata;
+  const persisted = sm?.syncStatus as LeadSyncStatus | undefined;
   if (persisted) return persisted;
-  return lead?.syncMetadata?.hubspot_contact_id ? 'synced' : 'sync_pending';
+  return sm?.hubspot_contact_id || sm?.hubspot_deal_id ? 'synced' : 'sync_pending';
 }
 
 /** Set of agentwebField names that are pushed to HubSpot (enabled, not pull-only). */
