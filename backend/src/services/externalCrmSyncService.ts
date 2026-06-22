@@ -855,6 +855,10 @@ export class ExternalCrmSyncService {
       let processed = 0;
       await this.reportPushProgress(config, 0, totalCount);
 
+      // One scratchpad shared across all chunks so the adapter can resolve its
+      // CRM client once and reuse per-connection caches (e.g. ensured props).
+      const pushCtx: Record<string, unknown> = {};
+
       do {
         const page = await crmDb.getLeadsByListId(listId, 500, lastKey);
         const chunk = page.items as any[];
@@ -862,7 +866,7 @@ export class ExternalCrmSyncService {
 
         if (chunk.length > 0) {
           hasLeads = true;
-          const chunkResult = await adapter.pushLeads(auth, chunk, config);
+          const chunkResult = await adapter.pushLeads(auth, chunk, config, pushCtx);
 
           // Accumulate results
           totalResult.successCount += chunkResult.successCount;
