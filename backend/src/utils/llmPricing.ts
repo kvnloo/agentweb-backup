@@ -88,6 +88,8 @@ export const IMAGE_GENERATION_PRICING_USD: Record<string, number> = {
   'gpt-image-2': 0.04,
   'gemini-2.5-flash-image': 0.039,
   'gemini-3-pro-image-preview': 0.039,
+  'gemini-3.1-flash-image': 0.039,
+  // Legacy preview id kept so historical usage records still price correctly.
   'gemini-3.1-flash-image-preview': 0.039,
   'gen4_image': 0.05,
   'gemini_2.5_flash': 0.04,

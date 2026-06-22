@@ -226,7 +226,7 @@ describe('ImageService', () => {
       }
     });
 
-    it('should accept gemini-3.1-flash-image-preview as a valid model', async () => {
+    it('should accept gemini-3.1-flash-image as a valid model', async () => {
       const mockApiKey = 'test-api-key';
       (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
       (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue('s3://bucket/file.png');
@@ -253,7 +253,7 @@ describe('ImageService', () => {
         prompt: 'Test prompt',
         filename: 'test.png',
         userId: 'user123',
-        imageModel: 'gemini-3.1-flash-image-preview',
+        imageModel: 'gemini-3.1-flash-image',
         size: '16:9'
       });
 
@@ -263,7 +263,48 @@ describe('ImageService', () => {
       }
     });
 
-    it('should route gemini-3.1-flash-image-preview to Google/Image API key', async () => {
+    it('should accept the legacy gemini-3.1-flash-image-preview id and normalize it to the GA model', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue('s3://bucket/file.png');
+
+      mockGenerateContentStream.mockReturnValue({
+        [Symbol.asyncIterator]: async function* () {
+          yield {
+            candidates: [{
+              content: {
+                parts: [{
+                  inlineData: {
+                    mimeType: 'image/png',
+                    data: 'base64data'
+                  }
+                }]
+              }
+            }]
+          };
+        }
+      });
+
+      // Persisted/in-flight sessions may still carry the preview id; it must be
+      // accepted (not rejected as invalid) and routed to the Gemini 3 path.
+      await imageService.generateImage({
+        prompt: 'Test prompt',
+        filename: 'test.png',
+        userId: 'user123',
+        imageModel: 'gemini-3.1-flash-image-preview',
+        size: '1:1'
+      });
+
+      // Routed through the same @google/genai path as the GA id (not rejected,
+      // not sent to Azure/OpenAI/Runway).
+      const mockModule = jest.requireMock('@google/genai');
+      expect(mockModule.GoogleGenAI).toHaveBeenCalled();
+      expect(secretsManager.getSecret).toHaveBeenCalledWith(
+        expect.stringContaining('Google/Image')
+      );
+    });
+
+    it('should route gemini-3.1-flash-image to Google/Image API key', async () => {
       const mockApiKey = 'test-api-key';
       (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
       (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue('s3://bucket/file.png');
@@ -289,7 +330,7 @@ describe('ImageService', () => {
         prompt: 'Test prompt',
         filename: 'test.png',
         userId: 'user123',
-        imageModel: 'gemini-3.1-flash-image-preview',
+        imageModel: 'gemini-3.1-flash-image',
         size: '1:1'
       });
 
@@ -302,7 +343,7 @@ describe('ImageService', () => {
       }
     });
 
-    it('should use same quality/size mapping for gemini-3.1-flash-image-preview as gemini-3-pro', async () => {
+    it('should use same quality/size mapping for gemini-3.1-flash-image as gemini-3-pro', async () => {
       const mockApiKey = 'test-api-key';
       (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
       (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue('s3://bucket/file.png');
@@ -328,7 +369,7 @@ describe('ImageService', () => {
         prompt: 'Test prompt',
         filename: 'test.png',
         userId: 'user123',
-        imageModel: 'gemini-3.1-flash-image-preview',
+        imageModel: 'gemini-3.1-flash-image',
         size: '16:9',
         quality: 'high'
       });
@@ -377,7 +418,7 @@ describe('ImageService', () => {
         prompt: 'Test prompt',
         filename: 'test.png',
         userId: 'user123',
-        imageModel: 'gemini-3.1-flash-image-preview',
+        imageModel: 'gemini-3.1-flash-image',
         size: '1:1',
         removeC2PA: false
       });
@@ -408,7 +449,7 @@ describe('ImageService', () => {
         prompt: 'Test prompt',
         filename: 'test.png',
         userId: 'user123',
-        imageModel: 'gemini-3.1-flash-image-preview',
+        imageModel: 'gemini-3.1-flash-image',
         size: '1:1',
         removeC2PA: false
       });
@@ -439,7 +480,7 @@ describe('ImageService', () => {
         prompt: 'Test prompt',
         filename: 'test.png',
         userId: 'user123',
-        imageModel: 'gemini-3.1-flash-image-preview',
+        imageModel: 'gemini-3.1-flash-image',
         size: '1:1',
         removeC2PA: false
       });
@@ -466,7 +507,7 @@ describe('ImageService', () => {
         prompt: 'Test prompt',
         filename: 'test.png',
         userId: 'user123',
-        imageModel: 'gemini-3.1-flash-image-preview',
+        imageModel: 'gemini-3.1-flash-image',
         size: '1:1',
         removeC2PA: false
       });

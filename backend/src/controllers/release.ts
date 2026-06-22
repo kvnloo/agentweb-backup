@@ -8,6 +8,15 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2026-06-22",
+    changes: [
+      "Gemini 3.1 Flash Image Model Migrated to GA Endpoint",
+      "- The Gemini 3.1 Flash image model now targets Google's generally available \"gemini-3.1-flash-image\" endpoint instead of the deprecated \"gemini-3.1-flash-image-preview\" preview endpoint (same cost, quality, and behavior)",
+      "- The Admin default-image-model selector now offers \"gemini-3.1-flash-image\"; the legacy preview id is still accepted as an alias, so any previously-saved default keeps working without reconfiguration",
+      "- No Imagen 4 (imagen-4.0-*) endpoints were used by Agent Mode; the only Imagen reference (a Python example notebook) was ported to the Gemini image API ahead of Google's August 17, 2026 Imagen 4 discontinuation",
+    ],
+  },
+  {
     date: "2026-06-12",
     changes: [
       "Stronger Password Minimum (12 Characters)",

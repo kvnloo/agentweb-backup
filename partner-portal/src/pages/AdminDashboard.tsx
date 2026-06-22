@@ -8324,7 +8324,9 @@ const AgentModeSettings = () => {
     }
   };
 
-  const IMAGE_API_MODELS = ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gpt-image-2', 'gemini-2.5-flash-image'];
+  // Keep in sync with AgentModeService.IMAGE_API_MODELS. 'gemini-3.1-flash-image-preview'
+  // is retained as a legacy alias so a previously-saved default still renders.
+  const IMAGE_API_MODELS = ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gpt-image-2', 'gemini-2.5-flash-image'];
 
   const loadImageApiDefaultModel = async () => {
     try {
