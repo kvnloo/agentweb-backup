@@ -553,22 +553,25 @@ describe('HubspotAdapter.pushLeads — batched push path', () => {
 
     const result = await adapter.pushLeads(auth, leads, makeConfig({ dealFieldMapping: dealMapping }));
 
-    // Deal-stage writebacks are those persisting hubspot_deal_id WITHOUT the fresh
-    // upsert contact id (Stage 3's contact-id writeback carries c_a@b.com and merely
-    // preserves pre-existing metadata; the deal stage carries the lead's own c1).
-    const dealWritebacks = (crmDb.updateLead as jest.Mock).mock.calls.filter(
-      (c) =>
-        c[2].syncMetadata?.hubspot_deal_id !== undefined &&
-        c[2].syncMetadata?.hubspot_contact_id !== 'c_a@b.com'
+    // The deal stage (Stage 4) runs AFTER the Stage 3 synced writeback, so the
+    // LAST writeback for the lead is authoritative. It must carry the NEW
+    // recreated dealId — never the stale (deleted) one. With the in-memory
+    // syncMetadata propagation, that final writeback also preserves the fresh
+    // upsert contact id (c_a@b.com) + synced status — confirming the clobber fix.
+    const allWritebacks = (crmDb.updateLead as jest.Mock).mock.calls.filter((c) => c[1] === 'l1');
+    const finalMeta = allWritebacks[allWritebacks.length - 1][2].syncMetadata;
+    expect(finalMeta.hubspot_deal_id).toBe('deal_recreated_l1');
+    expect(finalMeta.hubspot_contact_id).toBe('c_a@b.com');
+    expect(finalMeta.syncStatus).toBe('synced');
+    // The recreated dealId is the authoritative final value — the stale id is
+    // never the lead's final persisted deal id.
+    expect(finalMeta.hubspot_deal_id).not.toBe('deal_stale');
+    // And the dedicated deal-stage writeback (the recreated branch) carries the
+    // new id, not the stale one.
+    const dealStageWriteback = allWritebacks.find(
+      (c) => c[2].syncMetadata?.hubspot_deal_id === 'deal_recreated_l1'
     );
-    // Exactly one deal-stage writeback for l1, carrying the NEW recreated id.
-    expect(dealWritebacks).toHaveLength(1);
-    expect(dealWritebacks[0][2].syncMetadata.hubspot_deal_id).toBe('deal_recreated_l1');
-    // The deal stage must never write back the stale (deleted) dealId.
-    const wroteStaleInDealStage = dealWritebacks.some(
-      (c) => c[2].syncMetadata?.hubspot_deal_id === 'deal_stale'
-    );
-    expect(wroteStaleInDealStage).toBe(false);
+    expect(dealStageWriteback).toBeDefined();
     expect(result.errorCount).toBe(0);
   });
 
@@ -668,5 +671,111 @@ describe('HubspotAdapter.pushLeads — batched push path', () => {
       })
     );
     logSpy.mockRestore();
+  });
+
+  // ── 11. per-lead sync status writeback (synced / sync_failed) ───────────────
+  describe('pushLeads — per-lead sync status', () => {
+    let adapter: HubspotAdapter;
+    const ORIGINAL_FLAG = process.env.HUBSPOT_BATCH_PUSH_ENABLED;
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      mockBatchUpsertContacts.mockImplementation(async (inputs: any[]) =>
+        inputs.map((i) => ({ email: i.email, contactId: `c_${i.email}`, isNew: true }))
+      );
+      mockBatchCreateDeals.mockImplementation(async (inputs: any[]) =>
+        inputs.map((i) => ({ traceId: i.traceId, dealId: `deal_${i.traceId}` }))
+      );
+      mockBatchUpdateDeals.mockResolvedValue(undefined);
+      mockBatchAssociateContactsToDeals.mockResolvedValue(undefined);
+      mockUpsertContact.mockResolvedValue({ contactId: 'c1', isNew: true });
+      mockCreateContact.mockResolvedValue({ contactId: 'c_created' });
+      mockUpdateContact.mockResolvedValue({ contactId: 'c_updated' });
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list_1', name: 'Q1 Outbound' });
+      process.env.HUBSPOT_BATCH_PUSH_ENABLED = 'true';
+      adapter = new HubspotAdapter();
+    });
+
+    afterEach(() => {
+      if (ORIGINAL_FLAG === undefined) delete process.env.HUBSPOT_BATCH_PUSH_ENABLED;
+      else process.env.HUBSPOT_BATCH_PUSH_ENABLED = ORIGINAL_FLAG;
+    });
+
+    it('marks a successfully upserted lead synced with lastSyncedAt and clears prior error', async () => {
+      const lead = {
+        leadId: 'l1', listId: 'list_1', email: 'good@example.com', firstName: 'Good',
+        syncMetadata: { syncError: 'old failure' },
+      };
+
+      await adapter.pushLeads(auth, [lead], makeConfig());
+
+      const calls = (crmDb.updateLead as jest.Mock).mock.calls;
+      const meta = calls.find((c) => c[1] === lead.leadId)?.[2]?.syncMetadata;
+      expect(meta).toBeDefined();
+      expect(meta.syncStatus).toBe('synced');
+      expect(meta.hubspot_contact_id).toBeTruthy();
+      expect(typeof meta.lastSyncedAt).toBe('string');
+      expect('syncError' in meta).toBe(false);
+    });
+
+    it('marks exactly the failing lead sync_failed when its email is rejected', async () => {
+      const goodLead = { leadId: 'l1', listId: 'list_1', email: 'good@x.com', firstName: 'Good' };
+      const badLead = { leadId: 'l2', listId: 'list_1', email: 'bad@x.yc', firstName: 'Bad' };
+      // HubSpot rejects bad@x.yc as invalid; good@x.com resolves.
+      mockBatchUpsertContacts.mockImplementation(async (inputs: any[]) => {
+        if (inputs.some((i) => i.email === 'bad@x.yc')) throw invalidEmail400('bad@x.yc');
+        return inputs.map((i) => ({ email: i.email, contactId: `c_${i.email}`, isNew: true }));
+      });
+
+      await adapter.pushLeads(auth, [goodLead, badLead], makeConfig());
+
+      const calls = (crmDb.updateLead as jest.Mock).mock.calls;
+      const goodMeta = calls.find((c) => c[1] === goodLead.leadId)?.[2]?.syncMetadata;
+      const badMeta = calls.find((c) => c[1] === badLead.leadId)?.[2]?.syncMetadata;
+      expect(goodMeta.syncStatus).toBe('synced');
+      expect(badMeta.syncStatus).toBe('sync_failed');
+      expect(typeof badMeta.syncError).toBe('string');
+    });
+
+    it('marks an invalid-email lead sync_failed (local format check, before HubSpot)', async () => {
+      const goodLead = { leadId: 'l1', listId: 'list_1', email: 'good@example.com', firstName: 'Good' };
+      const badLead = { leadId: 'l2', listId: 'list_1', email: 'https://superdm.me/x', firstName: 'Bad' };
+
+      await adapter.pushLeads(auth, [goodLead, badLead], makeConfig());
+
+      const calls = (crmDb.updateLead as jest.Mock).mock.calls;
+      const goodMeta = calls.find((c) => c[1] === goodLead.leadId)?.[2]?.syncMetadata;
+      const badMeta = calls.find((c) => c[1] === badLead.leadId)?.[2]?.syncMetadata;
+      expect(goodMeta.syncStatus).toBe('synced');
+      expect(badMeta.syncStatus).toBe('sync_failed');
+      expect(typeof badMeta.syncError).toBe('string');
+    });
+
+    it('preserves hubspot_contact_id AND syncStatus after the deal writeback', async () => {
+      const lead = {
+        leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A', dealValue: '100',
+      };
+
+      await adapter.pushLeads(auth, [lead], makeConfig({ dealFieldMapping: dealMapping }));
+
+      const calls = (crmDb.updateLead as jest.Mock).mock.calls.filter((c) => c[1] === lead.leadId);
+      const last = calls[calls.length - 1][2].syncMetadata;
+      expect(last.hubspot_contact_id).toBeTruthy();
+      expect(last.hubspot_deal_id).toBeTruthy();
+      expect(last.syncStatus).toBe('synced');
+    });
+
+    it('marks a lead sync_failed via the per-lead path when its upsert throws (flag off)', async () => {
+      process.env.HUBSPOT_BATCH_PUSH_ENABLED = 'false';
+      const lead = { leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A' };
+      mockUpsertContact.mockRejectedValue(new Error('boom'));
+
+      await adapter.pushLeads(auth, [lead], makeConfig());
+
+      const calls = (crmDb.updateLead as jest.Mock).mock.calls;
+      const meta = calls.find((c) => c[1] === lead.leadId)?.[2]?.syncMetadata;
+      expect(meta.syncStatus).toBe('sync_failed');
+      expect(typeof meta.syncError).toBe('string');
+    });
   });
 });

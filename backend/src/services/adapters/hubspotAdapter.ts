@@ -4,6 +4,7 @@ import { HubSpotService } from '../hubspotService';
 import { crmDb } from '../db';
 import { validateEmail } from '../../utils/validation';
 import { splitAndRetry } from '../../utils/hubspotBatchRetry';
+import { buildSyncedMetadata, buildFailedMetadata } from '../../utils/leadSyncStatus';
 
 /**
  * How many 100-record batches to send to HubSpot at once during a push. The
@@ -228,6 +229,7 @@ export class HubspotAdapter implements CrmAdapter {
                     const msg = `Invalid email "${email}" — skipped (not a valid email address)`;
                     console.warn(`[HubspotAdapter] ${msg} for lead=${lead.leadId}`);
                     result.errors.push(`${email}: ${msg}`);
+                    await this.persistSyncMetadata(lead, config.listId, buildFailedMetadata(lead.syncMetadata, msg));
                     continue;
                 }
 
@@ -284,12 +286,11 @@ export class HubspotAdapter implements CrmAdapter {
 
                 result.successCount++;
 
-                // Persist HubSpot contact ID back to our DB
-                await crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
-                    syncMetadata: { ...(lead.syncMetadata || {}), hubspot_contact_id: contactId },
-                }).catch((err) => {
-                    console.error(`[HubspotAdapter] failed to persist hubspot_contact_id for ${lead.email}: ${this.formatError(err)}`);
-                });
+                // Persist HubSpot contact ID + synced status back to our DB.
+                await this.persistSyncMetadata(
+                    lead, config.listId,
+                    buildSyncedMetadata(lead.syncMetadata, contactId, new Date().toISOString()),
+                );
 
                 // ── 4. Deal sync (non-critical) ────────────────────────────────────
                 if (dealMappings.length > 0) {
@@ -307,6 +308,7 @@ export class HubspotAdapter implements CrmAdapter {
                 const msg = this.formatError(err);
                 console.error(`[HubspotAdapter] lead sync failed for ${lead.email || lead.leadId}: ${msg}`);
                 result.errors.push(`${lead.email || lead.leadId}: ${msg}`);
+                await this.persistSyncMetadata(lead, config.listId, buildFailedMetadata(lead.syncMetadata, msg));
             }
         }
     }
@@ -349,6 +351,7 @@ export class HubspotAdapter implements CrmAdapter {
                 const msg = `Invalid email "${email}" — skipped (not a valid email address)`;
                 console.warn(`[HubspotAdapter] ${msg} for lead=${lead.leadId}`);
                 result.errors.push(`${email}: ${msg}`);
+                await this.persistSyncMetadata(lead, config.listId, buildFailedMetadata(lead.syncMetadata, msg));
                 continue;
             }
 
@@ -424,6 +427,7 @@ export class HubspotAdapter implements CrmAdapter {
         const contactIdByLead = new Map<any, string>();      // lead → contactId
         const isNewByLead = new Map<any, boolean>();          // lead → isNew (for demotion)
         const succeededEmailLeads: any[] = [];
+        const failedEmailLeads: Array<{ lead: any; reason: string }> = [];
         for (const p of emailLeads) {
             const r = contactResults.get(p.emailLower);
             if (r) {
@@ -434,20 +438,25 @@ export class HubspotAdapter implements CrmAdapter {
                 succeededEmailLeads.push(p.lead);
             } else {
                 result.errorCount++;
-                result.errors.push(`${p.emailLower}: ${failureReason.get(p.emailLower) || 'contact upsert failed'}`);
+                const reason = failureReason.get(p.emailLower) || 'contact upsert failed';
+                result.errors.push(`${p.emailLower}: ${reason}`);
+                failedEmailLeads.push({ lead: p.lead, reason });
             }
         }
 
-        // ── Stage 3: write back contact ids BEFORE deals (idempotency) ─────────
-        await Promise.all(
-            succeededEmailLeads.map(lead =>
-                crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
-                    syncMetadata: { ...(lead.syncMetadata || {}), hubspot_contact_id: contactIdByLead.get(lead) },
-                }).catch((err: any) => {
-                    console.error(`[HubspotAdapter] failed to persist hubspot_contact_id for ${lead.email}: ${this.formatError(err)}`);
-                })
-            )
-        );
+        // ── Stage 3: write back contact ids + synced status BEFORE deals ───────
+        const stage3Now = new Date().toISOString();
+        await Promise.all([
+            ...succeededEmailLeads.map(lead =>
+                this.persistSyncMetadata(
+                    lead, config.listId,
+                    buildSyncedMetadata(lead.syncMetadata, contactIdByLead.get(lead)!, stage3Now),
+                )
+            ),
+            ...failedEmailLeads.map(({ lead, reason }) =>
+                this.persistSyncMetadata(lead, config.listId, buildFailedMetadata(lead.syncMetadata, reason))
+            ),
+        ]);
 
         // ── Stage 4: deals (only if deal mappings configured) ──────────────────
         if (dealMappings.length > 0 && succeededEmailLeads.length > 0) {
@@ -700,12 +709,27 @@ export class HubspotAdapter implements CrmAdapter {
         return { lead, contactId, traceId: lead.leadId, properties: propsWithName };
     }
 
+    /**
+     * Persist a syncMetadata map for a lead AND update the in-memory lead so
+     * later writebacks in the SAME push spread the latest value instead of a
+     * stale snapshot (updateLead replaces the whole map). Non-critical: logs on
+     * failure, never throws.
+     */
+    private async persistSyncMetadata(lead: any, listId: string, meta: Record<string, any>): Promise<void> {
+        lead.syncMetadata = meta;
+        await crmDb.updateLead(lead.listId || listId, lead.leadId, { syncMetadata: meta })
+            .catch((err: any) => {
+                console.error(`[HubspotAdapter] failed to persist syncMetadata for ${lead.email || lead.leadId}: ${this.formatError(err)}`);
+            });
+    }
+
     /** Persists hubspot_deal_id back to our DB (non-critical, logs on failure). */
     private writebackDealId(lead: any, dealId: string, config: ExternalCrmSyncConfig): Promise<any> {
-        return crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
-            syncMetadata: { ...(lead.syncMetadata || {}), hubspot_deal_id: dealId },
-        }).catch((err: any) => {
-            console.error(`[HubspotAdapter] failed to persist hubspot_deal_id for lead=${lead.email || lead.leadId}: ${this.formatError(err)}`);
+        // Merge onto the latest in-memory syncMetadata (set by Stage 3's synced
+        // writeback) so we don't clobber hubspot_contact_id / syncStatus.
+        return this.persistSyncMetadata(lead, config.listId, {
+            ...(lead.syncMetadata || {}),
+            hubspot_deal_id: dealId,
         });
     }
 
