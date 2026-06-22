@@ -1054,8 +1054,10 @@ export class AgentModeService {
     return this.getDefaultModel();
   }
 
-  // Supported image API models (must match SUPPORTED_MODELS in imageGeneration.ts)
-  static readonly IMAGE_API_MODELS = ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gpt-image-2', 'gemini-2.5-flash-image'];
+  // Supported image API models (must match SUPPORTED_MODELS in imageGeneration.ts).
+  // 'gemini-3.1-flash-image-preview' is retained as an accepted alias of the GA id
+  // 'gemini-3.1-flash-image' so persisted settings/sessions don't fail validation.
+  static readonly IMAGE_API_MODELS = ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gpt-image-2', 'gemini-2.5-flash-image'];
 
   async getImageApiDefaultModel(): Promise<string | undefined> {
     try {
@@ -2195,6 +2197,7 @@ export class AgentModeService {
       'gpt-image-2': 0.04,
       'gemini-2.5-flash-image': 0.039,
       'gemini-3-pro-image-preview': 0.039,
+      'gemini-3.1-flash-image': 0.039,
       'gemini-3.1-flash-image-preview': 0.039,
       'gen4_image': 0.05,
       'gemini_2.5_flash': 0.04,
@@ -2244,7 +2247,7 @@ export class AgentModeService {
       return undefined;
     }
 
-    const fallbackOrder = ['gpt-image-2', 'gemini-3.1-flash-image-preview', 'gemini-2.5-flash-image'];
+    const fallbackOrder = ['gpt-image-2', 'gemini-3.1-flash-image', 'gemini-2.5-flash-image'];
     return fallbackOrder[0];
   }
 

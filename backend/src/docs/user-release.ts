@@ -35,6 +35,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-06-22',
+    changes: [
+      'Updated: Nano Banana 2 (Gemini 3.1 Flash) Image Model Upgraded to the Stable Release',
+      '- The Nano Banana 2 (Gemini 3.1 Flash) image model now runs on Google\'s generally available "gemini-3.1-flash-image" endpoint instead of the earlier preview endpoint, for greater stability and reliability — at the same quality, speed, and price',
+      '- Nothing changes in how you use it: the model still appears as "Nano Banana 2 (Gemini 3.1 Flash)" in the Images page and agent mode, with the same 4K output and quality options',
+      '- Anything you set up before this update — including saved default-model preferences and scheduled chats — keeps working automatically',
+    ],
+  },
+  {
     date: '2026-06-12',
     changes: [
       'Improved: Changing Your Password Now Signs You Out Everywhere Else',

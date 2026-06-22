@@ -88,6 +88,8 @@ export const IMAGE_GENERATION_PRICING_USD: Record<string, number> = {
   'gpt-image-2': 0.04,
   'gemini-2.5-flash-image': 0.039,
   'gemini-3-pro-image-preview': 0.039,
+  'gemini-3.1-flash-image': 0.039,
+  // Legacy preview id kept so historical usage records still price correctly.
   'gemini-3.1-flash-image-preview': 0.039,
   'gen4_image': 0.05,
   'gemini_2.5_flash': 0.04,
@@ -115,6 +117,16 @@ const warnedUnknownModels = new Set<string>();
 export function getModelPrice(model: string): ModelPrice | null {
   const price = MODEL_PRICING[model];
   if (price) return price;
+
+  // Image and video models are intentionally NOT token-priced — they are billed
+  // per-image / per-clip via IMAGE_GENERATION_PRICING_USD and
+  // VIDEO_GENERATION_PRICING_USD_PER_CLIP. The shadow token recorder still calls
+  // getModelPrice for them (the metered client records token usage on every
+  // call), so treat them as a known "no token price" case (cost 0) rather than
+  // warning about a missing entry.
+  if (model in IMAGE_GENERATION_PRICING_USD || model in VIDEO_GENERATION_PRICING_USD_PER_CLIP) {
+    return null;
+  }
 
   if (!warnedUnknownModels.has(model)) {
     warnedUnknownModels.add(model);

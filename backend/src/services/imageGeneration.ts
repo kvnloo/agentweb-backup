@@ -17,12 +17,34 @@ const SUPPORTED_MODELS = [
   "gpt-image-2",
   "gemini-2.5-flash-image",
   "gemini-3-pro-image-preview",
+  "gemini-3.1-flash-image",
+  // Legacy preview id — accepted as an alias of gemini-3.1-flash-image so that
+  // persisted settings, in-flight sessions, and scheduled chats created before
+  // the GA migration keep working. Normalized to the GA id before dispatch.
   "gemini-3.1-flash-image-preview",
   "gen4_image",
   "gemini_2.5_flash",
 ] as const;
 
 type SupportedModel = typeof SUPPORTED_MODELS[number];
+
+// Legacy image-model id → canonical (GA) id. The preview Gemini 3.1 Flash Image
+// endpoint was replaced by the GA `gemini-3.1-flash-image` endpoint; we normalize
+// any persisted/incoming preview id to the GA id before routing or pricing.
+const LEGACY_IMAGE_MODEL_ALIASES: Record<string, string> = {
+  "gemini-3.1-flash-image-preview": "gemini-3.1-flash-image",
+};
+
+/**
+ * Normalize a legacy image-model id to its canonical (GA) equivalent.
+ * Unknown/canonical ids (and undefined) pass through unchanged.
+ */
+export function normalizeImageModel<T extends string | undefined>(model: T): T {
+  if (model && LEGACY_IMAGE_MODEL_ALIASES[model]) {
+    return LEGACY_IMAGE_MODEL_ALIASES[model] as T;
+  }
+  return model;
+}
 
 interface ImageGenerationParams {
   prompt: string;
@@ -321,7 +343,7 @@ export class ImageService {
         secretName = process.env.NODE_ENV === "development"
           ? "dev/AgentWeb/Azure/Image"
           : "prod/AgentWeb/Azure/Image";
-      } else if (model === "gemini-2.5-flash-image" || model === "gemini-3-pro-image-preview" || model === "gemini-3.1-flash-image-preview") {
+      } else if (model === "gemini-2.5-flash-image" || model === "gemini-3-pro-image-preview" || model === "gemini-3.1-flash-image" || model === "gemini-3.1-flash-image-preview") {
         // Google Gemini
         secretName = process.env.NODE_ENV === "development" 
           ? "dev/AgentWeb/Google/Image" 
@@ -409,7 +431,11 @@ export class ImageService {
       if (!params.imageModel) {
         params.imageModel = "gemini-3-pro-image-preview";
       }
-      
+
+      // Normalize legacy/preview ids to their canonical (GA) equivalent so that
+      // routing, generation behavior, and pricing all use a single id.
+      params.imageModel = normalizeImageModel(params.imageModel);
+
       // Validate the provided model
       if (!SUPPORTED_MODELS.includes(params.imageModel as SupportedModel)) {
         return {
@@ -438,7 +464,7 @@ export class ImageService {
           generationPromise = this.generateWithAzureAI(params, modelToUse, hasInputImages);
         } else if (modelToUse === "gemini-2.5-flash-image") {
           generationPromise = this.generateWithGoogleGemini(params);
-        } else if (modelToUse === "gemini-3-pro-image-preview" || modelToUse === "gemini-3.1-flash-image-preview") {
+        } else if (modelToUse === "gemini-3-pro-image-preview" || modelToUse === "gemini-3.1-flash-image") {
           generationPromise = this.generateWithGoogleGemini3Pro(params);
         } else if (modelToUse === "gen4_image" || modelToUse === "gemini_2.5_flash") {
           generationPromise = this.generateWithRunwayML(params, modelToUse);
@@ -1157,7 +1183,7 @@ export class ImageService {
       // Process streaming response to find image data.
       //
       // Gemini 3 image models ("thinking" models, e.g. gemini-3-pro-image-preview
-      // and gemini-3.1-flash-image-preview) emit up to two INTERIM draft images
+      // and gemini-3.1-flash-image) emit up to two INTERIM draft images
       // before the final rendered image. Per Google's docs, "the last image within
       // Thinking is also the final rendered image", and interim drafts are flagged
       // with part.thought === true. We must therefore keep the LAST non-thought
