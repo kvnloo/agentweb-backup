@@ -143,6 +143,16 @@ describe('llmPricing', () => {
       expect(warnSpy).toHaveBeenCalledTimes(2);
     });
 
+    it('returns null WITHOUT warning for image/video models (priced per-image/clip elsewhere)', () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      // GA image model + back-compat preview alias + a video model
+      expect(getModelPrice('gemini-3.1-flash-image')).toBeNull();
+      expect(getModelPrice('gemini-3.1-flash-image-preview')).toBeNull();
+      expect(getModelPrice('gpt-image-1')).toBeNull();
+      expect(getModelPrice('veo-3.1-generate-preview')).toBeNull();
+      expect(warnSpy).not.toHaveBeenCalled();
+    });
+
     it('embedding models price output at 0', () => {
       const price = getModelPrice('text-embedding-3-large');
       expect(price).not.toBeNull();
