@@ -7881,6 +7881,12 @@ export default function AdminDashboard() {
   );
 }
 
+// Image API models offered in the Agent Mode settings dropdown below.
+// Keep in sync with the backend AgentModeService.IMAGE_API_MODELS.
+// 'gemini-3.1-flash-image-preview' is retained as a legacy alias of the GA
+// 'gemini-3.1-flash-image' so a previously-saved default still renders/validates.
+export const IMAGE_API_MODELS = ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gpt-image-2', 'gemini-2.5-flash-image'];
+
 // Agent Mode Settings Component
 const AgentModeSettings = () => {
   const [systemPrompt, setSystemPrompt] = useState('');
@@ -8323,10 +8329,6 @@ const AgentModeSettings = () => {
       setSavingImageGenerationDefaultModel(false);
     }
   };
-
-  // Keep in sync with AgentModeService.IMAGE_API_MODELS. 'gemini-3.1-flash-image-preview'
-  // is retained as a legacy alias so a previously-saved default still renders.
-  const IMAGE_API_MODELS = ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gpt-image-2', 'gemini-2.5-flash-image'];
 
   const loadImageApiDefaultModel = async () => {
     try {
