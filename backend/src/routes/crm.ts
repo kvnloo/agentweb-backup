@@ -1714,6 +1714,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
     const engagedOnlyQuery = req.query.engagedOnly;
     const statusQuery = typeof req.query.status === 'string' ? req.query.status.trim() : '';
     const linkedInConnectedQuery = req.query.linkedInConnected;
+    const syncStatusQuery = typeof req.query.syncStatus === 'string' ? req.query.syncStatus.trim() : '';
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -1728,6 +1729,11 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
     if (!(await canAccessCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
+
+    // HubSpot connection drives the sync-status filter + per-lead resolution.
+    // The syncStatus param is only honored when the list is actually connected.
+    const hsConn = getHubspotConnection(list);
+    const syncStatusFilter = hsConn.connected ? syncStatusQuery : '';
 
     // Validate inputs
     const validPage = Math.max(1, page);
@@ -1751,7 +1757,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
 
     const linkedInConnectedFilter = linkedInConnectedQuery === 'true';
 
-    if (list.icpsOnly || search || effectiveEngagedOnly || statusQuery || linkedInConnectedFilter) {
+    if (list.icpsOnly || search || effectiveEngagedOnly || statusQuery || linkedInConnectedFilter || syncStatusFilter) {
       // Filtered mode: use flag indexes when possible, then apply remaining filters in-memory.
       const fetchLimit = Math.max(validLimit, 200);
 
@@ -1807,6 +1813,9 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
           const normalized = (lead.linkedin as string).trim().toLowerCase().replace(/\/?$/, '/');
           if (!connectedLinkedInUrlSet.has(normalized)) return false;
         }
+        if (syncStatusFilter && resolveSyncStatus(lead, hsConn.connected) !== syncStatusFilter) {
+          return false;
+        }
         return true;
       });
 
@@ -1861,12 +1870,15 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
     const leadsWithCounts = await Promise.all(
       filteredLeads.map(async (lead: any) => {
         const engagementCounts = await crmDb.getLeadEngagementCount(listId, lead.leadId, userId);
-        return sanitizeLeadForResponse({
-          ...lead,
-          engagementCount: engagementCounts.total,
-          engagementCountLast7Days: engagementCounts.last7Days,
-          totalAllMessages: engagementCounts.totalAllMessages,
-        });
+        return {
+          ...sanitizeLeadForResponse({
+            ...lead,
+            engagementCount: engagementCounts.total,
+            engagementCountLast7Days: engagementCounts.last7Days,
+            totalAllMessages: engagementCounts.totalAllMessages,
+          }),
+          syncStatus: resolveSyncStatus(lead, hsConn.connected),
+        };
       })
     );
 
@@ -1881,6 +1893,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
       totalPages: knownTotalPages ?? (hasMoreLeads ? null : validPage), // null means unknown total
       hasMore: hasMoreLeads,
       totalFilteredCount, // Total ICP count when icpsOnly is enabled, null otherwise
+      hubspotConnected: hsConn.connected,
     });
   } catch (error: any) {
     console.error('Error fetching leads:', error);
