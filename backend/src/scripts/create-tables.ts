@@ -1156,7 +1156,7 @@ const createLeadsTable = async () => {
       { AttributeName: 'linkedin', AttributeType: 'S' },
       { AttributeName: 'nameCompanyKey', AttributeType: 'S' },
       { AttributeName: 'updatedAt', AttributeType: 'S' },
-      { AttributeName: 'companyId', AttributeType: 'S' }
+      { AttributeName: 'companyId', AttributeType: 'S' },
     ],
     KeySchema: [
       { AttributeName: 'listId', KeyType: 'HASH' },

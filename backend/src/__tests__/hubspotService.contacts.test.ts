@@ -87,6 +87,24 @@ describe('HubSpotService — create() factory and token caching', () => {
     expect(mockGetAccountsByUserId).toHaveBeenCalledTimes(1);
   });
 
+  it('create() exposes portalId from config.hub_id', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([MOCK_ACCOUNT]);
+    const svc = await HubSpotService.create('user-1');
+    expect(svc.portalId).toBe('12345');
+  });
+
+  it('create() falls back to account_id for portalId when hub_id absent', async () => {
+    const noHubId = { ...MOCK_ACCOUNT, config: { ...MOCK_ACCOUNT.config, hub_id: undefined } };
+    mockGetAccountsByUserId.mockResolvedValue([noHubId]);
+    const svc = await HubSpotService.create('user-1');
+    expect(svc.portalId).toBe('12345');
+  });
+
+  it('fromToken() has no portalId', () => {
+    const svc = HubSpotService.fromToken('direct-api-key');
+    expect(svc.portalId).toBeUndefined();
+  });
+
   it('service methods use cached token without extra DB reads after create()', async () => {
     mockGetAccountsByUserId.mockResolvedValue([MOCK_ACCOUNT]);
     mockAxiosGet.mockResolvedValue({ data: { results: [] } });
@@ -432,6 +450,13 @@ describe('HubSpotService — ensureDealProperty', () => {
     const name = await svc.ensureDealProperty('My Custom Field!', 'My Custom Field');
     expect(name).toBe('my_custom_field');
   });
+
+  it('caches an ensured deal property so a repeat call skips the GET', async () => {
+    mockAxiosGet.mockResolvedValue({ data: { name: 'custom_score' } });
+    await svc.ensureDealProperty('custom_score', 'Custom Score');
+    await svc.ensureDealProperty('custom_score', 'Custom Score');
+    expect(mockAxiosGet).toHaveBeenCalledTimes(1);
+  });
 });
 
 // ─── getDealPipelineStages ────────────────────────────────────────────────────
@@ -530,6 +555,30 @@ describe('HubSpotService — ensureContactProperty', () => {
       expect.any(Object)
     );
   });
+
+  it('caches the result and does not GET the same property twice on one instance', async () => {
+    mockAxiosGet.mockResolvedValue({ data: { name: 'cached_prop' } });
+    await svc.ensureContactProperty('cached_prop', 'Cached Prop');
+    await svc.ensureContactProperty('cached_prop', 'Cached Prop');
+    expect(mockAxiosGet).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not re-create a 404 property on the second call (cached after create)', async () => {
+    mockAxiosGet.mockRejectedValue({ response: { status: 404 } });
+    mockAxiosPost.mockResolvedValue({ data: { name: 'made_prop' } });
+    await svc.ensureContactProperty('made_prop', 'Made Prop');
+    await svc.ensureContactProperty('made_prop', 'Made Prop');
+    expect(mockAxiosGet).toHaveBeenCalledTimes(1);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not share the property cache across instances', async () => {
+    mockAxiosGet.mockResolvedValue({ data: { name: 'shared_prop' } });
+    await svc.ensureContactProperty('shared_prop', 'Shared Prop');
+    const svc2 = HubSpotService.fromToken('valid-token');
+    await svc2.ensureContactProperty('shared_prop', 'Shared Prop');
+    expect(mockAxiosGet).toHaveBeenCalledTimes(2);
+  });
 });
 
 // ─── listContactsPage ─────────────────────────────────────────────────────────
@@ -583,6 +632,63 @@ describe('HubSpotService — getContactDealAssociations', () => {
     mockAxiosGet.mockResolvedValue({ data: { results: [] } });
     const ids = await svc.getContactDealAssociations('hs-contact-1');
     expect(ids).toEqual([]);
+  });
+});
+
+// ─── getDealContactAssociations ───────────────────────────────────────────────
+
+describe('HubSpotService — getDealContactAssociations', () => {
+  let svc: HubSpotService;
+  beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); jest.clearAllMocks(); });
+
+  it('returns all contact ids from a single page', async () => {
+    mockAxiosGet.mockResolvedValue({
+      data: { results: [{ id: 'c-1' }, { id: 'c-2' }] },
+    });
+    const ids = await svc.getDealContactAssociations('deal-99');
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      expect.stringContaining('deals/deal-99/associations/contacts'),
+      expect.any(Object)
+    );
+    expect(ids).toEqual(['c-1', 'c-2']);
+  });
+
+  it('follows pagination cursor to return all contacts across multiple pages', async () => {
+    mockAxiosGet
+      .mockResolvedValueOnce({
+        data: { results: [{ id: 'c-1' }], paging: { next: { after: 'cursor-abc' } } },
+      })
+      .mockResolvedValueOnce({
+        data: { results: [{ id: 'c-2' }, { id: 'c-3' }] },
+      });
+    const ids = await svc.getDealContactAssociations('deal-99');
+    expect(mockAxiosGet).toHaveBeenCalledTimes(2);
+    expect(mockAxiosGet).toHaveBeenNthCalledWith(2,
+      expect.stringContaining('deals/deal-99/associations/contacts'),
+      expect.objectContaining({ params: { after: 'cursor-abc' } })
+    );
+    expect(ids).toEqual(['c-1', 'c-2', 'c-3']);
+  });
+
+  it('returns empty array when deal has no contact associations', async () => {
+    mockAxiosGet.mockResolvedValue({ data: { results: [] } });
+    const ids = await svc.getDealContactAssociations('deal-99');
+    expect(ids).toEqual([]);
+  });
+
+  it('stops at MAX_PAGES (20) when cursor never terminates', async () => {
+    // Every page returns a cursor — simulates an infinite loop without the cap.
+    mockAxiosGet.mockResolvedValue({
+      data: { results: [{ id: 'c-1' }], paging: { next: { after: 'cursor-infinite' } } },
+    });
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const ids = await svc.getDealContactAssociations('deal-99');
+
+    expect(mockAxiosGet).toHaveBeenCalledTimes(20);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('20-page cap'));
+    expect(ids).toHaveLength(20); // 1 result per page × 20 pages
+    warnSpy.mockRestore();
   });
 });
 
@@ -670,5 +776,70 @@ describe('HubSpotService — getContactById', () => {
   it('rethrows non-404 errors', async () => {
     mockAxiosGet.mockRejectedValue({ response: { status: 500 }, message: 'Server error' });
     await expect(svc.getContactById('contact-err')).rejects.toMatchObject({ response: { status: 500 } });
+  });
+});
+
+describe('HubSpotService — addContactToList chunking', () => {
+  let svc: HubSpotService;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    svc = HubSpotService.fromToken('pat-test');
+    mockAxiosPut.mockResolvedValue({ data: {} });
+  });
+
+  it('makes 1 PUT call for ≤100 contacts and returns correct addedCount', async () => {
+    const ids = Array.from({ length: 50 }, (_, i) => `c${i}`);
+    const result = await svc.addContactToList('list-1', ids);
+    expect(mockAxiosPut).toHaveBeenCalledTimes(1);
+    expect(mockAxiosPut.mock.calls[0][1]).toEqual(ids);
+    expect(result.addedCount).toBe(50);
+    expect(result.failedChunks).toEqual([]);
+  });
+
+  it('makes 1 PUT call for exactly 100 contacts', async () => {
+    const ids = Array.from({ length: 100 }, (_, i) => `c${i}`);
+    const result = await svc.addContactToList('list-1', ids);
+    expect(mockAxiosPut).toHaveBeenCalledTimes(1);
+    expect(result.addedCount).toBe(100);
+    expect(result.failedChunks).toEqual([]);
+  });
+
+  it('splits 101 contacts into 2 PUT calls (100 + 1)', async () => {
+    const ids = Array.from({ length: 101 }, (_, i) => `c${i}`);
+    const result = await svc.addContactToList('list-1', ids);
+    expect(mockAxiosPut).toHaveBeenCalledTimes(2);
+    expect(mockAxiosPut.mock.calls[0][1]).toHaveLength(100);
+    expect(mockAxiosPut.mock.calls[1][1]).toHaveLength(1);
+    expect(result.addedCount).toBe(101);
+    expect(result.failedChunks).toEqual([]);
+  });
+
+  it('splits 250 contacts into 3 PUT calls (100 + 100 + 50)', async () => {
+    const ids = Array.from({ length: 250 }, (_, i) => `c${i}`);
+    const result = await svc.addContactToList('list-1', ids);
+    expect(mockAxiosPut).toHaveBeenCalledTimes(3);
+    expect(result.addedCount).toBe(250);
+  });
+
+  it('preserves contact ID ordering across chunks', async () => {
+    const ids = Array.from({ length: 150 }, (_, i) => `contact-${i}`);
+    await svc.addContactToList('list-1', ids);
+    const allSent = [...mockAxiosPut.mock.calls[0][1], ...mockAxiosPut.mock.calls[1][1]];
+    expect(allSent).toEqual(ids);
+  });
+
+  it('continues remaining chunks when one fails and reports partial success', async () => {
+    mockAxiosPut
+      .mockResolvedValueOnce({ data: {} })       // chunk 0 (0–99): success
+      .mockRejectedValueOnce({ response: { status: 429, data: 'rate limited' } }) // chunk 1 (100–199): fail
+      .mockResolvedValueOnce({ data: {} });       // chunk 2 (200–249): success
+
+    const ids = Array.from({ length: 250 }, (_, i) => `c${i}`);
+    const result = await svc.addContactToList('list-1', ids);
+
+    expect(mockAxiosPut).toHaveBeenCalledTimes(3);
+    expect(result.addedCount).toBe(150);        // chunk 0 (100) + chunk 2 (50) succeeded
+    expect(result.failedChunks).toEqual([100]); // chunk starting at index 100 failed
   });
 });

@@ -9,7 +9,7 @@ import { crmDb, userDb, tempEmailDb } from '../services/db';
 import { dripSequenceDb } from '../services/dripSequenceDb';
 import { getUserIdByHubSpotPortalId } from '../services/connectedAccountsDb';
 import { HubSpotService } from '../services/hubspotService';
-import { getHubSpotConfig } from '../config/integrations';
+import { getHubSpotClientSecretForAppId } from '../config/integrations';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
 import { agentModeService } from '../services/agentModeService';
 import { resendService } from '../services/resendService';
@@ -26,19 +26,48 @@ import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService'
 /**
  * Verifies a HubSpot v1 webhook signature.
  * HubSpot computes: SHA-256(clientSecret + rawBody) and sends it as hex in
- * the X-HubSpot-Signature header.
- * We re-stringify req.body (already JSON-parsed) which matches HubSpot's
- * canonical JSON in practice.
+ * the X-HubSpot-Signature header. Must use the original raw bytes, not a
+ * re-serialized JSON object (key order / whitespace would differ).
  */
-function verifyHubSpotSignature(clientSecret: string, body: any, signature: string): boolean {
+function verifyHubSpotSignature(clientSecret: string, rawBody: Buffer, signature: string): boolean {
   try {
     const expected = crypto
       .createHash('sha256')
-      .update(clientSecret + JSON.stringify(body))
+      .update(clientSecret + rawBody.toString('utf8'))
       .digest('hex');
     return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
   } catch {
     return false;
+  }
+}
+
+/**
+ * Resolve a contact's email for a webhook event that didn't include it.
+ * Retries once with a freshly-created HubSpot service so a transient failure
+ * (e.g. a concurrent token refresh rotating the access token → a stale 400/401)
+ * doesn't silently drop the update. Logs each failure instead of swallowing it.
+ */
+async function resolveContactEmail(
+  userId: string,
+  portalId: string,
+  objectId: string,
+  svc: HubSpotService,
+): Promise<string | null> {
+  try {
+    return await svc.getContactEmailById(objectId);
+  } catch (err: any) {
+    console.warn(
+      `[HubSpot Webhook] getContactEmailById failed for contact ${objectId} (attempt 1, status ${err?.response?.status ?? 'n/a'}): ${err?.message} — retrying with a fresh token`,
+    );
+    try {
+      const fresh = await HubSpotService.create(userId, portalId);
+      return await fresh.getContactEmailById(objectId);
+    } catch (err2: any) {
+      console.error(
+        `[HubSpot Webhook] getContactEmailById failed for contact ${objectId} (attempt 2, status ${err2?.response?.status ?? 'n/a'}): ${err2?.message} — skipping`,
+      );
+      return null;
+    }
   }
 }
 
@@ -770,29 +799,47 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
 
   void (async () => {
     try {
+      // Raw body captured by express.raw() — parse once for processing.
+      const rawBody = req.body as Buffer;
+      const parsedBody: any = JSON.parse(rawBody.toString('utf8'));
+
       // ── Signature verification ──────────────────────────────────────────────
       // Verify X-HubSpot-Signature when present. If the header is missing we
       // log a warning and continue (supports local dev / test environments).
       const signature = req.headers['x-hubspot-signature'] as string | undefined;
+      const isProd = process.env.NODE_ENV === 'production';
+      // HubSpot signs each event with the secret of the app that owns the
+      // subscription. Resolve the secret by the event's appId so events from an
+      // app we don't manage (e.g. a stray delivery from a different app pointed at
+      // this URL) are ignored — not verified against our app's secret.
+      const eventAppId: string | number | undefined = Array.isArray(parsedBody)
+        ? parsedBody[0]?.appId
+        : parsedBody?.appId;
       if (signature) {
-        const hubspotConfig = await getHubSpotConfig().catch(() => null);
-        if (hubspotConfig?.clientSecret) {
-          if (!verifyHubSpotSignature(hubspotConfig.clientSecret, req.body, signature)) {
-            console.warn('[HubSpot Webhook] Signature mismatch — request ignored');
-            return;
-          }
+        const clientSecret = await getHubSpotClientSecretForAppId(eventAppId).catch(() => null);
+        if (!clientSecret) {
+          console.warn(`[HubSpot Webhook] No managed client secret for appId=${eventAppId ?? 'absent'} — request ignored (unmanaged app or missing creds)`);
+          return;
         }
+        if (!verifyHubSpotSignature(clientSecret, rawBody, signature)) {
+          console.warn('[HubSpot Webhook] Signature mismatch — request ignored');
+          return;
+        }
+      } else if (isProd) {
+        console.warn('[HubSpot Webhook] Missing X-HubSpot-Signature in production — request rejected');
+        return;
       } else {
-        console.warn('[HubSpot Webhook] No X-HubSpot-Signature header — proceeding without verification');
+        console.warn('[HubSpot Webhook] No X-HubSpot-Signature header — proceeding without verification (dev only)');
       }
 
       // ── Aggregate events by objectId ────────────────────────────────────────
-      const events: any[] = Array.isArray(req.body) ? req.body : [req.body];
+      const events: any[] = Array.isArray(parsedBody) ? parsedBody : [parsedBody];
       type ContactChange = {
         portalId: number;
         properties: Record<string, string>;
         isCreation: boolean;
         isDeleted: boolean;
+        isDealChange: boolean;
       };
       const changesByObjectId: Record<string, ContactChange> = {};
 
@@ -805,20 +852,23 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
 
         console.log(`[HubSpot Webhook] event=${eventType} portal=${portalId} object=${objectId}${propertyName ? ` property=${propertyName}` : ''}`);
 
-        const isRelevantEvent = ['contact.creation', 'contact.propertyChange', 'contact.deletion'].includes(eventType);
-        if (!isRelevantEvent || !objectId) continue;
+        const isContactEvent = ['contact.creation', 'contact.propertyChange', 'contact.deletion'].includes(eventType);
+        const isDealEvent = eventType === 'deal.propertyChange';
+        if (!isContactEvent && !isDealEvent) continue;
+        if (!objectId) continue;
 
         if (!changesByObjectId[objectId]) {
-          changesByObjectId[objectId] = { portalId, properties: {}, isCreation: false, isDeleted: false };
+          changesByObjectId[objectId] = { portalId, properties: {}, isCreation: false, isDeleted: false, isDealChange: false };
         }
         if (eventType === 'contact.creation') changesByObjectId[objectId].isCreation = true;
         if (eventType === 'contact.deletion') changesByObjectId[objectId].isDeleted = true;
+        if (isDealEvent) changesByObjectId[objectId].isDealChange = true;
         if (propertyName && propertyValue !== undefined) {
           changesByObjectId[objectId].properties[propertyName] = propertyValue;
         }
       }
 
-      // ── Process each contact ────────────────────────────────────────────────
+      // ── Process each contact / deal ─────────────────────────────────────────
       for (const [objectId, data] of Object.entries(changesByObjectId)) {
         const userId = await getUserIdByHubSpotPortalId(data.portalId);
         if (!userId) {
@@ -826,27 +876,92 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
           continue;
         }
 
-        const svc = await HubSpotService.create(userId).catch(() => null);
+        const portalIdStr = String(data.portalId);
+        const svc = await HubSpotService.create(userId, portalIdStr).catch(() => null);
 
+        // Discard all events when the OAuth account is unavailable (expired token,
+        // revoked refresh, or account removed). Prevents webhook updates from landing
+        // on lists whose connection is broken (Type 1 disconnect — expired or manual).
+        if (!svc) {
+          console.log(`[HubSpot Webhook] OAuth token unavailable for portal ${portalIdStr} (user ${userId}) — discarding events`);
+          continue;
+        }
+
+        // ── Deal.propertyChange: resolve contacts via deal associations ──────────
+        if (data.isDealChange && svc) {
+          try {
+            const contactIds = await svc.getDealContactAssociations(objectId).catch(() => [] as string[]);
+            if (contactIds.length === 0) {
+              console.log(`[HubSpot Webhook] deal ${objectId} has no contact association, skipping`);
+              continue;
+            }
+
+            const allLists = await crmDb.getLeadListsByUserId(userId);
+            if (!allLists) continue;
+            const dealLists = allLists.filter(l => {
+              const cfgs = (l as any).externalCrmSyncConfigs as Record<string, any> | undefined;
+              return String(cfgs?.hubspot?.accountId) === portalIdStr;
+            });
+
+            // Fetch syncConfig per list once — doesn't vary per contact
+            const activeDealLists = (await Promise.all(
+              dealLists.map(async list => {
+                const syncConfig = await externalCrmSyncService.getConfig(userId, list.listId, 'hubspot').catch(() => null);
+                return syncConfig && syncConfig.webhookEnabled !== false ? { list, syncConfig } : null;
+              })
+            )).filter(Boolean) as Array<{ list: any; syncConfig: any }>;
+
+            const emailMap = await svc.getContactEmailsByIds(contactIds).catch(() => new Map<string, string>());
+            await Promise.all(contactIds.map(async (contactId) => {
+              const contactEmail = emailMap.get(contactId) ?? null;
+              if (!contactEmail) return;
+
+              for (const { list, syncConfig } of activeDealLists) {
+                const lead = await crmDb.getLeadByEmail(list.listId, contactEmail.toLowerCase());
+                if (!lead) continue;
+                const dealUpdates: any = {};
+                if (data.properties.amount !== undefined) dealUpdates.dealValue = data.properties.amount;
+                if (data.properties.deal_currency_code !== undefined) dealUpdates.dealCurrency = data.properties.deal_currency_code;
+                if (data.properties.dealstage !== undefined) {
+                  const mapped = syncConfig.hubspotDealStageMap
+                    ? Object.entries(syncConfig.hubspotDealStageMap).find(([, id]) => id === data.properties.dealstage)?.[0]
+                    : undefined;
+                  dealUpdates.status = mapped ?? data.properties.dealstage;
+                }
+                if (Object.keys(dealUpdates).length > 0) {
+                  await crmDb.updateLead(list.listId, lead.leadId, dealUpdates);
+                  console.log(`[HubSpot Webhook] Deal update synced to lead ${lead.leadId} in list ${list.listId}`);
+                }
+              }
+            }));
+          } catch (err: any) {
+            console.error(`[HubSpot Webhook] deal.propertyChange error for deal ${objectId}:`, err.message);
+          }
+          continue;
+        }
+
+        // ── Contact events ──────────────────────────────────────────────────────
         // For contact.creation: fetch full contact to populate all standard fields
         // (the creation event payload contains no property values).
         if (data.isCreation && svc) {
           try {
             const fullContact = await svc.getContactById(objectId);
-            // Merge fetched properties; explicit webhook payload values take precedence
             Object.entries(fullContact).forEach(([k, v]) => {
               if (data.properties[k] === undefined && v) data.properties[k] = v;
             });
           } catch { /* non-fatal */ }
         }
 
-        // Resolve email from payload or API fallback
+        // Resolve email from payload or API fallback. A contact.propertyChange
+        // event only carries the changed property, so a name/phone edit arrives
+        // without an email and must be resolved via the API. Don't swallow the
+        // failure silently (that drops the update invisibly) — log it and retry
+        // once with a freshly-created service so a transient token blip (e.g. a
+        // concurrent refresh rotating the access token) doesn't lose the event.
         let email = data.properties.email;
         if (!email && svc) {
-          try {
-            const fetchedEmail = await svc.getContactEmailById(objectId);
-            if (fetchedEmail) email = fetchedEmail;
-          } catch { /* non-fatal — skip if token unavailable */ }
+          const resolved = await resolveContactEmail(userId, portalIdStr, objectId, svc);
+          if (resolved) email = resolved;
         }
 
         if (!email) {
@@ -854,10 +969,22 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
           continue;
         }
 
-        const lists = await crmDb.getLeadListsByUserId(userId);
-        if (!lists) continue;
+        const allLists = await crmDb.getLeadListsByUserId(userId);
+        if (!allLists) continue;
 
-        for (const list of lists) {
+        // Only process lists explicitly linked to this portal — prevents a contact
+        // update in portal A from incorrectly updating a list linked to portal B
+        // when the same email happens to exist in both.
+        const contactLists = allLists.filter(l => {
+          const cfgs = (l as any).externalCrmSyncConfigs as Record<string, any> | undefined;
+          return String(cfgs?.hubspot?.accountId) === portalIdStr;
+        });
+        if (contactLists.length === 0) {
+          console.log(`[HubSpot Webhook] No lists linked to portal ${portalIdStr} for user ${userId}, skipping`);
+          continue;
+        }
+
+        for (const list of contactLists) {
           // Check per-list webhook preference — skip if user has disabled webhook updates
           const syncConfig = await externalCrmSyncService.getConfig(userId, list.listId, 'hubspot').catch(() => null);
           if (syncConfig?.webhookEnabled === false) {
@@ -866,31 +993,32 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
           }
 
           const lead = await crmDb.getLeadByEmail(list.listId, email.toLowerCase());
-          if (!lead) continue;
 
+          // Deletion: flag an existing lead as CRM-removed (nothing to do if absent).
           if (data.isDeleted) {
+            if (!lead) continue;
             await crmDb.updateLead(list.listId, lead.leadId, {
-              syncMetadata: { ...(lead.syncMetadata || {}), crmRemoved: true },
+              syncMetadata: { ...(lead.syncMetadata || {}), crmRemovedAt: new Date().toISOString() },
             });
             console.log(`[HubSpot Webhook] Marked lead ${lead.leadId} as CRM-removed`);
             continue;
           }
 
-          const updates: any = {};
-          if (data.properties.firstname    !== undefined) updates.firstName = data.properties.firstname;
-          if (data.properties.lastname     !== undefined) updates.lastName  = data.properties.lastname;
-          if (data.properties.phone        !== undefined) updates.phone     = data.properties.phone;
-          if (data.properties.jobtitle     !== undefined) updates.title     = data.properties.jobtitle;
-          if (data.properties.company      !== undefined) updates.company   = data.properties.company;
-          if (data.properties.hs_linkedin_url !== undefined) updates.linkedin = data.properties.hs_linkedin_url;
+          // Map standard HubSpot properties → lead fields (shared by create + update).
+          const fields: any = {};
+          if (data.properties.firstname       !== undefined) fields.firstName = data.properties.firstname;
+          if (data.properties.lastname        !== undefined) fields.lastName  = data.properties.lastname;
+          if (data.properties.phone           !== undefined) fields.phone     = data.properties.phone;
+          if (data.properties.jobtitle        !== undefined) fields.title     = data.properties.jobtitle;
+          if (data.properties.company         !== undefined) fields.company   = data.properties.company;
+          if (data.properties.hs_linkedin_url !== undefined) fields.linkedin  = data.properties.hs_linkedin_url;
 
           const standardHubspotProps = ['email', 'firstname', 'lastname', 'phone', 'jobtitle', 'company', 'hs_linkedin_url'];
           const customFieldUpdates: any = {};
           Object.entries(data.properties).forEach(([key, val]) => {
             if (standardHubspotProps.includes(key)) return;
-            // Match existing custom field key using case-insensitive slug comparison
             let matchedKey = key;
-            if (lead.customFields) {
+            if (lead?.customFields) {
               const found = Object.keys(lead.customFields).find(
                 k => k.toLowerCase().replace(/[^a-z0-9]/g, '_') === key
               );
@@ -899,11 +1027,23 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
             customFieldUpdates[matchedKey] = val;
           });
 
+          if (!lead) {
+            // New contact in HubSpot → create the lead. Only on creation events:
+            // a property change to a contact we've never seen isn't ours to add.
+            if (!data.isCreation) continue;
+            const newLead: any = { email: email.toLowerCase(), ...fields, syncMetadata: { hubspot_contact_id: objectId } };
+            if (Object.keys(customFieldUpdates).length > 0) newLead.customFields = customFieldUpdates;
+            await crmDb.createLead(list.listId, newLead);
+            console.log(`[HubSpot Webhook] Created lead for ${email} in list ${list.listId}`);
+            continue;
+          }
+
+          const updates: any = { ...fields };
           if (Object.keys(customFieldUpdates).length > 0) {
             updates.customFields = mergeCustomFields(
               lead.customFields,
               customFieldUpdates,
-              { source: 'webhooks.hubspot.legacy', listId: list.listId, leadId: lead.leadId },
+              { source: 'webhooks.hubspot', listId: list.listId, leadId: lead.leadId },
             );
           }
 

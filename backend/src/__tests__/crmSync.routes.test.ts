@@ -2,6 +2,10 @@ import request from 'supertest';
 import express from 'express';
 import crmSyncRoutes from '../routes/crmSync';
 
+jest.mock('../utils/hubspotWebhookSubscriptions', () => ({
+  ensureWebhookSubscriptions: jest.fn().mockResolvedValue(undefined),
+}));
+
 jest.mock('../middleware/auth', () => ({
   authenticateToken: (req: any, _res: any, next: any) => {
     req.user = { userId: 'user-1' };
@@ -14,6 +18,8 @@ jest.mock('../services/db', () => ({
     getLeadListById: jest.fn().mockResolvedValue({ listId: 'list-1', userId: 'user-1' }),
     setLeadListCrmSyncConfig: jest.fn().mockResolvedValue(undefined),
     getLeadsByListId: jest.fn().mockResolvedValue({ items: [], lastEvaluatedKey: undefined }),
+    getLeadListsByUserId: jest.fn().mockResolvedValue([]),
+    getLeadListsForUser: jest.fn().mockResolvedValue([]),
   },
   userDb: {
     getUserById: jest.fn().mockResolvedValue({ userId: 'user-1' }),
@@ -24,6 +30,7 @@ jest.mock('../services/externalCrmSyncService', () => ({
   externalCrmSyncService: {
     getDefaultMappings: jest.fn().mockResolvedValue({ contactFieldMapping: [], dealFieldMapping: [], customFieldMapping: [] }),
     getConfig: jest.fn().mockResolvedValue(null),
+    isAccountConnected: jest.fn().mockResolvedValue(true),
     saveConfig: jest.fn().mockResolvedValue({
       provider: 'attio',
       listId: 'list-1',
@@ -49,6 +56,20 @@ jest.mock('../services/externalCrmSyncService', () => ({
     pullAllContacts: jest.fn().mockResolvedValue({ successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] }),
     getExternalProperties: jest.fn().mockResolvedValue({ properties: [] }),
     getExternalPipelines: jest.fn().mockResolvedValue([]),
+    changePipeline: jest.fn().mockResolvedValue({
+      provider: 'hubspot',
+      listId: 'list-1',
+      userId: 'user-1',
+      accountId: 'acct-1',
+      externalPipelineId: 'new-pipe',
+      autoSyncEnabled: true,
+      contactFieldMapping: [],
+      dealFieldMapping: [],
+      customFieldMapping: [],
+      webhookEnabled: true,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-02T00:00:00.000Z',
+    }),
     deleteLeadFromCrm: jest.fn().mockResolvedValue(undefined),
     ensureWebhookSecret: jest.fn().mockResolvedValue(undefined),
   },
@@ -57,6 +78,44 @@ jest.mock('../services/externalCrmSyncService', () => ({
 const app = express();
 app.use(express.json());
 app.use('/api/crm-sync', crmSyncRoutes);
+
+describe('PUT /api/crm-sync/config/:listId/:provider/pipeline — change pipeline', () => {
+  const { externalCrmSyncService } = require('../services/externalCrmSyncService');
+
+  it('rejects a non-hubspot provider with 400', async () => {
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/attio/pipeline')
+      .send({ externalPipelineId: 'p1' })
+      .expect(400);
+    expect(res.body.error).toMatch(/only supported for HubSpot/i);
+  });
+
+  it('rejects a missing externalPipelineId with 400', async () => {
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot/pipeline')
+      .send({})
+      .expect(400);
+    expect(res.body.error).toMatch(/externalPipelineId is required/i);
+  });
+
+  it('changes the pipeline and returns the updated config', async () => {
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot/pipeline')
+      .send({ externalPipelineId: 'new-pipe' })
+      .expect(200);
+    expect(externalCrmSyncService.changePipeline).toHaveBeenCalledWith('user-1', 'list-1', 'hubspot', 'new-pipe');
+    expect(res.body.config.externalPipelineId).toBe('new-pipe');
+  });
+
+  it('surfaces service errors as 500', async () => {
+    externalCrmSyncService.changePipeline.mockRejectedValueOnce(new Error('Pipeline not found in HubSpot: nope'));
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot/pipeline')
+      .send({ externalPipelineId: 'nope' })
+      .expect(500);
+    expect(res.body.error).toMatch(/not found/i);
+  });
+});
 
 describe('PUT /api/crm-sync/config/:listId/:provider — Attio API key validation', () => {
   it('rejects an Attio API key shorter than 64 characters', async () => {
@@ -398,5 +457,374 @@ describe('Org-aware access control on CRM sync routes', () => {
       .expect(200);
 
     expect(res.body.configured).toBe(true);
+  });
+});
+
+describe('GET /api/crm-sync/config/:listId/:provider — needsReconnect state', () => {
+  const { crmDb, userDb } = require('../services/db');
+  const { externalCrmSyncService } = require('../services/externalCrmSyncService');
+
+  const configWithAccount = {
+    provider: 'hubspot', listId: 'list-1', userId: 'user-1', accountId: 'acct-1',
+    autoSyncEnabled: true, contactFieldMapping: [], dealFieldMapping: [], customFieldMapping: [],
+    deleteOnPush: false, deleteOnPull: false, webhookEnabled: true, webhookSecret: 'abc',
+    createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' });
+    userDb.getUserById.mockResolvedValue({ userId: 'user-1' });
+    externalCrmSyncService.getConfig.mockResolvedValue(configWithAccount);
+  });
+
+  it('reports needsReconnect=true when accountId is set but the account no longer resolves', async () => {
+    externalCrmSyncService.isAccountConnected.mockResolvedValue(false);
+    const res = await request(app).get('/api/crm-sync/config/list-1/hubspot').expect(200);
+    expect(res.body.configured).toBe(true);     // link preserved
+    expect(res.body.needsReconnect).toBe(true);  // but flagged for reconnect
+  });
+
+  it('reports needsReconnect=false when the account resolves', async () => {
+    externalCrmSyncService.isAccountConnected.mockResolvedValue(true);
+    const res = await request(app).get('/api/crm-sync/config/list-1/hubspot').expect(200);
+    expect(res.body.configured).toBe(true);
+    expect(res.body.needsReconnect).toBe(false);
+  });
+});
+
+describe('PUT /api/crm-sync/config/:listId/:provider — one-account-per-list enforcement', () => {
+  const { crmDb } = require('../services/db');
+  const { externalCrmSyncService } = require('../services/externalCrmSyncService');
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' });
+    externalCrmSyncService.saveConfig.mockResolvedValue({
+      provider: 'hubspot', listId: 'list-1', userId: 'user-1', accountId: 'portal-123',
+      autoSyncEnabled: false, contactFieldMapping: [], dealFieldMapping: [], customFieldMapping: [],
+      deleteOnPush: false, deleteOnPull: false, webhookEnabled: true, webhookSecret: 'abc',
+      createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+  });
+
+  it('returns 409 when accountId is already linked to a different list', async () => {
+    crmDb.getLeadListsForUser.mockResolvedValue([
+      { listId: 'list-other', name: 'Other List', externalCrmSyncConfigs: { hubspot: { accountId: 'portal-123' } } },
+    ]);
+
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot')
+      .send({ accountId: 'portal-123' })
+      .expect(409);
+
+    expect(res.body.error).toMatch(/already linked/);
+    expect(res.body.error).toMatch(/Other List/);
+    expect(externalCrmSyncService.saveConfig).not.toHaveBeenCalled();
+  });
+
+  it('allows save when the same list already owns the accountId (update scenario)', async () => {
+    crmDb.getLeadListsForUser.mockResolvedValue([
+      { listId: 'list-1', name: 'My List', externalCrmSyncConfigs: { hubspot: { accountId: 'portal-123' } } },
+    ]);
+
+    await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot')
+      .send({ accountId: 'portal-123' })
+      .expect(200);
+
+    expect(externalCrmSyncService.saveConfig).toHaveBeenCalled();
+  });
+
+  it('allows save when accountId is absent (mapping-only update)', async () => {
+    crmDb.getLeadListsForUser.mockResolvedValue([
+      { listId: 'list-other', name: 'Other', externalCrmSyncConfigs: { hubspot: { accountId: 'portal-123' } } },
+    ]);
+
+    await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot')
+      .send({ autoSyncEnabled: true })
+      .expect(200);
+
+    expect(externalCrmSyncService.saveConfig).toHaveBeenCalled();
+  });
+
+  it('returns 409 when an org member already has the accountId linked (org-scoped check)', async () => {
+    // Simulate a different org member's list owning the same portal
+    crmDb.getLeadListsForUser.mockResolvedValue([
+      { listId: 'list-org-member', name: 'Team List', externalCrmSyncConfigs: { hubspot: { accountId: 'portal-123' } } },
+    ]);
+
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot')
+      .send({ accountId: 'portal-123' })
+      .expect(409);
+
+    expect(res.body.error).toMatch(/already linked/);
+    expect(externalCrmSyncService.saveConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/crm-sync/test/:listId/:provider — one-account-per-list enforcement', () => {
+  const { crmDb } = require('../services/db');
+  const { externalCrmSyncService } = require('../services/externalCrmSyncService');
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' });
+    externalCrmSyncService.testConnection.mockResolvedValue({ valid: true });
+    externalCrmSyncService.saveConfig.mockResolvedValue({
+      provider: 'hubspot', listId: 'list-1', userId: 'user-1', accountId: 'portal-123',
+      autoSyncEnabled: false, contactFieldMapping: [], dealFieldMapping: [], customFieldMapping: [],
+      deleteOnPush: false, deleteOnPull: false, webhookEnabled: true, webhookSecret: 'sec',
+      createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+  });
+
+  it('returns 409 when accountId being tested is already linked to a different list', async () => {
+    crmDb.getLeadListsForUser.mockResolvedValue([
+      { listId: 'list-other', name: 'Taken List', externalCrmSyncConfigs: { hubspot: { accountId: 'portal-123' } } },
+    ]);
+
+    const res = await request(app)
+      .post('/api/crm-sync/test/list-1/hubspot')
+      .send({ accountId: 'portal-123' })
+      .expect(409);
+
+    expect(res.body.error).toMatch(/already linked/);
+    expect(externalCrmSyncService.saveConfig).not.toHaveBeenCalled();
+  });
+
+  it('saves config after successful test when no conflict exists', async () => {
+    crmDb.getLeadListsForUser.mockResolvedValue([]);
+
+    const res = await request(app)
+      .post('/api/crm-sync/test/list-1/hubspot')
+      .send({ accountId: 'portal-123' })
+      .expect(200);
+
+    expect(res.body.valid).toBe(true);
+    expect(externalCrmSyncService.saveConfig).toHaveBeenCalled();
+  });
+});
+
+describe('GET /api/crm-sync/used-accounts', () => {
+  const { crmDb } = require('../services/db');
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('returns empty array when user has no lists', async () => {
+    crmDb.getLeadListsByUserId.mockResolvedValue([]);
+
+    const res = await request(app).get('/api/crm-sync/used-accounts').expect(200);
+    expect(res.body.used).toEqual([]);
+  });
+
+  it('returns empty array when lists have no externalCrmSyncConfigs', async () => {
+    crmDb.getLeadListsByUserId.mockResolvedValue([
+      { listId: 'list-a', name: 'List A' },
+    ]);
+
+    const res = await request(app).get('/api/crm-sync/used-accounts').expect(200);
+    expect(res.body.used).toEqual([]);
+  });
+
+  it('returns empty array when configs have no accountId', async () => {
+    crmDb.getLeadListsByUserId.mockResolvedValue([
+      { listId: 'list-a', name: 'List A', externalCrmSyncConfigs: { hubspot: { apiKeyEncrypted: 'enc' } } },
+    ]);
+
+    const res = await request(app).get('/api/crm-sync/used-accounts').expect(200);
+    expect(res.body.used).toEqual([]);
+  });
+
+  it('returns accountId entries from all providers', async () => {
+    crmDb.getLeadListsByUserId.mockResolvedValue([
+      {
+        listId: 'list-a',
+        name: 'Prospects',
+        externalCrmSyncConfigs: {
+          hubspot: { accountId: 'portal-123' },
+        },
+      },
+    ]);
+
+    const res = await request(app).get('/api/crm-sync/used-accounts').expect(200);
+    expect(res.body.used).toHaveLength(1);
+    expect(res.body.used[0]).toMatchObject({
+      accountId: 'portal-123',
+      listId: 'list-a',
+      listName: 'Prospects',
+      provider: 'hubspot',
+    });
+  });
+
+  it('falls back to listId when list has no name', async () => {
+    crmDb.getLeadListsByUserId.mockResolvedValue([
+      {
+        listId: 'list-b',
+        externalCrmSyncConfigs: { hubspot: { accountId: 'portal-456' } },
+      },
+    ]);
+
+    const res = await request(app).get('/api/crm-sync/used-accounts').expect(200);
+    expect(res.body.used[0].listName).toBe('list-b');
+  });
+
+  it('returns entries from multiple lists', async () => {
+    crmDb.getLeadListsByUserId.mockResolvedValue([
+      { listId: 'list-a', name: 'A', externalCrmSyncConfigs: { hubspot: { accountId: 'p1' } } },
+      { listId: 'list-b', name: 'B', externalCrmSyncConfigs: { hubspot: { accountId: 'p2' } } },
+    ]);
+
+    const res = await request(app).get('/api/crm-sync/used-accounts').expect(200);
+    expect(res.body.used).toHaveLength(2);
+    const ids = res.body.used.map((u: any) => u.accountId);
+    expect(ids).toContain('p1');
+    expect(ids).toContain('p2');
+  });
+});
+
+describe('PUT /api/crm-sync/config/:listId/:provider — ensureWebhookSubscriptions', () => {
+  const { externalCrmSyncService } = require('../services/externalCrmSyncService');
+  const { ensureWebhookSubscriptions } = require('../utils/hubspotWebhookSubscriptions');
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    externalCrmSyncService.saveConfig.mockResolvedValue({
+      provider: 'hubspot',
+      listId: 'list-1',
+      userId: 'user-1',
+      accountId: 'portal-123',
+      autoSyncEnabled: false,
+      contactFieldMapping: [],
+      dealFieldMapping: [],
+      customFieldMapping: [],
+      deleteOnPush: false,
+      deleteOnPull: false,
+      webhookEnabled: true,
+      webhookSecret: 'abc',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+  });
+
+  it('calls ensureWebhookSubscriptions for hubspot when accountId in request', async () => {
+    await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot')
+      .send({ accountId: 'portal-123' })
+      .expect(200);
+
+    await new Promise(r => setTimeout(r, 20));
+    expect(ensureWebhookSubscriptions).toHaveBeenCalled();
+  });
+
+  it('calls ensureWebhookSubscriptions for hubspot when accountId in saved config', async () => {
+    await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot')
+      .send({ autoSyncEnabled: true })
+      .expect(200);
+
+    await new Promise(r => setTimeout(r, 20));
+    expect(ensureWebhookSubscriptions).toHaveBeenCalled();
+  });
+
+  it('does NOT call ensureWebhookSubscriptions for attio', async () => {
+    externalCrmSyncService.saveConfig.mockResolvedValue({
+      provider: 'attio',
+      listId: 'list-1',
+      userId: 'user-1',
+      autoSyncEnabled: false,
+      contactFieldMapping: [],
+      dealFieldMapping: [],
+      customFieldMapping: [],
+      deleteOnPush: false,
+      deleteOnPull: false,
+      webhookEnabled: true,
+      webhookSecret: 'abc',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+
+    await request(app)
+      .put('/api/crm-sync/config/list-1/attio')
+      .send({ apiKey: 'a'.repeat(64) })
+      .expect(200);
+
+    await new Promise(r => setTimeout(r, 20));
+    expect(ensureWebhookSubscriptions).not.toHaveBeenCalled();
+  });
+
+  it('passes contactFieldMapping and customFieldMapping to ensureWebhookSubscriptions', async () => {
+    const contactFieldMapping = [{ agentwebField: 'email', crmProperty: 'email', direction: 'both', enabled: true }];
+    const customFieldMapping = [{ agentwebField: 'myField', crmProperty: 'my_field', direction: 'both', enabled: true }];
+
+    externalCrmSyncService.saveConfig.mockResolvedValue({
+      provider: 'hubspot',
+      listId: 'list-1',
+      userId: 'user-1',
+      accountId: 'portal-123',
+      autoSyncEnabled: false,
+      contactFieldMapping,
+      customFieldMapping,
+      dealFieldMapping: [],
+      deleteOnPush: false,
+      deleteOnPull: false,
+      webhookEnabled: true,
+      webhookSecret: 'abc',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+
+    await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot')
+      .send({ accountId: 'portal-123', contactFieldMapping, customFieldMapping })
+      .expect(200);
+
+    await new Promise(r => setTimeout(r, 20));
+    expect(ensureWebhookSubscriptions).toHaveBeenCalledWith(
+      contactFieldMapping,
+      customFieldMapping
+    );
+  });
+});
+
+describe('DELETE /api/crm-sync/config/:listId/:provider/account — disconnect account', () => {
+  const { externalCrmSyncService } = require('../services/externalCrmSyncService');
+  const { crmDb } = require('../services/db');
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' });
+    externalCrmSyncService.disconnectAccount = jest.fn().mockResolvedValue(undefined);
+  });
+
+  it('returns 200 and calls disconnectAccount', async () => {
+    const res = await request(app)
+      .delete('/api/crm-sync/config/list-1/hubspot/account')
+      .expect(200);
+
+    expect(res.body.message).toBe('Account disconnected');
+    expect(externalCrmSyncService.disconnectAccount).toHaveBeenCalledWith('user-1', 'list-1', 'hubspot');
+  });
+
+  it('returns 404 when list does not exist', async () => {
+    crmDb.getLeadListById.mockResolvedValue(null);
+    await request(app)
+      .delete('/api/crm-sync/config/list-1/hubspot/account')
+      .expect(404);
+
+    expect(externalCrmSyncService.disconnectAccount).not.toHaveBeenCalled();
+  });
+
+  it('returns 500 when disconnectAccount throws', async () => {
+    externalCrmSyncService.disconnectAccount.mockRejectedValue(new Error('DB failure'));
+    const res = await request(app)
+      .delete('/api/crm-sync/config/list-1/hubspot/account')
+      .expect(500);
+
+    expect(res.body.error).toBe('DB failure');
   });
 });

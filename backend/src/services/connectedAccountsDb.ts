@@ -169,6 +169,8 @@ export interface HubSpotConfig extends BaseOAuthConfig {
   account_type: 'oauth';
   hub_id: number;        // HubSpot portal ID
   hub_domain: string;    // e.g. "mycompany.hubspot.com"
+  hubspot_account_type?: 'crm' | 'marketing';
+  granted_scopes?: string[];
 }
 
 export interface AttioConfig extends BaseOAuthConfig {

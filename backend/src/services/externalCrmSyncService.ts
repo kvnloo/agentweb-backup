@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { crmDb, userDb } from './db';
+import { getAccountById } from './connectedAccountsDb';
 import { decryptPassword, encryptPassword } from '../utils/crypto';
 import { CrmAuth, CrmAdapter } from './adapters/crmAdapterTypes';
 import { AttioAdapter } from './adapters/attioAdapter';
@@ -43,6 +44,9 @@ export interface PushJob {
   finishedAt?: string;
   result?: SyncResult;
   error?: string;
+  // Live progress, written per 500-lead chunk while running (push-only).
+  processedCount?: number;  // leads pushed so far (authoritative — sum of real chunk sizes)
+  totalCount?: number;      // best-effort denominator from list.leadCount (may drift)
 }
 
 export interface ExternalCrmSyncConfig {
@@ -301,6 +305,30 @@ export class ExternalCrmSyncService {
       config.accountId = undefined;
     }
 
+    // Reconnecting an OAuth account: a preserved pipeline/stage/sync state belongs to
+    // the PREVIOUSLY connected account. If the new account doesn't contain that pipeline,
+    // it's stale (a different account was connected) — drop the account-specific state so
+    // the user can pick a valid pipeline. Field mappings are account-agnostic and kept.
+    // On the same account the pipeline still exists, so everything is preserved.
+    if (isHubspot && updates.accountId && config.externalPipelineId) {
+      try {
+        const svc = await HubSpotService.create(userId, updates.accountId);
+        const pipelines = await svc.listDealPipelines();
+        const stillValid = pipelines.some(p => p.id === config.externalPipelineId);
+        if (!stillValid) {
+          config.externalPipelineId = undefined;
+          config.hubspotDealStageMap = undefined;
+          config.lastPushSyncAt = undefined;
+          config.lastPullSyncAt = undefined;
+          config.lastSyncStatus = undefined;
+          config.lastSyncError = undefined;
+        }
+      } catch {
+        // Can't reach HubSpot to validate — leave state intact rather than wiping on a
+        // transient error.
+      }
+    }
+
     await crmDb.setLeadListCrmSyncConfig(listId, provider, config as any);
     return config;
   }
@@ -309,6 +337,28 @@ export class ExternalCrmSyncService {
     const config = await this.getConfig(userId, listId, provider);
     if (!config) return;
     await crmDb.setLeadListCrmSyncConfig(listId, provider, null);
+  }
+
+  /**
+   * Disconnect the OAuth account from a list without wiping field mappings.
+   * Clears accountId, apiKeyEncrypted, and webhookSecret so the account is no
+   * longer "used" (drops out of used-accounts) and can be linked to another list.
+   * All other settings (mappings, autoSyncEnabled, webhookEnabled) are preserved.
+   */
+  async disconnectAccount(userId: string, listId: string, provider: string): Promise<void> {
+    const config = await this.getConfig(userId, listId, provider);
+    if (!config) return;
+    const now = new Date().toISOString();
+    const disconnected: ExternalCrmSyncConfig = {
+      ...config,
+      accountId: undefined,
+      apiKeyEncrypted: undefined,
+      webhookSecret: undefined,
+      autoSyncEnabled: false,
+      // Mark as not configured so the UI returns to account-selection state
+      updatedAt: now,
+    };
+    await crmDb.setLeadListCrmSyncConfig(listId, provider, disconnected as any);
   }
 
   async getDefaultMappings(provider: string): Promise<{
@@ -355,6 +405,25 @@ export class ExternalCrmSyncService {
     const config = await this.getConfig(userId, listId, provider);
     if (!config) throw new Error(`No sync configuration found for list ${listId} / ${provider}`);
     return this.resolveAuth(config);
+  }
+
+  /**
+   * True when the config's stored credential is currently usable:
+   * - token auth (apiKeyEncrypted) is self-contained → always connected
+   * - OAuth (accountId) → only if the account still resolves to a connected
+   *   account (a disconnected/removed/expired account leaves `accountId` set but
+   *   unresolvable). Mirrors the resolution push uses (getAccountById), so this
+   *   is true exactly when a sync would actually authenticate.
+   *
+   * We deliberately keep `accountId` after a disconnect (so reconnecting restores
+   * the list), so the UI can't tell from `accountId` alone that the connection is
+   * dead — this lets it surface a "reconnect needed" state instead.
+   */
+  async isAccountConnected(config: ExternalCrmSyncConfig): Promise<boolean> {
+    if (config.apiKeyEncrypted) return true;
+    if (!config.accountId) return false;
+    const account = await getAccountById(config.accountId, config.userId).catch(() => null);
+    return !!account;
   }
 
   async testConnection(
@@ -435,6 +504,49 @@ export class ExternalCrmSyncService {
         : await AttioService.create(auth.userId!, auth.accountId!);
       return svc.getAllLists();
     }
+  }
+
+  // Re-points a HubSpot list's sync config to a different deal pipeline AFTER the
+  // first sync (the normal saveConfig path locks the pipeline once synced). Clears
+  // the stage map so the next push rebuilds it for the new pipeline. Migration of
+  // existing deals is performed by re-pushing the list (the caller triggers the
+  // push job); the adapter moves each existing deal to config.externalPipelineId.
+  async changePipeline(
+    userId: string,
+    listId: string,
+    provider: string,
+    newPipelineId: string
+  ): Promise<ExternalCrmSyncConfig> {
+    if (provider !== 'hubspot') {
+      throw new Error('Changing the deal pipeline is only supported for HubSpot.');
+    }
+    if (!newPipelineId) {
+      throw new Error('A target pipeline is required.');
+    }
+
+    const config = await this.getConfig(userId, listId, provider);
+    if (!config) throw new Error('No sync configuration found for this list.');
+    if (!config.accountId && !config.apiKeyEncrypted) {
+      throw new Error('No authentication configured for this list.');
+    }
+
+    // Validate the target pipeline exists in the connected HubSpot account.
+    const svc = await this.getHubSpotService(this.resolveAuth(config));
+    const pipelines = await svc.listDealPipelines();
+    if (!pipelines.some(p => p.id === newPipelineId)) {
+      throw new Error(`Pipeline not found in HubSpot: ${newPipelineId}`);
+    }
+
+    // Bypass the saveConfig "locked after sync" guard: write the new pipeline and
+    // clear the stale stage map so the next push recomputes it for the new pipeline.
+    const updated: ExternalCrmSyncConfig = {
+      ...config,
+      externalPipelineId: newPipelineId,
+      hubspotDealStageMap: undefined,
+      updatedAt: new Date().toISOString(),
+    };
+    await crmDb.setLeadListCrmSyncConfig(listId, provider, updated as any);
+    return updated;
   }
 
   // ─── External property discovery ─────────────────────────────────────────────
@@ -660,6 +772,26 @@ export class ExternalCrmSyncService {
     return config?.pushJob ?? null;
   }
 
+  /** Provider-agnostic lookup: returns the first configured provider on the list
+   *  whose push job is currently running (and not stale), for refresh-resume of
+   *  the progress card. Returns null when none. Access-checked like getConfig. */
+  async getRunningPushJobForList(
+    userId: string,
+    listId: string
+  ): Promise<{ provider: string; job: PushJob } | null> {
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return null;
+    const configs = (list as any).externalCrmSyncConfigs as Record<string, ExternalCrmSyncConfig> | undefined;
+    if (!configs) return null;
+    for (const [provider, config] of Object.entries(configs)) {
+      const job = config?.pushJob;
+      if (!job || job.status !== 'running' || this.isPushJobStale(job)) continue;
+      if (!(await this.canAccessConfig(userId, config.userId))) continue;
+      return { provider, job };
+    }
+    return null;
+  }
+
   private isPushJobStale(job: PushJob): boolean {
     const started = Date.parse(job.startedAt);
     if (Number.isNaN(started)) return true;
@@ -674,56 +806,112 @@ export class ExternalCrmSyncService {
       .catch((err: any) => console.error(`[ExternalCrmSync] failed to persist push job ${job.jobId}:`, this.formatError(err)));
   }
 
+  /** Writes live push progress onto the running job (no-op for the synchronous
+   *  pushAllLeads path, which runs runPush without a job). Cheap: one config
+   *  write per 500-lead chunk. */
+  private async reportPushProgress(config: ExternalCrmSyncConfig, processed: number, total?: number): Promise<void> {
+    const job = config.pushJob;
+    if (!job || job.status !== 'running') return;
+    job.processedCount = processed;
+    if (total !== undefined) job.totalCount = total;
+    await this.persistPushJob(config, job);
+  }
+
+  // ─── Per-list push serialization ──────────────────────────────────────────────
+
+  /**
+   * In-process per-list lock. Ensures only ONE push operation (full push or
+   * single-lead auto-sync) runs for a given list at a time, so two concurrent
+   * pushes can't both create a deal for the same lead before either has written
+   * its deal id back (the duplicate-deal race). Serializes within this process
+   * only — cross-instance serialization would require a distributed lock.
+   */
+  private listPushLocks = new Map<string, Promise<unknown>>();
+
+  private async withListPushLock<T>(listId: string, fn: () => Promise<T>): Promise<T> {
+    // Wait for any in-progress push on this list to finish before claiming the lock.
+    while (this.listPushLocks.has(listId)) {
+      try { await this.listPushLocks.get(listId); } catch { /* prior push's failure is its own concern */ }
+    }
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    this.listPushLocks.set(listId, held);
+    try {
+      return await fn();
+    } finally {
+      this.listPushLocks.delete(listId);
+      release();
+    }
+  }
+
   /** Core push loop, operating on an already-resolved config. */
   private async runPush(config: ExternalCrmSyncConfig, listId: string, provider: string): Promise<SyncResult> {
-    // Attach the human-readable list name so adapters can use it when naming external lists
-    if (!config.listName) {
+    // Attach the human-readable list name + seed the progress denominator from the
+    // maintained leadCount (best-effort; used only for the % in the progress card).
+    let totalCount: number | undefined;
+    {
       const list = await crmDb.getLeadListById(listId);
-      if (list?.name) config.listName = list.name;
+      if (list?.name && !config.listName) config.listName = list.name;
+      if (typeof (list as any)?.leadCount === 'number') totalCount = (list as any).leadCount;
     }
 
-    try {
-      await this.syncHubSpotStatusOptions(config, 'push');
-    } catch (err) {
-      console.warn('[ExternalCrmSync] syncHubSpotStatusOptions failed, continuing sync:', (err as Error).message);
-    }
-
-    const auth = this.resolveAuth(config);
-    const adapter = getAdapter(provider);
-
-    const totalResult: SyncResult = { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
-    let lastKey: any = undefined;
-    let hasLeads = false;
-
-    do {
-      const page = await crmDb.getLeadsByListId(listId, 500, lastKey);
-      const chunk = page.items as any[];
-      lastKey = page.lastEvaluatedKey;
-
-      if (chunk.length > 0) {
-        hasLeads = true;
-        const chunkResult = await adapter.pushLeads(auth, chunk, config);
-
-        // Accumulate results
-        totalResult.successCount += chunkResult.successCount;
-        totalResult.newCount += chunkResult.newCount;
-        totalResult.updatedCount += chunkResult.updatedCount;
-        totalResult.errorCount += chunkResult.errorCount;
-        if (chunkResult.errors?.length > 0) {
-          totalResult.errors.push(...chunkResult.errors);
-        }
+    // Serialize all pushes for this list (full push + single-lead auto-sync) so two
+    // concurrent runs can't both create a deal for the same lead before either has
+    // written its deal id back (the duplicate-deal race).
+    return this.withListPushLock(listId, async () => {
+      try {
+        await this.syncHubSpotStatusOptions(config, 'push');
+      } catch (err) {
+        console.warn('[ExternalCrmSync] syncHubSpotStatusOptions failed, continuing sync:', (err as Error).message);
       }
-    } while (lastKey);
 
-    if (!hasLeads) {
-      return { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
-    }
+      const auth = this.resolveAuth(config);
+      const adapter = getAdapter(provider);
 
-    // Persist updated externalPeopleListId if the adapter set it
-    await this.saveUpdatedConfig(config);
-    await this.updateSyncTimestamp(config, 'push', totalResult.errorCount === 0);
+      const totalResult: SyncResult = { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
+      let lastKey: any = undefined;
+      let hasLeads = false;
 
-    return totalResult;
+      let processed = 0;
+      await this.reportPushProgress(config, 0, totalCount);
+
+      // One scratchpad shared across all chunks so the adapter can resolve its
+      // CRM client once and reuse per-connection caches (e.g. ensured props).
+      const pushCtx: Record<string, unknown> = {};
+
+      do {
+        const page = await crmDb.getLeadsByListId(listId, 500, lastKey);
+        const chunk = page.items as any[];
+        lastKey = page.lastEvaluatedKey;
+
+        if (chunk.length > 0) {
+          hasLeads = true;
+          const chunkResult = await adapter.pushLeads(auth, chunk, config, pushCtx);
+
+          // Accumulate results
+          totalResult.successCount += chunkResult.successCount;
+          totalResult.newCount += chunkResult.newCount;
+          totalResult.updatedCount += chunkResult.updatedCount;
+          totalResult.errorCount += chunkResult.errorCount;
+          if (chunkResult.errors?.length > 0) {
+            totalResult.errors.push(...chunkResult.errors);
+          }
+
+          processed += chunk.length;
+          await this.reportPushProgress(config, processed, totalCount);
+        }
+      } while (lastKey);
+
+      if (!hasLeads) {
+        return { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
+      }
+
+      // Persist updated externalPeopleListId if the adapter set it
+      await this.saveUpdatedConfig(config);
+      await this.updateSyncTimestamp(config, 'push', totalResult.errorCount === 0);
+
+      return totalResult;
+    });
   }
 
   // ─── Pull: CRM → all leads ────────────────────────────────────────────────────
@@ -789,7 +977,7 @@ export class ExternalCrmSyncService {
         const externalId = lead.syncMetadata?.[idField];
         if (!externalId) continue;                          // never synced — skip
         if (seenSet.has(externalId)) continue;              // still exists in CRM — skip
-        if (lead.syncMetadata?.crmRemovedAt) continue;      // already marked — skip
+        if (lead.syncMetadata?.crmRemovedAt || lead.syncMetadata?.crmRemoved) continue; // already marked — skip
 
         await crmDb.updateLead(listId, lead.leadId, {
           syncMetadata: {
@@ -818,12 +1006,24 @@ export class ExternalCrmSyncService {
       config = await this.getConfig(userId, listId, provider);
       if (!config?.autoSyncEnabled) return;
       if (!config.accountId && !config.apiKeyEncrypted) return;
+      // Capture the non-null config so the narrowing flows into the lock closure
+      // below (the reassignable `config` would widen back to `… | null` inside it).
+      const cfg = config;
 
-      await this.syncHubSpotStatusOptions(config, 'push');
-
-      const auth = this.resolveAuth(config);
+      const auth = this.resolveAuth(cfg);
       const adapter = getAdapter(provider);
-      const result = await adapter.pushLeads(auth, [lead], config);
+      // Serialize with any concurrent push for this list, and re-read the lead
+      // inside the lock so a deal id written by a just-finished push is seen here
+      // (update instead of creating a duplicate deal).
+      const result = await this.withListPushLock(listId, async () => {
+        await this.syncHubSpotStatusOptions(cfg, 'push');
+        // Re-read inside the lock so a deal id written by a just-finished push is
+        // seen here (update instead of creating a duplicate deal). Defensive: a
+        // transient read error shouldn't fail the whole auto-sync — fall back to
+        // the in-hand lead.
+        const fresh = await this.reReadLead(listId, lead);
+        return adapter.pushLeads(auth, [fresh], cfg);
+      });
 
       // The adapter catches per-lead failures (e.g. an invalid email) into
       // result.errors rather than throwing. A real-time auth failure (revoked
@@ -856,6 +1056,20 @@ export class ExternalCrmSyncService {
   }
 
   // ─── Private helpers ──────────────────────────────────────────────────────────
+
+  /**
+   * Re-reads a lead by id (used inside the per-list push lock so a deal id a
+   * just-finished push wrote back is visible here). Falls back to the in-hand
+   * lead on any error — a transient read failure shouldn't abort the auto-sync.
+   */
+  private async reReadLead(listId: string, lead: any): Promise<any> {
+    try {
+      const fresh = await crmDb.getLeadById(listId, lead.leadId);
+      return fresh ?? lead;
+    } catch {
+      return lead;
+    }
+  }
 
   private async saveUpdatedConfig(config: ExternalCrmSyncConfig): Promise<void> {
     await crmDb.setLeadListCrmSyncConfig(config.listId, config.provider, config as any)

@@ -239,6 +239,8 @@ app.use((req, res, next) => {
 app.use("/api/stripe/webhook", express.raw({ type: "application/json" }));
 // Stripe Connect webhook needs its own raw-body handler — also before express.json().
 app.use("/api/stripe/connect/webhook", express.raw({ type: "application/json" }));
+// HubSpot webhook needs raw body for HMAC-SHA256 signature verification.
+app.use("/api/webhooks/hubspot", express.raw({ type: "application/json" }));
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(passport.initialize());
