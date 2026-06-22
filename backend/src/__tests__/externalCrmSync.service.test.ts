@@ -5,6 +5,7 @@ import { ExternalCrmSyncService, ExternalCrmSyncConfig, FieldMapping } from '../
 jest.mock('../services/db', () => ({
   crmDb: {
     getLeadListById: jest.fn(),
+    getLeadById: jest.fn(),
     getLeadsByListId: jest.fn(),
     updateLead: jest.fn(),
     batchCreateLeads: jest.fn(),
@@ -169,6 +170,10 @@ describe('ExternalCrmSyncService', () => {
     mockHubSpotServiceInstance.createDealStage.mockResolvedValue({ id: 'stage_1', label: 'Stage 1', displayOrder: 0, metadata: { probability: 0.1 } });
     mockHubSpotServiceInstance.listDealPipelines.mockResolvedValue([]);
     mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+    // Default: re-read returns nothing so reReadLead falls back to the in-hand
+    // lead (preserves existing tests). The propagation tests below override this.
+    mockCrmDb.getLeadById.mockResolvedValue(undefined as any);
+    mockCrmDb.updateLead.mockResolvedValue(undefined as any);
     service = new ExternalCrmSyncService();
   });
 
@@ -1153,6 +1158,59 @@ describe('ExternalCrmSyncService', () => {
       expect(saved.lastSyncStatus).toBe('success');
       expect(saved.lastSyncError).toBeUndefined();
       expect(saved.lastPushSyncAt).toBeTruthy();
+    });
+
+    // ─── per-lead status propagation (Task 2 supplies the behaviour) ──────────
+    describe('autoSyncLead — per-lead status propagation', () => {
+      it('forwards the re-read lead to the adapter and marks it synced on success', async () => {
+        const config = makeConfig({ autoSyncEnabled: true });
+        mockListWithConfig(config);
+        // The lock re-reads the lead by id before pushing; return a fresh copy so
+        // we can verify the re-read object (not the in-hand one) is forwarded.
+        const fresh = { leadId: 'l1', listId: 'list1', email: 'a@b.com', firstName: 'Ada' };
+        mockCrmDb.getLeadById.mockResolvedValue(fresh as any);
+
+        await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com' }, 'hubspot', 'updated');
+
+        // The re-read lead was used (looked up by listId + leadId).
+        expect(mockCrmDb.getLeadById).toHaveBeenCalledWith('list1', 'l1');
+        // The adapter's per-lead success writeback marks the re-read lead synced.
+        const meta = mockCrmDb.updateLead.mock.calls.at(-1)?.[2]?.syncMetadata as Record<string, any> | undefined;
+        expect(meta?.syncStatus).toBe('synced');
+        expect(meta?.hubspot_contact_id).toBeTruthy();
+        expect(typeof meta?.lastSyncedAt).toBe('string');
+      });
+
+      it('marks the lead sync_failed when the adapter reports a per-lead error', async () => {
+        const config = makeConfig({ autoSyncEnabled: true });
+        mockListWithConfig(config);
+        // An invalid email is caught per-lead into result.errors (no throw); the
+        // adapter writes sync_failed for that lead before returning.
+        mockCrmDb.getLeadById.mockResolvedValue(
+          { leadId: 'l1', listId: 'list1', email: 'not-an-email' } as any,
+        );
+
+        await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'not-an-email' }, 'hubspot', 'created');
+
+        const failedWriteback = mockCrmDb.updateLead.mock.calls.find(
+          (c) => (c[2] as any)?.syncMetadata?.syncStatus === 'sync_failed',
+        );
+        expect(failedWriteback).toBeDefined();
+        expect((failedWriteback![2] as any).syncMetadata.syncError).toBeTruthy();
+      });
+
+      it('does nothing per-lead (no adapter push, no status write) when auto-sync is disabled', async () => {
+        const config = makeConfig({ autoSyncEnabled: false });
+        mockListWithConfig(config);
+
+        await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com' }, 'hubspot', 'updated');
+
+        // Auto-sync returns before resolving the adapter / HubSpot service, so no
+        // push happens and no per-lead sync status is written.
+        expect(mockHubSpotCreate).not.toHaveBeenCalled();
+        expect(mockHubSpotFromToken).not.toHaveBeenCalled();
+        expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+      });
     });
   });
 
