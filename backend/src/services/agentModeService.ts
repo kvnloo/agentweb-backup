@@ -106,6 +106,7 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
 const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
+import { twitterService } from './twitterService';
 import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
 import { HubSpotService } from './hubspotService';
@@ -26263,6 +26264,138 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         message: 'LinkedIn outreach action failed',
         error: errorMessage
       };
+    }
+  }
+
+  // --- Twitter / X outreach ---
+
+  /**
+   * Dispatch Twitter/X actions for Emma via the official X API (twitterService).
+   * Actions: post-tweet, reply, post-thread, send-dm, list-dms, get-profile.
+   *
+   * X has no site-wide read account (unlike LinkedIn), so every action requires
+   * an account owned by the caller or shared with their org. The owner's userId is
+   * passed to twitterService so refreshed OAuth tokens are written back to the
+   * owner's record. When list_id/lead_id/lead_email are supplied, sent tweets and
+   * DMs are logged to AW-EmailEvents for CRM parity with LinkedIn.
+   */
+  async twitterOutreach(userId: string, args: any): Promise<any> {
+    let { account_id } = args;
+    const action = (args.action as string)?.replace(/_/g, '-');
+    const { text, in_reply_to_tweet_id, handle, recipient_handle, tweets, list_id, lead_id, lead_email } = args;
+    console.log(`[AgentMode] twitterOutreach called: action=${action}, account_id=${account_id}`);
+
+    const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+    const twitterAccounts = (await getAccountsWithOwnerIncludingOrgShared(userId))
+      .filter((a: any) => a.platform === 'twitter');
+
+    if (twitterAccounts.length === 0) {
+      return {
+        success: false,
+        error: 'No X (Twitter) account is connected. Connect your X account in Settings → Connected Accounts.',
+      };
+    }
+
+    let account: any;
+    if (account_id) {
+      account = twitterAccounts.find((a: any) => a.account_id === account_id);
+      if (!account) {
+        return { success: false, error: `X account ${account_id} is not connected to your profile.` };
+      }
+    } else if (twitterAccounts.length === 1) {
+      account = twitterAccounts[0];
+    } else {
+      return {
+        success: false,
+        error: 'Multiple X accounts are connected — specify account_id. Use list_connected_accounts(platform="twitter").',
+      };
+    }
+
+    const ownerUserId = account.userId;
+    account_id = account.account_id;
+
+    // Best-effort CRM logging — never fails the action.
+    const logCrm = async (
+      eventType: 'twitter.tweet.sent' | 'twitter.dm.sent',
+      messageProviderId: string,
+      bodyText: string
+    ): Promise<void> => {
+      if (!list_id || !lead_id || !lead_email) return;
+      try {
+        const { emailEventsDb } = await import('./emailEventsDb');
+        await emailEventsDb.addTwitterMessageEvent({
+          eventId: `twitter_${eventType.includes('dm') ? 'dm' : 'tweet'}_${messageProviderId}`,
+          emailDomain: `twitter-${list_id}`,
+          leadEmail: lead_email,
+          eventType,
+          text: bodyText ?? null,
+          timestamp: new Date().toISOString(),
+          senderId: account_id,
+          messageProviderId,
+        });
+      } catch (e) {
+        console.error('[AgentMode] twitterOutreach CRM logging failed (non-fatal):', e);
+      }
+    };
+
+    try {
+      switch (action) {
+        case 'post-tweet': {
+          if (!text) throw new Error('text is required for post-tweet');
+          const result = await twitterService.postTweet(ownerUserId, account_id, text);
+          await logCrm('twitter.tweet.sent', result.id, result.text);
+          return { success: true, data: result };
+        }
+
+        case 'reply': {
+          if (!text) throw new Error('text is required for reply');
+          if (!in_reply_to_tweet_id) throw new Error('in_reply_to_tweet_id is required for reply');
+          const result = await twitterService.postTweet(ownerUserId, account_id, text, {
+            inReplyToTweetId: in_reply_to_tweet_id,
+          });
+          await logCrm('twitter.tweet.sent', result.id, result.text);
+          return { success: true, data: result };
+        }
+
+        case 'post-thread': {
+          if (!Array.isArray(tweets) || tweets.length === 0) {
+            throw new Error('tweets (non-empty array of strings) is required for post-thread');
+          }
+          const result = await twitterService.postThread(ownerUserId, account_id, tweets);
+          if (result[0]) await logCrm('twitter.tweet.sent', result[0].id, result[0].text);
+          return { success: true, data: result };
+        }
+
+        case 'send-dm': {
+          const target = recipient_handle || handle;
+          if (!target) throw new Error('recipient_handle is required for send-dm');
+          if (!text) throw new Error('text is required for send-dm');
+          const result = await twitterService.sendDm(ownerUserId, account_id, target, text);
+          await logCrm('twitter.dm.sent', result?.dm_event_id || `${account_id}_${Date.now()}`, text);
+          return { success: true, data: result };
+        }
+
+        case 'list-dms': {
+          const result = await twitterService.listDms(ownerUserId, account_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-profile': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for get-profile');
+          const result = await twitterService.getProfile(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        default: {
+          const validActions = ['post-tweet', 'reply', 'post-thread', 'send-dm', 'list-dms', 'get-profile'];
+          throw new Error(`Unsupported Twitter outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
+        }
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      console.error('AgentMode: Twitter outreach failed:', errorMessage);
+      return { success: false, message: 'Twitter outreach action failed', error: errorMessage };
     }
   }
 

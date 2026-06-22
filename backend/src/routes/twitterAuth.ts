@@ -1,0 +1,181 @@
+import express from 'express';
+import crypto from 'crypto';
+import { twitterService } from '../services/twitterService';
+import { createAccount, deleteAccountById, TwitterXConfig } from '../services/connectedAccountsDb';
+import { authenticateToken } from '../middleware/auth';
+
+const router = express.Router();
+
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const PKCE_SESSION_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute
+
+// X API v2 OAuth2 scopes. offline.access is required to receive a refresh_token
+// (access tokens expire ~2h). dm.* enable DM read/send.
+const TWITTER_SCOPES = [
+  'tweet.read',
+  'tweet.write',
+  'users.read',
+  'dm.read',
+  'dm.write',
+  'offline.access',
+];
+
+const getRedirectUri = (): string =>
+  `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/twitter/callback`;
+
+// ── PKCE session store (server-side, one-time use) ──────────────────────────
+// Holds the codeVerifier produced at /init keyed by the OAuth state, so it can
+// be retrieved at /finalize to complete the PKCE exchange. Mirrors the gmailAuth
+// token-session pattern (in-memory, userId-bound, TTL, one-time use).
+interface PkceSession {
+  userId: string;
+  codeVerifier: string;
+  expires: number;
+}
+
+const pkceSessions = new Map<string, PkceSession>();
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [state, session] of pkceSessions.entries()) {
+    if (now > session.expires) pkceSessions.delete(state);
+  }
+}, SESSION_CLEANUP_INTERVAL_MS).unref();
+
+const storePkceSession = (state: string, userId: string, codeVerifier: string): void => {
+  pkceSessions.set(state, { userId, codeVerifier, expires: Date.now() + PKCE_SESSION_TTL_MS });
+};
+
+const retrievePkceSession = (state: string, userId: string): string | null => {
+  const session = pkceSessions.get(state);
+  if (!session || session.userId !== userId || Date.now() > session.expires) {
+    pkceSessions.delete(state);
+    return null;
+  }
+  pkceSessions.delete(state); // one-time use
+  return session.codeVerifier;
+};
+
+// ── GET /init — build X authorization URL (OAuth2 + PKCE) ───────────────────
+
+router.get('/init', authenticateToken, async (req: any, res) => {
+  try {
+    const client = await twitterService.getAppClient();
+    const { url, codeVerifier, state } = client.generateOAuth2AuthLink(getRedirectUri(), {
+      scope: TWITTER_SCOPES,
+    });
+    storePkceSession(state, req.user.userId, codeVerifier);
+    res.json({ success: true, url });
+  } catch (error: any) {
+    console.error('[Twitter OAuth /init]', error);
+    res.status(500).json({ error: 'Failed to initialize Twitter OAuth' });
+  }
+});
+
+// ── GET /callback — receive redirect from X, forward to frontend ────────────
+
+router.get('/callback', (req, res) => {
+  const { code, state, error } = req.query;
+  const frontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+
+  if (error) {
+    return res.redirect(`${frontendUrl}/oauth/twitter/callback?error=twitter_access_denied&details=${error}`);
+  }
+  if (!code) {
+    return res.redirect(`${frontendUrl}/oauth/twitter/callback?error=no_code_provided`);
+  }
+
+  res.redirect(`${frontendUrl}/oauth/twitter/callback?code=${code}&state=${state}`);
+});
+
+// ── POST /finalize — exchange code for tokens, persist account ──────────────
+
+router.post('/finalize', authenticateToken, async (req: any, res) => {
+  const { code, state } = req.body;
+  const userId = req.user.userId;
+
+  if (!code || typeof code !== 'string' || code.trim() === '') {
+    return res.status(400).json({ error: 'Invalid or missing OAuth code' });
+  }
+  if (!state || typeof state !== 'string' || state.trim() === '') {
+    return res.status(400).json({ error: 'Invalid or missing state parameter' });
+  }
+
+  const codeVerifier = retrievePkceSession(state, userId);
+  if (!codeVerifier) {
+    return res.status(401).json({ error: 'Invalid or expired OAuth state. Please reconnect.' });
+  }
+
+  try {
+    const app = await twitterService.getAppClient();
+    const { client, accessToken, refreshToken, expiresIn } = await app.loginWithOAuth2({
+      code,
+      codeVerifier,
+      redirectUri: getRedirectUri(),
+    });
+
+    const me = await client.v2.me();
+    const profile = me.data;
+
+    const config: TwitterXConfig = {
+      account_type: 'personal',
+      twitter_user_id: profile.id,
+      username: profile.username,
+      access_token: accessToken,
+      refresh_token: refreshToken || '',
+      token_expires_at: Date.now() + (expiresIn ?? 7200) * 1000,
+      scopes: TWITTER_SCOPES,
+    };
+
+    const account = await createAccount(userId, 'twitter', {
+      account_id: profile.id,
+      account_name: `@${profile.username}`,
+      config,
+    });
+
+    res.json({ success: true, account });
+  } catch (error: any) {
+    console.error('[Twitter OAuth /finalize]', error);
+    const details = IS_PRODUCTION ? undefined : error.message;
+    res.status(500).json({ error: 'Failed to finalize Twitter connection', ...(details && { details }) });
+  }
+});
+
+// ── POST /reconnect — re-run the OAuth flow (same as init) ───────────────────
+
+router.post('/reconnect', authenticateToken, async (req: any, res) => {
+  try {
+    const client = await twitterService.getAppClient();
+    const { url, codeVerifier, state } = client.generateOAuth2AuthLink(getRedirectUri(), {
+      scope: TWITTER_SCOPES,
+    });
+    storePkceSession(state, req.user.userId, codeVerifier);
+    res.json({ success: true, url });
+  } catch (error: any) {
+    console.error('[Twitter OAuth /reconnect]', error);
+    res.status(500).json({ error: 'Failed to initialize Twitter reconnect' });
+  }
+});
+
+// ── DELETE /disconnect — remove the connected account ───────────────────────
+
+router.delete('/disconnect', authenticateToken, async (req: any, res) => {
+  const { accountId } = req.body;
+  const userId = req.user.userId;
+
+  if (!accountId) {
+    return res.status(400).json({ error: 'Missing accountId' });
+  }
+
+  try {
+    await deleteAccountById(userId, 'twitter', accountId);
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error('[Twitter OAuth /disconnect]', error);
+    const details = IS_PRODUCTION ? undefined : error.message;
+    res.status(500).json({ error: 'Failed to disconnect Twitter account', ...(details && { details }) });
+  }
+});
+
+export default router;

@@ -477,6 +477,80 @@ For target person identification (send-invite, send-message, get-profile, update
 });
 
 emmaToolRegistry.register({
+  name: 'twitter_outreach',
+  definition: {
+    name: 'twitter_outreach',
+    description: `Twitter/X tool via a connected X account (official X API). To find the account_id, call list_connected_accounts(platform='twitter'). account_id is optional when the user has exactly one X account connected.
+
+Actions:
+- post-tweet: Post a tweet. Requires text. Text over 280 chars is auto-trimmed on a word boundary before sending.
+- reply: Reply to a tweet (also used to build threads). Requires text and in_reply_to_tweet_id (the id of the tweet being replied to).
+- post-thread: Post a chained thread. Requires tweets (an array of strings, one per tweet). Each entry is auto-trimmed to 280 chars.
+- send-dm: Send a direct message to an X user. Requires recipient_handle (the @handle) and text. The backend resolves the handle to the user id automatically. DM text over 10000 chars is auto-trimmed.
+- list-dms: List recent direct message events for the connected account.
+- get-profile: Get an X user's profile by handle. Requires handle.
+
+For CRM logging of sent tweets/DMs, optionally pass list_id, lead_id and lead_email — when all three are present the message is recorded to the lead's CRM engagement history.
+
+Notes: Quote tweets and people-search are not supported. Replying to arbitrary third-party tweets may be restricted by X.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['post-tweet', 'reply', 'post-thread', 'send-dm', 'list-dms', 'get-profile'],
+          description: 'The Twitter/X action to perform.'
+        },
+        account_id: {
+          type: 'string',
+          description: 'The X account id. Optional when the user has exactly one X account connected. Obtain via list_connected_accounts(platform=\'twitter\').'
+        },
+        text: {
+          type: 'string',
+          description: 'Tweet or DM text. Required for post-tweet, reply, and send-dm. Auto-trimmed to 280 (tweet) or 10000 (DM) chars on a word boundary.'
+        },
+        in_reply_to_tweet_id: {
+          type: 'string',
+          description: 'The id of the tweet being replied to. Required for reply.'
+        },
+        tweets: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of tweet texts for post-thread, posted as a chained thread in order.'
+        },
+        recipient_handle: {
+          type: 'string',
+          description: 'The @handle of the DM recipient. Required for send-dm.'
+        },
+        handle: {
+          type: 'string',
+          description: 'The @handle to look up. Required for get-profile.'
+        },
+        list_id: {
+          type: 'string',
+          description: 'CRM lead list ID. Optional — provide with lead_id and lead_email to log the sent tweet/DM to CRM history.'
+        },
+        lead_id: {
+          type: 'string',
+          description: 'CRM lead ID. Optional — provide with list_id and lead_email for CRM logging.'
+        },
+        lead_email: {
+          type: 'string',
+          description: 'CRM lead email. Optional — provide with list_id and lead_id for CRM logging.'
+        }
+      },
+      required: ['action']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId) {
+      throw new Error("Missing user context");
+    }
+    return await agentModeService.twitterOutreach(context.userId, args);
+  }
+});
+
+emmaToolRegistry.register({
   name: 'list_meta_ads_campaigns',
   definition: {
     name: 'list_meta_ads_campaigns',

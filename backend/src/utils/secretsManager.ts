@@ -334,6 +334,48 @@ export async function getGmailCredentials(): Promise<GmailCredentials> {
 }
 
 /**
+ * Interface for Twitter/X OAuth2 credentials returned from Secrets Manager
+ */
+export interface TwitterCredentials {
+  clientId: string;
+  clientSecret: string;
+}
+
+/**
+ * Get Twitter/X OAuth2 (Authorization Code + PKCE) client credentials from AWS Secrets Manager.
+ *
+ * Secret location: dev/AgentWeb/TwitterX (or prod/AgentWeb/TwitterX for production)
+ * Secret format: { "clientId": "...", "clientSecret": "..." }
+ *
+ * @returns Twitter/X OAuth2 client credentials
+ */
+export async function getTwitterCredentials(): Promise<TwitterCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/TwitterX'
+      : 'dev/AgentWeb/TwitterX';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('Twitter credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as TwitterCredentials;
+
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new Error('Twitter credentials missing clientId or clientSecret');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching Twitter credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch Twitter credentials from Secrets Manager');
+  }
+}
+
+/**
  * Get YouTube OAuth credentials from AWS Secrets Manager.
  * Reuses the Gmail Google OAuth credentials (same Google Cloud project).
  *
