@@ -35,6 +35,7 @@ import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
 import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmMutationEvents';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { publishWithResolvedBlogPublisher } from './blogPublishers';
+import { enqueueAutoHumanEval } from './autoHumanEvalService';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -18193,6 +18194,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         } catch (error) {
           console.warn('Failed to store image generation metadata:', error);
         }
+
+        void enqueueAutoHumanEval({
+          reviewType: 'creative_image',
+          userId,
+          sessionId,
+          artifactUrl: result.imageUrl,
+          originalRequest: prompt,
+          outputSummary:
+            `Image generated: ${result.filename || filename}. ` +
+            `Model: ${imageModelUsed}. Size: ${size || 'default'}. Quality: ${quality || 'default'}.`,
+          sourceKey: `image:${sessionId}:${result.filename || filename}:${result.imageUrl}`,
+          action: {
+            type: 'agent_mode_image_revision',
+            sessionId,
+            userId,
+            artifactUrl: result.imageUrl,
+            filename: result.filename || filename,
+          },
+        });
 
         return {
           success: true,

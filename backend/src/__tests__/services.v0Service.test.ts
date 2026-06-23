@@ -61,6 +61,7 @@ jest.mock("../utils/secretsManager", () => ({
   getV0ApiKey: (...args: any[]) => mockGetV0ApiKey(...args),
   getGitHubOrgToken: jest.fn().mockResolvedValue({ token: "test-gh-token", org: "TestOrg" }),
   getVercelToken: jest.fn().mockResolvedValue("test-vercel-token"),
+  getLandingPagesConfig: jest.fn().mockResolvedValue({ ga4MeasurementId: undefined }),
   getSecret: jest.fn().mockResolvedValue('{"apiKey":"test-key"}'),
   secretExists: jest.fn().mockResolvedValue(true),
 }));
@@ -110,6 +111,9 @@ jest.mock("../services/settingsService", () => ({
     getSetting: (...args: any[]) => mockGetSetting(...args),
   },
 }));
+jest.mock("../services/autoHumanEvalService", () => ({
+  enqueueAutoHumanEval: jest.fn().mockResolvedValue(null),
+}), { virtual: true });
 
 // Mock fs for filesystem fallback tests
 const mockFsExistsSync = jest.fn().mockReturnValue(false);
@@ -168,6 +172,17 @@ import {
 
 import { setV0PollIntervals, setVercelPollConfig } from "../services/v0Service";
 import { _resetV0UsageGuardForTest } from "../services/v0UsageGuard";
+const { enqueueAutoHumanEval } = jest.requireMock("../services/autoHumanEvalService");
+
+async function createMinimalV0Zip(): Promise<Buffer> {
+  const AdmZip = (await import("adm-zip")).default;
+  const zip = new AdmZip();
+  zip.addFile(
+    "app/page.tsx",
+    Buffer.from("export default function Page() { return <main>Hi</main>; }"),
+  );
+  return zip.toBuffer();
+}
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -936,6 +951,86 @@ describe("v0Service - deployLandingPage", () => {
 
     // Verify it polled 3 times before finding the version
     expect(mockChatsGetById).toHaveBeenCalledTimes(3);
+  });
+
+  it("sends successful landing-page deployments to Matt for human eval", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page-1",
+            userId: "user-1",
+            name: "Demo Landing Page",
+            prompt: "Build a demo landing page",
+            status: "draft",
+            v0ChatId: "chat_1",
+            iterations: 0,
+            originatingSessionId: "session-1",
+          },
+        }),
+    });
+    mockChatsGetById.mockResolvedValueOnce({
+      id: "chat_1",
+      latestVersion: { id: "ver_1" },
+    });
+    mockChatsDownloadVersion.mockResolvedValueOnce(await createMinimalV0Zip());
+    mockAxiosGet.mockImplementation((url: string) => {
+      if (url.includes("/git/ref/heads/main")) {
+        return Promise.resolve({ data: { object: { sha: "base-sha" } } });
+      }
+      if (url === "https://api.github.com/repos/AgentWebPro/repo") {
+        return Promise.resolve({ data: { id: 12345 } });
+      }
+      if (url.includes("/v6/deployments")) {
+        return Promise.resolve({
+          data: { deployments: [{ uid: "dpl_1", readyState: "READY", meta: { githubCommitSha: "commit-sha" } }] },
+        });
+      }
+      if (url.includes("/v9/projects/prj_1")) {
+        return Promise.resolve({ data: { targets: { production: { alias: ["demo.vercel.app"] } } } });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    mockAxiosPost.mockImplementation((url: string) => {
+      if (url.includes("/orgs/TestOrg/repos")) {
+        return Promise.resolve({ data: { name: "repo", full_name: "AgentWebPro/repo", html_url: "https://github.com/AgentWebPro/repo" } });
+      }
+      if (url.includes("/git/blobs")) {
+        return Promise.resolve({ data: { sha: `blob-${mockAxiosPost.mock.calls.length}` } });
+      }
+      if (url.includes("/git/trees")) {
+        return Promise.resolve({ data: { sha: "tree-sha" } });
+      }
+      if (url.includes("/git/commits")) {
+        return Promise.resolve({ data: { sha: "commit-sha" } });
+      }
+      if (url === "https://api.vercel.com/v10/projects") {
+        return Promise.resolve({ data: { id: "prj_1", name: "demo", targets: { production: { alias: ["demo.vercel.app"] } } } });
+      }
+      if (url === "https://api.vercel.com/v13/deployments") {
+        return Promise.resolve({ data: { uid: "dpl_1" } });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    mockAxiosPatch.mockResolvedValue({ data: {} });
+
+    const result = await deployLandingPage("page-1", "user-1");
+
+    expect(result.status).toBe("deployed");
+    expect(enqueueAutoHumanEval).toHaveBeenCalledWith(expect.objectContaining({
+      reviewType: "landing_page",
+      userId: "user-1",
+      sessionId: "session-1",
+      artifactUrl: "https://healed-root.agentwebforms.com",
+      originalRequest: "Build a demo landing page",
+      outputSummary: expect.stringContaining("Demo Landing Page"),
+      sourceKey: "landing-page:page-1:iteration:0:url:https://healed-root.agentwebforms.com",
+      action: {
+        type: "landing_page_iteration_deploy",
+        landingPageId: "page-1",
+        userId: "user-1",
+      },
+    }));
   });
 
   it("FAIL: chats.downloadVersion throws → throws deployment error", async () => {

@@ -10,6 +10,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { getExecutionsWithAssets } from '../routes/tasks';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
+import { enqueueAutoHumanEval } from '../services/autoHumanEvalService';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -81,6 +82,66 @@ emmaToolRegistry.register({
     };
   }
 });
+
+function outputFieldNames(outputFields: unknown): string[] {
+  if (!Array.isArray(outputFields)) return [];
+  return outputFields
+    .map((field: any) => typeof field?.name === 'string' ? field.name : '')
+    .filter(Boolean);
+}
+
+function actionOutputFields(outputFields: unknown): Array<{ name: string; instruction: string; overwrite_policy?: 'fill_if_empty' | 'always_overwrite' }> {
+  if (!Array.isArray(outputFields)) return [];
+  return outputFields
+    .map((field: any) => ({
+      name: typeof field?.name === 'string' ? field.name : '',
+      instruction: typeof field?.instruction === 'string' ? field.instruction : '',
+      overwrite_policy: field?.overwrite_policy === 'always_overwrite' ? 'always_overwrite' as const : undefined,
+    }))
+    .filter((field) => field.name && field.instruction);
+}
+
+function enqueueLeadEnrichmentEval(input: {
+  summary: any;
+  userId?: string;
+  sessionId?: string;
+  listId: string;
+  leadId?: string;
+  leadIds?: string[];
+  outputFields: unknown;
+  toolName: 'enrich_leads_execute' | 'enrich_lead_custom';
+}): void {
+  const processedCount = Number(input.summary?.processedCount ?? 0);
+  if (!input.userId || processedCount <= 0) return;
+
+  const fields = outputFieldNames(input.outputFields);
+  const runId = typeof input.summary?.runId === 'string' && input.summary.runId
+    ? input.summary.runId
+    : `${input.toolName}:${input.listId}:${input.leadId || 'all'}:${fields.join(',')}`;
+  const target = input.leadId
+    ? `list=${input.listId} lead=${input.leadId}`
+    : `list=${input.listId}`;
+
+  void enqueueAutoHumanEval({
+    reviewType: 'lead_enrichment',
+    userId: input.userId,
+    sessionId: input.sessionId,
+    originalRequest: `${input.toolName} ${target} fields=${fields.join(',') || '(none)'}`,
+    outputSummary:
+      `Lead enrichment completed: processed ${processedCount} lead(s), ` +
+      `failed ${Number(input.summary?.failedCount ?? 0)}. Fields: ${fields.join(', ') || '(none)'}.`,
+    sourceKey: `lead-enrichment:${runId}`,
+    action: {
+      type: 'lead_enrichment_rerun',
+      userId: input.userId,
+      listId: input.listId,
+      leadId: input.leadId,
+      leadIds: input.leadIds,
+      outputFields: actionOutputFields(input.outputFields),
+      toolName: input.toolName,
+    },
+  });
+}
 
 emmaToolRegistry.register({
   name: 'install_skills',
@@ -5941,7 +6002,7 @@ output_fields guidance: one entry per distinct data point. Each entry has a snak
     }
     const { runEmmaEnrichment, pickPreviewLeadIds } = await import('./enrichmentToolRunner');
     const leadIds = await pickPreviewLeadIds(args.list_id, args.lead_ids);
-    return await runEmmaEnrichment({
+    const summary = await runEmmaEnrichment({
       listId: args.list_id,
       userId: context.userId,
       outputFields: args.output_fields,
@@ -5950,6 +6011,7 @@ output_fields guidance: one entry per distinct data point. Each entry has a snak
       socketId: context.socketId,
       socketEmit: context.socketEmit,
     });
+    return summary;
   },
 });
 
@@ -6010,7 +6072,7 @@ Call enrich_leads_preview first. For a single-list enrichment, ask the user to c
         `Narrow it with lead_ids, or run a full enrichment from the CRM page's Enrichment Config.`,
       );
     }
-    return await runEmmaEnrichment({
+    const summary = await runEmmaEnrichment({
       listId: args.list_id,
       userId: context.userId,
       outputFields: args.output_fields,
@@ -6019,6 +6081,16 @@ Call enrich_leads_preview first. For a single-list enrichment, ask the user to c
       socketId: context.socketId,
       socketEmit: context.socketEmit,
     });
+    enqueueLeadEnrichmentEval({
+      summary,
+      userId: context.userId,
+      sessionId: context.sessionId,
+      listId: args.list_id,
+      leadIds,
+      outputFields: args.output_fields,
+      toolName: 'enrich_leads_execute',
+    });
+    return summary;
   },
 });
 
@@ -6071,6 +6143,15 @@ output_fields: one entry per field to populate, each with a snake_case "name", a
       leadIds: [args.lead_id],
       socketId: context.socketId,
       socketEmit: context.socketEmit,
+    });
+    enqueueLeadEnrichmentEval({
+      summary,
+      userId: context.userId,
+      sessionId: context.sessionId,
+      listId: args.list_id,
+      leadId: args.lead_id,
+      outputFields: args.output_fields,
+      toolName: 'enrich_lead_custom',
     });
 
     // Read the lead back so we can return the actual enriched values.

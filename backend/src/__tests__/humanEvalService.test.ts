@@ -55,8 +55,12 @@ function makeHarness() {
     recordFeedback: jest.fn(async () => undefined),
   };
 
-  const service = new HumanEvalService(db as any, settingsService as any, slack, chatbot, learning);
-  return { service, db, settingsService, slack, chatbot, learning, items, settings };
+  const actions = {
+    run: jest.fn(async () => undefined),
+  };
+
+  const service = new HumanEvalService(db as any, settingsService as any, slack, chatbot, learning, actions);
+  return { service, db, settingsService, slack, chatbot, learning, actions, items, settings };
 }
 
 describe('HumanEvalService', () => {
@@ -104,7 +108,7 @@ describe('HumanEvalService', () => {
   });
 
   it('captures Slack thread replies as durable feedback and injects a session learning note', async () => {
-    const { service, chatbot, learning, items } = makeHarness();
+    const { service, chatbot, learning, actions, items } = makeHarness();
 
     const candidate = await service.createCandidate({
       reviewType: 'landing_page',
@@ -112,6 +116,11 @@ describe('HumanEvalService', () => {
       artifactUrl: 'https://example.com/landing',
       sessionId: 'session-2',
       userId: 'user-2',
+      action: {
+        type: 'landing_page_iteration_deploy',
+        landingPageId: 'page-1',
+        userId: 'user-2',
+      },
     });
 
     const handled = await service.handleSlackThreadReply({
@@ -139,6 +148,10 @@ describe('HumanEvalService', () => {
       }),
     );
     expect(learning.recordFeedback).toHaveBeenCalledWith(
+      expect.objectContaining({ candidateId: candidate.candidateId }),
+      expect.objectContaining({ text: expect.stringContaining('mobile hierarchy fails') }),
+    );
+    expect(actions.run).toHaveBeenCalledWith(
       expect.objectContaining({ candidateId: candidate.candidateId }),
       expect.objectContaining({ text: expect.stringContaining('mobile hierarchy fails') }),
     );

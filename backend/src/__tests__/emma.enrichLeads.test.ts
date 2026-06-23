@@ -14,6 +14,9 @@ jest.mock('../emma/enrichmentToolRunner', () => ({
 jest.mock('../services/db', () => ({
   crmDb: { getLeadById: jest.fn() },
 }));
+jest.mock('../services/autoHumanEvalService', () => ({
+  enqueueAutoHumanEval: jest.fn().mockResolvedValue(null),
+}), { virtual: true });
 
 import '../emma/tools';
 import { emmaToolRegistry } from '../emma/registry';
@@ -23,6 +26,7 @@ import {
   resolveExecuteLeadIds,
 } from '../emma/enrichmentToolRunner';
 import { crmDb } from '../services/db';
+const { enqueueAutoHumanEval } = jest.requireMock('../services/autoHumanEvalService');
 
 const SUMMARY = {
   runId: 'run-1',
@@ -67,6 +71,7 @@ describe('enrich_leads_preview', () => {
       socketId: 'sock-1',
     }));
     expect(result).toBe(SUMMARY);
+    expect(enqueueAutoHumanEval).not.toHaveBeenCalled();
   });
 
   it('rejects when there is no user context', async () => {
@@ -114,6 +119,31 @@ describe('enrich_leads_execute', () => {
     );
     expect(runEmmaEnrichment).toHaveBeenCalledWith(expect.objectContaining({
       listId: 'list-abc', userId: 'user1', mode: 'enrich', leadIds: undefined,
+    }));
+  });
+
+  it('sends completed list enrichment runs to Fangfang for human eval', async () => {
+    (resolveExecuteLeadIds as jest.Mock).mockResolvedValue({ leadIds: undefined, count: 5 });
+    const tool = emmaToolRegistry.getTool('enrich_leads_execute')!;
+    await tool.execute(
+      { list_id: 'list-abc', output_fields: [{ name: 'industry', instruction: 'classify' }] },
+      { userId: 'user1', sessionId: 'session-1' },
+    );
+
+    expect(enqueueAutoHumanEval).toHaveBeenCalledWith(expect.objectContaining({
+      reviewType: 'lead_enrichment',
+      userId: 'user1',
+      sessionId: 'session-1',
+      originalRequest: 'enrich_leads_execute list=list-abc fields=industry',
+      outputSummary: expect.stringContaining('processed 5 lead'),
+      sourceKey: 'lead-enrichment:run-1',
+      action: expect.objectContaining({
+        type: 'lead_enrichment_rerun',
+        listId: 'list-abc',
+        userId: 'user1',
+        outputFields: [{ name: 'industry', instruction: 'classify' }],
+        toolName: 'enrich_leads_execute',
+      }),
     }));
   });
 
@@ -193,6 +223,36 @@ describe('enrich_lead_custom', () => {
     }));
     expect(result.leadId).toBe('lead-7');
     expect(result.enrichedValues).toEqual({ company_size: '200', title: 'CTO' });
+  });
+
+  it('sends completed single-lead enrichment runs to Fangfang for human eval', async () => {
+    (runEmmaEnrichment as jest.Mock).mockResolvedValue({ ...SUMMARY, runId: 'run-single', processedCount: 1 });
+    const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+    await tool.execute(
+      {
+        list_id: 'list-abc',
+        lead_id: 'lead-7',
+        output_fields: [{ name: 'company_size', instruction: 'find headcount' }],
+      },
+      { userId: 'user1', sessionId: 'session-1' },
+    );
+
+    expect(enqueueAutoHumanEval).toHaveBeenCalledWith(expect.objectContaining({
+      reviewType: 'lead_enrichment',
+      userId: 'user1',
+      sessionId: 'session-1',
+      originalRequest: 'enrich_lead_custom list=list-abc lead=lead-7 fields=company_size',
+      outputSummary: expect.stringContaining('processed 1 lead'),
+      sourceKey: 'lead-enrichment:run-single',
+      action: expect.objectContaining({
+        type: 'lead_enrichment_rerun',
+        listId: 'list-abc',
+        leadId: 'lead-7',
+        userId: 'user1',
+        outputFields: [{ name: 'company_size', instruction: 'find headcount' }],
+        toolName: 'enrich_lead_custom',
+      }),
+    }));
   });
 
   it('returns sanitized per-field enrichmentMetadata so the agent can cite source/confidence', async () => {

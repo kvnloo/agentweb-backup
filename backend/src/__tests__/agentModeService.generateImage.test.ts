@@ -11,6 +11,11 @@ jest.mock('../services/chatbotService', () => ({
     addToolCostToSession: jest.fn().mockResolvedValue({}),
   }
 }));
+jest.mock('../services/autoHumanEvalService', () => ({
+  enqueueAutoHumanEval: jest.fn().mockResolvedValue(null),
+}), { virtual: true });
+
+const { enqueueAutoHumanEval } = jest.requireMock('../services/autoHumanEvalService');
 
 describe('AgentModeService - generate_image function', () => {
   let agentModeService: AgentModeService;
@@ -33,6 +38,42 @@ describe('AgentModeService - generate_image function', () => {
   });
 
   describe('Size Parameter Handling', () => {
+    it('sends successful image generations to Matt for human eval without blocking the result', async () => {
+      mockImageService.generateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/image.png',
+        filename: 'test.png'
+      });
+
+      const result = await (agentModeService as any).generateImage(
+        'Test prompt',
+        'test.png',
+        '1024:1024',
+        'medium',
+        [],
+        'user123',
+        'session123',
+        'gemini-3-pro-image-preview'
+      );
+
+      expect(result.success).toBe(true);
+      expect(enqueueAutoHumanEval).toHaveBeenCalledWith(expect.objectContaining({
+        reviewType: 'creative_image',
+        userId: 'user123',
+        sessionId: 'session123',
+        artifactUrl: 'https://example.com/image.png',
+        originalRequest: 'Test prompt',
+        outputSummary: expect.stringContaining('test.png'),
+        sourceKey: expect.stringContaining('image:session123:test.png'),
+        action: expect.objectContaining({
+          type: 'agent_mode_image_revision',
+          sessionId: 'session123',
+          userId: 'user123',
+          artifactUrl: 'https://example.com/image.png',
+        }),
+      }));
+    });
+
     it('should pass size parameter as-is without modification', async () => {
       mockImageService.generateImage.mockResolvedValue({
         success: true,

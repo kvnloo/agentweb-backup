@@ -24,6 +24,29 @@ export type HumanEvalReviewType = 'creative_image' | 'landing_page' | 'lead_enri
 export type HumanEvalReviewer = 'matt' | 'fangfang';
 export type HumanEvalStatus = 'pending' | 'reviewed';
 
+export type HumanEvalAction =
+  | {
+      type: 'agent_mode_image_revision';
+      sessionId: string;
+      userId: string;
+      artifactUrl?: string;
+      filename?: string;
+    }
+  | {
+      type: 'landing_page_iteration_deploy';
+      landingPageId: string;
+      userId: string;
+    }
+  | {
+      type: 'lead_enrichment_rerun';
+      listId: string;
+      userId: string;
+      leadId?: string;
+      leadIds?: string[];
+      outputFields: Array<{ name: string; instruction: string; overwrite_policy?: 'fill_if_empty' | 'always_overwrite' }>;
+      toolName: 'enrich_leads_execute' | 'enrich_lead_custom';
+    };
+
 export interface HumanEvalCandidate {
   candidateId: string;
   reviewType: HumanEvalReviewType;
@@ -37,6 +60,7 @@ export interface HumanEvalCandidate {
   chatUrl?: string;
   outputSummary: string;
   originalRequest?: string;
+  action?: HumanEvalAction;
   slackChannel: string;
   slackMessageTs: string;
   feedback: HumanEvalFeedback[];
@@ -62,6 +86,7 @@ export interface CreateHumanEvalCandidateInput {
   artifactUrl?: string;
   chatUrl?: string;
   originalRequest?: string;
+  action?: HumanEvalAction;
 }
 
 interface DynamoLike {
@@ -88,6 +113,17 @@ interface ChatbotLike {
 
 interface LearningLike {
   recordFeedback(candidate: HumanEvalCandidate, feedback: HumanEvalFeedback): Promise<void>;
+}
+
+interface ActionRunnerLike {
+  run(candidate: HumanEvalCandidate, feedback: HumanEvalFeedback): Promise<void>;
+}
+
+class HumanEvalActionRunner implements ActionRunnerLike {
+  async run(candidate: HumanEvalCandidate, feedback: HumanEvalFeedback): Promise<void> {
+    const { runHumanEvalFeedbackAction } = await import('./humanEvalActionService');
+    await runHumanEvalFeedbackAction(candidate, feedback);
+  }
 }
 
 class HumanEvalMemoryLearning implements LearningLike {
@@ -135,6 +171,7 @@ export class HumanEvalService {
     },
     private readonly chatbot: ChatbotLike = chatbotDb,
     private readonly learning: LearningLike = new HumanEvalMemoryLearning(),
+    private readonly actions: ActionRunnerLike = new HumanEvalActionRunner(),
   ) {}
 
   getReviewerForType(reviewType: HumanEvalReviewType): HumanEvalReviewer {
@@ -179,6 +216,7 @@ export class HumanEvalService {
       chatUrl,
       outputSummary: input.outputSummary.trim(),
       originalRequest: input.originalRequest?.trim() || undefined,
+      action: input.action,
       slackChannel: posted.channel || slackChannel,
       slackMessageTs: posted.ts,
       feedback: [],
@@ -241,6 +279,9 @@ export class HumanEvalService {
     await this.appendFeedback(candidate, feedback);
     await this.addFeedbackToSession(candidate, feedback);
     await this.learning.recordFeedback(candidate, feedback);
+    void this.actions.run(candidate, feedback).catch((err: any) => {
+      console.warn('[human-eval] failed to run feedback action:', err?.message || err);
+    });
     return true;
   }
 
@@ -323,6 +364,7 @@ export class HumanEvalService {
       input.chatUrl ? `*Chat:* <${input.chatUrl}|open associated chat>` : '',
       input.originalRequest ? `*Ask:* ${truncate(input.originalRequest, 700)}` : '',
       `*Summary:* ${truncate(input.outputSummary, 1000)}`,
+      input.action ? `*Auto-action:* ${humanEvalActionLabel(input.action)}` : '',
       '',
       'Reply in this thread with free-form feedback. Include what failed, what worked, and what would make it pass. No form needed for v0.',
       `Candidate: \`${input.candidateId}\``,
@@ -396,6 +438,17 @@ function reviewTypeLabel(reviewType: HumanEvalReviewType): string {
       return 'landing page';
     case 'lead_enrichment':
       return 'lead enrichment';
+  }
+}
+
+function humanEvalActionLabel(action: HumanEvalAction): string {
+  switch (action.type) {
+    case 'agent_mode_image_revision':
+      return 'revise the image in Agent Mode and send the new image back for eval';
+    case 'landing_page_iteration_deploy':
+      return 'iterate the landing page, deploy it, and send the live page back for eval';
+    case 'lead_enrichment_rerun':
+      return 'rerun lead enrichment with this feedback and send the updated results back for eval';
   }
 }
 
