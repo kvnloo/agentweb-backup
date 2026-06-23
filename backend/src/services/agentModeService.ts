@@ -3370,6 +3370,24 @@ export class AgentModeService {
       workPlanContent += `✅ ALL ${workPlan.steps.length} STEPS ARE DONE (${completedCount} completed, ${skippedCount} skipped). `;
       workPlanContent += `DO NOT retry or re-execute any work plan steps. DO NOT call generate_image or other tools to redo completed work. `;
       workPlanContent += `If the user is asking about the completed work, respond with a plain-text summary. If the user is asking for something new and unrelated to the work plan, help them with that new request normally.`;
+
+      // Carve-out for the "marked complete but assets are actually missing" case.
+      // A step can be marked completed while its deliverables were never fully produced
+      // (e.g. a context banner wrongly claimed all 18 images existed when only 3 did).
+      // Without this, the blanket "DO NOT call generate_image to redo completed work"
+      // above causes the agent to refuse an EXPLICIT user request to generate the
+      // genuinely-missing assets — it can't tell "redo finished work" (forbidden) from
+      // "produce assets that were supposed to exist but don't" (required). This carve-out
+      // draws that line: an explicit request to generate/regenerate is honored, and the
+      // agent must verify ground truth (search_user_assets) rather than trust the plan's
+      // completed flag, then generate ONLY what is missing.
+      //
+      // Gated to agent mode (includeResumeGuidance) to keep Emma's done-branch output
+      // byte-for-byte identical to current production, consistent with the rest of this
+      // function. The reported bug was agent-mode-only.
+      if (includeResumeGuidance) {
+        workPlanContent += ` EXCEPTION — missing or explicitly-requested assets: If the user explicitly asks you to generate, regenerate, redo, or finish specific images/assets (for example "generate the missing 15 images"), you MUST do it even though the plan is marked done — the "do not redo" rule above only blocks re-running finished work on your own initiative, not an explicit user request. First verify what actually exists using search_user_assets (the plan's completed status may be wrong), then call generate_image only for the assets that are genuinely missing. Do NOT regenerate assets that already exist unless the user asked you to.`;
+      }
       return [{ role: 'user', content: `[SYSTEM] ${workPlanContent.trim()}` }];
     }
 
