@@ -149,6 +149,26 @@ describe("onboardingIcpService", () => {
       expect(ctx.companyName).toBe("New Name");
       expect(ctx.companyUrl).toBe("new.com");
     });
+
+    it("includes uploaded onboarding seed context when present", () => {
+      const ctx = extractIcpBrandContext({
+        companyName: "AgentCap X",
+        productDomain: "https://agentcapx.com",
+        onboardingSeedContext: {
+          files: [
+            {
+              filename: "ai-compute-capital-markets-brand-seed.md",
+              content: "Sell first to GPU providers like Akash, CoreWeave, and Lambda Labs.",
+            },
+          ],
+        },
+      });
+      expect(ctx.seedFilenames).toEqual([
+        "ai-compute-capital-markets-brand-seed.md",
+      ]);
+      expect(ctx.seedContext).toContain("Akash");
+      expect(ctx.seedContext).toContain("CoreWeave");
+    });
   });
 
   describe("generateIcpsForUser", () => {
@@ -248,6 +268,25 @@ describe("onboardingIcpService", () => {
       expect(llm.lastUserPrompt).toContain("Value proposition: Fast");
       expect(llm.lastUserPrompt).toContain("Target audience hint: Software teams");
       expect(llm.lastUserPrompt).toContain("Tone of voice: Direct");
+    });
+
+    it("tells the LLM to prioritize uploaded seed context over generic domain inference", async () => {
+      const llm = new FakeLlm({ icps: fivePersonas });
+      await generateIcpsForUser(
+        {
+          companyName: "AgentCap X",
+          companyUrl: "https://agentcapx.com",
+          seedFilenames: ["ai-compute-capital-markets-brand-seed.md"],
+          seedContext:
+            "AgentCap X should sell first to AI compute providers including Akash, CoreWeave, and Lambda Labs.",
+        },
+        { llm: llm as any },
+      );
+      expect(llm.lastUserPrompt).toContain("highest priority");
+      expect(llm.lastUserPrompt).toContain("Akash");
+      expect(llm.lastUserPrompt).toContain("CoreWeave");
+      expect(llm.lastUserPrompt).toContain("source of truth");
+      expect(llm.lastUserPrompt).toContain("make those the first ICPs");
     });
 
     it("returns sanitisation result when LLM returns null icps", async () => {

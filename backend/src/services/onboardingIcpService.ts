@@ -96,6 +96,8 @@ export interface IcpBrandContext {
   toneOfVoice?: string;
   valueProposition?: string;
   targetAudience?: string;
+  seedContext?: string;
+  seedFilenames?: string[];
 }
 
 interface LlmResponse {
@@ -119,6 +121,12 @@ export function extractIcpBrandContext(user: {
       targetAudience?: string;
     };
   };
+  onboardingSeedContext?: {
+    files?: Array<{
+      filename?: string;
+      content?: string;
+    }>;
+  };
 }): IcpBrandContext {
   const bd = user.brandGuidelines?.brandData || {};
   const ctx: IcpBrandContext = {};
@@ -130,6 +138,23 @@ export function extractIcpBrandContext(user: {
   if (bd.toneOfVoice) ctx.toneOfVoice = bd.toneOfVoice;
   if (bd.valueProposition) ctx.valueProposition = bd.valueProposition;
   if (bd.targetAudience) ctx.targetAudience = bd.targetAudience;
+  const seedFiles = Array.isArray(user.onboardingSeedContext?.files)
+    ? user.onboardingSeedContext.files
+    : [];
+  const seedChunks = seedFiles
+    .map((file) => {
+      const filename = typeof file.filename === "string" ? file.filename.trim() : "";
+      const content = typeof file.content === "string" ? file.content.trim() : "";
+      if (!filename || !content) return "";
+      return `### ${filename}\n${content}`;
+    })
+    .filter(Boolean);
+  if (seedChunks.length > 0) {
+    ctx.seedContext = seedChunks.join("\n\n").slice(0, 36_000);
+    ctx.seedFilenames = seedFiles
+      .map((file) => (typeof file.filename === "string" ? file.filename.trim() : ""))
+      .filter(Boolean);
+  }
   return ctx;
 }
 
@@ -146,6 +171,21 @@ function buildUserPrompt(brand: IcpBrandContext): string {
   if (brand.targetAudience)
     lines.push(`Target audience hint: ${brand.targetAudience}`);
   if (brand.toneOfVoice) lines.push(`Tone of voice: ${brand.toneOfVoice}`);
+  if (brand.seedContext) {
+    lines.push("");
+    lines.push("User-uploaded onboarding seed context (highest priority):");
+    if (brand.seedFilenames?.length) {
+      lines.push(`Files: ${brand.seedFilenames.join(", ")}`);
+    }
+    lines.push(brand.seedContext);
+    lines.push("");
+    lines.push(
+      "Use the uploaded seed context as the source of truth when it conflicts with the website, company name, or generic industry inference.",
+    );
+    lines.push(
+      "If the seed names target accounts, categories, buyer types, or market participants, make those the first ICPs before considering broader personas.",
+    );
+  }
   lines.push("");
   lines.push(
     "For each ICP, capture: name (evocative), pain (one sentence), desire (one sentence), objection (one sentence), meta_targeting_brief (one sentence summarising who to target on Meta).",

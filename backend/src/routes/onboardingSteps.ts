@@ -83,6 +83,8 @@ import {
 } from "../services/adImageVariantRatingService";
 
 const router = express.Router();
+const SEED_CONTEXT_MAX_FILES = 3;
+const SEED_CONTEXT_MAX_CHARS_PER_FILE = 12_000;
 
 /** Pull the authenticated user id, or return 401. */
 function requireUserId(req: Request, res: Response): string | null {
@@ -110,6 +112,45 @@ function requireUserEmail(req: Request, res: Response): string | null {
   }
   return email;
 }
+
+function sanitizeSeedContextFiles(raw: unknown): Array<{ filename: string; content: string }> {
+  if (!Array.isArray(raw)) return [];
+  const files: Array<{ filename: string; content: string }> = [];
+  for (const item of raw.slice(0, SEED_CONTEXT_MAX_FILES)) {
+    if (!item || typeof item !== "object") continue;
+    const filename = String((item as any).filename ?? "").trim().slice(0, 180);
+    const content = String((item as any).content ?? "")
+      .trim()
+      .slice(0, SEED_CONTEXT_MAX_CHARS_PER_FILE);
+    if (!filename || !content) continue;
+    files.push({ filename, content });
+  }
+  return files;
+}
+
+router.post("/seed-context", authenticateToken, async (req, res) => {
+  try {
+    const userId = requireUserId(req, res);
+    if (!userId) return;
+    const files = sanitizeSeedContextFiles(req.body?.files);
+    if (files.length === 0) {
+      return res.status(400).json({ message: "files must include text content" });
+    }
+    const onboardingSeedContext = {
+      files,
+      updatedAt: new Date().toISOString(),
+    };
+    await userDb.updateUser(userId, { onboardingSeedContext } as any);
+    return res.json({
+      ok: true,
+      fileCount: files.length,
+      totalChars: files.reduce((sum, f) => sum + f.content.length, 0),
+    });
+  } catch (err) {
+    console.error("[onboarding] seed-context failed", err);
+    return res.status(500).json({ message: "Failed to save onboarding seed context" });
+  }
+});
 
 // ───────────────────────────────────── ICP ─────────────────────────────────────
 

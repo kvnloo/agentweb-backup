@@ -370,6 +370,13 @@ export interface User {
     createdAt: string;
     updatedAt: string;
   };
+  onboardingSeedContext?: {
+    files: Array<{
+      filename: string;
+      content: string;
+    }>;
+    updatedAt: string;
+  };
   marketStrategy?: {
     businessOverview: string;
     competitors: Array<{
