@@ -377,7 +377,7 @@ export async function startIcpDiscoveryForUser(
   userId: string,
   deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {},
 ): Promise<void> {
-  await userDb.updateUser(userId, icpStartPatch() as any);
+  await userDb.updateUser(userId, icpStartPatch() as any, { removeUndefined: true });
   // Eager DAG sub-task 2: kick the orchestrator. No-op for users not on
   // `useEagerPipeline`; for opted-in users the orchestrator drives the
   // ICP runner (which delegates to triggerIcpDiscoveryForUser), so we

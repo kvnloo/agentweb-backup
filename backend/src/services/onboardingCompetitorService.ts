@@ -529,7 +529,7 @@ export async function startCompetitorStrategyForUser(
     webSearchFn?: WebSearchFn;
   } = {},
 ): Promise<void> {
-  await userDb.updateUser(userId, competitorStartPatch() as any);
+  await userDb.updateUser(userId, competitorStartPatch() as any, { removeUndefined: true });
   // Eager DAG sub-task 2: orchestrator owns step ordering for opted-in
   // users; cheap no-op gated inside the orchestrator for everyone else.
   // eslint-disable-next-line @typescript-eslint/no-var-requires

@@ -4,6 +4,7 @@ jest.mock('aws-sdk', () => {
   const mockDocClient = {
     scan: jest.fn(),
     query: jest.fn(),
+    update: jest.fn(),
   };
   return {
     DynamoDB: {
@@ -155,6 +156,73 @@ describe('userDb - deleted_ tombstone filtering', () => {
 
       const result = await userDb.getUserById('nonexistent');
       expect(result).toBeUndefined();
+    });
+  });
+
+  // ── updateUser ────────────────────────────────────────────────────────────
+
+  describe('updateUser()', () => {
+    it('skips undefined fields by default for legacy partial updates', async () => {
+      mockDocClient.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Items: [{ userId: 'user-123', email: 'active@example.com', oldField: 'keep' }],
+        }),
+      });
+      mockDocClient.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: { userId: 'user-123' } }),
+      });
+
+      await userDb.updateUser('user-123', {
+        companyName: 'Acme',
+        icpResult: undefined,
+      } as any);
+
+      expect(mockDocClient.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          UpdateExpression: 'SET #companyName = :companyName',
+          ExpressionAttributeNames: { '#companyName': 'companyName' },
+          ExpressionAttributeValues: { ':companyName': 'Acme' },
+        }),
+      );
+    });
+
+    it('removes undefined fields when requested by state-machine reset patches', async () => {
+      mockDocClient.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Items: [{ userId: 'user-123', email: 'active@example.com' }],
+        }),
+      });
+      mockDocClient.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: { userId: 'user-123' } }),
+      });
+
+      await userDb.updateUser(
+        'user-123',
+        {
+          icpStatus: 'running',
+          icpStartedAt: '2026-06-23T03:49:07.184Z',
+          icpCompletedAt: undefined,
+          icpResult: undefined,
+        } as any,
+        { removeUndefined: true },
+      );
+
+      expect(mockDocClient.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          UpdateExpression:
+            'SET #icpStatus = :icpStatus, #icpStartedAt = :icpStartedAt REMOVE #icpCompletedAt, #icpResult',
+          ExpressionAttributeNames: {
+            '#icpStatus': 'icpStatus',
+            '#icpStartedAt': 'icpStartedAt',
+            '#icpCompletedAt': 'icpCompletedAt',
+            '#icpResult': 'icpResult',
+          },
+          ExpressionAttributeValues: {
+            ':icpStatus': 'running',
+            ':icpStartedAt': '2026-06-23T03:49:07.184Z',
+          },
+        }),
+      );
     });
   });
 });

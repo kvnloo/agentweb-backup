@@ -1317,7 +1317,11 @@ export class UserDB {
     }
   }
 
-  async updateUser(userId: string, updates: Partial<User>) {
+  async updateUser(
+    userId: string,
+    updates: Partial<User>,
+    options?: { removeUndefined?: boolean }
+  ) {
     // First, get the user by userId to ensure they exist and to get their email
     const user = await this.getUserById(userId);
     if (!user || !user.email) {
@@ -1338,6 +1342,7 @@ export class UserDB {
     }
 
     const updateExpressions: string[] = [];
+    const removeExpressions: string[] = [];
     const expressionAttributeNames: { [key: string]: string } = {};
     const expressionAttributeValues: { [key: string]: any } = {};
 
@@ -1347,19 +1352,32 @@ export class UserDB {
         updateExpressions.push(`#${key} = :${key}`);
         expressionAttributeNames[`#${key}`] = key;
         expressionAttributeValues[`:${key}`] = value;
+      } else if (options?.removeUndefined) {
+        removeExpressions.push(`#${key}`);
+        expressionAttributeNames[`#${key}`] = key;
       }
     });
 
-    if (updateExpressions.length === 0) {
+    if (updateExpressions.length === 0 && removeExpressions.length === 0) {
       return user;
+    }
+
+    const expressionParts: string[] = [];
+    if (updateExpressions.length > 0) {
+      expressionParts.push(`SET ${updateExpressions.join(", ")}`);
+    }
+    if (removeExpressions.length > 0) {
+      expressionParts.push(`REMOVE ${removeExpressions.join(", ")}`);
     }
 
     const params = {
       TableName: this.tableName,
       Key: { email: user.email }, // Use email as the primary key
-      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      UpdateExpression: expressionParts.join(" "),
       ExpressionAttributeNames: expressionAttributeNames,
-      ExpressionAttributeValues: expressionAttributeValues,
+      ...(Object.keys(expressionAttributeValues).length > 0
+        ? { ExpressionAttributeValues: expressionAttributeValues }
+        : {}),
       ReturnValues: "ALL_NEW",
     };
 
