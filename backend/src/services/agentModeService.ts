@@ -36,6 +36,8 @@ import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmM
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { publishWithResolvedBlogPublisher } from './blogPublishers';
 import { enqueueAutoHumanEval } from './autoHumanEvalService';
+import { performConfiguredSearch } from '../search/searchProviderFactory';
+import { inferSearchFreshness } from '../search/searchFreshness';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -17055,19 +17057,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       }
 
+      const provider = (searchResults as any).provider;
+      const normalizedResults = [...searchResults];
+
       // Format the results for LLM consumption
       const formattedContent = this.formatWebSearchResults({
         query,
-        results: searchResults,
-        totalResults: searchResults.length
+        results: normalizedResults,
+        totalResults: normalizedResults.length
       });
 
       return {
         success: true,
-        message: `Found ${searchResults.length} web search results for "${query}"`,
+        message: `Found ${normalizedResults.length} web search results for "${query}"`,
         query,
-        results: searchResults,
-        totalResults: searchResults.length,
+        results: normalizedResults,
+        totalResults: normalizedResults.length,
+        provider,
         formattedContent
       };
     } catch (error) {
@@ -17255,47 +17261,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  // Perform actual web search using Google Custom Search API
+  // Perform actual web search using the configured provider. Defaults to You.com
+  // with Google CSE fallback; SEARCH_PROVIDER=google restores the old primary.
   public async performWebSearch(query: string, maxResults: number): Promise<any[]> {
     try {
-      // Get credentials from Secrets Manager
-      const credentials = await this.getGoogleSearchCredentials();
-
-      if (!credentials) {
-        throw new Error('Google Search API not configured in Secrets Manager');
-      }
-
-      // Initialize Google Custom Search API
-      const customsearch = google.customsearch('v1');
-
-      // Perform the search
-      const response = await customsearch.cse.list({
-        auth: credentials.apiKey,
-        cx: credentials.searchEngineId,
-        q: query,
-        num: Math.min(maxResults, 10), // Google API max is 10
-        safe: 'medium', // Safe search level
-        fields: 'items(title,link,snippet,pagemap/metatags,pagemap/cse_thumbnail)'
+      const freshness = inferSearchFreshness(query);
+      const response = await performConfiguredSearch({
+        query,
+        count: maxResults,
+        freshness,
+        purpose: 'agent_research',
       });
 
-      if (!response.data.items || response.data.items.length === 0) {
-        throw new Error('No search results found');
-      }
-
-      // Transform Google API results to our format
-      const searchResults = response.data.items.map((item: any) => ({
-        title: item.title || 'No title',
-        url: item.link || '#',
-        snippet: item.snippet || 'No description available',
-        publishedDate: this.extractPublishedDate(item.pagemap?.metatags?.[0]) || new Date().toISOString(),
-        thumbnail: item.pagemap?.cse_thumbnail?.[0]?.src || null
-      }));
-
-      console.log(`Google Search API returned ${searchResults.length} results for query: "${query}"`);
-      return searchResults;
+      console.log(`${response.provider} Search returned ${response.results.length} results for query: "${query}"`);
+      return Object.assign(response.results, {
+        provider: response.provider,
+        metadata: response.metadata,
+      });
 
     } catch (error) {
-      console.error('Error performing Google web search:', error);
+      console.error('Error performing web search:', error);
       throw error;
     }
   }
