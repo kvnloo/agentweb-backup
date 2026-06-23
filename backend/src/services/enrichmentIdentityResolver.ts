@@ -54,6 +54,12 @@ export interface SiblingLeadResult {
   website?: string;
   title?: string;
   customFields?: Record<string, string>;
+  /** Per-field enrichment provenance from the sibling lead. Tier 0b reads this
+   *  so a copied web-sourced value carries its originating sourceUrl/sourceQuote
+   *  forward — letting the critic re-verify the copy instead of trusting it
+   *  blindly (Slashy/Slash bug: a sibling's unverified cross-company value must
+   *  not propagate uncritiqued). */
+  enrichmentMetadata?: Record<string, EnrichedFieldMeta>;
 }
 
 export interface IdentityResolverDeps {
