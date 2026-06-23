@@ -23,10 +23,7 @@
 
 import { LLMService } from "../utils/llmService";
 import { reportUIError } from "../utils/errorReporter";
-import { getGCSPPrivateKey } from "../utils/secretsManager";
-import { getS3ObjectAsString } from "../utils/s3Utils";
-import { taskDb, userDb } from "./db";
-import { Storage } from "@google-cloud/storage";
+import { userDb } from "./db";
 import {
   icpFailedPatch,
   icpReadyPatch,
@@ -44,11 +41,6 @@ const ICP_TEMPERATURE = 0.7;
 
 /** Token budget for 5 personas × ~6 fields each + meta brief. */
 const ICP_MAX_TOKENS = 4000;
-const MAX_STRATEGIC_CONTEXT_CHARS = 6000;
-const MAX_KB_CONTEXT_FILES = 3;
-const S3_KEY_PREFIX = "s3:";
-
-let gcsStorage: Storage | null = null;
 
 /**
  * Delay before firing the cascade trigger to the competitor step after
@@ -104,7 +96,6 @@ export interface IcpBrandContext {
   toneOfVoice?: string;
   valueProposition?: string;
   targetAudience?: string;
-  strategicContext?: string;
 }
 
 interface LlmResponse {
@@ -128,9 +119,6 @@ export function extractIcpBrandContext(user: {
       targetAudience?: string;
     };
   };
-  onboardingStrategicContext?: string;
-  onboardingIcpContext?: string;
-  strategicContext?: string;
 }): IcpBrandContext {
   const bd = user.brandGuidelines?.brandData || {};
   const ctx: IcpBrandContext = {};
@@ -142,11 +130,6 @@ export function extractIcpBrandContext(user: {
   if (bd.toneOfVoice) ctx.toneOfVoice = bd.toneOfVoice;
   if (bd.valueProposition) ctx.valueProposition = bd.valueProposition;
   if (bd.targetAudience) ctx.targetAudience = bd.targetAudience;
-  const strategicContext =
-    user.onboardingStrategicContext || user.onboardingIcpContext || user.strategicContext;
-  if (typeof strategicContext === "string" && strategicContext.trim()) {
-    ctx.strategicContext = strategicContext.trim().slice(0, MAX_STRATEGIC_CONTEXT_CHARS);
-  }
   return ctx;
 }
 
@@ -163,143 +146,12 @@ function buildUserPrompt(brand: IcpBrandContext): string {
   if (brand.targetAudience)
     lines.push(`Target audience hint: ${brand.targetAudience}`);
   if (brand.toneOfVoice) lines.push(`Tone of voice: ${brand.toneOfVoice}`);
-  if (brand.strategicContext) {
-    lines.push("");
-    lines.push("Strategic context from user-provided onboarding docs/notes:");
-    lines.push(brand.strategicContext);
-  }
   lines.push("");
-  lines.push(
-    "Before generating ICPs, infer the go-to-market sequence from the context: supply-side providers/partners first, demand-side buyers first, or both. If the context says supply/provider/capacity/network partners come first, generate ICPs for those providers first; do not default to generic founders, finance buyers, or end users.",
-  );
   lines.push(
     "For each ICP, capture: name (evocative), pain (one sentence), desire (one sentence), objection (one sentence), meta_targeting_brief (one sentence summarising who to target on Meta).",
   );
   lines.push("Return JSON matching the schema in the system prompt.");
   return lines.join("\n");
-}
-
-function isReadableContextFile(file: any): boolean {
-  const name = String(file?.filename || file?.name || "").toLowerCase();
-  const key = String(file?.key || "").toLowerCase();
-  const source = `${name} ${key}`;
-  return /\.(txt|md|markdown|csv)$/.test(source);
-}
-
-function normalizeContextText(text: string): string {
-  return text.replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-}
-
-function appendBoundedContext(parts: string[], next: string, maxChars: number): void {
-  const normalized = normalizeContextText(next);
-  if (!normalized) return;
-  const used = parts.join("\n\n").length;
-  const remaining = maxChars - used;
-  if (remaining <= 0) return;
-  parts.push(normalized.slice(0, remaining));
-}
-
-async function getGcsStorage(): Promise<Storage> {
-  if (!gcsStorage) {
-    const privateKey = await getGCSPPrivateKey();
-    gcsStorage = new Storage({
-      projectId: process.env.GCS_PROJECT_ID,
-      credentials: {
-        client_email: process.env.GCS_CLIENT_EMAIL,
-        private_key: privateKey,
-      },
-    });
-  }
-  return gcsStorage;
-}
-
-async function readKnowledgeBaseFileText(
-  task: any,
-  file: any,
-): Promise<string | null> {
-  if (typeof file?.searchableText === "string" && file.searchableText.trim()) {
-    return file.searchableText;
-  }
-
-  const key = typeof file?.key === "string" ? file.key : "";
-  if (!key) return null;
-
-  try {
-    if (key.startsWith(S3_KEY_PREFIX)) {
-      return await getS3ObjectAsString(key.slice(S3_KEY_PREFIX.length));
-    }
-
-    const storage = await getGcsStorage();
-    const bucketName =
-      task?.knowledgeBaseType === "public"
-        ? process.env.GCS_BUCKET_NAME || "agentweb-knowledge-base-dev"
-        : process.env.GCS_BUCKET_NAME_PRIVATE || "agentweb-knowledge-base-private-dev";
-    const bucket = storage.bucket(bucketName);
-    const [content] = await bucket.file(key).download();
-    return content.toString("utf-8");
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn("[onboardingIcpService] could not read KB context file", {
-      taskId: task?.taskId,
-      filename: file?.filename,
-      err: msg,
-    });
-    return null;
-  }
-}
-
-export async function loadOnboardingStrategicContextForUser(
-  userId: string,
-): Promise<string | null> {
-  try {
-    const tasks = await taskDb.getTasksWithKnowledgeBase(userId);
-    if (!Array.isArray(tasks) || tasks.length === 0) return null;
-
-    const preferredTasks = [...tasks].sort((a: any, b: any) => {
-      const aName = String(a?.name || "").toLowerCase();
-      const bName = String(b?.name || "").toLowerCase();
-      const aScore = aName.includes("brand") || aName.includes("onboarding") ? 0 : 1;
-      const bScore = bName.includes("brand") || bName.includes("onboarding") ? 0 : 1;
-      return aScore - bScore;
-    });
-
-    const parts: string[] = [];
-    let filesRead = 0;
-    for (const task of preferredTasks) {
-      const files = Array.isArray(task?.knowledgeBaseFiles)
-        ? [...task.knowledgeBaseFiles]
-        : [];
-      files.sort((a: any, b: any) =>
-        String(b?.uploadedAt || "").localeCompare(String(a?.uploadedAt || "")),
-      );
-
-      for (const file of files) {
-        if (filesRead >= MAX_KB_CONTEXT_FILES) break;
-        if (!isReadableContextFile(file)) continue;
-        const text = await readKnowledgeBaseFileText(task, file);
-        if (!text) continue;
-        appendBoundedContext(
-          parts,
-          `Source: ${file.filename || file.name || file.key}\n${text}`,
-          MAX_STRATEGIC_CONTEXT_CHARS,
-        );
-        filesRead += 1;
-      }
-      if (filesRead >= MAX_KB_CONTEXT_FILES || parts.join("\n\n").length >= MAX_STRATEGIC_CONTEXT_CHARS) {
-        break;
-      }
-    }
-
-    const context = parts.join("\n\n").trim();
-    return context || null;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn("[onboardingIcpService] could not load onboarding KB context", {
-      userId,
-      err: msg,
-    });
-    return null;
-  }
 }
 
 /**
@@ -424,20 +276,11 @@ export async function generateIcpsForUser(
  */
 export async function triggerIcpDiscoveryForUser(
   userId: string,
-  deps: {
-    llm?: { generateJsonRobust: LLMService["generateJsonRobust"] };
-    loadStrategicContext?: (userId: string) => Promise<string | null>;
-  } = {},
+  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {},
 ): Promise<void> {
   const user = await userDb.getUserById(userId);
   if (!user) return;
   const brand = extractIcpBrandContext(user as any);
-  if (!brand.strategicContext) {
-    const loadedContext = await (deps.loadStrategicContext ?? loadOnboardingStrategicContextForUser)(userId);
-    if (loadedContext) {
-      brand.strategicContext = loadedContext.slice(0, MAX_STRATEGIC_CONTEXT_CHARS);
-    }
-  }
   try {
     const personas = await generateIcpsForUser(brand, deps, userId);
     const current = await userDb.getUserById(userId);
