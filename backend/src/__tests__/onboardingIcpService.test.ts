@@ -9,6 +9,9 @@
 process.env.CASCADE_TRIGGER_DELAY_MS = "0";
 
 jest.mock("../services/db", () => ({
+  taskDb: {
+    getTasksWithKnowledgeBase: jest.fn(),
+  },
   userDb: {
     getUserById: jest.fn(),
     updateUser: jest.fn(),
@@ -27,11 +30,12 @@ import {
   extractIcpBrandContext,
   generateIcpsForUser,
   ICP_DISCOVERY_SYSTEM_PROMPT,
+  loadOnboardingStrategicContextForUser,
   mapIcpResultToMarketStrategy,
   startIcpDiscoveryForUser,
   triggerIcpDiscoveryForUser,
 } from "../services/onboardingIcpService";
-const { userDb } = require("../services/db");
+const { taskDb, userDb } = require("../services/db");
 
 class FakeLlm {
   public lastSystemPrompt = "";
@@ -94,6 +98,11 @@ const fivePersonas = [
 ];
 
 describe("onboardingIcpService", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    taskDb.getTasksWithKnowledgeBase.mockResolvedValue([]);
+  });
+
   describe("extractIcpBrandContext", () => {
     it("reads brand fields from brandGuidelines.brandData when present", () => {
       const user = {
@@ -150,24 +159,15 @@ describe("onboardingIcpService", () => {
       expect(ctx.companyUrl).toBe("new.com");
     });
 
-    it("includes uploaded onboarding seed context when present", () => {
+    it("includes explicit onboarding strategic context when present", () => {
       const ctx = extractIcpBrandContext({
         companyName: "AgentCap X",
-        productDomain: "https://agentcapx.com",
-        onboardingSeedContext: {
-          files: [
-            {
-              filename: "ai-compute-capital-markets-brand-seed.md",
-              content: "Sell first to GPU providers like Akash, CoreWeave, and Lambda Labs.",
-            },
-          ],
-        },
+        onboardingStrategicContext:
+          "Sell supply-side first: Akash, CoreWeave, GPU clouds, and decentralized compute networks.",
       });
-      expect(ctx.seedFilenames).toEqual([
-        "ai-compute-capital-markets-brand-seed.md",
-      ]);
-      expect(ctx.seedContext).toContain("Akash");
-      expect(ctx.seedContext).toContain("CoreWeave");
+
+      expect(ctx.strategicContext).toContain("supply-side first");
+      expect(ctx.strategicContext).toContain("CoreWeave");
     });
   });
 
@@ -243,6 +243,24 @@ describe("onboardingIcpService", () => {
       expect(llm.lastUserPrompt).toContain("Software teams");
     });
 
+    it("includes strategic context and marketplace sequencing instructions in the user prompt", async () => {
+      const llm = new FakeLlm({ icps: fivePersonas });
+      await generateIcpsForUser(
+        {
+          companyName: "AgentCap X",
+          strategicContext:
+            "This marketplace must win supply first. Prioritize GPU cloud providers like Akash and CoreWeave before end buyers.",
+        },
+        { llm: llm as any },
+      );
+
+      expect(llm.lastUserPrompt).toContain("Strategic context from user-provided onboarding docs/notes");
+      expect(llm.lastUserPrompt).toContain("Akash");
+      expect(llm.lastUserPrompt).toContain("CoreWeave");
+      expect(llm.lastUserPrompt).toContain("supply-side providers");
+      expect(llm.lastUserPrompt).toContain("do not default to generic founders");
+    });
+
     it("falls back gracefully when brand context is empty", async () => {
       const llm = new FakeLlm({ icps: fivePersonas });
       const result = await generateIcpsForUser({}, { llm: llm as any });
@@ -268,25 +286,6 @@ describe("onboardingIcpService", () => {
       expect(llm.lastUserPrompt).toContain("Value proposition: Fast");
       expect(llm.lastUserPrompt).toContain("Target audience hint: Software teams");
       expect(llm.lastUserPrompt).toContain("Tone of voice: Direct");
-    });
-
-    it("tells the LLM to prioritize uploaded seed context over generic domain inference", async () => {
-      const llm = new FakeLlm({ icps: fivePersonas });
-      await generateIcpsForUser(
-        {
-          companyName: "AgentCap X",
-          companyUrl: "https://agentcapx.com",
-          seedFilenames: ["ai-compute-capital-markets-brand-seed.md"],
-          seedContext:
-            "AgentCap X should sell first to AI compute providers including Akash, CoreWeave, and Lambda Labs.",
-        },
-        { llm: llm as any },
-      );
-      expect(llm.lastUserPrompt).toContain("highest priority");
-      expect(llm.lastUserPrompt).toContain("Akash");
-      expect(llm.lastUserPrompt).toContain("CoreWeave");
-      expect(llm.lastUserPrompt).toContain("source of truth");
-      expect(llm.lastUserPrompt).toContain("make those the first ICPs");
     });
 
     it("returns sanitisation result when LLM returns null icps", async () => {
@@ -316,9 +315,55 @@ describe("onboardingIcpService", () => {
     });
   });
 
+  describe("loadOnboardingStrategicContextForUser", () => {
+    it("loads bounded context from searchable text on uploaded brand docs", async () => {
+      taskDb.getTasksWithKnowledgeBase.mockResolvedValue([
+        {
+          taskId: "task-1",
+          name: "Brand Documents",
+          knowledgeBaseFiles: [
+            {
+              filename: "ai-compute-capital-markets-brand-seed.md",
+              key: "tasks/task-1/knowledge-base-files/seed.md",
+              searchableText:
+                "AgentCap X should sell supply-side first to Akash, CoreWeave, and other GPU compute providers.",
+              uploadedAt: "2026-06-23T03:44:34.893Z",
+            },
+          ],
+        },
+      ]);
+
+      const context = await loadOnboardingStrategicContextForUser("user-1");
+
+      expect(context).toContain("ai-compute-capital-markets-brand-seed.md");
+      expect(context).toContain("sell supply-side first");
+      expect(context).toContain("CoreWeave");
+    });
+
+    it("ignores non-text uploaded files for prompt context", async () => {
+      taskDb.getTasksWithKnowledgeBase.mockResolvedValue([
+        {
+          taskId: "task-1",
+          name: "Brand Documents",
+          knowledgeBaseFiles: [
+            {
+              filename: "brand-logo.png",
+              key: "s3:users/u/files/logo.png",
+              searchableText: "should not be used",
+              uploadedAt: "2026-06-23T03:44:34.893Z",
+            },
+          ],
+        },
+      ]);
+
+      await expect(loadOnboardingStrategicContextForUser("user-1")).resolves.toBeNull();
+    });
+  });
+
   describe("triggerIcpDiscoveryForUser (fire-and-forget orchestrator)", () => {
     beforeEach(() => {
       jest.clearAllMocks();
+      taskDb.getTasksWithKnowledgeBase.mockResolvedValue([]);
     });
 
     it("returns silently when user is missing", async () => {
@@ -347,6 +392,33 @@ describe("onboardingIcpService", () => {
       const writtenPatch = userDb.updateUser.mock.calls[0][1];
       expect(writtenPatch.icpStatus).toBe("ready");
       expect(writtenPatch.icpResult).toHaveLength(5);
+    });
+
+    it("adds uploaded strategic context to ICP generation when user brand fields are sparse", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          companyName: "AgentCap X",
+          productDomain: "https://agentcapx.com",
+        })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "running",
+          icpStartedAt: "2026-04-24T11:59:00.000Z",
+        });
+      userDb.updateUser.mockResolvedValue({});
+
+      const llm = new FakeLlm({ icps: fivePersonas });
+      await triggerIcpDiscoveryForUser("user-1", {
+        llm: llm as any,
+        loadStrategicContext: async () =>
+          "Sell to supply-side GPU providers first: Akash, CoreWeave, decentralized compute networks.",
+      });
+
+      expect(llm.lastUserPrompt).toContain("Akash");
+      expect(llm.lastUserPrompt).toContain("CoreWeave");
+      expect(llm.lastUserPrompt).toContain("supply-side GPU providers");
+      expect(userDb.updateUser.mock.calls[0][1].icpStatus).toBe("ready");
     });
 
     it("drops the ready patch silently when user is no longer running (stale completion)", async () => {
