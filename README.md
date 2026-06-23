@@ -629,9 +629,37 @@ To enable web search functionality in Agent Mode, you need to set up Google Cust
    - Go to "Setup" > "Basics"
    - Copy the "Search engine ID" (it looks like: `017576662512468239146:omuauf_lfve`)
 
-#### 4. Store Credentials in AWS Secrets Manager
+#### 4. Configure Web Search Provider
 
-Store your Google Search API credentials in AWS Secrets Manager:
+`search_web` now uses a provider abstraction. The default primary provider is You.com Search, with Google Custom Search as fallback. To restore Google as primary during rollback, set:
+
+```bash
+SEARCH_PROVIDER=google
+```
+
+You.com can be configured with either an environment variable or AWS Secrets Manager:
+
+```bash
+SEARCH_PROVIDER=you
+YOU_API_KEY=your_you_api_key_here
+```
+
+For AWS Secrets Manager:
+
+**For Development:**
+- Secret Name: `dev/AgentWeb/YouCom/Search`
+- Secret Value: either the raw API key string or JSON such as:
+```json
+{
+  "apiKey": "your_you_api_key_here"
+}
+```
+
+**For Production:**
+- Secret Name: `prod/AgentWeb/YouCom/Search`
+- Secret Value: either the raw API key string or the JSON shape above.
+
+Google remains available as fallback. Store your Google Search API credentials in AWS Secrets Manager:
 
 **For Development:**
 - Secret Name: `dev/AgentWeb/Google/Search`
@@ -677,10 +705,17 @@ Store your Google Search API credentials in AWS Secrets Manager:
 3. **Test Web Search**:
    - Go to Agent Mode in your application
    - Ask a question that requires current information (e.g., "What are the latest marketing trends?")
-   - The agent should now use real Google search results
+   - The agent should now use real You.com search results, or Google results if You.com is not configured and fallback is enabled
 
 #### 6. API Quotas and Limits
 
+**You.com Search:**
+- Returns unified web and news results from one request
+- Agent Mode automatically requests fresher You.com result windows for time-sensitive queries: `day` for `today`/`breaking` queries and `week` for `latest`/`current`/`news`/`release notes` queries
+- Supports up to 100 results per section at the provider layer; Agent Mode currently caps `search_web` requests to 10
+- Optional livecrawl is supported by the provider but not enabled by default in `search_web`
+
+**Google Custom Search fallback:**
 - **Free Tier**: 100 searches per day
 - **Paid Tier**: Up to 10,000 searches per day for $5
 - **Rate Limits**: 10 requests per second
@@ -689,31 +724,35 @@ Store your Google Search API credentials in AWS Secrets Manager:
 
 **Common Issues:**
 
-1. **"API key not valid"**:
+1. **"You.com Search API key is not configured"**:
+   - Set `YOU_API_KEY` / `YOUCOM_API_KEY`, or store the key in `dev/AgentWeb/YouCom/Search` or `prod/AgentWeb/YouCom/Search`
+   - If fallback is enabled, the backend will try Google next
+
+2. **"API key not valid"**:
    - Check that the API key is correct in AWS Secrets Manager
    - Ensure Custom Search API is enabled in Google Cloud Console
    - Verify API key restrictions
 
-2. **"Search engine not found"**:
+3. **"Search engine not found"**:
    - Verify the Search Engine ID is correct in AWS Secrets Manager
    - Check that the search engine is active in Google Custom Search Engine
 
-3. **"Secrets Manager access denied"**:
+4. **"Secrets Manager access denied"**:
    - Ensure your AWS credentials have permissions to access Secrets Manager
-   - Check that the secret names match exactly: `dev/AgentWeb/Google/Search` or `prod/AgentWeb/Google/Search`
-   - Verify the secret contains valid JSON with `apiKey` and `searchEngineId` fields
+   - Check that the secret names match exactly: `dev/AgentWeb/YouCom/Search`, `prod/AgentWeb/YouCom/Search`, `dev/AgentWeb/Google/Search`, or `prod/AgentWeb/Google/Search`
+   - For You.com, verify the secret is either a raw API key string or JSON with `apiKey`; for Google, verify JSON includes `apiKey` and `searchEngineId`
 
-4. **"Quota exceeded"**:
+5. **"Quota exceeded"**:
    - Check your daily quota usage in Google Cloud Console
    - Consider upgrading to paid tier if needed
 
-5. **No search results**:
-   - The system will fall back to mock results if the API fails
+6. **No search results**:
+   - Empty web/news arrays are treated as successful zero-result searches, so the agent can adjust the query rather than treating this as infrastructure failure
    - Check the backend logs for error messages
 
 **Fallback Behavior:**
-- If Google Search API credentials are not found in Secrets Manager or the API fails, the system automatically falls back to mock search results
-- This ensures Agent Mode continues to work even without the API configured
+- If You.com is not configured or fails and `SEARCH_PROVIDER_FALLBACK` is not `0`, the system tries Google Custom Search.
+- If all configured providers fail, `search_web` returns a tool failure with the provider error summary.
 
 ### Google Search Console API Configuration
 
