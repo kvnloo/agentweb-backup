@@ -7,6 +7,75 @@ import crypto from "crypto";
 
 const router = Router();
 
+type MarketStrategy = NonNullable<Organization["marketStrategy"]>;
+type MarketIcp = MarketStrategy["icp"][number];
+type MarketCompetitor = MarketStrategy["competitors"][number];
+
+function hasItems(value: unknown): boolean {
+  return Array.isArray(value) && value.length > 0;
+}
+
+function mapOnboardingIcps(user: any): MarketIcp[] {
+  if (!Array.isArray(user.icpResult)) return [];
+  return user.icpResult
+    .map((icp: any) => ({
+      title: typeof icp?.name === "string" ? icp.name : "",
+      description: typeof icp?.pain === "string" ? icp.pain : "",
+      valueProposition: typeof icp?.desire === "string" ? icp.desire : "",
+      buyerPersonas:
+        typeof icp?.meta_targeting_brief === "string" && icp.meta_targeting_brief
+          ? [icp.meta_targeting_brief]
+          : [],
+    }))
+    .filter((icp: MarketIcp) => icp.title || icp.description || icp.valueProposition || icp.buyerPersonas.length > 0);
+}
+
+function mapOnboardingCompetitors(user: any): MarketCompetitor[] {
+  const perIcp = user.competitorResult?.per_icp;
+  if (!Array.isArray(perIcp)) return [];
+
+  const grouped = new Map<string, string[]>();
+  for (const entry of perIcp) {
+    const names = Array.isArray(entry?.competitor_names) ? entry.competitor_names : [];
+    const angles = Array.isArray(entry?.offer_angles) ? entry.offer_angles : [];
+    for (const rawName of names) {
+      const name = typeof rawName === "string" ? rawName.trim() : "";
+      if (!name) continue;
+      if (!grouped.has(name)) grouped.set(name, []);
+      const bucket = grouped.get(name)!;
+      for (const rawAngle of angles) {
+        const angle = typeof rawAngle === "string" ? rawAngle.trim() : "";
+        if (angle && !bucket.includes(angle)) bucket.push(angle);
+      }
+    }
+  }
+
+  return Array.from(grouped.entries()).map(([name, angles]) => ({
+    name,
+    description: angles.slice(0, 2).join("; ") || "Identified during onboarding",
+  }));
+}
+
+function buildOrgMarketStrategyForCopy(user: any): MarketStrategy | undefined {
+  const existing = user.marketStrategy as MarketStrategy | undefined;
+  const fallbackIcps = mapOnboardingIcps(user);
+  const fallbackCompetitors = mapOnboardingCompetitors(user);
+  const shouldFillIcps = !hasItems(existing?.icp) && fallbackIcps.length > 0;
+  const shouldFillCompetitors = !hasItems(existing?.competitors) && fallbackCompetitors.length > 0;
+
+  if (!existing && !shouldFillIcps && !shouldFillCompetitors) return undefined;
+  if (existing && !shouldFillIcps && !shouldFillCompetitors) return existing;
+
+  const now = new Date().toISOString();
+  return {
+    businessOverview: existing?.businessOverview ?? "",
+    competitors: shouldFillCompetitors ? fallbackCompetitors : (existing?.competitors ?? []),
+    icp: shouldFillIcps ? fallbackIcps : (existing?.icp ?? []),
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now,
+  };
+}
+
 // All org routes require authentication
 router.use(authenticateToken);
 
@@ -597,7 +666,8 @@ router.post("/:orgId/copy-profile", async (req: Request, res: Response) => {
     // Currently only brand guidelines and market strategy are shared at org level
     const profileFields: Partial<Organization> = {};
     if (user.brandGuidelines) profileFields.brandGuidelines = user.brandGuidelines;
-    if (user.marketStrategy) profileFields.marketStrategy = user.marketStrategy;
+    const marketStrategy = buildOrgMarketStrategyForCopy(user);
+    if (marketStrategy) profileFields.marketStrategy = marketStrategy;
 
     if (Object.keys(profileFields).length === 0) {
       return res.json({ success: true, message: "No profile data to copy", copiedFields: [] });
