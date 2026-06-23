@@ -215,6 +215,124 @@ describe('Organization routes', () => {
     });
   });
 
+  describe('POST /api/org/:orgId/copy-profile - copy shared profile data', () => {
+    beforeEach(() => {
+      mockOrgs['org-1'] = {
+        orgId: 'org-1',
+        name: 'Test Org',
+        ownerUserId: 'user-1',
+        maxMembers: 5,
+      };
+      mockUsers['user-1'].orgId = 'org-1';
+      mockUsers['user-1'].orgRole = 'owner';
+    });
+
+    it('copies an existing marketStrategy along with brand guidelines', async () => {
+      mockUsers['user-1'].brandGuidelines = {
+        brandData: { brandName: 'Corgi' },
+        attachments: [],
+        createdAt: '2026-06-22T00:00:00.000Z',
+        updatedAt: '2026-06-22T00:00:00.000Z',
+      };
+      mockUsers['user-1'].marketStrategy = {
+        businessOverview: 'Corgi helps GTM teams target accounts.',
+        competitors: [{ name: 'Competitor A', description: 'Legacy option' }],
+        icp: [{ title: 'Account executives', description: 'Sales users', valueProposition: 'Find better leads', buyerPersonas: [] }],
+        createdAt: '2026-06-22T00:00:00.000Z',
+        updatedAt: '2026-06-22T00:00:00.000Z',
+      };
+
+      const res = await request(app).post('/api/org/org-1/copy-profile').send({});
+
+      expect(res.status).toBe(200);
+      expect(res.body.copiedFields).toEqual(['brandGuidelines', 'marketStrategy']);
+      expect(mockOrgs['org-1'].brandGuidelines.brandData.brandName).toBe('Corgi');
+      expect(mockOrgs['org-1'].marketStrategy.icp).toHaveLength(1);
+    });
+
+    it('copies ICPs from onboarding results when marketStrategy is missing', async () => {
+      mockUsers['user-1'].icpResult = [
+        {
+          name: 'Revenue leaders',
+          pain: 'Pipeline is too broad.',
+          desire: 'Prioritized target accounts.',
+          objection: 'Already has a CRM.',
+          meta_targeting_brief: 'VP Sales and RevOps leaders at B2B SaaS companies',
+        },
+      ];
+
+      const res = await request(app).post('/api/org/org-1/copy-profile').send({});
+
+      expect(res.status).toBe(200);
+      expect(res.body.copiedFields).toEqual(['marketStrategy']);
+      expect(mockOrgs['org-1'].marketStrategy.icp).toEqual([
+        {
+          title: 'Revenue leaders',
+          description: 'Pipeline is too broad.',
+          valueProposition: 'Prioritized target accounts.',
+          buyerPersonas: ['VP Sales and RevOps leaders at B2B SaaS companies'],
+        },
+      ]);
+    });
+
+    it('copies competitors from onboarding results when marketStrategy is missing', async () => {
+      mockUsers['user-1'].competitorResult = {
+        per_icp: [
+          {
+            icp_id: 'icp-1',
+            competitor_names: ['Legacy CRM', 'Legacy CRM', 'Point Solution'],
+            offer_angles: ['Fast list building', 'Targeted landing pages'],
+            meta_targeting_brief: 'AE teams',
+          },
+        ],
+      };
+
+      const res = await request(app).post('/api/org/org-1/copy-profile').send({});
+
+      expect(res.status).toBe(200);
+      expect(mockOrgs['org-1'].marketStrategy.competitors).toEqual([
+        { name: 'Legacy CRM', description: 'Fast list building; Targeted landing pages' },
+        { name: 'Point Solution', description: 'Fast list building; Targeted landing pages' },
+      ]);
+    });
+
+    it('fills missing ICP and competitor sections from onboarding without overwriting existing business overview', async () => {
+      mockUsers['user-1'].marketStrategy = {
+        businessOverview: 'Existing overview from the owner account.',
+        competitors: [],
+        icp: [],
+        createdAt: '2026-06-20T00:00:00.000Z',
+        updatedAt: '2026-06-20T00:00:00.000Z',
+      };
+      mockUsers['user-1'].icpResult = [
+        {
+          name: 'Account executives',
+          pain: 'Manual prospecting takes too long.',
+          desire: 'Sample lead lists for every segment.',
+          objection: 'Needs proof quality is high.',
+          meta_targeting_brief: 'AEs at growth-stage software companies',
+        },
+      ];
+      mockUsers['user-1'].competitorResult = {
+        per_icp: [
+          {
+            icp_id: 'icp-1',
+            competitor_names: ['Prospecting Tool'],
+            offer_angles: ['Enriched lists'],
+            meta_targeting_brief: 'Sales teams',
+          },
+        ],
+      };
+
+      const res = await request(app).post('/api/org/org-1/copy-profile').send({});
+
+      expect(res.status).toBe(200);
+      expect(mockOrgs['org-1'].marketStrategy.businessOverview).toBe('Existing overview from the owner account.');
+      expect(mockOrgs['org-1'].marketStrategy.icp).toHaveLength(1);
+      expect(mockOrgs['org-1'].marketStrategy.competitors).toHaveLength(1);
+    });
+  });
+
   describe('POST /api/org/:orgId/invite - invite member', () => {
     beforeEach(() => {
       mockOrgs['org-1'] = {
