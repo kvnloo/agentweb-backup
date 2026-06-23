@@ -1,6 +1,7 @@
 // Unit tests for generate_image function in agentModeService
 
 import { AgentModeService } from '../services/agentModeService';
+import * as autoHumanEvalService from '../services/autoHumanEvalService';
 import * as imageGeneration from '../services/imageGeneration';
 
 // Mock dependencies
@@ -11,18 +12,16 @@ jest.mock('../services/chatbotService', () => ({
     addToolCostToSession: jest.fn().mockResolvedValue({}),
   }
 }));
-jest.mock('../services/autoHumanEvalService', () => ({
-  enqueueAutoHumanEval: jest.fn().mockResolvedValue(null),
-}), { virtual: true });
-
-const { enqueueAutoHumanEval } = jest.requireMock('../services/autoHumanEvalService');
-
 describe('AgentModeService - generate_image function', () => {
   let agentModeService: AgentModeService;
   let mockImageService: any;
+  let enqueueAutoHumanEvalSpy: jest.SpyInstance;
 
   beforeEach(() => {
     jest.clearAllMocks();
+    enqueueAutoHumanEvalSpy = jest
+      .spyOn(autoHumanEvalService, 'enqueueAutoHumanEval')
+      .mockResolvedValue(null as any);
     
     // Mock imageService
     mockImageService = {
@@ -35,6 +34,10 @@ describe('AgentModeService - generate_image function', () => {
 
     // Create AgentModeService instance
     agentModeService = new AgentModeService();
+  });
+
+  afterEach(() => {
+    enqueueAutoHumanEvalSpy?.mockRestore();
   });
 
   describe('Size Parameter Handling', () => {
@@ -57,7 +60,7 @@ describe('AgentModeService - generate_image function', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(enqueueAutoHumanEval).toHaveBeenCalledWith(expect.objectContaining({
+      expect(enqueueAutoHumanEvalSpy).toHaveBeenCalledWith(expect.objectContaining({
         reviewType: 'creative_image',
         userId: 'user123',
         sessionId: 'session123',
