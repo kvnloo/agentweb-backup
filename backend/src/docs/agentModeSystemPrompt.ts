@@ -500,7 +500,12 @@ export function getScheduledSessionOverride(sessionType?: string): string {
 // connected). The directive now enforces a per-entity completion loop, isolates
 // a blocker to its own entity, adds a pre-output completion gate, and requires
 // gaps to be surfaced as actionable items rather than silently dropped.
-export function getUnattendedExecutionDirective(): string {
+//
+// Self-guards on sessionType (like getScheduledSessionOverride) so it is safe to
+// call unconditionally and never leaks the unattended block into a non-scheduled
+// session, even if a future caller omits the call-site guard.
+export function getUnattendedExecutionDirective(sessionType?: string): string {
+  if (sessionType !== 'scheduled') return '';
   return `\n\n[AUTOMATED UNATTENDED EXECUTION]
 This is a scheduled, automated run. No human is present. You MUST:
 - Execute the complete task in a single run without stopping to ask for confirmation, approval, or clarification at any point.

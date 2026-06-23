@@ -1911,7 +1911,7 @@ export async function generateSessionResponse(
           if (scheduleIdMatch) {
             systemPrompt += `\n\n[Schedule Context] This session was created by a scheduled chat (scheduleId: ${scheduleIdMatch[1]}). If the user asks to update this schedule, first call list_scheduled_chats to get the current schedule details, then use manage_scheduled_chat with action "update" and the schedule_id. You can do partial updates — only include the fields you want to change.`;
           }
-          systemPrompt += getUnattendedExecutionDirective();
+          systemPrompt += getUnattendedExecutionDirective(session.sessionType);
         }
 
         // For Slack sessions (including scheduled scans), inject team identity context so Emma

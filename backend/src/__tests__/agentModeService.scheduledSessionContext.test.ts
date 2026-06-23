@@ -142,7 +142,28 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
   // blocker to its entity and keep going, (3) add a pre-output completion gate,
   // and (4) surface gaps as actionable items.
 
-  const directive = getUnattendedExecutionDirective();
+  const directive = getUnattendedExecutionDirective('scheduled');
+
+  // ── Self-guard: mirrors getScheduledSessionOverride so the function is safe
+  //    to call unconditionally and cannot leak the unattended block into a
+  //    non-scheduled session even if a future caller forgets the call-site guard.
+  it('returns empty string when sessionType is undefined', () => {
+    expect(getUnattendedExecutionDirective(undefined)).toBe('');
+  });
+
+  it('returns empty string when sessionType is "regular"', () => {
+    expect(getUnattendedExecutionDirective('regular')).toBe('');
+  });
+
+  it('returns empty string for other known non-scheduled types', () => {
+    for (const t of ['image-generation', 'report_generation', 'emma-email', 'predefined-work-plan']) {
+      expect(getUnattendedExecutionDirective(t)).toBe('');
+    }
+  });
+
+  it('returns the directive only for sessionType "scheduled"', () => {
+    expect(getUnattendedExecutionDirective('scheduled')).not.toBe('');
+  });
 
   it('is non-empty and labelled as the unattended execution block', () => {
     expect(directive).toContain('AUTOMATED UNATTENDED EXECUTION');
