@@ -632,9 +632,15 @@ async function processLead(
 
     // Step 3: critic pass — only over web-tier fills.
     // Stamp the returned verdicts onto each web-fill's meta BEFORE the writer
-    // sees it. Phase 1 doesn't drop fills based on verdict — UI/downstream
-    // consumers filter by criticVerdict.
+    // sees it. `unsupported`/`partially-supported` fills are KEPT at low quality
+    // (criticView 'low') so the user can decide — SERP snippets often corroborate
+    // contextually without the literal value. `contradicted` fills are DROPPED:
+    // the critic determined the source describes a DIFFERENT entity (e.g. the
+    // "Slashy" lead matched to the company "Slash"), so the value is wrong for
+    // this lead and must not be persisted. This mirrors V2's runCriticPass
+    // (crmEnrichmentService.ts), which also nulls `contradicted` claims.
     const webFills = allFills.filter(f => f.meta.source === 'web_search');
+    const contradictedFields = new Set<string>();
     if (webFills.length > 0) {
       const cStart = Date.now();
       console.log(`[v3:${input.listId}:${lead.leadId}] critic START over ${webFills.length} web-fill(s)`);
@@ -643,15 +649,39 @@ async function processLead(
         const verdict = criticResult.verdicts[fill.field];
         if (verdict) {
           // Derive an actionable per-field quality view from the verdict.
-          // Advisory only — `drop` recommends removal but nothing is auto-deleted.
           const criticView: EnrichedFieldMeta['criticView'] =
             verdict === 'contradicted' ? 'drop' :
             verdict === 'supported' ? 'high' :
             'low';   // unsupported / partially-supported
           fill.meta = { ...fill.meta, criticVerdict: verdict, criticView };
+          if (verdict === 'contradicted') {
+            contradictedFields.add(fill.field);
+            console.warn(`[v3:${input.listId}:${lead.leadId}] critic DROPPED "${fill.field}"="${fill.value}" verdict=contradicted (source describes a different entity)`);
+          }
         }
       }
       console.log(`[v3:${input.listId}:${lead.leadId}] critic done in ${Date.now() - cStart}ms`);
+    }
+    // Remove contradicted web fills so they never reach smart-field deps or the
+    // lead write. Match on field+web-source so a same-named non-web fill (e.g. an
+    // Apollo value the user already trusts) is never collateral-dropped. This
+    // also catches Tier 0b sibling copies of web-sourced values, which are
+    // re-stamped as web_search precisely so the critic can re-verify them
+    // against this lead's identity (Slashy/Slash bug).
+    if (contradictedFields.size > 0) {
+      for (let i = allFills.length - 1; i >= 0; i--) {
+        const f = allFills[i];
+        if (f.meta.source === 'web_search' && contradictedFields.has(f.field)) {
+          allFills.splice(i, 1);
+        }
+      }
+      // Also purge the dropped values from the in-memory lead so they can't leak
+      // into smart-field dependency resolution (Step 4) or any later read.
+      for (const field of contradictedFields) {
+        if (enrichedLead.customFields && field in enrichedLead.customFields) {
+          delete enrichedLead.customFields[field];
+        }
+      }
     }
   } catch (err) {
     console.log(`[v3:${input.listId}:${lead.leadId}] processing threw after ${Date.now() - leadStart}ms: ${(err as Error).message}`);
