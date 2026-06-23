@@ -301,4 +301,58 @@ describe('Tier 0b copySiblingConfigFields', () => {
     const out = copySiblingConfigFields(lead(), [sib], [field('industry')], mappingTable);
     expect(out.fills).toHaveLength(1);
   });
+
+  // ── Provenance carry-forward (Slashy/Slash bug) ──────────────────────────
+  // A sibling value that originated from a web search must keep its web
+  // provenance when copied, re-stamped as source:'web_search', so the
+  // orchestrator's critic can re-verify it against THIS lead's identity.
+  it('re-stamps a web-sourced sibling value as web_search and carries source URL/quote', () => {
+    const sib = sibling({
+      leadId: 'sib-web',
+      customFields: { funding_stage: 'Series B' },
+      enrichmentMetadata: {
+        funding_stage: {
+          source: 'web_search',
+          provider: 'llm_web_search',
+          confidence: 'medium',
+          sourceUrl: 'https://www.slash.com/blog/slash-raises-series-b',
+          sourceQuote: 'Slash has recently raised $41 million in a Series B funding round',
+          enrichedAt: '2026-06-23T09:59:32Z',
+        } as any,
+      },
+    });
+    const out = copySiblingConfigFields(lead(), [sib], [field('funding_stage')], emptyMap);
+    expect(out.fills).toHaveLength(1);
+    expect(out.fills[0].value).toBe('Series B');
+    expect(out.fills[0].meta).toMatchObject({
+      source: 'web_search',
+      provider: 'llm_web_search',
+      confidence: 'medium',
+      sourceUrl: 'https://www.slash.com/blog/slash-raises-series-b',
+      sourceQuote: 'Slash has recently raised $41 million in a Series B funding round',
+      // sibling lineage retained for debugging
+      siblingLeadId: 'sib-web',
+    });
+  });
+
+  it('keeps the plain crm-history shape for a non-web (Apollo) sibling value', () => {
+    const sib = sibling({
+      leadId: 'sib-apollo',
+      customFields: { industry: 'Fintech' },
+      enrichmentMetadata: {
+        industry: { source: 'api', provider: 'apollo', confidence: 'high', enrichedAt: '2026-06-23T00:00:00Z' } as any,
+      },
+    });
+    const out = copySiblingConfigFields(lead(), [sib], [field('industry')], emptyMap);
+    expect(out.fills).toHaveLength(1);
+    expect(out.fills[0].meta).toMatchObject({ source: 'crm-history', provider: 'agentweb' });
+    expect((out.fills[0].meta as any).sourceUrl).toBeUndefined();
+  });
+
+  it('keeps the plain crm-history shape when the sibling has no provenance for the field', () => {
+    const sib = sibling({ leadId: 'sib-nometa', customFields: { tags: 'a, b' } });
+    const out = copySiblingConfigFields(lead(), [sib], [field('tags')], emptyMap);
+    expect(out.fills).toHaveLength(1);
+    expect(out.fills[0].meta).toMatchObject({ source: 'crm-history', provider: 'agentweb' });
+  });
 });

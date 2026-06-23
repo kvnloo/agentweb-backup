@@ -202,18 +202,37 @@ export function copySiblingConfigFields(
       for (const key of uniqueKeys) {
         const v = sib.customFields[key];
         if (typeof v !== 'string' || v.trim() === '') continue;
-        fills.push({
-          field: configField.name,
-          value: v,
-          meta: {
-            source: 'crm-history',
-            provider: 'agentweb',
-            enrichedAt,
-            siblingLeadId: sib.leadId,
-            siblingListId: sib.listId,
-            siblingUserId: sib.userId,
-          },
-        });
+        // Carry the sibling's originating provenance forward when the copied
+        // value came from a web search. Without this, a cross-company web fill
+        // (e.g. "Slash" funding copied onto a "Slashy" lead) would lose its
+        // sourceUrl/sourceQuote and silently bypass the critic. We re-stamp it
+        // as web_search so the orchestrator's critic pass re-verifies the copy
+        // against the lead's identity; the sibling audit IDs are retained for
+        // lineage. Non-web sibling values (Apollo, manual, etc.) keep the
+        // plain crm-history shape and remain trusted.
+        const sibMeta = sib.enrichmentMetadata?.[key];
+        const copiedFromWeb = sibMeta?.source === 'web_search';
+        const meta: EnrichedFieldMeta = copiedFromWeb
+          ? {
+              source: 'web_search',
+              provider: sibMeta!.provider ?? 'agentweb',
+              enrichedAt,
+              confidence: sibMeta!.confidence,
+              sourceUrl: sibMeta!.sourceUrl,
+              sourceQuote: sibMeta!.sourceQuote,
+              siblingLeadId: sib.leadId,
+              siblingListId: sib.listId,
+              siblingUserId: sib.userId,
+            }
+          : {
+              source: 'crm-history',
+              provider: 'agentweb',
+              enrichedAt,
+              siblingLeadId: sib.leadId,
+              siblingListId: sib.listId,
+              siblingUserId: sib.userId,
+            };
+        fills.push({ field: configField.name, value: v, meta });
         break; // field filled — move to next config field
       }
       // If we filled this field from this sibling, stop checking more siblings

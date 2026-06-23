@@ -116,6 +116,9 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
           if (!item || !item.leadId || item.leadId === excludeLeadId) continue;
           if (seen.has(item.leadId)) continue;
           seen.add(item.leadId);
+          // Raw lead rows already carry enrichmentMetadata (no projection is
+          // applied to these GSI queries), so Tier 0b can read each copied
+          // field's provenance and re-verify web-sourced copies via the critic.
           merged.push(item);
         }
       }
@@ -652,15 +655,26 @@ async function runCriticReal(input: {
   }));
 
   const systemPrompt =
-    `You are a fact-checker for CRM enrichment. Given each claim (field, value, ` +
-    `and source quote/URL when available), decide if the claim is "supported", ` +
-    `"partially-supported", "unsupported", or "contradicted" by the source. ` +
-    `Return strict JSON: an object keyed by field name.`;
+    `You are a fact-checker for CRM enrichment. Each claim has a field, value, and ` +
+    `a source quote/URL the value was extracted from. Decide whether the claim is ` +
+    `"supported", "partially-supported", "unsupported", or "contradicted" by the source.\n\n` +
+    `CRITICAL — entity identity: the claim must describe the SAME company as the lead. ` +
+    `Use the lead's company name, website domain, and email domain to judge identity. ` +
+    `If the source quote/URL is about a DIFFERENT company — including a similarly-named ` +
+    `but distinct one (e.g. "Slash" vs "Slashy", "Stripe" vs "Stripes") — the claim is ` +
+    `"contradicted", no matter how clearly the source states the value. Only treat the ` +
+    `source as a match when the company name AND/OR domain plausibly refer to the lead's ` +
+    `company. When identity is genuinely ambiguous, use "unsupported", not "supported".\n\n` +
+    `Return strict JSON: an object keyed by field name with one verdict string per field.`;
 
   const userPrompt =
-    `Lead: ${JSON.stringify({ email: input.lead.email, company: input.lead.company })}\n\n` +
+    `Lead: ${JSON.stringify({
+      email: input.lead.email,
+      company: input.lead.company,
+      website: input.lead.website,
+    })}\n\n` +
     `Claims to verify:\n${JSON.stringify(claims, null, 2)}\n\n` +
-    `Return ONLY JSON like {"field_a": "supported", "field_b": "partially-supported"}.`;
+    `Return ONLY JSON like {"field_a": "supported", "field_b": "contradicted"}.`;
 
   try {
     const llm = createLLMService(CRITIC_MODEL, 0.0);

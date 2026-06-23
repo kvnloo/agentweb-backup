@@ -9,6 +9,7 @@ import {
   setEnrichmentConfig,
   suggestFieldTypes,
   processEnrichmentConfig,
+  customColumnNamesFromConfig,
   RESERVED_FIELD_NAMES,
   STANDARD_ENRICHABLE_FIELDS,
   type ConfigServiceDeps,
@@ -36,6 +37,7 @@ function makeDeps(overrides: Partial<ConfigServiceDeps> = {}): ConfigServiceDeps
     readListConfig: jest.fn().mockResolvedValue(null),
     writeListConfig: jest.fn().mockResolvedValue(undefined),
     loadListFieldNames: jest.fn().mockResolvedValue([]),
+    mergeListFieldNames: jest.fn().mockResolvedValue(undefined),
     llmSuggestTypes: jest.fn().mockResolvedValue([]),
     llmInferAliases: jest.fn().mockResolvedValue({}),
     llmClassifySmartFields: jest.fn().mockResolvedValue({}),
@@ -390,6 +392,81 @@ describe('setEnrichmentConfig — happy path', () => {
 
     expect(result.config.updatedBy).toBe(USER_ID);
     expect(new Date(result.config.updatedAt).getTime()).toBeGreaterThanOrEqual(before);
+  });
+
+  // ─── Custom-column registration (funding_stage "disappeared" bug) ───────────
+  // A configured custom field must show up in the Configure Display Fields
+  // dialog (which reads list.fieldNames) even before any lead has a value —
+  // otherwise a field whose value is never found, or is dropped by the critic,
+  // silently vanishes from the column list.
+  it('registers configured CUSTOM field names on the parent list', async () => {
+    const deps = makeDeps();
+    await setEnrichmentConfig(
+      {
+        listId: LIST_ID,
+        userId: USER_ID,
+        config: validConfig({
+          fields: [
+            { name: 'funding_stage', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+            { name: 'company', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' }, // standard — skip
+            { name: 'website', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' }, // standard — skip
+            { name: 'emailDomain', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' }, // excluded — skip
+          ],
+        }),
+      },
+      deps,
+    );
+    expect(deps.mergeListFieldNames).toHaveBeenCalledTimes(1);
+    const [listIdArg, names] = (deps.mergeListFieldNames as jest.Mock).mock.calls[0];
+    expect(listIdArg).toBe(LIST_ID);
+    expect(names).toEqual(['funding_stage']);
+  });
+
+  it('does NOT call mergeListFieldNames when the config has only standard/excluded fields', async () => {
+    const deps = makeDeps();
+    await setEnrichmentConfig(
+      {
+        listId: LIST_ID,
+        userId: USER_ID,
+        config: validConfig({
+          fields: [
+            { name: 'company', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+            { name: 'email', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+          ],
+        }),
+      },
+      deps,
+    );
+    expect(deps.mergeListFieldNames).not.toHaveBeenCalled();
+  });
+
+  it('still persists the config when fieldNames registration fails (fail-soft)', async () => {
+    const deps = makeDeps({
+      mergeListFieldNames: jest.fn().mockRejectedValue(new Error('ddb down')),
+    });
+    const result = await setEnrichmentConfig(
+      { listId: LIST_ID, userId: USER_ID, config: validConfig() },  // 'industry' = custom
+      deps,
+    );
+    expect(deps.writeListConfig).toHaveBeenCalledTimes(1);
+    expect(result.config.fields[0]?.name).toBe('industry');
+  });
+});
+
+// ─── customColumnNamesFromConfig ──────────────────────────────────────────────
+
+describe('customColumnNamesFromConfig', () => {
+  it('returns only custom field names, de-duplicated, preserving order', () => {
+    const out = customColumnNamesFromConfig(validConfig({
+      fields: [
+        { name: 'funding_stage', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' },
+        { name: 'tech_stack', type: 'string', instruction: '', include: false, overwritePolicy: 'fill_if_empty' }, // include:false still a column
+        { name: 'funding_stage', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' }, // dup
+        { name: 'firstName', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' }, // standard
+        { name: '   ', type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' }, // blank
+      ],
+    }));
+    expect(out).toEqual(['funding_stage', 'tech_stack']);
   });
 });
 
