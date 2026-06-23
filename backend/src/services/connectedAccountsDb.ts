@@ -248,6 +248,7 @@ export interface TwitterXConfig extends BaseOAuthConfig {
   twitter_user_id: string; // X numeric user id (used as DM participant id)
   username: string;        // X handle without leading @
   refresh_token: string;   // required — offline.access grants this; needed to refresh ~2h access tokens
+  needs_reconnect?: boolean; // set when token refresh fails (revoked/expired refresh token); cleared on reconnect
 }
 
 export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig;

@@ -41,9 +41,11 @@ jest.mock('../utils/secretsManager', () => ({
 // ─── Mock connectedAccountsDb ─────────────────────────────────────────────────
 const mockGetAccountsByUserId = jest.fn();
 const mockUpdateAccountTokens = jest.fn();
+const mockUpdateAccountConfig = jest.fn();
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: (...a: any[]) => mockGetAccountsByUserId(...a),
   updateAccountTokens: (...a: any[]) => mockUpdateAccountTokens(...a),
+  updateAccountConfig: (...a: any[]) => mockUpdateAccountConfig(...a),
 }));
 
 import { twitterService } from '../services/twitterService';
@@ -69,6 +71,9 @@ const makeAccount = (overrides: any = {}) => ({
   updated_at: '2026-06-23T00:00:00.000Z',
 });
 
+// Convenience: build an error that looks like an X API 401 response.
+const makeXAuthError = () => Object.assign(new Error('Unauthorized'), { statusCode: 401 });
+
 beforeEach(() => {
   jest.clearAllMocks();
   twitterApiConstructorArgs.length = 0;
@@ -79,6 +84,7 @@ beforeEach(() => {
   mockUserByUsername.mockResolvedValue({ data: { id: '999', username: 'target', name: 'Target' } });
   mockListDmEvents.mockResolvedValue({ data: { data: [{ id: 'dm1', text: 'yo' }] } });
   mockRefreshOAuth2Token.mockResolvedValue({ accessToken: 'access-new', refreshToken: 'refresh-new', expiresIn: 7200 });
+  mockUpdateAccountConfig.mockResolvedValue(undefined);
 });
 
 // ─── FAIL cases ───────────────────────────────────────────────────────────────
@@ -199,5 +205,123 @@ describe('TwitterService.isAccountConnected', () => {
   it('false when no twitter account exists', async () => {
     mockGetAccountsByUserId.mockResolvedValue([]);
     await expect(twitterService.isAccountConnected(OWNER)).resolves.toBe(false);
+  });
+});
+
+// ─── Option 1: needs_reconnect hardening ─────────────────────────────────────
+
+describe('TwitterService.getClient — needs_reconnect fast-fail', () => {
+  it('throws immediately without attempting a refresh when needs_reconnect is true', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount({ needs_reconnect: true })]);
+    await expect(twitterService.getClient(OWNER, ACCOUNT_ID)).rejects.toThrow(/reconnect/i);
+    expect(mockRefreshOAuth2Token).not.toHaveBeenCalled();
+  });
+});
+
+describe('TwitterService.getClient — marks needs_reconnect on refresh failure', () => {
+  it('sets needs_reconnect and throws a reconnect message when pre-emptive refresh fails', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ token_expires_at: Date.now() - 1000 }),
+    ]);
+    mockRefreshOAuth2Token.mockRejectedValue(new Error('invalid_grant'));
+
+    await expect(twitterService.getClient(OWNER, ACCOUNT_ID)).rejects.toThrow(/reconnect/i);
+    expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
+      OWNER, 'twitter', ACCOUNT_ID, { needs_reconnect: true }
+    );
+    // Token update must NOT have been called — refresh never completed.
+    expect(mockUpdateAccountTokens).not.toHaveBeenCalled();
+  });
+
+  it('sets needs_reconnect and throws when there is no refresh_token at all', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ token_expires_at: Date.now() - 1000, refresh_token: '' }),
+    ]);
+
+    await expect(twitterService.getClient(OWNER, ACCOUNT_ID)).rejects.toThrow(/reconnect/i);
+    expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
+      OWNER, 'twitter', ACCOUNT_ID, { needs_reconnect: true }
+    );
+  });
+});
+
+// ─── Option 2: retry-on-401 ──────────────────────────────────────────────────
+
+describe('TwitterService — withRetryOn401 (via postTweet)', () => {
+  it('retries with a fresh token on a 401 and succeeds', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    // First call returns 401; second call (after refresh) succeeds.
+    mockTweet
+      .mockRejectedValueOnce(makeXAuthError())
+      .mockResolvedValueOnce({ data: { id: '999', text: 'retried' } });
+
+    const res = await twitterService.postTweet(OWNER, ACCOUNT_ID, 'hello');
+    expect(res.id).toBe('999');
+    // Force-refresh must have run, persisting new tokens.
+    expect(mockRefreshOAuth2Token).toHaveBeenCalledTimes(1);
+    expect(mockUpdateAccountTokens).toHaveBeenCalledWith(
+      OWNER, 'twitter',
+      expect.objectContaining({ access_token: 'access-new' }),
+      ACCOUNT_ID
+    );
+    // Two calls to v2.tweet: first fails, second (with fresh token) succeeds.
+    expect(mockTweet).toHaveBeenCalledTimes(2);
+  });
+
+  it('does NOT retry on non-401 errors', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockTweet.mockRejectedValue(new Error('rate limit exceeded'));
+
+    await expect(twitterService.postTweet(OWNER, ACCOUNT_ID, 'hello')).rejects.toThrow(/rate limit/i);
+    expect(mockTweet).toHaveBeenCalledTimes(1);
+    expect(mockRefreshOAuth2Token).not.toHaveBeenCalled();
+  });
+
+  it('marks needs_reconnect when force-refresh itself fails on 401', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockTweet.mockRejectedValue(makeXAuthError());
+    mockRefreshOAuth2Token.mockRejectedValue(new Error('invalid_grant'));
+
+    await expect(twitterService.postTweet(OWNER, ACCOUNT_ID, 'hello')).rejects.toThrow(/reconnect/i);
+    expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
+      OWNER, 'twitter', ACCOUNT_ID, { needs_reconnect: true }
+    );
+  });
+
+  it('marks needs_reconnect when force-refresh succeeds but retry call also returns 401', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    // Both calls return 401 (X revoked the new token immediately too).
+    mockTweet.mockRejectedValue(makeXAuthError());
+
+    await expect(twitterService.postTweet(OWNER, ACCOUNT_ID, 'hello')).rejects.toThrow(/reconnect/i);
+    expect(mockRefreshOAuth2Token).toHaveBeenCalledTimes(1);
+    expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
+      OWNER, 'twitter', ACCOUNT_ID, { needs_reconnect: true }
+    );
+  });
+
+  it('clears needs_reconnect flag when force-refresh succeeds', async () => {
+    // Account already flagged needs_reconnect = true but the refresh_token is still valid.
+    // This simulates a transient X-side revocation that self-healed.
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ needs_reconnect: true }),
+    ]);
+    // getClient() will fast-fail because needs_reconnect is set, so we test forceRefresh
+    // indirectly: we need to call it from a path that bypasses getClient.
+    // The most direct way is to have a valid token (not fast-failed) get a 401 mid-call,
+    // triggering forceRefresh, which then clears the flag.
+    // Arrange: token is valid (no fast-fail), but X rejects it with 401.
+    mockGetAccountsByUserId
+      .mockResolvedValueOnce([makeAccount({ needs_reconnect: false })]) // getClient succeeds
+      .mockResolvedValue([makeAccount({ needs_reconnect: true })]);    // forceRefresh re-reads — flag was set
+    mockTweet
+      .mockRejectedValueOnce(makeXAuthError())
+      .mockResolvedValueOnce({ data: { id: '321', text: 'ok' } });
+
+    await twitterService.postTweet(OWNER, ACCOUNT_ID, 'hello');
+    // forceRefresh should have cleared needs_reconnect on success.
+    expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
+      OWNER, 'twitter', ACCOUNT_ID, { needs_reconnect: false }
+    );
   });
 });

@@ -3,6 +3,7 @@ import { getTwitterCredentials } from '../utils/secretsManager';
 import {
   getAccountsByUserId,
   updateAccountTokens,
+  updateAccountConfig,
   TwitterXConfig,
 } from './connectedAccountsDb';
 
@@ -86,23 +87,47 @@ export class TwitterService {
 
   /**
    * Return a user-context TwitterApi client for the given account, refreshing the
-   * OAuth2 access token first when it is expired (or about to expire). New tokens
-   * are persisted back to the OWNER's record so org-shared accounts stay valid.
+   * OAuth2 access token pre-emptively when it is expired (or about to expire).
+   * If the account is flagged needs_reconnect, throws immediately — no point
+   * attempting a refresh with a known-dead refresh token.
+   * If a pre-emptive refresh fails, stamps needs_reconnect so Emma can surface
+   * a clear reconnect message instead of a raw API error.
    */
   async getClient(ownerUserId: string, accountId: string): Promise<TwitterApi> {
     const account = await this.resolveAccount(ownerUserId, accountId);
     const config = account.config as TwitterXConfig;
+
+    // Fast-fail if the refresh token is known-dead to avoid wasting an API round-trip.
+    if (config.needs_reconnect) {
+      throw new Error(
+        'Your X account needs to be reconnected. Go to Settings → Connected Accounts and reconnect your X account.'
+      );
+    }
 
     let accessToken = config.access_token;
     const expiresAt = Number(config.token_expires_at) || 0;
 
     if (Date.now() >= expiresAt - TOKEN_REFRESH_SKEW_MS) {
       if (!config.refresh_token) {
-        throw new Error('Twitter access token expired and no refresh_token available — reconnect required');
+        await this.markNeedsReconnect(ownerUserId, accountId);
+        throw new Error(
+          'Your X account needs to be reconnected. Go to Settings → Connected Accounts and reconnect your X account.'
+        );
       }
       this.log(`Refreshing expired token for account ${accountId}`);
-      const app = await this.getAppClient();
-      const refreshed = await app.refreshOAuth2Token(config.refresh_token);
+      // Only wrap the X API call — updateAccountTokens is a DB write and its
+      // failures should propagate as-is (a DB error is not a token error).
+      let refreshed: any;
+      try {
+        const app = await this.getAppClient();
+        refreshed = await app.refreshOAuth2Token(config.refresh_token);
+      } catch (refreshErr) {
+        this.log(`Pre-emptive refresh failed for account ${accountId} — marking needs_reconnect`, refreshErr);
+        await this.markNeedsReconnect(ownerUserId, accountId);
+        throw new Error(
+          'Your X account needs to be reconnected. Go to Settings → Connected Accounts and reconnect your X account.'
+        );
+      }
       accessToken = refreshed.accessToken;
       await updateAccountTokens(
         ownerUserId,
@@ -117,6 +142,104 @@ export class TwitterService {
     }
 
     return new TwitterApi(accessToken);
+  }
+
+  // ─── Token recovery helpers ───────────────────────────────────────────────────
+
+  /** Persist needs_reconnect=true so future calls fast-fail and the UI shows a banner. */
+  private async markNeedsReconnect(ownerUserId: string, accountId: string): Promise<void> {
+    try {
+      await updateAccountConfig(ownerUserId, 'twitter', accountId, { needs_reconnect: true });
+    } catch (e) {
+      console.error(`[TwitterService] Failed to mark account ${accountId} needs_reconnect:`, e);
+    }
+  }
+
+  /**
+   * Force-refresh the access token regardless of the stored expiry timestamp.
+   * Used by withRetryOn401 when X rejects a token that has not yet expired by
+   * our clock (revoked on X's side, clock skew, etc.).
+   * Clears needs_reconnect on success so a subsequent reconnect-triggered refresh
+   * is picked up without a UI reload.
+   */
+  private async forceRefresh(ownerUserId: string, accountId: string): Promise<TwitterApi> {
+    const account = await this.resolveAccount(ownerUserId, accountId);
+    const config = account.config as TwitterXConfig;
+    if (!config.refresh_token) {
+      throw new Error('No refresh_token available');
+    }
+    this.log(`Force-refreshing token for account ${accountId} (bypass expiry check)`);
+    // Only wrap the X API call — let DB write errors propagate naturally so
+    // callers don't mistakenly mark needs_reconnect on a DB failure.
+    let refreshed: any;
+    try {
+      const app = await this.getAppClient();
+      refreshed = await app.refreshOAuth2Token(config.refresh_token);
+    } catch {
+      throw new Error('X token refresh failed — refresh token may be revoked');
+    }
+    await updateAccountTokens(
+      ownerUserId,
+      'twitter',
+      {
+        access_token: refreshed.accessToken,
+        refresh_token: refreshed.refreshToken ?? config.refresh_token,
+        token_expires_at: Date.now() + (refreshed.expiresIn ?? 7200) * 1000,
+      },
+      accountId
+    );
+    // Clear the reconnect flag if it was set — the refresh token is still good.
+    if (config.needs_reconnect) {
+      await updateAccountConfig(ownerUserId, 'twitter', accountId, { needs_reconnect: false });
+    }
+    return new TwitterApi(refreshed.accessToken);
+  }
+
+  /**
+   * Execute an X API call and, on a 401, force-refresh the token and retry once.
+   * If the retry also returns 401 (or the refresh itself fails), stamps
+   * needs_reconnect so the UI can surface a "Reconnect your X account" prompt.
+   *
+   * All six public action methods go through this to get Option-2 retry behaviour
+   * on top of Option-1 needs_reconnect hardening.
+   */
+  private async withRetryOn401<T>(
+    ownerUserId: string,
+    accountId: string,
+    fn: (client: TwitterApi) => Promise<T>
+  ): Promise<T> {
+    const client = await this.getClient(ownerUserId, accountId);
+    const isXAuthError = (e: unknown): boolean =>
+      typeof e === 'object' && e !== null && (e as any).statusCode === 401;
+
+    try {
+      return await fn(client);
+    } catch (err) {
+      if (!isXAuthError(err)) throw err;
+
+      this.log(`Got 401 for account ${accountId} — force-refreshing and retrying`);
+      let freshClient: TwitterApi;
+      try {
+        freshClient = await this.forceRefresh(ownerUserId, accountId);
+      } catch {
+        await this.markNeedsReconnect(ownerUserId, accountId);
+        throw new Error(
+          'Your X account needs to be reconnected. Go to Settings → Connected Accounts and reconnect your X account.'
+        );
+      }
+
+      try {
+        return await fn(freshClient);
+      } catch (retryErr) {
+        if (isXAuthError(retryErr)) {
+          await this.markNeedsReconnect(ownerUserId, accountId);
+          throw new Error(
+            'Your X account needs to be reconnected. Go to Settings → Connected Accounts and reconnect your X account.'
+          );
+        }
+        throw retryErr;
+      }
+    }
   }
 
   // ─── Connectivity ─────────────────────────────────────────────────────────────
@@ -139,14 +262,12 @@ export class TwitterService {
     if (!text || text.trim() === '') {
       throw new Error('Tweet text cannot be empty');
     }
-    const client = await this.getClient(ownerUserId, accountId);
     const finalText = this.trimToLimit(text.trim(), TWEET_CHAR_LIMIT);
-
-    const res = opts?.inReplyToTweetId
-      ? await client.v2.reply(finalText, opts.inReplyToTweetId)
-      : await client.v2.tweet(finalText);
-
-    return { id: res.data.id, text: res.data.text };
+    return this.withRetryOn401(ownerUserId, accountId, (client) =>
+      opts?.inReplyToTweetId
+        ? client.v2.reply(finalText, opts.inReplyToTweetId!).then((r: any) => ({ id: r.data.id, text: r.data.text }))
+        : client.v2.tweet(finalText).then((r: any) => ({ id: r.data.id, text: r.data.text }))
+    );
   }
 
   /**
@@ -156,10 +277,12 @@ export class TwitterService {
     if (!Array.isArray(texts) || texts.length === 0) {
       throw new Error('Thread must contain at least one tweet');
     }
-    const client = await this.getClient(ownerUserId, accountId);
     const trimmed = texts.map((t) => this.trimToLimit((t || '').trim(), TWEET_CHAR_LIMIT));
-    const res = await client.v2.tweetThread(trimmed);
-    return res.map((r: any) => ({ id: r.data.id, text: r.data.text }));
+    return this.withRetryOn401(ownerUserId, accountId, (client) =>
+      client.v2.tweetThread(trimmed).then((res: any) =>
+        (res as any[]).map((r: any) => ({ id: r.data.id, text: r.data.text }))
+      )
+    );
   }
 
   /**
@@ -170,33 +293,36 @@ export class TwitterService {
     if (!text || text.trim() === '') {
       throw new Error('DM text cannot be empty');
     }
-    const client = await this.getClient(ownerUserId, accountId);
     const handle = recipientHandle.replace(/^@/, '').trim();
-    const user = await client.v2.userByUsername(handle);
-    if (!user?.data?.id) {
-      throw new Error(`Could not resolve X handle "@${handle}"`);
-    }
     const finalText = this.trimToLimit(text.trim(), DM_CHAR_LIMIT);
-    return client.v2.sendDmToParticipant(user.data.id, { text: finalText });
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const user = await client.v2.userByUsername(handle);
+      if (!user?.data?.id) {
+        throw new Error(`Could not resolve X handle "@${handle}"`);
+      }
+      return client.v2.sendDmToParticipant(user.data.id, { text: finalText });
+    });
   }
 
   /**
    * List recent DM events for the connected account.
    */
   async listDms(ownerUserId: string, accountId: string): Promise<any[]> {
-    const client = await this.getClient(ownerUserId, accountId);
-    const res: any = await client.v2.listDmEvents();
-    return res?.data?.data ?? res?.data ?? [];
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const res: any = await client.v2.listDmEvents();
+      return res?.data?.data ?? res?.data ?? [];
+    });
   }
 
   /**
    * Fetch an X profile by handle.
    */
   async getProfile(ownerUserId: string, accountId: string, handle: string): Promise<any> {
-    const client = await this.getClient(ownerUserId, accountId);
     const clean = handle.replace(/^@/, '').trim();
-    const res = await client.v2.userByUsername(clean);
-    return res.data;
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const res = await client.v2.userByUsername(clean);
+      return res.data;
+    });
   }
 }
 
