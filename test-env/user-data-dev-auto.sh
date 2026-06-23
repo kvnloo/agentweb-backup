@@ -73,6 +73,7 @@ systemctl restart sshd
 curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
 dnf install -y nodejs
 npm install -g @anthropic-ai/claude-code
+sudo -u ec2-user python3 -m pip install --user aider-chat
 
 dnf install -y dnf-plugins-core
 dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
@@ -223,6 +224,29 @@ CLAUDE_ENV=$(get_secret "agentweb/test-env/claude-code-env")
   done <<< "$CLAUDE_ENV"
 } >> /home/ec2-user/.bashrc
 
+# 6b. Azure OpenAI credentials for aider (gpt-5.5 alternative to Claude)
+# These already exist in backend/.env — re-export them for the ec2-user shell so
+# claude-run.sh can pass them to `codex` without reading secrets again.
+AZURE_KEY=$(grep '^AZURE_OPENAI_API_KEY=' "$APP_DIR/backend/.env" | cut -d= -f2-)
+AZURE_EP=$(grep '^AZURE_OPENAI_ENDPOINT=' "$APP_DIR/backend/.env" | cut -d= -f2-)
+AZURE_VER=$(grep '^AZURE_OPENAI_API_VERSION_AGENT_MODE=' "$APP_DIR/backend/.env" | cut -d= -f2-)
+[[ -z "$AZURE_VER" ]] && AZURE_VER=$(grep '^AZURE_OPENAI_API_VERSION=' "$APP_DIR/backend/.env" | cut -d= -f2-)
+{
+  echo ''
+  echo '# Azure OpenAI config for Codex CLI (gpt-5.5 alternative)'
+  [[ -n "$AZURE_KEY" ]] && echo "export AZURE_OPENAI_API_KEY=$AZURE_KEY"
+  [[ -n "$AZURE_EP" ]] && echo "export AZURE_OPENAI_ENDPOINT=$AZURE_EP"
+  [[ -n "$AZURE_VER" ]] && echo "export AZURE_OPENAI_API_VERSION=$AZURE_VER"
+} >> /home/ec2-user/.bashrc
+
+# Write aider model settings so gpt-5.5 gets temperature=1 (it rejects temperature=0)
+sudo -u ec2-user bash -c 'cat > ~/.aider.model.settings.yml << "EOF"
+- name: azure/gpt-5.5
+  edit_format: diff
+  extra_params:
+    temperature: 1
+EOF'
+
 # 7. Cloud-dev CLAUDE.md
 mkdir -p /home/ec2-user/.claude
 sed "s|PUBLIC_IP|$PUBLIC_IP|g" "$APP_DIR/test-env/cloud-dev-claude.md" \
@@ -291,6 +315,11 @@ PAGE_TITLE=$(echo "$PAGE_JSON" | jq -r '
   select(.value.type == "title") |
   .value.title | map(.plain_text) | join("")
 ')
+
+# Extract "Coding Model" select property (if set by the user in Notion).
+# Empty/unset → default (claude-opus-4-8). "gpt-5.5" → Azure Codex.
+CODING_MODEL=$(echo "$PAGE_JSON" | jq -r '.properties["Coding Model"].select.name // ""' 2>/dev/null || true)
+[[ "$CODING_MODEL" == "null" ]] && CODING_MODEL=""
 
 BLOCKS_JSON=$(curl -s "https://api.notion.com/v1/blocks/${NOTION_PAGE_ID}/children?page_size=100" \
   -H "Authorization: Bearer ${NOTION_TOKEN}" \
@@ -386,6 +415,14 @@ fi
 
 echo "$CLAUDE_PROMPT" > "$APP_DIR/.claude-prompt"
 chown ec2-user:ec2-user "$APP_DIR/.claude-prompt"
+
+# Write the chosen coding model so claude-run.sh can dispatch to the right CLI
+if [[ -n "$CODING_MODEL" ]]; then
+  echo "$CODING_MODEL" > "$APP_DIR/.coding-model"
+  chown ec2-user:ec2-user "$APP_DIR/.coding-model"
+else
+  rm -f "$APP_DIR/.coding-model"
+fi
 
 cp "$APP_DIR/test-env/claude-comment.py" "$APP_DIR/.claude-comment.py"
 chown ec2-user:ec2-user "$APP_DIR/.claude-comment.py"
