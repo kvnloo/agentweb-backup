@@ -5348,6 +5348,10 @@ emmaToolRegistry.register({
                 items: {
                   type: 'string'
                 }
+              },
+              expectedAssetCount: {
+                type: 'number',
+                description: 'Optional. For a step that must produce a specific number of media assets (e.g. "generate 18 images"), set this to that number. The step then cannot be marked completed until that many images/videos have actually been generated this session — preventing the step from being closed with only some assets produced. Omit for steps with no fixed asset count.'
               }
             },
             required: ['stepCount', 'title']
@@ -5427,6 +5431,10 @@ emmaToolRegistry.register({
                 items: {
                   type: 'string'
                 }
+              },
+              expectedAssetCount: {
+                type: 'number',
+                description: 'Optional. Number of media assets the step must produce before it can be completed. Set to a lower number (or 0 to remove the requirement entirely) when the user explicitly approves generating fewer assets than originally planned. Omitting it leaves the existing value unchanged.'
               }
             },
             required: ['stepCount', 'title']
