@@ -10,6 +10,7 @@ import { addSubdomain, generateSubdomain, listDomains, SUBDOMAIN_BASE } from "./
 import { settingsService } from "./settingsService";
 import { paginatedQuery } from "../utils/dynamoPagination";
 import { guardedV0ChatCreate, guardedV0CorrectionMessage } from "./v0UsageGuard";
+import { enqueueAutoHumanEval } from "./autoHumanEvalService";
 
 // Note: global fetch (undici) timeouts are managed by httpClient.ts (15 min headersTimeout/bodyTimeout).
 // No setGlobalDispatcher call here — duplicate calls cause the last-loaded config to win unpredictably.
@@ -1281,6 +1282,12 @@ async function addPageToExistingRepo(
     }
 
     // Update record to deployed, re-persisting repo fields in case they were missing
+    const deployedSubPage: GeneratedLandingPage = {
+      ...record,
+      status: "deployed",
+      updatedAt: new Date().toISOString(),
+    };
+
     await dynamodb
       .update({
         TableName: TABLE_NAME,
@@ -1297,11 +1304,9 @@ async function addPageToExistingRepo(
       })
       .promise();
 
-    return {
-      ...record,
-      status: "deployed",
-      updatedAt: new Date().toISOString(),
-    };
+    void enqueueLandingPageHumanEval(deployedSubPage);
+
+    return deployedSubPage;
   } catch (error: any) {
     console.error("[V0 SERVICE] Failed to add page to repo:", error);
 
@@ -1739,7 +1744,7 @@ export async function deployLandingPage(
       }
     }
 
-    return {
+    const deployedRecord: GeneratedLandingPage = {
       ...record,
       status: "deployed",
       deployedUrl,
@@ -1748,6 +1753,10 @@ export async function deployLandingPage(
       githubRepoUrl,
       updatedAt: now,
     };
+
+    void enqueueLandingPageHumanEval(deployedRecord);
+
+    return deployedRecord;
   } catch (error: any) {
     console.error("[V0 SERVICE] Deployment failed:", error);
 
@@ -1773,6 +1782,25 @@ export async function deployLandingPage(
 
     throw new Error(`Deployment failed: ${error.message}`);
   }
+}
+
+function enqueueLandingPageHumanEval(page: GeneratedLandingPage): void {
+  if (page.status !== "deployed") return;
+  const artifactUrl = getLandingPageLiveUrl(page);
+  void enqueueAutoHumanEval({
+    reviewType: "landing_page",
+    userId: page.userId,
+    sessionId: page.originatingSessionId,
+    artifactUrl: artifactUrl || undefined,
+    originalRequest: page.prompt,
+    outputSummary: `Landing page generated: ${page.name}. URL: ${artifactUrl || "not available"}.`,
+    sourceKey: `landing-page:${page.id}:iteration:${page.iterations || 0}:url:${artifactUrl || "none"}`,
+    action: {
+      type: "landing_page_iteration_deploy",
+      landingPageId: page.id,
+      userId: page.userId,
+    },
+  });
 }
 
 /**
