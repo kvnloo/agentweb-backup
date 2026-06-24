@@ -233,65 +233,73 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       );
     });
 
-    it('should count bravesearch_brave_web_search as satisfying a search_web requirement', async () => {
+    it('should require the built-in search_web tool for a search_web requirement', async () => {
       const scheduleWithSearchWeb = {
         ...baseSchedule,
         keywords: [],
         requiredFunctionCalls: ['search_web'],
       };
 
-      // Agent calls bravesearch MCP tool instead of the built-in search_web
-      const braveResponse = {
+      const legacySearchResponse = {
         ...mockResponse,
-        content: 'Found some results.',
+        content: 'Found some legacy results.',
         toolCalls: [
-          { name: 'bravesearch_brave_web_search', arguments: { query: 'test' } },
+          { name: 'legacy_search_web', arguments: { query: 'test' } },
+        ],
+      };
+      const searchWebResponse = {
+        ...mockResponse,
+        content: 'Found some current results.',
+        toolCalls: [
+          { name: 'search_web', arguments: { query: 'test' } },
         ],
       };
 
-      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(braveResponse);
+      mockGenerateMarketingResponseWorkerService.runInWorker
+        .mockResolvedValueOnce(legacySearchResponse)
+        .mockResolvedValueOnce(searchWebResponse);
 
       const result = await runScheduledChat(scheduleWithSearchWeb, mockUserId, true);
 
-      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(2);
       expect(result).toEqual(
         expect.objectContaining({
           status: 'success',
           passed: true,
-          attempt: 1,
+          attempt: 2,
           functionCallMatches: ['search_web'],
           functionCallMisses: [],
         })
       );
     });
 
-    it('should count bravesearch_brave_news_search as satisfying a search_web requirement', async () => {
+    it('should not count legacy news search calls as search_web', async () => {
       const scheduleWithSearchWeb = {
         ...baseSchedule,
         keywords: [],
         requiredFunctionCalls: ['search_web'],
       };
 
-      const braveNewsResponse = {
+      const legacyNewsResponse = {
         ...mockResponse,
         content: 'Found some news.',
         toolCalls: [
-          { name: 'bravesearch_brave_news_search', arguments: { query: 'test' } },
+          { name: 'legacy_news_search', arguments: { query: 'test' } },
         ],
       };
 
-      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(braveNewsResponse);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(legacyNewsResponse);
 
       const result = await runScheduledChat(scheduleWithSearchWeb, mockUserId, true);
 
-      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
       expect(result).toEqual(
         expect.objectContaining({
-          status: 'success',
-          passed: true,
-          attempt: 1,
-          functionCallMatches: ['search_web'],
-          functionCallMisses: [],
+          status: 'failure',
+          passed: false,
+          attempt: 20,
+          functionCallMatches: [],
+          functionCallMisses: ['search_web'],
         })
       );
     });

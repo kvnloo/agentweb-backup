@@ -66,7 +66,7 @@ describe('classifyToolFailureType', () => {
     it('classifies rate_limit / 429', () => {
       expect(classifyToolFailureType('rate_limit', '429 Too Many Requests')).toBe('config');
     });
-    it('classifies a Brave 429 from the MESSAGE even when errorClass is the unhelpful "Error" (old events)', () => {
+    it('classifies a provider 429 from the MESSAGE even when errorClass is the unhelpful "Error" (old events)', () => {
       // pre-classifier events recorded errorClass:'Error' on every failure, so
       // the message must carry the rate-limit signal on its own.
       expect(
@@ -137,7 +137,7 @@ describe('classifyToolFailureType', () => {
         classifyToolFailureType('Error', 'Invitation message is too long (201 characters). LinkedIn limits invitation notes to 200 characters'),
       ).toBe('schema_reject');
     });
-    it('the Brave summarizer cascade is config (downstream of a 429)', () => {
+    it('the summarizer cascade is config (downstream of a 429)', () => {
       expect(classifyToolFailureType('Error', 'Unable to retrieve a Summarizer summary.')).toBe('config');
     });
     it('a perform_data_analysis 404 is config (missing resource)', () => {

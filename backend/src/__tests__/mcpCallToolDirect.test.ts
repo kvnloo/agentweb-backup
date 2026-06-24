@@ -39,7 +39,7 @@ beforeEach(() => {
     "mcp_servers",
     JSON.stringify([
       { name: "higgsfield", transport: "streamable-http", url: "https://mcp.higgsfield.ai/mcp", authType: "oauth" },
-      { name: "bravesearch", transport: "stdio", command: "npx" },
+      { name: "filesystem", transport: "stdio", command: "npx" },
     ])
   );
   mockConnect.mockClear();

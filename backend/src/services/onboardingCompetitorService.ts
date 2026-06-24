@@ -208,8 +208,7 @@ export const COMPETITOR_STRATEGY_SYSTEM_PROMPT = [
 ].join("\n");
 
 /**
- * One web-search hit. Loose shape so any provider (Google CSE, Brave,
- * SerpAPI) can satisfy it.
+ * One web-search hit. Loose shape so any provider can satisfy it.
  */
 export interface WebSearchResult {
   title?: string;

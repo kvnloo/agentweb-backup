@@ -865,7 +865,7 @@ const McpServersTab: React.FC = () => {
                   fullWidth
                   multiline
                   minRows={3}
-                  placeholder={"-y\n@brave/brave-search-mcp-server\n--transport\nstdio"}
+                  placeholder={"-y\n@modelcontextprotocol/server-filesystem\n/tmp"}
                 />
                 <TextField
                   label="Environment Variables JSON (optional)"
@@ -874,7 +874,7 @@ const McpServersTab: React.FC = () => {
                   fullWidth
                   multiline
                   minRows={4}
-                  placeholder={'{"env":{"BRAVE_API_KEY":"${BRAVE_API_KEY}"}}'}
+                  placeholder={'{"env":{"MCP_LOG_LEVEL":"info"}}'}
                   helperText='Use ${VAR} for server env vars, {{var}} for per-user secrets (configured in Users tab)'
                 />
               </>
@@ -995,7 +995,7 @@ const McpServersTab: React.FC = () => {
                   fullWidth
                   multiline
                   minRows={4}
-                  placeholder={'{"env":{"BRAVE_API_KEY":"${BRAVE_API_KEY}"}}'}
+                  placeholder={'{"env":{"MCP_LOG_LEVEL":"info"}}'}
                   helperText='Use ${VAR} for server env vars, {{var}} for per-user secrets (configured in Users tab)'
                 />
               </>

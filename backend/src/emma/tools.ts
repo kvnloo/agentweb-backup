@@ -6443,7 +6443,7 @@ emmaToolRegistry.register({
         toolNames: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Array of tool names this skill can use (e.g., ["bravesearch_brave_news_search", "create_social_media_posts"])'
+          description: 'Array of tool names this skill can use (e.g., ["search_web", "create_social_media_posts"])'
         },
         systemPrompt: {
           type: 'string',

@@ -315,7 +315,7 @@ describe('McpServersTab', () => {
         fireEvent.click(screen.getByText('Add Server'));
         expect(screen.getByText('Add MCP Server')).toBeInTheDocument();
 
-        fireEvent.change(screen.getByLabelText(/Server Name/i), { target: { value: 'brave-local' } });
+        fireEvent.change(screen.getByLabelText(/Server Name/i), { target: { value: 'filesystem-local' } });
 
         fireEvent.mouseDown(screen.getByRole('combobox'));
         const listbox = screen.getByRole('listbox');
@@ -323,16 +323,16 @@ describe('McpServersTab', () => {
 
         fireEvent.change(await screen.findByLabelText(/Command/i), { target: { value: 'npx' } });
         fireEvent.change(screen.getByLabelText(/Arguments \(optional, one per line\)/i), {
-          target: { value: '-y\n@brave/brave-search-mcp-server\n--transport\nstdio' }
+          target: { value: '-y\n@modelcontextprotocol/server-filesystem\n/tmp' }
         });
         fireEvent.change(screen.getByLabelText(/Environment Variables JSON \(optional\)/i), {
-          target: { value: '{"env":{"BRAVE_API_KEY":"${BRAVE_API_KEY}"}}' }
+          target: { value: '{"env":{"MCP_LOG_LEVEL":"info"}}' }
         });
 
         mockedAxios.post.mockResolvedValueOnce({});
         mockedAxios.post.mockResolvedValueOnce({ data: { count: 1 } });
         mockedAxios.get.mockResolvedValueOnce({
-          data: [{ name: 'brave-local', transport: 'stdio', command: 'npx', discoveredTools: ['brave_web_search'] }]
+          data: [{ name: 'filesystem-local', transport: 'stdio', command: 'npx', discoveredTools: ['read_file'] }]
         });
 
         fireEvent.click(screen.getByRole('button', { name: 'Add' }));
@@ -342,11 +342,11 @@ describe('McpServersTab', () => {
             1,
             'http://localhost:3000/api/admin/mcp-servers',
             expect.objectContaining({
-              name: 'brave-local',
+              name: 'filesystem-local',
               transport: 'stdio',
               command: 'npx',
-              args: ['-y', '@brave/brave-search-mcp-server', '--transport', 'stdio'],
-              env: { BRAVE_API_KEY: '${BRAVE_API_KEY}' }
+              args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp'],
+              env: { MCP_LOG_LEVEL: 'info' }
             }),
             expect.any(Object)
           );

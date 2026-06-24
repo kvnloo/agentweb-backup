@@ -227,7 +227,7 @@ Pulled actual error strings from `Dev-AW-LoopEvents` (failure events carry `dime
 2. **Validators correctly rejecting bad input (working-as-designed, NOT failure)** — `run_local_agent_task` "Task rejected: web browsing/data extraction only" ×10 + forbidden-pattern `post.*comment` ×2; `linkedin_outreach` "Should delay new invitation to this recipient" ×9 (LinkedIn anti-spam delay). These inflate the rate; a naive ">30% → retire" rule would kill tools that are working. (run_local was the "55%" in the thread — most of it is this.)
 3. **Schema-validation rejections caught pre-execution (cheap)** — `read_tool_response` ×18, `search_tool_response`, `wait_seconds`: "arguments failed schema validation" / "s3_key and query required". Fix = mark args required; #1818 gateway pre-flight already catches these before execution.
 4. **Real config/infra bugs (the actually-actionable list):**
-   - **Brave 429 — CONFIRMED LIVE across every variant** (`brave_web/news/video/local/image_search` all "429 Too Many Requests" with a Brave `ErrorResponse` body; `brave_summarizer` 100% is a *cascade* — nothing to summarize once web-search 429s). One shared Brave key throttled. Fix: quota/key bump, or route to `search_web` (failed only 2×, both benign "No search results"). `brave_llm_context` = 400 (separate arg issue).
+   - **Legacy search-provider 429 — CONFIRMED LIVE across every variant** (web/news/video/local/image_search all "429 Too Many Requests"; summarizer failures were a *cascade* — nothing to summarize once web-search 429s). One shared key throttled. Fix: consolidate on `search_web` (failed only 2×, both benign "No search results").
    - `perform_data_analysis`: `404` / "The specified bucket does not exist" — missing/misconfigured S3 bucket.
    - `call_meta_ads_insights_api`: "Meta Insights Job timed out" — matches the Section-A background-job fix.
    - `slack_get_recent_messages`: "The Slack bot is not a member of channel …" ×4 — backend bot needs inviting (same class as the `LEAD_CAPTURE_ALERT_SLACK_CHANNEL` / #lead-capture caveat).
@@ -245,9 +245,9 @@ Pulled actual error strings from `Dev-AW-LoopEvents` (failure events carry `dime
 | model_uninstalled_tool | 34 | 15% |
 | by_design | 25 | 11% |
 
-So **only 28% of "failures" are real bugs** — the scorecard/policy should filter `dimensions.failureType = 'bug'`. Classifier reads signals from the error *message* too, so pre-classifier events (errorClass `'Error'`) still classify (rescues the Brave 429s from `bug`).
+So **only 28% of "failures" are real bugs** — the scorecard/policy should filter `dimensions.failureType = 'bug'`. Classifier reads signals from the error *message* too, so pre-classifier events (errorClass `'Error'`) still classify provider 429s correctly.
 
-**UPDATE 2 — classifier TUNED + Theme 1 fixed.** Investigated the 63 `bug`s: many were misclassified. Tuned the classifier (LinkedIn "cannot resend"/"recipient cannot be reached"/"no results"/bad-PDF → by_design; invite-too-long → schema_reject; Brave-summarizer cascade / 404 / aborted-op → config) and re-tagged all 227 (`backfill --force`, 27 changed). **Real `bug` count: 63 → 36 (16%).** New split: config 66 / schema_reject 55 / by_design 36 / **bug 36** / model_uninstalled_tool 34.
+**UPDATE 2 — classifier TUNED + Theme 1 fixed.** Investigated the 63 `bug`s: many were misclassified. Tuned the classifier (LinkedIn "cannot resend"/"recipient cannot be reached"/"no results"/bad-PDF → by_design; invite-too-long → schema_reject; summarizer cascade / 404 / aborted-op → config) and re-tagged all 227 (`backfill --force`, 27 changed). **Real `bug` count: 63 → 36 (16%).** New split: config 66 / schema_reject 55 / by_design 36 / **bug 36** / model_uninstalled_tool 34.
 
 The 36 real bugs cluster into: **opaque error propagation** (run_local "success=false", Meta "unknown error", linkedin "Invalid parameters", describe_image 400) · stale-file editing (`update_html_file` hash mismatch) · browser flakiness (playwright timeouts/snapshots) · misc (`get_leads` bad pagination key, `report_product_issues` self-failure).
 
@@ -440,7 +440,7 @@ Frontier-agent robustness pattern: failed trajectories become regression tests. 
 
 ### How this becomes the eval harness
 
-1. Run the export → `_summary.json` names the worst clusters (June data: linkedin_outreach × invalid_args, run_local_agent_task, bravesearch × rate_limit).
+1. Run the export → `_summary.json` names the worst clusters (June data: linkedin_outreach × invalid_args, run_local_agent_task, legacy search × rate_limit).
 2. Harsha + Fangfang curate: pick top clusters, write HUMAN expected-behavior assertions per cluster (per loop-acceptance-tests discipline).
 3. v2 runner replays curated cases against the current contract layer / tool schemas on change — regression suite from production failures.
 
@@ -479,7 +479,7 @@ Telemetry finding from the June 9-12 window: every recorded tool failure had err
 ### Assumptions to validate
 
 - The taxonomy covers the real distribution: after a few days, `SELECT errorClass COUNT` on new agent_tool_failed events should show <20% falling back to legacy names. If higher, extend classFromMessage patterns from actual messages.
-- Brave 429s → rate_limit and Meta 5xx → upstream_5xx in prod (heuristics verified against June messages, not live traffic).
+- Provider 429s → rate_limit and Meta 5xx → upstream_5xx in prod (heuristics verified against June messages, not live traffic).
 - errorClass consumers (failureRuleSet clustering, inspector) benefit rather than break from the rename — historical events keep old classes, so mixed-class clusters during transition are expected for ~7 days.
 
 ## Approval persistence closes the learning loop (Layer 4→5) (2026-06-12)
@@ -511,7 +511,7 @@ First product decision driven by the runtime-spine telemetry. Analyzed all 3,172
 
 - `linkedin_outreach` 16/59 (27%) — the single worst run retried it **15 times in 16 seconds**: 7× "Invitation message is too long (201–231 chars)" then 6× blind "Invalid parameters" retries in the same second.
 - `run_local_agent_task` 11/20 (55%) — model keeps sending out-of-scope tasks; rejection message only echoed the forbidden regex.
-- `bravesearch_*` ~41% (429 rate limits), `call_meta_ads_insights_api` 41% (sync wait on slow async job) — NOT fixed here; belong to search consolidation / background-job pattern respectively.
+- Legacy search tools ~41% (429 rate limits), `call_meta_ads_insights_api` 41% (sync wait on slow async job) — NOT fixed here; belong to search consolidation / background-job pattern respectively.
 
 ### Root cause of the LinkedIn cluster — misleading schema text
 
@@ -532,7 +532,7 @@ The tool schema said "message must be 300 characters or fewer". The real limit i
 
 ### Not fixed, filed for owners
 
-- Brave search 429s (consolidate on `search_web` at 1% failure, or add backoff) — Rui/backend.
+- Legacy search-provider 429s (consolidate on `search_web` at 1% failure) — Rui/backend.
 - Meta Insights timeout → background-job + poll pattern (same shape as CRM push #1791) — Rui.
 - `coding_agent` landing-page auth — already fixed by Rui's open #1835.
 
@@ -1327,7 +1327,7 @@ Audited all registered tools against published skills. Found **65 orphaned tools
 | Landing Page Design | `create_html_template` |
 | Knowledge Base | `perform_deep_research`, `search_ads_knowledge_base`, `list_books`, `get_book_details`, `get_book_content`, `update_book_content`, `generate_book_content`, `create_book`, `create_book_outline`, `create_blog_article`, `publish_blog_article`, `list_cms_categories`, `repair_blog_article` |
 | GTM Tracking | `account_summary`, `get_clarity_metrics`, `list_task_templates`, `create_task_from_template`, `create_task_from_prompt`, `create_image_task_from_prompt`, `create_revision`, `get_task_subscriber_metrics`, `remove_c2pa_from_image`, `rotate_primary`, `list_schedule_templates`, `manage_schedule_template`, `create_schedule_from_template`, `slack_list_channels`, `slack_get_recent_messages`, `slack_get_thread_replies`, `slack_send_message`, `send_for_review`, `notify_session`, `wait_seconds`, `search_tool_response`, `email`, `post_on_connected_account`, `perform_data_analysis` |
-| B2B Ad Image Batch Generation | `bravesearch_brave_local_search`, `bravesearch_brave_video_search`, `bravesearch_brave_summarizer` |
+| B2B Ad Image Batch Generation | `search_web`, `read_page_source` |
 
 After these assignments, `__other_skills__` is empty in dev.
 
@@ -5022,7 +5022,7 @@ Investigated a predefined-work-plan session (`AI_GTM_Position_Eval`, session `85
 
 The 6.5 minutes was real work by the "AI GTM Positioning Audit" skill:
 - 3× `read_page_source` calls (scraping homepage and blog)
-- 2× `bravesearch_brave_web_search` (one failed and retried)
+- 2× legacy web search calls (one failed and retried)
 - 1× `create_html_file` generating a full HTML audit report
 - 1× `save_file` to S3
 - 24,650 completion tokens of output (Sonnet 4.6 model)
