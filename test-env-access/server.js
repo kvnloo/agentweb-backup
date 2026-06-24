@@ -721,10 +721,11 @@ function runClaude(prompt) {
 
     let child;
     if (codingModel === "gpt-5.5") {
-      // Use aider via Azure OpenAI. Azure creds are exported to ~/.bashrc by user-data-dev-auto.sh.
+      // Use aider via Azure OpenAI. Azure creds are in ~/.bashrc as AZURE_OPENAI_* vars;
+      // map them to AZURE_API_* which is what aider/litellm expects.
       child = spawn(
         "bash",
-        ["-lc", `cd /home/ec2-user/agentweb && aider --model azure/gpt-5.5 --yes-always --map-tokens 0 --message '${escaped}'`],
+        ["-lc", `cd /home/ec2-user/agentweb && AZURE_API_KEY="$AZURE_OPENAI_API_KEY" AZURE_API_BASE="$AZURE_OPENAI_ENDPOINT" AZURE_API_VERSION="$AZURE_OPENAI_API_VERSION" aider --model azure/gpt-5.5 --yes-always --map-tokens 0 --no-check-update --message '${escaped}'`],
         {
           uid: 1000,
           gid: 1000,
