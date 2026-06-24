@@ -778,4 +778,97 @@ describe('HubspotAdapter.pushLeads — batched push path', () => {
       expect(typeof meta.syncError).toBe('string');
     });
   });
+
+  // ── Contact push constants (hs_marketable_status / lifecyclestage) ─────────
+  describe('list-level contact constants', () => {
+    function upsertProps(): Record<string, string> {
+      // The single upsert input's properties (batched path always sends 1 here).
+      return mockBatchUpsertContacts.mock.calls[0][0][0].properties;
+    }
+
+    it('stamps hs_marketable_status=false on every contact when configured (batched)', async () => {
+      enableBatch();
+      const leads = [{ leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A' }];
+
+      await adapter.pushLeads(auth, leads, makeConfig({ hubspotMarketableStatus: false }));
+
+      expect(upsertProps().hs_marketable_status).toBe('false');
+    });
+
+    it('stamps hs_marketable_status=true when configured true (batched)', async () => {
+      enableBatch();
+      const leads = [{ leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A' }];
+
+      await adapter.pushLeads(auth, leads, makeConfig({ hubspotMarketableStatus: true }));
+
+      expect(upsertProps().hs_marketable_status).toBe('true');
+    });
+
+    it('stamps the configured lifecyclestage internal value on every contact (batched)', async () => {
+      enableBatch();
+      const leads = [{ leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A' }];
+
+      await adapter.pushLeads(auth, leads, makeConfig({ hubspotLifecycleStage: '12345678' }));
+
+      expect(upsertProps().lifecyclestage).toBe('12345678');
+    });
+
+    it('omits both constants when neither is configured (batched)', async () => {
+      enableBatch();
+      const leads = [{ leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A' }];
+
+      await adapter.pushLeads(auth, leads, makeConfig());
+
+      const props = upsertProps();
+      expect(props.hs_marketable_status).toBeUndefined();
+      expect(props.lifecyclestage).toBeUndefined();
+    });
+
+    it('does NOT resurrect an empty (content-less) lead into a junk contact (batched)', async () => {
+      enableBatch();
+      // Email-less, no real props — only the constants would apply. The skip-empty
+      // guard must drop it BEFORE constants are stamped, so nothing is pushed.
+      const leads = [{ leadId: 'l1', listId: 'list_1' }];
+
+      const result = await adapter.pushLeads(
+        auth, leads,
+        makeConfig({ hubspotMarketableStatus: false, hubspotLifecycleStage: '12345678' }),
+      );
+
+      expect(mockBatchUpsertContacts).not.toHaveBeenCalled();
+      expect(mockCreateContact).not.toHaveBeenCalled();
+      expect(result.successCount).toBe(0);
+    });
+
+    it('stamps the constants via the per-lead path too (flag off)', async () => {
+      process.env.HUBSPOT_BATCH_PUSH_ENABLED = 'false';
+      const leads = [{ leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A' }];
+
+      await adapter.pushLeads(
+        auth, leads,
+        makeConfig({ hubspotMarketableStatus: false, hubspotLifecycleStage: '99' }),
+      );
+
+      const data = mockUpsertContact.mock.calls[0][0];
+      expect(data.customFields.hs_marketable_status).toBe('false');
+      expect(data.customFields.lifecyclestage).toBe('99');
+    });
+
+    it('does not clobber an explicit per-lead mapping to the same property', async () => {
+      enableBatch();
+      // An explicit contact mapping sets lifecyclestage per-lead → constant must yield.
+      const mappingWithLifecycle: FieldMapping[] = [
+        ...contactMapping,
+        { agentwebField: 'stage', crmProperty: 'lifecyclestage', direction: 'push', enabled: true },
+      ];
+      const leads = [{ leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A', stage: 'customer' }];
+
+      await adapter.pushLeads(
+        auth, leads,
+        makeConfig({ contactFieldMapping: mappingWithLifecycle, hubspotLifecycleStage: '12345678' }),
+      );
+
+      expect(upsertProps().lifecyclestage).toBe('customer');
+    });
+  });
 });

@@ -252,6 +252,62 @@ describe('HubSpotService — findContactByEmail', () => {
 
 // ─── upsertContact ─────────────────────────────────────────────────────────────
 
+describe('HubSpotService — getContactPropertyOptions', () => {
+  let svc: HubSpotService;
+  beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
+
+  it('returns value/label pairs for an enumeration property', async () => {
+    mockAxiosGet.mockResolvedValue({
+      data: {
+        options: [
+          { value: 'subscriber', label: 'Subscriber' },
+          { value: '12345678', label: 'Ad Audience' },
+        ],
+      },
+    });
+
+    const stages = await svc.getContactPropertyOptions('lifecyclestage');
+
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      expect.stringContaining('crm/v3/properties/contacts/lifecyclestage'),
+      expect.any(Object),
+    );
+    expect(stages).toEqual([
+      { value: 'subscriber', label: 'Subscriber' },
+      { value: '12345678', label: 'Ad Audience' },
+    ]);
+  });
+
+  it('filters out hidden options and falls back to value when label missing', async () => {
+    mockAxiosGet.mockResolvedValue({
+      data: {
+        options: [
+          { value: 'visible', label: 'Visible' },
+          { value: 'hidden', label: 'Hidden', hidden: true },
+          { value: 'no_label' },
+        ],
+      },
+    });
+
+    const stages = await svc.getContactPropertyOptions('lifecyclestage');
+
+    expect(stages).toEqual([
+      { value: 'visible', label: 'Visible' },
+      { value: 'no_label', label: 'no_label' },
+    ]);
+  });
+
+  it('returns an empty list when the property has no options', async () => {
+    mockAxiosGet.mockResolvedValue({ data: {} });
+    const stages = await svc.getContactPropertyOptions('lifecyclestage');
+    expect(stages).toEqual([]);
+  });
+
+  it('throws when propertyName is blank', async () => {
+    await expect(svc.getContactPropertyOptions('')).rejects.toThrow(/propertyName is required/i);
+  });
+});
+
 describe('HubSpotService — upsertContact', () => {
   let svc: HubSpotService;
   beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
