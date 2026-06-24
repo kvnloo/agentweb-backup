@@ -791,6 +791,27 @@ async function processLead(
     }
   }
 
+  // Taint pass — when identity was anchored ONLY on a name-only list-context
+  // LinkedIn guess, every field here was seeded (directly or transitively) by
+  // that guessed profile. The waterfall stamps its own medium/high confidence,
+  // overwriting the resolver's low-confidence linkedin meta, so we must
+  // re-apply the taint at THIS layer (where the persisted fills are assembled).
+  // Downgrade all fills to low confidence so fieldVerificationStatus() flags
+  // them unverified and the UI/critic caveat them — a wrong same-name match
+  // must never surface a trustworthy-looking email or company.
+  if (identity.ok && identity.fromContextGuess) {
+    for (const f of allFills) {
+      if (f.meta.confidence !== 'low') {
+        f.meta = {
+          ...f.meta,
+          confidence: 'low',
+          sourceQuote: f.meta.sourceQuote
+            || `Derived from a list-context LinkedIn match — verify before outreach.`,
+        };
+      }
+    }
+  }
+
   // Strip injected dep fills — they were never part of the user's config so should
   // not be persisted on the lead. allFills stays intact above for fillValueMap use.
   const writableFills = injectedDepNames.size > 0

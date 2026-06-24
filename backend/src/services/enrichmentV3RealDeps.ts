@@ -832,14 +832,28 @@ export async function findUnipileProfileByUrlImpl(
   return null;
 }
 
+/** Lowercase + collapse whitespace so evidence corroboration is robust to
+ *  spacing/case differences between the LLM's quote and the profile text. */
+function normalizeForMatch(s: string): string {
+  return s.toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
 /**
  * Disambiguate among multiple same-name LinkedIn candidates using the list
  * context. Asks a cheap extraction LLM to pick the 0-based index of the
  * candidate whose profile (headline / location / industry) best fits the
- * context, or to answer "none" when no candidate confidently matches.
+ * context, to rate its own confidence, and to QUOTE the profile snippet that
+ * justifies the pick.
  *
- * Returns the chosen index, or null when the LLM declines / errors / returns
- * an out-of-range answer — callers treat null as "refuse" so a low-confidence
+ * Three guards before a pick is accepted (defense against wrong-person fills):
+ *   1. Index in range and ≥ 0 (LLM may answer -1 to decline).
+ *   2. confidence must be 'high' or 'medium' — a 'low' self-rating is refused.
+ *   3. `evidence` must be a non-empty substring of the chosen candidate's own
+ *      profile text — guards against a hallucinated justification (the LLM
+ *      citing "Sequoia" for a profile that never mentions it).
+ *
+ * Returns the chosen index, or null when any guard fails / the LLM declines /
+ * errors — callers treat null as "refuse" so a low-confidence or fabricated
  * guess never attaches the wrong person to a lead.
  *
  * Exported for unit testing.
@@ -850,33 +864,58 @@ export async function pickCandidateByContextLLM(
   candidates: any[],
   userId: string,
 ): Promise<number | null> {
+  const profileText = (c: any): string =>
+    [c?.headline, c?.location, c?.industry]
+      .filter((s: unknown): s is string => typeof s === 'string' && s.trim().length > 0)
+      .map((s: string) => s.trim())
+      .join(' — ');
   try {
-    const profiles = candidates.map((c: any, i: number) => {
-      const parts = [c?.headline, c?.location, c?.industry]
-        .filter((s: unknown): s is string => typeof s === 'string' && s.trim().length > 0)
-        .map((s: string) => s.trim());
-      return `${i}: ${parts.join(' — ') || '(no profile details)'}`;
-    }).join('\n');
+    const profiles = candidates
+      .map((c: any, i: number) => `${i}: ${profileText(c) || '(no profile details)'}`)
+      .join('\n');
 
     const systemPrompt =
       'You disambiguate between multiple LinkedIn profiles that share the same ' +
       'name. Given a piece of list context describing a group the target person ' +
       'belongs to, pick the ONE candidate profile that best fits that context. ' +
       'Use real-world knowledge to bridge synonyms (e.g. "YC" means "Y ' +
-      'Combinator"). If NO candidate is a confident match for the context, ' +
-      'answer with index -1. Respond ONLY with JSON: {"index": <number>}.';
+      'Combinator"). Rate your confidence and QUOTE the exact words from the ' +
+      'chosen profile that justify the match. If NO candidate is a confident ' +
+      'match, use index -1. Respond ONLY with JSON: ' +
+      '{"index": <number>, "confidence": "high"|"medium"|"low", "evidence": "<verbatim words copied from the chosen profile>"}.';
     const userPrompt =
       `List context: "${listContext}"\n` +
       `Person name: "${name}"\n\n` +
       `Candidates (index: profile):\n${profiles}\n\n` +
-      `Which index best matches the list context? Use -1 if none confidently match.`;
+      `Which index best matches? Quote the chosen profile's exact words as evidence. Use index -1 if none confidently match.`;
 
     const llm = createLLMService(EXTRACT_MODEL, 0.0);
-    const parsed = await llm.generateJSONContent<{ index?: number }>(
+    const parsed = await llm.generateJSONContent<{ index?: number; confidence?: string; evidence?: string }>(
       systemPrompt, userPrompt, 'json', undefined, { userId, feature: 'enrichment' },
     );
+
     const idx = typeof parsed?.index === 'number' ? parsed.index : Number(parsed?.index);
     if (!Number.isInteger(idx) || idx < 0 || idx >= candidates.length) return null;
+
+    // Guard 2 — confidence threshold. Only 'high'/'medium' accepted.
+    const confidence = typeof parsed?.confidence === 'string' ? parsed.confidence.toLowerCase() : '';
+    if (confidence !== 'high' && confidence !== 'medium') {
+      console.log(`[v3 linkedin-search] context LLM refused: confidence="${confidence || '∅'}"`);
+      return null;
+    }
+
+    // Guard 3 — evidence must be grounded in the chosen profile's text.
+    const evidence = typeof parsed?.evidence === 'string' ? parsed.evidence.trim() : '';
+    if (!evidence) {
+      console.log('[v3 linkedin-search] context LLM refused: no evidence quoted');
+      return null;
+    }
+    const haystack = normalizeForMatch(profileText(candidates[idx]));
+    if (!haystack.includes(normalizeForMatch(evidence))) {
+      console.log(`[v3 linkedin-search] context LLM refused: evidence="${evidence}" not found in chosen profile`);
+      return null;
+    }
+
     return idx;
   } catch (err) {
     console.warn('[v3 linkedin-search] context LLM pick failed:', (err as Error).message);

@@ -183,7 +183,18 @@ export interface ResolveIdentityInput {
 }
 
 export type ResolveIdentityResult =
-  | { ok: true; resolved: Partial<LeadRecord> & { emailDomain?: string }; siblings: SiblingLeadResult[]; emailPattern?: string }
+  | {
+      ok: true;
+      resolved: Partial<LeadRecord> & { emailDomain?: string };
+      siblings: SiblingLeadResult[];
+      emailPattern?: string;
+      /** True when identity was anchored ONLY on a name-only list-context
+       *  LinkedIn guess (Tier 2.7 branch b). Signals the orchestrator to taint
+       *  every downstream waterfall fill to low confidence — the persisted
+       *  values overwrite the resolver's own meta, so the taint must also be
+       *  applied there. */
+      fromContextGuess?: boolean;
+    }
   | { ok: false; reason: 'no_identity_signal' | 'identity_unresolvable' };
 
 function makeApiMeta(provider: IdentityProvider, field?: string, fromCache?: boolean): EnrichedFieldMeta {
@@ -243,6 +254,10 @@ export async function resolveIdentity(
   const resolved: Partial<LeadRecord> & { emailDomain?: string } = {};
   const meta: Record<string, EnrichedFieldMeta> = {};
   let validSiblings: SiblingLeadResult[] = [];
+  // Set when identity is anchored on a name-only list-context LinkedIn guess
+  // (Tier 2.7 branch b). When true, ALL resolved fields are tainted to low
+  // confidence before persistence — see the taint pass before step 7.
+  let identityFromContextGuess = false;
 
   // 2. CRM-history Tier 0 — cross-tenant sibling-lead lookup. Queries all
   // three GSIs in parallel and does per-field best-of-N merge across the
@@ -428,7 +443,23 @@ export async function resolveIdentity(
       });
       if (foundLinkedin) {
         resolved.linkedin = foundLinkedin;
-        meta.linkedin = makeApiMeta('unipile', 'linkedin', false);
+        // Provenance: a URL found via the name-only list-context path (no
+        // company anchor) is an educated guess among same-name people, so it
+        // must NOT carry the same confidence as a company-anchored match.
+        // Stamp it 'low' (overriding makeApiMeta's default 'medium') so
+        // fieldVerificationStatus() flags it unverified and the UI/critic
+        // caveat it. company-anchored matches keep the default 'medium'.
+        const linkedinMeta = makeApiMeta('unipile', 'linkedin', false);
+        if (canSearchByContext && !canSearchByCompany) {
+          linkedinMeta.confidence = 'low';
+          linkedinMeta.sourceQuote = `Matched by list context "${listContext}" among same-name LinkedIn profiles — verify before outreach.`;
+          // Mark the whole identity as context-guessed so EVERY downstream
+          // field seeded from this URL (Apollo email/company/title, etc.) is
+          // tainted to low confidence before persistence — the identity is
+          // only as trustworthy as the guessed URL.
+          identityFromContextGuess = true;
+        }
+        meta.linkedin = linkedinMeta;
       }
     } catch (err) {
       console.warn(`${logTag} step 2 findLinkedInUrl failed:`, (err as Error).message);
@@ -740,6 +771,25 @@ export async function resolveIdentity(
     }
   }
 
+  // 6.9. Taint pass — when the entire identity was anchored on a name-only
+  // list-context LinkedIn guess, downgrade EVERY resolved field's confidence
+  // to 'low' so a wrong-person match can't surface a trustworthy-looking email
+  // or company. The guessed linkedin URL seeds Apollo/enrich.so, which stamp
+  // their own 'medium'/'high' confidence; this overrides that because those
+  // values are only as reliable as the disambiguation that produced the URL.
+  if (identityFromContextGuess) {
+    for (const key of Object.keys(meta)) {
+      if (meta[key].confidence !== 'low') {
+        meta[key] = {
+          ...meta[key],
+          confidence: 'low',
+          sourceQuote: meta[key].sourceQuote
+            || `Derived from a list-context LinkedIn match — verify before outreach.`,
+        };
+      }
+    }
+  }
+
   // 7. Persist newly-resolved attributes ONLY in enrich mode. Runs BEFORE the
   // completeness gate so that partial signals (linkedin, title, website from
   // Tier 0.5) are written to the lead even when we can't resolve company —
@@ -792,5 +842,5 @@ export async function resolveIdentity(
     if (!companyOk) return { ok: false, reason: 'identity_unresolvable' };
   }
 
-  return { ok: true, resolved, siblings: validSiblings, emailPattern };
+  return { ok: true, resolved, siblings: validSiblings, emailPattern, fromContextGuess: identityFromContextGuess };
 }
