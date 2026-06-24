@@ -37,8 +37,9 @@ import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmM
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { publishWithResolvedBlogPublisher } from './blogPublishers';
 import { enqueueAutoHumanEval } from './autoHumanEvalService';
-import { performConfiguredSearch } from '../search/searchProviderFactory';
 import { inferSearchFreshness } from '../search/searchFreshness';
+import { YouSearchProvider } from '../search/youSearchProvider';
+import { SearchResultSource } from '../search/searchProvider';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -3791,7 +3792,9 @@ export class AgentModeService {
     'search_knowledge_base',
     'list_knowledge_base_files',
     'read_knowledge_base_files',
-    'search_web',             // Web search - core research capability
+    'search_web',             // Compatibility alias for You.com search
+    'you_search_web',         // Explicit You.com web search
+    'you_search_news',        // Explicit You.com news search
 
     // Work Plans (Emma's execution planning system)
     'create_work_plan',
@@ -3868,6 +3871,8 @@ export class AgentModeService {
     'install_skills',
     'list_available_skills',
     'resolve_skill',
+    'you_search_web',
+    'you_search_news',
     // S3 overflow retrieval is infrastructure, not a skill: whenever a tool result
     // is offloaded to S3 the model is handed a "[Full response stored at S3 key: ...]"
     // pointer and MUST be able to resolve it. A DB `foundation_tools` setting that
@@ -4772,8 +4777,13 @@ export class AgentModeService {
         };
 
       case 'search_web':
+      case 'you_search_web':
+      case 'you_search_news':
         return {
           success: true,
+          provider: 'you',
+          toolName: toolName,
+          resultSource: toolName === 'you_search_news' ? 'news' : toolName === 'you_search_web' ? 'web' : 'all',
           results: [
             {
               title: `Mock search result for "${args.query}"`,
@@ -17071,20 +17081,60 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   // Web search functionality
   public async searchWeb(query: string, maxResults: number = 10): Promise<any> {
+    return this.searchWithYou({
+      toolName: 'search_web',
+      query,
+      maxResults,
+      resultSource: 'all',
+    });
+  }
+
+  public async youSearchWeb(query: string, maxResults: number = 10): Promise<any> {
+    return this.searchWithYou({
+      toolName: 'you_search_web',
+      query,
+      maxResults,
+      resultSource: 'web',
+    });
+  }
+
+  public async youSearchNews(query: string, maxResults: number = 10, freshness?: string): Promise<any> {
+    return this.searchWithYou({
+      toolName: 'you_search_news',
+      query,
+      maxResults,
+      resultSource: 'news',
+      freshness: freshness || inferSearchFreshness(query) || 'week',
+    });
+  }
+
+  private async searchWithYou(params: {
+    toolName: 'search_web' | 'you_search_web' | 'you_search_news';
+    query: string;
+    maxResults: number;
+    resultSource: SearchResultSource;
+    freshness?: string;
+  }): Promise<any> {
+    const { toolName, query, maxResults, resultSource } = params;
     try {
-      console.log('AgentMode: Searching web for query:', query, 'maxResults:', maxResults);
+      console.log(`AgentMode: ${toolName} using You.com for query:`, query, 'maxResults:', maxResults);
 
       // Limit max results to 10
       const limitedMaxResults = Math.min(maxResults, 10);
       const maxAttempts = Math.max(1, Number(process.env.SEARCH_WEB_MAX_RETRIES || 4));
       const baseDelayMs = Math.max(100, Number(process.env.SEARCH_WEB_RETRY_BASE_MS || 600));
       let attempt = 0;
-      let searchResults: any[] = [];
+      let searchResponse: Awaited<ReturnType<YouSearchProvider['search']>> | null = null;
 
       while (attempt < maxAttempts) {
         attempt += 1;
         try {
-          searchResults = await this.performWebSearch(query, limitedMaxResults);
+          searchResponse = await this.performYouSearch({
+            query,
+            maxResults: limitedMaxResults,
+            resultSource,
+            freshness: params.freshness,
+          });
           break;
         } catch (error) {
           const isLastAttempt = attempt >= maxAttempts;
@@ -17105,8 +17155,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       }
 
-      const provider = (searchResults as any).provider;
-      const normalizedResults = [...searchResults];
+      const normalizedResults = searchResponse?.results || [];
+      const provider = searchResponse?.provider || 'you';
+      const freshness = searchResponse?.metadata?.freshness || params.freshness || inferSearchFreshness(query);
 
       // Format the results for LLM consumption
       const formattedContent = this.formatWebSearchResults({
@@ -17122,13 +17173,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         results: normalizedResults,
         totalResults: normalizedResults.length,
         provider,
+        toolName,
+        resultSource,
+        freshness,
+        metadata: searchResponse?.metadata,
         formattedContent
       };
     } catch (error) {
-      console.error('AgentMode: Error searching web:', error);
+      console.error(`AgentMode: Error in ${toolName}:`, error);
       return {
         success: false,
-        message: 'Failed to search the web. Please try again.',
+        message: 'Failed to search You.com. Please try again.',
+        provider: 'you',
+        toolName,
+        resultSource,
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
@@ -17284,53 +17342,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return result;
   }
 
-  // Get Google Search API credentials from AWS Secrets Manager
-  public async getGoogleSearchCredentials(): Promise<{ apiKey: string; searchEngineId: string } | null> {
-    try {
-      const secretName = process.env.NODE_ENV === 'development'
-        ? 'dev/AgentWeb/Google/Search'
-        : 'prod/AgentWeb/Google/Search';
+  public async performYouSearch(params: {
+    query: string;
+    maxResults: number;
+    resultSource?: SearchResultSource;
+    freshness?: string;
+  }) {
+    const freshness = params.freshness || inferSearchFreshness(params.query);
+    const provider = new YouSearchProvider();
+    const response = await provider.search({
+      query: params.query,
+      count: params.maxResults,
+      freshness,
+      resultSource: params.resultSource || 'all',
+      purpose: params.resultSource === 'news' ? 'news' : 'agent_research',
+    });
 
-      const secretJson = await getSecret(secretName);
-      const credentials = JSON.parse(secretJson);
-
-      if (!credentials.apiKey || !credentials.searchEngineId) {
-        console.error('Google Search API credentials missing required fields');
-        return null;
-      }
-
-      return {
-        apiKey: credentials.apiKey,
-        searchEngineId: credentials.searchEngineId
-      };
-    } catch (error) {
-      console.error('Error fetching Google Search API credentials from Secrets Manager:', error);
-      return null;
-    }
-  }
-
-  // Perform actual web search using the configured provider. Defaults to You.com
-  // with Google CSE fallback; SEARCH_PROVIDER=google restores the old primary.
-  public async performWebSearch(query: string, maxResults: number): Promise<any[]> {
-    try {
-      const freshness = inferSearchFreshness(query);
-      const response = await performConfiguredSearch({
-        query,
-        count: maxResults,
+    console.log(`You.com Search returned ${response.results.length} ${params.resultSource || 'all'} results for query: "${params.query}"`);
+    return {
+      ...response,
+      metadata: {
+        ...(response.metadata || {}),
         freshness,
-        purpose: 'agent_research',
-      });
-
-      console.log(`${response.provider} Search returned ${response.results.length} results for query: "${query}"`);
-      return Object.assign(response.results, {
-        provider: response.provider,
-        metadata: response.metadata,
-      });
-
-    } catch (error) {
-      console.error('Error performing web search:', error);
-      throw error;
-    }
+      },
+    };
   }
 
 

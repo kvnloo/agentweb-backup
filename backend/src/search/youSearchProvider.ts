@@ -65,14 +65,19 @@ export class YouSearchProvider implements SearchProvider {
     });
 
     const data = response.data as any;
-    const web = this.normalizeResults(data?.results?.web, 'web');
-    const news = this.normalizeResults(data?.results?.news, 'news');
+    const resultSource = request.resultSource || 'all';
+    const web = resultSource === 'news' ? [] : this.normalizeResults(data?.results?.web, 'web');
+    const news = resultSource === 'web' ? [] : this.normalizeResults(data?.results?.news, 'news');
 
     return {
       provider: this.name,
       query: String(data?.metadata?.query || request.query),
       results: [...web, ...news],
-      metadata: data?.metadata,
+      metadata: {
+        ...(data?.metadata || {}),
+        provider: this.name,
+        resultSource,
+      },
     };
   }
 

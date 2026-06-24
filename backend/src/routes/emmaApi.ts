@@ -37,6 +37,26 @@ router.post('/search-web', async (req: Request, res: Response) => {
   }
 });
 
+router.post('/you-search-web', async (req: Request, res: Response) => {
+  try {
+    const svc = await getAgentModeService();
+    const result = await svc.youSearchWeb(req.body.query, req.body.max_results || 10);
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+router.post('/you-search-news', async (req: Request, res: Response) => {
+  try {
+    const svc = await getAgentModeService();
+    const result = await svc.youSearchNews(req.body.query, req.body.max_results || 10, req.body.freshness);
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 router.post('/deep-research', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();

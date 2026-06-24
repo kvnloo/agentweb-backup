@@ -629,18 +629,13 @@ To enable web search functionality in Agent Mode, you need to set up Google Cust
    - Go to "Setup" > "Basics"
    - Copy the "Search engine ID" (it looks like: `017576662512468239146:omuauf_lfve`)
 
-#### 4. Configure Web Search Provider
+#### 4. Configure You.com Search
 
-`search_web` now uses a provider abstraction. The default primary provider is You.com Search, with Google Custom Search as fallback. To restore Google as primary during rollback, set:
-
-```bash
-SEARCH_PROVIDER=google
-```
+`search_web`, `you_search_web`, and `you_search_news` call You.com Search directly. There is no silent provider fallback. Prefer the explicit `you_search_web` and `you_search_news` tool names when you want provider-specific telemetry.
 
 You.com can be configured with either an environment variable or AWS Secrets Manager:
 
 ```bash
-SEARCH_PROVIDER=you
 YOU_API_KEY=your_you_api_key_here
 ```
 
@@ -658,28 +653,6 @@ For AWS Secrets Manager:
 **For Production:**
 - Secret Name: `prod/AgentWeb/YouCom/Search`
 - Secret Value: either the raw API key string or the JSON shape above.
-
-Google remains available as fallback. Store your Google Search API credentials in AWS Secrets Manager:
-
-**For Development:**
-- Secret Name: `dev/AgentWeb/Google/Search`
-- Secret Value (JSON format):
-```json
-{
-  "apiKey": "your_google_api_key_here",
-  "searchEngineId": "your_search_engine_id_here"
-}
-```
-
-**For Production:**
-- Secret Name: `prod/AgentWeb/Google/Search`
-- Secret Value (JSON format):
-```json
-{
-  "apiKey": "your_google_api_key_here",
-  "searchEngineId": "your_search_engine_id_here"
-}
-```
 
 **Steps to add secrets:**
 1. Go to AWS Secrets Manager in your AWS Console
@@ -705,20 +678,17 @@ Google remains available as fallback. Store your Google Search API credentials i
 3. **Test Web Search**:
    - Go to Agent Mode in your application
    - Ask a question that requires current information (e.g., "What are the latest marketing trends?")
-   - The agent should now use real You.com search results, or Google results if You.com is not configured and fallback is enabled
+   - Telemetry should show `you_search_web`, `you_search_news`, or the compatibility alias `search_web`
+   - The tool response should include `provider: "you"` and no fallback provider
 
 #### 6. API Quotas and Limits
 
 **You.com Search:**
 - Returns unified web and news results from one request
 - Agent Mode automatically requests fresher You.com result windows for time-sensitive queries: `day` for `today`/`breaking` queries and `week` for `latest`/`current`/`news`/`release notes` queries
-- Supports up to 100 results per section at the provider layer; Agent Mode currently caps `search_web` requests to 10
-- Optional livecrawl is supported by the provider but not enabled by default in `search_web`
-
-**Google Custom Search fallback:**
-- **Free Tier**: 100 searches per day
-- **Paid Tier**: Up to 10,000 searches per day for $5
-- **Rate Limits**: 10 requests per second
+- `you_search_news` defaults to `week` freshness when the query does not imply a narrower window
+- Supports up to 100 results per section at the provider layer; Agent Mode currently caps search requests to 10
+- Optional livecrawl is supported by the provider but not enabled by default
 
 #### 7. Troubleshooting
 
@@ -726,33 +696,26 @@ Google remains available as fallback. Store your Google Search API credentials i
 
 1. **"You.com Search API key is not configured"**:
    - Set `YOU_API_KEY` / `YOUCOM_API_KEY`, or store the key in `dev/AgentWeb/YouCom/Search` or `prod/AgentWeb/YouCom/Search`
-   - If fallback is enabled, the backend will try Google next
 
 2. **"API key not valid"**:
    - Check that the API key is correct in AWS Secrets Manager
-   - Ensure Custom Search API is enabled in Google Cloud Console
-   - Verify API key restrictions
+   - Verify API key restrictions in You.com
 
-3. **"Search engine not found"**:
-   - Verify the Search Engine ID is correct in AWS Secrets Manager
-   - Check that the search engine is active in Google Custom Search Engine
-
-4. **"Secrets Manager access denied"**:
+3. **"Secrets Manager access denied"**:
    - Ensure your AWS credentials have permissions to access Secrets Manager
-   - Check that the secret names match exactly: `dev/AgentWeb/YouCom/Search`, `prod/AgentWeb/YouCom/Search`, `dev/AgentWeb/Google/Search`, or `prod/AgentWeb/Google/Search`
-   - For You.com, verify the secret is either a raw API key string or JSON with `apiKey`; for Google, verify JSON includes `apiKey` and `searchEngineId`
+   - Check that the secret names match exactly: `dev/AgentWeb/YouCom/Search` or `prod/AgentWeb/YouCom/Search`
+   - Verify the secret is either a raw API key string or JSON with `apiKey`
 
-5. **"Quota exceeded"**:
-   - Check your daily quota usage in Google Cloud Console
-   - Consider upgrading to paid tier if needed
+4. **"Quota exceeded"**:
+   - Check your You.com API quota and billing status
 
-6. **No search results**:
+5. **No search results**:
    - Empty web/news arrays are treated as successful zero-result searches, so the agent can adjust the query rather than treating this as infrastructure failure
    - Check the backend logs for error messages
 
-**Fallback Behavior:**
-- If You.com is not configured or fails and `SEARCH_PROVIDER_FALLBACK` is not `0`, the system tries Google Custom Search.
-- If all configured providers fail, `search_web` returns a tool failure with the provider error summary.
+**Failure Behavior:**
+- Search tools do not silently try another provider.
+- If You.com is not configured or fails, the tool response reports a You.com search failure with `provider: "you"`.
 
 ### Google Search Console API Configuration
 

@@ -4631,7 +4631,7 @@ emmaToolRegistry.register({
   name: "search_web",
   definition: {
     name: "search_web",
-    description: 'Search the web for information from the internet',
+    description: 'Compatibility web search tool. Uses You.com directly with no provider fallback. Prefer you_search_web or you_search_news when you want telemetry to show the explicit You.com tool.',
     inputSchema: {
       type: "object",
       properties: {
@@ -4650,6 +4650,63 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     return await agentModeService.searchWeb(args.query, args.max_results || 10);
+  }
+});
+
+emmaToolRegistry.register({
+  name: "you_search_web",
+  definition: {
+    name: "you_search_web",
+    description: 'Search the public web using You.com Search. This tool has no hidden fallback provider; failures are reported as You.com search failures.',
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: 'string',
+          description: 'The web search query'
+        },
+        max_results: {
+          type: 'number',
+          description: 'Maximum number of web results to return (default: 5, max: 10)',
+          default: 5
+        }
+      },
+      required: ["query"]
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.youSearchWeb(args.query, args.max_results || 10);
+  }
+});
+
+emmaToolRegistry.register({
+  name: "you_search_news",
+  definition: {
+    name: "you_search_news",
+    description: 'Search current news using You.com Search. This tool has no hidden fallback provider; failures are reported as You.com search failures.',
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: 'string',
+          description: 'The news search query'
+        },
+        max_results: {
+          type: 'number',
+          description: 'Maximum number of news results to return (default: 5, max: 10)',
+          default: 5
+        },
+        freshness: {
+          type: 'string',
+          enum: ['day', 'week', 'month', 'year'],
+          description: 'Optional You.com freshness window. Defaults to week for news unless the query implies a fresher window.'
+        }
+      },
+      required: ["query"]
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.youSearchNews(args.query, args.max_results || 10, args.freshness);
   }
 });
 
