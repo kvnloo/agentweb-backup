@@ -1643,8 +1643,10 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
     const deps = buildV3OrchestratorDeps(userId);
     const socketId = typeof req.body?.socketId === 'string' ? req.body.socketId : undefined;
     console.log(`[v3][route] enrich-v3 POST listId=${listId} userId=${userId} mode=${mode} socketId=${socketId ?? '∅'} leadIds=${leadIds?.length ?? 'all'}`);
+    const { buildListContext } = await import('../emma/enrichmentToolRunner');
+    const listContext = buildListContext(list);
     const result = await svcRunEnrichmentV3(
-      { listId, userId, config, mode, refreshFields, leadIds },
+      { listId, userId, config, mode, refreshFields, leadIds, listContext },
       deps,
       {
         userId,

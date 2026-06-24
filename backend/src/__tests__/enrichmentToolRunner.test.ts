@@ -22,6 +22,7 @@ import {
   runEmmaEnrichment,
   pickPreviewLeadIds,
   resolveExecuteLeadIds,
+  buildListContext,
 } from '../emma/enrichmentToolRunner';
 import { buildRawEnrichmentConfig } from '../emma/enrichmentToolConfig';
 
@@ -335,5 +336,85 @@ describe('resolveExecuteLeadIds', () => {
     (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue(null);
     const r = await resolveExecuteLeadIds('list-1', undefined);
     expect(r).toEqual({ leadIds: undefined, count: 0 });
+  });
+});
+
+describe('runEmmaEnrichment — listContext propagation', () => {
+  it('forwards the list name + description as listContext into the V3 run', async () => {
+    (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+      fieldNames: [],
+      name: 'YC Poker Night',
+      description: 'YC alumni',
+    });
+    (runEnrichment as jest.Mock).mockResolvedValue({
+      runId: 'run-ctx',
+      processed: 1,
+      failed: { identityResolutionFailed: 0, apolloFailed: 0, llmOrParseFailed: 0, updateFailed: 0, searchWebFailed: 0 },
+      tierFillBreakdown: {},
+      durationMs: 10,
+    });
+    await runEmmaEnrichment({
+      listId: 'list-1',
+      userId: 'user-1',
+      outputFields: [{ name: 'company', instruction: 'find company' }],
+      mode: 'enrich',
+    });
+    expect(runEnrichment).toHaveBeenCalledWith(
+      expect.objectContaining({ listContext: 'YC Poker Night — YC alumni' }),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it('passes listContext=undefined when the list lookup fails', async () => {
+    (crmDb.getLeadListById as jest.Mock).mockRejectedValue(new Error('ddb down'));
+    (runEnrichment as jest.Mock).mockResolvedValue({
+      runId: 'run-ctx2',
+      processed: 0,
+      failed: { identityResolutionFailed: 0, apolloFailed: 0, llmOrParseFailed: 0, updateFailed: 0, searchWebFailed: 0 },
+      tierFillBreakdown: {},
+      durationMs: 5,
+    });
+    await runEmmaEnrichment({
+      listId: 'list-1',
+      userId: 'user-1',
+      outputFields: [{ name: 'company', instruction: 'find company' }],
+      mode: 'enrich',
+    });
+    expect(runEnrichment).toHaveBeenCalledWith(
+      expect.objectContaining({ listContext: undefined }),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+});
+
+describe('buildListContext', () => {
+  it('combines name and description with an em-dash separator', () => {
+    expect(buildListContext({ name: 'YC Poker Night', description: 'YC alumni' }))
+      .toBe('YC Poker Night — YC alumni');
+  });
+
+  it('returns the name alone when description is empty', () => {
+    expect(buildListContext({ name: 'YC Poker Night', description: '' }))
+      .toBe('YC Poker Night');
+  });
+
+  it('returns the description alone when name is empty', () => {
+    expect(buildListContext({ name: '', description: 'YC alumni' }))
+      .toBe('YC alumni');
+  });
+
+  it('returns undefined when both name and description are missing', () => {
+    expect(buildListContext({})).toBeUndefined();
+    expect(buildListContext(null)).toBeUndefined();
+    expect(buildListContext({ name: '   ', description: '  ' })).toBeUndefined();
+  });
+
+  it('truncates an over-long combined context to 200 chars', () => {
+    const longDesc = 'x'.repeat(500);
+    const result = buildListContext({ name: 'List', description: longDesc });
+    expect(result).toBeDefined();
+    expect(result!.length).toBe(200);
   });
 });

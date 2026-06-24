@@ -109,6 +109,12 @@ export interface RunEnrichmentInput {
    *  `leadId` is in this set get enriched. Used by the bulk-action bar
    *  "Enrichment" button to scope a run to the user's selection. */
   leadIds?: string[];
+  /** Optional list-level disambiguation context (the lead list's name, and
+   *  optionally its description). Forwarded to identity resolution so a
+   *  name-only lead with no company can still be resolved via a contextual
+   *  LinkedIn search (e.g. a "YC Poker Night" list disambiguates common
+   *  names by shared affiliation). See enrichmentIdentityResolver Tier 2.7. */
+  listContext?: string;
 }
 
 interface TierCount {
@@ -163,6 +169,9 @@ export interface OrchestratorDeps {
     needsPersonFields: boolean;
     needsCompanyFields: boolean;
     mode: 'preview' | 'enrich';
+    /** List-level disambiguation context forwarded from RunEnrichmentInput
+     *  for Tier 2.7 name-only contextual LinkedIn search. */
+    listContext?: string;
     /** Forwarded to enable Tier 0a (CRM-history) per-field bypass. */
     refreshFields?: Set<string>;
     /** Standard identity fields the user deselected — resolved in-memory but
@@ -490,6 +499,7 @@ async function processLead(
       needsPersonFields: needsPerson,
       needsCompanyFields: needsCompany,
       mode: input.mode,
+      listContext: input.listContext,
       refreshFields: refreshSet,
       excludePersistFields,
     });
@@ -777,6 +787,27 @@ async function processLead(
         console.warn(`[v3:${input.listId}:${lead.leadId}] smart-eval failed for ${sf.name}: ${(err as Error).message}`);
       } finally {
         smartEvalSemaphore.release();
+      }
+    }
+  }
+
+  // Taint pass — when identity was anchored ONLY on a name-only list-context
+  // LinkedIn guess, every field here was seeded (directly or transitively) by
+  // that guessed profile. The waterfall stamps its own medium/high confidence,
+  // overwriting the resolver's low-confidence linkedin meta, so we must
+  // re-apply the taint at THIS layer (where the persisted fills are assembled).
+  // Downgrade all fills to low confidence so fieldVerificationStatus() flags
+  // them unverified and the UI/critic caveat them — a wrong same-name match
+  // must never surface a trustworthy-looking email or company.
+  if (identity.ok && identity.fromContextGuess) {
+    for (const f of allFills) {
+      if (f.meta.confidence !== 'low') {
+        f.meta = {
+          ...f.meta,
+          confidence: 'low',
+          sourceQuote: f.meta.sourceQuote
+            || `Derived from a list-context LinkedIn match — verify before outreach.`,
+        };
       }
     }
   }
