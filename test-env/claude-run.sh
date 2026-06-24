@@ -70,6 +70,7 @@ if [[ "$USE_CODEX" == "1" ]]; then
         aider \
           --model azure/gpt-5.5 \
           --yes-always \
+          --map-tokens 0 \
           --message "$(cat .claude-prompt)" 2>&1)
   EXIT_CODE=$?
 else
