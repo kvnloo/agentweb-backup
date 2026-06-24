@@ -118,10 +118,22 @@ export const GOOGLE_CALENDAR_READONLY_SCOPE =
   'https://www.googleapis.com/auth/calendar.readonly';
 
 /**
+ * Google Calendar write scope. Grants read/write on events (create, update,
+ * delete) for calendars the user can access. Required by
+ * google_calendar_create_event. `calendar.readonly` alone is NOT sufficient
+ * to create events — the Google API returns 403.
+ */
+export const GOOGLE_CALENDAR_EVENTS_SCOPE =
+  'https://www.googleapis.com/auth/calendar.events';
+
+/**
  * Helper: has the user actually granted the calendar.readonly scope on their
  * Gmail connection? Reads BOTH the modern `granted_scopes` field (populated
  * by gmailAuth /connect) and the legacy `BaseOAuthConfig.scopes` field, so
  * records written before the scopes-persistence fix still work.
+ *
+ * Note: the write scopes (`calendar` / `calendar.events`) also imply read
+ * access to events, so they satisfy this check too.
  */
 export const hasGmailCalendarScope = (config: GmailConfig | undefined | null): boolean => {
   if (!config) return false;
@@ -130,6 +142,30 @@ export const hasGmailCalendarScope = (config: GmailConfig | undefined | null): b
     ...(config.scopes || []),
   ];
   return all.some(s => s.includes('calendar.readonly') || s.includes('calendar'));
+};
+
+/**
+ * Helper: has the user granted a Google Calendar *write* scope (needed to
+ * create/modify events)? Only the full `calendar` scope or the
+ * `calendar.events` scope qualify — every read-only variant (`*.readonly`)
+ * is explicitly excluded so we don't mistake `calendar.events.readonly` for
+ * write access. Reads both the modern `granted_scopes` and legacy `scopes`
+ * fields for the same backward-compat reason as hasGmailCalendarScope.
+ */
+export const hasGmailCalendarWriteScope = (config: GmailConfig | undefined | null): boolean => {
+  if (!config) return false;
+  const all = [
+    ...(config.granted_scopes || []),
+    ...(config.scopes || []),
+  ];
+  return all.some(s => {
+    if (s.endsWith('.readonly')) return false;
+    return (
+      s.endsWith('/auth/calendar') ||
+      s.endsWith('/auth/calendar.events') ||
+      s.endsWith('/auth/calendar.events.owned')
+    );
+  });
 };
 
 /**

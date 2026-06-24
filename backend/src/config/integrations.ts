@@ -80,6 +80,9 @@ export const INTEGRATION_CONFIG = {
       'https://www.googleapis.com/auth/gmail.readonly',
       'https://www.googleapis.com/auth/gmail.send',
       'https://www.googleapis.com/auth/calendar.readonly',
+      // calendar.events grants create/update/delete on events so the agent can
+      // actually book meetings, not just read them. Implies read access too.
+      'https://www.googleapis.com/auth/calendar.events',
       'https://www.googleapis.com/auth/userinfo.email',
       'https://www.googleapis.com/auth/userinfo.profile',
     ],

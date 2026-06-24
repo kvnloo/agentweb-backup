@@ -598,9 +598,10 @@ export class AgentModeService {
       {
         name: 'Google Calendar',
         description:
-          'Read events and meetings from Google Calendar. List upcoming events, view event details, ' +
-          'and browse calendars. Requires Gmail connected with Calendar access (Settings → Connected Accounts).',
-        toolNames: ['google_calendar_list_events', 'google_calendar_get_event', 'google_calendar_list_calendars'],
+          'Read and manage Google Calendar. List upcoming events, view event details, browse calendars, ' +
+          'and create/book new events on your own calendar. Requires Gmail connected with Calendar access ' +
+          '(Settings → Connected Accounts); booking events also requires granting Calendar write access.',
+        toolNames: ['google_calendar_list_events', 'google_calendar_get_event', 'google_calendar_list_calendars', 'google_calendar_create_event'],
         category: 'tool_bundle',
       },
     ];
