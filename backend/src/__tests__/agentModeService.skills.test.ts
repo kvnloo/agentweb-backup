@@ -859,6 +859,10 @@ describe('AgentModeService - Skills', () => {
       expect(foundationTools.has('set_work_plan_status')).toBe(true);
       expect(foundationTools.has('search_leads')).toBe(true);
       expect(foundationTools.has('get_lead_lists')).toBe(true);
+      // Funnel signup/premium join must be reachable without installing a skill
+      // (no published CRM skill ships its toolNames), else Emma falls back to
+      // grinding via list_all_clients + search_tool_response.
+      expect(foundationTools.has('get_registration_status')).toBe(true);
       // S3 overflow retrieval tools must always be available so the LLM can read
       // large tool responses that were offloaded to S3 by the 10KB overflow mechanism.
       expect(foundationTools.has('search_tool_response')).toBe(true);

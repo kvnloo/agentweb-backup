@@ -3807,6 +3807,7 @@ export class AgentModeService {
     // GTM Discovery (teasers - hint at Emma's capabilities)
     'search_leads',           // CRM teaser
     'get_lead_lists',         // Lead management teaser
+    'get_registration_status', // Funnel: join lead emails -> signup/premium status (read-only, tenant-scoped)
     'list_connected_accounts', // Social/ads integration teaser
 
     'get_user_profile',         // Account info teaser
