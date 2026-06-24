@@ -18,6 +18,7 @@ import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
 import { settingsService } from './settingsService';
 import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
+import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { createWriteStream, promises as fs, default as fsSync } from 'fs';
 import os from 'os';
 import path from 'path';
@@ -1080,7 +1081,7 @@ export class AgentModeService {
   }
 
   // Supported video API models
-  static readonly VIDEO_API_MODELS = ['veo-3.1-generate-preview', 'veo-3-generate-preview'];
+  static readonly VIDEO_API_MODELS = ['veo-3.1-generate-preview', 'veo-3-generate-preview', 'seedance-2.0'];
 
   async getVideoApiDefaultModel(): Promise<string | undefined> {
     try {
@@ -1095,8 +1096,10 @@ export class AgentModeService {
     } catch (error) {
       console.error('AgentMode: Error getting video API default model setting:', error);
     }
-    // Return undefined to let the video generation service use its own hardcoded default
-    return undefined;
+    // Seedance 2.0 is the product default for all video generation (Veo is an
+    // automatic fallback inside the video service). Return it explicitly so the
+    // model is never undefined in logs / cost estimation.
+    return 'seedance-2.0';
   }
 
   async getVideoGenerationDefaultModel(): Promise<string> {
@@ -2264,6 +2267,8 @@ export class AgentModeService {
     const pricePerClip: Record<string, number> = {
       'veo-3.1-generate-preview': 2.80,
       'veo-3.1-fast-generate-preview': 1.40,
+      // Higgsfield Seedance — approximate per-clip cost; adjust to match billed Higgsfield rates.
+      'seedance-2.0': 0.50,
     };
     const clipPrice = pricePerClip[model] ?? 2.80;
     const VEO_MAX_SECONDS = 8;
@@ -3579,15 +3584,7 @@ export class AgentModeService {
       // This matches how generateSessionResponse processes attachments (lines 495-502 in agentModeController)
       if (msg.role === 'user' && (msg as any).metadata?.attachments?.length > 0) {
         const attachments = (msg as any).metadata.attachments;
-        const IMAGE_MIMETYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp', 'image/svg+xml']);
-        const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg']);
-        const attachmentUrls = attachments.map((attachment: any) => {
-          const mimetype = (attachment.mimetype || '').toLowerCase();
-          const ext = (attachment.filename || '').split('.').pop()?.toLowerCase() || '';
-          const isImage = IMAGE_MIMETYPES.has(mimetype) || IMAGE_EXTS.has(ext);
-          const hint = isImage ? ' (image — use describe_image tool to analyze)' : '';
-          return `[${attachment.filename || 'Attachment'}](${attachment.url})${hint}`;
-        }).join('\n');
+        const attachmentUrls = formatAttachmentUrls(attachments);
         // Ensure content is a string before concatenating
         let contentStr = '';
         if (Array.isArray(content)) {
@@ -18269,10 +18266,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     compose?: boolean,
     composeParams?: Record<string, any>,
     durationSeconds?: number,
-    useKeyframes?: boolean
+    useKeyframes?: boolean,
+    aspectRatio?: string,
+    resolution?: string
   ): Promise<any> {
     try {
-      console.log('AgentMode: Generating video with prompt:', prompt, 'filename:', filename, 'videoModel:', videoModel, 'startFrame:', startFrame ? 'provided' : 'none', 'endFrame:', endFrame ? 'provided' : 'none', 'compose:', compose ?? false, 'durationSeconds:', durationSeconds, 'useKeyframes:', useKeyframes ?? false, 'userId:', userId, 'sessionId:', sessionId);
+      console.log('AgentMode: Generating video with prompt:', prompt, 'filename:', filename, 'videoModel:', videoModel, 'startFrame:', startFrame ? 'provided' : 'none', 'endFrame:', endFrame ? 'provided' : 'none', 'compose:', compose ?? false, 'durationSeconds:', durationSeconds, 'useKeyframes:', useKeyframes ?? false, 'aspectRatio:', aspectRatio, 'resolution:', resolution, 'userId:', userId, 'sessionId:', sessionId);
 
       // Import the video generation service
       const { videoService } = await import('./videoGeneration');
@@ -18299,6 +18298,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         useKeyframes,
         compose,
         composeParams: composeParams as any,
+        aspectRatio,
+        resolution,
       });
 
       if (result.success && result.videoUrl) {

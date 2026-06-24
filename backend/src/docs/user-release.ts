@@ -136,6 +136,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-10',
     changes: [
+      'New: Generate Videos with Seedance 2.0',
+      '- Emma can now create videos using ByteDance\'s Seedance 2.0 model (via Higgsfield), in addition to Google Veo',
+      '- Just ask for a video and pick Seedance, or mention it by name — great for turning a product image into a polished motion clip',
+      '- If you don\'t provide a starting image, one is generated automatically from your prompt and animated into the final video',
+    ],
+  },
+  {
+    date: '2026-06-10',
+    changes: [
       'New: Report a Bug in One Click, Screenshot Included',
       '- A new "Report a bug" button is always within reach in the bottom-right corner of every page',
       '- Click it and we automatically grab a screenshot of the page you were just looking at — no need to capture or attach anything yourself',
