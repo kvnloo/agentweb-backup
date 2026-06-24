@@ -39,6 +39,7 @@ import { publishWithResolvedBlogPublisher } from './blogPublishers';
 import { enqueueAutoHumanEval } from './autoHumanEvalService';
 import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
+import { GoogleSearchProvider } from '../search/googleSearchProvider';
 import { SearchResultSource } from '../search/searchProvider';
 
 // Constant for the virtual "other skills" identifier
@@ -4779,11 +4780,12 @@ export class AgentModeService {
       case 'search_web':
       case 'you_search_web':
       case 'you_search_news':
+      case 'google_search_web':
         return {
           success: true,
-          provider: 'you',
+          provider: toolName === 'google_search_web' ? 'google' : 'you',
           toolName: toolName,
-          resultSource: toolName === 'you_search_news' ? 'news' : toolName === 'you_search_web' ? 'web' : 'all',
+          resultSource: toolName === 'you_search_news' ? 'news' : toolName === 'search_web' ? 'all' : 'web',
           results: [
             {
               title: `Mock search result for "${args.query}"`,
@@ -17108,6 +17110,48 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     });
   }
 
+  public async googleSearchWeb(query: string, maxResults: number = 10): Promise<any> {
+    const toolName = 'google_search_web';
+    const resultSource: SearchResultSource = 'web';
+    try {
+      console.log(`AgentMode: ${toolName} using Google Custom Search for query:`, query, 'maxResults:', maxResults);
+      const limitedMaxResults = Math.min(maxResults, 10);
+      const searchResponse = await this.performGoogleSearch({
+        query,
+        maxResults: limitedMaxResults,
+      });
+      const normalizedResults = searchResponse.results || [];
+      const formattedContent = this.formatWebSearchResults({
+        query,
+        results: normalizedResults,
+        totalResults: normalizedResults.length,
+      });
+
+      return {
+        success: true,
+        message: `Found ${normalizedResults.length} Google web search results for "${query}"`,
+        query,
+        results: normalizedResults,
+        totalResults: normalizedResults.length,
+        provider: 'google',
+        toolName,
+        resultSource,
+        metadata: searchResponse.metadata,
+        formattedContent,
+      };
+    } catch (error) {
+      console.error(`AgentMode: Error in ${toolName}:`, error);
+      return {
+        success: false,
+        message: 'Failed to search Google Custom Search. Please try again.',
+        provider: 'google',
+        toolName,
+        resultSource,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  }
+
   private async searchWithYou(params: {
     toolName: 'search_web' | 'you_search_web' | 'you_search_news';
     query: string;
@@ -17366,6 +17410,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         freshness,
       },
     };
+  }
+
+  public async performGoogleSearch(params: {
+    query: string;
+    maxResults: number;
+  }) {
+    const provider = new GoogleSearchProvider();
+    const response = await provider.search({
+      query: params.query,
+      count: params.maxResults,
+      resultSource: 'web',
+      purpose: 'agent_research',
+    });
+
+    console.log(`Google Custom Search returned ${response.results.length} web results for query: "${params.query}"`);
+    return response;
   }
 
 

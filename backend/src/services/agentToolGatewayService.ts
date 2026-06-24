@@ -251,6 +251,7 @@ const SESSION_STATE_TOOLS = new Set([
 const READ_TOOLS = new Set([
   'you_search_web',
   'you_search_news',
+  'google_search_web',
 ]);
 
 const INTERNAL_WRITE_TOOLS = new Set([

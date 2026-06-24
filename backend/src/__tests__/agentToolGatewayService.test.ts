@@ -98,6 +98,7 @@ describe('agentToolGatewayService', () => {
       evaluateAgentToolPolicy({ toolName: 'search_web' }),
       evaluateAgentToolPolicy({ toolName: 'you_search_web' }),
       evaluateAgentToolPolicy({ toolName: 'you_search_news' }),
+      evaluateAgentToolPolicy({ toolName: 'google_search_web' }),
       evaluateAgentToolPolicy({ toolName: 'send_email' }),
     ];
 
@@ -105,6 +106,7 @@ describe('agentToolGatewayService', () => {
     expect(summarizeAgentToolPolicyModes(decisions)).toContain('search_web:read:low:observe');
     expect(summarizeAgentToolPolicyModes(decisions)).toContain('you_search_web:read:low:observe');
     expect(summarizeAgentToolPolicyModes(decisions)).toContain('you_search_news:read:low:observe');
+    expect(summarizeAgentToolPolicyModes(decisions)).toContain('google_search_web:read:low:observe');
   });
 
   it('executes allowed tools and returns the exact result object', async () => {

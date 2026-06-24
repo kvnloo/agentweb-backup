@@ -33,10 +33,11 @@ describe('MCP Meta Ads (via API tools)', () => {
     expect(mcpToolRegistry.getTool('call_meta_marketing_api')).toBeUndefined();
   });
 
-  it('should expose explicit You.com search tools and generate_image as API-wrapping tools', () => {
+  it('should expose explicit provider search tools and generate_image as API-wrapping tools', () => {
     expect(mcpToolRegistry.getTool('search_web')).toBeDefined();
     expect(mcpToolRegistry.getTool('you_search_web')).toBeDefined();
     expect(mcpToolRegistry.getTool('you_search_news')).toBeDefined();
+    expect(mcpToolRegistry.getTool('google_search_web')).toBeDefined();
     expect(mcpToolRegistry.getTool('generate_image')).toBeDefined();
   });
 });

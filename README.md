@@ -629,9 +629,11 @@ To enable web search functionality in Agent Mode, you need to set up Google Cust
    - Go to "Setup" > "Basics"
    - Copy the "Search engine ID" (it looks like: `017576662512468239146:omuauf_lfve`)
 
-#### 4. Configure You.com Search
+#### 4. Configure Search Providers
 
 `search_web`, `you_search_web`, and `you_search_news` call You.com Search directly. There is no silent provider fallback. Prefer the explicit `you_search_web` and `you_search_news` tool names when you want provider-specific telemetry.
+
+Google Custom Search is still supported as the explicit `google_search_web` tool. It is intentionally not part of the default foundation tool set, so normal agent runs do not have multiple generic web-search tools competing for the same task. Enable or require `google_search_web` only for a skill, admin/debug flow, or provider comparison that deliberately needs Google CSE.
 
 You.com can be configured with either an environment variable or AWS Secrets Manager:
 
@@ -639,10 +641,18 @@ You.com can be configured with either an environment variable or AWS Secrets Man
 YOU_API_KEY=your_you_api_key_here
 ```
 
+Google Custom Search can be configured with environment variables:
+
+```bash
+GOOGLE_SEARCH_API_KEY=your_google_custom_search_api_key
+GOOGLE_SEARCH_ENGINE_ID=your_google_custom_search_engine_id
+```
+
 For AWS Secrets Manager:
 
 **For Development:**
-- Secret Name: `dev/AgentWeb/YouCom/Search`
+- You.com Secret Name: `dev/AgentWeb/YouCom/Search`
+- Google CSE Secret Name: `dev/AgentWeb/Google/Search`
 - Secret Value: either the raw API key string or JSON such as:
 ```json
 {
@@ -651,8 +661,18 @@ For AWS Secrets Manager:
 ```
 
 **For Production:**
-- Secret Name: `prod/AgentWeb/YouCom/Search`
+- You.com Secret Name: `prod/AgentWeb/YouCom/Search`
+- Google CSE Secret Name: `prod/AgentWeb/Google/Search`
 - Secret Value: either the raw API key string or the JSON shape above.
+
+For Google CSE, the secret value must be JSON:
+
+```json
+{
+  "apiKey": "your_google_custom_search_api_key",
+  "searchEngineId": "your_google_custom_search_engine_id"
+}
+```
 
 **Steps to add secrets:**
 1. Go to AWS Secrets Manager in your AWS Console
@@ -680,6 +700,7 @@ For AWS Secrets Manager:
    - Ask a question that requires current information (e.g., "What are the latest marketing trends?")
    - Telemetry should show `you_search_web`, `you_search_news`, or the compatibility alias `search_web`
    - The tool response should include `provider: "you"` and no fallback provider
+   - If explicitly testing Google CSE, call or require `google_search_web`; telemetry should show `toolName: "google_search_web"` and `provider: "google"`
 
 #### 6. API Quotas and Limits
 
@@ -690,6 +711,12 @@ For AWS Secrets Manager:
 - Supports up to 100 results per section at the provider layer; Agent Mode currently caps search requests to 10
 - Optional livecrawl is supported by the provider but not enabled by default
 
+**Google Custom Search (`google_search_web` only):**
+- Uses the existing Google CSE credentials and quota
+- Returns web results only
+- Is never called automatically as a fallback from You.com
+- Is intentionally excluded from foundation tools to avoid confusing normal search selection
+
 #### 7. Troubleshooting
 
 **Common Issues:**
@@ -697,11 +724,14 @@ For AWS Secrets Manager:
 1. **"You.com Search API key is not configured"**:
    - Set `YOU_API_KEY` / `YOUCOM_API_KEY`, or store the key in `dev/AgentWeb/YouCom/Search` or `prod/AgentWeb/YouCom/Search`
 
-2. **"API key not valid"**:
+2. **"Google Search API is not configured"**:
+   - Set `GOOGLE_SEARCH_API_KEY` and `GOOGLE_SEARCH_ENGINE_ID`, or store `{ "apiKey": "...", "searchEngineId": "..." }` in `dev/AgentWeb/Google/Search` or `prod/AgentWeb/Google/Search`
+
+3. **"API key not valid"**:
    - Check that the API key is correct in AWS Secrets Manager
    - Verify API key restrictions in You.com
 
-3. **"Secrets Manager access denied"**:
+4. **"Secrets Manager access denied"**:
    - Ensure your AWS credentials have permissions to access Secrets Manager
    - Check that the secret names match exactly: `dev/AgentWeb/YouCom/Search` or `prod/AgentWeb/YouCom/Search`
    - Verify the secret is either a raw API key string or JSON with `apiKey`

@@ -87,7 +87,7 @@ describe('apiTools', () => {
       const allNames = mcpToolRegistry.getToolNames();
       const externalDefs = mcpToolRegistry.getToolDefinitions();
       const externalNames = externalDefs.map((d: any) => d.name);
-      const internalTools = ['install_skills', 'list_available_skills', 'create_blog_article', 'publish_blog_article', 'search_web', 'you_search_web', 'you_search_news', 'generate_image', 'send_email', 'save_file'];
+      const internalTools = ['install_skills', 'list_available_skills', 'create_blog_article', 'publish_blog_article', 'search_web', 'you_search_web', 'you_search_news', 'google_search_web', 'generate_image', 'send_email', 'save_file'];
       for (const name of internalTools) {
         // Registered in the registry (available to Emma internally)
         expect(allNames).toContain(name);

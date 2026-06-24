@@ -1,4 +1,4 @@
-export type SearchProviderName = 'you';
+export type SearchProviderName = 'you' | 'google';
 export type SearchResultSource = 'all' | 'web' | 'news';
 
 export type SearchPurpose =

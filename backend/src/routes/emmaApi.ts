@@ -57,6 +57,16 @@ router.post('/you-search-news', async (req: Request, res: Response) => {
   }
 });
 
+router.post('/google-search-web', async (req: Request, res: Response) => {
+  try {
+    const svc = await getAgentModeService();
+    const result = await svc.googleSearchWeb(req.body.query, req.body.max_results || 10);
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 router.post('/deep-research', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();

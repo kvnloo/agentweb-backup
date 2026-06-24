@@ -311,6 +311,7 @@ describe('AgentModeService - Skills', () => {
       expect(result.allowedToolNames.has('search_web')).toBe(true);
       expect(result.allowedToolNames.has('you_search_web')).toBe(true);
       expect(result.allowedToolNames.has('you_search_news')).toBe(true);
+      expect(result.allowedToolNames.has('google_search_web')).toBe(false);
     });
 
     it('should add skill toolNames to allowed set', () => {
@@ -906,6 +907,7 @@ describe('AgentModeService - Skills', () => {
       expect(tools.has('resolve_skill')).toBe(true);
       expect(tools.has('you_search_web')).toBe(true);
       expect(tools.has('you_search_news')).toBe(true);
+      expect(tools.has('google_search_web')).toBe(false);
       expect(tools.has('search_tool_response')).toBe(true);
       expect(tools.has('read_tool_response')).toBe(true);
       // Force-merged so a DB config can't strip the self-status tool (else Emma

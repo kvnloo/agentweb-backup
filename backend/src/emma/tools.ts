@@ -4711,6 +4711,32 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
+  name: "google_search_web",
+  definition: {
+    name: "google_search_web",
+    description: 'Opt-in Google Custom Search web search. This is not the default search tool and has no hidden provider fallback. Use only when the user explicitly asks for Google search, when a skill requires Google CSE, or when comparing provider output.',
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: 'string',
+          description: 'The Google Custom Search query'
+        },
+        max_results: {
+          type: 'number',
+          description: 'Maximum number of Google web results to return (default: 5, max: 10)',
+          default: 5
+        }
+      },
+      required: ["query"]
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.googleSearchWeb(args.query, args.max_results || 10);
+  }
+});
+
+emmaToolRegistry.register({
   name: "search_knowledge_base",
   definition: {
     name: "search_knowledge_base",
