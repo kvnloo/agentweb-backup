@@ -783,15 +783,9 @@ export async function runVerifiedChat(
     }
   }
 
-  // When the agent calls a bravesearch MCP tool, it satisfies the equivalent built-in
-  // search_web requirement (but not vice-versa: explicit bravesearch_* requirements stay specific).
-  const FUNCTION_CALL_SATISFIES: Record<string, string[]> = {
-    'search_web': ['bravesearch_brave_web_search', 'bravesearch_brave_news_search'],
-  };
-  // Count how many times a required function was called, including via accepted aliases.
+  // Count how many times a required function was called.
   const countCallsForRequirement = (functionName: string, calls: string[]): number => {
-    const aliases = FUNCTION_CALL_SATISFIES[functionName] ?? [];
-    return calls.filter(c => c === functionName || aliases.includes(c)).length;
+    return calls.filter(c => c === functionName).length;
   };
 
   // Track remaining keywords and function calls
@@ -801,7 +795,7 @@ export async function runVerifiedChat(
     remainingFunctionCallCounts[reqFunc.functionName] = reqFunc.minCount;
   });
 
-  // Track all function calls across attempts (raw names, used for alias-aware evaluation)
+  // Track all function calls across attempts.
   const allActualFunctionCallsForReporting: string[] = [];
 
   while (attempt < maxAttempts) {
@@ -876,7 +870,6 @@ export async function runVerifiedChat(
       allToolCalls.push(...toolCalls);
       const actualFunctionCalls = toolCalls.map((call: any) => call.name).filter(Boolean);
 
-      // Keep original names so bravesearch_* requirements remain trackable
       allActualFunctionCallsForReporting.push(...actualFunctionCalls);
 
       // Check work plan status

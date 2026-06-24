@@ -616,8 +616,8 @@ describe('AgentModeService - Bedrock Converse message conversion', () => {
       expect(result.properties.mixed.description).toBe('Either string or number');
     });
 
-    it('should handle the full bravesearch_brave_web_search schema without throwing', () => {
-      const braveSchema = {
+    it('should handle legacy MCP search schemas without throwing', () => {
+      const legacySearchSchema = {
         type: 'object',
         '$schema': 'http://json-schema.org/draft-07/schema#',
         properties: {
@@ -637,7 +637,7 @@ describe('AgentModeService - Bedrock Converse message conversion', () => {
         },
         required: ['query'],
       };
-      const result = AgentModeService.sanitizeSchemaForBedrock(braveSchema);
+      const result = AgentModeService.sanitizeSchemaForBedrock(legacySearchSchema);
       expect(result['$schema']).toBeUndefined();
       expect(result.properties.units).toEqual({ type: 'string', enum: ['metric', 'imperial'], description: 'Measurement units' });
       expect(result.properties.query.maxLength).toBe(400);

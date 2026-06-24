@@ -13,7 +13,7 @@
  *   3. Unrecognizable errors fall back to the legacy name-based class so no
  *      information is lost (named custom errors keep their name).
  *   4. Real failure messages from the June 9-12 prod window classify
- *      correctly (LinkedIn arg validation, Brave 429s, Meta 5xx).
+ *      correctly (LinkedIn arg validation, provider 429s, Meta 5xx).
  */
 
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
@@ -38,7 +38,7 @@ describe('classifyToolErrorClass', () => {
     expect(classifyToolErrorClass(err('Unauthorized: missing credentials'))).toBe('auth');
   });
 
-  it('classifies rate limits — the Brave search cluster', () => {
+  it('classifies rate limits', () => {
     expect(classifyToolErrorClass(err('Request failed with status code 429'))).toBe('rate_limit');
     expect(classifyToolErrorClass(err('Too Many Requests'))).toBe('rate_limit');
     expect(classifyToolErrorClass(err('Rate limit exceeded, retry in 2s'))).toBe('rate_limit');
@@ -130,10 +130,10 @@ describe('classifyToolErrorClass', () => {
     expect(classifyToolErrorClass(err('The specified lead list does not exist'))).toBe('not_found');
   });
 
-  it('classifies the verbatim multiline Brave 429 payload as rate_limit', () => {
-    const brave429 =
+  it('classifies a verbatim multiline provider 429 payload as rate_limit', () => {
+    const provider429 =
       '429 Too Many Requests\n{\n  "type": "ErrorResponse",\n  "error": {\n    "id": "5df087ef",\n    "status": 429,\n    "detail": "Request rate limit exceeded for plan",\n    "meta": { "plan": "Free" }\n  }\n}';
-    expect(classifyToolErrorClass(err(brave429))).toBe('rate_limit');
+    expect(classifyToolErrorClass(err(provider429))).toBe('rate_limit');
   });
 
   it('leaves genuinely idiosyncratic one-offs in the legacy fallback', () => {

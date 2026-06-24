@@ -186,7 +186,7 @@ describe('MCP Servers Routes - Validation', () => {
           transport: 'stdio',
           url: 'test@example.com',
           command: 'npx',
-          args: ['-y', '@brave/brave-search-mcp-server']
+          args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp']
         });
 
       expect(res.status).toBe(201);

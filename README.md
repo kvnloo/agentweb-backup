@@ -1363,9 +1363,8 @@ External servers can be added dynamically via the Admin UI or configured in the 
 - **Management**: Admin Dashboard -> MCP Servers
 - **Supported Transports in Admin UI**: Streamable HTTP, SSE, and Stdio
 - **Local MCP via Backend**: Use `Stdio` in the Admin UI to let the backend spawn local MCP processes directly (no separate HTTP wrapper service required).
-  - Example (Brave Search MCP): `command: npx`, args lines: `-y`, `@brave/brave-search-mcp-server`, `--transport`, `stdio`
-  - Brave API key can be passed in args too: add `--brave-api-key` and then your key as the next argument line.
-  - Put API keys in the environment JSON field, e.g. `{"env":{"BRAVE_API_KEY":"${BRAVE_API_KEY}"}}`
+  - Example (local filesystem MCP): `command: npx`, args lines: `-y`, `@modelcontextprotocol/server-filesystem`, `/tmp`
+  - Put environment variables in the environment JSON field, e.g. `{"env":{"MCP_LOG_LEVEL":"info"}}`
 
 
 #### Configuring ClickUp MCP Server

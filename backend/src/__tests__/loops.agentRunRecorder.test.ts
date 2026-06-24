@@ -123,7 +123,7 @@ describe('AgentRunRecorder', () => {
     const rec = new AgentRunRecorder(port, clock);
 
     await rec.toolFailed('sess-1', {
-      toolName: 'bravesearch_brave_web_search',
+      toolName: 'legacy_search_web',
       error: new Error('Request failed with status code 429'),
     });
 
