@@ -1748,7 +1748,7 @@ mcpToolRegistry.register({
   internal: true,
   definition: {
     name: 'search_web',
-    description: 'Search the web for information.',
+    description: 'Compatibility web search tool. Uses You.com directly with no provider fallback. Prefer you_search_web or you_search_news for explicit provider telemetry.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1761,6 +1761,83 @@ mcpToolRegistry.register({
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'POST', path: '/api/emma/search-web', context: ctx(context),
+      body: { query: args.query, max_results: args.max_results || 10 }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'you_search_web',
+  internal: true,
+  definition: {
+    name: 'you_search_web',
+    description: 'Search the public web using You.com Search. No hidden fallback provider is used.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Web search query' },
+        max_results: { type: 'number', description: 'Max web results (default 5, max 10)', default: 5 }
+      },
+      required: ['query']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST', path: '/api/emma/you-search-web', context: ctx(context),
+      body: { query: args.query, max_results: args.max_results || 10 }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'you_search_news',
+  internal: true,
+  definition: {
+    name: 'you_search_news',
+    description: 'Search current news using You.com Search. No hidden fallback provider is used.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'News search query' },
+        max_results: { type: 'number', description: 'Max news results (default 5, max 10)', default: 5 },
+        freshness: {
+          type: 'string',
+          enum: ['day', 'week', 'month', 'year'],
+          description: 'Optional You.com freshness window. Defaults to week for news unless the query implies a fresher window.'
+        }
+      },
+      required: ['query']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST', path: '/api/emma/you-search-news', context: ctx(context),
+      body: { query: args.query, max_results: args.max_results || 10, freshness: args.freshness }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'google_search_web',
+  internal: true,
+  definition: {
+    name: 'google_search_web',
+    description: 'Opt-in Google Custom Search web search. Not a default search tool. No hidden fallback provider is used.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Google Custom Search query' },
+        max_results: { type: 'number', description: 'Max Google web results (default 5, max 10)', default: 5 }
+      },
+      required: ['query']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST', path: '/api/emma/google-search-web', context: ctx(context),
       body: { query: args.query, max_results: args.max_results || 10 }
     });
     return jsonResult(data);

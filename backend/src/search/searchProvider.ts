@@ -1,4 +1,5 @@
 export type SearchProviderName = 'you' | 'google';
+export type SearchResultSource = 'all' | 'web' | 'news';
 
 export type SearchPurpose =
   | 'agent_research'
@@ -18,6 +19,7 @@ export interface SearchRequest {
   livecrawl?: 'off' | 'web' | 'news' | 'all';
   livecrawlFormat?: 'markdown' | 'html';
   purpose?: SearchPurpose;
+  resultSource?: SearchResultSource;
 }
 
 export interface NormalizedSearchResult {
@@ -47,4 +49,3 @@ export function normalizeSearchCount(count: number, max = 100): number {
   if (!Number.isFinite(count)) return 10;
   return Math.max(1, Math.min(Math.floor(count), max));
 }
-
