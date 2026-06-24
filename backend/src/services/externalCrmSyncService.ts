@@ -66,6 +66,17 @@ export interface ExternalCrmSyncConfig {
   deleteOnPull?: boolean;   // Mark local lead as removed when CRM record is deleted
   // Human-readable display name — used when creating deal pipelines
   listName?: string;
+  // HubSpot-only push constants applied to EVERY synced contact (not per-lead
+  // field mappings). Injected after the skip-empty guard so they never resurrect
+  // an otherwise-empty lead into a junk contact.
+  // - hubspotMarketableStatus: literal value written to the standard
+  //   `hs_marketable_status` property. `false` keeps imported contacts OUT of the
+  //   marketing-contacts count. `undefined` leaves the property untouched.
+  // - hubspotLifecycleStage: internal value of the standard `lifecyclestage`
+  //   property (NOT the label — custom stages have a generated internal value).
+  //   `undefined`/'' leaves it untouched.
+  hubspotMarketableStatus?: boolean;
+  hubspotLifecycleStage?: string;
   // Cached external IDs to skip redundant lookups
   externalPipelineId?: string;      // HubSpot deal pipeline ID
   hubspotDealStageMap?: Record<string, string>; // AgentWeb status value -> HubSpot stage ID
@@ -213,6 +224,9 @@ export class ExternalCrmSyncService {
       // Pipeline selection — only honoured before first sync (server enforces the lock)
       externalPipelineId?: string;   // HubSpot: chosen deal pipeline ID
       listName?: string;
+      // HubSpot push constants applied to every synced contact
+      hubspotMarketableStatus?: boolean | null;  // null clears the override
+      hubspotLifecycleStage?: string | null;     // null/'' clears the override
     }
   ): Promise<ExternalCrmSyncConfig> {
     // Prevent configuring a second provider on the same list
@@ -243,6 +257,22 @@ export class ExternalCrmSyncService {
       nextCustomFieldMapping = [...nextCustomFieldMapping, ...dealEntries];
       nextDealFieldMapping = [];
     }
+
+    // HubSpot per-contact push constants. A non-CRM provider never carries them.
+    // `null` is an explicit clear (→ undefined); `undefined` (key absent) preserves
+    // the existing value so partial saves don't wipe a configured constant.
+    const resolveMarketableStatus = (): boolean | undefined => {
+      if (!isHubspot) return undefined;
+      if (updates.hubspotMarketableStatus === null) return undefined;
+      if (updates.hubspotMarketableStatus === undefined) return existing?.hubspotMarketableStatus;
+      return updates.hubspotMarketableStatus;
+    };
+    const resolveLifecycleStage = (): string | undefined => {
+      if (!isHubspot) return undefined;
+      if (updates.hubspotLifecycleStage === null || updates.hubspotLifecycleStage === '') return undefined;
+      if (updates.hubspotLifecycleStage === undefined) return existing?.hubspotLifecycleStage;
+      return updates.hubspotLifecycleStage;
+    };
 
     // Pipeline selection is locked once any sync has occurred.
     const alreadySynced = !!(existing?.lastPushSyncAt || existing?.lastPullSyncAt);
@@ -275,6 +305,8 @@ export class ExternalCrmSyncService {
       deleteOnPull: updates.deleteOnPull ?? existing?.deleteOnPull ?? false,
       webhookEnabled: updates.webhookEnabled ?? existing?.webhookEnabled ?? true,
       listName: resolvedListName,
+      hubspotMarketableStatus: resolveMarketableStatus(),
+      hubspotLifecycleStage: resolveLifecycleStage(),
       externalPipelineId: resolvedExternalPipelineId,
       hubspotDealStageMap: existing?.hubspotDealStageMap,
       lastPushSyncAt: existing?.lastPushSyncAt,
@@ -625,6 +657,36 @@ export class ExternalCrmSyncService {
     }
 
     return { properties };
+  }
+
+  /**
+   * Returns the HubSpot `lifecyclestage` property's selectable options
+   * (value + label). Powers the lifecycle-stage picker in the sync dialog so the
+   * user picks a stage by label while we persist its internal value (custom stages
+   * like "Ad Audience" have a generated internal value the write API requires).
+   * HubSpot only; accepts inline credentials so it works before the config is saved.
+   */
+  async getHubSpotLifecycleStages(
+    userId: string,
+    listId: string,
+    options: { accountId?: string; apiKey?: string }
+  ): Promise<{ stages: Array<{ value: string; label: string }> }> {
+    let auth: CrmAuth;
+    if (options.accountId) {
+      auth = { type: 'oauth', userId, accountId: options.accountId };
+    } else if (options.apiKey) {
+      auth = { type: 'token', apiKey: options.apiKey };
+    } else {
+      const config = await this.getConfig(userId, listId, 'hubspot');
+      if (!config) throw new Error('No sync configuration found. Save your connection settings first.');
+      if (!config.accountId && !config.apiKeyEncrypted) {
+        throw new Error('No authentication configured. Save your connection settings first.');
+      }
+      auth = this.resolveAuth(config);
+    }
+    const svc = await this.getHubSpotService(auth);
+    const stages = await svc.getContactPropertyOptions('lifecyclestage');
+    return { stages };
   }
 
   // ─── Delete lead from CRM ─────────────────────────────────────────────────────

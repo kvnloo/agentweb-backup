@@ -123,6 +123,8 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
       deleteOnPull: config.deleteOnPull ?? false,
       webhookEnabled: config.webhookEnabled ?? true,
       listName: config.listName,
+      hubspotMarketableStatus: config.hubspotMarketableStatus,
+      hubspotLifecycleStage: config.hubspotLifecycleStage,
       externalPipelineId: config.externalPipelineId,
       lastPushSyncAt: config.lastPushSyncAt,
       lastPullSyncAt: config.lastPullSyncAt,
@@ -159,6 +161,7 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       contactFieldMapping, dealFieldMapping, customFieldMapping,
       deleteOnPush, deleteOnPull, webhookEnabled,
       externalPipelineId, listName,
+      hubspotMarketableStatus, hubspotLifecycleStage,
     } = req.body;
 
     // Validate Attio API key length before encrypting and storing it.
@@ -189,6 +192,7 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       contactFieldMapping, dealFieldMapping, customFieldMapping,
       deleteOnPush, deleteOnPull, webhookEnabled,
       externalPipelineId, listName,
+      hubspotMarketableStatus, hubspotLifecycleStage,
     });
 
     // Fire-and-forget: register webhook subscriptions for any custom HubSpot
@@ -214,6 +218,8 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       deleteOnPull: config.deleteOnPull ?? false,
       webhookEnabled: config.webhookEnabled ?? true,
       listName: config.listName,
+      hubspotMarketableStatus: config.hubspotMarketableStatus,
+      hubspotLifecycleStage: config.hubspotLifecycleStage,
       externalPipelineId: config.externalPipelineId,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
@@ -297,6 +303,30 @@ router.get('/external-properties/:listId/:provider', async (req: any, res) => {
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to fetch CRM properties' });
+  }
+});
+
+// GET /api/crm-sync/lifecycle-stages/:listId/:provider
+// Returns HubSpot lifecycle-stage options (value + label) for the sync dialog's
+// lifecycle-stage picker. HubSpot only.
+router.get('/lifecycle-stages/:listId/:provider', async (req: any, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { listId, provider } = req.params;
+    if (provider !== 'hubspot') {
+      return res.status(400).json({ error: 'Lifecycle stages are only supported for HubSpot.' });
+    }
+
+    const ownership = await verifyListOwnership(userId, listId);
+    if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
+
+    const { accountId, apiKey } = req.query as { accountId?: string; apiKey?: string };
+    const result = await externalCrmSyncService.getHubSpotLifecycleStages(userId, listId, { accountId, apiKey });
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to fetch lifecycle stages' });
   }
 });
 

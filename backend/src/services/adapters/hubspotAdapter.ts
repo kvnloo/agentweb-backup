@@ -256,6 +256,10 @@ export class HubspotAdapter implements CrmAdapter {
                 );
                 if (!hasRealProps) continue;
 
+                // Stamp the list-level push constants (marketable status / lifecycle
+                // stage) onto every contact that actually syncs.
+                this.applyContactConstants(allContactProps, config);
+
                 const contactData = {
                     ...(email ? { email } : {}),
                     ...this.propsToContactData(allContactProps),
@@ -371,6 +375,10 @@ export class HubspotAdapter implements CrmAdapter {
             // worth syncing — pushing it would create a junk contact tagged with a list.
             const hasRealProps = Object.keys(allContactProps).some(k => !listIdentityProps.has(k));
             if (!hasRealProps) continue;
+
+            // Stamp the list-level push constants (marketable status / lifecycle
+            // stage) onto every contact that actually syncs.
+            this.applyContactConstants(allContactProps, config);
 
             if (email) {
                 emailLeads.push({ lead, emailLower: email.toLowerCase(), allContactProps });
@@ -943,6 +951,28 @@ export class HubspotAdapter implements CrmAdapter {
         const present = new Set(customMapping.map(m => m.agentwebField));
         const missing = HUBSPOT_LIST_IDENTITY_MAPPING.filter(m => !present.has(m.agentwebField));
         return missing.length > 0 ? [...customMapping, ...missing] : customMapping;
+    }
+
+    /**
+     * Applies the list-level push constants (hs_marketable_status / lifecyclestage)
+     * to a contact's resolved properties. These are NOT per-lead field mappings —
+     * they're a single value the user configured for the whole list and we stamp
+     * onto every synced contact. Both are standard HubSpot contact properties, so
+     * no ensureContactProperty is needed.
+     *
+     * Mutates and returns `props` for call-site convenience. Applied AFTER the
+     * skip-empty guard so a lead with no real content is never resurrected into a
+     * junk contact merely by carrying these constants. An explicit per-lead mapping
+     * to the same CRM property wins — we never clobber a value the mapping set.
+     */
+    private applyContactConstants(props: Record<string, string>, config: ExternalCrmSyncConfig): Record<string, string> {
+        if (config.hubspotMarketableStatus !== undefined && props.hs_marketable_status === undefined) {
+            props.hs_marketable_status = config.hubspotMarketableStatus ? 'true' : 'false';
+        }
+        if (config.hubspotLifecycleStage && props.lifecyclestage === undefined) {
+            props.lifecyclestage = config.hubspotLifecycleStage;
+        }
+        return props;
     }
 
     /**

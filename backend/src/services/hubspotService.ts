@@ -570,6 +570,25 @@ export class HubSpotService {
   }
 
   /**
+   * Returns the enumeration options of a single contact property (value + label).
+   * Used to populate the lifecycle-stage picker: custom stages (e.g. "Ad Audience")
+   * have a generated internal value that differs from the label, and the API expects
+   * the internal value on write — so the UI must offer value/label pairs.
+   * Non-enumeration properties (or a missing property) return an empty list.
+   */
+  async getContactPropertyOptions(propertyName: string): Promise<Array<{ value: string; label: string }>> {
+    if (!propertyName?.trim()) throw new Error('propertyName is required');
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/crm/v3/properties/contacts/${encodeURIComponent(propertyName)}`,
+      { headers: await this.authHeaders() }
+    );
+    const options: any[] = (res.data as any)?.options ?? [];
+    return options
+      .filter((o: any) => !o?.hidden)
+      .map((o: any) => ({ value: String(o.value), label: String(o.label ?? o.value) }));
+  }
+
+  /**
    * Returns all non-archived deal properties from HubSpot.
    * Uses GET /crm/v3/properties/deals.
    */
