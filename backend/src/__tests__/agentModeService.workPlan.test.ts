@@ -498,6 +498,106 @@ describe('AgentModeService - Work Plan', () => {
         })
       );
     });
+
+    // Asset-count completion gate (xCures incident, prod session 7c8ff5b2-…): a step
+    // declaring expectedAssetCount may not be completed until that many media assets
+    // have actually been produced this session (counted from "Image generated:" markers).
+    describe('expectedAssetCount completion gate', () => {
+      // Build a session with an image step needing 18 assets and `produced` images present.
+      const makeSession = (produced: number, expectedAssetCount = 18) => {
+        const messages: any[] = [];
+        for (let i = 0; i < produced; i++) {
+          messages.push({ role: 'system', content: `Image generated: hook_${i}.png`, metadata: { kind: 'image-generated', imageFilename: `hook_${i}.png` } });
+        }
+        return {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages,
+          workPlan: {
+            title: 'LinkedIn Ads Campaign generator',
+            steps: [
+              { stepCount: 1, title: 'Generate 3 Images Per Hook - 18 total', status: 'pending' as const, expectedAssetCount },
+            ],
+            createdAt: '2025-01-15T09:00:00.000Z',
+            updatedAt: '2025-01-15T10:00:00.000Z',
+          },
+        };
+      };
+
+      it('BLOCKS completing an image step when fewer assets than expected were produced', async () => {
+        const mockSession = makeSession(3, 18);
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.insufficientAssets).toEqual([
+          expect.objectContaining({ stepCount: 1, expected: 18, produced: 3 }),
+        ]);
+        expect(result.formattedContent).toContain('3 of 18');
+        // Must NOT have persisted a completed status.
+        expect(chatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
+      });
+
+      it('ALLOWS completing the step once the full asset count is produced', async () => {
+        const mockSession = makeSession(18, 18);
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalled();
+      });
+
+      it('does NOT gate a step that has no expectedAssetCount (zero regression)', async () => {
+        // Step with NO expectedAssetCount field at all and zero images produced.
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: {
+            title: 'LinkedIn Ads Campaign generator',
+            steps: [
+              { stepCount: 1, title: 'Generate 3 Images Per Hook - 18 total', status: 'pending' as const },
+            ],
+            createdAt: '2025-01-15T09:00:00.000Z',
+            updatedAt: '2025-01-15T10:00:00.000Z',
+          },
+        };
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalled();
+      });
+
+      it('does NOT gate skipping a short image step (only completion is gated)', async () => {
+        const mockSession = makeSession(3, 18);
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'skipped' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalled();
+      });
+    });
   });
 
   describe('buildMarketingContext with work plan', () => {

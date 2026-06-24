@@ -429,4 +429,66 @@ describe('executePreparedTools', () => {
       expect(result.mediaBudgetDeferred).toBe(true);
     });
   });
+
+  // Counter-pollution fix (xCures incident, prod session 7c8ff5b2-…): a media-gen
+  // tool can return success WITHOUT producing an asset — the generate_image
+  // confirmation gate returns {success:true, awaitingUserConfirmation:true} to pause
+  // before editing existing images. Those non-producing successes must NOT count
+  // toward calledFunctions (the set_work_plan_status completion gate) or the
+  // media-asset budget, or an image step can complete with 3 of 18 images while the
+  // counter reads 76.
+  describe('media-gen confirmation-gate successes do not pollute counters', () => {
+    it('does NOT count a generate_image confirmation-gate pause toward calledFunctions', async () => {
+      const ports = makePorts({
+        executePreparedAgentTool: async () => ({
+          success: true,
+          awaitingUserConfirmation: true,
+          requiresConfirmation: true,
+          message: 'Image edit requires user confirmation',
+        }),
+      });
+      const input = makeInput([toolCall('a', 'generate_image', '{"prompt":"edit","inputImages":["u"]}')], ports);
+      const result = await executePreparedTools(input);
+
+      // No asset produced, so no counter and no media-asset increment.
+      expect(result.pendingCounterUpdates).toEqual({});
+      expect(result.mediaAssetsProduced).toBe(0);
+      // It is NOT an error either — no failed counter, and the tool-role message is appended.
+      expect(result.failedCounterUpdates).toEqual({});
+      expect(input.messages).toHaveLength(1);
+      expect(input.messages[0]).toMatchObject({ tool_call_id: 'a', role: 'tool', name: 'generate_image' });
+    });
+
+    it('DOES count a generate_image success that produced an asset', async () => {
+      const ports = makePorts({
+        executePreparedAgentTool: async () => ({ success: true, imageUrl: 'https://s3/x.png', filename: 'x.png' }),
+      });
+      const input = makeInput([toolCall('a', 'generate_image', '{"prompt":"fresh"}')], ports);
+      const result = await executePreparedTools(input);
+
+      expect(result.pendingCounterUpdates).toEqual({ generate_image: 1 });
+      expect(result.mediaAssetsProduced).toBe(1);
+    });
+
+    it('counts only the producing call when a batch mixes a real asset and a confirmation pause', async () => {
+      const ports = makePorts({
+        executePreparedAgentTool: async (i: any) =>
+          i.functionArgs?.inputImages
+            ? { success: true, awaitingUserConfirmation: true }
+            : { success: true, imageUrl: 'https://s3/fresh.png', filename: 'fresh.png' },
+      });
+      const input = makeInput(
+        [
+          toolCall('a', 'generate_image', '{"prompt":"fresh"}'),
+          toolCall('b', 'generate_image', '{"prompt":"edit","inputImages":["u"]}'),
+        ],
+        ports,
+      );
+      const result = await executePreparedTools(input);
+
+      // Two generate_image calls, but only one produced an asset.
+      expect(result.pendingCounterUpdates).toEqual({ generate_image: 1 });
+      expect(result.mediaAssetsProduced).toBe(1);
+    });
+  });
 });

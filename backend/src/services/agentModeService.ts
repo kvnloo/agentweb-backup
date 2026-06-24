@@ -3370,6 +3370,24 @@ export class AgentModeService {
       workPlanContent += `✅ ALL ${workPlan.steps.length} STEPS ARE DONE (${completedCount} completed, ${skippedCount} skipped). `;
       workPlanContent += `DO NOT retry or re-execute any work plan steps. DO NOT call generate_image or other tools to redo completed work. `;
       workPlanContent += `If the user is asking about the completed work, respond with a plain-text summary. If the user is asking for something new and unrelated to the work plan, help them with that new request normally.`;
+
+      // Carve-out for the "marked complete but assets are actually missing" case.
+      // A step can be marked completed while its deliverables were never fully produced
+      // (e.g. a context banner wrongly claimed all 18 images existed when only 3 did).
+      // Without this, the blanket "DO NOT call generate_image to redo completed work"
+      // above causes the agent to refuse an EXPLICIT user request to generate the
+      // genuinely-missing assets — it can't tell "redo finished work" (forbidden) from
+      // "produce assets that were supposed to exist but don't" (required). This carve-out
+      // draws that line: an explicit request to generate/regenerate is honored, and the
+      // agent must verify ground truth (search_user_assets) rather than trust the plan's
+      // completed flag, then generate ONLY what is missing.
+      //
+      // Gated to agent mode (includeResumeGuidance) to keep Emma's done-branch output
+      // byte-for-byte identical to current production, consistent with the rest of this
+      // function. The reported bug was agent-mode-only.
+      if (includeResumeGuidance) {
+        workPlanContent += ` EXCEPTION — missing or explicitly-requested assets: If the user explicitly asks you to generate, regenerate, redo, or finish specific images/assets (for example "generate the missing 15 images"), you MUST do it even though the plan is marked done — the "do not redo" rule above only blocks re-running finished work on your own initiative, not an explicit user request. First verify what actually exists using search_user_assets (the plan's completed status may be wrong), then call generate_image only for the assets that are genuinely missing. Do NOT regenerate assets that already exist unless the user asked you to.`;
+      }
       return [{ role: 'user', content: `[SYSTEM] ${workPlanContent.trim()}` }];
     }
 
@@ -3394,6 +3412,14 @@ export class AgentModeService {
       // instructions (e.g. "keep 3 per hook / restart / generate the report / proceed").
       // Tell the model to resolve them in plan order rather than stalling on the conflict.
       workPlanContent += `⚠️ HANDLING MESSAGES WITH MULTIPLE INSTRUCTIONS: If a single user message bundles several stacked or seemingly conflicting instructions, do NOT stall or ask which one to do first. Briefly acknowledge what you understood, then act on them in work-plan order: finish the current step's remaining work first, then proceed to the next step. Only ask a clarifying question if an instruction is genuinely impossible to interpret.\n\n`;
+
+      // Asset-count honesty. A step with a "Required assets" target must actually have
+      // produced that many assets before you complete it. set_work_plan_status will
+      // reject completing it early. Do NOT mark the step done and claim the assets exist
+      // when they don't (the xCures incident: step closed claiming 18 images when 3 were
+      // made). Generate the rest first; if the user explicitly approves fewer, call
+      // modify_work_plan to lower that step's expectedAssetCount before completing.
+      workPlanContent += `⚠️ ASSET TARGETS: If the current step lists "Required assets: N", you must actually generate N images/assets before marking it completed — verify with search_user_assets if unsure. Never mark such a step complete while assets are still missing or claim work was done that wasn't. If the user explicitly agrees to fewer, call modify_work_plan to lower that step's expectedAssetCount, then complete it.\n\n`;
     }
 
     if (workPlan.autocomplete) {
@@ -3452,6 +3478,12 @@ export class AgentModeService {
       // Include required function calls if available
       if (step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
         workPlanContent += `   Required Functions: ${step.requiredFunctionCalls.join(', ')}\n`;
+      }
+
+      // Surface the asset target so the model knows how many images/videos this step
+      // owes before it can be completed (enforced by set_work_plan_status).
+      if (includeResumeGuidance && typeof step.expectedAssetCount === 'number' && step.expectedAssetCount > 0) {
+        workPlanContent += `   Required assets: ${step.expectedAssetCount} (this step cannot be completed until ${step.expectedAssetCount} images/assets have actually been generated this session)\n`;
       }
 
       // Include skill IDs if available (for awareness)
@@ -21727,7 +21759,7 @@ ${strippedHtml}`;
 
   // Work Plan Management Methods
 
-  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, sessionId: string, autocomplete?: boolean): Promise<any> {
+  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number }>, sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -21751,7 +21783,8 @@ ${strippedHtml}`;
           completedAt: undefined,
           notes: undefined,
           requiredFunctionCalls: step.requiredFunctionCalls,
-          skillIds: step.skillIds
+          skillIds: step.skillIds,
+          ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount })
         })),
         autocomplete: autocomplete || false,
         createdAt: new Date().toISOString(),
@@ -21864,6 +21897,7 @@ ${strippedHtml}`;
           notes: undefined,
           requiredFunctionCalls: step.requiredFunctionCalls,
           skillIds: step.skillIds,
+          ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
         })),
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
         autocomplete: predefinedPlan.autocomplete || false,
@@ -21919,7 +21953,7 @@ ${strippedHtml}`;
     }
   }
 
-  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
+  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || !session.workPlan) {
@@ -21952,7 +21986,11 @@ ${strippedHtml}`;
             description: newStep.description,
             ...(newStep.userInstructions !== undefined && { userInstructions: newStep.userInstructions }),
             requiredFunctionCalls: newStep.requiredFunctionCalls !== undefined ? newStep.requiredFunctionCalls : workPlan.steps[existingIndex].requiredFunctionCalls,
-            skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds
+            skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds,
+            // Allow scope changes: an explicit expectedAssetCount overrides (including 0
+            // to clear the asset gate when the user approves a smaller set); omitting it
+            // preserves the existing value.
+            expectedAssetCount: newStep.expectedAssetCount !== undefined ? newStep.expectedAssetCount : workPlan.steps[existingIndex].expectedAssetCount
           };
         } else {
           // Add new step (stepCount will be fixed by updateSessionWorkPlan)
@@ -21965,7 +22003,8 @@ ${strippedHtml}`;
             completedAt: undefined,
             notes: undefined,
             requiredFunctionCalls: newStep.requiredFunctionCalls,
-            skillIds: newStep.skillIds
+            skillIds: newStep.skillIds,
+            ...(newStep.expectedAssetCount !== undefined && { expectedAssetCount: newStep.expectedAssetCount })
           });
         }
       }
@@ -22015,6 +22054,14 @@ ${strippedHtml}`;
       const calledFunctionCounts = { ...(session.calledFunctions || {}) };
       let countsModified = false;
 
+      // Count media assets actually produced this session (distinct "Image generated:"
+      // markers), used by the expectedAssetCount completion gate below. This is ground
+      // truth from the message history — independent of the calledFunctions counter,
+      // which can be inflated by non-producing generate_image returns (confirmation
+      // gate). Computed once; cheap relative to the DynamoDB round-trips already done.
+      const producedAssetCount = AgentModeService.extractGeneratedImageFilenames(session.messages).length;
+      const insufficientAssets: Array<{ stepCount: number; title: string; expected: number; produced: number }> = [];
+
       // Process each update
       for (const update of updates) {
         const stepIndex = workPlan.steps.findIndex(s => s.stepCount === update.stepCount);
@@ -22059,6 +22106,29 @@ ${strippedHtml}`;
           }
         }
 
+        // Asset-count completion gate. When a step declares expectedAssetCount, it may
+        // not be marked completed until the session has actually produced that many
+        // media assets. This prevents the xCures failure mode: a "Generate 3 Images Per
+        // Hook — 18 total" step being marked done with only 3 images produced (the model
+        // self-reported "Hooks 2-6 generate-pending" yet completed the step). The
+        // required-function-calls gate above could not catch this — it only checked that
+        // generate_image was called ≥1×, and the call counter was inflated to 76 by
+        // non-producing confirmation-gate returns. Counting real assets is the fix.
+        // The user can still legitimately reduce scope via modify_work_plan (lowering or
+        // clearing expectedAssetCount), so this never becomes an unrecoverable block.
+        if (update.status === 'completed'
+          && typeof step.expectedAssetCount === 'number'
+          && step.expectedAssetCount > 0
+          && producedAssetCount < step.expectedAssetCount) {
+          insufficientAssets.push({
+            stepCount: update.stepCount,
+            title: step.title,
+            expected: step.expectedAssetCount,
+            produced: producedAssetCount,
+          });
+          continue; // Skip updating this step
+        }
+
         // Update the step status
         workPlan.steps[stepIndex] = {
           ...workPlan.steps[stepIndex],
@@ -22085,6 +22155,20 @@ ${strippedHtml}`;
           message: 'Cannot mark steps as completed. Required function calls have not been made yet.',
           missingFunctionCalls,
           formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nPlease make the required function calls first, then mark the steps as completed.`
+        };
+      }
+
+      // Asset-count gate failure — the step's declared media assets are not all produced.
+      if (insufficientAssets.length > 0) {
+        const errorDetails = insufficientAssets.map(ia =>
+          `Step ${ia.stepCount} "${ia.title}": ${ia.produced} of ${ia.expected} required images/assets have been generated (${ia.expected - ia.produced} still missing)`
+        ).join('\n');
+
+        return {
+          success: false,
+          message: 'Cannot mark steps as completed. The required number of assets has not been generated yet.',
+          insufficientAssets,
+          formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nGenerate the remaining assets with generate_image, then mark the step completed. If the user has explicitly approved a smaller set, call modify_work_plan to lower the step's expected asset count first.`
         };
       }
 

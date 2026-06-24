@@ -302,4 +302,41 @@ describe('AgentModeService.buildWorkPlanContextMessages', () => {
     // Should not enumerate individual step lines in the done case
     expect(content).not.toContain('1. ✓ Step one');
   });
+
+  describe('done-branch missing-asset carve-out', () => {
+    const doneWorkPlan = {
+      title: 'Lilly - LinkedIn Ads Campaign generator',
+      steps: [
+        { stepCount: 1, title: 'Analyze hooks', status: 'completed' as const },
+        { stepCount: 2, title: 'Generate 3 Images Per Hook - 18 total', status: 'completed' as const },
+      ],
+      createdAt: '2025-01-15T09:00:00.000Z',
+      updatedAt: '2025-01-15T10:00:00.000Z',
+    };
+
+    it('permits generate_image for explicitly-requested missing assets in agent mode', () => {
+      const messages = AgentModeService.buildWorkPlanContextMessages(doneWorkPlan);
+      const content: string = messages[0].content;
+      // Still emits the all-done banner and base "do not redo" guard...
+      expect(content).toContain('ALL 2 STEPS ARE DONE');
+      expect(content).toContain('DO NOT call generate_image or other tools to redo completed work');
+      // ...but now carves out an explicit user request to generate missing assets.
+      expect(content).toContain('EXCEPTION');
+      expect(content).toMatch(/missing/i);
+      expect(content).toContain('search_user_assets');
+      // The carve-out must explicitly re-authorize generate_image despite the done state.
+      expect(content).toMatch(/explicitly ask[^.]*generate/i);
+    });
+
+    it('does NOT add the carve-out on the Emma path (includeResumeGuidance=false)', () => {
+      const messages = AgentModeService.buildWorkPlanContextMessages(doneWorkPlan, undefined, false);
+      const content: string = messages[0].content;
+      // Emma's done-branch output stays byte-for-byte as production: banner + base guard,
+      // no carve-out, no search_user_assets mention.
+      expect(content).toContain('ALL 2 STEPS ARE DONE');
+      expect(content).toContain('DO NOT call generate_image or other tools to redo completed work');
+      expect(content).not.toContain('EXCEPTION');
+      expect(content).not.toContain('search_user_assets');
+    });
+  });
 });

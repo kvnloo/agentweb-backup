@@ -177,6 +177,12 @@ export interface ChatSession {
       notes?: string;
       requiredFunctionCalls?: string[]; // Required function names that must be called before marking complete
       skillIds?: string[]; // Skill IDs to auto-install when this step becomes active
+      // Expected number of media assets (images/videos) this step must produce before
+      // it may be marked completed. When set, setWorkPlanStatus blocks completion until
+      // the session has produced at least this many assets — preventing a multi-image
+      // step (e.g. "Generate 3 Images Per Hook — 18 total") from being marked done with
+      // only a fraction generated (the xCures incident). Unset = no asset-count gate.
+      expectedAssetCount?: number;
     }>;
     createdAt: string;
     updatedAt: string;
@@ -2605,6 +2611,7 @@ export class ChatbotDB {
         notes?: string;
         requiredFunctionCalls?: string[];
         skillIds?: string[];
+        expectedAssetCount?: number;
       }>;
       createdAt: string;
       updatedAt: string;
