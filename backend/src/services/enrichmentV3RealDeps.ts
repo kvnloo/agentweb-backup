@@ -845,16 +845,19 @@ function normalizeForMatch(s: string): string {
  * context, to rate its own confidence, and to QUOTE the profile snippet that
  * justifies the pick.
  *
- * Three guards before a pick is accepted (defense against wrong-person fills):
+ * Four guards before a pick is accepted (defense against wrong-person fills):
  *   1. Index in range and ≥ 0 (LLM may answer -1 to decline).
  *   2. confidence must be 'high' or 'medium' — a 'low' self-rating is refused.
  *   3. `evidence` must be a non-empty substring of the chosen candidate's own
  *      profile text — guards against a hallucinated justification (the LLM
  *      citing "Sequoia" for a profile that never mentions it).
+ *   4. `context_strength` must be 'specific' — a 'weak' rating means the list
+ *      context (e.g. "Imported Contacts", "Tech Founders") is too generic to
+ *      reliably separate same-name people, so we refuse rather than guess.
  *
  * Returns the chosen index, or null when any guard fails / the LLM declines /
- * errors — callers treat null as "refuse" so a low-confidence or fabricated
- * guess never attaches the wrong person to a lead.
+ * errors — callers treat null as "refuse" so a low-confidence, fabricated, or
+ * weakly-justified guess never attaches the wrong person to a lead.
  *
  * Exported for unit testing.
  */
@@ -879,20 +882,32 @@ export async function pickCandidateByContextLLM(
       'name. Given a piece of list context describing a group the target person ' +
       'belongs to, pick the ONE candidate profile that best fits that context. ' +
       'Use real-world knowledge to bridge synonyms (e.g. "YC" means "Y ' +
-      'Combinator"). Rate your confidence and QUOTE the exact words from the ' +
-      'chosen profile that justify the match. If NO candidate is a confident ' +
-      'match, use index -1. Respond ONLY with JSON: ' +
-      '{"index": <number>, "confidence": "high"|"medium"|"low", "evidence": "<verbatim words copied from the chosen profile>"}.';
+      'Combinator"). First judge whether the list context is SPECIFIC enough to ' +
+      'reliably distinguish people who share this name (a named company, ' +
+      'accelerator, school, or event is "specific"; a generic label like ' +
+      '"Imported Contacts", "Leads", or "Tech Founders" is "weak"). Then pick ' +
+      'the best match, rate your confidence, and QUOTE the exact words from the ' +
+      'chosen profile that justify the match. If the context is weak or NO ' +
+      'candidate is a confident match, use index -1. Respond ONLY with JSON: ' +
+      '{"context_strength": "specific"|"weak", "index": <number>, "confidence": "high"|"medium"|"low", "evidence": "<verbatim words copied from the chosen profile>"}.';
     const userPrompt =
       `List context: "${listContext}"\n` +
       `Person name: "${name}"\n\n` +
       `Candidates (index: profile):\n${profiles}\n\n` +
-      `Which index best matches? Quote the chosen profile's exact words as evidence. Use index -1 if none confidently match.`;
+      `Is the context specific enough to disambiguate? Which index best matches? Quote the chosen profile's exact words as evidence. Use index -1 if the context is weak or none confidently match.`;
 
     const llm = createLLMService(EXTRACT_MODEL, 0.0);
-    const parsed = await llm.generateJSONContent<{ index?: number; confidence?: string; evidence?: string }>(
+    const parsed = await llm.generateJSONContent<{ index?: number; confidence?: string; evidence?: string; context_strength?: string }>(
       systemPrompt, userPrompt, 'json', undefined, { userId, feature: 'enrichment' },
     );
+
+    // Guard 4 — context strength. A 'weak' (generic) list context can't reliably
+    // separate same-name people, so refuse regardless of the nominated index.
+    const contextStrength = typeof parsed?.context_strength === 'string' ? parsed.context_strength.toLowerCase() : '';
+    if (contextStrength !== 'specific') {
+      console.log(`[v3 linkedin-search] context LLM refused: context_strength="${contextStrength || '∅'}"`);
+      return null;
+    }
 
     const idx = typeof parsed?.index === 'number' ? parsed.index : Number(parsed?.index);
     if (!Number.isInteger(idx) || idx < 0 || idx >= candidates.length) return null;
