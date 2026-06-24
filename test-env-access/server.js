@@ -710,6 +710,49 @@ function runClaude(prompt) {
   return new Promise((resolve, reject) => {
     // Escape single quotes in prompt for shell
     const escaped = prompt.replace(/'/g, "'\\''");
+
+    // Check which coding agent to use
+    let codingModel = "";
+    try {
+      codingModel = fs.readFileSync("/home/ec2-user/agentweb/.coding-model", "utf-8").trim();
+    } catch {}
+
+    const childEnv = { ...process.env, HOME: "/home/ec2-user", ...claudeEnvOverrides };
+
+    let child;
+    if (codingModel === "gpt-5.5") {
+      // Use aider via Azure OpenAI. Azure creds are exported to ~/.bashrc by user-data-dev-auto.sh.
+      child = spawn(
+        "bash",
+        ["-lc", `cd /home/ec2-user/agentweb && aider --model azure/gpt-5.5 --yes-always --map-tokens 0 --message '${escaped}'`],
+        {
+          uid: 1000,
+          gid: 1000,
+          env: childEnv,
+          timeout: 2 * 60 * 60 * 1000,
+        }
+      );
+
+      let stdout = "";
+      let stderr = "";
+
+      child.stdout.on("data", (data) => { stdout += data.toString(); });
+      child.stderr.on("data", (data) => { stderr += data.toString(); });
+
+      child.on("close", (code) => {
+        const cleaned = stripAnsiAndControlCodes(stdout + (stderr ? `\n${stderr}` : ""));
+        if (code === 0 || cleaned) {
+          resolve(cleaned || "(no output)");
+        } else {
+          reject(new Error(`Aider exited with code ${code}: ${stderr.slice(0, 500)}`));
+        }
+      });
+
+      child.on("error", (err) => { reject(err); });
+      return;
+    }
+
+    // Default: Claude Opus 4.8 via AWS Bedrock
     // Use --resume <id> to continue the exact same session; fall back to --continue
     let resumeFlag = "--continue";
     try {
@@ -717,18 +760,16 @@ function runClaude(prompt) {
       if (sessionId) resumeFlag = `--resume ${sessionId}`;
     } catch {}
     const model = "us.anthropic.claude-opus-4-8";
-    const childEnv = { ...process.env, HOME: "/home/ec2-user", ...claudeEnvOverrides };
     // Bedrock config (CLAUDE_CODE_USE_BEDROCK=1, AWS_BEARER_TOKEN_BEDROCK) comes from
     // ~/.bashrc via the login shell (-lc), so no inline env override is needed.
-    const envFix = "";
-    const child = spawn(
+    child = spawn(
       "bash",
-      ["-lc", `cd /home/ec2-user/agentweb && ${envFix}claude ${resumeFlag} --model ${model} --permission-mode bypassPermissions --output-format json -p '${escaped}'`],
+      ["-lc", `cd /home/ec2-user/agentweb && claude ${resumeFlag} --model ${model} --permission-mode bypassPermissions --output-format json -p '${escaped}'`],
       {
-        uid: 1000, // ec2-user UID
+        uid: 1000,
         gid: 1000,
         env: childEnv,
-        timeout: 2 * 60 * 60 * 1000, // 2 hours
+        timeout: 2 * 60 * 60 * 1000,
       }
     );
 
