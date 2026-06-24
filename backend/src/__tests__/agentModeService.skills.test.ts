@@ -859,6 +859,11 @@ describe('AgentModeService - Skills', () => {
       expect(foundationTools.has('set_work_plan_status')).toBe(true);
       expect(foundationTools.has('search_leads')).toBe(true);
       expect(foundationTools.has('get_lead_lists')).toBe(true);
+      // get_registration_status is intentionally NOT a foundation tool — it
+      // queries AW-Users (signup/premium status) for arbitrary emails, which is
+      // an admin/founder funnel concern and an account-enumeration oracle if
+      // exposed to every tenant. It lives in ADMIN_SKILL_TOOL_NAMES instead.
+      expect(foundationTools.has('get_registration_status')).toBe(false);
       // S3 overflow retrieval tools must always be available so the LLM can read
       // large tool responses that were offloaded to S3 by the 10KB overflow mechanism.
       expect(foundationTools.has('search_tool_response')).toBe(true);

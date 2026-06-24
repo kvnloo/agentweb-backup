@@ -2400,6 +2400,53 @@ Example:
   },
 });
 
+mcpToolRegistry.register({
+  name: 'get_registration_status',
+  definition: {
+    name: 'get_registration_status',
+    description: `Join a batch of emails against AgentWeb user accounts to learn which ones registered (signed up) and which became premium (paying/trialing) users. Use this to attribute CRM leads — e.g. audit-page leads — to real signups and conversions in a funnel report. Read-only.
+
+For each input email the response reports:
+- \`registered\`: true if a (non-deleted) AgentWeb account exists for that email.
+- \`isPremium\`: true if that account's subscription is active or trialing.
+- \`subscriptionStatus\` / \`subscriptionType\` / \`userId\` / \`createdAt\`: present when registered.
+
+Emails with no matching account come back as \`{ registered: false, isPremium: false }\`. The response also includes a \`summary\` with \`total\`, \`registered\`, and \`premium\` counts.
+
+Example:
+  action inputs: { emails: ["lead1@acme.com", "lead2@acme.com"] }
+  response: { statuses: [ { email: "lead1@acme.com", registered: true, isPremium: true, ... }, { email: "lead2@acme.com", registered: false, isPremium: false } ], summary: { total: 2, registered: 1, premium: 1 } }`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        emails: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Emails to look up (1-1000). Case/whitespace-insensitive; duplicates are collapsed.',
+        },
+      },
+      required: ['emails'],
+      additionalProperties: false,
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const emails = Array.isArray(args?.emails)
+      ? args.emails
+          .filter((e: unknown) => typeof e === 'string')
+          .map((e: string) => e.trim())
+          .filter((e: string) => e.length > 0)
+      : [];
+
+    const data = await mcpFetch({
+      method: 'POST',
+      path: '/api/crm/registration-status',
+      context: ctx(context),
+      body: { emails },
+    });
+    return jsonResult(data);
+  },
+});
+
 // ─── PR Digest (admin-only) ─────────────────────────────────────────────────
 
 mcpToolRegistry.register({

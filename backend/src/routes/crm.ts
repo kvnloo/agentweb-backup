@@ -575,6 +575,53 @@ router.post('/sync', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * @route POST /api/crm/registration-status
+ * @desc  Join a batch of emails against AW-Users to learn which ones registered
+ *        for an AgentWeb account and which became premium (active/trialing)
+ *        users. Powers the internal funnel report's signup/premium attribution
+ *        without duplicating user data onto lead records. Read-only.
+ * @access Admin only — this queries the platform-wide AW-Users table for
+ *         arbitrary emails (an account-enumeration surface). It is an
+ *         admin/founder funnel concern, not a per-tenant capability.
+ * @body  { emails: string[] }  (1..1000 emails)
+ * @returns { statuses: RegistrationStatus[], summary: { total, registered, premium } }
+ */
+const REGISTRATION_STATUS_MAX_EMAILS = 1000;
+router.post('/registration-status', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user?.userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+    if (!authReq.user?.isAdmin) {
+      return res.status(403).json({ message: 'Admin access required' });
+    }
+
+    const emails = (req.body as { emails?: unknown })?.emails;
+    if (!Array.isArray(emails) || emails.length === 0) {
+      return res.status(400).json({ message: 'Invalid body. Required: emails (non-empty array of strings).' });
+    }
+    if (emails.length > REGISTRATION_STATUS_MAX_EMAILS) {
+      return res.status(400).json({
+        message: `Too many emails. Max ${REGISTRATION_STATUS_MAX_EMAILS} per request.`,
+      });
+    }
+
+    const statuses = await userDb.getRegistrationStatusByEmails(emails as string[]);
+    const summary = {
+      total: statuses.length,
+      registered: statuses.filter((s) => s.registered).length,
+      premium: statuses.filter((s) => s.isPremium).length,
+    };
+
+    return res.json({ statuses, summary });
+  } catch (error: any) {
+    console.error('Error in POST /api/crm/registration-status:', error);
+    return res.status(500).json({ message: error?.message || 'Failed to resolve registration status' });
+  }
+});
+
 // --------------------------------------------------------------------------
 // Saved Views (H1) — user-customized filter/sort combos over /crm tabs.
 // Built-in presets are returned from code (can't be edited/deleted); user
