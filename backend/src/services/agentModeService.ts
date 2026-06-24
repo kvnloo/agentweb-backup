@@ -12278,6 +12278,29 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return err;
   }
 
+  /**
+   * Ensure the selected Meta ad-account token is usable, refreshing it inline
+   * if it is expired or close to expiry. Meta has no refresh tokens, so we
+   * re-exchange the still-valid (or recently-expired-but-exchangeable) token
+   * via fb_exchange_token. Only throws if the token is expired AND the refresh
+   * could not produce a working token — otherwise the work proceeds without
+   * blocking the user. Mutates `selected.config` in place on success.
+   */
+  private async ensureUsableMetaToken(selected: any, userId: string): Promise<void> {
+    const { ensureFreshMetaAdAccountToken } = await import('./metaTokenRefresh');
+    // Mutates selected.config in place on a successful refresh; never throws.
+    await ensureFreshMetaAdAccountToken(selected, userId);
+
+    const expiresAt = selected.config.token_expires_at;
+    if (expiresAt && expiresAt < Date.now()) {
+      // Still expired after attempting a refresh — exchange failed (token too
+      // old / revoked). This is the only case that should block the work.
+      throw this.makeMetaAuthError(
+        'Meta access token has expired and could not be refreshed automatically. Please reconnect your Meta account in settings.'
+      );
+    }
+  }
+
   private async getMetaCredentials(userId: string, accountId?: string) {
     const { userDb } = await import('./db');
     const user = await userDb.getUserById(userId);
@@ -12325,9 +12348,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         throw this.makeMetaAuthError(`Meta ad account with ID "${accountId}" not found in connected accounts. Ensure you have the correct ID from list_connected_accounts.`);
       }
 
-      if (selected.config.token_expires_at && selected.config.token_expires_at < Date.now()) {
-        throw this.makeMetaAuthError('Meta access token has expired. Please reconnect your Meta account in settings.');
-      }
+      await this.ensureUsableMetaToken(selected, userId);
 
       return {
         accountId: clean(selected.account_id || selected.config?.ad_account_id),
@@ -12349,9 +12370,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // 4. Default to the single available account
     const selected = fbAccounts[0];
 
-    if (selected.config.token_expires_at && selected.config.token_expires_at < Date.now()) {
-      throw this.makeMetaAuthError('Meta access token has expired. Please reconnect your Meta account in settings.');
-    }
+    await this.ensureUsableMetaToken(selected, userId);
 
     console.log(`[AgentMode] Using Meta credentials from connected_accounts for user ${userId} (Account: ${selected.account_name})`);
 
