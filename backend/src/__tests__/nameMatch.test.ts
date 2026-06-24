@@ -65,6 +65,19 @@ describe('nameTokensMatch', () => {
     expect(nameTokensMatch('J.R.', 'Smith', 'JR', 'Smith')).toBe(true);
   });
 
+  it('matches a concatenated first+middle initial against the full first name', () => {
+    // Lead stored as full "Paul Graham"; LinkedIn profile shows "P.G. Graham"
+    // (first + middle initial). The first initial must still match "Paul".
+    expect(nameTokensMatch('Paul', 'Graham', 'P.G.', 'Graham')).toBe(true);
+    expect(nameTokensMatch('P.G.', 'Graham', 'Paul', 'Graham')).toBe(true);
+    expect(nameTokensMatch('Paul', 'Graham', 'P. G.', 'Graham')).toBe(true);
+  });
+
+  it('rejects a multi-initial whose FIRST initial is wrong', () => {
+    // "Q.G." → first initial "q" is not a prefix of "Paul" → reject.
+    expect(nameTokensMatch('Paul', 'Graham', 'Q.G.', 'Graham')).toBe(false);
+  });
+
   it('does NOT let punctuation-stripping create a false match between different names', () => {
     // Stripping punctuation must not collapse genuinely different surnames.
     expect(nameTokensMatch('Paul', "O'Brien", 'Paul', 'Obrienson')).toBe(true); // prefix — acceptable (Obrien… ⊂ Obrienson)
