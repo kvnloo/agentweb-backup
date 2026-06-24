@@ -6283,6 +6283,7 @@ const adminToolNames = [
   'manage_scoring_judges',
   'manage_user_notes',
   'get_users_by_lifecycle_stage',
+  'get_registration_status',
 ];
 
 for (const toolName of bridgedToolNames) {

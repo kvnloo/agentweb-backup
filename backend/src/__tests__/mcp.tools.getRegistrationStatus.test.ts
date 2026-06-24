@@ -43,6 +43,14 @@ describe('get_registration_status', () => {
     expect(handler?.definition.name).toBe('get_registration_status');
   });
 
+  it('is an admin-only tool (account-enumeration over AW-Users)', () => {
+    // Must live in ADMIN_SKILL_TOOL_NAMES so non-admin callers cannot execute it
+    // through Emma; the route also enforces isAdmin server-side.
+    const { agentModeService } = jest.requireActual('../services/agentModeService');
+    const adminNames: string[] = agentModeService.getAdminToolNames();
+    expect(adminNames).toContain('get_registration_status');
+  });
+
   it('requires an emails array in its schema', () => {
     const handler = mcpToolRegistry.getTool('get_registration_status');
     const schema = handler?.definition.inputSchema as any;

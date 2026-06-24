@@ -64,7 +64,7 @@ jest.mock('../services/dripSequenceDb', () => ({ dripSequenceDb: {} }));
 const mockUser: { userId: string; email: string; isAdmin?: boolean } = {
   userId: 'user-A',
   email: 'a@example.com',
-  isAdmin: false,
+  isAdmin: true,
 };
 
 jest.mock('../middleware/auth', () => ({
@@ -89,7 +89,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockUser.userId = 'user-A';
   mockUser.email = 'a@example.com';
-  mockUser.isAdmin = false;
+  mockUser.isAdmin = true;
 });
 
 describe('POST /api/crm/registration-status', () => {
@@ -99,6 +99,15 @@ describe('POST /api/crm/registration-status', () => {
       .post('/api/crm/registration-status')
       .send({ emails: ['a@x.com'] });
     expect(res.status).toBe(401);
+    expect(mockGetRegistrationStatusByEmails).not.toHaveBeenCalled();
+  });
+
+  it('returns 403 for a non-admin user (account-enumeration guard)', async () => {
+    mockUser.isAdmin = false;
+    const res = await request(app)
+      .post('/api/crm/registration-status')
+      .send({ emails: ['a@x.com'] });
+    expect(res.status).toBe(403);
     expect(mockGetRegistrationStatusByEmails).not.toHaveBeenCalled();
   });
 

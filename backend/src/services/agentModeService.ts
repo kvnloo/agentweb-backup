@@ -47,7 +47,7 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'manage_user_guide', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage'];
+const ADMIN_SKILL_TOOL_NAMES = ['manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'manage_user_guide', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -3807,7 +3807,6 @@ export class AgentModeService {
     // GTM Discovery (teasers - hint at Emma's capabilities)
     'search_leads',           // CRM teaser
     'get_lead_lists',         // Lead management teaser
-    'get_registration_status', // Funnel: join lead emails -> signup/premium status (read-only, tenant-scoped)
     'list_connected_accounts', // Social/ads integration teaser
 
     'get_user_profile',         // Account info teaser

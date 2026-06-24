@@ -577,11 +577,13 @@ router.post('/sync', async (req: Request, res: Response) => {
 
 /**
  * @route POST /api/crm/registration-status
- * @desc  Join a batch of (lead) emails against AW-Users to learn which ones
- *        registered for an account and which became premium (active/trialing)
- *        users. Powers the funnel report's signup/premium attribution without
- *        duplicating user data onto lead records. Read-only.
- * @access Private
+ * @desc  Join a batch of emails against AW-Users to learn which ones registered
+ *        for an AgentWeb account and which became premium (active/trialing)
+ *        users. Powers the internal funnel report's signup/premium attribution
+ *        without duplicating user data onto lead records. Read-only.
+ * @access Admin only — this queries the platform-wide AW-Users table for
+ *         arbitrary emails (an account-enumeration surface). It is an
+ *         admin/founder funnel concern, not a per-tenant capability.
  * @body  { emails: string[] }  (1..1000 emails)
  * @returns { statuses: RegistrationStatus[], summary: { total, registered, premium } }
  */
@@ -591,6 +593,9 @@ router.post('/registration-status', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     if (!authReq.user?.userId) {
       return res.status(401).json({ message: 'Unauthorized' });
+    }
+    if (!authReq.user?.isAdmin) {
+      return res.status(403).json({ message: 'Admin access required' });
     }
 
     const emails = (req.body as { emails?: unknown })?.emails;
