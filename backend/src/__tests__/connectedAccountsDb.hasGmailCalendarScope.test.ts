@@ -9,7 +9,9 @@
  */
 import {
   hasGmailCalendarScope,
+  hasGmailCalendarWriteScope,
   GOOGLE_CALENDAR_READONLY_SCOPE,
+  GOOGLE_CALENDAR_EVENTS_SCOPE,
   GmailConfig,
 } from '../services/connectedAccountsDb';
 
@@ -70,6 +72,76 @@ describe('hasGmailCalendarScope', () => {
   it('exports the canonical Google Calendar scope URL', () => {
     expect(GOOGLE_CALENDAR_READONLY_SCOPE).toBe(
       'https://www.googleapis.com/auth/calendar.readonly',
+    );
+  });
+});
+
+describe('hasGmailCalendarWriteScope', () => {
+  it('returns true when calendar.events is granted', () => {
+    const config: GmailConfig = {
+      ...baseConfig,
+      granted_scopes: [GOOGLE_CALENDAR_EVENTS_SCOPE],
+    };
+    expect(hasGmailCalendarWriteScope(config)).toBe(true);
+  });
+
+  it('returns true when the full calendar scope is granted', () => {
+    const config: GmailConfig = {
+      ...baseConfig,
+      granted_scopes: ['https://www.googleapis.com/auth/calendar'],
+    };
+    expect(hasGmailCalendarWriteScope(config)).toBe(true);
+  });
+
+  it('returns true when calendar write scope is only in legacy scopes array', () => {
+    const config: GmailConfig = {
+      ...baseConfig,
+      granted_scopes: [],
+      scopes: [GOOGLE_CALENDAR_EVENTS_SCOPE],
+    };
+    expect(hasGmailCalendarWriteScope(config)).toBe(true);
+  });
+
+  it('returns FALSE when only calendar.readonly is granted', () => {
+    const config: GmailConfig = {
+      ...baseConfig,
+      granted_scopes: [GOOGLE_CALENDAR_READONLY_SCOPE],
+    };
+    expect(hasGmailCalendarWriteScope(config)).toBe(false);
+  });
+
+  it('returns FALSE for calendar.events.readonly (read-only events variant)', () => {
+    const config: GmailConfig = {
+      ...baseConfig,
+      granted_scopes: ['https://www.googleapis.com/auth/calendar.events.readonly'],
+    };
+    expect(hasGmailCalendarWriteScope(config)).toBe(false);
+  });
+
+  it('returns FALSE for calendar.settings.readonly', () => {
+    const config: GmailConfig = {
+      ...baseConfig,
+      granted_scopes: ['https://www.googleapis.com/auth/calendar.settings.readonly'],
+    };
+    expect(hasGmailCalendarWriteScope(config)).toBe(false);
+  });
+
+  it('returns false when no calendar scope is present', () => {
+    const config: GmailConfig = {
+      ...baseConfig,
+      granted_scopes: ['https://www.googleapis.com/auth/gmail.readonly'],
+    };
+    expect(hasGmailCalendarWriteScope(config)).toBe(false);
+  });
+
+  it('returns false for undefined/null input', () => {
+    expect(hasGmailCalendarWriteScope(undefined)).toBe(false);
+    expect(hasGmailCalendarWriteScope(null)).toBe(false);
+  });
+
+  it('exports the canonical Google Calendar events scope URL', () => {
+    expect(GOOGLE_CALENDAR_EVENTS_SCOPE).toBe(
+      'https://www.googleapis.com/auth/calendar.events',
     );
   });
 });
