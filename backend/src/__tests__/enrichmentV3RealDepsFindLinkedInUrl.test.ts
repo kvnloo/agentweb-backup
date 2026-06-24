@@ -140,7 +140,7 @@ describe('findLinkedInUrlImpl — LLM context disambiguation among same-name can
 
   it('uses the LLM-chosen index when the pick is confident and its evidence is grounded in the profile', async () => {
     svc.searchPeople.mockResolvedValue(sameNameCandidates);
-    mockGenerateJSONContent.mockResolvedValue({ index: 1, confidence: 'high', evidence: 'Y Combinator' });
+    mockGenerateJSONContent.mockResolvedValue({ index: 1, confidence: 'high', evidence: 'Y Combinator', context_strength: 'specific' });
 
     const url = await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', undefined, 'YC alumni');
 
@@ -192,6 +192,31 @@ describe('findLinkedInUrlImpl — LLM context disambiguation among same-name can
     const url = await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', undefined, 'YC alumni');
 
     expect(url).toBeNull();
+  });
+
+  it('refuses when the LLM judges the list context too weak to disambiguate', async () => {
+    // Vague context like "Imported Contacts" / "Tech Founders" can't reliably
+    // separate same-name people — the LLM flags context_strength 'weak' and we
+    // refuse even if it nominated an index.
+    svc.searchPeople.mockResolvedValue(sameNameCandidates);
+    mockGenerateJSONContent.mockResolvedValue({
+      index: 1, confidence: 'high', evidence: 'Y Combinator', context_strength: 'weak',
+    });
+
+    const url = await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', undefined, 'Imported Contacts');
+
+    expect(url).toBeNull();
+  });
+
+  it('accepts when context is specific (context_strength=specific) and other guards pass', async () => {
+    svc.searchPeople.mockResolvedValue(sameNameCandidates);
+    mockGenerateJSONContent.mockResolvedValue({
+      index: 1, confidence: 'high', evidence: 'Y Combinator', context_strength: 'specific',
+    });
+
+    const url = await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', undefined, 'YC alumni');
+
+    expect(url).toBe('https://www.linkedin.com/in/jane-right');
   });
 
   it('refuses when the LLM call throws (fail-soft, no wrong-person guess)', async () => {
