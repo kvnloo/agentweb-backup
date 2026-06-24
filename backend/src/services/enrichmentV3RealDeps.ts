@@ -14,7 +14,7 @@ import type { MappedPerson, MappedOrganization } from './apolloFieldMapper';
 import type { OrchestratorDeps } from './crmEnrichmentServiceV3';
 import { CrmEnrichmentService, type LeadRecord } from './crmEnrichmentService';
 import { sanitizePhone } from '../utils/phoneValidation';
-import { nameTokensMatch } from '../utils/nameMatch';
+import { nameTokensMatch, normalizeNameToken } from '../utils/nameMatch';
 import type { IdentityResolverDeps } from './enrichmentIdentityResolver';
 import { resolveIdentity as pureResolveIdentity } from './enrichmentIdentityResolver';
 import { runWaterfall as pureRunWaterfall, type LLMFilledValue, type EnrichSoFetchResult } from './enrichmentGroupWaterfall';
@@ -962,8 +962,17 @@ export function unipileNameMatches(
   // Fallback: derive first/last from the combined `name` field. Split on
   // whitespace — first token → first name, last token → last name. Handles
   // middle names by ignoring everything between.
+  //
+  // Drop tokens that normalize to empty (emoji, symbols, decorative marks)
+  // BEFORE choosing first/last. Without this, a display name like
+  // "💡 Paul Graham" would take "💡" as the first name; normalization later
+  // turns it into "" → "no constraint" → a WRONG first name would slip
+  // through the gate (verified live). Filtering here keeps the first/last
+  // anchored on real name tokens.
   if (itemFirst === null && itemLast === null && typeof item.name === 'string') {
-    const tokens = item.name.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const tokens = item.name.trim().toLowerCase().split(/\s+/)
+      .filter(Boolean)
+      .filter((t: string) => normalizeNameToken(t) !== '');
     if (tokens.length >= 1) itemFirst = tokens[0];
     if (tokens.length >= 2) itemLast = tokens[tokens.length - 1];
   }
