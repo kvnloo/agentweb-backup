@@ -138,9 +138,9 @@ describe('findLinkedInUrlImpl — LLM context disambiguation among same-name can
     ],
   };
 
-  it('uses the LLM-chosen index when multiple same-name candidates exist and context is provided', async () => {
+  it('uses the LLM-chosen index when the pick is confident and its evidence is grounded in the profile', async () => {
     svc.searchPeople.mockResolvedValue(sameNameCandidates);
-    mockGenerateJSONContent.mockResolvedValue({ index: 1 });
+    mockGenerateJSONContent.mockResolvedValue({ index: 1, confidence: 'high', evidence: 'Y Combinator' });
 
     const url = await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', undefined, 'YC alumni');
 
@@ -150,7 +150,7 @@ describe('findLinkedInUrlImpl — LLM context disambiguation among same-name can
 
   it('refuses (returns null) when the LLM declines with index -1', async () => {
     svc.searchPeople.mockResolvedValue(sameNameCandidates);
-    mockGenerateJSONContent.mockResolvedValue({ index: -1 });
+    mockGenerateJSONContent.mockResolvedValue({ index: -1, confidence: 'low', evidence: '' });
 
     const url = await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', undefined, 'Acme Dentists');
 
@@ -159,7 +159,35 @@ describe('findLinkedInUrlImpl — LLM context disambiguation among same-name can
 
   it('refuses when the LLM returns an out-of-range index', async () => {
     svc.searchPeople.mockResolvedValue(sameNameCandidates);
-    mockGenerateJSONContent.mockResolvedValue({ index: 99 });
+    mockGenerateJSONContent.mockResolvedValue({ index: 99, confidence: 'high', evidence: 'Y Combinator' });
+
+    const url = await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', undefined, 'YC alumni');
+
+    expect(url).toBeNull();
+  });
+
+  it('refuses when the LLM pick is low confidence (threshold guard)', async () => {
+    svc.searchPeople.mockResolvedValue(sameNameCandidates);
+    mockGenerateJSONContent.mockResolvedValue({ index: 1, confidence: 'low', evidence: 'Y Combinator' });
+
+    const url = await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', undefined, 'YC alumni');
+
+    expect(url).toBeNull();
+  });
+
+  it('refuses when the LLM evidence is not found in the chosen profile (hallucination guard)', async () => {
+    svc.searchPeople.mockResolvedValue(sameNameCandidates);
+    // "Sequoia Capital" appears in NO candidate's profile — fabricated justification.
+    mockGenerateJSONContent.mockResolvedValue({ index: 1, confidence: 'high', evidence: 'Sequoia Capital' });
+
+    const url = await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', undefined, 'YC alumni');
+
+    expect(url).toBeNull();
+  });
+
+  it('refuses when the LLM omits evidence entirely', async () => {
+    svc.searchPeople.mockResolvedValue(sameNameCandidates);
+    mockGenerateJSONContent.mockResolvedValue({ index: 1, confidence: 'high' });
 
     const url = await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', undefined, 'YC alumni');
 

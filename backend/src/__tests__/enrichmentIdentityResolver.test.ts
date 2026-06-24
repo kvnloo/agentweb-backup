@@ -190,6 +190,90 @@ describe('resolveIdentity — name-only lead resolved via list-context LinkedIn 
       expect.objectContaining({ company: 'Acme', listContext: 'YC Poker Night' }),
     );
   });
+
+  it('stamps a context-resolved LinkedIn URL as LOW confidence so downstream treats it as unverified', async () => {
+    // A name-only lead resolved purely via list-context disambiguation is an
+    // educated guess among same-name people — it must NOT carry the same
+    // 'medium' confidence as a company-anchored Unipile match. Stamp it low so
+    // fieldVerificationStatus() flags it unverified and the UI caveats it.
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      findLinkedInUrl: jest.fn().mockResolvedValue('https://www.linkedin.com/in/jane-doe-yc'),
+      writeLeadFields,
+    });
+
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe' },
+        needsPersonFields: false,
+        needsCompanyFields: true,
+        mode: 'enrich',
+        listContext: 'YC Poker Night',
+      }),
+      deps,
+    );
+
+    const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta;
+    expect(meta.linkedin.provider).toBe('unipile');
+    expect(meta.linkedin.confidence).toBe('low');
+  });
+
+  it('taints DOWNSTREAM Apollo fields (email/company) to low confidence when identity rests on a context guess', async () => {
+    // The whole identity is only as trustworthy as the guessed LinkedIn URL,
+    // so Apollo-resolved fields seeded from it (email, company, title) must
+    // also be marked low/unverified — otherwise a wrong-person email looks
+    // trustworthy.
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      findLinkedInUrl: jest.fn().mockResolvedValue('https://www.linkedin.com/in/jane-doe-yc'),
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        email: 'jane@ycombinator.com', emailStatus: 'verified',
+        company: 'Y Combinator', website: 'ycombinator.com', title: 'Partner',
+      }),
+      writeLeadFields,
+    });
+
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe' },
+        needsPersonFields: false,
+        needsCompanyFields: true,
+        mode: 'enrich',
+        listContext: 'YC Poker Night',
+      }),
+      deps,
+    );
+
+    const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta;
+    // Every resolved field seeded from the context guess is low-confidence.
+    expect(meta.linkedin.confidence).toBe('low');
+    if (meta.email) expect(meta.email.confidence).toBe('low');
+    if (meta.company) expect(meta.company.confidence).toBe('low');
+  });
+
+  it('keeps MEDIUM confidence for a company-anchored Unipile match (not the context-guess path)', async () => {
+    // When the search was anchored by a known company, the match is not a
+    // context guess — preserve the prior 'medium' confidence.
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      findLinkedInUrl: jest.fn().mockResolvedValue('https://www.linkedin.com/in/jane-acme'),
+      writeLeadFields,
+    });
+
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', company: 'Acme' },
+        needsPersonFields: true,
+        needsCompanyFields: false,
+        mode: 'enrich',
+        listContext: 'YC Poker Night',
+      }),
+      deps,
+    );
+
+    const meta = (writeLeadFields as jest.Mock).mock.calls[0][0].meta;
+    expect(meta.linkedin.confidence).toBe('medium');
+  });
 });
 
 // ─── LinkedIn-URL-only identity (Unipile getProfile path) ────────────────────
