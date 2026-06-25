@@ -598,10 +598,17 @@ export class AgentModeService {
       {
         name: 'Google Calendar',
         description:
-          'Read events and meetings from Google Calendar. List upcoming events, view event details, ' +
-          'and browse calendars. Requires Gmail connected with Calendar access (Settings → Connected Accounts).',
-        toolNames: ['google_calendar_list_events', 'google_calendar_get_event', 'google_calendar_list_calendars'],
+          'Read and manage Google Calendar. List upcoming events, view event details, browse calendars, ' +
+          'create/book new events, update existing events, and delete events on your own calendar. ' +
+          'Requires Gmail connected with Calendar access (Settings → Connected Accounts); ' +
+          'creating, updating, or deleting events also requires granting Calendar write access.',
+        toolNames: ['google_calendar_list_events', 'google_calendar_get_event', 'google_calendar_list_calendars', 'google_calendar_create_event', 'google_calendar_update_event', 'google_calendar_delete_event'],
         category: 'tool_bundle',
+        systemPrompt:
+          'Before calling google_calendar_create_event, google_calendar_update_event, or google_calendar_delete_event, ' +
+          'always summarize the action you are about to take (event title, date/time, what will change or be deleted) ' +
+          'and ask the user to confirm. Only call the tool after the user explicitly confirms. ' +
+          'Do not ask for confirmation when only reading (list_events, get_event, list_calendars).',
       },
     ];
 
@@ -616,6 +623,13 @@ export class AgentModeService {
 
       for (const builtin of AgentModeService.BUILT_IN_SKILLS) {
         if (existingNames.has(builtin.name)) {
+          // Upsert: keep toolNames and description in sync with code.
+          const existing = existingSkills.find(s => s.name === builtin.name);
+          if (existing) {
+            existing.toolNames = builtin.toolNames;
+            existing.description = builtin.description;
+            await skillService.updateSkill(existing);
+          }
           continue;
         }
 

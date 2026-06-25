@@ -308,6 +308,17 @@ export interface GmailCredentials {
  * @returns Gmail OAuth client credentials
  */
 export async function getGmailCredentials(): Promise<GmailCredentials> {
+  // Env-var shortcut: if both Gmail OAuth client credentials are provided
+  // directly, use them and skip Secrets Manager entirely. Mirrors the same
+  // pattern used by getV0ApiKey/getGithubOrgToken and keeps local/dev runs
+  // working without AWS access.
+  if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+    return {
+      clientId: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    };
+  }
+
   try {
     const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production'
