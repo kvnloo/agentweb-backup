@@ -525,6 +525,37 @@ export class HubSpotService {
   }
 
   /**
+   * Batch-fetch the current `lifecyclestage` for up to 100 contact IDs per
+   * request. Returns a Map of contactId → lifecyclestage (empty string when the
+   * contact has no stage set). Contacts not returned (e.g. deleted) are omitted.
+   * Chunk size is 100 (HubSpot batch/read limit). Partial chunk failures are
+   * logged and skipped so the rest still resolves — callers treat a missing id
+   * as "unknown original" and fall back to clearing it.
+   * Used by the lifecycle-stage two-step so a failed set can be rolled back to
+   * the contact's prior stage instead of being left blank.
+   */
+  async getContactLifecycleStages(contactIds: string[]): Promise<Map<string, string>> {
+    const CHUNK_SIZE = 100;
+    const stageMap = new Map<string, string>();
+    for (let i = 0; i < contactIds.length; i += CHUNK_SIZE) {
+      const chunk = contactIds.slice(i, i + CHUNK_SIZE);
+      try {
+        const res = await axiosInstance.post(
+          `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/batch/read`,
+          { properties: ['lifecyclestage'], inputs: chunk.map((id) => ({ id })) },
+          { headers: await this.authHeaders() },
+        );
+        for (const contact of (res.data as any)?.results ?? []) {
+          stageMap.set(String(contact.id), String(contact?.properties?.lifecyclestage ?? ''));
+        }
+      } catch (e: any) {
+        console.warn(`[HubSpot] getContactLifecycleStages batch failed for chunk starting at ${i}:`, e?.message);
+      }
+    }
+    return stageMap;
+  }
+
+  /**
    * Fetches a contact by ID and returns all its property values as a flat map.
    * Pass specific propertyNames to request only those fields; omit to fetch
    * the standard set (email, name, phone, jobtitle, company, linkedin).
