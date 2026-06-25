@@ -113,6 +113,94 @@ describe('fathom_get_meetings', () => {
     );
   });
 
+  it('follows next_cursor pagination and aggregates all pages', async () => {
+    mockedGetAccounts.mockResolvedValue([makeFathomAccount()] as any);
+    // Page 1 returns 2 meetings + a cursor; page 2 returns 1 meeting + no cursor.
+    mockedAxios.get = jest.fn()
+      .mockResolvedValueOnce({
+        data: {
+          items: [
+            { recording_id: 201, title: 'Meeting A', created_at: '2026-03-15T10:00:00Z' },
+            { recording_id: 202, title: 'Meeting B', created_at: '2026-03-15T11:00:00Z' },
+          ],
+          next_cursor: 'CURSOR_PAGE_2',
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          items: [
+            { recording_id: 203, title: 'Florence Sync', created_at: '2026-03-16T09:00:00Z' },
+          ],
+          next_cursor: null,
+        },
+      });
+
+    const result = await executeTool('fathom_get_meetings', {}, { userId: 'user-1' });
+
+    expect(result.success).toBe(true);
+    // All three meetings across both pages must be present — not just the first page.
+    expect(result.meetings).toHaveLength(3);
+    expect(result.count).toBe(3);
+    const titles = result.meetings.map((m: any) => m.title);
+    expect(titles).toContain('Florence Sync');
+
+    // Two HTTP calls: initial page + cursor-followed page.
+    expect((mockedAxios.get as jest.Mock)).toHaveBeenCalledTimes(2);
+    const secondCallUrl = (mockedAxios.get as jest.Mock).mock.calls[1][0];
+    expect(secondCallUrl).toContain('cursor=CURSOR_PAGE_2');
+  });
+
+  it('reproduces the reported bug: finds people whose meetings are past page 1', async () => {
+    // Regression for the "cross-reference who we met last week" bug: Florence
+    // and Susthmia's meetings sat on page 2, so the first-page-only tool
+    // reported it "could not find" them. With cursor following they surface.
+    mockedGetAccounts.mockResolvedValue([makeFathomAccount()] as any);
+    const page1 = Array.from({ length: 10 }, (_, i) => ({
+      recording_id: 1000 + i,
+      title: `Internal Standup ${i + 1}`,
+      created_at: '2026-06-16T10:00:00Z',
+      calendar_invitees: [{ name: 'Rui', email: 'rui@agentweb.pro' }],
+    }));
+    const page2 = [
+      { recording_id: 2001, title: 'Florence Intro Call', created_at: '2026-06-17T15:00:00Z',
+        calendar_invitees: [{ name: 'Florence', email: 'florence@acme.com' }] },
+      { recording_id: 2002, title: 'Susthmia Discovery', created_at: '2026-06-18T16:00:00Z',
+        calendar_invitees: [{ name: 'Susthmia', email: 'susthmia@beta.io' }] },
+    ];
+    mockedAxios.get = jest.fn()
+      .mockResolvedValueOnce({ data: { items: page1, next_cursor: 'PAGE2' } })
+      .mockResolvedValueOnce({ data: { items: page2, next_cursor: null } });
+
+    const result = await executeTool(
+      'fathom_get_meetings',
+      { created_after: '2026-06-15T00:00:00Z', created_before: '2026-06-22T00:00:00Z' },
+      { userId: 'user-1' },
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.count).toBe(12);
+    const everyone = result.meetings.flatMap((m: any) => m.participants);
+    expect(everyone).toContain('Florence');
+    expect(everyone).toContain('Susthmia');
+  });
+
+  it('stops paginating at the page cap to avoid runaway loops', async () => {
+    mockedGetAccounts.mockResolvedValue([makeFathomAccount()] as any);
+    // Always return a cursor — the cap must break the loop.
+    mockedAxios.get = jest.fn().mockResolvedValue({
+      data: {
+        items: [{ recording_id: 1, title: 'Loop', created_at: '2026-03-15T10:00:00Z' }],
+        next_cursor: 'NEVER_ENDING',
+      },
+    });
+
+    const result = await executeTool('fathom_get_meetings', {}, { userId: 'user-1' });
+
+    expect(result.success).toBe(true);
+    // Must not exceed the safety cap of HTTP calls.
+    expect((mockedAxios.get as jest.Mock).mock.calls.length).toBeLessThanOrEqual(20);
+  });
+
   it('passes date filters to the API', async () => {
     mockedGetAccounts.mockResolvedValue([makeFathomAccount()] as any);
     mockedAxios.get = jest.fn().mockResolvedValue({ data: [] });
