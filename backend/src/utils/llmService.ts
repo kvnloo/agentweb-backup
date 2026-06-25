@@ -1,4 +1,4 @@
-import { AzureChatOpenAI } from '@langchain/openai';
+import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
 import { ChatBedrockConverse } from '@langchain/aws';
 import { BedrockRuntimeClient } from '@aws-sdk/client-bedrock-runtime';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
@@ -6,6 +6,13 @@ import { JsonOutputParser } from '@langchain/core/output_parsers';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { extractJson, JsonExtractError } from '../services/util/extractJson';
 import { recordUsage } from '../services/usageRecorderService';
+import {
+  getOpenRouterApiKey,
+  getOpenRouterBaseUrl,
+  getOpenRouterHeaders,
+  getOpenRouterModel,
+  isOpenRouterConfigured,
+} from './openRouterConfig';
 
 export type OutputFormat = 'json' | 'xml';
 
@@ -36,7 +43,7 @@ export interface LLMUsageContext {
 }
 
 export class LLMService {
-  private chatModel: AzureChatOpenAI | ChatBedrockConverse | null;
+  private chatModel: AzureChatOpenAI | ChatBedrockConverse | ChatOpenAI | null;
   private modelName: string;
   private isGemini: boolean;
   private provider: string;
@@ -45,6 +52,21 @@ export class LLMService {
     const model = modelName || process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4';
     this.modelName = model;
     this.isGemini = model.toLowerCase().includes('gemini');
+
+    if (isOpenRouterConfigured()) {
+      this.provider = 'openrouter';
+      this.chatModel = new ChatOpenAI({
+        apiKey: getOpenRouterApiKey() || undefined,
+        model: getOpenRouterModel(model),
+        temperature,
+        ...(maxTokens && { maxTokens }),
+        configuration: {
+          baseURL: getOpenRouterBaseUrl(),
+          defaultHeaders: getOpenRouterHeaders(),
+        },
+      });
+      return;
+    }
 
     if (this.isGemini) {
       this.chatModel = null;
@@ -108,7 +130,7 @@ export class LLMService {
    * Extract usage data from a LangChain AIMessage response.
    * LangChain standardizes token counts on `usage_metadata` across providers.
    */
-  private requireChatModel(): AzureChatOpenAI | ChatBedrockConverse {
+  private requireChatModel(): AzureChatOpenAI | ChatBedrockConverse | ChatOpenAI {
     if (!this.chatModel) throw new Error(`LLMService: model "${this.modelName}" requires generateJSONContentWithWebSearch, not generateJSONContent`);
     return this.chatModel;
   }
@@ -442,6 +464,10 @@ The HTML must be a complete, well-formed HTML document with proper DOCTYPE, head
     userPrompt: string,
     usageContext?: LLMUsageContext,
   ): Promise<T> {
+    if (this.provider === 'openrouter') {
+      return this.generateJSONContentWithOpenRouterWebSearch<T>(systemPrompt, userPrompt, usageContext);
+    }
+
     if (this.isGemini) {
       const { GoogleGenAI } = await import('@google/genai');
       const apiKey = process.env.GEMINI_API_KEY;
@@ -528,6 +554,72 @@ The HTML must be a complete, well-formed HTML document with proper DOCTYPE, head
         .filter(Boolean)
         .join('');
     }
+    return extractJson<T>(text);
+  }
+
+  private async generateJSONContentWithOpenRouterWebSearch<T = any>(
+    systemPrompt: string,
+    userPrompt: string,
+    usageContext?: LLMUsageContext,
+  ): Promise<T> {
+    const apiKey = getOpenRouterApiKey();
+    if (!apiKey) throw new Error('OPENROUTER_API_KEY must be set');
+
+    const reqBody = JSON.stringify({
+      model: getOpenRouterModel(this.modelName, { webSearch: true }),
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      plugins: [{ id: 'web' }],
+    });
+    const debug = process.env.LLM_WEB_SEARCH_DEBUG === '1';
+    const url = `${getOpenRouterBaseUrl()}/chat/completions`;
+    const reqStart = Date.now();
+    if (debug) {
+      console.log('[llm.webSearch] → POST', url);
+      console.log('[llm.webSearch] → headers: Authorization=[redacted], Content-Type=application/json');
+      console.log('[llm.webSearch] → body:', reqBody.slice(0, 500));
+    }
+
+    const httpResp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        ...getOpenRouterHeaders(),
+      },
+      body: reqBody,
+    });
+    if (debug) {
+      console.log(`[llm.webSearch] ← status=${httpResp.status} in ${Date.now() - reqStart}ms`);
+    }
+    if (!httpResp.ok) {
+      const errBody = await httpResp.text().catch(() => '');
+      throw new Error(`OpenRouter chat completions ${httpResp.status}: ${errBody.slice(0, 300)}`);
+    }
+
+    const rawBody = await httpResp.text();
+    if (debug) {
+      console.log('[llm.webSearch] ← body:', rawBody.slice(0, 800));
+    }
+    const resp = JSON.parse(rawBody) as {
+      choices?: Array<{ message?: { content?: string | Array<{ text?: string }> } }>;
+      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+    };
+    const respIn = resp.usage?.prompt_tokens || 0;
+    const respOut = resp.usage?.completion_tokens || 0;
+    this.meterUsage({
+      inputTokens: respIn,
+      outputTokens: respOut,
+      totalTokens: resp.usage?.total_tokens || (respIn + respOut),
+      model: this.modelName,
+    }, usageContext);
+
+    const content = resp.choices?.[0]?.message?.content;
+    const text = Array.isArray(content)
+      ? content.map(part => part?.text ?? '').join('')
+      : content ?? '';
     return extractJson<T>(text);
   }
 }

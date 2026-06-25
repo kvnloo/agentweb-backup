@@ -20,7 +20,12 @@ function makeService(): LLMService {
 
 describe('LLMService.generateJSONContentWithWebSearch — Azure path', () => {
   const originalFetch = global.fetch;
-  afterEach(() => { global.fetch = originalFetch; });
+  afterEach(() => {
+    global.fetch = originalFetch;
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_BASE_URL;
+    delete process.env.OPENROUTER_MODEL_GPT_5_CHAT_2;
+  });
 
   it('POSTs to the Azure /openai/responses endpoint with web_search tool and parses output_text', async () => {
     const fetchMock = jest.fn().mockResolvedValue({
@@ -127,6 +132,38 @@ describe('LLMService.generateJSONContentWithWebSearch — Azure path', () => {
     expect(url).toBe(
       'https://example.openai.azure.com/openai/responses?api-version=2025-03-01-preview',
     );
+  });
+
+  it('uses OpenRouter chat completions with the web plugin when configured', async () => {
+    const fetchMock = jest.fn().mockResolvedValue({
+      ok: true,
+      text: async () => JSON.stringify({
+        choices: [{ message: { content: '{"ok":true}' } }],
+        usage: { prompt_tokens: 12, completion_tokens: 4, total_tokens: 16 },
+      }),
+    });
+    (global as any).fetch = fetchMock;
+    process.env.OPENROUTER_API_KEY = 'sk-or-test';
+    process.env.OPENROUTER_BASE_URL = 'https://openrouter.example/api/v1/';
+    process.env.OPENROUTER_MODEL_GPT_5_CHAT_2 = 'openai/gpt-5.2';
+
+    const svc = makeService();
+    const out = await svc.generateJSONContentWithWebSearch<{ ok: boolean }>('sys', 'user');
+
+    expect(out).toEqual({ ok: true });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('https://openrouter.example/api/v1/chat/completions');
+    expect(init.headers.Authorization).toBe('Bearer sk-or-test');
+    expect(init.headers['api-key']).toBeUndefined();
+    const body = JSON.parse(init.body);
+    expect(body).toMatchObject({
+      model: 'openai/gpt-5.2:online',
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'user', content: 'user' },
+      ],
+      plugins: [{ id: 'web' }],
+    });
   });
 });
 

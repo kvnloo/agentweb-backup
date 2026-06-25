@@ -18,6 +18,9 @@ const mockChain = createChainMock();
 jest.mock('@langchain/openai', () => ({
   AzureChatOpenAI: jest.fn().mockImplementation(() => ({
     invoke: mockInvoke
+  })),
+  ChatOpenAI: jest.fn().mockImplementation(() => ({
+    invoke: mockInvoke
   }))
 }));
 
@@ -49,7 +52,7 @@ jest.mock('@langchain/core/output_parsers', () => ({
 }));
 
 import { LLMService, createLLMService } from '../../utils/llmService';
-import { AzureChatOpenAI } from '@langchain/openai';
+import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
 import { ChatBedrockConverse } from '@langchain/aws';
 
 describe('llmService', () => {
@@ -70,6 +73,9 @@ describe('llmService', () => {
     delete process.env.AWS_ACCESS_KEY_ID;
     delete process.env.AWS_SECRET_ACCESS_KEY;
     delete process.env.AWS_REGION;
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_BASE_URL;
+    delete process.env.OPENROUTER_MODEL_GPT_5_CHAT_2;
   });
 
   describe('LLMService constructor', () => {
@@ -101,6 +107,29 @@ describe('llmService', () => {
     it('should use default deployment from env when model not specified', () => {
       new LLMService();
       expect(AzureChatOpenAI).toHaveBeenCalled();
+    });
+
+    it('should route models through OpenRouter when OPENROUTER_API_KEY is configured', () => {
+      process.env.OPENROUTER_API_KEY = 'sk-or-test';
+      process.env.OPENROUTER_BASE_URL = 'https://openrouter.example/api/v1/';
+      process.env.OPENROUTER_MODEL_GPT_5_CHAT_2 = 'openai/gpt-5.2';
+
+      new LLMService('gpt-5-chat-2', 0.2, 1234);
+
+      expect(ChatOpenAI).toHaveBeenCalledWith(
+        expect.objectContaining({
+          apiKey: 'sk-or-test',
+          model: 'openai/gpt-5.2',
+          temperature: 0.2,
+          maxTokens: 1234,
+          configuration: expect.objectContaining({
+            baseURL: 'https://openrouter.example/api/v1',
+            defaultHeaders: expect.objectContaining({ 'X-OpenRouter-Title': 'AgentWeb' }),
+          }),
+        })
+      );
+      expect(AzureChatOpenAI).not.toHaveBeenCalled();
+      expect(ChatBedrockConverse).not.toHaveBeenCalled();
     });
 
     it('should throw error when Azure credentials are missing for non-Claude models', () => {
