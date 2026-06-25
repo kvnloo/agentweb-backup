@@ -4,6 +4,7 @@ import axios from "axios";
 import fs from "fs";
 import path from "path";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken, getLandingPagesConfig } from "../utils/secretsManager";
+import { resolveLandingPageGa4 } from "../utils/landingPageGa4";
 import { userDb, orgDb } from "./db";
 import { canEditItem } from "./orgShareService";
 import { addSubdomain, generateSubdomain, listDomains, SUBDOMAIN_BASE } from "./customDomainService";
@@ -1706,27 +1707,30 @@ export async function deployLandingPage(
     // 409 collisions; withRetry covers fetch-failed/5xx/timeout.
     const customDomain = await assignManagedSubdomain(id, userId, vercelProjectId, record.name);
 
-    // Auto-configure GSC domain + GA4 property when deployed to a managed subdomain
+    // Auto-configure GSC domain + GA4 property when deployed to a managed subdomain.
+    // resolveLandingPageGa4 picks the right mapping for the deployed host so audit
+    // pages on agentweb.pro get the audit GA4 property, form pages get the forms one.
     if (customDomain) {
       try {
         const lpConfig = await getLandingPagesConfig();
-        if (lpConfig && customDomain.endsWith(`.${lpConfig.gscDomain}`)) {
+        const mapping = resolveLandingPageGa4(lpConfig, customDomain);
+        if (mapping) {
           const user = await userDb.getUserById(userId);
           if (user) {
             const updates: Record<string, any> = {};
 
             // Ensure root GSC domain property is configured (covers all subdomains)
             const seoDomains: string[] = user.seoDomains ?? [];
-            if (!seoDomains.includes(lpConfig.gscDomain)) {
-              updates.seoDomains = [...seoDomains, lpConfig.gscDomain];
+            if (!seoDomains.includes(mapping.gscDomain)) {
+              updates.seoDomains = [...seoDomains, mapping.gscDomain];
             }
 
             // Ensure our GA4 property is in the user's configured properties
             const gaProps: Array<{ propertyId: string; label: string }> = user.googleAnalyticsProperties ?? [];
-            if (!gaProps.some(p => p.propertyId === lpConfig.ga4PropertyId)) {
+            if (!gaProps.some(p => p.propertyId === mapping.ga4PropertyId)) {
               updates.googleAnalyticsProperties = [
                 ...gaProps,
-                { propertyId: lpConfig.ga4PropertyId, label: lpConfig.gscDomain },
+                { propertyId: mapping.ga4PropertyId, label: mapping.gscDomain },
               ];
             }
 

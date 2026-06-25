@@ -136,6 +136,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-10',
     changes: [
+      'New: Generate Videos with Seedance 2.0',
+      '- Emma can now create videos using ByteDance\'s Seedance 2.0 model (via Higgsfield), in addition to Google Veo',
+      '- Just ask for a video and pick Seedance, or mention it by name — great for turning a product image into a polished motion clip',
+      '- If you don\'t provide a starting image, one is generated automatically from your prompt and animated into the final video',
+    ],
+  },
+  {
+    date: '2026-06-10',
+    changes: [
       'New: Report a Bug in One Click, Screenshot Included',
       '- A new "Report a bug" button is always within reach in the bottom-right corner of every page',
       '- Click it and we automatically grab a screenshot of the page you were just looking at — no need to capture or attach anything yourself',
@@ -891,15 +900,6 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When an admin accessed a customer\'s portal and then reloaded the page, the portal would switch to a different customer\'s account',
       '- Multiple delegate session tokens were accumulating in the browser\'s session storage, and the wrong one would be picked on reload due to non-deterministic key ordering',
       '- The fix ensures only one delegate token is ever active at a time: switching to a new customer now clears any previous delegate tokens before storing the new one',
-    ],
-  },
-  {
-    date: '2026-05-25',
-    changes: [
-      'Fixed: Scheduled Chats No Longer Fail When Using Brave Search MCP for Web Search',
-      '- Scheduled chats that required a web search step were failing validation with "Missing function calls: search_web" even though the agent was successfully searching the web',
-      '- The agent was using the Brave Search MCP tool (bravesearch_brave_web_search) which produces equivalent results to the built-in search_web, but the validation logic did not recognize them as the same',
-      '- The validator now treats bravesearch_brave_web_search and bravesearch_brave_news_search as aliases for search_web, so scheduled chats pass validation regardless of which search tool the agent chooses',
     ],
   },
   {
@@ -2522,10 +2522,6 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Generic openers like "Great post!", "Absolutely!", and "Thanks for sharing" are now explicitly avoided',
       '- Personality presets configured in Engagement Settings (e.g. Curious, Expert, Conversational) are now applied when generating comments and replies',
       '- Fallback comments (used if the AI call fails) are now varied and human-sounding instead of fixed bot phrases',
-      'Fix: Work Plan Sessions with Brave Search No Longer Fail Immediately',
-      '- Work plan sessions using the AI GTM Positioning Audit skill (and any skill with Brave Search) were failing on every attempt with "please try rephrasing your question"',
-      '- Root cause: the Brave Search MCP tool schemas use JSON Schema features (anyOf, $schema) that Amazon Bedrock rejects with a 400 error',
-      '- The agent engine now sanitizes tool schemas before sending them to Bedrock, converting anyOf-with-const patterns to enum arrays and stripping unsupported keywords',
       'Fix: Video Cost Tracking Now Accounts for Video Duration',
       '- Videos longer than 8 seconds require multiple AI generation calls (one per 8-second clip), but cost tracking was only charging for a single clip regardless of length',
       '- Cost tracking now correctly charges per clip: a 16s video costs $5.60 (2 clips), a 24s video costs $8.40 (3 clips), etc.',
@@ -5016,7 +5012,7 @@ export const userReleaseNotes: UserReleaseNote[] = [
     changes: [
       'Added Stdio MCP Support for Local MCP Servers',
       '- Admin MCP Servers now supports Stdio transport for backend-launched local MCP processes',
-      '- You can configure local MCPs (for example Brave Search MCP via npx) without running a separate HTTP MCP service',
+      '- You can configure local MCPs via npx without running a separate HTTP MCP service',
       'Improved Resend Email Delivery Reliability',
       '- Added a global Resend send queue to process outbound emails in order',
       '- Enforced a shared send rate of 2 requests per second to stay within provider limits',

@@ -1744,23 +1744,76 @@ mcpToolRegistry.register({
 // Infrastructure tools: use backend APIs (search, image gen, email, storage).
 
 mcpToolRegistry.register({
-  name: 'search_web',
+  name: 'you_search_web',
   internal: true,
   definition: {
-    name: 'search_web',
-    description: 'Search the web for information.',
+    name: 'you_search_web',
+    description: 'Search the public web using You.com Search. No hidden fallback provider is used. For social-platform research, include explicit site filters when useful, e.g. site:x.com, site:linkedin.com, site:reddit.com, or site:instagram.com.',
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Search query' },
-        max_results: { type: 'number', description: 'Max results (default 5, max 10)', default: 5 }
+        query: { type: 'string', description: 'Web search query' },
+        max_results: { type: 'number', description: 'Max web results (default 5, max 10)', default: 5 }
       },
       required: ['query']
     }
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'POST', path: '/api/emma/search-web', context: ctx(context),
+      method: 'POST', path: '/api/emma/you-search-web', context: ctx(context),
+      body: { query: args.query, max_results: args.max_results || 10 }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'you_search_news',
+  internal: true,
+  definition: {
+    name: 'you_search_news',
+    description: 'Search current news using You.com Search. Use this only when the user asks for news, today/latest/breaking updates, or recent articles. Do not call it as a companion to ordinary web/social searches unless the user explicitly asks for news too. No hidden fallback provider is used. Preserve freshness words from the user query such as today, latest, breaking, or the exact date; do not rewrite a today/latest-news request into a timeless entity query.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'News search query. For current-news requests, keep temporal terms like today/latest/breaking or include the exact date.' },
+        max_results: { type: 'number', description: 'Max news results (default 5, max 10)', default: 5 },
+        freshness: {
+          type: 'string',
+          enum: ['day', 'week', 'month', 'year'],
+          description: 'Optional You.com freshness window. Defaults to week for news unless the query implies a fresher window.'
+        }
+      },
+      required: ['query']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST', path: '/api/emma/you-search-news', context: ctx(context),
+      body: { query: args.query, max_results: args.max_results || 10, freshness: args.freshness }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'google_search_web',
+  internal: true,
+  definition: {
+    name: 'google_search_web',
+    description: 'Opt-in Google Custom Search web search. Not a default search tool. No hidden fallback provider is used.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Google Custom Search query' },
+        max_results: { type: 'number', description: 'Max Google web results (default 5, max 10)', default: 5 }
+      },
+      required: ['query']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST', path: '/api/emma/google-search-web', context: ctx(context),
       body: { query: args.query, max_results: args.max_results || 10 }
     });
     return jsonResult(data);
@@ -2395,6 +2448,53 @@ Example:
       path: '/api/drip-campaigns/preview-segment',
       context: ctx(context),
       body,
+    });
+    return jsonResult(data);
+  },
+});
+
+mcpToolRegistry.register({
+  name: 'get_registration_status',
+  definition: {
+    name: 'get_registration_status',
+    description: `Join a batch of emails against AgentWeb user accounts to learn which ones registered (signed up) and which became premium (paying/trialing) users. Use this to attribute CRM leads — e.g. audit-page leads — to real signups and conversions in a funnel report. Read-only.
+
+For each input email the response reports:
+- \`registered\`: true if a (non-deleted) AgentWeb account exists for that email.
+- \`isPremium\`: true if that account's subscription is active or trialing.
+- \`subscriptionStatus\` / \`subscriptionType\` / \`userId\` / \`createdAt\`: present when registered.
+
+Emails with no matching account come back as \`{ registered: false, isPremium: false }\`. The response also includes a \`summary\` with \`total\`, \`registered\`, and \`premium\` counts.
+
+Example:
+  action inputs: { emails: ["lead1@acme.com", "lead2@acme.com"] }
+  response: { statuses: [ { email: "lead1@acme.com", registered: true, isPremium: true, ... }, { email: "lead2@acme.com", registered: false, isPremium: false } ], summary: { total: 2, registered: 1, premium: 1 } }`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        emails: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Emails to look up (1-1000). Case/whitespace-insensitive; duplicates are collapsed.',
+        },
+      },
+      required: ['emails'],
+      additionalProperties: false,
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const emails = Array.isArray(args?.emails)
+      ? args.emails
+          .filter((e: unknown) => typeof e === 'string')
+          .map((e: string) => e.trim())
+          .filter((e: string) => e.length > 0)
+      : [];
+
+    const data = await mcpFetch({
+      method: 'POST',
+      path: '/api/crm/registration-status',
+      context: ctx(context),
+      body: { emails },
     });
     return jsonResult(data);
   },

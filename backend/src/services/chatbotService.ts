@@ -177,6 +177,12 @@ export interface ChatSession {
       notes?: string;
       requiredFunctionCalls?: string[]; // Required function names that must be called before marking complete
       skillIds?: string[]; // Skill IDs to auto-install when this step becomes active
+      // Expected number of media assets (images/videos) this step must produce before
+      // it may be marked completed. When set, setWorkPlanStatus blocks completion until
+      // the session has produced at least this many assets — preventing a multi-image
+      // step (e.g. "Generate 3 Images Per Hook — 18 total") from being marked done with
+      // only a fraction generated (the xCures incident). Unset = no asset-count gate.
+      expectedAssetCount?: number;
     }>;
     createdAt: string;
     updatedAt: string;
@@ -2605,6 +2611,7 @@ export class ChatbotDB {
         notes?: string;
         requiredFunctionCalls?: string[];
         skillIds?: string[];
+        expectedAssetCount?: number;
       }>;
       createdAt: string;
       updatedAt: string;
@@ -4036,7 +4043,7 @@ export async function generateChatResponse(
             'knowledge-base':   ['search_knowledge_base', 'list_knowledge_base_files', 'read_knowledge_base_files', 'read_file_content', 'create_knowledge_base', 'update_knowledge_base_file', 'attach_knowledge_base_files'],
             'templates':        ['list_html_templates', 'create_html_from_template', 'update_html_file', 'get_visual_context'],
             'books':            ['list_books', 'get_book_details', 'get_book_content', 'update_book_content', 'generate_book_content', 'create_book', 'create_book_outline', 'add_characters'],
-            'research-reports': ['perform_deep_research', 'search_web'],
+            'research-reports': ['perform_deep_research', 'you_search_web'],
             'tasks':            ['list_task_templates', 'create_task_from_template', 'create_task_from_prompt'],
             'newsletter':       ['create_social_media_posts', 'list_html_templates', 'create_html_from_template', 'update_html_file', 'get_visual_context'],
             'seo':              ['get_seo_metrics', 'get_website_analytics', 'get_clarity_metrics'],

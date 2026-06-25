@@ -17,7 +17,7 @@ jest.mock('../middleware/auth', () => ({
 
 // Mock agentModeService
 const mockService = {
-  searchWeb: jest.fn(),
+  youSearchWeb: jest.fn(),
   searchKnowledgeBase: jest.fn(),
   listKnowledgeBaseFiles: jest.fn(),
   readKnowledgeBaseFiles: jest.fn(),
@@ -59,12 +59,12 @@ describe('Emma API Routes', () => {
 
   // ─── FAIL tests ───────────────────────────────────────────────────────
 
-  describe('POST /api/emma/search-web - error cases', () => {
+  describe('POST /api/emma/you-search-web - error cases', () => {
     it('should return 500 when service throws', async () => {
-      mockService.searchWeb.mockRejectedValue(new Error('Search failed'));
+      mockService.youSearchWeb.mockRejectedValue(new Error('Search failed'));
 
       const res = await request(app)
-        .post('/api/emma/search-web')
+        .post('/api/emma/you-search-web')
         .send({ query: 'test' });
 
       expect(res.status).toBe(500);
@@ -100,17 +100,17 @@ describe('Emma API Routes', () => {
 
   // ─── SUCCESS tests ────────────────────────────────────────────────────
 
-  describe('POST /api/emma/search-web', () => {
+  describe('POST /api/emma/you-search-web', () => {
     it('should search the web and return results', async () => {
-      mockService.searchWeb.mockResolvedValue({ results: [{ title: 'Test' }] });
+      mockService.youSearchWeb.mockResolvedValue({ results: [{ title: 'Test' }] });
 
       const res = await request(app)
-        .post('/api/emma/search-web')
+        .post('/api/emma/you-search-web')
         .send({ query: 'test query', max_results: 5 });
 
       expect(res.status).toBe(200);
       expect(res.body.results).toHaveLength(1);
-      expect(mockService.searchWeb).toHaveBeenCalledWith('test query', 5);
+      expect(mockService.youSearchWeb).toHaveBeenCalledWith('test query', 5);
     });
   });
 

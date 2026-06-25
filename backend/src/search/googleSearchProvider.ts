@@ -55,6 +55,10 @@ export class GoogleSearchProvider implements SearchProvider {
       provider: this.name,
       query: request.query,
       results,
+      metadata: {
+        provider: this.name,
+        resultSource: 'web',
+      },
     };
   }
 
@@ -116,4 +120,3 @@ export function extractPublishedDate(metatags: any): string | null {
 
   return null;
 }
-

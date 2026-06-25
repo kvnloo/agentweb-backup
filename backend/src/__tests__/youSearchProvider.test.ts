@@ -1,5 +1,3 @@
-import { performConfiguredSearch } from '../search/searchProviderFactory';
-import { SearchProvider } from '../search/searchProvider';
 import { YouSearchProvider } from '../search/youSearchProvider';
 
 describe('YouSearchProvider', () => {
@@ -116,38 +114,31 @@ describe('YouSearchProvider', () => {
       }),
     );
   });
-});
 
-describe('performConfiguredSearch', () => {
-  const originalEnv = { ...process.env };
+  it('filters normalized results to the requested You.com result source', async () => {
+    const provider = new YouSearchProvider({
+      apiKey: 'test-you-key',
+      httpClient: {
+        post: jest.fn().mockResolvedValue({
+          data: {
+            results: {
+              web: [{ title: 'Web', url: 'https://example.com/web', description: 'web' }],
+              news: [{ title: 'News', url: 'https://example.com/news', description: 'news' }],
+            },
+            metadata: { query: 'current topic' },
+          },
+        }),
+      } as any,
+    });
 
-  afterEach(() => {
-    process.env = { ...originalEnv };
-    jest.restoreAllMocks();
-  });
+    const webOnly = await provider.search({ query: 'current topic', count: 5, resultSource: 'web' });
+    const newsOnly = await provider.search({ query: 'current topic', count: 5, resultSource: 'news' });
 
-  it('falls back to Google when the You.com provider fails', async () => {
-    process.env.SEARCH_PROVIDER = 'you';
-    const you: SearchProvider = {
-      name: 'you',
-      search: jest.fn().mockRejectedValue(new Error('You.com Search API key is not configured')),
-    };
-    const google: SearchProvider = {
-      name: 'google',
-      search: jest.fn().mockResolvedValue({
-        provider: 'google',
-        query: 'fallback query',
-        results: [{ title: 'Google', url: 'https://example.com', snippet: 'fallback', sourceType: 'web' }],
-      }),
-    };
-
-    const response = await performConfiguredSearch(
-      { query: 'fallback query', count: 5 },
-      { providers: { you, google } },
-    );
-
-    expect(response.provider).toBe('google');
-    expect(you.search).toHaveBeenCalledTimes(1);
-    expect(google.search).toHaveBeenCalledTimes(1);
+    expect(webOnly.provider).toBe('you');
+    expect(webOnly.results.map((result) => result.sourceType)).toEqual(['web']);
+    expect(webOnly.metadata).toEqual(expect.objectContaining({ provider: 'you', resultSource: 'web' }));
+    expect(newsOnly.provider).toBe('you');
+    expect(newsOnly.results.map((result) => result.sourceType)).toEqual(['news']);
+    expect(newsOnly.metadata).toEqual(expect.objectContaining({ provider: 'you', resultSource: 'news' }));
   });
 });

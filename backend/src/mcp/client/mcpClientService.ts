@@ -8,13 +8,34 @@ import { settingsService } from "../../services/settingsService";
 import { userDb } from "../../services/db";
 import { decryptPassword } from "../../utils/crypto";
 import { internalMcpServers } from "./mcp_config";
+import { McpOAuthClientProvider, getServerConfig } from "./mcpOAuthClientProvider";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { spawn } from "child_process";
 
+// OAuth fields shared by HTTP-based transports (sse / streamable-http / legacy).
+// Present when the remote MCP server authenticates via OAuth (e.g. Higgsfield).
+export interface HttpOAuthFields {
+  authType?: "none" | "bearer" | "oauth";
+  /** Encrypted JSON of the dynamically-registered OAuth client information. */
+  oauthClientInfo?: string;
+  /** Encrypted JSON of the stored OAuth tokens. */
+  oauthTokens?: string;
+  /** Absolute epoch-ms the current access token expires (non-secret). */
+  oauthExpiresAt?: number;
+  /** Whether stored tokens include a refresh_token. */
+  oauthHasRefreshToken?: boolean;
+  /**
+   * When true, the server is connected/used ONLY by backend services (e.g. the video
+   * service calls Higgsfield directly via its own client + getServerConfig). Its tools
+   * are NOT registered into the agent (Emma) toolset.
+   */
+  excludeFromAgent?: boolean;
+}
+
 // SSE transport configuration
-export interface SseTransportConfig {
+export interface SseTransportConfig extends HttpOAuthFields {
   transport: "sse";
   url: string;
   accessToken?: string;
@@ -28,10 +49,12 @@ export interface StdioTransportConfig {
   args?: string[];
   env?: Record<string, string>;
   isInternal?: boolean;
+  /** See HttpOAuthFields.excludeFromAgent — backend-only server, tools hidden from the agent. */
+  excludeFromAgent?: boolean;
 }
 
 // Streamable HTTP transport configuration (modern standard)
-export interface StreamableHttpTransportConfig {
+export interface StreamableHttpTransportConfig extends HttpOAuthFields {
   transport: "streamable-http";
   url: string;
   accessToken?: string;
@@ -39,7 +62,7 @@ export interface StreamableHttpTransportConfig {
 }
 
 // Legacy config without explicit transport (defaults to SSE for backward compatibility)
-export interface LegacyConfig {
+export interface LegacyConfig extends HttpOAuthFields {
   url: string;
   accessToken?: string;
   isInternal?: boolean;
@@ -299,6 +322,15 @@ export class McpClientService {
 
   private async safeConnectToServer(serverName: string, serverConfig: McpServerConfig, toolPrefix?: string) {
       try {
+          // Backend-only servers (e.g. Higgsfield, used directly by the video service via
+          // its own client + getServerConfig) are never connected here and never have their
+          // tools registered into the agent toolset. Skip entirely — don't even store the
+          // config, so no late/per-session discovery path can expose them to the agent.
+          if ('excludeFromAgent' in serverConfig && (serverConfig as any).excludeFromAgent) {
+            console.log(`MCP: Server "${serverName}" is backend-only (excludeFromAgent) — not exposing its tools to the agent`);
+            return;
+          }
+
           // Store config for creating session-specific clients later
           this.serverConfigs.set(serverName, { config: serverConfig, toolPrefix });
 
@@ -323,6 +355,8 @@ export class McpClientService {
     this.cleanupInterval = setInterval(() => {
       this.cleanupStaleSessions();
     }, this.SESSION_TIMEOUT_MS);
+    // Don't let this periodic timer keep the process (or a test run) alive on its own.
+    this.cleanupInterval.unref?.();
   }
 
   /**
@@ -757,13 +791,19 @@ export class McpClientService {
     }
     
     console.log(`MCP: Creating SSE transport for ${name} at ${resolvedUrl}`);
-    
-    const transportOptions: { 
+
+    const transportOptions: {
       eventSourceInit?: { fetch: typeof fetch };
       requestInit?: RequestInit;
+      authProvider?: McpOAuthClientProvider;
     } = {};
-    
-    if (resolvedToken) {
+
+    // OAuth-authenticated servers use an authProvider that loads/refreshes stored
+    // tokens. Token-based servers keep using the static Bearer header below.
+    if ('authType' in config && config.authType === 'oauth') {
+      transportOptions.authProvider = new McpOAuthClientProvider({ serverName: name });
+      console.log(`MCP: Using OAuth authentication for ${name}`);
+    } else if (resolvedToken) {
       const authFetch = (url: string | URL | Request, init?: RequestInit) => {
         const headers = new Headers(init?.headers);
         headers.set('Authorization', `Bearer ${resolvedToken}`);
@@ -922,8 +962,17 @@ export class McpClientService {
     console.log(`MCP: Creating Streamable HTTP transport for ${name} at ${resolvedUrl}`);
     
     const requestInit: RequestInit = {};
-    
-    if (resolvedToken) {
+
+    // OAuth-authenticated servers attach an authProvider (loads/refreshes stored
+    // tokens). Token-based servers keep using the static Bearer header.
+    const oauthProvider =
+      'authType' in config && config.authType === 'oauth'
+        ? new McpOAuthClientProvider({ serverName: name })
+        : undefined;
+
+    if (oauthProvider) {
+      console.log(`MCP: Using OAuth authentication for ${name}`);
+    } else if (resolvedToken) {
       requestInit.headers = {
         'Authorization': `Bearer ${resolvedToken}`
       };
@@ -982,10 +1031,21 @@ export class McpClientService {
       }
     };
     
+    // OAuth servers (e.g. Higgsfield) must use the native streaming fetch: the axios
+    // shim buffers the whole response (responseType:'arraybuffer'), which breaks the
+    // MCP SSE response stream and causes reconnect/abort loops on long jobs. The
+    // internal token-based server keeps the axios shim for its long-timeout behavior.
+    if (oauthProvider) {
+      return new StreamableHTTPClientTransport(new URL(resolvedUrl), {
+        requestInit,
+        authProvider: oauthProvider,
+      });
+    }
+
     // Pass custom fetch to transport
-    return new StreamableHTTPClientTransport(new URL(resolvedUrl), { 
-      requestInit, 
-      fetch: axiosFetch as any // Cast explicitly to match expected type
+    return new StreamableHTTPClientTransport(new URL(resolvedUrl), {
+      requestInit,
+      fetch: axiosFetch as any, // Cast explicitly to match expected type
     });
   }
 
@@ -1184,6 +1244,115 @@ export class McpClientService {
     }
 
     return discoveredCount;
+  }
+
+  /**
+   * Call a single tool on a named, already-registered MCP server (e.g. an OAuth
+   * server like "higgsfield"). Creates a one-off client/transport — for
+   * authType:'oauth' servers the OAuth authProvider + auto-refresh are attached
+   * automatically by createTransport. Not session-pooled; intended for backend
+   * service calls (e.g. video generation), not agent tool routing.
+   */
+  public async callToolDirect(
+    serverName: string,
+    toolName: string,
+    args: Record<string, any>,
+    options?: { timeoutMs?: number }
+  ): Promise<any> {
+    const config = await getServerConfig(serverName);
+    if (!config) {
+      throw new Error(`MCP server not found: ${serverName}`);
+    }
+
+    const transport = await this.createTransport(serverName, config as any);
+    const client = new Client(
+      { name: "AgentWeb-Backend", version: "1.0.0" },
+      { capabilities: {} }
+    );
+
+    let connectTimer: NodeJS.Timeout | undefined;
+    try {
+      const connectPromise = client.connect(transport);
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        connectTimer = setTimeout(() => reject(new Error("MCP connection timeout")), 60000);
+      });
+      await Promise.race([connectPromise, timeoutPromise]);
+
+      return await client.callTool(
+        { name: toolName, arguments: args },
+        undefined,
+        { timeout: options?.timeoutMs ?? 3600000 }
+      );
+    } finally {
+      if (connectTimer) clearTimeout(connectTimer); // don't leave a 60s timer pending on success
+      await client.close().catch(() => {});
+    }
+  }
+
+  /**
+   * Open ONE connected client to a named server, run a sequence of tool calls on
+   * it, then close. Use this for multi-call workflows (e.g. video generation:
+   * media import → generate → poll → display) so the whole job runs over a single
+   * MCP session instead of reconnecting (and re-doing OAuth) per call.
+   */
+  public async withServerSession<T>(
+    serverName: string,
+    fn: (
+      callTool: (toolName: string, args: Record<string, any>, opts?: { timeoutMs?: number }) => Promise<any>
+    ) => Promise<T>
+  ): Promise<T> {
+    const config = await getServerConfig(serverName);
+    if (!config) {
+      throw new Error(`MCP server not found: ${serverName}`);
+    }
+
+    const transport = await this.createTransport(serverName, config as any);
+    const client = new Client(
+      { name: "AgentWeb-Backend", version: "1.0.0" },
+      { capabilities: {} }
+    );
+
+    let connectTimer: NodeJS.Timeout | undefined;
+    try {
+      const connectPromise = client.connect(transport);
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        connectTimer = setTimeout(() => reject(new Error("MCP connection timeout")), 60000);
+      });
+      await Promise.race([connectPromise, timeoutPromise]);
+      if (connectTimer) clearTimeout(connectTimer); // connected — cancel the pending timeout
+
+      // Hard-abort wrapper: a half-aborted streamable-HTTP stream can leave the
+      // SDK's callTool pending past its own `timeout`, hanging until the caller's
+      // app-level cap. We race against our own timer that both aborts the request
+      // (via signal) AND rejects, so a dead/aborted stream fails deterministically.
+      const callTool = async (toolName: string, args: Record<string, any>, opts?: { timeoutMs?: number }) => {
+        const timeoutMs = opts?.timeoutMs ?? 3600000;
+        const controller = new AbortController();
+        let timer: NodeJS.Timeout | undefined;
+        const hardTimeout = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new Error(`MCP tool '${toolName}' on '${serverName}' timed out after ${timeoutMs}ms`));
+          }, timeoutMs);
+        });
+        try {
+          return await Promise.race([
+            client.callTool({ name: toolName, arguments: args }, undefined, {
+              timeout: timeoutMs,
+              signal: controller.signal,
+            }),
+            hardTimeout,
+          ]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      };
+
+      return await fn(callTool);
+    } finally {
+      if (connectTimer) clearTimeout(connectTimer); // also covers the connect-throw path
+      await client.close().catch(() => {});
+    }
   }
 
   /**

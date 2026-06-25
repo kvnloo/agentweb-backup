@@ -50,9 +50,9 @@ function degradedRun(runId: string, ts: string): AgentRunEventRow[] {
 function legacyDegradedRun(runId: string, ts: string): AgentRunEventRow[] {
   return [
     row(runId, 'agent_run_started', ts, { sessionId: `s-${runId}` }),
-    row(runId, 'agent_tool_failed', ts, { toolName: 'bravesearch_brave_web_search', errorClass: 'Error', errorMessage: 'Request failed with status code 429' }),
-    row(runId, 'agent_tool_failed', ts, { toolName: 'bravesearch_brave_web_search', errorClass: 'Error', errorMessage: 'Request failed with status code 429' }),
-    row(runId, 'agent_tool_failed', ts, { toolName: 'bravesearch_brave_web_search', errorClass: 'Error', errorMessage: 'Request failed with status code 429' }),
+    row(runId, 'agent_tool_failed', ts, { toolName: 'legacy_search_web', errorClass: 'Error', errorMessage: 'Request failed with status code 429' }),
+    row(runId, 'agent_tool_failed', ts, { toolName: 'legacy_search_web', errorClass: 'Error', errorMessage: 'Request failed with status code 429' }),
+    row(runId, 'agent_tool_failed', ts, { toolName: 'legacy_search_web', errorClass: 'Error', errorMessage: 'Request failed with status code 429' }),
     row(runId, 'agent_run_completed', ts, { toolCalls: 5, failedToolCalls: 3 }),
   ];
 }
@@ -107,7 +107,7 @@ describe('summarizeEvalCases', () => {
     expect(summary[0].errorClass).toBe('invalid_args');
     expect(summary[0].failureCount).toBe(6);
     expect(summary[0].runCount).toBe(2);
-    expect(summary[1].toolName).toBe('bravesearch_brave_web_search');
+    expect(summary[1].toolName).toBe('legacy_search_web');
     expect(summary[1].failureCount).toBe(3);
   });
 });

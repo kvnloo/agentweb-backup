@@ -94,6 +94,60 @@ describe('McpServersTab', () => {
         });
     });
 
+    it('shows a live auto-refresh countdown for OAuth servers', async () => {
+        mockedAxios.get.mockResolvedValue({
+            data: [{
+                name: 'oauth-server',
+                transport: 'streamable-http',
+                url: 'https://mcp.example/mcp',
+                authType: 'oauth',
+                oauthHasRefreshToken: true,
+                oauthExpiresAt: Date.now() + 30 * 60 * 1000, // 30 min out → ~25 min to refresh
+                discoveredTools: [],
+            }],
+        });
+
+        render(<McpServersTab />);
+
+        await waitFor(() => expect(screen.getByText('oauth-server')).toBeInTheDocument());
+        // Full status is exposed via aria-label/tooltip; the chip shows a short countdown.
+        expect(screen.getByLabelText(/Auto-refresh in/i)).toBeInTheDocument();
+    });
+
+    it('shows "Refreshing…" inside the refresh lead window', async () => {
+        mockedAxios.get.mockResolvedValue({
+            data: [{
+                name: 'oauth-server',
+                transport: 'streamable-http',
+                url: 'https://mcp.example/mcp',
+                authType: 'oauth',
+                oauthHasRefreshToken: true,
+                oauthExpiresAt: Date.now() + 2 * 60 * 1000, // 2 min left (< 5 min lead) → refreshing
+                discoveredTools: [],
+            }],
+        });
+        render(<McpServersTab />);
+        await waitFor(() => expect(screen.getByText('oauth-server')).toBeInTheDocument());
+        expect(screen.getByText(/Refreshing/i)).toBeInTheDocument();
+    });
+
+    it('prompts re-authorization when an OAuth token is expired with no refresh token', async () => {
+        mockedAxios.get.mockResolvedValue({
+            data: [{
+                name: 'oauth-server',
+                transport: 'streamable-http',
+                url: 'https://mcp.example/mcp',
+                authType: 'oauth',
+                oauthHasRefreshToken: false,
+                oauthExpiresAt: Date.now() - 60 * 1000, // already expired, cannot refresh
+                discoveredTools: [],
+            }],
+        });
+        render(<McpServersTab />);
+        await waitFor(() => expect(screen.getByText('oauth-server')).toBeInTheDocument());
+        expect(screen.getByText(/re-authorize/i)).toBeInTheDocument();
+    });
+
     it('handles load failure', async () => {
         mockedAxios.get.mockRejectedValueOnce({ 
             response: { data: { message: 'Failed to fetch' } } 
@@ -129,12 +183,15 @@ describe('McpServersTab', () => {
         fireEvent.change(screen.getByLabelText(/URL/i), { target: { value: 'http://new-mcp' } });
 
         // Mock add response
-        mockedAxios.post.mockResolvedValueOnce({}); 
-        // Mock discover response (called after add)
+        mockedAxios.post.mockResolvedValueOnce({});
+        // Mock OAuth initiate (HTTP servers are probed for OAuth before discovery).
+        // No OAuth required here → proceed straight to discovery.
+        mockedAxios.post.mockResolvedValueOnce({ data: { authorizationRequired: false } });
+        // Mock discover response (called after the OAuth probe)
         mockedAxios.post.mockResolvedValueOnce({ data: { count: 5 } });
         // Mock reload (called after discover)
-        mockedAxios.get.mockResolvedValueOnce({ 
-            data: [{ name: 'new-server', transport: 'streamable-http', url: 'http://new-mcp', discoveredTools: ['t1'] }] 
+        mockedAxios.get.mockResolvedValueOnce({
+            data: [{ name: 'new-server', transport: 'streamable-http', url: 'http://new-mcp', discoveredTools: ['t1'] }]
         });
 
         // Submit
@@ -144,10 +201,10 @@ describe('McpServersTab', () => {
             expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
         });
 
-        // Verify API calls
-        expect(mockedAxios.post).toHaveBeenCalledTimes(2); // Add + Discover
-        expect(mockedAxios.post).toHaveBeenNthCalledWith(1, 
-            'http://localhost:3000/api/admin/mcp-servers', 
+        // Verify API calls: Add + OAuth-probe + Discover
+        await waitFor(() => expect(mockedAxios.post).toHaveBeenCalledTimes(3));
+        expect(mockedAxios.post).toHaveBeenNthCalledWith(1,
+            'http://localhost:3000/api/admin/mcp-servers',
             expect.objectContaining({
                 name: 'new-server',
                 transport: 'streamable-http',
@@ -155,14 +212,98 @@ describe('McpServersTab', () => {
             }),
             expect.any(Object)
         );
-        expect(mockedAxios.post).toHaveBeenNthCalledWith(2, 
-            'http://localhost:3000/api/admin/mcp-servers/new-server/discover-tools', 
+        expect(mockedAxios.post).toHaveBeenNthCalledWith(2,
+            'http://localhost:3000/api/admin/mcp-servers/new-server/oauth/initiate',
+            {},
+            expect.any(Object)
+        );
+        expect(mockedAxios.post).toHaveBeenNthCalledWith(3,
+            'http://localhost:3000/api/admin/mcp-servers/new-server/discover-tools',
             {},
             expect.any(Object)
         );
 
         // Verify loaded
         expect(mockedAxios.get).toHaveBeenCalledTimes(2);
+    });
+
+    it('sends excludeFromAgent:true when the "Hide from agent" toggle is on', async () => {
+        mockedAxios.get.mockResolvedValueOnce({ data: [] }); // Initial load
+
+        render(<McpServersTab />);
+        await waitFor(() => expect(screen.queryByRole('progressbar')).not.toBeInTheDocument());
+
+        fireEvent.click(screen.getByText('Add Server'));
+        fireEvent.change(screen.getByLabelText(/Server Name/i), { target: { value: 'hidden-srv' } });
+        fireEvent.mouseDown(screen.getByRole('combobox'));
+        fireEvent.click(within(screen.getByRole('listbox')).getByText('Streamable HTTP'));
+        fireEvent.change(screen.getByLabelText(/URL/i), { target: { value: 'http://hidden-mcp' } });
+
+        // Flip the toggle ON
+        fireEvent.click(screen.getByLabelText(/Hide from agent/i));
+
+        mockedAxios.post.mockResolvedValueOnce({});
+        mockedAxios.post.mockResolvedValueOnce({ data: { authorizationRequired: false } });
+        mockedAxios.post.mockResolvedValueOnce({ data: { count: 0 } });
+        mockedAxios.get.mockResolvedValueOnce({ data: [{ name: 'hidden-srv', transport: 'streamable-http', url: 'http://hidden-mcp', excludeFromAgent: true }] });
+
+        fireEvent.click(screen.getByRole('button', { name: 'Add' }));
+
+        await waitFor(() => {
+            expect(mockedAxios.post).toHaveBeenNthCalledWith(1,
+                'http://localhost:3000/api/admin/mcp-servers',
+                expect.objectContaining({ name: 'hidden-srv', excludeFromAgent: true }),
+                expect.any(Object)
+            );
+        });
+    });
+
+    it('runs the OAuth popup flow when the server requires authorization', async () => {
+        mockedAxios.get.mockResolvedValueOnce({ data: [] }); // Initial load
+
+        render(<McpServersTab />);
+        await waitFor(() => expect(screen.queryByRole('progressbar')).not.toBeInTheDocument());
+
+        fireEvent.click(screen.getByText('Add Server'));
+        fireEvent.change(screen.getByLabelText(/Server Name/i), { target: { value: 'oauth-srv' } });
+        fireEvent.mouseDown(screen.getByRole('combobox'));
+        fireEvent.click(within(screen.getByRole('listbox')).getByText('Streamable HTTP'));
+        fireEvent.change(screen.getByLabelText(/URL/i), { target: { value: 'https://oauth-mcp' } });
+
+        // add → ok; initiate → OAuth required (returns authorization URL)
+        mockedAxios.post.mockResolvedValueOnce({});
+        mockedAxios.post.mockResolvedValueOnce({
+            data: { authorizationRequired: true, authorizationUrl: 'https://auth.example/authorize?x=1' },
+        });
+        // discover (after popup success) + reload
+        mockedAxios.post.mockResolvedValueOnce({ data: { count: 2 } });
+        mockedAxios.get.mockResolvedValueOnce({
+            data: [{ name: 'oauth-srv', transport: 'streamable-http', url: 'https://oauth-mcp', authType: 'oauth', discoveredTools: ['a', 'b'] }],
+        });
+
+        const popup = { closed: false } as any;
+        const openSpy = jest.spyOn(window, 'open').mockReturnValue(popup);
+
+        fireEvent.click(screen.getByRole('button', { name: 'Add' }));
+
+        // The provider login page should be opened in a popup.
+        await waitFor(() =>
+            expect(openSpy).toHaveBeenCalledWith('https://auth.example/authorize?x=1', 'mcp-oauth', expect.any(String))
+        );
+
+        // Simulate the backend callback posting a success message back to the opener.
+        window.dispatchEvent(new MessageEvent('message', { data: { source: 'mcp-oauth', success: true } }));
+
+        // After success, tool discovery runs for the newly-authorized server.
+        await waitFor(() =>
+            expect(mockedAxios.post).toHaveBeenCalledWith(
+                'http://localhost:3000/api/admin/mcp-servers/oauth-srv/discover-tools',
+                {},
+                expect.any(Object)
+            )
+        );
+
+        openSpy.mockRestore();
     });
 
     it('can add a stdio server with command, args, and env', async () => {
@@ -174,7 +315,7 @@ describe('McpServersTab', () => {
         fireEvent.click(screen.getByText('Add Server'));
         expect(screen.getByText('Add MCP Server')).toBeInTheDocument();
 
-        fireEvent.change(screen.getByLabelText(/Server Name/i), { target: { value: 'brave-local' } });
+        fireEvent.change(screen.getByLabelText(/Server Name/i), { target: { value: 'filesystem-local' } });
 
         fireEvent.mouseDown(screen.getByRole('combobox'));
         const listbox = screen.getByRole('listbox');
@@ -182,16 +323,16 @@ describe('McpServersTab', () => {
 
         fireEvent.change(await screen.findByLabelText(/Command/i), { target: { value: 'npx' } });
         fireEvent.change(screen.getByLabelText(/Arguments \(optional, one per line\)/i), {
-          target: { value: '-y\n@brave/brave-search-mcp-server\n--transport\nstdio' }
+          target: { value: '-y\n@modelcontextprotocol/server-filesystem\n/tmp' }
         });
         fireEvent.change(screen.getByLabelText(/Environment Variables JSON \(optional\)/i), {
-          target: { value: '{"env":{"BRAVE_API_KEY":"${BRAVE_API_KEY}"}}' }
+          target: { value: '{"env":{"MCP_LOG_LEVEL":"info"}}' }
         });
 
         mockedAxios.post.mockResolvedValueOnce({});
         mockedAxios.post.mockResolvedValueOnce({ data: { count: 1 } });
         mockedAxios.get.mockResolvedValueOnce({
-          data: [{ name: 'brave-local', transport: 'stdio', command: 'npx', discoveredTools: ['brave_web_search'] }]
+          data: [{ name: 'filesystem-local', transport: 'stdio', command: 'npx', discoveredTools: ['read_file'] }]
         });
 
         fireEvent.click(screen.getByRole('button', { name: 'Add' }));
@@ -201,11 +342,11 @@ describe('McpServersTab', () => {
             1,
             'http://localhost:3000/api/admin/mcp-servers',
             expect.objectContaining({
-              name: 'brave-local',
+              name: 'filesystem-local',
               transport: 'stdio',
               command: 'npx',
-              args: ['-y', '@brave/brave-search-mcp-server', '--transport', 'stdio'],
-              env: { BRAVE_API_KEY: '${BRAVE_API_KEY}' }
+              args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp'],
+              env: { MCP_LOG_LEVEL: 'info' }
             }),
             expect.any(Object)
           );

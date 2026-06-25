@@ -130,6 +130,75 @@ describe('runEnrichment — empty list', () => {
 // when set, paginated Query otherwise). The orchestrator's job is to pass it
 // through faithfully and process whatever the dep returns.
 
+describe('runEnrichment — listContext forwarding', () => {
+  it('forwards input.listContext into every resolveIdentity call', async () => {
+    const loadLeads = jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]);
+    const resolveIdentity = jest.fn().mockResolvedValue({ ok: true, resolved: {}, siblings: [] });
+    const deps = makeDeps({ loadLeads, resolveIdentity });
+
+    await runEnrichment(makeInput({ listContext: 'YC Poker Night — YC alumni' }), deps);
+
+    expect(resolveIdentity).toHaveBeenCalledWith(
+      expect.objectContaining({ listContext: 'YC Poker Night — YC alumni' }),
+    );
+  });
+
+  it('forwards listContext=undefined when not provided', async () => {
+    const loadLeads = jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]);
+    const resolveIdentity = jest.fn().mockResolvedValue({ ok: true, resolved: {}, siblings: [] });
+    const deps = makeDeps({ loadLeads, resolveIdentity });
+
+    await runEnrichment(makeInput(), deps);
+
+    expect(resolveIdentity).toHaveBeenCalledWith(
+      expect.objectContaining({ listContext: undefined }),
+    );
+  });
+
+  it('taints ALL waterfall fills to low confidence when identity came from a context guess', async () => {
+    // The waterfall stamps its own medium/high confidence onto persisted fills,
+    // overwriting the resolver's low-confidence linkedin meta. The orchestrator
+    // must re-apply the taint so a context-guessed identity can't surface a
+    // trustworthy-looking company/email.
+    const loadLeads = jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]);
+    const resolveIdentity = jest.fn().mockResolvedValue({
+      ok: true, resolved: {}, siblings: [], fromContextGuess: true,
+    });
+    const runWaterfall = jest.fn().mockResolvedValue({
+      fields: [
+        { field: 'company_name', value: 'Y Combinator', meta: { source: 'api', provider: 'apollo', confidence: 'high', enrichedAt: 'x' } },
+      ],
+      missing: [],
+      tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+    });
+    const deps = makeDeps({ loadLeads, resolveIdentity, runWaterfall });
+
+    const result = await runEnrichment(makeInput({ mode: 'preview', listContext: 'YC Poker Night' }), deps);
+
+    const sample = result.preview?.[0];
+    expect(sample?.meta?.company_name?.confidence).toBe('low');
+  });
+
+  it('does NOT taint fills when identity was NOT a context guess', async () => {
+    const loadLeads = jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]);
+    const resolveIdentity = jest.fn().mockResolvedValue({
+      ok: true, resolved: {}, siblings: [], fromContextGuess: false,
+    });
+    const runWaterfall = jest.fn().mockResolvedValue({
+      fields: [
+        { field: 'company_name', value: 'Acme', meta: { source: 'api', provider: 'apollo', confidence: 'high', enrichedAt: 'x' } },
+      ],
+      missing: [],
+      tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+    });
+    const deps = makeDeps({ loadLeads, resolveIdentity, runWaterfall });
+
+    const result = await runEnrichment(makeInput({ mode: 'preview' }), deps);
+
+    expect(result.preview?.[0]?.meta?.company_name?.confidence).toBe('high');
+  });
+});
+
 describe('runEnrichment — leadIds filter', () => {
   it('passes input.leadIds through to deps.loadLeads when set', async () => {
     const loadLeads = jest.fn().mockResolvedValue([

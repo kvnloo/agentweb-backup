@@ -3,6 +3,7 @@ import path from 'path';
 import { authenticateToken } from '../middleware/auth';
 import { userDb, taskDb } from '../services/db';
 import { metaService } from '../services/metaService';
+import { ensureFreshMetaAdAccountToken } from '../services/metaTokenRefresh';
 
 const router = express.Router();
 router.use(authenticateToken);
@@ -35,12 +36,19 @@ function getConnectedMetaAccountsList(user: any) {
 
 /**
  * Get credentials for a specific (or the only) Meta ad account.
- * Throws a user-friendly error if the account is missing/expired.
+ *
+ * Proactively refreshes the access token inline (fb_exchange_token) when it is
+ * expired or close to expiry, so the customer-portal ad builder self-heals the
+ * same way the agent tool path does instead of hard-failing between cron runs.
+ * `userId` is required to persist a refreshed token. Throws a user-friendly
+ * error only if the account is missing, or the token is expired AND could not
+ * be refreshed.
  */
-function getMetaAccountCredentials(
+async function getMetaAccountCredentials(
   user: any,
+  userId: string,
   accountId?: string
-): { accountId: string; accessToken: string; accountName: string } {
+): Promise<{ accountId: string; accessToken: string; accountName: string }> {
   const accounts = user.connected_accounts || [];
   const fbAccounts = accounts.filter((acc: any) =>
     (acc.platform === 'facebook' || acc.platform === 'meta') &&
@@ -74,9 +82,12 @@ function getMetaAccountCredentials(
     );
   }
 
+  // Self-heal: refresh in place if within the refresh window / expired-but-exchangeable.
+  await ensureFreshMetaAdAccountToken(selected, userId);
+
   if (selected.config?.token_expires_at && selected.config.token_expires_at < Date.now()) {
     throw new Error(
-      'Meta access token has expired. Please reconnect your Meta account in Settings.'
+      'Meta access token has expired and could not be refreshed automatically. Please reconnect your Meta account in Settings.'
     );
   }
 
@@ -214,7 +225,7 @@ router.get('/campaigns-and-adsets', async (req, res) => {
     const user = await userDb.getUserById(userId);
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    const { accountId: resolvedAccountId, accessToken } = getMetaAccountCredentials(user, accountId);
+    const { accountId: resolvedAccountId, accessToken } = await getMetaAccountCredentials(user, userId, accountId);
 
     const [campaigns, adSets, pages] = await Promise.all([
       metaService.listCampaigns(resolvedAccountId, accessToken),
@@ -268,7 +279,7 @@ router.post('/create-image-ad', async (req, res) => {
     const user = await userDb.getUserById(userId);
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    const { accountId, accessToken } = getMetaAccountCredentials(user, account_id);
+    const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, account_id);
 
     // 1. Upload image
     const imageHash = await uploadImageGetHash(accountId, accessToken, image_url, 'ad-image.jpg');
@@ -350,7 +361,7 @@ router.post('/create-carousel-ad', async (req, res) => {
     const user = await userDb.getUserById(userId);
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    const { accountId, accessToken } = getMetaAccountCredentials(user, account_id);
+    const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, account_id);
     const fallbackLink = default_link_url?.trim() || 'https://example.com';
 
     // Upload all images in parallel and build carousel_cards
@@ -428,7 +439,7 @@ router.post('/create-video-ad', async (req, res) => {
     const user = await userDb.getUserById(userId);
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    const { accountId, accessToken } = getMetaAccountCredentials(user, account_id);
+    const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, account_id);
 
     // 1. Upload video (Meta fetches from URL)
     const videoResult = await metaService.uploadVideo(accountId, accessToken, video_url);

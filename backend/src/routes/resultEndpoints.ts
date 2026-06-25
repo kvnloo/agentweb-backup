@@ -112,7 +112,7 @@ reviewRouter.get('/:sessionId', async (req, res) => {
     // Tools that produce assets we want to collect
     const ASSET_TOOLS = new Set(['generate_image', 'generate_video', 'create_html_file', 'update_html_file', 'create_html_from_template']);
     // Tools to skip (not assets)
-    const SKIP_TOOLS = new Set(['search_web', 'read_page_source', 'read_file_content', 'set_work_plan_status', 'send_for_review', 'install_skills']);
+    const SKIP_TOOLS = new Set(['search_web', 'you_search_web', 'you_search_news', 'google_search_web', 'read_page_source', 'read_file_content', 'set_work_plan_status', 'send_for_review', 'install_skills']);
 
     for (const msg of messages) {
       // Scan tool-role messages: these contain the actual JSON results

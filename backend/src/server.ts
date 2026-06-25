@@ -331,6 +331,14 @@ process.on('unhandledRejection', (reason: unknown, promise: Promise<unknown>) =>
 const gracefulShutdown = async (signal: string) => {
   console.log(`\n${signal} received. Shutting down gracefully...`);
 
+  // Stop the proactive MCP OAuth refresh scheduler
+  try {
+    const { stopMcpOAuthRefreshScheduler } = await import('./mcp/client/mcpOAuthRefreshService');
+    stopMcpOAuthRefreshScheduler();
+  } catch {
+    // ignore — scheduler may not have started
+  }
+
   // Shutdown Agent Mode services (closes MCP clients)
   await agentModeService.shutdown();
 
@@ -453,6 +461,11 @@ createTestAccount().then(async () => {
       .then(({ ensureCriticalTables }) => ensureCriticalTables())
       .catch((err) => console.error('[startup] ensureCriticalTables failed (non-fatal):', err?.message || err));
 
+    // Proactively refresh OAuth tokens for outbound MCP servers before they expire.
+    import('./mcp/client/mcpOAuthRefreshService')
+      .then(({ startMcpOAuthRefreshScheduler }) => startMcpOAuthRefreshScheduler())
+      .catch((error) => console.error('Failed to start MCP OAuth refresh scheduler:', error));
+
     // Initialize Agent Mode tools in background - don't block server startup
     // This prevents health check timeouts during deployment (e.g. Elastic Beanstalk)
     console.log('Initializing Agent Mode Tools (non-blocking)...');
@@ -561,6 +574,23 @@ createTestAccount().then(async () => {
         console.log('[linkedInConnectionSync] Initialized — running every 10 minutes');
       } catch (error) {
         console.error('[linkedInConnectionSync] Failed to initialize:', error);
+      }
+
+      // Meta Ad-Account Token Refresh — runs every 12 hours.
+      // Meta issues no refresh tokens; long-lived ad-account tokens (~60 days)
+      // must be re-exchanged while still valid. Proactively refreshes any token
+      // within the refresh window so Meta tools / the ad builder never block on
+      // an expired token.
+      try {
+        const { runMetaTokenRefresh } = await import('./cron/metaTokenRefreshCron');
+        const META_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
+        runMetaTokenRefresh().catch(e => console.error('[metaTokenRefreshCron] Error on first run:', e));
+        setInterval(() => {
+          runMetaTokenRefresh().catch(e => console.error('[metaTokenRefreshCron] Error:', e));
+        }, META_REFRESH_INTERVAL_MS);
+        console.log('[metaTokenRefreshCron] Initialized — running every 12 hours');
+      } catch (error) {
+        console.error('[metaTokenRefreshCron] Failed to initialize:', error);
       }
 
       // Onboarding stuck-user detector — DISABLED 2026-05-07. Was posting one

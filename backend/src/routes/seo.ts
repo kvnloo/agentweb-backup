@@ -3,6 +3,7 @@ import { authenticateToken } from "../middleware/auth";
 import { userDb, orgDb } from "../services/db";
 import { canViewItem } from "../services/orgShareService";
 import { getSecret, getLandingPagesConfig } from "../utils/secretsManager";
+import { resolveLandingPageGa4 } from "../utils/landingPageGa4";
 import { calculateFunnelMetrics, DEFAULT_FUNNEL_STAGES, validateFunnelStages } from "../services/funnelService";
 import {
   getGoogleSearchConsoleAccessToken,
@@ -457,17 +458,20 @@ router.get("/metrics", async (req, res) => {
     const metrics = await Promise.all(metricsPromises);
 
     // Fetch Google Analytics metrics for all configured properties.
-    // For *.agentwebforms.com subdomains, also inject the platform-owned GA4 property from Secrets Manager
-    // so traffic shows up without requiring per-user config.
+    // For managed landing-page subdomains (agentwebforms.com form pages,
+    // agentweb.pro audit pages, etc.), also inject the matching platform-owned
+    // GA4 property from Secrets Manager so traffic shows up without requiring
+    // per-user config. resolveLandingPageGa4 picks the right mapping per host.
     let gaMetricsArray: any[] = [];
     let gaProperties = resolved.properties;
 
     if (domainFilter) {
       const lpConfig = await getLandingPagesConfig();
-      if (lpConfig && bareHost(domainFilter).endsWith(`.${lpConfig.gscDomain}`)) {
-        const alreadyHas = gaProperties.some((p: any) => p.propertyId === lpConfig.ga4PropertyId);
+      const mapping = resolveLandingPageGa4(lpConfig, bareHost(domainFilter));
+      if (mapping) {
+        const alreadyHas = gaProperties.some((p: any) => p.propertyId === mapping.ga4PropertyId);
         if (!alreadyHas) {
-          gaProperties = [...gaProperties, { propertyId: lpConfig.ga4PropertyId, label: lpConfig.gscDomain }];
+          gaProperties = [...gaProperties, { propertyId: mapping.ga4PropertyId, label: mapping.gscDomain }];
         }
       }
     }

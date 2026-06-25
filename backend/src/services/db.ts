@@ -748,6 +748,24 @@ interface UserWithCounts extends User {
   chatSessionCount?: number;
 }
 
+/**
+ * Registration/premium status for a single email, as returned by
+ * userDb.getRegistrationStatusByEmails. One entry per input email (registered
+ * or not) so callers (the funnel report, the get_registration_status agent
+ * tool) can join the result back onto a list of CRM lead emails.
+ */
+export interface RegistrationStatus {
+  email: string;
+  /** True iff a (non-deleted) AW-Users record exists for this email. */
+  registered: boolean;
+  /** True iff the user's subscription is active or trialing. */
+  isPremium: boolean;
+  userId?: string;
+  createdAt?: string;
+  subscriptionType?: string | null;
+  subscriptionStatus?: string;
+}
+
 export class UserDB {
   private docClient: AWS.DynamoDB.DocumentClient;
   private tableName: string;
@@ -1563,6 +1581,75 @@ export class UserDB {
       this.handleError(error, "getUserByResetToken");
       return null;
     }
+  }
+
+  /**
+   * Batch-resolve registration + premium status for a list of emails.
+   *
+   * Email is the AW-Users table's HASH primary key, so a BatchGetItem keyed on
+   * { email } is an exact, strongly-targeted lookup (no GSI propagation lag,
+   * no scan). Used to join CRM lead emails against real user accounts for the
+   * funnel report and the get_registration_status agent tool — without
+   * duplicating user data onto lead records.
+   *
+   * Returns one entry per UNIQUE input email (lowercased/trimmed). Emails with
+   * no matching user — or matching only a soft-deleted (deleted_*) tombstone —
+   * come back as { registered: false, isPremium: false }. Premium = the user's
+   * subscription_status is "active" or "trialing".
+   */
+  async getRegistrationStatusByEmails(emails: string[]): Promise<RegistrationStatus[]> {
+    // Normalize, drop blanks, de-duplicate (preserve first-seen order).
+    const seen = new Set<string>();
+    const normalized: string[] = [];
+    for (const raw of emails ?? []) {
+      const email = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+      if (!email || seen.has(email)) continue;
+      seen.add(email);
+      normalized.push(email);
+    }
+    if (normalized.length === 0) return [];
+
+    // DynamoDB BatchGetItem caps at 100 keys per call; match batchGetLeads's
+    // conservative 25 for small payloads and retry headroom.
+    const BATCH_SIZE = 25;
+    const foundByEmail = new Map<string, any>();
+
+    for (let i = 0; i < normalized.length; i += BATCH_SIZE) {
+      const batch = normalized.slice(i, i + BATCH_SIZE);
+      const params = {
+        RequestItems: {
+          [this.tableName]: {
+            Keys: batch.map((email) => ({ email })),
+          },
+        },
+      };
+      const result = await this.docClient.batchGet(params).promise();
+      const items = (result.Responses?.[this.tableName] as any[]) || [];
+      for (const item of items) {
+        if (item?.email) foundByEmail.set(String(item.email).toLowerCase(), item);
+      }
+    }
+
+    return normalized.map((email) => {
+      const user = foundByEmail.get(email);
+      // A tombstoned account (userId begins with "deleted_") is treated as
+      // unregistered — it's a former user, not an active signup.
+      if (!user || (typeof user.userId === "string" && user.userId.startsWith("deleted_"))) {
+        return { email, registered: false, isPremium: false };
+      }
+      const subscriptionStatus: string | undefined = user.subscription_status;
+      const isPremium =
+        subscriptionStatus === "active" || subscriptionStatus === "trialing";
+      return {
+        email,
+        registered: true,
+        userId: user.userId,
+        createdAt: user.createdAt,
+        subscriptionType: user.subscriptionType ?? undefined,
+        subscriptionStatus,
+        isPremium,
+      };
+    });
   }
 
   /**
