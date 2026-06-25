@@ -15,7 +15,7 @@
  */
 import AWS from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
-import { runCodingAgent } from "./codingAgentService";
+import { LANDING_PAGE_PREVIEW_BRANCH, runCodingAgent } from "./codingAgentService";
 import { mcpFetch } from "../mcp/server/httpClient";
 import { buildPageSlug } from "./v0Service";
 import type { GeneratedLandingPage, BrandContext } from "./v0Service";
@@ -83,11 +83,11 @@ export async function addPageViaCodingAgent(
   await dynamodb.put({ TableName: TABLE_NAME, Item: record }).promise();
 
   // Best practice for agentic code generation: never commit unverified LLM output
-  // to the production branch. Stage the agent's edits on an isolated draft branch;
+  // to the production branch. Stage the agent's edits on the reusable preview branch;
   // the agent builds and self-verifies on that branch's Vercel preview
   // (check_deployment), and we promote to main ONLY on a green build — so the live
   // site is never broken by a bad generation.
-  const draftBranch = `draft/cap-${id.replace(/-/g, "").slice(0, 12)}`;
+  const draftBranch = LANDING_PAGE_PREVIEW_BRANCH;
   const task = buildSubPageTask(slug, name, prompt, brandContext, opts.leadListId);
 
   try {

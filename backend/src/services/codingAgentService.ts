@@ -9,9 +9,10 @@
 
 import AnthropicBedrock from '@anthropic-ai/bedrock-sdk';
 import Anthropic from '@anthropic-ai/sdk';
+import axios from 'axios';
 import { mcpFetch } from '../mcp/server/httpClient';
 import { agentModeService } from './agentModeService';
-import { getSecret } from '../utils/secretsManager';
+import { getGitHubOrgToken, getSecret } from '../utils/secretsManager';
 import { getLandingPageById, getLandingPagesByOwner, canUserEditLandingPage, GeneratedLandingPage } from './v0Service';
 import { AcceptanceCheck, AcceptanceStatus, AcceptanceVerificationResult, verifyAcceptanceChecks } from './codingAgentAcceptance';
 import {
@@ -22,6 +23,10 @@ import {
 } from './codingAgentRunService';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
+
+export const LANDING_PAGE_PREVIEW_BRANCH = 'draft/agentweb-preview';
+
+const GITHUB_API_TIMEOUT_MS = 30_000;
 
 /**
  * The repo a coding-agent run edits. Many landing pages share ONE GitHub repo —
@@ -45,7 +50,7 @@ export interface CodingAgentContext {
   userId: string;
   sessionId: string;
   llmModel: string;
-  /** Draft branch name for staging edits (e.g. "draft/abc12345"). If unset, edits go to main. */
+  /** Draft branch name for staging edits. Defaults upstream to LANDING_PAGE_PREVIEW_BRANCH. If unset, edits go to main. */
   draftBranch?: string;
   /**
    * Editable file boundary for this run. Resolved from the page record before the
@@ -163,6 +168,56 @@ async function getCurrentCommitSha(context: CodingAgentContext): Promise<string 
   }
 }
 
+async function resetReusablePreviewBranchToMain(context: CodingAgentContext): Promise<void> {
+  if (context.draftBranch !== LANDING_PAGE_PREVIEW_BRANCH) return;
+
+  const page = await getLandingPageById(context.pageId);
+  if (!page?.githubRepoUrl) {
+    throw new Error('Cannot prepare preview branch: landing page has no GitHub repository');
+  }
+
+  const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+  if (!repoMatch) {
+    throw new Error('Cannot prepare preview branch: invalid GitHub repo URL');
+  }
+
+  const [, owner, rawRepo] = repoMatch;
+  const repoName = rawRepo.replace('.git', '');
+  const repoBase = `https://api.github.com/repos/${owner}/${repoName}`;
+  const { token } = await getGitHubOrgToken();
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/vnd.github.v3+json',
+  };
+
+  const mainRef = await axios.get<any>(`${repoBase}/git/ref/heads/main`, {
+    headers,
+    timeout: GITHUB_API_TIMEOUT_MS,
+  });
+  const mainSha = mainRef.data?.object?.sha;
+  if (!mainSha) {
+    throw new Error('Cannot prepare preview branch: main SHA not found');
+  }
+
+  try {
+    await axios.patch(
+      `${repoBase}/git/refs/heads/${LANDING_PAGE_PREVIEW_BRANCH}`,
+      { sha: mainSha, force: true },
+      { headers, timeout: GITHUB_API_TIMEOUT_MS },
+    );
+    console.log(`[CODING AGENT] Reset ${LANDING_PAGE_PREVIEW_BRANCH} to main (${mainSha.substring(0, 7)})`);
+  } catch (error: any) {
+    if (error.response?.status !== 404) throw error;
+
+    await axios.post(
+      `${repoBase}/git/refs`,
+      { ref: `refs/heads/${LANDING_PAGE_PREVIEW_BRANCH}`, sha: mainSha },
+      { headers, timeout: GITHUB_API_TIMEOUT_MS },
+    );
+    console.log(`[CODING AGENT] Created ${LANDING_PAGE_PREVIEW_BRANCH} from main (${mainSha.substring(0, 7)})`);
+  }
+}
+
 async function rollbackEditedFiles(input: {
   context: CodingAgentContext;
   baseCommitSha?: string;
@@ -244,7 +299,7 @@ function is403Error(e: unknown): boolean {
 
 // ─── System Prompt ──────────────────────────────────────────────────────────
 
-const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent that edits landing page code in a GitHub repository connected to Vercel. Your edits go to a draft branch, creating a Vercel preview deployment for user review.
+const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent that edits landing page code in a GitHub repository connected to Vercel. Your edits go to the reusable draft branch draft/agentweb-preview, creating a Vercel preview deployment for user review.
 
 ## Project Architecture
 This is a **Next.js 15 (App Router)** project — NOT a static HTML site.
@@ -1914,6 +1969,23 @@ export async function runCodingAgent(
     }
   } catch (e) {
     console.warn('[CODING AGENT] Preflight authorization check failed; proceeding to edit path:', e);
+  }
+
+  try {
+    await resetReusablePreviewBranchToMain(runContext);
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    await updateCodingAgentRun(run.runId, {
+      state: 'failed',
+      failureReason: message,
+      transitionReason: 'preview_branch_reset_failed',
+    });
+    return withRun({
+      success: false,
+      message,
+      iterations: 0,
+      retryable: true,
+    }, 'failed');
   }
 
   const shouldCaptureBaseCommit =

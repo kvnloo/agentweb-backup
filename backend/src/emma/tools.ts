@@ -6361,7 +6361,7 @@ emmaToolRegistry.register({
   name: 'coding_agent',
   definition: {
     name: 'coding_agent',
-    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to a STAGING draft branch (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code. For user-visible landing-page changes, pass typed acceptance_checks that prove the requested behavior on the preview page; the backend verifier runs them after the coding agent finishes and fails or blocks the tool if they do not pass. Do not use hard-coded human-looking benchmark copy; use user-requested content or opaque tokens where a test marker is needed. If the tool fails because acceptance failed, report the failed checks and ask for the missing input or run a narrower follow-up. Only call coding_agent ONCE per user request unless it explicitly fails. LOGO TIP: Always pass logo URLs directly in the task_description — the coding agent will use them in <img src="..."> tags. For public company logos use Google\'s favicon service (https://www.google.com/s2/favicons?domain={domain}&sz=128). For the user\'s own brand logo, look it up with read_brand_guidelines first and include the URL in the task.',
+    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to the reusable STAGING branch draft/agentweb-preview (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code. For user-visible landing-page changes, pass typed acceptance_checks that prove the requested behavior on the preview page; the backend verifier runs them after the coding agent finishes and fails or blocks the tool if they do not pass. Do not use hard-coded human-looking benchmark copy; use user-requested content or opaque tokens where a test marker is needed. If the tool fails because acceptance failed, report the failed checks and ask for the missing input or run a narrower follow-up. Only call coding_agent ONCE per user request unless it explicitly fails. LOGO TIP: Always pass logo URLs directly in the task_description — the coding agent will use them in <img src="..."> tags. For public company logos use Google\'s favicon service (https://www.google.com/s2/favicons?domain={domain}&sz=128). For the user\'s own brand logo, look it up with read_brand_guidelines first and include the URL in the task.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -6405,7 +6405,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    const { runCodingAgent } = await import('../services/codingAgentService');
+    const { LANDING_PAGE_PREVIEW_BRANCH, runCodingAgent } = await import('../services/codingAgentService');
     const executeMcpTool = context?.service
       ? async (toolName: string, toolArgs: any) => {
         return context.service.executeTool(
@@ -6418,9 +6418,10 @@ emmaToolRegistry.register({
       }
       : undefined;
 
-    // Use a draft branch for staging — derive from session ID
+    // Use one reusable staging branch per landing-page repo. The coding agent
+    // resets it to main at run start, preventing unbounded draft branch/PR growth.
     const sessionId = context?.sessionId || '';
-    const draftBranch = sessionId ? `draft/${sessionId.substring(0, 16)}` : undefined;
+    const draftBranch = LANDING_PAGE_PREVIEW_BRANCH;
 
     const result = await runCodingAgent(
       args.task_description,

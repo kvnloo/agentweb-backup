@@ -54,11 +54,10 @@ const GENERATION_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 const EDIT_RATE_LIMIT_MAX = 60;
 const EDIT_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 
-// Branch name must be draft/<id> where id is alphanumeric, dashes, underscores (8-64 chars)
-const VALID_BRANCH_RE = /^draft\/[a-zA-Z0-9_-]{8,64}$/;
+const REUSABLE_PREVIEW_BRANCH = "draft/agentweb-preview";
 
 function validateBranchName(branch: string): boolean {
-  return branch === "main" || VALID_BRANCH_RE.test(branch);
+  return branch === "main" || branch === REUSABLE_PREVIEW_BRANCH;
 }
 
 /**
@@ -798,7 +797,7 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
     }
 
     if (!validateBranchName(branch)) {
-      return res.status(400).json({ error: "Invalid branch name. Must be 'main' or 'draft/<id>'." });
+      return res.status(400).json({ error: "Invalid branch name. Must be 'main' or 'draft/agentweb-preview'." });
     }
 
     // Prevent path traversal attacks

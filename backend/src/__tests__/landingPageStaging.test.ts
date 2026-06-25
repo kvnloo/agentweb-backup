@@ -188,12 +188,12 @@ describe("Branch name validation", () => {
       .send({
         file_path: "app/page.tsx",
         content: "export default function() { return <div>Hello</div> }",
-        branch: "draft/abcdef1234567890",
+        branch: "draft/agentweb-preview",
       });
 
     expect(res.status).toBe(200);
     expect(res.body.is_staging).toBe(true);
-    expect(res.body.branch).toBe("draft/abcdef1234567890");
+    expect(res.body.branch).toBe("draft/agentweb-preview");
   });
 });
 
@@ -214,7 +214,7 @@ describe("PUT /github-edit with draft branch", () => {
       .send({
         file_path: "app/page.tsx",
         content: "new content",
-        branch: "draft/session-12345678",
+        branch: "draft/agentweb-preview",
       });
 
     expect(res.status).toBe(200);
@@ -223,7 +223,7 @@ describe("PUT /github-edit with draft branch", () => {
     expect(mockedAxios.post).toHaveBeenCalledWith(
       expect.stringContaining("/git/refs"),
       expect.objectContaining({
-        ref: "refs/heads/draft/session-12345678",
+        ref: "refs/heads/draft/agentweb-preview",
         sha: "main-sha-123",
       }),
       expect.any(Object)
@@ -246,7 +246,7 @@ describe("PUT /github-edit with draft branch", () => {
       .send({
         file_path: "app/page.tsx",
         content: "retried content",
-        branch: "draft/session-retry123",
+        branch: "draft/agentweb-preview",
       });
 
     expect(res.status).toBe(200);
@@ -270,7 +270,7 @@ describe("PUT /github-edit with draft branch", () => {
       .send({
         file_path: "app/page.tsx",
         content: "updated content",
-        branch: "draft/session-12345678",
+        branch: "draft/agentweb-preview",
       });
 
     expect(res.status).toBe(200);
@@ -313,13 +313,13 @@ describe("GET /files with branch query param", () => {
     }));
 
     const res = await request(app)
-      .get("/api/landing-pages/v0/generated/page-123/files?branch=draft/session-12345678");
+      .get("/api/landing-pages/v0/generated/page-123/files?branch=draft/agentweb-preview");
 
     expect(res.status).toBe(200);
     expect(res.body.files).toHaveLength(2);
     // Verify the GitHub API was called with the draft branch
     expect(mockedAxios.get).toHaveBeenCalledWith(
-      expect.stringContaining("/git/trees/draft/session-12345678?recursive=1"),
+      expect.stringContaining("/git/trees/draft/agentweb-preview?recursive=1"),
       expect.any(Object)
     );
   });
@@ -354,12 +354,12 @@ describe("GET /file-content with branch query param", () => {
     mockedAxios.get.mockResolvedValueOnce(axiosRes({ content: fileContent, sha: "abc123" }));
 
     const res = await request(app)
-      .get("/api/landing-pages/v0/generated/page-123/file-content?path=app/page.tsx&branch=draft/session-12345678");
+      .get("/api/landing-pages/v0/generated/page-123/file-content?path=app/page.tsx&branch=draft/agentweb-preview");
 
     expect(res.status).toBe(200);
     expect(res.body.content).toBe("export default function() {}");
     expect(mockedAxios.get).toHaveBeenCalledWith(
-      expect.stringContaining("contents/app/page.tsx?ref=draft/session-12345678"),
+      expect.stringContaining("contents/app/page.tsx?ref=draft/agentweb-preview"),
       expect.any(Object)
     );
   });
@@ -390,7 +390,7 @@ describe("GET /commits with branch query param", () => {
     ]));
 
     const res = await request(app)
-      .get("/api/landing-pages/v0/generated/page-123/commits?branch=draft/session-12345678");
+      .get("/api/landing-pages/v0/generated/page-123/commits?branch=draft/agentweb-preview");
 
     expect(res.status).toBe(200);
     expect(res.body.commits).toHaveLength(1);
@@ -398,7 +398,7 @@ describe("GET /commits with branch query param", () => {
     expect(mockedAxios.get).toHaveBeenCalledWith(
       expect.any(String),
       expect.objectContaining({
-        params: expect.objectContaining({ sha: "draft/session-12345678" }),
+        params: expect.objectContaining({ sha: "draft/agentweb-preview" }),
       })
     );
   });
@@ -445,7 +445,7 @@ describe("POST /publish", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generated/page-123/publish")
-      .send({ branch: "draft/session-12345678" });
+      .send({ branch: "draft/agentweb-preview" });
 
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
@@ -457,14 +457,14 @@ describe("POST /publish", () => {
       expect.stringContaining("/merges"),
       expect.objectContaining({
         base: "main",
-        head: "draft/session-12345678",
+        head: "draft/agentweb-preview",
       }),
       expect.any(Object)
     );
 
     // Verify branch deletion was called
     expect(mockedAxios.delete).toHaveBeenCalledWith(
-      expect.stringContaining("/git/refs/heads/draft/session-12345678"),
+      expect.stringContaining("/git/refs/heads/draft/agentweb-preview"),
       expect.any(Object)
     );
 
@@ -474,7 +474,7 @@ describe("POST /publish", () => {
       expect.objectContaining({
         preMergeSha: "pre-merge-sha",
         mergeSha: "merge-sha-123",
-        branch: "draft/session-12345678",
+        branch: "draft/agentweb-preview",
       })
     );
   });
@@ -487,7 +487,7 @@ describe("POST /publish", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generated/page-123/publish")
-      .send({ branch: "draft/session-12345678" });
+      .send({ branch: "draft/agentweb-preview" });
 
     expect(res.status).toBe(200);
     expect(res.body.merge_commit_sha).toBe("merge-sha-456");
@@ -502,7 +502,7 @@ describe("POST /publish", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generated/page-123/publish")
-      .send({ branch: "draft/session-12345678" });
+      .send({ branch: "draft/agentweb-preview" });
 
     expect(res.status).toBe(200);
     expect(res.body.merge_commit_sha).toBe("merge-sha-789");
@@ -526,7 +526,7 @@ describe("POST /publish", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generated/page-123/publish")
-      .send({ branch: "draft/session-12345678" });
+      .send({ branch: "draft/agentweb-preview" });
 
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
@@ -547,7 +547,7 @@ describe("POST /publish", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generated/page-123/publish")
-      .send({ branch: "draft/session-12345678" });
+      .send({ branch: "draft/agentweb-preview" });
 
     expect(res.status).toBe(404);
     expect(res.body.error).toMatch(/Branch not found/);
@@ -563,7 +563,7 @@ describe("POST /revert-publish", () => {
     lastPublish: {
       preMergeSha: "pre-merge-sha-aaa",
       mergeSha: "merge-sha-bbb",
-      branch: "draft/session-12345678",
+      branch: "draft/agentweb-preview",
       publishedAt: "2026-06-01T00:00:00.000Z",
     },
   };
@@ -716,12 +716,12 @@ describe("GET /preview-url", () => {
     });
 
     const res = await request(app)
-      .get("/api/landing-pages/v0/generated/page-123/preview-url?branch=draft/session-12345678");
+      .get("/api/landing-pages/v0/generated/page-123/preview-url?branch=draft/agentweb-preview");
 
     expect(res.status).toBe(200);
     expect(res.body.previewUrl).toBe("https://test-landing-page-draft-session-12345678.vercel.app");
     expect(res.body.buildStatus).toBe("success");
-    expect(mockGetPreviewDeploymentUrl).toHaveBeenCalledWith("prj_test123", "draft/session-12345678");
+    expect(mockGetPreviewDeploymentUrl).toHaveBeenCalledWith("prj_test123", "draft/agentweb-preview");
   });
 
   it("SUCCESS: returns not_found when no deployment exists for the branch", async () => {
@@ -731,7 +731,7 @@ describe("GET /preview-url", () => {
     });
 
     const res = await request(app)
-      .get("/api/landing-pages/v0/generated/page-123/preview-url?branch=draft/session-12345678");
+      .get("/api/landing-pages/v0/generated/page-123/preview-url?branch=draft/agentweb-preview");
 
     expect(res.status).toBe(200);
     expect(res.body.buildStatus).toBe("not_found");
