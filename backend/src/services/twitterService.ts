@@ -319,7 +319,11 @@ export class TwitterService {
   async getProfile(ownerUserId: string, accountId: string, handle: string): Promise<any> {
     const clean = handle.replace(/^@/, '').trim();
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
-      const res = await client.v2.userByUsername(clean);
+      // Request the richer fields explicitly — the X API otherwise returns only
+      // id/name/username, so follower count and bio would always come back empty.
+      const res = await client.v2.userByUsername(clean, {
+        'user.fields': ['public_metrics', 'description', 'verified', 'location', 'url', 'profile_image_url', 'created_at'],
+      });
       return res.data;
     });
   }

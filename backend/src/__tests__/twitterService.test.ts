@@ -212,6 +212,18 @@ describe('TwitterService — happy paths', () => {
     expect(res.id).toBe('999');
   });
 
+  it('getProfile requests public_metrics and bio fields so follower count is populated', async () => {
+    await twitterService.getProfile(OWNER, ACCOUNT_ID, '@target');
+    // Without user.fields, the X API returns only id/name/username — never the
+    // follower count or bio. Assert we ask for the richer fields.
+    expect(mockUserByUsername).toHaveBeenCalledWith(
+      'target',
+      expect.objectContaining({
+        'user.fields': expect.arrayContaining(['public_metrics', 'description']),
+      })
+    );
+  });
+
   it('listDms returns dm events', async () => {
     const res = await twitterService.listDms(OWNER, ACCOUNT_ID);
     expect(mockListDmEvents).toHaveBeenCalled();
