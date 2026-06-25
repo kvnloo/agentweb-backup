@@ -14,7 +14,7 @@ import type { MappedPerson, MappedOrganization } from './apolloFieldMapper';
 import type { OrchestratorDeps } from './crmEnrichmentServiceV3';
 import { CrmEnrichmentService, type LeadRecord } from './crmEnrichmentService';
 import { sanitizePhone } from '../utils/phoneValidation';
-import { nameTokensMatch } from '../utils/nameMatch';
+import { nameTokensMatch, normalizeNameToken } from '../utils/nameMatch';
 import type { IdentityResolverDeps } from './enrichmentIdentityResolver';
 import { resolveIdentity as pureResolveIdentity } from './enrichmentIdentityResolver';
 import { runWaterfall as pureRunWaterfall, type LLMFilledValue, type EnrichSoFetchResult } from './enrichmentGroupWaterfall';
@@ -116,6 +116,9 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
           if (!item || !item.leadId || item.leadId === excludeLeadId) continue;
           if (seen.has(item.leadId)) continue;
           seen.add(item.leadId);
+          // Raw lead rows already carry enrichmentMetadata (no projection is
+          // applied to these GSI queries), so Tier 0b can read each copied
+          // field's provenance and re-verify web-sourced copies via the critic.
           merged.push(item);
         }
       }
@@ -158,8 +161,8 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
       }
     },
 
-    findLinkedInUrl: ({ firstName, lastName, company }) =>
-      findLinkedInUrlImpl(userId, firstName, lastName, company),
+    findLinkedInUrl: ({ firstName, lastName, company, listContext }) =>
+      findLinkedInUrlImpl(userId, firstName, lastName, company, listContext),
 
     findUnipileProfileByUrl: ({ linkedinUrl }) =>
       findUnipileProfileByUrlImpl(userId, linkedinUrl),
@@ -402,12 +405,12 @@ async function fetchWebForGroupReal(
   // 3. Google CSE — for company_technographic also run a job-postings query
   let webResults: any[] = [];
   try {
-    const search = await agentModeService.searchWeb(query, 10);
+    const search = await agentModeService.youSearchWeb(query, 10);
     if (search?.success && Array.isArray(search.results)) {
       webResults = search.results;
     }
   } catch (err) {
-    console.warn(`${wtag} searchWeb ERROR ${(err as Error).message}`);
+    console.warn(`${wtag} youSearchWeb ERROR ${(err as Error).message}`);
     return null;
   }
 
@@ -417,7 +420,7 @@ async function fetchWebForGroupReal(
       lead,
     );
     try {
-      const jobsSearch = await agentModeService.searchWeb(jobsQuery, 5);
+      const jobsSearch = await agentModeService.youSearchWeb(jobsQuery, 5);
       if (jobsSearch?.success && Array.isArray(jobsSearch.results)) {
         const existingUrls = new Set(webResults.map((r: any) => r.url || r.link).filter(Boolean));
         for (const r of jobsSearch.results) {
@@ -431,7 +434,7 @@ async function fetchWebForGroupReal(
   }
 
   if (webResults.length === 0) {
-    console.log(`${wtag} MISS searchWeb returned 0 results`);
+    console.log(`${wtag} MISS youSearchWeb returned 0 results`);
     return null;
   }
 
@@ -652,15 +655,26 @@ async function runCriticReal(input: {
   }));
 
   const systemPrompt =
-    `You are a fact-checker for CRM enrichment. Given each claim (field, value, ` +
-    `and source quote/URL when available), decide if the claim is "supported", ` +
-    `"partially-supported", "unsupported", or "contradicted" by the source. ` +
-    `Return strict JSON: an object keyed by field name.`;
+    `You are a fact-checker for CRM enrichment. Each claim has a field, value, and ` +
+    `a source quote/URL the value was extracted from. Decide whether the claim is ` +
+    `"supported", "partially-supported", "unsupported", or "contradicted" by the source.\n\n` +
+    `CRITICAL — entity identity: the claim must describe the SAME company as the lead. ` +
+    `Use the lead's company name, website domain, and email domain to judge identity. ` +
+    `If the source quote/URL is about a DIFFERENT company — including a similarly-named ` +
+    `but distinct one (e.g. "Slash" vs "Slashy", "Stripe" vs "Stripes") — the claim is ` +
+    `"contradicted", no matter how clearly the source states the value. Only treat the ` +
+    `source as a match when the company name AND/OR domain plausibly refer to the lead's ` +
+    `company. When identity is genuinely ambiguous, use "unsupported", not "supported".\n\n` +
+    `Return strict JSON: an object keyed by field name with one verdict string per field.`;
 
   const userPrompt =
-    `Lead: ${JSON.stringify({ email: input.lead.email, company: input.lead.company })}\n\n` +
+    `Lead: ${JSON.stringify({
+      email: input.lead.email,
+      company: input.lead.company,
+      website: input.lead.website,
+    })}\n\n` +
     `Claims to verify:\n${JSON.stringify(claims, null, 2)}\n\n` +
-    `Return ONLY JSON like {"field_a": "supported", "field_b": "partially-supported"}.`;
+    `Return ONLY JSON like {"field_a": "supported", "field_b": "contradicted"}.`;
 
   try {
     const llm = createLLMService(CRITIC_MODEL, 0.0);
@@ -686,27 +700,65 @@ export async function findLinkedInUrlImpl(
   firstName: string | undefined,
   lastName: string | undefined,
   company: string | undefined,
+  listContext?: string,
 ): Promise<string | null> {
   const { linkedInOutreachService } = await import('./linkedInOutreachService');
   let accountId: string | null = null;
   try {
     accountId = await linkedInOutreachService.resolveAccountIdForEnrichment(userId);
     if (!accountId) return null;
-    const keywords = [firstName, lastName].filter(Boolean).join(' ');
-    if (!keywords) return null;
-    console.log(`[v3 linkedin-search] name="${keywords}" company="${company ?? '∅'}"`);
+    const name = [firstName, lastName].filter(Boolean).join(' ');
+    if (!name) return null;
+    // IMPORTANT: keywords stay NAME-ONLY. LinkedIn keyword search matches the
+    // FULL profile text, so appending a company or list-context phrase (e.g.
+    // "YC Poker Night — YC alumni…") collapses a 10-hit name search to zero.
+    // The company filter is sent as the structured `company` param (its own
+    // field), and list context is applied AFTER the fetch as a re-ranking
+    // signal over the candidates' headline/location/industry — never folded
+    // into the query string. (Verified empirically: name → 10 hits,
+    // name+context → 0 hits.)
+    const ctx = (listContext || '').trim();
+    console.log(`[v3 linkedin-search] name="${name}" company="${company ?? '∅'}" context="${ctx || '∅'}"`);
     const result = await linkedInOutreachService.searchPeople(accountId, {
-      keywords,
+      keywords: name,
       company: company || undefined,
     });
     const candidates = result?.items ?? [];
-    const first = candidates[0];
-    console.log(`[v3 linkedin-search] got ${candidates.length} result(s) first=${first?.public_identifier ?? 'none'}`);
-    if (!first?.public_identifier) return null;
-    const nameOk = unipileNameMatches(first, firstName, lastName);
-    console.log(`[v3 linkedin-search] nameMatch=${nameOk} → ${nameOk ? `HIT url=https://www.linkedin.com/in/${first.public_identifier}` : 'MISS name mismatch'}`);
-    if (!nameOk) return null;
-    return `https://www.linkedin.com/in/${first.public_identifier}`;
+    console.log(`[v3 linkedin-search] got ${candidates.length} result(s)`);
+    // Keep only candidates whose name actually matches the lead — guards the
+    // whole selection, not just the first item.
+    const nameMatched = candidates.filter((c: any) => unipileNameMatches(c, firstName, lastName));
+    if (nameMatched.length === 0) {
+      console.log(`[v3 linkedin-search] MISS no name match among ${candidates.length} result(s)`);
+      return null;
+    }
+
+    let chosen: any;
+    if (!company && ctx && nameMatched.length > 1) {
+      // Name-only + list-context path with MULTIPLE same-name people: a bare
+      // name can return many distinct profiles, so taking candidates[0] would
+      // risk attaching the wrong person. Ask a cheap LLM which candidate's
+      // profile best fits the list context (e.g. "YC alumni" → "Founder at Y
+      // Combinator"). The LLM bridges semantic gaps token overlap can't
+      // (YC ↔ Y Combinator) and may answer "none" to refuse a wrong guess.
+      const idx = await pickCandidateByContextLLM(ctx, name, nameMatched, userId);
+      if (idx == null) {
+        console.log(`[v3 linkedin-search] MISS LLM found no confident context match among ${nameMatched.length} same-name candidate(s) for context="${ctx}"`);
+        return null;
+      }
+      chosen = nameMatched[idx];
+      console.log(`[v3 linkedin-search] context-picked idx=${idx} headline="${(chosen.headline || '').slice(0, 60)}"`);
+    } else {
+      // Company-known, no-context, or single-candidate path: take the first
+      // name-matched candidate. With company present the structured filter
+      // already narrowed server-side; with a single candidate there is nothing
+      // to disambiguate.
+      chosen = nameMatched[0];
+    }
+
+    if (!chosen?.public_identifier) return null;
+    console.log(`[v3 linkedin-search] HIT url=https://www.linkedin.com/in/${chosen.public_identifier}`);
+    return `https://www.linkedin.com/in/${chosen.public_identifier}`;
   } catch (err) {
     // Any failure after accountId was resolved — purge both caches so next call
     // re-resolves to a live account (covers NOT_FOUND + newly-connected replacements).
@@ -780,6 +832,112 @@ export async function findUnipileProfileByUrlImpl(
   return null;
 }
 
+/** Lowercase + collapse whitespace so evidence corroboration is robust to
+ *  spacing/case differences between the LLM's quote and the profile text. */
+function normalizeForMatch(s: string): string {
+  return s.toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Disambiguate among multiple same-name LinkedIn candidates using the list
+ * context. Asks a cheap extraction LLM to pick the 0-based index of the
+ * candidate whose profile (headline / location / industry) best fits the
+ * context, to rate its own confidence, and to QUOTE the profile snippet that
+ * justifies the pick.
+ *
+ * Four guards before a pick is accepted (defense against wrong-person fills):
+ *   1. Index in range and ≥ 0 (LLM may answer -1 to decline).
+ *   2. confidence must be 'high' or 'medium' — a 'low' self-rating is refused.
+ *   3. `evidence` must be a non-empty substring of the chosen candidate's own
+ *      profile text — guards against a hallucinated justification (the LLM
+ *      citing "Sequoia" for a profile that never mentions it).
+ *   4. `context_strength` must be 'specific' — a 'weak' rating means the list
+ *      context (e.g. "Imported Contacts", "Tech Founders") is too generic to
+ *      reliably separate same-name people, so we refuse rather than guess.
+ *
+ * Returns the chosen index, or null when any guard fails / the LLM declines /
+ * errors — callers treat null as "refuse" so a low-confidence, fabricated, or
+ * weakly-justified guess never attaches the wrong person to a lead.
+ *
+ * Exported for unit testing.
+ */
+export async function pickCandidateByContextLLM(
+  listContext: string,
+  name: string,
+  candidates: any[],
+  userId: string,
+): Promise<number | null> {
+  const profileText = (c: any): string =>
+    [c?.headline, c?.location, c?.industry]
+      .filter((s: unknown): s is string => typeof s === 'string' && s.trim().length > 0)
+      .map((s: string) => s.trim())
+      .join(' — ');
+  try {
+    const profiles = candidates
+      .map((c: any, i: number) => `${i}: ${profileText(c) || '(no profile details)'}`)
+      .join('\n');
+
+    const systemPrompt =
+      'You disambiguate between multiple LinkedIn profiles that share the same ' +
+      'name. Given a piece of list context describing a group the target person ' +
+      'belongs to, pick the ONE candidate profile that best fits that context. ' +
+      'Use real-world knowledge to bridge synonyms (e.g. "YC" means "Y ' +
+      'Combinator"). First judge whether the list context is SPECIFIC enough to ' +
+      'reliably distinguish people who share this name (a named company, ' +
+      'accelerator, school, or event is "specific"; a generic label like ' +
+      '"Imported Contacts", "Leads", or "Tech Founders" is "weak"). Then pick ' +
+      'the best match, rate your confidence, and QUOTE the exact words from the ' +
+      'chosen profile that justify the match. If the context is weak or NO ' +
+      'candidate is a confident match, use index -1. Respond ONLY with JSON: ' +
+      '{"context_strength": "specific"|"weak", "index": <number>, "confidence": "high"|"medium"|"low", "evidence": "<verbatim words copied from the chosen profile>"}.';
+    const userPrompt =
+      `List context: "${listContext}"\n` +
+      `Person name: "${name}"\n\n` +
+      `Candidates (index: profile):\n${profiles}\n\n` +
+      `Is the context specific enough to disambiguate? Which index best matches? Quote the chosen profile's exact words as evidence. Use index -1 if the context is weak or none confidently match.`;
+
+    const llm = createLLMService(EXTRACT_MODEL, 0.0);
+    const parsed = await llm.generateJSONContent<{ index?: number; confidence?: string; evidence?: string; context_strength?: string }>(
+      systemPrompt, userPrompt, 'json', undefined, { userId, feature: 'enrichment' },
+    );
+
+    // Guard 4 — context strength. A 'weak' (generic) list context can't reliably
+    // separate same-name people, so refuse regardless of the nominated index.
+    const contextStrength = typeof parsed?.context_strength === 'string' ? parsed.context_strength.toLowerCase() : '';
+    if (contextStrength !== 'specific') {
+      console.log(`[v3 linkedin-search] context LLM refused: context_strength="${contextStrength || '∅'}"`);
+      return null;
+    }
+
+    const idx = typeof parsed?.index === 'number' ? parsed.index : Number(parsed?.index);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= candidates.length) return null;
+
+    // Guard 2 — confidence threshold. Only 'high'/'medium' accepted.
+    const confidence = typeof parsed?.confidence === 'string' ? parsed.confidence.toLowerCase() : '';
+    if (confidence !== 'high' && confidence !== 'medium') {
+      console.log(`[v3 linkedin-search] context LLM refused: confidence="${confidence || '∅'}"`);
+      return null;
+    }
+
+    // Guard 3 — evidence must be grounded in the chosen profile's text.
+    const evidence = typeof parsed?.evidence === 'string' ? parsed.evidence.trim() : '';
+    if (!evidence) {
+      console.log('[v3 linkedin-search] context LLM refused: no evidence quoted');
+      return null;
+    }
+    const haystack = normalizeForMatch(profileText(candidates[idx]));
+    if (!haystack.includes(normalizeForMatch(evidence))) {
+      console.log(`[v3 linkedin-search] context LLM refused: evidence="${evidence}" not found in chosen profile`);
+      return null;
+    }
+
+    return idx;
+  } catch (err) {
+    console.warn('[v3 linkedin-search] context LLM pick failed:', (err as Error).message);
+    return null;
+  }
+}
+
 // ─── Orchestrator deps ────────────────────────────────────────────────────────
 
 /**
@@ -804,8 +962,17 @@ export function unipileNameMatches(
   // Fallback: derive first/last from the combined `name` field. Split on
   // whitespace — first token → first name, last token → last name. Handles
   // middle names by ignoring everything between.
+  //
+  // Drop tokens that normalize to empty (emoji, symbols, decorative marks)
+  // BEFORE choosing first/last. Without this, a display name like
+  // "💡 Paul Graham" would take "💡" as the first name; normalization later
+  // turns it into "" → "no constraint" → a WRONG first name would slip
+  // through the gate (verified live). Filtering here keeps the first/last
+  // anchored on real name tokens.
   if (itemFirst === null && itemLast === null && typeof item.name === 'string') {
-    const tokens = item.name.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const tokens = item.name.trim().toLowerCase().split(/\s+/)
+      .filter(Boolean)
+      .filter((t: string) => normalizeNameToken(t) !== '');
     if (tokens.length >= 1) itemFirst = tokens[0];
     if (tokens.length >= 2) itemLast = tokens[tokens.length - 1];
   }
@@ -1176,12 +1343,12 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       const query = `${domain} ${queryParts.join(' ')}`;
       let webContext = '';
       try {
-        const search = await agentModeService.searchWeb(query, 5);
+        const search = await agentModeService.youSearchWeb(query, 5);
         if (search?.success && Array.isArray(search.results)) {
           webContext = JSON.stringify(search.results.slice(0, 5), null, 2);
         }
       } catch (err) {
-        console.warn('[v3 deps] ungrouped searchWeb failed:', (err as Error).message);
+        console.warn('[v3 deps] ungrouped youSearchWeb failed:', (err as Error).message);
       }
       if (!webContext) {
         return {

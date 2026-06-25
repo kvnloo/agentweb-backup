@@ -17,6 +17,7 @@ import { emitProgress, registerProgressCallback, getLatestProgress, progressStor
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
+import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
@@ -821,15 +822,9 @@ export async function runVerifiedChat(
     }
   }
 
-  // When the agent calls a bravesearch MCP tool, it satisfies the equivalent built-in
-  // search_web requirement (but not vice-versa: explicit bravesearch_* requirements stay specific).
-  const FUNCTION_CALL_SATISFIES: Record<string, string[]> = {
-    'search_web': ['bravesearch_brave_web_search', 'bravesearch_brave_news_search'],
-  };
-  // Count how many times a required function was called, including via accepted aliases.
+  // Count how many times a required function was called.
   const countCallsForRequirement = (functionName: string, calls: string[]): number => {
-    const aliases = FUNCTION_CALL_SATISFIES[functionName] ?? [];
-    return calls.filter(c => c === functionName || aliases.includes(c)).length;
+    return calls.filter(c => c === functionName).length;
   };
 
   // Track remaining keywords and function calls
@@ -839,7 +834,7 @@ export async function runVerifiedChat(
     remainingFunctionCallCounts[reqFunc.functionName] = reqFunc.minCount;
   });
 
-  // Track all function calls across attempts (raw names, used for alias-aware evaluation)
+  // Track all function calls across attempts.
   const allActualFunctionCallsForReporting: string[] = [];
 
   // Set when the completion gate asks for one more continuation turn; the next
@@ -922,7 +917,7 @@ export async function runVerifiedChat(
         } else {
           // Work plan completed or doesn't exist - check keywords and function calls
           // NOTE: Only missing function calls are requested on retry. If a search tool
-          // (e.g. search_web) was already called, it won't be re-requested even if the
+          // (e.g. you_search_web) was already called, it won't be re-requested even if the
           // output was insufficient. Avoid adding search tools to requiredFunctionCalls
           // unless a minimum call count is truly needed — the LLM calls them organically.
           const keywordText = remainingKeywords.length > 0
@@ -975,7 +970,6 @@ export async function runVerifiedChat(
       allToolCalls.push(...toolCalls);
       const actualFunctionCalls = toolCalls.map((call: any) => call.name).filter(Boolean);
 
-      // Keep original names so bravesearch_* requirements remain trackable
       allActualFunctionCallsForReporting.push(...actualFunctionCalls);
 
       // Check work plan status
@@ -1943,25 +1937,7 @@ export async function generateSessionResponse(
   // Process attachments and include URLs in message content for LLM
   let messageContent = userMessage;
   if (attachments && attachments.length > 0) {
-    const IMAGE_MIMETYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp', 'image/svg+xml']);
-    const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg']);
-    const VIDEO_MIMETYPES = new Set(['video/mp4', 'video/quicktime', 'video/webm', 'video/avi', 'video/x-msvideo']);
-    const VIDEO_EXTS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv']);
-    const attachmentUrls = attachments.map((attachment: any) => {
-      const mimetype = (attachment.mimetype || '').toLowerCase();
-      const ext = (attachment.filename || '').split('.').pop()?.toLowerCase() || '';
-      const isImage = IMAGE_MIMETYPES.has(mimetype) || IMAGE_EXTS.has(ext);
-      const isVideo = VIDEO_MIMETYPES.has(mimetype) || VIDEO_EXTS.has(ext);
-      let hint: string;
-      if (isImage) {
-        hint = ' (image — use describe_image tool to analyze)';
-      } else if (isVideo) {
-        hint = ' (video — use describe_video tool to analyze)';
-      } else {
-        hint = ' (document — use read_file_content tool to read its contents)';
-      }
-      return `[${attachment.filename || 'Attachment'}](${attachment.url})${hint}`;
-    }).join('\n');
+    const attachmentUrls = formatAttachmentUrls(attachments);
     messageContent = `${userMessage}\n\n**Attached Files:**\n${attachmentUrls}`;
   }
 

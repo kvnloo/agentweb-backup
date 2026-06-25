@@ -40,6 +40,20 @@ describe('unipileNameMatches — combined `name` field (Unipile people-search sh
       unipileNameMatches({ public_identifier: 'x' }, 'Ayush', 'Jha'),
     ).toBe(false);
   });
+
+  it('ignores a leading emoji/symbol token so the real first name is compared', () => {
+    // Live finding: a profile named "💡 Paul Graham" split to tokens
+    // ["💡","Paul","Graham"], taking "💡" as the first name. After
+    // normalization that token is empty → treated as "no constraint", which
+    // let a WRONG first initial ("Q") slip through. The splitter must drop
+    // symbol-only tokens BEFORE choosing first/last.
+    expect(unipileNameMatches({ name: '💡 Paul Graham' }, 'Paul', 'Graham')).toBe(true);
+    expect(unipileNameMatches({ name: '💡 Paul Graham' }, 'Q', 'Graham')).toBe(false);
+  });
+
+  it('accepts a dotted-initial first name against the combined `name` field', () => {
+    expect(unipileNameMatches({ name: 'Paul Graham' }, 'P.', 'Graham')).toBe(true);
+  });
 });
 
 describe('unipileNameMatches — separate first_name / last_name (existing behavior)', () => {

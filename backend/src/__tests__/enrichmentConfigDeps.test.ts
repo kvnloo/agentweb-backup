@@ -8,6 +8,7 @@ jest.mock('../services/db', () => ({
     getEnrichmentConfig: jest.fn(),
     setEnrichmentConfig: jest.fn(),
     getLeadListById: jest.fn(),
+    mergeFieldNames: jest.fn(),
   },
 }));
 
@@ -71,6 +72,22 @@ describe('buildConfigServiceDeps', () => {
     const deps = buildConfigServiceDeps();
     const names = await deps.loadListFieldNames('list-1');
     expect(names).toEqual([]);
+  });
+
+  it('mergeListFieldNames appends only names not already on the list', async () => {
+    (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ fieldNames: ['industry', 'website'] });
+    (crmDb.mergeFieldNames as jest.Mock).mockResolvedValue(undefined);
+    const deps = buildConfigServiceDeps();
+    await deps.mergeListFieldNames('list-1', ['industry', 'funding_stage']);
+    expect(crmDb.mergeFieldNames).toHaveBeenCalledWith('list-1', ['funding_stage']);
+  });
+
+  it('mergeListFieldNames does not call mergeFieldNames when all names already exist', async () => {
+    (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ fieldNames: ['industry', 'funding_stage'] });
+    (crmDb.mergeFieldNames as jest.Mock).mockClear();
+    const deps = buildConfigServiceDeps();
+    await deps.mergeListFieldNames('list-1', ['funding_stage']);
+    expect(crmDb.mergeFieldNames).not.toHaveBeenCalled();
   });
 
   // ─── heuristicTypeSuggestion (via llmSuggestTypes) ───────────────────────

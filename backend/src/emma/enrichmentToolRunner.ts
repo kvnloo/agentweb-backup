@@ -11,6 +11,21 @@ import { buildRawEnrichmentConfig, type EmmaEnrichmentOutputField } from './enri
 import { normalizeOutputFields, type FieldRemap } from './enrichmentFieldNormalizer';
 import { fieldVerificationStatus } from '../utils/enrichedFieldValue';
 
+/**
+ * Build the list-level disambiguation context string from a lead list record.
+ * Combines the list name and description (e.g. "YC Poker Night — YC alumni")
+ * so identity resolution can disambiguate a name-only lead via shared
+ * affiliation. Returns undefined when neither is present. Bounded to a short
+ * string so it stays a useful search-keyword suffix rather than a paragraph.
+ */
+export function buildListContext(list: any): string | undefined {
+  const name = typeof list?.name === 'string' ? list.name.trim() : '';
+  const description = typeof list?.description === 'string' ? list.description.trim() : '';
+  const combined = [name, description].filter(Boolean).join(' — ').trim();
+  if (!combined) return undefined;
+  return combined.length > 200 ? combined.slice(0, 200) : combined;
+}
+
 /** Emma-facing summary of a V3 enrichment run. */
 export interface EmmaEnrichmentSummary {
   runId: string;
@@ -56,6 +71,7 @@ export async function runEmmaEnrichment(
   // with the original output_fields unchanged (enrichment must never be blocked).
   let effectiveOutputFields = params.outputFields;
   let remaps: FieldRemap[] = [];
+  let listContext: string | undefined;
   try {
     const { crmDb } = await import('../services/db');
     const list = await crmDb.getLeadListById(params.listId);
@@ -63,6 +79,7 @@ export async function runEmmaEnrichment(
     const normalized = normalizeOutputFields(params.outputFields, existingFieldNames);
     effectiveOutputFields = normalized.fields;
     remaps = normalized.remaps;
+    listContext = buildListContext(list);
   } catch (err) {
     console.warn(
       `[emma-enrich] Failed to fetch list fieldNames for normalization (listId=${params.listId}); ` +
@@ -84,6 +101,7 @@ export async function runEmmaEnrichment(
       config,
       mode: params.mode,
       leadIds: params.leadIds,
+      listContext,
     },
     deps,
     { userId: params.userId, socketId: params.socketId, socketEmit: params.socketEmit },

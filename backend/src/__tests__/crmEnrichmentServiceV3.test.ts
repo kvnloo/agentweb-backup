@@ -130,6 +130,75 @@ describe('runEnrichment — empty list', () => {
 // when set, paginated Query otherwise). The orchestrator's job is to pass it
 // through faithfully and process whatever the dep returns.
 
+describe('runEnrichment — listContext forwarding', () => {
+  it('forwards input.listContext into every resolveIdentity call', async () => {
+    const loadLeads = jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]);
+    const resolveIdentity = jest.fn().mockResolvedValue({ ok: true, resolved: {}, siblings: [] });
+    const deps = makeDeps({ loadLeads, resolveIdentity });
+
+    await runEnrichment(makeInput({ listContext: 'YC Poker Night — YC alumni' }), deps);
+
+    expect(resolveIdentity).toHaveBeenCalledWith(
+      expect.objectContaining({ listContext: 'YC Poker Night — YC alumni' }),
+    );
+  });
+
+  it('forwards listContext=undefined when not provided', async () => {
+    const loadLeads = jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]);
+    const resolveIdentity = jest.fn().mockResolvedValue({ ok: true, resolved: {}, siblings: [] });
+    const deps = makeDeps({ loadLeads, resolveIdentity });
+
+    await runEnrichment(makeInput(), deps);
+
+    expect(resolveIdentity).toHaveBeenCalledWith(
+      expect.objectContaining({ listContext: undefined }),
+    );
+  });
+
+  it('taints ALL waterfall fills to low confidence when identity came from a context guess', async () => {
+    // The waterfall stamps its own medium/high confidence onto persisted fills,
+    // overwriting the resolver's low-confidence linkedin meta. The orchestrator
+    // must re-apply the taint so a context-guessed identity can't surface a
+    // trustworthy-looking company/email.
+    const loadLeads = jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]);
+    const resolveIdentity = jest.fn().mockResolvedValue({
+      ok: true, resolved: {}, siblings: [], fromContextGuess: true,
+    });
+    const runWaterfall = jest.fn().mockResolvedValue({
+      fields: [
+        { field: 'company_name', value: 'Y Combinator', meta: { source: 'api', provider: 'apollo', confidence: 'high', enrichedAt: 'x' } },
+      ],
+      missing: [],
+      tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+    });
+    const deps = makeDeps({ loadLeads, resolveIdentity, runWaterfall });
+
+    const result = await runEnrichment(makeInput({ mode: 'preview', listContext: 'YC Poker Night' }), deps);
+
+    const sample = result.preview?.[0];
+    expect(sample?.meta?.company_name?.confidence).toBe('low');
+  });
+
+  it('does NOT taint fills when identity was NOT a context guess', async () => {
+    const loadLeads = jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1' })]);
+    const resolveIdentity = jest.fn().mockResolvedValue({
+      ok: true, resolved: {}, siblings: [], fromContextGuess: false,
+    });
+    const runWaterfall = jest.fn().mockResolvedValue({
+      fields: [
+        { field: 'company_name', value: 'Acme', meta: { source: 'api', provider: 'apollo', confidence: 'high', enrichedAt: 'x' } },
+      ],
+      missing: [],
+      tierFills: { crm: 0, apollo: 1, web: 0, missing: 0 },
+    });
+    const deps = makeDeps({ loadLeads, resolveIdentity, runWaterfall });
+
+    const result = await runEnrichment(makeInput({ mode: 'preview' }), deps);
+
+    expect(result.preview?.[0]?.meta?.company_name?.confidence).toBe('high');
+  });
+});
+
 describe('runEnrichment — leadIds filter', () => {
   it('passes input.leadIds through to deps.loadLeads when set', async () => {
     const loadLeads = jest.fn().mockResolvedValue([
@@ -1547,12 +1616,18 @@ describe('runEnrichment — critic view derivation (Fix 5)', () => {
     fields: [{ name: 'company_description', type: 'string', instruction: 'desc', include: true, overwritePolicy: 'always_overwrite' }],
   });
 
-  it('FAIL CASE: a contradicted verdict derives criticView "drop"', async () => {
+  it('FAIL CASE: a contradicted verdict DROPS the fill (not persisted)', async () => {
+    // Behavior change (Slashy bug): contradicted web fills describe a different
+    // entity than the lead, so they are removed before the write rather than
+    // persisted with an advisory criticView. See the dedicated
+    // "contradicted web fills are dropped" describe block below.
     const deps = webFillDeps({ company_description: 'contradicted' });
     await runEnrichment(makeInput({ config: cfg }), deps);
-    const meta = (deps.setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.company_description;
-    expect(meta.criticVerdict).toBe('contradicted');
-    expect(meta.criticView).toBe('drop');
+    for (const [arg] of (deps.setLeadFields as jest.Mock).mock.calls) {
+      expect(arg.topLevel?.company_description).toBeUndefined();
+      expect(arg.customFields?.company_description).toBeUndefined();
+      expect(arg.enrichmentMetadata?.company_description).toBeUndefined();
+    }
   });
 
   it('FAIL CASE: an unsupported verdict derives criticView "low"', async () => {
@@ -1583,6 +1658,157 @@ describe('runEnrichment — critic view derivation (Fix 5)', () => {
     const meta = (deps.setLeadFields as jest.Mock).mock.calls[0][0].enrichmentMetadata.company_description;
     expect(meta.criticVerdict).toBeUndefined();
     expect(meta.criticView).toBeUndefined();
+  });
+});
+
+// ─── Slashy/Slash bug: contradicted web fills are DROPPED, not persisted ───────
+// A "contradicted" verdict means the critic decided the source describes a
+// different entity than the lead (e.g. funding data for "Slash" applied to the
+// "Slashy" lead). Such fills must never be written to the lead.
+describe('runEnrichment — contradicted web fills are dropped (Slashy bug)', () => {
+  function webFillDeps(verdicts: Record<string, string>, waterfallFields?: any[]) {
+    return makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1', company: 'Slashy' })]),
+      runWaterfall: jest.fn().mockResolvedValue({
+        fields: waterfallFields ?? [{
+          field: 'funding_stage',
+          value: 'Series C',
+          meta: { source: 'web_search', provider: 'llm_web_search', enrichedAt: '2026-01-01T00:00:00Z', sourceUrl: 'https://example.com/slash', sourceQuote: "Slash's Series C" },
+        }],
+        missing: [],
+        tierFills: { crm: 0, apollo: 0, web: 1, missing: 0 },
+      }),
+      runCriticOverWebFills: jest.fn().mockResolvedValue({ verdicts }),
+      setLeadFields: jest.fn().mockResolvedValue(undefined),
+    });
+  }
+
+  const cfg = makeConfig({
+    fields: [
+      { name: 'funding_stage', type: 'string', instruction: 'funding stage', include: true, overwritePolicy: 'always_overwrite' },
+      { name: 'industry', type: 'string', instruction: 'industry', include: true, overwritePolicy: 'always_overwrite' },
+    ],
+  });
+
+  it('FAIL CASE: a contradicted web fill is NOT persisted to the lead at all', async () => {
+    const deps = webFillDeps({ funding_stage: 'contradicted' });
+    await runEnrichment(makeInput({ config: cfg }), deps);
+    const calls = (deps.setLeadFields as jest.Mock).mock.calls;
+    // Either setLeadFields was not called (no fills left) or, if called, the
+    // contradicted field is absent from every destination bucket.
+    for (const [arg] of calls) {
+      expect(arg.topLevel?.funding_stage).toBeUndefined();
+      expect(arg.customFields?.funding_stage).toBeUndefined();
+      expect(arg.enrichmentMetadata?.funding_stage).toBeUndefined();
+    }
+  });
+
+  it('SUCCESS CASE: a supported web fill alongside a contradicted one — only the supported one persists', async () => {
+    const deps = webFillDeps(
+      { funding_stage: 'contradicted', industry: 'supported' },
+      [
+        { field: 'funding_stage', value: 'Series C', meta: { source: 'web_search', provider: 'llm_web_search', enrichedAt: '2026-01-01T00:00:00Z' } },
+        { field: 'industry', value: 'Fintech', meta: { source: 'web_search', provider: 'llm_web_search', enrichedAt: '2026-01-01T00:00:00Z' } },
+      ],
+    );
+    await runEnrichment(makeInput({ config: cfg }), deps);
+    const arg = (deps.setLeadFields as jest.Mock).mock.calls[0][0];
+    const fundingVal = arg.topLevel?.funding_stage ?? arg.customFields?.funding_stage;
+    const industryVal = arg.topLevel?.industry ?? arg.customFields?.industry;
+    expect(fundingVal).toBeUndefined();
+    expect(industryVal).toBe('Fintech');
+    expect(arg.enrichmentMetadata?.industry?.criticView).toBe('high');
+  });
+
+  it('SUCCESS CASE: an unsupported web fill is KEPT (only contradicted is dropped)', async () => {
+    const deps = webFillDeps({ funding_stage: 'unsupported' });
+    await runEnrichment(makeInput({ config: cfg }), deps);
+    const arg = (deps.setLeadFields as jest.Mock).mock.calls[0][0];
+    const fundingVal = arg.topLevel?.funding_stage ?? arg.customFields?.funding_stage;
+    expect(fundingVal).toBe('Series C');
+    expect(arg.enrichmentMetadata.funding_stage.criticView).toBe('low');
+  });
+
+  it('a same-named non-web (Apollo) fill is NOT dropped when the web fill is contradicted', async () => {
+    // Defensive: contradicted drop must match on web source, not field name alone.
+    const deps = webFillDeps(
+      { funding_stage: 'contradicted' },
+      [
+        { field: 'funding_stage', value: 'Series C (web)', meta: { source: 'web_search', provider: 'llm_web_search', enrichedAt: '2026-01-01T00:00:00Z' } },
+        { field: 'funding_stage', value: 'Series A (apollo)', meta: { source: 'api', provider: 'apollo', enrichedAt: '2026-01-01T00:00:00Z' } },
+      ],
+    );
+    await runEnrichment(makeInput({ config: cfg }), deps);
+    const arg = (deps.setLeadFields as jest.Mock).mock.calls[0][0];
+    const fundingVal = arg.topLevel?.funding_stage ?? arg.customFields?.funding_stage;
+    // The Apollo fill survives; the contradicted web fill is gone.
+    expect(fundingVal).toBe('Series A (apollo)');
+  });
+
+  // The reported regression: the bad value arrived via Tier 0b sibling-copy
+  // (provider 'agentweb'/'crm-history'), which previously bypassed the critic.
+  // Now web-sourced sibling copies are re-stamped source:'web_search' so the
+  // critic re-verifies them and a contradicted copy is dropped.
+  it('FAIL CASE: a Tier 0b sibling-copied web value that the critic contradicts is NOT persisted', async () => {
+    const sibling = {
+      leadId: 'sib-web', listId: 'list-other', userId: 'user-other',
+      updatedAt: new Date().toISOString(),
+      customFields: { funding_stage: 'Series B' },
+      enrichmentMetadata: {
+        funding_stage: {
+          source: 'web_search', provider: 'llm_web_search', confidence: 'medium',
+          sourceUrl: 'https://www.slash.com/blog/slash-raises-series-b',
+          sourceQuote: 'Slash has recently raised $41 million in a Series B funding round',
+          enrichedAt: '2026-06-23T09:59:32Z',
+        },
+      },
+    };
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1', email: 'harsha@slashy.com', company: 'Slashy' })]),
+      // siblings supplied here flow into the real copySiblingConfigFields (Tier 0b).
+      resolveIdentity: jest.fn().mockResolvedValue({ ok: true, resolved: {}, siblings: [sibling] }),
+      // Waterfall finds nothing for funding_stage this run — the only source is the sibling copy.
+      runWaterfall: jest.fn().mockResolvedValue({ fields: [], missing: ['funding_stage'], tierFills: { crm: 0, apollo: 0, web: 0, missing: 1 } }),
+      runCriticOverWebFills: jest.fn().mockResolvedValue({ verdicts: { funding_stage: 'contradicted' } }),
+      setLeadFields: jest.fn().mockResolvedValue(undefined),
+    });
+    await runEnrichment(makeInput({ config: cfg }), deps);
+    // The critic must have been asked to judge the sibling-copied web value.
+    expect(deps.runCriticOverWebFills).toHaveBeenCalledTimes(1);
+    const criticFields = (deps.runCriticOverWebFills as jest.Mock).mock.calls[0][0].fills.map((f: any) => f.field);
+    expect(criticFields).toContain('funding_stage');
+    // And the contradicted copy must not reach the lead write.
+    for (const [arg] of (deps.setLeadFields as jest.Mock).mock.calls) {
+      expect(arg.topLevel?.funding_stage).toBeUndefined();
+      expect(arg.customFields?.funding_stage).toBeUndefined();
+      expect(arg.enrichmentMetadata?.funding_stage).toBeUndefined();
+    }
+  });
+
+  it('SUCCESS CASE: a Tier 0b sibling-copied web value the critic supports IS persisted', async () => {
+    const sibling = {
+      leadId: 'sib-web', listId: 'list-other', userId: 'user-other',
+      updatedAt: new Date().toISOString(),
+      customFields: { funding_stage: 'Series B' },
+      enrichmentMetadata: {
+        funding_stage: {
+          source: 'web_search', provider: 'llm_web_search', confidence: 'medium',
+          sourceUrl: 'https://example.com/slashy', sourceQuote: 'Slashy raised a Series B',
+          enrichedAt: '2026-06-23T09:59:32Z',
+        },
+      },
+    };
+    const deps = makeDeps({
+      loadLeads: jest.fn().mockResolvedValue([makeLead({ leadId: 'lead-1', email: 'harsha@slashy.com', company: 'Slashy' })]),
+      resolveIdentity: jest.fn().mockResolvedValue({ ok: true, resolved: {}, siblings: [sibling] }),
+      runWaterfall: jest.fn().mockResolvedValue({ fields: [], missing: ['funding_stage'], tierFills: { crm: 0, apollo: 0, web: 0, missing: 1 } }),
+      runCriticOverWebFills: jest.fn().mockResolvedValue({ verdicts: { funding_stage: 'supported' } }),
+      setLeadFields: jest.fn().mockResolvedValue(undefined),
+    });
+    await runEnrichment(makeInput({ config: cfg }), deps);
+    const arg = (deps.setLeadFields as jest.Mock).mock.calls[0][0];
+    const fundingVal = arg.topLevel?.funding_stage ?? arg.customFields?.funding_stage;
+    expect(fundingVal).toBe('Series B');
   });
 });
 

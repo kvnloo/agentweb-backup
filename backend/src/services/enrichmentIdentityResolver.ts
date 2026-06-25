@@ -54,6 +54,12 @@ export interface SiblingLeadResult {
   website?: string;
   title?: string;
   customFields?: Record<string, string>;
+  /** Per-field enrichment provenance from the sibling lead. Tier 0b reads this
+   *  so a copied web-sourced value carries its originating sourceUrl/sourceQuote
+   *  forward — letting the critic re-verify the copy instead of trusting it
+   *  blindly (Slashy/Slash bug: a sibling's unverified cross-company value must
+   *  not propagate uncritiqued). */
+  enrichmentMetadata?: Record<string, EnrichedFieldMeta>;
 }
 
 export interface IdentityResolverDeps {
@@ -84,8 +90,14 @@ export interface IdentityResolverDeps {
     domain: string;
   }): Promise<{ email: string; pattern?: string } | null>;
   /** Step 2 — Unipile LinkedIn people search. Finds linkedin_url from name+company.
-   *  Returns null when no connected LinkedIn account or no confident match. */
-  findLinkedInUrl(input: { firstName: string; lastName: string; company: string }): Promise<string | null>;
+   *  `listContext` (optional) carries list-level disambiguation — the lead
+   *  list's name/description (e.g. "YC Poker Night"). The dep searches by name
+   *  only (folding context into the query collapses results) and uses the
+   *  context to pick the right profile among same-name candidates, so a
+   *  name-only lead with no company can still be resolved against the right
+   *  person. Returns null when no connected LinkedIn account or no confident
+   *  match. */
+  findLinkedInUrl(input: { firstName: string; lastName: string; company: string; listContext?: string }): Promise<string | null>;
   /** Step 3.5 — Unipile profile lookup BY LinkedIn URL. Resolves
    *  name/title/company directly from a /in/ URL — the one identity source
    *  that works for a LinkedIn-only lead Apollo doesn't cover. Without it such
@@ -151,6 +163,15 @@ export interface ResolveIdentityInput {
    *  (run_waterfall_email) via `deps.apolloBrokerChain`. Without this hint
    *  there is no lead to write the async result back to, so Tier 6.5 is skipped. */
   leadHint?: { listId: string; leadId: string };
+  /** List-level disambiguation context — the lead list's name (and optionally
+   *  description), e.g. "YC Poker Night". When a lead has a name but no company,
+   *  Tier 2.7 runs a name-only Unipile LinkedIn search and uses this context to
+   *  pick the right profile among same-name candidates, so a common name can
+   *  still be resolved against the right person via the shared affiliation.
+   *  Undefined/empty disables the name-only contextual search — a bare name
+   *  search risks matching the wrong person, so we only attempt it when there
+   *  is a disambiguating signal. */
+  listContext?: string;
   /** Standard identity-signal field names (firstName, lastName, email,
    *  linkedin, company, website, title) the user did NOT opt into enriching.
    *  These are still resolved IN MEMORY — company/website are needed as signals
@@ -162,7 +183,18 @@ export interface ResolveIdentityInput {
 }
 
 export type ResolveIdentityResult =
-  | { ok: true; resolved: Partial<LeadRecord> & { emailDomain?: string }; siblings: SiblingLeadResult[]; emailPattern?: string }
+  | {
+      ok: true;
+      resolved: Partial<LeadRecord> & { emailDomain?: string };
+      siblings: SiblingLeadResult[];
+      emailPattern?: string;
+      /** True when identity was anchored ONLY on a name-only list-context
+       *  LinkedIn guess (Tier 2.7 branch b). Signals the orchestrator to taint
+       *  every downstream waterfall fill to low confidence — the persisted
+       *  values overwrite the resolver's own meta, so the taint must also be
+       *  applied there. */
+      fromContextGuess?: boolean;
+    }
   | { ok: false; reason: 'no_identity_signal' | 'identity_unresolvable' };
 
 function makeApiMeta(provider: IdentityProvider, field?: string, fromCache?: boolean): EnrichedFieldMeta {
@@ -222,6 +254,10 @@ export async function resolveIdentity(
   const resolved: Partial<LeadRecord> & { emailDomain?: string } = {};
   const meta: Record<string, EnrichedFieldMeta> = {};
   let validSiblings: SiblingLeadResult[] = [];
+  // Set when identity is anchored on a name-only list-context LinkedIn guess
+  // (Tier 2.7 branch b). When true, ALL resolved fields are tainted to low
+  // confidence before persistence — see the taint pass before step 7.
+  let identityFromContextGuess = false;
 
   // 2. CRM-history Tier 0 — cross-tenant sibling-lead lookup. Queries all
   // three GSIs in parallel and does per-field best-of-N merge across the
@@ -371,21 +407,59 @@ export async function resolveIdentity(
     }
   }
 
-  // 2.7. Unipile LinkedIn search. Fires when linkedin is still missing but
-  // firstName + lastName + company are known. Finds the linkedin_url so
-  // step 3 (Apollo-by-LinkedIn) can fire and resolve email + org in one shot.
+  // 2.7. Unipile LinkedIn search. Finds the linkedin_url so step 3
+  // (Apollo-by-LinkedIn) can fire and resolve email + org in one shot.
+  //
+  // Two trigger conditions, both requiring name + missing linkedin:
+  //  (a) company is known → search by name, narrowed by the company filter
+  //      (original behavior).
+  //  (b) company is UNKNOWN but list-level context is available AND company
+  //      fields are requested → search by name only, then use listContext to
+  //      pick the right profile among same-name candidates (e.g. a "YC Poker
+  //      Night" list disambiguates a common name via the shared affiliation;
+  //      the dep does NOT fold context into the query string — that collapses
+  //      LinkedIn results to zero). This is the name-only fallback: without it
+  //      such leads fail the company-completeness gate below and are skipped
+  //      entirely. Gated on listContext because a bare name-only search risks
+  //      matching the wrong person. The unipileNameMatches guard in the dep
+  //      still rejects results whose name doesn't match.
   const linkedinEffective = lead.linkedin || resolved.linkedin || linkedinUrl;
   const firstNameEffective = lead.firstName || resolved.firstName;
   const lastNameEffective = lead.lastName || resolved.lastName;
-  if (!linkedinEffective && firstNameEffective && lastNameEffective && (lead.company || resolved.company)) {
+  const companyEffectiveForSearch = lead.company || resolved.company;
+  const listContext = (input.listContext || '').trim();
+  const canSearchByCompany = !!companyEffectiveForSearch;
+  const canSearchByContext = !companyEffectiveForSearch && needsCompanyFields && !!listContext;
+  if (!linkedinEffective && firstNameEffective && lastNameEffective && (canSearchByCompany || canSearchByContext)) {
     try {
-      const firstName = (lead.firstName || resolved.firstName)!;
-      const lastName = (lead.lastName || resolved.lastName)!;
-      const company = (lead.company || resolved.company)!;
-      const foundLinkedin = await deps.findLinkedInUrl({ firstName, lastName, company });
+      const firstName = firstNameEffective;
+      const lastName = lastNameEffective;
+      const company = companyEffectiveForSearch || '';
+      const foundLinkedin = await deps.findLinkedInUrl({
+        firstName,
+        lastName,
+        company,
+        ...(listContext ? { listContext } : {}),
+      });
       if (foundLinkedin) {
         resolved.linkedin = foundLinkedin;
-        meta.linkedin = makeApiMeta('unipile', 'linkedin', false);
+        // Provenance: a URL found via the name-only list-context path (no
+        // company anchor) is an educated guess among same-name people, so it
+        // must NOT carry the same confidence as a company-anchored match.
+        // Stamp it 'low' (overriding makeApiMeta's default 'medium') so
+        // fieldVerificationStatus() flags it unverified and the UI/critic
+        // caveat it. company-anchored matches keep the default 'medium'.
+        const linkedinMeta = makeApiMeta('unipile', 'linkedin', false);
+        if (canSearchByContext && !canSearchByCompany) {
+          linkedinMeta.confidence = 'low';
+          linkedinMeta.sourceQuote = `Matched by list context "${listContext}" among same-name LinkedIn profiles — verify before outreach.`;
+          // Mark the whole identity as context-guessed so EVERY downstream
+          // field seeded from this URL (Apollo email/company/title, etc.) is
+          // tainted to low confidence before persistence — the identity is
+          // only as trustworthy as the guessed URL.
+          identityFromContextGuess = true;
+        }
+        meta.linkedin = linkedinMeta;
       }
     } catch (err) {
       console.warn(`${logTag} step 2 findLinkedInUrl failed:`, (err as Error).message);
@@ -697,6 +771,25 @@ export async function resolveIdentity(
     }
   }
 
+  // 6.9. Taint pass — when the entire identity was anchored on a name-only
+  // list-context LinkedIn guess, downgrade EVERY resolved field's confidence
+  // to 'low' so a wrong-person match can't surface a trustworthy-looking email
+  // or company. The guessed linkedin URL seeds Apollo/enrich.so, which stamp
+  // their own 'medium'/'high' confidence; this overrides that because those
+  // values are only as reliable as the disambiguation that produced the URL.
+  if (identityFromContextGuess) {
+    for (const key of Object.keys(meta)) {
+      if (meta[key].confidence !== 'low') {
+        meta[key] = {
+          ...meta[key],
+          confidence: 'low',
+          sourceQuote: meta[key].sourceQuote
+            || `Derived from a list-context LinkedIn match — verify before outreach.`,
+        };
+      }
+    }
+  }
+
   // 7. Persist newly-resolved attributes ONLY in enrich mode. Runs BEFORE the
   // completeness gate so that partial signals (linkedin, title, website from
   // Tier 0.5) are written to the lead even when we can't resolve company —
@@ -749,5 +842,5 @@ export async function resolveIdentity(
     if (!companyOk) return { ok: false, reason: 'identity_unresolvable' };
   }
 
-  return { ok: true, resolved, siblings: validSiblings, emailPattern };
+  return { ok: true, resolved, siblings: validSiblings, emailPattern, fromContextGuess: identityFromContextGuess };
 }

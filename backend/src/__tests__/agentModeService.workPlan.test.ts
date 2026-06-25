@@ -498,6 +498,106 @@ describe('AgentModeService - Work Plan', () => {
         })
       );
     });
+
+    // Asset-count completion gate (xCures incident, prod session 7c8ff5b2-…): a step
+    // declaring expectedAssetCount may not be completed until that many media assets
+    // have actually been produced this session (counted from "Image generated:" markers).
+    describe('expectedAssetCount completion gate', () => {
+      // Build a session with an image step needing 18 assets and `produced` images present.
+      const makeSession = (produced: number, expectedAssetCount = 18) => {
+        const messages: any[] = [];
+        for (let i = 0; i < produced; i++) {
+          messages.push({ role: 'system', content: `Image generated: hook_${i}.png`, metadata: { kind: 'image-generated', imageFilename: `hook_${i}.png` } });
+        }
+        return {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages,
+          workPlan: {
+            title: 'LinkedIn Ads Campaign generator',
+            steps: [
+              { stepCount: 1, title: 'Generate 3 Images Per Hook - 18 total', status: 'pending' as const, expectedAssetCount },
+            ],
+            createdAt: '2025-01-15T09:00:00.000Z',
+            updatedAt: '2025-01-15T10:00:00.000Z',
+          },
+        };
+      };
+
+      it('BLOCKS completing an image step when fewer assets than expected were produced', async () => {
+        const mockSession = makeSession(3, 18);
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.insufficientAssets).toEqual([
+          expect.objectContaining({ stepCount: 1, expected: 18, produced: 3 }),
+        ]);
+        expect(result.formattedContent).toContain('3 of 18');
+        // Must NOT have persisted a completed status.
+        expect(chatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
+      });
+
+      it('ALLOWS completing the step once the full asset count is produced', async () => {
+        const mockSession = makeSession(18, 18);
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalled();
+      });
+
+      it('does NOT gate a step that has no expectedAssetCount (zero regression)', async () => {
+        // Step with NO expectedAssetCount field at all and zero images produced.
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: {
+            title: 'LinkedIn Ads Campaign generator',
+            steps: [
+              { stepCount: 1, title: 'Generate 3 Images Per Hook - 18 total', status: 'pending' as const },
+            ],
+            createdAt: '2025-01-15T09:00:00.000Z',
+            updatedAt: '2025-01-15T10:00:00.000Z',
+          },
+        };
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalled();
+      });
+
+      it('does NOT gate skipping a short image step (only completion is gated)', async () => {
+        const mockSession = makeSession(3, 18);
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'skipped' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalled();
+      });
+    });
   });
 
   describe('buildMarketingContext with work plan', () => {
@@ -645,7 +745,7 @@ describe('AgentModeService - Work Plan', () => {
           {
             stepCount: 1,
             title: 'Research topic',
-            requiredFunctionCalls: ['search_web'],
+            requiredFunctionCalls: ['you_search_web'],
             status: 'pending' as const,
           },
           {
@@ -683,7 +783,7 @@ describe('AgentModeService - Work Plan', () => {
       );
 
       expect(workPlanMessage).toBeDefined();
-      expect(workPlanMessage.content).toContain('Required Functions: search_web');
+      expect(workPlanMessage.content).toContain('Required Functions: you_search_web');
       expect(workPlanMessage.content).toContain('Required Functions: create_blog_article, create_blog_article, create_blog_article');
       expect(workPlanMessage.content).toContain('Required Functions: generate_image');
       // Step 4 should not have required functions
@@ -702,7 +802,7 @@ describe('AgentModeService - Work Plan', () => {
             stepCount: 1,
             title: 'Analyze website and business',
             description: 'Research and analyze the client\'s website and business to understand their industry',
-            requiredFunctionCalls: ['search_web'],
+            requiredFunctionCalls: ['you_search_web'],
             status: 'pending' as const,
           },
           {
@@ -732,7 +832,7 @@ describe('AgentModeService - Work Plan', () => {
       // Check step 1 has both description and required functions
       expect(workPlanMessage.content).toContain('1. ○ Analyze website and business (pending)');
       expect(workPlanMessage.content).toContain('Description: Research and analyze the client\'s website and business to understand their industry');
-      expect(workPlanMessage.content).toContain('Required Functions: search_web');
+      expect(workPlanMessage.content).toContain('Required Functions: you_search_web');
       // Check step 2 has both description and required functions
       expect(workPlanMessage.content).toContain('2. ✓ Create brand guidelines (completed)');
       expect(workPlanMessage.content).toContain('Description: Establish brand guidelines');
@@ -878,7 +978,7 @@ describe('AgentModeService - Work Plan', () => {
             {
               stepCount: 1,
               title: 'Analyze website',
-              requiredFunctionCalls: ['search_web'],
+              requiredFunctionCalls: ['you_search_web'],
             },
             {
               stepCount: 2,
@@ -896,7 +996,7 @@ describe('AgentModeService - Work Plan', () => {
               expect.objectContaining({
                 stepCount: 1,
                 title: 'Analyze website',
-                requiredFunctionCalls: ['search_web'],
+                requiredFunctionCalls: ['you_search_web'],
               }),
               expect.objectContaining({
                 stepCount: 2,
@@ -935,7 +1035,7 @@ describe('AgentModeService - Work Plan', () => {
             {
               stepCount: 1,
               title: 'Step 1',
-              requiredFunctionCalls: ['search_web', 'create_blog_article'],
+              requiredFunctionCalls: ['you_search_web', 'create_blog_article'],
             },
           ],
           [],
@@ -948,7 +1048,7 @@ describe('AgentModeService - Work Plan', () => {
             steps: expect.arrayContaining([
               expect.objectContaining({
                 stepCount: 1,
-                requiredFunctionCalls: ['search_web', 'create_blog_article'],
+                requiredFunctionCalls: ['you_search_web', 'create_blog_article'],
               }),
             ]),
           })
@@ -965,7 +1065,7 @@ describe('AgentModeService - Work Plan', () => {
               stepCount: 1,
               title: 'Research',
               status: 'pending' as const,
-              requiredFunctionCalls: ['search_web'],
+              requiredFunctionCalls: ['you_search_web'],
             },
           ],
           createdAt: '2025-01-15T09:00:00.000Z',
@@ -990,7 +1090,7 @@ describe('AgentModeService - Work Plan', () => {
         expect(result.success).toBe(false);
         expect(result.message).toContain('Required function calls have not been made');
         expect(result.missingFunctionCalls).toBeDefined();
-        expect(result.missingFunctionCalls[0].missing).toContain('search_web (need 1, have 0)');
+        expect(result.missingFunctionCalls[0].missing).toContain('you_search_web (need 1, have 0)');
       });
 
       it('should succeed when required functions have been called', async () => {
@@ -1001,7 +1101,7 @@ describe('AgentModeService - Work Plan', () => {
               stepCount: 1,
               title: 'Research',
               status: 'pending' as const,
-              requiredFunctionCalls: ['search_web'],
+              requiredFunctionCalls: ['you_search_web'],
             },
           ],
           createdAt: '2025-01-15T09:00:00.000Z',
@@ -1013,7 +1113,7 @@ describe('AgentModeService - Work Plan', () => {
           userId: mockUserId,
           messages: [],
           workPlan: JSON.parse(JSON.stringify(workPlan)),
-          calledFunctions: { search_web: 1 }, // Function has been called
+          calledFunctions: { you_search_web: 1 },
         };
 
         (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
@@ -1029,7 +1129,7 @@ describe('AgentModeService - Work Plan', () => {
         expect(result.message).toContain('Step 1 status updated to completed');
         expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(
           mockSessionId,
-          { search_web: 0 } // Counter should be decremented
+          { you_search_web: 0 }
         );
       });
 
@@ -1115,7 +1215,7 @@ describe('AgentModeService - Work Plan', () => {
               stepCount: 1,
               title: 'Complete onboarding',
               status: 'pending' as const,
-              requiredFunctionCalls: ['search_web', 'create_blog_article', 'generate_image'],
+              requiredFunctionCalls: ['you_search_web', 'create_blog_article', 'generate_image'],
             },
           ],
           createdAt: '2025-01-15T09:00:00.000Z',
@@ -1128,7 +1228,7 @@ describe('AgentModeService - Work Plan', () => {
           messages: [],
           workPlan: JSON.parse(JSON.stringify(workPlan)),
           calledFunctions: {
-            search_web: 1,
+            you_search_web: 1,
             create_blog_article: 1,
             generate_image: 0, // This one is missing
           },
@@ -1143,7 +1243,7 @@ describe('AgentModeService - Work Plan', () => {
 
         expect(result.success).toBe(false);
         expect(result.missingFunctionCalls[0].missing).toContain('generate_image (need 1, have 0)');
-        expect(result.missingFunctionCalls[0].missing).not.toContain('search_web');
+        expect(result.missingFunctionCalls[0].missing).not.toContain('you_search_web');
         expect(result.missingFunctionCalls[0].missing).not.toContain('create_blog_article');
       });
 
@@ -1155,7 +1255,7 @@ describe('AgentModeService - Work Plan', () => {
               stepCount: 1,
               title: 'Research',
               status: 'pending' as const,
-              requiredFunctionCalls: ['search_web'],
+              requiredFunctionCalls: ['you_search_web'],
             },
           ],
           createdAt: '2025-01-15T09:00:00.000Z',
@@ -1186,4 +1286,3 @@ describe('AgentModeService - Work Plan', () => {
     });
   });
 });
-

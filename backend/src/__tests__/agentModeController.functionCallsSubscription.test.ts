@@ -16,12 +16,12 @@ jest.mock('../services/agentModeService', () => ({
     getAvailableTools: () => [
       { type: 'function', function: { name: 'generate_image', description: 'Generate images' } },
       { type: 'function', function: { name: 'generate_video', description: 'Generate videos' } },
-      { type: 'function', function: { name: 'search_web', description: 'Search the web' } },
+      { type: 'function', function: { name: 'you_search_web', description: 'Search the web' } },
       { type: 'function', function: { description: 'Missing name' } },
       { type: 'function' },
       { type: 'non-function', other: true },
     ],
-    getFoundationToolNames: () => new Set(['search_web']),
+    getFoundationToolNames: () => new Set(['you_search_web']),
   },
 }));
 
@@ -52,7 +52,7 @@ describe('agentModeController.getAvailableFunctionCalls subscription behaviour',
   });
 
   it('should include foundation tools for non-admin users even when not in subscription', async () => {
-    // getAllowedFunctionCalls returns only 'generate_image' — does NOT include 'search_web'
+    // getAllowedFunctionCalls returns only 'generate_image' — does NOT include 'you_search_web'
     mockedGetAllowed.mockResolvedValueOnce(['generate_image']);
 
     const req = {
@@ -66,21 +66,21 @@ describe('agentModeController.getAvailableFunctionCalls subscription behaviour',
     expect(mockedFilter).toHaveBeenCalled();
     const allowedArg = mockedFilter.mock.calls[0][1];
     expect(allowedArg).toContain('generate_image');
-    expect(allowedArg).toContain('search_web'); // Foundation tool injected
+    expect(allowedArg).toContain('you_search_web'); // Foundation tool injected
 
     // Response should contain both the subscription tool and the foundation tool
     const response = (res.json as jest.Mock).mock.calls[0][0];
     expect(response.functionCalls).toEqual(
       expect.arrayContaining([
         { name: 'generate_image', description: 'Generate images' },
-        { name: 'search_web', description: 'Search the web' },
+        { name: 'you_search_web', description: 'Search the web' },
       ])
     );
   });
 
   it('should not duplicate foundation tools if already in subscription', async () => {
-    // getAllowedFunctionCalls already includes 'search_web'
-    mockedGetAllowed.mockResolvedValueOnce(['generate_image', 'search_web']);
+    // getAllowedFunctionCalls already includes 'you_search_web'
+    mockedGetAllowed.mockResolvedValueOnce(['generate_image', 'you_search_web']);
 
     const req = {
       user: { userId: 'user-1', isAdmin: false },
@@ -90,7 +90,7 @@ describe('agentModeController.getAvailableFunctionCalls subscription behaviour',
     await agentModeController.getAvailableFunctionCalls(req, res);
 
     const allowedArg = mockedFilter.mock.calls[0][1];
-    const searchWebCount = allowedArg.filter((n: string) => n === 'search_web').length;
+    const searchWebCount = allowedArg.filter((n: string) => n === 'you_search_web').length;
     expect(searchWebCount).toBe(1); // Not duplicated
   });
 
@@ -111,7 +111,7 @@ describe('agentModeController.getAvailableFunctionCalls subscription behaviour',
       functionCalls: [
         { name: 'generate_image', description: 'Generate images' },
         { name: 'generate_video', description: 'Generate videos' },
-        { name: 'search_web', description: 'Search the web' },
+        { name: 'you_search_web', description: 'Search the web' },
       ],
     });
   });
@@ -129,7 +129,7 @@ describe('agentModeController.getAvailableFunctionCalls subscription behaviour',
     const response = (res.json as jest.Mock).mock.calls[0][0];
     expect(response.functionCalls).toEqual(
       expect.arrayContaining([
-        { name: 'search_web', description: 'Search the web' },
+        { name: 'you_search_web', description: 'Search the web' },
       ])
     );
   });
@@ -144,6 +144,6 @@ describe('agentModeController.getAvailableFunctionCalls subscription behaviour',
     await agentModeController.getAvailableFunctionCalls(req, res);
 
     const response = (res.json as jest.Mock).mock.calls[0][0];
-    expect(response.functionCalls.some((fc: any) => fc.name === 'search_web')).toBe(true);
+    expect(response.functionCalls.some((fc: any) => fc.name === 'you_search_web')).toBe(true);
   });
 });

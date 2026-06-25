@@ -41,6 +41,28 @@ export const MEDIA_GEN_TOOLS = new Set<string>([
   'generate_voiceover',
 ]);
 
+/**
+ * A media-gen tool can return `success: true` WITHOUT producing an asset: the
+ * generate_image / generate_video human-in-the-loop confirmation gate returns
+ * `{ success: true, awaitingUserConfirmation: true }` (no imageUrl/videoUrl) to
+ * pause for approval BEFORE editing existing assets. Counting those non-producing
+ * returns toward calledFunctions is the proven cause of the xCures incident's
+ * "generate_image called 76× but only 3 images exist" counter pollution
+ * (prod session 7c8ff5b2-…) — it inflated calledFunctions.generate_image far past
+ * the set_work_plan_status requiredFunctionCalls gate while no assets were made.
+ *
+ * Returns true only when a media-gen success actually produced/queued an asset
+ * (i.e. it is NOT a confirmation-gate pause). Non-media tools are unaffected.
+ */
+export function mediaGenProducedAsset(toolName: string, result: any): boolean {
+  if (!MEDIA_GEN_TOOLS.has(toolName)) return true; // not a media-gen tool — N/A
+  if (result && typeof result === 'object'
+    && ((result as any).awaitingUserConfirmation === true || (result as any).requiresConfirmation === true)) {
+    return false;
+  }
+  return true;
+}
+
 /** A tool-result outcome from the gateway, normalized into the loop's union shape. */
 export interface ToolExecOutcome {
   status: 'success' | 'error';
@@ -432,9 +454,15 @@ export async function executePreparedTools(
     mediaBudgetDeferred = true;
     return { status: 'deferred', toolCall, functionArgs, duration: 0, policyDecision };
   };
-  // A genuine media asset (gateway success that isn't an encoded {success:false}).
+  // A genuine media asset: a gateway success that isn't an encoded {success:false}
+  // AND actually produced an asset (not a confirmation-gate pause — see
+  // mediaGenProducedAsset). Keeps the deferral budget's notion of "an asset exists
+  // this batch" consistent with the calledFunctions / mediaAssetsProduced counters.
   const countsAsAsset = (dr: DispatchToolResult): boolean =>
-    dr.status === 'success' && isMediaGenTool(dr.toolCall) && !ports.toolResultError(dr.result);
+    dr.status === 'success'
+    && isMediaGenTool(dr.toolCall)
+    && !ports.toolResultError(dr.result)
+    && mediaGenProducedAsset(dr.toolCall.function.name, dr.result);
 
   if (hasWaitTool || hasMultipleMediaGenTools) {
     toolResults = [];
@@ -530,17 +558,26 @@ export async function executePreparedTools(
         }
       }
 
-      // For create_social_media_posts, count actual posts in the array (not function calls)
-      const counterIncrement = toolCall.function.name === 'create_social_media_posts'
-        ? ((functionArgs.posts as any[])?.length ?? 1)
-        : 1;
-      pendingCounterUpdates[toolCall.function.name] =
-        (pendingCounterUpdates[toolCall.function.name] || 0) + counterIncrement;
+      // A media-gen "success" that only paused for confirmation produced no asset —
+      // do NOT count it toward calledFunctions (the set_work_plan_status completion
+      // gate) or the per-run media-asset total. See mediaGenProducedAsset: this is
+      // the fix for the counter pollution that let an image step be marked complete
+      // with 3 of 18 images (calledFunctions.generate_image=76, assets=3).
+      const producedAsset = mediaGenProducedAsset(toolCall.function.name, result);
 
-      // Track media assets produced this iteration so the loop can carry a running
-      // per-run total into the next call's time-budget decision.
-      if (MEDIA_GEN_TOOLS.has(toolCall.function.name)) {
-        mediaAssetsProduced += 1;
+      if (producedAsset) {
+        // For create_social_media_posts, count actual posts in the array (not function calls)
+        const counterIncrement = toolCall.function.name === 'create_social_media_posts'
+          ? ((functionArgs.posts as any[])?.length ?? 1)
+          : 1;
+        pendingCounterUpdates[toolCall.function.name] =
+          (pendingCounterUpdates[toolCall.function.name] || 0) + counterIncrement;
+
+        // Track media assets produced this iteration so the loop can carry a running
+        // per-run total into the next call's time-budget decision.
+        if (MEDIA_GEN_TOOLS.has(toolCall.function.name)) {
+          mediaAssetsProduced += 1;
+        }
       }
 
       // For playwright screenshots, pass the image back to the LLM as a vision input.

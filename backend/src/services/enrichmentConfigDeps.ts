@@ -128,6 +128,14 @@ export function buildConfigServiceDeps(): ConfigServiceDeps {
       const list = await crmDb.getLeadListById(listId);
       return Array.isArray(list?.fieldNames) ? (list!.fieldNames as string[]) : [];
     },
+    mergeListFieldNames: async (listId, fieldNames) => {
+      // Append only names not already present (getLeadListById dedupes on
+      // read), so calling this on every config save is idempotent.
+      const list = await crmDb.getLeadListById(listId);
+      const existing = new Set(Array.isArray(list?.fieldNames) ? (list!.fieldNames as string[]) : []);
+      const trulyNew = fieldNames.filter((n) => !existing.has(n));
+      if (trulyNew.length > 0) await crmDb.mergeFieldNames(listId, trulyNew);
+    },
     llmSuggestTypes: async (fields) => heuristicTypeSuggestion(fields),
     llmInferAliases,
     llmClassifySmartFields,

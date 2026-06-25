@@ -177,6 +177,13 @@ export interface ConfigServiceDeps {
   readListConfig(listId: string): Promise<EnrichmentConfig | null>;
   writeListConfig(listId: string, config: EnrichmentConfig): Promise<void>;
   loadListFieldNames(listId: string): Promise<string[]>;
+  /** Register custom-field column names on the parent list so the Configure
+   *  Display Fields dialog (which reads list.fieldNames) shows a configured
+   *  enrichment column even before any lead has a value for it. Without this,
+   *  a field whose value is never found — or is dropped by the critic — never
+   *  appears as a column and the user thinks it "disappeared". Implementations
+   *  should fail soft (the config write already succeeded). */
+  mergeListFieldNames(listId: string, fieldNames: string[]): Promise<void>;
   llmSuggestTypes(
     input: Array<{ name: string; instruction: string }>,
   ): Promise<FieldTypeSuggestion[]>;
@@ -589,12 +596,46 @@ export async function processEnrichmentConfig(
   return { config: stamped, warnings };
 }
 
+/** Config field names that represent CUSTOM columns (i.e. not standard lead
+ *  columns rendered through dedicated UI, and not internal sidecars). These
+ *  are the names the Configure Display Fields dialog lists under "Custom
+ *  Fields" — so registering them on list.fieldNames makes a configured
+ *  enrichment field visible as a column even when it has no value yet. */
+export function customColumnNamesFromConfig(config: EnrichmentConfig): string[] {
+  const standard = new Set<string>([...STANDARD_ENRICHABLE_FIELDS, 'website']);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const f of config.fields ?? []) {
+    const name = (f.name ?? '').trim();
+    if (!name) continue;
+    if (standard.has(name)) continue;
+    if (EXCLUDED_LIST_FIELD_NAMES.has(name)) continue;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
+  }
+  return out;
+}
+
 export async function setEnrichmentConfig(
   input: { listId: string; userId: string; config: EnrichmentConfig },
   deps: ConfigServiceDeps,
 ): Promise<{ config: EnrichmentConfig; warnings: string[] }> {
   const { config, warnings } = await processEnrichmentConfig(input, deps);
   await deps.writeListConfig(input.listId, config);
+  // Register configured custom columns on the parent list so they show up in
+  // the Configure Display Fields dialog immediately — independent of whether
+  // enrichment ever finds (or the critic keeps) a value. Fail soft: the config
+  // itself is already persisted.
+  const customColumns = customColumnNamesFromConfig(config);
+  if (customColumns.length > 0) {
+    try {
+      await deps.mergeListFieldNames(input.listId, customColumns);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[setEnrichmentConfig] fieldNames registration failed:', (err as Error).message);
+    }
+  }
   return { config, warnings };
 }
 

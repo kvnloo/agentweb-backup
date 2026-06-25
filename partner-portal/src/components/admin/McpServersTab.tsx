@@ -24,6 +24,10 @@ import {
   Chip,
   IconButton,
   Collapse,
+  Tooltip,
+  Switch,
+  FormControlLabel,
+  Backdrop,
 } from "@mui/material";
 import {
   Add as AddIcon,
@@ -32,10 +36,29 @@ import {
   Refresh as RefreshIcon,
   ExpandMore as ExpandMoreIcon,
   ExpandLess as ExpandLessIcon,
+  VpnKey as KeyIcon,
+  Autorenew as AutorenewIcon,
 } from "@mui/icons-material";
 import axios from "axios";
 import { useAuth } from "../../contexts/AuthContext";
 import { buildApiUrl } from "../../config";
+
+// Tokens are proactively refreshed once they're within this window of expiry
+// (must match OAUTH_REFRESH_LEAD_MS on the backend).
+const OAUTH_REFRESH_LEAD_MS = 5 * 60 * 1000;
+// How often to silently re-fetch servers so the countdown reflects refreshed tokens.
+const SERVER_POLL_MS = 30 * 1000;
+
+// Format a millisecond duration as a compact countdown, e.g. "1h 4m", "4m 12s", "9s".
+const formatDuration = (ms: number): string => {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+};
 
 // Validation constants
 const NAME_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -89,7 +112,73 @@ interface McpServer {
   env?: Record<string, string>;
   accessToken?: string;
   isInternal?: boolean;
+  // Backend-only: server is used by backend services but its tools are hidden from the agent (Emma).
+  excludeFromAgent?: boolean;
   discoveredTools?: string[];
+  authType?: "none" | "bearer" | "oauth";
+  oauthExpiresAt?: number;
+  oauthHasRefreshToken?: boolean;
+}
+
+// Renders a compact, live "auto-refresh" countdown chip for an OAuth server.
+// The chip stays narrow (short label) with the full status in a tooltip, so it
+// doesn't widen the table column; aria-label carries the full text.
+const OAuthCountdown: React.FC<{ expiresAt: number; canRefresh?: boolean; now: number }> = ({
+  expiresAt,
+  canRefresh,
+  now,
+}) => {
+  const nextRefreshIn = expiresAt - OAUTH_REFRESH_LEAD_MS - now;
+  const expiresIn = expiresAt - now;
+
+  let short: string;
+  let full: string;
+  let color: "success" | "warning" | "error";
+  if (!canRefresh && expiresIn <= 0) {
+    short = "Re-authorize";
+    full = "Token expired — click the key icon to re-authorize";
+    color = "error";
+  } else if (nextRefreshIn > 0) {
+    short = formatDuration(nextRefreshIn);
+    full = `Auto-refresh in ${short}`;
+    color = "success";
+  } else if (expiresIn > 0) {
+    short = "Refreshing…";
+    full = "Refreshing token…";
+    color = "warning";
+  } else {
+    // Reached only when the token is at/just past expiry but a refresh is still possible
+    // (canRefresh is necessarily true here — the !canRefresh+expired case is handled above).
+    short = "Refreshing…";
+    full = "Refreshing token…";
+    color = "warning";
+  }
+
+  return (
+    <Tooltip title={full}>
+      <Chip
+        aria-label={full}
+        icon={<AutorenewIcon sx={{ fontSize: 14 }} />}
+        label={short}
+        size="small"
+        variant="outlined"
+        color={color}
+        sx={{
+          mt: 0.5,
+          height: 22,
+          maxWidth: "100%",
+          "& .MuiChip-label": { px: 0.75, fontSize: "0.7rem" },
+          "& .MuiChip-icon": { ml: 0.5, mr: -0.25 },
+        }}
+      />
+    </Tooltip>
+  );
+};
+
+interface OAuthFlowResult {
+  ok: boolean;
+  skipped?: boolean;
+  error?: string;
 }
 
 
@@ -115,6 +204,7 @@ const McpServersTab: React.FC = () => {
     command: "",
     accessToken: "",
     isInternal: false,
+    excludeFromAgent: false,
   });
   const [argsInput, setArgsInput] = useState("");
   const [configInput, setConfigInput] = useState("");
@@ -123,9 +213,88 @@ const McpServersTab: React.FC = () => {
   // Tool discovery state
   const [discoveryLoading, setDiscoveryLoading] = useState<string | null>(null);
   const [expandedServer, setExpandedServer] = useState<string | null>(null);
-  // unused state removed
-  
+  // OAuth authorization state (server name currently being authorized)
+  const [authorizingServer, setAuthorizingServer] = useState<string | null>(null);
+  // Server name we're currently contacting to start OAuth (initiate round-trip). Drives a
+  // blocking loader because the backend connection can take a few seconds before the popup opens.
+  const [oauthConnecting, setOauthConnecting] = useState<string | null>(null);
+  // Ticking clock that drives the live OAuth countdowns.
+  const [now, setNow] = useState<number>(() => Date.now());
+
   const { token } = useAuth();
+
+  // Opens the OAuth provider's login page in a popup and resolves once the
+  // backend callback posts a result message back (or the popup is closed).
+  const openOAuthPopup = (authorizationUrl: string): Promise<OAuthFlowResult> =>
+    new Promise((resolve) => {
+      const popup = window.open(authorizationUrl, "mcp-oauth", "width=600,height=720");
+      if (!popup) {
+        resolve({ ok: false, error: "Popup blocked. Allow popups and try again." });
+        return;
+      }
+      const cleanup = () => {
+        window.removeEventListener("message", onMessage);
+        clearInterval(timer);
+      };
+      const onMessage = (event: MessageEvent) => {
+        if (event.data && event.data.source === "mcp-oauth") {
+          cleanup();
+          resolve({ ok: !!event.data.success, error: event.data.error });
+        }
+      };
+      window.addEventListener("message", onMessage);
+      const timer = setInterval(() => {
+        if (popup.closed) {
+          cleanup();
+          resolve({ ok: false, error: "Authorization window was closed before completing." });
+        }
+      }, 800);
+    });
+
+  // Asks the backend whether the server needs OAuth; if so, runs the popup flow.
+  // Returns skipped:true when the server connects without interactive auth.
+  const runOAuthFlow = async (serverName: string): Promise<OAuthFlowResult> => {
+    // Show a loader while the backend connects to the server to start OAuth — this
+    // initiate round-trip is the delay before the popup opens. Cleared once we have a
+    // response (popup opens immediately after, or the server skipped interactive auth).
+    setOauthConnecting(serverName);
+    let response;
+    try {
+      response = await axios.post(
+        buildApiUrl(`/api/admin/mcp-servers/${encodeURIComponent(serverName)}/oauth/initiate`),
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+    } finally {
+      setOauthConnecting(null);
+    }
+    if (!response.data?.authorizationRequired) {
+      return { ok: true, skipped: true };
+    }
+    return openOAuthPopup(response.data.authorizationUrl);
+  };
+
+  const handleAuthorize = async (server: McpServer) => {
+    try {
+      setAuthorizingServer(server.name);
+      setError("");
+      setSuccess("");
+      const result = await runOAuthFlow(server.name);
+      if (result.skipped) {
+        setSuccess(`${server.name} connected — no OAuth required.`);
+        await handleDiscoverTools(server.name);
+      } else if (result.ok) {
+        setSuccess(`Authorized ${server.name} successfully.`);
+        await handleDiscoverTools(server.name);
+      } else {
+        setError(`Authorization failed: ${result.error || "Unknown error"}`);
+      }
+    } catch (err: any) {
+      setError(err.response?.data?.message || "Failed to start authorization");
+    } finally {
+      setAuthorizingServer(null);
+    }
+  };
 
   const isHttpTransport =
     formData.transport === "streamable-http" || formData.transport === "sse";
@@ -145,18 +314,32 @@ const McpServersTab: React.FC = () => {
     loadServers();
   }, []);
 
-  const loadServers = async () => {
+  // Tick every second so OAuth countdowns stay live.
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Silently re-fetch servers periodically so refreshed token expiries show up.
+  // Depend on token so the interval re-binds to the current token (a stale closure would
+  // keep polling with the token captured at mount after re-auth / delegation).
+  useEffect(() => {
+    const id = setInterval(() => loadServers(true), SERVER_POLL_MS);
+    return () => clearInterval(id);
+  }, [token]);
+
+  const loadServers = async (silent = false) => {
     try {
-      setLoading(true);
-      setError("");
+      if (!silent) setLoading(true);
+      if (!silent) setError("");
       const response = await axios.get(buildApiUrl("/api/admin/mcp-servers"), {
         headers: { Authorization: `Bearer ${token}` },
       });
       setServers(response.data);
     } catch (err: any) {
-      setError(err.response?.data?.message || "Failed to load MCP servers");
+      if (!silent) setError(err.response?.data?.message || "Failed to load MCP servers");
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
@@ -213,6 +396,7 @@ const McpServersTab: React.FC = () => {
             command: formData.command,
             args: parsedArgs,
             isInternal: formData.isInternal,
+            excludeFromAgent: formData.excludeFromAgent,
           }
         : {
             ...parsedConfig,
@@ -221,26 +405,53 @@ const McpServersTab: React.FC = () => {
             url: formData.url,
             accessToken: formData.accessToken,
             isInternal: formData.isInternal,
+            excludeFromAgent: formData.excludeFromAgent,
           };
 
       await axios.post(buildApiUrl("/api/admin/mcp-servers"), finalPayload, {
         headers: { Authorization: `Bearer ${token}` },
       });
       // Don't set success message here yet, wait for discovery
-      // setSuccess("Server added successfully"); 
+      // setSuccess("Server added successfully");
       setAddDialogOpen(false);
       const newServerName = formData.name!; // Name is required in form
+      const isHttpServer = formData.transport !== "stdio";
       resetForm();
-      
+
       // Auto-discover tools
       // We keep formLoading true while discovering? Or maybe separate loading state?
       // existing handleDiscoverTools sets discoveryLoading
       setFormLoading(false); // Valid to clear form loading as dialog is closed
-      
+
+      // For HTTP servers, detect whether the server needs OAuth. If it does, run
+      // the login popup before discovering tools. The system decides based on the
+      // server's own response — no manual auth-type selection needed.
+      if (isHttpServer) {
+        try {
+          const result = await runOAuthFlow(newServerName);
+          if (!result.ok && !result.skipped) {
+            setError(
+              `Server added, but authorization failed: ${result.error || "Unknown error"}. Use the key icon to retry.`
+            );
+            loadServers();
+            return;
+          }
+          if (result.ok && !result.skipped) {
+            setSuccess(`Authorized ${newServerName} successfully.`);
+          }
+        } catch (err: any) {
+          setError(
+            `Server added, but the authorization check failed: ${err.response?.data?.message || err.message}. Use the key icon to retry.`
+          );
+          loadServers();
+          return;
+        }
+      }
+
       await handleDiscoverTools(newServerName);
-      
+
       // loadServers is called inside handleDiscoverTools
-    
+
     } catch (err: any) {
       setError(err.response?.data?.message || "Failed to add server");
       setFormLoading(false);
@@ -276,6 +487,7 @@ const McpServersTab: React.FC = () => {
             command: formData.command,
             args: parsedArgs,
             isInternal: formData.isInternal,
+            excludeFromAgent: formData.excludeFromAgent,
           }
         : {
             ...parsedConfig,
@@ -284,6 +496,7 @@ const McpServersTab: React.FC = () => {
             url: formData.url,
             accessToken: formData.accessToken,
             isInternal: formData.isInternal,
+            excludeFromAgent: formData.excludeFromAgent,
           };
 
       await axios.put(
@@ -332,6 +545,7 @@ const McpServersTab: React.FC = () => {
       command: "",
       accessToken: "",
       isInternal: false,
+      excludeFromAgent: false,
     });
     setArgsInput("");
     setConfigInput("");
@@ -347,6 +561,7 @@ const McpServersTab: React.FC = () => {
       command: server.command || "",
       accessToken: server.accessToken || "",
       isInternal: server.isInternal || false,
+      excludeFromAgent: server.excludeFromAgent || false,
     });
     setArgsInput(server.args ? server.args.join('\n') : "");
     
@@ -381,13 +596,21 @@ const McpServersTab: React.FC = () => {
 
   return (
     <Box>
+      {/* Blocking loader while we contact the server to start OAuth (initiate round-trip),
+          so the gap before the login popup opens isn't a dead click. */}
+      <Backdrop open={!!oauthConnecting} sx={{ color: "#fff", zIndex: (theme) => theme.zIndex.modal + 1, backdropFilter: "blur(4px)", backgroundColor: "rgba(0,0,0,0.4)" }}>
+        <Box display="flex" flexDirection="column" alignItems="center" gap={2}>
+          <CircularProgress color="inherit" />
+          <Typography>Connecting to {oauthConnecting} for authorization…</Typography>
+        </Box>
+      </Backdrop>
       <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
         <Typography variant="h6">MCP Servers</Typography>
         <Box>
           <Button
             variant="outlined"
             startIcon={<RefreshIcon />}
-            onClick={loadServers}
+            onClick={() => loadServers()}
             sx={{ mr: 1 }}
           >
             Refresh
@@ -461,19 +684,28 @@ const McpServersTab: React.FC = () => {
                       </Box>
                     </TableCell>
                     <TableCell>
-                      <Chip
-                        label={server.transport}
-                        size="small"
-                        color={
-                          server.transport === "streamable-http"
-                            ? "primary"
-                            : server.transport === "sse"
-                            ? "secondary"
-                            : server.transport === "stdio"
-                            ? "success"
-                            : "default"
-                        }
-                      />
+                      <Box display="flex" flexDirection="column" alignItems="flex-start">
+                        <Chip
+                          label={server.transport}
+                          size="small"
+                          color={
+                            server.transport === "streamable-http"
+                              ? "primary"
+                              : server.transport === "sse"
+                              ? "secondary"
+                              : server.transport === "stdio"
+                              ? "success"
+                              : "default"
+                          }
+                        />
+                        {server.authType === "oauth" && typeof server.oauthExpiresAt === "number" && (
+                          <OAuthCountdown
+                            expiresAt={server.oauthExpiresAt}
+                            canRefresh={server.oauthHasRefreshToken}
+                            now={now}
+                          />
+                        )}
+                      </Box>
                     </TableCell>
                     <TableCell>
                       <Typography variant="body2" sx={{ maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis" }}>
@@ -498,7 +730,18 @@ const McpServersTab: React.FC = () => {
                       </Button>
                     </TableCell>
 
-                    <TableCell>
+                    <TableCell sx={{ whiteSpace: "nowrap" }}>
+                      {(server.transport === "streamable-http" || server.transport === "sse") && (
+                        <IconButton
+                          size="small"
+                          onClick={() => handleAuthorize(server)}
+                          title={server.authType === "oauth" ? "Re-authorize (OAuth)" : "Authorize / connect"}
+                          color={server.authType === "oauth" ? "success" : "default"}
+                          disabled={authorizingServer === server.name}
+                        >
+                          {authorizingServer === server.name ? <CircularProgress size={16} /> : <KeyIcon />}
+                        </IconButton>
+                      )}
                       <IconButton
                         size="small"
                         onClick={() => openEditDialog(server)}
@@ -622,7 +865,7 @@ const McpServersTab: React.FC = () => {
                   fullWidth
                   multiline
                   minRows={3}
-                  placeholder={"-y\n@brave/brave-search-mcp-server\n--transport\nstdio"}
+                  placeholder={"-y\n@modelcontextprotocol/server-filesystem\n/tmp"}
                 />
                 <TextField
                   label="Environment Variables JSON (optional)"
@@ -631,7 +874,7 @@ const McpServersTab: React.FC = () => {
                   fullWidth
                   multiline
                   minRows={4}
-                  placeholder={'{"env":{"BRAVE_API_KEY":"${BRAVE_API_KEY}"}}'}
+                  placeholder={'{"env":{"MCP_LOG_LEVEL":"info"}}'}
                   helperText='Use ${VAR} for server env vars, {{var}} for per-user secrets (configured in Users tab)'
                 />
               </>
@@ -644,8 +887,21 @@ const McpServersTab: React.FC = () => {
                 fullWidth
                 type="password"
                 placeholder="${MCP_ACCESS_TOKEN}"
+                helperText="Leave blank for servers that use OAuth — after adding, a login window opens automatically if the server requires it."
               />
             )}
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={!!formData.excludeFromAgent}
+                  onChange={(e) => setFormData({ ...formData, excludeFromAgent: e.target.checked })}
+                />
+              }
+              label="Hide from agent (backend-only)"
+            />
+            <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+              When on, this server is connected for backend services only — its tools are not exposed to the agent.
+            </Typography>
 
           </Box>
         </DialogContent>
@@ -739,7 +995,7 @@ const McpServersTab: React.FC = () => {
                   fullWidth
                   multiline
                   minRows={4}
-                  placeholder={'{"env":{"BRAVE_API_KEY":"${BRAVE_API_KEY}"}}'}
+                  placeholder={'{"env":{"MCP_LOG_LEVEL":"info"}}'}
                   helperText='Use ${VAR} for server env vars, {{var}} for per-user secrets (configured in Users tab)'
                 />
               </>
@@ -753,6 +1009,18 @@ const McpServersTab: React.FC = () => {
                 type="password"
               />
             )}
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={!!formData.excludeFromAgent}
+                  onChange={(e) => setFormData({ ...formData, excludeFromAgent: e.target.checked })}
+                />
+              }
+              label="Hide from agent (backend-only)"
+            />
+            <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+              When on, this server is connected for backend services only — its tools are not exposed to the agent.
+            </Typography>
 
           </Box>
         </DialogContent>

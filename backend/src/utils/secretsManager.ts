@@ -780,6 +780,18 @@ export interface LandingPagesConfig {
   ga4PropertyId: string;
   gscDomain: string;
   ga4MeasurementId?: string;
+  /**
+   * Additional domain→GA4 mappings beyond the base gscDomain/ga4PropertyId.
+   * Lets the platform serve landing pages on more than one root domain (e.g.
+   * audit pages on agentweb.pro alongside form pages on agentwebforms.com),
+   * each with its own GA4 property + measurement ID. Resolved by
+   * resolveLandingPageGa4 (utils/landingPageGa4.ts).
+   */
+  additionalDomains?: Array<{
+    gscDomain: string;
+    ga4PropertyId: string;
+    ga4MeasurementId?: string;
+  }>;
 }
 
 /**

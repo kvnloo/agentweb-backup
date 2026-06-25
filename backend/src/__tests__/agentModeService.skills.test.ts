@@ -305,10 +305,13 @@ describe('AgentModeService - Skills', () => {
       expect(result.allowedToolNames.has('install_skills')).toBe(true);
     });
 
-    it('should include search_web in foundation tools', () => {
+    it('should expose explicit You.com search tools in foundation tools without the compatibility alias', () => {
       const result = (agentModeService as any).buildSkillContext([], ['*'], [], []);
 
-      expect(result.allowedToolNames.has('search_web')).toBe(true);
+      expect(result.allowedToolNames.has('search_web')).toBe(false);
+      expect(result.allowedToolNames.has('you_search_web')).toBe(true);
+      expect(result.allowedToolNames.has('you_search_news')).toBe(true);
+      expect(result.allowedToolNames.has('google_search_web')).toBe(false);
     });
 
     it('should add skill toolNames to allowed set', () => {
@@ -578,7 +581,8 @@ describe('AgentModeService - Skills', () => {
         { name: 'read_brand_guidelines', definition: { function: { name: 'read_brand_guidelines', description: 'desc' } } },
         { name: 'install_skills', definition: { function: { name: 'install_skills', description: 'infra' } } },
         { name: 'create_work_plan', definition: { function: { name: 'create_work_plan', description: 'Create work plan' } } },
-        { name: 'search_web', definition: { function: { name: 'search_web', description: 'Search the web' } } },
+        { name: 'you_search_web', definition: { function: { name: 'you_search_web', description: 'Search the web with You.com' } } },
+        { name: 'you_search_news', definition: { function: { name: 'you_search_news', description: 'Search news with You.com' } } },
       ];
       jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
 
@@ -655,8 +659,27 @@ describe('AgentModeService - Skills', () => {
       // Foundation tools should bypass subscription filter
       expect(toolNames).toContain('create_work_plan');
       expect(toolNames).toContain('install_skills');
+      expect(toolNames).toContain('you_search_web');
+      expect(toolNames).not.toContain('search_web');
       // Non-foundation tool allowed by subscription should also be present
       expect(toolNames).toContain('read_brand_guidelines');
+    });
+
+    it('should not expose a deprecated search tool when a legacy skill allows search_web', async () => {
+      const { filterFunctionCalls: mockFilterFn } = require('../services/subscriptionService');
+      (mockFilterFn as jest.Mock).mockImplementationOnce((tools: any[], allowed: string[]) => {
+        if (allowed.includes('*')) return tools;
+        return tools.filter((t: any) => {
+          const name = t.function?.name || t.name;
+          return !name || allowed.includes(name);
+        });
+      });
+
+      const result = await agentModeService.getFilteredTools('user-123', new Set(['search_web']));
+
+      const toolNames = result.map((t: any) => t.function?.name || t.name);
+      expect(toolNames).not.toContain('search_web');
+      expect(toolNames).not.toContain('you_search_web');
     });
   });
 
@@ -859,6 +882,11 @@ describe('AgentModeService - Skills', () => {
       expect(foundationTools.has('set_work_plan_status')).toBe(true);
       expect(foundationTools.has('search_leads')).toBe(true);
       expect(foundationTools.has('get_lead_lists')).toBe(true);
+      // get_registration_status is intentionally NOT a foundation tool — it
+      // queries AW-Users (signup/premium status) for arbitrary emails, which is
+      // an admin/founder funnel concern and an account-enumeration oracle if
+      // exposed to every tenant. It lives in ADMIN_SKILL_TOOL_NAMES instead.
+      expect(foundationTools.has('get_registration_status')).toBe(false);
       // S3 overflow retrieval tools must always be available so the LLM can read
       // large tool responses that were offloaded to S3 by the 10KB overflow mechanism.
       expect(foundationTools.has('search_tool_response')).toBe(true);
@@ -897,6 +925,9 @@ describe('AgentModeService - Skills', () => {
       expect(tools.has('install_skills')).toBe(true);
       expect(tools.has('list_available_skills')).toBe(true);
       expect(tools.has('resolve_skill')).toBe(true);
+      expect(tools.has('you_search_web')).toBe(true);
+      expect(tools.has('you_search_news')).toBe(true);
+      expect(tools.has('google_search_web')).toBe(false);
       expect(tools.has('search_tool_response')).toBe(true);
       expect(tools.has('read_tool_response')).toBe(true);
       // Force-merged so a DB config can't strip the self-status tool (else Emma

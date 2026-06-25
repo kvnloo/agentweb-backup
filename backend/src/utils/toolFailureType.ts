@@ -19,7 +19,7 @@
  *   schema_reject          — arguments failed validation before execution
  *                            (missing required arg). Cheap; fix the schema/args.
  *   config                 — environment/credentials/quota/missing-resource;
- *                            fixable without touching tool logic (Brave 429,
+ *                            fixable without touching tool logic (provider 429,
  *                            missing S3 bucket, bot-not-in-channel, auth gap).
  *   bug                    — genuine or transient failure to investigate
  *                            (network drop, opaque 5xx, unknown). The default.
@@ -54,8 +54,8 @@ const SCHEMA_RE =
 
 // Includes the technical config/credential/quota signals from the error MESSAGE
 // so pre-classifier events (errorClass recorded as the unhelpful 'Error') are
-// still classified — e.g. the Brave 429s, which would otherwise fall to 'bug'.
-// "summarizer summary" = downstream of a Brave 429 (cascade). "operation was
+// still classified — e.g. provider 429s, which would otherwise fall to 'bug'.
+// "summarizer summary" = downstream of a provider 429 (cascade). "operation was
 // aborted" = an AbortController timeout — a tunable-infra issue, not a code bug.
 const CONFIG_RE =
   /\b429\b|too many requests|rate.?limit|quota exceeded|unauthorized|forbidden|invalid api key|missing credentials|bad credentials|authentication failed|does not exist|not configured|not a member of channel|not authorized|no secrets configured|account connected|specified bucket|job timed out|insights job|unable to retrieve a summarizer|status code 404|operation was aborted/i;
