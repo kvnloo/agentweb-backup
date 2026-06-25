@@ -136,6 +136,14 @@ describe('google_calendar_update_event guards', () => {
     expect(res.message).toMatch(/no fields to update/i);
     expect(mockPatch).not.toHaveBeenCalled();
   });
+
+  it('rejects all-day start combined with a datetime end', async () => {
+    mockGetAccountByPlatform.mockResolvedValue(writeAccount());
+    const res = await runUpdate({ event_id: 'ev1', start: '2026-07-01', end: '2026-07-01T10:00:00' });
+    expect(res.success).toBe(false);
+    expect(res.message).toMatch(/all-day/i);
+    expect(mockPatch).not.toHaveBeenCalled();
+  });
 });
 
 // ── google_calendar_update_event happy paths ──────────────────────────────────

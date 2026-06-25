@@ -158,12 +158,12 @@ emmaToolRegistry.register({
       const items = response.data.items || [];
       const events = items.map((e: any) => ({
         id: e.id,
-        title: e.summary || '(No title)',
+        title: sanitizeField(e.summary, 200) ?? '(No title)',
         start: e.start?.dateTime || e.start?.date || null,
         end: e.end?.dateTime || e.end?.date || null,
         all_day: !e.start?.dateTime,
-        location: e.location || null,
-        description: e.description ? e.description.substring(0, 500) : null,
+        location: sanitizeField(e.location, 200),
+        description: sanitizeField(e.description, 500),
         status: e.status,
         organizer: e.organizer?.email || null,
         attendees: (e.attendees || []).map((a: any) => ({
@@ -259,12 +259,12 @@ emmaToolRegistry.register({
         success: true,
         event: {
           id: e.id,
-          title: e.summary || '(No title)',
+          title: sanitizeField(e.summary, 200) ?? '(No title)',
           start: e.start?.dateTime || e.start?.date || null,
           end: e.end?.dateTime || e.end?.date || null,
           all_day: !e.start?.dateTime,
-          location: e.location || null,
-          description: e.description || null,
+          location: sanitizeField(e.location, 200),
+          description: sanitizeField(e.description, 500),
           status: e.status,
           organizer: e.organizer ? { email: e.organizer.email, name: e.organizer.displayName || null } : null,
           attendees: (e.attendees || []).map((a: any) => ({
@@ -474,11 +474,16 @@ emmaToolRegistry.register({
     let end: any;
 
     if (isAllDay) {
+      if (args.end && !/^\d{4}-\d{2}-\d{2}$/.test(args.end.trim())) {
+        return {
+          success: false,
+          message: `start is an all-day date ("${args.start.trim()}") but end looks like a datetime ("${args.end.trim()}"). ` +
+            'Use matching formats: both "YYYY-MM-DD" for all-day, or both "YYYY-MM-DDThh:mm:ss" for timed events.',
+        };
+      }
       start = { date: args.start.trim() };
       // Google requires end.date for all-day events; default to the day after start.
-      const endDate = args.end && /^\d{4}-\d{2}-\d{2}$/.test(args.end.trim())
-        ? args.end.trim()
-        : addDaysToDateString(args.start.trim(), 1);
+      const endDate = args.end ? args.end.trim() : addDaysToDateString(args.start.trim(), 1);
       end = { date: endDate };
     } else {
       const timeZone = args.time_zone || undefined;
@@ -535,14 +540,14 @@ emmaToolRegistry.register({
       const e = response.data;
       return {
         success: true,
-        message: `Event "${e.summary || args.summary}" created.`,
+        message: `Event "${sanitizeField(e.summary, 100) || args.summary}" created.`,
         event: {
           id: e.id,
-          title: e.summary || args.summary,
+          title: sanitizeField(e.summary, 200) ?? sanitizeField(args.summary, 200),
           start: e.start?.dateTime || e.start?.date || null,
           end: e.end?.dateTime || e.end?.date || null,
           all_day: !e.start?.dateTime,
-          location: e.location || null,
+          location: sanitizeField(e.location, 200),
           attendees: (e.attendees || []).map((a: any) => ({
             email: a.email,
             response: a.responseStatus,
@@ -631,7 +636,7 @@ emmaToolRegistry.register({
         },
         add_conference: {
           type: 'boolean',
-          description: 'When true, attach a Google Meet link (only if one does not already exist).',
+          description: 'When true, attach or replace a Google Meet link on the event.',
         },
       },
       required: ['event_id'],
@@ -670,10 +675,15 @@ emmaToolRegistry.register({
     if (args.start !== undefined) {
       const isAllDay = /^\d{4}-\d{2}-\d{2}$/.test(args.start.trim());
       if (isAllDay) {
+        if (args.end && !/^\d{4}-\d{2}-\d{2}$/.test(args.end.trim())) {
+          return {
+            success: false,
+            message: `start is an all-day date ("${args.start.trim()}") but end looks like a datetime ("${args.end.trim()}"). ` +
+              'Use matching formats: both "YYYY-MM-DD" for all-day, or both "YYYY-MM-DDThh:mm:ss" for timed events.',
+          };
+        }
         patch.start = { date: args.start.trim() };
-        const endDate = args.end && /^\d{4}-\d{2}-\d{2}$/.test(args.end.trim())
-          ? args.end.trim()
-          : addDaysToDateString(args.start.trim(), 1);
+        const endDate = args.end ? args.end.trim() : addDaysToDateString(args.start.trim(), 1);
         patch.end = { date: endDate };
       } else {
         const timeZone = args.time_zone || undefined;
@@ -719,14 +729,14 @@ emmaToolRegistry.register({
       const e = response.data;
       return {
         success: true,
-        message: `Event "${e.summary}" updated.`,
+        message: `Event "${sanitizeField(e.summary, 100) ?? args.event_id}" updated.`,
         event: {
           id: e.id,
-          title: e.summary || null,
+          title: sanitizeField(e.summary, 200),
           start: e.start?.dateTime || e.start?.date || null,
           end: e.end?.dateTime || e.end?.date || null,
           all_day: !e.start?.dateTime,
-          location: e.location || null,
+          location: sanitizeField(e.location, 200),
           meeting_link: e.hangoutLink || null,
           html_link: e.htmlLink || null,
         },
@@ -865,8 +875,9 @@ function addMinutesToDateTime(dateTimeStr: string, minutes: number): string | nu
 
   // Floating local datetime (no zone), e.g. "2026-06-30T14:00:00". Parse the
   // wall-clock components as if UTC and format them back as UTC so parse and
-  // format stay consistent (no server-timezone drift). The event's timeZone
-  // field resolves the real instant.
+  // format stay consistent (no server-timezone drift). The returned string has
+  // no Z suffix intentionally — Google treats it as a floating local time resolved
+  // by the event's timeZone field, not as a UTC instant.
   const m = dateTimeStr
     .trim()
     .match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?$/);
@@ -885,4 +896,13 @@ function extractMeetingLink(description: string | null | undefined): string | nu
   if (!description) return null;
   const match = description.match(/https:\/\/(meet\.google\.com|zoom\.us|teams\.microsoft\.com)\S*/);
   return match ? match[0] : null;
+}
+
+/**
+ * Truncate a string from external calendar data before returning it to the LLM.
+ * Limits injection surface from untrusted event content (titles, descriptions, etc.).
+ */
+function sanitizeField(value: string | null | undefined, maxLen: number): string | null {
+  if (!value) return null;
+  return value.length > maxLen ? value.slice(0, maxLen) + '…' : value;
 }

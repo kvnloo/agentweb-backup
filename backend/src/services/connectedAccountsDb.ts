@@ -141,6 +141,10 @@ export const hasGmailCalendarScope = (config: GmailConfig | undefined | null): b
     ...(config.granted_scopes || []),
     ...(config.scopes || []),
   ];
+  // Intentional substring match: 'calendar' catches calendar.events and
+  // calendar (full) scopes in addition to calendar.readonly, since all imply
+  // at least read access. calendar.events.readonly would also match — acceptable,
+  // as it grants the same read capability we need here.
   return all.some(s => s.includes('calendar.readonly') || s.includes('calendar'));
 };
 
@@ -162,8 +166,7 @@ export const hasGmailCalendarWriteScope = (config: GmailConfig | undefined | nul
     if (s.endsWith('.readonly')) return false;
     return (
       s.endsWith('/auth/calendar') ||
-      s.endsWith('/auth/calendar.events') ||
-      s.endsWith('/auth/calendar.events.owned')
+      s.endsWith('/auth/calendar.events')
     );
   });
 };

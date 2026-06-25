@@ -172,6 +172,23 @@ describe('google_calendar_create_event success paths', () => {
     expect(res.success).toBe(true);
   });
 
+  it('rejects all-day start combined with a datetime end', async () => {
+    mockGetAccountByPlatform.mockResolvedValue(writeAccount());
+    const res = await run({ summary: 's', start: '2026-07-01', end: '2026-07-01T10:00:00' });
+    expect(res.success).toBe(false);
+    expect(res.message).toMatch(/all-day/i);
+    expect(mockInsert).not.toHaveBeenCalled();
+  });
+
+  it('returns error when start datetime is malformed and end is omitted', async () => {
+    mockGetAccountByPlatform.mockResolvedValue(writeAccount());
+    // "2026-06-30T14" has no minutes — addMinutesToDateTime returns null → error path
+    const res = await run({ summary: 's', start: '2026-06-30T14' });
+    expect(res.success).toBe(false);
+    expect(res.message).toMatch(/end time/i);
+    expect(mockInsert).not.toHaveBeenCalled();
+  });
+
   it('wires attendees and requests email updates', async () => {
     mockGetAccountByPlatform.mockResolvedValue(writeAccount());
     mockInsert.mockResolvedValue({ data: { id: 'e', summary: 's', start: {}, end: {}, attendees: [] } });
@@ -197,6 +214,54 @@ describe('google_calendar_create_event success paths', () => {
     expect(call.conferenceDataVersion).toBe(1);
     expect(call.requestBody.conferenceData.createRequest.conferenceSolutionKey.type).toBe('hangoutsMeet');
     expect(res.event.meeting_link).toBe('https://meet/x');
+  });
+
+  it('does not attach conference when add_conference is false', async () => {
+    mockGetAccountByPlatform.mockResolvedValue(writeAccount());
+    mockInsert.mockResolvedValue({ data: { id: 'e', summary: 's', start: {}, end: {} } });
+
+    await run({ summary: 's', start: '2026-06-30T10:00:00', add_conference: false });
+
+    const call = mockInsert.mock.calls[0][0];
+    expect(call.requestBody.conferenceData).toBeUndefined();
+    expect(call.conferenceDataVersion).toBeUndefined();
+  });
+});
+
+describe('sanitizeField truncation', () => {
+  beforeEach(() => {
+    mockGetAccountByPlatform.mockResolvedValue(writeAccount());
+  });
+
+  it('truncates event title >200 chars in response', async () => {
+    const longTitle = 'A'.repeat(250);
+    mockInsert.mockResolvedValue({ data: { id: 'e', summary: longTitle, start: {}, end: {} } });
+
+    const res = await run({ summary: 's', start: '2026-06-30T10:00:00' });
+    expect(res.event.title).toBe('A'.repeat(200) + '…');
+  });
+
+  it('truncates title >100 chars in success message', async () => {
+    const longTitle = 'B'.repeat(150);
+    mockInsert.mockResolvedValue({ data: { id: 'e', summary: longTitle, start: {}, end: {} } });
+
+    const res = await run({ summary: 's', start: '2026-06-30T10:00:00' });
+    expect(res.message).toContain('B'.repeat(100) + '…');
+  });
+
+  it('does not truncate title under the limit', async () => {
+    mockInsert.mockResolvedValue({ data: { id: 'e', summary: 'Short title', start: {}, end: {} } });
+
+    const res = await run({ summary: 's', start: '2026-06-30T10:00:00' });
+    expect(res.event.title).toBe('Short title');
+  });
+
+  it('truncates location >200 chars', async () => {
+    const longLocation = 'L'.repeat(250);
+    mockInsert.mockResolvedValue({ data: { id: 'e', summary: 's', start: {}, end: {}, location: longLocation } });
+
+    const res = await run({ summary: 's', start: '2026-06-30T10:00:00' });
+    expect(res.event.location).toBe('L'.repeat(200) + '…');
   });
 });
 
