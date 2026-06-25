@@ -577,6 +577,264 @@ emmaToolRegistry.register({
   },
 });
 
+// ── google_calendar_update_event ─────────────────────────────────────────────
+
+emmaToolRegistry.register({
+  name: 'google_calendar_update_event',
+  definition: {
+    name: 'google_calendar_update_event',
+    description:
+      'Update (edit) an existing event on the user\'s Google Calendar. ' +
+      'Only the fields you provide are changed; omitted fields stay as-is. ' +
+      'Use the event ID from google_calendar_list_events or google_calendar_create_event. ' +
+      'Requires Gmail connected with Calendar write access. ' +
+      'Note: if attendees are provided, they replace the full existing attendee list.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        event_id: {
+          type: 'string',
+          description: 'ID of the event to update (required).',
+        },
+        calendar_id: {
+          type: 'string',
+          description: 'Calendar ID the event belongs to. Defaults to "primary".',
+        },
+        summary: {
+          type: 'string',
+          description: 'New event title.',
+        },
+        start: {
+          type: 'string',
+          description: 'New start datetime ("YYYY-MM-DDThh:mm:ss") or date ("YYYY-MM-DD") for all-day.',
+        },
+        end: {
+          type: 'string',
+          description: 'New end datetime or date. Required when changing start.',
+        },
+        time_zone: {
+          type: 'string',
+          description: 'IANA time zone for timed events (e.g. "America/Los_Angeles").',
+        },
+        description: {
+          type: 'string',
+          description: 'New event description / notes.',
+        },
+        location: {
+          type: 'string',
+          description: 'New location text.',
+        },
+        attendees: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Replacement attendee email list. Replaces all existing attendees.',
+        },
+        add_conference: {
+          type: 'boolean',
+          description: 'When true, attach a Google Meet link (only if one does not already exist).',
+        },
+      },
+      required: ['event_id'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId;
+    if (!userId) return { success: false, message: 'Authentication required: no user context.' };
+    if (!args.event_id) return { success: false, message: 'event_id is required.' };
+
+    const result = await getCalendarClient(userId, true);
+    if (!result) {
+      return {
+        success: false,
+        message: 'No Gmail account connected. Please connect your Gmail account in Settings → Connected Accounts.',
+      };
+    }
+    if ('error' in result) {
+      return {
+        success: false,
+        needs_reconnect: true,
+        message:
+          'Updating calendar events requires Calendar write access. Please go to Settings → Connected Accounts, ' +
+          'reconnect your Gmail account, and allow Calendar access (including managing events).',
+      };
+    }
+
+    const { client } = result;
+    const calendarId = args.calendar_id || 'primary';
+
+    const patch: any = {};
+    if (args.summary !== undefined) patch.summary = String(args.summary).trim();
+    if (args.description !== undefined) patch.description = String(args.description);
+    if (args.location !== undefined) patch.location = String(args.location);
+
+    if (args.start !== undefined) {
+      const isAllDay = /^\d{4}-\d{2}-\d{2}$/.test(args.start.trim());
+      if (isAllDay) {
+        patch.start = { date: args.start.trim() };
+        const endDate = args.end && /^\d{4}-\d{2}-\d{2}$/.test(args.end.trim())
+          ? args.end.trim()
+          : addDaysToDateString(args.start.trim(), 1);
+        patch.end = { date: endDate };
+      } else {
+        const timeZone = args.time_zone || undefined;
+        patch.start = { dateTime: args.start.trim(), ...(timeZone && { timeZone }) };
+        const endDateTime = args.end && args.end.trim()
+          ? args.end.trim()
+          : addMinutesToDateTime(args.start.trim(), 30);
+        if (!endDateTime) {
+          return { success: false, message: 'Could not determine end time. Please provide a valid end datetime.' };
+        }
+        patch.end = { dateTime: endDateTime, ...(timeZone && { timeZone }) };
+      }
+    }
+
+    if (Array.isArray(args.attendees)) {
+      patch.attendees = args.attendees
+        .filter((e: any) => typeof e === 'string' && e.includes('@'))
+        .map((email: string) => ({ email: email.trim() }));
+    }
+
+    if (args.add_conference) {
+      patch.conferenceData = {
+        createRequest: {
+          requestId: `aw-upd-${userId}-${Buffer.from(`${args.event_id}|${args.start || ''}`).toString('base64').slice(0, 32)}`,
+          conferenceSolutionKey: { type: 'hangoutsMeet' },
+        },
+      };
+    }
+
+    if (Object.keys(patch).length === 0) {
+      return { success: false, message: 'No fields to update. Provide at least one field to change.' };
+    }
+
+    try {
+      const response = await client.events.patch({
+        calendarId,
+        eventId: args.event_id,
+        requestBody: patch,
+        ...(args.add_conference && { conferenceDataVersion: 1 }),
+        ...(patch.attendees && patch.attendees.length > 0 && { sendUpdates: 'all' }),
+      });
+
+      const e = response.data;
+      return {
+        success: true,
+        message: `Event "${e.summary}" updated.`,
+        event: {
+          id: e.id,
+          title: e.summary || null,
+          start: e.start?.dateTime || e.start?.date || null,
+          end: e.end?.dateTime || e.end?.date || null,
+          all_day: !e.start?.dateTime,
+          location: e.location || null,
+          meeting_link: e.hangoutLink || null,
+          html_link: e.htmlLink || null,
+        },
+      };
+    } catch (error: any) {
+      const status = error?.response?.status || error?.code;
+      console.error('[google_calendar_update_event] API error:', error?.message);
+      if (status === 404) {
+        return { success: false, message: `Event ${args.event_id} not found in calendar ${calendarId}.` };
+      }
+      if (status === 403 || status === 401) {
+        return {
+          success: false,
+          needs_reconnect: true,
+          message: 'Calendar write access denied. Please reconnect your Gmail account in Settings → Connected Accounts.',
+        };
+      }
+      return { success: false, message: `Failed to update event: ${error?.message || 'Unknown error'}` };
+    }
+  },
+});
+
+// ── google_calendar_delete_event ─────────────────────────────────────────────
+
+emmaToolRegistry.register({
+  name: 'google_calendar_delete_event',
+  definition: {
+    name: 'google_calendar_delete_event',
+    description:
+      'Delete (cancel) an event from the user\'s Google Calendar. ' +
+      'Use the event ID from google_calendar_list_events. ' +
+      'Attendees will receive a cancellation notification by default. ' +
+      'Requires Gmail connected with Calendar write access. ' +
+      'This action cannot be undone — confirm with the user before calling.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        event_id: {
+          type: 'string',
+          description: 'ID of the event to delete (required).',
+        },
+        calendar_id: {
+          type: 'string',
+          description: 'Calendar ID the event belongs to. Defaults to "primary".',
+        },
+        send_updates: {
+          type: 'string',
+          enum: ['all', 'externalOnly', 'none'],
+          description: 'Whether to notify attendees of the cancellation. Defaults to "all".',
+        },
+      },
+      required: ['event_id'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId;
+    if (!userId) return { success: false, message: 'Authentication required: no user context.' };
+    if (!args.event_id) return { success: false, message: 'event_id is required.' };
+
+    const result = await getCalendarClient(userId, true);
+    if (!result) {
+      return {
+        success: false,
+        message: 'No Gmail account connected. Please connect your Gmail account in Settings → Connected Accounts.',
+      };
+    }
+    if ('error' in result) {
+      return {
+        success: false,
+        needs_reconnect: true,
+        message:
+          'Deleting calendar events requires Calendar write access. Please go to Settings → Connected Accounts, ' +
+          'reconnect your Gmail account, and allow Calendar access (including managing events).',
+      };
+    }
+
+    const { client } = result;
+    const calendarId = args.calendar_id || 'primary';
+    const sendUpdates = args.send_updates || 'all';
+
+    try {
+      await client.events.delete({ calendarId, eventId: args.event_id, sendUpdates });
+      return {
+        success: true,
+        message: `Event ${args.event_id} deleted.`,
+        event_id: args.event_id,
+      };
+    } catch (error: any) {
+      const status = error?.response?.status || error?.code;
+      console.error('[google_calendar_delete_event] API error:', error?.message);
+      if (status === 404) {
+        return { success: false, message: `Event ${args.event_id} not found in calendar ${calendarId}.` };
+      }
+      if (status === 410) {
+        return { success: false, message: `Event ${args.event_id} was already deleted.` };
+      }
+      if (status === 403 || status === 401) {
+        return {
+          success: false,
+          needs_reconnect: true,
+          message: 'Calendar write access denied. Please reconnect your Gmail account in Settings → Connected Accounts.',
+        };
+      }
+      return { success: false, message: `Failed to delete event: ${error?.message || 'Unknown error'}` };
+    }
+  },
+});
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
