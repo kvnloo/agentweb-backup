@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken } from '../middleware/auth';
 import { agentModeService, AgentModeService } from '../services/agentModeService';
-import { ABOUT_AGENTWEB_TEAM } from '../docs/agentModeSystemPrompt';
+import { ABOUT_AGENTWEB_TEAM, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
 import { scheduleDb, userDb, taskDb, scheduleTemplateDb } from '../services/db';
 import { User } from '../types/auth';
@@ -654,6 +654,33 @@ async function sendDailyDigestEmail(schedule: any, emailNotifications: string[])
   }
 }
 
+// Deterministic completion-gate detector for scheduled runs.
+//
+// PR #1941's PER-ENTITY COMPLETION LOOP directive reduces the chance a scheduled
+// multi-entity run stops short, but it is a probabilistic prompt nudge. This
+// detector is the deterministic backstop: it returns true when the final turn of
+// a scheduled run ADMITS it left work unfinished that the agent could have done
+// (so runVerifiedChat issues one more continuation turn), and false otherwise.
+//
+// It must NOT fire on legitimate per-entity blockers ("LinkedIn not connected /
+// not accessible") — those are a valid terminal state handled by BLOCKER
+// ISOLATION, and looping on them would waste attempts. The patterns below match
+// explicit "I stopped / did not finish / not yet processed / will continue later"
+// admissions, which are distinct from "I cannot access X".
+const INCOMPLETE_WORK_PATTERNS: RegExp[] = [
+  /\bi (?:did\s*not|didn'?t)\s+(?:complete|finish)\b/i,
+  /\b(?:did\s*not|didn'?t)\s+finish\b/i,
+  /\bstopped\b[^.]*\bbefore\s+(?:fully|finish|complet|resolving)/i,
+  /\bhave\s*not\s+yet\s+(?:processed|completed|finished|researched)\b/i,
+  /\b(?:remaining|other)\s+(?:events|leads|items|entities)\b[^.]*\b(?:were|was)?\s*not\s+(?:processed|completed|finished|researched|done)\b/i,
+  /\bi\s+will\s+continue\b[^.]*\b(?:later|remaining|next)\b/i,
+];
+
+export function scheduledRunSignalsIncompleteWork(content: string): boolean {
+  if (!content || typeof content !== 'string') return false;
+  return INCOMPLETE_WORK_PATTERNS.some((re) => re.test(content));
+}
+
 // Common function to run verified chat with work plan, keywords, and function call verification
 // Used by both scheduled chat and verified-generate
 export async function runVerifiedChat(
@@ -666,6 +693,12 @@ export async function runVerifiedChat(
     maxAttempts?: number;
     attachments?: any[];
     llmModel?: string;
+    // Opt-in deterministic completion gate (scheduled runs only). When true and
+    // the latest turn admits unfinished work (scheduledRunSignalsIncompleteWork),
+    // issue up to `completionGateMaxContinuations` extra continuation turns
+    // before returning success. Default off so other callers are unaffected.
+    completionGate?: boolean;
+    completionGateMaxContinuations?: number;
   }
 ): Promise<{
   success: boolean;
@@ -691,8 +724,14 @@ export async function runVerifiedChat(
     keywords = [],
     requiredFunctions = [],
     maxAttempts = 20,
-    attachments = []
+    attachments = [],
+    completionGate = false,
+    completionGateMaxContinuations = 2
   } = params;
+
+  // Tracks how many completion-gate continuation turns we've already spent, so a
+  // model that keeps admitting "not finished" can't loop indefinitely.
+  let completionGateContinuationsUsed = 0;
   
   // Ensure attachments is always an array
   const attachmentsArray = Array.isArray(attachments) ? attachments : [];
@@ -798,12 +837,73 @@ export async function runVerifiedChat(
   // Track all function calls across attempts.
   const allActualFunctionCallsForReporting: string[] = [];
 
+  // Set when the completion gate asks for one more continuation turn; the next
+  // iteration uses a "finish the unfinished entities" continuation message.
+  let completionGateContinue = false;
+
   while (attempt < maxAttempts) {
     attempt++;
 
     try {
       // Prepare user message for this attempt
       let userMessage = startingMessage;
+
+      if (completionGateContinue) {
+        // Completion-gate continuation: the prior turn admitted unfinished work.
+        completionGateContinue = false;
+        userMessage =
+          'Your previous response indicated some entities/steps were not finished. ' +
+          'Complete ALL remaining per-entity work now (research, filtering, approval ' +
+          'checks, drafts) for every entity that is not finished and not genuinely ' +
+          'blocked. Do not stop early. Then produce the final consolidated report, ' +
+          'surfacing any genuinely blocked items as actionable next steps.';
+        const continuationResponse = await generateSessionResponse(
+          sessionId,
+          userMessage,
+          userId,
+          defaultModel,
+          []
+        );
+        if (continuationResponse.content) {
+          allContent += (allContent ? '\n\n' : '') + continuationResponse.content;
+        }
+        const continuationToolCalls = continuationResponse.toolCalls || [];
+        allToolCalls.push(...continuationToolCalls);
+        allActualFunctionCallsForReporting.push(
+          ...continuationToolCalls.map((call: any) => call.name).filter(Boolean)
+        );
+        // Re-evaluate the gate against the continuation's own output.
+        if (
+          completionGateContinuationsUsed < completionGateMaxContinuations &&
+          attempt < maxAttempts &&
+          scheduledRunSignalsIncompleteWork(continuationResponse.content || '')
+        ) {
+          completionGateContinuationsUsed++;
+          completionGateContinue = true;
+          await waitForVerifiedChatRetry(attempt);
+          continue;
+        }
+        // Continuation produced no further "unfinished" admission → done.
+        return {
+          success: true,
+          content: allContent,
+          toolCalls: allToolCalls,
+          keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
+          keywordMisses: remainingKeywords,
+          functionCallMatches: requiredFunctions.filter(reqFunc =>
+            countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) >= reqFunc.minCount
+          ).map(reqFunc => reqFunc.functionName),
+          functionCallMisses: requiredFunctions.filter(reqFunc =>
+            countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) < reqFunc.minCount
+          ).map(reqFunc => reqFunc.functionName),
+          functionStatus: requiredFunctions.map((reqFunc) => {
+            const actualCount = countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting);
+            return { functionName: reqFunc.functionName, requiredCount: reqFunc.minCount, actualCount, met: actualCount >= reqFunc.minCount };
+          }),
+          attempts: attempt,
+          workPlanCompleted: true
+        };
+      }
 
       if (attempt > 1) {
         // Check work plan status
@@ -914,6 +1014,26 @@ export async function runVerifiedChat(
         return countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) >= reqFunc.minCount;
       });
       const allRequirementsMet = (!workPlan || workPlanCompleted) && allKeywordsMet && allFunctionCallsMet;
+
+      // Deterministic completion gate (opt-in, scheduled runs only): if all other
+      // requirements are met but the latest turn admits it left work unfinished,
+      // spend one more continuation turn instead of returning success — unless we
+      // still have attempts left AND haven't exhausted the continuation budget.
+      if (
+        allRequirementsMet &&
+        completionGate &&
+        completionGateContinuationsUsed < completionGateMaxContinuations &&
+        attempt < maxAttempts &&
+        scheduledRunSignalsIncompleteWork(response.content || '')
+      ) {
+        completionGateContinuationsUsed++;
+        console.log(
+          `AgentMode runVerifiedChat: completion gate triggered (continuation ${completionGateContinuationsUsed}/${completionGateMaxContinuations}) — latest turn admitted unfinished work for session ${sessionId}`
+        );
+        completionGateContinue = true;
+        await waitForVerifiedChatRetry(attempt);
+        continue;
+      }
 
       if (allRequirementsMet) {
         // Build final function status
@@ -1321,7 +1441,10 @@ export async function runScheduledChat(
       requiredFunctions,
       maxAttempts: 20,
       attachments: fileAttachments,
-      llmModel: schedule.llmModel || defaultModel
+      llmModel: schedule.llmModel || defaultModel,
+      // Deterministic backstop for multi-entity scheduled runs (PR #1941 follow-up):
+      // if the run admits it left work unfinished, auto-continue before finishing.
+      completionGate: true
     });
 
     if (!isTest && process.env.NODE_ENV !== 'test') {
@@ -1887,7 +2010,7 @@ export async function generateSessionResponse(
           if (scheduleIdMatch) {
             systemPrompt += `\n\n[Schedule Context] This session was created by a scheduled chat (scheduleId: ${scheduleIdMatch[1]}). If the user asks to update this schedule, first call list_scheduled_chats to get the current schedule details, then use manage_scheduled_chat with action "update" and the schedule_id. You can do partial updates — only include the fields you want to change.`;
           }
-          systemPrompt += `\n\n[AUTOMATED UNATTENDED EXECUTION]\nThis is a scheduled, automated run. No human is present. You MUST:\n- Execute the complete task in a single run without stopping to ask for confirmation, approval, or clarification at any point.\n- If the task specifies a volume or range (e.g. "send 30-40 connection requests", "post 5 times"), treat the FULL stated amount as your target for this session. Do NOT split into sub-batches and pause between them.\n- Never ask "should I continue?" or "shall I proceed with the next batch?" — just execute continuously until the stated goal is reached.\n- If you encounter an unrecoverable error, stop and report it in your final message. Otherwise, keep going.`;
+          systemPrompt += getUnattendedExecutionDirective(session.sessionType);
         }
 
         // For Slack sessions (including scheduled scans), inject team identity context so Emma
