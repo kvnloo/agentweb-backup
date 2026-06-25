@@ -49,6 +49,16 @@ export class TwitterService {
     return (lastSpace > 0 ? hardCut.slice(0, lastSpace) : hardCut).trimEnd();
   }
 
+  /**
+   * Clamp an X API max_results into the endpoint's accepted window. The X API
+   * rejects out-of-range values with HTTP 400 — recent-search requires 10–100,
+   * the user-timeline endpoint requires 5–100. Callers pass the correct min.
+   */
+  private clampMaxResults(value: number | undefined, min: number, fallback: number): number {
+    const n = value ?? fallback;
+    return Math.min(Math.max(n, min), 100);
+  }
+
   // ─── Credentials ──────────────────────────────────────────────────────────────
   private async getCredentials(): Promise<{ clientId: string; clientSecret: string }> {
     if (!this.cachedClientId || !this.cachedClientSecret) {
@@ -446,7 +456,7 @@ export class TwitterService {
     if (!query || query.trim() === '') throw new Error('query is required for search-tweets');
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.search(query.trim(), {
-        max_results: Math.min(maxResults ?? 10, 100),
+        max_results: this.clampMaxResults(maxResults, 10, 10),
         'tweet.fields': ['public_metrics', 'created_at', 'author_id'],
       });
       return res?.data?.data ?? res?.data ?? [];
@@ -522,7 +532,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.userTimeline(targetId, {
-        max_results: Math.min(maxResults ?? 10, 100),
+        max_results: this.clampMaxResults(maxResults, 5, 10),
         'tweet.fields': ['public_metrics', 'created_at'],
       });
       return res?.data?.data ?? res?.data ?? [];
@@ -586,7 +596,7 @@ export class TwitterService {
     if (!tweetId || tweetId.trim() === '') throw new Error('tweet_id is required for get-quote-tweets');
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.quotes(tweetId.trim(), {
-        max_results: Math.min(maxResults ?? 10, 100),
+        max_results: this.clampMaxResults(maxResults, 10, 10),
         'tweet.fields': ['public_metrics', 'created_at', 'author_id'],
       });
       return res?.data?.data ?? res?.data ?? [];
@@ -661,7 +671,7 @@ export class TwitterService {
     if (!tweetId || tweetId.trim() === '') throw new Error('tweet_id is required for list-replies');
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.search(`conversation_id:${tweetId.trim()} is:reply`, {
-        max_results: Math.min(maxResults ?? 10, 100),
+        max_results: this.clampMaxResults(maxResults, 10, 10),
         'tweet.fields': ['public_metrics', 'created_at', 'author_id'],
       });
       return res?.data?.data ?? res?.data ?? [];

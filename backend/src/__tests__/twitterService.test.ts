@@ -22,6 +22,7 @@ const mockSendDmToParticipant = jest.fn();
 const mockUserByUsername = jest.fn();
 const mockListDmEvents = jest.fn();
 const mockDeleteTweet = jest.fn();
+const mockUserTimeline = jest.fn();
 const mockRefreshOAuth2Token = jest.fn();
 
 // Records how TwitterApi was constructed so tests can assert which token was used.
@@ -50,6 +51,7 @@ jest.mock('twitter-api-v2', () => ({
         userByUsername: (...a: any[]) => mockUserByUsername(...a),
         listDmEvents: (...a: any[]) => mockListDmEvents(...a),
         deleteTweet: (...a: any[]) => mockDeleteTweet(...a),
+        userTimeline: (...a: any[]) => mockUserTimeline(...a),
       },
     };
   }),
@@ -108,6 +110,7 @@ beforeEach(() => {
   mockRefreshOAuth2Token.mockResolvedValue({ accessToken: 'access-new', refreshToken: 'refresh-new', expiresIn: 7200 });
   mockUpdateAccountConfig.mockResolvedValue(undefined);
   mockDeleteTweet.mockResolvedValue({ data: { deleted: true } });
+  mockUserTimeline.mockResolvedValue({ data: { data: [{ id: 'ut1', text: 'mine' }] } });
 });
 
 // ─── FAIL cases ───────────────────────────────────────────────────────────────
@@ -496,6 +499,60 @@ describe('TwitterService.listReplies', () => {
   it('throws when tweet_id is empty', async () => {
     await expect(twitterService.listReplies(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/tweet_id/i);
     expect(mockSearch).not.toHaveBeenCalled();
+  });
+
+  // The X recent-search endpoint rejects max_results < 10 with HTTP 400.
+  it('floors maxResults to 10 for the search endpoint', async () => {
+    await twitterService.listReplies(OWNER, ACCOUNT_ID, 'tw99', 5);
+    expect(mockSearch).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ max_results: 10 }),
+    );
+  });
+});
+
+// ─── searchTweets max_results clamping ─────────────────────────────────────────
+
+describe('TwitterService.searchTweets', () => {
+  beforeEach(() => {
+    mockSearch.mockResolvedValue({ data: { data: [{ id: 's1', text: 'hit' }] } });
+  });
+
+  // Regression: a request for fewer than 10 results used to pass through and 400.
+  it('floors maxResults to the endpoint minimum of 10', async () => {
+    await twitterService.searchTweets(OWNER, ACCOUNT_ID, 'agentweb', 5);
+    expect(mockSearch).toHaveBeenCalledWith(
+      'agentweb',
+      expect.objectContaining({ max_results: 10 }),
+    );
+  });
+
+  it('passes valid in-range values through', async () => {
+    await twitterService.searchTweets(OWNER, ACCOUNT_ID, 'agentweb', 42);
+    expect(mockSearch).toHaveBeenCalledWith('agentweb', expect.objectContaining({ max_results: 42 }));
+  });
+
+  it('caps maxResults at 100', async () => {
+    await twitterService.searchTweets(OWNER, ACCOUNT_ID, 'agentweb', 999);
+    expect(mockSearch).toHaveBeenCalledWith('agentweb', expect.objectContaining({ max_results: 100 }));
+  });
+});
+
+// ─── getUserTweets max_results clamping ────────────────────────────────────────
+
+describe('TwitterService.getUserTweets', () => {
+  // The user-timeline endpoint requires max_results between 5 and 100.
+  it('floors maxResults to the endpoint minimum of 5', async () => {
+    await twitterService.getUserTweets(OWNER, ACCOUNT_ID, '@target', 1);
+    expect(mockUserTimeline).toHaveBeenCalledWith(
+      '999',
+      expect.objectContaining({ max_results: 5 }),
+    );
+  });
+
+  it('caps maxResults at 100', async () => {
+    await twitterService.getUserTweets(OWNER, ACCOUNT_ID, '@target', 999);
+    expect(mockUserTimeline).toHaveBeenCalledWith('999', expect.objectContaining({ max_results: 100 }));
   });
 });
 
