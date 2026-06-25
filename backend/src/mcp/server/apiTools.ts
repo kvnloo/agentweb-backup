@@ -1748,7 +1748,7 @@ mcpToolRegistry.register({
   internal: true,
   definition: {
     name: 'you_search_web',
-    description: 'Search the public web using You.com Search. No hidden fallback provider is used.',
+    description: 'Search the public web using You.com Search. No hidden fallback provider is used. For social-platform research, include explicit site filters when useful, e.g. site:x.com, site:linkedin.com, site:reddit.com, or site:instagram.com.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1772,11 +1772,11 @@ mcpToolRegistry.register({
   internal: true,
   definition: {
     name: 'you_search_news',
-    description: 'Search current news using You.com Search. No hidden fallback provider is used.',
+    description: 'Search current news using You.com Search. Use this only when the user asks for news, today/latest/breaking updates, or recent articles. Do not call it as a companion to ordinary web/social searches unless the user explicitly asks for news too. No hidden fallback provider is used. Preserve freshness words from the user query such as today, latest, breaking, or the exact date; do not rewrite a today/latest-news request into a timeless entity query.',
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'News search query' },
+        query: { type: 'string', description: 'News search query. For current-news requests, keep temporal terms like today/latest/breaking or include the exact date.' },
         max_results: { type: 'number', description: 'Max news results (default 5, max 10)', default: 5 },
         freshness: {
           type: 'string',
