@@ -490,6 +490,44 @@ export function getScheduledSessionOverride(sessionType?: string): string {
   return '\n\n⚠️ CRITICAL OVERRIDE: This IS a scheduled automated session. The user has ALREADY set up a schedule. NEVER suggest creating a schedule, setting up automated runs, or saying "want this to run automatically" — doing so would be incorrect and confusing. Just deliver the results.';
 }
 
+// Directive injected for scheduled / automated unattended runs.
+// No human is present, so the agent must run to completion on its own.
+//
+// Hardening added after session b56a2eac (Daily Event Lead Engagement Review),
+// where the agent extracted guest lists for all 3 events but then skipped the
+// LinkedIn research / ICP filtering / pending-approval steps for events 2 & 3
+// after hitting a single per-entity blocker (one teammate's LinkedIn not
+// connected). The directive now enforces a per-entity completion loop, isolates
+// a blocker to its own entity, adds a pre-output completion gate, and requires
+// gaps to be surfaced as actionable items rather than silently dropped.
+//
+// Self-guards on sessionType (like getScheduledSessionOverride) so it is safe to
+// call unconditionally and never leaks the unattended block into a non-scheduled
+// session, even if a future caller omits the call-site guard.
+export function getUnattendedExecutionDirective(sessionType?: string): string {
+  if (sessionType !== 'scheduled') return '';
+  return `\n\n[AUTOMATED UNATTENDED EXECUTION]
+This is a scheduled, automated run. No human is present. You MUST:
+- Execute the complete task in a single run without stopping to ask for confirmation, approval, or clarification at any point.
+- If the task specifies a volume or range (e.g. "send 30-40 connection requests", "post 5 times"), treat the FULL stated amount as your target for this session. Do NOT split into sub-batches and pause between them.
+- Never ask "should I continue?" or "shall I proceed with the next batch?" — just execute continuously until the stated goal is reached.
+
+PER-ENTITY COMPLETION LOOP (CRITICAL):
+- When the task applies to multiple entities (e.g. several events, leads, accounts, or guest lists), you MUST complete EVERY step of the workflow for EACH entity before finishing. Process every entity, not just the first.
+- Do NOT stop after the first entity, and do NOT extract/collect data for all entities and then skip the remaining per-entity work (research, filtering, approval checks, drafting, etc.). Finish each entity end-to-end.
+- Treat the per-entity steps as a checklist you repeat for every item until the list is exhausted.
+
+BLOCKER ISOLATION:
+- If you hit a blocker that is specific to ONE entity (e.g. a single person's LinkedIn is not connected, one record is missing a field, one page won't load), that blocker is scoped to that entity only. It does NOT block the others — note it for that entity and CONTINUE processing the remaining entities.
+- Only a truly unrecoverable, GLOBAL error (a tool that keeps failing for every entity, the session cannot continue at all) justifies stopping early. In that case, stop and report it in your final message. A single-entity blocker is never a reason to abandon the rest.
+
+COMPLETION GATE (before final output):
+- Before producing your final report, run a completion check: verify that every entity has had every required step either completed or explicitly marked blocked-with-reason. If any entity still has unfinished steps that are NOT blocked, go back and finish them before writing the final output.
+
+SURFACE GAPS AS ACTIONABLE ITEMS:
+- In your final report, surface every blocked or skipped item as a clear, actionable item the user can act on (e.g. "Connect Harsha's LinkedIn so we can research his guests next run"). Never bury or omit a gap — make the remaining action explicit.`;
+}
+
 // Additional context injected ONLY when Emma runs as the sidebar/popup in the Customer Portal.
 // This is appended to AGENT_MODE_SYSTEM_PROMPT at runtime.
 // Keep this strictly sidebar-specific — anything that applies to all Emma interactions belongs in AGENT_MODE_SYSTEM_PROMPT above.
