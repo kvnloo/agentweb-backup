@@ -123,7 +123,6 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
       deleteOnPull: config.deleteOnPull ?? false,
       webhookEnabled: config.webhookEnabled ?? true,
       listName: config.listName,
-      hubspotMarketableStatus: config.hubspotMarketableStatus,
       hubspotLifecycleStage: config.hubspotLifecycleStage,
       externalPipelineId: config.externalPipelineId,
       lastPushSyncAt: config.lastPushSyncAt,
@@ -161,7 +160,7 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       contactFieldMapping, dealFieldMapping, customFieldMapping,
       deleteOnPush, deleteOnPull, webhookEnabled,
       externalPipelineId, listName,
-      hubspotMarketableStatus, hubspotLifecycleStage,
+      hubspotLifecycleStage,
     } = req.body;
 
     // Validate Attio API key length before encrypting and storing it.
@@ -192,7 +191,7 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       contactFieldMapping, dealFieldMapping, customFieldMapping,
       deleteOnPush, deleteOnPull, webhookEnabled,
       externalPipelineId, listName,
-      hubspotMarketableStatus, hubspotLifecycleStage,
+      hubspotLifecycleStage,
     });
 
     // Fire-and-forget: register webhook subscriptions for any custom HubSpot
@@ -218,7 +217,6 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       deleteOnPull: config.deleteOnPull ?? false,
       webhookEnabled: config.webhookEnabled ?? true,
       listName: config.listName,
-      hubspotMarketableStatus: config.hubspotMarketableStatus,
       hubspotLifecycleStage: config.hubspotLifecycleStage,
       externalPipelineId: config.externalPipelineId,
       createdAt: config.createdAt,

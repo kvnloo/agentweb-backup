@@ -66,16 +66,11 @@ export interface ExternalCrmSyncConfig {
   deleteOnPull?: boolean;   // Mark local lead as removed when CRM record is deleted
   // Human-readable display name — used when creating deal pipelines
   listName?: string;
-  // HubSpot-only push constants applied to EVERY synced contact (not per-lead
-  // field mappings). Injected after the skip-empty guard so they never resurrect
-  // an otherwise-empty lead into a junk contact.
-  // - hubspotMarketableStatus: literal value written to the standard
-  //   `hs_marketable_status` property. `false` keeps imported contacts OUT of the
-  //   marketing-contacts count. `undefined` leaves the property untouched.
-  // - hubspotLifecycleStage: internal value of the standard `lifecyclestage`
-  //   property (NOT the label — custom stages have a generated internal value).
-  //   `undefined`/'' leaves it untouched.
-  hubspotMarketableStatus?: boolean;
+  // HubSpot-only push constant applied to EVERY synced contact (not a per-lead
+  // field mapping). The two-step clear+set in hubspotAdapter overcomes HubSpot's
+  // forward-only restriction so any existing stage is always overwritten.
+  // Internal value of the standard `lifecyclestage` property (NOT the label —
+  // custom stages have a generated internal value). `undefined`/'' leaves it untouched.
   hubspotLifecycleStage?: string;
   // Cached external IDs to skip redundant lookups
   externalPipelineId?: string;      // HubSpot deal pipeline ID
@@ -224,8 +219,7 @@ export class ExternalCrmSyncService {
       // Pipeline selection — only honoured before first sync (server enforces the lock)
       externalPipelineId?: string;   // HubSpot: chosen deal pipeline ID
       listName?: string;
-      // HubSpot push constants applied to every synced contact
-      hubspotMarketableStatus?: boolean | null;  // null clears the override
+      // HubSpot push constant applied to every synced contact
       hubspotLifecycleStage?: string | null;     // null/'' clears the override
     }
   ): Promise<ExternalCrmSyncConfig> {
@@ -258,15 +252,9 @@ export class ExternalCrmSyncService {
       nextDealFieldMapping = [];
     }
 
-    // HubSpot per-contact push constants. A non-CRM provider never carries them.
+    // HubSpot per-contact push constant. A non-CRM provider never carries it.
     // `null` is an explicit clear (→ undefined); `undefined` (key absent) preserves
     // the existing value so partial saves don't wipe a configured constant.
-    const resolveMarketableStatus = (): boolean | undefined => {
-      if (!isHubspot) return undefined;
-      if (updates.hubspotMarketableStatus === null) return undefined;
-      if (updates.hubspotMarketableStatus === undefined) return existing?.hubspotMarketableStatus;
-      return updates.hubspotMarketableStatus;
-    };
     const resolveLifecycleStage = (): string | undefined => {
       if (!isHubspot) return undefined;
       if (updates.hubspotLifecycleStage === null || updates.hubspotLifecycleStage === '') return undefined;
@@ -305,7 +293,6 @@ export class ExternalCrmSyncService {
       deleteOnPull: updates.deleteOnPull ?? existing?.deleteOnPull ?? false,
       webhookEnabled: updates.webhookEnabled ?? existing?.webhookEnabled ?? true,
       listName: resolvedListName,
-      hubspotMarketableStatus: resolveMarketableStatus(),
       hubspotLifecycleStage: resolveLifecycleStage(),
       externalPipelineId: resolvedExternalPipelineId,
       hubspotDealStageMap: existing?.hubspotDealStageMap,

@@ -256,10 +256,6 @@ export class HubspotAdapter implements CrmAdapter {
                 );
                 if (!hasRealProps) continue;
 
-                // Stamp the list-level push constants (marketable status / lifecycle
-                // stage) onto every contact that actually syncs.
-                this.applyContactConstants(allContactProps, config);
-
                 const contactData = {
                     ...(email ? { email } : {}),
                     ...this.propsToContactData(allContactProps),
@@ -285,6 +281,17 @@ export class HubspotAdapter implements CrmAdapter {
                         const created = await svc.createContact(contactData);
                         contactId = created.contactId;
                         result.newCount++;
+                    }
+                }
+
+                // Two-step lifecycle stage update: clear then set overcomes HubSpot's
+                // forward-only restriction. Skip if per-lead mapping already set lifecyclestage.
+                if (config.hubspotLifecycleStage && !('lifecyclestage' in allContactProps)) {
+                    try {
+                        await svc.updateContact(contactId, { customFields: { lifecyclestage: '' } });
+                        await svc.updateContact(contactId, { customFields: { lifecyclestage: config.hubspotLifecycleStage } });
+                    } catch (err: any) {
+                        console.warn(`[HubspotAdapter] lifecycle stage update failed for contact ${contactId}: ${this.formatError(err)}`);
                     }
                 }
 
@@ -345,6 +352,9 @@ export class HubspotAdapter implements CrmAdapter {
         }
         const emailLeads: PreppedLead[] = [];
         const emaillessLeads: any[] = [];
+        // Tracks leads where a per-lead field mapping already set lifecyclestage —
+        // these must skip the two-step so the explicit mapping value is preserved.
+        const perLeadLifecycleSet = new Set<any>();
 
         for (const lead of leads) {
             const email = typeof lead.email === 'string' ? lead.email.trim() : '';
@@ -376,9 +386,7 @@ export class HubspotAdapter implements CrmAdapter {
             const hasRealProps = Object.keys(allContactProps).some(k => !listIdentityProps.has(k));
             if (!hasRealProps) continue;
 
-            // Stamp the list-level push constants (marketable status / lifecycle
-            // stage) onto every contact that actually syncs.
-            this.applyContactConstants(allContactProps, config);
+            if ('lifecyclestage' in allContactProps) perLeadLifecycleSet.add(lead);
 
             if (email) {
                 emailLeads.push({ lead, emailLower: email.toLowerCase(), allContactProps });
@@ -477,6 +485,26 @@ export class HubspotAdapter implements CrmAdapter {
             for (const lead of dealFailedLeads) {
                 result.successCount--;
                 if (isNewByLead.get(lead)) result.newCount--; else result.updatedCount--;
+            }
+        }
+
+        // ── Stage 4.5: lifecycle stage two-step (clear → set) ─────────────────
+        // HubSpot's forward-only restriction blocks downgrading an existing stage
+        // via a single PATCH. Clearing first then setting works for all contacts
+        // regardless of their current stage. Chunked to stay within the 100/request
+        // batch limit. Skips leads where a per-lead mapping already set lifecyclestage.
+        if (config.hubspotLifecycleStage && succeededEmailLeads.length > 0) {
+            const ids = succeededEmailLeads
+                .filter(lead => !perLeadLifecycleSet.has(lead))
+                .map(lead => contactIdByLead.get(lead)!);
+            for (let i = 0; i < ids.length; i += 100) {
+                const chunk = ids.slice(i, i + 100);
+                try {
+                    await svc.batchUpdateContacts(chunk.map(id => ({ id, properties: { lifecyclestage: '' } })));
+                    await svc.batchUpdateContacts(chunk.map(id => ({ id, properties: { lifecyclestage: config.hubspotLifecycleStage! } })));
+                } catch (err: any) {
+                    console.warn(`[HubspotAdapter] lifecycle stage batch update failed (chunk ${i / 100 + 1}): ${this.formatError(err)}`);
+                }
             }
         }
 
@@ -951,28 +979,6 @@ export class HubspotAdapter implements CrmAdapter {
         const present = new Set(customMapping.map(m => m.agentwebField));
         const missing = HUBSPOT_LIST_IDENTITY_MAPPING.filter(m => !present.has(m.agentwebField));
         return missing.length > 0 ? [...customMapping, ...missing] : customMapping;
-    }
-
-    /**
-     * Applies the list-level push constants (hs_marketable_status / lifecyclestage)
-     * to a contact's resolved properties. These are NOT per-lead field mappings —
-     * they're a single value the user configured for the whole list and we stamp
-     * onto every synced contact. Both are standard HubSpot contact properties, so
-     * no ensureContactProperty is needed.
-     *
-     * Mutates and returns `props` for call-site convenience. Applied AFTER the
-     * skip-empty guard so a lead with no real content is never resurrected into a
-     * junk contact merely by carrying these constants. An explicit per-lead mapping
-     * to the same CRM property wins — we never clobber a value the mapping set.
-     */
-    private applyContactConstants(props: Record<string, string>, config: ExternalCrmSyncConfig): Record<string, string> {
-        if (config.hubspotMarketableStatus !== undefined && props.hs_marketable_status === undefined) {
-            props.hs_marketable_status = config.hubspotMarketableStatus ? 'true' : 'false';
-        }
-        if (config.hubspotLifecycleStage && props.lifecyclestage === undefined) {
-            props.lifecyclestage = config.hubspotLifecycleStage;
-        }
-        return props;
     }
 
     /**

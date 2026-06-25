@@ -1874,6 +1874,26 @@ export class HubSpotService {
   }
 
   /**
+   * Batch update contacts by internal HubSpot contact ID.
+   * POST /crm/v3/objects/contacts/batch/update
+   */
+  async batchUpdateContacts(
+    inputs: Array<{ id: string; properties: Record<string, string> }>
+  ): Promise<void> {
+    if (inputs.length > 100) {
+      throw new Error(`batchUpdateContacts accepts at most 100 inputs per batch, got ${inputs.length}`);
+    }
+
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/batch/update`,
+      { inputs: inputs.map((i) => ({ id: i.id, properties: i.properties })) },
+      { headers: await this.authHeaders() }
+    );
+
+    throwIfBatchPartialFailure(res);
+  }
+
+  /**
    * Batch create DEFAULT contact→deal associations.
    * POST /crm/v4/associations/contact/deal/batch/create/default
    */

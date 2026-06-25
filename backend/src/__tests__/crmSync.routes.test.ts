@@ -850,32 +850,30 @@ describe('PUT /api/crm-sync/config — HubSpot contact constants forwarding', ()
       deleteOnPull: false,
       webhookEnabled: true,
       webhookSecret: 'abc',
-      hubspotMarketableStatus: false,
       hubspotLifecycleStage: '12345678',
       createdAt: '2026-01-01T00:00:00.000Z',
       updatedAt: '2026-01-01T00:00:00.000Z',
     });
   });
 
-  it('forwards hubspotMarketableStatus and hubspotLifecycleStage to saveConfig', async () => {
+  it('forwards hubspotLifecycleStage to saveConfig', async () => {
     await request(app)
       .put('/api/crm-sync/config/list-1/hubspot')
-      .send({ accountId: 'portal-123', hubspotMarketableStatus: false, hubspotLifecycleStage: '12345678' })
+      .send({ accountId: 'portal-123', hubspotLifecycleStage: '12345678' })
       .expect(200);
 
     expect(externalCrmSyncService.saveConfig).toHaveBeenCalledWith(
       'user-1', 'list-1', 'hubspot',
-      expect.objectContaining({ hubspotMarketableStatus: false, hubspotLifecycleStage: '12345678' }),
+      expect.objectContaining({ hubspotLifecycleStage: '12345678' }),
     );
   });
 
-  it('echoes the constants back in the response', async () => {
+  it('echoes hubspotLifecycleStage back in the response', async () => {
     const res = await request(app)
       .put('/api/crm-sync/config/list-1/hubspot')
       .send({ accountId: 'portal-123' })
       .expect(200);
 
-    expect(res.body.hubspotMarketableStatus).toBe(false);
     expect(res.body.hubspotLifecycleStage).toBe('12345678');
   });
 });

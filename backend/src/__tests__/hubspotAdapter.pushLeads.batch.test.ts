@@ -29,6 +29,7 @@ const mockAssociateContactToDeal = jest.fn();
 const mockBatchUpsertContacts = jest.fn();
 const mockBatchCreateDeals = jest.fn();
 const mockBatchUpdateDeals = jest.fn();
+const mockBatchUpdateContacts = jest.fn();
 const mockBatchAssociateContactsToDeals = jest.fn();
 
 const mockSvc = {
@@ -43,6 +44,7 @@ const mockSvc = {
   batchUpsertContacts: mockBatchUpsertContacts,
   batchCreateDeals: mockBatchCreateDeals,
   batchUpdateDeals: mockBatchUpdateDeals,
+  batchUpdateContacts: mockBatchUpdateContacts,
   batchAssociateContactsToDeals: mockBatchAssociateContactsToDeals,
 };
 jest.mock('../services/hubspotService', () => ({
@@ -101,6 +103,7 @@ describe('HubspotAdapter.pushLeads — batched push path', () => {
       inputs.map((i) => ({ traceId: i.traceId, dealId: `deal_${i.traceId}` }))
     );
     mockBatchUpdateDeals.mockResolvedValue(undefined);
+    mockBatchUpdateContacts.mockResolvedValue(undefined);
     mockBatchAssociateContactsToDeals.mockResolvedValue(undefined);
     // Per-lead fallbacks (used by emailless leads + flag-off test)
     mockUpsertContact.mockResolvedValue({ contactId: 'c1', isNew: true });
@@ -779,60 +782,40 @@ describe('HubspotAdapter.pushLeads — batched push path', () => {
     });
   });
 
-  // ── Contact push constants (hs_marketable_status / lifecyclestage) ─────────
-  describe('list-level contact constants', () => {
-    function upsertProps(): Record<string, string> {
-      // The single upsert input's properties (batched path always sends 1 here).
-      return mockBatchUpsertContacts.mock.calls[0][0][0].properties;
-    }
-
-    it('stamps hs_marketable_status=false on every contact when configured (batched)', async () => {
-      enableBatch();
-      const leads = [{ leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A' }];
-
-      await adapter.pushLeads(auth, leads, makeConfig({ hubspotMarketableStatus: false }));
-
-      expect(upsertProps().hs_marketable_status).toBe('false');
-    });
-
-    it('stamps hs_marketable_status=true when configured true (batched)', async () => {
-      enableBatch();
-      const leads = [{ leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A' }];
-
-      await adapter.pushLeads(auth, leads, makeConfig({ hubspotMarketableStatus: true }));
-
-      expect(upsertProps().hs_marketable_status).toBe('true');
-    });
-
-    it('stamps the configured lifecyclestage internal value on every contact (batched)', async () => {
+  // ── Lifecycle stage two-step (clear → set) ────────────────────────────────
+  describe('lifecycle stage two-step update', () => {
+    it('calls batchUpdateContacts twice (clear then set) after upsert (batched)', async () => {
       enableBatch();
       const leads = [{ leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A' }];
 
       await adapter.pushLeads(auth, leads, makeConfig({ hubspotLifecycleStage: '12345678' }));
 
-      expect(upsertProps().lifecyclestage).toBe('12345678');
+      expect(mockBatchUpdateContacts).toHaveBeenCalledTimes(2);
+      expect(mockBatchUpdateContacts.mock.calls[0][0]).toEqual([
+        { id: 'c_a@b.com', properties: { lifecyclestage: '' } },
+      ]);
+      expect(mockBatchUpdateContacts.mock.calls[1][0]).toEqual([
+        { id: 'c_a@b.com', properties: { lifecyclestage: '12345678' } },
+      ]);
     });
 
-    it('omits both constants when neither is configured (batched)', async () => {
+    it('does NOT call batchUpdateContacts when no lifecycle stage configured (batched)', async () => {
       enableBatch();
       const leads = [{ leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A' }];
 
       await adapter.pushLeads(auth, leads, makeConfig());
 
-      const props = upsertProps();
-      expect(props.hs_marketable_status).toBeUndefined();
-      expect(props.lifecyclestage).toBeUndefined();
+      expect(mockBatchUpdateContacts).not.toHaveBeenCalled();
     });
 
     it('does NOT resurrect an empty (content-less) lead into a junk contact (batched)', async () => {
       enableBatch();
-      // Email-less, no real props — only the constants would apply. The skip-empty
-      // guard must drop it BEFORE constants are stamped, so nothing is pushed.
+      // Email-less, no real props — the skip-empty guard must drop it before anything is pushed.
       const leads = [{ leadId: 'l1', listId: 'list_1' }];
 
       const result = await adapter.pushLeads(
         auth, leads,
-        makeConfig({ hubspotMarketableStatus: false, hubspotLifecycleStage: '12345678' }),
+        makeConfig({ hubspotLifecycleStage: '12345678' }),
       );
 
       expect(mockBatchUpsertContacts).not.toHaveBeenCalled();
@@ -840,23 +823,20 @@ describe('HubspotAdapter.pushLeads — batched push path', () => {
       expect(result.successCount).toBe(0);
     });
 
-    it('stamps the constants via the per-lead path too (flag off)', async () => {
+    it('does two-step via updateContact on the per-lead path (flag off)', async () => {
       process.env.HUBSPOT_BATCH_PUSH_ENABLED = 'false';
       const leads = [{ leadId: 'l1', listId: 'list_1', email: 'a@b.com', firstName: 'A' }];
 
-      await adapter.pushLeads(
-        auth, leads,
-        makeConfig({ hubspotMarketableStatus: false, hubspotLifecycleStage: '99' }),
-      );
+      await adapter.pushLeads(auth, leads, makeConfig({ hubspotLifecycleStage: '99' }));
 
-      const data = mockUpsertContact.mock.calls[0][0];
-      expect(data.customFields.hs_marketable_status).toBe('false');
-      expect(data.customFields.lifecyclestage).toBe('99');
+      expect(mockUpdateContact).toHaveBeenCalledTimes(2);
+      expect(mockUpdateContact.mock.calls[0][1]).toEqual({ customFields: { lifecyclestage: '' } });
+      expect(mockUpdateContact.mock.calls[1][1]).toEqual({ customFields: { lifecyclestage: '99' } });
     });
 
-    it('does not clobber an explicit per-lead mapping to the same property', async () => {
+    it('does not clobber an explicit per-lead mapping to lifecyclestage (batched)', async () => {
       enableBatch();
-      // An explicit contact mapping sets lifecyclestage per-lead → constant must yield.
+      // An explicit contact mapping sets lifecyclestage per-lead → two-step must be skipped.
       const mappingWithLifecycle: FieldMapping[] = [
         ...contactMapping,
         { agentwebField: 'stage', crmProperty: 'lifecyclestage', direction: 'push', enabled: true },
@@ -868,7 +848,8 @@ describe('HubspotAdapter.pushLeads — batched push path', () => {
         makeConfig({ contactFieldMapping: mappingWithLifecycle, hubspotLifecycleStage: '12345678' }),
       );
 
-      expect(upsertProps().lifecyclestage).toBe('customer');
+      // lifecyclestage already in upsert payload — two-step skipped entirely
+      expect(mockBatchUpdateContacts).not.toHaveBeenCalled();
     });
   });
 });
