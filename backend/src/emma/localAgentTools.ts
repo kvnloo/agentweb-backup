@@ -269,7 +269,8 @@ export function suggestAlternativeTool(task: string): string {
   if (/\b(code|repo|repository|commit|deploy|build|script|function|bug|fix)\b/i.test(task)) return 'coding_agent';
   if (/\b(analyz|analys|data analysis|metrics|chart|spreadsheet|csv|dataset)\b/i.test(task)) return 'perform_data_analysis';
   if (/\b(post|comment|message|dm|connect|invite|outreach)\b/i.test(task) && /\blinkedin\b/i.test(task)) return 'linkedin_outreach';
-  if (/\b(tweet|thread|dm|reply|post|message)\b/i.test(task) && /\b(twitter|x|tweet)\b/i.test(task)) return 'twitter_outreach';
+  if (/\b(dm|follow|unfollow|profile|block|mute|bookmark|search)\b/i.test(task) && /\b(twitter|x|tweet)\b/i.test(task)) return 'twitter_outreach';
+  if (/\b(tweet|thread|reply|post|like|retweet|quote)\b/i.test(task) && /\b(twitter|x|tweet)\b/i.test(task)) return 'twitter_manage_post';
   if (/\b(send|email|reply)\b/i.test(task) && /\bemail\b/i.test(task)) return 'send_email';
   return 'you_search_web';
 }

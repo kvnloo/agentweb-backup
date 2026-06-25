@@ -15,8 +15,7 @@ import {
  * expire ~2h, so getClient() refreshes via the stored refresh_token and persists
  * the new tokens back to the OWNER's connected account before returning a client.
  *
- * v1 capabilities: post tweet, reply/thread, send DM, list DMs, get profile.
- * Dropped from v1: people search (no X endpoint), quote tweet (Enterprise-only).
+ * Capabilities: post/reply/thread/quote, like/retweet/bookmark, DMs, follow/block/mute, metrics, search.
  */
 
 export const TWEET_CHAR_LIMIT = 280;     // standard accounts (verified/Premium allow more)
@@ -322,6 +321,346 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res = await client.v2.userByUsername(clean);
       return res.data;
+    });
+  }
+
+  /**
+   * Delete a tweet by id. Only tweets authored by the authenticated user can be deleted.
+   */
+  async deleteTweet(ownerUserId: string, accountId: string, tweetId: string): Promise<{ deleted: boolean }> {
+    if (!tweetId || tweetId.trim() === '') {
+      throw new Error('tweet_id is required for delete-tweet');
+    }
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const res: any = await client.v2.deleteTweet(tweetId.trim());
+      return { deleted: res?.data?.deleted ?? false };
+    });
+  }
+
+  /**
+   * Edit an existing tweet. Creates a new tweet in the same edit chain.
+   * Tweets are editable for 30 minutes and up to 5 times. Each edit produces
+   * a new tweet id. Polls and scheduled tweets cannot be edited.
+   */
+  async editTweet(ownerUserId: string, accountId: string, tweetId: string, newText: string): Promise<TweetResult> {
+    if (!tweetId || tweetId.trim() === '') {
+      throw new Error('tweet_id is required for edit-tweet');
+    }
+    if (!newText || newText.trim() === '') {
+      throw new Error('text is required for edit-tweet');
+    }
+    const finalText = this.trimToLimit(newText.trim(), TWEET_CHAR_LIMIT);
+    return this.withRetryOn401(ownerUserId, accountId, (client) =>
+      (client.v2 as any).tweet({ text: finalText, edit_options: { previous_post_id: tweetId.trim() } })
+        .then((r: any) => ({ id: r.data.id, text: r.data.text }))
+    );
+  }
+
+  // ─── Private helpers for actions that need the authed user's own Twitter ID ──
+
+  /** Read the authed user's numeric Twitter user ID from their stored config. */
+  private async getMyTwitterUserId(ownerUserId: string, accountId: string): Promise<string> {
+    const account = await this.resolveAccount(ownerUserId, accountId);
+    const config = account.config as TwitterXConfig;
+    if (!config.twitter_user_id) {
+      throw new Error(
+        'Twitter user ID not found in account config. Please reconnect your X account.'
+      );
+    }
+    return config.twitter_user_id;
+  }
+
+  /** Resolve an @handle (with or without @) to a numeric Twitter user ID. */
+  private async resolveHandleToUserId(client: TwitterApi, handle: string): Promise<string> {
+    const clean = handle.replace(/^@/, '').trim();
+    const res = await client.v2.userByUsername(clean);
+    if (!res?.data?.id) throw new Error(`Could not resolve X handle "@${clean}"`);
+    return res.data.id;
+  }
+
+  // ─── Follow / unfollow ────────────────────────────────────────────────────────
+
+  /**
+   * Follow a user by handle. Analogous to LinkedIn send-invite.
+   */
+  async followUser(ownerUserId: string, accountId: string, handle: string): Promise<any> {
+    if (!handle || handle.trim() === '') throw new Error('handle is required for follow');
+    const myId = await this.getMyTwitterUserId(ownerUserId, accountId);
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const targetId = await this.resolveHandleToUserId(client, handle);
+      const res: any = await client.v2.follow(myId, targetId);
+      return res?.data ?? res;
+    });
+  }
+
+  /**
+   * Unfollow a user by handle. Analogous to LinkedIn cancel-invitation.
+   */
+  async unfollowUser(ownerUserId: string, accountId: string, handle: string): Promise<any> {
+    if (!handle || handle.trim() === '') throw new Error('handle is required for unfollow');
+    const myId = await this.getMyTwitterUserId(ownerUserId, accountId);
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const targetId = await this.resolveHandleToUserId(client, handle);
+      const res: any = await client.v2.unfollow(myId, targetId);
+      return res?.data ?? res;
+    });
+  }
+
+  // ─── List followers / following ───────────────────────────────────────────────
+
+  /**
+   * List followers of own account (or another user by handle).
+   * Analogous to LinkedIn list-connections.
+   */
+  async listFollowers(ownerUserId: string, accountId: string, handle?: string): Promise<any[]> {
+    const myId = await this.getMyTwitterUserId(ownerUserId, accountId);
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const targetId = handle ? await this.resolveHandleToUserId(client, handle) : myId;
+      const res: any = await client.v2.followers(targetId);
+      return res?.data ?? [];
+    });
+  }
+
+  /**
+   * List accounts the own account (or another user) is following.
+   */
+  async listFollowing(ownerUserId: string, accountId: string, handle?: string): Promise<any[]> {
+    const myId = await this.getMyTwitterUserId(ownerUserId, accountId);
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const targetId = handle ? await this.resolveHandleToUserId(client, handle) : myId;
+      const res: any = await client.v2.following(targetId);
+      return res?.data ?? [];
+    });
+  }
+
+  // ─── Search tweets ────────────────────────────────────────────────────────────
+
+  /**
+   * Search recent tweets by query. Analogous to LinkedIn search-people.
+   */
+  async searchTweets(ownerUserId: string, accountId: string, query: string, maxResults?: number): Promise<any[]> {
+    if (!query || query.trim() === '') throw new Error('query is required for search-tweets');
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const res: any = await client.v2.search(query.trim(), {
+        max_results: Math.min(maxResults ?? 10, 100),
+        'tweet.fields': ['public_metrics', 'created_at', 'author_id'],
+      });
+      return res?.data?.data ?? res?.data ?? [];
+    });
+  }
+
+  // ─── DM conversation ─────────────────────────────────────────────────────────
+
+  /**
+   * Retrieve DM event history with a specific participant by handle.
+   * Analogous to LinkedIn update-conversation-history.
+   */
+  async getDmConversation(ownerUserId: string, accountId: string, handle: string): Promise<any[]> {
+    if (!handle || handle.trim() === '') throw new Error('handle is required for get-dm-conversation');
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const participantId = await this.resolveHandleToUserId(client, handle);
+      const res: any = await client.v2.listDmEventsWithParticipant(participantId);
+      return res?.data?.data ?? res?.data ?? [];
+    });
+  }
+
+  // ─── Like / unlike ────────────────────────────────────────────────────────────
+
+  /** Like a tweet. */
+  async likeTweet(ownerUserId: string, accountId: string, tweetId: string): Promise<any> {
+    if (!tweetId || tweetId.trim() === '') throw new Error('tweet_id is required for like-tweet');
+    const myId = await this.getMyTwitterUserId(ownerUserId, accountId);
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const res: any = await client.v2.like(myId, tweetId.trim());
+      return res?.data ?? res;
+    });
+  }
+
+  /** Unlike a tweet. */
+  async unlikeTweet(ownerUserId: string, accountId: string, tweetId: string): Promise<any> {
+    if (!tweetId || tweetId.trim() === '') throw new Error('tweet_id is required for unlike-tweet');
+    const myId = await this.getMyTwitterUserId(ownerUserId, accountId);
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const res: any = await client.v2.unlike(myId, tweetId.trim());
+      return res?.data ?? res;
+    });
+  }
+
+  // ─── Retweet / unretweet ─────────────────────────────────────────────────────
+
+  /** Retweet a tweet. */
+  async retweetTweet(ownerUserId: string, accountId: string, tweetId: string): Promise<any> {
+    if (!tweetId || tweetId.trim() === '') throw new Error('tweet_id is required for retweet');
+    const myId = await this.getMyTwitterUserId(ownerUserId, accountId);
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const res: any = await client.v2.retweet(myId, tweetId.trim());
+      return res?.data ?? res;
+    });
+  }
+
+  /** Undo a retweet. */
+  async unretweetTweet(ownerUserId: string, accountId: string, tweetId: string): Promise<any> {
+    if (!tweetId || tweetId.trim() === '') throw new Error('tweet_id is required for unretweet');
+    const myId = await this.getMyTwitterUserId(ownerUserId, accountId);
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const res: any = await client.v2.unretweet(myId, tweetId.trim());
+      return res?.data ?? res;
+    });
+  }
+
+  // ─── User tweets timeline ────────────────────────────────────────────────────
+
+  /**
+   * Fetch recent tweets authored by a user (identified by handle).
+   */
+  async getUserTweets(ownerUserId: string, accountId: string, handle: string, maxResults?: number): Promise<any[]> {
+    if (!handle || handle.trim() === '') throw new Error('handle is required for get-user-tweets');
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const targetId = await this.resolveHandleToUserId(client, handle);
+      const res: any = await client.v2.userTimeline(targetId, {
+        max_results: Math.min(maxResults ?? 10, 100),
+        'tweet.fields': ['public_metrics', 'created_at'],
+      });
+      return res?.data?.data ?? res?.data ?? [];
+    });
+  }
+
+  // ─── Bookmarks ────────────────────────────────────────────────────────────────
+
+  /** Bookmark a tweet. */
+  async bookmarkTweet(ownerUserId: string, accountId: string, tweetId: string): Promise<any> {
+    if (!tweetId || tweetId.trim() === '') throw new Error('tweet_id is required for bookmark');
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const res: any = await client.v2.bookmark(tweetId.trim());
+      return res?.data ?? res;
+    });
+  }
+
+  /** Retrieve the authed user's bookmarked tweets. */
+  async getBookmarks(ownerUserId: string, accountId: string): Promise<any[]> {
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const res: any = await client.v2.bookmarks();
+      return res?.data?.data ?? res?.data ?? [];
+    });
+  }
+
+  // ─── Quote tweet ─────────────────────────────────────────────────────────────
+
+  /** Post a quote tweet — retweet with added commentary. Trimmed to 280 chars. */
+  async quoteTweet(ownerUserId: string, accountId: string, text: string, quotedTweetId: string): Promise<TweetResult> {
+    if (!text || text.trim() === '') throw new Error('text is required for quote-tweet');
+    if (!quotedTweetId || quotedTweetId.trim() === '') throw new Error('quoted_tweet_id is required for quote-tweet');
+    const finalText = this.trimToLimit(text.trim(), TWEET_CHAR_LIMIT);
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const res: any = await client.v2.quote(finalText, quotedTweetId.trim());
+      return { id: res.data.id, text: res.data.text };
+    });
+  }
+
+  // ─── Engagement lookup ────────────────────────────────────────────────────────
+
+  /** List users who retweeted a tweet. */
+  async getRetweeters(ownerUserId: string, accountId: string, tweetId: string): Promise<any[]> {
+    if (!tweetId || tweetId.trim() === '') throw new Error('tweet_id is required for get-retweeters');
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const res: any = await client.v2.tweetRetweetedBy(tweetId.trim());
+      return res?.data ?? [];
+    });
+  }
+
+  /** List users who liked a tweet. */
+  async getLikingUsers(ownerUserId: string, accountId: string, tweetId: string): Promise<any[]> {
+    if (!tweetId || tweetId.trim() === '') throw new Error('tweet_id is required for get-liking-users');
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const res: any = await client.v2.tweetLikedBy(tweetId.trim());
+      return res?.data ?? [];
+    });
+  }
+
+  /** List quote tweets of a tweet. */
+  async getQuoteTweets(ownerUserId: string, accountId: string, tweetId: string, maxResults?: number): Promise<any[]> {
+    if (!tweetId || tweetId.trim() === '') throw new Error('tweet_id is required for get-quote-tweets');
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const res: any = await client.v2.quotes(tweetId.trim(), {
+        max_results: Math.min(maxResults ?? 10, 100),
+        'tweet.fields': ['public_metrics', 'created_at', 'author_id'],
+      });
+      return res?.data?.data ?? res?.data ?? [];
+    });
+  }
+
+  // ─── Block / unblock ─────────────────────────────────────────────────────────
+
+  /** Block a user by handle. Requires block.write scope. */
+  async blockUser(ownerUserId: string, accountId: string, handle: string): Promise<any> {
+    if (!handle || handle.trim() === '') throw new Error('handle is required for block');
+    const myId = await this.getMyTwitterUserId(ownerUserId, accountId);
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const targetId = await this.resolveHandleToUserId(client, handle);
+      const res: any = await client.v2.block(myId, targetId);
+      return res?.data ?? res;
+    });
+  }
+
+  /** Unblock a user by handle. Requires block.write scope. */
+  async unblockUser(ownerUserId: string, accountId: string, handle: string): Promise<any> {
+    if (!handle || handle.trim() === '') throw new Error('handle is required for unblock');
+    const myId = await this.getMyTwitterUserId(ownerUserId, accountId);
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const targetId = await this.resolveHandleToUserId(client, handle);
+      const res: any = await client.v2.unblock(myId, targetId);
+      return res?.data ?? res;
+    });
+  }
+
+  // ─── Mute / unmute ───────────────────────────────────────────────────────────
+
+  /** Mute a user by handle. Requires mute.write scope. */
+  async muteUser(ownerUserId: string, accountId: string, handle: string): Promise<any> {
+    if (!handle || handle.trim() === '') throw new Error('handle is required for mute');
+    const myId = await this.getMyTwitterUserId(ownerUserId, accountId);
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const targetId = await this.resolveHandleToUserId(client, handle);
+      const res: any = await client.v2.mute(myId, targetId);
+      return res?.data ?? res;
+    });
+  }
+
+  /** Unmute a user by handle. Requires mute.write scope. */
+  async unmuteUser(ownerUserId: string, accountId: string, handle: string): Promise<any> {
+    if (!handle || handle.trim() === '') throw new Error('handle is required for unmute');
+    const myId = await this.getMyTwitterUserId(ownerUserId, accountId);
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const targetId = await this.resolveHandleToUserId(client, handle);
+      const res: any = await client.v2.unmute(myId, targetId);
+      return res?.data ?? res;
+    });
+  }
+
+  // ─── Tweet metrics ───────────────────────────────────────────────────────────
+
+  /** Fetch public engagement metrics for one or more tweet IDs. */
+  async getTweetMetrics(ownerUserId: string, accountId: string, tweetIds: string[]): Promise<any[]> {
+    if (!tweetIds?.length) throw new Error('tweet_ids is required for get-tweet-metrics');
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const res: any = await (client.v2 as any).tweets(tweetIds, {
+        'tweet.fields': ['public_metrics', 'created_at', 'text'],
+      });
+      return res?.data?.data ?? res?.data ?? [];
+    });
+  }
+
+  // ─── List replies ────────────────────────────────────────────────────────────
+
+  /** List replies to a tweet using conversation_id search (last 7 days). */
+  async listReplies(ownerUserId: string, accountId: string, tweetId: string, maxResults?: number): Promise<any[]> {
+    if (!tweetId || tweetId.trim() === '') throw new Error('tweet_id is required for list-replies');
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const res: any = await client.v2.search(`conversation_id:${tweetId.trim()} is:reply`, {
+        max_results: Math.min(maxResults ?? 10, 100),
+        'tweet.fields': ['public_metrics', 'created_at', 'author_id'],
+      });
+      return res?.data?.data ?? res?.data ?? [];
     });
   }
 }

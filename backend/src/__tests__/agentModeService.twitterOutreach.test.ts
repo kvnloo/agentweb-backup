@@ -1,6 +1,7 @@
 /**
- * Unit tests for AgentModeService.twitterOutreach (official X API dispatch).
- * Covers account resolution, each action, validation, and CRM logging parity.
+ * Unit tests for AgentModeService.twitterManagePost and .twitterOutreach.
+ * twitterManagePost — tweet-level interactions (reply, thread, quote, delete, edit, like, retweet, metrics).
+ * twitterOutreach   — people/discovery/DM interactions (profile, follow, DM, search, bookmark, block, mute).
  */
 
 jest.mock('unipile-node-sdk', () => ({
@@ -22,18 +23,72 @@ jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {},
 }));
 
+// ── twitterManagePost mocks ──
 const mockPostTweet = jest.fn();
 const mockPostThread = jest.fn();
+const mockQuoteTweet = jest.fn();
+const mockDeleteTweet = jest.fn();
+const mockEditTweet = jest.fn();
+const mockLikeTweet = jest.fn();
+const mockUnlikeTweet = jest.fn();
+const mockRetweetTweet = jest.fn();
+const mockUnretweetTweet = jest.fn();
+const mockGetTweetMetrics = jest.fn();
+const mockListReplies = jest.fn();
+const mockGetRetweeters = jest.fn();
+const mockGetLikingUsers = jest.fn();
+const mockGetQuoteTweets = jest.fn();
+
+// ── twitterOutreach mocks ──
+const mockGetProfile = jest.fn();
+const mockFollowUser = jest.fn();
+const mockUnfollowUser = jest.fn();
+const mockListFollowers = jest.fn();
+const mockListFollowing = jest.fn();
+const mockSearchTweets = jest.fn();
+const mockGetUserTweets = jest.fn();
 const mockSendDm = jest.fn();
 const mockListDms = jest.fn();
-const mockGetProfile = jest.fn();
+const mockGetDmConversation = jest.fn();
+const mockBookmarkTweet = jest.fn();
+const mockGetBookmarks = jest.fn();
+const mockBlockUser = jest.fn();
+const mockUnblockUser = jest.fn();
+const mockMuteUser = jest.fn();
+const mockUnmuteUser = jest.fn();
+
 jest.mock('../services/twitterService', () => ({
   twitterService: {
     postTweet: (...a: any[]) => mockPostTweet(...a),
     postThread: (...a: any[]) => mockPostThread(...a),
+    quoteTweet: (...a: any[]) => mockQuoteTweet(...a),
+    deleteTweet: (...a: any[]) => mockDeleteTweet(...a),
+    editTweet: (...a: any[]) => mockEditTweet(...a),
+    likeTweet: (...a: any[]) => mockLikeTweet(...a),
+    unlikeTweet: (...a: any[]) => mockUnlikeTweet(...a),
+    retweetTweet: (...a: any[]) => mockRetweetTweet(...a),
+    unretweetTweet: (...a: any[]) => mockUnretweetTweet(...a),
+    getTweetMetrics: (...a: any[]) => mockGetTweetMetrics(...a),
+    listReplies: (...a: any[]) => mockListReplies(...a),
+    getRetweeters: (...a: any[]) => mockGetRetweeters(...a),
+    getLikingUsers: (...a: any[]) => mockGetLikingUsers(...a),
+    getQuoteTweets: (...a: any[]) => mockGetQuoteTweets(...a),
+    getProfile: (...a: any[]) => mockGetProfile(...a),
+    followUser: (...a: any[]) => mockFollowUser(...a),
+    unfollowUser: (...a: any[]) => mockUnfollowUser(...a),
+    listFollowers: (...a: any[]) => mockListFollowers(...a),
+    listFollowing: (...a: any[]) => mockListFollowing(...a),
+    searchTweets: (...a: any[]) => mockSearchTweets(...a),
+    getUserTweets: (...a: any[]) => mockGetUserTweets(...a),
     sendDm: (...a: any[]) => mockSendDm(...a),
     listDms: (...a: any[]) => mockListDms(...a),
-    getProfile: (...a: any[]) => mockGetProfile(...a),
+    getDmConversation: (...a: any[]) => mockGetDmConversation(...a),
+    bookmarkTweet: (...a: any[]) => mockBookmarkTweet(...a),
+    getBookmarks: (...a: any[]) => mockGetBookmarks(...a),
+    blockUser: (...a: any[]) => mockBlockUser(...a),
+    unblockUser: (...a: any[]) => mockUnblockUser(...a),
+    muteUser: (...a: any[]) => mockMuteUser(...a),
+    unmuteUser: (...a: any[]) => mockUnmuteUser(...a),
   },
 }));
 
@@ -51,33 +106,47 @@ jest.mock('../services/db', () => ({
 
 import { AgentModeService } from '../services/agentModeService';
 
-describe('AgentModeService.twitterOutreach', () => {
+const OWNER = 'owner-1';
+const SINGLE_ACCOUNT = [{ platform: 'twitter', account_id: 'tw1', userId: OWNER }];
+
+// ══════════════════════════════════════════════════════════
+// twitterManagePost — tweet-level interactions
+// ══════════════════════════════════════════════════════════
+describe('AgentModeService.twitterManagePost', () => {
   let service: AgentModeService;
-  const OWNER = 'owner-1';
 
   beforeEach(() => {
     jest.clearAllMocks();
     service = new AgentModeService();
-    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
-      { platform: 'twitter', account_id: 'tw1', userId: OWNER },
-    ]);
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(SINGLE_ACCOUNT);
     mockPostTweet.mockResolvedValue({ id: 't100', text: 'hi' });
     mockPostThread.mockResolvedValue([{ id: 't1', text: 'a' }, { id: 't2', text: 'b' }]);
-    mockSendDm.mockResolvedValue({ dm_conversation_id: 'c1', dm_event_id: 'e1' });
-    mockListDms.mockResolvedValue([{ id: 'dm1' }]);
-    mockGetProfile.mockResolvedValue({ id: '999', username: 'target' });
+    mockQuoteTweet.mockResolvedValue({ id: 'qt1', text: 'quoting...' });
+    mockDeleteTweet.mockResolvedValue({ deleted: true });
+    mockEditTweet.mockResolvedValue({ id: 't200', text: 'edited' });
+    mockLikeTweet.mockResolvedValue({ liked: true });
+    mockUnlikeTweet.mockResolvedValue({ liked: false });
+    mockRetweetTweet.mockResolvedValue({ retweeted: true });
+    mockUnretweetTweet.mockResolvedValue({ retweeted: false });
+    mockGetTweetMetrics.mockResolvedValue([
+      { id: 'tw1', text: 'hello', public_metrics: { retweet_count: 2, reply_count: 1, like_count: 5, quote_count: 0, impression_count: 100, bookmark_count: 3 } },
+    ]);
+    mockListReplies.mockResolvedValue([{ id: 'r1', text: 'a reply', author_id: 'u2' }]);
+    mockGetRetweeters.mockResolvedValue([{ id: 'u3', username: 'retweeter' }]);
+    mockGetLikingUsers.mockResolvedValue([{ id: 'u4', username: 'liker' }]);
+    mockGetQuoteTweets.mockResolvedValue([{ id: 'qt2', text: 'a quote' }]);
   });
 
-  // ── FAIL cases ──
+  // ── Account resolution ──
   it('returns error when no twitter account is connected', async () => {
     mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([]);
-    const res = await service.twitterOutreach('u', { action: 'post-tweet', text: 'hi' });
+    const res = await service.twitterManagePost('u', { action: 'delete_tweet', tweet_id: 't1' });
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/no x.*account|connect/i);
   });
 
   it('returns error when a specified account_id is not connected', async () => {
-    const res = await service.twitterOutreach('u', { action: 'post-tweet', text: 'hi', account_id: 'nope' });
+    const res = await service.twitterManagePost('u', { action: 'delete_tweet', tweet_id: 't1', account_id: 'nope' });
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/not connected/i);
   });
@@ -87,27 +156,353 @@ describe('AgentModeService.twitterOutreach', () => {
       { platform: 'twitter', account_id: 'tw1', userId: OWNER },
       { platform: 'twitter', account_id: 'tw2', userId: OWNER },
     ]);
-    const res = await service.twitterOutreach('u', { action: 'post-tweet', text: 'hi' });
+    const res = await service.twitterManagePost('u', { action: 'delete_tweet', tweet_id: 't1' });
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/multiple/i);
   });
 
-  it('post-tweet without text errors', async () => {
-    const res = await service.twitterOutreach('u', { action: 'post-tweet' });
-    expect(res.success).toBe(false);
-    expect(res.error).toMatch(/text is required/i);
-  });
-
+  // ── Validation failures ──
   it('reply without in_reply_to_tweet_id errors', async () => {
-    const res = await service.twitterOutreach('u', { action: 'reply', text: 'hi' });
+    const res = await service.twitterManagePost('u', { action: 'reply', text: 'hi' });
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/in_reply_to_tweet_id/i);
   });
 
-  it('send-dm without recipient errors', async () => {
-    const res = await service.twitterOutreach('u', { action: 'send-dm', text: 'hi' });
+  it('like without tweet_id errors', async () => {
+    const res = await service.twitterManagePost('u', { action: 'like' });
     expect(res.success).toBe(false);
-    expect(res.error).toMatch(/recipient_handle/i);
+    expect(res.error).toMatch(/tweet_id.*required|required.*tweet_id/i);
+  });
+
+  it('unlike without tweet_id errors', async () => {
+    const res = await service.twitterManagePost('u', { action: 'unlike' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/tweet_id.*required|required.*tweet_id/i);
+  });
+
+  it('retweet without tweet_id errors', async () => {
+    const res = await service.twitterManagePost('u', { action: 'retweet' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/tweet_id.*required|required.*tweet_id/i);
+  });
+
+  it('unretweet without tweet_id errors', async () => {
+    const res = await service.twitterManagePost('u', { action: 'unretweet' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/tweet_id.*required|required.*tweet_id/i);
+  });
+
+  it('quote_tweet without text errors', async () => {
+    const res = await service.twitterManagePost('u', { action: 'quote_tweet', tweet_id: 'tw1' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/text.*required|required.*text/i);
+  });
+
+  it('quote_tweet without tweet_id errors', async () => {
+    const res = await service.twitterManagePost('u', { action: 'quote_tweet', text: 'nice!' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/tweet_id.*required|required.*tweet_id/i);
+  });
+
+  it('get_retweeters without tweet_id errors', async () => {
+    const res = await service.twitterManagePost('u', { action: 'get_retweeters' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/tweet_id.*required|required.*tweet_id/i);
+  });
+
+  it('get_liking_users without tweet_id errors', async () => {
+    const res = await service.twitterManagePost('u', { action: 'get_liking_users' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/tweet_id.*required|required.*tweet_id/i);
+  });
+
+  it('get_quote_tweets without tweet_id errors', async () => {
+    const res = await service.twitterManagePost('u', { action: 'get_quote_tweets' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/tweet_id.*required|required.*tweet_id/i);
+  });
+
+  it('unknown action errors', async () => {
+    const res = await service.twitterManagePost('u', { action: 'frobnicate' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/unsupported/i);
+  });
+
+  // ── Happy paths ──
+  it('reply calls postTweet with inReplyToTweetId option', async () => {
+    const res = await service.twitterManagePost('u', { action: 'reply', text: 'yo', in_reply_to_tweet_id: '555' });
+    expect(mockPostTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'yo', { inReplyToTweetId: '555' });
+    expect(res.success).toBe(true);
+  });
+
+  it('post_thread forwards the tweets array', async () => {
+    const res = await service.twitterManagePost('u', { action: 'post_thread', tweets: ['a', 'b'] });
+    expect(mockPostThread).toHaveBeenCalledWith(OWNER, 'tw1', ['a', 'b']);
+    expect(res.data).toHaveLength(2);
+  });
+
+  it('quote_tweet calls quoteTweet with text and tweet_id', async () => {
+    const res = await service.twitterManagePost('u', { action: 'quote_tweet', text: 'nice tweet!', tweet_id: 'tw42' });
+    expect(mockQuoteTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'nice tweet!', 'tw42');
+    expect(res.success).toBe(true);
+    expect(res.data.id).toBe('qt1');
+  });
+
+  it('delete_tweet calls deleteTweet with tweet_id', async () => {
+    const res = await service.twitterManagePost('u', { action: 'delete_tweet', tweet_id: 'tw42' });
+    expect(mockDeleteTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'tw42');
+    expect(res.success).toBe(true);
+    expect(res.data.deleted).toBe(true);
+  });
+
+  it('edit_tweet calls editTweet with tweet_id and text', async () => {
+    const res = await service.twitterManagePost('u', { action: 'edit_tweet', tweet_id: 'tw42', text: 'edited' });
+    expect(mockEditTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'tw42', 'edited');
+    expect(res.success).toBe(true);
+    expect(res.data.id).toBe('t200');
+  });
+
+  it('like calls likeTweet with tweet_id', async () => {
+    const res = await service.twitterManagePost('u', { action: 'like', tweet_id: 'tw42' });
+    expect(mockLikeTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'tw42');
+    expect(res.success).toBe(true);
+    expect(res.data.liked).toBe(true);
+  });
+
+  it('unlike calls unlikeTweet with tweet_id', async () => {
+    const res = await service.twitterManagePost('u', { action: 'unlike', tweet_id: 'tw42' });
+    expect(mockUnlikeTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'tw42');
+    expect(res.success).toBe(true);
+    expect(res.data.liked).toBe(false);
+  });
+
+  it('retweet calls retweetTweet with tweet_id', async () => {
+    const res = await service.twitterManagePost('u', { action: 'retweet', tweet_id: 'tw42' });
+    expect(mockRetweetTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'tw42');
+    expect(res.success).toBe(true);
+    expect(res.data.retweeted).toBe(true);
+  });
+
+  it('unretweet calls unretweetTweet with tweet_id', async () => {
+    const res = await service.twitterManagePost('u', { action: 'unretweet', tweet_id: 'tw42' });
+    expect(mockUnretweetTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'tw42');
+    expect(res.success).toBe(true);
+    expect(res.data.retweeted).toBe(false);
+  });
+
+  it('get_tweet_metrics without tweet_ids errors', async () => {
+    const res = await service.twitterManagePost('u', { action: 'get_tweet_metrics' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/tweet_ids/i);
+  });
+
+  it('get_tweet_metrics calls getTweetMetrics with tweet_ids array', async () => {
+    const res = await service.twitterManagePost('u', { action: 'get_tweet_metrics', tweet_ids: ['tw1', 'tw2'] });
+    expect(mockGetTweetMetrics).toHaveBeenCalledWith(OWNER, 'tw1', ['tw1', 'tw2']);
+    expect(res.success).toBe(true);
+    expect(res.data[0].public_metrics.like_count).toBe(5);
+  });
+
+  it('list_replies without tweet_id errors', async () => {
+    const res = await service.twitterManagePost('u', { action: 'list_replies' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/tweet_id/i);
+  });
+
+  it('list_replies calls listReplies with tweet_id', async () => {
+    const res = await service.twitterManagePost('u', { action: 'list_replies', tweet_id: 'tw99' });
+    expect(mockListReplies).toHaveBeenCalledWith(OWNER, 'tw1', 'tw99', undefined);
+    expect(res.success).toBe(true);
+    expect(res.data).toHaveLength(1);
+  });
+
+  it('list_replies passes max_results when provided', async () => {
+    await service.twitterManagePost('u', { action: 'list_replies', tweet_id: 'tw99', max_results: 20 });
+    expect(mockListReplies).toHaveBeenCalledWith(OWNER, 'tw1', 'tw99', 20);
+  });
+
+  it('get_retweeters calls getRetweeters with tweet_id', async () => {
+    const res = await service.twitterManagePost('u', { action: 'get_retweeters', tweet_id: 'tw42' });
+    expect(mockGetRetweeters).toHaveBeenCalledWith(OWNER, 'tw1', 'tw42');
+    expect(res.success).toBe(true);
+    expect(res.data).toHaveLength(1);
+  });
+
+  it('get_liking_users calls getLikingUsers with tweet_id', async () => {
+    const res = await service.twitterManagePost('u', { action: 'get_liking_users', tweet_id: 'tw42' });
+    expect(mockGetLikingUsers).toHaveBeenCalledWith(OWNER, 'tw1', 'tw42');
+    expect(res.success).toBe(true);
+    expect(res.data).toHaveLength(1);
+  });
+
+  it('get_quote_tweets calls getQuoteTweets with tweet_id', async () => {
+    const res = await service.twitterManagePost('u', { action: 'get_quote_tweets', tweet_id: 'tw42' });
+    expect(mockGetQuoteTweets).toHaveBeenCalledWith(OWNER, 'tw1', 'tw42', undefined);
+    expect(res.success).toBe(true);
+    expect(res.data).toHaveLength(1);
+  });
+
+  it('get_quote_tweets passes max_results when provided', async () => {
+    await service.twitterManagePost('u', { action: 'get_quote_tweets', tweet_id: 'tw42', max_results: 5 });
+    expect(mockGetQuoteTweets).toHaveBeenCalledWith(OWNER, 'tw1', 'tw42', 5);
+  });
+
+  // ── CRM logging ──
+  it('logs an edited tweet to CRM when list_id/lead_id/lead_email present', async () => {
+    await service.twitterManagePost('u', {
+      action: 'edit_tweet', tweet_id: 'tw42', text: 'updated', list_id: 'L1', lead_id: 'LD1', lead_email: 'a@b.com',
+    });
+    expect(mockAddTwitterMessageEvent).toHaveBeenCalledWith(expect.objectContaining({
+      eventType: 'twitter.tweet.sent',
+      emailDomain: 'twitter-L1',
+      leadEmail: 'a@b.com',
+      messageProviderId: 't200',
+    }));
+  });
+
+  it('does NOT log to CRM when lead context is incomplete', async () => {
+    await service.twitterManagePost('u', { action: 'list_replies', tweet_id: 'tw1', list_id: 'L1' });
+    expect(mockAddTwitterMessageEvent).not.toHaveBeenCalled();
+  });
+
+  it('CRM logging failure does not fail the action', async () => {
+    mockAddTwitterMessageEvent.mockRejectedValueOnce(new Error('dynamo down'));
+    const res = await service.twitterManagePost('u', {
+      action: 'edit_tweet', tweet_id: 'tw42', text: 'updated', list_id: 'L1', lead_id: 'LD1', lead_email: 'a@b.com',
+    });
+    expect(res.success).toBe(true);
+  });
+});
+
+// ══════════════════════════════════════════════════════════
+// twitterOutreach — people / DM / discovery interactions
+// ══════════════════════════════════════════════════════════
+describe('AgentModeService.twitterOutreach', () => {
+  let service: AgentModeService;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new AgentModeService();
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(SINGLE_ACCOUNT);
+    mockGetProfile.mockResolvedValue({ id: '999', username: 'target' });
+    mockFollowUser.mockResolvedValue({ following: true });
+    mockUnfollowUser.mockResolvedValue({ following: false });
+    mockListFollowers.mockResolvedValue([{ id: 'u1', username: 'alice' }]);
+    mockListFollowing.mockResolvedValue([{ id: 'u2', username: 'bob' }]);
+    mockSearchTweets.mockResolvedValue([{ id: 'tw99', text: 'search result' }]);
+    mockGetUserTweets.mockResolvedValue([{ id: 'utw1', text: 'user tweet' }]);
+    mockSendDm.mockResolvedValue({ dm_conversation_id: 'c1', dm_event_id: 'e1' });
+    mockListDms.mockResolvedValue([{ id: 'dm1' }]);
+    mockGetDmConversation.mockResolvedValue([{ id: 'dm_ev1', text: 'hello' }]);
+    mockBookmarkTweet.mockResolvedValue({ bookmarked: true });
+    mockGetBookmarks.mockResolvedValue([{ id: 'bm1', text: 'bookmarked tweet' }]);
+    mockBlockUser.mockResolvedValue({ blocking: true });
+    mockUnblockUser.mockResolvedValue({ blocking: false });
+    mockMuteUser.mockResolvedValue({ muting: true });
+    mockUnmuteUser.mockResolvedValue({ muting: false });
+  });
+
+  // ── Account resolution ──
+  it('returns error when no twitter account is connected', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([]);
+    const res = await service.twitterOutreach('u', { action: 'get_profile', handle: '@jack' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/no x.*account|connect/i);
+  });
+
+  it('returns error when a specified account_id is not connected', async () => {
+    const res = await service.twitterOutreach('u', { action: 'get_profile', handle: '@jack', account_id: 'nope' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/not connected/i);
+  });
+
+  it('returns error when multiple accounts and no account_id', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      { platform: 'twitter', account_id: 'tw1', userId: OWNER },
+      { platform: 'twitter', account_id: 'tw2', userId: OWNER },
+    ]);
+    const res = await service.twitterOutreach('u', { action: 'get_profile', handle: '@jack' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/multiple/i);
+  });
+
+  // ── Validation failures ──
+  it('get_profile without handle errors', async () => {
+    const res = await service.twitterOutreach('u', { action: 'get_profile' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/handle.*required|required.*handle/i);
+  });
+
+  it('follow without handle errors', async () => {
+    const res = await service.twitterOutreach('u', { action: 'follow' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/handle.*required|required.*handle/i);
+  });
+
+  it('unfollow without handle errors', async () => {
+    const res = await service.twitterOutreach('u', { action: 'unfollow' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/handle.*required|required.*handle/i);
+  });
+
+  it('search_tweets without query errors', async () => {
+    const res = await service.twitterOutreach('u', { action: 'search_tweets' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/query.*required|required.*query/i);
+  });
+
+  it('get_user_tweets without handle errors', async () => {
+    const res = await service.twitterOutreach('u', { action: 'get_user_tweets' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/handle.*required|required.*handle/i);
+  });
+
+  it('send_dm without handle errors', async () => {
+    const res = await service.twitterOutreach('u', { action: 'send_dm', text: 'hi' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/handle.*required|required.*handle/i);
+  });
+
+  it('send_dm without text errors', async () => {
+    const res = await service.twitterOutreach('u', { action: 'send_dm', handle: '@bob' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/text.*required|required.*text/i);
+  });
+
+  it('get_dm_conversation without handle errors', async () => {
+    const res = await service.twitterOutreach('u', { action: 'get_dm_conversation' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/handle.*required|required.*handle/i);
+  });
+
+  it('bookmark without tweet_id errors', async () => {
+    const res = await service.twitterOutreach('u', { action: 'bookmark' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/tweet_id.*required|required.*tweet_id/i);
+  });
+
+  it('block without handle errors', async () => {
+    const res = await service.twitterOutreach('u', { action: 'block' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/handle.*required|required.*handle/i);
+  });
+
+  it('unblock without handle errors', async () => {
+    const res = await service.twitterOutreach('u', { action: 'unblock' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/handle.*required|required.*handle/i);
+  });
+
+  it('mute without handle errors', async () => {
+    const res = await service.twitterOutreach('u', { action: 'mute' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/handle.*required|required.*handle/i);
+  });
+
+  it('unmute without handle errors', async () => {
+    const res = await service.twitterOutreach('u', { action: 'unmute' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/handle.*required|required.*handle/i);
   });
 
   it('unknown action errors', async () => {
@@ -117,75 +512,152 @@ describe('AgentModeService.twitterOutreach', () => {
   });
 
   // ── Happy paths ──
-  it('post-tweet passes owner userId and resolved account to the service', async () => {
-    const res = await service.twitterOutreach('u', { action: 'post-tweet', text: 'hi' });
-    expect(mockPostTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'hi');
-    expect(res.success).toBe(true);
-    expect(res.data.id).toBe('t100');
-  });
-
-  it('reply uses inReplyToTweetId option', async () => {
-    const res = await service.twitterOutreach('u', { action: 'reply', text: 'yo', in_reply_to_tweet_id: '555' });
-    expect(mockPostTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'yo', { inReplyToTweetId: '555' });
-    expect(res.success).toBe(true);
-  });
-
-  it('post-thread forwards the tweets array', async () => {
-    const res = await service.twitterOutreach('u', { action: 'post-thread', tweets: ['a', 'b'] });
-    expect(mockPostThread).toHaveBeenCalledWith(OWNER, 'tw1', ['a', 'b']);
-    expect(res.data).toHaveLength(2);
-  });
-
-  it('send-dm resolves recipient_handle', async () => {
-    const res = await service.twitterOutreach('u', { action: 'send-dm', recipient_handle: '@target', text: 'hey' });
-    expect(mockSendDm).toHaveBeenCalledWith(OWNER, 'tw1', '@target', 'hey');
-    expect(res.success).toBe(true);
-  });
-
-  it('list-dms returns events', async () => {
-    const res = await service.twitterOutreach('u', { action: 'list-dms' });
-    expect(mockListDms).toHaveBeenCalledWith(OWNER, 'tw1');
-    expect(res.data).toHaveLength(1);
-  });
-
-  it('get-profile resolves handle', async () => {
-    const res = await service.twitterOutreach('u', { action: 'get-profile', handle: 'target' });
+  it('get_profile calls getProfile with handle', async () => {
+    const res = await service.twitterOutreach('u', { action: 'get_profile', handle: 'target' });
     expect(mockGetProfile).toHaveBeenCalledWith(OWNER, 'tw1', 'target');
     expect(res.data.id).toBe('999');
   });
 
-  // ── CRM logging (full parity) ──
-  it('logs a sent tweet to CRM when list_id/lead_id/lead_email present', async () => {
-    await service.twitterOutreach('u', {
-      action: 'post-tweet', text: 'hi', list_id: 'L1', lead_id: 'LD1', lead_email: 'a@b.com',
-    });
-    expect(mockAddTwitterMessageEvent).toHaveBeenCalledWith(expect.objectContaining({
-      eventType: 'twitter.tweet.sent',
-      emailDomain: 'twitter-L1',
-      leadEmail: 'a@b.com',
-      messageProviderId: 't100',
-    }));
+  it('follow calls followUser with handle', async () => {
+    const res = await service.twitterOutreach('u', { action: 'follow', handle: '@jack' });
+    expect(mockFollowUser).toHaveBeenCalledWith(OWNER, 'tw1', '@jack');
+    expect(res.success).toBe(true);
+    expect(res.data.following).toBe(true);
   });
 
-  it('logs a sent DM to CRM with dm event type', async () => {
+  it('unfollow calls unfollowUser with handle', async () => {
+    const res = await service.twitterOutreach('u', { action: 'unfollow', handle: '@jack' });
+    expect(mockUnfollowUser).toHaveBeenCalledWith(OWNER, 'tw1', '@jack');
+    expect(res.success).toBe(true);
+    expect(res.data.following).toBe(false);
+  });
+
+  it('list_followers calls listFollowers (own account when no handle)', async () => {
+    const res = await service.twitterOutreach('u', { action: 'list_followers' });
+    expect(mockListFollowers).toHaveBeenCalledWith(OWNER, 'tw1', undefined);
+    expect(res.success).toBe(true);
+    expect(res.data).toHaveLength(1);
+  });
+
+  it('list_followers passes handle when provided', async () => {
+    await service.twitterOutreach('u', { action: 'list_followers', handle: '@alice' });
+    expect(mockListFollowers).toHaveBeenCalledWith(OWNER, 'tw1', '@alice');
+  });
+
+  it('list_following calls listFollowing (own account when no handle)', async () => {
+    const res = await service.twitterOutreach('u', { action: 'list_following' });
+    expect(mockListFollowing).toHaveBeenCalledWith(OWNER, 'tw1', undefined);
+    expect(res.success).toBe(true);
+    expect(res.data).toHaveLength(1);
+  });
+
+  it('search_tweets calls searchTweets with query', async () => {
+    const res = await service.twitterOutreach('u', { action: 'search_tweets', query: 'hello world' });
+    expect(mockSearchTweets).toHaveBeenCalledWith(OWNER, 'tw1', 'hello world', undefined);
+    expect(res.success).toBe(true);
+    expect(res.data).toHaveLength(1);
+  });
+
+  it('search_tweets passes max_results when provided', async () => {
+    await service.twitterOutreach('u', { action: 'search_tweets', query: 'foo', max_results: 25 });
+    expect(mockSearchTweets).toHaveBeenCalledWith(OWNER, 'tw1', 'foo', 25);
+  });
+
+  it('get_user_tweets calls getUserTweets with handle', async () => {
+    const res = await service.twitterOutreach('u', { action: 'get_user_tweets', handle: '@sam' });
+    expect(mockGetUserTweets).toHaveBeenCalledWith(OWNER, 'tw1', '@sam', undefined);
+    expect(res.success).toBe(true);
+    expect(res.data).toHaveLength(1);
+  });
+
+  it('send_dm calls sendDm with handle and text', async () => {
+    const res = await service.twitterOutreach('u', { action: 'send_dm', handle: '@target', text: 'hey' });
+    expect(mockSendDm).toHaveBeenCalledWith(OWNER, 'tw1', '@target', 'hey');
+    expect(res.success).toBe(true);
+  });
+
+  it('send_dm also accepts recipient_handle', async () => {
+    const res = await service.twitterOutreach('u', { action: 'send_dm', recipient_handle: '@target', text: 'hey' });
+    expect(mockSendDm).toHaveBeenCalledWith(OWNER, 'tw1', '@target', 'hey');
+    expect(res.success).toBe(true);
+  });
+
+  it('list_dms returns events', async () => {
+    const res = await service.twitterOutreach('u', { action: 'list_dms' });
+    expect(mockListDms).toHaveBeenCalledWith(OWNER, 'tw1');
+    expect(res.data).toHaveLength(1);
+  });
+
+  it('get_dm_conversation calls getDmConversation with handle', async () => {
+    const res = await service.twitterOutreach('u', { action: 'get_dm_conversation', handle: '@bob' });
+    expect(mockGetDmConversation).toHaveBeenCalledWith(OWNER, 'tw1', '@bob');
+    expect(res.success).toBe(true);
+    expect(res.data).toHaveLength(1);
+  });
+
+  it('bookmark calls bookmarkTweet with tweet_id', async () => {
+    const res = await service.twitterOutreach('u', { action: 'bookmark', tweet_id: 'tw99' });
+    expect(mockBookmarkTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'tw99');
+    expect(res.success).toBe(true);
+    expect(res.data.bookmarked).toBe(true);
+  });
+
+  it('get_bookmarks calls getBookmarks with no extra args', async () => {
+    const res = await service.twitterOutreach('u', { action: 'get_bookmarks' });
+    expect(mockGetBookmarks).toHaveBeenCalledWith(OWNER, 'tw1');
+    expect(res.success).toBe(true);
+    expect(res.data).toHaveLength(1);
+  });
+
+  it('block calls blockUser with handle', async () => {
+    const res = await service.twitterOutreach('u', { action: 'block', handle: '@spammer' });
+    expect(mockBlockUser).toHaveBeenCalledWith(OWNER, 'tw1', '@spammer');
+    expect(res.success).toBe(true);
+    expect(res.data.blocking).toBe(true);
+  });
+
+  it('unblock calls unblockUser with handle', async () => {
+    const res = await service.twitterOutreach('u', { action: 'unblock', handle: '@spammer' });
+    expect(mockUnblockUser).toHaveBeenCalledWith(OWNER, 'tw1', '@spammer');
+    expect(res.success).toBe(true);
+    expect(res.data.blocking).toBe(false);
+  });
+
+  it('mute calls muteUser with handle', async () => {
+    const res = await service.twitterOutreach('u', { action: 'mute', handle: '@noisy' });
+    expect(mockMuteUser).toHaveBeenCalledWith(OWNER, 'tw1', '@noisy');
+    expect(res.success).toBe(true);
+    expect(res.data.muting).toBe(true);
+  });
+
+  it('unmute calls unmuteUser with handle', async () => {
+    const res = await service.twitterOutreach('u', { action: 'unmute', handle: '@noisy' });
+    expect(mockUnmuteUser).toHaveBeenCalledWith(OWNER, 'tw1', '@noisy');
+    expect(res.success).toBe(true);
+    expect(res.data.muting).toBe(false);
+  });
+
+  // ── CRM logging for send_dm ──
+  it('logs a sent DM to CRM when list_id/lead_id/lead_email present', async () => {
     await service.twitterOutreach('u', {
-      action: 'send-dm', recipient_handle: 'target', text: 'hey', list_id: 'L1', lead_id: 'LD1', lead_email: 'a@b.com',
+      action: 'send_dm', handle: 'target', text: 'hey', list_id: 'L1', lead_id: 'LD1', lead_email: 'a@b.com',
     });
     expect(mockAddTwitterMessageEvent).toHaveBeenCalledWith(expect.objectContaining({
       eventType: 'twitter.dm.sent',
+      emailDomain: 'twitter-L1',
       leadEmail: 'a@b.com',
     }));
   });
 
   it('does NOT log to CRM when lead context is incomplete', async () => {
-    await service.twitterOutreach('u', { action: 'post-tweet', text: 'hi', list_id: 'L1' });
+    await service.twitterOutreach('u', { action: 'list_dms', list_id: 'L1' });
     expect(mockAddTwitterMessageEvent).not.toHaveBeenCalled();
   });
 
-  it('CRM logging failure does not fail the action', async () => {
+  it('CRM logging failure does not fail the DM action', async () => {
     mockAddTwitterMessageEvent.mockRejectedValueOnce(new Error('dynamo down'));
     const res = await service.twitterOutreach('u', {
-      action: 'post-tweet', text: 'hi', list_id: 'L1', lead_id: 'LD1', lead_email: 'a@b.com',
+      action: 'send_dm', handle: 'target', text: 'hey', list_id: 'L1', lead_id: 'LD1', lead_email: 'a@b.com',
     });
     expect(res.success).toBe(true);
   });

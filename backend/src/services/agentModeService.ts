@@ -25280,17 +25280,41 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }
 
   // Post on connected account helper
-  async postOnConnectedAccount(userId: string, accountId: string, content: string, mediaUrls: string[] = []): Promise<any> {
+  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string): Promise<any> {
     console.log('[AgentMode] postOnConnectedAccount called:', {
       userId,
       accountId,
+      platform,
       contentLength: content?.length || 0,
       mediaUrlCount: mediaUrls?.length || 0
     });
 
     try {
-      const { getAccountById, isTokenValid } = await import('./connectedAccountsDb');
+      const { getAccountById, isTokenValid, getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
+
+      if (!accountId) {
+        const allAccounts = await getAccountsWithOwnerIncludingOrgShared(userId);
+        const socialAccounts = allAccounts.filter((a: any) =>
+          ['twitter', 'linkedin', 'instagram', 'youtube'].includes(a.platform)
+        );
+        // Narrow by platform hint when provided
+        const candidates = platform
+          ? socialAccounts.filter((a: any) => a.platform === platform)
+          : socialAccounts;
+        if (candidates.length === 0) {
+          const msg = platform
+            ? `No ${platform} account connected. Connect one in Settings → Connected Accounts.`
+            : 'No social media accounts connected. Connect an account in Settings → Connected Accounts.';
+          return { success: false, message: msg };
+        }
+        if (candidates.length > 1) {
+          const names = candidates.map((a: any) => a.account_id).join(', ');
+          return { success: false, message: `Multiple ${platform ?? 'social'} accounts connected. Call list_connected_accounts(platform="${platform ?? 'twitter'}") to see account names, ask the user which one to use, then re-call with account_id. Connected IDs: ${names}` };
+        }
+        accountId = candidates[0].account_id;
+        console.log('[AgentMode] Auto-resolved account_id:', accountId);
+      }
 
       try {
         console.log('[AgentMode] Looking up account:', accountId);
@@ -26267,23 +26291,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
-  // --- Twitter / X outreach ---
+  // --- Twitter / X ---
 
   /**
-   * Dispatch Twitter/X actions for Emma via the official X API (twitterService).
-   * Actions: post-tweet, reply, post-thread, send-dm, list-dms, get-profile.
+   * Dispatch Twitter/X interaction actions for Emma via the official X API.
+   * Posting a single tweet is handled by post_on_connected_account (TwitterAdapter).
+   * This method covers all other interactions: reply, thread, edit, delete, like,
+   * retweet, follow, DMs, search, bookmarks, and profile lookup.
    *
-   * X has no site-wide read account (unlike LinkedIn), so every action requires
-   * an account owned by the caller or shared with their org. The owner's userId is
-   * passed to twitterService so refreshed OAuth tokens are written back to the
-   * owner's record. When list_id/lead_id/lead_email are supplied, sent tweets and
-   * DMs are logged to AW-EmailEvents for CRM parity with LinkedIn.
+   * Every action requires an account owned by the caller or shared with their org.
+   * The owner's userId is passed to twitterService so refreshed OAuth tokens are
+   * written back to the owner's record. When list_id/lead_id/lead_email are
+   * supplied, sent tweets and DMs are logged to AW-EmailEvents for CRM parity.
    */
-  async twitterOutreach(userId: string, args: any): Promise<any> {
+  async twitterManagePost(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
-    const { text, in_reply_to_tweet_id, handle, recipient_handle, tweets, list_id, lead_id, lead_email } = args;
-    console.log(`[AgentMode] twitterOutreach called: action=${action}, account_id=${account_id}`);
+    const { text, in_reply_to_tweet_id, tweet_id, tweet_ids, handle, recipient_handle, tweets, list_id, lead_id, lead_email, query, max_results } = args;
+    console.log(`[AgentMode] twitterManagePost called: action=${action}, account_id=${account_id}`);
 
     const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
     const twitterAccounts = (await getAccountsWithOwnerIncludingOrgShared(userId))
@@ -26334,19 +26359,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           messageProviderId,
         });
       } catch (e) {
-        console.error('[AgentMode] twitterOutreach CRM logging failed (non-fatal):', e);
+        console.error('[AgentMode] twitterManagePost CRM logging failed (non-fatal):', e);
       }
     };
 
     try {
       switch (action) {
-        case 'post-tweet': {
-          if (!text) throw new Error('text is required for post-tweet');
-          const result = await twitterService.postTweet(ownerUserId, account_id, text);
-          await logCrm('twitter.tweet.sent', result.id, result.text);
-          return { success: true, data: result };
-        }
-
         case 'reply': {
           if (!text) throw new Error('text is required for reply');
           if (!in_reply_to_tweet_id) throw new Error('in_reply_to_tweet_id is required for reply');
@@ -26361,17 +26379,216 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!Array.isArray(tweets) || tweets.length === 0) {
             throw new Error('tweets (non-empty array of strings) is required for post-thread');
           }
+          if (tweets.length < 2) {
+            throw new Error('post_thread requires at least 2 tweets. To post a single tweet, use post_on_connected_account instead.');
+          }
           const result = await twitterService.postThread(ownerUserId, account_id, tweets);
           if (result[0]) await logCrm('twitter.tweet.sent', result[0].id, result[0].text);
           return { success: true, data: result };
         }
 
+        case 'quote-tweet': {
+          if (!text) throw new Error('text is required for quote_tweet');
+          if (!tweet_id) throw new Error('tweet_id is required for quote_tweet');
+          const result = await twitterService.quoteTweet(ownerUserId, account_id, text, tweet_id);
+          await logCrm('twitter.tweet.sent', result.id, result.text);
+          return { success: true, data: result };
+        }
+
+        case 'delete-tweet': {
+          if (!tweet_id) throw new Error('tweet_id is required for delete-tweet');
+          const result = await twitterService.deleteTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'edit-tweet': {
+          if (!tweet_id) throw new Error('tweet_id is required for edit-tweet');
+          if (!text) throw new Error('text is required for edit-tweet');
+          const result = await twitterService.editTweet(ownerUserId, account_id, tweet_id, text);
+          await logCrm('twitter.tweet.sent', result.id, result.text);
+          return { success: true, data: result };
+        }
+
+        case 'like': {
+          if (!tweet_id) throw new Error('tweet_id is required for like');
+          const result = await twitterService.likeTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'unlike': {
+          if (!tweet_id) throw new Error('tweet_id is required for unlike');
+          const result = await twitterService.unlikeTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'retweet': {
+          if (!tweet_id) throw new Error('tweet_id is required for retweet');
+          const result = await twitterService.retweetTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'unretweet': {
+          if (!tweet_id) throw new Error('tweet_id is required for unretweet');
+          const result = await twitterService.unretweetTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-tweet-metrics': {
+          if (!tweet_ids?.length) throw new Error('tweet_ids is required for get_tweet_metrics');
+          const result = await twitterService.getTweetMetrics(ownerUserId, account_id, tweet_ids);
+          return { success: true, data: result };
+        }
+
+        case 'list-replies': {
+          if (!tweet_id) throw new Error('tweet_id is required for list_replies');
+          const result = await twitterService.listReplies(ownerUserId, account_id, tweet_id, max_results);
+          return { success: true, data: result };
+        }
+
+        case 'get-retweeters': {
+          if (!tweet_id) throw new Error('tweet_id is required for get_retweeters');
+          const result = await twitterService.getRetweeters(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-liking-users': {
+          if (!tweet_id) throw new Error('tweet_id is required for get_liking_users');
+          const result = await twitterService.getLikingUsers(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-quote-tweets': {
+          if (!tweet_id) throw new Error('tweet_id is required for get_quote_tweets');
+          const result = await twitterService.getQuoteTweets(ownerUserId, account_id, tweet_id, max_results);
+          return { success: true, data: result };
+        }
+
+        default: {
+          const validActions = [
+            'reply', 'post-thread', 'quote-tweet',
+            'delete-tweet', 'edit-tweet',
+            'like', 'unlike', 'retweet', 'unretweet',
+            'list-replies', 'get-tweet-metrics',
+            'get-retweeters', 'get-liking-users', 'get-quote-tweets',
+          ];
+          throw new Error(`Unsupported twitter_manage_post action: "${action}". Valid actions are: ${validActions.join(', ')}`);
+        }
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      console.error('AgentMode: twitter_manage_post failed:', errorMessage);
+      return { success: false, message: 'Twitter action failed', error: errorMessage };
+    }
+  }
+
+  async twitterOutreach(userId: string, args: any): Promise<any> {
+    let { account_id } = args;
+    const action = (args.action as string)?.replace(/_/g, '-');
+    const { text, handle, recipient_handle, query, max_results, tweet_id, list_id, lead_id, lead_email } = args;
+    console.log(`[AgentMode] twitterOutreach called: action=${action}, account_id=${account_id}`);
+
+    const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+    const twitterAccounts = (await getAccountsWithOwnerIncludingOrgShared(userId))
+      .filter((a: any) => a.platform === 'twitter');
+
+    if (twitterAccounts.length === 0) {
+      return {
+        success: false,
+        error: 'No X (Twitter) account is connected. Connect your X account in Settings → Connected Accounts.',
+      };
+    }
+
+    let account: any;
+    if (account_id) {
+      account = twitterAccounts.find((a: any) => a.account_id === account_id);
+      if (!account) {
+        return { success: false, error: `X account ${account_id} is not connected to your profile.` };
+      }
+    } else if (twitterAccounts.length === 1) {
+      account = twitterAccounts[0];
+    } else {
+      return {
+        success: false,
+        error: 'Multiple X accounts are connected — specify account_id. Use list_connected_accounts(platform="twitter").',
+      };
+    }
+
+    const ownerUserId = account.userId;
+    account_id = account.account_id;
+
+    const logCrm = async (messageProviderId: string, bodyText: string): Promise<void> => {
+      if (!list_id || !lead_id || !lead_email) return;
+      try {
+        const { emailEventsDb } = await import('./emailEventsDb');
+        await emailEventsDb.addTwitterMessageEvent({
+          eventId: `twitter_dm_${messageProviderId}`,
+          emailDomain: `twitter-${list_id}`,
+          leadEmail: lead_email,
+          eventType: 'twitter.dm.sent',
+          text: bodyText ?? null,
+          timestamp: new Date().toISOString(),
+          senderId: account_id,
+          messageProviderId,
+        });
+      } catch (e) {
+        console.error('[AgentMode] twitterOutreach CRM logging failed (non-fatal):', e);
+      }
+    };
+
+    try {
+      switch (action) {
+        case 'get-profile': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for get_profile');
+          const result = await twitterService.getProfile(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'follow': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for follow');
+          const result = await twitterService.followUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'unfollow': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for unfollow');
+          const result = await twitterService.unfollowUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'list-followers': {
+          const target = handle || recipient_handle;
+          const result = await twitterService.listFollowers(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'list-following': {
+          const target = handle || recipient_handle;
+          const result = await twitterService.listFollowing(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'search-tweets': {
+          if (!query) throw new Error('query is required for search_tweets');
+          const result = await twitterService.searchTweets(ownerUserId, account_id, query, max_results);
+          return { success: true, data: result };
+        }
+
+        case 'get-user-tweets': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for get_user_tweets');
+          const result = await twitterService.getUserTweets(ownerUserId, account_id, target, max_results);
+          return { success: true, data: result };
+        }
+
         case 'send-dm': {
           const target = recipient_handle || handle;
-          if (!target) throw new Error('recipient_handle is required for send-dm');
-          if (!text) throw new Error('text is required for send-dm');
+          if (!target) throw new Error('handle is required for send_dm');
+          if (!text) throw new Error('text is required for send_dm');
           const result = await twitterService.sendDm(ownerUserId, account_id, target, text);
-          await logCrm('twitter.dm.sent', result?.dm_event_id || `${account_id}_${Date.now()}`, text);
+          await logCrm(result?.dm_event_id || `${account_id}_dm`, text);
           return { success: true, data: result };
         }
 
@@ -26380,21 +26597,66 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, data: result };
         }
 
-        case 'get-profile': {
+        case 'get-dm-conversation': {
           const target = handle || recipient_handle;
-          if (!target) throw new Error('handle is required for get-profile');
-          const result = await twitterService.getProfile(ownerUserId, account_id, target);
+          if (!target) throw new Error('handle is required for get_dm_conversation');
+          const result = await twitterService.getDmConversation(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'bookmark': {
+          if (!tweet_id) throw new Error('tweet_id is required for bookmark');
+          const result = await twitterService.bookmarkTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-bookmarks': {
+          const result = await twitterService.getBookmarks(ownerUserId, account_id);
+          return { success: true, data: result };
+        }
+
+        case 'block': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for block');
+          const result = await twitterService.blockUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'unblock': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for unblock');
+          const result = await twitterService.unblockUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'mute': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for mute');
+          const result = await twitterService.muteUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'unmute': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for unmute');
+          const result = await twitterService.unmuteUser(ownerUserId, account_id, target);
           return { success: true, data: result };
         }
 
         default: {
-          const validActions = ['post-tweet', 'reply', 'post-thread', 'send-dm', 'list-dms', 'get-profile'];
-          throw new Error(`Unsupported Twitter outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
+          const validActions = [
+            'get-profile', 'follow', 'unfollow', 'list-followers', 'list-following',
+            'search-tweets', 'get-user-tweets',
+            'send-dm', 'list-dms', 'get-dm-conversation',
+            'bookmark', 'get-bookmarks',
+            'block', 'unblock', 'mute', 'unmute',
+          ];
+          throw new Error(`Unsupported twitter_outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
         }
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      console.error('AgentMode: Twitter outreach failed:', errorMessage);
+      console.error('AgentMode: twitter_outreach failed:', errorMessage);
       return { success: false, message: 'Twitter outreach action failed', error: errorMessage };
     }
   }

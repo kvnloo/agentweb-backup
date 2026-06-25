@@ -12,6 +12,7 @@ jest.mock('unipile-node-sdk', () => ({
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: jest.fn(),
   getAccountsByUserIdIncludingOrgShared: jest.fn(),
+  getAccountsWithOwnerIncludingOrgShared: jest.fn(),
   getAccountById: jest.fn(),
   isTokenValid: jest.fn(),
 }));
@@ -24,7 +25,7 @@ jest.mock('../services/socialPlatformService', () => ({
 
 // Import after mocks
 import { AgentModeService } from '../services/agentModeService';
-import { getAccountsByUserId, getAccountsByUserIdIncludingOrgShared, getAccountById, isTokenValid } from '../services/connectedAccountsDb';
+import { getAccountsByUserId, getAccountsByUserIdIncludingOrgShared, getAccountsWithOwnerIncludingOrgShared, getAccountById, isTokenValid } from '../services/connectedAccountsDb';
 import { socialPlatformService } from '../services/socialPlatformService';
 
 describe('AgentModeService - Social Media Tools', () => {
@@ -32,6 +33,7 @@ describe('AgentModeService - Social Media Tools', () => {
 
   const mockGetAccountsByUserId = getAccountsByUserId as jest.MockedFunction<typeof getAccountsByUserId>;
   const mockGetAccountsByUserIdIncludingOrgShared = getAccountsByUserIdIncludingOrgShared as jest.MockedFunction<typeof getAccountsByUserIdIncludingOrgShared>;
+  const mockGetAccountsWithOwnerIncludingOrgShared = getAccountsWithOwnerIncludingOrgShared as jest.MockedFunction<typeof getAccountsWithOwnerIncludingOrgShared>;
   const mockGetAccountById = getAccountById as jest.MockedFunction<typeof getAccountById>;
   const mockIsTokenValid = isTokenValid as jest.MockedFunction<typeof isTokenValid>;
   const mockSocialPlatformService = socialPlatformService as jest.Mocked<typeof socialPlatformService>;
@@ -266,6 +268,84 @@ describe('AgentModeService - Social Media Tools', () => {
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('Failed to post');
+    });
+
+    // ── Auto-resolution (no account_id provided) ──
+    it('auto-resolves to the only connected social account when account_id is omitted', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockTwitterAccount] as any);
+      mockGetAccountById.mockResolvedValue(mockTwitterAccount as any);
+      mockAdapter.createPost.mockResolvedValue({ success: true, message: 'Posted', postId: 'tw-1', postUrl: 'https://x.com/tw-1' });
+
+      const result = await service.postOnConnectedAccount('user-123', undefined, 'Hello Twitter!');
+
+      expect(mockGetAccountsWithOwnerIncludingOrgShared).toHaveBeenCalledWith('user-123');
+      expect(mockGetAccountById).toHaveBeenCalledWith('twitter-user-123', 'user-123');
+      expect(result.success).toBe(true);
+    });
+
+    it('returns error when no account_id given and multiple social accounts are connected', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockTwitterAccount, mockLinkedInAccount] as any);
+
+      const result = await service.postOnConnectedAccount('user-123', undefined, 'Hello!');
+
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/multiple social accounts/i);
+      expect(result.message).toMatch(/list_connected_accounts/i);
+      expect(mockGetAccountById).not.toHaveBeenCalled();
+    });
+
+    it('returns error when no account_id given and no social accounts are connected', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([]);
+
+      const result = await service.postOnConnectedAccount('user-123', undefined, 'Hello!');
+
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/no social media accounts connected/i);
+      expect(mockGetAccountById).not.toHaveBeenCalled();
+    });
+
+    // ── Platform hint (multiple accounts, platform narrows to one) ──
+    it('resolves correct account when platform hint narrows multiple accounts to one', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockTwitterAccount, mockLinkedInAccount] as any);
+      mockGetAccountById.mockResolvedValue(mockTwitterAccount as any);
+      mockAdapter.createPost.mockResolvedValue({ success: true, message: 'Posted', postId: 'tw-1', postUrl: 'https://x.com/tw-1' });
+
+      const result = await service.postOnConnectedAccount('user-123', undefined, 'Hello Twitter!', [], 'twitter');
+
+      expect(mockGetAccountById).toHaveBeenCalledWith('twitter-user-123', 'user-123');
+      expect(result.success).toBe(true);
+    });
+
+    it('returns error when platform hint matches no connected account', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+
+      const result = await service.postOnConnectedAccount('user-123', undefined, 'Hello!', [], 'twitter');
+
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/no twitter account connected/i);
+      expect(mockGetAccountById).not.toHaveBeenCalled();
+    });
+
+    it('returns error when platform hint still matches multiple accounts', async () => {
+      const twitter2 = { ...mockTwitterAccount, account_id: 'twitter-user-456' };
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockTwitterAccount, twitter2] as any);
+
+      const result = await service.postOnConnectedAccount('user-123', undefined, 'Hello!', [], 'twitter');
+
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/multiple twitter accounts/i);
+      expect(result.message).toMatch(/list_connected_accounts/i);
+      expect(mockGetAccountById).not.toHaveBeenCalled();
+    });
+
+    it('explicit account_id bypasses auto-resolution entirely', async () => {
+      mockGetAccountById.mockResolvedValue(mockTwitterAccount as any);
+      mockAdapter.createPost.mockResolvedValue({ success: true, message: 'Posted', postId: 'tw-1', postUrl: 'https://x.com/tw-1' });
+
+      await service.postOnConnectedAccount('user-123', 'twitter-user-123', 'Hello!', [], 'twitter');
+
+      expect(mockGetAccountsWithOwnerIncludingOrgShared).not.toHaveBeenCalled();
+      expect(mockGetAccountById).toHaveBeenCalledWith('twitter-user-123', 'user-123');
     });
   });
 

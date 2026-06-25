@@ -477,58 +477,170 @@ For target person identification (send-invite, send-message, get-profile, update
 });
 
 emmaToolRegistry.register({
-  name: 'twitter_outreach',
+  name: 'twitter_manage_post',
   definition: {
-    name: 'twitter_outreach',
-    description: `Twitter/X tool via a connected X account (official X API). To find the account_id, call list_connected_accounts(platform='twitter'). account_id is optional when the user has exactly one X account connected.
+    name: 'twitter_manage_post',
+    description: `Manage X (Twitter) tweet interactions. ⚠️ NEVER use this tool to post a single new tweet — use post_on_connected_account for that. This tool is for: multi-tweet threads (2+ tweets), replies, quote-tweets, edits, deletes, likes, retweets, and analytics.
+
+To find the account_id, call list_connected_accounts(platform='twitter'). account_id is optional when the user has exactly one X account connected.
 
 Actions:
-- post-tweet: Post a tweet. Requires text. Text over 280 chars is auto-trimmed on a word boundary before sending.
-- reply: Reply to a tweet (also used to build threads). Requires text and in_reply_to_tweet_id (the id of the tweet being replied to).
-- post-thread: Post a chained thread. Requires tweets (an array of strings, one per tweet). Each entry is auto-trimmed to 280 chars.
-- send-dm: Send a direct message to an X user. Requires recipient_handle (the @handle) and text. The backend resolves the handle to the user id automatically. DM text over 10000 chars is auto-trimmed.
-- list-dms: List recent direct message events for the connected account.
-- get-profile: Get an X user's profile by handle. Requires handle.
+- reply: Reply to an existing tweet. Requires text and in_reply_to_tweet_id.
+- post_thread: Post a NEW chain of 2 or more tweets in sequence. Requires tweets array with MINIMUM 2 entries — if you only have 1 tweet, use post_on_connected_account instead. Each entry auto-trimmed to 280 chars.
+- quote_tweet: Quote-tweet a tweet with added commentary. Requires text and tweet_id.
+- delete_tweet: Delete a tweet you authored. Requires tweet_id. CRITICAL: Always get explicit user approval before deleting.
+- edit_tweet: Edit an existing tweet (editable within 30 min, up to 5 times). Requires tweet_id and text. Each edit produces a new tweet id.
+- like: Like a tweet. Requires tweet_id.
+- unlike: Remove a like from a tweet. Requires tweet_id.
+- retweet: Retweet a tweet. Requires tweet_id.
+- unretweet: Undo a retweet. Requires tweet_id.
+- get_tweet_metrics: Fetch public engagement metrics (retweets, replies, likes, quotes, impressions, bookmarks) for one or more tweets. Requires tweet_ids array.
+- list_replies: List replies to a tweet (searches last 7 days). Requires tweet_id. Optional max_results (default 10, max 100).
+- get_retweeters: List users who retweeted a tweet. Requires tweet_id.
+- get_liking_users: List users who liked a tweet. Requires tweet_id.
+- get_quote_tweets: List quote tweets of a tweet. Requires tweet_id. Optional max_results.
 
-For CRM logging of sent tweets/DMs, optionally pass list_id, lead_id and lead_email — when all three are present the message is recorded to the lead's CRM engagement history.
-
-Notes: Quote tweets and people-search are not supported. Replying to arbitrary third-party tweets may be restricted by X.`,
+For CRM logging of sent tweets, optionally pass list_id, lead_id and lead_email.`,
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['post-tweet', 'reply', 'post-thread', 'send-dm', 'list-dms', 'get-profile'],
-          description: 'The Twitter/X action to perform.'
+          enum: [
+            'reply', 'post_thread', 'quote_tweet',
+            'delete_tweet', 'edit_tweet',
+            'like', 'unlike', 'retweet', 'unretweet',
+            'get_tweet_metrics', 'list_replies',
+            'get_retweeters', 'get_liking_users', 'get_quote_tweets',
+          ],
+          description: 'The X post action to perform.'
         },
         account_id: {
           type: 'string',
-          description: 'The X account id. Optional when the user has exactly one X account connected. Obtain via list_connected_accounts(platform=\'twitter\').'
+          description: "The connected X account ID. Optional when the user has exactly one X account connected. Obtain via list_connected_accounts(platform='twitter')."
         },
         text: {
           type: 'string',
-          description: 'Tweet or DM text. Required for post-tweet, reply, and send-dm. Auto-trimmed to 280 (tweet) or 10000 (DM) chars on a word boundary.'
+          description: 'Tweet text. Required for reply, edit_tweet, quote_tweet. Auto-trimmed to 280 chars on a word boundary.'
+        },
+        tweet_id: {
+          type: 'string',
+          description: 'Tweet ID. Required for delete_tweet, edit_tweet, like, unlike, retweet, unretweet, quote_tweet, list_replies, get_retweeters, get_liking_users, get_quote_tweets.'
         },
         in_reply_to_tweet_id: {
           type: 'string',
-          description: 'The id of the tweet being replied to. Required for reply.'
+          description: 'ID of the tweet being replied to. Required for reply.'
         },
         tweets: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Array of tweet texts for post-thread, posted as a chained thread in order.'
+          description: 'Array of tweet texts for post_thread, posted as a chained thread in order.'
         },
-        recipient_handle: {
-          type: 'string',
-          description: 'The @handle of the DM recipient. Required for send-dm.'
+        max_results: {
+          type: 'number',
+          description: 'Maximum results to return. Optional for list_replies and get_quote_tweets (default 10, max 100).'
         },
-        handle: {
-          type: 'string',
-          description: 'The @handle to look up. Required for get-profile.'
+        tweet_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of tweet IDs to fetch metrics for. Required for get_tweet_metrics.'
         },
         list_id: {
           type: 'string',
-          description: 'CRM lead list ID. Optional — provide with lead_id and lead_email to log the sent tweet/DM to CRM history.'
+          description: 'CRM lead list ID. Optional — provide with lead_id and lead_email to log the sent tweet to CRM history.'
+        },
+        lead_id: {
+          type: 'string',
+          description: 'CRM lead ID. Optional — provide with list_id and lead_email for CRM logging.'
+        },
+        lead_email: {
+          type: 'string',
+          description: 'CRM lead email. Optional — provide with list_id and lead_id for CRM logging.'
+        }
+      },
+      required: ['action']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId) {
+      throw new Error("Missing user context");
+    }
+    return await agentModeService.twitterManagePost(context.userId, args);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'twitter_outreach',
+  definition: {
+    name: 'twitter_outreach',
+    description: `Manage X (Twitter) people and outreach interactions using a connected X account. Use this for profile lookup, follows, DMs, user search, bookmarks, and account management (block/mute).
+
+To find the account_id, call list_connected_accounts(platform='twitter'). account_id is optional when the user has exactly one X account connected.
+
+Actions:
+- get_profile: Get an X user's public profile by handle. Requires handle.
+- follow: Follow a user by handle. Requires handle. CRITICAL: Always get explicit user approval before following.
+- unfollow: Unfollow a user by handle. Requires handle. CRITICAL: Always get explicit user approval before unfollowing.
+- list_followers: List followers of the connected account (or another user if handle is provided).
+- list_following: List accounts the connected account follows (or another user if handle is provided).
+- search_tweets: Search recent tweets by query. Requires query. Optional max_results (default 10, max 100).
+- get_user_tweets: Get recent tweets by a user. Requires handle. Optional max_results (default 10, max 100).
+- send_dm: Send a direct message. Requires handle and text. DM text over 10000 chars is auto-trimmed. CRITICAL: Always get explicit user approval before sending.
+- list_dms: List recent DM events for the connected account.
+- get_dm_conversation: Get DM history with a specific user. Requires handle.
+- bookmark: Bookmark a tweet. Requires tweet_id.
+- get_bookmarks: Retrieve the authenticated user's bookmarked tweets.
+- block: Block a user by handle. Requires handle. CRITICAL: Always get explicit user approval before blocking.
+- unblock: Unblock a user by handle. Requires handle. CRITICAL: Always get explicit user approval before unblocking.
+- mute: Mute a user by handle. Requires handle. CRITICAL: Always get explicit user approval before muting.
+- unmute: Unmute a user by handle. Requires handle. CRITICAL: Always get explicit user approval before unmuting.
+
+For CRM logging of sent DMs, optionally pass list_id, lead_id and lead_email.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: [
+            'get_profile', 'follow', 'unfollow', 'list_followers', 'list_following',
+            'search_tweets', 'get_user_tweets',
+            'send_dm', 'list_dms', 'get_dm_conversation',
+            'bookmark', 'get_bookmarks',
+            'block', 'unblock', 'mute', 'unmute',
+          ],
+          description: 'The X outreach action to perform.'
+        },
+        account_id: {
+          type: 'string',
+          description: "The connected X account ID. Optional when the user has exactly one X account connected. Obtain via list_connected_accounts(platform='twitter')."
+        },
+        text: {
+          type: 'string',
+          description: 'DM text. Required for send_dm. Auto-trimmed to 10000 chars on a word boundary.'
+        },
+        handle: {
+          type: 'string',
+          description: 'The @handle to look up or act on. Required for get_profile, follow, unfollow, send_dm, get_dm_conversation, get_user_tweets, block, unblock, mute, unmute. Optional for list_followers and list_following (defaults to own account).'
+        },
+        recipient_handle: {
+          type: 'string',
+          description: 'Alias for handle. Use when the context makes "recipient" clearer (e.g., send_dm).'
+        },
+        query: {
+          type: 'string',
+          description: 'Search query string. Required for search_tweets.'
+        },
+        tweet_id: {
+          type: 'string',
+          description: 'Tweet ID. Required for bookmark.'
+        },
+        max_results: {
+          type: 'number',
+          description: 'Maximum results to return. Optional for search_tweets and get_user_tweets (default 10, max 100).'
+        },
+        list_id: {
+          type: 'string',
+          description: 'CRM lead list ID. Optional — provide with lead_id and lead_email to log the sent DM to CRM history.'
         },
         lead_id: {
           type: 'string',
@@ -3826,11 +3938,12 @@ emmaToolRegistry.register({
   name: 'post_on_connected_account',
   definition: {
     name: 'post_on_connected_account',
-    description: 'Create a post on a connected social media account. Supports LinkedIn, Instagram, and YouTube. For YouTube: this UPLOADS a video — you MUST provide a video URL in media_urls. The content becomes the video title (first 100 chars) and description. CRITICAL: Always review the post content with the user and get explicit approval before publishing to social media. IMPORTANT: The content parameter must contain the COMPLETE, FULL post text exactly as approved by the user. Never truncate, abbreviate, summarize, or use placeholders like "..." in the content.',
+    description: 'Create a post on a connected social media account. Supports LinkedIn, Instagram, YouTube, and X (Twitter). This is the ONLY tool for posting a new standalone tweet on X/Twitter — do NOT use twitter_manage_post for this. For YouTube: this UPLOADS a video — you MUST provide a video URL in media_urls. The content becomes the video title (first 100 chars) and description. For X (Twitter): content is trimmed to 280 characters on a word boundary. Provide either account_id OR platform — the tool auto-resolves to the matching account. CRITICAL: Always review the post content with the user and get explicit approval before publishing to social media. IMPORTANT: The content parameter must contain the COMPLETE, FULL post text exactly as approved by the user. Never truncate, abbreviate, summarize, or use placeholders like "..." in the content.',
     inputSchema: {
       type: 'object',
       properties: {
-        account_id: { type: 'string', description: 'The connected account ID' },
+        account_id: { type: 'string', description: 'The connected account ID. Optional — provide either account_id or platform, not both. Use account_id when the user has multiple accounts on the same platform.' },
+        platform: { type: 'string', enum: ['twitter', 'linkedin', 'instagram', 'youtube'], description: 'Platform to post on. Optional — use instead of account_id when the user has one account per platform. E.g. platform="twitter" to post a tweet.' },
         content: { type: 'string', description: 'The COMPLETE post text content. MUST include the full, untruncated text exactly as approved by the user. Do NOT abbreviate, summarize, or omit any part of the content. Include all paragraphs, hashtags, emojis, and formatting. Length limits depend on the specific platform. CRITICAL FOR LINKEDIN: LinkedIn does NOT render markdown. Never use **bold**, *italic*, - bullets, [links](url), or # headings — they appear as raw text. Use LinkedIn-native plain text: line breaks, unicode bullets (•), emojis for emphasis, and full URLs (LinkedIn auto-links them).' },
         media_urls: {
           type: 'array',
@@ -3838,11 +3951,11 @@ emmaToolRegistry.register({
           description: 'Optional URLs of images/videos to attach. REQUIRED for YouTube — must be a direct video file URL (e.g. .mp4). The video will be downloaded and uploaded to YouTube.'
         }
       },
-      required: ['account_id', 'content']
+      required: ['content']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls);
+    return await agentModeService.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform);
   }
 });
 

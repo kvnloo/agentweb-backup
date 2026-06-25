@@ -1,8 +1,8 @@
 import express from 'express';
-import crypto from 'crypto';
 import { twitterService } from '../services/twitterService';
 import { createAccount, deleteAccountById, TwitterXConfig } from '../services/connectedAccountsDb';
 import { authenticateToken } from '../middleware/auth';
+import { INTEGRATION_CONFIG } from '../config/integrations';
 
 const router = express.Router();
 
@@ -10,19 +10,8 @@ const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const PKCE_SESSION_TTL_MS = 15 * 60 * 1000; // 15 minutes
 const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute
 
-// X API v2 OAuth2 scopes. offline.access is required to receive a refresh_token
-// (access tokens expire ~2h). dm.* enable DM read/send.
-const TWITTER_SCOPES = [
-  'tweet.read',
-  'tweet.write',
-  'users.read',
-  'dm.read',
-  'dm.write',
-  'offline.access',
-];
-
-const getRedirectUri = (): string =>
-  `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/twitter/callback`;
+const TWITTER_SCOPES = INTEGRATION_CONFIG.twitter.scopes;
+const getRedirectUri = (): string => INTEGRATION_CONFIG.twitter.redirectUri;
 
 // ── PKCE session store (server-side, one-time use) ──────────────────────────
 // Holds the codeVerifier produced at /init keyed by the OAuth state, so it can
@@ -66,7 +55,11 @@ router.get('/init', authenticateToken, async (req: any, res) => {
       scope: TWITTER_SCOPES,
     });
     storePkceSession(state, req.user.userId, codeVerifier);
-    res.json({ success: true, url });
+    // force_login=true makes X show a fresh login page instead of the
+    // "re-authorize this app" screen, so users can connect a second account.
+    const authUrl = new URL(url);
+    authUrl.searchParams.set('force_login', 'true');
+    res.json({ success: true, url: authUrl.toString() });
   } catch (error: any) {
     console.error('[Twitter OAuth /init]', error);
     res.status(500).json({ error: 'Failed to initialize Twitter OAuth' });
