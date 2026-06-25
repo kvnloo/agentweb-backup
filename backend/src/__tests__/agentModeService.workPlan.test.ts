@@ -1113,7 +1113,7 @@ describe('AgentModeService - Work Plan', () => {
           userId: mockUserId,
           messages: [],
           workPlan: JSON.parse(JSON.stringify(workPlan)),
-          calledFunctions: { search_web: 1 }, // Function has been called
+          calledFunctions: { you_search_web: 1 }, // Canonical replacement satisfies legacy search_web requirement
         };
 
         (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
@@ -1129,7 +1129,7 @@ describe('AgentModeService - Work Plan', () => {
         expect(result.message).toContain('Step 1 status updated to completed');
         expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(
           mockSessionId,
-          { search_web: 0 } // Counter should be decremented
+          { you_search_web: 0 } // Canonical counter should be decremented
         );
       });
 
@@ -1286,4 +1286,3 @@ describe('AgentModeService - Work Plan', () => {
     });
   });
 });
-

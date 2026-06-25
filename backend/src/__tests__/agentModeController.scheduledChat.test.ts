@@ -233,7 +233,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       );
     });
 
-    it('should require the built-in search_web tool for a search_web requirement', async () => {
+    it('should accept canonical you_search_web for a legacy search_web requirement', async () => {
       const scheduleWithSearchWeb = {
         ...baseSchedule,
         keywords: [],
@@ -247,17 +247,17 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           { name: 'legacy_search_web', arguments: { query: 'test' } },
         ],
       };
-      const searchWebResponse = {
+      const canonicalSearchResponse = {
         ...mockResponse,
         content: 'Found some current results.',
         toolCalls: [
-          { name: 'search_web', arguments: { query: 'test' } },
+          { name: 'you_search_web', arguments: { query: 'test' } },
         ],
       };
 
       mockGenerateMarketingResponseWorkerService.runInWorker
         .mockResolvedValueOnce(legacySearchResponse)
-        .mockResolvedValueOnce(searchWebResponse);
+        .mockResolvedValueOnce(canonicalSearchResponse);
 
       const result = await runScheduledChat(scheduleWithSearchWeb, mockUserId, true);
 

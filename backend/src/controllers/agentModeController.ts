@@ -29,6 +29,10 @@ import { checkTokenUsage } from '../services/tokenUsageService';
 import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
 import { DynamoDB } from 'aws-sdk';
+import {
+  canonicalToolNameForRequirement,
+  countCallsForRequirement as countEquivalentCallsForRequirement,
+} from '../utils/toolNameAliases';
 
 const ZERO_ASSISTANT_REQUEUE_BASE_MS = 15 * 60 * 1000;
 const ZERO_ASSISTANT_REQUEUE_MAX_MS = 2 * 60 * 60 * 1000;
@@ -544,11 +548,12 @@ function evaluateScheduleResponse(
   // Count actual function calls using a hash map
   const actualFunctionCallCounts: { [functionName: string]: number } = {};
   actualFunctionCalls.forEach((call: string) => {
-    actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
+    const canonicalCall = canonicalToolNameForRequirement(call);
+    actualFunctionCallCounts[canonicalCall] = (actualFunctionCallCounts[canonicalCall] || 0) + 1;
   });
 
   expectedFunctionCalls.forEach((expectedCall: string) => {
-    const actualCount = actualFunctionCallCounts[expectedCall] || 0;
+    const actualCount = actualFunctionCallCounts[canonicalToolNameForRequirement(expectedCall)] || 0;
     const requiredCount = functionCallMinCalls[expectedCall] || 1; // Default to 1 if not specified
 
     functionCallDetails[expectedCall] = {
@@ -785,7 +790,7 @@ export async function runVerifiedChat(
 
   // Count how many times a required function was called.
   const countCallsForRequirement = (functionName: string, calls: string[]): number => {
-    return calls.filter(c => c === functionName).length;
+    return countEquivalentCallsForRequirement(functionName, calls);
   };
 
   // Track remaining keywords and function calls
@@ -1170,8 +1175,19 @@ export async function runScheduledChat(
       const scheduleUser = await userDb.getUserById(userId);
       const adminToolNames = new Set(agentModeService.getAdminToolNames());
       const isAdminUser = scheduleUser?.isAdmin || false;
+      const hasEquivalentTool = (tools: Iterable<string>, funcName: string): boolean => {
+        const canonicalFuncName = canonicalToolNameForRequirement(funcName);
+        for (const toolName of tools) {
+          if (canonicalToolNameForRequirement(toolName) === canonicalFuncName) {
+            return true;
+          }
+        }
+        return false;
+      };
       const disallowedFunctions = allAllowed ? [] : expectedFunctionCalls.filter((funcName: string) =>
-        !allowedFunctionCalls.includes(funcName) && !foundationTools.has(funcName) && !(isAdminUser && adminToolNames.has(funcName))
+        !hasEquivalentTool(allowedFunctionCalls, funcName) &&
+        !hasEquivalentTool(foundationTools, funcName) &&
+        !(isAdminUser && hasEquivalentTool(adminToolNames, funcName))
       );
 
       if (disallowedFunctions.length > 0) {
