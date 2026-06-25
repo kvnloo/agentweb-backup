@@ -13,7 +13,7 @@ import {
 describe('agentToolGatewayService', () => {
   it('treats read tools as low-risk and allowed', () => {
     const decision = evaluateAgentToolPolicy({
-      toolName: 'search_web',
+      toolName: 'you_search_web',
       args: { query: 'agent reliability architecture' },
     });
 
@@ -95,7 +95,6 @@ describe('agentToolGatewayService', () => {
 
   it('summarizes policy decisions for compact AgentRun telemetry', () => {
     const decisions = [
-      evaluateAgentToolPolicy({ toolName: 'search_web' }),
       evaluateAgentToolPolicy({ toolName: 'you_search_web' }),
       evaluateAgentToolPolicy({ toolName: 'you_search_news' }),
       evaluateAgentToolPolicy({ toolName: 'google_search_web' }),
@@ -103,7 +102,6 @@ describe('agentToolGatewayService', () => {
     ];
 
     expect(summarizeAgentToolPolicyFlags(decisions)).toContain('send_email:confirmation_recommended:critical');
-    expect(summarizeAgentToolPolicyModes(decisions)).toContain('search_web:read:low:observe');
     expect(summarizeAgentToolPolicyModes(decisions)).toContain('you_search_web:read:low:observe');
     expect(summarizeAgentToolPolicyModes(decisions)).toContain('you_search_news:read:low:observe');
     expect(summarizeAgentToolPolicyModes(decisions)).toContain('google_search_web:read:low:observe');
@@ -114,7 +112,7 @@ describe('agentToolGatewayService', () => {
     let now = 100;
 
     const outcome = await executeAgentToolThroughGateway({
-      toolName: 'search_web',
+      toolName: 'you_search_web',
       args: { query: 'agent runtime' },
       now: () => {
         now += 25;
@@ -135,7 +133,7 @@ describe('agentToolGatewayService', () => {
     const error = new Error('tool failed');
 
     const outcome = await executeAgentToolThroughGateway({
-      toolName: 'search_web',
+      toolName: 'you_search_web',
       execute: async () => {
         throw error;
       },
@@ -1093,12 +1091,12 @@ describe('agentToolGatewayService', () => {
     });
 
     it('does not apply the expensive media budget to ordinary tools', async () => {
-      await failNTimes('run-non-media', 'search_web', '429 rate limit', 1);
-      await failNTimes('run-non-media', 'search_web', 'network timeout', 1);
+      await failNTimes('run-non-media', 'you_search_web', '429 rate limit', 1);
+      await failNTimes('run-non-media', 'you_search_web', 'network timeout', 1);
 
       const execute = jest.fn().mockResolvedValue({ ok: true });
       const outcome = await executeAgentToolThroughGateway({
-        toolName: 'search_web',
+        toolName: 'you_search_web',
         args: { query: 'fallback research' },
         runId: 'run-non-media',
         execute,
@@ -1128,7 +1126,7 @@ describe('agentToolGatewayService', () => {
 
       // Push 500 more runs through to evict run-oldest from the tracker.
       for (let i = 0; i < 500; i += 1) {
-        await failNTimes(`run-filler-${i}`, 'search_web', 'No search results found', 1);
+        await failNTimes(`run-filler-${i}`, 'you_search_web', 'No search results found', 1);
       }
 
       const execute = jest.fn().mockResolvedValue({ ok: true });

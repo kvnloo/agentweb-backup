@@ -15,7 +15,7 @@ import {
 
 const mockSearchWeb = jest.fn();
 jest.mock('../services/agentModeService', () => ({
-  agentModeService: { searchWeb: (...a: any[]) => mockSearchWeb(...a) },
+  agentModeService: { youSearchWeb: (...a: any[]) => mockSearchWeb(...a) },
 }));
 
 const cbSnippet = (overrides: Partial<{ title: string; url: string; snippet: string }> = {}) => ({
@@ -173,7 +173,7 @@ describe('buildCrunchbaseSourceContext', () => {
   });
 });
 
-// ── End-to-end: specialist resolves via mocked searchWeb ────────────────────
+// ── End-to-end: specialist resolves via mocked You.com search ───────────────
 
 describe('crunchbase specialist (end-to-end with mocked SERP)', () => {
   it('resolves funding_round when Crunchbase returns a Series B snippet', async () => {

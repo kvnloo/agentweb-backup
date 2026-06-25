@@ -7,7 +7,6 @@ import { skillService } from '../services/skillService';
 import { AuthenticatedRequest, isRealAdmin } from '../middleware/auth';
 import { BenchmarkTest, CreateBenchmarkTestRequest, RunBenchmarkTestRequest } from '../types/benchmark';
 import { v4 as uuidv4 } from 'uuid';
-import { canonicalToolNameForRequirement } from '../utils/toolNameAliases';
 
 // Create a new benchmark test from a session
 export async function createBenchmarkTest(req: AuthenticatedRequest, res: Response) {
@@ -260,12 +259,9 @@ function evaluateBenchmarkResponse(
   // Evaluate function calls
   const functionCallMatches: string[] = [];
   const functionCallMisses: string[] = [];
-  const actualCanonicalCalls = new Set(
-    actualFunctionCalls.map((call: string) => canonicalToolNameForRequirement(call))
-  );
   
   expectedFunctionCalls.forEach((expectedCall: string) => {
-    if (actualCanonicalCalls.has(canonicalToolNameForRequirement(expectedCall))) {
+    if (actualFunctionCalls.includes(expectedCall)) {
       functionCallMatches.push(expectedCall);
     } else {
       functionCallMisses.push(expectedCall);

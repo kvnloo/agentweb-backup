@@ -91,7 +91,7 @@ describe('run_local_agent_task scope-rejection reliability', () => {
     });
 
     it('is NOT downgraded to an error by toolResultError (the dispatch downgrade gate)', () => {
-      const result = buildScopeRejectionResult('Task rejected (out of scope).', 'search_web');
+      const result = buildScopeRejectionResult('Task rejected (out of scope).', 'you_search_web');
       // Before the fix the handler returned { success:false }, which this util
       // turns into an Error → status:'error' → recorder.toolFailed. Now null.
       expect(toolResultError(result)).toBeNull();
@@ -118,8 +118,8 @@ describe('run_local_agent_task scope-rejection reliability', () => {
     it('routes email actions to send_email', () => {
       expect(suggestAlternativeTool('send a follow-up email to the lead')).toBe('send_email');
     });
-    it('defaults to search_web for general research', () => {
-      expect(suggestAlternativeTool('what is the latest news on AI agents')).toBe('search_web');
+    it('defaults to you_search_web for general research', () => {
+      expect(suggestAlternativeTool('what is the latest news on AI agents')).toBe('you_search_web');
     });
   });
 

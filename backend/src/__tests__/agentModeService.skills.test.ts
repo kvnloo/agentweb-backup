@@ -581,7 +581,6 @@ describe('AgentModeService - Skills', () => {
         { name: 'read_brand_guidelines', definition: { function: { name: 'read_brand_guidelines', description: 'desc' } } },
         { name: 'install_skills', definition: { function: { name: 'install_skills', description: 'infra' } } },
         { name: 'create_work_plan', definition: { function: { name: 'create_work_plan', description: 'Create work plan' } } },
-        { name: 'search_web', definition: { function: { name: 'search_web', description: 'Search the web' } } },
         { name: 'you_search_web', definition: { function: { name: 'you_search_web', description: 'Search the web with You.com' } } },
         { name: 'you_search_news', definition: { function: { name: 'you_search_news', description: 'Search news with You.com' } } },
       ];
@@ -666,7 +665,7 @@ describe('AgentModeService - Skills', () => {
       expect(toolNames).toContain('read_brand_guidelines');
     });
 
-    it('should expose canonical You.com search when a legacy skill allows search_web', async () => {
+    it('should not expose a deprecated search tool when a legacy skill allows search_web', async () => {
       const { filterFunctionCalls: mockFilterFn } = require('../services/subscriptionService');
       (mockFilterFn as jest.Mock).mockImplementationOnce((tools: any[], allowed: string[]) => {
         if (allowed.includes('*')) return tools;
@@ -679,8 +678,8 @@ describe('AgentModeService - Skills', () => {
       const result = await agentModeService.getFilteredTools('user-123', new Set(['search_web']));
 
       const toolNames = result.map((t: any) => t.function?.name || t.name);
-      expect(toolNames).toContain('you_search_web');
       expect(toolNames).not.toContain('search_web');
+      expect(toolNames).not.toContain('you_search_web');
     });
   });
 

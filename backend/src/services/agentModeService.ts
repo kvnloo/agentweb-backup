@@ -41,16 +41,6 @@ import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
 import { GoogleSearchProvider } from '../search/googleSearchProvider';
 import { SearchResultSource } from '../search/searchProvider';
-import {
-  canonicalToolNameForRequirement,
-  canonicalizeModelVisibleToolNames,
-  countCalledFunctionsForRequirement,
-  countCallsForRequirement,
-  decrementCalledFunctionForRequirement,
-  expandAllowedFunctionCallsForCanonicalTools,
-  isModelHiddenCompatibilityTool,
-  MODEL_HIDDEN_COMPATIBILITY_TOOLS,
-} from '../utils/toolNameAliases';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -272,7 +262,7 @@ function summarizeToolDecision(
   const toolNames = toolResults.map((r) => r.toolCall?.function?.name ?? 'unknown');
   const uniqueTools = [...new Set(toolNames)];
   if (uniqueTools.length === 0) return 'No tool decision was recorded.';
-  if (uniqueTools.every((name) => name === 'search_web')) {
+  if (uniqueTools.every((name) => name === 'you_search_web')) {
     const queries = toolResults
       .map((r) => typeof r.functionArgs?.query === 'string' ? r.functionArgs.query : '')
       .filter(Boolean)
@@ -3311,6 +3301,7 @@ export class AgentModeService {
       'list_meta_ads_campaigns': 'Meta ads campaigns list',
       'get_meta_ads_metrics': 'Meta ads metrics analysis',
       'search_web': 'web search',
+      'you_search_web': 'web search',
       'create_revision': 'task revision',
       'save_file': 'file save'
     };
@@ -3924,7 +3915,6 @@ export class AgentModeService {
     // Build exclusion set: foundation tools + admin-only tools + page-context-only tools
     const excludedTools = new Set<string>(AgentModeService.FOUNDATION_TOOLS);
     ADMIN_SKILL_TOOL_NAMES.forEach(t => excludedTools.add(t));
-    MODEL_HIDDEN_COMPATIBILITY_TOOLS.forEach(t => excludedTools.add(t));
     // get_visual_context is page-embedded Emma only — never expose in Agent Mode or __other_skills__
     excludedTools.add('get_visual_context');
 
@@ -3956,40 +3946,6 @@ export class AgentModeService {
 
   public getAdminToolNames(): string[] {
     return [...ADMIN_SKILL_TOOL_NAMES];
-  }
-
-  public static canonicalToolNameForRequirement(toolName: string): string {
-    return canonicalToolNameForRequirement(toolName);
-  }
-
-  public static countCallsForRequirement(functionName: string, calls: string[]): number {
-    return countCallsForRequirement(functionName, calls);
-  }
-
-  public static countCalledFunctionsForRequirement(
-    functionName: string,
-    calledFunctions: Record<string, number>
-  ): number {
-    return countCalledFunctionsForRequirement(functionName, calledFunctions);
-  }
-
-  private static decrementCalledFunctionForRequirement(
-    functionName: string,
-    calledFunctions: Record<string, number>
-  ): boolean {
-    return decrementCalledFunctionForRequirement(functionName, calledFunctions);
-  }
-
-  private static canonicalizeModelVisibleToolNames(toolNames: Iterable<string>): Set<string> {
-    return canonicalizeModelVisibleToolNames(toolNames);
-  }
-
-  private static expandAllowedFunctionCallsForCanonicalTools(toolNames: string[]): string[] {
-    return expandAllowedFunctionCallsForCanonicalTools(toolNames);
-  }
-
-  private static isModelHiddenCompatibilityTool(toolName: string): boolean {
-    return isModelHiddenCompatibilityTool(toolName);
   }
 
   /**
@@ -4225,7 +4181,7 @@ export class AgentModeService {
     sessionAssociatedSkillIds: string[] = [],
     hasAdminAccess: boolean = false
   ): { allowedToolNames: Set<string>; installedSkillContextMsg: string } {
-    const allowedToolNames = AgentModeService.canonicalizeModelVisibleToolNames(AgentModeService.FOUNDATION_TOOLS);
+    const allowedToolNames = new Set<string>(AgentModeService.FOUNDATION_TOOLS);
 
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSkillSet = new Set(userAllowedSkillIds);
@@ -4236,7 +4192,7 @@ export class AgentModeService {
         if (isWildcard || allowedSkillSet.has(s.skillId)) {
           if (s.toolNames) {
             s.toolNames.forEach((t: string) => {
-              allowedToolNames.add(AgentModeService.canonicalToolNameForRequirement(t));
+              allowedToolNames.add(t);
             });
           }
         }
@@ -4246,7 +4202,7 @@ export class AgentModeService {
     // Handle virtual other_skills (gated by subscription)
     if (sessionAssociatedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID) && (isWildcard || allowedSkillSet.has(OTHER_SKILLS_VIRTUAL_ID))) {
       const unassociatedTools = this.getUnassociatedTools(publishedSkills);
-      unassociatedTools.forEach(t => allowedToolNames.add(AgentModeService.canonicalToolNameForRequirement(t.name)));
+      unassociatedTools.forEach(t => allowedToolNames.add(t.name));
     }
 
     // Handle virtual admin_tools skill — always available to admin users regardless of session install
@@ -4288,12 +4244,9 @@ export class AgentModeService {
 
       // 2. Apply skill-based filtering if a skill filter is provided.
       // Pre-skills sessions pass undefined to get all tools for backward compatibility.
-      const modelVisibleAllowedToolNames = precomputedAllowedSkillToolNames
-        ? AgentModeService.canonicalizeModelVisibleToolNames(precomputedAllowedSkillToolNames)
-        : undefined;
       const contextAwareTools = precomputedAllowedSkillToolNames
-        ? allInternalTools.filter(tool => modelVisibleAllowedToolNames!.has(tool.name))
-        : allInternalTools.filter(tool => !AgentModeService.isModelHiddenCompatibilityTool(tool.name));
+        ? allInternalTools.filter(tool => precomputedAllowedSkillToolNames.has(tool.name))
+        : allInternalTools;
 
       // 3. Map back to wire-format definitions for the LLM
       const definitions = contextAwareTools.map(t => t.definition);
@@ -4323,10 +4276,7 @@ export class AgentModeService {
         });
       }
 
-      return filterFunctionCalls(
-        definitions,
-        AgentModeService.expandAllowedFunctionCallsForCanonicalTools(allowedFunctionCalls)
-      );
+      return filterFunctionCalls(definitions, allowedFunctionCalls);
     } catch (error) {
       console.error('Error filtering tools:', error);
       // Fallback: return only install_skills to be safe, or empty array
@@ -4827,7 +4777,6 @@ export class AgentModeService {
           formattedContent: `📊 **Meta Ads Performance Data**\n\n**Attribution Window:** ${formatDate(startDate)} to ${formatDate(endDate)} (${days} days)\n\n**📈 Campaign Summary**\n- Total Campaigns: 3\n- Total Spend: $1250.75\n- Impressions: 125,000\n- Clicks: 4,500\n- CTR: 3.60%\n- CPC: $0.28\n- Website Leads: 23\n\n**📥 Detailed Data Files**\n1. **Ad-Level Data**\n   📥 [Download CSV](https://s3.amazonaws.com/mock-bucket/mock-file.csv)\n2. **Demographics Breakdown**\n   📥 [Download CSV](https://s3.amazonaws.com/mock-bucket/mock-file.csv)\n3. **Placement Breakdown**\n   📥 [Download CSV](https://s3.amazonaws.com/mock-bucket/mock-file.csv)\n4. **Device Breakdown**\n   📥 [Download CSV](https://s3.amazonaws.com/mock-bucket/mock-file.csv)\n`
         };
 
-      case 'search_web':
       case 'you_search_web':
       case 'you_search_news':
       case 'google_search_web':
@@ -4835,7 +4784,7 @@ export class AgentModeService {
           success: true,
           provider: toolName === 'google_search_web' ? 'google' : 'you',
           toolName: toolName,
-          resultSource: toolName === 'you_search_news' ? 'news' : toolName === 'search_web' ? 'all' : 'web',
+          resultSource: toolName === 'you_search_news' ? 'news' : 'web',
           results: [
             {
               title: `Mock search result for "${args.query}"`,
@@ -17132,15 +17081,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   // Web search functionality
-  public async searchWeb(query: string, maxResults: number = 10): Promise<any> {
-    return this.searchWithYou({
-      toolName: 'search_web',
-      query,
-      maxResults,
-      resultSource: 'all',
-    });
-  }
-
   public async youSearchWeb(query: string, maxResults: number = 10): Promise<any> {
     return this.searchWithYou({
       toolName: 'you_search_web',
@@ -17203,7 +17143,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   private async searchWithYou(params: {
-    toolName: 'search_web' | 'you_search_web' | 'you_search_news';
+    toolName: 'you_search_web' | 'you_search_news';
     query: string;
     maxResults: number;
     resultSource: SearchResultSource;
@@ -22229,7 +22169,7 @@ ${strippedHtml}`;
           // Check if we have enough calls for each required function
           const missing: string[] = [];
           for (const [fn, requiredCount] of Object.entries(requiredCounts)) {
-            const availableCount = AgentModeService.countCalledFunctionsForRequirement(fn, calledFunctionCounts);
+            const availableCount = calledFunctionCounts[fn] || 0;
             if (availableCount < requiredCount) {
               missing.push(`${fn} (need ${requiredCount}, have ${availableCount})`);
             }
@@ -22246,7 +22186,8 @@ ${strippedHtml}`;
 
           // If validation passed and marking as completed, decrement the function counts
           for (const fn of step.requiredFunctionCalls) {
-            countsModified = AgentModeService.decrementCalledFunctionForRequirement(fn, calledFunctionCounts) || countsModified;
+            calledFunctionCounts[fn] = (calledFunctionCounts[fn] || 0) - 1;
+            countsModified = true;
           }
         }
 

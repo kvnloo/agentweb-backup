@@ -405,12 +405,12 @@ async function fetchWebForGroupReal(
   // 3. Google CSE — for company_technographic also run a job-postings query
   let webResults: any[] = [];
   try {
-    const search = await agentModeService.searchWeb(query, 10);
+    const search = await agentModeService.youSearchWeb(query, 10);
     if (search?.success && Array.isArray(search.results)) {
       webResults = search.results;
     }
   } catch (err) {
-    console.warn(`${wtag} searchWeb ERROR ${(err as Error).message}`);
+    console.warn(`${wtag} youSearchWeb ERROR ${(err as Error).message}`);
     return null;
   }
 
@@ -420,7 +420,7 @@ async function fetchWebForGroupReal(
       lead,
     );
     try {
-      const jobsSearch = await agentModeService.searchWeb(jobsQuery, 5);
+      const jobsSearch = await agentModeService.youSearchWeb(jobsQuery, 5);
       if (jobsSearch?.success && Array.isArray(jobsSearch.results)) {
         const existingUrls = new Set(webResults.map((r: any) => r.url || r.link).filter(Boolean));
         for (const r of jobsSearch.results) {
@@ -434,7 +434,7 @@ async function fetchWebForGroupReal(
   }
 
   if (webResults.length === 0) {
-    console.log(`${wtag} MISS searchWeb returned 0 results`);
+    console.log(`${wtag} MISS youSearchWeb returned 0 results`);
     return null;
   }
 
@@ -1343,12 +1343,12 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       const query = `${domain} ${queryParts.join(' ')}`;
       let webContext = '';
       try {
-        const search = await agentModeService.searchWeb(query, 5);
+        const search = await agentModeService.youSearchWeb(query, 5);
         if (search?.success && Array.isArray(search.results)) {
           webContext = JSON.stringify(search.results.slice(0, 5), null, 2);
         }
       } catch (err) {
-        console.warn('[v3 deps] ungrouped searchWeb failed:', (err as Error).message);
+        console.warn('[v3 deps] ungrouped youSearchWeb failed:', (err as Error).message);
       }
       if (!webContext) {
         return {

@@ -1744,30 +1744,6 @@ mcpToolRegistry.register({
 // Infrastructure tools: use backend APIs (search, image gen, email, storage).
 
 mcpToolRegistry.register({
-  name: 'search_web',
-  internal: true,
-  definition: {
-    name: 'search_web',
-    description: 'Compatibility web search tool. Uses You.com directly with no provider fallback. Prefer you_search_web or you_search_news for explicit provider telemetry.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        query: { type: 'string', description: 'Search query' },
-        max_results: { type: 'number', description: 'Max results (default 5, max 10)', default: 5 }
-      },
-      required: ['query']
-    }
-  },
-  execute: async (args: any, context: any) => {
-    const data = await mcpFetch({
-      method: 'POST', path: '/api/emma/search-web', context: ctx(context),
-      body: { query: args.query, max_results: args.max_results || 10 }
-    });
-    return jsonResult(data);
-  }
-});
-
-mcpToolRegistry.register({
   name: 'you_search_web',
   internal: true,
   definition: {

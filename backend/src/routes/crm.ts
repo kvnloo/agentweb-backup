@@ -6539,7 +6539,7 @@ router.post('/debug/serp', async (req: Request, res: Response) => {
   if (!query) return res.status(400).json({ message: 'query required' });
 
   const { agentModeService } = await import('../services/agentModeService');
-  const result = await agentModeService.searchWeb(query, n);
+  const result = await agentModeService.youSearchWeb(query, n);
   return res.json({
     query,
     success: result?.success,

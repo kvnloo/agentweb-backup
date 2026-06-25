@@ -29,10 +29,6 @@ import { checkTokenUsage } from '../services/tokenUsageService';
 import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
 import { DynamoDB } from 'aws-sdk';
-import {
-  canonicalToolNameForRequirement,
-  countCallsForRequirement as countEquivalentCallsForRequirement,
-} from '../utils/toolNameAliases';
 
 const ZERO_ASSISTANT_REQUEUE_BASE_MS = 15 * 60 * 1000;
 const ZERO_ASSISTANT_REQUEUE_MAX_MS = 2 * 60 * 60 * 1000;
@@ -548,12 +544,11 @@ function evaluateScheduleResponse(
   // Count actual function calls using a hash map
   const actualFunctionCallCounts: { [functionName: string]: number } = {};
   actualFunctionCalls.forEach((call: string) => {
-    const canonicalCall = canonicalToolNameForRequirement(call);
-    actualFunctionCallCounts[canonicalCall] = (actualFunctionCallCounts[canonicalCall] || 0) + 1;
+    actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
   });
 
   expectedFunctionCalls.forEach((expectedCall: string) => {
-    const actualCount = actualFunctionCallCounts[canonicalToolNameForRequirement(expectedCall)] || 0;
+    const actualCount = actualFunctionCallCounts[expectedCall] || 0;
     const requiredCount = functionCallMinCalls[expectedCall] || 1; // Default to 1 if not specified
 
     functionCallDetails[expectedCall] = {
@@ -790,7 +785,7 @@ export async function runVerifiedChat(
 
   // Count how many times a required function was called.
   const countCallsForRequirement = (functionName: string, calls: string[]): number => {
-    return countEquivalentCallsForRequirement(functionName, calls);
+    return calls.filter(c => c === functionName).length;
   };
 
   // Track remaining keywords and function calls
@@ -822,7 +817,7 @@ export async function runVerifiedChat(
         } else {
           // Work plan completed or doesn't exist - check keywords and function calls
           // NOTE: Only missing function calls are requested on retry. If a search tool
-          // (e.g. search_web) was already called, it won't be re-requested even if the
+          // (e.g. you_search_web) was already called, it won't be re-requested even if the
           // output was insufficient. Avoid adding search tools to requiredFunctionCalls
           // unless a minimum call count is truly needed — the LLM calls them organically.
           const keywordText = remainingKeywords.length > 0
@@ -1175,19 +1170,8 @@ export async function runScheduledChat(
       const scheduleUser = await userDb.getUserById(userId);
       const adminToolNames = new Set(agentModeService.getAdminToolNames());
       const isAdminUser = scheduleUser?.isAdmin || false;
-      const hasEquivalentTool = (tools: Iterable<string>, funcName: string): boolean => {
-        const canonicalFuncName = canonicalToolNameForRequirement(funcName);
-        for (const toolName of tools) {
-          if (canonicalToolNameForRequirement(toolName) === canonicalFuncName) {
-            return true;
-          }
-        }
-        return false;
-      };
       const disallowedFunctions = allAllowed ? [] : expectedFunctionCalls.filter((funcName: string) =>
-        !hasEquivalentTool(allowedFunctionCalls, funcName) &&
-        !hasEquivalentTool(foundationTools, funcName) &&
-        !(isAdminUser && hasEquivalentTool(adminToolNames, funcName))
+        !allowedFunctionCalls.includes(funcName) && !foundationTools.has(funcName) && !(isAdminUser && adminToolNames.has(funcName))
       );
 
       if (disallowedFunctions.length > 0) {
