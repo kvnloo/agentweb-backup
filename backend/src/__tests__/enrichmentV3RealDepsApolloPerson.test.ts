@@ -8,6 +8,11 @@
  * when email is absent but name + (website or emailDomain) are present.
  */
 
+const mockYouSearchWeb = jest.fn().mockResolvedValue({ success: true, results: [] });
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: { youSearchWeb: (...args: any[]) => mockYouSearchWeb(...args) },
+}));
+
 import { buildOrchestratorDeps, buildIdentityDeps, buildFieldGuidanceV3, rejectHallucinatedLinkedInUrls } from '../services/enrichmentV3RealDeps';
 import * as apolloServiceModule from '../services/apolloService';
 import type { ApolloService } from '../services/apolloService';
@@ -44,6 +49,8 @@ function makeLead(overrides: Partial<LeadRecord> = {}): LeadRecord {
 
 afterEach(() => {
   jest.restoreAllMocks();
+  mockYouSearchWeb.mockReset();
+  mockYouSearchWeb.mockResolvedValue({ success: true, results: [] });
 });
 
 describe('fetchApolloPerson — no email, name+website path', () => {

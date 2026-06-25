@@ -262,7 +262,7 @@ function summarizeToolDecision(
   const toolNames = toolResults.map((r) => r.toolCall?.function?.name ?? 'unknown');
   const uniqueTools = [...new Set(toolNames)];
   if (uniqueTools.length === 0) return 'No tool decision was recorded.';
-  if (uniqueTools.every((name) => name === 'search_web')) {
+  if (uniqueTools.every((name) => name === 'you_search_web')) {
     const queries = toolResults
       .map((r) => typeof r.functionArgs?.query === 'string' ? r.functionArgs.query : '')
       .filter(Boolean)
@@ -3301,6 +3301,7 @@ export class AgentModeService {
       'list_meta_ads_campaigns': 'Meta ads campaigns list',
       'get_meta_ads_metrics': 'Meta ads metrics analysis',
       'search_web': 'web search',
+      'you_search_web': 'web search',
       'create_revision': 'task revision',
       'save_file': 'file save'
     };
@@ -3793,7 +3794,6 @@ export class AgentModeService {
     'search_knowledge_base',
     'list_knowledge_base_files',
     'read_knowledge_base_files',
-    'search_web',             // Compatibility alias for You.com search
     'you_search_web',         // Explicit You.com web search
     'you_search_news',        // Explicit You.com news search
 
@@ -4777,7 +4777,6 @@ export class AgentModeService {
           formattedContent: `📊 **Meta Ads Performance Data**\n\n**Attribution Window:** ${formatDate(startDate)} to ${formatDate(endDate)} (${days} days)\n\n**📈 Campaign Summary**\n- Total Campaigns: 3\n- Total Spend: $1250.75\n- Impressions: 125,000\n- Clicks: 4,500\n- CTR: 3.60%\n- CPC: $0.28\n- Website Leads: 23\n\n**📥 Detailed Data Files**\n1. **Ad-Level Data**\n   📥 [Download CSV](https://s3.amazonaws.com/mock-bucket/mock-file.csv)\n2. **Demographics Breakdown**\n   📥 [Download CSV](https://s3.amazonaws.com/mock-bucket/mock-file.csv)\n3. **Placement Breakdown**\n   📥 [Download CSV](https://s3.amazonaws.com/mock-bucket/mock-file.csv)\n4. **Device Breakdown**\n   📥 [Download CSV](https://s3.amazonaws.com/mock-bucket/mock-file.csv)\n`
         };
 
-      case 'search_web':
       case 'you_search_web':
       case 'you_search_news':
       case 'google_search_web':
@@ -4785,7 +4784,7 @@ export class AgentModeService {
           success: true,
           provider: toolName === 'google_search_web' ? 'google' : 'you',
           toolName: toolName,
-          resultSource: toolName === 'you_search_news' ? 'news' : toolName === 'search_web' ? 'all' : 'web',
+          resultSource: toolName === 'you_search_news' ? 'news' : 'web',
           results: [
             {
               title: `Mock search result for "${args.query}"`,
@@ -17082,15 +17081,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   // Web search functionality
-  public async searchWeb(query: string, maxResults: number = 10): Promise<any> {
-    return this.searchWithYou({
-      toolName: 'search_web',
-      query,
-      maxResults,
-      resultSource: 'all',
-    });
-  }
-
   public async youSearchWeb(query: string, maxResults: number = 10): Promise<any> {
     return this.searchWithYou({
       toolName: 'you_search_web',
@@ -17153,7 +17143,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   private async searchWithYou(params: {
-    toolName: 'search_web' | 'you_search_web' | 'you_search_news';
+    toolName: 'you_search_web' | 'you_search_news';
     query: string;
     maxResults: number;
     resultSource: SearchResultSource;
@@ -17212,7 +17202,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       return {
         success: true,
-        message: `Found ${normalizedResults.length} web search results for "${query}"`,
+        message: `Found ${normalizedResults.length} ${resultSource === 'news' ? 'news' : 'web search'} results for "${query}"`,
         query,
         results: normalizedResults,
         totalResults: normalizedResults.length,

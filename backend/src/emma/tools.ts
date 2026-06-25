@@ -4628,36 +4628,10 @@ emmaToolRegistry.register({
 
 // --- Tools from searchTools.ts ---
 emmaToolRegistry.register({
-  name: "search_web",
-  definition: {
-    name: "search_web",
-    description: 'Compatibility web search tool. Uses You.com directly with no provider fallback. Prefer you_search_web or you_search_news when you want telemetry to show the explicit You.com tool.',
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: {
-          type: 'string',
-          description: 'The search query to find relevant information on the web'
-        },
-        max_results: {
-          type: 'number',
-          description: 'Maximum number of search results to return (default: 5, max: 10)',
-          default: 5
-        }
-      },
-      required: ["query"]
-    }
-  },
-  execute: async (args: any, context?: any) => {
-    return await agentModeService.searchWeb(args.query, args.max_results || 10);
-  }
-});
-
-emmaToolRegistry.register({
   name: "you_search_web",
   definition: {
     name: "you_search_web",
-    description: 'Search the public web using You.com Search. This tool has no hidden fallback provider; failures are reported as You.com search failures.',
+    description: 'Search the public web using You.com Search. This tool has no hidden fallback provider; failures are reported as You.com search failures. For social-platform research, include explicit site filters when useful, e.g. site:x.com, site:linkedin.com, site:reddit.com, or site:instagram.com.',
     inputSchema: {
       type: "object",
       properties: {
@@ -4683,13 +4657,13 @@ emmaToolRegistry.register({
   name: "you_search_news",
   definition: {
     name: "you_search_news",
-    description: 'Search current news using You.com Search. This tool has no hidden fallback provider; failures are reported as You.com search failures.',
+    description: 'Search current news using You.com Search. Use this only when the user asks for news, today/latest/breaking updates, or recent articles. Do not call it as a companion to ordinary web/social searches unless the user explicitly asks for news too. This tool has no hidden fallback provider; failures are reported as You.com search failures. Preserve freshness words from the user query such as today, latest, breaking, or the exact date; do not rewrite a today/latest-news request into a timeless entity query.',
     inputSchema: {
       type: "object",
       properties: {
         query: {
           type: 'string',
-          description: 'The news search query'
+          description: 'The news search query. For current-news requests, keep temporal terms like today/latest/breaking or include the exact date.'
         },
         max_results: {
           type: 'number',
@@ -6526,7 +6500,7 @@ emmaToolRegistry.register({
         toolNames: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Array of tool names this skill can use (e.g., ["search_web", "create_social_media_posts"])'
+          description: 'Array of tool names this skill can use (e.g., ["you_search_web", "create_social_media_posts"])'
         },
         systemPrompt: {
           type: 'string',
@@ -6613,7 +6587,7 @@ emmaToolRegistry.register({
               requiredFunctionCalls: {
                 type: 'array',
                 items: { type: 'string' },
-                description: 'Function names that must be called to complete this step (e.g. search_web, update_brand_guidelines)'
+                description: 'Function names that must be called to complete this step (e.g. you_search_web, update_brand_guidelines)'
               },
               skillIds: {
                 type: 'array',

@@ -305,10 +305,10 @@ describe('AgentModeService - Skills', () => {
       expect(result.allowedToolNames.has('install_skills')).toBe(true);
     });
 
-    it('should include search_web compatibility and explicit You.com search tools in foundation tools', () => {
+    it('should expose explicit You.com search tools in foundation tools without the compatibility alias', () => {
       const result = (agentModeService as any).buildSkillContext([], ['*'], [], []);
 
-      expect(result.allowedToolNames.has('search_web')).toBe(true);
+      expect(result.allowedToolNames.has('search_web')).toBe(false);
       expect(result.allowedToolNames.has('you_search_web')).toBe(true);
       expect(result.allowedToolNames.has('you_search_news')).toBe(true);
       expect(result.allowedToolNames.has('google_search_web')).toBe(false);
@@ -581,7 +581,8 @@ describe('AgentModeService - Skills', () => {
         { name: 'read_brand_guidelines', definition: { function: { name: 'read_brand_guidelines', description: 'desc' } } },
         { name: 'install_skills', definition: { function: { name: 'install_skills', description: 'infra' } } },
         { name: 'create_work_plan', definition: { function: { name: 'create_work_plan', description: 'Create work plan' } } },
-        { name: 'search_web', definition: { function: { name: 'search_web', description: 'Search the web' } } },
+        { name: 'you_search_web', definition: { function: { name: 'you_search_web', description: 'Search the web with You.com' } } },
+        { name: 'you_search_news', definition: { function: { name: 'you_search_news', description: 'Search news with You.com' } } },
       ];
       jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
 
@@ -658,8 +659,27 @@ describe('AgentModeService - Skills', () => {
       // Foundation tools should bypass subscription filter
       expect(toolNames).toContain('create_work_plan');
       expect(toolNames).toContain('install_skills');
+      expect(toolNames).toContain('you_search_web');
+      expect(toolNames).not.toContain('search_web');
       // Non-foundation tool allowed by subscription should also be present
       expect(toolNames).toContain('read_brand_guidelines');
+    });
+
+    it('should not expose a deprecated search tool when a legacy skill allows search_web', async () => {
+      const { filterFunctionCalls: mockFilterFn } = require('../services/subscriptionService');
+      (mockFilterFn as jest.Mock).mockImplementationOnce((tools: any[], allowed: string[]) => {
+        if (allowed.includes('*')) return tools;
+        return tools.filter((t: any) => {
+          const name = t.function?.name || t.name;
+          return !name || allowed.includes(name);
+        });
+      });
+
+      const result = await agentModeService.getFilteredTools('user-123', new Set(['search_web']));
+
+      const toolNames = result.map((t: any) => t.function?.name || t.name);
+      expect(toolNames).not.toContain('search_web');
+      expect(toolNames).not.toContain('you_search_web');
     });
   });
 

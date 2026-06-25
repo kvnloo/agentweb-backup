@@ -38,7 +38,7 @@ jest.mock('../services/agentModeService', () => ({
     installSkills: jest.fn().mockResolvedValue({ success: true, installedSkills: [] }),
     getSkillsForDisplay: jest.fn().mockResolvedValue([]),
     getFoundationToolNames: jest.fn().mockReturnValue(new Set([
-      'install_skills', 'search_web', 'read_file_content', 'read_page_source',
+      'install_skills', 'you_search_web', 'read_file_content', 'read_page_source',
       'search_knowledge_base', 'list_knowledge_base_files', 'read_knowledge_base_files',
       'create_work_plan', 'modify_work_plan', 'set_work_plan_status',
       'save_file', 'describe_image',
@@ -233,11 +233,11 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       );
     });
 
-    it('should require the built-in search_web tool for a search_web requirement', async () => {
+    it('should require canonical you_search_web for You.com web search', async () => {
       const scheduleWithSearchWeb = {
         ...baseSchedule,
         keywords: [],
-        requiredFunctionCalls: ['search_web'],
+        requiredFunctionCalls: ['you_search_web'],
       };
 
       const legacySearchResponse = {
@@ -247,17 +247,17 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           { name: 'legacy_search_web', arguments: { query: 'test' } },
         ],
       };
-      const searchWebResponse = {
+      const canonicalSearchResponse = {
         ...mockResponse,
         content: 'Found some current results.',
         toolCalls: [
-          { name: 'search_web', arguments: { query: 'test' } },
+          { name: 'you_search_web', arguments: { query: 'test' } },
         ],
       };
 
       mockGenerateMarketingResponseWorkerService.runInWorker
         .mockResolvedValueOnce(legacySearchResponse)
-        .mockResolvedValueOnce(searchWebResponse);
+        .mockResolvedValueOnce(canonicalSearchResponse);
 
       const result = await runScheduledChat(scheduleWithSearchWeb, mockUserId, true);
 
@@ -267,17 +267,17 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           status: 'success',
           passed: true,
           attempt: 2,
-          functionCallMatches: ['search_web'],
+          functionCallMatches: ['you_search_web'],
           functionCallMisses: [],
         })
       );
     });
 
-    it('should not count legacy news search calls as search_web', async () => {
+    it('should not count legacy news search calls as you_search_web', async () => {
       const scheduleWithSearchWeb = {
         ...baseSchedule,
         keywords: [],
-        requiredFunctionCalls: ['search_web'],
+        requiredFunctionCalls: ['you_search_web'],
       };
 
       const legacyNewsResponse = {
@@ -299,7 +299,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           passed: false,
           attempt: 20,
           functionCallMatches: [],
-          functionCallMisses: ['search_web'],
+          functionCallMisses: ['you_search_web'],
         })
       );
     });

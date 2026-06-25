@@ -817,7 +817,7 @@ export async function runVerifiedChat(
         } else {
           // Work plan completed or doesn't exist - check keywords and function calls
           // NOTE: Only missing function calls are requested on retry. If a search tool
-          // (e.g. search_web) was already called, it won't be re-requested even if the
+          // (e.g. you_search_web) was already called, it won't be re-requested even if the
           // output was insufficient. Avoid adding search tools to requiredFunctionCalls
           // unless a minimum call count is truly needed — the LLM calls them organically.
           const keywordText = remainingKeywords.length > 0

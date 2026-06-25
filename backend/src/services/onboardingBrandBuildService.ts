@@ -4,7 +4,7 @@
  * Thin wrapper around Emma's existing chat-session entry points. We do NOT
  * fork Emma's tools or rebuild scrape logic — we hand Emma a tight prompt
  * and let her use her existing toolkit (`update_brand_guidelines`,
- * `update_market_strategy`, `search_web`, Playwright/fetch, etc.) the same
+ * `update_market_strategy`, `you_search_web`, Playwright/fetch, etc.) the same
  * way she does in the prod work plan. The onboarding UI is just a
  * user-friendly wrapper around that process.
  *
@@ -41,7 +41,7 @@ const BRAND_BUILD_MODEL = "anthropic.claude-sonnet-4-6";
  * `update_*` tool calls take real time; 300s gives Emma enough headroom
  * to do real work even on slow site renders. The previous 180s budget
  * was hitting the wall in normal usage when Playwright was unavailable
- * and Emma fell back to search_web (slower per query). With Chrome now
+ * and Emma fell back to web search (slower per query). With Chrome now
  * installed in the Dockerfile, normal builds should land well under 90s
  * — this 300s ceiling is the safety net for genuinely slow runs.
  */

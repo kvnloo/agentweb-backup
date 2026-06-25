@@ -22,7 +22,7 @@ jest.mock('../controllers/templates', () => ({
 
 const mockSearchWeb = jest.fn();
 jest.mock('../services/agentModeService', () => ({
-  agentModeService: { searchWeb: (...args: any[]) => mockSearchWeb(...args) },
+  agentModeService: { youSearchWeb: (...args: any[]) => mockSearchWeb(...args) },
 }));
 
 const dynamoScan = jest.fn();

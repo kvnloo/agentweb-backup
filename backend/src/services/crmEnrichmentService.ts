@@ -639,7 +639,7 @@ export class CrmEnrichmentService {
 
     if (query && !skipMainSearch) {
       console.log(`[CrmEnrichment][gatherWebContext] searchWeb query="${query}"`);
-      let result = await agentModeService.searchWeb(query, 5);
+      let result = await agentModeService.youSearchWeb(query, 5);
       console.log(`[CrmEnrichment][gatherWebContext] searchWeb done success=${result?.success} resultCount=${Array.isArray(result?.results) ? result.results.length : 0}`);
       const primarySucceededEmpty = result?.success && (!Array.isArray(result.results) || result.results.length === 0);
       if (primarySucceededEmpty) {
@@ -648,7 +648,7 @@ export class CrmEnrichmentService {
           ? `${personName} ${lead.company || ''}`.trim()
           : `${lead.company || (!CrmEnrichmentService.isPersonalEmailDomain(lead.email || '') ? lead.email?.split('@')[1] : '') || ''} company overview`.trim();
         if (fallbackQuery && fallbackQuery !== query) {
-          result = await agentModeService.searchWeb(fallbackQuery, 5);
+          result = await agentModeService.youSearchWeb(fallbackQuery, 5);
         }
       }
 
@@ -694,7 +694,7 @@ export class CrmEnrichmentService {
       if (companyTerm) {
         try {
           const linkedinCompanyQuery = `${companyTerm} site:linkedin.com/company`;
-          const linkedinCompanyResult = await agentModeService.searchWeb(linkedinCompanyQuery, 5);
+          const linkedinCompanyResult = await agentModeService.youSearchWeb(linkedinCompanyQuery, 5);
           if (linkedinCompanyResult?.success && Array.isArray(linkedinCompanyResult.results) && linkedinCompanyResult.results.length > 0) {
             linkedinCompanyResults = linkedinCompanyResult.results as RawWebResult[];
             const companyUrls = linkedinCompanyResults
@@ -1502,7 +1502,7 @@ export class CrmEnrichmentService {
 
         const targetedQuery = `${companyTermForRetry} ${missing.join(' ').replace(/_/g, ' ')}`.trim();
         try {
-          const targetedResult = await agentModeService.searchWeb(targetedQuery, 5);
+          const targetedResult = await agentModeService.youSearchWeb(targetedQuery, 5);
           if (!targetedResult?.success || !Array.isArray(targetedResult.results) || targetedResult.results.length === 0) continue;
           const targetedCtx = JSON.stringify(targetedResult.results, null, 2);
           sourceContextParts.push(targetedCtx);

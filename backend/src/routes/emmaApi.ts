@@ -27,16 +27,6 @@ function userId(req: Request): string {
 
 // ─── Search & Research ──────────────────────────────────────────────────────
 
-router.post('/search-web', async (req: Request, res: Response) => {
-  try {
-    const svc = await getAgentModeService();
-    const result = await svc.searchWeb(req.body.query, req.body.max_results || 10);
-    res.json(result);
-  } catch (err: any) {
-    res.status(500).json({ message: err.message });
-  }
-});
-
 router.post('/you-search-web', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();

@@ -34,7 +34,7 @@ describe('MCP Meta Ads (via API tools)', () => {
   });
 
   it('should expose explicit provider search tools and generate_image as API-wrapping tools', () => {
-    expect(mcpToolRegistry.getTool('search_web')).toBeDefined();
+    expect(mcpToolRegistry.getTool('search_web')).toBeUndefined();
     expect(mcpToolRegistry.getTool('you_search_web')).toBeDefined();
     expect(mcpToolRegistry.getTool('you_search_news')).toBeDefined();
     expect(mcpToolRegistry.getTool('google_search_web')).toBeDefined();
