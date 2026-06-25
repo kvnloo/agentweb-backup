@@ -304,6 +304,32 @@ router.get('/external-properties/:listId/:provider', async (req: any, res) => {
   }
 });
 
+// POST /api/crm-sync/lifecycle-stages/:listId/:provider
+// Creates a new custom lifecycle stage option in HubSpot. HubSpot only.
+router.post('/lifecycle-stages/:listId/:provider', async (req: any, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { listId, provider } = req.params;
+    if (provider !== 'hubspot') {
+      return res.status(400).json({ error: 'Lifecycle stages are only supported for HubSpot.' });
+    }
+
+    const ownership = await verifyListOwnership(userId, listId);
+    if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
+
+    const { label } = req.body;
+    if (!label?.trim()) return res.status(400).json({ error: 'label is required' });
+
+    const { accountId, apiKey } = req.query as { accountId?: string; apiKey?: string };
+    const stage = await externalCrmSyncService.createHubSpotLifecycleStage(userId, listId, label, { accountId, apiKey });
+    res.json(stage);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to create lifecycle stage' });
+  }
+});
+
 // GET /api/crm-sync/lifecycle-stages/:listId/:provider
 // Returns HubSpot lifecycle-stage options (value + label) for the sync dialog's
 // lifecycle-stage picker. HubSpot only.

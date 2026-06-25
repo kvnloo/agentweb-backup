@@ -653,6 +653,27 @@ export class ExternalCrmSyncService {
    * like "Ad Audience" have a generated internal value the write API requires).
    * HubSpot only; accepts inline credentials so it works before the config is saved.
    */
+  async createHubSpotLifecycleStage(
+    userId: string,
+    listId: string,
+    label: string,
+    options: { accountId?: string; apiKey?: string }
+  ): Promise<{ value: string; label: string }> {
+    if (!label?.trim()) throw new Error('label is required');
+    let auth: CrmAuth;
+    if (options.accountId) {
+      auth = { type: 'oauth', userId, accountId: options.accountId };
+    } else if (options.apiKey) {
+      auth = { type: 'token', apiKey: options.apiKey };
+    } else {
+      const config = await this.getConfig(userId, listId, 'hubspot');
+      if (!config) throw new Error('No sync configuration found. Save your connection settings first.');
+      auth = this.resolveAuth(config);
+    }
+    const svc = await this.getHubSpotService(auth);
+    return svc.createLifecycleStageOption(label.trim());
+  }
+
   async getHubSpotLifecycleStages(
     userId: string,
     listId: string,

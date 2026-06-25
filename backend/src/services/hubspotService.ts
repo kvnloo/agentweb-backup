@@ -620,6 +620,52 @@ export class HubSpotService {
   }
 
   /**
+   * Creates a new custom option on the lifecyclestage contact property.
+   * Fetches all existing options (including hidden), appends the new one, and
+   * PATCHes the full list back — HubSpot's options field is a full replacement.
+   * Returns the new option's value (timestamp-based, guaranteed unique).
+   */
+  async createLifecycleStageOption(label: string): Promise<{ value: string; label: string }> {
+    if (!label?.trim()) throw new Error('label is required');
+
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/crm/v3/properties/contacts/lifecyclestage`,
+      { headers: await this.authHeaders() }
+    );
+    const data = res.data as any;
+
+    if (data?.modificationMetadata?.readOnlyOptions) {
+      throw new Error('Lifecycle stage options are read-only on this portal and cannot be modified via API.');
+    }
+
+    const existingOptions: any[] = data?.options ?? [];
+    const maxOrder = existingOptions.reduce((max: number, o: any) => Math.max(max, o.displayOrder ?? 0), 0);
+    const value = Date.now().toString();
+
+    // Normalize existing options to only the fields HubSpot's PATCH accepts —
+    // the GET response may include internal-only fields that the write API rejects.
+    const normalizedOptions = existingOptions.map((o: any) => ({
+      label: String(o.label ?? o.value),
+      value: String(o.value),
+      displayOrder: Number(o.displayOrder ?? 0),
+      hidden: Boolean(o.hidden),
+    }));
+
+    await axiosInstance.patch(
+      `${HUBSPOT_API_BASE}/crm/v3/properties/contacts/lifecyclestage`,
+      {
+        options: [
+          ...normalizedOptions,
+          { label: label.trim(), value, displayOrder: maxOrder + 1, hidden: false },
+        ],
+      },
+      { headers: await this.authHeaders() }
+    );
+
+    return { value, label: label.trim() };
+  }
+
+  /**
    * Returns all non-archived deal properties from HubSpot.
    * Uses GET /crm/v3/properties/deals.
    */
