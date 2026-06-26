@@ -461,9 +461,15 @@ export class ExternalCrmSyncService {
 
     try {
       const adapter = getAdapter(provider);
-      return adapter.testConnection(auth);
+      // `await` is REQUIRED: getSvc()/HubSpotService.create() can reject while
+      // resolving or refreshing the OAuth token (e.g. an expired token whose
+      // refresh fails with HubSpot's MISMATCH_REFRESH_TOKEN_CLIENT). Without the
+      // await the rejected promise escapes this try/catch and surfaces as a generic
+      // HTTP 500 ("Request failed with status code 400") with no reason shown.
+      return await adapter.testConnection(auth);
     } catch (err: any) {
-      return { valid: false, error: err.message || 'Unknown error' };
+      const detail = err.response?.data?.message || err.message || 'Unknown error';
+      return { valid: false, error: detail };
     }
   }
 
