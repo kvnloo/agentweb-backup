@@ -17,6 +17,7 @@ jest.mock("aws-sdk", () => {
 
 const mockRunCodingAgent = jest.fn();
 jest.mock("../services/codingAgentService", () => ({
+  LANDING_PAGE_PREVIEW_BRANCH: "draft/agentweb-preview",
   runCodingAgent: (...a: any[]) => mockRunCodingAgent(...a),
 }));
 
@@ -78,7 +79,7 @@ describe("addPageViaCodingAgent", () => {
     expect(ctx.llmModel).toContain("opus-4-8"); // net-new design → most capable model
     expect(ctx.pageId).toBe(put.id);
     expect(ctx.sessionId).toBe("s9");
-    expect(ctx.draftBranch).toMatch(/^draft\//); // staged on an isolated branch, not main
+    expect(ctx.draftBranch).toBe("draft/agentweb-preview"); // staged on the reusable preview branch, not main
     expect(task).toContain("app/pricing/page.tsx");
 
     // Promoted to main via the publish endpoint, using the same draft branch.
