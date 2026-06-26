@@ -1764,6 +1764,444 @@ describe('AgentModeService - CRM Tools', () => {
     });
   });
 
+  // ─── sendEmailFromConfiguredSender ─────────────────────────────────────
+  // Ad-hoc / one-off email send using the user's configured CRM sender(s),
+  // without needing a connected Gmail account or a CRM lead+draft. This is the
+  // fix for "Configured email sender cannot send email from Emma chat".
+
+  describe('sendEmailFromConfiguredSender', () => {
+    const resendSenders = {
+      success: true,
+      senders: [
+        { id: 'sender-1', email: 'sales@acme.com', fromName: 'Sales Team' },
+        { id: 'sender-2', email: 'info@acme.com', fromName: 'Info' },
+      ],
+      defaultSenderId: 'sender-2',
+    };
+
+    it('should send via the default Resend sender (happy path)', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+      mockResend.sendEmail.mockResolvedValue({ id: 'email-abc' } as any);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi there</p>',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.emailId).toBe('email-abc');
+      expect(result.from).toBe('info@acme.com'); // default sender (sender-2)
+      expect(mockResend.sendEmail).toHaveBeenCalledWith({
+        from: 'Info <info@acme.com>',
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi there</p>',
+        text: undefined,
+      });
+    });
+
+    it('should send via an explicitly requested senderId', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+      mockResend.sendEmail.mockResolvedValue({ id: 'email-def' } as any);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        text: 'Hi there',
+        senderId: 'sender-1',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.from).toBe('sales@acme.com'); // explicit sender-1
+    });
+
+    it('should send via a gmail-type sender through gmailService', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [
+          {
+            id: 'sender-g1',
+            email: 'shopify@pmps.ai',
+            fromName: 'PMPS',
+            senderType: 'gmail',
+            gmailAccountId: 'shopify@pmps.ai',
+          },
+        ],
+        defaultSenderId: 'sender-g1',
+      });
+      mockGmail.sendEmail.mockResolvedValue({ messageId: 'gmail-1', threadId: 't-1' } as any);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.emailId).toBe('gmail-1');
+      expect(result.from).toBe('shopify@pmps.ai');
+      expect(mockGmail.sendEmail).toHaveBeenCalledWith(
+        userId,
+        'shopify@pmps.ai',
+        expect.objectContaining({
+          to: 'someone@external.com',
+          subject: 'Hello',
+          body: '<p>Hi</p>',
+          isHtml: true,
+        })
+      );
+      expect(mockResend.sendEmail).not.toHaveBeenCalled();
+    });
+
+    it('should return error when no senders are configured', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [],
+        defaultSenderId: null,
+      });
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('No senders configured');
+      expect(mockResend.sendEmail).not.toHaveBeenCalled();
+    });
+
+    it('should return error when requested senderId does not exist', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+        senderId: 'does-not-exist',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Sender not found');
+      expect(mockResend.sendEmail).not.toHaveBeenCalled();
+      // The error should list the available senders so the model/user can pick one.
+      expect(result.error).toContain('sales@acme.com');
+      expect(result.error).toContain('info@acme.com');
+      expect(Array.isArray(result.availableSenders)).toBe(true);
+      expect(result.availableSenders).toHaveLength(2);
+    });
+
+    it('should resolve a sender by its email address', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+      mockResend.sendEmail.mockResolvedValue({ id: 'email-by-email' } as any);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+        senderId: 'sales@acme.com', // email, not the internal id
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.from).toBe('sales@acme.com');
+    });
+
+    it('should resolve a sender by its from-name (case-insensitive)', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+      mockResend.sendEmail.mockResolvedValue({ id: 'email-by-name' } as any);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+        senderId: 'sales team', // matches fromName "Sales Team"
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.from).toBe('sales@acme.com');
+    });
+
+    it('should resolve the Gmail-type sender when asked for the "gmail" sender', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [
+          { id: 'sender-1', email: 'sales@acme.com', fromName: 'Sales Team' },
+          { id: 'sender-g', email: 'me@gmail.com', fromName: 'Manan', senderType: 'gmail', gmailAccountId: 'me@gmail.com' },
+        ],
+        defaultSenderId: 'sender-1',
+      });
+      mockGmail.sendEmail.mockResolvedValue({ messageId: 'g-1', threadId: 't-1' } as any);
+
+      // The user says "from my gmail sender" → sender_id resolves by senderType.
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+        senderId: 'gmail',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.from).toBe('me@gmail.com');
+      expect(mockGmail.sendEmail).toHaveBeenCalled();
+    });
+
+    it('should include senderType in the availableSenders list on no match', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [
+          { id: 'sender-1', email: 'sales@acme.com', fromName: 'Sales Team' },
+          { id: 'sender-g', email: 'me@gmail.com', fromName: 'Manan', senderType: 'gmail', gmailAccountId: 'me@gmail.com' },
+        ],
+        defaultSenderId: 'sender-1',
+      });
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+        senderId: 'no-such-sender',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Sender not found');
+      const gmailEntry = result.availableSenders.find((s: any) => s.email === 'me@gmail.com');
+      expect(gmailEntry.senderType).toBe('gmail');
+      // The default/resend sender should be marked accordingly (not undefined).
+      const resendEntry = result.availableSenders.find((s: any) => s.email === 'sales@acme.com');
+      expect(resendEntry.senderType).toBe('resend');
+    });
+
+    it('should return a recipient-validation error when "to" is missing', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: '',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Recipient');
+      expect(mockResend.sendEmail).not.toHaveBeenCalled();
+    });
+
+    it.each(['notanemail', 'foo@', 'foo@bar', 'a b@x.com', 'foo@@bar.com'])(
+      'should reject a malformed recipient address "%s" before sending',
+      async (badTo) => {
+        jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+
+        const result = await service.sendEmailFromConfiguredSender(userId, {
+          to: badTo,
+          subject: 'Hello',
+          html: '<p>Hi</p>',
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Invalid recipient');
+        expect(result.error).toContain(badTo);
+        // Must not attempt a send for a clearly malformed address.
+        expect(mockResend.sendEmail).not.toHaveBeenCalled();
+        expect(mockGmail.sendEmail).not.toHaveBeenCalled();
+      }
+    );
+
+    it('should accept a well-formed recipient and send normally', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+      mockResend.sendEmail.mockResolvedValue({ id: 'ok-1' } as any);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'valid.person@example.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockResend.sendEmail).toHaveBeenCalled();
+    });
+
+    it('should return error when subject is missing', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: '',
+        html: '<p>Hi</p>',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Subject');
+    });
+
+    it('should return error when body (html and text) is missing', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('body');
+    });
+
+    it('should return error when html body is whitespace-only', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Empty',
+        html: '   ',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('body');
+      expect(mockResend.sendEmail).not.toHaveBeenCalled();
+    });
+
+    it('should return error when text body is whitespace-only', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Empty',
+        text: '   \n  ',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('body');
+      expect(mockResend.sendEmail).not.toHaveBeenCalled();
+    });
+
+    it('should return error when both html and text are empty strings', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Empty',
+        html: '',
+        text: '',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('body');
+      expect(mockResend.sendEmail).not.toHaveBeenCalled();
+    });
+
+    it('should accept a "body" alias as the email body (plain text)', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+      mockResend.sendEmail.mockResolvedValue({ id: 'email-body-alias' } as any);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        body: 'Hi there from the body alias',
+      } as any);
+
+      expect(result.success).toBe(true);
+      expect(mockResend.sendEmail).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: 'someone@external.com',
+          subject: 'Hello',
+          text: 'Hi there from the body alias',
+        })
+      );
+    });
+
+    it('should surface the failure when Resend returns null', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+      mockResend.sendEmail.mockResolvedValue(null as any);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Email send failed');
+    });
+
+    it('should return error when gmail-type sender is missing gmailAccountId', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [
+          { id: 'sender-gb', email: 'x@x.com', fromName: 'X', senderType: 'gmail' },
+        ],
+        defaultSenderId: 'sender-gb',
+      });
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Gmail sender misconfigured');
+      expect(mockGmail.sendEmail).not.toHaveBeenCalled();
+    });
+
+    it('should propagate gmail send errors gracefully', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [
+          {
+            id: 'sender-g2',
+            email: 'test@gmail.com',
+            fromName: 'Test',
+            senderType: 'gmail',
+            gmailAccountId: 'test@gmail.com',
+          },
+        ],
+        defaultSenderId: 'sender-g2',
+      });
+      mockGmail.sendEmail.mockRejectedValue(new Error('Internal server error'));
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+      });
+
+      expect(result.success).toBe(false);
+      // Non-auth Gmail errors surface as a "Gmail send failed" with the raw cause.
+      expect(result.message).toContain('Gmail send failed');
+      expect(result.error).toContain('Internal server error');
+      expect(result.error).toContain('test@gmail.com');
+    });
+
+    it('should return an actionable reconnect message on a Gmail OAuth failure', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [
+          {
+            id: 'sender-g3',
+            email: 'broken@gmail.com',
+            fromName: 'Broken',
+            senderType: 'gmail',
+            gmailAccountId: 'broken@gmail.com',
+          },
+        ],
+        defaultSenderId: 'sender-g3',
+      });
+      // Google's token refresh surfaces raw OAuth errors like this one.
+      mockGmail.sendEmail.mockRejectedValue(new Error('unauthorized_client'));
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Gmail');
+      // Tell the user the sender's Gmail account needs reconnecting, and which one.
+      expect(result.error).toContain('reconnect');
+      expect(result.error).toContain('broken@gmail.com');
+    });
+  });
+
   // ─── Shared: ownership & error handling ────────────────────────────────
 
   describe('Shared ownership checks', () => {

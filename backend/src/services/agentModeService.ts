@@ -3898,6 +3898,12 @@ export class AgentModeService {
     // Session Notifications (no email integration required)
     'notify_session',
 
+    // Ad-hoc email send via the user's CONFIGURED sender (CRM → Senders).
+    // Lets the agent send a one-off email without a connected Gmail account and
+    // without a CRM lead+draft. Foundation so it is always offered alongside the
+    // Gmail-only `email` tool.
+    'send_email_from_sender',
+
     // Local Agent Relay (Codex agent running on user's machine)
     'run_local_agent_task',
     'check_local_agent_status',
@@ -3943,6 +3949,11 @@ export class AgentModeService {
     // DB foundation_tools setting is stale and omits it, Matt-style edit flows
     // fail before the reliability layer can even create a run.
     'coding_agent',
+    // Ad-hoc email send via the configured sender. Force-merged because the prod
+    // `foundation_tools` AW-Settings override omits DEFAULT-only additions — without
+    // this, users with a configured sender but no connected Gmail still cannot send
+    // a one-off email from chat (the reported bug).
+    'send_email_from_sender',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
@@ -10152,6 +10163,178 @@ export class AgentModeService {
       };
     } catch (error) {
       console.error('AgentMode: Error sending email to lead:', error);
+      return { success: false, message: 'Failed to send email', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Send a one-off / ad-hoc email using the user's configured CRM sender(s).
+   *
+   * This is the counterpart to sendEmailToLead for emails that are NOT tied to a
+   * CRM lead + saved draft. The generic `email` tool can only send through a
+   * connected Gmail OAuth account; users who configured a sender (Resend custom
+   * domain, or a Gmail-account sender) but never connected a raw Gmail account
+   * previously had no way to send an arbitrary email from chat. This routes the
+   * send through the same configured senders sendEmailToLead uses.
+   *
+   * Sender resolution: explicit senderId → defaultSenderId → first available.
+   */
+  public async sendEmailFromConfiguredSender(
+    userId: string,
+    params: { to: string; subject?: string; html?: string; text?: string; body?: string; senderId?: string }
+  ): Promise<any> {
+    try {
+      const to = (params.to || '').trim();
+      if (!to) {
+        return { success: false, message: 'Recipient required', error: 'A recipient email address ("to") is required' };
+      }
+      // Reject clearly malformed recipients up front so the user gets an
+      // actionable "check the address" message instead of a generic provider
+      // failure (Resend) or a silent accept-then-bounce (Gmail). Note: a
+      // well-formed but non-existent mailbox cannot be detected at send time —
+      // that bounce is asynchronous and outside this tool's control.
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(to)) {
+        return { success: false, message: 'Invalid recipient', error: `The recipient address "${to}" is not a valid email address. Please check it and try again.` };
+      }
+      if (!params.subject || !params.subject.trim()) {
+        return { success: false, message: 'Subject required', error: 'An email subject is required' };
+      }
+
+      // Normalize the body. Accept `body` as an alias for `text` (the generic
+      // `email` tool and most LLM calls use `body`), and treat empty/whitespace
+      // values as absent so we never send a blank email. html takes precedence.
+      const htmlBody = params.html && params.html.trim() ? params.html : undefined;
+      const textBody = (() => {
+        const t = params.text && params.text.trim() ? params.text : undefined;
+        if (t) return t;
+        return params.body && params.body.trim() ? params.body : undefined;
+      })();
+      if (!htmlBody && !textBody) {
+        return { success: false, message: 'Email body required', error: 'The email body (html or text) is required and cannot be empty' };
+      }
+
+      // Resolve sender from the user's configured CRM senders.
+      const sendersResult = await this.getCrmSenders(userId);
+      if (!sendersResult.success || sendersResult.senders.length === 0) {
+        return { success: false, message: 'No senders configured', error: 'No sender email is configured for your account. To set one up, open CRM, select a lead list, and click "Senders".' };
+      }
+
+      let sender: any = null;
+      if (params.senderId) {
+        // The model can't see internal sender IDs, so accept an id, an email
+        // address, a from-name (case-insensitive), or a sender-type keyword like
+        // "gmail" — whatever the user named ("send from my gmail sender").
+        const needle = params.senderId.trim().toLowerCase();
+        const wantsGmail = needle === 'gmail' || needle === 'gmail sender' || needle === 'my gmail' || needle === 'my gmail sender';
+        sender = sendersResult.senders.find((s: any) =>
+          s.id === params.senderId ||
+          (s.email && s.email.toLowerCase() === needle) ||
+          (s.fromName && s.fromName.toLowerCase() === needle)
+        );
+        // Fall back to matching by sender type (e.g. the single Gmail-account sender).
+        if (!sender && wantsGmail) {
+          const gmailSenders = sendersResult.senders.filter((s: any) => s.senderType === 'gmail');
+          if (gmailSenders.length === 1) {
+            sender = gmailSenders[0];
+          } else if (gmailSenders.length > 1) {
+            const list = gmailSenders.map((s: any) => `${s.fromName} <${s.email}>`).join(', ');
+            return {
+              success: false,
+              message: 'Multiple Gmail senders',
+              error: `You have more than one Gmail sender: ${list}. Tell me which one to use by its email address.`,
+              availableSenders: gmailSenders.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName, senderType: 'gmail' })),
+            };
+          }
+        }
+        if (!sender) {
+          const available = sendersResult.senders.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName, senderType: s.senderType === 'gmail' ? 'gmail' : 'resend' }));
+          const list = available.map((s: any) => `${s.fromName} <${s.email}> [${s.senderType}]`).join(', ');
+          return {
+            success: false,
+            message: 'Sender not found',
+            error: `No configured sender matches "${params.senderId}". Available senders: ${list}. Pass one of their email addresses as sender_id, or omit sender_id to use the default sender.`,
+            availableSenders: available,
+          };
+        }
+      } else {
+        const defaultSenderId = sendersResult.defaultSenderId;
+        sender = defaultSenderId
+          ? sendersResult.senders.find((s: any) => s.id === defaultSenderId)
+          : sendersResult.senders[0];
+        if (!sender) {
+          sender = sendersResult.senders[0];
+        }
+      }
+
+      if (!sender) {
+        return { success: false, message: 'No valid sender', error: 'Could not resolve a valid sender email' };
+      }
+
+      let emailId: string;
+
+      if ((sender as any).senderType === 'gmail') {
+        const gmailAccountId = (sender as any).gmailAccountId;
+        if (!gmailAccountId) {
+          return { success: false, message: 'Gmail sender misconfigured', error: 'Gmail sender is missing gmailAccountId' };
+        }
+        const { gmailService } = await import('./gmailService');
+        const body = htmlBody || textBody || '';
+        try {
+          const gmailResult = await gmailService.sendEmail(userId, gmailAccountId, {
+            to,
+            subject: params.subject,
+            body,
+            isHtml: !!htmlBody,
+          });
+          emailId = gmailResult.messageId;
+        } catch (gmailErr: any) {
+          // Translate Gmail/OAuth failures into an actionable message that names
+          // the affected sender. Raw errors like "unauthorized_client" /
+          // "invalid_grant" are otherwise opaque and get mis-paraphrased by the LLM
+          // (e.g. "no Gmail account configured"). Nearly all of these are resolved
+          // by reconnecting the Gmail account in Settings → Connected Accounts.
+          const raw = gmailErr instanceof Error ? gmailErr.message : String(gmailErr);
+          const needsReconnect = /unauthorized_client|invalid_grant|invalid_client|token|revoked|expired|not connected|not authorized|insufficient|scope/i.test(raw);
+          if (needsReconnect) {
+            return {
+              success: false,
+              message: 'Gmail sender needs reconnecting',
+              error: `Could not send from the Gmail sender ${sender.email} (${gmailAccountId}): ${raw}. Please reconnect this Gmail account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
+            };
+          }
+          return {
+            success: false,
+            message: 'Gmail send failed',
+            error: `Could not send from the Gmail sender ${sender.email}: ${raw}`,
+          };
+        }
+      } else {
+        const { resendService } = await import('./resendService');
+        const from = `${sender.fromName} <${sender.email}>`;
+        const result = await resendService.sendEmail({
+          from,
+          to,
+          subject: params.subject,
+          html: htmlBody,
+          text: textBody,
+        });
+        if (!result) {
+          return { success: false, message: 'Email send failed', error: `Failed to send email to "${to}" via the configured sender ${sender.email}. This is often caused by an invalid or rejected recipient address, or the sender domain not being verified. Please double-check the recipient address.` };
+        }
+        emailId = result.id;
+      }
+
+      return {
+        success: true,
+        message: `Email sent successfully to ${to}`,
+        emailId,
+        to,
+        from: sender.email,
+        subject: params.subject,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error sending email from configured sender:', error);
       return { success: false, message: 'Failed to send email', error: error instanceof Error ? error.message : 'Unknown error' };
     }
   }
