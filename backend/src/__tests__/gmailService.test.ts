@@ -241,6 +241,19 @@ describe('GmailService', () => {
 
       await expect(service.searchEmails('user-123', ACCOUNT_ID, 'test')).rejects.toThrow(GmailTokenRevokedError);
     });
+
+    it('throws GmailTokenRevokedError on unauthorized_client from Google', async () => {
+      mockGetAccountById.mockResolvedValue(EXPIRING_ACCOUNT);
+      const { google } = require('googleapis');
+      google.auth.OAuth2.mockImplementationOnce(() => ({
+        setCredentials: jest.fn(),
+        refreshAccessToken: jest.fn().mockRejectedValue(
+          Object.assign(new Error('unauthorized_client'), { message: 'unauthorized_client' })
+        ),
+      }));
+
+      await expect(service.searchEmails('user-123', ACCOUNT_ID, 'test')).rejects.toThrow(GmailTokenRevokedError);
+    });
   });
 
   // ── searchEmails ─────────────────────────────────────────────────────────
