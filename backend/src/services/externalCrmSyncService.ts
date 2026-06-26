@@ -85,6 +85,13 @@ export interface ExternalCrmSyncConfig {
    * 'connection' by default for back-compat).
    */
   lastSyncErrorCategory?: 'connection' | 'data';
+  /**
+   * How many leads failed in the last push that recorded the error. Lets the UI
+   * say "12 leads couldn't sync" instead of naming only the first offender. Only
+   * meaningful for category 'data' (per-lead rejections); undefined for a
+   * connection failure (which isn't lead-scoped) and on legacy configs.
+   */
+  lastSyncErrorCount?: number;
   // Latest async full-list push job (status + result for the polling UI)
   pushJob?: PushJob;
   createdAt: string;
@@ -292,6 +299,8 @@ export class ExternalCrmSyncService {
       lastPullSyncAt: existing?.lastPullSyncAt,
       lastSyncStatus: existing?.lastSyncStatus,
       lastSyncError: existing?.lastSyncError,
+      lastSyncErrorCategory: existing?.lastSyncErrorCategory,
+      lastSyncErrorCount: existing?.lastSyncErrorCount,
       createdAt: existing?.createdAt || now,
       updatedAt: now,
       // Preserve existing secret; generate once and never rotate (stable URL)
@@ -333,6 +342,8 @@ export class ExternalCrmSyncService {
           config.lastPullSyncAt = undefined;
           config.lastSyncStatus = undefined;
           config.lastSyncError = undefined;
+          config.lastSyncErrorCategory = undefined;
+          config.lastSyncErrorCount = undefined;
         }
       } catch {
         // Can't reach HubSpot to validate — leave state intact rather than wiping on a
@@ -778,8 +789,10 @@ export class ExternalCrmSyncService {
         config.lastSyncStatus = 'error';
         config.lastSyncError = message;
         // A thrown push-job failure is a connection-level fault (the run aborted
-        // before completing) — reconnecting is the remedy.
+        // before completing) — reconnecting is the remedy. Not lead-scoped, so
+        // clear any stale per-lead count.
         config.lastSyncErrorCategory = 'connection';
+        config.lastSyncErrorCount = undefined;
         await this.persistPushJob(config, failed);
       });
 
@@ -940,6 +953,9 @@ export class ExternalCrmSyncService {
         );
         config.lastSyncError = detail;
         config.lastSyncErrorCategory = category;
+        // Record how many leads failed so the UI can say "N leads couldn't sync"
+        // instead of naming only the first. Lead-scoped → only for 'data' errors.
+        config.lastSyncErrorCount = category === 'data' ? totalResult.errorCount : undefined;
       }
       await this.updateSyncTimestamp(config, 'push', totalResult.errorCount === 0);
 
@@ -1076,6 +1092,9 @@ export class ExternalCrmSyncService {
         console.error(`[ExternalCrmSync] Auto-sync error for lead ${lead.leadId} in list ${listId}:`, detail);
         config.lastSyncError = detail;
         config.lastSyncErrorCategory = category;
+        // Auto-sync pushes a single lead, so a data failure here is exactly one
+        // lead. Lead-scoped → only for 'data' errors.
+        config.lastSyncErrorCount = category === 'data' ? result.errorCount : undefined;
         await this.updateSyncTimestamp(config, 'push', false);
         return;
       }
@@ -1096,6 +1115,7 @@ export class ExternalCrmSyncService {
         // correct remedy.
         config.lastSyncError = typeof details === 'string' ? details : JSON.stringify(details);
         config.lastSyncErrorCategory = 'connection';
+        config.lastSyncErrorCount = undefined; // not lead-scoped
         await this.updateSyncTimestamp(config, 'push', false).catch(() => { });
       }
     }
@@ -1174,6 +1194,7 @@ export class ExternalCrmSyncService {
     if (success) {
       config.lastSyncError = undefined;
       config.lastSyncErrorCategory = undefined;
+      config.lastSyncErrorCount = undefined;
     }
     config.updatedAt = now;
     await this.saveUpdatedConfig(config);

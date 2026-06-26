@@ -129,6 +129,7 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
       lastSyncStatus: config.lastSyncStatus,
       lastSyncError: config.lastSyncError,
       lastSyncErrorCategory: config.lastSyncErrorCategory,
+      lastSyncErrorCount: config.lastSyncErrorCount,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
       // Webhook URL — secret embedded as query param so HubSpot/Attio can call it with no custom headers
