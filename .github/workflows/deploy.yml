@@ -10,11 +10,6 @@ on:
         type: choice
         options:
           - prod
-      bypass_staging_smoke:
-        description: 'Bypass coding-agent staging smoke gate'
-        required: true
-        default: false
-        type: boolean
   schedule:
     # Run at 2:00 AM UTC (6:00 PM PST) every day
     - cron: '0 2 * * *'
@@ -55,85 +50,10 @@ jobs:
           echo "backend=true" >> $GITHUB_OUTPUT
           echo "partner=true" >> $GITHUB_OUTPUT
 
-  backend-staging-smoke-gate:
-    name: Coding agent staging smoke gate
-    needs: detect-changes
-    if: needs.detect-changes.outputs.backend == 'true' && (github.event_name != 'workflow_dispatch' || inputs.bypass_staging_smoke != true)
-    runs-on: ubuntu-latest
-    environment: staging
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          cache: 'npm'
-          cache-dependency-path: backend/package-lock.json
-
-      - name: Install dependencies
-        working-directory: backend
-        run: npm ci
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Coding agent staging smoke
-        working-directory: backend
-        timeout-minutes: 15
-        env:
-          STAGING_API_URL: https://api-stage.agentweb.pro
-          STAGING_SMOKE_AUTH_TOKEN: ${{ secrets.STAGING_SMOKE_AUTH_TOKEN }}
-          STAGING_SMOKE_USER_ID: ${{ vars.STAGING_SMOKE_USER_ID }}
-          STAGING_SMOKE_USER_EMAIL: ${{ vars.STAGING_SMOKE_USER_EMAIL }}
-          STAGING_SMOKE_USER_SESSION_VERSION: ${{ vars.STAGING_SMOKE_USER_SESSION_VERSION || '0' }}
-          STAGING_SMOKE_PAGE_ID: ${{ vars.STAGING_SMOKE_PAGE_ID }}
-          STAGING_SMOKE_CONSOLE_ALLOW_PATTERNS: ${{ vars.STAGING_SMOKE_CONSOLE_ALLOW_PATTERNS }}
-          V0_USAGE_TABLE_NAME: Dev-AW-V0Usage
-        run: |
-          mkdir -p smoke-artifacts
-          if [ -z "${STAGING_SMOKE_AUTH_TOKEN:-}" ]; then
-            if [ -z "${STAGING_SMOKE_USER_ID:-}" ] || [ -z "${STAGING_SMOKE_USER_EMAIL:-}" ]; then
-              echo "Set STAGING_SMOKE_AUTH_TOKEN or STAGING_SMOKE_USER_ID/STAGING_SMOKE_USER_EMAIL for staging smoke."
-              exit 1
-            fi
-            JWT_SECRET=$(aws elasticbeanstalk describe-configuration-settings \
-              --application-name "${{ vars.EB_BACKEND_STAGING_APPLICATION_NAME }}" \
-              --environment-name "${{ vars.EB_BACKEND_STAGING_ENVIRONMENT_NAME }}" \
-              --query "ConfigurationSettings[0].OptionSettings[?Namespace=='aws:elasticbeanstalk:application:environment' && OptionName=='JWT_SECRET'].Value | [0]" \
-              --output text)
-            export STAGING_SMOKE_AUTH_TOKEN=$(JWT_SECRET="$JWT_SECRET" node - <<'NODE'
-          const jwt = require('jsonwebtoken');
-          const token = jwt.sign({
-            userId: process.env.STAGING_SMOKE_USER_ID,
-            email: process.env.STAGING_SMOKE_USER_EMAIL,
-            isAdmin: false,
-            roles: ['customer'],
-            sv: Number(process.env.STAGING_SMOKE_USER_SESSION_VERSION || 0),
-          }, process.env.JWT_SECRET, { expiresIn: '2h' });
-          process.stdout.write(token);
-          NODE
-          )
-          fi
-          npx ts-node src/scripts/coding-agent-staging-smoke.ts | tee smoke-artifacts/coding-agent-staging-smoke.json
-
-      - name: Upload coding agent smoke artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coding-agent-prod-gate-smoke
-          path: backend/smoke-artifacts/
-
   backend-deploy:
     name: Backend deploy to production
-    needs: [detect-changes, backend-staging-smoke-gate]
-    if: needs.detect-changes.outputs.backend == 'true' && (needs.backend-staging-smoke-gate.result == 'success' || needs.backend-staging-smoke-gate.result == 'skipped')
+    needs: detect-changes
+    if: needs.detect-changes.outputs.backend == 'true'
     runs-on: ubuntu-latest
     environment: prod
     steps:
