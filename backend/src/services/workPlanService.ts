@@ -37,6 +37,11 @@ export interface WorkPlanStep {
   userInstructions?: string;
   requiredFunctionCalls?: string[];
   skillIds?: string[];
+  /** Number of media assets (images/videos) this step must produce before it can be
+   *  marked completed. Carried through to the session work plan and enforced by
+   *  setWorkPlanStatus. Set this on multi-image steps (e.g. "Generate 18 images") so
+   *  the step cannot be closed with only a fraction generated. */
+  expectedAssetCount?: number;
 }
 
 export interface WorkPlan {

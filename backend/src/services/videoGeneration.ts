@@ -3,6 +3,7 @@ import { getSecret } from "../utils/secretsManager";
 import { uploadFileToS3 } from "../utils/s3Utils";
 import { remotionService, RemotionComposeParams } from "./remotionService";
 import { imageService } from "./imageGeneration";
+import { McpClientService } from "../mcp/client/mcpClientService";
 
 interface VideoGenerationResult {
   success: boolean;
@@ -17,9 +18,147 @@ interface VideoGenerationResult {
 const SUPPORTED_MODELS = [
   "veo-3.1-generate-preview",
   "veo-3.1-fast-generate-preview",
+  "seedance-2.0",
 ] as const;
 
 type SupportedModel = typeof SUPPORTED_MODELS[number];
+
+// Seedance 2.0 is served only through Higgsfield's hosted MCP server (registered in
+// the admin MCP Servers tab as "higgsfield", OAuth). The name is overridable via env.
+const HIGGSFIELD_MCP_SERVER = process.env.HIGGSFIELD_MCP_SERVER_NAME || "higgsfield";
+
+// Maps our internal model id → the Higgsfield MCP catalog id (from models_explore).
+const HIGGSFIELD_MODEL_IDS: Record<string, string> = {
+  "seedance-2.0": "seedance_2_0",
+};
+
+const isHiggsfieldModel = (model: string): boolean =>
+  Object.prototype.hasOwnProperty.call(HIGGSFIELD_MODEL_IDS, model);
+
+// Seedance 2.0 capability sets (confirmed via models_explore). The UI dropdowns and
+// backend validation both source these so they can't drift.
+export const SEEDANCE_RESOLUTIONS = ["480p", "720p", "1080p"] as const;
+export const SEEDANCE_ASPECT_RATIOS = ["auto", "16:9", "9:16", "1:1", "4:3", "3:4", "21:9"] as const;
+const SEEDANCE_MIN_DURATION = 4;
+const SEEDANCE_MAX_DURATION = 15;
+const DEFAULT_VIDEO_MODEL = "seedance-2.0";
+
+// Time budgets are LENGTH-DRIVEN — generation time scales with output length (more
+// frames = more compute), so the budget does too. No env knobs: duration is the only
+// input. Generous on purpose (image-to-video, references, and queue wait add overhead
+// on top of raw length); calibrate from the fat logs rather than guessing tighter.
+//
+// Applies to both surfaces (Emma chat + /videos) since both run through generateVideo.
+// /videos has no turn cap (45-min worker limit), so long budgets run free there; Emma
+// chat's 600s turn cap still bounds a turn independently if a long video runs there.
+
+/** Clamp to Seedance's supported 4–15s range (also what we ever request). */
+const budgetSeconds = (durationSeconds?: number): number =>
+  Math.max(SEEDANCE_MIN_DURATION, Math.min(SEEDANCE_MAX_DURATION, Math.round(durationSeconds ?? 8)));
+
+/** Veo fallback reserve (ms): scales with clip count (Veo caps at 8s/clip → ceil(secs/8) clips). */
+export function veoFallbackReserveMs(durationSeconds?: number): number {
+  const secs = budgetSeconds(durationSeconds);
+  const clips = secs > 8 ? Math.ceil(secs / 8) : 1;
+  return clips * 150_000; // ~150s per Veo clip (generate + poll)
+}
+
+/** Whole-op wall-clock budget (ms): generous Seedance allowance (base + per-second) plus the Veo reserve. */
+export function videoTotalBudgetMs(durationSeconds?: number): number {
+  const secs = budgetSeconds(durationSeconds);
+  const seedance = 150_000 + secs * 45_000; // base overhead + generous per output-second
+  return seedance + veoFallbackReserveMs(secs);
+}
+
+/**
+ * Poll budget (ms) for the Seedance attempt: whatever's left before the deadline after
+ * reserving the (length-scaled) Veo fallback time. Returns 0 → skip polling, go to Veo.
+ */
+export function seedancePollBudgetMs(now: number, deadlineMs: number, durationSeconds?: number): number {
+  return Math.max(0, deadlineMs - now - veoFallbackReserveMs(durationSeconds));
+}
+
+/** Time (ms) left until `deadlineMs`, floored at 0. */
+export function remainingBudgetMs(now: number, deadlineMs: number): number {
+  return Math.max(0, deadlineMs - now);
+}
+
+// Veo 3.1 only supports a subset of Seedance's aspect ratios (auto / 16:9 / 9:16).
+// The UI offers the full Seedance set; when Seedance fails and we fall back to Veo,
+// map the chosen ratio to the closest Veo-supported one so orientation is preserved.
+export const VEO_ASPECT_RATIOS = ["auto", "16:9", "9:16"] as const;
+
+const aspectToNumber = (a: string): number => {
+  const [w, h] = a.split(":").map(Number);
+  return w && h ? w / h : NaN;
+};
+
+/** Map any Seedance aspect ratio to the nearest Veo-supported ratio (auto/16:9/9:16). */
+export function closestVeoAspectRatio(aspect?: string): string {
+  if (!aspect || aspect === "auto") return "auto";
+  if ((VEO_ASPECT_RATIOS as readonly string[]).includes(aspect)) return aspect;
+  const target = aspectToNumber(aspect);
+  if (!isFinite(target)) return "auto";
+  let best = "16:9";
+  let bestDiff = Infinity;
+  for (const c of ["16:9", "9:16"]) {
+    const diff = Math.abs(aspectToNumber(c) - target);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = c;
+    }
+  }
+  return best;
+}
+
+// Lazy singleton MCP client for backend tool calls (createTransport attaches the
+// OAuth authProvider + auto-refresh for the "higgsfield" server automatically).
+let mcpClientSingleton: McpClientService | null = null;
+const getMcpClient = (): McpClientService => {
+  if (!mcpClientSingleton) mcpClientSingleton = new McpClientService();
+  return mcpClientSingleton;
+};
+
+// Extract the JSON payload from an MCP tool result (prefers structuredContent,
+// falls back to parsing the first text content block).
+const parseMcpResult = (result: any): any => {
+  if (!result) return undefined;
+  if (result.structuredContent !== undefined) return result.structuredContent;
+  const text = Array.isArray(result.content)
+    ? result.content.find((c: any) => c?.type === "text")?.text
+    : undefined;
+  if (typeof text === "string") {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { text };
+    }
+  }
+  return undefined;
+};
+
+// Pull the single "generation" object from a Higgsfield tool result. The success
+// wrapper differs by tool (confirmed via outputSchema):
+//   generate_video / job_display → structuredContent.results (ARRAY) → take [0]
+//   job_status                   → structuredContent.generation (single OBJECT)
+const extractGeneration = (result: any): any => {
+  const sc = parseMcpResult(result);
+  if (!sc || typeof sc !== "object") return undefined;
+  if (Array.isArray(sc.results)) return sc.results[0];
+  if (sc.generation) return sc.generation;
+  return undefined;
+};
+
+// The finished video URL lives on the generation's inner `results` object.
+// rawUrl is the full-res file (confirmed primary); minUrl/thumbnailUrl are fallbacks.
+const extractVideoUrl = (generation: any): string | undefined => {
+  const r = generation?.results;
+  if (!r || typeof r !== "object") return undefined;
+  return r.rawUrl || r.minUrl || r.thumbnailUrl;
+};
+
+const clampDuration = (seconds: number): number =>
+  Math.max(SEEDANCE_MIN_DURATION, Math.min(SEEDANCE_MAX_DURATION, Math.round(seconds)));
 
 interface VideoGenerationParams {
   prompt: string;
@@ -40,6 +179,16 @@ interface VideoGenerationParams {
   compose?: boolean;
   /** Brand overlay params — required when compose is true */
   composeParams?: Omit<RemotionComposeParams, "clipUrl" | "filename" | "userId">;
+  /** Seedance aspect ratio (one of SEEDANCE_ASPECT_RATIOS). Defaults to "auto". */
+  aspectRatio?: string;
+  /** Seedance output resolution (one of SEEDANCE_RESOLUTIONS). Defaults to "720p". */
+  resolution?: string;
+  /**
+   * Internal: absolute epoch-ms hard stop for the WHOLE video op (Seedance + Veo
+   * fallback). Set once by generateVideo and propagated through the Seedance attempt
+   * and the Veo fallback so their combined wall-clock stays under the turn cap.
+   */
+  deadlineMs?: number;
 }
 
 export class VideoService {
@@ -53,11 +202,11 @@ export class VideoService {
   private async getApiKey(model: string): Promise<string> {
     try {
       let secretName: string;
-      
+
       if (model === "veo-3.1-generate-preview" || model === "veo-3.1-fast-generate-preview") {
         // Google Veo (both standard and fast models use the same API key)
-        secretName = process.env.NODE_ENV === "development" 
-          ? "dev/AgentWeb/Google/Video" 
+        secretName = process.env.NODE_ENV === "development"
+          ? "dev/AgentWeb/Google/Video"
           : "prod/AgentWeb/Google/Video";
       } else {
         // Default to Google Video
@@ -301,6 +450,15 @@ export class VideoService {
         config.lastFrame = lastFrameImage;
       }
 
+      // Honor the requested aspect ratio, mapped to the nearest Veo-supported value
+      // (the UI offers the full Seedance set; Veo only does 16:9/9:16). 'auto' is left
+      // unset so Veo defaults / matches the input frame.
+      const veoAspect = closestVeoAspectRatio(params.aspectRatio);
+      if (veoAspect === "16:9" || veoAspect === "9:16") {
+        config.aspectRatio = veoAspect;
+        console.log(`VideoService: Veo aspect ratio set to ${veoAspect} (from requested "${params.aspectRatio ?? "auto"}")`);
+      }
+
       // Add duration if provided (Veo supports 5–8 seconds)
       if (params.durationSeconds) {
         config.durationSeconds = Math.min(8, Math.max(5, params.durationSeconds));
@@ -347,25 +505,36 @@ export class VideoService {
         }
       }
       
-      // Poll the operation status until the video is ready
+      // Poll the operation status until the video is ready.
+      // Bound by the whole-op deadline (shared with any Seedance attempt that ran
+      // first) so the turn never overruns the agent-mode cap; the attempt count is a
+      // secondary safety cap. When called standalone (no deadline) fall back to 20 min.
       const maxPollAttempts = 120; // 20 minutes max (120 * 10 seconds)
+      const deadlineMs = params.deadlineMs ?? (Date.now() + videoTotalBudgetMs(params.durationSeconds));
       let pollAttempts = 0;
-      
-      while (!operation.done && pollAttempts < maxPollAttempts) {
+
+      while (!operation.done && pollAttempts < maxPollAttempts && Date.now() < deadlineMs) {
         console.log(`Waiting for video generation to complete... (attempt ${pollAttempts + 1}/${maxPollAttempts})`);
         await new Promise((resolve) => setTimeout(resolve, 10000)); // Wait 10 seconds
-        
+
         operation = await ai.operations.getVideosOperation({
           operation: operation,
         });
-        
+
         pollAttempts++;
       }
 
       if (!operation.done) {
+        const budgetExceeded = Date.now() >= deadlineMs;
+        console.warn(
+          `VideoService: Veo generation did not finish — ${budgetExceeded ? 'exceeded its time budget' : 'timed out after 20 minutes'} ` +
+          `(${pollAttempts} poll attempts)`
+        );
         return {
           success: false,
-          error: 'Video generation timed out after 20 minutes'
+          error: budgetExceeded
+            ? 'Video generation exceeded its time budget'
+            : 'Video generation timed out after 20 minutes'
         };
       }
 
@@ -447,6 +616,226 @@ export class VideoService {
   }
 
   /**
+   * Download a video from an HTTP(S) URL and upload it to S3.
+   * Used by providers (e.g. Higgsfield) that return a hosted video URL rather than
+   * an SDK file handle.
+   */
+  private async downloadUrlAndUploadVideo(
+    videoUrl: string,
+    filename: string,
+    userId: string
+  ): Promise<{ success: boolean; url?: string; error?: string }> {
+    // The source clip is already generated (and, for Seedance, already PAID for) by the
+    // time we get here. A transient download/S3 hiccup must not bubble up as a generation
+    // failure — that would trigger a full Veo regen and double-charge. Retry a few times
+    // with backoff so only a persistent failure surfaces.
+    const MAX_ATTEMPTS = 3;
+    let lastError = "Failed to download video to S3";
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        const downloadResponse = await axios.get(videoUrl, {
+          responseType: "arraybuffer",
+          timeout: 300000, // 5 minutes for large video downloads
+        });
+        const buffer = Buffer.from(downloadResponse.data as ArrayBuffer);
+        const uploadResult = await uploadFileToS3(buffer, filename, userId, "video/mp4");
+        if (uploadResult.success && uploadResult.url) {
+          return { success: true, url: uploadResult.url };
+        }
+        lastError = uploadResult.error || "Failed to upload video to S3";
+      } catch (error: any) {
+        lastError = `Failed to download video: ${error.message}`;
+        console.error(`❌ Failed to download and upload video from URL (attempt ${attempt}/${MAX_ATTEMPTS}):`, error.message);
+      }
+      if (attempt < MAX_ATTEMPTS) {
+        console.warn(`VideoService: download/upload attempt ${attempt}/${MAX_ATTEMPTS} failed (${lastError}); retrying`);
+        await new Promise((resolve) => setTimeout(resolve, 1000 * attempt)); // 1s, 2s backoff
+      }
+    }
+    console.error(`❌ Download/upload to S3 failed after ${MAX_ATTEMPTS} attempts: ${lastError}`);
+    return { success: false, error: lastError };
+  }
+
+  /**
+   * Generate a video using Higgsfield (e.g. ByteDance Seedance 2.0).
+   *
+   * Higgsfield models are image-to-video, so an input image is required. When no
+   * startFrame is supplied we generate a first frame from the prompt using the image
+   * service, mirroring the keyframe approach used elsewhere in this service.
+   *
+   * The Higgsfield API is an async queue: POST returns a request_id + status_url, which
+   * we poll until the job reaches a terminal state (completed/failed/nsfw).
+   */
+  private async generateWithHiggsfield(
+    params: VideoGenerationParams
+  ): Promise<VideoGenerationResult> {
+    try {
+      const model = params.videoModel || DEFAULT_VIDEO_MODEL;
+      const modelId = HIGGSFIELD_MODEL_IDS[model];
+      if (!modelId) {
+        return { success: false, error: `No Higgsfield MCP model id configured for '${model}'` };
+      }
+
+      const mcp = getMcpClient();
+
+      // Build the generate_video params (all args nest under a single `params` object;
+      // only `model` is required). Resolution/aspect ratio come from the user; defaults
+      // match Seedance's own (720p / auto) when unset.
+      const resolution = SEEDANCE_RESOLUTIONS.includes(params.resolution as any)
+        ? (params.resolution as string)
+        : "720p";
+      const aspectRatio = SEEDANCE_ASPECT_RATIOS.includes(params.aspectRatio as any)
+        ? (params.aspectRatio as string)
+        : "auto";
+
+      const seedanceParams: Record<string, any> = {
+        model: modelId,
+        prompt: params.prompt,
+        duration: clampDuration(params.durationSeconds ?? 8),
+        resolution,
+        aspect_ratio: aspectRatio,
+      };
+
+      // Run the entire job over ONE MCP session (media import → submit → poll →
+      // display) so the streamable-HTTP connection + OAuth isn't re-established per
+      // call (which previously caused reconnect/abort loops and the 600s timeout).
+      const outcome = await mcp.withServerSession(HIGGSFIELD_MCP_SERVER, async (callTool) => {
+        // Image-to-video: register start/end frames with Higgsfield (URL import is
+        // single-step → returns a ready media_id) and pass them as medias references.
+        // `medias[].value` must be a media_id, never a raw URL.
+        const medias: Array<{ value: string; role: string }> = [];
+        if (params.startFrame) {
+          medias.push({ value: await this.importHiggsfieldMedia(callTool, params.startFrame), role: "start_image" });
+        }
+        if (params.endFrame) {
+          medias.push({ value: await this.importHiggsfieldMedia(callTool, params.endFrame), role: "end_image" });
+        }
+        if (medias.length) {
+          seedanceParams.medias = medias;
+        }
+
+        // Submit — returns a job id (async).
+        const submitRaw = await callTool("generate_video", { params: seedanceParams }, { timeoutMs: 120000 });
+        // The job id is `generation.id` (same key in every tool's payload).
+        const submitGen = extractGeneration(submitRaw);
+        const jobId = submitGen?.id;
+        if (!jobId) {
+          console.error("Seedance generate_video returned no job id; raw:", JSON.stringify(submitRaw)?.slice(0, 2000));
+          return { ok: false as const, error: "Seedance did not return a job id (check credits/auth)" };
+        }
+
+        // Poll job_status until terminal. completed = done; failed/canceled/nsfw =
+        // terminal failure; ip_detected = gated (treated as failure → Veo fallback).
+        // Bounded by a wall-clock budget that stays under the agent-mode cap.
+        const maxPollAttempts = 240; // safety cap; the real bound is the time budget
+        const failStates = new Set(["failed", "canceled", "nsfw"]);
+        // Grant Seedance only what we can spend while still reserving time for a Veo
+        // fallback before the whole-op deadline — so a Seedance hang can't starve Veo.
+        const pollBudgetMs = params.deadlineMs !== undefined
+          ? seedancePollBudgetMs(Date.now(), params.deadlineMs, params.durationSeconds)
+          : (videoTotalBudgetMs(params.durationSeconds) - veoFallbackReserveMs(params.durationSeconds));
+        const deadline = Date.now() + pollBudgetMs;
+        console.log(`VideoService: Seedance job ${jobId} polling with a ${Math.round(pollBudgetMs / 1000)}s budget (requested ${params.durationSeconds ?? 8}s video)`);
+        let status = (submitGen?.status || "").toString().toLowerCase();
+        let resultUrl: string | undefined = extractVideoUrl(submitGen);
+        let backoffMs = 10000;
+        let timedOut = false;
+
+        for (let attempt = 0; attempt < maxPollAttempts; attempt++) {
+          if (status === "completed" || status === "ip_detected" || failStates.has(status)) break;
+          if (Date.now() >= deadline) {
+            timedOut = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+          // job_status requires the camelCase `jobId` (confirmed against the live MCP
+          // schema). Sending `job_id` fails validation → empty status → spurious timeout.
+          const statusRaw = await callTool("job_status", { jobId }, { timeoutMs: 60000 });
+          const statusSc = parseMcpResult(statusRaw);
+          const gen = extractGeneration(statusRaw);
+          status = (gen?.status || "").toString().toLowerCase();
+          resultUrl = extractVideoUrl(gen) || resultUrl;
+          // Respect server-provided backoff (poll_after_seconds), clamped to 2–30s.
+          if (typeof statusSc?.poll_after_seconds === "number" && statusSc.poll_after_seconds > 0) {
+            backoffMs = Math.max(2000, Math.min(30000, statusSc.poll_after_seconds * 1000));
+          }
+        }
+
+        if (timedOut && status !== "completed") {
+          const remainingForVeo = params.deadlineMs !== undefined ? remainingBudgetMs(Date.now(), params.deadlineMs) : 0;
+          console.warn(
+            `VideoService: Seedance job ${jobId} exceeded its ${Math.round(pollBudgetMs / 1000)}s budget ` +
+            `(last status "${status}") — failing over to Veo with ~${Math.round(remainingForVeo / 1000)}s left`
+          );
+          return {
+            ok: false as const,
+            error: `Seedance generation exceeded the ${Math.round(pollBudgetMs / 1000)}s budget`,
+          };
+        }
+
+        if (failStates.has(status)) {
+          return {
+            ok: false as const,
+            error:
+              status === "nsfw"
+                ? "Video generation was blocked by content policies (NSFW)"
+                : "Seedance video generation failed",
+          };
+        }
+        if (status === "ip_detected") {
+          return { ok: false as const, error: "Seedance generation is gated by IP detection and needs manual review" };
+        }
+
+        // Pull the final URL via job_display if job_status didn't include it.
+        if (!resultUrl) {
+          // job_display requires `id` (confirmed against the live MCP schema).
+          const displayRaw = await callTool("job_display", { id: jobId }, { timeoutMs: 60000 });
+          resultUrl = extractVideoUrl(extractGeneration(displayRaw));
+        }
+        if (!resultUrl) {
+          return { ok: false as const, error: "Seedance generation did not return a video URL (or timed out)" };
+        }
+        return { ok: true as const, url: resultUrl };
+      });
+
+      if (!outcome.ok) {
+        return { success: false, error: outcome.error };
+      }
+
+      // Download the hosted video and re-upload to our S3 bucket (outside the MCP session).
+      const uploadResult = await this.downloadUrlAndUploadVideo(outcome.url, params.filename, params.userId);
+      if (!uploadResult.success || !uploadResult.url) {
+        return { success: false, error: uploadResult.error || "Failed to upload video to S3" };
+      }
+
+      return { success: true, videoUrl: uploadResult.url, filename: params.filename };
+    } catch (error: any) {
+      const detail = error?.message || String(error);
+      console.error("❌ Error generating video with Seedance (Higgsfield MCP):", detail);
+      // Surface auth/credit problems clearly so the Veo fallback can engage.
+      return { success: false, error: `Seedance (Higgsfield MCP) failed: ${detail}` };
+    }
+  }
+
+  /**
+   * Import an image URL into Higgsfield via the MCP `media_import_url` tool, using
+   * the caller's open session. URL import is single-step (no media_confirm needed)
+   * and returns a ready media_id.
+   */
+  private async importHiggsfieldMedia(
+    callTool: (toolName: string, args: Record<string, any>, opts?: { timeoutMs?: number }) => Promise<any>,
+    url: string
+  ): Promise<string> {
+    const raw = await callTool("media_import_url", { url, type: "image" }, { timeoutMs: 120000 });
+    const data = parseMcpResult(raw);
+    const mediaId = data?.media_id || data?.id;
+    if (!mediaId) {
+      throw new Error("media_import_url did not return a media_id");
+    }
+    return mediaId;
+  }
+
+  /**
    * Generate N+1 keyframe images for a multi-clip video sequence.
    * Frame i is the start of clip i; frame i+1 is its end, which is also the start of clip i+1.
    * All frames are generated in parallel using the image service.
@@ -513,12 +902,28 @@ export class VideoService {
     params: VideoGenerationParams
   ): Promise<VideoGenerationResult> {
     try {
-      // Determine which model to use before validation
-      // If model not defined, use veo-3.1-generate-preview as default
+      // Determine which model to use before validation.
+      // Seedance 2.0 is the default for all video generation; Veo 3.1 is an
+      // automatic fallback if Seedance fails (see the generation branch below).
       if (!params.videoModel) {
-        params.videoModel = "veo-3.1-generate-preview";
+        params.videoModel = DEFAULT_VIDEO_MODEL;
       }
-      
+
+      // Establish the whole-op deadline ONCE, on the first (Seedance) call. The Veo
+      // fallback re-enters generateVideo with the same params, so this carries over —
+      // Seedance + Veo together are bounded by VIDEO_TOTAL_BUDGET_MS (< the turn cap).
+      if (params.deadlineMs === undefined) {
+        const total = videoTotalBudgetMs(params.durationSeconds);
+        const veoReserve = veoFallbackReserveMs(params.durationSeconds);
+        params.deadlineMs = Date.now() + total;
+        console.log(
+          `VideoService: length-driven budget for ${params.durationSeconds ?? 8}s video → ` +
+          `total=${Math.round(total / 1000)}s ` +
+          `(Seedance up to ~${Math.round((total - veoReserve) / 1000)}s, ` +
+          `~${Math.round(veoReserve / 1000)}s reserved for Veo fallback)`
+        );
+      }
+
       // Validate the provided model
       if (!SUPPORTED_MODELS.includes(params.videoModel as SupportedModel)) {
         return {
@@ -574,8 +979,33 @@ export class VideoService {
       let result: VideoGenerationResult;
       try {
         let clipUrls: string[] = [];
+        // Per-clip playback durations + the max-clip cap passed to Remotion.
+        // Default to the Veo per-8s-clip model; Seedance overrides both below since it
+        // returns ONE clip of the full (≤15s) length.
+        let composeClipDurations: number[] = clipPlaybackDurations;
+        let composeMaxClipSeconds = VEO_MAX_SECONDS;
 
-        if (modelToUse === "veo-3.1-generate-preview") {
+        if (isHiggsfieldModel(modelToUse)) {
+          // Seedance (Higgsfield MCP) generates a single clip per request and handles its
+          // own duration; multi-clip Veo composition does not apply here.
+          result = await this.generateWithHiggsfield({ ...params, durationSeconds: requestedDuration });
+          if (!result.success) {
+            // Automatic fallback: if Seedance fails (auth/credits/job error/timeout),
+            // regenerate with Veo 3.1 so video generation still succeeds.
+            console.warn(
+              `VideoService: Seedance generation failed (${result.error}); falling back to Veo 3.1`
+            );
+            return await this.generateVideo({ ...params, videoModel: "veo-3.1-generate-preview" });
+          }
+          if (result.videoUrl) {
+            clipUrls = [result.videoUrl];
+            // ONE real clip of the full requested length (clamped to Seedance's range).
+            // Override the Veo [8,6]-style split so compose renders all paid seconds,
+            // and lift the 8s clip cap to Seedance's 15s max.
+            composeClipDurations = [budgetSeconds(requestedDuration)];
+            composeMaxClipSeconds = SEEDANCE_MAX_DURATION;
+          }
+        } else if (modelToUse === "veo-3.1-generate-preview") {
           if (clipCount === 1) {
             result = await this.generateWithVeo31({ ...params, durationSeconds: veoGenerateDuration });
             if (result.success && result.videoUrl) {
@@ -619,16 +1049,26 @@ export class VideoService {
           };
         }
 
-        // Post-process with Remotion if requested and Veo succeeded
-        if (result.success && clipUrls.length > 0 && params.compose && params.composeParams) {
-          console.log(`VideoService: Composing ${clipUrls.length} clip(s) with Remotion...`);
+        // Stitch/compose with Remotion when needed:
+        //  - branded composition when compose+composeParams are supplied, OR
+        //  - a plain concatenation whenever there is >1 clip (e.g. a >8s Veo fallback),
+        //    so multi-clip videos aren't silently truncated to the first 8s clip.
+        // For the plain-concat case we pass empty branding; the composition skips the
+        // intro overlay when brandName is empty (acts as a pure concatenator).
+        const needsBranding = !!(params.compose && params.composeParams);
+        const needsConcat = clipUrls.length > 1;
+        if (result.success && clipUrls.length > 0 && (needsBranding || needsConcat)) {
+          const composeArgs = params.composeParams ?? { brandName: "", primaryColor: "#000000", secondaryColor: "#000000" };
+          console.log(`VideoService: ${needsBranding ? "Composing" : "Stitching"} ${clipUrls.length} clip(s) with Remotion...`);
           const composeResult = await remotionService.compose({
-            ...params.composeParams,
+            ...composeArgs,
             clipUrl: clipUrls[0],
             extraClipUrls: clipUrls.slice(1),
             // Pass per-clip playback durations so Remotion places each clip exactly
-            // (e.g. [8,8,8,6] for a 30s video — last clip plays only 6s of its 8s footage)
-            clipDurationsSeconds: clipPlaybackDurations,
+            // (e.g. [8,8,8,6] for a 30s Veo video; [14] for a single 14s Seedance clip)
+            clipDurationsSeconds: composeClipDurations,
+            // Max single-clip length (Veo=8s, Seedance=15s) so Remotion's clamp matches the provider
+            maxClipSeconds: composeMaxClipSeconds,
             filename: params.filename,
             userId: params.userId,
           });

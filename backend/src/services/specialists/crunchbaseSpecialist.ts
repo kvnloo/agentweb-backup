@@ -87,7 +87,7 @@ async function fetchCrunchbaseResults(lead: LeadRecord): Promise<CrunchbaseSnipp
   // surface "{{company}} closed $X Series Y" in their snippets.
   let result;
   try {
-    result = await agentModeService.searchWeb(`${term} funding round Series`, 8);
+    result = await agentModeService.youSearchWeb(`${term} funding round Series`, 8);
   } catch {
     return [];
   }

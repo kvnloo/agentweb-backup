@@ -219,7 +219,7 @@ const SCOPE_GUIDANCE =
   'run_local_agent_task only handles READ-ONLY web browsing and data extraction (visit a URL, read/scrape page content). ' +
   'It cannot run commands, edit files or accounts, submit forms, log in, send messages, or handle credentials. ' +
   'Do not retry this task here — use coding_agent for code changes, perform_data_analysis for data analysis, ' +
-  'search_web for research, or the dedicated tool for the action you need (e.g. linkedin_outreach, send_email).';
+  'you_search_web for research, or the dedicated tool for the action you need (e.g. linkedin_outreach, send_email).';
 
 function hasReadOnlyIntent(task: string): boolean {
   return READ_ONLY_INTENT_PATTERNS.some((p) => p.test(task));
@@ -270,7 +270,7 @@ export function suggestAlternativeTool(task: string): string {
   if (/\b(analyz|analys|data analysis|metrics|chart|spreadsheet|csv|dataset)\b/i.test(task)) return 'perform_data_analysis';
   if (/\b(post|comment|message|dm|connect|invite|outreach)\b/i.test(task) && /\blinkedin\b/i.test(task)) return 'linkedin_outreach';
   if (/\b(send|email|reply)\b/i.test(task) && /\bemail\b/i.test(task)) return 'send_email';
-  return 'search_web';
+  return 'you_search_web';
 }
 
 /**

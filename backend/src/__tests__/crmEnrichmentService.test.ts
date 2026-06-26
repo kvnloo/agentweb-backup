@@ -31,7 +31,7 @@ jest.mock('../services/db', () => ({
 const mockGeminiCreate = jest.fn();
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
-    searchWeb: jest.fn(),
+    youSearchWeb: jest.fn(),
     linkedinOutreach: jest.fn(),
     getGeminiClient: jest.fn().mockResolvedValue({
       chat: {
@@ -200,7 +200,7 @@ describe('CrmEnrichmentService', () => {
         // Second lead succeeds
         .mockResolvedValueOnce(geminiResponse({ company_size: '500+' }));
 
-      mockAgentModeService.searchWeb
+      mockAgentModeService.youSearchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'A company' }] });
       mockCrmDb.updateLead.mockResolvedValue({} as any);
       mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
@@ -226,7 +226,7 @@ describe('CrmEnrichmentService', () => {
         lastEvaluatedKey: null, hasMore: false,
       });
 
-      mockAgentModeService.searchWeb
+      mockAgentModeService.youSearchWeb
         .mockResolvedValueOnce({ success: false, error: 'Rate limited' })
         .mockResolvedValueOnce({ success: true, results: [{ title: 'Acme', snippet: 'A company' }] });
 
@@ -308,7 +308,7 @@ describe('CrmEnrichmentService', () => {
       await service.preview(spec);
 
       // The whole point of this fix: the broken generic search must NOT fire.
-      expect(mockAgentModeService.searchWeb).not.toHaveBeenCalled();
+      expect(mockAgentModeService.youSearchWeb).not.toHaveBeenCalled();
     });
   });
 
@@ -323,7 +323,7 @@ describe('CrmEnrichmentService', () => {
       ];
       mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
 
-      mockAgentModeService.searchWeb
+      mockAgentModeService.youSearchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'A company' }] });
 
       mockGeminiCreate.mockResolvedValue(geminiResponse({ company_size: '500+', industry: 'Technology' }));
@@ -379,7 +379,7 @@ describe('CrmEnrichmentService', () => {
       const leads = [createLead({ leadId: 'lead1' })];
       mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
 
-      mockAgentModeService.searchWeb
+      mockAgentModeService.youSearchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Tech company' }] });
 
       mockGeminiCreate.mockResolvedValue(geminiResponse({ company_size: '500+' }));
@@ -397,8 +397,8 @@ describe('CrmEnrichmentService', () => {
 
       const result = await service.execute(spec);
       expect(result.processedCount).toBe(1);
-      expect(mockAgentModeService.searchWeb).toHaveBeenCalledWith(expect.stringContaining('Acme Corp'), 5);
-      expect(mockAgentModeService.searchWeb).toHaveBeenCalledTimes(1);
+      expect(mockAgentModeService.youSearchWeb).toHaveBeenCalledWith(expect.stringContaining('Acme Corp'), 5);
+      expect(mockAgentModeService.youSearchWeb).toHaveBeenCalledTimes(1);
       expect(mockGeminiCreate).toHaveBeenCalled();
     });
 
@@ -576,7 +576,7 @@ describe('CrmEnrichmentService', () => {
 
       mockGetAccountsByUserId.mockResolvedValue([{ account_id: 'acc1', platform: 'unipile' }] as any);
 
-      mockAgentModeService.searchWeb
+      mockAgentModeService.youSearchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Tech company' }] });
       // First call: search-people returns a result, second call: get-profile returns profile
       mockAgentModeService.linkedinOutreach
@@ -598,7 +598,7 @@ describe('CrmEnrichmentService', () => {
 
       const result = await service.execute(spec);
       expect(result.processedCount).toBe(1);
-      expect(mockAgentModeService.searchWeb).toHaveBeenCalled();
+      expect(mockAgentModeService.youSearchWeb).toHaveBeenCalled();
       expect(mockAgentModeService.linkedinOutreach).toHaveBeenCalled();
       // Both data sources fed into Gemini (per-group dispatch — web and linkedin
       // go to separate parallel calls; assert both contexts surface across calls).
@@ -618,7 +618,7 @@ describe('CrmEnrichmentService', () => {
 
       mockGeminiCreate.mockResolvedValue(geminiResponse({ company_size: '500+' }));
 
-      mockAgentModeService.searchWeb
+      mockAgentModeService.youSearchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Big company' }] });
       mockCrmDb.updateLead.mockResolvedValue({} as any);
       mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
@@ -647,7 +647,7 @@ describe('CrmEnrichmentService', () => {
 
       mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Tech' }));
 
-      mockAgentModeService.searchWeb
+      mockAgentModeService.youSearchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Company' }] });
       mockCrmDb.updateLead.mockResolvedValue({} as any);
       mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
@@ -676,7 +676,7 @@ describe('CrmEnrichmentService', () => {
 
       mockGeminiCreate.mockResolvedValue(geminiResponse({ company_size: '100' }));
 
-      mockAgentModeService.searchWeb
+      mockAgentModeService.youSearchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Company' }] });
       mockCrmDb.updateLead.mockResolvedValue({} as any);
       mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
@@ -858,7 +858,7 @@ describe('CrmEnrichmentService', () => {
       const leads = [createLead({ leadId: 'lead1', company: '', title: '' })];
       mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
 
-      mockAgentModeService.searchWeb
+      mockAgentModeService.youSearchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Tech company' }] });
       mockGeminiCreate.mockResolvedValue(geminiResponse({
         company: 'Black Tiger',
@@ -897,7 +897,7 @@ describe('CrmEnrichmentService', () => {
       const leads = [createLead({ leadId: 'lead1', company: '', email: 'reed@blacktiger.tech' })];
       mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
 
-      mockAgentModeService.searchWeb
+      mockAgentModeService.youSearchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Black Tiger', snippet: '51-200 employees' }] });
       mockGeminiCreate.mockResolvedValue(geminiResponse({ employee_count: '51-200' }));
       mockCrmDb.updateLead.mockResolvedValue({} as any);
@@ -914,7 +914,7 @@ describe('CrmEnrichmentService', () => {
       const result = await service.execute(spec);
       expect(result.processedCount).toBe(1);
       // Should search using the email domain, not skip the search
-      expect(mockAgentModeService.searchWeb).toHaveBeenCalledWith(
+      expect(mockAgentModeService.youSearchWeb).toHaveBeenCalledWith(
         expect.stringContaining('blacktiger.tech'),
         5,
       );
@@ -940,7 +940,7 @@ describe('CrmEnrichmentService', () => {
       const result = await service.execute(spec);
       expect(result.processedCount).toBe(1);
       // No search term available — web search should be skipped
-      expect(mockAgentModeService.searchWeb).not.toHaveBeenCalled();
+      expect(mockAgentModeService.youSearchWeb).not.toHaveBeenCalled();
     });
   });
 
@@ -1025,7 +1025,7 @@ describe('CrmEnrichmentService', () => {
 
       await service.execute(spec);
       // Web search must NOT be called with a personal domain as the company term
-      expect(mockAgentModeService.searchWeb).not.toHaveBeenCalledWith(
+      expect(mockAgentModeService.youSearchWeb).not.toHaveBeenCalledWith(
         expect.stringContaining('gmail.com'),
         expect.anything(),
       );
@@ -1049,7 +1049,7 @@ describe('CrmEnrichmentService', () => {
       };
 
       await service.execute(spec);
-      expect(mockAgentModeService.searchWeb).not.toHaveBeenCalledWith(
+      expect(mockAgentModeService.youSearchWeb).not.toHaveBeenCalledWith(
         expect.stringContaining('outlook.com'),
         expect.anything(),
       );
@@ -1060,7 +1060,7 @@ describe('CrmEnrichmentService', () => {
       const leads = [createLead({ leadId: 'lead1', company: '', email: 'reed@blacktiger.tech' })];
       mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
 
-      mockAgentModeService.searchWeb
+      mockAgentModeService.youSearchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Black Tiger', snippet: '51-200 employees' }] });
       mockGeminiCreate.mockResolvedValue(geminiResponse({ employee_count: '51-200' }));
       mockCrmDb.updateLead.mockResolvedValue({} as any);
@@ -1075,7 +1075,7 @@ describe('CrmEnrichmentService', () => {
       };
 
       await service.execute(spec);
-      expect(mockAgentModeService.searchWeb).toHaveBeenCalledWith(
+      expect(mockAgentModeService.youSearchWeb).toHaveBeenCalledWith(
         expect.stringContaining('blacktiger.tech'),
         5,
       );
@@ -1095,7 +1095,7 @@ describe('CrmEnrichmentService', () => {
       mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
 
       mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Tech' }));
-      mockAgentModeService.searchWeb
+      mockAgentModeService.youSearchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Company' }] });
       mockCrmDb.updateLead.mockResolvedValue({} as any);
       mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
@@ -1127,7 +1127,7 @@ describe('CrmEnrichmentService', () => {
       mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
 
       mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Tech' }));
-      mockAgentModeService.searchWeb
+      mockAgentModeService.youSearchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Company' }] });
       mockCrmDb.updateLead.mockResolvedValue({} as any);
       mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
@@ -1175,7 +1175,7 @@ describe('CrmEnrichmentService', () => {
       mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
 
       mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Tech' }));
-      mockAgentModeService.searchWeb
+      mockAgentModeService.youSearchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Company' }] });
       mockCrmDb.updateLead.mockResolvedValue({} as any);
       mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
@@ -1206,7 +1206,7 @@ describe('CrmEnrichmentService', () => {
       mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
 
       mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Tech' }));
-      mockAgentModeService.searchWeb
+      mockAgentModeService.youSearchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Company' }] });
 
       const spec: EnrichmentJobSpec = {
@@ -1249,7 +1249,7 @@ describe('CrmEnrichmentService', () => {
 
       mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Tech' }));
 
-      mockAgentModeService.searchWeb
+      mockAgentModeService.youSearchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Company' }] });
       mockCrmDb.updateLead.mockResolvedValue({} as any);
       mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
@@ -1525,7 +1525,7 @@ describe('CrmEnrichmentService search grouping', () => {
     jest.clearAllMocks();
     mockCrmDb.updateLead.mockResolvedValue({} as any);
     mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
-    mockAgentModeService.searchWeb.mockResolvedValue({
+    mockAgentModeService.youSearchWeb.mockResolvedValue({
       success: true,
       results: [{ title: 'Result', snippet: 'info', url: 'https://example.com' }],
     });
@@ -1554,7 +1554,7 @@ describe('CrmEnrichmentService search grouping', () => {
       sources: ['web_search'],
     });
 
-    expect(mockAgentModeService.searchWeb).toHaveBeenCalledTimes(1);
+    expect(mockAgentModeService.youSearchWeb).toHaveBeenCalledTimes(1);
   });
 
   it('uses webSearchTemplate from spec to build the single query', async () => {
@@ -1581,8 +1581,8 @@ describe('CrmEnrichmentService search grouping', () => {
       webSearchTemplate: '{{firstName}} {{lastName}} {{company}} linkedin',
     });
 
-    expect(mockAgentModeService.searchWeb).toHaveBeenCalledTimes(1);
-    expect(mockAgentModeService.searchWeb).toHaveBeenCalledWith('Jane Smith Beta Inc linkedin', 5);
+    expect(mockAgentModeService.youSearchWeb).toHaveBeenCalledTimes(1);
+    expect(mockAgentModeService.youSearchWeb).toHaveBeenCalledWith('Jane Smith Beta Inc linkedin', 5);
   });
 });
 
@@ -1593,7 +1593,7 @@ describe('CrmEnrichmentService template fallback chain', () => {
     jest.clearAllMocks();
     mockCrmDb.updateLead.mockResolvedValue({} as any);
     mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
-    mockAgentModeService.searchWeb.mockResolvedValue({ success: true, results: [] });
+    mockAgentModeService.youSearchWeb.mockResolvedValue({ success: true, results: [] });
   });
 
   it('runtime spec webSearchTemplate overrides stored template', async () => {
@@ -1615,7 +1615,7 @@ describe('CrmEnrichmentService template fallback chain', () => {
       webSearchTemplate: '{{company}} runtime override',
     });
 
-    expect(mockAgentModeService.searchWeb).toHaveBeenCalledWith('Delta Corp runtime override', 5);
+    expect(mockAgentModeService.youSearchWeb).toHaveBeenCalledWith('Delta Corp runtime override', 5);
   });
 
   it('stored webSearchTemplate is used when spec provides none', async () => {
@@ -1636,7 +1636,7 @@ describe('CrmEnrichmentService template fallback chain', () => {
       sources: ['web_search'],
     });
 
-    expect(mockAgentModeService.searchWeb).toHaveBeenCalledWith('Epsilon Ltd funding crunchbase', 5);
+    expect(mockAgentModeService.youSearchWeb).toHaveBeenCalledWith('Epsilon Ltd funding crunchbase', 5);
   });
 });
 
@@ -1861,7 +1861,7 @@ describe('CrmEnrichmentService - enrichment history snapshot', () => {
       items: [createLead({ leadId: 'lead-fail' })],
       lastEvaluatedKey: null, hasMore: false,
     });
-    mockAgentModeService.searchWeb.mockResolvedValue({ success: false, error: 'Network error' });
+    mockAgentModeService.youSearchWeb.mockResolvedValue({ success: false, error: 'Network error' });
 
     const spec: EnrichmentJobSpec = {
       listId: 'list1', userId: 'user1',
@@ -1885,7 +1885,7 @@ describe('CrmEnrichmentService - enrichment history snapshot', () => {
     mockCrmDb.getLeadsByListId.mockResolvedValue({
       items: [lead], lastEvaluatedKey: null, hasMore: false,
     });
-    mockAgentModeService.searchWeb.mockResolvedValue({
+    mockAgentModeService.youSearchWeb.mockResolvedValue({
       success: true, results: [{ title: 'Acme', snippet: 'SaaS company' }],
     });
     mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'FinTech' }));
@@ -1935,7 +1935,7 @@ describe('CrmEnrichmentService - enrichment history snapshot', () => {
     });
     mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
     mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [lead], lastEvaluatedKey: null, hasMore: false });
-    mockAgentModeService.searchWeb.mockResolvedValue({
+    mockAgentModeService.youSearchWeb.mockResolvedValue({
       success: true, results: [{ title: 'John Doe', snippet: 'Person profile' }],
     });
     // LLM returns first_name (original key) — STANDARD_FIELD_MAP maps it to firstName
@@ -1967,7 +1967,7 @@ describe('CrmEnrichmentService - enrichment history snapshot', () => {
     mockCrmDb.getLeadsByListId.mockResolvedValue({
       items: [lead], lastEvaluatedKey: null, hasMore: false,
     });
-    mockAgentModeService.searchWeb.mockResolvedValue({
+    mockAgentModeService.youSearchWeb.mockResolvedValue({
       success: true, results: [{ title: 'Acme', snippet: 'FinTech company' }],
     });
     mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'FinTech' }));
@@ -1997,7 +1997,7 @@ describe('CrmEnrichmentService - enrichment history snapshot', () => {
     mockCrmDb.getLeadsByListId.mockResolvedValue({
       items: [lead], lastEvaluatedKey: null, hasMore: false,
     });
-    mockAgentModeService.searchWeb.mockResolvedValue({
+    mockAgentModeService.youSearchWeb.mockResolvedValue({
       success: true, results: [{ title: 'Acme', snippet: 'Tech company' }],
     });
     mockGeminiCreate.mockResolvedValue(geminiResponse({ tech_stack: 'React, Node.js' }));
@@ -2023,7 +2023,7 @@ describe('CrmEnrichmentService - enrichment history snapshot', () => {
     mockCrmDb.getLeadsByListId.mockResolvedValue({
       items: [lead], lastEvaluatedKey: null, hasMore: false,
     });
-    mockAgentModeService.searchWeb.mockResolvedValue({
+    mockAgentModeService.youSearchWeb.mockResolvedValue({
       success: true, results: [{ title: 'Acme', snippet: 'Tech company' }],
     });
     mockGeminiCreate.mockResolvedValue(geminiResponse({ tech_stack: 'React' }));
@@ -2271,7 +2271,7 @@ describe('CrmEnrichmentService - citation verification', () => {
       lastEvaluatedKey: null,
       hasMore: false,
     });
-    mockAgentModeService.searchWeb.mockResolvedValue({
+    mockAgentModeService.youSearchWeb.mockResolvedValue({
       success: true,
       results: [{ title: 'Acme', url: 'https://acme.com', snippet: searchSnippet }],
     });
@@ -2506,7 +2506,7 @@ describe('CrmEnrichmentService - citation verification', () => {
       lastEvaluatedKey: null,
       hasMore: false,
     });
-    mockAgentModeService.searchWeb.mockResolvedValue({
+    mockAgentModeService.youSearchWeb.mockResolvedValue({
       success: true,
       results: [{ title: 'Acme', url: 'https://acme.com', snippet: 'no industry info here' }],
     });
@@ -2566,7 +2566,7 @@ describe('CrmEnrichmentService - citation verification', () => {
       hasMore: false,
     });
     // First search returns generic info; targeted retry finds revenue & funding details
-    mockAgentModeService.searchWeb
+    mockAgentModeService.youSearchWeb
       .mockResolvedValueOnce({
         success: true,
         results: [{ title: 'Acme', url: 'https://acme.com', snippet: 'Acme is a tech company' }],
@@ -2604,7 +2604,7 @@ describe('CrmEnrichmentService - citation verification', () => {
     expect(result.processedCount).toBe(1);
     // Targeted re-search produced an extra searchWeb call.
     // Gemini is called >= 2 times (extraction + retargeted extraction; critic adds 1 more if enabled).
-    expect(mockAgentModeService.searchWeb).toHaveBeenCalledTimes(2);
+    expect(mockAgentModeService.youSearchWeb).toHaveBeenCalledTimes(2);
     expect(mockGeminiCreate.mock.calls.length).toBeGreaterThanOrEqual(2);
     const cf = lastUpdateCustomFields();
     expect(cf.industry).toBe('Tech');
@@ -2927,7 +2927,7 @@ describe('CrmEnrichmentService - LinkedIn confidence scoring (Stage 3)', () => {
     ] as any);
 
     // Web search returns a snippet containing a LinkedIn URL — regex picks it up
-    mockAgentModeService.searchWeb.mockResolvedValue({
+    mockAgentModeService.youSearchWeb.mockResolvedValue({
       success: true,
       results: [
         { title: 'John Doe', url: 'https://example.com', snippet: 'See https://www.linkedin.com/in/john-doe-from-web' },
@@ -3089,7 +3089,7 @@ describe('enrichLead — apolloTechStack waterfall', () => {
     await service.execute(baseSpec());
 
     expect(matchOrg).toHaveBeenCalledWith('acme.com');
-    expect(mockAgentModeService.searchWeb).not.toHaveBeenCalled();
+    expect(mockAgentModeService.youSearchWeb).not.toHaveBeenCalled();
     expect(mockGeminiCreate).toHaveBeenCalled();
     // First call is field-alias resolution; Apollo context appears in a later extraction call.
     const allPrompts = mockGeminiCreate.mock.calls.map(c => JSON.stringify(c[0])).join('\n');
@@ -3099,7 +3099,7 @@ describe('enrichLead — apolloTechStack waterfall', () => {
 
   it('falls back to web search when Apollo returns no techStack', async () => {
     const { matchOrg } = mockApolloOrg(null);
-    mockAgentModeService.searchWeb.mockResolvedValue({
+    mockAgentModeService.youSearchWeb.mockResolvedValue({
       success: true,
       results: [{ title: 'Acme tech', snippet: 'Uses Mixpanel and Shopify' }],
     });
@@ -3116,12 +3116,12 @@ describe('enrichLead — apolloTechStack waterfall', () => {
     await service.execute(baseSpec());
 
     expect(matchOrg).toHaveBeenCalledWith('acme.com');
-    expect(mockAgentModeService.searchWeb).toHaveBeenCalled();
+    expect(mockAgentModeService.youSearchWeb).toHaveBeenCalled();
   });
 
   it('skips Apollo and runs web search when lead has no domain', async () => {
     const { matchOrg } = mockApolloOrg(['React']);
-    mockAgentModeService.searchWeb.mockResolvedValue({
+    mockAgentModeService.youSearchWeb.mockResolvedValue({
       success: true,
       results: [{ title: 'Acme', snippet: 'Uses Hubspot' }],
     });
@@ -3136,12 +3136,12 @@ describe('enrichLead — apolloTechStack waterfall', () => {
     await service.execute(baseSpec());
 
     expect(matchOrg).not.toHaveBeenCalled();
-    expect(mockAgentModeService.searchWeb).toHaveBeenCalled();
+    expect(mockAgentModeService.youSearchWeb).toHaveBeenCalled();
   });
 
   it('falls back to web search when Apollo service is not ready', async () => {
     jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(false);
-    mockAgentModeService.searchWeb.mockResolvedValue({
+    mockAgentModeService.youSearchWeb.mockResolvedValue({
       success: true,
       results: [{ title: 'Acme', snippet: 'Uses AWS' }],
     });
@@ -3155,7 +3155,7 @@ describe('enrichLead — apolloTechStack waterfall', () => {
 
     await service.execute(baseSpec());
 
-    expect(mockAgentModeService.searchWeb).toHaveBeenCalled();
+    expect(mockAgentModeService.youSearchWeb).toHaveBeenCalled();
   });
 
   it('does not call Apollo when apolloTechStack flag is absent', async () => {
@@ -3164,7 +3164,7 @@ describe('enrichLead — apolloTechStack waterfall', () => {
     jest.spyOn(apolloServiceModule, 'getApolloService').mockReturnValue(
       { matchOrg, matchPerson: jest.fn(), findEmail: jest.fn() } as unknown as ApolloService,
     );
-    mockAgentModeService.searchWeb.mockResolvedValue({
+    mockAgentModeService.youSearchWeb.mockResolvedValue({
       success: true,
       results: [{ title: 'Acme', snippet: 'Uses AWS' }],
     });
@@ -3185,7 +3185,7 @@ describe('enrichLead — apolloTechStack waterfall', () => {
   it('does not call Apollo during preview (no credits burned on preview)', async () => {
     const { matchOrg } = mockApolloOrg(['React', 'AWS']);
     mockGeminiCreate.mockResolvedValue(geminiResponse({ tech_stack_analytics: 'Unknown' }));
-    mockAgentModeService.searchWeb.mockResolvedValue({
+    mockAgentModeService.youSearchWeb.mockResolvedValue({
       success: true,
       results: [{ title: 'Acme', snippet: 'Uses AWS' }],
     });
@@ -3203,7 +3203,7 @@ describe('enrichLead — apolloTechStack waterfall', () => {
 
   it('does not call Apollo when domain is a personal email domain', async () => {
     const { matchOrg } = mockApolloOrg(['React']);
-    mockAgentModeService.searchWeb.mockResolvedValue({
+    mockAgentModeService.youSearchWeb.mockResolvedValue({
       success: true,
       results: [{ title: 'Gmail', snippet: 'Email service' }],
     });
@@ -3218,7 +3218,7 @@ describe('enrichLead — apolloTechStack waterfall', () => {
     await service.execute(baseSpec());
 
     expect(matchOrg).not.toHaveBeenCalled();
-    expect(mockAgentModeService.searchWeb).toHaveBeenCalled();
+    expect(mockAgentModeService.youSearchWeb).toHaveBeenCalled();
   });
 
   it('extracts domain from website when emailDomain absent', async () => {
@@ -3252,7 +3252,7 @@ describe('enrichLead — apolloTechStack waterfall', () => {
     await service.execute(baseSpec());
 
     expect(matchOrg).toHaveBeenCalledWith('acme.com');
-    expect(mockAgentModeService.searchWeb).toHaveBeenCalled();
+    expect(mockAgentModeService.youSearchWeb).toHaveBeenCalled();
   });
 
   it('falls back to web search when Apollo returns found:true with empty techStack', async () => {
@@ -3276,6 +3276,6 @@ describe('enrichLead — apolloTechStack waterfall', () => {
     await service.execute(baseSpec());
 
     expect(matchOrg).toHaveBeenCalledWith('acme.com');
-    expect(mockAgentModeService.searchWeb).toHaveBeenCalled();
+    expect(mockAgentModeService.youSearchWeb).toHaveBeenCalled();
   });
 });

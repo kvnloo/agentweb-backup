@@ -121,7 +121,7 @@ import { McpToolRegistry } from '../mcp/server/registry';
 import { mcpFetch } from '../mcp/server/httpClient';
 
 const INTERNAL_TOOL_NAMES = [
-  'search_web',
+  'you_search_web',
   'generate_image',
   'send_email',
   'save_file',

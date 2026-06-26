@@ -575,6 +575,53 @@ router.post('/sync', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * @route POST /api/crm/registration-status
+ * @desc  Join a batch of emails against AW-Users to learn which ones registered
+ *        for an AgentWeb account and which became premium (active/trialing)
+ *        users. Powers the internal funnel report's signup/premium attribution
+ *        without duplicating user data onto lead records. Read-only.
+ * @access Admin only — this queries the platform-wide AW-Users table for
+ *         arbitrary emails (an account-enumeration surface). It is an
+ *         admin/founder funnel concern, not a per-tenant capability.
+ * @body  { emails: string[] }  (1..1000 emails)
+ * @returns { statuses: RegistrationStatus[], summary: { total, registered, premium } }
+ */
+const REGISTRATION_STATUS_MAX_EMAILS = 1000;
+router.post('/registration-status', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user?.userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+    if (!authReq.user?.isAdmin) {
+      return res.status(403).json({ message: 'Admin access required' });
+    }
+
+    const emails = (req.body as { emails?: unknown })?.emails;
+    if (!Array.isArray(emails) || emails.length === 0) {
+      return res.status(400).json({ message: 'Invalid body. Required: emails (non-empty array of strings).' });
+    }
+    if (emails.length > REGISTRATION_STATUS_MAX_EMAILS) {
+      return res.status(400).json({
+        message: `Too many emails. Max ${REGISTRATION_STATUS_MAX_EMAILS} per request.`,
+      });
+    }
+
+    const statuses = await userDb.getRegistrationStatusByEmails(emails as string[]);
+    const summary = {
+      total: statuses.length,
+      registered: statuses.filter((s) => s.registered).length,
+      premium: statuses.filter((s) => s.isPremium).length,
+    };
+
+    return res.json({ statuses, summary });
+  } catch (error: any) {
+    console.error('Error in POST /api/crm/registration-status:', error);
+    return res.status(500).json({ message: error?.message || 'Failed to resolve registration status' });
+  }
+});
+
 // --------------------------------------------------------------------------
 // Saved Views (H1) — user-customized filter/sort combos over /crm tabs.
 // Built-in presets are returned from code (can't be edited/deleted); user
@@ -1643,8 +1690,10 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
     const deps = buildV3OrchestratorDeps(userId);
     const socketId = typeof req.body?.socketId === 'string' ? req.body.socketId : undefined;
     console.log(`[v3][route] enrich-v3 POST listId=${listId} userId=${userId} mode=${mode} socketId=${socketId ?? '∅'} leadIds=${leadIds?.length ?? 'all'}`);
+    const { buildListContext } = await import('../emma/enrichmentToolRunner');
+    const listContext = buildListContext(list);
     const result = await svcRunEnrichmentV3(
-      { listId, userId, config, mode, refreshFields, leadIds },
+      { listId, userId, config, mode, refreshFields, leadIds, listContext },
       deps,
       {
         userId,
@@ -2165,11 +2214,39 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'icpIndex (non-negative integer) is required' });
     }
 
-    const { userDb } = await import('../services/db');
+    const { userDb, orgDb } = await import('../services/db');
     const user: any = await userDb.getUserById(userId);
-    const personas: any[] = Array.isArray(user?.icpResult) ? user.icpResult : [];
+
+    // Resolve the persona list. Three stores hold ICP data and a user may
+    // have ICPs in only one of them:
+    //   1. user.icpResult — personas generated during onboarding / mirrored
+    //      from Emma's brand build. Carries the extractedFilters cache.
+    //   2. marketStrategy.icp — personas authored on the /market-strategy
+    //      page or by Emma's update_market_strategy tool. For org members
+    //      this lives on the ORG (see routes/marketStrategy.ts: "If user is
+    //      in an org, always read market strategy from the org"), so an org
+    //      owner can have 5 ICPs the user record never sees.
+    // Prefer icpResult (it has the cache); otherwise fall back to the
+    // marketStrategy.icp store, converting to the icpResult shape with the
+    // same mapping Emma's brand-build mirror uses.
+    let personas: any[] = Array.isArray(user?.icpResult) ? user.icpResult : [];
+    let fromMarketStrategy = false;
     if (personas.length === 0) {
-      return res.status(404).json({ message: 'No ICP personas found. Generate them on the GTM Plan page first.' });
+      let marketStrategy: any = user?.marketStrategy;
+      if (user?.orgId) {
+        const org: any = await orgDb.getOrgById(user.orgId);
+        if (org) marketStrategy = org.marketStrategy;
+      }
+      const marketIcp = Array.isArray(marketStrategy?.icp) ? marketStrategy.icp : [];
+      if (marketIcp.length > 0) {
+        const { mapMarketIcpToResult } = await import('../services/onboardingBrandBuildService');
+        personas = mapMarketIcpToResult(marketIcp);
+        fromMarketStrategy = personas.length > 0;
+      }
+    }
+
+    if (personas.length === 0) {
+      return res.status(404).json({ message: 'No ICP personas found. Define your Ideal Customer Profiles in Market Strategy first.' });
     }
     if (icpIndex >= personas.length) {
       return res.status(404).json({ message: `icpIndex ${icpIndex} out of range (have ${personas.length} personas)` });
@@ -2210,37 +2287,47 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
       });
     }
 
-    // Re-read user before persisting so we don't clobber concurrent edits
-    // made during the ~3s LLM window (e.g., GTM page regenerating
-    // personas). Mirrors the pattern in onboardingIcpService.ts: read →
-    // long-running work → re-read → write.
-    //
-    // If the persona at icpIndex is gone, or its content changed (hash
-    // mismatch), the LLM result we just produced no longer matches what
-    // the user has now — skip the write so the next click can regenerate
-    // against the current content. We still return the variants to the
-    // caller for the current request.
-    const freshUser: any = await userDb.getUserById(userId);
-    const freshPersonas: any[] = Array.isArray(freshUser?.icpResult) ? freshUser.icpResult : [];
-    const freshPersona = freshPersonas[icpIndex];
-    const cacheStillApplies =
-      freshPersona && personaCacheKey(freshPersona) === currentKey;
+    // Persist the extracted filters as a cache — but ONLY for personas that
+    // came from user.icpResult. We deliberately do NOT write back when the
+    // personas were derived from marketStrategy.icp: materializing them onto
+    // user.icpResult would make the user record take precedence over the
+    // (possibly org-level) marketStrategy on the next click, so later edits
+    // to the org's ICPs would be masked by a stale user-level snapshot. The
+    // marketStrategy store stays the source of truth; we just re-run the LLM
+    // on each click there (rare, explicit, ~3s).
+    if (!fromMarketStrategy) {
+      // Re-read user before persisting so we don't clobber concurrent edits
+      // made during the ~3s LLM window (e.g., onboarding regenerating
+      // personas). Mirrors the pattern in onboardingIcpService.ts: read →
+      // long-running work → re-read → write.
+      //
+      // If the persona at icpIndex is gone, or its content changed (hash
+      // mismatch), the LLM result we just produced no longer matches what
+      // the user has now — skip the write so the next click can regenerate
+      // against the current content. We still return the variants to the
+      // caller for the current request.
+      const freshUser: any = await userDb.getUserById(userId);
+      const freshPersonas: any[] = Array.isArray(freshUser?.icpResult) ? freshUser.icpResult : [];
+      const freshPersona = freshPersonas[icpIndex];
+      const cacheStillApplies =
+        freshPersona && personaCacheKey(freshPersona) === currentKey;
 
-    if (cacheStillApplies) {
-      const nextIcpResult = freshPersonas.map((p: any, i: number) =>
-        i === icpIndex
-          ? {
-              ...p,
-              extractedFilters: {
-                cacheKey: currentKey,
-                cacheVersion: ICP_FILTER_CACHE_VERSION,
-                variants,
-                generatedAt: new Date().toISOString(),
-              },
-            }
-          : p,
-      );
-      await userDb.updateUser(userId, { icpResult: nextIcpResult } as any);
+      if (cacheStillApplies) {
+        const nextIcpResult = freshPersonas.map((p: any, i: number) =>
+          i === icpIndex
+            ? {
+                ...p,
+                extractedFilters: {
+                  cacheKey: currentKey,
+                  cacheVersion: ICP_FILTER_CACHE_VERSION,
+                  variants,
+                  generatedAt: new Date().toISOString(),
+                },
+              }
+            : p,
+        );
+        await userDb.updateUser(userId, { icpResult: nextIcpResult } as any);
+      }
     }
 
     return res.status(200).json({
@@ -6490,7 +6577,7 @@ router.post('/debug/serp', async (req: Request, res: Response) => {
   if (!query) return res.status(400).json({ message: 'query required' });
 
   const { agentModeService } = await import('../services/agentModeService');
-  const result = await agentModeService.searchWeb(query, n);
+  const result = await agentModeService.youSearchWeb(query, n);
   return res.json({
     query,
     success: result?.success,

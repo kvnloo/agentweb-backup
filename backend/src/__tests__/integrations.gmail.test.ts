@@ -37,6 +37,17 @@ describe('getGmailConfig', () => {
     expect(config.scopes).toContain('https://www.googleapis.com/auth/gmail.send');
   });
 
+  it('requests calendar.events scope (supersedes calendar.readonly — grants read + write)', async () => {
+    mockGetGmailCredentials.mockResolvedValue(mockCredentials);
+    const { getGmailConfig } = await import('../config/integrations');
+
+    const config = await getGmailConfig();
+
+    // calendar.events is a superset of calendar.readonly — no need for both.
+    expect(config.scopes).toContain('https://www.googleapis.com/auth/calendar.events');
+    expect(config.scopes).not.toContain('https://www.googleapis.com/auth/calendar.readonly');
+  });
+
   it('caches the result and does not call secrets manager again within TTL', async () => {
     mockGetGmailCredentials.mockResolvedValue(mockCredentials);
     const { getGmailConfig } = await import('../config/integrations');

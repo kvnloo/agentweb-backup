@@ -35,7 +35,7 @@ jest.mock('../services/agentModeService', () => ({
     installSkills: jest.fn().mockResolvedValue({ success: true, installedSkills: [] }),
     getSkillsForDisplay: jest.fn().mockResolvedValue([]),
     getFoundationToolNames: jest.fn().mockReturnValue(new Set([
-      'install_skills', 'search_web', 'read_file_content', 'read_page_source',
+      'install_skills', 'you_search_web', 'read_file_content', 'read_page_source',
       'search_knowledge_base', 'list_knowledge_base_files', 'read_knowledge_base_files',
       'create_work_plan', 'modify_work_plan', 'set_work_plan_status',
       'save_file', 'describe_image',
@@ -166,18 +166,18 @@ describe('Scheduled Chat - Admin Tool Auto-Install', () => {
       scheduleName: 'Non-Admin Schedule',
       startingMessage: 'Run marketing analysis',
       keywords: ['marketing'],
-      requiredFunctionCalls: ['search_web'],
+      requiredFunctionCalls: ['you_search_web'],
       userId: mockUserId,
     };
 
     const publishedSkills = [
-      { skillId: 'web-skill', name: 'Web', toolNames: ['search_web'] },
+      { skillId: 'web-skill', name: 'Web', toolNames: ['you_search_web'] },
     ];
     mockedSkillService.getPublishedSkills.mockResolvedValue(publishedSkills as any);
 
     mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
       content: 'Done',
-      toolCalls: [{ name: 'search_web', arguments: {} }],
+      toolCalls: [{ name: 'you_search_web', arguments: {} }],
       knowledgeBaseQueries: [],
       sources: [],
       responseMessages: [],

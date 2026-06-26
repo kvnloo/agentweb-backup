@@ -4234,7 +4234,7 @@ emmaToolRegistry.register({
   name: 'generate_video',
   definition: {
     name: 'generate_video',
-    description: 'Generate videos using AI video generation models. Supports text-to-video generation and video generation with optional start and end frames for interpolation. Can optionally post-process the generated clip with Remotion to add brand overlays (headline, tagline, logo, CTA). IMPORTANT: For multi-clip videos (e.g. 24s = 3 clips), ALWAYS use a single generate_video call with durationSeconds=24 and compose=true — do NOT generate clips separately and stitch later. To stitch already-generated clips, use compose_video instead.',
+    description: 'Generate videos using AI video generation models. Supports text-to-video generation and video generation with optional start and end frames for interpolation. Can optionally post-process the generated clip with Remotion to add brand overlays (headline, tagline, logo, CTA). IMPORTANT: For multi-clip videos (e.g. 24s = 3 clips), ALWAYS use a single generate_video call with durationSeconds=24 and compose=true — do NOT generate clips separately and stitch later. To stitch already-generated clips, use compose_video instead. REFERENCE IMAGES: When the user provides image(s) to base the video on, ALWAYS pass the actual image(s) as frames — never use a text description in place of the image. Recommended flow: (1) call describe_image on each reference image so you understand what it depicts (this grounds your motion prompt; it does NOT replace the frame); (2) pass the image URL(s) as frames — ONE image → set startFrame to its URL and leave endFrame unset (do NOT invent or duplicate a second frame); TWO images → startFrame = the opening/first image, endFrame = the closing/last image (only set endFrame when the user actually intends an end frame); (3) write a prompt that describes the MOTION/transition you want (informed by the descriptions) rather than restating the static contents the frame already carries. You may skip describe_image (step 1) when the user has already given a clear, detailed prompt and just wants the exact image animated. The default model (seedance-2.0 via Higgsfield) and the Veo fallback BOTH accept a single reference frame or two frames natively, so the actual image(s) are used. Only if a generation explicitly fails because a reference frame could not be loaded/imported should you fall back to describing the image(s) with describe_image and adding that to the prompt as text. ASPECT RATIO: infer the aspect ratio from the user\'s intent (e.g. a reel/short → vertical 9:16); if the user gives no orientation/format cue AND no reference frame to match, ASK them for the orientation before generating. Never ask about resolution — infer it or use the default. LENGTH: infer the duration from the request (4–15s for the default Seedance model); if the user gives no length and you cannot infer one, ASK before generating rather than defaulting silently.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4248,12 +4248,12 @@ emmaToolRegistry.register({
         },
         videoModel: {
           type: 'string',
-          description: 'Optional: Specific video generation model to use. Currently supports: veo-3.1-generate-preview (by Google). Defaults to veo-3.1-generate-preview if not specified.',
-          enum: ['veo-3.1-generate-preview']
+          description: 'Optional: video generation model. Leave unset — the default is seedance-2.0 (ByteDance Seedance 2.0 via Higgsfield; text-to-video, or image-to-video when startFrame/endFrame are given). Veo 3.1 is used automatically as a fallback if Seedance fails. Do not surface model choice to the user.',
+          enum: ['veo-3.1-generate-preview', 'seedance-2.0']
         },
         durationSeconds: {
           type: 'number',
-          description: 'Optional: Requested total duration of the generated video in seconds. For durations up to 8s, a single Veo clip is generated. For durations 9–32s, multiple 8s clips are generated in parallel and concatenated by Remotion. Defaults to 8 if not specified. Common values: 8 (default), 16 (2 clips), 24 (3 clips). Requires compose:true for multi-clip videos.'
+          description: 'Requested total video length in seconds. INFER it from the user\'s request (e.g. "a 12-second video" → 12, "make it 15s" → 15); if the user does not specify a length and you cannot infer one, ASK them before generating — do NOT silently default. The default model (Seedance 2.0) produces a SINGLE clip of 4–15s, so for the normal path set this to the requested length within 4–15. (If a generation falls back to Veo, which caps at 8s/clip, durations >8s are produced as multiple 8s clips stitched to the target length via Remotion — needs compose:true; for ≤8s Veo uses a single clip.) Falls back to 8 only if truly unspecified.'
         },
         useKeyframes: {
           type: 'boolean',
@@ -4261,11 +4261,21 @@ emmaToolRegistry.register({
         },
         startFrame: {
           type: 'string',
-          description: 'Optional: URL of the first frame image to use as the starting point for video generation. If provided, the video will start from this frame.'
+          description: 'Optional: URL of the first frame image to use as the starting point for video generation. If provided, the video will start from this frame. When the user uploads/provides a reference image for the video, put its URL here (do NOT describe it into the prompt).'
         },
         endFrame: {
           type: 'string',
-          description: 'Optional: URL of the last frame image to use as the ending point for video generation. If provided, the video will end at this frame. Can be used together with startFrame for interpolation between two frames.'
+          description: 'Optional: URL of the last frame image to use as the ending point for video generation. If provided, the video will end at this frame. Can be used together with startFrame for interpolation between two frames. When the user provides a SECOND reference image, put its URL here.'
+        },
+        aspectRatio: {
+          type: 'string',
+          description: 'Video aspect ratio (Seedance 2.0). INFER it from the user\'s intent/format cues whenever possible — e.g. reel/short/story/TikTok/"vertical" → 9:16; "square"/feed post → 1:1; YouTube/"widescreen"/"landscape" → 16:9; cinematic → 21:9. If the user gives NO orientation or format cue, ASK them which orientation/aspect ratio they want BEFORE calling this tool — do not silently default. Exception: when a reference start frame is provided, "auto" (match the frame) is an acceptable no-ask default. (Resolution is the opposite — never ask; just infer or use the 720p default.)',
+          enum: ['auto', '16:9', '9:16', '1:1', '4:3', '3:4', '21:9']
+        },
+        resolution: {
+          type: 'string',
+          description: 'Optional: output resolution (Seedance 2.0). Set from the user\'s request, e.g. "1080p"/"full HD"→1080p, "480p"/"low-res"→480p. Defaults to "720p".',
+          enum: ['480p', '720p', '1080p']
         },
         compose: {
           type: 'boolean',
@@ -4336,7 +4346,9 @@ emmaToolRegistry.register({
       args.compose,
       args.composeParams,
       args.durationSeconds,
-      args.useKeyframes
+      args.useKeyframes,
+      args.aspectRatio,
+      args.resolution
     );
   }
 });
@@ -4616,20 +4628,20 @@ emmaToolRegistry.register({
 
 // --- Tools from searchTools.ts ---
 emmaToolRegistry.register({
-  name: "search_web",
+  name: "you_search_web",
   definition: {
-    name: "search_web",
-    description: 'Search the web for information from the internet',
+    name: "you_search_web",
+    description: 'Search the public web using You.com Search. This tool has no hidden fallback provider; failures are reported as You.com search failures. For social-platform research, include explicit site filters when useful, e.g. site:x.com, site:linkedin.com, site:reddit.com, or site:instagram.com.',
     inputSchema: {
       type: "object",
       properties: {
         query: {
           type: 'string',
-          description: 'The search query to find relevant information on the web'
+          description: 'The web search query'
         },
         max_results: {
           type: 'number',
-          description: 'Maximum number of search results to return (default: 5, max: 10)',
+          description: 'Maximum number of web results to return (default: 5, max: 10)',
           default: 5
         }
       },
@@ -4637,7 +4649,64 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.searchWeb(args.query, args.max_results || 10);
+    return await agentModeService.youSearchWeb(args.query, args.max_results || 10);
+  }
+});
+
+emmaToolRegistry.register({
+  name: "you_search_news",
+  definition: {
+    name: "you_search_news",
+    description: 'Search current news using You.com Search. Use this only when the user asks for news, today/latest/breaking updates, or recent articles. Do not call it as a companion to ordinary web/social searches unless the user explicitly asks for news too. This tool has no hidden fallback provider; failures are reported as You.com search failures. Preserve freshness words from the user query such as today, latest, breaking, or the exact date; do not rewrite a today/latest-news request into a timeless entity query.',
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: 'string',
+          description: 'The news search query. For current-news requests, keep temporal terms like today/latest/breaking or include the exact date.'
+        },
+        max_results: {
+          type: 'number',
+          description: 'Maximum number of news results to return (default: 5, max: 10)',
+          default: 5
+        },
+        freshness: {
+          type: 'string',
+          enum: ['day', 'week', 'month', 'year'],
+          description: 'Optional You.com freshness window. Defaults to week for news unless the query implies a fresher window.'
+        }
+      },
+      required: ["query"]
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.youSearchNews(args.query, args.max_results || 10, args.freshness);
+  }
+});
+
+emmaToolRegistry.register({
+  name: "google_search_web",
+  definition: {
+    name: "google_search_web",
+    description: 'Opt-in Google Custom Search web search. This is not the default search tool and has no hidden provider fallback. Use only when the user explicitly asks for Google search, when a skill requires Google CSE, or when comparing provider output.',
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: 'string',
+          description: 'The Google Custom Search query'
+        },
+        max_results: {
+          type: 'number',
+          description: 'Maximum number of Google web results to return (default: 5, max: 10)',
+          default: 5
+        }
+      },
+      required: ["query"]
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.googleSearchWeb(args.query, args.max_results || 10);
   }
 });
 
@@ -5336,6 +5405,10 @@ emmaToolRegistry.register({
                 items: {
                   type: 'string'
                 }
+              },
+              expectedAssetCount: {
+                type: 'number',
+                description: 'Optional. For a step that must produce a specific number of media assets (e.g. "generate 18 images"), set this to that number. The step then cannot be marked completed until that many images/videos have actually been generated this session — preventing the step from being closed with only some assets produced. Omit for steps with no fixed asset count.'
               }
             },
             required: ['stepCount', 'title']
@@ -5415,6 +5488,10 @@ emmaToolRegistry.register({
                 items: {
                   type: 'string'
                 }
+              },
+              expectedAssetCount: {
+                type: 'number',
+                description: 'Optional. Number of media assets the step must produce before it can be completed. Set to a lower number (or 0 to remove the requirement entirely) when the user explicitly approves generating fewer assets than originally planned. Omitting it leaves the existing value unchanged.'
               }
             },
             required: ['stepCount', 'title']
@@ -5960,7 +6037,7 @@ Returns: runId, processedCount (the 2 sampled leads), and samples — each with 
 
 IMPORTANT — data accuracy / unverifiedFields: unverifiedFields lists the fields in this sample whose value is low-confidence or unverified (typically pulled from web search rather than a structured provider, and not confirmed by the fact-check critic). These values may be wrong — for example a small company's funding_stage guessed from the web. Do NOT state unverified values as established fact. When you present them, caveat them explicitly (e.g. "funding_stage: Series C (unverified — from web search, please confirm)"). Fields NOT in unverifiedFields are high-confidence and can be stated plainly. If the user questions or corrects an unverified value, accept the correction gracefully and explain it came from a low-confidence source.
 
-IMPORTANT — identity resolution failures: If processedCount is 0 and failureBreakdown.identityResolutionFailed > 0, the sampled leads lack sufficient identifying information (no email address, no LinkedIn URL, and no full name). This list cannot be enriched — tell the user clearly that the list is unenrichable due to missing identity data (email/LinkedIn/name required) and do NOT call enrich_leads_execute for it. Skip it and continue with the other lists.
+IMPORTANT — identity resolution failures: If processedCount is 0 and failureBreakdown.identityResolutionFailed > 0, the sampled leads could not be matched to a real person/company. The engine already attempts a contextual LinkedIn search for name-only leads using the lead list's name/description (e.g. a "YC Poker Night" list disambiguates common names), so a failure here means even that fell short for the sample. Before declaring the list unenrichable: (1) if the leads have at least a full name but no email/LinkedIn/company, a contextual LinkedIn search needs a connected LinkedIn account — if the user has none, tell them connecting one (or adding email/LinkedIn/company to the list) would let enrichment resolve these leads; (2) the list name/description is the disambiguation signal, so a vague list name reduces match rate. If the leads truly lack any full name (only partial data), the list is genuinely unenrichable — tell the user clearly and do NOT call enrich_leads_execute for it. Otherwise, surface the above options rather than flatly refusing. Skip it and continue with the other lists either way.
 
 "Enrich all lists" workflow: When the user asks to enrich multiple or all lists at once, preview each list first (you may run all previews sequentially without waiting for per-list confirmation). After all previews complete, summarize which lists passed (processedCount > 0) and which are unenrichable (processedCount === 0 with identityResolutionFailed > 0). If the user already confirmed they want all lists enriched, proceed to call enrich_leads_execute for each passing list without asking again per list — only pause if a list has an unexpected issue.
 
@@ -6263,6 +6340,7 @@ const adminToolNames = [
   'manage_scoring_judges',
   'manage_user_notes',
   'get_users_by_lifecycle_stage',
+  'get_registration_status',
 ];
 
 for (const toolName of bridgedToolNames) {
@@ -6422,7 +6500,7 @@ emmaToolRegistry.register({
         toolNames: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Array of tool names this skill can use (e.g., ["bravesearch_brave_news_search", "create_social_media_posts"])'
+          description: 'Array of tool names this skill can use (e.g., ["you_search_web", "create_social_media_posts"])'
         },
         systemPrompt: {
           type: 'string',
@@ -6509,7 +6587,7 @@ emmaToolRegistry.register({
               requiredFunctionCalls: {
                 type: 'array',
                 items: { type: 'string' },
-                description: 'Function names that must be called to complete this step (e.g. search_web, update_brand_guidelines)'
+                description: 'Function names that must be called to complete this step (e.g. you_search_web, update_brand_guidelines)'
               },
               skillIds: {
                 type: 'array',

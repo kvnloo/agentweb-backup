@@ -629,27 +629,48 @@ To enable web search functionality in Agent Mode, you need to set up Google Cust
    - Go to "Setup" > "Basics"
    - Copy the "Search engine ID" (it looks like: `017576662512468239146:omuauf_lfve`)
 
-#### 4. Store Credentials in AWS Secrets Manager
+#### 4. Configure Search Providers
 
-Store your Google Search API credentials in AWS Secrets Manager:
+`search_web`, `you_search_web`, and `you_search_news` call You.com Search directly. There is no silent provider fallback. Prefer the explicit `you_search_web` and `you_search_news` tool names when you want provider-specific telemetry.
+
+Google Custom Search is still supported as the explicit `google_search_web` tool. It is intentionally not part of the default foundation tool set, so normal agent runs do not have multiple generic web-search tools competing for the same task. Enable or require `google_search_web` only for a skill, admin/debug flow, or provider comparison that deliberately needs Google CSE.
+
+You.com can be configured with either an environment variable or AWS Secrets Manager:
+
+```bash
+YOU_API_KEY=your_you_api_key_here
+```
+
+Google Custom Search can be configured with environment variables:
+
+```bash
+GOOGLE_SEARCH_API_KEY=your_google_custom_search_api_key
+GOOGLE_SEARCH_ENGINE_ID=your_google_custom_search_engine_id
+```
+
+For AWS Secrets Manager:
 
 **For Development:**
-- Secret Name: `dev/AgentWeb/Google/Search`
-- Secret Value (JSON format):
+- You.com Secret Name: `dev/AgentWeb/YouCom/Search`
+- Google CSE Secret Name: `dev/AgentWeb/Google/Search`
+- Secret Value: either the raw API key string or JSON such as:
 ```json
 {
-  "apiKey": "your_google_api_key_here",
-  "searchEngineId": "your_search_engine_id_here"
+  "apiKey": "your_you_api_key_here"
 }
 ```
 
 **For Production:**
-- Secret Name: `prod/AgentWeb/Google/Search`
-- Secret Value (JSON format):
+- You.com Secret Name: `prod/AgentWeb/YouCom/Search`
+- Google CSE Secret Name: `prod/AgentWeb/Google/Search`
+- Secret Value: either the raw API key string or the JSON shape above.
+
+For Google CSE, the secret value must be JSON:
+
 ```json
 {
-  "apiKey": "your_google_api_key_here",
-  "searchEngineId": "your_search_engine_id_here"
+  "apiKey": "your_google_custom_search_api_key",
+  "searchEngineId": "your_google_custom_search_engine_id"
 }
 ```
 
@@ -677,43 +698,54 @@ Store your Google Search API credentials in AWS Secrets Manager:
 3. **Test Web Search**:
    - Go to Agent Mode in your application
    - Ask a question that requires current information (e.g., "What are the latest marketing trends?")
-   - The agent should now use real Google search results
+   - Telemetry should show `you_search_web`, `you_search_news`, or the compatibility alias `search_web`
+   - The tool response should include `provider: "you"` and no fallback provider
+   - If explicitly testing Google CSE, call or require `google_search_web`; telemetry should show `toolName: "google_search_web"` and `provider: "google"`
 
 #### 6. API Quotas and Limits
 
-- **Free Tier**: 100 searches per day
-- **Paid Tier**: Up to 10,000 searches per day for $5
-- **Rate Limits**: 10 requests per second
+**You.com Search:**
+- Returns unified web and news results from one request
+- Agent Mode automatically requests fresher You.com result windows for time-sensitive queries: `day` for `today`/`breaking` queries and `week` for `latest`/`current`/`news`/`release notes` queries
+- `you_search_news` defaults to `week` freshness when the query does not imply a narrower window
+- Supports up to 100 results per section at the provider layer; Agent Mode currently caps search requests to 10
+- Optional livecrawl is supported by the provider but not enabled by default
+
+**Google Custom Search (`google_search_web` only):**
+- Uses the existing Google CSE credentials and quota
+- Returns web results only
+- Is never called automatically as a fallback from You.com
+- Is intentionally excluded from foundation tools to avoid confusing normal search selection
 
 #### 7. Troubleshooting
 
 **Common Issues:**
 
-1. **"API key not valid"**:
+1. **"You.com Search API key is not configured"**:
+   - Set `YOU_API_KEY` / `YOUCOM_API_KEY`, or store the key in `dev/AgentWeb/YouCom/Search` or `prod/AgentWeb/YouCom/Search`
+
+2. **"Google Search API is not configured"**:
+   - Set `GOOGLE_SEARCH_API_KEY` and `GOOGLE_SEARCH_ENGINE_ID`, or store `{ "apiKey": "...", "searchEngineId": "..." }` in `dev/AgentWeb/Google/Search` or `prod/AgentWeb/Google/Search`
+
+3. **"API key not valid"**:
    - Check that the API key is correct in AWS Secrets Manager
-   - Ensure Custom Search API is enabled in Google Cloud Console
-   - Verify API key restrictions
+   - Verify API key restrictions in You.com
 
-2. **"Search engine not found"**:
-   - Verify the Search Engine ID is correct in AWS Secrets Manager
-   - Check that the search engine is active in Google Custom Search Engine
-
-3. **"Secrets Manager access denied"**:
+4. **"Secrets Manager access denied"**:
    - Ensure your AWS credentials have permissions to access Secrets Manager
-   - Check that the secret names match exactly: `dev/AgentWeb/Google/Search` or `prod/AgentWeb/Google/Search`
-   - Verify the secret contains valid JSON with `apiKey` and `searchEngineId` fields
+   - Check that the secret names match exactly: `dev/AgentWeb/YouCom/Search` or `prod/AgentWeb/YouCom/Search`
+   - Verify the secret is either a raw API key string or JSON with `apiKey`
 
 4. **"Quota exceeded"**:
-   - Check your daily quota usage in Google Cloud Console
-   - Consider upgrading to paid tier if needed
+   - Check your You.com API quota and billing status
 
 5. **No search results**:
-   - The system will fall back to mock results if the API fails
+   - Empty web/news arrays are treated as successful zero-result searches, so the agent can adjust the query rather than treating this as infrastructure failure
    - Check the backend logs for error messages
 
-**Fallback Behavior:**
-- If Google Search API credentials are not found in Secrets Manager or the API fails, the system automatically falls back to mock search results
-- This ensures Agent Mode continues to work even without the API configured
+**Failure Behavior:**
+- Search tools do not silently try another provider.
+- If You.com is not configured or fails, the tool response reports a You.com search failure with `provider: "you"`.
 
 ### Google Search Console API Configuration
 
@@ -1324,9 +1356,8 @@ External servers can be added dynamically via the Admin UI or configured in the 
 - **Management**: Admin Dashboard -> MCP Servers
 - **Supported Transports in Admin UI**: Streamable HTTP, SSE, and Stdio
 - **Local MCP via Backend**: Use `Stdio` in the Admin UI to let the backend spawn local MCP processes directly (no separate HTTP wrapper service required).
-  - Example (Brave Search MCP): `command: npx`, args lines: `-y`, `@brave/brave-search-mcp-server`, `--transport`, `stdio`
-  - Brave API key can be passed in args too: add `--brave-api-key` and then your key as the next argument line.
-  - Put API keys in the environment JSON field, e.g. `{"env":{"BRAVE_API_KEY":"${BRAVE_API_KEY}"}}`
+  - Example (local filesystem MCP): `command: npx`, args lines: `-y`, `@modelcontextprotocol/server-filesystem`, `/tmp`
+  - Put environment variables in the environment JSON field, e.g. `{"env":{"MCP_LOG_LEVEL":"info"}}`
 
 
 #### Configuring ClickUp MCP Server

@@ -118,4 +118,34 @@ describe('McpClientService Tool Namespacing', () => {
       name: 'search' // SHOULD be original name, NOT prefixed
     }), undefined, { timeout: 3600000 });
   });
+
+  it('should NOT expose tools from a server flagged excludeFromAgent (backend-only)', async () => {
+    // higgsfield is used directly by the backend video service (its own client +
+    // getServerConfig), so its 40+ tools must NOT leak into Emma's agent toolset.
+    (settingsService.getSetting as jest.Mock).mockResolvedValue({
+      settingValue: JSON.stringify([
+        {
+          name: 'higgsfield',
+          transport: 'streamable-http',
+          url: 'https://mcp.higgsfield.ai/mcp',
+          authType: 'oauth',
+          excludeFromAgent: true,
+        },
+        {
+          name: 'visible-server',
+          transport: 'stdio',
+          command: 'node',
+          args: ['s.js'],
+        },
+      ]),
+    });
+
+    await mcpClientService.initialize();
+    const tools = mcpClientService.getTools();
+
+    // Backend-only server: none of its tools registered (and connect never attempted)
+    expect(tools.find(t => t.name.startsWith('higgsfield_'))).toBeUndefined();
+    // A normal DB server alongside it is still exposed (prefixed)
+    expect(tools.find(t => t.name === 'visible-server_search')).toBeDefined();
+  });
 });

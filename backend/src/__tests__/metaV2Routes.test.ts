@@ -34,6 +34,12 @@ jest.mock('../services/metaService', () => ({
   },
 }));
 
+// Inline token self-heal is unit-tested separately (metaTokenRefresh.test.ts).
+// Here it is a no-op so route tests stay focused on routing/credential resolution.
+jest.mock('../services/metaTokenRefresh', () => ({
+  ensureFreshMetaAdAccountToken: jest.fn().mockResolvedValue({ attempted: false, refreshed: false }),
+}));
+
 // Mock dynamic import for chatbotService
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
@@ -129,6 +135,59 @@ describe('Meta V2 Routes', () => {
       const response = await request(app).get('/api/meta/v2/campaigns-and-adsets');
 
       expect(response.status).toBe(500);
+    });
+  });
+
+  describe('inline token self-heal (getMetaAccountCredentials)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { ensureFreshMetaAdAccountToken } = require('../services/metaTokenRefresh');
+
+    // Factory — each test gets a fresh object so in-place config mutation by
+    // one test does not leak into the next.
+    const makeExpiredUser = () => ({
+      id: 'user123',
+      connected_accounts: [
+        {
+          platform: 'meta',
+          account_id: 'act_123456789',
+          account_name: 'Test Account',
+          config: {
+            account_type: 'ad_account',
+            access_token: 'old-token',
+            token_expires_at: Date.now() - 10_000, // expired
+          },
+        },
+      ],
+    });
+
+    it('proceeds when an expired token is refreshed inline', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(makeExpiredUser());
+      // Simulate a successful refresh: mutate config to a future expiry.
+      (ensureFreshMetaAdAccountToken as jest.Mock).mockImplementation(async (account: any) => {
+        account.config.access_token = 'fresh-token';
+        account.config.token_expires_at = Date.now() + 60 * 24 * 60 * 60 * 1000;
+        return { attempted: true, refreshed: true };
+      });
+      (metaService.listCampaigns as jest.Mock).mockResolvedValue([]);
+      (metaService.listAdSets as jest.Mock).mockResolvedValue([]);
+      (metaService.getPages as jest.Mock).mockResolvedValue([]);
+
+      const response = await request(app).get('/api/meta/v2/campaigns-and-adsets');
+
+      expect(response.status).toBe(200);
+      // The refreshed token must reach the Meta API call.
+      expect(metaService.listCampaigns).toHaveBeenCalledWith('123456789', 'fresh-token');
+    });
+
+    it('returns a reconnect error when the token is still expired after refresh', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(makeExpiredUser());
+      // Refresh fails: leave config expired.
+      (ensureFreshMetaAdAccountToken as jest.Mock).mockResolvedValue({ attempted: true, refreshed: false });
+
+      const response = await request(app).get('/api/meta/v2/campaigns-and-adsets');
+
+      expect(response.status).toBe(500);
+      expect(JSON.stringify(response.body)).toMatch(/could not be refreshed automatically/i);
     });
   });
 

@@ -308,6 +308,17 @@ export interface GmailCredentials {
  * @returns Gmail OAuth client credentials
  */
 export async function getGmailCredentials(): Promise<GmailCredentials> {
+  // Env-var shortcut: if both Gmail OAuth client credentials are provided
+  // directly, use them and skip Secrets Manager entirely. Mirrors the same
+  // pattern used by getV0ApiKey/getGithubOrgToken and keeps local/dev runs
+  // working without AWS access.
+  if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+    return {
+      clientId: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    };
+  }
+
   try {
     const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production'
@@ -780,6 +791,18 @@ export interface LandingPagesConfig {
   ga4PropertyId: string;
   gscDomain: string;
   ga4MeasurementId?: string;
+  /**
+   * Additional domain→GA4 mappings beyond the base gscDomain/ga4PropertyId.
+   * Lets the platform serve landing pages on more than one root domain (e.g.
+   * audit pages on agentweb.pro alongside form pages on agentwebforms.com),
+   * each with its own GA4 property + measurement ID. Resolved by
+   * resolveLandingPageGa4 (utils/landingPageGa4.ts).
+   */
+  additionalDomains?: Array<{
+    gscDomain: string;
+    ga4PropertyId: string;
+    ga4MeasurementId?: string;
+  }>;
 }
 
 /**

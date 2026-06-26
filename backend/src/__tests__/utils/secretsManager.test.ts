@@ -584,6 +584,21 @@ describe('secretsManager utils', () => {
   });
 
   describe('getGmailCredentials', () => {
+    let savedClientId: string | undefined;
+    let savedClientSecret: string | undefined;
+
+    beforeEach(() => {
+      savedClientId = process.env.GOOGLE_CLIENT_ID;
+      savedClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+      process.env.GOOGLE_CLIENT_ID = '';
+      process.env.GOOGLE_CLIENT_SECRET = '';
+    });
+
+    afterEach(() => {
+      process.env.GOOGLE_CLIENT_ID = savedClientId ?? '';
+      process.env.GOOGLE_CLIENT_SECRET = savedClientSecret ?? '';
+    });
+
     it('should return Gmail credentials', async () => {
       mockGetSecretValue.mockReturnValue({
         promise: jest.fn().mockResolvedValue({
@@ -792,6 +807,21 @@ describe('secretsManager utils', () => {
   });
 
   describe('getYouTubeCredentials', () => {
+    let savedClientId: string | undefined;
+    let savedClientSecret: string | undefined;
+
+    beforeEach(() => {
+      savedClientId = process.env.GOOGLE_CLIENT_ID;
+      savedClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+      process.env.GOOGLE_CLIENT_ID = '';
+      process.env.GOOGLE_CLIENT_SECRET = '';
+    });
+
+    afterEach(() => {
+      process.env.GOOGLE_CLIENT_ID = savedClientId ?? '';
+      process.env.GOOGLE_CLIENT_SECRET = savedClientSecret ?? '';
+    });
+
     it('should delegate to getGmailCredentials and return same result', async () => {
       mockGetSecretValue.mockReturnValue({
         promise: jest.fn().mockResolvedValue({

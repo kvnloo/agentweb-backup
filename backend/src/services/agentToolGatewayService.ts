@@ -248,6 +248,12 @@ const SESSION_STATE_TOOLS = new Set([
   'save_memory',
 ]);
 
+const READ_TOOLS = new Set([
+  'you_search_web',
+  'you_search_news',
+  'google_search_web',
+]);
+
 const INTERNAL_WRITE_TOOLS = new Set([
   'save_file',
   'create_gtm_plan',
@@ -629,7 +635,7 @@ function classifyToolEffect(toolName: string, args: unknown): AgentToolEffect {
     return 'read';
   }
 
-  if (READ_PREFIXES.some((prefix) => toolName.startsWith(prefix))) return 'read';
+  if (READ_TOOLS.has(toolName) || READ_PREFIXES.some((prefix) => toolName.startsWith(prefix))) return 'read';
   if (SIDE_EFFECTING_PREFIXES.some((prefix) => toolName.startsWith(prefix))) return 'internal_write';
   return 'unknown';
 }

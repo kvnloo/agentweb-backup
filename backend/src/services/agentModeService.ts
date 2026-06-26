@@ -18,6 +18,7 @@ import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
 import { settingsService } from './settingsService';
 import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
+import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { createWriteStream, promises as fs, default as fsSync } from 'fs';
 import os from 'os';
 import path from 'path';
@@ -36,6 +37,10 @@ import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmM
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { publishWithResolvedBlogPublisher } from './blogPublishers';
 import { enqueueAutoHumanEval } from './autoHumanEvalService';
+import { inferSearchFreshness } from '../search/searchFreshness';
+import { YouSearchProvider } from '../search/youSearchProvider';
+import { GoogleSearchProvider } from '../search/googleSearchProvider';
+import { SearchResultSource } from '../search/searchProvider';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -44,7 +49,7 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'manage_user_guide', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage'];
+const ADMIN_SKILL_TOOL_NAMES = ['manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'manage_user_guide', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -70,6 +75,42 @@ export function extractToolContent(result: any): string {
   if (result?.formattedContent) return result.formattedContent;
   if (result?.content?.[0]?.text) return result.content[0].text;
   return JSON.stringify(result);
+}
+
+/**
+ * Normalize a video timecode to a numeric number of seconds.
+ *
+ * Gemini localizes timestamps far more reliably when asked for the MM:SS format
+ * (per Google's video-understanding docs), so describe_video requests MM:SS /
+ * HH:MM:SS strings and uses this to convert them back to the numeric seconds the
+ * transcript/scene schema (and all downstream consumers) expect. Already-numeric
+ * values pass through unchanged for backward compatibility.
+ *
+ * Returns undefined for null/undefined/unparseable input so callers can drop the
+ * field rather than emit a misleading 0.
+ */
+export function parseTimecodeToSeconds(value: unknown): number | undefined {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+  if (typeof value !== 'string') return undefined;
+
+  const trimmed = value.trim();
+  if (trimmed === '') return undefined;
+
+  // Plain numeric string (e.g. "10", "5.5")
+  if (/^\d+(\.\d+)?$/.test(trimmed)) {
+    const n = parseFloat(trimmed);
+    return Number.isFinite(n) ? n : undefined;
+  }
+
+  // Colon-separated timecode: MM:SS or HH:MM:SS (seconds may be fractional)
+  if (/^\d+(:\d{1,2}){1,2}(\.\d+)?$/.test(trimmed)) {
+    const parts = trimmed.split(':').map(p => parseFloat(p));
+    if (parts.some(p => !Number.isFinite(p))) return undefined;
+    return parts.reduce((acc, p) => acc * 60 + p, 0);
+  }
+
+  return undefined;
 }
 const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
@@ -257,7 +298,7 @@ function summarizeToolDecision(
   const toolNames = toolResults.map((r) => r.toolCall?.function?.name ?? 'unknown');
   const uniqueTools = [...new Set(toolNames)];
   if (uniqueTools.length === 0) return 'No tool decision was recorded.';
-  if (uniqueTools.every((name) => name === 'search_web')) {
+  if (uniqueTools.every((name) => name === 'you_search_web')) {
     const queries = toolResults
       .map((r) => typeof r.functionArgs?.query === 'string' ? r.functionArgs.query : '')
       .filter(Boolean)
@@ -593,10 +634,17 @@ export class AgentModeService {
       {
         name: 'Google Calendar',
         description:
-          'Read events and meetings from Google Calendar. List upcoming events, view event details, ' +
-          'and browse calendars. Requires Gmail connected with Calendar access (Settings → Connected Accounts).',
-        toolNames: ['google_calendar_list_events', 'google_calendar_get_event', 'google_calendar_list_calendars'],
+          'Read and manage Google Calendar. List upcoming events, view event details, browse calendars, ' +
+          'create/book new events, update existing events, and delete events on your own calendar. ' +
+          'Requires Gmail connected with Calendar access (Settings → Connected Accounts); ' +
+          'creating, updating, or deleting events also requires granting Calendar write access.',
+        toolNames: ['google_calendar_list_events', 'google_calendar_get_event', 'google_calendar_list_calendars', 'google_calendar_create_event', 'google_calendar_update_event', 'google_calendar_delete_event'],
         category: 'tool_bundle',
+        systemPrompt:
+          'Before calling google_calendar_create_event, google_calendar_update_event, or google_calendar_delete_event, ' +
+          'always summarize the action you are about to take (event title, date/time, what will change or be deleted) ' +
+          'and ask the user to confirm. Only call the tool after the user explicitly confirms. ' +
+          'Do not ask for confirmation when only reading (list_events, get_event, list_calendars).',
       },
     ];
 
@@ -611,6 +659,13 @@ export class AgentModeService {
 
       for (const builtin of AgentModeService.BUILT_IN_SKILLS) {
         if (existingNames.has(builtin.name)) {
+          // Upsert: keep toolNames and description in sync with code.
+          const existing = existingSkills.find(s => s.name === builtin.name);
+          if (existing) {
+            existing.toolNames = builtin.toolNames;
+            existing.description = builtin.description;
+            await skillService.updateSkill(existing);
+          }
           continue;
         }
 
@@ -1078,7 +1133,7 @@ export class AgentModeService {
   }
 
   // Supported video API models
-  static readonly VIDEO_API_MODELS = ['veo-3.1-generate-preview', 'veo-3-generate-preview'];
+  static readonly VIDEO_API_MODELS = ['veo-3.1-generate-preview', 'veo-3-generate-preview', 'seedance-2.0'];
 
   async getVideoApiDefaultModel(): Promise<string | undefined> {
     try {
@@ -1093,8 +1148,10 @@ export class AgentModeService {
     } catch (error) {
       console.error('AgentMode: Error getting video API default model setting:', error);
     }
-    // Return undefined to let the video generation service use its own hardcoded default
-    return undefined;
+    // Seedance 2.0 is the product default for all video generation (Veo is an
+    // automatic fallback inside the video service). Return it explicitly so the
+    // model is never undefined in logs / cost estimation.
+    return 'seedance-2.0';
   }
 
   async getVideoGenerationDefaultModel(): Promise<string> {
@@ -2262,6 +2319,8 @@ export class AgentModeService {
     const pricePerClip: Record<string, number> = {
       'veo-3.1-generate-preview': 2.80,
       'veo-3.1-fast-generate-preview': 1.40,
+      // Higgsfield Seedance — approximate per-clip cost; adjust to match billed Higgsfield rates.
+      'seedance-2.0': 0.50,
     };
     const clipPrice = pricePerClip[model] ?? 2.80;
     const VEO_MAX_SECONDS = 8;
@@ -3292,6 +3351,7 @@ export class AgentModeService {
       'list_meta_ads_campaigns': 'Meta ads campaigns list',
       'get_meta_ads_metrics': 'Meta ads metrics analysis',
       'search_web': 'web search',
+      'you_search_web': 'web search',
       'create_revision': 'task revision',
       'save_file': 'file save'
     };
@@ -3363,6 +3423,24 @@ export class AgentModeService {
       workPlanContent += `✅ ALL ${workPlan.steps.length} STEPS ARE DONE (${completedCount} completed, ${skippedCount} skipped). `;
       workPlanContent += `DO NOT retry or re-execute any work plan steps. DO NOT call generate_image or other tools to redo completed work. `;
       workPlanContent += `If the user is asking about the completed work, respond with a plain-text summary. If the user is asking for something new and unrelated to the work plan, help them with that new request normally.`;
+
+      // Carve-out for the "marked complete but assets are actually missing" case.
+      // A step can be marked completed while its deliverables were never fully produced
+      // (e.g. a context banner wrongly claimed all 18 images existed when only 3 did).
+      // Without this, the blanket "DO NOT call generate_image to redo completed work"
+      // above causes the agent to refuse an EXPLICIT user request to generate the
+      // genuinely-missing assets — it can't tell "redo finished work" (forbidden) from
+      // "produce assets that were supposed to exist but don't" (required). This carve-out
+      // draws that line: an explicit request to generate/regenerate is honored, and the
+      // agent must verify ground truth (search_user_assets) rather than trust the plan's
+      // completed flag, then generate ONLY what is missing.
+      //
+      // Gated to agent mode (includeResumeGuidance) to keep Emma's done-branch output
+      // byte-for-byte identical to current production, consistent with the rest of this
+      // function. The reported bug was agent-mode-only.
+      if (includeResumeGuidance) {
+        workPlanContent += ` EXCEPTION — missing or explicitly-requested assets: If the user explicitly asks you to generate, regenerate, redo, or finish specific images/assets (for example "generate the missing 15 images"), you MUST do it even though the plan is marked done — the "do not redo" rule above only blocks re-running finished work on your own initiative, not an explicit user request. First verify what actually exists using search_user_assets (the plan's completed status may be wrong), then call generate_image only for the assets that are genuinely missing. Do NOT regenerate assets that already exist unless the user asked you to.`;
+      }
       return [{ role: 'user', content: `[SYSTEM] ${workPlanContent.trim()}` }];
     }
 
@@ -3387,6 +3465,14 @@ export class AgentModeService {
       // instructions (e.g. "keep 3 per hook / restart / generate the report / proceed").
       // Tell the model to resolve them in plan order rather than stalling on the conflict.
       workPlanContent += `⚠️ HANDLING MESSAGES WITH MULTIPLE INSTRUCTIONS: If a single user message bundles several stacked or seemingly conflicting instructions, do NOT stall or ask which one to do first. Briefly acknowledge what you understood, then act on them in work-plan order: finish the current step's remaining work first, then proceed to the next step. Only ask a clarifying question if an instruction is genuinely impossible to interpret.\n\n`;
+
+      // Asset-count honesty. A step with a "Required assets" target must actually have
+      // produced that many assets before you complete it. set_work_plan_status will
+      // reject completing it early. Do NOT mark the step done and claim the assets exist
+      // when they don't (the xCures incident: step closed claiming 18 images when 3 were
+      // made). Generate the rest first; if the user explicitly approves fewer, call
+      // modify_work_plan to lower that step's expectedAssetCount before completing.
+      workPlanContent += `⚠️ ASSET TARGETS: If the current step lists "Required assets: N", you must actually generate N images/assets before marking it completed — verify with search_user_assets if unsure. Never mark such a step complete while assets are still missing or claim work was done that wasn't. If the user explicitly agrees to fewer, call modify_work_plan to lower that step's expectedAssetCount, then complete it.\n\n`;
     }
 
     if (workPlan.autocomplete) {
@@ -3445,6 +3531,12 @@ export class AgentModeService {
       // Include required function calls if available
       if (step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
         workPlanContent += `   Required Functions: ${step.requiredFunctionCalls.join(', ')}\n`;
+      }
+
+      // Surface the asset target so the model knows how many images/videos this step
+      // owes before it can be completed (enforced by set_work_plan_status).
+      if (includeResumeGuidance && typeof step.expectedAssetCount === 'number' && step.expectedAssetCount > 0) {
+        workPlanContent += `   Required assets: ${step.expectedAssetCount} (this step cannot be completed until ${step.expectedAssetCount} images/assets have actually been generated this session)\n`;
       }
 
       // Include skill IDs if available (for awareness)
@@ -3577,15 +3669,7 @@ export class AgentModeService {
       // This matches how generateSessionResponse processes attachments (lines 495-502 in agentModeController)
       if (msg.role === 'user' && (msg as any).metadata?.attachments?.length > 0) {
         const attachments = (msg as any).metadata.attachments;
-        const IMAGE_MIMETYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp', 'image/svg+xml']);
-        const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg']);
-        const attachmentUrls = attachments.map((attachment: any) => {
-          const mimetype = (attachment.mimetype || '').toLowerCase();
-          const ext = (attachment.filename || '').split('.').pop()?.toLowerCase() || '';
-          const isImage = IMAGE_MIMETYPES.has(mimetype) || IMAGE_EXTS.has(ext);
-          const hint = isImage ? ' (image — use describe_image tool to analyze)' : '';
-          return `[${attachment.filename || 'Attachment'}](${attachment.url})${hint}`;
-        }).join('\n');
+        const attachmentUrls = formatAttachmentUrls(attachments);
         // Ensure content is a string before concatenating
         let contentStr = '';
         if (Array.isArray(content)) {
@@ -3760,7 +3844,8 @@ export class AgentModeService {
     'search_knowledge_base',
     'list_knowledge_base_files',
     'read_knowledge_base_files',
-    'search_web',             // Web search - core research capability
+    'you_search_web',         // Explicit You.com web search
+    'you_search_news',        // Explicit You.com news search
 
     // Work Plans (Emma's execution planning system)
     'create_work_plan',
@@ -3837,6 +3922,8 @@ export class AgentModeService {
     'install_skills',
     'list_available_skills',
     'resolve_skill',
+    'you_search_web',
+    'you_search_news',
     // S3 overflow retrieval is infrastructure, not a skill: whenever a tool result
     // is offloaded to S3 the model is handed a "[Full response stored at S3 key: ...]"
     // pointer and MUST be able to resolve it. A DB `foundation_tools` setting that
@@ -4740,9 +4827,14 @@ export class AgentModeService {
           formattedContent: `📊 **Meta Ads Performance Data**\n\n**Attribution Window:** ${formatDate(startDate)} to ${formatDate(endDate)} (${days} days)\n\n**📈 Campaign Summary**\n- Total Campaigns: 3\n- Total Spend: $1250.75\n- Impressions: 125,000\n- Clicks: 4,500\n- CTR: 3.60%\n- CPC: $0.28\n- Website Leads: 23\n\n**📥 Detailed Data Files**\n1. **Ad-Level Data**\n   📥 [Download CSV](https://s3.amazonaws.com/mock-bucket/mock-file.csv)\n2. **Demographics Breakdown**\n   📥 [Download CSV](https://s3.amazonaws.com/mock-bucket/mock-file.csv)\n3. **Placement Breakdown**\n   📥 [Download CSV](https://s3.amazonaws.com/mock-bucket/mock-file.csv)\n4. **Device Breakdown**\n   📥 [Download CSV](https://s3.amazonaws.com/mock-bucket/mock-file.csv)\n`
         };
 
-      case 'search_web':
+      case 'you_search_web':
+      case 'you_search_news':
+      case 'google_search_web':
         return {
           success: true,
+          provider: toolName === 'google_search_web' ? 'google' : 'you',
+          toolName: toolName,
+          resultSource: toolName === 'you_search_news' ? 'news' : 'web',
           results: [
             {
               title: `Mock search result for "${args.query}"`,
@@ -6022,15 +6114,18 @@ export class AgentModeService {
       if (wantStructured) {
         const fields: string[] = ['description: a concise overall description of the video'];
         if (wantTranscript) {
-          fields.push('transcript: an array of objects with {start: number (seconds), end: number (seconds), text: string} for all spoken content');
+          fields.push('transcript: an array of objects with {start: string, end: string, text: string} for all spoken content, where start/end are timestamps in MM:SS format (or HH:MM:SS if over an hour)');
         }
         if (wantScenes) {
-          fields.push('scenes: an array of objects with {start: number (seconds), end: number (seconds), title: string, description: string} identifying distinct scene segments');
+          fields.push('scenes: an array of objects with {start: string, end: string, title: string, description: string} identifying distinct scene segments, where start/end are timestamps in MM:SS format (or HH:MM:SS if over an hour)');
         }
-        fields.push('duration: total video duration in seconds as a number');
+        fields.push('duration: total video duration as a timestamp in MM:SS format (or HH:MM:SS if over an hour)');
         analysisPrompt = [
           prompt || 'Analyze this video thoroughly.',
           timeRange,
+          // Gemini localizes timestamps most accurately in MM:SS (per Google's
+          // video-understanding guidance); we parse them back to numeric seconds.
+          'For every timestamp, use the MM:SS format (e.g. 01:15 for 1 minute 15 seconds), and base each one on the actual moment it occurs in the video.',
           `Return ONLY a JSON object (no markdown fences) with these fields: ${fields.join('; ')}.`
         ].filter(Boolean).join(' ');
       } else {
@@ -6185,12 +6280,30 @@ export class AgentModeService {
           // Strip optional markdown code fences Gemini may add despite instructions
           const jsonText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
           const parsed = JSON.parse(jsonText);
+
+          // Gemini is prompted for MM:SS timestamps (most accurate); convert them
+          // back to the numeric seconds the transcript/scene schema expects.
+          const normalizeSegments = (segments: any): any => {
+            if (!Array.isArray(segments)) return segments;
+            return segments.map(seg => {
+              if (!seg || typeof seg !== 'object') return seg;
+              const start = parseTimecodeToSeconds(seg.start);
+              const end = parseTimecodeToSeconds(seg.end);
+              return {
+                ...seg,
+                ...(start !== undefined ? { start } : {}),
+                ...(end !== undefined ? { end } : {}),
+              };
+            });
+          };
+          const normalizedDuration = parseTimecodeToSeconds(parsed.duration);
+
           return {
             success: true,
             description: parsed.description || rawText,
-            ...(wantTranscript && parsed.transcript !== undefined ? { transcript: parsed.transcript } : {}),
-            ...(wantScenes && parsed.scenes !== undefined ? { scenes: parsed.scenes } : {}),
-            ...(parsed.duration !== undefined ? { duration: parsed.duration } : {}),
+            ...(wantTranscript && parsed.transcript !== undefined ? { transcript: normalizeSegments(parsed.transcript) } : {}),
+            ...(wantScenes && parsed.scenes !== undefined ? { scenes: normalizeSegments(parsed.scenes) } : {}),
+            ...(normalizedDuration !== undefined ? { duration: normalizedDuration } : {}),
             videoUrl: videoFileUrl
           };
         } catch {
@@ -12276,6 +12389,29 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return err;
   }
 
+  /**
+   * Ensure the selected Meta ad-account token is usable, refreshing it inline
+   * if it is expired or close to expiry. Meta has no refresh tokens, so we
+   * re-exchange the still-valid (or recently-expired-but-exchangeable) token
+   * via fb_exchange_token. Only throws if the token is expired AND the refresh
+   * could not produce a working token — otherwise the work proceeds without
+   * blocking the user. Mutates `selected.config` in place on success.
+   */
+  private async ensureUsableMetaToken(selected: any, userId: string): Promise<void> {
+    const { ensureFreshMetaAdAccountToken } = await import('./metaTokenRefresh');
+    // Mutates selected.config in place on a successful refresh; never throws.
+    await ensureFreshMetaAdAccountToken(selected, userId);
+
+    const expiresAt = selected.config.token_expires_at;
+    if (expiresAt && expiresAt < Date.now()) {
+      // Still expired after attempting a refresh — exchange failed (token too
+      // old / revoked). This is the only case that should block the work.
+      throw this.makeMetaAuthError(
+        'Meta access token has expired and could not be refreshed automatically. Please reconnect your Meta account in settings.'
+      );
+    }
+  }
+
   private async getMetaCredentials(userId: string, accountId?: string) {
     const { userDb } = await import('./db');
     const user = await userDb.getUserById(userId);
@@ -12323,9 +12459,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         throw this.makeMetaAuthError(`Meta ad account with ID "${accountId}" not found in connected accounts. Ensure you have the correct ID from list_connected_accounts.`);
       }
 
-      if (selected.config.token_expires_at && selected.config.token_expires_at < Date.now()) {
-        throw this.makeMetaAuthError('Meta access token has expired. Please reconnect your Meta account in settings.');
-      }
+      await this.ensureUsableMetaToken(selected, userId);
 
       return {
         accountId: clean(selected.account_id || selected.config?.ad_account_id),
@@ -12347,9 +12481,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // 4. Default to the single available account
     const selected = fbAccounts[0];
 
-    if (selected.config.token_expires_at && selected.config.token_expires_at < Date.now()) {
-      throw this.makeMetaAuthError('Meta access token has expired. Please reconnect your Meta account in settings.');
-    }
+    await this.ensureUsableMetaToken(selected, userId);
 
     console.log(`[AgentMode] Using Meta credentials from connected_accounts for user ${userId} (Account: ${selected.account_name})`);
 
@@ -17020,21 +17152,94 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   // Web search functionality
-  public async searchWeb(query: string, maxResults: number = 10): Promise<any> {
+  public async youSearchWeb(query: string, maxResults: number = 10): Promise<any> {
+    return this.searchWithYou({
+      toolName: 'you_search_web',
+      query,
+      maxResults,
+      resultSource: 'web',
+    });
+  }
+
+  public async youSearchNews(query: string, maxResults: number = 10, freshness?: string): Promise<any> {
+    return this.searchWithYou({
+      toolName: 'you_search_news',
+      query,
+      maxResults,
+      resultSource: 'news',
+      freshness: freshness || inferSearchFreshness(query) || 'week',
+    });
+  }
+
+  public async googleSearchWeb(query: string, maxResults: number = 10): Promise<any> {
+    const toolName = 'google_search_web';
+    const resultSource: SearchResultSource = 'web';
     try {
-      console.log('AgentMode: Searching web for query:', query, 'maxResults:', maxResults);
+      console.log(`AgentMode: ${toolName} using Google Custom Search for query:`, query, 'maxResults:', maxResults);
+      const limitedMaxResults = Math.min(maxResults, 10);
+      const searchResponse = await this.performGoogleSearch({
+        query,
+        maxResults: limitedMaxResults,
+      });
+      const normalizedResults = searchResponse.results || [];
+      const formattedContent = this.formatWebSearchResults({
+        query,
+        results: normalizedResults,
+        totalResults: normalizedResults.length,
+      });
+
+      return {
+        success: true,
+        message: `Found ${normalizedResults.length} Google web search results for "${query}"`,
+        query,
+        results: normalizedResults,
+        totalResults: normalizedResults.length,
+        provider: 'google',
+        toolName,
+        resultSource,
+        metadata: searchResponse.metadata,
+        formattedContent,
+      };
+    } catch (error) {
+      console.error(`AgentMode: Error in ${toolName}:`, error);
+      return {
+        success: false,
+        message: 'Failed to search Google Custom Search. Please try again.',
+        provider: 'google',
+        toolName,
+        resultSource,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  }
+
+  private async searchWithYou(params: {
+    toolName: 'you_search_web' | 'you_search_news';
+    query: string;
+    maxResults: number;
+    resultSource: SearchResultSource;
+    freshness?: string;
+  }): Promise<any> {
+    const { toolName, query, maxResults, resultSource } = params;
+    try {
+      console.log(`AgentMode: ${toolName} using You.com for query:`, query, 'maxResults:', maxResults);
 
       // Limit max results to 10
       const limitedMaxResults = Math.min(maxResults, 10);
       const maxAttempts = Math.max(1, Number(process.env.SEARCH_WEB_MAX_RETRIES || 4));
       const baseDelayMs = Math.max(100, Number(process.env.SEARCH_WEB_RETRY_BASE_MS || 600));
       let attempt = 0;
-      let searchResults: any[] = [];
+      let searchResponse: Awaited<ReturnType<YouSearchProvider['search']>> | null = null;
 
       while (attempt < maxAttempts) {
         attempt += 1;
         try {
-          searchResults = await this.performWebSearch(query, limitedMaxResults);
+          searchResponse = await this.performYouSearch({
+            query,
+            maxResults: limitedMaxResults,
+            resultSource,
+            freshness: params.freshness,
+          });
           break;
         } catch (error) {
           const isLastAttempt = attempt >= maxAttempts;
@@ -17055,26 +17260,38 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       }
 
+      const normalizedResults = searchResponse?.results || [];
+      const provider = searchResponse?.provider || 'you';
+      const freshness = searchResponse?.metadata?.freshness || params.freshness || inferSearchFreshness(query);
+
       // Format the results for LLM consumption
       const formattedContent = this.formatWebSearchResults({
         query,
-        results: searchResults,
-        totalResults: searchResults.length
+        results: normalizedResults,
+        totalResults: normalizedResults.length
       });
 
       return {
         success: true,
-        message: `Found ${searchResults.length} web search results for "${query}"`,
+        message: `Found ${normalizedResults.length} ${resultSource === 'news' ? 'news' : 'web search'} results for "${query}"`,
         query,
-        results: searchResults,
-        totalResults: searchResults.length,
+        results: normalizedResults,
+        totalResults: normalizedResults.length,
+        provider,
+        toolName,
+        resultSource,
+        freshness,
+        metadata: searchResponse?.metadata,
         formattedContent
       };
     } catch (error) {
-      console.error('AgentMode: Error searching web:', error);
+      console.error(`AgentMode: Error in ${toolName}:`, error);
       return {
         success: false,
-        message: 'Failed to search the web. Please try again.',
+        message: 'Failed to search You.com. Please try again.',
+        provider: 'you',
+        toolName,
+        resultSource,
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
@@ -17230,74 +17447,46 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return result;
   }
 
-  // Get Google Search API credentials from AWS Secrets Manager
-  public async getGoogleSearchCredentials(): Promise<{ apiKey: string; searchEngineId: string } | null> {
-    try {
-      const secretName = process.env.NODE_ENV === 'development'
-        ? 'dev/AgentWeb/Google/Search'
-        : 'prod/AgentWeb/Google/Search';
+  public async performYouSearch(params: {
+    query: string;
+    maxResults: number;
+    resultSource?: SearchResultSource;
+    freshness?: string;
+  }) {
+    const freshness = params.freshness || inferSearchFreshness(params.query);
+    const provider = new YouSearchProvider();
+    const response = await provider.search({
+      query: params.query,
+      count: params.maxResults,
+      freshness,
+      resultSource: params.resultSource || 'all',
+      purpose: params.resultSource === 'news' ? 'news' : 'agent_research',
+    });
 
-      const secretJson = await getSecret(secretName);
-      const credentials = JSON.parse(secretJson);
-
-      if (!credentials.apiKey || !credentials.searchEngineId) {
-        console.error('Google Search API credentials missing required fields');
-        return null;
-      }
-
-      return {
-        apiKey: credentials.apiKey,
-        searchEngineId: credentials.searchEngineId
-      };
-    } catch (error) {
-      console.error('Error fetching Google Search API credentials from Secrets Manager:', error);
-      return null;
-    }
+    console.log(`You.com Search returned ${response.results.length} ${params.resultSource || 'all'} results for query: "${params.query}"`);
+    return {
+      ...response,
+      metadata: {
+        ...(response.metadata || {}),
+        freshness,
+      },
+    };
   }
 
-  // Perform actual web search using Google Custom Search API
-  public async performWebSearch(query: string, maxResults: number): Promise<any[]> {
-    try {
-      // Get credentials from Secrets Manager
-      const credentials = await this.getGoogleSearchCredentials();
+  public async performGoogleSearch(params: {
+    query: string;
+    maxResults: number;
+  }) {
+    const provider = new GoogleSearchProvider();
+    const response = await provider.search({
+      query: params.query,
+      count: params.maxResults,
+      resultSource: 'web',
+      purpose: 'agent_research',
+    });
 
-      if (!credentials) {
-        throw new Error('Google Search API not configured in Secrets Manager');
-      }
-
-      // Initialize Google Custom Search API
-      const customsearch = google.customsearch('v1');
-
-      // Perform the search
-      const response = await customsearch.cse.list({
-        auth: credentials.apiKey,
-        cx: credentials.searchEngineId,
-        q: query,
-        num: Math.min(maxResults, 10), // Google API max is 10
-        safe: 'medium', // Safe search level
-        fields: 'items(title,link,snippet,pagemap/metatags,pagemap/cse_thumbnail)'
-      });
-
-      if (!response.data.items || response.data.items.length === 0) {
-        throw new Error('No search results found');
-      }
-
-      // Transform Google API results to our format
-      const searchResults = response.data.items.map((item: any) => ({
-        title: item.title || 'No title',
-        url: item.link || '#',
-        snippet: item.snippet || 'No description available',
-        publishedDate: this.extractPublishedDate(item.pagemap?.metatags?.[0]) || new Date().toISOString(),
-        thumbnail: item.pagemap?.cse_thumbnail?.[0]?.src || null
-      }));
-
-      console.log(`Google Search API returned ${searchResults.length} results for query: "${query}"`);
-      return searchResults;
-
-    } catch (error) {
-      console.error('Error performing Google web search:', error);
-      throw error;
-    }
+    console.log(`Google Custom Search returned ${response.results.length} web results for query: "${params.query}"`);
+    return response;
   }
 
 
@@ -18265,10 +18454,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     compose?: boolean,
     composeParams?: Record<string, any>,
     durationSeconds?: number,
-    useKeyframes?: boolean
+    useKeyframes?: boolean,
+    aspectRatio?: string,
+    resolution?: string
   ): Promise<any> {
     try {
-      console.log('AgentMode: Generating video with prompt:', prompt, 'filename:', filename, 'videoModel:', videoModel, 'startFrame:', startFrame ? 'provided' : 'none', 'endFrame:', endFrame ? 'provided' : 'none', 'compose:', compose ?? false, 'durationSeconds:', durationSeconds, 'useKeyframes:', useKeyframes ?? false, 'userId:', userId, 'sessionId:', sessionId);
+      console.log('AgentMode: Generating video with prompt:', prompt, 'filename:', filename, 'videoModel:', videoModel, 'startFrame:', startFrame ? 'provided' : 'none', 'endFrame:', endFrame ? 'provided' : 'none', 'compose:', compose ?? false, 'durationSeconds:', durationSeconds, 'useKeyframes:', useKeyframes ?? false, 'aspectRatio:', aspectRatio, 'resolution:', resolution, 'userId:', userId, 'sessionId:', sessionId);
 
       // Import the video generation service
       const { videoService } = await import('./videoGeneration');
@@ -18295,6 +18486,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         useKeyframes,
         compose,
         composeParams: composeParams as any,
+        aspectRatio,
+        resolution,
       });
 
       if (result.success && result.videoUrl) {
@@ -21722,7 +21915,7 @@ ${strippedHtml}`;
 
   // Work Plan Management Methods
 
-  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, sessionId: string, autocomplete?: boolean): Promise<any> {
+  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number }>, sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -21746,7 +21939,8 @@ ${strippedHtml}`;
           completedAt: undefined,
           notes: undefined,
           requiredFunctionCalls: step.requiredFunctionCalls,
-          skillIds: step.skillIds
+          skillIds: step.skillIds,
+          ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount })
         })),
         autocomplete: autocomplete || false,
         createdAt: new Date().toISOString(),
@@ -21859,6 +22053,7 @@ ${strippedHtml}`;
           notes: undefined,
           requiredFunctionCalls: step.requiredFunctionCalls,
           skillIds: step.skillIds,
+          ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
         })),
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
         autocomplete: predefinedPlan.autocomplete || false,
@@ -21914,7 +22109,7 @@ ${strippedHtml}`;
     }
   }
 
-  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
+  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || !session.workPlan) {
@@ -21947,7 +22142,11 @@ ${strippedHtml}`;
             description: newStep.description,
             ...(newStep.userInstructions !== undefined && { userInstructions: newStep.userInstructions }),
             requiredFunctionCalls: newStep.requiredFunctionCalls !== undefined ? newStep.requiredFunctionCalls : workPlan.steps[existingIndex].requiredFunctionCalls,
-            skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds
+            skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds,
+            // Allow scope changes: an explicit expectedAssetCount overrides (including 0
+            // to clear the asset gate when the user approves a smaller set); omitting it
+            // preserves the existing value.
+            expectedAssetCount: newStep.expectedAssetCount !== undefined ? newStep.expectedAssetCount : workPlan.steps[existingIndex].expectedAssetCount
           };
         } else {
           // Add new step (stepCount will be fixed by updateSessionWorkPlan)
@@ -21960,7 +22159,8 @@ ${strippedHtml}`;
             completedAt: undefined,
             notes: undefined,
             requiredFunctionCalls: newStep.requiredFunctionCalls,
-            skillIds: newStep.skillIds
+            skillIds: newStep.skillIds,
+            ...(newStep.expectedAssetCount !== undefined && { expectedAssetCount: newStep.expectedAssetCount })
           });
         }
       }
@@ -22010,6 +22210,14 @@ ${strippedHtml}`;
       const calledFunctionCounts = { ...(session.calledFunctions || {}) };
       let countsModified = false;
 
+      // Count media assets actually produced this session (distinct "Image generated:"
+      // markers), used by the expectedAssetCount completion gate below. This is ground
+      // truth from the message history — independent of the calledFunctions counter,
+      // which can be inflated by non-producing generate_image returns (confirmation
+      // gate). Computed once; cheap relative to the DynamoDB round-trips already done.
+      const producedAssetCount = AgentModeService.extractGeneratedImageFilenames(session.messages).length;
+      const insufficientAssets: Array<{ stepCount: number; title: string; expected: number; produced: number }> = [];
+
       // Process each update
       for (const update of updates) {
         const stepIndex = workPlan.steps.findIndex(s => s.stepCount === update.stepCount);
@@ -22054,6 +22262,29 @@ ${strippedHtml}`;
           }
         }
 
+        // Asset-count completion gate. When a step declares expectedAssetCount, it may
+        // not be marked completed until the session has actually produced that many
+        // media assets. This prevents the xCures failure mode: a "Generate 3 Images Per
+        // Hook — 18 total" step being marked done with only 3 images produced (the model
+        // self-reported "Hooks 2-6 generate-pending" yet completed the step). The
+        // required-function-calls gate above could not catch this — it only checked that
+        // generate_image was called ≥1×, and the call counter was inflated to 76 by
+        // non-producing confirmation-gate returns. Counting real assets is the fix.
+        // The user can still legitimately reduce scope via modify_work_plan (lowering or
+        // clearing expectedAssetCount), so this never becomes an unrecoverable block.
+        if (update.status === 'completed'
+          && typeof step.expectedAssetCount === 'number'
+          && step.expectedAssetCount > 0
+          && producedAssetCount < step.expectedAssetCount) {
+          insufficientAssets.push({
+            stepCount: update.stepCount,
+            title: step.title,
+            expected: step.expectedAssetCount,
+            produced: producedAssetCount,
+          });
+          continue; // Skip updating this step
+        }
+
         // Update the step status
         workPlan.steps[stepIndex] = {
           ...workPlan.steps[stepIndex],
@@ -22080,6 +22311,20 @@ ${strippedHtml}`;
           message: 'Cannot mark steps as completed. Required function calls have not been made yet.',
           missingFunctionCalls,
           formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nPlease make the required function calls first, then mark the steps as completed.`
+        };
+      }
+
+      // Asset-count gate failure — the step's declared media assets are not all produced.
+      if (insufficientAssets.length > 0) {
+        const errorDetails = insufficientAssets.map(ia =>
+          `Step ${ia.stepCount} "${ia.title}": ${ia.produced} of ${ia.expected} required images/assets have been generated (${ia.expected - ia.produced} still missing)`
+        ).join('\n');
+
+        return {
+          success: false,
+          message: 'Cannot mark steps as completed. The required number of assets has not been generated yet.',
+          insufficientAssets,
+          formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nGenerate the remaining assets with generate_image, then mark the step completed. If the user has explicitly approved a smaller set, call modify_work_plan to lower the step's expected asset count first.`
         };
       }
 
@@ -25714,6 +25959,7 @@ export const __testHooks = {
   enqueueFindEmailJobForNewLeads,
   parseCompanyFromTitle,
   batchParseCompaniesFromTitlesWithLLM,
+  parseTimecodeToSeconds,
 };
 
 export const agentModeService = new AgentModeService();

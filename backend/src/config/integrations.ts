@@ -79,7 +79,8 @@ export const INTEGRATION_CONFIG = {
     scopes: [
       'https://www.googleapis.com/auth/gmail.readonly',
       'https://www.googleapis.com/auth/gmail.send',
-      'https://www.googleapis.com/auth/calendar.readonly',
+      // calendar.events grants read + create/update/delete; supersedes calendar.readonly.
+      'https://www.googleapis.com/auth/calendar.events',
       'https://www.googleapis.com/auth/userinfo.email',
       'https://www.googleapis.com/auth/userinfo.profile',
     ],

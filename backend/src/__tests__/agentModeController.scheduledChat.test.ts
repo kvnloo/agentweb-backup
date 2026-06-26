@@ -38,7 +38,7 @@ jest.mock('../services/agentModeService', () => ({
     installSkills: jest.fn().mockResolvedValue({ success: true, installedSkills: [] }),
     getSkillsForDisplay: jest.fn().mockResolvedValue([]),
     getFoundationToolNames: jest.fn().mockReturnValue(new Set([
-      'install_skills', 'search_web', 'read_file_content', 'read_page_source',
+      'install_skills', 'you_search_web', 'read_file_content', 'read_page_source',
       'search_knowledge_base', 'list_knowledge_base_files', 'read_knowledge_base_files',
       'create_work_plan', 'modify_work_plan', 'set_work_plan_status',
       'save_file', 'describe_image',
@@ -233,65 +233,73 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       );
     });
 
-    it('should count bravesearch_brave_web_search as satisfying a search_web requirement', async () => {
+    it('should require canonical you_search_web for You.com web search', async () => {
       const scheduleWithSearchWeb = {
         ...baseSchedule,
         keywords: [],
-        requiredFunctionCalls: ['search_web'],
+        requiredFunctionCalls: ['you_search_web'],
       };
 
-      // Agent calls bravesearch MCP tool instead of the built-in search_web
-      const braveResponse = {
+      const legacySearchResponse = {
         ...mockResponse,
-        content: 'Found some results.',
+        content: 'Found some legacy results.',
         toolCalls: [
-          { name: 'bravesearch_brave_web_search', arguments: { query: 'test' } },
+          { name: 'legacy_search_web', arguments: { query: 'test' } },
+        ],
+      };
+      const canonicalSearchResponse = {
+        ...mockResponse,
+        content: 'Found some current results.',
+        toolCalls: [
+          { name: 'you_search_web', arguments: { query: 'test' } },
         ],
       };
 
-      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(braveResponse);
+      mockGenerateMarketingResponseWorkerService.runInWorker
+        .mockResolvedValueOnce(legacySearchResponse)
+        .mockResolvedValueOnce(canonicalSearchResponse);
 
       const result = await runScheduledChat(scheduleWithSearchWeb, mockUserId, true);
 
-      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(2);
       expect(result).toEqual(
         expect.objectContaining({
           status: 'success',
           passed: true,
-          attempt: 1,
-          functionCallMatches: ['search_web'],
+          attempt: 2,
+          functionCallMatches: ['you_search_web'],
           functionCallMisses: [],
         })
       );
     });
 
-    it('should count bravesearch_brave_news_search as satisfying a search_web requirement', async () => {
+    it('should not count legacy news search calls as you_search_web', async () => {
       const scheduleWithSearchWeb = {
         ...baseSchedule,
         keywords: [],
-        requiredFunctionCalls: ['search_web'],
+        requiredFunctionCalls: ['you_search_web'],
       };
 
-      const braveNewsResponse = {
+      const legacyNewsResponse = {
         ...mockResponse,
         content: 'Found some news.',
         toolCalls: [
-          { name: 'bravesearch_brave_news_search', arguments: { query: 'test' } },
+          { name: 'legacy_news_search', arguments: { query: 'test' } },
         ],
       };
 
-      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(braveNewsResponse);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(legacyNewsResponse);
 
       const result = await runScheduledChat(scheduleWithSearchWeb, mockUserId, true);
 
-      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
       expect(result).toEqual(
         expect.objectContaining({
-          status: 'success',
-          passed: true,
-          attempt: 1,
-          functionCallMatches: ['search_web'],
-          functionCallMisses: [],
+          status: 'failure',
+          passed: false,
+          attempt: 20,
+          functionCallMatches: [],
+          functionCallMisses: ['you_search_web'],
         })
       );
     });

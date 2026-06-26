@@ -279,6 +279,23 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
     expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 
+  it('discards all events when OAuth token is unavailable (expired or revoked)', async () => {
+    // Simulate HubSpotService.create throwing — expired token, revoked refresh, etc.
+    const { HubSpotService } = require('../services/hubspotService');
+    HubSpotService.create.mockRejectedValueOnce(new Error('Token refresh failed'));
+
+    const body = [
+      { subscriptionType: 'contact.propertyChange', portalId: PORTAL_ID, objectId: '1', propertyName: 'email', propertyValue: 'alice@example.com' },
+    ];
+    await request(app)
+      .post('/api/webhooks/hubspot')
+      .set('x-hubspot-signature', makeSignature(body))
+      .send(body);
+
+    await flushPromises();
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
   // ── Boundary cases ──────────────────────────────────────────────────────────
 
   it('rejects unsigned request in production (NODE_ENV=production)', async () => {
