@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-06-26',
+    changes: [
+      'Fixed: Emma Can Now Send One-Off Emails Using Your Configured Sender',
+      '- Previously, if you asked Emma in chat to send an email (for example "send an email to alice@example.com"), she could only send it through a connected Gmail account — so if you had set up a sender under CRM → Senders but had not connected a raw Gmail account, Emma would say no email account was connected and could not send',
+      '- Emma can now send a one-off email directly through your configured sender (a verified custom-domain sender or a connected Gmail-account sender), no separate Gmail connection required',
+      '- You can let Emma pick your default sender automatically, or tell her which configured sender to send from',
+    ],
+  },
+  {
     date: '2026-06-22',
     changes: [
       'Improved: Large Image Batches No Longer Stall Mid-Way',
