@@ -74,6 +74,17 @@ export interface ExternalCrmSyncConfig {
   lastPullSyncAt?: string;
   lastSyncStatus?: 'success' | 'error';
   lastSyncError?: string;
+  /**
+   * Classifies a recorded sync error so the UI can react appropriately:
+   *  - 'connection' — the CRM connection itself failed (revoked/expired token,
+   *    disconnected account). Reconnecting fixes it.
+   *  - 'data'       — the connection is healthy but one or more leads were
+   *    rejected for a per-record reason (e.g. an invalid email). Reconnecting
+   *    does NOT help; the lead data must be corrected.
+   * Undefined on configs written before this field existed (treated as
+   * 'connection' by default for back-compat).
+   */
+  lastSyncErrorCategory?: 'connection' | 'data';
   // Latest async full-list push job (status + result for the polling UI)
   pushJob?: PushJob;
   createdAt: string;
@@ -760,6 +771,9 @@ export class ExternalCrmSyncService {
         config.pushJob = failed;
         config.lastSyncStatus = 'error';
         config.lastSyncError = message;
+        // A thrown push-job failure is a connection-level fault (the run aborted
+        // before completing) — reconnecting is the remedy.
+        config.lastSyncErrorCategory = 'connection';
         await this.persistPushJob(config, failed);
       });
 
@@ -908,6 +922,16 @@ export class ExternalCrmSyncService {
 
       // Persist updated externalPeopleListId if the adapter set it
       await this.saveUpdatedConfig(config);
+      // A completed run with per-lead errors (errorCount>0, no throw) is a data
+      // fault — the connection worked but some leads were rejected (e.g. invalid
+      // emails). Record the detail + 'data' category so the UI shows a
+      // non-actionable note rather than a misleading "Reconnect" prompt. A clean
+      // run (errorCount===0) clears any prior error via updateSyncTimestamp.
+      if (totalResult.errorCount > 0) {
+        const detail = totalResult.errors[0] || 'Some leads could not be synced';
+        config.lastSyncError = detail;
+        config.lastSyncErrorCategory = this.categorizeLeadError(detail);
+      }
       await this.updateSyncTimestamp(config, 'push', totalResult.errorCount === 0);
 
       return totalResult;
@@ -1033,7 +1057,12 @@ export class ExternalCrmSyncService {
       if (result.errorCount > 0) {
         const detail = result.errors[0] || 'Auto-sync reported an error';
         console.error(`[ExternalCrmSync] Auto-sync error for lead ${lead.leadId} in list ${listId}:`, detail);
+        // A non-zero errorCount with no throw usually means the connection
+        // succeeded but a per-lead push was rejected (e.g. an invalid email);
+        // reconnecting would not help. categorizeLeadError downgrades only genuine
+        // data rejections to 'data' and leaves auth-shaped failures as 'connection'.
         config.lastSyncError = detail;
+        config.lastSyncErrorCategory = this.categorizeLeadError(detail);
         await this.updateSyncTimestamp(config, 'push', false);
         return;
       }
@@ -1049,7 +1078,11 @@ export class ExternalCrmSyncService {
       // that needs attention (e.g. a revoked HubSpot token). Without this,
       // real-time failures are invisible because only manual push wrote status.
       if (config) {
+        // A thrown failure (vs. a per-lead errorCount) is a connection-level fault
+        // — a revoked/expired token or unreachable account — so reconnecting is the
+        // correct remedy.
         config.lastSyncError = typeof details === 'string' ? details : JSON.stringify(details);
+        config.lastSyncErrorCategory = 'connection';
         await this.updateSyncTimestamp(config, 'push', false).catch(() => { });
       }
     }
@@ -1076,6 +1109,19 @@ export class ExternalCrmSyncService {
       .catch(() => { /* non-critical */ });
   }
 
+  /**
+   * Classifies a non-throwing per-lead sync error (errorCount>0). Only genuine
+   * per-record DATA rejections (e.g. an invalid email) are 'data' — those can't
+   * be fixed by reconnecting. Everything else (including an auth failure that the
+   * batch path records per-lead instead of throwing — e.g. a 401/403 recorded by
+   * splitAndRetry) defaults to 'connection', the safe choice that still offers the
+   * Reconnect CTA. The regex matches both the adapter's own message ("Invalid
+   * email …") and HubSpot's rejection text ("invalid email (rejected by HubSpot)").
+   */
+  private categorizeLeadError(detail: string): 'connection' | 'data' {
+    return /invalid email/i.test(detail) ? 'data' : 'connection';
+  }
+
   private async updateSyncTimestamp(
     config: ExternalCrmSyncConfig,
     direction: 'push' | 'pull',
@@ -1085,7 +1131,10 @@ export class ExternalCrmSyncService {
     if (direction === 'push') config.lastPushSyncAt = now;
     else config.lastPullSyncAt = now;
     config.lastSyncStatus = success ? 'success' : 'error';
-    if (success) config.lastSyncError = undefined;
+    if (success) {
+      config.lastSyncError = undefined;
+      config.lastSyncErrorCategory = undefined;
+    }
     config.updatedAt = now;
     await this.saveUpdatedConfig(config);
   }
