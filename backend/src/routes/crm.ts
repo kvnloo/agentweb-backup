@@ -2214,11 +2214,39 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'icpIndex (non-negative integer) is required' });
     }
 
-    const { userDb } = await import('../services/db');
+    const { userDb, orgDb } = await import('../services/db');
     const user: any = await userDb.getUserById(userId);
-    const personas: any[] = Array.isArray(user?.icpResult) ? user.icpResult : [];
+
+    // Resolve the persona list. Three stores hold ICP data and a user may
+    // have ICPs in only one of them:
+    //   1. user.icpResult — personas generated during onboarding / mirrored
+    //      from Emma's brand build. Carries the extractedFilters cache.
+    //   2. marketStrategy.icp — personas authored on the /market-strategy
+    //      page or by Emma's update_market_strategy tool. For org members
+    //      this lives on the ORG (see routes/marketStrategy.ts: "If user is
+    //      in an org, always read market strategy from the org"), so an org
+    //      owner can have 5 ICPs the user record never sees.
+    // Prefer icpResult (it has the cache); otherwise fall back to the
+    // marketStrategy.icp store, converting to the icpResult shape with the
+    // same mapping Emma's brand-build mirror uses.
+    let personas: any[] = Array.isArray(user?.icpResult) ? user.icpResult : [];
+    let fromMarketStrategy = false;
     if (personas.length === 0) {
-      return res.status(404).json({ message: 'No ICP personas found. Generate them on the GTM Plan page first.' });
+      let marketStrategy: any = user?.marketStrategy;
+      if (user?.orgId) {
+        const org: any = await orgDb.getOrgById(user.orgId);
+        if (org) marketStrategy = org.marketStrategy;
+      }
+      const marketIcp = Array.isArray(marketStrategy?.icp) ? marketStrategy.icp : [];
+      if (marketIcp.length > 0) {
+        const { mapMarketIcpToResult } = await import('../services/onboardingBrandBuildService');
+        personas = mapMarketIcpToResult(marketIcp);
+        fromMarketStrategy = personas.length > 0;
+      }
+    }
+
+    if (personas.length === 0) {
+      return res.status(404).json({ message: 'No ICP personas found. Define your Ideal Customer Profiles in Market Strategy first.' });
     }
     if (icpIndex >= personas.length) {
       return res.status(404).json({ message: `icpIndex ${icpIndex} out of range (have ${personas.length} personas)` });
@@ -2259,37 +2287,47 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
       });
     }
 
-    // Re-read user before persisting so we don't clobber concurrent edits
-    // made during the ~3s LLM window (e.g., GTM page regenerating
-    // personas). Mirrors the pattern in onboardingIcpService.ts: read →
-    // long-running work → re-read → write.
-    //
-    // If the persona at icpIndex is gone, or its content changed (hash
-    // mismatch), the LLM result we just produced no longer matches what
-    // the user has now — skip the write so the next click can regenerate
-    // against the current content. We still return the variants to the
-    // caller for the current request.
-    const freshUser: any = await userDb.getUserById(userId);
-    const freshPersonas: any[] = Array.isArray(freshUser?.icpResult) ? freshUser.icpResult : [];
-    const freshPersona = freshPersonas[icpIndex];
-    const cacheStillApplies =
-      freshPersona && personaCacheKey(freshPersona) === currentKey;
+    // Persist the extracted filters as a cache — but ONLY for personas that
+    // came from user.icpResult. We deliberately do NOT write back when the
+    // personas were derived from marketStrategy.icp: materializing them onto
+    // user.icpResult would make the user record take precedence over the
+    // (possibly org-level) marketStrategy on the next click, so later edits
+    // to the org's ICPs would be masked by a stale user-level snapshot. The
+    // marketStrategy store stays the source of truth; we just re-run the LLM
+    // on each click there (rare, explicit, ~3s).
+    if (!fromMarketStrategy) {
+      // Re-read user before persisting so we don't clobber concurrent edits
+      // made during the ~3s LLM window (e.g., onboarding regenerating
+      // personas). Mirrors the pattern in onboardingIcpService.ts: read →
+      // long-running work → re-read → write.
+      //
+      // If the persona at icpIndex is gone, or its content changed (hash
+      // mismatch), the LLM result we just produced no longer matches what
+      // the user has now — skip the write so the next click can regenerate
+      // against the current content. We still return the variants to the
+      // caller for the current request.
+      const freshUser: any = await userDb.getUserById(userId);
+      const freshPersonas: any[] = Array.isArray(freshUser?.icpResult) ? freshUser.icpResult : [];
+      const freshPersona = freshPersonas[icpIndex];
+      const cacheStillApplies =
+        freshPersona && personaCacheKey(freshPersona) === currentKey;
 
-    if (cacheStillApplies) {
-      const nextIcpResult = freshPersonas.map((p: any, i: number) =>
-        i === icpIndex
-          ? {
-              ...p,
-              extractedFilters: {
-                cacheKey: currentKey,
-                cacheVersion: ICP_FILTER_CACHE_VERSION,
-                variants,
-                generatedAt: new Date().toISOString(),
-              },
-            }
-          : p,
-      );
-      await userDb.updateUser(userId, { icpResult: nextIcpResult } as any);
+      if (cacheStillApplies) {
+        const nextIcpResult = freshPersonas.map((p: any, i: number) =>
+          i === icpIndex
+            ? {
+                ...p,
+                extractedFilters: {
+                  cacheKey: currentKey,
+                  cacheVersion: ICP_FILTER_CACHE_VERSION,
+                  variants,
+                  generatedAt: new Date().toISOString(),
+                },
+              }
+            : p,
+        );
+        await userDb.updateUser(userId, { icpResult: nextIcpResult } as any);
+      }
     }
 
     return res.status(200).json({
