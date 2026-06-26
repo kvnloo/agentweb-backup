@@ -1922,6 +1922,56 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.from).toBe('sales@acme.com');
     });
 
+    it('should resolve the Gmail-type sender when asked for the "gmail" sender', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [
+          { id: 'sender-1', email: 'sales@acme.com', fromName: 'Sales Team' },
+          { id: 'sender-g', email: 'me@gmail.com', fromName: 'Manan', senderType: 'gmail', gmailAccountId: 'me@gmail.com' },
+        ],
+        defaultSenderId: 'sender-1',
+      });
+      mockGmail.sendEmail.mockResolvedValue({ messageId: 'g-1', threadId: 't-1' } as any);
+
+      // The user says "from my gmail sender" → sender_id resolves by senderType.
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+        senderId: 'gmail',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.from).toBe('me@gmail.com');
+      expect(mockGmail.sendEmail).toHaveBeenCalled();
+    });
+
+    it('should include senderType in the availableSenders list on no match', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [
+          { id: 'sender-1', email: 'sales@acme.com', fromName: 'Sales Team' },
+          { id: 'sender-g', email: 'me@gmail.com', fromName: 'Manan', senderType: 'gmail', gmailAccountId: 'me@gmail.com' },
+        ],
+        defaultSenderId: 'sender-1',
+      });
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+        senderId: 'no-such-sender',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Sender not found');
+      const gmailEntry = result.availableSenders.find((s: any) => s.email === 'me@gmail.com');
+      expect(gmailEntry.senderType).toBe('gmail');
+      // The default/resend sender should be marked accordingly (not undefined).
+      const resendEntry = result.availableSenders.find((s: any) => s.email === 'sales@acme.com');
+      expect(resendEntry.senderType).toBe('resend');
+    });
+
     it('should return a recipient-validation error when "to" is missing', async () => {
       jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
 
