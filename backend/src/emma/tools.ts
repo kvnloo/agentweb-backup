@@ -3597,6 +3597,56 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
+  name: 'send_email_from_sender',
+  definition: {
+    name: 'send_email_from_sender',
+    description:
+      'Send a one-off email to any recipient using the user\'s CONFIGURED email sender (set up in CRM → Senders). ' +
+      'Use this for ad-hoc emails that are NOT tied to a CRM lead draft — e.g. "send an email to alice@example.com". ' +
+      'This does NOT require a connected Gmail account: it sends through the user\'s configured sender (a verified custom-domain sender, or a connected Gmail-account sender). ' +
+      'Prefer this over the `email` tool when the user has no connected Gmail account but has a configured sender. ' +
+      'If no sender is configured, tell the user to open CRM, select a lead list, and click "Senders" to configure one.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        to: {
+          type: 'string',
+          description: 'Recipient email address'
+        },
+        subject: {
+          type: 'string',
+          description: 'Email subject line'
+        },
+        html: {
+          type: 'string',
+          description: 'HTML body of the email. Provide either html or text (html preferred for formatted emails).'
+        },
+        text: {
+          type: 'string',
+          description: 'Plain-text body of the email. Used when html is not provided.'
+        },
+        sender_id: {
+          type: 'string',
+          description: 'Optional ID of a specific configured sender to send from. Omit to use the default sender. Sender IDs come from the user\'s CRM sender configuration.'
+        }
+      },
+      required: ['to', 'subject']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId;
+    if (!userId) throw new Error('Missing user context');
+    return await agentModeService.sendEmailFromConfiguredSender(userId, {
+      to: args.to,
+      subject: args.subject,
+      html: args.html,
+      text: args.text,
+      senderId: args.sender_id,
+    });
+  }
+});
+
+emmaToolRegistry.register({
   name: 'list_connected_accounts',
   definition: {
     name: 'list_connected_accounts',
@@ -5604,6 +5654,7 @@ emmaToolRegistry.register({
     description:
       'Read, search, and send emails across connected email accounts (Gmail, and more providers in the future). ' +
       'Always call list_connected_accounts first to get the account_id for the user\'s email account. ' +
+      'NOTE: this tool requires a CONNECTED Gmail account. To send a one-off email when the user has NO connected Gmail account but HAS a configured sender (CRM → Senders), use send_email_from_sender instead. ' +
       'Actions:\n' +
       '  \u2022 search \u2014 find emails by query. Gmail syntax: "from:alice@example.com subject:invoice newer_than:7d is:unread has:attachment"\n' +
       '  \u2022 list   \u2014 list recent emails from a folder (INBOX, SENT, TRASH, SPAM, or custom label)\n' +
