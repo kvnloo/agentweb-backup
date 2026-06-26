@@ -568,8 +568,27 @@ router.get("/users", async (req, res) => {
     const hideBotLike = req.query.hideBotLike !== "false";
     const users = await userDb.getAllUsers(hideBotLike);
     // Transform: replace encrypted secrets map with just key names for the frontend
+    // and drop large GTM/onboarding artifact blobs the admin user table never reads.
+    // These blobs (competitorResult, marketStrategy, brandGuidelines, etc.) can be
+    // hundreds of KB each; left in, the array grows past the nginx proxy buffers and
+    // spills to a temp file, which fails (and empties the table) when the EB instance
+    // disk is full. `password` is a bcrypt hash that must never reach the frontend.
     const sanitized = users.map((user: any) => {
-      const { secrets, ...rest } = user;
+      const {
+        secrets,
+        password,
+        competitorResult,
+        marketStrategy,
+        brandGuidelines,
+        adImageResult,
+        icpResult,
+        creativeDirResult,
+        adCopyResult,
+        onboardingEvents,
+        startupProfiles,
+        connected_accounts,
+        ...rest
+      } = user;
       return {
         ...rest,
         secretNames: secrets ? Object.keys(secrets) : [],
