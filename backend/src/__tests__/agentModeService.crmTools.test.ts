@@ -2072,7 +2072,7 @@ describe('AgentModeService - CRM Tools', () => {
         ],
         defaultSenderId: 'sender-g2',
       });
-      mockGmail.sendEmail.mockRejectedValue(new Error('Token revoked'));
+      mockGmail.sendEmail.mockRejectedValue(new Error('Internal server error'));
 
       const result = await service.sendEmailFromConfiguredSender(userId, {
         to: 'someone@external.com',
@@ -2081,7 +2081,40 @@ describe('AgentModeService - CRM Tools', () => {
       });
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('Token revoked');
+      // Non-auth Gmail errors surface as a "Gmail send failed" with the raw cause.
+      expect(result.message).toContain('Gmail send failed');
+      expect(result.error).toContain('Internal server error');
+      expect(result.error).toContain('test@gmail.com');
+    });
+
+    it('should return an actionable reconnect message on a Gmail OAuth failure', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [
+          {
+            id: 'sender-g3',
+            email: 'broken@gmail.com',
+            fromName: 'Broken',
+            senderType: 'gmail',
+            gmailAccountId: 'broken@gmail.com',
+          },
+        ],
+        defaultSenderId: 'sender-g3',
+      });
+      // Google's token refresh surfaces raw OAuth errors like this one.
+      mockGmail.sendEmail.mockRejectedValue(new Error('unauthorized_client'));
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Gmail');
+      // Tell the user the sender's Gmail account needs reconnecting, and which one.
+      expect(result.error).toContain('reconnect');
+      expect(result.error).toContain('broken@gmail.com');
     });
   });
 
