@@ -1986,6 +1986,40 @@ describe('AgentModeService - CRM Tools', () => {
       expect(mockResend.sendEmail).not.toHaveBeenCalled();
     });
 
+    it.each(['notanemail', 'foo@', 'foo@bar', 'a b@x.com', 'foo@@bar.com'])(
+      'should reject a malformed recipient address "%s" before sending',
+      async (badTo) => {
+        jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+
+        const result = await service.sendEmailFromConfiguredSender(userId, {
+          to: badTo,
+          subject: 'Hello',
+          html: '<p>Hi</p>',
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Invalid recipient');
+        expect(result.error).toContain(badTo);
+        // Must not attempt a send for a clearly malformed address.
+        expect(mockResend.sendEmail).not.toHaveBeenCalled();
+        expect(mockGmail.sendEmail).not.toHaveBeenCalled();
+      }
+    );
+
+    it('should accept a well-formed recipient and send normally', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+      mockResend.sendEmail.mockResolvedValue({ id: 'ok-1' } as any);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'valid.person@example.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockResend.sendEmail).toHaveBeenCalled();
+    });
+
     it('should return error when subject is missing', async () => {
       jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
 
