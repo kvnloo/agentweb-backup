@@ -97,7 +97,7 @@ jest.mock('../services/icpFilterLlmExtractor', () => {
   };
 });
 
-import { userDb } from '../services/db';
+import { userDb, orgDb } from '../services/db';
 import router from '../routes/crm';
 import {
   extractIcpFiltersWithLlm,
@@ -145,6 +145,7 @@ describe('GET /api/crm/icp/filters', () => {
     mockRes = { status: jest.fn().mockReturnThis(), json: jest.fn().mockReturnThis() };
     (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'u1', icpResult: [persona()] });
     (userDb.updateUser as jest.Mock).mockResolvedValue(undefined);
+    (orgDb.getOrgById as jest.Mock).mockResolvedValue(null);
     (extractIcpFiltersWithLlm as jest.Mock).mockResolvedValue(llmVariants());
   });
 
@@ -390,5 +391,140 @@ describe('GET /api/crm/icp/filters', () => {
     mockReq.query = { icpIndex: '0' };
     await handler!(mockReq, mockRes);
     expect(agentModeService.importLeadsFromSearch).not.toHaveBeenCalled();
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // marketStrategy.icp fallback (user- and org-level).
+  //
+  // Root cause of the "Use my ICP does nothing" report: an org owner had 5
+  // ICPs defined only at org.marketStrategy.icp, with no user.icpResult, so
+  // the route 404'd. The route now falls back to the marketStrategy.icp
+  // store (org-level for org members, per the /market-strategy convention),
+  // converting personas with the same mapping Emma's brand-build mirror uses.
+  // ──────────────────────────────────────────────────────────────────────
+
+  const marketIcp = () => [
+    {
+      title: 'ICP 1 — The Margin-Squeezed DTC Founder',
+      description: 'Bootstrapped DTC brand bleeding margin on blanket discounts.',
+      valueProposition: 'Convert shoppers with outcome-tied incentives.',
+      buyerPersonas: ['Founder/CEO — owns all tool decisions', 'Head of Growth — runs promos'],
+    },
+    {
+      title: 'ICP 2 — The Shopify Agency Operator',
+      description: 'Agency managing many merchant stores.',
+      valueProposition: 'Smarter promo strategy for clients.',
+      buyerPersonas: ['Agency Owner — recommends tools'],
+    },
+  ];
+
+  it('falls back to user.marketStrategy.icp when icpResult is absent', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: 'u1',
+      marketStrategy: { icp: marketIcp() },
+    });
+    mockReq.query = { icpIndex: '0' };
+    await handler!(mockReq, mockRes);
+
+    expect(extractIcpFiltersWithLlm).toHaveBeenCalledTimes(1);
+    // The persona handed to the LLM is the converted marketStrategy entry.
+    const passedPersona = (extractIcpFiltersWithLlm as jest.Mock).mock.calls[0][0];
+    expect(passedPersona.name).toBe('ICP 1 — The Margin-Squeezed DTC Founder');
+    expect(mockRes.status).toHaveBeenCalledWith(200);
+    const body = (mockRes.json as jest.Mock).mock.calls[0][0];
+    expect(body.persona.name).toBe('ICP 1 — The Margin-Squeezed DTC Founder');
+    expect(body.variants).toEqual(llmVariants());
+  });
+
+  it('falls back to ORG marketStrategy.icp for an org member with no user-level ICP data', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: 'u1',
+      orgId: 'org1',
+    });
+    (orgDb.getOrgById as jest.Mock).mockResolvedValue({
+      orgId: 'org1',
+      marketStrategy: { icp: marketIcp() },
+    });
+    mockReq.query = { icpIndex: '1' };
+    await handler!(mockReq, mockRes);
+
+    expect(orgDb.getOrgById).toHaveBeenCalledWith('org1');
+    expect(mockRes.status).toHaveBeenCalledWith(200);
+    const body = (mockRes.json as jest.Mock).mock.calls[0][0];
+    expect(body.persona.name).toBe('ICP 2 — The Shopify Agency Operator');
+    expect(body.variants).toEqual(llmVariants());
+  });
+
+  it('org marketStrategy takes precedence over a user-level marketStrategy for org members', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: 'u1',
+      orgId: 'org1',
+      marketStrategy: { icp: [{ title: 'USER-LEVEL ICP', description: '', valueProposition: '', buyerPersonas: [] }] },
+    });
+    (orgDb.getOrgById as jest.Mock).mockResolvedValue({
+      orgId: 'org1',
+      marketStrategy: { icp: marketIcp() },
+    });
+    mockReq.query = { icpIndex: '0' };
+    await handler!(mockReq, mockRes);
+
+    const body = (mockRes.json as jest.Mock).mock.calls[0][0];
+    expect(body.persona.name).toBe('ICP 1 — The Margin-Squeezed DTC Founder');
+  });
+
+  it('user.icpResult takes precedence over marketStrategy.icp when both exist', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: 'u1',
+      icpResult: [persona()],
+      orgId: 'org1',
+    });
+    (orgDb.getOrgById as jest.Mock).mockResolvedValue({
+      orgId: 'org1',
+      marketStrategy: { icp: marketIcp() },
+    });
+    mockReq.query = { icpIndex: '0' };
+    await handler!(mockReq, mockRes);
+
+    const body = (mockRes.json as jest.Mock).mock.calls[0][0];
+    // Uses the icpResult persona, not the org marketStrategy one.
+    expect(body.persona.name).toBe('Mid-market RevOps Leaders');
+  });
+
+  it('404 when neither icpResult nor any marketStrategy.icp exists', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'u1', orgId: 'org1' });
+    (orgDb.getOrgById as jest.Mock).mockResolvedValue({ orgId: 'org1' }); // org has no marketStrategy
+    mockReq.query = { icpIndex: '0' };
+    await handler!(mockReq, mockRes);
+    expect(mockRes.status).toHaveBeenCalledWith(404);
+  });
+
+  it('404 when icpIndex is out of range against marketStrategy.icp', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: 'u1',
+      marketStrategy: { icp: marketIcp() },
+    });
+    mockReq.query = { icpIndex: '9' };
+    await handler!(mockReq, mockRes);
+    expect(mockRes.status).toHaveBeenCalledWith(404);
+  });
+
+  it('does NOT write back to user.icpResult when personas came from marketStrategy', async () => {
+    // Materializing org/marketStrategy personas onto user.icpResult would
+    // make the user record shadow later org edits, so the fallback path
+    // re-runs the LLM each click instead of caching onto the user.
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: 'u1',
+      orgId: 'org1',
+    });
+    (orgDb.getOrgById as jest.Mock).mockResolvedValue({
+      orgId: 'org1',
+      marketStrategy: { icp: marketIcp() },
+    });
+    mockReq.query = { icpIndex: '0' };
+    await handler!(mockReq, mockRes);
+
+    expect(extractIcpFiltersWithLlm).toHaveBeenCalledTimes(1);
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+    expect(mockRes.status).toHaveBeenCalledWith(200);
   });
 });
