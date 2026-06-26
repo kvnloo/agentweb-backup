@@ -3632,7 +3632,7 @@ emmaToolRegistry.register({
         },
         sender_id: {
           type: 'string',
-          description: 'Optional sender to send from. Accepts the sender\'s email address or its from-name (or internal id). Omit to use the user\'s default configured sender. If the value does not match any configured sender, the tool returns the list of available senders so you can pick one — relay those options to the user rather than guessing.'
+          description: 'Optional sender to send from. Accepts the sender\'s email address, its from-name, the keyword "gmail" (to use the configured Gmail-account sender), or the internal id. Omit to use the user\'s default configured sender. If the value does not match any configured sender, the tool returns the list of available senders (each marked [gmail] or [resend]) — relay those options to the user rather than claiming no sender exists.'
         }
       },
       required: ['to', 'subject']

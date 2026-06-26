@@ -10157,16 +10157,33 @@ export class AgentModeService {
       let sender: any = null;
       if (params.senderId) {
         // The model can't see internal sender IDs, so accept an id, an email
-        // address, or a from-name (case-insensitive) — whatever the user named.
+        // address, a from-name (case-insensitive), or a sender-type keyword like
+        // "gmail" — whatever the user named ("send from my gmail sender").
         const needle = params.senderId.trim().toLowerCase();
+        const wantsGmail = needle === 'gmail' || needle === 'gmail sender' || needle === 'my gmail' || needle === 'my gmail sender';
         sender = sendersResult.senders.find((s: any) =>
           s.id === params.senderId ||
           (s.email && s.email.toLowerCase() === needle) ||
           (s.fromName && s.fromName.toLowerCase() === needle)
         );
+        // Fall back to matching by sender type (e.g. the single Gmail-account sender).
+        if (!sender && wantsGmail) {
+          const gmailSenders = sendersResult.senders.filter((s: any) => s.senderType === 'gmail');
+          if (gmailSenders.length === 1) {
+            sender = gmailSenders[0];
+          } else if (gmailSenders.length > 1) {
+            const list = gmailSenders.map((s: any) => `${s.fromName} <${s.email}>`).join(', ');
+            return {
+              success: false,
+              message: 'Multiple Gmail senders',
+              error: `You have more than one Gmail sender: ${list}. Tell me which one to use by its email address.`,
+              availableSenders: gmailSenders.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName, senderType: 'gmail' })),
+            };
+          }
+        }
         if (!sender) {
-          const available = sendersResult.senders.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName }));
-          const list = available.map((s: any) => `${s.fromName} <${s.email}>`).join(', ');
+          const available = sendersResult.senders.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName, senderType: s.senderType === 'gmail' ? 'gmail' : 'resend' }));
+          const list = available.map((s: any) => `${s.fromName} <${s.email}> [${s.senderType}]`).join(', ');
           return {
             success: false,
             message: 'Sender not found',
