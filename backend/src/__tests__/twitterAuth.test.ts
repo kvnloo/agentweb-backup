@@ -127,6 +127,72 @@ describe('POST /finalize', () => {
   });
 });
 
+describe('POST /reconnect', () => {
+  it('returns an authorization url', async () => {
+    const res = await request(app).post('/api/oauth/twitter/reconnect');
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.url).toContain('oauth2');
+    expect(mockGenerateOAuth2AuthLink).toHaveBeenCalled();
+  });
+
+  it('returns 500 when getAppClient fails', async () => {
+    const { TwitterApi } = require('twitter-api-v2');
+    TwitterApi.mockImplementationOnce(() => { throw new Error('credentials unavailable'); });
+    const res = await request(app).post('/api/oauth/twitter/reconnect');
+    expect(res.status).toBe(500);
+  });
+});
+
+describe('POST /finalize — 500 error paths', () => {
+  it('returns 500 when loginWithOAuth2 throws', async () => {
+    await request(app).get('/api/oauth/twitter/init');
+    mockLoginWithOAuth2.mockRejectedValueOnce(new Error('X API down'));
+    const res = await request(app).post('/api/oauth/twitter/finalize').send({ code: 'C1', state: 'ST8' });
+    expect(res.status).toBe(500);
+  });
+
+  it('returns 500 when me() throws', async () => {
+    await request(app).get('/api/oauth/twitter/init');
+    mockMe.mockRejectedValueOnce(new Error('profile fetch failed'));
+    const res = await request(app).post('/api/oauth/twitter/finalize').send({ code: 'C1', state: 'ST8' });
+    expect(res.status).toBe(500);
+  });
+
+  it('returns 500 when createAccount throws', async () => {
+    await request(app).get('/api/oauth/twitter/init');
+    mockCreateAccount.mockRejectedValueOnce(new Error('DB write failed'));
+    const res = await request(app).post('/api/oauth/twitter/finalize').send({ code: 'C1', state: 'ST8' });
+    expect(res.status).toBe(500);
+  });
+
+  it('does not include OAuth tokens in the success response', async () => {
+    await request(app).get('/api/oauth/twitter/init');
+    const res = await request(app).post('/api/oauth/twitter/finalize').send({ code: 'C1', state: 'ST8' });
+    expect(res.status).toBe(200);
+    expect(res.body.account).not.toHaveProperty('config');
+    expect(res.body.account).toHaveProperty('platform', 'twitter');
+  });
+});
+
+describe('PKCE session security', () => {
+  it('rejects a finalize with an expired session', async () => {
+    await request(app).get('/api/oauth/twitter/init');
+    const realNow = Date.now;
+    jest.spyOn(Date, 'now').mockReturnValue(realNow() + 16 * 60 * 1000); // past 15-min TTL
+    const res = await request(app).post('/api/oauth/twitter/finalize').send({ code: 'C1', state: 'ST8' });
+    jest.spyOn(Date, 'now').mockRestore();
+    expect([400, 401, 403]).toContain(res.status);
+  });
+
+  it('rejects a second finalize with the same state (one-time use)', async () => {
+    await request(app).get('/api/oauth/twitter/init');
+    await request(app).post('/api/oauth/twitter/finalize').send({ code: 'C1', state: 'ST8' });
+    const res = await request(app).post('/api/oauth/twitter/finalize').send({ code: 'C1', state: 'ST8' });
+    expect([400, 401, 403]).toContain(res.status);
+  });
+});
+
 describe('DELETE /disconnect', () => {
   it('removes the connected account', async () => {
     const res = await request(app).delete('/api/oauth/twitter/disconnect').send({ accountId: '999' });

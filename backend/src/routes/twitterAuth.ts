@@ -23,6 +23,7 @@ interface PkceSession {
   expires: number;
 }
 
+const MAX_PKCE_SESSIONS_PER_USER = 5;
 const pkceSessions = new Map<string, PkceSession>();
 
 setInterval(() => {
@@ -32,8 +33,13 @@ setInterval(() => {
   }
 }, SESSION_CLEANUP_INTERVAL_MS).unref();
 
-const storePkceSession = (state: string, userId: string, codeVerifier: string): void => {
+// Returns false when the per-user cap is already reached, so the route can
+// return 429 instead of growing the map without bound (authenticated DoS).
+const storePkceSession = (state: string, userId: string, codeVerifier: string): boolean => {
+  const userCount = [...pkceSessions.values()].filter(s => s.userId === userId).length;
+  if (userCount >= MAX_PKCE_SESSIONS_PER_USER) return false;
   pkceSessions.set(state, { userId, codeVerifier, expires: Date.now() + PKCE_SESSION_TTL_MS });
+  return true;
 };
 
 const retrievePkceSession = (state: string, userId: string): string | null => {
@@ -54,7 +60,9 @@ router.get('/init', authenticateToken, async (req: any, res) => {
     const { url, codeVerifier, state } = client.generateOAuth2AuthLink(getRedirectUri(), {
       scope: TWITTER_SCOPES,
     });
-    storePkceSession(state, req.user.userId, codeVerifier);
+    if (!storePkceSession(state, req.user.userId, codeVerifier)) {
+      return res.status(429).json({ error: 'Too many pending OAuth sessions. Complete or wait for existing sessions to expire.' });
+    }
     // force_login=true makes X show a fresh login page instead of the
     // "re-authorize this app" screen, so users can connect a second account.
     const authUrl = new URL(url);
@@ -72,14 +80,20 @@ router.get('/callback', (req, res) => {
   const { code, state, error } = req.query;
   const frontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
+  const buildCallbackUrl = (params: Record<string, string>) => {
+    const u = new URL(`${frontendUrl}/oauth/twitter/callback`);
+    for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+    return u.toString();
+  };
+
   if (error) {
-    return res.redirect(`${frontendUrl}/oauth/twitter/callback?error=twitter_access_denied&details=${error}`);
+    return res.redirect(buildCallbackUrl({ error: 'twitter_access_denied', details: String(error) }));
   }
   if (!code) {
-    return res.redirect(`${frontendUrl}/oauth/twitter/callback?error=no_code_provided`);
+    return res.redirect(buildCallbackUrl({ error: 'no_code_provided' }));
   }
 
-  res.redirect(`${frontendUrl}/oauth/twitter/callback?code=${code}&state=${state}`);
+  res.redirect(buildCallbackUrl({ code: String(code), state: String(state) }));
 });
 
 // ── POST /finalize — exchange code for tokens, persist account ──────────────
@@ -127,7 +141,11 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
       config,
     });
 
-    res.json({ success: true, account });
+    // Strip OAuth tokens from the response — the frontend only needs account
+    // metadata; sending access_token/refresh_token risks leaking them into
+    // ALB logs, browser history, or middleware caches.
+    const { config: _config, ...safeAccount } = account;
+    res.json({ success: true, account: safeAccount });
   } catch (error: any) {
     console.error('[Twitter OAuth /finalize]', error);
     const details = IS_PRODUCTION ? undefined : error.message;
@@ -143,7 +161,9 @@ router.post('/reconnect', authenticateToken, async (req: any, res) => {
     const { url, codeVerifier, state } = client.generateOAuth2AuthLink(getRedirectUri(), {
       scope: TWITTER_SCOPES,
     });
-    storePkceSession(state, req.user.userId, codeVerifier);
+    if (!storePkceSession(state, req.user.userId, codeVerifier)) {
+      return res.status(429).json({ error: 'Too many pending OAuth sessions. Complete or wait for existing sessions to expire.' });
+    }
     res.json({ success: true, url });
   } catch (error: any) {
     console.error('[Twitter OAuth /reconnect]', error);

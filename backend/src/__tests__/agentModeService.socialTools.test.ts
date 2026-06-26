@@ -198,8 +198,7 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should successfully post content to account', async () => {
-      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
-      mockIsTokenValid.mockResolvedValue(true);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
       mockAdapter.createPost.mockResolvedValue({
         success: true,
         message: 'Posted successfully',
@@ -214,7 +213,7 @@ describe('AgentModeService - Social Media Tools', () => {
         []
       );
 
-      expect(mockGetAccountById).toHaveBeenCalledWith('urn:li:organization:123456', 'user-123');
+      expect(mockGetAccountsWithOwnerIncludingOrgShared).toHaveBeenCalledWith('user-123');
       expect(mockAdapter.createPost).toHaveBeenCalledWith(
         mockLinkedInAccount,
         'Hello from the API!',
@@ -227,7 +226,7 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should return error when account not found', async () => {
-      mockGetAccountById.mockResolvedValue(null);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
 
       const result = await service.postOnConnectedAccount(
         'user-123',
@@ -240,9 +239,7 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should return error when adapter fails due to expired token', async () => {
-      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
-      // The implementation doesn't check isTokenValid - it lets the adapter handle token refresh
-      // So we need to mock the adapter throwing an error when token refresh fails
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
       mockAdapter.createPost.mockRejectedValue(new Error('LinkedIn access token expired. Please reconnect your account.'));
 
       const result = await service.postOnConnectedAccount(
@@ -256,8 +253,7 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should handle adapter errors', async () => {
-      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
-      mockIsTokenValid.mockResolvedValue(true);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
       mockAdapter.createPost.mockRejectedValue(new Error('LinkedIn API error'));
 
       const result = await service.postOnConnectedAccount(
@@ -273,13 +269,11 @@ describe('AgentModeService - Social Media Tools', () => {
     // ── Auto-resolution (no account_id provided) ──
     it('auto-resolves to the only connected social account when account_id is omitted', async () => {
       mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockTwitterAccount] as any);
-      mockGetAccountById.mockResolvedValue(mockTwitterAccount as any);
       mockAdapter.createPost.mockResolvedValue({ success: true, message: 'Posted', postId: 'tw-1', postUrl: 'https://x.com/tw-1' });
 
       const result = await service.postOnConnectedAccount('user-123', undefined, 'Hello Twitter!');
 
       expect(mockGetAccountsWithOwnerIncludingOrgShared).toHaveBeenCalledWith('user-123');
-      expect(mockGetAccountById).toHaveBeenCalledWith('twitter-user-123', 'user-123');
       expect(result.success).toBe(true);
     });
 
@@ -307,12 +301,11 @@ describe('AgentModeService - Social Media Tools', () => {
     // ── Platform hint (multiple accounts, platform narrows to one) ──
     it('resolves correct account when platform hint narrows multiple accounts to one', async () => {
       mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockTwitterAccount, mockLinkedInAccount] as any);
-      mockGetAccountById.mockResolvedValue(mockTwitterAccount as any);
       mockAdapter.createPost.mockResolvedValue({ success: true, message: 'Posted', postId: 'tw-1', postUrl: 'https://x.com/tw-1' });
 
       const result = await service.postOnConnectedAccount('user-123', undefined, 'Hello Twitter!', [], 'twitter');
 
-      expect(mockGetAccountById).toHaveBeenCalledWith('twitter-user-123', 'user-123');
+      expect(mockGetAccountsWithOwnerIncludingOrgShared).toHaveBeenCalledWith('user-123');
       expect(result.success).toBe(true);
     });
 
@@ -338,14 +331,14 @@ describe('AgentModeService - Social Media Tools', () => {
       expect(mockGetAccountById).not.toHaveBeenCalled();
     });
 
-    it('explicit account_id bypasses auto-resolution entirely', async () => {
-      mockGetAccountById.mockResolvedValue(mockTwitterAccount as any);
+    it('explicit account_id uses org-shared account list to find the account', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockTwitterAccount] as any);
       mockAdapter.createPost.mockResolvedValue({ success: true, message: 'Posted', postId: 'tw-1', postUrl: 'https://x.com/tw-1' });
 
-      await service.postOnConnectedAccount('user-123', 'twitter-user-123', 'Hello!', [], 'twitter');
+      const result = await service.postOnConnectedAccount('user-123', 'twitter-user-123', 'Hello!', [], 'twitter');
 
-      expect(mockGetAccountsWithOwnerIncludingOrgShared).not.toHaveBeenCalled();
-      expect(mockGetAccountById).toHaveBeenCalledWith('twitter-user-123', 'user-123');
+      expect(mockGetAccountsWithOwnerIncludingOrgShared).toHaveBeenCalledWith('user-123');
+      expect(result.success).toBe(true);
     });
   });
 

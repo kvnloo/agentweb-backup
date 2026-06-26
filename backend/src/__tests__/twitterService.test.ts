@@ -16,6 +16,13 @@ const mockBlock = jest.fn();
 const mockUnblock = jest.fn();
 const mockMute = jest.fn();
 const mockUnmute = jest.fn();
+const mockFollow = jest.fn();
+const mockUnfollow = jest.fn();
+const mockFollowers = jest.fn();
+const mockFollowing = jest.fn();
+const mockBookmark = jest.fn();
+const mockBookmarks = jest.fn();
+const mockListDmEventsWithParticipant = jest.fn();
 const mockReply = jest.fn();
 const mockTweetThread = jest.fn();
 const mockSendDmToParticipant = jest.fn();
@@ -45,6 +52,13 @@ jest.mock('twitter-api-v2', () => ({
         unblock: (...a: any[]) => mockUnblock(...a),
         mute: (...a: any[]) => mockMute(...a),
         unmute: (...a: any[]) => mockUnmute(...a),
+        follow: (...a: any[]) => mockFollow(...a),
+        unfollow: (...a: any[]) => mockUnfollow(...a),
+        followers: (...a: any[]) => mockFollowers(...a),
+        following: (...a: any[]) => mockFollowing(...a),
+        bookmark: (...a: any[]) => mockBookmark(...a),
+        bookmarks: (...a: any[]) => mockBookmarks(...a),
+        listDmEventsWithParticipant: (...a: any[]) => mockListDmEventsWithParticipant(...a),
         reply: (...a: any[]) => mockReply(...a),
         tweetThread: (...a: any[]) => mockTweetThread(...a),
         sendDmToParticipant: (...a: any[]) => mockSendDmToParticipant(...a),
@@ -515,6 +529,7 @@ describe('TwitterService.listReplies', () => {
 
 describe('TwitterService.searchTweets', () => {
   beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
     mockSearch.mockResolvedValue({ data: { data: [{ id: 's1', text: 'hit' }] } });
   });
 
@@ -541,6 +556,10 @@ describe('TwitterService.searchTweets', () => {
 // ─── getUserTweets max_results clamping ────────────────────────────────────────
 
 describe('TwitterService.getUserTweets', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+  });
+
   // The user-timeline endpoint requires max_results between 5 and 100.
   it('floors maxResults to the endpoint minimum of 5', async () => {
     await twitterService.getUserTweets(OWNER, ACCOUNT_ID, '@target', 1);
@@ -728,6 +747,146 @@ describe('TwitterService.muteUser / unmuteUser', () => {
 
   it('unmuteUser throws when handle is empty', async () => {
     await expect(twitterService.unmuteUser(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/handle/i);
+  });
+});
+
+// ─── follow / unfollow ────────────────────────────────────────────────────────
+
+describe('TwitterService.followUser / unfollowUser', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockUserByUsername.mockResolvedValue({ data: { id: 'target-uid', username: 'target' } });
+    mockFollow.mockResolvedValue({ data: { following: true } });
+    mockUnfollow.mockResolvedValue({ data: { following: false } });
+  });
+
+  it('followUser calls follow with myId and resolved targetId', async () => {
+    await twitterService.followUser(OWNER, ACCOUNT_ID, 'target');
+    expect(mockFollow).toHaveBeenCalledWith('12345', 'target-uid');
+  });
+
+  it('followUser returns data', async () => {
+    const res = await twitterService.followUser(OWNER, ACCOUNT_ID, 'target');
+    expect(res.following).toBe(true);
+  });
+
+  it('unfollowUser calls unfollow with myId and resolved targetId', async () => {
+    await twitterService.unfollowUser(OWNER, ACCOUNT_ID, 'target');
+    expect(mockUnfollow).toHaveBeenCalledWith('12345', 'target-uid');
+  });
+
+  it('unfollowUser returns data', async () => {
+    const res = await twitterService.unfollowUser(OWNER, ACCOUNT_ID, 'target');
+    expect(res.following).toBe(false);
+  });
+
+  it('followUser throws when handle is empty', async () => {
+    await expect(twitterService.followUser(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/handle/i);
+  });
+
+  it('unfollowUser throws when handle is empty', async () => {
+    await expect(twitterService.unfollowUser(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/handle/i);
+  });
+});
+
+// ─── listFollowers / listFollowing ────────────────────────────────────────────
+
+describe('TwitterService.listFollowers / listFollowing', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockUserByUsername.mockResolvedValue({ data: { id: 'other-uid', username: 'other' } });
+    mockFollowers.mockResolvedValue({ data: [{ id: 'f1', username: 'alice' }] });
+    mockFollowing.mockResolvedValue({ data: [{ id: 'f2', username: 'bob' }] });
+  });
+
+  it('listFollowers calls followers with own id when no handle given', async () => {
+    await twitterService.listFollowers(OWNER, ACCOUNT_ID);
+    expect(mockFollowers).toHaveBeenCalledWith('12345');
+  });
+
+  it('listFollowers calls followers with resolved targetId when handle given', async () => {
+    await twitterService.listFollowers(OWNER, ACCOUNT_ID, 'other');
+    expect(mockFollowers).toHaveBeenCalledWith('other-uid');
+  });
+
+  it('listFollowers returns array of users', async () => {
+    const res = await twitterService.listFollowers(OWNER, ACCOUNT_ID);
+    expect(res).toHaveLength(1);
+    expect(res[0].username).toBe('alice');
+  });
+
+  it('listFollowing calls following with own id when no handle given', async () => {
+    await twitterService.listFollowing(OWNER, ACCOUNT_ID);
+    expect(mockFollowing).toHaveBeenCalledWith('12345');
+  });
+
+  it('listFollowing returns array of users', async () => {
+    const res = await twitterService.listFollowing(OWNER, ACCOUNT_ID);
+    expect(res).toHaveLength(1);
+    expect(res[0].username).toBe('bob');
+  });
+});
+
+// ─── bookmarkTweet / getBookmarks ─────────────────────────────────────────────
+
+describe('TwitterService.bookmarkTweet / getBookmarks', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockBookmark.mockResolvedValue({ data: { bookmarked: true } });
+    mockBookmarks.mockResolvedValue({ data: { data: [{ id: 'bm1', text: 'saved' }] } });
+  });
+
+  it('bookmarkTweet calls bookmark with the tweet id', async () => {
+    await twitterService.bookmarkTweet(OWNER, ACCOUNT_ID, 'tw99');
+    expect(mockBookmark).toHaveBeenCalledWith('tw99');
+  });
+
+  it('bookmarkTweet returns data', async () => {
+    const res = await twitterService.bookmarkTweet(OWNER, ACCOUNT_ID, 'tw99');
+    expect(res.bookmarked).toBe(true);
+  });
+
+  it('bookmarkTweet throws when tweet_id is empty', async () => {
+    await expect(twitterService.bookmarkTweet(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/tweet_id/i);
+  });
+
+  it('getBookmarks calls bookmarks and returns the list', async () => {
+    const res = await twitterService.getBookmarks(OWNER, ACCOUNT_ID);
+    expect(mockBookmarks).toHaveBeenCalled();
+    expect(res).toHaveLength(1);
+    expect(res[0].text).toBe('saved');
+  });
+
+  it('getBookmarks returns empty array when API returns no data', async () => {
+    mockBookmarks.mockResolvedValue({ data: { data: [] } });
+    const res = await twitterService.getBookmarks(OWNER, ACCOUNT_ID);
+    expect(res).toEqual([]);
+  });
+});
+
+// ─── getDmConversation ────────────────────────────────────────────────────────
+
+describe('TwitterService.getDmConversation', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockUserByUsername.mockResolvedValue({ data: { id: 'part-uid', username: 'partner' } });
+    mockListDmEventsWithParticipant.mockResolvedValue({ data: { data: [{ id: 'dm2', text: 'hello' }] } });
+  });
+
+  it('resolves handle to participantId then calls listDmEventsWithParticipant', async () => {
+    await twitterService.getDmConversation(OWNER, ACCOUNT_ID, 'partner');
+    expect(mockUserByUsername).toHaveBeenCalledWith('partner');
+    expect(mockListDmEventsWithParticipant).toHaveBeenCalledWith('part-uid');
+  });
+
+  it('returns the dm event array', async () => {
+    const res = await twitterService.getDmConversation(OWNER, ACCOUNT_ID, 'partner');
+    expect(res).toHaveLength(1);
+    expect(res[0].text).toBe('hello');
+  });
+
+  it('throws when handle is empty', async () => {
+    await expect(twitterService.getDmConversation(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/handle/i);
   });
 });
 

@@ -214,7 +214,9 @@ export class TwitterService {
       const account = await this.resolveAccount(ownerUserId, accountId);
       const config = account.config as TwitterXConfig;
       if (!config.refresh_token) {
-        throw new Error('No refresh_token available');
+        const err = new Error('No refresh_token available');
+        (err as any).isXTokenRefreshFailure = true;
+        throw err;
       }
       this.log(`Force-refreshing token for account ${accountId} (bypass expiry check)`);
       let refreshed: any;
@@ -222,7 +224,11 @@ export class TwitterService {
         const app = await this.getAppClient();
         refreshed = await app.refreshOAuth2Token(config.refresh_token);
       } catch {
-        throw new Error('X token refresh failed — refresh token may be revoked');
+        // Tag so withRetryOn401 knows to mark needs_reconnect only for this case,
+        // not for infra errors (DynamoDB timeouts etc.) from resolveAccount above.
+        const err = new Error('X token refresh failed — refresh token may be revoked');
+        (err as any).isXTokenRefreshFailure = true;
+        throw err;
       }
       await updateAccountTokens(
         ownerUserId,
@@ -278,8 +284,13 @@ export class TwitterService {
       let freshClient: TwitterApi;
       try {
         freshClient = await this.forceRefresh(ownerUserId, accountId);
-      } catch {
-        await this.markNeedsReconnect(ownerUserId, accountId);
+      } catch (refreshErr: any) {
+        // Only mark needs_reconnect when the X token exchange itself failed
+        // (isXTokenRefreshFailure). Infrastructure errors (DynamoDB timeouts,
+        // network blips inside resolveAccount) must not permanently disable the account.
+        if (refreshErr?.isXTokenRefreshFailure) {
+          await this.markNeedsReconnect(ownerUserId, accountId);
+        }
         throw new Error(
           'Your X account needs to be reconnected. Go to Settings → Connected Accounts and reconnect your X account.'
         );

@@ -659,28 +659,3 @@ export async function getAttioConfig(): Promise<AttioOAuthConfig> {
   return cachedAttioConfig;
 }
 
-export interface TwitterOAuthConfig {
-  clientId: string;
-  clientSecret: string;
-  redirectUri: string;
-  scopes: string[];
-}
-
-let cachedTwitterConfig: TwitterOAuthConfig | null = null;
-let twitterConfigCacheExpiresAt = 0;
-const TWITTER_CONFIG_CACHE_TTL_MS = 5 * 60 * 1000;
-
-export async function getTwitterConfig(): Promise<TwitterOAuthConfig> {
-  if (cachedTwitterConfig && Date.now() < twitterConfigCacheExpiresAt) {
-    return cachedTwitterConfig;
-  }
-  const credentials = await getTwitterCredentials();
-  cachedTwitterConfig = {
-    clientId: credentials.clientId,
-    clientSecret: credentials.clientSecret,
-    redirectUri: INTEGRATION_CONFIG.twitter.redirectUri,
-    scopes: INTEGRATION_CONFIG.twitter.scopes,
-  };
-  twitterConfigCacheExpiresAt = Date.now() + TWITTER_CONFIG_CACHE_TTL_MS;
-  return cachedTwitterConfig;
-}

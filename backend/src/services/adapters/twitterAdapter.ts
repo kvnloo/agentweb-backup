@@ -5,8 +5,10 @@ import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnal
 export class TwitterAdapter implements SocialPlatformAdapter {
 
   async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string): Promise<PostResult> {
-    if (!userId) throw new Error('userId is required to post on X');
-    const result = await twitterService.postTweet(userId, account.account_id, content);
+    // account.userId is the token owner (differs from userId for org-shared accounts).
+    const ownerUserId = (account as any).userId || userId;
+    if (!ownerUserId) throw new Error('userId is required to post on X');
+    const result = await twitterService.postTweet(ownerUserId, account.account_id, content);
     return {
       success: true,
       message: 'Posted successfully on X (Twitter)',
