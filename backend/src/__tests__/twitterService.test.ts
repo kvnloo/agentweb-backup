@@ -730,3 +730,99 @@ describe('TwitterService.muteUser / unmuteUser', () => {
     await expect(twitterService.unmuteUser(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/handle/i);
   });
 });
+
+// ─── Concurrent refresh deduplication (race condition fix) ────────────────────
+describe('TwitterService.getClient — concurrent refresh deduplication', () => {
+  it('makes only one X API refresh call when two requests race on an expired token', async () => {
+    const expiredAccount = makeAccount({ token_expires_at: Date.now() - 1000 });
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount]);
+    // Simulate a slow refresh so both concurrent calls overlap.
+    mockRefreshOAuth2Token.mockImplementation(
+      () => new Promise(resolve => setTimeout(() => resolve({ accessToken: 'access-new', refreshToken: 'refresh-new', expiresIn: 7200 }), 20))
+    );
+    mockUpdateAccountTokens.mockResolvedValue(undefined);
+
+    const [r1, r2] = await Promise.all([
+      twitterService.getClient(OWNER, ACCOUNT_ID),
+      twitterService.getClient(OWNER, ACCOUNT_ID),
+    ]);
+
+    // Only one refresh call should have been made despite two concurrent requests.
+    expect(mockRefreshOAuth2Token).toHaveBeenCalledTimes(1);
+    // Both callers should receive a valid client.
+    expect(r1).toBeDefined();
+    expect(r2).toBeDefined();
+  });
+
+  it('does not mark needs_reconnect when the second concurrent call joins an in-flight refresh', async () => {
+    const expiredAccount = makeAccount({ token_expires_at: Date.now() - 1000 });
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount]);
+    mockRefreshOAuth2Token.mockImplementation(
+      () => new Promise(resolve => setTimeout(() => resolve({ accessToken: 'access-new', refreshToken: 'refresh-new', expiresIn: 7200 }), 20))
+    );
+    mockUpdateAccountTokens.mockResolvedValue(undefined);
+
+    await Promise.all([
+      twitterService.getClient(OWNER, ACCOUNT_ID),
+      twitterService.getClient(OWNER, ACCOUNT_ID),
+    ]);
+
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalledWith(
+      expect.anything(), expect.anything(), expect.anything(),
+      expect.objectContaining({ needs_reconnect: true })
+    );
+  });
+
+  it('makes only one X API refresh call when two withRetryOn401 calls race on a 401', async () => {
+    // Both postTweet calls have a valid token initially (not expired),
+    // so getClient returns without refreshing. Then both hit a 401 mid-call
+    // and both race into forceRefresh simultaneously. The second should join
+    // the first's in-flight promise rather than calling refreshOAuth2Token again.
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockRefreshOAuth2Token.mockImplementation(
+      () => new Promise(resolve => setTimeout(() => resolve({ accessToken: 'access-new', refreshToken: 'refresh-new', expiresIn: 7200 }), 20))
+    );
+    mockUpdateAccountTokens.mockResolvedValue(undefined);
+    // First call from each postTweet returns 401; second call (after forceRefresh) succeeds.
+    let callCount = 0;
+    mockTweet.mockImplementation(() => {
+      callCount++;
+      // Calls 1 and 2 are the initial attempts (both 401); calls 3 and 4 are the retries.
+      if (callCount <= 2) return Promise.reject(makeXAuthError());
+      return Promise.resolve({ data: { id: String(callCount), text: 'retried' } });
+    });
+
+    const [r1, r2] = await Promise.all([
+      twitterService.postTweet(OWNER, ACCOUNT_ID, 'msg-1'),
+      twitterService.postTweet(OWNER, ACCOUNT_ID, 'msg-2'),
+    ]);
+
+    expect(mockRefreshOAuth2Token).toHaveBeenCalledTimes(1);
+    expect(r1).toBeDefined();
+    expect(r2).toBeDefined();
+  });
+
+  it('does not mark needs_reconnect when two concurrent forceRefresh calls share one refresh', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockRefreshOAuth2Token.mockImplementation(
+      () => new Promise(resolve => setTimeout(() => resolve({ accessToken: 'access-new', refreshToken: 'refresh-new', expiresIn: 7200 }), 20))
+    );
+    mockUpdateAccountTokens.mockResolvedValue(undefined);
+    let callCount = 0;
+    mockTweet.mockImplementation(() => {
+      callCount++;
+      if (callCount <= 2) return Promise.reject(makeXAuthError());
+      return Promise.resolve({ data: { id: String(callCount), text: 'retried' } });
+    });
+
+    await Promise.all([
+      twitterService.postTweet(OWNER, ACCOUNT_ID, 'msg-1'),
+      twitterService.postTweet(OWNER, ACCOUNT_ID, 'msg-2'),
+    ]);
+
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalledWith(
+      expect.anything(), expect.anything(), expect.anything(),
+      expect.objectContaining({ needs_reconnect: true })
+    );
+  });
+});

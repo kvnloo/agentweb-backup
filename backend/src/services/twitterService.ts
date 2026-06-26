@@ -32,6 +32,15 @@ export class TwitterService {
   private cachedClientId: string | null = null;
   private cachedClientSecret: string | null = null;
 
+  /**
+   * Deduplicates concurrent token refreshes per account.
+   * Twitter uses rotating refresh tokens — if two requests both try to refresh
+   * simultaneously, the second call uses an already-invalidated refresh token
+   * and fails, causing markNeedsReconnect to fire incorrectly.
+   * Any concurrent refresh for the same accountId waits on the same Promise.
+   */
+  private readonly refreshInFlight = new Map<string, Promise<string>>();
+
   // ─── Logging ────────────────────────────────────────────────────────────────
   private log(message: string, data?: any) {
     console.log(`[TwitterService] ${message}`, data ? JSON.stringify(data, null, 2) : '');
@@ -123,31 +132,46 @@ export class TwitterService {
           'Your X account needs to be reconnected. Go to Settings → Connected Accounts and reconnect your X account.'
         );
       }
-      this.log(`Refreshing expired token for account ${accountId}`);
-      // Only wrap the X API call — updateAccountTokens is a DB write and its
-      // failures should propagate as-is (a DB error is not a token error).
-      let refreshed: any;
-      try {
-        const app = await this.getAppClient();
-        refreshed = await app.refreshOAuth2Token(config.refresh_token);
-      } catch (refreshErr) {
-        this.log(`Pre-emptive refresh failed for account ${accountId} — marking needs_reconnect`, refreshErr);
-        await this.markNeedsReconnect(ownerUserId, accountId);
-        throw new Error(
-          'Your X account needs to be reconnected. Go to Settings → Connected Accounts and reconnect your X account.'
-        );
+      // Deduplicate: if a refresh is already in-flight for this account, wait on
+      // it instead of making a second call with the same (soon-to-be-rotated) refresh token.
+      const inFlight = this.refreshInFlight.get(accountId);
+      if (inFlight) {
+        this.log(`Joining in-flight token refresh for account ${accountId}`);
+        accessToken = await inFlight;
+      } else {
+        this.log(`Refreshing expired token for account ${accountId}`);
+        const refreshPromise = (async (): Promise<string> => {
+          let refreshed: any;
+          try {
+            const app = await this.getAppClient();
+            refreshed = await app.refreshOAuth2Token(config.refresh_token);
+          } catch (refreshErr) {
+            this.log(`Pre-emptive refresh failed for account ${accountId} — marking needs_reconnect`, refreshErr);
+            await this.markNeedsReconnect(ownerUserId, accountId);
+            throw new Error(
+              'Your X account needs to be reconnected. Go to Settings → Connected Accounts and reconnect your X account.'
+            );
+          }
+          await updateAccountTokens(
+            ownerUserId,
+            'twitter',
+            {
+              access_token: refreshed.accessToken,
+              refresh_token: refreshed.refreshToken ?? config.refresh_token,
+              token_expires_at: Date.now() + (refreshed.expiresIn ?? 7200) * 1000,
+            },
+            accountId
+          );
+          return refreshed.accessToken as string;
+        })();
+
+        this.refreshInFlight.set(accountId, refreshPromise);
+        try {
+          accessToken = await refreshPromise;
+        } finally {
+          this.refreshInFlight.delete(accountId);
+        }
       }
-      accessToken = refreshed.accessToken;
-      await updateAccountTokens(
-        ownerUserId,
-        'twitter',
-        {
-          access_token: refreshed.accessToken,
-          refresh_token: refreshed.refreshToken ?? config.refresh_token,
-          token_expires_at: Date.now() + (refreshed.expiresIn ?? 7200) * 1000,
-        },
-        accountId
-      );
     }
 
     return new TwitterApi(accessToken);
@@ -172,36 +196,60 @@ export class TwitterService {
    * is picked up without a UI reload.
    */
   private async forceRefresh(ownerUserId: string, accountId: string): Promise<TwitterApi> {
-    const account = await this.resolveAccount(ownerUserId, accountId);
-    const config = account.config as TwitterXConfig;
-    if (!config.refresh_token) {
-      throw new Error('No refresh_token available');
+    // Deduplicate: if any refresh (pre-emptive or forced) is already in-flight for
+    // this account, join it instead of racing with a second call on the same refresh token.
+    const inFlight = this.refreshInFlight.get(accountId);
+    if (inFlight) {
+      this.log(`Joining in-flight token refresh for force-refresh of account ${accountId}`);
+      const accessToken = await inFlight;
+      return new TwitterApi(accessToken);
     }
-    this.log(`Force-refreshing token for account ${accountId} (bypass expiry check)`);
-    // Only wrap the X API call — let DB write errors propagate naturally so
-    // callers don't mistakenly mark needs_reconnect on a DB failure.
-    let refreshed: any;
+
+    // IMPORTANT: resolveAccount is moved inside the IIFE so that refreshInFlight.set()
+    // happens synchronously right after the map check (no await in between). Without this,
+    // two concurrent forceRefresh calls both pass the empty-map check before either sets
+    // the entry — classic TOCTOU leading to two refreshOAuth2Token calls on the same
+    // rotating refresh token, causing the second to fail and trigger needs_reconnect.
+    const refreshPromise = (async (): Promise<string> => {
+      const account = await this.resolveAccount(ownerUserId, accountId);
+      const config = account.config as TwitterXConfig;
+      if (!config.refresh_token) {
+        throw new Error('No refresh_token available');
+      }
+      this.log(`Force-refreshing token for account ${accountId} (bypass expiry check)`);
+      let refreshed: any;
+      try {
+        const app = await this.getAppClient();
+        refreshed = await app.refreshOAuth2Token(config.refresh_token);
+      } catch {
+        throw new Error('X token refresh failed — refresh token may be revoked');
+      }
+      await updateAccountTokens(
+        ownerUserId,
+        'twitter',
+        {
+          access_token: refreshed.accessToken,
+          refresh_token: refreshed.refreshToken ?? config.refresh_token,
+          token_expires_at: Date.now() + (refreshed.expiresIn ?? 7200) * 1000,
+        },
+        accountId
+      );
+      // Clear the reconnect flag if it was set — the refresh token is still good.
+      if (config.needs_reconnect) {
+        await updateAccountConfig(ownerUserId, 'twitter', accountId, { needs_reconnect: false });
+      }
+      return refreshed.accessToken as string;
+    })();
+
+    // Set synchronously (no await between check above and this line) so concurrent
+    // callers see the entry immediately when JS resumes them.
+    this.refreshInFlight.set(accountId, refreshPromise);
     try {
-      const app = await this.getAppClient();
-      refreshed = await app.refreshOAuth2Token(config.refresh_token);
-    } catch {
-      throw new Error('X token refresh failed — refresh token may be revoked');
+      const accessToken = await refreshPromise;
+      return new TwitterApi(accessToken);
+    } finally {
+      this.refreshInFlight.delete(accountId);
     }
-    await updateAccountTokens(
-      ownerUserId,
-      'twitter',
-      {
-        access_token: refreshed.accessToken,
-        refresh_token: refreshed.refreshToken ?? config.refresh_token,
-        token_expires_at: Date.now() + (refreshed.expiresIn ?? 7200) * 1000,
-      },
-      accountId
-    );
-    // Clear the reconnect flag if it was set — the refresh token is still good.
-    if (config.needs_reconnect) {
-      await updateAccountConfig(ownerUserId, 'twitter', accountId, { needs_reconnect: false });
-    }
-    return new TwitterApi(refreshed.accessToken);
   }
 
   /**
