@@ -184,16 +184,31 @@ export class HubspotAdapter implements CrmAdapter {
         }
 
         // ── 3. Sync leads — batched or per-lead, depending on the feature flag ───
+        // Collects succeeded contact IDs across both paths for post-sync import.
+        const allContactIds = new Set<string>();
+
         if (!this.batchEnabled()) {
             await this.pushLeadsPerLead(
                 svc, leads, config, result,
-                effectiveCustomMapping, listIdentityProps, resolvedListName,
+                effectiveCustomMapping, listIdentityProps, resolvedListName, allContactIds,
             );
         } else {
             await this.pushLeadsBatched(
                 svc, leads, config, result, dealMappings,
-                effectiveCustomMapping, listIdentityProps, resolvedListName,
+                effectiveCustomMapping, listIdentityProps, resolvedListName, allContactIds,
             );
+        }
+
+        // Post-sync: mark contacts as non-marketing via HubSpot Imports API.
+        // Async on HubSpot's side — changes reflect within seconds to minutes.
+        // Non-critical: a failure here is logged but does NOT fail the sync.
+        if (config.hubspotMarkAsNonMarketing && allContactIds.size > 0) {
+            try {
+                const jobId = await svc.importContactsMarketableStatus([...allContactIds], false);
+                console.log(`[HubspotAdapter] marketing status import started: jobId=${jobId} contacts=${allContactIds.size}`);
+            } catch (err: any) {
+                console.warn(`[HubspotAdapter] marketing status import failed (non-critical): ${this.formatError(err)}`);
+            }
         }
 
         return result;
@@ -213,6 +228,7 @@ export class HubspotAdapter implements CrmAdapter {
         effectiveCustomMapping: FieldMapping[],
         listIdentityProps: Set<string>,
         resolvedListName: string | undefined,
+        contactIdCollector?: Set<string>,
     ): Promise<void> {
         const dealMappings = config.dealFieldMapping.filter(m => m.enabled && m.direction !== 'pull');
         for (const lead of leads) {
@@ -263,11 +279,12 @@ export class HubspotAdapter implements CrmAdapter {
                 };
 
                 let contactId: string;
+                let wasNew: boolean;
                 if (email) {
                     // Email present — find-or-create by email (dedup).
                     const upserted = await svc.upsertContact(contactData);
                     contactId = upserted.contactId;
-                    if (upserted.isNew) result.newCount++; else result.updatedCount++;
+                    wasNew = upserted.isNew;
                 } else {
                     // No email to dedup on. If we synced this lead before, update the
                     // known contact by id; otherwise create a fresh email-less contact.
@@ -276,15 +293,46 @@ export class HubspotAdapter implements CrmAdapter {
                     if (existingContactId) {
                         const updated = await svc.updateContact(existingContactId, contactData);
                         contactId = updated.contactId;
-                        result.updatedCount++;
+                        wasNew = false;
                     } else {
                         const created = await svc.createContact(contactData);
                         contactId = created.contactId;
-                        result.newCount++;
+                        wasNew = true;
                     }
+                }
+                if (wasNew) result.newCount++; else result.updatedCount++;
+
+                // Two-step lifecycle stage update (read → clear → set, with restore
+                // on failure). Overcomes HubSpot's forward-only restriction. Skip if a
+                // per-lead mapping already set lifecyclestage on the upsert above.
+                // A failure here means the contact did NOT reach the target stage, so
+                // the lead is recorded as an error (and healed on the next push)
+                // rather than reported as a clean success — but the contact id is
+                // still persisted so the link isn't lost. Deal sync is skipped for a
+                // failed lead; a re-push re-runs it idempotently.
+                let lifecycleReason: string | null = null;
+                if (config.hubspotLifecycleStage && !('lifecyclestage' in allContactProps)) {
+                    const r = await this.applyLifecycleStageSingle(svc, contactId, config.hubspotLifecycleStage);
+                    if (!r.ok) lifecycleReason = r.reason;
+                }
+
+                if (lifecycleReason) {
+                    // Demote: count as error, undo the new/updated tally, preserve the
+                    // contact id in the failed metadata.
+                    if (wasNew) result.newCount--; else result.updatedCount--;
+                    result.errorCount++;
+                    const msg = `lifecycle stage not set — ${lifecycleReason}`;
+                    console.warn(`[HubspotAdapter] ${msg} for contact ${contactId} (lead=${lead.email || lead.leadId})`);
+                    result.errors.push(`${lead.email || lead.leadId}: ${msg}`);
+                    await this.persistSyncMetadata(lead, config.listId, {
+                        ...buildFailedMetadata(lead.syncMetadata, msg),
+                        hubspot_contact_id: contactId,
+                    });
+                    continue;
                 }
 
                 result.successCount++;
+                if (contactIdCollector) contactIdCollector.add(contactId);
 
                 // Persist HubSpot contact ID + synced status back to our DB.
                 await this.persistSyncMetadata(
@@ -330,6 +378,7 @@ export class HubspotAdapter implements CrmAdapter {
         effectiveCustomMapping: FieldMapping[],
         listIdentityProps: Set<string>,
         resolvedListName: string | undefined,
+        contactIdCollector?: Set<string>,
     ): Promise<void> {
         const t0 = Date.now();
 
@@ -341,6 +390,9 @@ export class HubspotAdapter implements CrmAdapter {
         }
         const emailLeads: PreppedLead[] = [];
         const emaillessLeads: any[] = [];
+        // Tracks leads where a per-lead field mapping already set lifecyclestage —
+        // these must skip the two-step so the explicit mapping value is preserved.
+        const perLeadLifecycleSet = new Set<any>();
 
         for (const lead of leads) {
             const email = typeof lead.email === 'string' ? lead.email.trim() : '';
@@ -371,6 +423,8 @@ export class HubspotAdapter implements CrmAdapter {
             // worth syncing — pushing it would create a junk contact tagged with a list.
             const hasRealProps = Object.keys(allContactProps).some(k => !listIdentityProps.has(k));
             if (!hasRealProps) continue;
+
+            if ('lifecyclestage' in allContactProps) perLeadLifecycleSet.add(lead);
 
             if (email) {
                 emailLeads.push({ lead, emailLower: email.toLowerCase(), allContactProps });
@@ -458,17 +512,54 @@ export class HubspotAdapter implements CrmAdapter {
             ),
         ]);
 
+        // Leads whose contact upserted but a post-upsert stage failed — tracked so
+        // each is demoted from success → error exactly once and is not re-processed
+        // by a later stage. A lead already failed here is already an error.
+        const postUpsertFailedLeads = new Set<any>();
+        const demote = (lead: any) => {
+            if (postUpsertFailedLeads.has(lead)) return;
+            postUpsertFailedLeads.add(lead);
+            result.successCount--;
+            if (isNewByLead.get(lead)) result.newCount--; else result.updatedCount--;
+        };
+
         // ── Stage 4: deals (only if deal mappings configured) ──────────────────
         if (dealMappings.length > 0 && succeededEmailLeads.length > 0) {
             // A lead's contact synced but its deal failed is NOT a clean success:
-            // demote it from success → error so successCount + errorCount still
-            // equals the leads attempted (pushDealsBatched records the error +
-            // collects the lead here). Counts each lead exactly once.
+            // pushDealsBatched records the error + collects the lead here; demote()
+            // drops the earlier success. Counts each lead exactly once.
             const dealFailedLeads = new Set<any>();
             await this.pushDealsBatched(svc, succeededEmailLeads, contactIdByLead, config, result, dealFailedLeads);
-            for (const lead of dealFailedLeads) {
-                result.successCount--;
-                if (isNewByLead.get(lead)) result.newCount--; else result.updatedCount--;
+            for (const lead of dealFailedLeads) demote(lead);
+        }
+
+        // ── Stage 4.5: lifecycle stage two-step (clear → set) ─────────────────
+        // HubSpot's forward-only restriction blocks downgrading an existing stage
+        // via a single PATCH, so we read each contact's current stage, clear it, then
+        // set the target — restoring the original if the set fails, so a contact is
+        // never left blank. Skips leads where a per-lead mapping already set
+        // lifecyclestage (the upsert applied the explicit value) and leads already
+        // failed by the deal stage (already errors — no point updating their stage,
+        // and re-counting would double the error). Each remaining lead that doesn't
+        // reach the target stage is recorded as an error and demoted.
+        if (config.hubspotLifecycleStage && succeededEmailLeads.length > 0) {
+            const lifecycleLeads = succeededEmailLeads.filter(
+                lead => !perLeadLifecycleSet.has(lead) && !postUpsertFailedLeads.has(lead),
+            );
+            const lifecycleFailedLeads = new Set<any>();
+            await this.applyLifecycleStageBatched(
+                svc, lifecycleLeads, contactIdByLead, config.hubspotLifecycleStage, config.listId, result, lifecycleFailedLeads,
+            );
+            for (const lead of lifecycleFailedLeads) demote(lead);
+        }
+
+        // Collect succeeded (non-failed) email-lead contact IDs for post-sync import.
+        if (contactIdCollector) {
+            for (const lead of succeededEmailLeads) {
+                if (!postUpsertFailedLeads.has(lead)) {
+                    const id = contactIdByLead.get(lead);
+                    if (id) contactIdCollector.add(id);
+                }
             }
         }
 
@@ -476,7 +567,7 @@ export class HubspotAdapter implements CrmAdapter {
         if (emaillessLeads.length > 0) {
             await this.pushLeadsPerLead(
                 svc, emaillessLeads, config, result,
-                effectiveCustomMapping, listIdentityProps, resolvedListName,
+                effectiveCustomMapping, listIdentityProps, resolvedListName, contactIdCollector,
             );
         }
 
@@ -688,6 +779,188 @@ export class HubspotAdapter implements CrmAdapter {
             writebacks.push(this.writebackDealId(item.lead, item.dealId, config));
         }
         await Promise.all(writebacks);
+    }
+
+    /**
+     * Applies a target lifecycle stage to a set of already-upserted contacts using
+     * the clear→set two-step that overcomes HubSpot's forward-only restriction
+     * (a single PATCH can't move a contact to an earlier stage).
+     *
+     * Per contact, working in 100-id chunks (the batch limit):
+     *   1. READ the contact's current lifecyclestage (so a failed set can be rolled
+     *      back, and so we can skip contacts already at the target — making a
+     *      re-push nearly free and avoiding needless writes).
+     *   2. SKIP contacts already at the target.
+     *   3. CLEAR the stage (set to '').
+     *   4. SET the target stage.
+     *   5. If SET fails, best-effort RESTORE the original stage so the contact is
+     *      never left blank, and mark the lead failed.
+     *
+     * There is NO cross-call transaction in HubSpot, so this is best-effort: a
+     * contact that fails the set (and possibly the restore) is recorded in
+     * `failedLeads` + as an error + flagged in syncMetadata, and is healed on the
+     * next push (the stage is re-applied every push). failedLeads excludes leads
+     * whose stage was already correct or successfully set.
+     *
+     * Failures are isolated per contact-id via splitAndRetry (mirrors the deal
+     * stage), so one bad id never fails a whole chunk. Each step's 429s are
+     * absorbed by the service's built-in retry interceptor.
+     */
+    private async applyLifecycleStageBatched(
+        svc: HubSpotService,
+        leads: any[],
+        contactIdByLead: Map<any, string>,
+        targetStage: string,
+        listId: string,
+        result: SyncResult,
+        failedLeads: Set<any>,
+    ): Promise<void> {
+        if (leads.length === 0) return;
+
+        // Multiple leads can share one contact id (same email). Operate on unique
+        // ids; map each id back to all its leads so a per-id failure fails them all.
+        const leadsByContactId = new Map<string, any[]>();
+        for (const lead of leads) {
+            const id = contactIdByLead.get(lead);
+            if (!id) continue; // defensive: only succeeded-upsert leads reach here
+            const arr = leadsByContactId.get(id);
+            if (arr) arr.push(lead); else leadsByContactId.set(id, [lead]);
+        }
+        const allIds = Array.from(leadsByContactId.keys());
+        if (allIds.length === 0) return;
+
+        // ── Step 1: read current stages so we can skip-if-correct and restore-on-fail.
+        const originalStages = await svc.getContactLifecycleStages(allIds);
+
+        // ── Step 2: only act on ids NOT already at the target stage.
+        const idsToUpdate = allIds.filter(id => originalStages.get(id) !== targetStage);
+        if (idsToUpdate.length === 0) return;
+
+        // Record a per-id failure: mark every lead on that contact failed (once),
+        // add one error line, and persist failed metadata while PRESERVING the
+        // contact id (the upsert did succeed — only the stage didn't take).
+        const failPersists: Array<Promise<void>> = [];
+        const markIdFailed = (id: string, reason: string) => {
+            for (const lead of leadsByContactId.get(id) ?? []) {
+                if (failedLeads.has(lead)) continue;
+                failedLeads.add(lead);
+                result.errorCount++;
+                result.errors.push(`${lead.email || lead.leadId}: lifecycle stage not set — ${reason}`);
+                failPersists.push(
+                    this.persistSyncMetadata(
+                        lead, listId,
+                        buildFailedMetadata(lead.syncMetadata, `lifecycle stage not set — ${reason}`),
+                    ),
+                );
+            }
+        };
+
+        for (let i = 0; i < idsToUpdate.length; i += 100) {
+            const chunk = idsToUpdate.slice(i, i + 100);
+
+            // ── Step 3: CLEAR. A clear failure leaves the contact at its original
+            // stage (no change) — record the failure and skip set/restore for it.
+            const clearedIds = new Set<string>();
+            const clearOutcome = await splitAndRetry(
+                chunk,
+                async (ids) => {
+                    await svc.batchUpdateContacts(ids.map(id => ({ id, properties: { lifecyclestage: '' } })));
+                    for (const id of ids) clearedIds.add(id);
+                },
+                { maxBatchSize: 100, concurrency: PUSH_BATCH_CONCURRENCY },
+            );
+            for (const f of clearOutcome.failed) {
+                markIdFailed(f.item, `clear failed: ${this.formatError(f.error)}`);
+            }
+
+            // ── Step 4: SET the target stage on the cleared ids.
+            const setTargets = chunk.filter(id => clearedIds.has(id));
+            if (setTargets.length === 0) continue;
+            const setFailedIds = new Set<string>();
+            const setOutcome = await splitAndRetry(
+                setTargets,
+                (ids) => svc.batchUpdateContacts(ids.map(id => ({ id, properties: { lifecyclestage: targetStage } }))),
+                { maxBatchSize: 100, concurrency: PUSH_BATCH_CONCURRENCY },
+            );
+            for (const f of setOutcome.failed) setFailedIds.add(f.item);
+
+            // ── Step 5: RESTORE the original stage for ids whose set failed, so the
+            // contact isn't left blank. Best-effort: a restore that also fails just
+            // leaves the contact blank until the next push re-applies the stage.
+            // Only restore ids that HAD a non-empty original (else '' is already the
+            // current cleared state — nothing to restore).
+            if (setFailedIds.size > 0) {
+                const restoreInputs = Array.from(setFailedIds)
+                    .filter(id => (originalStages.get(id) ?? '') !== '')
+                    .map(id => ({ id, properties: { lifecyclestage: originalStages.get(id)! } }));
+                if (restoreInputs.length > 0) {
+                    await splitAndRetry(
+                        restoreInputs,
+                        (batch) => svc.batchUpdateContacts(batch),
+                        { maxBatchSize: 100, concurrency: PUSH_BATCH_CONCURRENCY },
+                    ).catch(() => { /* best-effort; failure leaves contact blank, healed next push */ });
+                }
+                for (const id of setFailedIds) {
+                    const orig = originalStages.get(id) ?? '';
+                    markIdFailed(id, orig ? `set failed, restored prior stage "${orig}"` : 'set failed');
+                }
+            }
+        }
+
+        await Promise.all(failPersists);
+    }
+
+    /**
+     * Single-contact version of the lifecycle-stage two-step (used by the per-lead
+     * path). Reads the current stage, skips if already at the target, else
+     * clear→set, and restores the original stage if the set fails so the contact is
+     * never left blank.
+     *
+     * Returns { ok: true } when the contact ends at the target stage (or already
+     * was), or { ok: false, reason } when it does not — the caller treats that lead
+     * as a failure. Best-effort: HubSpot has no cross-call transaction, so a failed
+     * set (and possibly a failed restore) is healed on the next push.
+     */
+    private async applyLifecycleStageSingle(
+        svc: HubSpotService,
+        contactId: string,
+        targetStage: string,
+    ): Promise<{ ok: true } | { ok: false; reason: string }> {
+        // Read current stage: skip-if-correct (cheap re-pushes) and enable restore.
+        let original = '';
+        try {
+            const props = await svc.getContactById(contactId, ['lifecyclestage']);
+            original = String(props.lifecyclestage ?? '');
+        } catch (err: any) {
+            // A read failure is non-fatal: fall through and attempt the two-step
+            // with an unknown original (restore simply won't have a value to write).
+            console.warn(`[HubspotAdapter] could not read lifecyclestage for contact ${contactId}: ${this.formatError(err)}`);
+        }
+        if (original === targetStage) return { ok: true };
+
+        // CLEAR. If it fails the contact is unchanged (still at original) — report.
+        try {
+            await svc.updateContact(contactId, { customFields: { lifecyclestage: '' } });
+        } catch (err: any) {
+            return { ok: false, reason: `clear failed: ${this.formatError(err)}` };
+        }
+
+        // SET the target. On failure, best-effort restore the prior stage.
+        try {
+            await svc.updateContact(contactId, { customFields: { lifecyclestage: targetStage } });
+            return { ok: true };
+        } catch (err: any) {
+            const reason = this.formatError(err);
+            if (original) {
+                try {
+                    await svc.updateContact(contactId, { customFields: { lifecyclestage: original } });
+                    return { ok: false, reason: `set failed, restored prior stage "${original}": ${reason}` };
+                } catch {
+                    // Restore also failed — contact left blank, healed next push.
+                }
+            }
+            return { ok: false, reason: `set failed: ${reason}` };
+        }
     }
 
     /**

@@ -55,6 +55,8 @@ jest.mock('../services/externalCrmSyncService', () => ({
     getPushJob: jest.fn().mockResolvedValue({ jobId: 'job-1', status: 'running', startedAt: '2026-01-01T00:00:00.000Z' }),
     pullAllContacts: jest.fn().mockResolvedValue({ successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] }),
     getExternalProperties: jest.fn().mockResolvedValue({ properties: [] }),
+    getHubSpotLifecycleStages: jest.fn().mockResolvedValue({ stages: [] }),
+    createHubSpotLifecycleStage: jest.fn().mockResolvedValue({ value: '1700000000000', label: 'Ad Audience' }),
     getExternalPipelines: jest.fn().mockResolvedValue([]),
     changePipeline: jest.fn().mockResolvedValue({
       provider: 'hubspot',
@@ -839,5 +841,202 @@ describe('DELETE /api/crm-sync/config/:listId/:provider/account — disconnect a
       .expect(500);
 
     expect(res.body.error).toBe('DB failure');
+  });
+});
+
+describe('PUT /api/crm-sync/config — HubSpot contact constants forwarding', () => {
+  const { externalCrmSyncService } = require('../services/externalCrmSyncService');
+  const { crmDb } = require('../services/db');
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' });
+    externalCrmSyncService.saveConfig.mockResolvedValue({
+      provider: 'hubspot',
+      listId: 'list-1',
+      userId: 'user-1',
+      accountId: 'portal-123',
+      autoSyncEnabled: false,
+      contactFieldMapping: [],
+      dealFieldMapping: [],
+      customFieldMapping: [],
+      deleteOnPush: false,
+      deleteOnPull: false,
+      webhookEnabled: true,
+      webhookSecret: 'abc',
+      hubspotLifecycleStage: '12345678',
+      hubspotMarkAsNonMarketing: true,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+  });
+
+  it('forwards hubspotLifecycleStage to saveConfig', async () => {
+    await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot')
+      .send({ accountId: 'portal-123', hubspotLifecycleStage: '12345678' })
+      .expect(200);
+
+    expect(externalCrmSyncService.saveConfig).toHaveBeenCalledWith(
+      'user-1', 'list-1', 'hubspot',
+      expect.objectContaining({ hubspotLifecycleStage: '12345678' }),
+    );
+  });
+
+  it('echoes hubspotLifecycleStage back in the response', async () => {
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot')
+      .send({ accountId: 'portal-123' })
+      .expect(200);
+
+    expect(res.body.hubspotLifecycleStage).toBe('12345678');
+  });
+
+  it('forwards hubspotMarkAsNonMarketing to saveConfig', async () => {
+    await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot')
+      .send({ accountId: 'portal-123', hubspotMarkAsNonMarketing: true })
+      .expect(200);
+
+    expect(externalCrmSyncService.saveConfig).toHaveBeenCalledWith(
+      'user-1', 'list-1', 'hubspot',
+      expect.objectContaining({ hubspotMarkAsNonMarketing: true }),
+    );
+  });
+
+  it('echoes hubspotMarkAsNonMarketing back in the response', async () => {
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot')
+      .send({ accountId: 'portal-123' })
+      .expect(200);
+
+    expect(res.body.hubspotMarkAsNonMarketing).toBe(true);
+  });
+});
+
+describe('GET /api/crm-sync/lifecycle-stages/:listId/:provider', () => {
+  const { externalCrmSyncService } = require('../services/externalCrmSyncService');
+  const { crmDb } = require('../services/db');
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' });
+  });
+
+  it('returns lifecycle stages for hubspot', async () => {
+    externalCrmSyncService.getHubSpotLifecycleStages.mockResolvedValue({
+      stages: [{ value: '12345678', label: 'Ad Audience' }],
+    });
+    const res = await request(app)
+      .get('/api/crm-sync/lifecycle-stages/list-1/hubspot')
+      .expect(200);
+    expect(res.body.stages).toEqual([{ value: '12345678', label: 'Ad Audience' }]);
+    expect(externalCrmSyncService.getHubSpotLifecycleStages).toHaveBeenCalledWith('user-1', 'list-1', {});
+  });
+
+  it('forwards inline accountId to the service', async () => {
+    externalCrmSyncService.getHubSpotLifecycleStages.mockResolvedValue({ stages: [] });
+    await request(app)
+      .get('/api/crm-sync/lifecycle-stages/list-1/hubspot?accountId=acct-9')
+      .expect(200);
+    expect(externalCrmSyncService.getHubSpotLifecycleStages).toHaveBeenCalledWith(
+      'user-1', 'list-1', expect.objectContaining({ accountId: 'acct-9' }),
+    );
+  });
+
+  it('rejects a non-hubspot provider with 400', async () => {
+    const res = await request(app)
+      .get('/api/crm-sync/lifecycle-stages/list-1/attio')
+      .expect(400);
+    expect(res.body.error).toMatch(/only supported for HubSpot/i);
+    expect(externalCrmSyncService.getHubSpotLifecycleStages).not.toHaveBeenCalled();
+  });
+
+  it('surfaces service errors as 500', async () => {
+    externalCrmSyncService.getHubSpotLifecycleStages.mockRejectedValue(new Error('HubSpot down'));
+    const res = await request(app)
+      .get('/api/crm-sync/lifecycle-stages/list-1/hubspot')
+      .expect(500);
+    expect(res.body.error).toMatch(/HubSpot down/);
+  });
+});
+
+describe('POST /api/crm-sync/lifecycle-stages/:listId/:provider', () => {
+  const { externalCrmSyncService } = require('../services/externalCrmSyncService');
+  const { crmDb } = require('../services/db');
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' });
+  });
+
+  it('creates a stage and returns the new option', async () => {
+    externalCrmSyncService.createHubSpotLifecycleStage.mockResolvedValue({ value: '999', label: 'Ad Audience' });
+    const res = await request(app)
+      .post('/api/crm-sync/lifecycle-stages/list-1/hubspot')
+      .send({ label: 'Ad Audience' })
+      .expect(200);
+    expect(res.body).toEqual({ value: '999', label: 'Ad Audience' });
+    expect(externalCrmSyncService.createHubSpotLifecycleStage).toHaveBeenCalledWith(
+      'user-1', 'list-1', 'Ad Audience', {},
+    );
+  });
+
+  it('forwards inline accountId to the service', async () => {
+    externalCrmSyncService.createHubSpotLifecycleStage.mockResolvedValue({ value: '1', label: 'X' });
+    await request(app)
+      .post('/api/crm-sync/lifecycle-stages/list-1/hubspot?accountId=acct-9')
+      .send({ label: 'X' })
+      .expect(200);
+    expect(externalCrmSyncService.createHubSpotLifecycleStage).toHaveBeenCalledWith(
+      'user-1', 'list-1', 'X', expect.objectContaining({ accountId: 'acct-9' }),
+    );
+  });
+
+  it('rejects a missing label with 400', async () => {
+    const res = await request(app)
+      .post('/api/crm-sync/lifecycle-stages/list-1/hubspot')
+      .send({})
+      .expect(400);
+    expect(res.body.error).toMatch(/label is required/i);
+    expect(externalCrmSyncService.createHubSpotLifecycleStage).not.toHaveBeenCalled();
+  });
+
+  it('rejects a blank (whitespace-only) label with 400', async () => {
+    const res = await request(app)
+      .post('/api/crm-sync/lifecycle-stages/list-1/hubspot')
+      .send({ label: '   ' })
+      .expect(400);
+    expect(res.body.error).toMatch(/label is required/i);
+    expect(externalCrmSyncService.createHubSpotLifecycleStage).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-hubspot provider with 400', async () => {
+    const res = await request(app)
+      .post('/api/crm-sync/lifecycle-stages/list-1/attio')
+      .send({ label: 'X' })
+      .expect(400);
+    expect(res.body.error).toMatch(/only supported for HubSpot/i);
+    expect(externalCrmSyncService.createHubSpotLifecycleStage).not.toHaveBeenCalled();
+  });
+
+  it('surfaces the HubSpot error message on failure (500)', async () => {
+    const err: any = new Error('generic');
+    err.response = { data: { message: 'Lifecycle stage options are read-only on this portal' } };
+    externalCrmSyncService.createHubSpotLifecycleStage.mockRejectedValue(err);
+    const res = await request(app)
+      .post('/api/crm-sync/lifecycle-stages/list-1/hubspot')
+      .send({ label: 'X' })
+      .expect(500);
+    expect(res.body.error).toMatch(/read-only/i);
+  });
+
+  it('falls back to the generic message when HubSpot provides none (500)', async () => {
+    externalCrmSyncService.createHubSpotLifecycleStage.mockRejectedValue(new Error('boom'));
+    const res = await request(app)
+      .post('/api/crm-sync/lifecycle-stages/list-1/hubspot')
+      .send({ label: 'X' })
+      .expect(500);
+    expect(res.body.error).toMatch(/boom/);
   });
 });

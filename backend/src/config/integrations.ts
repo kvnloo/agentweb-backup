@@ -142,6 +142,7 @@ export const INTEGRATION_CONFIG = {
       'crm.schemas.contacts.write',
       'crm.schemas.deals.read',
       'crm.schemas.deals.write',
+      'crm.import',
     ] as const,
     marketingOnlyScopes: [
       'marketing.campaigns.read',

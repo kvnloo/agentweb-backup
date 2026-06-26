@@ -40,6 +40,8 @@ const mockHubSpotServiceInstance = {
   listDealPipelines: jest.fn().mockResolvedValue([]),
   listContactProperties: jest.fn().mockResolvedValue([]),
   listDealProperties: jest.fn().mockResolvedValue([]),
+  getContactPropertyOptions: jest.fn().mockResolvedValue([]),
+  createLifecycleStageOption: jest.fn().mockResolvedValue({ value: '1700000000000', label: 'Ad Audience' }),
   deleteContact: jest.fn().mockResolvedValue(undefined),
   deleteDeal: jest.fn().mockResolvedValue(undefined),
 };
@@ -489,6 +491,138 @@ describe('ExternalCrmSyncService', () => {
       expect(saved.externalPipelineId).toBe('pipeline-123');
       expect(saved.listName).toBe('Locked Pipeline');
     });
+
+    // ─── HubSpot contact constant (lifecyclestage) ────────────────────────────
+
+    it('persists a lifecycle stage', async () => {
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', {
+        apiKey: 'my-token',
+        hubspotLifecycleStage: '12345678',
+      });
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as Record<string, any>;
+      expect(saved.hubspotLifecycleStage).toBe('12345678');
+    });
+
+    it('clears lifecycle stage when null is sent', async () => {
+      const existing = makeConfig({
+        apiKeyEncrypted: 'enc:old',
+        hubspotLifecycleStage: '12345678',
+      });
+      mockListWithConfig(existing);
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', {
+        hubspotLifecycleStage: null,
+      });
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as Record<string, any>;
+      expect(saved.hubspotLifecycleStage).toBeUndefined();
+    });
+
+    it('preserves existing lifecycle stage across a partial save (key absent)', async () => {
+      const existing = makeConfig({
+        apiKeyEncrypted: 'enc:old',
+        hubspotLifecycleStage: '12345678',
+      });
+      mockListWithConfig(existing);
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', { autoSyncEnabled: true });
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as Record<string, any>;
+      expect(saved.hubspotLifecycleStage).toBe('12345678');
+    });
+
+    it('treats an empty-string lifecycle stage as a clear', async () => {
+      const existing = makeConfig({ apiKeyEncrypted: 'enc:old', hubspotLifecycleStage: '12345678' });
+      mockListWithConfig(existing);
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', { hubspotLifecycleStage: '' });
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as Record<string, any>;
+      expect(saved.hubspotLifecycleStage).toBeUndefined();
+    });
+
+    it('never stores lifecycle stage for a non-HubSpot (Attio) provider', async () => {
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'attio', {
+        apiKey: 'a'.repeat(64),
+        hubspotLifecycleStage: '12345678',
+      });
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as Record<string, any>;
+      expect(saved.hubspotLifecycleStage).toBeUndefined();
+    });
+
+    // ─── hubspotMarkAsNonMarketing ────────────────────────────────────────────
+
+    it('persists hubspotMarkAsNonMarketing=true', async () => {
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', {
+        apiKey: 'my-token',
+        hubspotMarkAsNonMarketing: true,
+      });
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as Record<string, any>;
+      expect(saved.hubspotMarkAsNonMarketing).toBe(true);
+    });
+
+    it('stores hubspotMarkAsNonMarketing=false as undefined (treated as unset)', async () => {
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', {
+        apiKey: 'my-token',
+        hubspotMarkAsNonMarketing: false,
+      });
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as Record<string, any>;
+      expect(saved.hubspotMarkAsNonMarketing).toBeUndefined();
+    });
+
+    it('clears hubspotMarkAsNonMarketing when null is sent', async () => {
+      const existing = makeConfig({ apiKeyEncrypted: 'enc:old', hubspotMarkAsNonMarketing: true });
+      mockListWithConfig(existing);
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', { hubspotMarkAsNonMarketing: null });
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as Record<string, any>;
+      expect(saved.hubspotMarkAsNonMarketing).toBeUndefined();
+    });
+
+    it('preserves existing hubspotMarkAsNonMarketing across a partial save (key absent)', async () => {
+      const existing = makeConfig({ apiKeyEncrypted: 'enc:old', hubspotMarkAsNonMarketing: true });
+      mockListWithConfig(existing);
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', { autoSyncEnabled: true });
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as Record<string, any>;
+      expect(saved.hubspotMarkAsNonMarketing).toBe(true);
+    });
+
+    it('never stores hubspotMarkAsNonMarketing for a non-HubSpot (Attio) provider', async () => {
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'attio', {
+        apiKey: 'a'.repeat(64),
+        hubspotMarkAsNonMarketing: true,
+      });
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0][2] as Record<string, any>;
+      expect(saved.hubspotMarkAsNonMarketing).toBeUndefined();
+    });
   });
 
   // ─── deleteConfig ─────────────────────────────────────────────────────────
@@ -617,6 +751,81 @@ describe('ExternalCrmSyncService', () => {
       const fields = defaults.customFieldMapping.map(m => m.agentwebField);
       expect(fields).not.toContain('listName');
       expect(fields).not.toContain('listId');
+    });
+  });
+
+  // ─── getHubSpotLifecycleStages ────────────────────────────────────────────
+
+  describe('getHubSpotLifecycleStages', () => {
+    it('returns the lifecyclestage property options via inline credentials', async () => {
+      mockHubSpotServiceInstance.getContactPropertyOptions.mockResolvedValue([
+        { value: 'subscriber', label: 'Subscriber' },
+        { value: '12345678', label: 'Ad Audience' },
+      ]);
+
+      const result = await service.getHubSpotLifecycleStages('user1', 'list1', { accountId: 'acct1' });
+
+      expect(mockHubSpotServiceInstance.getContactPropertyOptions).toHaveBeenCalledWith('lifecyclestage');
+      expect(result.stages).toEqual([
+        { value: 'subscriber', label: 'Subscriber' },
+        { value: '12345678', label: 'Ad Audience' },
+      ]);
+    });
+
+    it('falls back to the saved config credentials when none are passed inline', async () => {
+      mockListWithConfig(makeConfig({ accountId: 'acct1' }));
+      mockHubSpotServiceInstance.getContactPropertyOptions.mockResolvedValue([]);
+
+      const result = await service.getHubSpotLifecycleStages('user1', 'list1', {});
+
+      expect(result.stages).toEqual([]);
+      expect(mockHubSpotServiceInstance.getContactPropertyOptions).toHaveBeenCalledWith('lifecyclestage');
+    });
+
+    it('throws when there is no config and no inline credentials', async () => {
+      mockNoConfig();
+      await expect(service.getHubSpotLifecycleStages('user1', 'list1', {}))
+        .rejects.toThrow(/no sync configuration/i);
+    });
+  });
+
+  describe('createHubSpotLifecycleStage', () => {
+    it('creates a stage via inline credentials and returns the new option', async () => {
+      mockHubSpotServiceInstance.createLifecycleStageOption.mockResolvedValue({ value: '999', label: 'Ad Audience' });
+
+      const result = await service.createHubSpotLifecycleStage('user1', 'list1', 'Ad Audience', { accountId: 'acct1' });
+
+      expect(mockHubSpotServiceInstance.createLifecycleStageOption).toHaveBeenCalledWith('Ad Audience');
+      expect(result).toEqual({ value: '999', label: 'Ad Audience' });
+    });
+
+    it('trims the label before passing it to the service', async () => {
+      mockHubSpotServiceInstance.createLifecycleStageOption.mockResolvedValue({ value: '999', label: 'Ad Audience' });
+
+      await service.createHubSpotLifecycleStage('user1', 'list1', '  Ad Audience  ', { accountId: 'acct1' });
+
+      expect(mockHubSpotServiceInstance.createLifecycleStageOption).toHaveBeenCalledWith('Ad Audience');
+    });
+
+    it('throws when label is blank (no service call)', async () => {
+      await expect(service.createHubSpotLifecycleStage('user1', 'list1', '   ', { accountId: 'acct1' }))
+        .rejects.toThrow(/label is required/i);
+      expect(mockHubSpotServiceInstance.createLifecycleStageOption).not.toHaveBeenCalled();
+    });
+
+    it('falls back to saved config credentials when none passed inline', async () => {
+      mockListWithConfig(makeConfig({ accountId: 'acct1' }));
+      mockHubSpotServiceInstance.createLifecycleStageOption.mockResolvedValue({ value: '1', label: 'X' });
+
+      await service.createHubSpotLifecycleStage('user1', 'list1', 'X', {});
+
+      expect(mockHubSpotServiceInstance.createLifecycleStageOption).toHaveBeenCalledWith('X');
+    });
+
+    it('throws when there is no config and no inline credentials', async () => {
+      mockNoConfig();
+      await expect(service.createHubSpotLifecycleStage('user1', 'list1', 'X', {}))
+        .rejects.toThrow(/no sync configuration/i);
     });
   });
 
