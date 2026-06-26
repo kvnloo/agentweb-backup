@@ -600,7 +600,7 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generated/page-1/publish")
-      .send({ branch: "draft/8060dd55-a8b7-4c" });
+      .send({ branch: "draft/agentweb-preview" });
 
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);

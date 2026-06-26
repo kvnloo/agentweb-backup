@@ -9,6 +9,7 @@ import {
 import { toolResultError } from '../utils/toolResultError';
 
 jest.mock('../services/codingAgentService', () => ({
+  LANDING_PAGE_PREVIEW_BRANCH: 'draft/agentweb-preview',
   runCodingAgent: jest.fn(),
 }));
 
@@ -100,7 +101,7 @@ describe('coding_agent acceptance end-to-end smoke', () => {
       message: `Updated the simple landing page token.\n\nAcceptance passed (1/1 checks).`,
       iterations: 2,
       previewUrl: 'https://preview.example',
-      branch: 'draft/session-smoke-12',
+      branch: 'draft/agentweb-preview',
       acceptanceStatus: 'passed',
       acceptance: {
         status: 'passed',
@@ -139,7 +140,7 @@ describe('coding_agent acceptance end-to-end smoke', () => {
         pageId: 'lp_smoke',
         userId: 'user-smoke',
         sessionId: 'session-smoke-1234567890',
-        draftBranch: 'draft/session-smoke-12',
+        draftBranch: 'draft/agentweb-preview',
         acceptanceChecks,
       }),
     );
@@ -165,7 +166,7 @@ describe('coding_agent acceptance end-to-end smoke', () => {
       message: `Updated the simple landing page token.\n\nAcceptance failed (1/1 checks failed).\n- Opaque token visible: Did not find expected text "${token}".`,
       iterations: 2,
       previewUrl: 'https://preview.example',
-      branch: 'draft/session-smoke-12',
+      branch: 'draft/agentweb-preview',
       acceptanceStatus: 'failed',
       acceptance: {
         status: 'failed',
