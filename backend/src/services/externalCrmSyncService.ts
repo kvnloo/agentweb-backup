@@ -928,9 +928,12 @@ export class ExternalCrmSyncService {
       // non-actionable note rather than a misleading "Reconnect" prompt. A clean
       // run (errorCount===0) clears any prior error via updateSyncTimestamp.
       if (totalResult.errorCount > 0) {
-        const detail = totalResult.errors[0] || 'Some leads could not be synced';
+        const { category, detail } = this.categorizeErrors(
+          totalResult.errors,
+          'Some leads could not be synced'
+        );
         config.lastSyncError = detail;
-        config.lastSyncErrorCategory = this.categorizeLeadError(detail);
+        config.lastSyncErrorCategory = category;
       }
       await this.updateSyncTimestamp(config, 'push', totalResult.errorCount === 0);
 
@@ -1055,14 +1058,18 @@ export class ExternalCrmSyncService {
       // errorCount as a failed sync too, mirroring the manual-push semantics
       // in runPush (errorCount === 0 ⇒ success).
       if (result.errorCount > 0) {
-        const detail = result.errors[0] || 'Auto-sync reported an error';
-        console.error(`[ExternalCrmSync] Auto-sync error for lead ${lead.leadId} in list ${listId}:`, detail);
         // A non-zero errorCount with no throw usually means the connection
         // succeeded but a per-lead push was rejected (e.g. an invalid email);
-        // reconnecting would not help. categorizeLeadError downgrades only genuine
-        // data rejections to 'data' and leaves auth-shaped failures as 'connection'.
+        // reconnecting would not help. categorizeErrors downgrades only genuine
+        // data rejections to 'data' and leaves auth-shaped failures as 'connection'
+        // — and when both occur, 'connection' wins so Reconnect is still offered.
+        const { category, detail } = this.categorizeErrors(
+          result.errors,
+          'Auto-sync reported an error'
+        );
+        console.error(`[ExternalCrmSync] Auto-sync error for lead ${lead.leadId} in list ${listId}:`, detail);
         config.lastSyncError = detail;
-        config.lastSyncErrorCategory = this.categorizeLeadError(detail);
+        config.lastSyncErrorCategory = category;
         await this.updateSyncTimestamp(config, 'push', false);
         return;
       }
@@ -1110,16 +1117,43 @@ export class ExternalCrmSyncService {
   }
 
   /**
-   * Classifies a non-throwing per-lead sync error (errorCount>0). Only genuine
-   * per-record DATA rejections (e.g. an invalid email) are 'data' — those can't
-   * be fixed by reconnecting. Everything else (including an auth failure that the
-   * batch path records per-lead instead of throwing — e.g. a 401/403 recorded by
-   * splitAndRetry) defaults to 'connection', the safe choice that still offers the
-   * Reconnect CTA. The regex matches both the adapter's own message ("Invalid
-   * email …") and HubSpot's rejection text ("invalid email (rejected by HubSpot)").
+   * Classifies the per-lead sync errors of a non-throwing push (errorCount>0) and
+   * picks the message to surface, scanning ALL errors (not just the first).
+   *
+   * A single error is 'data' ONLY when it's a genuine per-record rejection (an
+   * invalid email). Anything else — including an auth failure the batch path
+   * records per-lead instead of throwing (e.g. a 401/403 isolated by
+   * splitAndRetry) — is 'connection': the safe choice that still offers Reconnect.
+   *
+   * When a push mixes both (some leads have bad emails AND the connection is also
+   * failing), 'connection' WINS so the UI shows the actionable Reconnect prompt
+   * rather than a non-actionable data note — reconnecting is the prerequisite to
+   * fixing anything. We also surface a connection-shaped message in that case, so
+   * the banner detail matches the category even though the data error may sort
+   * first in `errors`.
+   *
+   * The /invalid email/i regex matches both the adapter's own message
+   * ("Invalid email …") and HubSpot's rejection text
+   * ("invalid email (rejected by HubSpot)").
    */
-  private categorizeLeadError(detail: string): 'connection' | 'data' {
-    return /invalid email/i.test(detail) ? 'data' : 'connection';
+  private categorizeErrors(
+    errors: string[],
+    fallback: string
+  ): { category: 'connection' | 'data'; detail: string } {
+    const isDataError = (e: string) => /invalid email/i.test(e);
+    // A connection-shaped error is any error that ISN'T a recognised data error.
+    const connectionError = errors.find((e) => !isDataError(e));
+    if (connectionError) {
+      return { category: 'connection', detail: connectionError };
+    }
+    // Only classify as 'data' when we actually have a recognised data error to
+    // point the user at. An errorCount>0 with NO error strings (defensive — should
+    // not happen) defaults to 'connection': showing an actionable Reconnect prompt
+    // is safer than telling the user "your connection is fine" with no lead named.
+    if (errors.length > 0) {
+      return { category: 'data', detail: errors[0] };
+    }
+    return { category: 'connection', detail: fallback };
   }
 
   private async updateSyncTimestamp(
