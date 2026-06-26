@@ -804,6 +804,29 @@ describe('ExternalCrmSyncService', () => {
       expect(saved.lastSyncErrorCategory).toBe('data');
     });
 
+    it('records lastSyncErrorCount = number of failed leads for a multi-lead data failure', async () => {
+      mockListWithConfig(makeConfig({ autoSyncEnabled: true }));
+      mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+      mockCrmDb.updateLead.mockResolvedValue(undefined as any);
+      // Three invalid emails + one valid → 3 data errors, 1 success.
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [
+          { leadId: 'l1', email: 'bad-one' },
+          { leadId: 'l2', email: 'bad-two' },
+          { leadId: 'l3', email: 'bad-three' },
+          { leadId: 'l4', email: 'good@example.com' },
+        ],
+        lastEvaluatedKey: null, hasMore: false,
+      });
+
+      const result = await service.pushAllLeads('user1', 'list1', 'hubspot');
+
+      expect(result.errorCount).toBe(3);
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      expect(saved.lastSyncErrorCategory).toBe('data');
+      expect(saved.lastSyncErrorCount).toBe(3);
+    });
+
     it('prioritizes connection over data when a push has BOTH (mixed errors)', async () => {
       mockListWithConfig(makeConfig({ autoSyncEnabled: true }));
       mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
@@ -832,6 +855,8 @@ describe('ExternalCrmSyncService', () => {
       // Connection wins; the surfaced message is the connection-shaped one.
       expect(saved.lastSyncErrorCategory).toBe('connection');
       expect(saved.lastSyncError).toMatch(/Authentication credentials not found/);
+      // A connection failure isn't lead-scoped, so no per-lead count is recorded.
+      expect(saved.lastSyncErrorCount).toBeUndefined();
     });
 
     it('resolves the HubSpot service once for a multi-chunk push, not per chunk', async () => {
@@ -1313,12 +1338,13 @@ describe('ExternalCrmSyncService', () => {
       expect(saved.lastPushSyncAt).toBeTruthy();
     });
 
-    it('clears a stale lastSyncErrorCategory on a healthy sync', async () => {
+    it('clears a stale lastSyncErrorCategory and lastSyncErrorCount on a healthy sync', async () => {
       const config = makeConfig({
         autoSyncEnabled: true,
         lastSyncStatus: 'error',
         lastSyncError: 'old failure',
         lastSyncErrorCategory: 'data',
+        lastSyncErrorCount: 7,
       });
       mockListWithConfig(config);
 
@@ -1327,6 +1353,7 @@ describe('ExternalCrmSyncService', () => {
       const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
       expect(saved.lastSyncStatus).toBe('success');
       expect(saved.lastSyncErrorCategory).toBeUndefined();
+      expect(saved.lastSyncErrorCount).toBeUndefined();
     });
 
     // ─── per-lead status propagation (Task 2 supplies the behaviour) ──────────
