@@ -308,6 +308,140 @@ describe('HubSpotService — getContactPropertyOptions', () => {
   });
 });
 
+describe('HubSpotService — createLifecycleStageOption', () => {
+  let svc: HubSpotService;
+  let nowSpy: jest.SpyInstance;
+  beforeEach(() => {
+    svc = HubSpotService.fromToken('valid-token');
+    // Value is derived from Date.now() — pin it so the assertion is deterministic.
+    nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1700000000000);
+  });
+  afterEach(() => { nowSpy.mockRestore(); });
+
+  it('GETs existing options, appends the new one (normalized), and PATCHes the full list', async () => {
+    mockAxiosGet.mockResolvedValue({
+      data: {
+        // Include an internal-only field that must be stripped, and a missing-label option.
+        options: [
+          { label: 'Subscriber', value: 'subscriber', displayOrder: 0, hidden: false, description: 'internal' },
+          { value: 'lead', displayOrder: 2 },
+        ],
+      },
+    });
+    mockAxiosPatch.mockResolvedValue({ data: {} });
+
+    const result = await svc.createLifecycleStageOption('Ad Audience');
+
+    expect(result).toEqual({ value: '1700000000000', label: 'Ad Audience' });
+    expect(mockAxiosPatch).toHaveBeenCalledWith(
+      expect.stringContaining('crm/v3/properties/contacts/lifecyclestage'),
+      {
+        options: [
+          { label: 'Subscriber', value: 'subscriber', displayOrder: 0, hidden: false },
+          { label: 'lead', value: 'lead', displayOrder: 2, hidden: false },
+          { label: 'Ad Audience', value: '1700000000000', displayOrder: 3, hidden: false },
+        ],
+      },
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer valid-token' }) }),
+    );
+  });
+
+  it('throws when label is blank (no API calls)', async () => {
+    await expect(svc.createLifecycleStageOption('   ')).rejects.toThrow(/label is required/i);
+    expect(mockAxiosGet).not.toHaveBeenCalled();
+    expect(mockAxiosPatch).not.toHaveBeenCalled();
+  });
+
+  it('refuses to modify read-only lifecyclestage options', async () => {
+    mockAxiosGet.mockResolvedValue({
+      data: { options: [], modificationMetadata: { readOnlyOptions: true } },
+    });
+    await expect(svc.createLifecycleStageOption('Ad Audience')).rejects.toThrow(/read-only/i);
+    expect(mockAxiosPatch).not.toHaveBeenCalled();
+  });
+
+  it('handles a property with no existing options (displayOrder starts at 1)', async () => {
+    mockAxiosGet.mockResolvedValue({ data: {} });
+    mockAxiosPatch.mockResolvedValue({ data: {} });
+
+    await svc.createLifecycleStageOption('First Stage');
+
+    expect(mockAxiosPatch.mock.calls[0][1]).toEqual({
+      options: [{ label: 'First Stage', value: '1700000000000', displayOrder: 1, hidden: false }],
+    });
+  });
+});
+
+describe('HubSpotService — importContactsMarketableStatus', () => {
+  let svc: HubSpotService;
+  let originalFetch: typeof global.fetch;
+  let nowSpy: jest.SpyInstance;
+  beforeEach(() => {
+    svc = HubSpotService.fromToken('valid-token');
+    originalFetch = global.fetch;
+    nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1700000000000);
+  });
+  afterEach(() => {
+    global.fetch = originalFetch;
+    nowSpy.mockRestore();
+  });
+
+  it('POSTs a multipart import to /crm/v3/imports and returns the job id', async () => {
+    const fetchMock = jest.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ id: 'import_job_99' }),
+    });
+    global.fetch = fetchMock as any;
+
+    const jobId = await svc.importContactsMarketableStatus(['111', '222'], false);
+
+    expect(jobId).toBe('import_job_99');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(url).toContain('/crm/v3/imports');
+    expect(opts.method).toBe('POST');
+    // Auth header present; Content-Type omitted so fetch sets the multipart boundary.
+    expect(opts.headers.Authorization).toBe('Bearer valid-token');
+    expect(opts.headers['Content-Type']).toBeUndefined();
+    expect(opts.body).toBeInstanceOf(FormData);
+    // The importRequest part carries marketableContactImport=false (non-marketing).
+    const importRequest = JSON.parse((opts.body as FormData).get('importRequest') as string);
+    expect(importRequest.marketableContactImport).toBe(false);
+    expect(importRequest.importOperations).toEqual({ '0-1': 'UPDATE' });
+  });
+
+  it('throws when contactIds is empty (no fetch)', async () => {
+    const fetchMock = jest.fn();
+    global.fetch = fetchMock as any;
+    await expect(svc.importContactsMarketableStatus([], false)).rejects.toThrow(/must not be empty/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('throws with the HubSpot status + body on a non-ok response', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 403,
+      text: () => Promise.resolve('Forbidden: missing crm.import scope'),
+    }) as any;
+
+    await expect(svc.importContactsMarketableStatus(['111'], false))
+      .rejects.toThrow(/403.*crm\.import/i);
+  });
+
+  it('passes marketableContactImport=true when re-marking as marketing', async () => {
+    const fetchMock = jest.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ id: 'job_mkt' }),
+    });
+    global.fetch = fetchMock as any;
+
+    await svc.importContactsMarketableStatus(['111'], true);
+
+    const importRequest = JSON.parse((fetchMock.mock.calls[0][1].body as FormData).get('importRequest') as string);
+    expect(importRequest.marketableContactImport).toBe(true);
+  });
+});
+
 describe('HubSpotService — upsertContact', () => {
   let svc: HubSpotService;
   beforeEach(() => { svc = HubSpotService.fromToken('valid-token'); });
