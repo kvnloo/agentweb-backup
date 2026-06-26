@@ -109,6 +109,7 @@ interface SlackLike {
 
 interface ChatbotLike {
   addMessageToSession(sessionId: string, message: any): Promise<any>;
+  createOrReuseInteractiveShare(sessionId: string): Promise<string>;
 }
 
 interface LearningLike {
@@ -191,7 +192,7 @@ export class HumanEvalService {
     const reviewerSlackUserId = await this.getReviewerSlackUserId(reviewer);
     const candidateId = uuidv4();
     const now = new Date().toISOString();
-    const chatUrl = input.chatUrl || this.buildChatUrl(input.sessionId);
+    const chatUrl = await this.resolveChatUrl(input);
 
     const message = this.buildSlackMessage({
       ...input,
@@ -407,8 +408,19 @@ export class HumanEvalService {
     return `human_eval_thread_${channel}_${threadTs}`;
   }
 
-  private buildChatUrl(sessionId?: string): string | undefined {
-    if (!sessionId) return undefined;
+  private async resolveChatUrl(input: CreateHumanEvalCandidateInput): Promise<string | undefined> {
+    if (input.chatUrl?.trim()) return input.chatUrl.trim();
+    if (!input.sessionId) return undefined;
+
+    try {
+      return await this.chatbot.createOrReuseInteractiveShare(input.sessionId);
+    } catch (err: any) {
+      console.warn('[human-eval] failed to create interactive share link:', err?.message || err);
+      return this.buildDirectChatUrl(input.sessionId);
+    }
+  }
+
+  private buildDirectChatUrl(sessionId: string): string {
     const base = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
     return `${base}/agent-mode/${encodeURIComponent(sessionId)}`;
   }

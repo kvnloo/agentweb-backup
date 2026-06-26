@@ -41,7 +41,7 @@ function makeHarness() {
   };
 
   const slack = {
-    postSlackMessage: jest.fn(async (channelId: string) => ({ channel: channelId, ts: '1780000000.123456' })),
+    postSlackMessage: jest.fn(async (channelId: string, _text: string) => ({ channel: channelId, ts: '1780000000.123456' })),
     getSlackUserDisplayName: jest.fn(async () => 'Matthew Wilmer'),
     getSlackUserEmail: jest.fn(async () => 'matthew@agentweb.pro'),
     resolveSlackMentionsInText: jest.fn(async (text: string) => text),
@@ -49,6 +49,7 @@ function makeHarness() {
 
   const chatbot = {
     addMessageToSession: jest.fn(async () => ({})),
+    createOrReuseInteractiveShare: jest.fn(async (sessionId: string) => `https://app.agentweb.pro/ishare/${sessionId}?conversable=token-123`),
   };
 
   const learning = {
@@ -88,6 +89,94 @@ describe('HumanEvalService', () => {
     );
     expect(settings.get('human_eval_thread_C_EVAL_1780000000.123456')).toBe(candidate.candidateId);
     expect(items.get(candidate.candidateId)?.artifactUrl).toBe('https://example.com/ad.png');
+  });
+
+  it('uses an interactive share link for associated Agent Mode chats', async () => {
+    const { service, slack, chatbot } = makeHarness();
+
+    const candidate = await service.createCandidate({
+      reviewType: 'lead_enrichment',
+      outputSummary: 'Lead enrichment completed.',
+      sessionId: 'session-123',
+    });
+
+    expect(chatbot.createOrReuseInteractiveShare).toHaveBeenCalledWith('session-123');
+    expect(candidate.chatUrl).toBe('https://app.agentweb.pro/ishare/session-123?conversable=token-123');
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.stringContaining('*Chat:* <https://app.agentweb.pro/ishare/session-123?conversable=token-123|open associated chat>'),
+    );
+  });
+
+  it('stores reviewer-safe share links on session-backed candidates', async () => {
+    const { service } = makeHarness();
+
+    const candidate = await service.createCandidate({
+      reviewType: 'creative_image',
+      outputSummary: 'Image generated.',
+      sessionId: 'image-session',
+    });
+
+    expect(candidate.chatUrl).toContain('/ishare/image-session?conversable=');
+    expect(candidate.chatUrl).not.toContain('/agent-mode/image-session');
+  });
+
+  it('does not post private Agent Mode links for automatic lead enrichment evals', async () => {
+    const { service, slack } = makeHarness();
+
+    await service.createCandidate({
+      reviewType: 'lead_enrichment',
+      outputSummary: 'Lead enrichment completed.',
+      sessionId: 'lead-session',
+      originalRequest: 'enrich_leads_execute feedback rerun list=list_123',
+    });
+
+    const postedMessage = slack.postSlackMessage.mock.calls[0][1];
+    expect(postedMessage).toContain('/ishare/lead-session?conversable=');
+    expect(postedMessage).not.toContain('/agent-mode/lead-session');
+  });
+
+  it('preserves an explicit chat URL without creating a new interactive share', async () => {
+    const { service, chatbot } = makeHarness();
+
+    const candidate = await service.createCandidate({
+      reviewType: 'landing_page',
+      outputSummary: 'Landing page generated.',
+      sessionId: 'session-123',
+      chatUrl: 'https://app.agentweb.pro/custom-review-link',
+    });
+
+    expect(chatbot.createOrReuseInteractiveShare).not.toHaveBeenCalled();
+    expect(candidate.chatUrl).toBe('https://app.agentweb.pro/custom-review-link');
+  });
+
+  it('falls back to an encoded direct Agent Mode link when interactive share creation fails', async () => {
+    const { service, chatbot } = makeHarness();
+    chatbot.createOrReuseInteractiveShare.mockRejectedValueOnce(new Error('share failed'));
+
+    const candidate = await service.createCandidate({
+      reviewType: 'creative_image',
+      outputSummary: 'Image generated.',
+      sessionId: 'session with spaces',
+    });
+
+    expect(candidate.chatUrl).toBe('http://localhost:5174/agent-mode/session%20with%20spaces');
+  });
+
+  it('omits the associated chat line when no session or chat URL is available', async () => {
+    const { service, slack, chatbot } = makeHarness();
+
+    const candidate = await service.createCandidate({
+      reviewType: 'lead_enrichment',
+      outputSummary: 'Lead enrichment completed.',
+    });
+
+    expect(chatbot.createOrReuseInteractiveShare).not.toHaveBeenCalled();
+    expect(candidate.chatUrl).toBeUndefined();
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.not.stringContaining('open associated chat'),
+    );
   });
 
   it('routes lead enrichment to Fangfang', async () => {
