@@ -10124,7 +10124,7 @@ export class AgentModeService {
    */
   public async sendEmailFromConfiguredSender(
     userId: string,
-    params: { to: string; subject?: string; html?: string; text?: string; senderId?: string }
+    params: { to: string; subject?: string; html?: string; text?: string; body?: string; senderId?: string }
   ): Promise<any> {
     try {
       const to = (params.to || '').trim();
@@ -10134,8 +10134,18 @@ export class AgentModeService {
       if (!params.subject || !params.subject.trim()) {
         return { success: false, message: 'Subject required', error: 'An email subject is required' };
       }
-      if (!params.html && !params.text) {
-        return { success: false, message: 'Email body required', error: 'The email body (html or text) is required' };
+
+      // Normalize the body. Accept `body` as an alias for `text` (the generic
+      // `email` tool and most LLM calls use `body`), and treat empty/whitespace
+      // values as absent so we never send a blank email. html takes precedence.
+      const htmlBody = params.html && params.html.trim() ? params.html : undefined;
+      const textBody = (() => {
+        const t = params.text && params.text.trim() ? params.text : undefined;
+        if (t) return t;
+        return params.body && params.body.trim() ? params.body : undefined;
+      })();
+      if (!htmlBody && !textBody) {
+        return { success: false, message: 'Email body required', error: 'The email body (html or text) is required and cannot be empty' };
       }
 
       // Resolve sender from the user's configured CRM senders.
@@ -10172,12 +10182,12 @@ export class AgentModeService {
           return { success: false, message: 'Gmail sender misconfigured', error: 'Gmail sender is missing gmailAccountId' };
         }
         const { gmailService } = await import('./gmailService');
-        const body = params.html || params.text || '';
+        const body = htmlBody || textBody || '';
         const gmailResult = await gmailService.sendEmail(userId, gmailAccountId, {
           to,
           subject: params.subject,
           body,
-          isHtml: !!params.html,
+          isHtml: !!htmlBody,
         });
         emailId = gmailResult.messageId;
       } else {
@@ -10187,8 +10197,8 @@ export class AgentModeService {
           from,
           to,
           subject: params.subject,
-          html: params.html,
-          text: params.text,
+          html: htmlBody,
+          text: textBody,
         });
         if (!result) {
           return { success: false, message: 'Email send failed', error: 'Failed to send email via the configured sender' };

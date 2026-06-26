@@ -3619,11 +3619,16 @@ emmaToolRegistry.register({
         },
         html: {
           type: 'string',
-          description: 'HTML body of the email. Provide either html or text (html preferred for formatted emails).'
+          description: 'HTML body of the email. Provide a non-empty body via html, text, or body (html preferred for formatted emails).'
         },
         text: {
           type: 'string',
-          description: 'Plain-text body of the email. Used when html is not provided.'
+          'x-aliases': ['body'],
+          description: 'Plain-text body of the email. Used when html is not provided. The email is not sent if no non-empty body is supplied.'
+        },
+        body: {
+          type: 'string',
+          description: 'Alias for text — the plain-text email body. Use this if you are not providing html.'
         },
         sender_id: {
           type: 'string',
@@ -3641,6 +3646,7 @@ emmaToolRegistry.register({
       subject: args.subject,
       html: args.html,
       text: args.text,
+      body: args.body,
       senderId: args.sender_id,
     });
   }
