@@ -671,6 +671,8 @@ const INCOMPLETE_WORK_PATTERNS: RegExp[] = [
   /\bi (?:did\s*not|didn'?t)\s+(?:complete|finish)\b/i,
   /\b(?:did\s*not|didn'?t)\s+finish\b/i,
   /\bstopped\b[^.]*\bbefore\s+(?:fully|finish|complet|resolving)/i,
+  /\btimed\s*out\b[^.]*\bbefore\b[^.]*\bcould\s+(?:be\s+)?(?:complete|completed|finish|finished|synthesize|synthesized)\b/i,
+  /\bcould\s+not\s+(?:complete|finish|synthesize)\b[^.]*\b(?:timed\s*out|timeout)\b/i,
   /\bhave\s*not\s+yet\s+(?:processed|completed|finished|researched)\b/i,
   /\b(?:remaining|other)\s+(?:events|leads|items|entities)\b[^.]*\b(?:were|was)?\s*not\s+(?:processed|completed|finished|researched|done)\b/i,
   /\bi\s+will\s+continue\b[^.]*\b(?:later|remaining|next)\b/i,

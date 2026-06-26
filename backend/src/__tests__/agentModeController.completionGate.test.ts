@@ -28,6 +28,9 @@ describe('scheduledRunSignalsIncompleteWork — completion-gate detector', () =>
     "I didn't finish researching Events 2 and 3.",
     'I will continue with the remaining leads later.',
     'The remaining events were not processed in this run.',
+    'I have successfully gathered the contact information for the requested providers, but the research process timed out before the analysis could be completed. Please try your request again, and I will proceed with synthesizing their backgrounds and professional overlaps.',
+    'The research process timed out before I could complete the analysis for the remaining providers.',
+    'I collected the source data, but could not complete the synthesis because the run timed out.',
   ];
 
   it.each(incompleteAdmissions)('fires on incomplete-work admission: %s', (text) => {
