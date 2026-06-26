@@ -491,6 +491,19 @@ describe('GET /api/crm-sync/config/:listId/:provider — needsReconnect state', 
     expect(res.body.configured).toBe(true);
     expect(res.body.needsReconnect).toBe(false);
   });
+
+  it('surfaces lastSyncErrorCategory so the UI can distinguish data vs connection errors', async () => {
+    externalCrmSyncService.isAccountConnected.mockResolvedValue(true);
+    externalCrmSyncService.getConfig.mockResolvedValue({
+      ...configWithAccount,
+      lastSyncStatus: 'error',
+      lastSyncError: 'bad@email8: invalid email (rejected by HubSpot)',
+      lastSyncErrorCategory: 'data',
+    });
+    const res = await request(app).get('/api/crm-sync/config/list-1/hubspot').expect(200);
+    expect(res.body.lastSyncStatus).toBe('error');
+    expect(res.body.lastSyncErrorCategory).toBe('data');
+  });
 });
 
 describe('PUT /api/crm-sync/config/:listId/:provider — one-account-per-list enforcement', () => {

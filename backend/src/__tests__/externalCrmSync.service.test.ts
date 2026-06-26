@@ -1172,6 +1172,19 @@ describe('ExternalCrmSyncService', () => {
       expect(saved.lastSyncError).toContain('Authentication credentials not found');
     });
 
+    it('categorizes a thrown push failure (revoked token) as a connection error', async () => {
+      const config = makeConfig({ autoSyncEnabled: true });
+      mockListWithConfig(config);
+      mockHubSpotServiceInstance.ensureContactProperty.mockRejectedValue(
+        new Error('Authentication credentials not found')
+      );
+
+      await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com', notes: 'x' }, 'hubspot', 'created');
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      expect(saved.lastSyncErrorCategory).toBe('connection');
+    });
+
     it('persists lastSyncStatus=error when the adapter reports a per-lead error (errorCount>0)', async () => {
       const config = makeConfig({ autoSyncEnabled: true });
       mockListWithConfig(config);
@@ -1183,6 +1196,35 @@ describe('ExternalCrmSyncService', () => {
       const saved = call![2] as Record<string, any>;
       expect(saved.lastSyncStatus).toBe('error');
       expect(saved.lastSyncError).toBeTruthy();
+    });
+
+    it('categorizes a per-lead failure (errorCount>0, no throw) as a data error', async () => {
+      const config = makeConfig({ autoSyncEnabled: true });
+      mockListWithConfig(config);
+      // An invalid email is caught per-lead into result.errors (no throw): the
+      // connection is healthy, so reconnecting would not help — category 'data'.
+      await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'not-an-email' }, 'hubspot', 'created');
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      expect(saved.lastSyncStatus).toBe('error');
+      expect(saved.lastSyncErrorCategory).toBe('data');
+    });
+
+    it('keeps an auth-shaped per-lead failure (errorCount>0) as a connection error', async () => {
+      const config = makeConfig({ autoSyncEnabled: true });
+      mockListWithConfig(config);
+      // A valid email, but the per-lead upsert is rejected for an auth reason that
+      // the batch path records into result.errors instead of throwing. This must
+      // NOT be downgraded to 'data' — reconnecting is still the right remedy.
+      mockHubSpotServiceInstance.upsertContact.mockRejectedValue(
+        new Error('Authentication credentials not found')
+      );
+
+      await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'valid@example.com' }, 'hubspot', 'created');
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      expect(saved.lastSyncStatus).toBe('error');
+      expect(saved.lastSyncErrorCategory).toBe('connection');
     });
 
     it('persists lastSyncStatus=success and clears lastSyncError on a healthy sync', async () => {
@@ -1198,6 +1240,22 @@ describe('ExternalCrmSyncService', () => {
       expect(saved.lastSyncStatus).toBe('success');
       expect(saved.lastSyncError).toBeUndefined();
       expect(saved.lastPushSyncAt).toBeTruthy();
+    });
+
+    it('clears a stale lastSyncErrorCategory on a healthy sync', async () => {
+      const config = makeConfig({
+        autoSyncEnabled: true,
+        lastSyncStatus: 'error',
+        lastSyncError: 'old failure',
+        lastSyncErrorCategory: 'data',
+      });
+      mockListWithConfig(config);
+
+      await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com', firstName: 'Ada' }, 'hubspot', 'created');
+
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      expect(saved.lastSyncStatus).toBe('success');
+      expect(saved.lastSyncErrorCategory).toBeUndefined();
     });
 
     // ─── per-lead status propagation (Task 2 supplies the behaviour) ──────────
