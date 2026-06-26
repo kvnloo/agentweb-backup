@@ -657,6 +657,29 @@ describe('ExternalCrmSyncService', () => {
       expect(result.error).toBe('Unauthorized');
     });
 
+    it('returns valid=false (not a rejection) when account resolution/token refresh throws', async () => {
+      // Repro: an expired OAuth token whose refresh fails (e.g. HubSpot
+      // MISMATCH_REFRESH_TOKEN_CLIENT — refresh token issued to a different app).
+      // HubSpotService.create() rejects BEFORE testConnection() runs. The service
+      // must surface this as { valid:false, error } so the route returns 200 with a
+      // reason — not let the rejection escape to a generic HTTP 500.
+      mockListWithConfig(makeConfig({ accountId: 'acct1' }));
+      mockHubSpotCreate.mockRejectedValue(new Error('Request failed with status code 400'));
+
+      const result = await service.testConnection('user1', 'list1', 'hubspot');
+      expect(result.valid).toBe(false);
+      expect(result.error).toMatch(/status code 400/);
+    });
+
+    it('surfaces a thrown error for inline accountId credentials too', async () => {
+      mockListWithConfig(makeConfig());
+      mockHubSpotCreate.mockRejectedValue(new Error('refresh token was not issued to this client'));
+
+      const result = await service.testConnection('user1', 'list1', 'hubspot', { accountId: '245820641' });
+      expect(result.valid).toBe(false);
+      expect(result.error).toMatch(/refresh token was not issued/);
+    });
+
     it('returns valid=true on successful Attio API call (manual token)', async () => {
       const config = makeConfig({ provider: 'attio', accountId: undefined, apiKeyEncrypted: 'enc:attio-token' });
       mockListWithConfig(config, 'attio');
