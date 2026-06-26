@@ -1523,7 +1523,7 @@ mcpToolRegistry.register({
   name: 'edit_landing_page_file',
   definition: {
     name: 'edit_landing_page_file',
-    description: '[DEPRECATED — use coding_agent instead] Direct file edit requiring full file content. This tool is deprecated because it requires you to provide the entire file content, which fails for large files. Use the coding_agent tool instead — it supports diff-based editing, reads files automatically, checks deployment status, and iterates on errors. If you must use this tool, pass a branch to stage changes (e.g. "draft/<session-id>") and use publish_landing_page_changes to go live.',
+    description: '[DEPRECATED — use coding_agent instead] Direct file edit requiring full file content. This tool is deprecated because it requires you to provide the entire file content, which fails for large files. Use the coding_agent tool instead — it supports diff-based editing, reads files automatically, checks deployment status, and iterates on errors. If you must use this tool, pass "draft/agentweb-preview" to stage changes and use publish_landing_page_changes to go live.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1531,7 +1531,7 @@ mcpToolRegistry.register({
         file_path: { type: 'string', description: 'Path to the file in the repo (e.g., "src/app/page.tsx")' },
         content: { type: 'string', description: 'The new file content' },
         commit_message: { type: 'string', description: 'Git commit message (optional)' },
-        branch: { type: 'string', description: 'Target branch for staging (e.g. "draft/abc12345"). Defaults to "main" for backward compatibility.' }
+        branch: { type: 'string', description: 'Target branch for staging. Use "draft/agentweb-preview". Defaults to "main" for backward compatibility.' }
       },
       required: ['page_id', 'file_path', 'content']
     }
@@ -1613,12 +1613,12 @@ mcpToolRegistry.register({
   name: 'get_landing_page_preview_url',
   definition: {
     name: 'get_landing_page_preview_url',
-    description: 'Get the Vercel preview URL for a landing page draft branch. Use this after the coding_agent edits a landing page to get the preview link for the user to review before publishing. IMPORTANT: The branch name MUST come from the coding_agent tool result (the "branch" field). Do NOT guess or construct branch names yourself. If coding_agent returned is_staging=false or no branch, there is no draft to preview. If buildStatus is "not_found", the branch does not exist on Vercel — do NOT keep polling. If buildStatus is "building", the Vercel deployment is still in progress — wait 20-30 seconds and call this tool again to get the URL once ready.',
+    description: 'Get the Vercel preview URL for the reusable landing page draft branch. Use this after the coding_agent edits a landing page to get the preview link for the user to review before publishing. IMPORTANT: The branch name MUST come from the coding_agent tool result (normally "draft/agentweb-preview"). Do NOT invent random draft branches. If coding_agent returned is_staging=false or no branch, there is no draft to preview. If buildStatus is "not_found", the branch does not exist on Vercel — do NOT keep polling. If buildStatus is "building", the Vercel deployment is still in progress — wait 20-30 seconds and call this tool again to get the URL once ready.',
     inputSchema: {
       type: 'object',
       properties: {
         page_id: { type: 'string', description: 'The landing page ID' },
-        branch: { type: 'string', description: 'The draft branch name from the coding_agent result (e.g. "draft/c8e16e74-0cad-4f"). Do NOT guess this value.' }
+        branch: { type: 'string', description: 'The draft branch name from the coding_agent result, normally "draft/agentweb-preview". Do NOT guess this value.' }
       },
       required: ['page_id', 'branch']
     }
@@ -1638,12 +1638,12 @@ mcpToolRegistry.register({
   name: 'publish_landing_page_changes',
   definition: {
     name: 'publish_landing_page_changes',
-    description: 'Merge a draft branch into main to make landing page changes live. Use this after the user has reviewed the preview and approved the changes. This merges the draft branch, triggers a production deployment, and deletes the draft branch.',
+    description: 'Merge the reusable draft branch into main to make landing page changes live. Use this after the user has reviewed the preview and approved the changes. This merges the draft branch, triggers a production deployment, and deletes the draft branch.',
     inputSchema: {
       type: 'object',
       properties: {
         page_id: { type: 'string', description: 'The landing page ID' },
-        branch: { type: 'string', description: 'The draft branch to merge (e.g. "draft/abc12345")' }
+        branch: { type: 'string', description: 'The draft branch to merge, normally "draft/agentweb-preview"' }
       },
       required: ['page_id', 'branch']
     }
