@@ -139,7 +139,12 @@ export class GmailService implements IEmailService {
 
       return newToken;
     } catch (err: any) {
-      if (err.message?.includes('invalid_grant') || err.message?.includes('Token has been expired or revoked')) {
+      if (
+        err.message?.includes('invalid_grant') ||
+        err.message?.includes('unauthorized_client') ||
+        err.message?.includes('invalid_client') ||
+        err.message?.includes('Token has been expired or revoked')
+      ) {
         throw new GmailTokenRevokedError();
       }
       throw err; // network error — let caller handle

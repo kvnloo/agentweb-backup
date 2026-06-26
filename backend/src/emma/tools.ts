@@ -3597,6 +3597,63 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
+  name: 'send_email_from_sender',
+  definition: {
+    name: 'send_email_from_sender',
+    description:
+      'Send a one-off email to any recipient using the user\'s CONFIGURED email sender (set up in CRM → Senders). ' +
+      'Use this for ad-hoc emails that are NOT tied to a CRM lead draft — e.g. "send an email to alice@example.com". ' +
+      'This does NOT require a connected Gmail account: it sends through the user\'s configured sender (a verified custom-domain sender, or a connected Gmail-account sender). ' +
+      'Prefer this over the `email` tool when the user has no connected Gmail account but has a configured sender. ' +
+      'If no sender is configured, tell the user to open CRM, select a lead list, and click "Senders" to configure one. ' +
+      'IMPORTANT about delivery: a successful result means the email was ACCEPTED for delivery by the provider, NOT that it reached the recipient\'s inbox. Do not claim guaranteed delivery — say it was "sent" or "queued for delivery". The provider cannot detect a well-formed but non-existent mailbox at send time; such messages bounce asynchronously to the sender\'s own inbox. Always double-check the recipient address with the user before sending if it looks suspicious. Malformed addresses are rejected before sending.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        to: {
+          type: 'string',
+          description: 'Recipient email address'
+        },
+        subject: {
+          type: 'string',
+          description: 'Email subject line'
+        },
+        html: {
+          type: 'string',
+          description: 'HTML body of the email. Provide a non-empty body via html, text, or body (html preferred for formatted emails).'
+        },
+        text: {
+          type: 'string',
+          'x-aliases': ['body'],
+          description: 'Plain-text body of the email. Used when html is not provided. The email is not sent if no non-empty body is supplied.'
+        },
+        body: {
+          type: 'string',
+          description: 'Alias for text — the plain-text email body. Use this if you are not providing html.'
+        },
+        sender_id: {
+          type: 'string',
+          description: 'Optional sender to send from. Accepts the sender\'s email address, its from-name, the keyword "gmail" (to use the configured Gmail-account sender), or the internal id. Omit to use the user\'s default configured sender. If the value does not match any configured sender, the tool returns the list of available senders (each marked [gmail] or [resend]) — relay those options to the user rather than claiming no sender exists.'
+        }
+      },
+      required: ['to', 'subject']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId;
+    if (!userId) throw new Error('Missing user context');
+    return await agentModeService.sendEmailFromConfiguredSender(userId, {
+      to: args.to,
+      subject: args.subject,
+      html: args.html,
+      text: args.text,
+      body: args.body,
+      senderId: args.sender_id,
+    });
+  }
+});
+
+emmaToolRegistry.register({
   name: 'list_connected_accounts',
   definition: {
     name: 'list_connected_accounts',
@@ -5604,6 +5661,7 @@ emmaToolRegistry.register({
     description:
       'Read, search, and send emails across connected email accounts (Gmail, and more providers in the future). ' +
       'Always call list_connected_accounts first to get the account_id for the user\'s email account. ' +
+      'NOTE: this tool requires a CONNECTED Gmail account. To send a one-off email when the user has NO connected Gmail account but HAS a configured sender (CRM → Senders), use send_email_from_sender instead. ' +
       'Actions:\n' +
       '  \u2022 search \u2014 find emails by query. Gmail syntax: "from:alice@example.com subject:invoice newer_than:7d is:unread has:attachment"\n' +
       '  \u2022 list   \u2014 list recent emails from a folder (INBOX, SENT, TRASH, SPAM, or custom label)\n' +

@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-06-22
+// Last updated: 2026-06-26
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,51 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-06-26',
+    changes: [
+      'Fixed: Emma Can Now Send One-Off Emails Using Your Configured Sender',
+      '- Previously, if you asked Emma in chat to send an email (for example "send an email to alice@example.com"), she could only send it through a connected Gmail account — so if you had set up a sender under CRM → Senders but had not connected a raw Gmail account, Emma would say no email account was connected and could not send',
+      '- Emma can now send a one-off email directly through your configured sender (a verified custom-domain sender or a connected Gmail-account sender), no separate Gmail connection required',
+      '- You can let Emma pick your default sender automatically, or tell her which configured sender to send from',
+    ],
+  },
+  {
+    date: '2026-06-26',
+    changes: [
+      'Improved: More Accurate Video Timestamps',
+      '- When you ask Emma for a timestamped transcript or scene breakdown of a video, the timestamps now line up much more closely with where things actually happen, and stay in the right order',
+      '- This makes it easier to jump to a moment, cut short-form clips, or cite a specific quote with the correct time',
+    ],
+  },
+  {
+    date: '2026-06-26',
+    changes: [
+      'Improved: Emma Now Reliably Watches and Transcribes YouTube Videos',
+      '- When you share a YouTube link (or a video file) and ask Emma to summarize, script, or repurpose it, she now watches and transcribes it directly instead of occasionally saying she "can\'t access videos" and asking you to do it yourself',
+      '- Great for turning a video interview or webinar into LinkedIn posts, blog drafts, or short-form content — just paste the link and tell Emma what you want',
+    ],
+  },
+  {
+    date: '2026-06-26',
+    changes: [
+      'Fixed: HubSpot Sync Banner No Longer Asks You to Reconnect Over a Bad Lead Email',
+      '- When a lead failed to sync only because its email address was invalid, the CRM banner used to say the connection was rejected and offered a "Reconnect HubSpot" button — even though your connection was perfectly fine and reconnecting would not help',
+      '- The banner now recognizes this case and instead tells you the lead couldn\'t be synced because of its data, names the problem email, and reassures you the connection is healthy — with no unnecessary reconnect prompt',
+      '- Genuine connection problems (an expired or revoked HubSpot connection) still show the "Reconnect HubSpot" button as before, so the action you\'re offered always matches the actual issue',
+    ],
+  },
+  {
+    date: '2026-06-23',
+    changes: [
+      'Added: Set a Lifecycle Stage and Mark Contacts Non-Marketing When Syncing to HubSpot',
+      '- In a lead list\'s HubSpot sync settings, you can now pick a lifecycle stage (including custom stages like "Ad Audience") to apply to every contact the list pushes, so synced leads land in the right stage automatically — and you can create a brand-new stage right from the picker without leaving the page',
+      '- The stage is applied even when a contact is already further along — HubSpot normally blocks moving a contact backward, so we set the stage in a way that reliably overwrites the existing one',
+      '- New "Mark contacts as non-marketing" toggle: when on, contacts pushed from that list are set to non-marketing in HubSpot after each sync, so they don\'t count toward your billable marketing-contact limit (useful for large imported or prospecting lists). HubSpot applies this asynchronously, so it may take a few minutes to reflect',
+      '- To use the non-marketing toggle you\'ll need to reconnect your HubSpot account once (Settings → Connected Accounts) so we can request the additional permission it requires',
+      '- Both settings apply to all contacts pushed from that list and never overwrite a lifecycle stage you\'ve explicitly mapped per-field; leave either one unset to keep HubSpot\'s existing behavior',
+    ],
+  },
   {
     date: '2026-06-22',
     changes: [

@@ -11,7 +11,7 @@
  * regular/undefined sessions preserve the proactive scheduling behaviour.
  */
 
-import { getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
+import { getScheduledSessionOverride, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import { getEmmaSystemContext } from '../services/chatbotService';
 
 // ── Heavy module mocks required to import chatbotService ──────────────────────
@@ -128,6 +128,83 @@ describe('getScheduledSessionOverride — pure function', () => {
   it('returns the same empty string on repeated calls for "regular"', () => {
     expect(getScheduledSessionOverride('regular')).toBe('');
     expect(getScheduledSessionOverride('regular')).toBe('');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('getUnattendedExecutionDirective — per-entity completion guidance', () => {
+  // Regression coverage for session b56a2eac (Daily Event Lead Engagement Review):
+  // the agent extracted guest lists for all 3 events but then skipped LinkedIn
+  // research / ICP filtering / pending-approval checks for events 2 & 3 after
+  // hitting a single per-entity blocker (one teammate's LinkedIn not connected).
+  // The directive must (1) enforce a per-entity completion loop, (2) isolate a
+  // blocker to its entity and keep going, (3) add a pre-output completion gate,
+  // and (4) surface gaps as actionable items.
+
+  const directive = getUnattendedExecutionDirective('scheduled');
+
+  // ── Self-guard: mirrors getScheduledSessionOverride so the function is safe
+  //    to call unconditionally and cannot leak the unattended block into a
+  //    non-scheduled session even if a future caller forgets the call-site guard.
+  it('returns empty string when sessionType is undefined', () => {
+    expect(getUnattendedExecutionDirective(undefined)).toBe('');
+  });
+
+  it('returns empty string when sessionType is "regular"', () => {
+    expect(getUnattendedExecutionDirective('regular')).toBe('');
+  });
+
+  it('returns empty string for other known non-scheduled types', () => {
+    for (const t of ['image-generation', 'report_generation', 'emma-email', 'predefined-work-plan']) {
+      expect(getUnattendedExecutionDirective(t)).toBe('');
+    }
+  });
+
+  it('returns the directive only for sessionType "scheduled"', () => {
+    expect(getUnattendedExecutionDirective('scheduled')).not.toBe('');
+  });
+
+  it('is non-empty and labelled as the unattended execution block', () => {
+    expect(directive).toContain('AUTOMATED UNATTENDED EXECUTION');
+  });
+
+  it('still instructs continuous single-run execution (preserves existing behaviour)', () => {
+    expect(directive).toContain('without stopping to ask');
+    expect(directive).toContain('FULL stated amount');
+  });
+
+  // ── (1) Per-entity completion loop ──────────────────────────────────────────
+  it('requires completing ALL steps for EACH entity before finishing', () => {
+    expect(directive.toLowerCase()).toContain('each');
+    expect(directive).toMatch(/every (entity|item)/i);
+  });
+
+  it('forbids stopping after the first entity when more remain', () => {
+    expect(directive.toLowerCase()).toContain('do not stop after the first');
+  });
+
+  // ── (2) Blocker isolation ────────────────────────────────────────────────────
+  it('scopes a blocker to its own entity and continues the others', () => {
+    expect(directive.toLowerCase()).toContain('blocker');
+    expect(directive.toLowerCase()).toContain('continue');
+    // must distinguish a per-entity blocker from a true unrecoverable error
+    expect(directive.toLowerCase()).toContain('does not block');
+  });
+
+  it('still allows stopping only on a truly unrecoverable / global error', () => {
+    expect(directive.toLowerCase()).toContain('unrecoverable');
+  });
+
+  // ── (3) Pre-output completion gate ──────────────────────────────────────────
+  it('adds a completion gate before producing the final output', () => {
+    expect(directive.toLowerCase()).toContain('before');
+    expect(directive.toLowerCase()).toMatch(/completion (gate|check)|verify (that )?(all|every)/i);
+  });
+
+  // ── (4) Surface gaps as actionable items ────────────────────────────────────
+  it('requires surfacing skipped/blocked work as actionable items', () => {
+    expect(directive.toLowerCase()).toContain('actionable');
   });
 });
 

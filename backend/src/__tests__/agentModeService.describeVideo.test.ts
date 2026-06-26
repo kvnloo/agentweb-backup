@@ -1,6 +1,6 @@
 // Consolidates: describeVideo.enhanced + describeVideo.likeness-fix
 
-import { AgentModeService } from '../services/agentModeService';
+import { AgentModeService, __testHooks } from '../services/agentModeService';
 import axios from 'axios';
 import { Readable } from 'stream';
 
@@ -149,6 +149,98 @@ describe('AgentModeService - describeVideo', () => {
     });
   });
 
+  describe('timestamp accuracy (MM:SS prompt + parsing)', () => {
+    it('should ask Gemini for MM:SS timestamps when transcript is requested', async () => {
+      mockAxiosVideo();
+      const { mockGenerateContent } = mockGemini(JSON.stringify({
+        description: 'demo', transcript: [{ start: '00:00', end: '00:05', text: 'hi' }], duration: '00:05'
+      }));
+
+      await service.describeVideo('https://example.com/demo.mp4', undefined, { return_transcript: true });
+
+      const promptText = mockGenerateContent.mock.calls[0][0].contents[0].parts.find((p: any) => p.text)?.text || '';
+      expect(promptText).toContain('MM:SS');
+    });
+
+    it('should normalize MM:SS transcript timestamps to numeric seconds', async () => {
+      mockAxiosVideo();
+      mockGemini(JSON.stringify({
+        description: 'A demo video.',
+        transcript: [
+          { start: '00:00', end: '00:05', text: 'Welcome.' },
+          { start: '01:15', end: '01:20', text: 'Main feature.' }
+        ],
+        duration: '01:20'
+      }));
+
+      const result = await service.describeVideo('https://example.com/demo.mp4', undefined, { return_transcript: true });
+
+      expect(result.success).toBe(true);
+      expect(result.transcript[0].start).toBe(0);
+      expect(result.transcript[0].end).toBe(5);
+      expect(result.transcript[1].start).toBe(75);
+      expect(result.transcript[1].end).toBe(80);
+      expect(result.duration).toBe(80);
+    });
+
+    it('should normalize HH:MM:SS scene timestamps to numeric seconds', async () => {
+      mockAxiosVideo();
+      mockGemini(JSON.stringify({
+        description: 'A long video.',
+        scenes: [{ start: '01:00:30', end: '01:01:00', title: 'Late scene', description: 'x' }],
+        duration: '01:01:00'
+      }));
+
+      const result = await service.describeVideo('https://example.com/demo.mp4', undefined, { return_scenes: true });
+
+      expect(result.success).toBe(true);
+      expect(result.scenes[0].start).toBe(3630);
+      expect(result.scenes[0].end).toBe(3660);
+    });
+
+    it('should leave already-numeric timestamps unchanged (backward compatible)', async () => {
+      mockAxiosVideo();
+      mockGemini(JSON.stringify({
+        description: 'A demo video.',
+        transcript: [{ start: 0, end: 5.5, text: 'Welcome.' }],
+        duration: 5.5
+      }));
+
+      const result = await service.describeVideo('https://example.com/demo.mp4', undefined, { return_transcript: true });
+
+      expect(result.success).toBe(true);
+      expect(result.transcript[0].start).toBe(0);
+      expect(result.transcript[0].end).toBe(5.5);
+      expect(result.duration).toBe(5.5);
+    });
+  });
+
+  describe('parseTimecodeToSeconds helper', () => {
+    const parse = __testHooks.parseTimecodeToSeconds;
+    it.each([
+      ['00:00', 0],
+      ['00:05', 5],
+      ['1:15', 75],
+      ['01:15', 75],
+      ['01:00:30', 3630],
+      ['10', 10],
+      ['5.5', 5.5],
+      [12, 12],
+      [0, 0],
+    ])('parses %s -> %s', (input, expected) => {
+      expect(parse(input as any)).toBe(expected);
+    });
+
+    it.each([
+      [undefined],
+      [null],
+      ['not-a-time'],
+      [''],
+    ])('returns undefined for invalid input %s', (input) => {
+      expect(parse(input as any)).toBeUndefined();
+    });
+  });
+
   describe('return_scenes parameter', () => {
     it('should include scenes in return when return_scenes=true', async () => {
       const fakeResponse = JSON.stringify({
@@ -231,6 +323,48 @@ describe('AgentModeService - describeVideo', () => {
       expect(result.transcript).toBeDefined();
       expect(result.scenes).toBeDefined();
       expect(result.duration).toBeDefined();
+    });
+  });
+
+  describe('YouTube URL handling', () => {
+    it.each([
+      'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+      'https://youtu.be/dQw4w9WgXcQ',
+      'https://youtube.com/shorts/abc123'
+    ])('should pass YouTube URLs directly to Gemini without downloading (%s)', async (ytUrl) => {
+      const { mockGenerateContent } = mockGemini('A YouTube interview about agentic AI.');
+
+      const result = await service.describeVideo(ytUrl);
+
+      expect(result.success).toBe(true);
+      // YouTube URLs must NOT be downloaded via axios — Gemini fetches them natively
+      expect(axios.get as jest.Mock).not.toHaveBeenCalled();
+      // The raw YouTube URL is handed to Gemini as fileData.fileUri
+      const parts = mockGenerateContent.mock.calls[0][0].contents[0].parts;
+      const fileDataPart = parts.find((p: any) => p.fileData);
+      expect(fileDataPart?.fileData?.fileUri).toBe(ytUrl);
+    });
+
+    it('should return a timestamped transcript for a YouTube URL when return_transcript=true', async () => {
+      mockGemini(JSON.stringify({
+        description: 'An interview about agentic AI.',
+        transcript: [
+          { start: 0, end: 6, text: 'Today we discuss agentic AI.' },
+          { start: 6, end: 12, text: 'It changes how software is built.' }
+        ],
+        duration: 12
+      }));
+
+      const result = await service.describeVideo(
+        'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+        undefined,
+        { return_transcript: true }
+      );
+
+      expect(result.success).toBe(true);
+      expect(axios.get as jest.Mock).not.toHaveBeenCalled();
+      expect(Array.isArray(result.transcript)).toBe(true);
+      expect(result.transcript[0]).toHaveProperty('text');
     });
   });
 

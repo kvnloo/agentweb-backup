@@ -23,13 +23,45 @@ describe('secretsManager', () => {
   // ── getGmailCredentials ───────────────────────────────────────────────────
 
   describe('getGmailCredentials', () => {
+    // For all tests except the env-var test, remove env-var shortcut so the
+    // Secrets Manager path is exercised. Restore after each test.
+    let savedClientId: string | undefined;
+    let savedClientSecret: string | undefined;
+
+    afterEach(() => {
+      process.env.GOOGLE_CLIENT_ID = savedClientId ?? '';
+      process.env.GOOGLE_CLIENT_SECRET = savedClientSecret ?? '';
+    });
+
+    // Helper: require module then blank out env-var bypass BEFORE calling the fn.
+    // The require() itself can trigger dotenv re-evaluation, so we clear after require.
+    function requireAndBlank() {
+      const mod = require('../utils/secretsManager');
+      savedClientId = process.env.GOOGLE_CLIENT_ID;
+      savedClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+      process.env.GOOGLE_CLIENT_ID = '';
+      process.env.GOOGLE_CLIENT_SECRET = '';
+      return mod;
+    }
+
+    it('returns env-var credentials directly without calling Secrets Manager', async () => {
+      process.env.GOOGLE_CLIENT_ID = 'env-id';
+      process.env.GOOGLE_CLIENT_SECRET = 'env-secret';
+
+      const { getGmailCredentials } = require('../utils/secretsManager');
+      const creds = await getGmailCredentials();
+
+      expect(creds).toEqual({ clientId: 'env-id', clientSecret: 'env-secret' });
+      expect(mockGetSecretValue).not.toHaveBeenCalled();
+    });
+
     it('returns credentials from dev secret in development', async () => {
       process.env.NODE_ENV = 'development';
       mockGetSecretValue.mockResolvedValue({
         SecretString: JSON.stringify({ clientId: 'gmail-id', clientSecret: 'gmail-secret' }),
       });
 
-      const { getGmailCredentials } = require('../utils/secretsManager');
+      const { getGmailCredentials } = requireAndBlank();
       const creds = await getGmailCredentials();
 
       expect(creds).toEqual({ clientId: 'gmail-id', clientSecret: 'gmail-secret' });
@@ -42,7 +74,7 @@ describe('secretsManager', () => {
         SecretString: JSON.stringify({ clientId: 'prod-id', clientSecret: 'prod-secret' }),
       });
 
-      const { getGmailCredentials } = require('../utils/secretsManager');
+      const { getGmailCredentials } = requireAndBlank();
       await getGmailCredentials();
 
       expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'prod/AgentWeb/Google/Gmail' });
@@ -52,7 +84,7 @@ describe('secretsManager', () => {
       process.env.NODE_ENV = 'development';
       mockGetSecretValue.mockResolvedValue({ SecretString: '' });
 
-      const { getGmailCredentials } = require('../utils/secretsManager');
+      const { getGmailCredentials } = requireAndBlank();
       await expect(getGmailCredentials()).rejects.toThrow('Failed to fetch Gmail credentials');
     });
 
@@ -60,7 +92,7 @@ describe('secretsManager', () => {
       process.env.NODE_ENV = 'development';
       mockGetSecretValue.mockResolvedValue({ SecretString: '   ' });
 
-      const { getGmailCredentials } = require('../utils/secretsManager');
+      const { getGmailCredentials } = requireAndBlank();
       await expect(getGmailCredentials()).rejects.toThrow('Failed to fetch Gmail credentials');
     });
 
@@ -70,7 +102,7 @@ describe('secretsManager', () => {
         SecretString: JSON.stringify({ clientSecret: 'secret-only' }),
       });
 
-      const { getGmailCredentials } = require('../utils/secretsManager');
+      const { getGmailCredentials } = requireAndBlank();
       await expect(getGmailCredentials()).rejects.toThrow('Failed to fetch Gmail credentials');
     });
 
@@ -80,7 +112,7 @@ describe('secretsManager', () => {
         SecretString: JSON.stringify({ clientId: 'id-only' }),
       });
 
-      const { getGmailCredentials } = require('../utils/secretsManager');
+      const { getGmailCredentials } = requireAndBlank();
       await expect(getGmailCredentials()).rejects.toThrow('Failed to fetch Gmail credentials');
     });
 
@@ -88,7 +120,7 @@ describe('secretsManager', () => {
       process.env.NODE_ENV = 'development';
       mockGetSecretValue.mockRejectedValue(new Error('Access denied'));
 
-      const { getGmailCredentials } = require('../utils/secretsManager');
+      const { getGmailCredentials } = requireAndBlank();
       await expect(getGmailCredentials()).rejects.toThrow('Failed to fetch Gmail credentials');
     });
   });
