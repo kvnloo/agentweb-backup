@@ -109,6 +109,83 @@ const isAfterLastSync = (recordTime: string | undefined, lastSyncAt: string | un
   return recordMs > lastSyncMs;
 };
 
+const ADMIN_USER_LIST_FIELDS = [
+  "userId",
+  "email",
+  "isAdmin",
+  "isActive",
+  "createdAt",
+  "lastLoginTime",
+  "lastActiveAt",
+  "displayName",
+  "supportNote",
+  "role",
+  "roles",
+  "taskCount",
+  "workflowCount",
+  "chatSessionCount",
+  "isOAuthUser",
+  "stripe_customer_id",
+  "stripe_subscription_id",
+  "subscription_status",
+  "subscription_amount",
+  "subscription_interval",
+  "subscription_current_period_end",
+  "subscription_cancel_at_period_end",
+  "trial_end",
+  "has_payment_method",
+  "current_period_end",
+  "adAccount",
+  "emailDomain",
+  "defaultSenderUsername",
+  "fromName",
+  "slackChannel",
+  "slackChannels",
+  "slackSuggestedRepliesDisabled",
+  "seoDomains",
+  "googleAnalyticsPropertyId",
+  "googleAnalyticsProperties",
+  "primaryAnalyticsPropertyId",
+  "clarityProjects",
+  "gaFilteredDomains",
+  "clarityProjectId",
+  "productDomain",
+  "cmsType",
+  "subscriptionType",
+  "tokenUsage",
+  "tokenUsageHistory",
+  "tokenAllowanceBonus",
+  "extraCostUsage",
+  "extraCostUsageHistory",
+  "googleDriveFolders",
+  "introductionEmailSent",
+  "utmSource",
+  "utmMedium",
+  "utmCampaign",
+  "utmContent",
+  "utmTerm",
+  "monthlyMarketingSpend",
+  "businessArea",
+  "marketingChannels",
+  "companyName",
+  "fullName",
+  "name",
+  "phoneNumber",
+  "orgId",
+  "orgRole",
+] as const;
+
+const compactAdminUserForList = (user: any): Record<string, any> => {
+  const compact: Record<string, any> = {};
+  for (const field of ADMIN_USER_LIST_FIELDS) {
+    if (user[field] !== undefined) {
+      compact[field] = user[field];
+    }
+  }
+  compact.secretNames = user.secrets ? Object.keys(user.secrets) : [];
+  return compact;
+};
+
 // Apply authentication and admin middleware to all routes
 router.use(authenticateToken);
 router.use(isAdmin);
@@ -567,14 +644,7 @@ router.get("/users", async (req, res) => {
   try {
     const hideBotLike = req.query.hideBotLike !== "false";
     const users = await userDb.getAllUsers(hideBotLike);
-    // Transform: replace encrypted secrets map with just key names for the frontend
-    const sanitized = users.map((user: any) => {
-      const { secrets, ...rest } = user;
-      return {
-        ...rest,
-        secretNames: secrets ? Object.keys(secrets) : [],
-      };
-    });
+    const sanitized = users.map(compactAdminUserForList);
 
     // Batch-fetch org name + owner + analytics-sharing flag for users in an org
     const orgIds = [...new Set(sanitized.filter((u: any) => u.orgId).map((u: any) => u.orgId as string))];
