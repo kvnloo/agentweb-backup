@@ -10156,9 +10156,23 @@ export class AgentModeService {
 
       let sender: any = null;
       if (params.senderId) {
-        sender = sendersResult.senders.find((s: any) => s.id === params.senderId);
+        // The model can't see internal sender IDs, so accept an id, an email
+        // address, or a from-name (case-insensitive) — whatever the user named.
+        const needle = params.senderId.trim().toLowerCase();
+        sender = sendersResult.senders.find((s: any) =>
+          s.id === params.senderId ||
+          (s.email && s.email.toLowerCase() === needle) ||
+          (s.fromName && s.fromName.toLowerCase() === needle)
+        );
         if (!sender) {
-          return { success: false, message: 'Sender not found', error: `No configured sender matches senderId "${params.senderId}". Omit senderId to use the default sender.` };
+          const available = sendersResult.senders.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName }));
+          const list = available.map((s: any) => `${s.fromName} <${s.email}>`).join(', ');
+          return {
+            success: false,
+            message: 'Sender not found',
+            error: `No configured sender matches "${params.senderId}". Available senders: ${list}. Pass one of their email addresses as sender_id, or omit sender_id to use the default sender.`,
+            availableSenders: available,
+          };
         }
       } else {
         const defaultSenderId = sendersResult.defaultSenderId;

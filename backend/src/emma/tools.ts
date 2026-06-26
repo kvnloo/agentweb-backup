@@ -3632,7 +3632,7 @@ emmaToolRegistry.register({
         },
         sender_id: {
           type: 'string',
-          description: 'Optional ID of a specific configured sender to send from. Omit to use the default sender. Sender IDs come from the user\'s CRM sender configuration.'
+          description: 'Optional sender to send from. Accepts the sender\'s email address or its from-name (or internal id). Omit to use the user\'s default configured sender. If the value does not match any configured sender, the tool returns the list of available senders so you can pick one — relay those options to the user rather than guessing.'
         }
       },
       required: ['to', 'subject']
