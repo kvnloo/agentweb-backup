@@ -151,6 +151,28 @@ describe('AgentModeService - Tool Descriptions', () => {
       expect(systemPrompt).toContain('File Attachments');
     });
 
+    it('should tell the agent describe_video handles YouTube URLs and transcripts', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('describe_video');
+      expect(systemPrompt).toContain('YouTube');
+      expect(systemPrompt).toContain('return_transcript');
+    });
+
+    it('should guard against claiming it cannot access or transcribe videos', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      // The capability-awareness guard must explicitly forbid under-claiming.
+      expect(systemPrompt).toContain('Never tell the user you cannot watch, access, or transcribe');
+    });
+
+    it('should route a shared video/YouTube link to describe_video in the feature reference', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      // The "videos" feature-reference line must mention describe_video for
+      // analysis/repurposing, not only generate_video for generation.
+      const videoLineMatch = systemPrompt.match(/"videos".*$/m);
+      expect(videoLineMatch).toBeTruthy();
+      expect(videoLineMatch![0]).toContain('describe_video');
+    });
+
     it('should include response formatting guidelines', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
       expect(systemPrompt).toContain('Format your responses in HTML5');

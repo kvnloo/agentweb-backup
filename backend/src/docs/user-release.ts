@@ -9,6 +9,22 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-06-26',
+    changes: [
+      'Improved: More Accurate Video Timestamps',
+      '- When you ask Emma for a timestamped transcript or scene breakdown of a video, the timestamps now line up much more closely with where things actually happen, and stay in the right order',
+      '- This makes it easier to jump to a moment, cut short-form clips, or cite a specific quote with the correct time',
+    ],
+  },
+  {
+    date: '2026-06-26',
+    changes: [
+      'Improved: Emma Now Reliably Watches and Transcribes YouTube Videos',
+      '- When you share a YouTube link (or a video file) and ask Emma to summarize, script, or repurpose it, she now watches and transcribes it directly instead of occasionally saying she "can\'t access videos" and asking you to do it yourself',
+      '- Great for turning a video interview or webinar into LinkedIn posts, blog drafts, or short-form content — just paste the link and tell Emma what you want',
+    ],
+  },
+  {
     date: '2026-06-22',
     changes: [
       'Improved: Large Image Batches No Longer Stall Mid-Way',
