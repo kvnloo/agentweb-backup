@@ -1926,6 +1926,69 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.message).toContain('body');
     });
 
+    it('should return error when html body is whitespace-only', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Empty',
+        html: '   ',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('body');
+      expect(mockResend.sendEmail).not.toHaveBeenCalled();
+    });
+
+    it('should return error when text body is whitespace-only', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Empty',
+        text: '   \n  ',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('body');
+      expect(mockResend.sendEmail).not.toHaveBeenCalled();
+    });
+
+    it('should return error when both html and text are empty strings', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Empty',
+        html: '',
+        text: '',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('body');
+      expect(mockResend.sendEmail).not.toHaveBeenCalled();
+    });
+
+    it('should accept a "body" alias as the email body (plain text)', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+      mockResend.sendEmail.mockResolvedValue({ id: 'email-body-alias' } as any);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        body: 'Hi there from the body alias',
+      } as any);
+
+      expect(result.success).toBe(true);
+      expect(mockResend.sendEmail).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: 'someone@external.com',
+          subject: 'Hello',
+          text: 'Hi there from the body alias',
+        })
+      );
+    });
+
     it('should surface the failure when Resend returns null', async () => {
       jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
       mockResend.sendEmail.mockResolvedValue(null as any);
