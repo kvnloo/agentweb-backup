@@ -1,6 +1,6 @@
 // Consolidates: describeVideo.enhanced + describeVideo.likeness-fix
 
-import { AgentModeService } from '../services/agentModeService';
+import { AgentModeService, __testHooks } from '../services/agentModeService';
 import axios from 'axios';
 import { Readable } from 'stream';
 
@@ -146,6 +146,98 @@ describe('AgentModeService - describeVideo', () => {
       const result = await service.describeVideo('https://example.com/demo.mp4');
       expect(result.success).toBe(true);
       expect(result.transcript).toBeUndefined();
+    });
+  });
+
+  describe('timestamp accuracy (MM:SS prompt + parsing)', () => {
+    it('should ask Gemini for MM:SS timestamps when transcript is requested', async () => {
+      mockAxiosVideo();
+      const { mockGenerateContent } = mockGemini(JSON.stringify({
+        description: 'demo', transcript: [{ start: '00:00', end: '00:05', text: 'hi' }], duration: '00:05'
+      }));
+
+      await service.describeVideo('https://example.com/demo.mp4', undefined, { return_transcript: true });
+
+      const promptText = mockGenerateContent.mock.calls[0][0].contents[0].parts.find((p: any) => p.text)?.text || '';
+      expect(promptText).toContain('MM:SS');
+    });
+
+    it('should normalize MM:SS transcript timestamps to numeric seconds', async () => {
+      mockAxiosVideo();
+      mockGemini(JSON.stringify({
+        description: 'A demo video.',
+        transcript: [
+          { start: '00:00', end: '00:05', text: 'Welcome.' },
+          { start: '01:15', end: '01:20', text: 'Main feature.' }
+        ],
+        duration: '01:20'
+      }));
+
+      const result = await service.describeVideo('https://example.com/demo.mp4', undefined, { return_transcript: true });
+
+      expect(result.success).toBe(true);
+      expect(result.transcript[0].start).toBe(0);
+      expect(result.transcript[0].end).toBe(5);
+      expect(result.transcript[1].start).toBe(75);
+      expect(result.transcript[1].end).toBe(80);
+      expect(result.duration).toBe(80);
+    });
+
+    it('should normalize HH:MM:SS scene timestamps to numeric seconds', async () => {
+      mockAxiosVideo();
+      mockGemini(JSON.stringify({
+        description: 'A long video.',
+        scenes: [{ start: '01:00:30', end: '01:01:00', title: 'Late scene', description: 'x' }],
+        duration: '01:01:00'
+      }));
+
+      const result = await service.describeVideo('https://example.com/demo.mp4', undefined, { return_scenes: true });
+
+      expect(result.success).toBe(true);
+      expect(result.scenes[0].start).toBe(3630);
+      expect(result.scenes[0].end).toBe(3660);
+    });
+
+    it('should leave already-numeric timestamps unchanged (backward compatible)', async () => {
+      mockAxiosVideo();
+      mockGemini(JSON.stringify({
+        description: 'A demo video.',
+        transcript: [{ start: 0, end: 5.5, text: 'Welcome.' }],
+        duration: 5.5
+      }));
+
+      const result = await service.describeVideo('https://example.com/demo.mp4', undefined, { return_transcript: true });
+
+      expect(result.success).toBe(true);
+      expect(result.transcript[0].start).toBe(0);
+      expect(result.transcript[0].end).toBe(5.5);
+      expect(result.duration).toBe(5.5);
+    });
+  });
+
+  describe('parseTimecodeToSeconds helper', () => {
+    const parse = __testHooks.parseTimecodeToSeconds;
+    it.each([
+      ['00:00', 0],
+      ['00:05', 5],
+      ['1:15', 75],
+      ['01:15', 75],
+      ['01:00:30', 3630],
+      ['10', 10],
+      ['5.5', 5.5],
+      [12, 12],
+      [0, 0],
+    ])('parses %s -> %s', (input, expected) => {
+      expect(parse(input as any)).toBe(expected);
+    });
+
+    it.each([
+      [undefined],
+      [null],
+      ['not-a-time'],
+      [''],
+    ])('returns undefined for invalid input %s', (input) => {
+      expect(parse(input as any)).toBeUndefined();
     });
   });
 
