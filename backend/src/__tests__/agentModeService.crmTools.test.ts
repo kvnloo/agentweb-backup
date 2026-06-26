@@ -1885,6 +1885,41 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.success).toBe(false);
       expect(result.message).toContain('Sender not found');
       expect(mockResend.sendEmail).not.toHaveBeenCalled();
+      // The error should list the available senders so the model/user can pick one.
+      expect(result.error).toContain('sales@acme.com');
+      expect(result.error).toContain('info@acme.com');
+      expect(Array.isArray(result.availableSenders)).toBe(true);
+      expect(result.availableSenders).toHaveLength(2);
+    });
+
+    it('should resolve a sender by its email address', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+      mockResend.sendEmail.mockResolvedValue({ id: 'email-by-email' } as any);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+        senderId: 'sales@acme.com', // email, not the internal id
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.from).toBe('sales@acme.com');
+    });
+
+    it('should resolve a sender by its from-name (case-insensitive)', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue(resendSenders);
+      mockResend.sendEmail.mockResolvedValue({ id: 'email-by-name' } as any);
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+        senderId: 'sales team', // matches fromName "Sales Team"
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.from).toBe('sales@acme.com');
     });
 
     it('should return a recipient-validation error when "to" is missing', async () => {
