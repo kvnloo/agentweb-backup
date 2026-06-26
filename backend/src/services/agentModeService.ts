@@ -76,6 +76,42 @@ export function extractToolContent(result: any): string {
   if (result?.content?.[0]?.text) return result.content[0].text;
   return JSON.stringify(result);
 }
+
+/**
+ * Normalize a video timecode to a numeric number of seconds.
+ *
+ * Gemini localizes timestamps far more reliably when asked for the MM:SS format
+ * (per Google's video-understanding docs), so describe_video requests MM:SS /
+ * HH:MM:SS strings and uses this to convert them back to the numeric seconds the
+ * transcript/scene schema (and all downstream consumers) expect. Already-numeric
+ * values pass through unchanged for backward compatibility.
+ *
+ * Returns undefined for null/undefined/unparseable input so callers can drop the
+ * field rather than emit a misleading 0.
+ */
+export function parseTimecodeToSeconds(value: unknown): number | undefined {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+  if (typeof value !== 'string') return undefined;
+
+  const trimmed = value.trim();
+  if (trimmed === '') return undefined;
+
+  // Plain numeric string (e.g. "10", "5.5")
+  if (/^\d+(\.\d+)?$/.test(trimmed)) {
+    const n = parseFloat(trimmed);
+    return Number.isFinite(n) ? n : undefined;
+  }
+
+  // Colon-separated timecode: MM:SS or HH:MM:SS (seconds may be fractional)
+  if (/^\d+(:\d{1,2}){1,2}(\.\d+)?$/.test(trimmed)) {
+    const parts = trimmed.split(':').map(p => parseFloat(p));
+    if (parts.some(p => !Number.isFinite(p))) return undefined;
+    return parts.reduce((acc, p) => acc * 60 + p, 0);
+  }
+
+  return undefined;
+}
 const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
@@ -6078,15 +6114,18 @@ export class AgentModeService {
       if (wantStructured) {
         const fields: string[] = ['description: a concise overall description of the video'];
         if (wantTranscript) {
-          fields.push('transcript: an array of objects with {start: number (seconds), end: number (seconds), text: string} for all spoken content');
+          fields.push('transcript: an array of objects with {start: string, end: string, text: string} for all spoken content, where start/end are timestamps in MM:SS format (or HH:MM:SS if over an hour)');
         }
         if (wantScenes) {
-          fields.push('scenes: an array of objects with {start: number (seconds), end: number (seconds), title: string, description: string} identifying distinct scene segments');
+          fields.push('scenes: an array of objects with {start: string, end: string, title: string, description: string} identifying distinct scene segments, where start/end are timestamps in MM:SS format (or HH:MM:SS if over an hour)');
         }
-        fields.push('duration: total video duration in seconds as a number');
+        fields.push('duration: total video duration as a timestamp in MM:SS format (or HH:MM:SS if over an hour)');
         analysisPrompt = [
           prompt || 'Analyze this video thoroughly.',
           timeRange,
+          // Gemini localizes timestamps most accurately in MM:SS (per Google's
+          // video-understanding guidance); we parse them back to numeric seconds.
+          'For every timestamp, use the MM:SS format (e.g. 01:15 for 1 minute 15 seconds), and base each one on the actual moment it occurs in the video.',
           `Return ONLY a JSON object (no markdown fences) with these fields: ${fields.join('; ')}.`
         ].filter(Boolean).join(' ');
       } else {
@@ -6241,12 +6280,30 @@ export class AgentModeService {
           // Strip optional markdown code fences Gemini may add despite instructions
           const jsonText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
           const parsed = JSON.parse(jsonText);
+
+          // Gemini is prompted for MM:SS timestamps (most accurate); convert them
+          // back to the numeric seconds the transcript/scene schema expects.
+          const normalizeSegments = (segments: any): any => {
+            if (!Array.isArray(segments)) return segments;
+            return segments.map(seg => {
+              if (!seg || typeof seg !== 'object') return seg;
+              const start = parseTimecodeToSeconds(seg.start);
+              const end = parseTimecodeToSeconds(seg.end);
+              return {
+                ...seg,
+                ...(start !== undefined ? { start } : {}),
+                ...(end !== undefined ? { end } : {}),
+              };
+            });
+          };
+          const normalizedDuration = parseTimecodeToSeconds(parsed.duration);
+
           return {
             success: true,
             description: parsed.description || rawText,
-            ...(wantTranscript && parsed.transcript !== undefined ? { transcript: parsed.transcript } : {}),
-            ...(wantScenes && parsed.scenes !== undefined ? { scenes: parsed.scenes } : {}),
-            ...(parsed.duration !== undefined ? { duration: parsed.duration } : {}),
+            ...(wantTranscript && parsed.transcript !== undefined ? { transcript: normalizeSegments(parsed.transcript) } : {}),
+            ...(wantScenes && parsed.scenes !== undefined ? { scenes: normalizeSegments(parsed.scenes) } : {}),
+            ...(normalizedDuration !== undefined ? { duration: normalizedDuration } : {}),
             videoUrl: videoFileUrl
           };
         } catch {
@@ -25902,6 +25959,7 @@ export const __testHooks = {
   enqueueFindEmailJobForNewLeads,
   parseCompanyFromTitle,
   batchParseCompaniesFromTitlesWithLLM,
+  parseTimecodeToSeconds,
 };
 
 export const agentModeService = new AgentModeService();
