@@ -3605,7 +3605,8 @@ emmaToolRegistry.register({
       'Use this for ad-hoc emails that are NOT tied to a CRM lead draft — e.g. "send an email to alice@example.com". ' +
       'This does NOT require a connected Gmail account: it sends through the user\'s configured sender (a verified custom-domain sender, or a connected Gmail-account sender). ' +
       'Prefer this over the `email` tool when the user has no connected Gmail account but has a configured sender. ' +
-      'If no sender is configured, tell the user to open CRM, select a lead list, and click "Senders" to configure one.',
+      'If no sender is configured, tell the user to open CRM, select a lead list, and click "Senders" to configure one. ' +
+      'IMPORTANT about delivery: a successful result means the email was ACCEPTED for delivery by the provider, NOT that it reached the recipient\'s inbox. Do not claim guaranteed delivery — say it was "sent" or "queued for delivery". The provider cannot detect a well-formed but non-existent mailbox at send time; such messages bounce asynchronously to the sender\'s own inbox. Always double-check the recipient address with the user before sending if it looks suspicious. Malformed addresses are rejected before sending.',
     inputSchema: {
       type: 'object',
       properties: {

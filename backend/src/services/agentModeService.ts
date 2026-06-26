@@ -10131,6 +10131,15 @@ export class AgentModeService {
       if (!to) {
         return { success: false, message: 'Recipient required', error: 'A recipient email address ("to") is required' };
       }
+      // Reject clearly malformed recipients up front so the user gets an
+      // actionable "check the address" message instead of a generic provider
+      // failure (Resend) or a silent accept-then-bounce (Gmail). Note: a
+      // well-formed but non-existent mailbox cannot be detected at send time —
+      // that bounce is asynchronous and outside this tool's control.
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(to)) {
+        return { success: false, message: 'Invalid recipient', error: `The recipient address "${to}" is not a valid email address. Please check it and try again.` };
+      }
       if (!params.subject || !params.subject.trim()) {
         return { success: false, message: 'Subject required', error: 'An email subject is required' };
       }
@@ -10254,7 +10263,7 @@ export class AgentModeService {
           text: textBody,
         });
         if (!result) {
-          return { success: false, message: 'Email send failed', error: 'Failed to send email via the configured sender' };
+          return { success: false, message: 'Email send failed', error: `Failed to send email to "${to}" via the configured sender ${sender.email}. This is often caused by an invalid or rejected recipient address, or the sender domain not being verified. Please double-check the recipient address.` };
         }
         emailId = result.id;
       }
