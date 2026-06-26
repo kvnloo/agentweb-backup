@@ -10197,13 +10197,35 @@ export class AgentModeService {
         }
         const { gmailService } = await import('./gmailService');
         const body = htmlBody || textBody || '';
-        const gmailResult = await gmailService.sendEmail(userId, gmailAccountId, {
-          to,
-          subject: params.subject,
-          body,
-          isHtml: !!htmlBody,
-        });
-        emailId = gmailResult.messageId;
+        try {
+          const gmailResult = await gmailService.sendEmail(userId, gmailAccountId, {
+            to,
+            subject: params.subject,
+            body,
+            isHtml: !!htmlBody,
+          });
+          emailId = gmailResult.messageId;
+        } catch (gmailErr: any) {
+          // Translate Gmail/OAuth failures into an actionable message that names
+          // the affected sender. Raw errors like "unauthorized_client" /
+          // "invalid_grant" are otherwise opaque and get mis-paraphrased by the LLM
+          // (e.g. "no Gmail account configured"). Nearly all of these are resolved
+          // by reconnecting the Gmail account in Settings → Connected Accounts.
+          const raw = gmailErr instanceof Error ? gmailErr.message : String(gmailErr);
+          const needsReconnect = /unauthorized_client|invalid_grant|invalid_client|token|revoked|expired|not connected|not authorized|insufficient|scope/i.test(raw);
+          if (needsReconnect) {
+            return {
+              success: false,
+              message: 'Gmail sender needs reconnecting',
+              error: `Could not send from the Gmail sender ${sender.email} (${gmailAccountId}): ${raw}. Please reconnect this Gmail account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
+            };
+          }
+          return {
+            success: false,
+            message: 'Gmail send failed',
+            error: `Could not send from the Gmail sender ${sender.email}: ${raw}`,
+          };
+        }
       } else {
         const { resendService } = await import('./resendService');
         const from = `${sender.fromName} <${sender.email}>`;
