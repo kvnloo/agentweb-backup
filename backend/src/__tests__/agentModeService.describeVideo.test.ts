@@ -234,6 +234,48 @@ describe('AgentModeService - describeVideo', () => {
     });
   });
 
+  describe('YouTube URL handling', () => {
+    it.each([
+      'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+      'https://youtu.be/dQw4w9WgXcQ',
+      'https://youtube.com/shorts/abc123'
+    ])('should pass YouTube URLs directly to Gemini without downloading (%s)', async (ytUrl) => {
+      const { mockGenerateContent } = mockGemini('A YouTube interview about agentic AI.');
+
+      const result = await service.describeVideo(ytUrl);
+
+      expect(result.success).toBe(true);
+      // YouTube URLs must NOT be downloaded via axios — Gemini fetches them natively
+      expect(axios.get as jest.Mock).not.toHaveBeenCalled();
+      // The raw YouTube URL is handed to Gemini as fileData.fileUri
+      const parts = mockGenerateContent.mock.calls[0][0].contents[0].parts;
+      const fileDataPart = parts.find((p: any) => p.fileData);
+      expect(fileDataPart?.fileData?.fileUri).toBe(ytUrl);
+    });
+
+    it('should return a timestamped transcript for a YouTube URL when return_transcript=true', async () => {
+      mockGemini(JSON.stringify({
+        description: 'An interview about agentic AI.',
+        transcript: [
+          { start: 0, end: 6, text: 'Today we discuss agentic AI.' },
+          { start: 6, end: 12, text: 'It changes how software is built.' }
+        ],
+        duration: 12
+      }));
+
+      const result = await service.describeVideo(
+        'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+        undefined,
+        { return_transcript: true }
+      );
+
+      expect(result.success).toBe(true);
+      expect(axios.get as jest.Mock).not.toHaveBeenCalled();
+      expect(Array.isArray(result.transcript)).toBe(true);
+      expect(result.transcript[0]).toHaveProperty('text');
+    });
+  });
+
   describe('backward compatibility', () => {
     it('should work with no options (original signature)', async () => {
       mockAxiosVideo();
