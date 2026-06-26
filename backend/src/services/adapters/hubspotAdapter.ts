@@ -184,16 +184,31 @@ export class HubspotAdapter implements CrmAdapter {
         }
 
         // ── 3. Sync leads — batched or per-lead, depending on the feature flag ───
+        // Collects succeeded contact IDs across both paths for post-sync import.
+        const allContactIds = new Set<string>();
+
         if (!this.batchEnabled()) {
             await this.pushLeadsPerLead(
                 svc, leads, config, result,
-                effectiveCustomMapping, listIdentityProps, resolvedListName,
+                effectiveCustomMapping, listIdentityProps, resolvedListName, allContactIds,
             );
         } else {
             await this.pushLeadsBatched(
                 svc, leads, config, result, dealMappings,
-                effectiveCustomMapping, listIdentityProps, resolvedListName,
+                effectiveCustomMapping, listIdentityProps, resolvedListName, allContactIds,
             );
+        }
+
+        // Post-sync: mark contacts as non-marketing via HubSpot Imports API.
+        // Async on HubSpot's side — changes reflect within seconds to minutes.
+        // Non-critical: a failure here is logged but does NOT fail the sync.
+        if (config.hubspotMarkAsNonMarketing && allContactIds.size > 0) {
+            try {
+                const jobId = await svc.importContactsMarketableStatus([...allContactIds], false);
+                console.log(`[HubspotAdapter] marketing status import started: jobId=${jobId} contacts=${allContactIds.size}`);
+            } catch (err: any) {
+                console.warn(`[HubspotAdapter] marketing status import failed (non-critical): ${this.formatError(err)}`);
+            }
         }
 
         return result;
@@ -213,6 +228,7 @@ export class HubspotAdapter implements CrmAdapter {
         effectiveCustomMapping: FieldMapping[],
         listIdentityProps: Set<string>,
         resolvedListName: string | undefined,
+        contactIdCollector?: Set<string>,
     ): Promise<void> {
         const dealMappings = config.dealFieldMapping.filter(m => m.enabled && m.direction !== 'pull');
         for (const lead of leads) {
@@ -316,6 +332,7 @@ export class HubspotAdapter implements CrmAdapter {
                 }
 
                 result.successCount++;
+                if (contactIdCollector) contactIdCollector.add(contactId);
 
                 // Persist HubSpot contact ID + synced status back to our DB.
                 await this.persistSyncMetadata(
@@ -361,6 +378,7 @@ export class HubspotAdapter implements CrmAdapter {
         effectiveCustomMapping: FieldMapping[],
         listIdentityProps: Set<string>,
         resolvedListName: string | undefined,
+        contactIdCollector?: Set<string>,
     ): Promise<void> {
         const t0 = Date.now();
 
@@ -535,11 +553,21 @@ export class HubspotAdapter implements CrmAdapter {
             for (const lead of lifecycleFailedLeads) demote(lead);
         }
 
+        // Collect succeeded (non-failed) email-lead contact IDs for post-sync import.
+        if (contactIdCollector) {
+            for (const lead of succeededEmailLeads) {
+                if (!postUpsertFailedLeads.has(lead)) {
+                    const id = contactIdByLead.get(lead);
+                    if (id) contactIdCollector.add(id);
+                }
+            }
+        }
+
         // ── Stage 5: email-less leads via per-lead path ────────────────────────
         if (emaillessLeads.length > 0) {
             await this.pushLeadsPerLead(
                 svc, emaillessLeads, config, result,
-                effectiveCustomMapping, listIdentityProps, resolvedListName,
+                effectiveCustomMapping, listIdentityProps, resolvedListName, contactIdCollector,
             );
         }
 

@@ -124,6 +124,7 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
       webhookEnabled: config.webhookEnabled ?? true,
       listName: config.listName,
       hubspotLifecycleStage: config.hubspotLifecycleStage,
+      hubspotMarkAsNonMarketing: config.hubspotMarkAsNonMarketing ?? false,
       externalPipelineId: config.externalPipelineId,
       lastPushSyncAt: config.lastPushSyncAt,
       lastPullSyncAt: config.lastPullSyncAt,
@@ -160,7 +161,7 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       contactFieldMapping, dealFieldMapping, customFieldMapping,
       deleteOnPush, deleteOnPull, webhookEnabled,
       externalPipelineId, listName,
-      hubspotLifecycleStage,
+      hubspotLifecycleStage, hubspotMarkAsNonMarketing,
     } = req.body;
 
     // Validate Attio API key length before encrypting and storing it.
@@ -191,7 +192,7 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       contactFieldMapping, dealFieldMapping, customFieldMapping,
       deleteOnPush, deleteOnPull, webhookEnabled,
       externalPipelineId, listName,
-      hubspotLifecycleStage,
+      hubspotLifecycleStage, hubspotMarkAsNonMarketing,
     });
 
     // Fire-and-forget: register webhook subscriptions for any custom HubSpot
@@ -218,6 +219,7 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       webhookEnabled: config.webhookEnabled ?? true,
       listName: config.listName,
       hubspotLifecycleStage: config.hubspotLifecycleStage,
+      hubspotMarkAsNonMarketing: config.hubspotMarkAsNonMarketing ?? false,
       externalPipelineId: config.externalPipelineId,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
@@ -326,7 +328,8 @@ router.post('/lifecycle-stages/:listId/:provider', async (req: any, res) => {
     const stage = await externalCrmSyncService.createHubSpotLifecycleStage(userId, listId, label, { accountId, apiKey });
     res.json(stage);
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to create lifecycle stage' });
+    const hubspotMsg = err?.response?.data?.message;
+    res.status(500).json({ error: hubspotMsg || err.message || 'Failed to create lifecycle stage' });
   }
 });
 

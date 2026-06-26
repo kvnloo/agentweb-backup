@@ -993,4 +993,71 @@ describe('HubspotAdapter.pushLeads — batched push path', () => {
       expect(mockUpdateContact).not.toHaveBeenCalled();
     });
   });
+
+  // ── Marketing status import (hs_marketable_status via Imports API) ──────────
+  describe('marketing status import — hubspotMarkAsNonMarketing', () => {
+    const mockImportContactsMarketableStatus = jest.fn();
+
+    beforeEach(() => {
+      enableBatch();
+      mockImportContactsMarketableStatus.mockResolvedValue('job_123');
+      (mockSvc as any).importContactsMarketableStatus = mockImportContactsMarketableStatus;
+    });
+
+    afterEach(() => {
+      delete (mockSvc as any).importContactsMarketableStatus;
+    });
+
+    it('calls importContactsMarketableStatus with all succeeded contact IDs after sync', async () => {
+      const leads = [
+        { leadId: 'l1', listId: 'list_1', email: 'a@example.com' },
+        { leadId: 'l2', listId: 'list_1', email: 'b@example.com' },
+      ];
+
+      await adapter.pushLeads(auth, leads, makeConfig({ hubspotMarkAsNonMarketing: true }));
+
+      expect(mockImportContactsMarketableStatus).toHaveBeenCalledTimes(1);
+      const [ids, flag] = mockImportContactsMarketableStatus.mock.calls[0];
+      expect(ids.sort()).toEqual(['c_a@example.com', 'c_b@example.com'].sort());
+      expect(flag).toBe(false); // false = non-marketing
+    });
+
+    it('does NOT call importContactsMarketableStatus when hubspotMarkAsNonMarketing is not set', async () => {
+      const leads = [{ leadId: 'l1', listId: 'list_1', email: 'a@example.com' }];
+
+      await adapter.pushLeads(auth, leads, makeConfig());
+
+      expect(mockImportContactsMarketableStatus).not.toHaveBeenCalled();
+    });
+
+    it('excludes failed leads from the import call', async () => {
+      const leads = [
+        { leadId: 'l1', listId: 'list_1', email: 'good@example.com' },
+        { leadId: 'l2', listId: 'list_1', email: 'bad@example.com' },
+      ];
+      mockBatchUpsertContacts.mockImplementation(async (inputs: any[]) => {
+        // Only return good — bad fails (simulated by omission, caught by splitAndRetry)
+        return inputs
+          .filter((i: any) => i.email !== 'bad@example.com')
+          .map((i: any) => ({ email: i.email, contactId: `c_${i.email}`, isNew: true }));
+      });
+
+      await adapter.pushLeads(auth, leads, makeConfig({ hubspotMarkAsNonMarketing: true }));
+
+      expect(mockImportContactsMarketableStatus).toHaveBeenCalledTimes(1);
+      const [ids] = mockImportContactsMarketableStatus.mock.calls[0];
+      expect(ids).toEqual(['c_good@example.com']);
+    });
+
+    it('does not fail the sync when the import call throws', async () => {
+      const leads = [{ leadId: 'l1', listId: 'list_1', email: 'a@example.com' }];
+      mockImportContactsMarketableStatus.mockRejectedValue(new Error('403 Forbidden'));
+
+      const result = await adapter.pushLeads(auth, leads, makeConfig({ hubspotMarkAsNonMarketing: true }));
+
+      // Sync still succeeded — import failure is non-critical
+      expect(result.successCount).toBe(1);
+      expect(result.errorCount).toBe(0);
+    });
+  });
 });

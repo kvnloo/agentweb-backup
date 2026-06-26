@@ -1951,6 +1951,64 @@ export class HubSpotService {
   }
 
   /**
+   * Posts a CSV of HubSpot contact IDs to the Imports API to flip their
+   * marketable status. `marketableContactImport: false` = non-marketing,
+   * `true` = marketing. The import is asynchronous — HubSpot processes it in
+   * the background; changes reflect within seconds to minutes.
+   * Returns the HubSpot import job ID for logging.
+   * POST /crm/v3/imports
+   */
+  async importContactsMarketableStatus(
+    contactIds: string[],
+    marketableContactImport: boolean,
+  ): Promise<string> {
+    if (contactIds.length === 0) throw new Error('contactIds must not be empty');
+
+    const csv = 'Record ID\n' + contactIds.join('\n');
+    const importRequest = {
+      name: `AgentWeb Marketing Status ${Date.now()}`,
+      importOperations: { '0-1': 'UPDATE' },
+      dateFormat: 'YEAR_MONTH_DAY',
+      marketableContactImport,
+      files: [{
+        fileName: 'contacts.csv',
+        fileFormat: 'CSV',
+        fileImportPage: {
+          hasHeader: true,
+          columnMappings: [{
+            columnObjectTypeId: '0-1',
+            columnName: 'Record ID',
+            propertyName: 'hs_object_id',
+            columnType: 'HUBSPOT_OBJECT_ID',
+          }],
+        },
+      }],
+    };
+
+    // Use native fetch instead of axios — axios doesn't auto-detect Node's
+    // native FormData (no getHeaders()), causing a 415 with missing boundary.
+    const form = new FormData();
+    form.append('importRequest', JSON.stringify(importRequest));
+    form.append('files', new Blob([csv], { type: 'text/csv' }), 'contacts.csv');
+
+    const { 'Content-Type': _ct, ...authOnlyHeaders } = await this.authHeaders();
+    const res = await fetch(`${HUBSPOT_API_BASE}/crm/v3/imports`, {
+      method: 'POST',
+      // Omit Content-Type — fetch sets it automatically with the multipart boundary.
+      headers: authOnlyHeaders as Record<string, string>,
+      body: form,
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => res.statusText);
+      throw new Error(`HubSpot Imports API ${res.status}: ${text}`);
+    }
+
+    const data = (await res.json()) as any;
+    return String(data?.id ?? '');
+  }
+
+  /**
    * Batch update contacts by internal HubSpot contact ID.
    * POST /crm/v3/objects/contacts/batch/update
    */

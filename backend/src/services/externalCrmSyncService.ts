@@ -72,6 +72,10 @@ export interface ExternalCrmSyncConfig {
   // Internal value of the standard `lifecyclestage` property (NOT the label —
   // custom stages have a generated internal value). `undefined`/'' leaves it untouched.
   hubspotLifecycleStage?: string;
+  // When true, contacts are marked as non-marketing via the HubSpot Imports API
+  // after each sync (marketableContactImport=false). Async — reflects within
+  // seconds to minutes. false/undefined = leave marketing status untouched.
+  hubspotMarkAsNonMarketing?: boolean;
   // Cached external IDs to skip redundant lookups
   externalPipelineId?: string;      // HubSpot deal pipeline ID
   hubspotDealStageMap?: Record<string, string>; // AgentWeb status value -> HubSpot stage ID
@@ -221,6 +225,7 @@ export class ExternalCrmSyncService {
       listName?: string;
       // HubSpot push constant applied to every synced contact
       hubspotLifecycleStage?: string | null;     // null/'' clears the override
+      hubspotMarkAsNonMarketing?: boolean | null; // null clears the override
     }
   ): Promise<ExternalCrmSyncConfig> {
     // Prevent configuring a second provider on the same list
@@ -262,6 +267,13 @@ export class ExternalCrmSyncService {
       return updates.hubspotLifecycleStage;
     };
 
+    const resolveMarkAsNonMarketing = (): boolean | undefined => {
+      if (!isHubspot) return undefined;
+      if (updates.hubspotMarkAsNonMarketing === null) return undefined;
+      if (updates.hubspotMarkAsNonMarketing === undefined) return existing?.hubspotMarkAsNonMarketing;
+      return updates.hubspotMarkAsNonMarketing || undefined; // false → undefined (treat as unset)
+    };
+
     // Pipeline selection is locked once any sync has occurred.
     const alreadySynced = !!(existing?.lastPushSyncAt || existing?.lastPullSyncAt);
 
@@ -294,6 +306,7 @@ export class ExternalCrmSyncService {
       webhookEnabled: updates.webhookEnabled ?? existing?.webhookEnabled ?? true,
       listName: resolvedListName,
       hubspotLifecycleStage: resolveLifecycleStage(),
+      hubspotMarkAsNonMarketing: resolveMarkAsNonMarketing(),
       externalPipelineId: resolvedExternalPipelineId,
       hubspotDealStageMap: existing?.hubspotDealStageMap,
       lastPushSyncAt: existing?.lastPushSyncAt,
