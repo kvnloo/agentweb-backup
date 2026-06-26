@@ -59,8 +59,30 @@ function makeHarness() {
     run: jest.fn(async () => undefined),
   };
 
-  const service = new HumanEvalService(db as any, settingsService as any, slack, chatbot, learning, actions);
-  return { service, db, settingsService, slack, chatbot, learning, actions, items, settings };
+  const assetStore = {
+    uploadInlineImage: jest.fn(async () => ({
+      url: 'https://files.example.com/human-eval/ad.jpg',
+      key: 'human-eval/ad.jpg',
+      byteLength: 3,
+      mimeType: 'image/jpeg',
+    })),
+  };
+
+  const telemetry = {
+    recordAssetEvent: jest.fn(async () => undefined),
+  };
+
+  const service = new HumanEvalService(
+    db as any,
+    settingsService as any,
+    slack,
+    chatbot,
+    learning,
+    actions,
+    assetStore,
+    telemetry,
+  );
+  return { service, db, settingsService, slack, chatbot, learning, actions, assetStore, telemetry, items, settings };
 }
 
 describe('HumanEvalService', () => {
@@ -104,6 +126,114 @@ describe('HumanEvalService', () => {
     expect(slack.postSlackMessage).toHaveBeenCalledWith(
       'C_EVAL',
       expect.stringContaining('<@U_FANGFANG>'),
+    );
+  });
+
+  it('uploads inline image data before posting a human eval Slack message', async () => {
+    const { service, slack, assetStore, telemetry, items } = makeHarness();
+    const dataUri = 'data:image/jpeg;base64,/9j/';
+
+    const candidate = await service.createCandidate({
+      reviewType: 'creative_image',
+      outputSummary: `Output was ${dataUri}`,
+      artifactUrl: dataUri,
+      sessionId: 'session-image',
+      userId: 'user-image',
+    });
+
+    expect(assetStore.uploadInlineImage).toHaveBeenCalledWith(
+      dataUri,
+      expect.objectContaining({
+        candidateId: candidate.candidateId,
+        reviewType: 'creative_image',
+        userId: 'user-image',
+      }),
+    );
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.stringContaining('<https://files.example.com/human-eval/ad.jpg|open output>'),
+    );
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.not.stringContaining('data:image/jpeg;base64'),
+    );
+    expect(items.get(candidate.candidateId)?.artifactUrl).toBe('https://files.example.com/human-eval/ad.jpg');
+    expect(items.get(candidate.candidateId)?.outputSummary).not.toContain('data:image/jpeg;base64');
+    expect(telemetry.recordAssetEvent).toHaveBeenCalledWith(
+      'human_eval_asset_inline_image_uploaded',
+      expect.objectContaining({
+        candidateId: candidate.candidateId,
+        reviewType: 'creative_image',
+        mimeType: 'image/jpeg',
+      }),
+    );
+  });
+
+  it('does not let telemetry failures block a valid inline image eval', async () => {
+    const { service, slack, telemetry } = makeHarness();
+    const dataUri = 'data:image/jpeg;base64,/9j/';
+    telemetry.recordAssetEvent.mockRejectedValue(new Error('Dynamo down'));
+
+    const candidate = await service.createCandidate({
+      reviewType: 'creative_image',
+      outputSummary: 'Generated ad creative.',
+      artifactUrl: dataUri,
+      sessionId: 'session-image',
+      userId: 'user-image',
+    });
+
+    expect(candidate.artifactUrl).toBe('https://files.example.com/human-eval/ad.jpg');
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.stringContaining('<https://files.example.com/human-eval/ad.jpg|open output>'),
+    );
+  });
+
+  it('fails closed and records telemetry when inline image upload fails', async () => {
+    const { service, slack, db, assetStore, telemetry } = makeHarness();
+    const dataUri = 'data:image/png;base64,iVBORw0KGgo=';
+    assetStore.uploadInlineImage.mockRejectedValueOnce(new Error('S3 upload failed'));
+
+    await expect(service.createCandidate({
+      reviewType: 'creative_image',
+      outputSummary: 'Generated ad creative.',
+      artifactUrl: dataUri,
+      sessionId: 'session-image',
+      userId: 'user-image',
+    })).rejects.toThrow('Human eval image artifact could not be uploaded');
+
+    expect(slack.postSlackMessage).not.toHaveBeenCalled();
+    expect(db.put).not.toHaveBeenCalled();
+    expect(telemetry.recordAssetEvent).toHaveBeenCalledWith(
+      'human_eval_asset_delivery_failed',
+      expect.objectContaining({
+        reviewType: 'creative_image',
+        reason: 'inline_image_upload_failed',
+        errorClass: expect.any(String),
+      }),
+    );
+  });
+
+  it('rejects unsupported data artifacts before Slack can render raw data', async () => {
+    const { service, slack, db, assetStore, telemetry } = makeHarness();
+
+    await expect(service.createCandidate({
+      reviewType: 'landing_page',
+      outputSummary: 'Generated HTML.',
+      artifactUrl: 'data:text/html;base64,PGh0bWw+',
+      sessionId: 'session-html',
+      userId: 'user-html',
+    })).rejects.toThrow('Human eval artifact must be a fetchable URL');
+
+    expect(assetStore.uploadInlineImage).not.toHaveBeenCalled();
+    expect(slack.postSlackMessage).not.toHaveBeenCalled();
+    expect(db.put).not.toHaveBeenCalled();
+    expect(telemetry.recordAssetEvent).toHaveBeenCalledWith(
+      'human_eval_asset_delivery_failed',
+      expect.objectContaining({
+        reviewType: 'landing_page',
+        reason: 'unsupported_data_uri',
+      }),
     );
   });
 
