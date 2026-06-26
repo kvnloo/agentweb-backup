@@ -11,10 +11,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-06-23',
     changes: [
-      'Added: Set a Lifecycle Stage When Syncing Leads to HubSpot',
-      '- In a lead list\'s HubSpot sync settings, you can now pick a lifecycle stage (including custom stages like "Ad Audience") to apply to every contact the list pushes, so synced leads land in the right stage automatically',
+      'Added: Set a Lifecycle Stage and Mark Contacts Non-Marketing When Syncing to HubSpot',
+      '- In a lead list\'s HubSpot sync settings, you can now pick a lifecycle stage (including custom stages like "Ad Audience") to apply to every contact the list pushes, so synced leads land in the right stage automatically — and you can create a brand-new stage right from the picker without leaving the page',
       '- The stage is applied even when a contact is already further along — HubSpot normally blocks moving a contact backward, so we set the stage in a way that reliably overwrites the existing one',
-      '- This applies to all contacts pushed from that list and never overwrites a lifecycle stage you\'ve explicitly mapped per-field; leave it unset to keep HubSpot\'s existing behavior',
+      '- New "Mark contacts as non-marketing" toggle: when on, contacts pushed from that list are set to non-marketing in HubSpot after each sync, so they don\'t count toward your billable marketing-contact limit (useful for large imported or prospecting lists). HubSpot applies this asynchronously, so it may take a few minutes to reflect',
+      '- To use the non-marketing toggle you\'ll need to reconnect your HubSpot account once (Settings → Connected Accounts) so we can request the additional permission it requires',
+      '- Both settings apply to all contacts pushed from that list and never overwrite a lifecycle stage you\'ve explicitly mapped per-field; leave either one unset to keep HubSpot\'s existing behavior',
     ],
   },
   {
