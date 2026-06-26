@@ -763,6 +763,54 @@ describe('ExternalCrmSyncService', () => {
       expect(result.successCount).toBe(0);
     });
 
+    it('categorizes a push with ONLY invalid-email errors as a data error', async () => {
+      mockListWithConfig(makeConfig({ autoSyncEnabled: true }));
+      mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+      mockCrmDb.updateLead.mockResolvedValue(undefined as any);
+      // A single lead with an invalid email — rejected by the adapter's guard, no throw.
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [{ leadId: 'l1', email: 'not-an-email' }],
+        lastEvaluatedKey: null, hasMore: false,
+      });
+
+      const result = await service.pushAllLeads('user1', 'list1', 'hubspot');
+
+      expect(result.errorCount).toBeGreaterThan(0);
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      expect(saved.lastSyncStatus).toBe('error');
+      expect(saved.lastSyncErrorCategory).toBe('data');
+    });
+
+    it('prioritizes connection over data when a push has BOTH (mixed errors)', async () => {
+      mockListWithConfig(makeConfig({ autoSyncEnabled: true }));
+      mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
+      mockCrmDb.updateLead.mockResolvedValue(undefined as any);
+      // Two leads: the FIRST has an invalid email (data error, recorded first by the
+      // adapter's pre-validation guard); the SECOND has a valid email but its upsert
+      // is rejected for an auth reason (connection error, recorded second). The
+      // connection failure must win so the UI still offers Reconnect — even though
+      // the data error sorts first in result.errors.
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [
+          { leadId: 'l1', email: 'not-an-email' },
+          { leadId: 'l2', email: 'valid@example.com' },
+        ],
+        lastEvaluatedKey: null, hasMore: false,
+      });
+      mockHubSpotServiceInstance.upsertContact.mockRejectedValue(
+        new Error('Authentication credentials not found')
+      );
+
+      const result = await service.pushAllLeads('user1', 'list1', 'hubspot');
+
+      expect(result.errorCount).toBe(2);
+      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      expect(saved.lastSyncStatus).toBe('error');
+      // Connection wins; the surfaced message is the connection-shaped one.
+      expect(saved.lastSyncErrorCategory).toBe('connection');
+      expect(saved.lastSyncError).toMatch(/Authentication credentials not found/);
+    });
+
     it('resolves the HubSpot service once for a multi-chunk push, not per chunk', async () => {
       mockListWithConfig(makeConfig());
       mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
