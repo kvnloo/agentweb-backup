@@ -1601,7 +1601,8 @@ export class ChatbotDB {
     sortDescending: boolean = true,
     lastEvaluatedKey?: string,
     pageIdentifier?: string,
-    searchTerm?: string
+    searchTerm?: string,
+    sessionTypeFilter?: 'exclude-scheduled' | 'only-scheduled'
   ): Promise<{ sessions: ChatSession[], lastEvaluatedKey?: any }> {
     console.log(
       `Getting chat sessions for user: ${userId} from table: ${this.tableName}, portalType: ${portalType || 'all'}, limit: ${limit || 'unlimited'}${searchTerm ? `, search: "${searchTerm}"` : ''}`
@@ -1630,6 +1631,17 @@ export class ChatbotDB {
       filterParts.push('(contains(#title, :searchTerm) OR contains(sessionSummary.#summary, :searchTerm))');
       params.ExpressionAttributeNames = { '#title': 'title', '#summary': 'summary' };
       params.ExpressionAttributeValues[':searchTerm'] = searchTerm;
+    }
+    if (sessionTypeFilter === 'exclude-scheduled') {
+      // Live tab: drop scheduled cron runs so they don't flood the recency-
+      // sorted page and starve interactive chats. attribute_not_exists keeps
+      // legacy sessions written before sessionType existed (they're non-scheduled).
+      filterParts.push('(attribute_not_exists(sessionType) OR sessionType <> :scheduledSessionType)');
+      params.ExpressionAttributeValues[':scheduledSessionType'] = 'scheduled';
+    } else if (sessionTypeFilter === 'only-scheduled') {
+      // Scheduled tab: isolate scheduled cron runs.
+      filterParts.push('sessionType = :scheduledSessionType');
+      params.ExpressionAttributeValues[':scheduledSessionType'] = 'scheduled';
     }
     if (filterParts.length > 0) {
       params.FilterExpression = filterParts.join(' AND ');

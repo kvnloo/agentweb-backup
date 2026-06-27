@@ -1,3 +1,15 @@
+## Prod outage: partner-portal "Failed to load users" — full disk + nginx PrivateTmp trap (2026-06-26)
+
+Three stacked failures, only the last self-inflicted by the attempted fixes:
+
+1. **What filled the disk (true root cause).** `services/devEnvService.ts` `teardownEnvironment()` only guarded `if (!instanceId)`, so a dev-env Notion page stuck at the placeholder `"pending"` made it call EC2 `terminateInstances(['pending'])` → `InvalidInstanceID.Malformed` on every webhook tick (~12.5k times), and each failure retried commenting on a maxed-out Notion thread, dumping full AWS-SDK + Axios error object graphs (request `config`+`data`) to stdout at ~79 MB/day → `/var/log/messages` = 424 MB (98.6% app stdout). Root volume was the AL2023 default **8 GB** (RootVolumeSize unset), no `RootFilesystemUtil` metric/alarm, instance up 11 days.
+2. **Why only `/admin/users` broke.** That response is ~1.9 MB (AW-Users rows inline `marketStrategy`/`competitorResult`/`brandGuidelines` = 62%), exceeding nginx in-memory proxy buffers, so nginx must spill it to an on-disk temp file. At 03:17 UTC a scheduled deploy tipped the disk to 100% → temp write fails → response never completes → "Failed to load users". Smaller endpoints fit in RAM and kept working.
+3. **Why the fixes made it worse.** A custom `client_body_temp_path /var/tmp/agentweb-nginx` + predeploy hook were added. AL2023 nginx.service runs `PrivateTmp=true`, so nginx can't see the host-created dir and fails startup: `nginx: [emerg] mkdir() ".../client_body" failed (ENOENT)`. `nginx -t` PASSES out-of-band (host namespace) but the unit's own `ExecStartPre nginx -t` runs in the private namespace and ENOENTs → `systemctl start` exit 1 → every fresh deploy fails → env can't self-heal. SELinux refuted (errno 2/ENOENT, not 13/EACCES; the only AVC was permissive on error.log).
+
+**Assumptions validated:** the count fan-out in `getAllUsers` is real but was NOT the cause (GSI COUNT queries, ~1,181 ops/req, 4.1 s — a latency time bomb near ~1,000 users, separate follow-up). The #1968 payload whitelist (already on main) cuts 1.9 MB→130 KB and is behavior-preserving (FE reads none of the dropped fields).
+
+**Fixes.** Mitigated by EB rollback to `backend-20260625-pr1955`. PR #1971: remove the custom nginx temp path + hook, keep `proxy_buffers.conf` (the 1.9 MB response stays in memory). Hardening PR: devEnv `'pending'` guard + concise error logging; root volume 8→40 GB gp3; publish `RootFilesystemUtil` + 80% alarm → `agentweb-oncall-alerts`; weekly instance refresh; log caps. **Never override nginx temp paths to a custom `/var/tmp` dir on AL2023 EB — stock `/var/lib/nginx/tmp` is outside PrivateTmp's isolation.** The scheduled prod deploy runs daily 02:00 UTC, so the broken main config had to be fixed before then.
+
 ## Landing-page builder reliability — telemetry-driven hardening of the GitHub commit path (2026-06-13)
 
 Scanned `AW-LandingPages` (prod) to ground "the builder is unreliable" in data rather than one anecdote.

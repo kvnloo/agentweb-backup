@@ -163,4 +163,71 @@ describe('GET /api/admin/users - replay URLs', () => {
     expect(res.body[0].secrets).toBeUndefined();
     expect(res.body[0].secretNames).toEqual(['GITHUB_TOKEN', 'API_KEY']);
   });
+
+  it('should return a compact list payload without large raw user fields', async () => {
+    const largeBlob = 'x'.repeat(250_000);
+    const users = [
+      {
+        userId: 'user-1',
+        email: 'user1@test.com',
+        isAdmin: false,
+        isActive: true,
+        createdAt: '2026-01-01',
+        lastLoginTime: '2026-02-01',
+        roles: ['customer'],
+        taskCount: 4,
+        workflowCount: 2,
+        chatSessionCount: 9,
+        subscription_status: 'active',
+        current_period_end: '2026-07-01',
+        tokenUsage: {
+          month: '2026-06',
+          totalTokens: 123,
+          totalCost: 1.23,
+          resetDate: '2026-07-01',
+        },
+        googleDriveFolders: [{ folderId: 'folder-1', name: 'Customer assets' }],
+        slackChannels: ['C123'],
+        secrets: { OPENAI_API_KEY: 'encrypted-value' },
+        chatSessions: [{ messages: [{ role: 'user', content: largeBlob }] }],
+        onboardingEvents: [{ event: 'huge', payload: largeBlob }],
+        rawWorkflowCache: largeBlob,
+        connected_accounts: [{ account_id: 'acct-1', access_token: largeBlob }],
+      },
+    ];
+
+    mockUserDb.getAllUsers.mockResolvedValue(users as any);
+    mockSettingsService.getSetting.mockRejectedValue(new Error('Not found'));
+
+    const res = await request(app)
+      .get('/api/admin/users')
+      .expect(200);
+
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0]).toMatchObject({
+      userId: 'user-1',
+      email: 'user1@test.com',
+      roles: ['customer'],
+      taskCount: 4,
+      workflowCount: 2,
+      chatSessionCount: 9,
+      subscription_status: 'active',
+      current_period_end: '2026-07-01',
+      tokenUsage: {
+        month: '2026-06',
+        totalTokens: 123,
+        totalCost: 1.23,
+        resetDate: '2026-07-01',
+      },
+      googleDriveFolders: [{ folderId: 'folder-1', name: 'Customer assets' }],
+      slackChannels: ['C123'],
+      secretNames: ['OPENAI_API_KEY'],
+    });
+    expect(res.body[0].secrets).toBeUndefined();
+    expect(res.body[0].chatSessions).toBeUndefined();
+    expect(res.body[0].onboardingEvents).toBeUndefined();
+    expect(res.body[0].rawWorkflowCache).toBeUndefined();
+    expect(res.body[0].connected_accounts).toBeUndefined();
+    expect(JSON.stringify(res.body).length).toBeLessThan(5_000);
+  });
 });
