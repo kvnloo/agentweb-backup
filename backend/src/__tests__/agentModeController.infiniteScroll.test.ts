@@ -102,6 +102,7 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
         true,
         undefined,
         undefined,
+        undefined,
         undefined
       );
       expect(res.json).toHaveBeenCalledWith({
@@ -134,6 +135,7 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
         true,
         lastEvaluatedKey,
         undefined,
+        undefined,
         undefined
       );
       expect(res.json).toHaveBeenCalledWith({
@@ -162,6 +164,7 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
         true,
         undefined,
         undefined,
+        undefined,
         undefined
       );
     });
@@ -183,6 +186,7 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
         'agent',
         50, // Default limit
         true,
+        undefined,
         undefined,
         undefined,
         undefined
@@ -290,6 +294,7 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
         true,
         undefined,
         undefined,
+        undefined,
         undefined
       );
     });
@@ -313,6 +318,7 @@ describe('Agent Mode Controller - Infinite Scroll', () => {
         true,
         undefined,
         'dashboard',
+        undefined,
         undefined
       );
     });

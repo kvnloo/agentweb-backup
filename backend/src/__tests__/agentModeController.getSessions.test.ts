@@ -269,7 +269,8 @@ describe('agentModeController.getSessions', () => {
       true,
       undefined,
       undefined,
-      'reCAPTCHA'
+      'reCAPTCHA',
+      undefined
     );
   });
 
@@ -321,5 +322,39 @@ describe('agentModeController.getSessions', () => {
 
     const { sessions } = res.json.mock.calls[0][0];
     expect(sessions[0].previewText).toBe('Cached preview from DB');
+  });
+});
+
+describe('agentModeController.getSessions scheduled filter wiring', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockSummarize.mockResolvedValue(null);
+    mockGetUserSessions.mockResolvedValue({ sessions: [], lastEvaluatedKey: null });
+  });
+
+  // 8th positional arg of getUserSessions is the sessionTypeFilter.
+  const filterArgOf = (call: any[]) => call[7];
+
+  test('no query param → passes undefined (back-compat, list unchanged)', async () => {
+    await agentModeController.getSessions(makeRequest(), makeResponse());
+    expect(filterArgOf(mockGetUserSessions.mock.calls[0])).toBeUndefined();
+  });
+
+  test('?excludeScheduled=true → passes "exclude-scheduled" (Live tab)', async () => {
+    await agentModeController.getSessions(makeRequest({ excludeScheduled: 'true' }), makeResponse());
+    expect(filterArgOf(mockGetUserSessions.mock.calls[0])).toBe('exclude-scheduled');
+  });
+
+  test('?sessionType=scheduled → passes "only-scheduled" (Scheduled tab)', async () => {
+    await agentModeController.getSessions(makeRequest({ sessionType: 'scheduled' }), makeResponse());
+    expect(filterArgOf(mockGetUserSessions.mock.calls[0])).toBe('only-scheduled');
+  });
+
+  test('excludeScheduled wins when both params are sent', async () => {
+    await agentModeController.getSessions(
+      makeRequest({ excludeScheduled: 'true', sessionType: 'scheduled' }),
+      makeResponse(),
+    );
+    expect(filterArgOf(mockGetUserSessions.mock.calls[0])).toBe('exclude-scheduled');
   });
 });
