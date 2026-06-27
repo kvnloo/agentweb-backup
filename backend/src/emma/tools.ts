@@ -4914,7 +4914,7 @@ emmaToolRegistry.register({
   name: "read_knowledge_base_files",
   definition: {
     name: "read_knowledge_base_files",
-    description: 'Read one or more knowledge base files. Each entry requires a knowledge base identifier (kb_identifier) and a file name (file_name). For Google Drive shared folders, use the identifier from list_knowledge_base_files (e.g., "gdrive:FOLDER_ID") and the file name. For ClickUp docs, use the identifier (e.g., "clickup:WORKSPACE_ID") and the doc name. Public knowledge base files can be accessed by any user, while private files require ownership. Returns the content for each requested file.',
+    description: 'Read one or more knowledge base files. Each entry requires a knowledge base identifier (kb_identifier) and a file name (file_name). For Google Drive shared folders, use the identifier from list_knowledge_base_files (e.g., "gdrive:FOLDER_ID") and the file name. For ClickUp docs, use the identifier (e.g., "clickup:WORKSPACE_ID") and the doc name; if a fresh ClickUp doc is not yet visible in list_knowledge_base_files, pass its doc_id or use the ClickUp doc ID/URL as file_name. Public knowledge base files can be accessed by any user, while private files require ownership. Returns the content for each requested file.',
     inputSchema: {
       type: "object",
       properties: {
@@ -4931,6 +4931,10 @@ emmaToolRegistry.register({
               file_name: {
                 type: 'string',
                 description: 'Name of the file to read (e.g., knowledge-base.txt or uploaded filename)'
+              },
+              doc_id: {
+                type: 'string',
+                description: 'Optional ClickUp doc ID for clickup: knowledge bases. Use this when a newly created ClickUp doc is not yet visible in list_knowledge_base_files.'
               }
             },
             required: ['kb_identifier', 'file_name']

@@ -16788,7 +16788,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   // Read multiple knowledge base files; each entry must include kb_identifier (taskId) and file_name
-  public async readKnowledgeBaseFiles(files: Array<{ kb_identifier: string; file_name: string }>, userId: string): Promise<any> {
+  public async readKnowledgeBaseFiles(files: Array<{ kb_identifier: string; file_name: string; doc_id?: string; docId?: string }>, userId: string): Promise<any> {
     try {
       if (!Array.isArray(files) || files.length === 0) {
         return {
@@ -16812,7 +16812,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
 
         try {
-          const result = await this.readSingleKnowledgeBaseFile(kbIdentifier, fileName, userId);
+          const result = await this.readSingleKnowledgeBaseFile(kbIdentifier, fileName, userId, {
+            clickUpDocId: entry?.doc_id || entry?.docId,
+          });
           results.push(result);
         } catch (err: any) {
           results.push({
@@ -16917,7 +16919,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   // Helper: read a single knowledge base file
-  public async readSingleKnowledgeBaseFile(kbIdentifier: string, fileName: string, userId: string): Promise<any> {
+  public async readSingleKnowledgeBaseFile(
+    kbIdentifier: string,
+    fileName: string,
+    userId: string,
+    options?: { clickUpDocId?: string }
+  ): Promise<any> {
     // Handle Google Drive shared folder files (identifier starts with "gdrive:")
     if (kbIdentifier.startsWith('gdrive:')) {
       return await this.readGoogleDriveSharedFile(kbIdentifier, fileName, userId);
@@ -16930,7 +16937,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     // Handle ClickUp docs (identifier starts with "clickup:")
     if (kbIdentifier.startsWith('clickup:')) {
-      return await this.readClickUpSharedDoc(kbIdentifier, fileName, userId);
+      return await this.readClickUpSharedDoc(kbIdentifier, fileName, userId, options?.clickUpDocId);
     }
 
     // Handle Foreplay ads (identifier starts with "foreplay-board:" or "foreplay-swipefile")
@@ -17126,8 +17133,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
+  private extractClickUpDocId(value?: string): string | null {
+    if (!value || typeof value !== 'string') return null;
+    const trimmed = value.trim();
+
+    const clickUpUrlMatch = trimmed.match(/\/d\/h\/([^/?#]+)/i);
+    if (clickUpUrlMatch?.[1]) return decodeURIComponent(clickUpUrlMatch[1]);
+
+    if (/^[a-z0-9]{4,}-[a-z0-9]{4,}$/i.test(trimmed) && /[a-z]/i.test(trimmed)) {
+      return trimmed;
+    }
+
+    return null;
+  }
+
   // Helper: read a document from a ClickUp workspace
-  private async readClickUpSharedDoc(kbIdentifier: string, fileName: string, userId: string): Promise<any> {
+  private async readClickUpSharedDoc(kbIdentifier: string, fileName: string, userId: string, docId?: string): Promise<any> {
     const workspaceId = kbIdentifier.replace('clickup:', '');
 
     try {
@@ -17143,15 +17164,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return { success: false, message: 'Not authorized to access this ClickUp workspace' };
       }
 
-      // Find the doc by name in the workspace
+      // Find the doc by name in the workspace. Fresh ClickUp docs can lag in
+      // the list endpoint, so also allow direct reads by doc id or shared URL.
       const docs = await listClickUpDocs(clickUpToken, workspaceId);
-      const doc = docs.find(d => d.name === fileName);
-      if (!doc) {
+      const requestedDocId = this.extractClickUpDocId(docId) || this.extractClickUpDocId(fileName);
+      const doc = docs.find(d => d.name === fileName || (requestedDocId && d.id === requestedDocId));
+      const docIdToRead = doc?.id || requestedDocId;
+      if (!docIdToRead) {
         return { success: false, message: `Document "${fileName}" not found in ClickUp workspace "${workspace.name}"` };
       }
 
       // Read doc content (all pages concatenated)
-      const content = await readClickUpDocContent(clickUpToken, workspaceId, doc.id);
+      let content: string;
+      try {
+        content = await readClickUpDocContent(clickUpToken, workspaceId, docIdToRead);
+      } catch (readError) {
+        if (!doc && requestedDocId) {
+          return { success: false, message: `Document "${fileName}" not found in ClickUp workspace "${workspace.name}"` };
+        }
+        throw readError;
+      }
 
       const maxContentLength = 1_000_000;
       const truncated = content.length > maxContentLength
@@ -17167,7 +17199,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         content: truncated,
         size: content.length,
         type: 'clickup',
-        dateUpdated: doc.dateUpdated,
+        dateUpdated: doc?.dateUpdated,
       };
     } catch (error) {
       console.error('AgentMode: Error reading ClickUp doc:', error);

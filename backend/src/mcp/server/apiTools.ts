@@ -1076,7 +1076,7 @@ mcpToolRegistry.register({
   name: 'read_knowledge_base_files',
   definition: {
     name: 'read_knowledge_base_files',
-    description: 'Read specific files from the knowledge base.',
+    description: 'Read specific files from the knowledge base. For ClickUp docs, callers may pass doc_id when a fresh doc is not yet visible in list_knowledge_base_files.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1086,7 +1086,8 @@ mcpToolRegistry.register({
             type: 'object',
             properties: {
               kb_identifier: { type: 'string', description: 'Knowledge base task ID' },
-              file_name: { type: 'string', description: 'File name to read' }
+              file_name: { type: 'string', description: 'File name to read' },
+              doc_id: { type: 'string', description: 'Optional ClickUp doc ID for clickup: knowledge bases' }
             },
             required: ['kb_identifier', 'file_name']
           }

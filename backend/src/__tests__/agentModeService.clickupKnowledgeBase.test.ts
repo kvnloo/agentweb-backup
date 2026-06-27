@@ -96,6 +96,38 @@ describe('AgentModeService - ClickUp Knowledge Base', () => {
       expect(result.message).toContain('not found in ClickUp workspace');
     });
 
+    it('should read a fresh ClickUp document by doc id when the workspace listing is stale', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'Test Workspace' }]);
+      mockListDocs.mockResolvedValue([
+        { id: 'doc-old', name: 'Older Doc', dateCreated: '1000', dateUpdated: '2000' },
+      ]);
+      mockReadDocContent.mockResolvedValue('# Fresh Page\n\nNewly created content.');
+
+      const result = await (agentModeService as any).readClickUpSharedDoc('clickup:ws-1', '8cfrabr-76254', 'user-123');
+      expect(result.success).toBe(true);
+      expect(result.file_name).toBe('8cfrabr-76254');
+      expect(result.content).toContain('Newly created content');
+      expect(mockReadDocContent).toHaveBeenCalledWith('ck_token', 'ws-1', '8cfrabr-76254');
+    });
+
+    it('should read a fresh ClickUp document from a shared doc URL when the workspace listing is stale', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'Test Workspace' }]);
+      mockListDocs.mockResolvedValue([]);
+      mockReadDocContent.mockResolvedValue('# URL Page\n\nContent from URL doc.');
+
+      const result = await (agentModeService as any).readClickUpSharedDoc(
+        'clickup:ws-1',
+        'https://doc.clickup.com/9009113464/d/h/8cfrabr-76254/84b3cd814509bfe',
+        'user-123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.content).toContain('Content from URL doc');
+      expect(mockReadDocContent).toHaveBeenCalledWith('ck_token', 'ws-1', '8cfrabr-76254');
+    });
+
     it('should successfully read a ClickUp document', async () => {
       mockGetAccessToken.mockResolvedValue('ck_token');
       mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'Test Workspace' }]);
@@ -143,6 +175,24 @@ describe('AgentModeService - ClickUp Knowledge Base', () => {
       const result = await (agentModeService as any).readSingleKnowledgeBaseFile('clickup:ws-1', 'My Doc', 'user-123');
       expect(result.success).toBe(false);
       expect(result.message).toBe('ClickUp not connected');
+    });
+
+    it('should read ClickUp docs using explicit doc_id from read_knowledge_base_files entries', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'Test Workspace' }]);
+      mockListDocs.mockResolvedValue([
+        { id: 'doc-old', name: 'Older Doc', dateCreated: '1000', dateUpdated: '2000' },
+      ]);
+      mockReadDocContent.mockResolvedValue('# Explicit ID\n\nContent from explicit id.');
+
+      const result = await (agentModeService as any).readKnowledgeBaseFiles([
+        { kb_identifier: 'clickup:ws-1', file_name: 'Fresh Customer Doc', doc_id: '8cfrabr-76254' },
+      ], 'user-123');
+
+      expect(result.success).toBe(true);
+      expect(result.files[0].success).toBe(true);
+      expect(result.files[0].content).toContain('Content from explicit id');
+      expect(mockReadDocContent).toHaveBeenCalledWith('ck_token', 'ws-1', '8cfrabr-76254');
     });
   });
 
