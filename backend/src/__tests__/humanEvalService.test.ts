@@ -326,6 +326,85 @@ describe('HumanEvalService', () => {
     );
   });
 
+  it('sanitizes the nested action.artifactUrl so a raw image binary never persists in the queue item', async () => {
+    const { service, assetStore, items } = makeHarness();
+    const dataUri = 'data:image/jpeg;base64,/9j/';
+
+    const candidate = await service.createCandidate({
+      reviewType: 'creative_image',
+      outputSummary: 'Generated ad creative.',
+      artifactUrl: dataUri,
+      sessionId: 'session-image',
+      userId: 'user-image',
+      action: {
+        type: 'agent_mode_image_revision',
+        sessionId: 'session-image',
+        userId: 'user-image',
+        artifactUrl: dataUri,
+        filename: 'ad.jpg',
+      },
+    });
+
+    const stored = items.get(candidate.candidateId);
+    // Both the top-level artifact and the nested action copy become the uploaded S3 URL.
+    expect(stored?.artifactUrl).toBe('https://files.example.com/human-eval/ad.jpg');
+    expect(stored?.action).toMatchObject({
+      type: 'agent_mode_image_revision',
+      artifactUrl: 'https://files.example.com/human-eval/ad.jpg',
+    });
+    // The raw base64 binary is nowhere in the persisted item (the exact gap this closes).
+    expect(JSON.stringify(stored)).not.toContain('data:image/jpeg;base64');
+    // The data URI duplicated across both fields only hits S3 once.
+    expect(assetStore.uploadInlineImage).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops a data: URI chatUrl and falls back to a real session share link', async () => {
+    const { service, slack, chatbot, telemetry, items } = makeHarness();
+
+    const candidate = await service.createCandidate({
+      reviewType: 'lead_enrichment',
+      outputSummary: 'Lead enrichment completed.',
+      chatUrl: 'data:image/png;base64,iVBORw0KGgo=',
+      sessionId: 'session-chat',
+    });
+
+    // The data: URI never reaches Slack or the persisted item.
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.not.stringContaining('data:image/png;base64'),
+    );
+    expect(items.get(candidate.candidateId)?.chatUrl).not.toContain('data:image');
+    // It is dropped, so the chat link falls back to the session interactive-share link.
+    expect(chatbot.createOrReuseInteractiveShare).toHaveBeenCalledWith('session-chat');
+    expect(candidate.chatUrl).toBe('https://app.agentweb.pro/ishare/session-chat?conversable=token-123');
+    expect(telemetry.recordAssetEvent).toHaveBeenCalledWith(
+      'human_eval_asset_delivery_failed',
+      expect.objectContaining({ reason: 'unsupported_chat_url_data_uri' }),
+    );
+  });
+
+  it('redacts inline image data from originalRequest before Slack and storage', async () => {
+    const { service, slack, items } = makeHarness();
+    const dataUri = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==';
+
+    const candidate = await service.createCandidate({
+      reviewType: 'landing_page',
+      outputSummary: 'Generated landing page.',
+      originalRequest: `Make it look like ${dataUri}`,
+      artifactUrl: 'https://example.com/landing',
+      sessionId: 'session-ask',
+      userId: 'user-ask',
+    });
+
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.not.stringContaining('data:image/png;base64'),
+    );
+    const stored = items.get(candidate.candidateId);
+    expect(stored?.originalRequest).not.toContain('data:image/png;base64');
+    expect(stored?.originalRequest).toContain('inline image data redacted');
+  });
+
   it('captures Slack thread replies as durable feedback and injects a session learning note', async () => {
     const { service, chatbot, learning, actions, items } = makeHarness();
 
