@@ -2279,11 +2279,21 @@ export const agentModeController = {
       const portalType = (req.query.portalType as string) === 'emma-sidebar' ? 'emma-sidebar' as const : 'agent' as const;
       const pageIdentifier = req.query.pageIdentifier as string | undefined;
       const search = req.query.search as string | undefined;
+      // Scheduled cron runs (sessionType === 'scheduled') update daily and flood
+      // the recency-sorted list, starving the Live tab. Let the caller ask the DB
+      // to exclude them (Live) or isolate them (Scheduled) so each tab's page is
+      // already the rows it wants. ?excludeScheduled=true wins if both are sent.
+      const sessionTypeFilter: 'exclude-scheduled' | 'only-scheduled' | undefined =
+        req.query.excludeScheduled === 'true'
+          ? 'exclude-scheduled'
+          : req.query.sessionType === 'scheduled'
+            ? 'only-scheduled'
+            : undefined;
 
       // Get sessions with pagination — messages are stripped here and replaced with
       // a lightweight previewText so the list payload stays small (the full message
       // history is loaded on-demand when a session is actually opened).
-      const result = await chatbotDb.getUserSessions(user.userId, portalType, limit, true, lastEvaluatedKey, pageIdentifier, search);
+      const result = await chatbotDb.getUserSessions(user.userId, portalType, limit, true, lastEvaluatedKey, pageIdentifier, search, sessionTypeFilter);
 
       const listSessions = result.sessions.map(session => {
         // Derive previewText from first user message if not already stored
