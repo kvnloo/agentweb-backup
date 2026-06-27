@@ -299,7 +299,7 @@ export class HumanEvalService {
     const candidateId = uuidv4();
     const now = new Date().toISOString();
     const preparedInput = await this.prepareCandidateInput(input, candidateId);
-    const chatUrl = await this.resolveChatUrl(input);
+    const chatUrl = await this.resolveChatUrl(preparedInput);
 
     const message = this.buildSlackMessage({
       ...preparedInput,
@@ -324,7 +324,7 @@ export class HumanEvalService {
       chatUrl,
       outputSummary: preparedInput.outputSummary.trim(),
       originalRequest: preparedInput.originalRequest?.trim() || undefined,
-      action: input.action,
+      action: preparedInput.action,
       slackChannel: posted.channel || slackChannel,
       slackMessageTs: posted.ts,
       feedback: [],
@@ -426,17 +426,6 @@ export class HumanEvalService {
     input: CreateHumanEvalCandidateInput,
     candidateId: string,
   ): Promise<CreateHumanEvalCandidateInput> {
-    const prepared: CreateHumanEvalCandidateInput = {
-      ...input,
-      artifactUrl: input.artifactUrl?.trim() || undefined,
-      outputSummary: redactInlineImageData(input.outputSummary),
-      originalRequest: input.originalRequest ? redactInlineImageData(input.originalRequest) : undefined,
-    };
-
-    if (!prepared.artifactUrl) {
-      return prepared;
-    }
-
     const telemetryBase: UploadInlineImageContext = {
       candidateId,
       reviewType: input.reviewType,
@@ -445,18 +434,63 @@ export class HumanEvalService {
       agentRunId: input.agentRunId,
     };
 
-    if (isInlineImageDataUri(prepared.artifactUrl)) {
+    const prepared: CreateHumanEvalCandidateInput = {
+      ...input,
+      artifactUrl: input.artifactUrl?.trim() || undefined,
+      chatUrl: await this.sanitizeChatUrl(input.chatUrl, telemetryBase),
+      outputSummary: redactInlineImageData(input.outputSummary),
+      originalRequest: input.originalRequest ? redactInlineImageData(input.originalRequest) : undefined,
+    };
+
+    // Memoize uploads so a data URI duplicated across artifactUrl and action.artifactUrl
+    // (the auto image-revision case sends the same result.imageUrl into both) only hits S3 once.
+    const uploadCache = new Map<string, string>();
+
+    prepared.artifactUrl = await this.sanitizeArtifactReference(prepared.artifactUrl, telemetryBase, uploadCache);
+
+    // The nested action carries a second copy of the artifact (agent_mode_image_revision); run it
+    // through the same upload/fail-closed guard so a raw image binary never lands in the persisted item.
+    if (prepared.action?.type === 'agent_mode_image_revision' && prepared.action.artifactUrl) {
+      const safeActionArtifactUrl = await this.sanitizeArtifactReference(
+        prepared.action.artifactUrl.trim() || undefined,
+        telemetryBase,
+        uploadCache,
+      );
+      prepared.action = { ...prepared.action, artifactUrl: safeActionArtifactUrl };
+    }
+
+    return prepared;
+  }
+
+  // Converts a supported inline image data URI to an S3 URL, fails closed on any other data: URI or
+  // upload failure, and passes through ordinary URLs. Shared by the top-level artifact and the nested
+  // action artifact so neither can deliver a raw binary to Slack or persist one in the queue item.
+  private async sanitizeArtifactReference(
+    rawUrl: string | undefined,
+    telemetryBase: UploadInlineImageContext,
+    uploadCache: Map<string, string>,
+  ): Promise<string | undefined> {
+    if (!rawUrl) {
+      return undefined;
+    }
+
+    if (isInlineImageDataUri(rawUrl)) {
+      const cached = uploadCache.get(rawUrl);
+      if (cached) {
+        return cached;
+      }
+
       await this.recordAssetTelemetry('human_eval_asset_inline_image_detected', telemetryBase);
       try {
-        const uploaded = await this.assets.uploadInlineImage(prepared.artifactUrl, telemetryBase);
-        prepared.artifactUrl = uploaded.url;
+        const uploaded = await this.assets.uploadInlineImage(rawUrl, telemetryBase);
+        uploadCache.set(rawUrl, uploaded.url);
         await this.recordAssetTelemetry('human_eval_asset_inline_image_uploaded', {
           ...telemetryBase,
           mimeType: uploaded.mimeType,
           byteLength: uploaded.byteLength,
           artifactKey: uploaded.key,
         });
-        return prepared;
+        return uploaded.url;
       } catch (err) {
         await this.recordAssetTelemetry('human_eval_asset_delivery_failed', {
           ...telemetryBase,
@@ -468,7 +502,7 @@ export class HumanEvalService {
       }
     }
 
-    if (isDataUri(prepared.artifactUrl)) {
+    if (isDataUri(rawUrl)) {
       await this.recordAssetTelemetry('human_eval_asset_delivery_failed', {
         ...telemetryBase,
         reason: 'unsupported_data_uri',
@@ -476,7 +510,27 @@ export class HumanEvalService {
       throw new Error('Human eval artifact must be a fetchable URL or supported data:image URI.');
     }
 
-    return prepared;
+    return rawUrl;
+  }
+
+  // A chat link is never a data: URI. Drop one if present (so resolveChatUrl falls back to a real
+  // session share link) rather than rendering the raw binary into Slack or storing it on the item.
+  private async sanitizeChatUrl(
+    chatUrl: string | undefined,
+    telemetryBase: UploadInlineImageContext,
+  ): Promise<string | undefined> {
+    const trimmed = chatUrl?.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    if (isDataUri(trimmed)) {
+      await this.recordAssetTelemetry('human_eval_asset_delivery_failed', {
+        ...telemetryBase,
+        reason: 'unsupported_chat_url_data_uri',
+      });
+      return undefined;
+    }
+    return trimmed;
   }
 
   private async recordAssetTelemetry(eventType: HumanEvalAssetEvent, info: HumanEvalAssetTelemetryInfo): Promise<void> {
