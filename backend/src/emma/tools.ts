@@ -6883,14 +6883,13 @@ emmaToolRegistry.register({
           issueContext['Reported By (Admin)'] = adminEmail;
         }
 
-        // Route user-filed intake. When FEATUREBASE_INTAKE is on, feature requests +
-        // bugs go to Featurebase (per-user portal, dedup->vote, Linear sync, ship-email);
-        // it falls back to the Notion oncall board on any error so a filing is never
-        // lost. When the flag is off, behaviour is unchanged (Notion). Emma's own
-        // auto-detected issues are not filed through this tool.
-        const filedTracker = (process.env.FEATUREBASE_INTAKE === 'true')
-          ? 'Featurebase'
-          : 'Notion';
+        // Route user-filed intake. When FEATUREBASE_INTAKE is on, create a Linear issue
+        // (source of truth) tagged "Featurebase" — Featurebase auto-imports it as a linked,
+        // status-synced public post. Dedup/vote-stacking is owned by Featurebase's native AI
+        // dedup/merge on the board (not a backend heuristic, not Emma). Falls back to the
+        // Notion oncall board on any error so a filing is never lost. Flag off -> unchanged
+        // (Notion). Emma's own auto-detected issues don't use this tool.
+        const useLinearIntake = (process.env.FEATUREBASE_INTAKE === 'true');
         const itemType: 'feature_request' | 'bug' = issue.type === 'feature_request' ? 'feature_request' : 'bug';
         let result: { pageId: string; url: string; tracker: string };
         const fileToNotion = async () => {
@@ -6904,19 +6903,18 @@ emmaToolRegistry.register({
           });
           return { pageId: oncall.pageId, url: oncall.notionUrl, tracker: 'Notion' };
         };
-        if (filedTracker === 'Featurebase') {
+        if (useLinearIntake) {
           try {
-            const { createFeaturebasePost } = await import('../services/featurebaseService');
-            const fb = await createFeaturebasePost({
+            const { createLinearIssue } = await import('../services/linearService');
+            const li = await createLinearIssue({
               type: itemType,
               title: issue.title,
               description,
               userEmail: user.email,
-              userName: user.displayName || user.email,
             });
-            result = { pageId: fb.id, url: fb.url, tracker: 'Featurebase' };
-          } catch (fbErr) {
-            console.warn('[report_product_issues] Featurebase intake failed, falling back to Notion:', fbErr instanceof Error ? fbErr.message : fbErr);
+            result = { pageId: li.identifier, url: li.url, tracker: 'Linear' };
+          } catch (err) {
+            console.warn('[report_product_issues] Linear intake failed, falling back to Notion:', err instanceof Error ? err.message : err);
             result = await fileToNotion();
           }
         } else {

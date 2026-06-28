@@ -1,0 +1,168 @@
+import { getSecret } from '../utils/secretsManager';
+
+/**
+ * Linear intake service.
+ *
+ * Linear is the source of truth for engineering work. User-filed feature requests
+ * and bugs (via Emma's report_product_issues tool) are created here as Linear issues
+ * tagged with the "Featurebase" label — which makes Featurebase automatically import
+ * the issue as a linked, public post and keep its status in sync (Linear -> Featurebase).
+ *
+ * Why this direction: Featurebase's FB->Linear auto-push does NOT fire for posts
+ * created via its REST API (only its own UI/widget), so the reliable path is to
+ * create in Linear and let Featurebase mirror it via the label import. Verified
+ * working 2026-06-28 (import + status sync both ~10s).
+ *
+ * Manual Linear issues created WITHOUT the "Featurebase" label are never imported,
+ * so internal engineering work stays private.
+ */
+
+const LINEAR_API = 'https://api.linear.app/graphql';
+const TEAM_KEY = 'ENG';
+const FEATUREBASE_LABEL = 'Featurebase';
+
+export interface LinearCredentials {
+  apiKey: string;
+}
+
+const credentialsCache: Record<string, LinearCredentials> = {};
+
+export async function getLinearCredentialsForEnv(env: 'development' | 'production'): Promise<LinearCredentials> {
+  if (credentialsCache[env]) return credentialsCache[env];
+  const secretName = env === 'production' ? 'prod/AgentWeb/Linear' : 'dev/AgentWeb/Linear';
+  const secretString = await getSecret(secretName);
+  if (!secretString || secretString.trim() === '') {
+    throw new Error(`Linear credentials secret is empty for ${env}`);
+  }
+  const credentials = JSON.parse(secretString) as LinearCredentials;
+  if (!credentials.apiKey) throw new Error(`Linear credentials missing apiKey for ${env}`);
+  credentialsCache[env] = credentials;
+  return credentials;
+}
+
+export async function getLinearCredentials(): Promise<LinearCredentials> {
+  const environment = process.env.NODE_ENV || 'development';
+  return getLinearCredentialsForEnv(environment === 'production' ? 'production' : 'development');
+}
+
+async function linearGraphQL(query: string, variables?: Record<string, any>): Promise<any> {
+  const { apiKey } = await getLinearCredentials();
+  const MAX_RETRIES = 3;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const res = await fetch(LINEAR_API, {
+      method: 'POST',
+      // Linear personal API keys use the raw key in Authorization (NO "Bearer " prefix).
+      headers: { 'Authorization': apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, variables }),
+    });
+    const data = await res.json().catch(() => ({} as any));
+    const rateLimited = res.status === 400 && Array.isArray(data?.errors)
+      && data.errors.some((e: any) => e?.extensions?.code === 'RATELIMITED');
+    if (rateLimited && attempt < MAX_RETRIES) {
+      await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+      continue;
+    }
+    if (!res.ok || data?.errors) {
+      throw new Error(`Linear API error: ${JSON.stringify(data?.errors || res.status)}`);
+    }
+    return data.data;
+  }
+  throw new Error('Linear API: rate-limit retries exhausted');
+}
+
+interface TeamMeta {
+  teamId: string;
+  backlogStateId: string;
+  labelIds: Record<string, string>; // name -> id
+}
+let teamMetaCache: TeamMeta | null = null;
+
+async function getTeamMeta(): Promise<TeamMeta> {
+  if (teamMetaCache) return teamMetaCache;
+  const data = await linearGraphQL(
+    `query($key: String!) {
+      teams(filter: { key: { eq: $key } }, first: 1) {
+        nodes { id states { nodes { id name type } } labels { nodes { id name } } }
+      }
+    }`,
+    { key: TEAM_KEY },
+  );
+  const team = data?.teams?.nodes?.[0];
+  if (!team) throw new Error(`Linear team "${TEAM_KEY}" not found`);
+  const states: any[] = team.states?.nodes || [];
+  const backlog = states.find(s => s.type === 'backlog') || states.find(s => s.type === 'unstarted');
+  const labelIds: Record<string, string> = {};
+  for (const l of (team.labels?.nodes || [])) labelIds[l.name.toLowerCase()] = l.id;
+  teamMetaCache = {
+    teamId: team.id,
+    backlogStateId: backlog?.id,
+    labelIds,
+  };
+  return teamMetaCache;
+}
+
+/** Test seam — reset the cached team metadata. */
+export function _resetLinearTeamCache(): void {
+  teamMetaCache = null;
+}
+
+export type LinearItemType = 'feature_request' | 'bug';
+
+export interface CreateLinearIssueParams {
+  type: LinearItemType;
+  title: string;
+  description: string;
+  userEmail: string;
+  /** Public Featurebase post URL, if one already exists to cross-link. */
+  sourceUrl?: string;
+}
+
+export interface LinearIssueResult {
+  identifier: string; // e.g. ENG-42
+  url: string;
+}
+
+/**
+ * Create a Linear issue for a user-filed request. Tags it with the "Featurebase"
+ * label so Featurebase imports + links + status-syncs it as a public post.
+ */
+export async function createLinearIssue(params: CreateLinearIssueParams): Promise<LinearIssueResult> {
+  const { type, title, description, userEmail, sourceUrl } = params;
+  const meta = await getTeamMeta();
+
+  // Always include the Featurebase label (drives the FB import/sync) + the type label.
+  const wantLabels = [FEATUREBASE_LABEL, type === 'bug' ? 'Bug' : 'Feature'];
+  if (type === 'feature_request') wantLabels.push('Customer Request');
+  else wantLabels.push('Customer Reported');
+  const labelIds = wantLabels
+    .map(n => meta.labelIds[n.toLowerCase()])
+    .filter((id): id is string => Boolean(id));
+
+  const body = [
+    description,
+    '',
+    '---',
+    `Filed by ${userEmail} via Emma.`,
+    ...(sourceUrl ? [`Source: ${sourceUrl}`] : []),
+  ].join('\n');
+
+  const input: Record<string, any> = {
+    teamId: meta.teamId,
+    title,
+    description: body,
+    labelIds,
+  };
+  if (meta.backlogStateId) input.stateId = meta.backlogStateId;
+
+  const data = await linearGraphQL(
+    `mutation($input: IssueCreateInput!) {
+      issueCreate(input: $input) { success issue { identifier url } }
+    }`,
+    { input },
+  );
+  const issue = data?.issueCreate?.issue;
+  if (!data?.issueCreate?.success || !issue) {
+    throw new Error('Linear issueCreate did not return an issue');
+  }
+  return { identifier: issue.identifier, url: issue.url };
+}
