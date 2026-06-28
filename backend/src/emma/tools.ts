@@ -6776,6 +6776,11 @@ emmaToolRegistry.register({
               run_id: {
                 type: 'string',
                 description: 'Optional AgentRun id (from the AgentRun inspector / runtime telemetry). When given, the server automatically attaches the run dossier — verdict, failed tool calls with error class/message and the failing arguments — to the report. Strongly recommended when reporting an agent/tool failure.'
+              },
+              type: {
+                type: 'string',
+                enum: ['bug', 'feature_request'],
+                description: 'Whether this is a bug report or a feature request. Feature requests go to the public, votable roadmap; bugs are tracked privately (the user sees their own). Default: bug.'
               }
             },
             required: ['title', 'description']
@@ -6878,14 +6883,45 @@ emmaToolRegistry.register({
           issueContext['Reported By (Admin)'] = adminEmail;
         }
 
-        const result = await createOncallItem({
-          title: issue.title,
-          description,
-          // External MCP clients (Claude Code etc.) are tagged distinctly so
-          // benchmark filters on Customer Reported stay clean.
-          additionalTags: [context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported'],
-          context: issueContext,
-        });
+        // Route user-filed intake. When FEATUREBASE_INTAKE is on, feature requests +
+        // bugs go to Featurebase (per-user portal, dedup->vote, Linear sync, ship-email);
+        // it falls back to the Notion oncall board on any error so a filing is never
+        // lost. When the flag is off, behaviour is unchanged (Notion). Emma's own
+        // auto-detected issues are not filed through this tool.
+        const filedTracker = (process.env.FEATUREBASE_INTAKE === 'true')
+          ? 'Featurebase'
+          : 'Notion';
+        const itemType: 'feature_request' | 'bug' = issue.type === 'feature_request' ? 'feature_request' : 'bug';
+        let result: { pageId: string; url: string; tracker: string };
+        const fileToNotion = async () => {
+          const oncall = await createOncallItem({
+            title: issue.title,
+            description,
+            // External MCP clients (Claude Code etc.) are tagged distinctly so
+            // benchmark filters on Customer Reported stay clean.
+            additionalTags: [context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported'],
+            context: issueContext,
+          });
+          return { pageId: oncall.pageId, url: oncall.notionUrl, tracker: 'Notion' };
+        };
+        if (filedTracker === 'Featurebase') {
+          try {
+            const { createFeaturebasePost } = await import('../services/featurebaseService');
+            const fb = await createFeaturebasePost({
+              type: itemType,
+              title: issue.title,
+              description,
+              userEmail: user.email,
+              userName: user.displayName || user.email,
+            });
+            result = { pageId: fb.id, url: fb.url, tracker: 'Featurebase' };
+          } catch (fbErr) {
+            console.warn('[report_product_issues] Featurebase intake failed, falling back to Notion:', fbErr instanceof Error ? fbErr.message : fbErr);
+            result = await fileToNotion();
+          }
+        } else {
+          result = await fileToNotion();
+        }
 
         // Never email the customer — internal team + admin (if known) only.
         const emailRecipients = adminEmail
@@ -6911,7 +6947,7 @@ emmaToolRegistry.register({
                 </tr>
                 ${isDelegatedAdmin && adminEmail ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Via delegation</strong></td><td style="padding: 6px 0;">${adminEmail}</td></tr>` : ''}
                 ${result.pageId ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Issue ID</strong></td><td style="padding: 6px 0; font-family: monospace;">AGW-${result.pageId}</td></tr>` : ''}
-                ${result.notionUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Notion</strong></td><td style="padding: 6px 0;"><a href="${result.notionUrl}" style="color: #4F46E5; font-weight: 600;">→ Open in Notion</a></td></tr>` : ''}
+                ${result.url ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>${result.tracker}</strong></td><td style="padding: 6px 0;"><a href="${result.url}" style="color: #4F46E5; font-weight: 600;">→ Open in ${result.tracker}</a></td></tr>` : ''}
                 ${issue.pageUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Page URL</strong></td><td style="padding: 6px 0;"><a href="${issue.pageUrl}" style="color: #4F46E5;">${issue.pageUrl}</a></td></tr>` : ''}
               </table>
 
