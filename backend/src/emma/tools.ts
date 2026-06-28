@@ -6741,7 +6741,7 @@ emmaToolRegistry.register({
   name: 'report_product_issues',
   definition: {
     name: 'report_product_issues',
-    description: 'Report one or more product issues or bugs. Creates tracked items in the engineering sprint board and notifies the oncall team. Use this when users encounter errors, unexpected behavior, or want to request fixes. Batch multiple issues into a single call when possible.',
+    description: 'File product feedback for the team: BUGS (errors, unexpected behavior, broken output) AND FEATURE REQUESTS / enhancement ideas — including when nothing is broken and the user simply wants a new capability ("I want a feature where…", "I wish the app could…", "can you add…", "it would be great if…"). Creates a tracked item the user can follow: feature requests go on the public, votable roadmap; bugs are tracked privately so the user sees their own. Set `type` to "feature_request" or "bug". Batch multiple items into a single call when possible. Prefer filing over silently declining — if a request is a product capability you do not have, file it as a feature_request rather than just saying no.',
     inputSchema: {
       type: 'object',
       properties: {
