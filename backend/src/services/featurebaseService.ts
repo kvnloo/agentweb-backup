@@ -102,9 +102,34 @@ async function resolveBoardId(preferredNames: string[]): Promise<string> {
   throw new Error('Featurebase: no boards available to post to');
 }
 
-/** Test seam — reset the in-process board cache. */
+let pushStatusIdCache: string | null = null;
+
+/**
+ * Resolve a status id that Featurebase WILL auto-push to Linear.
+ * New posts default to the "reviewing"-type status (e.g. "In Review"), which
+ * Featurebase holds in its inbox and does NOT push. Creating the post directly
+ * in a committed status (prefer "Planned", else the first non-reviewing status)
+ * makes the native auto-push fire immediately, so every filing reaches Linear.
+ */
+async function resolvePushStatusId(): Promise<string | null> {
+  if (pushStatusIdCache) return pushStatusIdCache;
+  try {
+    const statuses = await featurebaseFetch('/post_statuses', { method: 'GET' });
+    const list: any[] = Array.isArray(statuses) ? statuses : (statuses?.data || []);
+    const planned = list.find(s => (s.name || '').toLowerCase() === 'planned');
+    const firstCommitted = list.find(s => s.type && s.type !== 'reviewing');
+    const chosen = planned || firstCommitted;
+    if (chosen) { pushStatusIdCache = chosen.id; return chosen.id; }
+  } catch (e) {
+    console.warn('[featurebase] could not resolve push status; post will use default status:', e instanceof Error ? e.message : e);
+  }
+  return null;
+}
+
+/** Test seam — reset the in-process caches. */
 export function _resetFeaturebaseBoardCache(): void {
   boardsCache = null;
+  pushStatusIdCache = null;
 }
 
 export type FeaturebaseItemType = 'feature_request' | 'bug';
@@ -161,9 +186,16 @@ export async function createFeaturebasePost(params: CreateFeaturebasePostParams)
     }
   }
 
+  // Create directly in a committed (non-"reviewing") status so Featurebase's native
+  // Linear auto-push fires immediately — otherwise new posts sit in the "In Review"
+  // inbox and never reach Linear. statusId is best-effort; omitted if unresolved.
+  const statusId = await resolvePushStatusId();
+  const body: Record<string, any> = { title, content: description, boardId, visibility, author };
+  if (statusId) body.statusId = statusId;
+
   const created = await featurebaseFetch('/posts', {
     method: 'POST',
-    body: JSON.stringify({ title, content: description, boardId, visibility, author }),
+    body: JSON.stringify(body),
   });
   return { id: created.id, url: postUrl(created), deduped: false };
 }

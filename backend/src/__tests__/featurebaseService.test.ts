@@ -23,6 +23,11 @@ function routeFetch(handlers: {
 }) {
   return (url: string, opts: any = {}) => {
     const u = String(url);
+    if (u.endsWith('/post_statuses')) return jsonRes([
+      { id: 'st_review', name: 'In Review', type: 'reviewing', isDefault: true },
+      { id: 'st_planned', name: 'Planned', type: 'unstarted' },
+      { id: 'st_done', name: 'Completed', type: 'completed' },
+    ]);
     if (u.endsWith('/boards')) return jsonRes(BOARDS);
     if (u.includes('/voters')) return handlers.onVote ? handlers.onVote() : jsonRes({ ok: true });
     if (u.includes('/posts?')) {
@@ -57,6 +62,8 @@ describe('featurebaseService.createFeaturebasePost', () => {
     expect(body.author.email).toBe('u@e.com');
     expect(body.visibility).toBe('public');
     expect(body.boardId).toBe('board_feat');
+    // created in a committed (non-reviewing) status so Featurebase auto-pushes to Linear
+    expect(body.statusId).toBe('st_planned');
   });
 
   it('UPVOTES an existing near-duplicate instead of creating a new post (dedup -> vote)', async () => {
