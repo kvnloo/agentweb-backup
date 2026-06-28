@@ -6820,7 +6820,10 @@ emmaToolRegistry.register({
     }
     const isDelegatedAdmin = isDelegate && !!adminEmail;
 
-    const results: Array<{ title: string; success: boolean; issueId?: string; error?: string; deduped?: boolean; url?: string }> = [];
+    const results: Array<{ title: string; success: boolean; issueId?: string; error?: string; deduped?: boolean; url?: string; trackingUrl?: string }> = [];
+    // Public, user-facing board (what the customer can actually open). Per-result `url` is the
+    // internal tracker (Linear/Notion) for the team email; `trackingUrl`/`userUrl` is the user's link.
+    const FEATUREBASE_BOARD_URL = 'https://agentweb.featurebase.app/';
 
     // Fetch once before the loop to avoid N DynamoDB reads for a batch of issues
     const { settingsService } = await import('../services/settingsService');
@@ -6894,7 +6897,7 @@ emmaToolRegistry.register({
         // Flag off -> unchanged (Notion). Emma's own auto-detected issues don't use this tool.
         const useLinearIntake = (process.env.FEATUREBASE_INTAKE === 'true');
         const itemType: 'feature_request' | 'bug' = issue.type === 'feature_request' ? 'feature_request' : 'bug';
-        let result: { pageId: string; url: string; tracker: string; deduped?: boolean };
+        let result: { pageId: string; url: string; tracker: string; deduped?: boolean; userUrl?: string };
         const fileToNotion = async () => {
           const oncall = await createOncallItem({
             title: issue.title,
@@ -6927,7 +6930,9 @@ emmaToolRegistry.register({
               } catch (e) {
                 console.warn('[report_product_issues] dedup upvote failed:', e instanceof Error ? e.message : e);
               }
-              result = { pageId: dup.identifier, url: dup.featurebasePostUrl || '', tracker: 'Linear', deduped: true };
+              // Hand the user the public post if we have it, else the board (the post they
+              // just stacked onto is already live there).
+              result = { pageId: dup.identifier, url: dup.featurebasePostUrl || dup.identifier, tracker: 'Linear', deduped: true, userUrl: dup.featurebasePostUrl || FEATUREBASE_BOARD_URL };
             } else {
               const { createLinearIssue } = await import('../services/linearService');
               const li = await createLinearIssue({
@@ -6937,7 +6942,10 @@ emmaToolRegistry.register({
                 userEmail: user.email,
                 reportedByAdmin: isDelegatedAdmin && adminEmail ? adminEmail : undefined,
               });
-              result = { pageId: li.identifier, url: li.url, tracker: 'Linear' };
+              // The Featurebase post is imported from Linear a few seconds later, so the
+              // specific post URL isn't available yet — give the user the board, where their
+              // freshly-filed item appears at the top. (url stays the Linear link for the team.)
+              result = { pageId: li.identifier, url: li.url, tracker: 'Linear', userUrl: FEATUREBASE_BOARD_URL };
             }
           } catch (err) {
             console.warn('[report_product_issues] Linear intake failed, falling back to Notion:', err instanceof Error ? err.message : err);
@@ -6988,7 +6996,7 @@ emmaToolRegistry.register({
           replyTo: user.email,
         });
 
-        results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}`, deduped: result.deduped === true, url: result.url || undefined });
+        results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}`, deduped: result.deduped === true, url: result.url || undefined, trackingUrl: result.userUrl || undefined });
       } catch (err: any) {
         results.push({ title: issue.title, success: false, error: err.message });
       }
@@ -7000,15 +7008,21 @@ emmaToolRegistry.register({
     // Tell Emma how to talk to the user: deduped items are KNOWN requests the user's
     // vote/report was added to (not newly filed), so she should say so rather than
     // implying a brand-new ticket was created.
+    // Surface a clickable public-board link to the user (their item, even when it's a
+    // duplicate they were stacked onto). trackingUrl is the Featurebase board/post.
+    const trackingLinks = results.filter(r => r.success && r.trackingUrl).map(r => r.trackingUrl);
+    const linkLine = trackingLinks.length === 1
+      ? ` You can track it here: ${trackingLinks[0]}`
+      : (trackingLinks.length > 1 ? ` Track them on the roadmap: ${FEATUREBASE_BOARD_URL}` : '');
     let summary: string;
     if (failCount > 0) {
       summary = `${successCount} of ${results.length} issue(s) reported successfully. ${failCount} failed.`;
     } else if (dedupedCount === successCount && successCount > 0) {
-      summary = `This is already a known request that's being tracked — I've added your report/vote to the existing item and you'll be notified when its status changes. Nothing new was filed.`;
+      summary = `This is already a known request that's being tracked — I've added your report/vote to the existing item and you'll be notified when its status changes. Nothing new was filed.${linkLine}`;
     } else if (dedupedCount > 0) {
-      summary = `Tracked: ${successCount - dedupedCount} new item(s) filed, and ${dedupedCount} matched existing known request(s) (your report/vote was added to those). The engineering team has been notified.`;
+      summary = `Tracked: ${successCount - dedupedCount} new item(s) filed, and ${dedupedCount} matched existing known request(s) (your report/vote was added to those). The engineering team has been notified.${linkLine}`;
     } else {
-      summary = `All ${successCount} issue(s) have been reported and tracked. The engineering team has been notified.`;
+      summary = `All ${successCount} issue(s) have been reported and tracked. The engineering team has been notified.${linkLine}`;
     }
 
     return {
