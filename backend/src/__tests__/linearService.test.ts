@@ -1,4 +1,4 @@
-import { createLinearIssue, _resetLinearTeamCache } from '../services/linearService';
+import { createLinearIssue, listOpenCanonicals, addIssueComment, _resetLinearTeamCache } from '../services/linearService';
 
 jest.mock('../utils/secretsManager', () => ({
   getSecret: jest.fn().mockResolvedValue(JSON.stringify({ apiKey: 'lin_api_test' })),
@@ -94,5 +94,62 @@ describe('linearService.createLinearIssue', () => {
     await createLinearIssue({ type: 'bug', title: 't', description: 'd', userEmail: 'u@e.com' });
     const headers = (global.fetch as jest.Mock).mock.calls[0][1].headers;
     expect(headers.Authorization).toBe('lin_api_test');
+  });
+});
+
+describe('linearService.listOpenCanonicals', () => {
+  beforeEach(() => { _resetLinearTeamCache(); });
+  afterEach(() => jest.clearAllMocks());
+
+  it('queries open issues by type + Featurebase label and maps the FB attachment url', async () => {
+    let n = 0;
+    (global.fetch as any) = jest.fn(() => {
+      n += 1;
+      const body = n === 1 ? TEAM_RESPONSE : {
+        data: { issues: { nodes: [
+          { id: 'uuid-1', identifier: 'ENG-1', title: 'Add dark mode', description: 'theme',
+            attachments: { nodes: [{ title: 'Featurebase Submission', url: 'https://agentweb.featurebase.app/p/dark' }] } },
+          { id: 'uuid-2', identifier: 'ENG-2', title: 'No FB link', description: 'x', attachments: { nodes: [] } },
+        ] } },
+      };
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) } as any);
+    });
+    const res = await listOpenCanonicals('feature_request', 30);
+    expect(res).toEqual([
+      { identifier: 'ENG-1', issueId: 'uuid-1', title: 'Add dark mode', description: 'theme', featurebasePostUrl: 'https://agentweb.featurebase.app/p/dark' },
+      { identifier: 'ENG-2', issueId: 'uuid-2', title: 'No FB link', description: 'x', featurebasePostUrl: undefined },
+    ]);
+    // The issues query variables carry the Feature type label (type-scoped).
+    const issuesCall = (global.fetch as jest.Mock).mock.calls[1];
+    expect(JSON.parse(issuesCall[1].body).variables.typeLabel).toBe('Feature');
+  });
+
+  it('passes the Bug type label when type is bug', async () => {
+    let n = 0;
+    (global.fetch as any) = jest.fn(() => {
+      n += 1;
+      const body = n === 1 ? TEAM_RESPONSE : { data: { issues: { nodes: [] } } };
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) } as any);
+    });
+    await listOpenCanonicals('bug');
+    const issuesCall = (global.fetch as jest.Mock).mock.calls[1];
+    expect(JSON.parse(issuesCall[1].body).variables.typeLabel).toBe('Bug');
+  });
+});
+
+describe('linearService.addIssueComment', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  it('calls commentCreate with the issueId + body', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { commentCreate: { success: true } } }) } as any));
+    await addIssueComment('uuid-1', 'Also reported by u@e.com');
+    const body = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body);
+    expect(body.query).toContain('commentCreate');
+    expect(body.variables.input).toEqual({ issueId: 'uuid-1', body: 'Also reported by u@e.com' });
+  });
+
+  it('throws when commentCreate fails', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { commentCreate: { success: false } } }) } as any));
+    await expect(addIssueComment('uuid-1', 'x')).rejects.toThrow(/commentCreate failed/);
   });
 });

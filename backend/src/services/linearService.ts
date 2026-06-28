@@ -166,3 +166,68 @@ export async function createLinearIssue(params: CreateLinearIssueParams): Promis
   }
   return { identifier: issue.identifier, url: issue.url };
 }
+
+export interface OpenCanonical {
+  identifier: string; // e.g. ENG-42
+  issueId: string;    // internal uuid (for comments/mutations)
+  title: string;
+  description: string;
+  /** Public Featurebase post URL, from the "Featurebase Submission" attachment, if present. */
+  featurebasePostUrl?: string;
+}
+
+/**
+ * List OPEN canonical issues of a given type — i.e. user-filed requests that were
+ * imported to Featurebase (carry the "Featurebase" label) and are not yet resolved.
+ * These are the dedup-match candidates. Type-scoped (Bug vs Feature) and open-only
+ * (excludes completed/canceled) per the dedup contract.
+ */
+export async function listOpenCanonicals(type: LinearItemType, limit = 30): Promise<OpenCanonical[]> {
+  const meta = await getTeamMeta();
+  const typeLabel = type === 'bug' ? 'Bug' : 'Feature';
+  const data = await linearGraphQL(
+    `query($team: String!, $fb: String!, $typeLabel: String!, $limit: Int!) {
+      issues(
+        first: $limit,
+        orderBy: createdAt,
+        filter: {
+          team: { key: { eq: $team } },
+          state: { type: { nin: ["completed", "canceled"] } },
+          and: [
+            { labels: { name: { eq: $fb } } },
+            { labels: { name: { eq: $typeLabel } } }
+          ]
+        }
+      ) {
+        nodes { id identifier title description attachments { nodes { title url } } }
+      }
+    }`,
+    { team: TEAM_KEY, fb: FEATUREBASE_LABEL, typeLabel, limit },
+  );
+  const nodes: any[] = data?.issues?.nodes || [];
+  return nodes.map((n) => {
+    const fbAttachment = (n.attachments?.nodes || []).find(
+      (a: any) => typeof a?.url === 'string' && a.url.includes('featurebase.app'),
+    );
+    return {
+      identifier: n.identifier,
+      issueId: n.id,
+      title: n.title || '',
+      description: n.description || '',
+      featurebasePostUrl: fbAttachment?.url,
+    };
+  });
+}
+
+/** Add a comment to a Linear issue (used to record additional reporters on a canonical). */
+export async function addIssueComment(issueId: string, body: string): Promise<void> {
+  const data = await linearGraphQL(
+    `mutation($input: CommentCreateInput!) {
+      commentCreate(input: $input) { success }
+    }`,
+    { input: { issueId, body } },
+  );
+  if (!data?.commentCreate?.success) {
+    throw new Error('Linear commentCreate failed');
+  }
+}

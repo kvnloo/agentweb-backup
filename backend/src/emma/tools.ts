@@ -6820,7 +6820,7 @@ emmaToolRegistry.register({
     }
     const isDelegatedAdmin = isDelegate && !!adminEmail;
 
-    const results: Array<{ title: string; success: boolean; issueId?: string; error?: string }> = [];
+    const results: Array<{ title: string; success: boolean; issueId?: string; error?: string; deduped?: boolean; url?: string }> = [];
 
     // Fetch once before the loop to avoid N DynamoDB reads for a batch of issues
     const { settingsService } = await import('../services/settingsService');
@@ -6883,15 +6883,18 @@ emmaToolRegistry.register({
           issueContext['Reported By (Admin)'] = adminEmail;
         }
 
-        // Route user-filed intake. When FEATUREBASE_INTAKE is on, create a Linear issue
-        // (source of truth) tagged "Featurebase" — Featurebase auto-imports it as a linked,
-        // status-synced public post. Dedup/vote-stacking is owned by Featurebase's native AI
-        // dedup/merge on the board (not a backend heuristic, not Emma). Falls back to the
-        // Notion oncall board on any error so a filing is never lost. Flag off -> unchanged
-        // (Notion). Emma's own auto-detected issues don't use this tool.
+        // Route user-filed intake. When FEATUREBASE_INTAKE is on:
+        //   1. Dedup judge (dedupService): is this the same as an existing OPEN canonical?
+        //      - MATCH -> stack onto it: add the user as an upvoter on the canonical's
+        //        Featurebase post (class-action + resolution email) + comment the reporter
+        //        on the canonical Linear issue. No new issue. Tell the user it's known.
+        //      - NO MATCH -> createLinearIssue (source of truth, tagged "Featurebase" ->
+        //        Featurebase auto-imports the single public post).
+        // Falls back to the Notion oncall board on any error so a filing is never lost.
+        // Flag off -> unchanged (Notion). Emma's own auto-detected issues don't use this tool.
         const useLinearIntake = (process.env.FEATUREBASE_INTAKE === 'true');
         const itemType: 'feature_request' | 'bug' = issue.type === 'feature_request' ? 'feature_request' : 'bug';
-        let result: { pageId: string; url: string; tracker: string };
+        let result: { pageId: string; url: string; tracker: string; deduped?: boolean };
         const fileToNotion = async () => {
           const oncall = await createOncallItem({
             title: issue.title,
@@ -6905,14 +6908,36 @@ emmaToolRegistry.register({
         };
         if (useLinearIntake) {
           try {
-            const { createLinearIssue } = await import('../services/linearService');
-            const li = await createLinearIssue({
-              type: itemType,
-              title: issue.title,
-              description,
-              userEmail: user.email,
-            });
-            result = { pageId: li.identifier, url: li.url, tracker: 'Linear' };
+            const { findDuplicateCanonical } = await import('../services/dedupService');
+            const dup = await findDuplicateCanonical({ type: itemType, title: issue.title, description });
+            if (dup) {
+              // Stack onto the existing canonical. Both writes are best-effort — a failure
+              // to upvote/comment must not turn this into a duplicate issue.
+              const reportedLine = `Also reported by ${user.email} on ${new Date().toISOString().slice(0, 10)}${isDelegatedAdmin && adminEmail ? ` (via ${adminEmail})` : ''}.`;
+              try {
+                const { addIssueComment } = await import('../services/linearService');
+                await addIssueComment(dup.issueId, reportedLine);
+              } catch (e) {
+                console.warn('[report_product_issues] dedup comment failed:', e instanceof Error ? e.message : e);
+              }
+              try {
+                const { findPostByTitle, addVoter } = await import('../services/featurebaseService');
+                const post = await findPostByTitle(dup.title);
+                if (post) await addVoter(post.id, user.email, user.displayName || user.email);
+              } catch (e) {
+                console.warn('[report_product_issues] dedup upvote failed:', e instanceof Error ? e.message : e);
+              }
+              result = { pageId: dup.identifier, url: dup.featurebasePostUrl || '', tracker: 'Linear', deduped: true };
+            } else {
+              const { createLinearIssue } = await import('../services/linearService');
+              const li = await createLinearIssue({
+                type: itemType,
+                title: issue.title,
+                description,
+                userEmail: user.email,
+              });
+              result = { pageId: li.identifier, url: li.url, tracker: 'Linear' };
+            }
           } catch (err) {
             console.warn('[report_product_issues] Linear intake failed, falling back to Notion:', err instanceof Error ? err.message : err);
             result = await fileToNotion();
@@ -6962,7 +6987,7 @@ emmaToolRegistry.register({
           replyTo: user.email,
         });
 
-        results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}` });
+        results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}`, deduped: result.deduped === true, url: result.url || undefined });
       } catch (err: any) {
         results.push({ title: issue.title, success: false, error: err.message });
       }
@@ -6970,9 +6995,20 @@ emmaToolRegistry.register({
 
     const successCount = results.filter(r => r.success).length;
     const failCount = results.filter(r => !r.success).length;
-    const summary = failCount === 0
-      ? `All ${successCount} issue(s) have been reported and tracked. The engineering team has been notified.`
-      : `${successCount} of ${results.length} issue(s) reported successfully. ${failCount} failed.`;
+    const dedupedCount = results.filter(r => r.success && r.deduped).length;
+    // Tell Emma how to talk to the user: deduped items are KNOWN requests the user's
+    // vote/report was added to (not newly filed), so she should say so rather than
+    // implying a brand-new ticket was created.
+    let summary: string;
+    if (failCount > 0) {
+      summary = `${successCount} of ${results.length} issue(s) reported successfully. ${failCount} failed.`;
+    } else if (dedupedCount === successCount && successCount > 0) {
+      summary = `This is already a known request that's being tracked — I've added your report/vote to the existing item and you'll be notified when its status changes. Nothing new was filed.`;
+    } else if (dedupedCount > 0) {
+      summary = `Tracked: ${successCount - dedupedCount} new item(s) filed, and ${dedupedCount} matched existing known request(s) (your report/vote was added to those). The engineering team has been notified.`;
+    } else {
+      summary = `All ${successCount} issue(s) have been reported and tracked. The engineering team has been notified.`;
+    }
 
     return {
       success: failCount === 0,
