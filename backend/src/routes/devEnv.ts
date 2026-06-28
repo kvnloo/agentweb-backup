@@ -37,10 +37,18 @@ router.post(
         return res.status(200).json({ verification_token: body.verification_token });
       }
 
-      console.log("[devEnv] Webhook payload:", JSON.stringify(body));
-
       // Detect event type
       const eventType = body?.type || "";
+
+      // Log a compact summary, not the full payload. The Notion dev-env webhook
+      // fires on every page edit; dumping the entire JSON body on each delivery
+      // is unnecessary stdout volume that journald/rsyslog persist to
+      // /var/log/messages. (The catastrophic disk-fill source — full AWS-SDK
+      // error graphs from the teardownEnvironment retry loop — was already fixed
+      // in devEnvService.ts; this just trims the routine per-webhook noise.)
+      console.log(
+        `[devEnv] Webhook: type="${eventType}", entity=${body?.entity?.id || "n/a"}`
+      );
 
       // --- comment.created ---
       if (eventType === "comment.created") {
