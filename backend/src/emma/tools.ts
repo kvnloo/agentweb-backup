@@ -6935,6 +6935,7 @@ emmaToolRegistry.register({
                 title: issue.title,
                 description,
                 userEmail: user.email,
+                reportedByAdmin: isDelegatedAdmin && adminEmail ? adminEmail : undefined,
               });
               result = { pageId: li.identifier, url: li.url, tracker: 'Linear' };
             }

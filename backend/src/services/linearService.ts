@@ -113,6 +113,8 @@ export interface CreateLinearIssueParams {
   title: string;
   description: string;
   userEmail: string;
+  /** Admin email when this was filed via a delegated session (admin acting on the user's behalf). */
+  reportedByAdmin?: string;
   /** Public Featurebase post URL, if one already exists to cross-link. */
   sourceUrl?: string;
 }
@@ -127,7 +129,7 @@ export interface LinearIssueResult {
  * label so Featurebase imports + links + status-syncs it as a public post.
  */
 export async function createLinearIssue(params: CreateLinearIssueParams): Promise<LinearIssueResult> {
-  const { type, title, description, userEmail, sourceUrl } = params;
+  const { type, title, description, userEmail, reportedByAdmin, sourceUrl } = params;
   const meta = await getTeamMeta();
 
   // Always include the Featurebase label (drives the FB import/sync) + the type label.
@@ -142,7 +144,9 @@ export async function createLinearIssue(params: CreateLinearIssueParams): Promis
     description,
     '',
     '---',
-    `Filed by ${userEmail} via Emma.`,
+    reportedByAdmin
+      ? `Filed by ${userEmail} (via ${reportedByAdmin} acting on their behalf — delegated session) through Emma.`
+      : `Filed by ${userEmail} via Emma.`,
     ...(sourceUrl ? [`Source: ${sourceUrl}`] : []),
   ].join('\n');
 

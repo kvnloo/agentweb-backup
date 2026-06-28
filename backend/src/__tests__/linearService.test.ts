@@ -82,6 +82,20 @@ describe('linearService.createLinearIssue', () => {
     expect(lastCreateInput().description).toContain('https://fb/p/x');
   });
 
+  it('notes delegation in the description when reportedByAdmin is set', async () => {
+    mockLinear();
+    await createLinearIssue({ type: 'feature_request', title: 't', description: 'd', userEmail: 'cust@e.com', reportedByAdmin: 'admin@agentweb.pro' });
+    const desc = lastCreateInput().description;
+    expect(desc).toContain('Filed by cust@e.com');
+    expect(desc).toContain('via admin@agentweb.pro acting on their behalf');
+  });
+
+  it('uses the plain "Filed by" line when not delegated', async () => {
+    mockLinear();
+    await createLinearIssue({ type: 'feature_request', title: 't', description: 'd', userEmail: 'cust@e.com' });
+    expect(lastCreateInput().description).toContain('Filed by cust@e.com via Emma.');
+  });
+
   it('throws when issueCreate does not return an issue', async () => {
     mockLinear({ data: { issueCreate: { success: false, issue: null } } });
     await expect(
