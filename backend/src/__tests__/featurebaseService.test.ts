@@ -13,6 +13,7 @@ import {
   replyToTicket,
   _resetTicketCategoryCache,
   _resetTicketStatusCache,
+  _resetAdminCache,
 } from '../services/featurebaseService';
 
 jest.mock('../utils/secretsManager', () => ({
@@ -29,7 +30,7 @@ function routed(boards: any, other: any) {
 }
 
 describe('featurebaseService', () => {
-  beforeEach(() => { _resetBoardCache(); _resetTicketCategoryCache(); _resetTicketStatusCache(); });
+  beforeEach(() => { _resetBoardCache(); _resetTicketCategoryCache(); _resetTicketStatusCache(); _resetAdminCache(); });
   afterEach(() => jest.clearAllMocks());
 
   describe('getTicketStatusId', () => {
@@ -52,13 +53,13 @@ describe('featurebaseService', () => {
   });
 
   describe('replyToTicket', () => {
-    it('POSTs an admin reply (notifies the reporter) to the ticket reply endpoint', async () => {
-      (global.fetch as any) = jest.fn(() => jsonRes({ id: 'r1' }));
+    it('resolves an admin id then POSTs an admin reply (type/adminId/body) that notifies the reporter', async () => {
+      (global.fetch as any) = jest.fn((url: any) =>
+        String(url).includes('/admins') ? jsonRes({ data: [{ id: 'admin-1', name: 'Harsha' }] }) : jsonRes({ id: 'r1' }));
       await replyToTicket(12, 'resolved!');
-      const [url, opts] = (global.fetch as jest.Mock).mock.calls[0];
-      expect(String(url)).toContain('/tickets/12/reply');
-      expect(opts.method).toBe('POST');
-      expect(JSON.parse(opts.body)).toEqual({ type: 'admin', content: 'resolved!' });
+      const replyCall = (global.fetch as jest.Mock).mock.calls.find((c) => String(c[0]).includes('/reply'));
+      expect(String(replyCall[0])).toContain('/tickets/12/reply');
+      expect(JSON.parse(replyCall[1].body)).toEqual({ type: 'admin', adminId: 'admin-1', body: 'resolved!' });
     });
   });
 
