@@ -8037,3 +8037,202 @@ TYPICAL WORKFLOW:
     return agentModeService.handleHubspotApi(userId, args);
   },
 });
+
+emmaToolRegistry.register({
+  name: 'read_google_doc',
+  definition: {
+    name: 'read_google_doc',
+    description: 'Read a Google Doc or Google Sheet by URL or file ID, including all inline comments and replies. If the user has connected Google Drive in Settings → Connected Accounts, uses their credentials (works for internal Workspace files). Otherwise falls back to the service account (file must be shared with the SA). Use this to ingest a specific Doc or Sheet that is NOT inside a registered Drive folder.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url_or_id: {
+          type: 'string',
+          description: 'Google Doc/Sheet URL (e.g. https://docs.google.com/document/d/FILE_ID/edit) or raw file ID',
+        },
+      },
+      required: ['url_or_id'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    const fileId = (args.url_or_id as string).match(/\/d\/([a-zA-Z0-9_-]+)/)?.[1] ?? args.url_or_id.trim();
+    return agentModeService.readGoogleFileById(fileId, context.userId);
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'list_google_drive_folder',
+  definition: {
+    name: 'list_google_drive_folder',
+    description: 'List files and folders inside a Google Drive folder. Works on folders Emma created (drive.file scope). Returns file names, IDs, types, and URLs. Use this when the user asks what\'s inside a folder or wants to reference a file Emma previously created.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        folder_url_or_id: {
+          type: 'string',
+          description: 'Google Drive folder URL or folder ID',
+        },
+      },
+      required: ['folder_url_or_id'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    return agentModeService.listGoogleDriveFolder(args.folder_url_or_id, context.userId);
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'create_google_drive_folder',
+  definition: {
+    name: 'create_google_drive_folder',
+    description: 'Create a new folder in the user\'s Google Drive. Requires Google Drive connected in Settings → Connected Accounts. Returns the folder ID and URL. Use the returned folder_id to place Docs or Sheets inside it via create_google_doc or create_google_sheet. IMPORTANT: Before calling this tool, always ask the user to confirm — e.g. "Should I create a folder called X in your Google Drive?" — and wait for explicit approval.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Name of the folder to create',
+        },
+        parent_folder_id: {
+          type: 'string',
+          description: 'Optional: ID of a parent folder to create this folder inside. If omitted, creates in the root of the user\'s Drive.',
+        },
+      },
+      required: ['name'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    return agentModeService.createGoogleDriveFolder(args.name, context.userId, args.parent_folder_id);
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'create_google_doc',
+  definition: {
+    name: 'create_google_doc',
+    description: 'Create a new Google Doc with the given content. Requires the user to have connected Google Drive in Settings → Connected Accounts. The Doc is created in the user\'s own Drive (or a specific folder if folder_id is provided) and optionally shared with additional emails. Returns the Doc URL. Use this when the user wants to deliver output as a native Google Doc for team review and inline comments. IMPORTANT: Before calling this tool, always ask the user two things and wait for explicit answers: (1) "Should I go ahead and create this Google Doc titled X?" (2) "Where should I put it — your root Drive, or a specific folder? If a folder, please share the folder ID or URL."',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: {
+          type: 'string',
+          description: 'Title of the Google Doc',
+        },
+        content: {
+          type: 'string',
+          description: 'Plain text content to write into the Doc',
+        },
+        folder_id: {
+          type: 'string',
+          description: 'Optional: Google Drive folder ID to create the Doc in. If omitted, creates in the user\'s root Drive or first connected folder. Get folder IDs from list_knowledge_base_files (gdrive: identifiers).',
+        },
+        share_with_emails: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional: additional email addresses to share the Doc with (writer access). The calling user is always shared automatically.',
+        },
+      },
+      required: ['title', 'content'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    return agentModeService.createGoogleDoc(args.title, args.content, context.userId, args.folder_id, args.share_with_emails);
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'update_google_doc',
+  definition: {
+    name: 'update_google_doc',
+    description: 'Replace the entire content of an existing Google Doc. Use this to write revised content back to a Doc after the team has left comments and the user has approved the edits. Accepts a Doc URL or file ID. IMPORTANT: Before calling this tool, always confirm with the user — e.g. "Should I update [Doc title/URL] with the new content?" — and wait for explicit approval. If multiple Docs are in the conversation context and the user says "update the doc" without specifying which one, ask them to clarify before proceeding.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url_or_id: {
+          type: 'string',
+          description: 'Google Doc URL or file ID',
+        },
+        content: {
+          type: 'string',
+          description: 'New plain text content (replaces all existing content)',
+        },
+      },
+      required: ['url_or_id', 'content'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    return agentModeService.updateGoogleDoc(args.url_or_id, args.content, context.userId);
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'create_google_sheet',
+  definition: {
+    name: 'create_google_sheet',
+    description: 'Create a new Google Sheet with structured data. Requires the user to have connected Google Drive in Settings → Connected Accounts. The Sheet is created in the user\'s own Drive and optionally shared with additional emails. Data is a 2D array (rows × columns). Use this to deliver tabular output as a native Google Sheet. IMPORTANT: Before calling this tool, always ask the user two things and wait for explicit answers: (1) "Should I go ahead and create this Google Sheet titled X?" (2) "Where should I put it — your root Drive, or a specific folder? If a folder, please share the folder ID or URL."',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: {
+          type: 'string',
+          description: 'Title of the Google Sheet',
+        },
+        data: {
+          type: 'array',
+          items: { type: 'array', items: { type: 'string' } },
+          description: 'Rows of data. First row is typically headers. Example: [["Name","Email","Score"],["Alice","a@co.com","90"]]',
+        },
+        folder_id: {
+          type: 'string',
+          description: 'Optional: Google Drive folder ID to create the Sheet in. If omitted, creates in the user\'s root Drive or first connected folder.',
+        },
+        share_with_emails: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional: additional emails to share with (writer access).',
+        },
+      },
+      required: ['title', 'data'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    return agentModeService.createGoogleSheet(args.title, args.data, context.userId, args.folder_id, args.share_with_emails);
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'update_google_sheet',
+  definition: {
+    name: 'update_google_sheet',
+    description: 'Write data into a range of an existing Google Sheet. Use this to update specific cells or add new rows to a Sheet. Existing data outside the range is preserved. IMPORTANT: Before calling this tool, always confirm with the user — e.g. "Should I update [Sheet title/URL] range X with the new data?" — and wait for explicit approval. If multiple Sheets are in the conversation context and the user says "update the sheet" without specifying which one, ask them to clarify before proceeding.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url_or_id: {
+          type: 'string',
+          description: 'Google Sheet URL or file ID',
+        },
+        range: {
+          type: 'string',
+          description: 'A1 notation range to write into, e.g. "Sheet1!A1" or "Sheet1!B2:D10"',
+        },
+        data: {
+          type: 'array',
+          items: { type: 'array', items: { type: 'string' } },
+          description: 'Rows of data to write into the range',
+        },
+      },
+      required: ['url_or_id', 'range', 'data'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    return agentModeService.updateGoogleSheet(args.url_or_id, args.range, args.data, context.userId);
+  },
+});

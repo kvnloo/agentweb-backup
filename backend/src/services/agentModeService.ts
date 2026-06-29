@@ -16102,17 +16102,47 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // Knowledge base search functionality
   // Helper: get an authenticated Google Drive client using the service account
   private async getGoogleDriveClient() {
+    const { getSecret } = await import('../utils/secretsManager');
     const environment = process.env.NODE_ENV || 'development';
-    const secretName = environment === 'production'
-      ? 'prod/AgentWeb/Google/Share'
-      : 'dev/AgentWeb/Google/Share';
-    const secretString = await getSecret(secretName);
-    const credentials = JSON.parse(secretString);
+    const secretName = environment === 'production' ? 'prod/AgentWeb/Google/Share' : 'dev/AgentWeb/Google/Share';
+    const credentials = JSON.parse(await getSecret(secretName));
     const auth = new google.auth.GoogleAuth({
       credentials,
       scopes: ['https://www.googleapis.com/auth/drive.readonly'],
     });
     return google.drive({ version: 'v3', auth });
+  }
+
+  private extractGoogleFileId(urlOrId: string): string {
+    const match = urlOrId.match(/\/d\/([a-zA-Z0-9_-]+)/);
+    return match ? match[1] : urlOrId.trim();
+  }
+
+  private async fetchDriveFileComments(drive: any, fileId: string): Promise<string> {
+    try {
+      const resp = await drive.comments.list({
+        fileId,
+        fields: 'comments(content,quotedFileContent,author,replies,resolved,createdTime)',
+        includeDeleted: false,
+        pageSize: 100,
+      });
+      const comments: any[] = resp.data.comments || [];
+      if (comments.length === 0) return '';
+      const lines: string[] = ['\n\n--- COMMENTS & FEEDBACK ---'];
+      for (const c of comments) {
+        const author = c.author?.displayName || 'Unknown';
+        const quote = c.quotedFileContent?.value ? ` [on: "${c.quotedFileContent.value}"]` : '';
+        const resolved = c.resolved ? ' [resolved]' : '';
+        lines.push(`\n[${author}]${quote}${resolved}: ${c.content}`);
+        for (const reply of (c.replies || [])) {
+          const rAuthor = reply.author?.displayName || 'Unknown';
+          lines.push(`  ↳ [${rAuthor}]: ${reply.content}`);
+        }
+      }
+      return lines.join('\n');
+    } catch {
+      return '';
+    }
   }
 
   // Helper: get Google Drive shared folders for a caller.
@@ -16974,6 +17004,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       }
       return lines.join('\n\n');
+    } else if (['docx', 'doc'].includes(extension) ||
+      mimeType.includes('wordprocessingml') || mimeType.includes('msword')) {
+      try {
+        const mammoth = require('mammoth');
+        const result = await mammoth.extractRawText({ buffer: content });
+        return result.value || '';
+      } catch {
+        return content.toString('utf-8');
+      }
     } else if (['txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'log'].includes(extension) ||
       mimeType.startsWith('text/') ||
       mimeType.startsWith('application/vnd.google-apps.')) {
@@ -16988,6 +17027,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // Handle Google Drive shared folder files (identifier starts with "gdrive:")
     if (kbIdentifier.startsWith('gdrive:')) {
       return await this.readGoogleDriveSharedFile(kbIdentifier, fileName, userId);
+    }
+
+    // Handle direct Google Doc/Sheet by ID
+    if (kbIdentifier.startsWith('gdoc:') || kbIdentifier.startsWith('gsheet:')) {
+      const fileId = kbIdentifier.replace(/^g(doc|sheet):/, '');
+      return await this.readGoogleFileById(fileId, userId);
     }
 
     // Handle ClickUp tasks (identifier starts with "clickup-tasks:")
@@ -17166,12 +17211,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       const file = files[0];
-      const contentStr = await this.readGoogleDriveFileContent(drive, file.id!, file.name || fileName, file.mimeType || '');
+      const isGoogleDoc = file.mimeType === 'application/vnd.google-apps.document' || file.mimeType === 'application/vnd.google-apps.spreadsheet';
+      const [contentStr, commentsStr] = await Promise.all([
+        this.readGoogleDriveFileContent(drive, file.id!, file.name || fileName, file.mimeType || ''),
+        isGoogleDoc ? this.fetchDriveFileComments(drive, file.id!) : Promise.resolve(''),
+      ]);
 
       const maxContentLength = 1_000_000;
-      const truncated = contentStr.length > maxContentLength
-        ? contentStr.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]'
-        : contentStr;
+      const combined = contentStr + commentsStr;
+      const truncated = combined.length > maxContentLength
+        ? combined.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]'
+        : combined;
 
       return {
         success: true,
@@ -17341,6 +17391,358 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: `Failed to create ClickUp document "${name}": ${error instanceof Error ? error.message : 'Unknown error'}`
       };
+    }
+  }
+
+  // Read a Google Doc or Sheet directly by file ID.
+  // Tries user OAuth first (works for internal Workspace files); falls back to service account.
+  public async readGoogleFileById(fileId: string, userId: string): Promise<any> {
+    let drive: any;
+    let usingOAuth = false;
+    try {
+      const oauthClient = await this.getGoogleDriveOAuthClient(userId);
+      drive = google.drive({ version: 'v3', auth: oauthClient });
+      usingOAuth = true;
+    } catch {
+      drive = await this.getGoogleDriveClient();
+    }
+
+    const readWithDrive = async (driveClient: any) => {
+      const meta = await driveClient.files.get({ fileId, fields: 'id,name,mimeType,modifiedTime' });
+      const { name, mimeType, modifiedTime } = meta.data;
+      const isGoogleNative =
+        mimeType === 'application/vnd.google-apps.document' ||
+        mimeType === 'application/vnd.google-apps.spreadsheet';
+      const [contentStr, commentsStr] = await Promise.all([
+        this.readGoogleDriveFileContent(driveClient, fileId, name || fileId, mimeType || ''),
+        isGoogleNative ? this.fetchDriveFileComments(driveClient, fileId) : Promise.resolve(''),
+      ]);
+      const combined = contentStr + commentsStr;
+      const maxLen = 1_000_000;
+      return {
+        success: true,
+        message: `Successfully read Google file "${name}"`,
+        file_id: fileId,
+        file_name: name,
+        content: combined.length > maxLen ? combined.substring(0, maxLen) + '\n\n[Content truncated]' : combined,
+        size: contentStr.length,
+        type: mimeType,
+        modifiedTime,
+      };
+    };
+
+    try {
+      return await readWithDrive(drive);
+    } catch (oauthErr: any) {
+      // OAuth drive.file scope can't access files it didn't create — retry with SA
+      if (usingOAuth && (oauthErr?.code === 403 || oauthErr?.status === 403 || oauthErr?.code === 401 || oauthErr?.status === 401)) {
+        try {
+          const saDrive = await this.getGoogleDriveClient();
+          return await readWithDrive(saDrive);
+        } catch (saErr: any) {
+          const is404 = saErr?.code === 404 || saErr?.status === 404;
+          const msg = is404
+            ? `File not found or not accessible. Share the file with the service account, or connect Google Drive in Settings for files you own.`
+            : `Failed to read file: ${saErr instanceof Error ? saErr.message : 'Unknown error'}`;
+          return { success: false, message: msg };
+        }
+      }
+      const is404 = oauthErr?.code === 404 || oauthErr?.status === 404;
+      const msg = is404
+        ? `File not found or you don't have access (fileId: ${fileId}).`
+        : `Failed to read file: ${oauthErr instanceof Error ? oauthErr.message : 'Unknown error'}`;
+      return { success: false, message: msg };
+    }
+  }
+
+  // ── Google Drive OAuth helpers (user-authenticated, write-capable) ──────────
+
+  private async getGoogleDriveOAuthClient(userId: string) {
+    const { getAccountByPlatform } = await import('../services/connectedAccountsDb');
+    const account = await getAccountByPlatform(userId, 'google_drive');
+    if (!account) {
+      throw new Error('Google Drive not connected. Connect Google Drive in Settings → Connected Accounts.');
+    }
+    const cfg = account.config as any;
+    const { getGoogleDriveConfig } = await import('../config/integrations');
+    const driveConfig = await getGoogleDriveConfig();
+    const { OAuth2Client } = await import('google-auth-library');
+    const client = new OAuth2Client(driveConfig.clientId, driveConfig.clientSecret);
+    client.setCredentials({
+      access_token: cfg.access_token,
+      refresh_token: cfg.refresh_token,
+      expiry_date: cfg.token_expires_at,
+    });
+    // Persist refreshed tokens back to DB
+    client.on('tokens', async (tokens) => {
+      try {
+        const { createAccount } = await import('../services/connectedAccountsDb');
+        await createAccount(userId, 'google_drive', {
+          account_id: cfg.email,
+          account_name: cfg.display_name || cfg.email,
+          config: {
+            ...cfg,
+            access_token: tokens.access_token ?? cfg.access_token,
+            refresh_token: tokens.refresh_token ?? cfg.refresh_token,
+            token_expires_at: tokens.expiry_date ?? cfg.token_expires_at,
+          },
+        });
+      } catch { /* best effort */ }
+    });
+    return client;
+  }
+
+  public async listGoogleDriveFolder(folderIdOrUrl: string, userId: string): Promise<any> {
+    try {
+      const auth = await this.getGoogleDriveOAuthClient(userId);
+      const drive = google.drive({ version: 'v3', auth });
+      const folderId = folderIdOrUrl.match(/\/folders\/([a-zA-Z0-9_-]+)/)?.[1] ?? folderIdOrUrl.trim();
+
+      const resp = await drive.files.list({
+        q: `'${folderId}' in parents and trashed = false`,
+        fields: 'files(id,name,mimeType,modifiedTime,webViewLink)',
+        orderBy: 'name',
+      });
+
+      const files = resp.data.files || [];
+      if (files.length === 0) {
+        return { success: true, message: 'Folder is empty.', files: [] };
+      }
+
+      const formatted = files.map(f => ({
+        id: f.id,
+        name: f.name,
+        type: f.mimeType,
+        url: f.webViewLink,
+        modified: f.modifiedTime,
+      }));
+
+      return {
+        success: true,
+        message: `Found ${files.length} item(s) in folder.`,
+        folder_id: folderId,
+        files: formatted,
+      };
+    } catch (err: any) {
+      const code = err?.code || err?.status;
+      if (code === 403 || code === 401) {
+        return { success: false, message: 'Cannot list this folder — it was not created by Emma or you don\'t have access.' };
+      }
+      if (code === 404) {
+        return { success: false, message: 'Folder not found. Check the URL or ID and try again.' };
+      }
+      return { success: false, message: err?.message || 'Failed to list folder contents' };
+    }
+  }
+
+  public async createGoogleDriveFolder(name: string, userId: string, parentFolderId?: string): Promise<any> {
+    try {
+      const auth = await this.getGoogleDriveOAuthClient(userId);
+      const drive = google.drive({ version: 'v3', auth });
+
+      const requestBody: any = { name, mimeType: 'application/vnd.google-apps.folder' };
+      if (parentFolderId) requestBody.parents = [parentFolderId];
+
+      const resp = await drive.files.create({ requestBody, fields: 'id,name,webViewLink' });
+      const folderId = resp.data.id!;
+      const folderUrl = resp.data.webViewLink || `https://drive.google.com/drive/folders/${folderId}`;
+
+      return { success: true, folder_id: folderId, folder_url: folderUrl, name: resp.data.name };
+    } catch (err: any) {
+      const code = err?.code || err?.status;
+      if (code === 403 || code === 401) {
+        return { success: false, message: 'Cannot create folder in that location — Emma does not have access to the specified parent folder.' };
+      }
+      if (code === 404) {
+        return { success: false, message: 'Parent folder not found. Check the folder ID and try again.' };
+      }
+      return { success: false, message: err?.message || 'Failed to create Google Drive folder' };
+    }
+  }
+
+  public async createGoogleDoc(title: string, content: string, userId: string, folderId?: string, shareWithEmails?: string[]): Promise<any> {
+    try {
+      const auth = await this.getGoogleDriveOAuthClient(userId);
+      const drive = google.drive({ version: 'v3', auth });
+      const docs = google.docs({ version: 'v1', auth });
+
+      const createResp = await drive.files.create({
+        requestBody: {
+          name: title,
+          mimeType: 'application/vnd.google-apps.document',
+          ...(folderId ? { parents: [folderId] } : {}),
+        },
+        fields: 'id,name,webViewLink',
+      });
+      const docId = createResp.data.id!;
+      const docUrl = createResp.data.webViewLink || `https://docs.google.com/document/d/${docId}/edit`;
+
+      if (content) {
+        await docs.documents.batchUpdate({
+          documentId: docId,
+          requestBody: { requests: [{ insertText: { location: { index: 1 }, text: content } }] },
+        });
+      }
+
+      const emailsToShare = [...new Set(shareWithEmails || [])];
+      for (const email of emailsToShare) {
+        try {
+          await drive.permissions.create({
+            fileId: docId,
+            sendNotificationEmail: true,
+            requestBody: { type: 'user', role: 'writer', emailAddress: email },
+          });
+        } catch (permErr) {
+          console.log(`AgentMode: Could not share Doc ${docId} with ${email}:`, permErr);
+        }
+      }
+
+      return {
+        success: true,
+        message: emailsToShare.length ? `Created Google Doc "${title}" and shared with ${emailsToShare.join(', ')}` : `Created Google Doc "${title}"`,
+        doc_id: docId,
+        url: docUrl,
+        title,
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error creating Google Doc:', error);
+      const code = error?.code || error?.status;
+      if (code === 403 || code === 401) {
+        return { success: false, message: 'Cannot create Doc in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.' };
+      }
+      if (code === 404) {
+        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.' };
+      }
+      return { success: false, message: `Failed to create Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}` };
+    }
+  }
+
+  public async updateGoogleDoc(fileIdOrUrl: string, content: string, userId: string): Promise<any> {
+    try {
+      const auth = await this.getGoogleDriveOAuthClient(userId);
+      const docs = google.docs({ version: 'v1', auth });
+      const fileId = this.extractGoogleFileId(fileIdOrUrl);
+
+      const docResp = await docs.documents.get({ documentId: fileId });
+      const body = docResp.data.body?.content || [];
+      const lastEl = body[body.length - 1];
+      const endIndex = (lastEl?.endIndex ?? 2) - 1;
+
+      const requests: any[] = [];
+      if (endIndex > 1) requests.push({ deleteContentRange: { range: { startIndex: 1, endIndex } } });
+      requests.push({ insertText: { location: { index: 1 }, text: content } });
+
+      await docs.documents.batchUpdate({ documentId: fileId, requestBody: { requests } });
+
+      return {
+        success: true,
+        message: `Updated Google Doc (id: ${fileId})`,
+        doc_id: fileId,
+        url: `https://docs.google.com/document/d/${fileId}/edit`,
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error updating Google Doc:', error);
+      const code = error?.code || error?.status;
+      if (code === 403 || code === 401) {
+        return { success: false, message: 'Cannot update this Google Doc — it was not created by Emma. Emma can only edit Docs she created.' };
+      }
+      if (code === 404) {
+        return { success: false, message: 'Google Doc not found. Check the URL or ID and try again.' };
+      }
+      return { success: false, message: `Failed to update Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}` };
+    }
+  }
+
+  public async createGoogleSheet(title: string, data: string[][], userId: string, folderId?: string, shareWithEmails?: string[]): Promise<any> {
+    try {
+      const auth = await this.getGoogleDriveOAuthClient(userId);
+      const drive = google.drive({ version: 'v3', auth });
+      const sheets = google.sheets({ version: 'v4', auth });
+
+      const createResp = await drive.files.create({
+        requestBody: {
+          name: title,
+          mimeType: 'application/vnd.google-apps.spreadsheet',
+          ...(folderId ? { parents: [folderId] } : {}),
+        },
+        fields: 'id,name,webViewLink',
+      });
+      const sheetId = createResp.data.id!;
+      const sheetUrl = createResp.data.webViewLink || `https://docs.google.com/spreadsheets/d/${sheetId}/edit`;
+
+      if (data && data.length > 0) {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: sheetId,
+          range: 'Sheet1!A1',
+          valueInputOption: 'RAW',
+          requestBody: { values: data },
+        });
+      }
+
+      const emailsToShare = [...new Set(shareWithEmails || [])];
+      for (const email of emailsToShare) {
+        try {
+          await drive.permissions.create({
+            fileId: sheetId,
+            sendNotificationEmail: true,
+            requestBody: { type: 'user', role: 'writer', emailAddress: email },
+          });
+        } catch (permErr) {
+          console.log(`AgentMode: Could not share Sheet ${sheetId} with ${email}:`, permErr);
+        }
+      }
+
+      return {
+        success: true,
+        message: emailsToShare.length ? `Created Google Sheet "${title}" and shared with ${emailsToShare.join(', ')}` : `Created Google Sheet "${title}"`,
+        sheet_id: sheetId,
+        url: sheetUrl,
+        title,
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error creating Google Sheet:', error);
+      const code = error?.code || error?.status;
+      if (code === 403 || code === 401) {
+        return { success: false, message: 'Cannot create Sheet in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.' };
+      }
+      if (code === 404) {
+        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.' };
+      }
+      return { success: false, message: `Failed to create Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}` };
+    }
+  }
+
+  public async updateGoogleSheet(fileIdOrUrl: string, range: string, data: string[][], userId: string): Promise<any> {
+    try {
+      const auth = await this.getGoogleDriveOAuthClient(userId);
+      const sheets = google.sheets({ version: 'v4', auth });
+      const fileId = this.extractGoogleFileId(fileIdOrUrl);
+
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: fileId,
+        range,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values: data },
+      });
+
+      return {
+        success: true,
+        message: `Updated Google Sheet (id: ${fileId}) range ${range}`,
+        sheet_id: fileId,
+        url: `https://docs.google.com/spreadsheets/d/${fileId}/edit`,
+        range,
+        rows_written: data.length,
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error updating Google Sheet:', error);
+      const code = error?.code || error?.status;
+      if (code === 403 || code === 401) {
+        return { success: false, message: 'Cannot update this Google Sheet — it was not created by Emma. Emma can only edit Sheets she created.' };
+      }
+      if (code === 404) {
+        return { success: false, message: 'Google Sheet not found. Check the URL or ID and try again.' };
+      }
+      return { success: false, message: `Failed to update Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}` };
     }
   }
 
