@@ -125,9 +125,13 @@ export interface FileAutoIssueParams {
 
 export interface FiledAutoResult {
   pageId: string;
+  /** Link to the filed item (Linear issue or Notion page), for alert emails. */
+  url?: string;
   deduped: boolean;
   tracker: 'Linear' | 'Notion';
 }
+
+const LINEAR_ISSUE_BASE = 'https://linear.app/emmabyaw/issue';
 
 /**
  * File an auto-identified issue. Callers should treat this as best-effort and wrap it
@@ -144,7 +148,7 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
       additionalTags: p.notionTags || ['Oncall'],
       context: p.notionContext,
     });
-    return { pageId: o.pageId, deduped: false, tracker: 'Notion' };
+    return { pageId: o.pageId, url: o.notionUrl, deduped: false, tracker: 'Notion' };
   }
 
   const { listOpenIssuesByLabel, addIssueComment, createInternalLinearIssue } = await import('./linearService');
@@ -157,7 +161,7 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
     } catch (e) {
       console.warn('[intake] auto recur-comment failed:', e instanceof Error ? e.message : e);
     }
-    return { pageId: match.identifier, deduped: true, tracker: 'Linear' };
+    return { pageId: match.identifier, url: `${LINEAR_ISSUE_BASE}/${match.identifier}`, deduped: true, tracker: 'Linear' };
   }
   const body = [
     p.description,
@@ -171,5 +175,5 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
     description: body,
     labelNames: ['Auto', ...(p.extraLabels || [])],
   });
-  return { pageId: li.identifier, deduped: false, tracker: 'Linear' };
+  return { pageId: li.identifier, url: li.url, deduped: false, tracker: 'Linear' };
 }

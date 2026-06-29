@@ -55,11 +55,13 @@ describe('EmailService - sendOncallAlert', () => {
       { 'Context Key': 'Context Value' }
     );
 
-    expect(mockCreateOncallItem).toHaveBeenCalledWith({
+    // Oncall alerts now route through intakeService.fileAutoIssue, which (flag off) calls
+    // createOncallItem with notionTags [] (createOncallItem still adds its internal Oncall tag).
+    expect(mockCreateOncallItem).toHaveBeenCalledWith(expect.objectContaining({
       title: 'Test Alert',
       description: 'This is a test alert message',
       context: { 'Context Key': 'Context Value' },
-    });
+    }));
 
     expect(mockSendMail).toHaveBeenCalled();
     const callArgs = mockSendMail.mock.calls[0][0];
