@@ -376,7 +376,17 @@ router.post("/report-ui-bug", async (req, res) => {
       replyTo: user.email,
     });
 
-    res.json({ success: true, message: "Report submitted successfully", issueId });
+    res.json({
+      success: true,
+      // When deduped, tell the user it's a known request (and that they'll be notified) so the
+      // client can show the right copy + a link to track it.
+      message: filed.deduped
+        ? "Thanks — this is already a known request. We've added your report and you'll be notified when it's resolved."
+        : "Report submitted successfully",
+      issueId,
+      trackingUrl: filed.userUrl, // public link to the user's request on the feedback board
+      deduped: filed.deduped,
+    });
   } catch (error) {
     console.error("Error submitting product report:", error);
     res.status(500).json({ message: "Failed to submit report" });
