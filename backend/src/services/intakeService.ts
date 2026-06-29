@@ -124,68 +124,40 @@ async function fileFeatureRequest(p: FileUserIssueParams): Promise<FiledUserResu
 }
 
 /**
- * Bug -> a PRIVATE per-reporter Featurebase ticket (the reporter's own card, authorOnly) +
- * group it onto a private Linear canonical. Every reporter gets their own ticket; the canonical
- * carries a `[reporter-ticket #N]` comment per reporter (eng sees who + session, and the
- * Linear resolve-bridge reads those numbers to flip + notify every linked ticket on fix).
+ * Bug -> a PRIVATE per-reporter Featurebase ticket (the reporter's own card, authorOnly).
+ *
+ * The ticket auto-links to a Linear issue via Featurebase's native Linear sync, and the
+ * `Completed <-> Done (Notify)` sync rule flips the ticket + notifies the reporter when eng
+ * marks that issue Done — so we need NO custom canonical and NO resolve bridge. Each reporter
+ * gets their own card + own linked Linear issue; eng groups duplicates with Linear's native
+ * "Duplicate" status (the `Rejected <- Duplicate (Notify)` rule notifies those reporters too).
+ *
+ * The reporter's own words are the ticket body (what THEY see); a short Diagnostics footer
+ * carries who-filed + session + page so eng has the breadcrumbs on the synced Linear issue.
  */
 async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
-  const { findDuplicate, MAX_CANDIDATES } = await import('./dedupService');
-  const { listOpenBugCanonicals, createInternalLinearIssue, addIssueComment } = await import('./linearService');
   const { createTicket } = await import('./featurebaseService');
 
-  // 1. Find or create the canonical Linear issue that groups all reporters of this bug.
-  const cans = await listOpenBugCanonicals(MAX_CANDIDATES);
-  const byRef = new Map(cans.map((c) => [c.identifier, c]));
-  const dup = await findDuplicate(
-    { type: 'bug', title: p.title, description: p.description },
-    cans.map((c) => ({ ref: c.identifier, title: c.title, description: c.description })),
-  );
+  const filedBy = p.reportedByAdmin
+    ? `Filed by ${reporterLabel(p)} via ${p.reportedByAdmin} acting on their behalf (delegated session).`
+    : `Filed by ${reporterLabel(p)}.`;
+  const content = [
+    p.description,
+    '',
+    '—',
+    filedBy,
+    ...(p.sessionId ? [`Session: ${p.sessionId}`] : []),
+    ...contextLines(p.notionContext),
+  ].join('\n');
 
-  let canonicalUuid = '';
-  if (dup) {
-    canonicalUuid = byRef.get(dup.ref)!.issueId;
-  } else {
-    // New PRIVATE canonical (no Featurebase label -> never a public post). First reporter's
-    // details live in the description for eng.
-    const filedBy = p.reportedByAdmin
-      ? `Filed by ${reporterLabel(p)} via ${p.reportedByAdmin} acting on their behalf (delegated session).`
-      : `Filed by ${reporterLabel(p)}.`;
-    const li = await createInternalLinearIssue({
-      title: p.title,
-      description: [
-        p.description, '', '---', filedBy,
-        ...(p.sessionId ? [`Session: ${p.sessionId}`] : []),
-        ...contextLines(p.notionContext),
-        '', 'Customer-reported bug. Each reporter has a private Featurebase ticket; resolving this issue notifies them all (see the [reporter-ticket #N] comments).',
-      ].join('\n'),
-      labelNames: ['Bug', 'Customer Reported'],
-    });
-    canonicalUuid = li.id || '';
-  }
-
-  // 2. The reporter's OWN private ticket (their card). Body = their words (what THEY see).
-  //    Propagates on failure — caller surfaces it; no Notion reroute.
-  const ticket = await createTicket({ title: p.title, content: p.description, authorEmail: p.userEmail, authorName: p.userName });
-
-  // 3. Record this reporter's ticket on the canonical (best-effort). The `[reporter-ticket #N]`
-  //    marker is the contract the resolve-bridge parses; eng also sees who reported + session.
-  if (canonicalUuid) {
-    const note = [
-      `[reporter-ticket #${ticket.number}] ${reporterLabel(p)}${p.reportedByAdmin ? ` — via ${p.reportedByAdmin}` : ''} on ${new Date().toISOString().slice(0, 10)}.`,
-      ...(p.sessionId ? [`Session: ${p.sessionId}`] : []),
-      // For the FIRST reporter the text is already in the canonical description.
-      ...(dup ? ['', 'Their report:', p.description] : []),
-      ...contextLines(p.notionContext),
-    ].join('\n');
-    try { await addIssueComment(canonicalUuid, note); } catch (e) { console.warn('[intake] bug canonical comment failed:', e instanceof Error ? e.message : e); }
-  }
+  // Propagates on failure — caller surfaces it; no Notion reroute.
+  const ticket = await createTicket({ title: p.title, content, authorEmail: p.userEmail, authorName: p.userName });
 
   return {
     pageId: String(ticket.number),
     trackerUrl: ticket.url || FEATUREBASE_BOARD_URL,
     userUrl: ticket.url || FEATUREBASE_BOARD_URL, // the reporter's OWN private card
-    deduped: !!dup,
+    deduped: false,
     tracker: 'Featurebase',
   };
 }

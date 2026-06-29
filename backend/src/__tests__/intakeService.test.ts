@@ -62,51 +62,34 @@ describe('fileUserIssue — feature_request (public post)', () => {
   });
 });
 
-describe('fileUserIssue — bug (private own-card ticket + Linear canonical)', () => {
+describe('fileUserIssue — bug (private own-card ticket; native Linear sync)', () => {
   const realFlag = process.env.FEATUREBASE_INTAKE;
-  beforeEach(() => { process.env.FEATUREBASE_INTAKE = 'true'; linear.listOpenBugCanonicals.mockResolvedValue([]); });
+  beforeEach(() => { process.env.FEATUREBASE_INTAKE = 'true'; });
   afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
 
-  it('no canonical -> creates a private Linear canonical + the reporter own-card ticket + reporter-ticket comment', async () => {
-    dedup.findDuplicate.mockResolvedValue(null);
-    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
+  it('creates the reporter own-card ticket (their words + a diagnostics footer w/ session); no hand-made canonical', async () => {
     fb.createTicket.mockResolvedValue({ id: 'tk', number: 7, url: 'https://fb/t/7' });
     const r = await fileUserIssue({ type: 'bug', title: 'crash', description: 'on save', userEmail: 'u@e.com', userName: 'U', sessionId: 'sess-2' });
-    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({ labelNames: ['Bug', 'Customer Reported'] }));
-    expect(fb.createTicket).toHaveBeenCalledWith(expect.objectContaining({ title: 'crash', content: 'on save', authorEmail: 'u@e.com', authorName: 'U' }));
-    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-9', expect.stringContaining('[reporter-ticket #7]'));
-    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-9', expect.stringContaining('Session: sess-2'));
+    expect(fb.createTicket).toHaveBeenCalledWith(expect.objectContaining({ title: 'crash', authorEmail: 'u@e.com', authorName: 'U' }));
+    const content = fb.createTicket.mock.calls[0][0].content;
+    expect(content).toContain('on save');           // the reporter's own words
+    expect(content).toContain('Session: sess-2');    // diagnostics footer for eng (synced to Linear)
+    // No hand-made canonical / dedup grouping — the ticket auto-syncs to its own Linear issue.
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(dedup.findDuplicate).not.toHaveBeenCalled();
     expect(r).toMatchObject({ pageId: '7', deduped: false, tracker: 'Featurebase', userUrl: 'https://fb/t/7' });
   });
 
-  it('matches an existing canonical -> still its OWN new ticket, comments on the existing canonical, deduped=true', async () => {
-    linear.listOpenBugCanonicals.mockResolvedValue([{ identifier: 'ENG-5', issueId: 'uuid-5', title: 'crash', description: 'x' }]);
-    dedup.findDuplicate.mockResolvedValue({ ref: 'ENG-5', title: 'crash', description: 'x' });
-    fb.createTicket.mockResolvedValue({ id: 'tk2', number: 8, url: 'https://fb/t/8' });
-    const r = await fileUserIssue({ type: 'bug', title: 'crashes too', description: 'also on save', userEmail: 'u2@e.com', sessionId: 'sess-3' });
-    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
-    expect(fb.createTicket).toHaveBeenCalled();
-    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-5', expect.stringContaining('[reporter-ticket #8]'));
-    // For a duplicate, the reporter's own text is folded into the canonical comment (eng sees it).
-    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-5', expect.stringContaining('also on save'));
-    expect(r).toMatchObject({ pageId: '8', deduped: true, tracker: 'Featurebase', userUrl: 'https://fb/t/8' });
+  it('notes delegation in the ticket footer', async () => {
+    fb.createTicket.mockResolvedValue({ id: 'tk', number: 7, url: 'https://fb/t/7' });
+    await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'cust@e.com', reportedByAdmin: 'admin@a.com' });
+    expect(fb.createTicket.mock.calls[0][0].content).toContain('via admin@a.com acting on their behalf');
   });
 
   it('createTicket throws -> PROPAGATES (no Notion fallback)', async () => {
-    dedup.findDuplicate.mockResolvedValue(null);
-    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
     fb.createTicket.mockRejectedValue(new Error('FB tickets down'));
     await expect(fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'u@e.com' })).rejects.toThrow('FB tickets down');
     expect(notion.createOncallItem).not.toHaveBeenCalled();
-  });
-
-  it('canonical comment failure is best-effort -> ticket still returned', async () => {
-    dedup.findDuplicate.mockResolvedValue(null);
-    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
-    fb.createTicket.mockResolvedValue({ id: 'tk', number: 7, url: 'https://fb/t/7' });
-    linear.addIssueComment.mockRejectedValue(new Error('comment down'));
-    const r = await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'u@e.com' });
-    expect(r).toMatchObject({ pageId: '7', deduped: false });
   });
 });
 

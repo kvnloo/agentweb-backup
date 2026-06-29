@@ -227,35 +227,6 @@ export async function listOpenCanonicals(type: LinearItemType, limit = 30): Prom
   });
 }
 
-/**
- * List OPEN private bug canonicals — Linear issues we created for customer-reported bugs
- * (labels Bug + Customer Reported, NO Featurebase label so they're not public posts). These
- * are the dedup-match candidates for the ticket flow: multiple reporters group onto one.
- */
-export async function listOpenBugCanonicals(limit = 30): Promise<OpenCanonical[]> {
-  const data = await linearGraphQL(
-    `query($team: String!, $bug: String!, $cust: String!, $limit: Int!) {
-      issues(
-        first: $limit,
-        orderBy: createdAt,
-        filter: {
-          team: { key: { eq: $team } },
-          state: { type: { nin: ["completed", "canceled"] } },
-          and: [
-            { labels: { name: { eq: $bug } } },
-            { labels: { name: { eq: $cust } } }
-          ]
-        }
-      ) {
-        nodes { id identifier title description }
-      }
-    }`,
-    { team: TEAM_KEY, bug: 'Bug', cust: 'Customer Reported', limit },
-  );
-  const nodes: any[] = data?.issues?.nodes || [];
-  return nodes.map((n) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }));
-}
-
 /** Add a comment to a Linear issue (used to record additional reporters on a canonical). */
 export async function addIssueComment(issueId: string, body: string): Promise<void> {
   const data = await linearGraphQL(
