@@ -43,6 +43,8 @@ export interface FileUserIssueParams {
   userName?: string;
   /** Admin email when filed via a delegated session. */
   reportedByAdmin?: string;
+  /** Chat session id of the reporter, so eng can jump straight to the offending session. */
+  sessionId?: string;
   /** Tags + context for the Notion path (flag off). */
   notionTags?: string[];
   notionContext?: Record<string, any>;
@@ -74,8 +76,17 @@ export async function fileUserIssue(p: FileUserIssueParams): Promise<FiledUserRe
   const dup = await findDuplicateCanonical({ type: p.type, title: p.title, description: p.description });
   if (dup) {
     // Stacking writes are best-effort — a failure here must not turn this into a duplicate
-    // issue, so degrade in place rather than failing the whole filing.
-    const reportedLine = `Also reported by ${p.userEmail} on ${new Date().toISOString().slice(0, 10)}${p.reportedByAdmin ? ` (via ${p.reportedByAdmin} acting on their behalf)` : ''}.`;
+    // issue, so degrade in place rather than failing the whole filing. Capture the reporter's
+    // FULL text + session id (not just "also reported") so grouping is not lossy and eng can
+    // jump straight to this reporter's session.
+    const reportedLine = [
+      `Also reported by ${p.userEmail}${p.userName && p.userName !== p.userEmail ? ` (${p.userName})` : ''} on ${new Date().toISOString().slice(0, 10)}${p.reportedByAdmin ? ` — via ${p.reportedByAdmin} acting on their behalf` : ''}.`,
+      ...(p.sessionId ? [`Session: ${p.sessionId}`] : []),
+      '',
+      'Their report:',
+      p.description,
+      ...contextLines(p.notionContext),
+    ].join('\n');
     try {
       const { addIssueComment } = await import('./linearService');
       await addIssueComment(dup.issueId, reportedLine);
@@ -107,6 +118,7 @@ export async function fileUserIssue(p: FileUserIssueParams): Promise<FiledUserRe
     description: p.description,
     userEmail: p.userEmail,
     reportedByAdmin: p.reportedByAdmin,
+    sessionId: p.sessionId,
   });
   return { pageId: li.identifier, trackerUrl: li.url, userUrl: FEATUREBASE_BOARD_URL, deduped: false, tracker: 'Linear' };
 }

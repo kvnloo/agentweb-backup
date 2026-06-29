@@ -258,7 +258,7 @@ router.post("/report-ui-bug", async (req, res) => {
   try {
     const authenticatedReq = req as any;
     const userId = authenticatedReq.user.userId;
-    const { description, pageUrl, screenshot, reportType } = req.body;
+    const { description, pageUrl, screenshot, reportType, sessionId } = req.body;
 
     if (!description || !description.trim()) {
       return res.status(400).json({ message: "Description is required" });
@@ -313,6 +313,7 @@ router.post("/report-ui-bug", async (req, res) => {
       userEmail: user.email,
       userName: user.displayName || user.email,
       reportedByAdmin: isDelegated && adminEmail ? adminEmail : undefined,
+      sessionId: typeof sessionId === "string" ? sessionId : undefined,
       notionTags: ["Customer Reported", config.tag],
       notionContext: issueContext,
     });

@@ -40,6 +40,17 @@ describe('intakeService.fileUserIssue', () => {
     expect(r).toMatchObject({ deduped: true, tracker: 'Linear', userUrl: 'https://fb/p/dark' });
   });
 
+  it('flag ON + match -> dedup comment carries the reporter full text + session id (not lossy)', async () => {
+    process.env.FEATUREBASE_INTAKE = 'true';
+    dedup.findDuplicateCanonical.mockResolvedValue({ identifier: 'ENG-5', issueId: 'uuid-5', title: 'X', featurebasePostUrl: 'u' });
+    fb.findPostByTitle.mockResolvedValue(null);
+    await fileUserIssue({ type: 'bug', title: 'x', description: 'the export button does nothing on CRM', userEmail: 'u2@e.com', userName: 'Two', sessionId: 'sess-abc' });
+    const body = linear.addIssueComment.mock.calls[0][1];
+    expect(body).toContain('Also reported by u2@e.com (Two)');
+    expect(body).toContain('Session: sess-abc');
+    expect(body).toContain('the export button does nothing on CRM');
+  });
+
   it('flag ON + delegated match -> comment notes the admin', async () => {
     process.env.FEATUREBASE_INTAKE = 'true';
     dedup.findDuplicateCanonical.mockResolvedValue({ identifier: 'ENG-5', issueId: 'uuid-5', title: 'X', featurebasePostUrl: 'u' });

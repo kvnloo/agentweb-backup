@@ -76,6 +76,12 @@ describe('linearService.createLinearIssue', () => {
     expect(lastCreateInput().labelIds).toContain('lab_fb');
   });
 
+  it('records the session id in the description when provided', async () => {
+    mockLinear();
+    await createLinearIssue({ type: 'bug', title: 't', description: 'd', userEmail: 'u@e.com', sessionId: 'sess-xyz' });
+    expect(lastCreateInput().description).toContain('Session: sess-xyz');
+  });
+
   it('includes the source URL in the description when provided', async () => {
     mockLinear();
     await createLinearIssue({ type: 'bug', title: 't', description: 'd', userEmail: 'u@e.com', sourceUrl: 'https://fb/p/x' });

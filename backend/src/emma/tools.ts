@@ -6899,6 +6899,7 @@ emmaToolRegistry.register({
           userEmail: user.email,
           userName: user.displayName || user.email,
           reportedByAdmin: isDelegatedAdmin && adminEmail ? adminEmail : undefined,
+          sessionId: context?.sessionId,
           // External MCP clients (Claude Code etc.) are tagged distinctly so benchmark
           // filters on Customer Reported stay clean (used on the flag-off Notion path).
           notionTags: [context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported'],
