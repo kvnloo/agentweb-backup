@@ -6788,7 +6788,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     // Lazy imports to avoid pulling in heavy dependencies at module load time
-    const { createOncallItem } = await import('../services/notionService');
+    const { createFeaturebasePost } = await import('../services/featurebaseService');
     const { resendService } = await import('../services/resendService');
 
     const userId = context?.userId;
@@ -6815,7 +6815,7 @@ emmaToolRegistry.register({
     }
     const isDelegatedAdmin = isDelegate && !!adminEmail;
 
-    const results: Array<{ title: string; success: boolean; issueId?: string; error?: string }> = [];
+    const results: Array<{ title: string; success: boolean; issueId?: string; issueUrl?: string; error?: string }> = [];
 
     // Fetch once before the loop to avoid N DynamoDB reads for a batch of issues
     const { settingsService } = await import('../services/settingsService');
@@ -6878,12 +6878,22 @@ emmaToolRegistry.register({
           issueContext['Reported By (Admin)'] = adminEmail;
         }
 
-        const result = await createOncallItem({
+        const sourceTag = context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported';
+        const priority = issue.priority || 'Medium';
+        const result = await createFeaturebasePost({
           title: issue.title,
           description,
+          kind: 'bug',
+          priority,
           // External MCP clients (Claude Code etc.) are tagged distinctly so
           // benchmark filters on Customer Reported stay clean.
-          additionalTags: [context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported'],
+          tags: [sourceTag, 'bug', `priority:${priority}`],
+          attachmentUrls,
+          reporter: {
+            userId,
+            email: user.email,
+            name: user.displayName || user.email,
+          },
           context: issueContext,
         });
 
@@ -6892,7 +6902,11 @@ emmaToolRegistry.register({
           ? [...productIssueEmails, adminEmail]
           : [...productIssueEmails];
 
-        const priorityColor = (issue.priority || 'Medium') === 'High' ? '#dc2626' : (issue.priority || 'Medium') === 'Low' ? '#6b7280' : '#d97706';
+        const priorityColor = priority === 'High' ? '#dc2626' : priority === 'Low' ? '#6b7280' : '#d97706';
+        const issueId = `FB-${result.postId}`;
+        const linearLinks = result.linearIssueUrls.length > 0
+          ? result.linearIssueUrls.map((url: string) => `<a href="${url}" style="color: #4F46E5;">${url}</a>`).join('<br>')
+          : '';
         await resendService.sendEmail({
           from: `${RESEND_SYSTEM_NAME} Support <${RESEND_SYSTEM_EMAIL}>`,
           to: emailRecipients,
@@ -6901,7 +6915,7 @@ emmaToolRegistry.register({
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
               <div style="background-color: #f8f9fa; padding: 16px 20px; border-radius: 8px; margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between;">
                 <h2 style="margin: 0; color: #111; font-size: 18px;">Customer Issue Report</h2>
-                <span style="background-color: ${priorityColor}; color: #fff; font-size: 12px; font-weight: 600; padding: 2px 10px; border-radius: 12px;">${issue.priority || 'Medium'}</span>
+                <span style="background-color: ${priorityColor}; color: #fff; font-size: 12px; font-weight: 600; padding: 2px 10px; border-radius: 12px;">${priority}</span>
               </div>
 
               <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
@@ -6910,8 +6924,9 @@ emmaToolRegistry.register({
                   <td style="padding: 6px 0;"><a href="mailto:${user.email}" style="color: #4F46E5;">${user.displayName || user.email}</a> (${user.email})</td>
                 </tr>
                 ${isDelegatedAdmin && adminEmail ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Via delegation</strong></td><td style="padding: 6px 0;">${adminEmail}</td></tr>` : ''}
-                ${result.pageId ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Issue ID</strong></td><td style="padding: 6px 0; font-family: monospace;">AGW-${result.pageId}</td></tr>` : ''}
-                ${result.notionUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Notion</strong></td><td style="padding: 6px 0;"><a href="${result.notionUrl}" style="color: #4F46E5; font-weight: 600;">→ Open in Notion</a></td></tr>` : ''}
+                <tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Issue ID</strong></td><td style="padding: 6px 0; font-family: monospace;">${issueId}</td></tr>
+                <tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Featurebase</strong></td><td style="padding: 6px 0;"><a href="${result.postUrl}" style="color: #4F46E5; font-weight: 600;">Open in Featurebase</a></td></tr>
+                ${linearLinks ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Linear</strong></td><td style="padding: 6px 0;">${linearLinks}</td></tr>` : ''}
                 ${issue.pageUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Page URL</strong></td><td style="padding: 6px 0;"><a href="${issue.pageUrl}" style="color: #4F46E5;">${issue.pageUrl}</a></td></tr>` : ''}
               </table>
 
@@ -6928,7 +6943,7 @@ emmaToolRegistry.register({
           replyTo: user.email,
         });
 
-        results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}` });
+        results.push({ title: issue.title, success: true, issueId, issueUrl: result.postUrl });
       } catch (err: any) {
         results.push({ title: issue.title, success: false, error: err.message });
       }

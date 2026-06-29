@@ -5,7 +5,7 @@
  * action item to the correct system via meetingIntakeService:
  *   - eng-task       -> Notion sprint board
  *   - delivery-task  -> ClickUp CEO board
- *   - feature-request -> Notion with "Customer Request" tag
+ *   - feature-request -> Featurebase feature board
  *   - ignore         -> skipped
  */
 
@@ -20,7 +20,7 @@ emmaToolRegistry.register({
       'Route meeting action items to the correct project management systems. ' +
       'Takes a meeting title, participants, and action items (from Fathom or any source). ' +
       'Each action item is classified as: eng-task (-> Notion), delivery-task (-> ClickUp), ' +
-      'feature-request (-> Notion with Customer Request tag), or ignored. ' +
+      'feature-request (-> Featurebase), or ignored. ' +
       'Deduplicates against existing tasks before creating new ones.',
     inputSchema: {
       type: 'object',

@@ -1,6 +1,6 @@
 /**
  * Tests for meetingIntakeService — Meeting action item classification,
- * deduplication, and routing to Notion / ClickUp.
+ * deduplication, and routing to Notion / ClickUp / Featurebase.
  */
 
 import {
@@ -152,6 +152,11 @@ describe('computeSimilarity', () => {
 describe('processActionItems', () => {
   const mockCreateNotionTask = jest.fn().mockResolvedValue({ id: 'notion-123' });
   const mockCreateClickUpTask = jest.fn().mockResolvedValue({ id: 'clickup-456' });
+  const mockCreateFeaturebasePost = jest.fn().mockResolvedValue({
+    postId: 'featurebase-789',
+    postUrl: 'https://feedback.agentweb.pro/p/featurebase-789',
+    linearIssueUrls: ['https://linear.app/agentweb/issue/ENG-789'],
+  });
   const mockSearchExistingTasks = jest.fn().mockResolvedValue([]);
 
   // Save originals so we can restore
@@ -168,6 +173,7 @@ describe('processActionItems', () => {
     // Inject mocks into _deps
     _deps.createNotionTask = mockCreateNotionTask;
     _deps.createClickUpTask = mockCreateClickUpTask;
+    _deps.createFeaturebasePost = mockCreateFeaturebasePost;
     _deps.searchExistingTasks = mockSearchExistingTasks;
   });
 
@@ -175,6 +181,7 @@ describe('processActionItems', () => {
     // Restore originals
     _deps.createNotionTask = originalDeps.createNotionTask;
     _deps.createClickUpTask = originalDeps.createClickUpTask;
+    _deps.createFeaturebasePost = originalDeps.createFeaturebasePost;
     _deps.searchExistingTasks = originalDeps.searchExistingTasks;
   });
 
@@ -213,7 +220,7 @@ describe('processActionItems', () => {
     expect(mockCreateClickUpTask).toHaveBeenCalledTimes(1);
   });
 
-  it('creates Notion task with Customer Request tag for feature-requests', async () => {
+  it('creates Featurebase post with Customer Request tag for feature-requests', async () => {
     const meeting: MeetingData = {
       ...baseMeetingData,
       actionItems: ['Can we add a CSV export feature?'],
@@ -223,11 +230,18 @@ describe('processActionItems', () => {
 
     expect(result.created.length).toBe(1);
     expect(result.created[0].type).toBe('feature-request');
-    expect(result.created[0].destination).toBe('notion');
-    expect(mockCreateNotionTask).toHaveBeenCalledTimes(1);
+    expect(result.created[0].destination).toBe('featurebase');
+    expect(result.created[0].externalId).toBe('featurebase-789');
+    expect(mockCreateNotionTask).not.toHaveBeenCalled();
+    expect(mockCreateFeaturebasePost).toHaveBeenCalledTimes(1);
     // Verify it was called with Customer Request tag
-    const callArgs = mockCreateNotionTask.mock.calls[0][0];
+    const callArgs = mockCreateFeaturebasePost.mock.calls[0][0];
     expect(callArgs.tags).toContain('Customer Request');
+    expect(callArgs.kind).toBe('feature');
+    expect(callArgs.context).toEqual(expect.objectContaining({
+      'Meeting Title': 'Sprint Planning',
+      'Meeting Timestamp': '2026-03-16T10:00:00Z',
+    }));
   });
 
   it('skips ignored items and creates no tasks', async () => {
@@ -243,6 +257,7 @@ describe('processActionItems', () => {
     expect(result.skipped[0].reason).toBe('ignored');
     expect(mockCreateNotionTask).not.toHaveBeenCalled();
     expect(mockCreateClickUpTask).not.toHaveBeenCalled();
+    expect(mockCreateFeaturebasePost).not.toHaveBeenCalled();
   });
 
   it('handles empty action items gracefully', async () => {
@@ -257,6 +272,7 @@ describe('processActionItems', () => {
     expect(result.skipped.length).toBe(0);
     expect(mockCreateNotionTask).not.toHaveBeenCalled();
     expect(mockCreateClickUpTask).not.toHaveBeenCalled();
+    expect(mockCreateFeaturebasePost).not.toHaveBeenCalled();
   });
 
   it('deduplicates items that already exist in Notion', async () => {
@@ -297,6 +313,7 @@ describe('processActionItems', () => {
     expect(types).toContain('eng-task');
     expect(types).toContain('delivery-task');
     expect(types).toContain('feature-request');
+    expect(mockCreateFeaturebasePost).toHaveBeenCalledTimes(1);
   });
 
   it('includes meeting metadata in created tasks', async () => {

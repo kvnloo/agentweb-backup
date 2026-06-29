@@ -189,7 +189,7 @@ describe('fathom_route_action_items', () => {
       created: [
         { description: 'Update the UI', type: 'eng-task', destination: 'notion', externalId: 'n-1' },
         { description: 'Email client update', type: 'delivery-task', destination: 'clickup', externalId: 'c-1' },
-        { description: 'Add dark mode', type: 'feature-request', destination: 'notion', externalId: 'n-2' },
+        { description: 'Add dark mode', type: 'feature-request', destination: 'featurebase', externalId: 'fb-2' },
       ],
       skipped: [
         { description: 'Sounds good', reason: 'ignored' },

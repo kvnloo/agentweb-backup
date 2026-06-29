@@ -4,7 +4,7 @@
  * Processes meeting transcripts and routes action items to the correct systems:
  *   - eng-task       → Notion sprint board
  *   - delivery-task  → ClickUp CEO board
- *   - feature-request → Notion with "Customer Request" tag
+ *   - feature-request → Featurebase feature board
  *   - ignore         → skipped
  *
  * Classification is keyword/pattern-based for speed (no LLM call).
@@ -12,6 +12,11 @@
  */
 
 import axios from 'axios';
+import {
+  CreateFeaturebasePostParams,
+  CreateFeaturebasePostResult,
+  createFeaturebasePost,
+} from './featurebaseService';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -36,7 +41,7 @@ export interface MeetingData {
 export interface CreatedTaskResult {
   description: string;
   type: ClassifiedItem['type'];
-  destination: 'notion' | 'clickup';
+  destination: 'notion' | 'clickup' | 'featurebase';
   externalId?: string;
 }
 
@@ -84,6 +89,7 @@ interface ExistingTask {
 interface Deps {
   createNotionTask: (payload: NotionTaskPayload) => Promise<{ id: string }>;
   createClickUpTask: (payload: ClickUpTaskPayload) => Promise<{ id: string }>;
+  createFeaturebasePost: (payload: CreateFeaturebasePostParams) => Promise<CreateFeaturebasePostResult>;
   searchExistingTasks: () => Promise<ExistingTask[]>;
 }
 
@@ -106,6 +112,10 @@ const defaultCreateClickUpTask = async (payload: ClickUpTaskPayload): Promise<{ 
   return { id: 'clickup-placeholder' };
 };
 
+const defaultCreateFeaturebasePost = async (
+  payload: CreateFeaturebasePostParams,
+): Promise<CreateFeaturebasePostResult> => createFeaturebasePost(payload);
+
 const defaultSearchExistingTasks = async (): Promise<ExistingTask[]> => {
   // TODO: Query Notion Master Table view for existing task titles
   // Use view://2bf09247-c951-81c2-bfc0-000cf28e3775
@@ -120,6 +130,7 @@ const defaultSearchExistingTasks = async (): Promise<ExistingTask[]> => {
 export const _deps: Deps = {
   createNotionTask: defaultCreateNotionTask,
   createClickUpTask: defaultCreateClickUpTask,
+  createFeaturebasePost: defaultCreateFeaturebasePost,
   searchExistingTasks: defaultSearchExistingTasks,
 };
 
@@ -373,28 +384,33 @@ export async function processActionItems(meeting: MeetingData): Promise<RoutingR
           externalId: taskResult.id,
         });
       } else if (classified.type === 'feature-request') {
-        const taskResult = await _deps.createNotionTask({
+        const taskResult = await _deps.createFeaturebasePost({
           title: classified.description,
-          status: 'To-do',
+          description: `From meeting: ${meeting.meetingTitle} (${meeting.timestamp})\nParticipants: ${meeting.participants.join(', ')}`,
+          kind: 'feature',
           priority: classified.priority,
-          source: 'Human',
-          tags: ['Customer Request'],
-          planned: '__NO__',
-          assigneeId: '1c8d872b-594c-8168-8c1b-00022b54e40d', // Harsha
-          meetingTitle: meeting.meetingTitle,
-          meetingTimestamp: meeting.timestamp,
+          tags: ['Customer Request', 'feature-request', `priority:${classified.priority}`],
+          reporter: {
+            userId: 'meeting-intake',
+            name: 'Meeting intake',
+          },
+          context: {
+            'Meeting Title': meeting.meetingTitle,
+            'Meeting Timestamp': meeting.timestamp,
+            Participants: meeting.participants.join(', ') || 'N/A',
+          },
         });
 
         result.created.push({
           description: classified.description,
           type: 'feature-request',
-          destination: 'notion',
-          externalId: taskResult.id,
+          destination: 'featurebase',
+          externalId: taskResult.postId,
         });
       }
 
       console.log(
-        `[MeetingIntake] Created ${classified.type} → ${classified.type === 'delivery-task' ? 'ClickUp' : 'Notion'}: "${classified.description}"`
+        `[MeetingIntake] Created ${classified.type} → ${classified.type === 'delivery-task' ? 'ClickUp' : classified.type === 'feature-request' ? 'Featurebase' : 'Notion'}: "${classified.description}"`
       );
     } catch (err) {
       console.error(`[MeetingIntake] Failed to create task for "${rawItem}":`, err);

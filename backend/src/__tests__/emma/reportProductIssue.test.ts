@@ -5,6 +5,11 @@ jest.mock('../../services/notionService', () => ({
   createOncallItem: jest.fn(),
 }));
 
+const mockCreateFeaturebasePost = jest.fn();
+jest.mock('../../services/featurebaseService', () => ({
+  createFeaturebasePost: mockCreateFeaturebasePost,
+}), { virtual: true });
+
 jest.mock('../../services/resendService', () => ({
   resendService: {
     sendEmail: jest.fn().mockResolvedValue(undefined),
@@ -86,6 +91,11 @@ describe('report_product_issues tool', () => {
       pageId: 'notion-page-id',
       notionUrl: 'https://notion.so/notionpageid',
     });
+    mockCreateFeaturebasePost.mockResolvedValue({
+      postId: 'featurebase-post-id',
+      postUrl: 'https://feedback.agentweb.pro/p/featurebase-post-id',
+      linearIssueUrls: ['https://linear.app/agentweb/issue/ENG-123'],
+    });
     mockGetUserById.mockResolvedValue({
       userId: 'user-123',
       email: 'customer@example.com',
@@ -109,7 +119,7 @@ describe('report_product_issues tool', () => {
     )).rejects.toThrow('User not found');
   });
 
-  it('should create Notion item with Customer Reported tag for a single issue', async () => {
+  it('should create Featurebase post with Customer Reported tag for a single issue', async () => {
     const result = await toolExecute(
       { issues: [{ title: 'Login fails', description: 'Cannot log in on mobile', priority: 'High', pageUrl: 'https://app.example.com/login' }] },
       { userId: 'user-123', sessionId: 'sess-456' }
@@ -117,12 +127,21 @@ describe('report_product_issues tool', () => {
 
     expect(result.success).toBe(true);
     expect(result.results).toHaveLength(1);
-    expect(result.results[0].issueId).toBe('AGW-notion-page-id');
+    expect(result.results[0].issueId).toBe('FB-featurebase-post-id');
 
-    expect(mockCreateOncallItem).toHaveBeenCalledWith({
+    expect(mockCreateOncallItem).not.toHaveBeenCalled();
+    expect(mockCreateFeaturebasePost).toHaveBeenCalledWith({
       title: 'Login fails',
       description: 'Cannot log in on mobile',
-      additionalTags: ['Customer Reported'],
+      kind: 'bug',
+      priority: 'High',
+      tags: ['Customer Reported', 'bug', 'priority:High'],
+      attachmentUrls: [],
+      reporter: {
+        userId: 'user-123',
+        email: 'customer@example.com',
+        name: 'Test Customer',
+      },
       context: {
         'User Name': 'Test Customer',
         'User Email': 'customer@example.com',
@@ -135,9 +154,9 @@ describe('report_product_issues tool', () => {
   });
 
   it('should process multiple issues in one call', async () => {
-    mockCreateOncallItem
-      .mockResolvedValueOnce({ pageId: 'p1', notionUrl: 'https://notion.so/p1' })
-      .mockResolvedValueOnce({ pageId: 'p2', notionUrl: 'https://notion.so/p2' });
+    mockCreateFeaturebasePost
+      .mockResolvedValueOnce({ postId: 'p1', postUrl: 'https://feedback.agentweb.pro/p/p1', linearIssueUrls: [] })
+      .mockResolvedValueOnce({ postId: 'p2', postUrl: 'https://feedback.agentweb.pro/p/p2', linearIssueUrls: [] });
 
     const result = await toolExecute(
       { issues: [
@@ -149,16 +168,17 @@ describe('report_product_issues tool', () => {
 
     expect(result.success).toBe(true);
     expect(result.results).toHaveLength(2);
-    expect(result.results[0]).toEqual({ title: 'Bug 1', success: true, issueId: 'AGW-p1' });
-    expect(result.results[1]).toEqual({ title: 'Bug 2', success: true, issueId: 'AGW-p2' });
-    expect(mockCreateOncallItem).toHaveBeenCalledTimes(2);
+    expect(result.results[0]).toEqual({ title: 'Bug 1', success: true, issueId: 'FB-p1', issueUrl: 'https://feedback.agentweb.pro/p/p1' });
+    expect(result.results[1]).toEqual({ title: 'Bug 2', success: true, issueId: 'FB-p2', issueUrl: 'https://feedback.agentweb.pro/p/p2' });
+    expect(mockCreateFeaturebasePost).toHaveBeenCalledTimes(2);
+    expect(mockCreateOncallItem).not.toHaveBeenCalled();
     expect(mockResendSendEmail).toHaveBeenCalledTimes(2);
   });
 
   it('should handle partial failures gracefully', async () => {
-    mockCreateOncallItem
-      .mockResolvedValueOnce({ pageId: 'p1', notionUrl: 'https://notion.so/p1' })
-      .mockRejectedValueOnce(new Error('Notion API error'));
+    mockCreateFeaturebasePost
+      .mockResolvedValueOnce({ postId: 'p1', postUrl: 'https://feedback.agentweb.pro/p/p1', linearIssueUrls: [] })
+      .mockRejectedValueOnce(new Error('Featurebase API error'));
 
     const result = await toolExecute(
       { issues: [
@@ -172,7 +192,7 @@ describe('report_product_issues tool', () => {
     expect(result.results).toHaveLength(2);
     expect(result.results[0].success).toBe(true);
     expect(result.results[1].success).toBe(false);
-    expect(result.results[1].error).toBe('Notion API error');
+    expect(result.results[1].error).toBe('Featurebase API error');
     expect(result.message).toContain('1 of 2');
   });
 
@@ -187,9 +207,10 @@ describe('report_product_issues tool', () => {
         to: ['founders@agentweb.pro'],
         subject: '[Issue] Bug — reported by customer@example.com',
         replyTo: 'customer@example.com',
-        html: expect.stringContaining('AGW-notion-page-id'),
+        html: expect.stringContaining('FB-featurebase-post-id'),
       })
     );
+    expect(mockResendSendEmail.mock.calls[0][0].html).toContain('Open in Featurebase');
     const callArgs = mockResendSendEmail.mock.calls[0][0];
     expect(callArgs.to).not.toContain('customer@example.com');
   });
@@ -209,14 +230,15 @@ describe('report_product_issues tool', () => {
       { userId: 'user-123' }
     );
 
-    expect(mockCreateOncallItem).toHaveBeenCalledWith(
+    expect(mockCreateFeaturebasePost).toHaveBeenCalledWith(
       expect.objectContaining({
+        priority: 'Medium',
         context: expect.objectContaining({
           'Priority': 'Medium',
           'Page URL': 'N/A',
           'Session ID': 'N/A',
         }),
-      })
+      }),
     );
   });
 
@@ -256,13 +278,13 @@ describe('report_product_issues tool', () => {
       expect(callArgs.html).toContain('customer@example.com');
     });
 
-    it('should add Reported By (Admin) field to Notion context when isDelegatedAdmin', async () => {
+    it('should add Reported By (Admin) field to Featurebase context when isDelegatedAdmin', async () => {
       await toolExecute(
         { issues: [{ title: 'Admin-reported bug', description: 'Found via delegation' }] },
         delegateContext
       );
 
-      expect(mockCreateOncallItem).toHaveBeenCalledWith(
+      expect(mockCreateFeaturebasePost).toHaveBeenCalledWith(
         expect.objectContaining({
           context: expect.objectContaining({
             'Reported By (Admin)': 'admin@agentweb.pro',
