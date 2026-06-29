@@ -1333,7 +1333,7 @@ emmaToolRegistry.register({
   name: 'update_brand_guidelines',
   definition: {
     name: 'update_brand_guidelines',
-    description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Can update both brand data and brand assets (logos, brand guides, etc.). NOTE: SVG files are NOT allowed for logo or secondaryLogo uploads. If the user provides an SVG file, ask them to convert it to PNG or another raster format first.',
+    description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Can update both brand data and brand assets (logos, brand guides, etc.). NOTE: SVG files are NOT allowed for logo or secondaryLogo uploads. If the user provides an SVG file, ask them to convert it to PNG or another raster format first. MARKET STRATEGY SCOPE: this tool only updates brand guidelines — it does NOT change the market strategy (business overview, competitors, ICPs). When you perform a broad brand re-setup, the result includes a marketStrategyRefresh object; if present, you MUST tell the user their market strategy was not changed, then offer to regenerate it to match the new brand via regenerate_market_strategy. If marketStrategyRefresh.existingCompetitors or existingIcps is greater than 0, warn that regenerating will replace them, and only call regenerate_market_strategy after the user explicitly confirms.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1463,6 +1463,23 @@ emmaToolRegistry.register({
   },
   execute: async (args, context) => {
     return await agentModeService.updateMarketStrategy(args, context?.userId);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'regenerate_market_strategy',
+  definition: {
+    name: 'regenerate_market_strategy',
+    description: 'Regenerate the user\'s market strategy (ideal customer profiles and competitors) from their CURRENT brand guidelines, so the strategy matches the latest brand. DESTRUCTIVE: this REPLACES the existing competitors and ICPs (the business overview is preserved). Only call this AFTER the user has explicitly confirmed they want to regenerate — if they already have competitors/ICPs, first tell them how many will be replaced and get a clear yes. Takes ~30-60s. Typically used right after a broad brand re-setup, when update_brand_guidelines returned a marketStrategyRefresh hint.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+      },
+      required: []
+    }
+  },
+  execute: async (args, context) => {
+    return await agentModeService.regenerateMarketStrategy(context?.userId);
   }
 });
 
