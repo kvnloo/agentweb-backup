@@ -6,6 +6,11 @@ import {
   addComment,
   getDefaultBoardId,
   _resetBoardCache,
+  getCustomerTicketCategoryId,
+  createTicket,
+  patchTicketStatus,
+  findTicketsByQuery,
+  _resetTicketCategoryCache,
 } from '../services/featurebaseService';
 
 jest.mock('../utils/secretsManager', () => ({
@@ -22,8 +27,61 @@ function routed(boards: any, other: any) {
 }
 
 describe('featurebaseService', () => {
-  beforeEach(() => { _resetBoardCache(); });
+  beforeEach(() => { _resetBoardCache(); _resetTicketCategoryCache(); });
   afterEach(() => jest.clearAllMocks());
+
+  describe('getCustomerTicketCategoryId', () => {
+    it('matches the "Bug Report" category by name + caches it (one fetch)', async () => {
+      (global.fetch as any) = jest.fn(() => jsonRes([
+        { id: 'cat-tracker', name: 'Tracked Issue' },
+        { id: 'cat-bug', name: 'Bug Report' },
+      ]));
+      const a = await getCustomerTicketCategoryId();
+      const b = await getCustomerTicketCategoryId();
+      expect(a).toBe('cat-bug');
+      expect(b).toBe('cat-bug');
+      expect((global.fetch as jest.Mock).mock.calls.length).toBe(1);
+    });
+  });
+
+  describe('createTicket', () => {
+    it('creates a ticket in the customer category authored by the reporter; returns id+number+url', async () => {
+      (global.fetch as any) = jest.fn((url: any) =>
+        String(url).includes('/tickets/categories')
+          ? jsonRes([{ id: 'cat-bug', name: 'Bug Report' }])
+          : jsonRes({ id: 'hex1', ticketNumber: 12, ticketUrl: 'https://fb/t/12' }));
+      const r = await createTicket({ title: 't', content: 'd', authorEmail: 'u@e.com', authorName: 'U' });
+      expect(r).toEqual({ id: 'hex1', number: 12, url: 'https://fb/t/12' });
+      const postCall = (global.fetch as jest.Mock).mock.calls.find((c) => String(c[0]).endsWith('/tickets'));
+      const body = JSON.parse(postCall[1].body);
+      expect(body).toMatchObject({ ticketCategoryId: 'cat-bug', title: 't', content: 'd', author: { email: 'u@e.com', name: 'U' } });
+    });
+
+    it('throws when the API does not return id+number', async () => {
+      (global.fetch as any) = jest.fn((url: any) =>
+        String(url).includes('/tickets/categories') ? jsonRes([{ id: 'cat-bug', name: 'Bug Report' }]) : jsonRes({ id: 'hex1' }));
+      await expect(createTicket({ title: 't', content: 'd', authorEmail: 'u@e.com' })).rejects.toThrow(/did not return id\+number/);
+    });
+  });
+
+  describe('patchTicketStatus', () => {
+    it('PATCHes the ticket by NUMBER with the statusId', async () => {
+      (global.fetch as any) = jest.fn(() => jsonRes({ ok: true }));
+      await patchTicketStatus(12, 'status-done');
+      const [url, opts] = (global.fetch as jest.Mock).mock.calls[0];
+      expect(String(url)).toContain('/tickets/12');
+      expect(opts.method).toBe('PATCH');
+      expect(JSON.parse(opts.body)).toEqual({ statusId: 'status-done' });
+    });
+  });
+
+  describe('findTicketsByQuery', () => {
+    it('searches tickets and maps id/number/title', async () => {
+      (global.fetch as any) = jest.fn(() => jsonRes({ data: [{ id: 'h1', ticketNumber: 7, title: 'crash' }] }));
+      const res = await findTicketsByQuery('ENG-9');
+      expect(res).toEqual([{ id: 'h1', number: 7, title: 'crash' }]);
+    });
+  });
 
   describe('getDefaultBoardId', () => {
     it('resolves + caches the board id (one /boards fetch)', async () => {

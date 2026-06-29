@@ -193,3 +193,94 @@ export async function addVoter(postId: string, email: string, name?: string): Pr
     body: JSON.stringify({ email, name: name || email }),
   });
 }
+
+// ---------------------------------------------------------------------------
+// Tickets (private, per-reporter "own card").
+//
+// A bug report becomes a private Customer ticket (the category's postDefaults are
+// authorOnly), authored by the reporter, so each reporter sees ONLY their own card in
+// the Ticket Portal with a live status. Featurebase's API does NOT expose customer↔tracker
+// linking, and Linear doesn't sync to tickets — so grouping + "resolve once → notify all"
+// is driven by us (intakeService groups reporters onto one Linear canonical; a Linear
+// webhook patches/replies to the linked tickets on resolve). The tracker ticket TYPE is
+// therefore unused in this design — the canonical is the Linear issue.
+//
+// IMPORTANT: the ticket API is keyed by the numeric `ticketNumber`, NOT the hex id.
+// Contract verified live (2026-06-29):
+//   POST  /v2/tickets {ticketCategoryId, title, content, author:{email,name}} -> {id, ticketNumber, ticketUrl, status}
+//   GET   /v2/tickets/{number} ; PATCH /v2/tickets/{number} {statusId}
+//   GET   /v2/tickets?q=  (searches title/content) ; ticket categories are at /v2/tickets/categories
+// ---------------------------------------------------------------------------
+
+let customerTicketCategoryCache: string | null = null;
+
+/** For tests: reset cached ticket-category id. */
+export function _resetTicketCategoryCache(): void {
+  customerTicketCategoryCache = null;
+}
+
+/**
+ * Resolve the Customer ("Bug Report") ticket category id by name (the API does not expose
+ * the customer/tracker type on the category, so we match by name). Override the name with
+ * FEATUREBASE_BUG_TICKET_CATEGORY. Cached for the process lifetime.
+ */
+export async function getCustomerTicketCategoryId(): Promise<string> {
+  if (customerTicketCategoryCache) return customerTicketCategoryCache;
+  const data = await featurebaseFetch('/tickets/categories', { method: 'GET' });
+  const cats: any[] = Array.isArray(data) ? data : data?.data || [];
+  const wantName = (process.env.FEATUREBASE_BUG_TICKET_CATEGORY || 'Bug Report').trim().toLowerCase();
+  const chosen = cats.find((c) => ((c.name || c.localization?.name?.en || '').trim().toLowerCase() === wantName)) || cats[0];
+  const id: string = chosen?._id || chosen?.id;
+  if (!id) throw new Error(`Featurebase: no ticket category found (looked for "${wantName}")`);
+  customerTicketCategoryCache = id;
+  return id;
+}
+
+export interface CreatedTicket {
+  id: string;            // hex id
+  number: number;        // ticketNumber — the key for GET/PATCH
+  url: string;           // ticketUrl — the user-facing link to their own card
+}
+
+/**
+ * Create a private Customer ticket authored by the reporter. content is the body of the
+ * reporter's card (their own words + any eng breadcrumbs we choose to include).
+ */
+export async function createTicket(p: {
+  title: string;
+  content: string;
+  authorEmail: string;
+  authorName?: string;
+  categoryId?: string;
+}): Promise<CreatedTicket> {
+  const ticketCategoryId = p.categoryId || (await getCustomerTicketCategoryId());
+  const data = await featurebaseFetch('/tickets', {
+    method: 'POST',
+    body: JSON.stringify({
+      ticketCategoryId,
+      title: p.title,
+      content: p.content,
+      author: { email: p.authorEmail, name: p.authorName || p.authorEmail },
+    }),
+  });
+  const t = data?.data || data;
+  if (!t?.id || t?.ticketNumber == null) {
+    throw new Error(`Featurebase createTicket did not return id+number: ${JSON.stringify(data).slice(0, 200)}`);
+  }
+  return { id: t.id, number: t.ticketNumber, url: t.ticketUrl || '' };
+}
+
+/** Set a ticket's status (keyed by ticketNumber). Used by the resolve bridge. */
+export async function patchTicketStatus(ticketNumber: number, statusId: string): Promise<void> {
+  await featurebaseFetch(`/tickets/${ticketNumber}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ statusId }),
+  });
+}
+
+/** Search tickets by free text (title/content). Used by the bridge to find a canonical's linked reporter tickets. */
+export async function findTicketsByQuery(q: string, limit = 50): Promise<Array<{ id: string; number: number; title: string }>> {
+  const data = await featurebaseFetch(`/tickets?q=${encodeURIComponent(q.slice(0, 200))}&limit=${limit}`, { method: 'GET' });
+  const tickets: any[] = data?.data || [];
+  return tickets.map((t) => ({ id: t.id, number: t.ticketNumber, title: t.title || '' }));
+}

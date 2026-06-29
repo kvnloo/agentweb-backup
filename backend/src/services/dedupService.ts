@@ -1,22 +1,21 @@
 import { agentModeService } from './agentModeService';
-import { listOpenPosts, OpenPost } from './featurebaseService';
 import { extractJson } from './util/extractJson';
 
 /**
  * Dedup judge for user-filed requests (report_product_issues + the in-app bug button).
  *
- * Given a new filing, find an existing OPEN public Featurebase post that is the *same
- * underlying feature/bug* (reworded is fine). Used to stack a new report onto an existing
- * canonical (upvote + private comment) instead of creating a duplicate post.
+ * Given a new filing and a set of OPEN candidates, find the one that is the *same underlying
+ * feature/bug* (reworded is fine). Used to group a new report onto an existing canonical
+ * instead of creating a duplicate. The candidate source is the CALLER's choice — features
+ * dedup against public Featurebase posts; bugs dedup against private Linear bug canonicals —
+ * so this judge is decoupled from where canonicals live.
  *
  * Design notes:
- * - Candidate set = open posts on the board (featurebaseService.listOpenPosts). Closed
- *   (completed/canceled) posts are excluded there.
  * - The match decision is a focused LLM judge (not a keyword heuristic, not Emma's freeform
  *   reasoning) with a confidence gate biased toward NEW (a false-merge is worse than a missed
- *   one — periodic Featurebase "Find Duplicates" catches the tail).
+ *   one — periodic review catches the tail).
  * - The judge returns a 1-based INDEX into the shown list (not a free-form id) so it cannot
- *   hallucinate an identifier; we map the index back to the post.
+ *   hallucinate an identifier; we map the index back to the candidate.
  * - Model is sourced from settings via agentModeService.getDedupJudgeModel() — NOT a
  *   hardcoded literal. TODO(ENG-9): route this LLM call through OpenRouter so model choice
  *   is gateway/routing config.
@@ -25,7 +24,7 @@ import { extractJson } from './util/extractJson';
 
 const JUDGE_TIMEOUT_MS = 12000;
 const MATCH_CONFIDENCE_THRESHOLD = 75; // bias to NEW: only stack on a confident match
-const MAX_CANDIDATES = 30;
+export const MAX_CANDIDATES = 30;
 const MAX_TEXT_CHARS = 600; // keep the prompt cheap
 
 export type DedupItemType = 'feature_request' | 'bug';
@@ -36,10 +35,12 @@ export interface DedupInput {
   description: string;
 }
 
-export interface DedupMatch {
-  postId: string; // canonical Featurebase post id (for voter + comment stacking)
+/** A canonical the new filing might match. `ref` is opaque to the judge — the caller keys
+ *  its own full objects (post / Linear canonical) by it to recover what it needs. */
+export interface DedupCandidate {
+  ref: string;
   title: string;
-  url?: string;   // public post URL
+  description: string;
 }
 
 interface JudgeVerdict {
@@ -48,7 +49,7 @@ interface JudgeVerdict {
   reason?: string;
 }
 
-function buildPrompt(input: DedupInput, candidates: OpenPost[]): { system: string; user: string } {
+function buildPrompt(input: DedupInput, candidates: DedupCandidate[]): { system: string; user: string } {
   const kind = input.type === 'bug' ? 'bug report' : 'feature request';
   const system =
     `You are a deduplication judge for a product feedback system. You are given a NEW ${kind} ` +
@@ -71,11 +72,11 @@ function buildPrompt(input: DedupInput, candidates: OpenPost[]): { system: strin
 }
 
 /**
- * Returns the canonical post to stack onto, or null to create a fresh canonical.
+ * Returns the candidate to group onto, or null to create a fresh canonical. The caller
+ * supplies the open candidates (features: FB posts; bugs: Linear bug canonicals).
  */
-export async function findDuplicateCanonical(input: DedupInput): Promise<DedupMatch | null> {
+export async function findDuplicate(input: DedupInput, candidates: DedupCandidate[]): Promise<DedupCandidate | null> {
   try {
-    const candidates = await listOpenPosts(MAX_CANDIDATES);
     if (candidates.length === 0) return null;
 
     const model = await agentModeService.getDedupJudgeModel();
@@ -103,8 +104,7 @@ export async function findDuplicateCanonical(input: DedupInput): Promise<DedupMa
     if (!Number.isInteger(idx) || idx < 1 || idx > candidates.length) return null;
     if (typeof verdict.confidence === 'number' && verdict.confidence < MATCH_CONFIDENCE_THRESHOLD) return null;
 
-    const match = candidates[idx - 1];
-    return { postId: match.id, title: match.title, url: match.url };
+    return candidates[idx - 1];
   } catch (e) {
     console.warn('[dedup] judge failed; treating as new (no match):', e instanceof Error ? e.message : e);
     return null;
