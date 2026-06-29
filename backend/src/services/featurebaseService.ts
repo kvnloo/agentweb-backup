@@ -276,3 +276,36 @@ export async function patchTicketStatus(ticketNumber: number, statusId: string):
     body: JSON.stringify({ statusId }),
   });
 }
+
+let ticketStatusCache: Record<string, string> = {};
+
+/** For tests: reset cached ticket statuses. */
+export function _resetTicketStatusCache(): void {
+  ticketStatusCache = {};
+}
+
+/** Resolve a ticket status id by name (e.g. "Completed"). Cached for the process lifetime. */
+export async function getTicketStatusId(name: string): Promise<string> {
+  if (Object.keys(ticketStatusCache).length === 0) {
+    const data = await featurebaseFetch('/tickets/statuses', { method: 'GET' });
+    const statuses: any[] = Array.isArray(data) ? data : data?.data || [];
+    for (const s of statuses) {
+      const id = s._id || s.id;
+      if (s.name && id) ticketStatusCache[s.name] = id;
+    }
+  }
+  const id = ticketStatusCache[name];
+  if (!id) throw new Error(`Featurebase: no ticket status named "${name}"`);
+  return id;
+}
+
+/**
+ * Post an admin reply on a ticket — an agent message that NOTIFIES the reporter (the contact).
+ * The resolve bridge uses this to tell each reporter their issue was fixed.
+ */
+export async function replyToTicket(ticketNumber: number, content: string): Promise<void> {
+  await featurebaseFetch(`/tickets/${ticketNumber}/reply`, {
+    method: 'POST',
+    body: JSON.stringify({ type: 'admin', content }),
+  });
+}

@@ -257,6 +257,15 @@ export async function listOpenBugCanonicals(limit = 30): Promise<OpenCanonical[]
   return nodes.map((n) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }));
 }
 
+/** Read an issue's comment bodies (the resolve bridge parses `[reporter-ticket #N]` from these). */
+export async function getIssueComments(issueId: string): Promise<string[]> {
+  const data = await linearGraphQL(
+    `query($id: String!) { issue(id: $id) { comments { nodes { body } } } }`,
+    { id: issueId },
+  );
+  return (data?.issue?.comments?.nodes || []).map((c: any) => c?.body || '');
+}
+
 /** Add a comment to a Linear issue (used to record additional reporters on a canonical). */
 export async function addIssueComment(issueId: string, body: string): Promise<void> {
   const data = await linearGraphQL(

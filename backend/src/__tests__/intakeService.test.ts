@@ -10,12 +10,16 @@ jest.mock('../services/featurebaseService', () => ({
   addComment: jest.fn(),
   addVoter: jest.fn(),
   createTicket: jest.fn(),
+  getTicketStatusId: jest.fn().mockResolvedValue('status-completed'),
+  patchTicketStatus: jest.fn(),
+  replyToTicket: jest.fn(),
 }));
 jest.mock('../services/linearService', () => ({
   listOpenBugCanonicals: jest.fn().mockResolvedValue([]),
   createInternalLinearIssue: jest.fn(),
   addIssueComment: jest.fn(),
   listOpenIssuesByLabel: jest.fn(),
+  getIssueComments: jest.fn(),
 }));
 
 const notion = require('../services/notionService');
@@ -108,6 +112,48 @@ describe('fileUserIssue — bug (private own-card + one canonical listing affect
     linear.addIssueComment.mockRejectedValue(new Error('comment down'));
     const r = await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'u@e.com' });
     expect(r).toMatchObject({ pageId: '7', deduped: false });
+  });
+});
+
+describe('intakeService.notifyCanonicalResolved (resolve bridge)', () => {
+  const { notifyCanonicalResolved } = require('../services/intakeService');
+  afterEach(() => jest.clearAllMocks());
+
+  it('reads [reporter-ticket #N] from the canonical comments and notifies + flips each card', async () => {
+    linear.getIssueComments.mockResolvedValue([
+      'Customer-reported bug...\nAffected user: a@e.com',
+      '[reporter-ticket #10] Affected user: a@e.com on 2026-06-29.\nSession: s1',
+      '[reporter-ticket #11] Affected user: b@e.com on 2026-06-29.\nSession: s2',
+    ]);
+    const r = await notifyCanonicalResolved('issue-uuid');
+    expect(r.ticketNumbers.sort()).toEqual([10, 11]);
+    expect(fb.replyToTicket).toHaveBeenCalledWith(10, expect.stringContaining('resolved'));
+    expect(fb.replyToTicket).toHaveBeenCalledWith(11, expect.stringContaining('resolved'));
+    expect(fb.patchTicketStatus).toHaveBeenCalledWith(10, 'status-completed');
+    expect(fb.patchTicketStatus).toHaveBeenCalledWith(11, 'status-completed');
+  });
+
+  it('no reporter-ticket comments -> no-op (not a bug canonical)', async () => {
+    linear.getIssueComments.mockResolvedValue(['just a normal comment', 'another']);
+    const r = await notifyCanonicalResolved('issue-uuid');
+    expect(r.ticketNumbers).toEqual([]);
+    expect(fb.replyToTicket).not.toHaveBeenCalled();
+    expect(fb.getTicketStatusId).not.toHaveBeenCalled();
+  });
+
+  it('dedupes repeated ticket numbers across comments', async () => {
+    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #7] x', '[reporter-ticket #7] x again']);
+    const r = await notifyCanonicalResolved('issue-uuid');
+    expect(r.ticketNumbers).toEqual([7]);
+    expect(fb.replyToTicket).toHaveBeenCalledTimes(1);
+  });
+
+  it('one card failing is best-effort -> the others still get notified', async () => {
+    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #10] a', '[reporter-ticket #11] b']);
+    fb.replyToTicket.mockImplementation((n: number) => (n === 10 ? Promise.reject(new Error('down')) : Promise.resolve()));
+    const r = await notifyCanonicalResolved('issue-uuid');
+    expect(r.ticketNumbers).toEqual([11]); // 10 failed, 11 succeeded
+    expect(fb.patchTicketStatus).toHaveBeenCalledWith(11, 'status-completed');
   });
 });
 

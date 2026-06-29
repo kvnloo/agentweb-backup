@@ -264,3 +264,41 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
   });
   return { pageId: li.identifier, url: li.url, deduped: false, tracker: 'Linear' };
 }
+
+/**
+ * Resolve bridge: when a bug canonical Linear issue is marked Done, notify EVERY reporter whose
+ * private card is grouped onto it. We read the canonical's `[reporter-ticket #N]` comments
+ * (written at intake) to find the cards, then for each card post a notifying admin reply and flip
+ * its status to Completed. Per-card best-effort so one failure can't block the rest. Idempotent in
+ * effect — re-running flips already-Completed cards to Completed again (no-op) and re-replies are
+ * harmless. Returns the ticket numbers we acted on. Called by the Linear webhook handler.
+ */
+const REPORTER_TICKET_RE = /\[reporter-ticket #(\d+)\]/g;
+
+export async function notifyCanonicalResolved(canonicalIssueId: string): Promise<{ ticketNumbers: number[] }> {
+  const { getIssueComments } = await import('./linearService');
+  const { getTicketStatusId, patchTicketStatus, replyToTicket } = await import('./featurebaseService');
+
+  const comments = await getIssueComments(canonicalIssueId);
+  const numbers = new Set<number>();
+  for (const body of comments) {
+    let m: RegExpExecArray | null;
+    REPORTER_TICKET_RE.lastIndex = 0;
+    while ((m = REPORTER_TICKET_RE.exec(body)) !== null) numbers.add(Number(m[1]));
+  }
+  if (numbers.size === 0) return { ticketNumbers: [] };
+
+  const completedId = await getTicketStatusId('Completed');
+  const acted: number[] = [];
+  for (const n of numbers) {
+    try {
+      // Reply first (this is what NOTIFIES the reporter), then reflect the resolved state on the card.
+      await replyToTicket(n, 'Good news — the issue you reported has been resolved. Thanks for flagging it! Reopen this ticket if you still see it.');
+      await patchTicketStatus(n, completedId);
+      acted.push(n);
+    } catch (e) {
+      console.warn(`[resolve-bridge] notifying card #${n} failed:`, e instanceof Error ? e.message : e);
+    }
+  }
+  return { ticketNumbers: acted };
+}

@@ -9,7 +9,10 @@ import {
   getCustomerTicketCategoryId,
   createTicket,
   patchTicketStatus,
+  getTicketStatusId,
+  replyToTicket,
   _resetTicketCategoryCache,
+  _resetTicketStatusCache,
 } from '../services/featurebaseService';
 
 jest.mock('../utils/secretsManager', () => ({
@@ -26,8 +29,38 @@ function routed(boards: any, other: any) {
 }
 
 describe('featurebaseService', () => {
-  beforeEach(() => { _resetBoardCache(); _resetTicketCategoryCache(); });
+  beforeEach(() => { _resetBoardCache(); _resetTicketCategoryCache(); _resetTicketStatusCache(); });
   afterEach(() => jest.clearAllMocks());
+
+  describe('getTicketStatusId', () => {
+    it('resolves a status by name + caches the lookup (one fetch)', async () => {
+      (global.fetch as any) = jest.fn(() => jsonRes([
+        { id: 's-rev', name: 'In Review', type: 'reviewing' },
+        { id: 's-done', name: 'Completed', type: 'completed' },
+      ]));
+      const a = await getTicketStatusId('Completed');
+      const b = await getTicketStatusId('In Review');
+      expect(a).toBe('s-done');
+      expect(b).toBe('s-rev');
+      expect((global.fetch as jest.Mock).mock.calls.length).toBe(1);
+    });
+
+    it('throws when the status name is unknown', async () => {
+      (global.fetch as any) = jest.fn(() => jsonRes([{ id: 's1', name: 'In Review' }]));
+      await expect(getTicketStatusId('Nope')).rejects.toThrow(/no ticket status named/);
+    });
+  });
+
+  describe('replyToTicket', () => {
+    it('POSTs an admin reply (notifies the reporter) to the ticket reply endpoint', async () => {
+      (global.fetch as any) = jest.fn(() => jsonRes({ id: 'r1' }));
+      await replyToTicket(12, 'resolved!');
+      const [url, opts] = (global.fetch as jest.Mock).mock.calls[0];
+      expect(String(url)).toContain('/tickets/12/reply');
+      expect(opts.method).toBe('POST');
+      expect(JSON.parse(opts.body)).toEqual({ type: 'admin', content: 'resolved!' });
+    });
+  });
 
   describe('getCustomerTicketCategoryId', () => {
     it('matches the "Bug Report" category by name + caches it (one fetch)', async () => {
