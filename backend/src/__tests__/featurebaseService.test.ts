@@ -9,7 +9,6 @@ import {
   getCustomerTicketCategoryId,
   createTicket,
   patchTicketStatus,
-  findTicketsByQuery,
   _resetTicketCategoryCache,
 } from '../services/featurebaseService';
 
@@ -72,14 +71,6 @@ describe('featurebaseService', () => {
       expect(String(url)).toContain('/tickets/12');
       expect(opts.method).toBe('PATCH');
       expect(JSON.parse(opts.body)).toEqual({ statusId: 'status-done' });
-    });
-  });
-
-  describe('findTicketsByQuery', () => {
-    it('searches tickets and maps id/number/title', async () => {
-      (global.fetch as any) = jest.fn(() => jsonRes({ data: [{ id: 'h1', ticketNumber: 7, title: 'crash' }] }));
-      const res = await findTicketsByQuery('ENG-9');
-      expect(res).toEqual([{ id: 'h1', number: 7, title: 'crash' }]);
     });
   });
 

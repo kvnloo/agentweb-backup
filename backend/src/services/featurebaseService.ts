@@ -208,8 +208,7 @@ export async function addVoter(postId: string, email: string, name?: string): Pr
 // IMPORTANT: the ticket API is keyed by the numeric `ticketNumber`, NOT the hex id.
 // Contract verified live (2026-06-29):
 //   POST  /v2/tickets {ticketCategoryId, title, content, author:{email,name}} -> {id, ticketNumber, ticketUrl, status}
-//   GET   /v2/tickets/{number} ; PATCH /v2/tickets/{number} {statusId}
-//   GET   /v2/tickets?q=  (searches title/content) ; ticket categories are at /v2/tickets/categories
+//   PATCH /v2/tickets/{number} {statusId} ; ticket categories are at /v2/tickets/categories
 // ---------------------------------------------------------------------------
 
 let customerTicketCategoryCache: string | null = null;
@@ -237,14 +236,14 @@ export async function getCustomerTicketCategoryId(): Promise<string> {
 }
 
 export interface CreatedTicket {
-  id: string;            // hex id
-  number: number;        // ticketNumber — the key for GET/PATCH
-  url: string;           // ticketUrl — the user-facing link to their own card
+  id: string;     // hex id
+  number: number; // ticketNumber — the key for GET/PATCH
+  url: string;    // ticketUrl — the user-facing link to their own card
 }
 
 /**
- * Create a private Customer ticket authored by the reporter. content is the body of the
- * reporter's card (their own words + any eng breadcrumbs we choose to include).
+ * Create a private Customer ticket authored by the reporter. content is the reporter's own
+ * words (what THEY see on their private card).
  */
 export async function createTicket(p: {
   title: string;
@@ -270,17 +269,10 @@ export async function createTicket(p: {
   return { id: t.id, number: t.ticketNumber, url: t.ticketUrl || '' };
 }
 
-/** Set a ticket's status (keyed by ticketNumber). Used by the resolve bridge. */
+/** Set a ticket's status (keyed by ticketNumber). Used by the resolve bridge to flip cards on fix. */
 export async function patchTicketStatus(ticketNumber: number, statusId: string): Promise<void> {
   await featurebaseFetch(`/tickets/${ticketNumber}`, {
     method: 'PATCH',
     body: JSON.stringify({ statusId }),
   });
-}
-
-/** Search tickets by free text (title/content). Used by the bridge to find a canonical's linked reporter tickets. */
-export async function findTicketsByQuery(q: string, limit = 50): Promise<Array<{ id: string; number: number; title: string }>> {
-  const data = await featurebaseFetch(`/tickets?q=${encodeURIComponent(q.slice(0, 200))}&limit=${limit}`, { method: 'GET' });
-  const tickets: any[] = data?.data || [];
-  return tickets.map((t) => ({ id: t.id, number: t.ticketNumber, title: t.title || '' }));
 }
