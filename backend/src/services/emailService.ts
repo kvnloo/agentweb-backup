@@ -1761,20 +1761,28 @@ View Session: ${sessionUrl}`;
       const env: string = process.env.NODE_ENV || 'unknown';
       const envLabel = env === 'production' ? 'PROD' : env.toUpperCase();
 
-      // Attempt to create a Notion oncall item if no URL was provided
+      // File a tracked oncall item if no URL was provided. Routes via the shared intake
+      // service: behind FEATUREBASE_INTAKE this creates a PRIVATE Linear issue (Auto label,
+      // deduped by title) instead of Notion. Best-effort — a filing failure just means the
+      // alert email carries full details instead of a link.
       let resolvedNotionUrl = notionUrl || null;
       if (!resolvedNotionUrl) {
         try {
-          const { createOncallItem } = await import('./notionService');
-          const result = await createOncallItem({
+          const { fileAutoIssue } = await import('./intakeService');
+          const result = await fileAutoIssue({
             title: subject,
             description: message,
-            context,
+            source: 'Oncall alert',
+            extraLabels: ['Oncall'],
+            // notionTags [] -> createOncallItem still adds its internal "Oncall" tag, so the
+            // Notion-path behaviour is unchanged (no duplicate Oncall tag).
+            notionTags: [],
+            notionContext: context,
           });
-          resolvedNotionUrl = result.notionUrl;
-          console.log(`Oncall Notion item created: ${resolvedNotionUrl}`);
-        } catch (notionError) {
-          console.error('Failed to create Notion oncall item, falling back to full email:', notionError);
+          resolvedNotionUrl = result.url || null;
+          console.log(`Oncall item filed (${result.tracker}): ${resolvedNotionUrl}`);
+        } catch (fileError) {
+          console.error('Failed to file oncall item, falling back to full email:', fileError);
         }
       }
 
