@@ -682,6 +682,119 @@ describe('AgentModeService.performDataAnalysis', () => {
     expect(apiUrl).toContain('gemini-3-flash-preview');
     delete process.env.DATA_ANALYSIS_LLM_NAME;
   });
+
+  // ---------------------------------------------------------------------------
+  // Regression: response shapes that carry the real analysis in
+  // codeExecutionResult.output (no final `text` part). Gemini code-execution
+  // models — gemini-3.5-flash especially — intermittently end a turn after the
+  // last code block without emitting a summary text part, or pause on an
+  // internal functionCall. The old extractor only mined codeExecutionResult
+  // output for download markers and never surfaced it as analysis text, so these
+  // turns produced zero resultParts and failed with "No analysis results
+  // received from Gemini" — the exact failure seen in scheduled session
+  // 8aa71237 (perform_data_analysis failed 4x on a ~400KB payload).
+  // ---------------------------------------------------------------------------
+  test('surfaces codeExecutionResult.output as analysis when there is no text part', async () => {
+    const stdout = 'Total tokens: 1234567\nTotal cost: $42.50\nTop session: sess-9 ($5.00)';
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: {
+        candidates: [
+          {
+            content: {
+              parts: [
+                { executableCode: { language: 'PYTHON', code: 'print(report)' } },
+                { codeExecutionResult: { outcome: 'OUTCOME_OK', output: stdout } }
+              ]
+            },
+            finishReason: 'STOP'
+          }
+        ]
+      }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Daily token usage & cost report.', 'user-1');
+
+    expect(result.success).toBe(true);
+    expect(result.codeExecuted).toBe(true);
+    expect(result.analysis).toContain('Total tokens: 1234567');
+    expect(result.analysis).toContain('Total cost: $42.50');
+  });
+
+  test('surfaces snake_case code_execution_result.output as analysis when there is no text part', async () => {
+    const stdout = 'Grand total: 999\nRows processed: 2300';
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: {
+        candidates: [
+          {
+            content: {
+              parts: [
+                { code_execution_result: { outcome: 'OUTCOME_OK', output: stdout } }
+              ]
+            }
+          }
+        ]
+      }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Compute grand total.', 'user-1');
+
+    expect(result.success).toBe(true);
+    expect(result.codeExecuted).toBe(true);
+    expect(result.analysis).toContain('Grand total: 999');
+  });
+
+  test('still strips download-marker blocks from code-exec output surfaced as analysis', async () => {
+    mockedUploadFileToS3.mockResolvedValueOnce({
+      success: true,
+      url: 'https://agentweb-user-files.s3.amazonaws.com/report.csv',
+      key: 'report.csv'
+    });
+    const stdout = 'Summary line one.\n<<<AGENTWEB_FILE:report.csv>>>\na,b\n1,2\n<<<AGENTWEB_FILE_END>>>\nSummary line two.';
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: {
+        candidates: [
+          { content: { parts: [{ codeExecutionResult: { output: stdout } }] } }
+        ]
+      }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Save report.csv and summarize.', 'user-1');
+
+    expect(result.success).toBe(true);
+    // The raw CSV body must not leak into the analysis text.
+    expect(result.analysis).not.toContain('a,b\n1,2');
+    // The human-readable summary lines around the marker should survive.
+    expect(result.analysis).toContain('Summary line one.');
+    expect(result.analysis).toContain('Summary line two.');
+    // And the download link is still surfaced.
+    expect(result.analysis).toContain('**Generated Files:**');
+    expect(result.analysis).toContain('report.csv');
+  });
+
+  test('returns actionable guidance (not the generic message) when the turn ends on a functionCall with no usable output', async () => {
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: {
+        candidates: [
+          {
+            content: {
+              parts: [
+                { functionCall: { name: 'run_command', args: { CommandLine: 'head -n 5 input_file_0.csv' } } }
+              ]
+            },
+            finishReason: 'STOP'
+          }
+        ]
+      }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Analyze the dataset.', 'user-1');
+
+    expect(result.success).toBe(false);
+    // Must be actionable + flagged non-retryable, NOT the old opaque string that
+    // triggered blind retries.
+    expect(result.message).toMatch(/did not return|incomplete|try again|rephrase|simplif/i);
+    expect(result.message).not.toBe('No analysis results received from Gemini');
+  });
 });
 
 describe('perform_data_analysis in DEFAULT_FOUNDATION_TOOLS', () => {

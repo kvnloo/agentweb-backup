@@ -6784,6 +6784,12 @@ export class AgentModeService {
 
       const resultParts: string[] = [];
       let codeExecuted = false;
+      let hasNarrativeText = false;
+      // Cleaned stdout from code-execution parts, kept separate from resultParts.
+      // Used ONLY as a fallback when the model emits no narrative `text` part (see
+      // the post-loop block) — folding every intermediate code stdout into the
+      // analysis would bury the real summary under print()-debugging noise.
+      const codeExecOutputs: string[] = [];
 
       // Extract parts from response
       const responseParts = candidates[0].content.parts || [];
@@ -6793,18 +6799,29 @@ export class AgentModeService {
 
       for (const part of responseParts) {
         if (part.text) {
+          hasNarrativeText = true;
           const { cleanedText, links } = await this.extractAndUploadAnalysisFiles(part.text, userId);
           fileLinks.push(...links);
           resultParts.push(`**Analysis:** ${cleanedText}`);
         }
-        // Capture files the model printed to stdout via code execution. Gemini returns
-        // executed-code output in a codeExecutionResult / code_execution_result part;
-        // the marker protocol means generated file contents arrive here, not on disk.
+        // Capture the model's executed-code output. Gemini returns executed-code
+        // stdout in a codeExecutionResult / code_execution_result part. This is
+        // also where the marker protocol delivers generated file contents, so we
+        // always mine it for download links. We additionally KEEP the cleaned
+        // stdout as a fallback narrative: code-execution models (gemini-3.5-flash
+        // especially) intermittently end a turn after the last code block WITHOUT
+        // a summary `text` part — the computed answer then lives only in this
+        // stdout. Surfacing it (when no text part exists) prevents a good analysis
+        // from being dropped as "No analysis results received from Gemini"
+        // (scheduled session 8aa71237 failed 4x this way on a ~400KB payload).
         const execResult = (part as any).codeExecutionResult || (part as any).code_execution_result;
         if (execResult && typeof execResult.output === 'string') {
           codeExecuted = true;
-          const { links } = await this.extractAndUploadAnalysisFiles(execResult.output, userId);
+          const { cleanedText, links } = await this.extractAndUploadAnalysisFiles(execResult.output, userId);
           fileLinks.push(...links);
+          if (cleanedText && cleanedText.trim()) {
+            codeExecOutputs.push(cleanedText.trim());
+          }
         }
         // Handle inline data (images/charts from code execution) (handle both camelCase and snake_case)
         if ((part as any).inlineData && (part as any).inlineData.data) {
@@ -6871,15 +6888,43 @@ export class AgentModeService {
         }
       }
 
+      // Fallback narrative: the model produced executed-code output but no
+      // summary `text` part. Surface the final stdout block (the last code cell's
+      // output is the result; earlier cells are typically inspection/debug) so the
+      // computed answer is not lost. Only when there's no narrative text — when a
+      // text part exists, that is the intended human-readable summary.
+      if (!hasNarrativeText && codeExecOutputs.length > 0) {
+        resultParts.push(`**Output:**\n${codeExecOutputs[codeExecOutputs.length - 1]}`);
+      }
+
       // Surface real, downloadable links for any files the model generated.
       if (fileLinks.length > 0) {
         resultParts.push(`**Generated Files:**\n${fileLinks.join('\n')}`);
       }
 
       if (resultParts.length === 0) {
+        // The turn produced no text, no code-execution output, and no images.
+        // The dominant cause is the model pausing on an internal tool/functionCall
+        // (run_command, python_interpreter) instead of completing the inline
+        // code_execution in one shot — we send a single-shot request with no
+        // tool-call loop, so the turn just ends empty. This is transient and
+        // resolves on a re-run, but the OLD generic message ("No analysis results
+        // received from Gemini") was classified as empty_result and triggered the
+        // model to retry blindly with the same payload. Return an actionable
+        // message that names the real next step and log the finishReason so the
+        // failure mode is diagnosable from prod logs.
+        const finishReason = (candidates[0] as any)?.finishReason;
+        const sawFunctionCall = responseParts.some((p: any) => p.functionCall || p.function_call);
+        console.warn(
+          `AgentMode: performDataAnalysis got no usable parts (finishReason=${finishReason}, ` +
+          `numParts=${responseParts.length}, sawFunctionCall=${sawFunctionCall}, model=${modelName})`
+        );
         return {
           success: false,
-          message: 'No analysis results received from Gemini'
+          message:
+            'The data analysis did not return any results — the code-execution model ended its turn without producing output. ' +
+            'This is usually transient. Try again once with the same file_urls and a simpler, more direct analysis_instruction ' +
+            '(e.g. ask for specific totals or columns rather than an open-ended report). Do NOT re-inline the raw data.'
         };
       }
 
