@@ -280,33 +280,3 @@ export async function getTicketStatusId(name: string): Promise<string> {
   if (!id) throw new Error(`Featurebase: no ticket status named "${name}"`);
   return id;
 }
-
-let adminIdCache: string | null = null;
-
-/** For tests: reset cached admin id. */
-export function _resetAdminCache(): void {
-  adminIdCache = null;
-}
-
-/** Resolve an admin id (the team member a bridge reply is posted as). Cached. */
-async function getAdminId(): Promise<string> {
-  if (adminIdCache) return adminIdCache;
-  const data = await featurebaseFetch('/admins', { method: 'GET' });
-  const admins: any[] = data?.data || (Array.isArray(data) ? data : []);
-  const id = admins[0]?._id || admins[0]?.id;
-  if (!id) throw new Error('Featurebase: no admin found for ticket replies');
-  adminIdCache = id;
-  return id;
-}
-
-/**
- * Post an admin reply on a ticket — an agent message that NOTIFIES the reporter (the contact).
- * The resolve bridge uses this to tell each reporter their issue was fixed.
- */
-export async function replyToTicket(ticketNumber: number, content: string): Promise<void> {
-  const adminId = await getAdminId();
-  await featurebaseFetch(`/tickets/${ticketNumber}/reply`, {
-    method: 'POST',
-    body: JSON.stringify({ type: 'admin', adminId, body: content }),
-  });
-}

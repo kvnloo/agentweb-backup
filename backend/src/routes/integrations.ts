@@ -8,7 +8,8 @@ const router = express.Router();
  *
  * When a bug-canonical Linear issue transitions to a completed state, notify every reporter whose
  * private Featurebase card is grouped onto it (intakeService.notifyCanonicalResolved reads the
- * canonical's `[reporter-ticket #N]` comments, replies to each card, and flips it to Completed).
+ * canonical's `[reporter-ticket #N <email>]` comments, emails each reporter, and flips their card
+ * to Completed).
  *
  * Mounted with express.raw() in app.ts (BEFORE express.json) so req.body is the raw Buffer —
  * required to verify Linear's HMAC-SHA256 `linear-signature` over the exact payload bytes.
@@ -37,7 +38,7 @@ router.post('/linear/webhook', async (req, res) => {
 
     if (completed) {
       const { notifyCanonicalResolved } = await import('../services/intakeService');
-      const r = await notifyCanonicalResolved(payload.data.id);
+      const r = await notifyCanonicalResolved(payload.data.id, payload.data.title || undefined);
       return res.json({ ok: true, notified: r.ticketNumbers.length, ticketNumbers: r.ticketNumbers });
     }
     return res.json({ ok: true, notified: 0 });

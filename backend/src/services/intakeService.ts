@@ -180,7 +180,7 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   //    the resolve-bridge parses to notify each card; eng also sees the affected user + session.
   if (canonicalUuid) {
     const note = [
-      `[reporter-ticket #${ticket.number}] Affected user: ${reporterLabel(p)}${p.reportedByAdmin ? ` — via ${p.reportedByAdmin}` : ''} on ${new Date().toISOString().slice(0, 10)}.`,
+      `[reporter-ticket #${ticket.number} ${p.userEmail}] Affected user: ${reporterLabel(p)}${p.reportedByAdmin ? ` — via ${p.reportedByAdmin}` : ''} on ${new Date().toISOString().slice(0, 10)}.`,
       ...(p.sessionId ? [`Session: ${p.sessionId}`] : []),
       // For the FIRST reporter the text is already in the canonical description.
       ...(dup ? ['', 'Their report:', p.description] : []),
@@ -267,37 +267,52 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
 
 /**
  * Resolve bridge: when a bug canonical Linear issue is marked Done, notify EVERY reporter whose
- * private card is grouped onto it. We read the canonical's `[reporter-ticket #N]` comments
- * (written at intake) to find the cards, then for each card post a notifying admin reply and flip
- * its status to Completed. Per-card best-effort so one failure can't block the rest. Idempotent in
- * effect — re-running flips already-Completed cards to Completed again (no-op) and re-replies are
- * harmless. Returns the ticket numbers we acted on. Called by the Linear webhook handler.
+ * private card is grouped onto it. We read the canonical's `[reporter-ticket #N <email>]` comments
+ * (written at intake) to find each card + its reporter, then EMAIL the reporter and flip their card
+ * to Completed. The email is sent from our own system address because Featurebase exposes no API
+ * trigger for ticket emails (a ticket reply/status-change via API stays silent) — so we own
+ * delivery rather than depend on a path that doesn't fire. Per-reporter best-effort so one failure
+ * can't block the rest; idempotent in effect (re-flipping a Completed card is a no-op; a duplicate
+ * email is harmless). Returns the ticket numbers we acted on. Called by the Linear webhook handler.
+ *
+ * Feature requests need no bridge: their Featurebase post is synced to Linear, so marking the Linear
+ * issue Done flips the post to Completed and Featurebase emails every upvoter natively (verified).
  */
-const REPORTER_TICKET_RE = /\[reporter-ticket #(\d+)\]/g;
+const REPORTER_TICKET_RE = /\[reporter-ticket #(\d+)\s+([^\]\s]+)\]/g;
+const escapeHtml = (s: string) => s.replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c] as string));
 
-export async function notifyCanonicalResolved(canonicalIssueId: string): Promise<{ ticketNumbers: number[] }> {
+export async function notifyCanonicalResolved(
+  canonicalIssueId: string,
+  issueTitle = 'the issue you reported',
+): Promise<{ ticketNumbers: number[] }> {
   const { getIssueComments } = await import('./linearService');
-  const { getTicketStatusId, patchTicketStatus, replyToTicket } = await import('./featurebaseService');
+  const { getTicketStatusId, patchTicketStatus } = await import('./featurebaseService');
+  const { resendService } = await import('./resendService');
 
   const comments = await getIssueComments(canonicalIssueId);
-  const numbers = new Set<number>();
+  const reporters = new Map<number, string>(); // ticket number -> reporter email
   for (const body of comments) {
     let m: RegExpExecArray | null;
     REPORTER_TICKET_RE.lastIndex = 0;
-    while ((m = REPORTER_TICKET_RE.exec(body)) !== null) numbers.add(Number(m[1]));
+    while ((m = REPORTER_TICKET_RE.exec(body)) !== null) reporters.set(Number(m[1]), m[2]);
   }
-  if (numbers.size === 0) return { ticketNumbers: [] };
+  if (reporters.size === 0) return { ticketNumbers: [] };
 
   const completedId = await getTicketStatusId('Completed');
+  const safeTitle = escapeHtml(issueTitle);
   const acted: number[] = [];
-  for (const n of numbers) {
+  for (const [num, email] of reporters) {
     try {
-      // Reply first (this is what NOTIFIES the reporter), then reflect the resolved state on the card.
-      await replyToTicket(n, 'Good news — the issue you reported has been resolved. Thanks for flagging it! Reopen this ticket if you still see it.');
-      await patchTicketStatus(n, completedId);
-      acted.push(n);
+      // The EMAIL is what notifies the reporter; the status flip reflects the resolved state on their card.
+      await resendService.sendSystemEmail({
+        to: email,
+        subject: `Resolved: ${issueTitle}`,
+        html: `<p>Good news — the issue you reported (<strong>${safeTitle}</strong>) has been resolved. Thanks for flagging it!</p><p>If you still run into it, just reply to this email and we'll take another look.</p>`,
+      });
+      await patchTicketStatus(num, completedId);
+      acted.push(num);
     } catch (e) {
-      console.warn(`[resolve-bridge] notifying card #${n} failed:`, e instanceof Error ? e.message : e);
+      console.warn(`[resolve-bridge] notifying reporter #${num} failed:`, e instanceof Error ? e.message : e);
     }
   }
   return { ticketNumbers: acted };
