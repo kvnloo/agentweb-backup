@@ -12,7 +12,6 @@ jest.mock('../services/featurebaseService', () => ({
   createTicket: jest.fn(),
   getTicketStatusId: jest.fn().mockResolvedValue('status-completed'),
   patchTicketStatus: jest.fn(),
-  replyToTicket: jest.fn(),
 }));
 jest.mock('../services/linearService', () => ({
   listOpenBugCanonicals: jest.fn().mockResolvedValue([]),
@@ -21,11 +20,13 @@ jest.mock('../services/linearService', () => ({
   listOpenIssuesByLabel: jest.fn(),
   getIssueComments: jest.fn(),
 }));
+jest.mock('../services/resendService', () => ({ resendService: { sendSystemEmail: jest.fn() } }));
 
 const notion = require('../services/notionService');
 const dedup = require('../services/dedupService');
 const fb = require('../services/featurebaseService');
 const linear = require('../services/linearService');
+const resend = require('../services/resendService').resendService;
 
 describe('fileUserIssue — flag off', () => {
   const realFlag = process.env.FEATUREBASE_INTAKE;
@@ -81,8 +82,9 @@ describe('fileUserIssue — bug (private own-card + one canonical listing affect
     // ONE canonical, listing the affected user
     expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({ labelNames: ['Bug', 'Customer Reported'] }));
     expect(linear.createInternalLinearIssue.mock.calls[0][0].description).toContain('Affected user: u@e.com');
-    // reporter-ticket comment (bridge contract + affected user + session)
-    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-9', expect.stringContaining('[reporter-ticket #7]'));
+    // reporter-ticket comment (bridge contract + affected user + session). Marker embeds the
+    // reporter email so the resolve bridge can email them directly.
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-9', expect.stringContaining('[reporter-ticket #7 u@e.com]'));
     expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-9', expect.stringContaining('Session: sess-2'));
     expect(r).toMatchObject({ pageId: '7', deduped: false, tracker: 'Featurebase', userUrl: 'https://fb/t/7' });
   });
@@ -94,7 +96,7 @@ describe('fileUserIssue — bug (private own-card + one canonical listing affect
     const r = await fileUserIssue({ type: 'bug', title: 'crashes too', description: 'also on save', userEmail: 'u2@e.com', sessionId: 'sess-3' });
     expect(linear.createInternalLinearIssue).not.toHaveBeenCalled(); // grouped onto the existing canonical
     expect(fb.createTicket).toHaveBeenCalled(); // still gets its own card
-    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-5', expect.stringContaining('[reporter-ticket #8]'));
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-5', expect.stringContaining('[reporter-ticket #8 u2@e.com]'));
     expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-5', expect.stringContaining('also on save')); // dup folds their text in
     expect(r).toMatchObject({ pageId: '8', deduped: true, tracker: 'Featurebase', userUrl: 'https://fb/t/8' });
   });
@@ -119,38 +121,48 @@ describe('intakeService.notifyCanonicalResolved (resolve bridge)', () => {
   const { notifyCanonicalResolved } = require('../services/intakeService');
   afterEach(() => jest.clearAllMocks());
 
-  it('reads [reporter-ticket #N] from the canonical comments and notifies + flips each card', async () => {
+  it('reads [reporter-ticket #N <email>] from the canonical comments and EMAILs + flips each card', async () => {
     linear.getIssueComments.mockResolvedValue([
       'Customer-reported bug...\nAffected user: a@e.com',
-      '[reporter-ticket #10] Affected user: a@e.com on 2026-06-29.\nSession: s1',
-      '[reporter-ticket #11] Affected user: b@e.com on 2026-06-29.\nSession: s2',
+      '[reporter-ticket #10 a@e.com] Affected user: a@e.com on 2026-06-29.\nSession: s1',
+      '[reporter-ticket #11 b@e.com] Affected user: b@e.com on 2026-06-29.\nSession: s2',
     ]);
-    const r = await notifyCanonicalResolved('issue-uuid');
+    const r = await notifyCanonicalResolved('issue-uuid', 'Save button crashes');
     expect(r.ticketNumbers.sort()).toEqual([10, 11]);
-    expect(fb.replyToTicket).toHaveBeenCalledWith(10, expect.stringContaining('resolved'));
-    expect(fb.replyToTicket).toHaveBeenCalledWith(11, expect.stringContaining('resolved'));
+    // The EMAIL is the notification — sent to each reporter's address, with the issue title.
+    expect(resend.sendSystemEmail).toHaveBeenCalledWith(expect.objectContaining({ to: 'a@e.com', subject: 'Resolved: Save button crashes' }));
+    expect(resend.sendSystemEmail).toHaveBeenCalledWith(expect.objectContaining({ to: 'b@e.com', subject: 'Resolved: Save button crashes' }));
+    // The card status flip reflects the resolved state.
     expect(fb.patchTicketStatus).toHaveBeenCalledWith(10, 'status-completed');
     expect(fb.patchTicketStatus).toHaveBeenCalledWith(11, 'status-completed');
+  });
+
+  it('escapes HTML in the issue title in the email body (one reporter is emailed another reporter title)', async () => {
+    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #10 a@e.com] x']);
+    await notifyCanonicalResolved('issue-uuid', '<script>alert(1)</script>');
+    const html = resend.sendSystemEmail.mock.calls[0][0].html;
+    expect(html).toContain('&lt;script&gt;');
+    expect(html).not.toContain('<script>');
   });
 
   it('no reporter-ticket comments -> no-op (not a bug canonical)', async () => {
     linear.getIssueComments.mockResolvedValue(['just a normal comment', 'another']);
     const r = await notifyCanonicalResolved('issue-uuid');
     expect(r.ticketNumbers).toEqual([]);
-    expect(fb.replyToTicket).not.toHaveBeenCalled();
+    expect(resend.sendSystemEmail).not.toHaveBeenCalled();
     expect(fb.getTicketStatusId).not.toHaveBeenCalled();
   });
 
   it('dedupes repeated ticket numbers across comments', async () => {
-    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #7] x', '[reporter-ticket #7] x again']);
+    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #7 x@e.com] x', '[reporter-ticket #7 x@e.com] x again']);
     const r = await notifyCanonicalResolved('issue-uuid');
     expect(r.ticketNumbers).toEqual([7]);
-    expect(fb.replyToTicket).toHaveBeenCalledTimes(1);
+    expect(resend.sendSystemEmail).toHaveBeenCalledTimes(1);
   });
 
-  it('one card failing is best-effort -> the others still get notified', async () => {
-    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #10] a', '[reporter-ticket #11] b']);
-    fb.replyToTicket.mockImplementation((n: number) => (n === 10 ? Promise.reject(new Error('down')) : Promise.resolve()));
+  it('one reporter failing is best-effort -> the others still get notified', async () => {
+    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #10 a@e.com] a', '[reporter-ticket #11 b@e.com] b']);
+    resend.sendSystemEmail.mockImplementation((p: any) => (p.to === 'a@e.com' ? Promise.reject(new Error('down')) : Promise.resolve()));
     const r = await notifyCanonicalResolved('issue-uuid');
     expect(r.ticketNumbers).toEqual([11]); // 10 failed, 11 succeeded
     expect(fb.patchTicketStatus).toHaveBeenCalledWith(11, 'status-completed');
