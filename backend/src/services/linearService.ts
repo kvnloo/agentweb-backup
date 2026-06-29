@@ -235,3 +235,59 @@ export async function addIssueComment(issueId: string, body: string): Promise<vo
     throw new Error('Linear commentCreate failed');
   }
 }
+
+/**
+ * Create an INTERNAL Linear issue (auto-identified by the system). Crucially does NOT
+ * carry the "Featurebase" label, so Featurebase never imports it as a public post —
+ * these stay private engineering items. labelNames (e.g. ["Auto","Oncall"]) are
+ * resolved against the team's labels; unknown names are dropped.
+ */
+export async function createInternalLinearIssue(params: { title: string; description: string; labelNames: string[] }): Promise<LinearIssueResult> {
+  const meta = await getTeamMeta();
+  const labelIds = params.labelNames
+    .map((n) => meta.labelIds[n.toLowerCase()])
+    .filter((id): id is string => Boolean(id));
+  const input: Record<string, any> = {
+    teamId: meta.teamId,
+    title: params.title,
+    description: params.description,
+    labelIds,
+  };
+  if (meta.backlogStateId) input.stateId = meta.backlogStateId;
+  const data = await linearGraphQL(
+    `mutation($input: IssueCreateInput!) {
+      issueCreate(input: $input) { success issue { identifier url } }
+    }`,
+    { input },
+  );
+  const issue = data?.issueCreate?.issue;
+  if (!data?.issueCreate?.success || !issue) {
+    throw new Error('Linear issueCreate (internal) did not return an issue');
+  }
+  return { identifier: issue.identifier, url: issue.url };
+}
+
+export interface OpenIssue {
+  identifier: string;
+  issueId: string;
+  title: string;
+}
+
+/** List OPEN issues carrying a given label (used for auto-issue dedup). Open-only. */
+export async function listOpenIssuesByLabel(labelName: string, limit = 50): Promise<OpenIssue[]> {
+  const data = await linearGraphQL(
+    `query($team: String!, $label: String!, $limit: Int!) {
+      issues(
+        first: $limit,
+        orderBy: createdAt,
+        filter: {
+          team: { key: { eq: $team } },
+          state: { type: { nin: ["completed", "canceled"] } },
+          labels: { name: { eq: $label } }
+        }
+      ) { nodes { id identifier title } }
+    }`,
+    { team: TEAM_KEY, label: labelName, limit },
+  );
+  return (data?.issues?.nodes || []).map((n: any) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '' }));
+}

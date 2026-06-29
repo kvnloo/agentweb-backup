@@ -1,4 +1,4 @@
-import { createLinearIssue, listOpenCanonicals, addIssueComment, _resetLinearTeamCache } from '../services/linearService';
+import { createLinearIssue, listOpenCanonicals, addIssueComment, createInternalLinearIssue, listOpenIssuesByLabel, _resetLinearTeamCache } from '../services/linearService';
 
 jest.mock('../utils/secretsManager', () => ({
   getSecret: jest.fn().mockResolvedValue(JSON.stringify({ apiKey: 'lin_api_test' })),
@@ -148,6 +148,40 @@ describe('linearService.listOpenCanonicals', () => {
     await listOpenCanonicals('bug');
     const issuesCall = (global.fetch as jest.Mock).mock.calls[1];
     expect(JSON.parse(issuesCall[1].body).variables.typeLabel).toBe('Bug');
+  });
+});
+
+describe('linearService.createInternalLinearIssue', () => {
+  beforeEach(() => { _resetLinearTeamCache(); });
+  afterEach(() => jest.clearAllMocks());
+
+  it('creates an issue with the given labels and NO Featurebase label (stays private)', async () => {
+    // team query adds an "Auto" label to the registry for resolution
+    const TEAM_WITH_AUTO = { data: { teams: { nodes: [{ id: 'team_eng', states: TEAM_RESPONSE.data.teams.nodes[0].states, labels: { nodes: [...TEAM_RESPONSE.data.teams.nodes[0].labels.nodes, { id: 'lab_auto', name: 'Auto' }] } }] } } };
+    let n = 0;
+    (global.fetch as any) = jest.fn(() => {
+      n += 1;
+      const body = n === 1 ? TEAM_WITH_AUTO : { data: { issueCreate: { success: true, issue: { identifier: 'ENG-50', url: 'u' } } } };
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) } as any);
+    });
+    const r = await createInternalLinearIssue({ title: 'auto thing', description: 'd', labelNames: ['Auto', 'Bug'] });
+    expect(r.identifier).toBe('ENG-50');
+    const input = lastCreateInput();
+    expect(input.labelIds.sort()).toEqual(['lab_auto', 'lab_bug'].sort());
+    expect(input.labelIds).not.toContain('lab_fb'); // no Featurebase label -> never public
+  });
+});
+
+describe('linearService.listOpenIssuesByLabel', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  it('queries open issues by a single label and maps id/identifier/title', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({
+      data: { issues: { nodes: [{ id: 'u1', identifier: 'ENG-1', title: 'Context limit reached' }] } },
+    }) } as any));
+    const res = await listOpenIssuesByLabel('Auto');
+    expect(res).toEqual([{ identifier: 'ENG-1', issueId: 'u1', title: 'Context limit reached' }]);
+    expect(JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body).variables.label).toBe('Auto');
   });
 });
 

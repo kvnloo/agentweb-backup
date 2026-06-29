@@ -6793,7 +6793,6 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     // Lazy imports to avoid pulling in heavy dependencies at module load time
-    const { createOncallItem } = await import('../services/notionService');
     const { resendService } = await import('../services/resendService');
 
     const userId = context?.userId;
@@ -6886,74 +6885,26 @@ emmaToolRegistry.register({
           issueContext['Reported By (Admin)'] = adminEmail;
         }
 
-        // Route user-filed intake. When FEATUREBASE_INTAKE is on:
-        //   1. Dedup judge (dedupService): is this the same as an existing OPEN canonical?
-        //      - MATCH -> stack onto it: add the user as an upvoter on the canonical's
-        //        Featurebase post (class-action + resolution email) + comment the reporter
-        //        on the canonical Linear issue. No new issue. Tell the user it's known.
-        //      - NO MATCH -> createLinearIssue (source of truth, tagged "Featurebase" ->
-        //        Featurebase auto-imports the single public post).
-        // Falls back to the Notion oncall board on any error so a filing is never lost.
-        // Flag off -> unchanged (Notion). Emma's own auto-detected issues don't use this tool.
-        const useLinearIntake = (process.env.FEATUREBASE_INTAKE === 'true');
+        // Route user-filed intake through the shared intake service: dedup -> stack onto an
+        // existing public canonical, else create a new one (Featurebase-imported public post).
+        // The FEATUREBASE_INTAKE flag selects Linear vs Notion (migration switch, not a
+        // fallback). A hard failure here propagates to this loop's per-issue catch below,
+        // which records the issue as failed — we do NOT silently reroute to another tracker.
         const itemType: 'feature_request' | 'bug' = issue.type === 'feature_request' ? 'feature_request' : 'bug';
-        let result: { pageId: string; url: string; tracker: string; deduped?: boolean; userUrl?: string };
-        const fileToNotion = async () => {
-          const oncall = await createOncallItem({
-            title: issue.title,
-            description,
-            // External MCP clients (Claude Code etc.) are tagged distinctly so
-            // benchmark filters on Customer Reported stay clean.
-            additionalTags: [context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported'],
-            context: issueContext,
-          });
-          return { pageId: oncall.pageId, url: oncall.notionUrl, tracker: 'Notion' };
-        };
-        if (useLinearIntake) {
-          try {
-            const { findDuplicateCanonical } = await import('../services/dedupService');
-            const dup = await findDuplicateCanonical({ type: itemType, title: issue.title, description });
-            if (dup) {
-              // Stack onto the existing canonical. Both writes are best-effort — a failure
-              // to upvote/comment must not turn this into a duplicate issue.
-              const reportedLine = `Also reported by ${user.email} on ${new Date().toISOString().slice(0, 10)}${isDelegatedAdmin && adminEmail ? ` (via ${adminEmail})` : ''}.`;
-              try {
-                const { addIssueComment } = await import('../services/linearService');
-                await addIssueComment(dup.issueId, reportedLine);
-              } catch (e) {
-                console.warn('[report_product_issues] dedup comment failed:', e instanceof Error ? e.message : e);
-              }
-              try {
-                const { findPostByTitle, addVoter } = await import('../services/featurebaseService');
-                const post = await findPostByTitle(dup.title);
-                if (post) await addVoter(post.id, user.email, user.displayName || user.email);
-              } catch (e) {
-                console.warn('[report_product_issues] dedup upvote failed:', e instanceof Error ? e.message : e);
-              }
-              // Hand the user the public post if we have it, else the board (the post they
-              // just stacked onto is already live there).
-              result = { pageId: dup.identifier, url: dup.featurebasePostUrl || dup.identifier, tracker: 'Linear', deduped: true, userUrl: dup.featurebasePostUrl || FEATUREBASE_BOARD_URL };
-            } else {
-              const { createLinearIssue } = await import('../services/linearService');
-              const li = await createLinearIssue({
-                type: itemType,
-                title: issue.title,
-                description,
-                userEmail: user.email,
-                reportedByAdmin: isDelegatedAdmin && adminEmail ? adminEmail : undefined,
-              });
-              // The Featurebase post is imported from Linear a few seconds later, so the
-              // specific post URL isn't available yet — give the user the board, where their
-              // freshly-filed item appears at the top. (url stays the Linear link for the team.)
-              result = { pageId: li.identifier, url: li.url, tracker: 'Linear', userUrl: FEATUREBASE_BOARD_URL };
-            }
-          } catch (err) {
-            console.warn('[report_product_issues] Linear intake failed, falling back to Notion:', err instanceof Error ? err.message : err);
-            result = await fileToNotion();
-          }
-        } else {
-          result = await fileToNotion();
-        }
+        const { fileUserIssue } = await import('../services/intakeService');
+        const filed = await fileUserIssue({
+          type: itemType,
+          title: issue.title,
+          description,
+          userEmail: user.email,
+          userName: user.displayName || user.email,
+          reportedByAdmin: isDelegatedAdmin && adminEmail ? adminEmail : undefined,
+          // External MCP clients (Claude Code etc.) are tagged distinctly so benchmark
+          // filters on Customer Reported stay clean (used on the flag-off Notion path).
+          notionTags: [context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported'],
+          notionContext: issueContext,
+        });
+        const result = { pageId: filed.pageId, url: filed.trackerUrl, tracker: filed.tracker, deduped: filed.deduped, userUrl: filed.userUrl };
 
         // Never email the customer — internal team + admin (if known) only.
         const emailRecipients = adminEmail
