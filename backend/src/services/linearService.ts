@@ -19,7 +19,6 @@ import { getSecret } from '../utils/secretsManager';
 
 const LINEAR_API = 'https://api.linear.app/graphql';
 const TEAM_KEY = 'ENG';
-const FEATUREBASE_LABEL = 'Featurebase';
 
 export interface LinearCredentials {
   apiKey: string;
@@ -106,73 +105,10 @@ export function _resetLinearTeamCache(): void {
   teamMetaCache = null;
 }
 
-export type LinearItemType = 'feature_request' | 'bug';
-
-export interface CreateLinearIssueParams {
-  type: LinearItemType;
-  title: string;
-  description: string;
-  userEmail: string;
-  /** Admin email when this was filed via a delegated session (admin acting on the user's behalf). */
-  reportedByAdmin?: string;
-  /** Public Featurebase post URL, if one already exists to cross-link. */
-  sourceUrl?: string;
-  /** Reporter's chat session id, recorded in the body so eng can jump to the session. */
-  sessionId?: string;
-}
-
 export interface LinearIssueResult {
   identifier: string; // e.g. ENG-42
   url: string;
   id?: string;        // internal uuid (returned by createInternalLinearIssue, for commenting)
-}
-
-/**
- * Create a Linear issue for a user-filed request. Tags it with the "Featurebase"
- * label so Featurebase imports + links + status-syncs it as a public post.
- */
-export async function createLinearIssue(params: CreateLinearIssueParams): Promise<LinearIssueResult> {
-  const { type, title, description, userEmail, reportedByAdmin, sourceUrl, sessionId } = params;
-  const meta = await getTeamMeta();
-
-  // Always include the Featurebase label (drives the FB import/sync) + the type label.
-  const wantLabels = [FEATUREBASE_LABEL, type === 'bug' ? 'Bug' : 'Feature'];
-  if (type === 'feature_request') wantLabels.push('Customer Request');
-  else wantLabels.push('Customer Reported');
-  const labelIds = wantLabels
-    .map(n => meta.labelIds[n.toLowerCase()])
-    .filter((id): id is string => Boolean(id));
-
-  const body = [
-    description,
-    '',
-    '---',
-    reportedByAdmin
-      ? `Filed by ${userEmail} (via ${reportedByAdmin} acting on their behalf — delegated session) through Emma.`
-      : `Filed by ${userEmail} via Emma.`,
-    ...(sessionId ? [`Session: ${sessionId}`] : []),
-    ...(sourceUrl ? [`Source: ${sourceUrl}`] : []),
-  ].join('\n');
-
-  const input: Record<string, any> = {
-    teamId: meta.teamId,
-    title,
-    description: body,
-    labelIds,
-  };
-  if (meta.backlogStateId) input.stateId = meta.backlogStateId;
-
-  const data = await linearGraphQL(
-    `mutation($input: IssueCreateInput!) {
-      issueCreate(input: $input) { success issue { identifier url } }
-    }`,
-    { input },
-  );
-  const issue = data?.issueCreate?.issue;
-  if (!data?.issueCreate?.success || !issue) {
-    throw new Error('Linear issueCreate did not return an issue');
-  }
-  return { identifier: issue.identifier, url: issue.url };
 }
 
 export interface OpenCanonical {
@@ -180,51 +116,6 @@ export interface OpenCanonical {
   issueId: string;    // internal uuid (for comments/mutations)
   title: string;
   description: string;
-  /** Public Featurebase post URL, from the "Featurebase Submission" attachment, if present. */
-  featurebasePostUrl?: string;
-}
-
-/**
- * List OPEN canonical issues of a given type — i.e. user-filed requests that were
- * imported to Featurebase (carry the "Featurebase" label) and are not yet resolved.
- * These are the dedup-match candidates. Type-scoped (Bug vs Feature) and open-only
- * (excludes completed/canceled) per the dedup contract.
- */
-export async function listOpenCanonicals(type: LinearItemType, limit = 30): Promise<OpenCanonical[]> {
-  const meta = await getTeamMeta();
-  const typeLabel = type === 'bug' ? 'Bug' : 'Feature';
-  const data = await linearGraphQL(
-    `query($team: String!, $fb: String!, $typeLabel: String!, $limit: Int!) {
-      issues(
-        first: $limit,
-        orderBy: createdAt,
-        filter: {
-          team: { key: { eq: $team } },
-          state: { type: { nin: ["completed", "canceled"] } },
-          and: [
-            { labels: { name: { eq: $fb } } },
-            { labels: { name: { eq: $typeLabel } } }
-          ]
-        }
-      ) {
-        nodes { id identifier title description attachments { nodes { title url } } }
-      }
-    }`,
-    { team: TEAM_KEY, fb: FEATUREBASE_LABEL, typeLabel, limit },
-  );
-  const nodes: any[] = data?.issues?.nodes || [];
-  return nodes.map((n) => {
-    const fbAttachment = (n.attachments?.nodes || []).find(
-      (a: any) => typeof a?.url === 'string' && a.url.includes('featurebase.app'),
-    );
-    return {
-      identifier: n.identifier,
-      issueId: n.id,
-      title: n.title || '',
-      description: n.description || '',
-      featurebasePostUrl: fbAttachment?.url,
-    };
-  });
 }
 
 /**

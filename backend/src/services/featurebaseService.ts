@@ -79,12 +79,6 @@ async function featurebaseFetch(path: string, options: RequestInit = {}): Promis
   throw new Error('Featurebase API: rate-limit retries exhausted');
 }
 
-export interface FeaturebasePost {
-  id: string;
-  title: string;
-  url?: string;
-}
-
 /** A candidate canonical for dedup: an open public post on the board. */
 export interface OpenPost {
   id: string;
@@ -172,18 +166,6 @@ export async function addComment(postId: string, content: string, isPrivate = tr
     method: 'POST',
     body: JSON.stringify({ postId, content, isPrivate }),
   });
-}
-
-/** Find a post by (near-exact) title — used to resolve a canonical's imported post. */
-export async function findPostByTitle(title: string): Promise<FeaturebasePost | null> {
-  const q = encodeURIComponent(title.slice(0, 200));
-  const data = await featurebaseFetch(`/posts?q=${q}&limit=5`, { method: 'GET' });
-  const candidates: any[] = data?.data || [];
-  const norm = (s: string) => (s || '').trim().toLowerCase();
-  const exact = candidates.find((p) => norm(p.title) === norm(title));
-  const chosen = exact || candidates[0];
-  if (!chosen) return null;
-  return { id: chosen.id, title: chosen.title, url: chosen.postUrl || chosen.url };
 }
 
 /** Add a voter (additional reporter) to a post, attributed by email. Auto-creates the contact. */
