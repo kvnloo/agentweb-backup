@@ -4,9 +4,8 @@ jest.mock('../services/notionService', () => ({
   createOncallItem: jest.fn().mockResolvedValue({ pageId: 'notion-1', notionUrl: 'https://notion.so/notion-1' }),
 }));
 jest.mock('../services/dedupService', () => ({ findDuplicateCanonical: jest.fn() }));
-jest.mock('../services/featurebaseService', () => ({ findPostByTitle: jest.fn(), addVoter: jest.fn() }));
+jest.mock('../services/featurebaseService', () => ({ createPost: jest.fn(), addComment: jest.fn(), addVoter: jest.fn() }));
 jest.mock('../services/linearService', () => ({
-  createLinearIssue: jest.fn(),
   addIssueComment: jest.fn(),
   createInternalLinearIssue: jest.fn(),
   listOpenIssuesByLabel: jest.fn(),
@@ -17,7 +16,7 @@ const dedup = require('../services/dedupService');
 const fb = require('../services/featurebaseService');
 const linear = require('../services/linearService');
 
-describe('intakeService.fileUserIssue', () => {
+describe('intakeService.fileUserIssue (Featurebase-first)', () => {
   const realFlag = process.env.FEATUREBASE_INTAKE;
   afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
 
@@ -29,60 +28,70 @@ describe('intakeService.fileUserIssue', () => {
     expect(dedup.findDuplicateCanonical).not.toHaveBeenCalled();
   });
 
-  it('flag ON + match -> stacks (comment + upvote), no new issue, deduped=true', async () => {
+  it('flag ON + no match -> creates a public post authored by the filer + a private eng note', async () => {
     process.env.FEATUREBASE_INTAKE = 'true';
-    dedup.findDuplicateCanonical.mockResolvedValue({ identifier: 'ENG-5', issueId: 'uuid-5', title: 'Dark mode', featurebasePostUrl: 'https://fb/p/dark' });
-    fb.findPostByTitle.mockResolvedValue({ id: 'post5' });
-    const r = await fileUserIssue({ type: 'feature_request', title: 'night mode', description: 'd', userEmail: 'u@e.com', userName: 'U' });
-    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-5', expect.stringContaining('Also reported by u@e.com'));
-    expect(fb.addVoter).toHaveBeenCalledWith('post5', 'u@e.com', 'U');
-    expect(linear.createLinearIssue).not.toHaveBeenCalled();
-    expect(r).toMatchObject({ deduped: true, tracker: 'Linear', userUrl: 'https://fb/p/dark' });
+    dedup.findDuplicateCanonical.mockResolvedValue(null);
+    fb.createPost.mockResolvedValue({ id: 'post9', url: 'https://fb/p/new' });
+    const r = await fileUserIssue({ type: 'feature_request', title: 'new thing', description: 'd', userEmail: 'u@e.com', userName: 'U', sessionId: 'sess-1' });
+    expect(fb.createPost).toHaveBeenCalledWith(expect.objectContaining({ title: 'new thing', description: 'd', authorEmail: 'u@e.com', authorName: 'U' }));
+    // private (eng-only) note carries the session — NOT in the public post body
+    expect(fb.addComment).toHaveBeenCalledWith('post9', expect.stringContaining('Session: sess-1'), true);
+    expect(r).toMatchObject({ pageId: 'post9', deduped: false, tracker: 'Featurebase', userUrl: 'https://fb/p/new' });
   });
 
-  it('flag ON + match -> dedup comment carries the reporter full text + session id (not lossy)', async () => {
+  it('flag ON + match -> stacks (private comment + voter), no new post, deduped=true', async () => {
     process.env.FEATUREBASE_INTAKE = 'true';
-    dedup.findDuplicateCanonical.mockResolvedValue({ identifier: 'ENG-5', issueId: 'uuid-5', title: 'X', featurebasePostUrl: 'u' });
-    fb.findPostByTitle.mockResolvedValue(null);
+    dedup.findDuplicateCanonical.mockResolvedValue({ postId: 'post5', title: 'Dark mode', url: 'https://fb/p/dark' });
+    const r = await fileUserIssue({ type: 'feature_request', title: 'night mode', description: 'd', userEmail: 'u@e.com', userName: 'U' });
+    expect(fb.addComment).toHaveBeenCalledWith('post5', expect.stringContaining('Also reported by u@e.com'), true);
+    expect(fb.addVoter).toHaveBeenCalledWith('post5', 'u@e.com', 'U');
+    expect(fb.createPost).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ deduped: true, tracker: 'Featurebase', userUrl: 'https://fb/p/dark' });
+  });
+
+  it('flag ON + match -> private comment carries the reporter full text + session id (not lossy)', async () => {
+    process.env.FEATUREBASE_INTAKE = 'true';
+    dedup.findDuplicateCanonical.mockResolvedValue({ postId: 'post5', title: 'X', url: 'u' });
     await fileUserIssue({ type: 'bug', title: 'x', description: 'the export button does nothing on CRM', userEmail: 'u2@e.com', userName: 'Two', sessionId: 'sess-abc' });
-    const body = linear.addIssueComment.mock.calls[0][1];
+    const [postId, body, isPrivate] = fb.addComment.mock.calls[0];
+    expect(postId).toBe('post5');
     expect(body).toContain('Also reported by u2@e.com (Two)');
     expect(body).toContain('Session: sess-abc');
     expect(body).toContain('the export button does nothing on CRM');
+    expect(isPrivate).toBe(true);
   });
 
   it('flag ON + delegated match -> comment notes the admin', async () => {
     process.env.FEATUREBASE_INTAKE = 'true';
-    dedup.findDuplicateCanonical.mockResolvedValue({ identifier: 'ENG-5', issueId: 'uuid-5', title: 'X', featurebasePostUrl: 'u' });
-    fb.findPostByTitle.mockResolvedValue(null);
+    dedup.findDuplicateCanonical.mockResolvedValue({ postId: 'post5', title: 'X', url: 'u' });
     await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'cust@e.com', reportedByAdmin: 'admin@a.com' });
-    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-5', expect.stringContaining('via admin@a.com acting on their behalf'));
+    expect(fb.addComment).toHaveBeenCalledWith('post5', expect.stringContaining('via admin@a.com acting on their behalf'), true);
   });
 
-  it('flag ON + no match -> creates a canonical, deduped=false, userUrl=board', async () => {
+  it('flag ON + match but comment/vote throw -> still deduped (best-effort, no duplicate post)', async () => {
     process.env.FEATUREBASE_INTAKE = 'true';
-    dedup.findDuplicateCanonical.mockResolvedValue(null);
-    linear.createLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'https://linear/ENG-9' });
-    const r = await fileUserIssue({ type: 'feature_request', title: 'new thing', description: 'd', userEmail: 'u@e.com' });
-    expect(linear.createLinearIssue).toHaveBeenCalled();
-    expect(r).toMatchObject({ pageId: 'ENG-9', deduped: false, tracker: 'Linear', userUrl: 'https://agentweb.featurebase.app/' });
-  });
-
-  it('flag ON + match but upvote/comment throw -> still deduped (best-effort, no duplicate)', async () => {
-    process.env.FEATUREBASE_INTAKE = 'true';
-    dedup.findDuplicateCanonical.mockResolvedValue({ identifier: 'ENG-5', issueId: 'uuid-5', title: 'X', featurebasePostUrl: 'u' });
-    linear.addIssueComment.mockRejectedValue(new Error('comment down'));
-    fb.findPostByTitle.mockRejectedValue(new Error('fb down'));
+    dedup.findDuplicateCanonical.mockResolvedValue({ postId: 'post5', title: 'X', url: 'u' });
+    fb.addComment.mockRejectedValue(new Error('comment down'));
+    fb.addVoter.mockRejectedValue(new Error('vote down'));
     const r = await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'u@e.com' });
     expect(r.deduped).toBe(true);
-    expect(linear.createLinearIssue).not.toHaveBeenCalled();
+    expect(fb.createPost).not.toHaveBeenCalled();
   });
 
-  it('flag ON + create throws -> PROPAGATES (no Notion fallback)', async () => {
+  it('flag ON + no match + private note throws -> still filed (best-effort note)', async () => {
     process.env.FEATUREBASE_INTAKE = 'true';
     dedup.findDuplicateCanonical.mockResolvedValue(null);
-    linear.createLinearIssue.mockRejectedValue(new Error('Linear down'));
-    await expect(fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'u@e.com' })).rejects.toThrow('Linear down');
+    fb.createPost.mockResolvedValue({ id: 'post9', url: 'u' });
+    fb.addComment.mockRejectedValue(new Error('note down'));
+    const r = await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'u@e.com' });
+    expect(r).toMatchObject({ deduped: false, pageId: 'post9' });
+  });
+
+  it('flag ON + createPost throws -> PROPAGATES (no Notion fallback)', async () => {
+    process.env.FEATUREBASE_INTAKE = 'true';
+    dedup.findDuplicateCanonical.mockResolvedValue(null);
+    fb.createPost.mockRejectedValue(new Error('FB down'));
+    await expect(fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'u@e.com' })).rejects.toThrow('FB down');
     expect(notion.createOncallItem).not.toHaveBeenCalled();
   });
 });

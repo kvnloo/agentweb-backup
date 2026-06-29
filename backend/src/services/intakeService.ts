@@ -51,11 +51,11 @@ export interface FileUserIssueParams {
 }
 
 export interface FiledUserResult {
-  pageId: string;       // Linear identifier (or Notion pageId when the flag is off)
-  trackerUrl: string;   // internal tracker link (Linear issue / Notion page)
-  userUrl?: string;     // public, user-facing Featurebase link
+  pageId: string;       // Featurebase post id (or Notion pageId when the flag is off)
+  trackerUrl: string;   // internal tracker link (Featurebase post / Notion page)
+  userUrl?: string;     // public, user-facing Featurebase post link
   deduped: boolean;
-  tracker: 'Linear' | 'Notion';
+  tracker: 'Featurebase' | 'Notion';
 }
 
 export async function fileUserIssue(p: FileUserIssueParams): Promise<FiledUserResult> {
@@ -71,15 +71,16 @@ export async function fileUserIssue(p: FileUserIssueParams): Promise<FiledUserRe
     return { pageId: o.pageId, trackerUrl: o.notionUrl, deduped: false, tracker: 'Notion' };
   }
 
-  // Linear path. dedup is best-effort internally (returns null on error -> treated as new).
+  // Featurebase-first path. dedup is best-effort internally (returns null on error -> new).
   const { findDuplicateCanonical } = await import('./dedupService');
+  const { createPost, addComment, addVoter } = await import('./featurebaseService');
   const dup = await findDuplicateCanonical({ type: p.type, title: p.title, description: p.description });
+
   if (dup) {
-    // Stacking writes are best-effort — a failure here must not turn this into a duplicate
-    // issue, so degrade in place rather than failing the whole filing. Capture the reporter's
-    // FULL text + session id (not just "also reported") so grouping is not lossy and eng can
-    // jump straight to this reporter's session.
-    const reportedLine = [
+    // Stack onto the existing canonical. Both writes are best-effort — a failure must not turn
+    // this into a duplicate post, so degrade in place. The reporter's full text + session id go
+    // in a PRIVATE (eng-only) comment so grouping is not lossy and nothing private goes public.
+    const reportedNote = [
       `Also reported by ${p.userEmail}${p.userName && p.userName !== p.userEmail ? ` (${p.userName})` : ''} on ${new Date().toISOString().slice(0, 10)}${p.reportedByAdmin ? ` — via ${p.reportedByAdmin} acting on their behalf` : ''}.`,
       ...(p.sessionId ? [`Session: ${p.sessionId}`] : []),
       '',
@@ -88,39 +89,50 @@ export async function fileUserIssue(p: FileUserIssueParams): Promise<FiledUserRe
       ...contextLines(p.notionContext),
     ].join('\n');
     try {
-      const { addIssueComment } = await import('./linearService');
-      await addIssueComment(dup.issueId, reportedLine);
+      await addComment(dup.postId, reportedNote, true);
     } catch (e) {
-      console.warn('[intake] dedup comment failed:', e instanceof Error ? e.message : e);
+      console.warn('[intake] dedup private comment failed:', e instanceof Error ? e.message : e);
     }
     try {
-      const { findPostByTitle, addVoter } = await import('./featurebaseService');
-      const post = await findPostByTitle(dup.title);
-      if (post) await addVoter(post.id, p.userEmail, p.userName);
+      // Voter = subscriber: stacks the class-action signal AND subscribes this reporter to the
+      // fix notification, and surfaces the canonical in their Featurebase "My profile".
+      await addVoter(dup.postId, p.userEmail, p.userName);
     } catch (e) {
       console.warn('[intake] dedup upvote failed:', e instanceof Error ? e.message : e);
     }
     return {
-      pageId: dup.identifier,
-      trackerUrl: dup.featurebasePostUrl || dup.identifier,
-      userUrl: dup.featurebasePostUrl || FEATUREBASE_BOARD_URL,
+      pageId: dup.postId,
+      trackerUrl: dup.url || FEATUREBASE_BOARD_URL,
+      userUrl: dup.url || FEATUREBASE_BOARD_URL,
       deduped: true,
-      tracker: 'Linear',
+      tracker: 'Featurebase',
     };
   }
 
-  // Core create: if this throws, it propagates — the caller surfaces a clean failure to
-  // the user. We do NOT reroute to Notion.
-  const { createLinearIssue } = await import('./linearService');
-  const li = await createLinearIssue({
-    type: p.type,
+  // Core create: a public post authored by the filer (-> shows in their "My profile") which
+  // Featurebase pushes to Linear for eng. If this throws it propagates — the caller surfaces a
+  // clean failure to the user. We do NOT reroute to Notion.
+  const post = await createPost({
     title: p.title,
     description: p.description,
-    userEmail: p.userEmail,
-    reportedByAdmin: p.reportedByAdmin,
-    sessionId: p.sessionId,
+    authorEmail: p.userEmail,
+    authorName: p.userName,
   });
-  return { pageId: li.identifier, trackerUrl: li.url, userUrl: FEATUREBASE_BOARD_URL, deduped: false, tracker: 'Linear' };
+  // Private (eng-only) note: who filed, delegation, session, internal context. Best-effort —
+  // the public post + the filer's authorship already landed; a failed note must not fail the filing.
+  const filedNote = [
+    p.reportedByAdmin
+      ? `Filed by ${p.userEmail}${p.userName && p.userName !== p.userEmail ? ` (${p.userName})` : ''} via ${p.reportedByAdmin} acting on their behalf (delegated session).`
+      : `Filed by ${p.userEmail}${p.userName && p.userName !== p.userEmail ? ` (${p.userName})` : ''}.`,
+    ...(p.sessionId ? [`Session: ${p.sessionId}`] : []),
+    ...contextLines(p.notionContext),
+  ].join('\n');
+  try {
+    await addComment(post.id, filedNote, true);
+  } catch (e) {
+    console.warn('[intake] filed private comment failed:', e instanceof Error ? e.message : e);
+  }
+  return { pageId: post.id, trackerUrl: post.url || FEATUREBASE_BOARD_URL, userUrl: post.url || FEATUREBASE_BOARD_URL, deduped: false, tracker: 'Featurebase' };
 }
 
 export interface FileAutoIssueParams {
