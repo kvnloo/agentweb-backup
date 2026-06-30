@@ -17565,12 +17565,195 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
+  public async searchGoogleDrive(query: string, userId: string, type?: string): Promise<any> {
+    try {
+      const auth = await this.getGoogleDriveOAuthClient(userId);
+      const drive = google.drive({ version: 'v3', auth });
+
+      const namePart = `name contains '${query.replace(/'/g, "\\'")}'`;
+      const typePart = type === 'folder'
+        ? ` and mimeType = 'application/vnd.google-apps.folder'`
+        : type === 'file'
+        ? ` and mimeType != 'application/vnd.google-apps.folder'`
+        : '';
+      const q = `${namePart}${typePart} and trashed = false`;
+
+      const resp = await drive.files.list({
+        q,
+        fields: 'files(id,name,mimeType,webViewLink,parents)',
+        orderBy: 'modifiedTime desc',
+        pageSize: 20,
+      });
+
+      const files = resp.data.files || [];
+      if (files.length === 0) {
+        return { success: true, message: `No items found matching "${query}".`, results: [] };
+      }
+
+      const results = files.map(f => ({
+        id: f.id,
+        name: f.name,
+        type: f.mimeType === 'application/vnd.google-apps.folder' ? 'folder' : f.mimeType,
+        url: f.webViewLink,
+        parent_folder_ids: f.parents,
+      }));
+
+      return { success: true, message: `Found ${results.length} item(s) matching "${query}".`, results };
+    } catch (err: any) {
+      const code = err?.code || err?.status;
+      if (code === 403 || code === 401) {
+        return { success: false, message: 'Google Drive access denied. Ensure Drive is connected in Settings → Connected Accounts.' };
+      }
+      return { success: false, message: err?.message || 'Failed to search Google Drive' };
+    }
+  }
+
+  // ── Markdown → HTML (for Google Drive HTML import) ───────────────────────
+
+  private static escapeHtml(s: string): string {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  /** Convert inline markdown to HTML string. */
+  private static inlineToHtml(text: string): string {
+    let result = '';
+    let remaining = text;
+    while (remaining.length > 0) {
+      let m = remaining.match(/^\*{3}(.+?)\*{3}/s) ?? remaining.match(/^_{3}(.+?)_{3}/s);
+      if (m) { result += `<strong><em>${AgentModeService.escapeHtml(m[1])}</em></strong>`; remaining = remaining.slice(m[0].length); continue; }
+      m = remaining.match(/^\*{2}(.+?)\*{2}/s) ?? remaining.match(/^_{2}(.+?)_{2}/s);
+      if (m) { result += `<strong>${AgentModeService.escapeHtml(m[1])}</strong>`; remaining = remaining.slice(m[0].length); continue; }
+      m = remaining.match(/^\*([^*\n]+?)\*/s) ?? remaining.match(/^_([^_\n]+?)_/s);
+      if (m) { result += `<em>${AgentModeService.escapeHtml(m[1])}</em>`; remaining = remaining.slice(m[0].length); continue; }
+      m = remaining.match(/^`([^`\n]+)`/s);
+      if (m) { result += `<code>${AgentModeService.escapeHtml(m[1])}</code>`; remaining = remaining.slice(m[0].length); continue; }
+      m = remaining.match(/^\[([^\]]+)\]\(([^)]+)\)/);
+      if (m) { result += `<a href="${AgentModeService.escapeHtml(m[2])}">${AgentModeService.escapeHtml(m[1])}</a>`; remaining = remaining.slice(m[0].length); continue; }
+      m = remaining.match(/^<[^>]+>/);
+      if (m) { remaining = remaining.slice(m[0].length); continue; }
+      result += AgentModeService.escapeHtml(remaining[0]);
+      remaining = remaining.slice(1);
+    }
+    return result;
+  }
+
+  /** Convert markdown to an HTML string for Google Drive HTML import.
+   *  style='plain'  → bare semantic HTML; Google Docs applies its own default styling (default)
+   *  style='styled' → inline CSS with modern colors, table headers, spacing
+   */
+  static markdownToHtml(markdown: string, style: 'plain' | 'styled' = 'plain', primaryColor = '#1a73e8'): string {
+    if (!markdown?.trim()) return '';
+    const tokens = AgentModeService.lexMarkdown(markdown);
+    const styled = style === 'styled';
+    const pc = primaryColor || '#1a73e8';
+
+    // Style tokens — empty strings when plain so attrs are omitted cleanly
+    const bodyAttr   = styled ? ' style="font-family:Arial,sans-serif;font-size:14px;color:#202124;line-height:1.6;max-width:900px;margin:0 auto;padding:24px"' : '';
+    const hStyles: Record<number, string> = styled ? {
+      1: ` style="font-size:24px;font-weight:700;color:${pc};border-bottom:2px solid #e8eaed;padding-bottom:8px;margin-top:32px;margin-bottom:16px"`,
+      2: ' style="font-size:20px;font-weight:700;color:#202124;margin-top:28px;margin-bottom:12px"',
+      3: ' style="font-size:16px;font-weight:700;color:#3c4043;margin-top:24px;margin-bottom:8px"',
+    } : {};
+    const pAttr      = styled ? ' style="margin:8px 0;line-height:1.7"' : '';
+    const ulAttr     = styled ? ' style="margin:8px 0;padding-left:24px;line-height:1.7"' : '';
+    const liAttr     = styled ? ' style="margin:4px 0"' : '';
+    const bqAttr     = styled ? ` style="border-left:4px solid ${pc};margin:16px 0;padding:8px 16px;background-color:#f8f9fa;color:#5f6368;font-style:italic"` : '';
+    const preAttr    = styled ? ' style="background-color:#f8f9fa;border:1px solid #e8eaed;padding:16px;margin:12px 0"' : '';
+    const codeAttr   = styled ? ' style="font-family:Courier New,monospace;font-size:13px"' : '';
+    const tableAttr  = styled ? ' style="border-collapse:collapse;width:100%;margin:16px 0;font-size:14px"' : '';
+    const thAttr     = styled ? ` style="padding:10px 16px;text-align:left;background-color:${pc};color:#ffffff;font-weight:bold;font-size:14px"` : '';
+    const hrAttr     = styled ? ' style="border:none;border-top:1px solid #e8eaed;margin:24px 0"' : '';
+
+    const tdStyle = (ri: number) => styled
+      ? ` style="padding:10px 16px;border-bottom:1px solid #e8eaed;vertical-align:top;background-color:${ri % 2 === 0 ? '#ffffff' : '#f8f9fa'}"`
+      : '';
+
+    const parts: string[] = [
+      '<!DOCTYPE html>',
+      '<html>',
+      '<head><meta charset="utf-8"></head>',
+      `<body${bodyAttr}>`,
+    ];
+
+    for (const tok of tokens) {
+      switch (tok.type) {
+        case 'heading': {
+          const level = Math.min(tok.depth ?? 1, 6);
+          const hAttr = hStyles[level] ?? (styled ? ' style="font-weight:700"' : '');
+          parts.push(`<h${level}${hAttr}>${AgentModeService.inlineToHtml(tok.text ?? '')}</h${level}>`);
+          break;
+        }
+        case 'paragraph':
+          parts.push(`<p${pAttr}>${AgentModeService.inlineToHtml(tok.text ?? '')}</p>`);
+          break;
+        case 'list': {
+          const tag = tok.ordered ? 'ol' : 'ul';
+          parts.push(`<${tag}${ulAttr}>`);
+          for (const item of tok.items ?? []) {
+            parts.push(`<li${liAttr}>${AgentModeService.inlineToHtml(item.text)}`);
+            if (item.nestedItems?.length) {
+              const ntag = item.nestedItems[0].ordered ? 'ol' : 'ul';
+              parts.push(`<${ntag}${ulAttr}>`);
+              for (const n of item.nestedItems) {
+                parts.push(`<li${liAttr}>${AgentModeService.inlineToHtml(n.text)}</li>`);
+              }
+              parts.push(`</${ntag}>`);
+            }
+            parts.push(`</li>`);
+          }
+          parts.push(`</${tag}>`);
+          break;
+        }
+        case 'blockquote':
+          parts.push(`<blockquote${bqAttr}><p style="margin:0">${AgentModeService.inlineToHtml(tok.text ?? '')}</p></blockquote>`);
+          break;
+        case 'code': {
+          const codeHtml = (tok.codeLines ?? []).map(l => AgentModeService.escapeHtml(l)).join('\n');
+          parts.push(`<pre${preAttr}><code${codeAttr}>${codeHtml}</code></pre>`);
+          break;
+        }
+        case 'table': {
+          parts.push(`<table${tableAttr}>`);
+          if (tok.headerCells?.length) {
+            parts.push('<thead><tr>');
+            for (const cell of tok.headerCells) {
+              parts.push(`<th${thAttr}>${AgentModeService.inlineToHtml(cell)}</th>`);
+            }
+            parts.push('</tr></thead>');
+          }
+          if (tok.dataRows?.length) {
+            parts.push('<tbody>');
+            tok.dataRows.forEach((row, ri) => {
+              parts.push(`<tr>`);
+              for (const cell of row) {
+                parts.push(`<td${tdStyle(ri)}>${AgentModeService.inlineToHtml(cell)}</td>`);
+              }
+              parts.push('</tr>');
+            });
+            parts.push('</tbody>');
+          }
+          parts.push('</table>');
+          break;
+        }
+        case 'hr':
+          parts.push(`<hr${hrAttr}>`);
+          break;
+        case 'space':
+          break;
+      }
+    }
+
+    parts.push('</body></html>');
+    return parts.join('\n');
+  }
+
   // ── Markdown → Google Docs API batchUpdate requests ──────────────────────
+  // Kept for updateGoogleDoc (batchUpdate on existing docs).
   // Self-contained tokenizer (no external dep) handles Emma's markdown output.
 
   /** Parse inline markdown into styled runs. Handles bold, italic, code, links. */
-  private static parseInlineRuns(text: string): Array<{ text: string; bold: boolean; italic: boolean; monospace: boolean }> {
-    type Run = { text: string; bold: boolean; italic: boolean; monospace: boolean };
+  private static parseInlineRuns(text: string): Array<{ text: string; bold: boolean; italic: boolean; monospace: boolean; url?: string }> {
+    type Run = { text: string; bold: boolean; italic: boolean; monospace: boolean; url?: string };
     const runs: Run[] = [];
     let remaining = text;
 
@@ -17603,10 +17786,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         remaining = remaining.slice(m[0].length);
         continue;
       }
-      // Link: [text](url)
+      // Link: [text](url) — emit as clickable hyperlink run
       m = remaining.match(/^\[([^\]]+)\]\(([^)]+)\)/);
       if (m) {
-        runs.push({ text: `${m[1]} (${m[2]})`, bold: false, italic: false, monospace: false });
+        runs.push({ text: m[1], bold: false, italic: false, monospace: false, url: m[2] });
         remaining = remaining.slice(m[0].length);
         continue;
       }
@@ -17795,7 +17978,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   /** Convert block tokens → DocBlocks with inline runs and style metadata. */
   private static buildDocBlocks(tokens: ReturnType<typeof AgentModeService.lexMarkdown>): Array<{
     text: string;
-    runs: Array<{ text: string; bold: boolean; italic: boolean; monospace: boolean }>;
+    runs: Array<{ text: string; bold: boolean; italic: boolean; monospace: boolean; url?: string }>;
     namedStyleType?: string;
     isBullet?: boolean;
     isOrderedBullet?: boolean;
@@ -17859,13 +18042,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           break;
         }
         case 'table': {
+          type Run = { text: string; bold: boolean; italic: boolean; monospace: boolean; url?: string };
+          const sep: Run = { text: ' | ', bold: false, italic: false, monospace: false };
           if (tok.headerCells?.length) {
-            const hText = tok.headerCells.join(' | ');
-            blocks.push({ text: hText, runs: [{ text: hText, bold: true, italic: false, monospace: false }] });
+            const headerRuns: Run[] = [];
+            tok.headerCells.forEach((cell, ci) => {
+              if (ci > 0) headerRuns.push({ ...sep, bold: true });
+              AgentModeService.parseInlineRuns(cell).forEach(r => headerRuns.push({ ...r, bold: true }));
+            });
+            blocks.push({ text: headerRuns.map(r => r.text).join(''), runs: headerRuns });
           }
           for (const row of tok.dataRows ?? []) {
-            const rText = row.join(' | ');
-            blocks.push({ text: rText, runs: [{ text: rText, bold: false, italic: false, monospace: false }] });
+            const rowRuns: Run[] = [];
+            row.forEach((cell, ci) => {
+              if (ci > 0) rowRuns.push(sep);
+              rowRuns.push(...AgentModeService.parseInlineRuns(cell));
+            });
+            blocks.push({ text: rowRuns.map(r => r.text).join(''), runs: rowRuns });
           }
           break;
         }
@@ -17978,6 +18171,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           textStyle.weightedFontFamily = { fontFamily: 'Courier New', weight: 400 };
           fields.push('weightedFontFamily');
         }
+        if ((run as any).url) {
+          textStyle.link = { url: (run as any).url };
+          fields.push('link');
+        }
         if (!fields.length) continue;
         requests.push({
           updateTextStyle: {
@@ -18034,31 +18231,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   // ─────────────────────────────────────────────────────────────────────────
 
-  public async createGoogleDoc(title: string, content: string, userId: string, folderId?: string, shareWithEmails?: string[]): Promise<any> {
+  public async createGoogleDoc(title: string, content: string, userId: string, folderId?: string, shareWithEmails?: string[], style: 'plain' | 'styled' = 'plain', primaryColor?: string): Promise<any> {
     let docId: string | undefined;
     let drive: any;
     try {
       const auth = await this.getGoogleDriveOAuthClient(userId);
       drive = google.drive({ version: 'v3', auth });
-      const docs = google.docs({ version: 'v1', auth });
 
+      const htmlBody = content ? AgentModeService.markdownToHtml(content, style, primaryColor) : undefined;
       const createResp = await drive.files.create({
         requestBody: {
           name: title,
           mimeType: 'application/vnd.google-apps.document',
           ...(folderId ? { parents: [folderId] } : {}),
         },
+        ...(htmlBody ? { media: { mimeType: 'text/html', body: htmlBody } } : {}),
         fields: 'id,name,webViewLink',
       });
       docId = createResp.data.id!;
       const docUrl = createResp.data.webViewLink || `https://docs.google.com/document/d/${docId}/edit`;
-
-      if (content) {
-        const requests = AgentModeService.markdownToDocsRequests(content, 1);
-        if (requests.length) {
-          await docs.documents.batchUpdate({ documentId: docId, requestBody: { requests } });
-        }
-      }
 
       const emailsToShare = [...new Set(shareWithEmails || [])];
       for (const email of emailsToShare) {
@@ -18081,9 +18272,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         title,
       };
     } catch (error: any) {
-      if (docId && drive) {
-        try { await drive.files.delete({ fileId: docId }); } catch {}
-      }
       console.error('AgentMode: Error creating Google Doc:', error);
       const code = error?.code || error?.status;
       if (code === 403 || code === 401) {
@@ -18096,23 +18284,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async updateGoogleDoc(fileIdOrUrl: string, content: string, userId: string): Promise<any> {
+  public async updateGoogleDoc(fileIdOrUrl: string, content: string, userId: string, style: 'plain' | 'styled' = 'plain', primaryColor?: string): Promise<any> {
     try {
       const auth = await this.getGoogleDriveOAuthClient(userId);
-      const docs = google.docs({ version: 'v1', auth });
+      const drive = google.drive({ version: 'v3', auth });
       const fileId = this.extractGoogleFileId(fileIdOrUrl);
 
-      const docResp = await docs.documents.get({ documentId: fileId });
-      const body = docResp.data.body?.content || [];
-      const lastEl = body.length > 0 ? body[body.length - 1] : null;
-      const endIndex = lastEl ? (lastEl.endIndex ?? 2) - 1 : 0;
-
-      const requests: any[] = [];
-      if (endIndex > 1) requests.push({ deleteContentRange: { range: { startIndex: 1, endIndex } } });
-      requests.push(...AgentModeService.markdownToDocsRequests(content, 1));
-
-      if (requests.length) {
-        await docs.documents.batchUpdate({ documentId: fileId, requestBody: { requests } });
+      if (content) {
+        const htmlBody = AgentModeService.markdownToHtml(content, style, primaryColor);
+        await drive.files.update({
+          fileId,
+          media: { mimeType: 'text/html', body: htmlBody },
+        });
       }
 
       return {

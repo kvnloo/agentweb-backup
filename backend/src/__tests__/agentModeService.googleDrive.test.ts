@@ -74,6 +74,7 @@ jest.mock('google-auth-library', () => ({
 const mockDriveFiles = {
   list: jest.fn(),
   create: jest.fn(),
+  update: jest.fn(),
   get: jest.fn(),
   export: jest.fn(),
   delete: jest.fn(),
@@ -401,13 +402,11 @@ describe('AgentModeService - Google Drive methods', () => {
       );
     });
 
-    it('inserts content via batchUpdate', async () => {
+    it('uploads HTML media when content is provided', async () => {
       await service.createGoogleDoc('Test Doc', 'Hello world', USER_ID);
-      expect(mockDocuments.batchUpdate).toHaveBeenCalledTimes(1);
-      const { requests } = mockDocuments.batchUpdate.mock.calls[0][0].requestBody;
-      // First request is always insertText; text gets a trailing newline from the formatter
-      expect(requests[0].insertText.location.index).toBe(1);
-      expect(requests[0].insertText.text).toContain('Hello world');
+      const call = mockDriveFiles.create.mock.calls[0][0];
+      expect(call.media?.mimeType).toBe('text/html');
+      expect(call.media?.body).toContain('Hello world');
     });
 
     it('shares with emails when shareWithEmails is provided', async () => {
@@ -447,12 +446,12 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(result.message).toMatch(/Folder not found/i);
     });
 
-    it('deletes the created file when batchUpdate fails to prevent orphaned docs', async () => {
-      mockDriveFiles.delete.mockResolvedValue({});
-      mockDocuments.batchUpdate.mockRejectedValue(new Error('Docs API quota exceeded'));
-      const result = await service.createGoogleDoc('Test Doc', 'content', USER_ID);
-      expect(result.success).toBe(false);
-      expect(mockDriveFiles.delete).toHaveBeenCalledWith({ fileId: 'doc-id-1' });
+    it('does not call batchUpdate — formatting is done via HTML media upload', async () => {
+      await service.createGoogleDoc('Test Doc', '# Heading\n\n**bold** text', USER_ID);
+      expect(mockDocuments.batchUpdate).not.toHaveBeenCalled();
+      const call = mockDriveFiles.create.mock.calls[0][0];
+      expect(call.media?.body).toContain('<h1');
+      expect(call.media?.body).toContain('<strong>');
     });
   });
 
@@ -462,39 +461,28 @@ describe('AgentModeService - Google Drive methods', () => {
 
   describe('updateGoogleDoc', () => {
     beforeEach(() => {
-      mockDocuments.get.mockResolvedValue({
-        data: {
-          body: {
-            content: [
-              { startIndex: 0, endIndex: 1 },
-              { startIndex: 1, endIndex: 20 },
-            ],
-          },
-        },
-      });
-      mockDocuments.batchUpdate.mockResolvedValue({ data: {} });
+      mockDriveFiles.update.mockResolvedValue({ data: {} });
     });
 
-    it('extracts file ID from a Google Doc URL', async () => {
+    it('extracts file ID from a Google Doc URL and calls drive.files.update', async () => {
       const url = 'https://docs.google.com/document/d/file-id-abc/edit';
       await service.updateGoogleDoc(url, 'New content', USER_ID);
-      expect(mockDocuments.get).toHaveBeenCalledWith({ documentId: 'file-id-abc' });
-      expect(mockDocuments.batchUpdate).toHaveBeenCalledWith(
-        expect.objectContaining({ documentId: 'file-id-abc' })
+      expect(mockDriveFiles.update).toHaveBeenCalledWith(
+        expect.objectContaining({ fileId: 'file-id-abc' })
       );
     });
 
-    it('deletes existing content then inserts new content', async () => {
-      await service.updateGoogleDoc('file-id-plain', 'New content', USER_ID);
-      const call = mockDocuments.batchUpdate.mock.calls[0][0];
-      const requests: any[] = call.requestBody.requests;
-      // Should have a deleteContentRange followed by an insertText
-      expect(requests.some((r: any) => r.deleteContentRange)).toBe(true);
-      expect(requests.some((r: any) => r.insertText)).toBe(true);
+    it('uploads HTML media replacing all previous content', async () => {
+      const result = await service.updateGoogleDoc('file-id-plain', '# New heading\n\nParagraph', USER_ID);
+      expect(result.success).toBe(true);
+      const call = mockDriveFiles.update.mock.calls[0][0];
+      expect(call.media.mimeType).toBe('text/html');
+      expect(call.media.body).toContain('>New heading</h1>');
+      expect(call.media.body).toContain('>Paragraph</p>');
     });
 
     it('returns friendly 403 message that reflects access issue, not file ownership', async () => {
-      mockDocuments.get.mockRejectedValue(makeApiError(403));
+      mockDriveFiles.update.mockRejectedValue(makeApiError(403));
       const result = await service.updateGoogleDoc('file-id', 'content', USER_ID);
       expect(result.success).toBe(false);
       expect(result.message).toMatch(/Cannot update this Google Doc/i);
@@ -503,19 +491,16 @@ describe('AgentModeService - Google Drive methods', () => {
     });
 
     it('returns friendly 404 message', async () => {
-      mockDocuments.get.mockRejectedValue(makeApiError(404));
+      mockDriveFiles.update.mockRejectedValue(makeApiError(404));
       const result = await service.updateGoogleDoc('file-id', 'content', USER_ID);
       expect(result.success).toBe(false);
       expect(result.message).toMatch(/Google Doc not found/i);
     });
 
-    it('handles empty document body without throwing and inserts content directly', async () => {
-      mockDocuments.get.mockResolvedValue({ data: { body: { content: [] } } });
-      const result = await service.updateGoogleDoc('file-id', 'New content', USER_ID);
+    it('skips drive.files.update when content is empty and returns success', async () => {
+      const result = await service.updateGoogleDoc('file-id', '', USER_ID);
       expect(result.success).toBe(true);
-      const requests: any[] = mockDocuments.batchUpdate.mock.calls[0][0].requestBody.requests;
-      expect(requests.some((r: any) => r.deleteContentRange)).toBe(false);
-      expect(requests.some((r: any) => r.insertText)).toBe(true);
+      expect(mockDriveFiles.update).not.toHaveBeenCalled();
     });
   });
 
@@ -946,9 +931,12 @@ describe('AgentModeService - Google Drive methods', () => {
 
     // ── Links ────────────────────────────────────────────────────────────────
 
-    it('link renders as "text (url)" in plain text', () => {
+    it('link renders as clickable hyperlink (text only in insertText, link style in updateTextStyle)', () => {
       const reqs = md2r('[Click here](https://example.com)');
-      expect(reqs[0].insertText.text).toContain('Click here (https://example.com)');
+      expect(reqs[0].insertText.text).toContain('Click here');
+      expect(reqs[0].insertText.text).not.toContain('(https://example.com)');
+      const linkStyle = reqs.find(r => r.updateTextStyle?.textStyle?.link);
+      expect(linkStyle?.updateTextStyle.textStyle.link.url).toBe('https://example.com');
     });
 
     // ── Unordered list ───────────────────────────────────────────────────────
@@ -1081,36 +1069,47 @@ describe('AgentModeService - Google Drive methods', () => {
       mockDriveFiles.create.mockResolvedValue({
         data: { id: 'new-doc-id', webViewLink: 'https://docs.google.com/document/d/new-doc-id/edit' },
       });
-      mockDocuments.batchUpdate.mockResolvedValue({});
     });
 
-    it('calls batchUpdate with heading style request for markdown heading', async () => {
-      await service.createGoogleDoc('My Doc', '# Hello\n\nWorld', USER_ID);
-      expect(mockDocuments.batchUpdate).toHaveBeenCalledTimes(1);
-      const { requests } = mockDocuments.batchUpdate.mock.calls[0][0].requestBody;
-      const hasHeading = requests.some(
-        (r: any) => r.updateParagraphStyle?.paragraphStyle?.namedStyleType === 'HEADING_1',
-      );
-      expect(hasHeading).toBe(true);
+    it('uploads HTML with <h1> tag for markdown heading, styled mode has inline styles', async () => {
+      await service.createGoogleDoc('My Doc', '# Hello\n\nWorld', USER_ID, undefined, undefined, 'styled');
+      const html = mockDriveFiles.create.mock.calls[0][0].media?.body as string;
+      expect(html).toContain('<h1 style=');
+      expect(html).toContain('>Hello</h1>');
+      expect(html).toContain('>World</p>');
     });
 
-    it('calls batchUpdate with bold style request for **bold** text', async () => {
+    it('uploads HTML with <strong> tag for **bold** text', async () => {
       await service.createGoogleDoc('My Doc', 'Some **bold** text', USER_ID);
-      const { requests } = mockDocuments.batchUpdate.mock.calls[0][0].requestBody;
-      const hasBold = requests.some((r: any) => r.updateTextStyle?.textStyle?.bold === true);
-      expect(hasBold).toBe(true);
+      const html = mockDriveFiles.create.mock.calls[0][0].media?.body as string;
+      expect(html).toContain('<strong>bold</strong>');
     });
 
-    it('calls batchUpdate with bullet request for list', async () => {
+    it('uploads HTML with <ul><li> for unordered list', async () => {
       await service.createGoogleDoc('My Doc', '- Apple\n- Banana', USER_ID);
-      const { requests } = mockDocuments.batchUpdate.mock.calls[0][0].requestBody;
-      const hasBullet = requests.some((r: any) => r.createParagraphBullets);
-      expect(hasBullet).toBe(true);
+      const html = mockDriveFiles.create.mock.calls[0][0].media?.body as string;
+      expect(html).toContain('<ul');
+      expect(html).toContain('>Apple');
     });
 
-    it('skips batchUpdate entirely when content is empty', async () => {
+    it('uploads HTML with <table> for markdown table', async () => {
+      await service.createGoogleDoc('My Doc', '| A | B |\n|---|---|\n| 1 | 2 |', USER_ID);
+      const html = mockDriveFiles.create.mock.calls[0][0].media?.body as string;
+      expect(html).toContain('<table');
+      expect(html).toContain('<th');
+      expect(html).toContain('>1</td>');
+    });
+
+    it('uploads HTML with <a href> for markdown link', async () => {
+      await service.createGoogleDoc('My Doc', '[Click here](https://example.com)', USER_ID);
+      const html = mockDriveFiles.create.mock.calls[0][0].media?.body as string;
+      expect(html).toContain('<a href="https://example.com">Click here</a>');
+    });
+
+    it('omits media entirely when content is empty', async () => {
       await service.createGoogleDoc('My Doc', '', USER_ID);
-      expect(mockDocuments.batchUpdate).not.toHaveBeenCalled();
+      const call = mockDriveFiles.create.mock.calls[0][0];
+      expect(call.media).toBeUndefined();
     });
   });
 
@@ -1118,41 +1117,28 @@ describe('AgentModeService - Google Drive methods', () => {
     beforeEach(() => {
       const { getAccountByPlatform } = require('../services/connectedAccountsDb');
       getAccountByPlatform.mockResolvedValue(FAKE_ACCOUNT);
-
-      mockDocuments.get.mockResolvedValue({
-        data: {
-          body: {
-            content: [
-              { startIndex: 0, endIndex: 1 },
-              { startIndex: 1, endIndex: 20 },
-            ],
-          },
-        },
-      });
-      mockDocuments.batchUpdate.mockResolvedValue({});
+      mockDriveFiles.update.mockResolvedValue({ data: {} });
     });
 
-    it('first request in batchUpdate is deleteContentRange when doc has content', async () => {
+    it('calls drive.files.update with HTML media', async () => {
       await service.updateGoogleDoc('doc-id', '# New heading', USER_ID);
-      const { requests } = mockDocuments.batchUpdate.mock.calls[0][0].requestBody;
-      expect(requests[0]).toHaveProperty('deleteContentRange');
-    });
-
-    it('includes heading style request after deleteContentRange', async () => {
-      await service.updateGoogleDoc('doc-id', '## Section', USER_ID);
-      const { requests } = mockDocuments.batchUpdate.mock.calls[0][0].requestBody;
-      const hasHeading = requests.some(
-        (r: any) => r.updateParagraphStyle?.paragraphStyle?.namedStyleType === 'HEADING_2',
+      expect(mockDriveFiles.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          fileId: 'doc-id',
+          media: expect.objectContaining({ mimeType: 'text/html' }),
+        }),
       );
-      expect(hasHeading).toBe(true);
     });
 
-    it('skips batchUpdate when doc is empty and content is also empty', async () => {
-      mockDocuments.get.mockResolvedValue({
-        data: { body: { content: [] } },
-      });
+    it('HTML contains <h2> for ## heading', async () => {
+      await service.updateGoogleDoc('doc-id', '## Section', USER_ID);
+      const html = mockDriveFiles.update.mock.calls[0][0].media?.body as string;
+      expect(html).toContain('>Section</h2>');
+    });
+
+    it('skips drive.files.update when content is empty', async () => {
       await service.updateGoogleDoc('doc-id', '', USER_ID);
-      expect(mockDocuments.batchUpdate).not.toHaveBeenCalled();
+      expect(mockDriveFiles.update).not.toHaveBeenCalled();
     });
   });
 });

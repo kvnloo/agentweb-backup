@@ -342,7 +342,7 @@ describe('create_google_doc — delegation', () => {
     mockCreateGoogleDoc.mockResolvedValue({ success: true, url: 'https://docs.google.com/document/d/doc1/edit' });
     const tool = await getTool('create_google_doc');
     await tool.execute({ title: 'GTM Plan', content: 'Strategy content here' }, { userId: USER });
-    expect(mockCreateGoogleDoc).toHaveBeenCalledWith('GTM Plan', 'Strategy content here', USER, undefined, undefined);
+    expect(mockCreateGoogleDoc).toHaveBeenCalledWith('GTM Plan', 'Strategy content here', USER, undefined, undefined, undefined, undefined);
   });
 
   it('passes folder_id and share_with_emails to the service when provided', async () => {
@@ -363,6 +363,8 @@ describe('create_google_doc — delegation', () => {
       USER,
       'folder-abc',
       ['alice@co.com', 'bob@co.com'],
+      undefined,
+      undefined,
     );
   });
 
@@ -426,6 +428,8 @@ describe('update_google_doc — delegation', () => {
       'https://docs.google.com/document/d/docABC/edit',
       'Updated content',
       USER,
+      undefined,
+      undefined,
     );
   });
 
@@ -433,7 +437,7 @@ describe('update_google_doc — delegation', () => {
     mockUpdateGoogleDoc.mockResolvedValue({ success: true });
     const tool = await getTool('update_google_doc');
     await tool.execute({ url_or_id: 'raw-doc-id-555', content: 'Replaced content' }, { userId: USER });
-    expect(mockUpdateGoogleDoc).toHaveBeenCalledWith('raw-doc-id-555', 'Replaced content', USER);
+    expect(mockUpdateGoogleDoc).toHaveBeenCalledWith('raw-doc-id-555', 'Replaced content', USER, undefined, undefined);
   });
 
   it('returns the service result to the caller', async () => {

@@ -8084,10 +8084,37 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
+  name: 'search_google_drive',
+  definition: {
+    name: 'search_google_drive',
+    description: 'Search for files or folders in the user\'s Google Drive by name. Use this when the user refers to a folder or file by name (e.g. "Emma Test folder", "Q2 report") — search for it first, then use the returned ID with create_google_doc, list_google_drive_folder, or other tools. Do NOT ask the user for a folder URL if they gave you a name — search first.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Name or partial name to search for',
+        },
+        type: {
+          type: 'string',
+          enum: ['folder', 'file', 'any'],
+          description: 'Filter results: "folder" for folders only, "file" for files only, "any" for both. Default: "any"',
+        },
+      },
+      required: ['query'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    return agentModeService.searchGoogleDrive(args.query, context.userId, args.type);
+  },
+});
+
+emmaToolRegistry.register({
   name: 'create_google_drive_folder',
   definition: {
     name: 'create_google_drive_folder',
-    description: 'Create a new folder in the user\'s Google Drive. Requires Google Drive connected in Settings → Connected Accounts. Returns the folder ID and URL. Use the returned folder_id to place Docs or Sheets inside it via create_google_doc or create_google_sheet. IMPORTANT: Before calling this tool, always ask the user to confirm — e.g. "Should I create a folder called X in your Google Drive?" — and wait for explicit approval.',
+    description: 'Create a new folder in the user\'s Google Drive. Requires Google Drive connected in Settings → Connected Accounts. Returns the folder ID and URL. Use the returned folder_id to place Docs or Sheets inside it via create_google_doc or create_google_sheet. Just do it when the user has asked for a folder — do not ask for additional confirmation.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -8113,7 +8140,7 @@ emmaToolRegistry.register({
   name: 'create_google_doc',
   definition: {
     name: 'create_google_doc',
-    description: 'Create a new Google Doc with the given content. Requires the user to have connected Google Drive in Settings → Connected Accounts. The Doc is created in the user\'s own Drive (or a specific folder if folder_id is provided) and optionally shared with additional emails. Returns the Doc URL. Use this when the user wants to deliver output as a native Google Doc for team review and inline comments. IMPORTANT: Before calling this tool, always ask the user two things and wait for explicit answers: (1) "Should I go ahead and create this Google Doc titled X?" (2) "Where should I put it — your root Drive, or a specific folder? If a folder, please share the folder ID or URL."',
+    description: 'Create a new Google Doc with rich formatting. Requires the user to have connected Google Drive in Settings → Connected Accounts. The Doc is created in the user\'s own Drive (or a specific folder if folder_id is provided) and optionally shared with additional emails. Returns the Doc URL. Content is written in markdown and automatically converted to rich Google Docs formatting (headings, bold, italic, bullet lists, numbered lists, tables, code blocks, blockquotes, etc.) — write full markdown, do NOT flatten to plain text. BEHAVIOR: Just do it — do NOT present options or ask the user to choose a format. Make the best judgment call from context and create the doc immediately. If the user names a destination folder by name (e.g. "Emma Test folder"), use search_google_drive first to find its ID — do NOT ask the user for the URL. Images and logos cannot be embedded inline via the API — include them as clickable links in the doc content instead. For style: use "styled" when the user wants polished/branded/professional output, "plain" for quick or simple docs. For primary_color: derive from brand colors or user\'s explicit color request.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -8123,7 +8150,7 @@ emmaToolRegistry.register({
         },
         content: {
           type: 'string',
-          description: 'Plain text content to write into the Doc',
+          description: 'Content in markdown format. Write full markdown (# Heading 1, ## Heading 2, **bold**, *italic*, - bullet lists, 1. numbered lists, | tables |, ```code blocks```, > blockquotes, [text](url) links). Markdown is automatically converted to rich Google Docs formatting — do NOT flatten to plain text.',
         },
         folder_id: {
           type: 'string',
@@ -8134,13 +8161,22 @@ emmaToolRegistry.register({
           items: { type: 'string' },
           description: 'Optional: additional email addresses to share the Doc with (writer access). The calling user is always shared automatically.',
         },
+        style: {
+          type: 'string',
+          enum: ['plain', 'styled'],
+          description: 'Optional: "plain" (default) = standard Google Doc appearance, Google\'s own default formatting. "styled" = modern visual design with colored table headers, accent colors, and enhanced spacing. Use "styled" when the user asks for a polished, professional, branded, or nicely formatted document. Use "plain" (or omit) for everyday documents, quick notes, or when the user says "simple" or "just put it in a doc".',
+        },
+        primary_color: {
+          type: 'string',
+          description: 'Optional: hex color code (e.g. "#6B21A8") used as the accent color when style is "styled". Applied to table headers, H1 headings, and blockquote borders. Derive from the user\'s brand colors or their explicit request (e.g. "use purple" → "#7C3AED"). Omit to use the default blue (#1a73e8).',
+        },
       },
       required: ['title', 'content'],
     },
   },
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
-    return agentModeService.createGoogleDoc(args.title, args.content, context.userId, args.folder_id, args.share_with_emails);
+    return agentModeService.createGoogleDoc(args.title, args.content, context.userId, args.folder_id, args.share_with_emails, args.style, args.primary_color);
   },
 });
 
@@ -8148,7 +8184,7 @@ emmaToolRegistry.register({
   name: 'update_google_doc',
   definition: {
     name: 'update_google_doc',
-    description: 'Replace the entire content of an existing Google Doc. Use this to write revised content back to a Doc after the team has left comments and the user has approved the edits. Accepts a Doc URL or file ID. IMPORTANT: Before calling this tool, always confirm with the user — e.g. "Should I update [Doc title/URL] with the new content?" — and wait for explicit approval. If multiple Docs are in the conversation context and the user says "update the doc" without specifying which one, ask them to clarify before proceeding.',
+    description: 'Replace the entire content of an existing Google Doc with rich formatting. Content is written in markdown and automatically converted to rich Google Docs formatting — write full markdown, do NOT flatten to plain text. Use this to write revised content back to a Doc after the team has left comments and the user has approved edits. Accepts a Doc URL or file ID. BEHAVIOR: Just do it when the user has clearly asked for an update. Only ask for clarification if multiple Docs are in context and it\'s genuinely ambiguous which one to update.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -8158,7 +8194,16 @@ emmaToolRegistry.register({
         },
         content: {
           type: 'string',
-          description: 'New plain text content (replaces all existing content)',
+          description: 'New content in markdown format (replaces all existing content). Write full markdown — it is automatically converted to rich Google Docs formatting. Do NOT flatten to plain text.',
+        },
+        style: {
+          type: 'string',
+          enum: ['plain', 'styled'],
+          description: 'Optional: "plain" (default) = standard Google Doc appearance. "styled" = modern visual design with colors and enhanced formatting. Match whatever style was used when the doc was created.',
+        },
+        primary_color: {
+          type: 'string',
+          description: 'Optional: hex color code (e.g. "#6B21A8") for the accent color when style is "styled". Match the color used when the doc was originally created.',
         },
       },
       required: ['url_or_id', 'content'],
@@ -8166,7 +8211,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
-    return agentModeService.updateGoogleDoc(args.url_or_id, args.content, context.userId);
+    return agentModeService.updateGoogleDoc(args.url_or_id, args.content, context.userId, args.style, args.primary_color);
   },
 });
 
