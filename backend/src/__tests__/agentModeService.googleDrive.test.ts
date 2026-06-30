@@ -403,14 +403,11 @@ describe('AgentModeService - Google Drive methods', () => {
 
     it('inserts content via batchUpdate', async () => {
       await service.createGoogleDoc('Test Doc', 'Hello world', USER_ID);
-      expect(mockDocuments.batchUpdate).toHaveBeenCalledWith(
-        expect.objectContaining({
-          documentId: 'doc-id-1',
-          requestBody: {
-            requests: [{ insertText: { location: { index: 1 }, text: 'Hello world' } }],
-          },
-        })
-      );
+      expect(mockDocuments.batchUpdate).toHaveBeenCalledTimes(1);
+      const { requests } = mockDocuments.batchUpdate.mock.calls[0][0].requestBody;
+      // First request is always insertText; text gets a trailing newline from the formatter
+      expect(requests[0].insertText.location.index).toBe(1);
+      expect(requests[0].insertText.text).toContain('Hello world');
     });
 
     it('shares with emails when shareWithEmails is provided', async () => {
@@ -849,6 +846,313 @@ describe('AgentModeService - Google Drive methods', () => {
       // Comments section should be included in content
       expect(result.content).toMatch(/COMMENTS & FEEDBACK/);
       expect(result.content).toMatch(/Alice/);
+    });
+  });
+
+  // ── markdownToDocsRequests ─────────────────────────────────────────────────
+
+  describe('markdownToDocsRequests', () => {
+    const md2r = AgentModeService.markdownToDocsRequests.bind(AgentModeService);
+
+    // ── Edge cases: empty / blank ────────────────────────────────────────────
+
+    it('returns [] for empty string', () => {
+      expect(md2r('')).toEqual([]);
+    });
+
+    it('returns [] for whitespace-only string', () => {
+      expect(md2r('   \n\n  ')).toEqual([]);
+    });
+
+    // ── Plain text (no markdown) ─────────────────────────────────────────────
+
+    it('plain text: emits only insertText, no style requests', () => {
+      const reqs = md2r('Hello world');
+      expect(reqs).toHaveLength(1);
+      expect(reqs[0].insertText.text).toBe('Hello world\n');
+    });
+
+    // ── Headings ─────────────────────────────────────────────────────────────
+
+    it('H1 emits updateParagraphStyle HEADING_1', () => {
+      const reqs = md2r('# Title');
+      const style = reqs.find(r => r.updateParagraphStyle);
+      expect(style?.updateParagraphStyle.paragraphStyle.namedStyleType).toBe('HEADING_1');
+    });
+
+    it('H2 emits HEADING_2', () => {
+      const reqs = md2r('## Section');
+      const style = reqs.find(r => r.updateParagraphStyle);
+      expect(style?.updateParagraphStyle.paragraphStyle.namedStyleType).toBe('HEADING_2');
+    });
+
+    it('H3 emits HEADING_3', () => {
+      const reqs = md2r('### Sub');
+      const style = reqs.find(r => r.updateParagraphStyle);
+      expect(style?.updateParagraphStyle.paragraphStyle.namedStyleType).toBe('HEADING_3');
+    });
+
+    it('H4 is capped to HEADING_3', () => {
+      const reqs = md2r('#### Deep');
+      const style = reqs.find(r => r.updateParagraphStyle);
+      expect(style?.updateParagraphStyle.paragraphStyle.namedStyleType).toBe('HEADING_3');
+    });
+
+    it('heading range startIndex = insertIndex (default 1)', () => {
+      const reqs = md2r('# Title');
+      const style = reqs.find(r => r.updateParagraphStyle);
+      expect(style?.updateParagraphStyle.range.startIndex).toBe(1);
+    });
+
+    // ── Inline styles ─────────────────────────────────────────────────────────
+
+    it('**bold** emits updateTextStyle with bold:true', () => {
+      const reqs = md2r('Hello **world**');
+      const boldReq = reqs.find(r => r.updateTextStyle?.textStyle?.bold === true);
+      expect(boldReq).toBeDefined();
+      expect(boldReq.updateTextStyle.fields).toContain('bold');
+    });
+
+    it('*italic* emits updateTextStyle with italic:true', () => {
+      const reqs = md2r('Hello *world*');
+      const italicReq = reqs.find(r => r.updateTextStyle?.textStyle?.italic === true);
+      expect(italicReq).toBeDefined();
+      expect(italicReq.updateTextStyle.fields).toContain('italic');
+    });
+
+    it('***bold+italic*** emits updateTextStyle with both bold and italic', () => {
+      const reqs = md2r('***bold italic***');
+      const both = reqs.find(
+        r => r.updateTextStyle?.textStyle?.bold === true && r.updateTextStyle?.textStyle?.italic === true,
+      );
+      expect(both).toBeDefined();
+    });
+
+    it('`inline code` emits updateTextStyle with Courier New', () => {
+      const reqs = md2r('Use `const x = 1`');
+      const codeReq = reqs.find(
+        r => r.updateTextStyle?.textStyle?.weightedFontFamily?.fontFamily === 'Courier New',
+      );
+      expect(codeReq).toBeDefined();
+    });
+
+    it('bold range startIndex matches offset after plain prefix', () => {
+      // "Hello " = 6 chars, starts at index 1, bold starts at index 7
+      const reqs = md2r('Hello **world**');
+      const boldReq = reqs.find(r => r.updateTextStyle?.textStyle?.bold === true);
+      expect(boldReq.updateTextStyle.range.startIndex).toBe(7); // 1 + len("Hello ")
+      expect(boldReq.updateTextStyle.range.endIndex).toBe(12);  // 7 + len("world")
+    });
+
+    // ── Links ────────────────────────────────────────────────────────────────
+
+    it('link renders as "text (url)" in plain text', () => {
+      const reqs = md2r('[Click here](https://example.com)');
+      expect(reqs[0].insertText.text).toContain('Click here (https://example.com)');
+    });
+
+    // ── Unordered list ───────────────────────────────────────────────────────
+
+    it('unordered list emits createParagraphBullets with BULLET preset', () => {
+      const reqs = md2r('- Apple\n- Banana\n- Cherry');
+      const bullet = reqs.find(r => r.createParagraphBullets);
+      expect(bullet?.createParagraphBullets.bulletPreset).toBe('BULLET_DISC_CIRCLE_SQUARE');
+    });
+
+    it('unordered list range covers all items', () => {
+      const reqs = md2r('- A\n- B\n- C');
+      const text = reqs[0].insertText.text; // "A\nB\nC\n"
+      const bullet = reqs.find(r => r.createParagraphBullets);
+      expect(bullet.createParagraphBullets.range.startIndex).toBe(1);
+      // endIndex should be before the trailing \n of last item
+      expect(bullet.createParagraphBullets.range.endIndex).toBe(1 + text.length - 1);
+    });
+
+    // ── Ordered list ─────────────────────────────────────────────────────────
+
+    it('ordered list emits createParagraphBullets with NUMBERED preset', () => {
+      const reqs = md2r('1. First\n2. Second');
+      const bullet = reqs.find(r => r.createParagraphBullets);
+      expect(bullet?.createParagraphBullets.bulletPreset).toBe('NUMBERED_DECIMAL_ALPHA_ROMAN_SEQUENCE');
+    });
+
+    // ── Nested list ───────────────────────────────────────────────────────────
+
+    it('nested list item emits indent updateParagraphStyle', () => {
+      const reqs = md2r('- Parent\n  - Child');
+      const indentReq = reqs.find(
+        r => r.updateParagraphStyle?.paragraphStyle?.indentStart?.magnitude === 36,
+      );
+      expect(indentReq).toBeDefined();
+    });
+
+    // ── Blockquote ───────────────────────────────────────────────────────────
+
+    it('blockquote emits indent paragraph style', () => {
+      const reqs = md2r('> A quote');
+      const indent = reqs.find(r => r.updateParagraphStyle?.paragraphStyle?.indentStart);
+      expect(indent?.updateParagraphStyle.paragraphStyle.indentStart.magnitude).toBe(36);
+    });
+
+    it('blockquote emits italic text style', () => {
+      const reqs = md2r('> A quote');
+      const italic = reqs.find(r => r.updateTextStyle?.textStyle?.italic === true);
+      expect(italic).toBeDefined();
+    });
+
+    // ── Code block ───────────────────────────────────────────────────────────
+
+    it('fenced code block emits Courier New text style per line', () => {
+      const reqs = md2r('    const x = 1;');
+      const mono = reqs.find(
+        r => r.updateTextStyle?.textStyle?.weightedFontFamily?.fontFamily === 'Courier New',
+      );
+      expect(mono).toBeDefined();
+    });
+
+    // ── Table ────────────────────────────────────────────────────────────────
+
+    it('table header row is inserted as bold text', () => {
+      const reqs = md2r('| Col1 | Col2 |\n|------|------|\n| A    | B    |');
+      const headerBold = reqs.find(r => r.updateTextStyle?.textStyle?.bold === true);
+      expect(headerBold).toBeDefined();
+      expect(reqs[0].insertText.text).toContain('Col1 | Col2');
+    });
+
+    it('table data row is included in plain text', () => {
+      const reqs = md2r('| Col1 | Col2 |\n|------|------|\n| A    | B    |');
+      expect(reqs[0].insertText.text).toContain('A | B');
+    });
+
+    // ── HR ───────────────────────────────────────────────────────────────────
+
+    it('HR emits em-dash line as text', () => {
+      const reqs = md2r('---');
+      expect(reqs[0].insertText.text).toContain('─');
+    });
+
+    // ── Leading/trailing blank lines stripped ────────────────────────────────
+
+    it('leading blank lines do not shift heading to wrong index', () => {
+      const withBlanks = md2r('\n\n# Title');
+      const withoutBlanks = md2r('# Title');
+      const styleWith = withBlanks.find(r => r.updateParagraphStyle);
+      const styleWithout = withoutBlanks.find(r => r.updateParagraphStyle);
+      // Same heading startIndex — blanks stripped
+      expect(styleWith?.updateParagraphStyle.range.startIndex).toBe(
+        styleWithout?.updateParagraphStyle.range.startIndex,
+      );
+    });
+
+    // ── Custom insertIndex ────────────────────────────────────────────────────
+
+    it('custom insertIndex shifts all positions', () => {
+      const reqs = md2r('# Title', 10);
+      expect(reqs[0].insertText.location.index).toBe(10);
+      const style = reqs.find(r => r.updateParagraphStyle);
+      expect(style?.updateParagraphStyle.range.startIndex).toBe(10);
+    });
+
+    // ── Mixed document ────────────────────────────────────────────────────────
+
+    it('mixed document: insertText is always first request', () => {
+      const reqs = md2r('# Title\n\nSome **bold** text\n\n- item 1\n- item 2');
+      expect(reqs[0]).toHaveProperty('insertText');
+    });
+
+    it('mixed document: produces heading + bold + bullet requests', () => {
+      const reqs = md2r('# Title\n\nSome **bold** text\n\n- item 1\n- item 2');
+      const hasHeading = reqs.some(r => r.updateParagraphStyle?.paragraphStyle?.namedStyleType === 'HEADING_1');
+      const hasBold = reqs.some(r => r.updateTextStyle?.textStyle?.bold === true);
+      const hasBullet = reqs.some(r => r.createParagraphBullets);
+      expect(hasHeading).toBe(true);
+      expect(hasBold).toBe(true);
+      expect(hasBullet).toBe(true);
+    });
+  });
+
+  // ── createGoogleDoc / updateGoogleDoc integration ─────────────────────────
+
+  describe('createGoogleDoc - markdown formatting integration', () => {
+    beforeEach(() => {
+      const { getAccountByPlatform } = require('../services/connectedAccountsDb');
+      getAccountByPlatform.mockResolvedValue(FAKE_ACCOUNT);
+
+      mockDriveFiles.create.mockResolvedValue({
+        data: { id: 'new-doc-id', webViewLink: 'https://docs.google.com/document/d/new-doc-id/edit' },
+      });
+      mockDocuments.batchUpdate.mockResolvedValue({});
+    });
+
+    it('calls batchUpdate with heading style request for markdown heading', async () => {
+      await service.createGoogleDoc('My Doc', '# Hello\n\nWorld', USER_ID);
+      expect(mockDocuments.batchUpdate).toHaveBeenCalledTimes(1);
+      const { requests } = mockDocuments.batchUpdate.mock.calls[0][0].requestBody;
+      const hasHeading = requests.some(
+        (r: any) => r.updateParagraphStyle?.paragraphStyle?.namedStyleType === 'HEADING_1',
+      );
+      expect(hasHeading).toBe(true);
+    });
+
+    it('calls batchUpdate with bold style request for **bold** text', async () => {
+      await service.createGoogleDoc('My Doc', 'Some **bold** text', USER_ID);
+      const { requests } = mockDocuments.batchUpdate.mock.calls[0][0].requestBody;
+      const hasBold = requests.some((r: any) => r.updateTextStyle?.textStyle?.bold === true);
+      expect(hasBold).toBe(true);
+    });
+
+    it('calls batchUpdate with bullet request for list', async () => {
+      await service.createGoogleDoc('My Doc', '- Apple\n- Banana', USER_ID);
+      const { requests } = mockDocuments.batchUpdate.mock.calls[0][0].requestBody;
+      const hasBullet = requests.some((r: any) => r.createParagraphBullets);
+      expect(hasBullet).toBe(true);
+    });
+
+    it('skips batchUpdate entirely when content is empty', async () => {
+      await service.createGoogleDoc('My Doc', '', USER_ID);
+      expect(mockDocuments.batchUpdate).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('updateGoogleDoc - markdown formatting integration', () => {
+    beforeEach(() => {
+      const { getAccountByPlatform } = require('../services/connectedAccountsDb');
+      getAccountByPlatform.mockResolvedValue(FAKE_ACCOUNT);
+
+      mockDocuments.get.mockResolvedValue({
+        data: {
+          body: {
+            content: [
+              { startIndex: 0, endIndex: 1 },
+              { startIndex: 1, endIndex: 20 },
+            ],
+          },
+        },
+      });
+      mockDocuments.batchUpdate.mockResolvedValue({});
+    });
+
+    it('first request in batchUpdate is deleteContentRange when doc has content', async () => {
+      await service.updateGoogleDoc('doc-id', '# New heading', USER_ID);
+      const { requests } = mockDocuments.batchUpdate.mock.calls[0][0].requestBody;
+      expect(requests[0]).toHaveProperty('deleteContentRange');
+    });
+
+    it('includes heading style request after deleteContentRange', async () => {
+      await service.updateGoogleDoc('doc-id', '## Section', USER_ID);
+      const { requests } = mockDocuments.batchUpdate.mock.calls[0][0].requestBody;
+      const hasHeading = requests.some(
+        (r: any) => r.updateParagraphStyle?.paragraphStyle?.namedStyleType === 'HEADING_2',
+      );
+      expect(hasHeading).toBe(true);
+    });
+
+    it('skips batchUpdate when doc is empty and content is also empty', async () => {
+      mockDocuments.get.mockResolvedValue({
+        data: { body: { content: [] } },
+      });
+      await service.updateGoogleDoc('doc-id', '', USER_ID);
+      expect(mockDocuments.batchUpdate).not.toHaveBeenCalled();
     });
   });
 });

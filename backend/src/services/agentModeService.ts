@@ -17565,6 +17565,475 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
+  // ── Markdown → Google Docs API batchUpdate requests ──────────────────────
+  // Self-contained tokenizer (no external dep) handles Emma's markdown output.
+
+  /** Parse inline markdown into styled runs. Handles bold, italic, code, links. */
+  private static parseInlineRuns(text: string): Array<{ text: string; bold: boolean; italic: boolean; monospace: boolean }> {
+    type Run = { text: string; bold: boolean; italic: boolean; monospace: boolean };
+    const runs: Run[] = [];
+    let remaining = text;
+
+    while (remaining.length > 0) {
+      // Bold+italic: ***text*** or ___text___
+      let m = remaining.match(/^\*{3}(.+?)\*{3}/s) ?? remaining.match(/^_{3}(.+?)_{3}/s);
+      if (m) {
+        runs.push({ text: m[1], bold: true, italic: true, monospace: false });
+        remaining = remaining.slice(m[0].length);
+        continue;
+      }
+      // Bold: **text** or __text__
+      m = remaining.match(/^\*{2}(.+?)\*{2}/s) ?? remaining.match(/^_{2}(.+?)_{2}/s);
+      if (m) {
+        runs.push({ text: m[1], bold: true, italic: false, monospace: false });
+        remaining = remaining.slice(m[0].length);
+        continue;
+      }
+      // Italic: *text* or _text_  (single, not preceded by same char)
+      m = remaining.match(/^\*([^*\n]+?)\*/s) ?? remaining.match(/^_([^_\n]+?)_/s);
+      if (m) {
+        runs.push({ text: m[1], bold: false, italic: true, monospace: false });
+        remaining = remaining.slice(m[0].length);
+        continue;
+      }
+      // Inline code: `text`
+      m = remaining.match(/^`([^`\n]+)`/s);
+      if (m) {
+        runs.push({ text: m[1], bold: false, italic: false, monospace: true });
+        remaining = remaining.slice(m[0].length);
+        continue;
+      }
+      // Link: [text](url)
+      m = remaining.match(/^\[([^\]]+)\]\(([^)]+)\)/);
+      if (m) {
+        runs.push({ text: `${m[1]} (${m[2]})`, bold: false, italic: false, monospace: false });
+        remaining = remaining.slice(m[0].length);
+        continue;
+      }
+      // Strip HTML tags
+      m = remaining.match(/^<[^>]+>/);
+      if (m) { remaining = remaining.slice(m[0].length); continue; }
+
+      // Regular character — accumulate into last run if same style
+      const last = runs[runs.length - 1];
+      if (last && !last.bold && !last.italic && !last.monospace) {
+        last.text += remaining[0];
+      } else {
+        runs.push({ text: remaining[0], bold: false, italic: false, monospace: false });
+      }
+      remaining = remaining.slice(1);
+    }
+
+    return runs.filter(r => r.text.length > 0);
+  }
+
+  /** Lex markdown into block tokens. Handles all common block types. */
+  private static lexMarkdown(markdown: string): Array<{
+    type: 'heading' | 'paragraph' | 'list' | 'blockquote' | 'code' | 'table' | 'hr' | 'space';
+    depth?: number;
+    text?: string;
+    ordered?: boolean;
+    items?: Array<{ text: string; nestedItems?: Array<{ text: string; ordered: boolean }> }>;
+    codeLines?: string[];
+    headerCells?: string[];
+    dataRows?: string[][];
+  }> {
+    type Block = ReturnType<typeof AgentModeService.lexMarkdown>[number];
+    const blocks: Block[] = [];
+    const lines = markdown.split('\n');
+    let i = 0;
+
+    while (i < lines.length) {
+      const line = lines[i];
+      const trimmed = line.trim();
+
+      // Code fence (``` or ~~~)
+      if (/^(`{3,}|~{3,})/.test(trimmed)) {
+        const fence = trimmed.match(/^(`{3,}|~{3,})/)![1];
+        const codeLines: string[] = [];
+        i++;
+        while (i < lines.length && !lines[i].trim().startsWith(fence)) {
+          codeLines.push(lines[i]);
+          i++;
+        }
+        i++; // skip closing fence
+        blocks.push({ type: 'code', codeLines });
+        continue;
+      }
+
+      // Indented code block (4 spaces or tab)
+      if (/^(    |\t)/.test(line) && trimmed) {
+        const codeLines: string[] = [];
+        while (i < lines.length && (/^(    |\t)/.test(lines[i]) || !lines[i].trim())) {
+          codeLines.push(lines[i].replace(/^(    |\t)/, ''));
+          i++;
+        }
+        blocks.push({ type: 'code', codeLines: codeLines.filter(l => l.trim()) });
+        continue;
+      }
+
+      // Blank line
+      if (!trimmed) {
+        blocks.push({ type: 'space' });
+        i++;
+        continue;
+      }
+
+      // HR: --- or *** or ___
+      if (/^(-{3,}|_{3,}|\*{3,})\s*$/.test(trimmed)) {
+        blocks.push({ type: 'hr' });
+        i++;
+        continue;
+      }
+
+      // Heading
+      const headingMatch = trimmed.match(/^(#{1,6})\s+(.+?)(?:\s+#+\s*)?$/);
+      if (headingMatch) {
+        blocks.push({ type: 'heading', depth: headingMatch[1].length, text: headingMatch[2].trim() });
+        i++;
+        continue;
+      }
+
+      // Blockquote
+      if (trimmed.startsWith('>')) {
+        const bqLines: string[] = [];
+        while (i < lines.length && lines[i].trim().startsWith('>')) {
+          bqLines.push(lines[i].replace(/^[ \t]*>\s?/, ''));
+          i++;
+        }
+        blocks.push({ type: 'blockquote', text: bqLines.join(' ').trim() });
+        continue;
+      }
+
+      // List (unordered: - * +, or ordered: 1.)
+      const ulStart = /^[-*+]\s+/.test(trimmed);
+      const olStart = /^\d+[.)]\s+/.test(trimmed);
+      if (ulStart || olStart) {
+        const ordered = olStart;
+        const items: Array<{ text: string; nestedItems?: Array<{ text: string; ordered: boolean }> }> = [];
+
+        while (i < lines.length) {
+          const cur = lines[i];
+          const curTrimmed = cur.trim();
+          if (!curTrimmed) { i++; break; } // blank line ends list
+
+          // Nested item (2+ spaces indent)
+          const nestedUL = cur.match(/^ {2,}[-*+]\s+(.+)/);
+          const nestedOL = cur.match(/^ {2,}\d+[.)]\s+(.+)/);
+          if ((nestedUL ?? nestedOL) && items.length > 0) {
+            const nestedText = (nestedUL ?? nestedOL)![1];
+            const last = items[items.length - 1];
+            last.nestedItems = last.nestedItems ?? [];
+            last.nestedItems.push({ text: nestedText, ordered: !!nestedOL });
+            i++;
+            continue;
+          }
+
+          // Top-level item
+          const ulItem = curTrimmed.match(/^[-*+]\s+(.+)/);
+          const olItem = curTrimmed.match(/^\d+[.)]\s+(.+)/);
+          if (ulItem ?? olItem) {
+            items.push({ text: (ulItem ?? olItem)![1] });
+            i++;
+            continue;
+          }
+
+          // Continuation line (indented, no marker)
+          if (cur.startsWith('  ') && items.length > 0) {
+            items[items.length - 1].text += ' ' + curTrimmed;
+            i++;
+            continue;
+          }
+
+          break;
+        }
+
+        if (items.length) blocks.push({ type: 'list', ordered, items });
+        continue;
+      }
+
+      // Table: header row contains | and next non-blank line is separator (|---|)
+      if (trimmed.includes('|')) {
+        const nextLine = lines[i + 1]?.trim() ?? '';
+        if (/^\|?[-|: ]+\|[-|: ]+\|?$/.test(nextLine) || /^[-|: ]+\|[-|: ]+/.test(nextLine)) {
+          const headerCells = trimmed.replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+          i += 2; // skip header + separator
+          const dataRows: string[][] = [];
+          while (i < lines.length && lines[i].trim().includes('|') && lines[i].trim()) {
+            const cells = lines[i].trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+            dataRows.push(cells);
+            i++;
+          }
+          blocks.push({ type: 'table', headerCells, dataRows });
+          continue;
+        }
+      }
+
+      // Paragraph (collect until blank line or block-level element)
+      const paraLines: string[] = [];
+      while (i < lines.length) {
+        const cur = lines[i];
+        const curTrimmed = cur.trim();
+        if (!curTrimmed) break;
+        if (/^#{1,6}\s/.test(curTrimmed)) break;
+        if (/^(-{3,}|_{3,}|\*{3,})\s*$/.test(curTrimmed)) break;
+        if (/^[-*+]\s/.test(curTrimmed) || /^\d+[.)]\s/.test(curTrimmed)) break;
+        if (curTrimmed.startsWith('>')) break;
+        if (/^(`{3,}|~{3,})/.test(curTrimmed)) break;
+        if (/^(    |\t)/.test(cur)) break;
+        paraLines.push(curTrimmed);
+        i++;
+      }
+      if (paraLines.length) {
+        blocks.push({ type: 'paragraph', text: paraLines.join(' ') });
+      }
+    }
+
+    return blocks;
+  }
+
+  /** Convert block tokens → DocBlocks with inline runs and style metadata. */
+  private static buildDocBlocks(tokens: ReturnType<typeof AgentModeService.lexMarkdown>): Array<{
+    text: string;
+    runs: Array<{ text: string; bold: boolean; italic: boolean; monospace: boolean }>;
+    namedStyleType?: string;
+    isBullet?: boolean;
+    isOrderedBullet?: boolean;
+    bulletNestLevel?: number;
+    isBlockquote?: boolean;
+    isCode?: boolean;
+    isBlank?: boolean;
+  }> {
+    type DocBlock = ReturnType<typeof AgentModeService.buildDocBlocks>[number];
+    const blocks: DocBlock[] = [];
+
+    for (const tok of tokens) {
+      switch (tok.type) {
+        case 'heading': {
+          const level = Math.min(tok.depth ?? 1, 3);
+          const runs = AgentModeService.parseInlineRuns(tok.text ?? '');
+          blocks.push({ text: runs.map(r => r.text).join(''), runs, namedStyleType: `HEADING_${level}` });
+          break;
+        }
+        case 'paragraph': {
+          const runs = AgentModeService.parseInlineRuns(tok.text ?? '');
+          blocks.push({ text: runs.map(r => r.text).join(''), runs });
+          break;
+        }
+        case 'list': {
+          for (const item of tok.items ?? []) {
+            const runs = AgentModeService.parseInlineRuns(item.text);
+            blocks.push({
+              text: runs.map(r => r.text).join(''),
+              runs,
+              isBullet: !tok.ordered,
+              isOrderedBullet: !!tok.ordered,
+              bulletNestLevel: 0,
+            });
+            for (const nested of item.nestedItems ?? []) {
+              const nRuns = AgentModeService.parseInlineRuns(nested.text);
+              blocks.push({
+                text: nRuns.map(r => r.text).join(''),
+                runs: nRuns,
+                isBullet: !nested.ordered,
+                isOrderedBullet: nested.ordered,
+                bulletNestLevel: 1,
+              });
+            }
+          }
+          break;
+        }
+        case 'blockquote': {
+          const runs = AgentModeService.parseInlineRuns(tok.text ?? '');
+          if (runs.length) blocks.push({ text: runs.map(r => r.text).join(''), runs, isBlockquote: true });
+          break;
+        }
+        case 'code': {
+          for (const codeLine of tok.codeLines ?? []) {
+            blocks.push({
+              text: codeLine,
+              runs: [{ text: codeLine, bold: false, italic: false, monospace: true }],
+              isCode: true,
+            });
+          }
+          break;
+        }
+        case 'table': {
+          if (tok.headerCells?.length) {
+            const hText = tok.headerCells.join(' | ');
+            blocks.push({ text: hText, runs: [{ text: hText, bold: true, italic: false, monospace: false }] });
+          }
+          for (const row of tok.dataRows ?? []) {
+            const rText = row.join(' | ');
+            blocks.push({ text: rText, runs: [{ text: rText, bold: false, italic: false, monospace: false }] });
+          }
+          break;
+        }
+        case 'hr': {
+          const hrText = '─────────────────────────────────────────';
+          blocks.push({ text: hrText, runs: [{ text: hrText, bold: false, italic: false, monospace: false }] });
+          break;
+        }
+        case 'space':
+          blocks.push({ text: '', runs: [], isBlank: true });
+          break;
+      }
+    }
+
+    return blocks;
+  }
+
+  /**
+   * Convert markdown to Google Docs API batchUpdate requests.
+   * Returns [] when content is blank (caller can skip batchUpdate).
+   */
+  static markdownToDocsRequests(markdown: string, insertIndex = 1): any[] {
+    if (!markdown?.trim()) return [];
+
+    const rawBlocks = AgentModeService.buildDocBlocks(AgentModeService.lexMarkdown(markdown));
+
+    // Strip leading/trailing blank lines
+    while (rawBlocks.length && rawBlocks[0].isBlank) rawBlocks.shift();
+    while (rawBlocks.length && rawBlocks[rawBlocks.length - 1].isBlank) rawBlocks.pop();
+
+    if (rawBlocks.length === 0) return [];
+
+    type Meta = { startIndex: number; endIndex: number; block: (typeof rawBlocks)[number] };
+    const blockMeta: Meta[] = [];
+    let pos = insertIndex;
+    let fullText = '';
+
+    for (const block of rawBlocks) {
+      const lineText = block.text + '\n';
+      blockMeta.push({ startIndex: pos, endIndex: pos + lineText.length, block });
+      fullText += lineText;
+      pos += lineText.length;
+    }
+
+    const requests: any[] = [];
+
+    // 1. Single insertText for all content
+    requests.push({ insertText: { location: { index: insertIndex }, text: fullText } });
+
+    // 2. Heading paragraph styles
+    for (const { startIndex, endIndex, block } of blockMeta) {
+      if (block.namedStyleType) {
+        requests.push({
+          updateParagraphStyle: {
+            range: { startIndex, endIndex },
+            paragraphStyle: { namedStyleType: block.namedStyleType },
+            fields: 'namedStyleType',
+          },
+        });
+      }
+    }
+
+    // 3. Blockquote: indent + italic
+    for (const { startIndex, endIndex, block } of blockMeta) {
+      if (!block.isBlockquote) continue;
+      requests.push({
+        updateParagraphStyle: {
+          range: { startIndex, endIndex },
+          paragraphStyle: { indentStart: { magnitude: 36, unit: 'PT' } },
+          fields: 'indentStart',
+        },
+      });
+      requests.push({
+        updateTextStyle: {
+          range: { startIndex, endIndex: endIndex - 1 },
+          textStyle: { italic: true },
+          fields: 'italic',
+        },
+      });
+    }
+
+    // 4. Code block: Courier New per non-empty line
+    for (const { startIndex, endIndex, block } of blockMeta) {
+      if (!block.isCode) continue;
+      if (startIndex < endIndex - 1) {
+        requests.push({
+          updateTextStyle: {
+            range: { startIndex, endIndex: endIndex - 1 },
+            textStyle: { weightedFontFamily: { fontFamily: 'Courier New', weight: 400 } },
+            fields: 'weightedFontFamily',
+          },
+        });
+      }
+    }
+
+    // 5. Inline text styles (bold, italic, monospace) per run
+    for (const { startIndex, block } of blockMeta) {
+      if (block.isBlockquote || block.isCode || block.isBlank) continue;
+      let offset = startIndex;
+      for (const run of block.runs) {
+        const runStart = offset;
+        const runEnd = offset + run.text.length;
+        offset = runEnd;
+        if (runStart >= runEnd) continue;
+        const textStyle: any = {};
+        const fields: string[] = [];
+        if (run.bold) { textStyle.bold = true; fields.push('bold'); }
+        if (run.italic) { textStyle.italic = true; fields.push('italic'); }
+        if (run.monospace) {
+          textStyle.weightedFontFamily = { fontFamily: 'Courier New', weight: 400 };
+          fields.push('weightedFontFamily');
+        }
+        if (!fields.length) continue;
+        requests.push({
+          updateTextStyle: {
+            range: { startIndex: runStart, endIndex: runEnd },
+            textStyle,
+            fields: fields.join(','),
+          },
+        });
+      }
+    }
+
+    // 6. Bullet/numbered lists — group consecutive bullet blocks
+    {
+      let i = 0;
+      while (i < blockMeta.length) {
+        const { block: b } = blockMeta[i];
+        if (!b.isBullet && !b.isOrderedBullet) { i++; continue; }
+        const isOrdered = !!b.isOrderedBullet;
+        let j = i;
+        while (
+          j + 1 < blockMeta.length &&
+          (blockMeta[j + 1].block.isBullet || blockMeta[j + 1].block.isOrderedBullet)
+        ) j++;
+
+        requests.push({
+          createParagraphBullets: {
+            range: { startIndex: blockMeta[i].startIndex, endIndex: blockMeta[j].endIndex - 1 },
+            bulletPreset: isOrdered ? 'NUMBERED_DECIMAL_ALPHA_ROMAN_SEQUENCE' : 'BULLET_DISC_CIRCLE_SQUARE',
+          },
+        });
+
+        // Indent nested items visually
+        for (let k = i; k <= j; k++) {
+          if ((blockMeta[k].block.bulletNestLevel ?? 0) > 0) {
+            requests.push({
+              updateParagraphStyle: {
+                range: { startIndex: blockMeta[k].startIndex, endIndex: blockMeta[k].endIndex },
+                paragraphStyle: {
+                  indentStart: { magnitude: 36, unit: 'PT' },
+                  indentFirstLine: { magnitude: 36, unit: 'PT' },
+                },
+                fields: 'indentStart,indentFirstLine',
+              },
+            });
+          }
+        }
+
+        i = j + 1;
+      }
+    }
+
+    return requests;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+
   public async createGoogleDoc(title: string, content: string, userId: string, folderId?: string, shareWithEmails?: string[]): Promise<any> {
     let docId: string | undefined;
     let drive: any;
@@ -17585,10 +18054,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const docUrl = createResp.data.webViewLink || `https://docs.google.com/document/d/${docId}/edit`;
 
       if (content) {
-        await docs.documents.batchUpdate({
-          documentId: docId,
-          requestBody: { requests: [{ insertText: { location: { index: 1 }, text: content } }] },
-        });
+        const requests = AgentModeService.markdownToDocsRequests(content, 1);
+        if (requests.length) {
+          await docs.documents.batchUpdate({ documentId: docId, requestBody: { requests } });
+        }
       }
 
       const emailsToShare = [...new Set(shareWithEmails || [])];
@@ -17640,9 +18109,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       const requests: any[] = [];
       if (endIndex > 1) requests.push({ deleteContentRange: { range: { startIndex: 1, endIndex } } });
-      requests.push({ insertText: { location: { index: 1 }, text: content } });
+      requests.push(...AgentModeService.markdownToDocsRequests(content, 1));
 
-      await docs.documents.batchUpdate({ documentId: fileId, requestBody: { requests } });
+      if (requests.length) {
+        await docs.documents.batchUpdate({ documentId: fileId, requestBody: { requests } });
+      }
 
       return {
         success: true,
