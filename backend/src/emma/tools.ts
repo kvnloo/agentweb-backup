@@ -6032,7 +6032,7 @@ emmaToolRegistry.register({
   name: 'get_website_analytics',
   definition: {
     name: 'get_website_analytics',
-    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources, top pages by engagement, and daily trends. If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
+    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources (with conversion counts per source/medium), key-event/conversion breakdown by traffic source and event name (conversionsBySource), top pages by engagement, and daily trends. Use conversionsBySource for UTM-source-level attribution of form fills and other conversion events. If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
     inputSchema: {
       type: 'object',
       properties: {
