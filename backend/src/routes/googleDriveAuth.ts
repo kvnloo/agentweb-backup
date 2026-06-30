@@ -115,7 +115,7 @@ router.get('/callback', (req, res) => {
     return res.redirect(`${frontendUrl}/oauth/google-drive/callback?error=no_code_provided`);
   }
 
-  res.redirect(`${frontendUrl}/oauth/google-drive/callback?code=${code}&state=${state}`);
+  res.redirect(`${frontendUrl}/oauth/google-drive/callback?code=${encodeURIComponent(code as string)}&state=${encodeURIComponent(state as string)}`);
 });
 
 // POST /finalize

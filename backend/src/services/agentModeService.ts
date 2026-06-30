@@ -17403,7 +17403,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const oauthClient = await this.getGoogleDriveOAuthClient(userId);
       drive = google.drive({ version: 'v3', auth: oauthClient });
       usingOAuth = true;
-    } catch {
+    } catch (e) {
+      console.error('[AgentMode] getGoogleDriveOAuthClient failed, falling back to SA:', e);
       drive = await this.getGoogleDriveClient();
     }
 
@@ -17473,20 +17474,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       refresh_token: cfg.refresh_token,
       expiry_date: cfg.token_expires_at,
     });
-    // Persist refreshed tokens back to DB
+    // Persist refreshed tokens back to DB — use updateAccountTokens to preserve all other account fields
     client.on('tokens', async (tokens) => {
       try {
-        const { createAccount } = await import('../services/connectedAccountsDb');
-        await createAccount(userId, 'google_drive', {
-          account_id: cfg.email,
-          account_name: cfg.display_name || cfg.email,
-          config: {
-            ...cfg,
-            access_token: tokens.access_token ?? cfg.access_token,
-            refresh_token: tokens.refresh_token ?? cfg.refresh_token,
-            token_expires_at: tokens.expiry_date ?? cfg.token_expires_at,
-          },
-        });
+        const { updateAccountTokens } = await import('../services/connectedAccountsDb');
+        await updateAccountTokens(userId, 'google_drive', {
+          access_token: tokens.access_token ?? cfg.access_token,
+          refresh_token: tokens.refresh_token ?? cfg.refresh_token,
+          token_expires_at: tokens.expiry_date ?? cfg.token_expires_at,
+        }, cfg.email);
       } catch { /* best effort */ }
     });
     return client;
@@ -17496,15 +17492,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     try {
       const auth = await this.getGoogleDriveOAuthClient(userId);
       const drive = google.drive({ version: 'v3', auth });
-      const folderId = folderIdOrUrl.match(/\/folders\/([a-zA-Z0-9_-]+)/)?.[1] ?? folderIdOrUrl.trim();
+
+      const folderIdFromUrl = folderIdOrUrl.match(/\/folders\/([a-zA-Z0-9_-]+)/)?.[1];
+      const rawId = folderIdOrUrl.trim();
+      const folderId = folderIdFromUrl ?? (/^[a-zA-Z0-9_-]+$/.test(rawId) ? rawId : null);
+      if (!folderId) {
+        return { success: false, message: 'Invalid folder ID or URL. Please provide a valid Google Drive folder URL or folder ID.' };
+      }
 
       const resp = await drive.files.list({
         q: `'${folderId}' in parents and trashed = false`,
-        fields: 'files(id,name,mimeType,modifiedTime,webViewLink)',
+        fields: 'files(id,name,mimeType,modifiedTime,webViewLink),nextPageToken',
         orderBy: 'name',
+        pageSize: 100,
       });
 
       const files = resp.data.files || [];
+      const hasMore = !!resp.data.nextPageToken;
+
       if (files.length === 0) {
         return { success: true, message: 'Folder is empty.', files: [] };
       }
@@ -17519,7 +17524,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       return {
         success: true,
-        message: `Found ${files.length} item(s) in folder.`,
+        message: `Found ${files.length} item(s) in folder.${hasMore ? ' (Showing first 100 — folder has more items.)' : ''}`,
         folder_id: folderId,
         files: formatted,
       };
@@ -17561,9 +17566,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   public async createGoogleDoc(title: string, content: string, userId: string, folderId?: string, shareWithEmails?: string[]): Promise<any> {
+    let docId: string | undefined;
+    let drive: any;
     try {
       const auth = await this.getGoogleDriveOAuthClient(userId);
-      const drive = google.drive({ version: 'v3', auth });
+      drive = google.drive({ version: 'v3', auth });
       const docs = google.docs({ version: 'v1', auth });
 
       const createResp = await drive.files.create({
@@ -17574,7 +17581,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         },
         fields: 'id,name,webViewLink',
       });
-      const docId = createResp.data.id!;
+      docId = createResp.data.id!;
       const docUrl = createResp.data.webViewLink || `https://docs.google.com/document/d/${docId}/edit`;
 
       if (content) {
@@ -17605,6 +17612,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         title,
       };
     } catch (error: any) {
+      if (docId && drive) {
+        try { await drive.files.delete({ fileId: docId }); } catch {}
+      }
       console.error('AgentMode: Error creating Google Doc:', error);
       const code = error?.code || error?.status;
       if (code === 403 || code === 401) {
@@ -17625,8 +17635,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       const docResp = await docs.documents.get({ documentId: fileId });
       const body = docResp.data.body?.content || [];
-      const lastEl = body[body.length - 1];
-      const endIndex = (lastEl?.endIndex ?? 2) - 1;
+      const lastEl = body.length > 0 ? body[body.length - 1] : null;
+      const endIndex = lastEl ? (lastEl.endIndex ?? 2) - 1 : 0;
 
       const requests: any[] = [];
       if (endIndex > 1) requests.push({ deleteContentRange: { range: { startIndex: 1, endIndex } } });
@@ -17644,7 +17654,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       console.error('AgentMode: Error updating Google Doc:', error);
       const code = error?.code || error?.status;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot update this Google Doc — it was not created by Emma. Emma can only edit Docs she created.' };
+        return { success: false, message: 'Cannot update this Google Doc — you may not have edit access to it, or it may have been deleted.' };
       }
       if (code === 404) {
         return { success: false, message: 'Google Doc not found. Check the URL or ID and try again.' };
@@ -17654,9 +17664,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   public async createGoogleSheet(title: string, data: string[][], userId: string, folderId?: string, shareWithEmails?: string[]): Promise<any> {
+    let sheetId: string | undefined;
+    let drive: any;
     try {
       const auth = await this.getGoogleDriveOAuthClient(userId);
-      const drive = google.drive({ version: 'v3', auth });
+      drive = google.drive({ version: 'v3', auth });
       const sheets = google.sheets({ version: 'v4', auth });
 
       const createResp = await drive.files.create({
@@ -17667,7 +17679,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         },
         fields: 'id,name,webViewLink',
       });
-      const sheetId = createResp.data.id!;
+      sheetId = createResp.data.id!;
       const sheetUrl = createResp.data.webViewLink || `https://docs.google.com/spreadsheets/d/${sheetId}/edit`;
 
       if (data && data.length > 0) {
@@ -17700,6 +17712,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         title,
       };
     } catch (error: any) {
+      if (sheetId && drive) {
+        try { await drive.files.delete({ fileId: sheetId }); } catch {}
+      }
       console.error('AgentMode: Error creating Google Sheet:', error);
       const code = error?.code || error?.status;
       if (code === 403 || code === 401) {
