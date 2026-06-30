@@ -215,6 +215,19 @@ describe('Google Drive OAuth routes', () => {
       expect(res.headers.location).toContain('http://localhost:5174/oauth/google-drive/callback');
     });
 
+    it('URL-encodes code and state so special characters survive the redirect', async () => {
+      const code = 'abc/def=ghi+jkl';
+      const state = 'tok&en=val';
+      const res = await request(app)
+        .get('/callback')
+        .query({ code, state });
+
+      expect(res.status).toBe(302);
+      const location = res.headers.location as string;
+      expect(location).toContain(`code=${encodeURIComponent(code)}`);
+      expect(location).toContain(`state=${encodeURIComponent(state)}`);
+    });
+
     it('redirects with error=google_drive_access_denied when Google returns an error', async () => {
       const res = await request(app)
         .get('/callback')

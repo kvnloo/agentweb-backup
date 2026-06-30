@@ -76,6 +76,7 @@ const mockDriveFiles = {
   create: jest.fn(),
   get: jest.fn(),
   export: jest.fn(),
+  delete: jest.fn(),
 };
 const mockDrivePermissions = { create: jest.fn() };
 const mockDriveComments = { list: jest.fn() };
@@ -102,6 +103,7 @@ jest.mock('googleapis', () => ({
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountByPlatform: jest.fn(),
   createAccount: jest.fn().mockResolvedValue({}),
+  updateAccountTokens: jest.fn().mockResolvedValue(undefined),
 }));
 
 jest.mock('../config/integrations', () => ({
@@ -196,6 +198,25 @@ describe('AgentModeService - Google Drive methods', () => {
         expiry_date: FAKE_ACCOUNT.config.token_expires_at,
       });
     });
+
+    it('calls updateAccountTokens (not createAccount) when tokens are refreshed', async () => {
+      mockDriveFiles.list.mockResolvedValue({ data: { files: [] } });
+      await service.listGoogleDriveFolder('folder-id', USER_ID);
+
+      // Find and invoke the 'tokens' handler registered on the OAuth client
+      const tokenCall = mockOAuth2Client.on.mock.calls.find(([event]: [string]) => event === 'tokens');
+      expect(tokenCall).toBeDefined();
+      const [, tokenHandler] = tokenCall;
+      await tokenHandler({ access_token: 'new-access-token', expiry_date: Date.now() + 7_200_000 });
+
+      expect(connectedAccountsDb.updateAccountTokens).toHaveBeenCalledWith(
+        USER_ID,
+        'google_drive',
+        expect.objectContaining({ access_token: 'new-access-token' }),
+        FAKE_ACCOUNT.config.email
+      );
+      expect(connectedAccountsDb.createAccount).not.toHaveBeenCalled();
+    });
   });
 
   // ────────────────────────────────────────────────────────────────────────────
@@ -227,6 +248,13 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(mockDriveFiles.list).toHaveBeenCalledWith(
         expect.objectContaining({ q: expect.stringContaining('raw-folder-id') })
       );
+    });
+
+    it('returns { success: false } for a malformed folder ID without calling Drive API', async () => {
+      const result = await service.listGoogleDriveFolder("abc' OR '1'='1", USER_ID);
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/Invalid folder ID/i);
+      expect(mockDriveFiles.list).not.toHaveBeenCalled();
     });
 
     it('returns formatted file list on success', async () => {
@@ -265,6 +293,25 @@ describe('AgentModeService - Google Drive methods', () => {
       const result = await service.listGoogleDriveFolder('folder-id', USER_ID);
       expect(result.success).toBe(false);
       expect(result.message).toMatch(/Folder not found/i);
+    });
+
+    it('includes truncation warning when Drive returns nextPageToken', async () => {
+      const files = Array.from({ length: 100 }, (_, i) => ({
+        id: `f${i}`, name: `file-${i}.txt`, mimeType: 'text/plain',
+        modifiedTime: '2024-01-01T00:00:00Z', webViewLink: `https://drive.google.com/file/d/f${i}`,
+      }));
+      mockDriveFiles.list.mockResolvedValue({ data: { files, nextPageToken: 'page-token-xyz' } });
+      const result = await service.listGoogleDriveFolder('folder-id', USER_ID);
+      expect(result.success).toBe(true);
+      expect(result.files).toHaveLength(100);
+      expect(result.message).toMatch(/Showing first 100/i);
+    });
+
+    it('does not include truncation warning when all items fit in one page', async () => {
+      const files = [{ id: 'f1', name: 'only.txt', mimeType: 'text/plain', modifiedTime: '2024-01-01', webViewLink: '' }];
+      mockDriveFiles.list.mockResolvedValue({ data: { files } });
+      const result = await service.listGoogleDriveFolder('folder-id', USER_ID);
+      expect(result.message).not.toMatch(/Showing first 100/i);
     });
   });
 
@@ -402,6 +449,14 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(result.success).toBe(false);
       expect(result.message).toMatch(/Folder not found/i);
     });
+
+    it('deletes the created file when batchUpdate fails to prevent orphaned docs', async () => {
+      mockDriveFiles.delete.mockResolvedValue({});
+      mockDocuments.batchUpdate.mockRejectedValue(new Error('Docs API quota exceeded'));
+      const result = await service.createGoogleDoc('Test Doc', 'content', USER_ID);
+      expect(result.success).toBe(false);
+      expect(mockDriveFiles.delete).toHaveBeenCalledWith({ fileId: 'doc-id-1' });
+    });
   });
 
   // ────────────────────────────────────────────────────────────────────────────
@@ -441,11 +496,13 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(requests.some((r: any) => r.insertText)).toBe(true);
     });
 
-    it('returns friendly 403 message', async () => {
+    it('returns friendly 403 message that reflects access issue, not file ownership', async () => {
       mockDocuments.get.mockRejectedValue(makeApiError(403));
       const result = await service.updateGoogleDoc('file-id', 'content', USER_ID);
       expect(result.success).toBe(false);
       expect(result.message).toMatch(/Cannot update this Google Doc/i);
+      expect(result.message).toMatch(/edit access/i);
+      expect(result.message).not.toMatch(/not created by Emma/i);
     });
 
     it('returns friendly 404 message', async () => {
@@ -453,6 +510,15 @@ describe('AgentModeService - Google Drive methods', () => {
       const result = await service.updateGoogleDoc('file-id', 'content', USER_ID);
       expect(result.success).toBe(false);
       expect(result.message).toMatch(/Google Doc not found/i);
+    });
+
+    it('handles empty document body without throwing and inserts content directly', async () => {
+      mockDocuments.get.mockResolvedValue({ data: { body: { content: [] } } });
+      const result = await service.updateGoogleDoc('file-id', 'New content', USER_ID);
+      expect(result.success).toBe(true);
+      const requests: any[] = mockDocuments.batchUpdate.mock.calls[0][0].requestBody.requests;
+      expect(requests.some((r: any) => r.deleteContentRange)).toBe(false);
+      expect(requests.some((r: any) => r.insertText)).toBe(true);
     });
   });
 
@@ -506,6 +572,14 @@ describe('AgentModeService - Google Drive methods', () => {
       const result = await service.createGoogleSheet('My Sheet', [], USER_ID, 'missing-folder');
       expect(result.success).toBe(false);
       expect(result.message).toMatch(/Folder not found/i);
+    });
+
+    it('deletes the created file when data write fails to prevent orphaned sheets', async () => {
+      mockDriveFiles.delete.mockResolvedValue({});
+      mockSheetsValues.update.mockRejectedValue(new Error('Sheets API quota exceeded'));
+      const result = await service.createGoogleSheet('My Sheet', [['A', 'B']], USER_ID);
+      expect(result.success).toBe(false);
+      expect(mockDriveFiles.delete).toHaveBeenCalledWith({ fileId: 'sheet-id-1' });
     });
   });
 
