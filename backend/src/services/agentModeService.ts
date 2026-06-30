@@ -130,6 +130,7 @@ import {
   validateAndRepairToolArgs,
 } from './agentToolGatewayService';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { summarizeBreakdownSections } from './agentMode/metaBreakdownStatus';
 
 type MetaApiResult = {
   success: boolean;
@@ -14504,17 +14505,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         console.error('AgentMode: Campaign-level Insights API Error:', campaignInsightsData.error);
         throw new Error(`Campaign-level Insights API Error: ${campaignInsightsData.error.message}`);
       }
-      if (insightsDemographicsData.error) {
-        console.error('AgentMode: Demographics Insights API Error:', insightsDemographicsData.error);
-        // Don't throw; proceed without demographics
-      }
-      if (insightsPlacementData.error) {
-        console.error('AgentMode: Placement Insights API Error:', insightsPlacementData.error);
-        // Don't throw; proceed without placements
-      }
-      if (insightsDeviceData.error) {
-        console.error('AgentMode: Device Insights API Error:', insightsDeviceData.error);
-        // Don't throw; proceed without devices
+      // ENG-104: breakdown endpoints are NON-fatal (we proceed without them), but
+      // a missing/errored breakdown must be distinguishable from an empty-but-OK
+      // one. Summarize the three raw responses into an explicit per-section status
+      // and surface partial failures in ONE structured warning (telemetry-visible)
+      // instead of three scattered console.errors.
+      const breakdownStatus = summarizeBreakdownSections({
+        demographics: insightsDemographicsData,
+        placement: insightsPlacementData,
+        device: insightsDeviceData,
+      });
+      if (breakdownStatus.partialFailure) {
+        console.warn('AgentMode: get_meta_ads_metrics partial breakdown failure', {
+          tool: 'get_meta_ads_metrics',
+          unavailableSections: breakdownStatus.unavailableSections,
+          sectionErrors: breakdownStatus.sectionErrors,
+        });
       }
 
       // Process the data using simplified logic (filtering is now done at API level)
@@ -14558,11 +14564,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       const result = {
         success: true,
-        message: `Meta ads metrics loaded for ${timeframe} timeframe`,
+        message: breakdownStatus.partialFailure
+          ? `Meta ads metrics loaded for ${timeframe} timeframe (some breakdown sections unavailable: ${breakdownStatus.unavailableSections.join(', ')})`
+          : `Meta ads metrics loaded for ${timeframe} timeframe`,
         timeframe,
         attributionWindow: { start: sinceStr, end: untilStr, days: attributionDays },
         campaignSummary,
-        formattedContent
+        formattedContent,
+        // ENG-104: which breakdown sections are complete vs unavailable, so a
+        // partial result is explicit in the tool result (and flows into the tool
+        // telemetry that captures the tool output) rather than looking fully ok.
+        sections: breakdownStatus.sections,
+        partialFailure: breakdownStatus.partialFailure,
+        unavailableSections: breakdownStatus.unavailableSections,
       };
 
       return result;
