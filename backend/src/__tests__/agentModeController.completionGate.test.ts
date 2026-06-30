@@ -28,6 +28,9 @@ describe('scheduledRunSignalsIncompleteWork — completion-gate detector', () =>
     "I didn't finish researching Events 2 and 3.",
     'I will continue with the remaining leads later.',
     'The remaining events were not processed in this run.',
+    "I'll continue with Step 2 next.",
+    'Next, I will proceed with the remaining workflow steps.',
+    'I skipped the remaining lead approval steps.',
   ];
 
   it.each(incompleteAdmissions)('fires on incomplete-work admission: %s', (text) => {
@@ -69,5 +72,9 @@ Event 3 — I stopped row-by-row LinkedIn extraction before fully resolving each
 
   it('is case-insensitive', () => {
     expect(scheduledRunSignalsIncompleteWork('I DID NOT FINISH the remaining events.')).toBe(true);
+  });
+
+  it('does NOT fire on user-facing next steps after a complete report', () => {
+    expect(scheduledRunSignalsIncompleteWork('All leads processed. Next steps: connect Bob on LinkedIn.')).toBe(false);
   });
 });
