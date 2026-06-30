@@ -246,3 +246,85 @@ describe('AgentRunRecorder failed-call args capture', () => {
     expect((puts[0].item as any).dimensions.failedArgsJson).toBeUndefined();
   });
 });
+
+describe('AgentRunRecorder serialized write chain (ENG-102)', () => {
+  // The recorder must serialize writes for one run so a terminal run record
+  // (run_completed/run_failed) can never persist before the per-tool records
+  // enqueued before it, and a drain (flush) before teardown guarantees nothing
+  // is lost on worker exit. Persistence failures surface as a structured logger
+  // signal + writeFailures counter, not console-only.
+
+  it('serializes a terminal record AFTER per-tool records even when tool puts are slow', async () => {
+    // Fake Dynamo that DELAYS only the per-tool events; resolves run_completed
+    // immediately. Without the chain, the immediate run_completed put would land
+    // before the delayed tool_failed put (the original fire-and-forget bug).
+    const puts: Array<{ item: any }> = [];
+    const port: DynamoPort = {
+      putItem: jest.fn(async (_table: string, item: DynamoAttributeMap) => {
+        const eventType = (item as any).eventType as string;
+        if (eventType.startsWith('agent_tool_')) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        puts.push({ item });
+      }),
+      getItem: jest.fn(async () => null),
+      query: jest.fn(async () => ({ items: [] })),
+    };
+    const rec = new AgentRunRecorder(port, clock);
+
+    // Fire-and-forget call order: tool failure first, then the terminal record.
+    void rec.toolFailed('run-1', { toolName: 'publish_post', error: new Error('boom'), durationMs: 5 });
+    void rec.runCompleted('run-1', { toolCalls: 1, failedToolCalls: 1 });
+
+    await rec.flush();
+
+    const order = puts.map((p) => p.item.eventType);
+    const failedIdx = order.indexOf(EVT_TOOL_FAILED);
+    const completedIdx = order.indexOf(EVT_RUN_COMPLETED);
+    expect(failedIdx).toBeGreaterThanOrEqual(0);
+    expect(completedIdx).toBeGreaterThanOrEqual(0);
+    // The per-tool record is durably written BEFORE the terminal record.
+    expect(failedIdx).toBeLessThan(completedIdx);
+  });
+
+  it('flush() drains all enqueued writes (nothing lost if the caller drains before exit)', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    // Many fire-and-forget emits without awaiting individual calls.
+    void rec.runStarted('run-1', { sessionId: 'sess-1' });
+    void rec.toolInvoked('run-1', { toolName: 'search', iteration: 1 });
+    void rec.toolSucceeded('run-1', { toolName: 'search', durationMs: 3 });
+    void rec.toolInvoked('run-1', { toolName: 'send_email', iteration: 1 });
+    void rec.toolFailed('run-1', { toolName: 'send_email', error: new Error('x') });
+    void rec.runCompleted('run-1', { toolCalls: 2, failedToolCalls: 1 });
+
+    await rec.flush();
+
+    // runStarted(1) + invoked(2) + succeeded(1) + failed(1) + completed(1) + verdict(1) = 7
+    expect(puts).toHaveLength(7);
+  });
+
+  it('surfaces a write failure as a structured logger signal + writeFailures counter (not a throw)', async () => {
+    const port: DynamoPort = {
+      putItem: jest.fn().mockRejectedValue(new Error('Request failed with status code 429')),
+      getItem: jest.fn(),
+      query: jest.fn(),
+    };
+    const log = jest.fn();
+    const rec = new AgentRunRecorder(port, clock, undefined, { log });
+
+    // The calling method must NOT throw — it resolves even though the write failed.
+    await expect(
+      rec.toolFailed('run-1', { toolName: 't', error: new Error('inner') }),
+    ).resolves.toBeUndefined();
+    await rec.flush();
+
+    expect(rec.writeFailures).toBe(1);
+    expect(log).toHaveBeenCalledWith(
+      'error',
+      'agent_recorder_write_failed',
+      expect.objectContaining({ eventType: EVT_TOOL_FAILED, runId: 'run-1', errorClass: 'rate_limit' }),
+    );
+  });
+});

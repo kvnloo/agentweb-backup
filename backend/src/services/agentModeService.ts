@@ -180,43 +180,49 @@ function recordAgentModeToolTelemetry(
   const recorder = getAgentRunRecorderSafe();
   if (!recorder || toolResults.length === 0) return;
 
-  void (async () => {
-    try {
-      const toolNames = toolResults.map(r => r.toolCall?.function?.name ?? 'unknown');
-      // PR #1818 follow-up: contract-layer activity as countable telemetry so
-      // the enforcement decision has data (args_repaired / schema-error rates).
-      const argsRepairedCount = toolResults.filter(
-        (r) => r.policyDecision?.flags?.some((flag) => flag.code === 'args_repaired'),
-      ).length;
-      const schemaErrorCount = toolResults.filter(
-        (r) => r.status === 'error' && classifyToolErrorClass(r.error) === 'invalid_args',
-      ).length;
-      await recorder.decision(runId, {
-        iteration,
-        toolNames,
-        sessionId,
-        toolArgKeys: summarizeToolArgKeys(toolResults),
-        toolArgsPreview: summarizeToolArgs(toolResults),
-        decisionExplanation: summarizeToolDecision(toolResults),
-        explanationSource: 'deterministic_tool_summary',
-        toolPolicyFlags: summarizeAgentToolPolicyFlags(toolResults.map((r) => r.policyDecision)),
-        toolPolicySummary: summarizeAgentToolPolicyModes(toolResults.map((r) => r.policyDecision)),
-        argsRepairedCount,
-        schemaErrorCount,
-      });
-      for (const r of toolResults) {
-        const toolName = r.toolCall?.function?.name ?? 'unknown';
-        await recorder.toolInvoked(runId, { toolName, iteration, sessionId });
-        if (r.status === 'success') {
-          await recorder.toolSucceeded(runId, { toolName, durationMs: r.duration, sessionId });
-        } else {
-          await recorder.toolFailed(runId, { toolName, error: r.error, durationMs: r.duration, sessionId, args: r.functionArgs });
-        }
+  // ENG-102: enqueue the per-tool records SYNCHRONOUSLY (no detached `void
+  // (async)` wrapper). The recorder's internal write chain serializes them in
+  // call order, so they always precede the terminal run record enqueued after
+  // the loop — and the terminal record's flush implies these are durably
+  // written before the worker exits. Still non-blocking from the caller's view:
+  // the recorder methods return immediately and the chain settles in the
+  // background (drained at run end). Only the synchronous summary computation is
+  // wrapped in try/catch — telemetry must never break the chat hot path.
+  try {
+    const toolNames = toolResults.map(r => r.toolCall?.function?.name ?? 'unknown');
+    // PR #1818 follow-up: contract-layer activity as countable telemetry so
+    // the enforcement decision has data (args_repaired / schema-error rates).
+    const argsRepairedCount = toolResults.filter(
+      (r) => r.policyDecision?.flags?.some((flag) => flag.code === 'args_repaired'),
+    ).length;
+    const schemaErrorCount = toolResults.filter(
+      (r) => r.status === 'error' && classifyToolErrorClass(r.error) === 'invalid_args',
+    ).length;
+    void recorder.decision(runId, {
+      iteration,
+      toolNames,
+      sessionId,
+      toolArgKeys: summarizeToolArgKeys(toolResults),
+      toolArgsPreview: summarizeToolArgs(toolResults),
+      decisionExplanation: summarizeToolDecision(toolResults),
+      explanationSource: 'deterministic_tool_summary',
+      toolPolicyFlags: summarizeAgentToolPolicyFlags(toolResults.map((r) => r.policyDecision)),
+      toolPolicySummary: summarizeAgentToolPolicyModes(toolResults.map((r) => r.policyDecision)),
+      argsRepairedCount,
+      schemaErrorCount,
+    });
+    for (const r of toolResults) {
+      const toolName = r.toolCall?.function?.name ?? 'unknown';
+      void recorder.toolInvoked(runId, { toolName, iteration, sessionId });
+      if (r.status === 'success') {
+        void recorder.toolSucceeded(runId, { toolName, durationMs: r.duration, sessionId });
+      } else {
+        void recorder.toolFailed(runId, { toolName, error: r.error, durationMs: r.duration, sessionId, args: r.functionArgs });
       }
-    } catch (err) {
-      console.error('[agent-mode] tool telemetry failed (swallowed):', err);
     }
-  })();
+  } catch (err) {
+    console.error('[agent-mode] tool telemetry failed (swallowed):', err);
+  }
 }
 
 
@@ -354,6 +360,25 @@ function getAgentRunRecorderSafe() {
   } catch (err) {
     console.error('[agent-mode] runtime spine recorder unavailable (swallowed):', err);
     return null;
+  }
+}
+
+/**
+ * Drain the recorder's pending writes before worker/IPC teardown (ENG-102) so
+ * per-tool + terminal telemetry are durably written before the worker process
+ * exits — bounded by a timeout (mirroring the 5s generateSuggestedReplies guard)
+ * so it can never hang the response. No-op when the runtime spine is disabled.
+ */
+async function flushAgentRunRecorderSafe(timeoutMs = 5000): Promise<void> {
+  const recorder = getAgentRunRecorderSafe();
+  if (!recorder) return;
+  try {
+    await Promise.race([
+      recorder.flush(),
+      new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+    ]);
+  } catch {
+    // best-effort — telemetry drain must never break the chat turn
   }
 }
 
@@ -3193,6 +3218,10 @@ export class AgentModeService {
         failedToolCalls: countFailedToolCalls(toolCalls),
         maxSameToolFailures: maxSameToolFailureCount(toolCalls),
       });
+      // ENG-102: drain telemetry before the worker reports success to the parent
+      // process (fire-and-forget would race with IPC teardown — same treatment
+      // the suggested-replies tail work already gets). Bounded, so never hangs.
+      await flushAgentRunRecorderSafe();
       return {
         content,
         toolCalls,
@@ -3258,6 +3287,8 @@ export class AgentModeService {
         failedToolCalls: countFailedToolCalls(_toolCallsForTelemetry),
         maxSameToolFailures: maxSameToolFailureCount(_toolCallsForTelemetry),
       });
+      // ENG-102: drain telemetry before the error propagates / worker tears down.
+      await flushAgentRunRecorderSafe();
       throw wrappedError;
     }
   }
