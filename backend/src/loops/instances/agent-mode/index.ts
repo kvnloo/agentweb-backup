@@ -19,6 +19,7 @@
 import { CaptureGate } from '../../core/gates/captureGate';
 import { SlackReactionGate } from '../../core/gates/slackReactionGate';
 import { postLoopDigest, type LoopDigestTemplate } from '../../core/digest/loopDigest';
+import { claimLoopDailyDigestPost } from '../../core/digest/dailyDigestClaim';
 import { createInstanceRunner } from '../../core/instanceRunner';
 import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
 import { CooldownRuleSet } from '../../core/policy/cooldownRuleSet';
@@ -66,7 +67,15 @@ const runner = createInstanceRunner({
     // AGENT_MODE_LOOP_DIGEST=true once the Slack approval gate (C1) makes the
     // digest actionable. See dev.md 2026-06-14.
     if (process.env.AGENT_MODE_LOOP_DIGEST !== 'true') return;
-    await postLoopDigest(result, ports.slack, manifest.approval.slackUserId, agentModeDigestTemplate, drained.length);
+    await postLoopDigest(result, ports.slack, manifest.approval.slackUserId, agentModeDigestTemplate, drained.length, {
+      claimDailyDigest: (digestDate, slackUserId, runId) =>
+        claimLoopDailyDigestPost(ports.dynamo, {
+          loopId: AGENT_MODE_LOOP_ID,
+          digestDate,
+          slackUserId,
+          runId,
+        }),
+    });
   },
 });
 
@@ -153,10 +162,10 @@ const agentModeDigestTemplate: LoopDigestTemplate<number> = {
     `_No agent-mode tool events in the 7d window — recorder off, or no tool use. Not "healthy", just empty._`,
   ],
   quietBody: () => [
-    `_No tool crossed the failure threshold this window. Tool reliability looks healthy._`,
+    `_No tool crossed the failure threshold this window. Keep watching the trend; this is not a dispatchable finding._`,
   ],
   findingsBody: (result, drainedCount) => [
-    `*Failing tools (fix specs dispatched: ${drainedCount})*`,
+    `*Failing tools (fix specs prepared: ${drainedCount})*`,
     ...result.proposals.map((p, i) => `${i + 1}. ${p.hypothesis}`),
   ],
 };
