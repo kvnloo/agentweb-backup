@@ -6,7 +6,10 @@
  * empty-but-successful one, and that a partial failure is reported explicitly.
  */
 
-import { summarizeBreakdownSections } from '../services/agentMode/metaBreakdownStatus';
+import {
+  summarizeBreakdownSections,
+  buildToolPartialFailureTelemetry,
+} from '../services/agentMode/metaBreakdownStatus';
 
 describe('summarizeBreakdownSections (ENG-104)', () => {
   it('reports no partial failure when all three sections have data', () => {
@@ -71,5 +74,46 @@ describe('summarizeBreakdownSections (ENG-104)', () => {
     expect(summary.sections.placement).toBe('unavailable');
     expect(summary.sections.device).toBe('ok');
     expect(summary.unavailableSections).toEqual(['demographics', 'placement']);
+  });
+});
+
+describe('buildToolPartialFailureTelemetry (ENG-104 — telemetry routing)', () => {
+  it('builds a payload from a tool result flagged partialFailure, carrying the unavailable sections', () => {
+    // The exact shape getMetaAdsMetrics attaches on a partial breakdown failure.
+    const result = {
+      success: true,
+      partialFailure: true,
+      unavailableSections: ['demographics', 'device'],
+      formattedContent: 'metrics…',
+    };
+    const payload = buildToolPartialFailureTelemetry('get_meta_ads_metrics', result);
+    expect(payload).toEqual({
+      toolName: 'get_meta_ads_metrics',
+      unavailableSections: ['demographics', 'device'],
+    });
+  });
+
+  it('returns null for an all-success result (no partialFailure) — the success path emits nothing', () => {
+    const result = {
+      success: true,
+      partialFailure: false,
+      unavailableSections: [],
+      formattedContent: 'metrics…',
+    };
+    expect(buildToolPartialFailureTelemetry('get_meta_ads_metrics', result)).toBeNull();
+  });
+
+  it('returns null for a result with no partial-failure fields at all (other tools)', () => {
+    expect(buildToolPartialFailureTelemetry('save_memory', { success: true })).toBeNull();
+    expect(buildToolPartialFailureTelemetry('save_memory', 'plain string')).toBeNull();
+    expect(buildToolPartialFailureTelemetry('save_memory', undefined)).toBeNull();
+  });
+
+  it('coerces a malformed unavailableSections to an empty array (never throws)', () => {
+    const payload = buildToolPartialFailureTelemetry('get_meta_ads_metrics', {
+      partialFailure: true,
+      unavailableSections: 'demographics', // not an array
+    });
+    expect(payload).toEqual({ toolName: 'get_meta_ads_metrics', unavailableSections: [] });
   });
 });

@@ -20,6 +20,7 @@ import {
   EVT_TOOL_DEFERRED,
   EVT_TOOL_FAILED,
   EVT_TOOL_INVOKED,
+  EVT_TOOL_PARTIAL_FAILURE,
   EVT_TOOL_SUCCEEDED,
 } from '../loops/instances/agent-mode/eventTypes';
 import type { DynamoAttributeMap, DynamoPort } from '../loops/core/ports';
@@ -181,6 +182,42 @@ describe('AgentRunRecorder', () => {
     expect(item.dimensions.iteration).toBe(4);
     expect(item.dimensions.mediaAssetsProducedThisRun).toBe(3);
     expect(item.dimensions.deadlineMs).toBe(1700000000000);
+  });
+
+  it('records a partial-failure tool call as its own event class with the unavailable sections (ENG-104)', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    await rec.toolPartialFailure('sess-1:run:abc', {
+      toolName: 'get_meta_ads_metrics',
+      unavailableSections: ['demographics', 'device'],
+      iteration: 2,
+      sessionId: 'sess-1',
+    });
+
+    const item = puts[0].item as any;
+    // Partial failure is its OWN class — NOT toolFailed (the call succeeded) and
+    // NOT toolDeferred (the call executed).
+    expect(item.eventType).toBe(EVT_TOOL_PARTIAL_FAILURE);
+    expect(item.subjectId).toBe('sess-1:run:abc');
+    expect(item.dimensions.toolName).toBe('get_meta_ads_metrics');
+    // Sections are stored comma-joined + a numeric count (cleanDims drops arrays).
+    expect(item.dimensions.unavailableSections).toBe('demographics,device');
+    expect(item.dimensions.unavailableCount).toBe(2);
+    expect(item.dimensions.iteration).toBe(2);
+    expect(item.dimensions.sessionId).toBe('sess-1');
+  });
+
+  it('partial-failure telemetry never throws into the caller hot path when Dynamo fails', async () => {
+    const port: DynamoPort = {
+      putItem: jest.fn().mockRejectedValue(new Error('dynamo down')),
+      getItem: jest.fn(),
+      query: jest.fn(),
+    };
+    const rec = new AgentRunRecorder(port, clock);
+    await expect(
+      rec.toolPartialFailure('sess-1', { toolName: 't', unavailableSections: ['x'] }),
+    ).resolves.toBeUndefined();
   });
 
   it('never throws into the caller hot path when Dynamo fails', async () => {

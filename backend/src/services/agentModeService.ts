@@ -120,7 +120,7 @@ import {
   validateAndRepairToolArgs,
 } from './agentToolGatewayService';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
-import { summarizeBreakdownSections } from './agentMode/metaBreakdownStatus';
+import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './agentMode/metaBreakdownStatus';
 import { validateToolOutputContract } from '../utils/toolOutputContract';
 
 type MetaApiResult = {
@@ -167,7 +167,7 @@ function recordAgentModeToolTelemetry(
   runId: string,
   sessionId: string,
   iteration: number,
-  toolResults: Array<{ status: 'success' | 'error' | 'deferred'; toolCall: any; functionArgs?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>,
+  toolResults: Array<{ status: 'success' | 'error' | 'deferred'; toolCall: any; functionArgs?: any; result?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>,
   budgetContext?: { mediaAssetsProducedThisRun?: number; mediaGenerationDeadlineMs?: number },
 ): void {
   const recorder = getAgentRunRecorderSafe();
@@ -227,6 +227,21 @@ function recordAgentModeToolTelemetry(
       void recorder.toolInvoked(runId, { toolName, iteration, sessionId });
       if (r.status === 'success') {
         void recorder.toolSucceeded(runId, { toolName, durationMs: r.duration, sessionId });
+        // ENG-104: a success that returned an explicitly partial result (e.g.
+        // get_meta_ads_metrics with an errored breakdown section) is still a
+        // success, but its degradation is recorded as its own class so a section
+        // silently going dark is visible in telemetry instead of hiding behind
+        // success:true. Emitted only when the result is flagged partialFailure —
+        // the all-success path emits nothing (behavior-preserving).
+        const partial = buildToolPartialFailureTelemetry(toolName, r.result);
+        if (partial) {
+          void recorder.toolPartialFailure(runId, {
+            toolName: partial.toolName,
+            unavailableSections: partial.unavailableSections,
+            iteration,
+            sessionId,
+          });
+        }
       } else {
         void recorder.toolFailed(runId, { toolName, error: r.error, durationMs: r.duration, sessionId, args: r.functionArgs });
       }

@@ -88,3 +88,35 @@ export function summarizeBreakdownSections(input: {
     sectionErrors,
   };
 }
+
+/** Structured telemetry payload for a tool that succeeded with a partial result. */
+export interface ToolPartialFailureTelemetry {
+  toolName: string;
+  unavailableSections: string[];
+}
+
+/**
+ * Detect a partial-failure tool result and build its telemetry payload (ENG-104).
+ *
+ * A successful tool result that carries `partialFailure: true` (e.g.
+ * get_meta_ads_metrics with an errored breakdown section) is a success whose
+ * degradation must still be observable. This PURE helper extracts the
+ * unavailable-section metadata so the agent-mode telemetry layer — which has the
+ * runId/sessionId the leaf tool method does not — can route it through
+ * `recorder.toolPartialFailure`, the same loop-event mechanism ENG-102/103 use.
+ *
+ * Returns null for any result that is NOT an explicit partial failure, so the
+ * all-success path emits nothing (behavior-preserving).
+ */
+export function buildToolPartialFailureTelemetry(
+  toolName: string,
+  result: unknown,
+): ToolPartialFailureTelemetry | null {
+  if (!result || typeof result !== 'object') return null;
+  const r = result as Record<string, unknown>;
+  if (r.partialFailure !== true) return null;
+  const unavailableSections = Array.isArray(r.unavailableSections)
+    ? r.unavailableSections.filter((s): s is string => typeof s === 'string')
+    : [];
+  return { toolName, unavailableSections };
+}

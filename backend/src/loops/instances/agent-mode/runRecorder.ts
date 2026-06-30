@@ -41,6 +41,7 @@ import {
   EVT_TOOL_DEFERRED,
   EVT_TOOL_FAILED,
   EVT_TOOL_INVOKED,
+  EVT_TOOL_PARTIAL_FAILURE,
   EVT_TOOL_SUCCEEDED,
 } from './eventTypes';
 
@@ -218,6 +219,32 @@ export class AgentRunRecorder {
     },
   ): Promise<void> {
     await this.emit(runId, EVT_TOOL_DEFERRED, cleanDims(info));
+  }
+
+  /**
+   * A tool call SUCCEEDED but with a partial result — some sub-sections of its
+   * output were unavailable (ENG-104). Recorded as its OWN event class, NOT as
+   * toolFailed: the call did not error, so it must not enter the failure ratio or
+   * the failure-cluster policy. It also is NOT toolDeferred (the call DID execute).
+   * The unavailable sections are stored as a comma-joined string + a numeric count
+   * so a section silently going dark is queryable in Dev-AW-LoopEvents.
+   */
+  async toolPartialFailure(
+    runId: string,
+    info: {
+      toolName: string;
+      unavailableSections: string[];
+      iteration?: number;
+      sessionId?: string;
+    },
+  ): Promise<void> {
+    await this.emit(runId, EVT_TOOL_PARTIAL_FAILURE, cleanDims({
+      toolName: info.toolName,
+      unavailableSections: info.unavailableSections.join(','),
+      unavailableCount: info.unavailableSections.length,
+      iteration: info.iteration,
+      sessionId: info.sessionId,
+    }));
   }
 
   async runCompleted(
