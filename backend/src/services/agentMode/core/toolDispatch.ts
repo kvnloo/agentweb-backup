@@ -320,6 +320,29 @@ export async function executePreparedTools(
   const seenToolCallKeys = new Map<string, string>(); // dedupe key -> first tool_call_id
   const suppressedDuplicates: Array<{ toolCall: any; functionArgs: any; duplicateOfId: string }> = [];
 
+  const appendSuppressedDuplicate = (
+    suppressed: { toolCall: any; functionArgs: any; duplicateOfId: string },
+  ) => {
+    const { toolCall, functionArgs, duplicateOfId } = suppressed;
+    const suppressMsg =
+      `This call was collapsed: an identical ${toolCall.function.name} call with the same arguments `
+      + `was already handled by tool_call_id ${duplicateOfId}. Use that completed tool result — do not repeat this call.`;
+    (messages as any[]).push({
+      tool_call_id: toolCall.id,
+      role: 'tool',
+      name: toolCall.function.name,
+      content: suppressMsg,
+      metadata: { timestamp: new Date().toISOString(), duplicateSuppressed: true, duplicateOfId },
+    });
+    toolCalls.push({
+      id: toolCall.id,
+      name: toolCall.function.name,
+      arguments: functionArgs,
+      duplicateOf: duplicateOfId,
+      duration: 0,
+    });
+  };
+
   const appendPreflightToolFailure = (
     toolCall: any,
     functionArgs: any,
@@ -442,23 +465,6 @@ export async function executePreparedTools(
       const dedupeKey = `${toolCall.function.name}:${stableStringify(preparedFunctionArgs)}`;
       if (!NON_DEDUPABLE_TOOLS.has(toolCall.function.name) && seenToolCallKeys.has(dedupeKey)) {
         const duplicateOfId = seenToolCallKeys.get(dedupeKey) as string;
-        const suppressMsg =
-          `This call was collapsed: an identical ${toolCall.function.name} call with the same arguments is already being handled this turn `
-          + `(tool_call_id ${duplicateOfId}). Use that call's result — do not repeat this call.`;
-        (messages as any[]).push({
-          tool_call_id: toolCall.id,
-          role: 'tool',
-          name: toolCall.function.name,
-          content: suppressMsg,
-          metadata: { timestamp: new Date().toISOString(), duplicateSuppressed: true, duplicateOfId },
-        });
-        toolCalls.push({
-          id: toolCall.id,
-          name: toolCall.function.name,
-          arguments: preparedFunctionArgs,
-          duplicateOf: duplicateOfId,
-          duration: 0,
-        });
         suppressedDuplicates.push({ toolCall, functionArgs: preparedFunctionArgs, duplicateOfId });
         continue;
       }
@@ -777,6 +783,12 @@ export async function executePreparedTools(
         metadata: { timestamp: new Date().toISOString() },
       });
     }
+  }
+
+  // Same-turn duplicates are appended only after the real tool results above, so
+  // the model sees the completed original call before the "use that result" note.
+  for (const suppressed of suppressedDuplicates) {
+    appendSuppressedDuplicate(suppressed);
   }
 
   return { pendingCounterUpdates, failedCounterUpdates, skillsUpdated, mediaAssetsProduced, mediaBudgetDeferred };

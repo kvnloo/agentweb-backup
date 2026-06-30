@@ -473,9 +473,11 @@ describe('executePreparedTools', () => {
 
       // The tool executed exactly once.
       expect((ports as any).__execOrder).toEqual(['create_lead']);
-      // Every emitted tool_call_id is answered with a tool-role message.
-      const answeredIds = input.messages.map((m: any) => m.tool_call_id).sort();
-      expect(answeredIds).toEqual(['a', 'b']);
+      // Every emitted tool_call_id is answered, with the real result before the
+      // duplicate's "use that result" note.
+      expect(input.messages.map((m: any) => m.tool_call_id)).toEqual(['a', 'b']);
+      expect(input.messages[0].content).toBe('{"success":true,"echo":"create_lead"}');
+      expect(input.messages[1].content).toContain('was already handled by tool_call_id a');
       // The duplicate is neither a success counter nor a failed counter increment.
       expect(result.pendingCounterUpdates).toEqual({ create_lead: 1 });
       expect(result.failedCounterUpdates).toEqual({});
