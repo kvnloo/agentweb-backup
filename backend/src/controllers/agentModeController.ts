@@ -21,7 +21,7 @@ import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
-import { createOncallItem } from '../services/notionService';
+import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
 import { normalizeEmailList } from '../utils/validation';
 import { getAllowedSkills } from '../services/subscriptionService';
@@ -181,11 +181,12 @@ async function autoReportContextLimitToNotion(
 ): Promise<void> {
   if (!sessionId || session?.contextLimitReported) return;
   try {
-    await createOncallItem({
+    await fileAutoIssue({
       title: `Context limit reached - session ${sessionId}`,
       description: `User hit the context window limit in agent mode.\n\nUser: ${userEmail || 'Unknown'}\nModel: ${llmModel || 'Not specified'}\nSession messages: ${session?.messages?.length ?? 'N/A'}\nSession title: ${session?.title || 'N/A'}`,
-      additionalTags: ['Customer Reported', 'Context Limit'],
-      context: {
+      source: 'Context limit',
+      notionTags: ['Customer Reported', 'Context Limit'],
+      notionContext: {
         'User ID': userId || 'N/A',
         'User Email': userEmail || 'N/A',
         'Session ID': sessionId,
@@ -1550,17 +1551,19 @@ export async function runScheduledChat(
           'Timestamp': finalResult.createdAt
         }
       }).catch(err => console.error('Failed to send oncall alert for scheduled chat failure:', err));
-      createOncallItem({
+      fileAutoIssue({
         title: `Scheduled Chat Failed: ${schedule.scheduleName}`,
         description: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
-        additionalTags: ['Scheduled Chat'],
-        context: {
+        source: 'Scheduled chat (validation)',
+        extraLabels: ['Scheduled Chat'],
+        notionTags: ['Scheduled Chat'],
+        notionContext: {
           'Schedule ID': schedule.scheduleId,
           'User ID': userId,
           'Session ID': sessionId,
           'Attempts': finalResult.attempt,
         }
-      }).catch(err => console.error('Failed to create Notion item for scheduled chat failure:', err));
+      }).catch(err => console.error('Failed to file scheduled-chat-failure issue:', err));
     }
 
     // Also sync Research Reports execution for email campaigns
@@ -1722,15 +1725,17 @@ export async function runScheduledChat(
         'Timestamp': errorResult.createdAt
       }
     }).catch(err => console.error('Failed to send oncall alert for scheduled chat error:', err));
-    createOncallItem({
+    fileAutoIssue({
       title: zeroAssistantOutput
         ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
         : `Scheduled Chat Error: ${schedule.scheduleName}`,
       description: zeroAssistantOutput
         ? `Scheduled chat "${schedule.scheduleName}" terminated with zero assistant messages.${zeroAssistantRequeuedAt ? ` It was requeued for ${zeroAssistantRequeuedAt}.` : ''}\n\nError: ${errorMessage}${originalMessage ? `\n\nOriginal API error: ${originalMessage}` : ''}`
         : `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}${originalMessage ? `\n\nOriginal API error: ${originalMessage}` : ''}`,
-      additionalTags: ['Scheduled Chat'],
-      context: {
+      source: 'Scheduled chat (error)',
+      extraLabels: ['Scheduled Chat'],
+      notionTags: ['Scheduled Chat'],
+      notionContext: {
         'Schedule ID': schedule.scheduleId,
         'User ID': userId,
         'Session ID': sessionId || 'N/A',
@@ -1740,7 +1745,7 @@ export async function runScheduledChat(
         'Error Message': errorMessage,
         ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
       }
-    }).catch(err => console.error('Failed to create Notion item for scheduled chat error:', err));
+    }).catch(err => console.error('Failed to file scheduled-chat-error issue:', err));
 
     // Return error result for error reporting
     return errorResult;
@@ -3781,8 +3786,8 @@ export const agentModeController = {
         console.warn('Failed to propagate message feedback to images:', propagateError);
       }
 
-      // Fire-and-forget: create a Notion item so the team can review positive/negative feedback
-      createOncallItem({
+      // Fire-and-forget: file an item so the team can review positive/negative feedback
+      fileAutoIssue({
         title: `Agent Mode ${type === 'like' ? 'Like' : 'Dislike'} Feedback – ${session.title || sessionId}`,
         description: [
           `User ${user.email} voted ${type} on a message in session "${session.title || sessionId}".`,
@@ -3790,15 +3795,16 @@ export const agentModeController = {
           '',
           `Message preview: ${String(message.content || '').slice(0, 300)}`,
         ].filter(Boolean).join('\n'),
-        additionalTags: [type === 'like' ? 'Feedback-Like' : 'Feedback-Dislike'],
-        context: {
+        source: `Feedback (${type})`,
+        notionTags: [type === 'like' ? 'Feedback-Like' : 'Feedback-Dislike'],
+        notionContext: {
           sessionId,
           messageIndex: messageIndexNum,
           userId: user.userId,
           userEmail: user.email,
         },
       }).catch((err: Error) => {
-        console.warn('Failed to create Notion feedback item:', err.message);
+        console.warn('Failed to file feedback item:', err.message);
       });
 
       res.json({
@@ -3945,8 +3951,8 @@ export const agentModeController = {
         console.warn('Failed to propagate ishare message feedback to images:', propagateError);
       }
 
-      // Fire-and-forget: create a Notion item for anonymous ishare votes
-      createOncallItem({
+      // Fire-and-forget: file an item for anonymous ishare votes
+      fileAutoIssue({
         title: `Agent Mode ${type === 'like' ? 'Like' : 'Dislike'} Feedback (iShare) – ${session.title || shareId}`,
         description: [
           `Anonymous visitor voted ${type} on a message in shared session "${session.title || shareId}".`,
@@ -3954,14 +3960,15 @@ export const agentModeController = {
           '',
           `Message preview: ${String(message.content || '').slice(0, 300)}`,
         ].filter(Boolean).join('\n'),
-        additionalTags: [type === 'like' ? 'Feedback-Like' : 'Feedback-Dislike'],
-        context: {
+        source: `Feedback iShare (${type})`,
+        notionTags: [type === 'like' ? 'Feedback-Like' : 'Feedback-Dislike'],
+        notionContext: {
           sessionId: shareId,
           messageIndex: messageIndexNum,
           source: 'ishare',
         },
       }).catch((err: Error) => {
-        console.warn('Failed to create Notion feedback item (ishare):', err.message);
+        console.warn('Failed to file feedback item (ishare):', err.message);
       });
 
       res.json({
