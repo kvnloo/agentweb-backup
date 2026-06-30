@@ -528,6 +528,78 @@ describe('devEnvService', () => {
       expect(mockEC2.terminateInstances).not.toHaveBeenCalled();
     });
 
+    // Regression: the 2026-06-26 prod disk-fill outage. A page stuck at
+    // "pending" (never provisioned) made teardown call terminateInstances with a
+    // malformed id every webhook tick, throwing + dumping full error objects.
+    it.each(['pending', 'i-', 'launching', '550e8400-e29b-41d4-a716-446655440000'])(
+      'should NOT call EC2 terminateInstances for non-EC2 instanceId "%s"',
+      async (badId) => {
+        mockAxios.mockResolvedValueOnce({
+          data: {
+            parent: { database_id: 'db-1' },
+            properties: {
+              Name: { type: 'title', title: [{ plain_text: 'Task' }] },
+              Status: { status: { name: 'Done' } },
+              'Instance ID': { rich_text: [{ plain_text: badId }] },
+              'SG ID': { rich_text: [{ plain_text: 'sg-x' }] },
+            },
+          },
+        });
+        mockAxios.mockResolvedValue({ data: {} });
+
+        await teardownEnvironment('page-bad-id');
+
+        expect(mockEC2.terminateInstances).not.toHaveBeenCalled();
+      }
+    );
+
+    it('should clear the page (so teardown stops re-firing) when instanceId is "pending"', async () => {
+      mockAxios.mockResolvedValueOnce({
+        data: {
+          parent: { database_id: 'db-1' },
+          properties: {
+            Name: { type: 'title', title: [{ plain_text: 'Task' }] },
+            Status: { status: { name: 'Done' } },
+            'Instance ID': { rich_text: [{ plain_text: 'pending' }] },
+            'SG ID': { rich_text: [{ plain_text: 'sg-x' }] },
+          },
+        },
+      });
+      mockAxios.mockResolvedValue({ data: {} });
+
+      await teardownEnvironment('page-pending');
+
+      const patchCall = (mockAxios.mock.calls as any[]).find(
+        (c) => c[0]?.method === 'patch'
+      );
+      expect(patchCall).toBeDefined();
+      expect(patchCall[0].data.properties['Instance ID']).toEqual({ rich_text: [] });
+    });
+
+    it('still terminates a real EC2 instance id (happy path unchanged)', async () => {
+      mockAxios.mockResolvedValueOnce({
+        data: {
+          parent: { database_id: 'db-1' },
+          properties: {
+            Name: { type: 'title', title: [{ plain_text: 'Task' }] },
+            Status: { status: { name: 'Done' } },
+            'Instance ID': { rich_text: [{ plain_text: 'i-0abc123def456' }] },
+            'SG ID': { rich_text: [{ plain_text: 'sg-x' }] },
+          },
+        },
+      });
+      mockAxios.mockResolvedValue({ data: {} });
+      mockEC2.terminateInstances.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+      mockEC2.waitFor.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+      mockEC2.deleteSecurityGroup.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+
+      await teardownEnvironment('page-real');
+
+      expect(mockEC2.terminateInstances).toHaveBeenCalledWith({
+        InstanceIds: ['i-0abc123def456'],
+      });
+    });
+
     it('should handle SG deletion failure gracefully', async () => {
       mockAxios.mockResolvedValueOnce({
         data: {

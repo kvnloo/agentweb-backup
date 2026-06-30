@@ -420,3 +420,112 @@ describe('HubSpotService — batchAssociateContactsToDeals', () => {
     ).rejects.toThrow(/207|partial|VALIDATION_ERROR/i);
   });
 });
+
+// ─── batchUpdateContacts ──────────────────────────────────────────────────────
+
+describe('HubSpotService — batchUpdateContacts', () => {
+  let svc: HubSpotService;
+  beforeEach(() => {
+    jest.clearAllMocks();
+    svc = HubSpotService.fromToken('valid-token');
+  });
+
+  it('POSTs {id, properties} inputs to the contacts batch/update endpoint', async () => {
+    mockAxiosPost.mockResolvedValue({ data: { results: [] } });
+
+    await svc.batchUpdateContacts([
+      { id: 'c-1', properties: { lifecyclestage: '' } },
+      { id: 'c-2', properties: { lifecyclestage: '12345678' } },
+    ]);
+
+    expect(mockAxiosPost).toHaveBeenCalledWith(
+      expect.stringContaining('crm/v3/objects/contacts/batch/update'),
+      expect.objectContaining({
+        inputs: [
+          { id: 'c-1', properties: { lifecyclestage: '' } },
+          { id: 'c-2', properties: { lifecyclestage: '12345678' } },
+        ],
+      }),
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer valid-token' }) })
+    );
+  });
+
+  it('throws when inputs.length > 100 (does not call the API)', async () => {
+    const inputs = Array.from({ length: 101 }, (_, i) => ({ id: `c-${i}`, properties: {} }));
+    await expect(svc.batchUpdateContacts(inputs)).rejects.toThrow(/100/);
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
+  it('THROWS on a 207 Multi-Status partial-failure response', async () => {
+    mockAxiosPost.mockResolvedValue({
+      status: 207,
+      data: {
+        status: 'COMPLETE',
+        numErrors: 1,
+        results: [{ id: 'c-1' }],
+        errors: [{ status: 'error', category: 'VALIDATION_ERROR', message: 'bad stage' }],
+      },
+    });
+    await expect(
+      svc.batchUpdateContacts([
+        { id: 'c-1', properties: { lifecyclestage: 'x' } },
+        { id: 'c-2', properties: { lifecyclestage: 'y' } },
+      ])
+    ).rejects.toThrow(/207|partial|VALIDATION_ERROR/i);
+  });
+});
+
+// ─── getContactLifecycleStages ────────────────────────────────────────────────
+
+describe('HubSpotService — getContactLifecycleStages', () => {
+  let svc: HubSpotService;
+  beforeEach(() => {
+    jest.clearAllMocks();
+    svc = HubSpotService.fromToken('valid-token');
+  });
+
+  it('reads lifecyclestage for a chunk and returns an id → stage map', async () => {
+    mockAxiosPost.mockResolvedValue({
+      data: { results: [
+        { id: 'c-1', properties: { lifecyclestage: 'customer' } },
+        { id: 'c-2', properties: { lifecyclestage: '12345678' } },
+      ] },
+    });
+
+    const map = await svc.getContactLifecycleStages(['c-1', 'c-2']);
+
+    expect(mockAxiosPost).toHaveBeenCalledWith(
+      expect.stringContaining('crm/v3/objects/contacts/batch/read'),
+      expect.objectContaining({
+        properties: ['lifecyclestage'],
+        inputs: [{ id: 'c-1' }, { id: 'c-2' }],
+      }),
+      expect.any(Object),
+    );
+    expect(map.get('c-1')).toBe('customer');
+    expect(map.get('c-2')).toBe('12345678');
+  });
+
+  it('maps a contact with no stage to an empty string', async () => {
+    mockAxiosPost.mockResolvedValue({ data: { results: [{ id: 'c-1', properties: {} }] } });
+    const map = await svc.getContactLifecycleStages(['c-1']);
+    expect(map.get('c-1')).toBe('');
+  });
+
+  it('chunks into batches of 100', async () => {
+    mockAxiosPost.mockResolvedValue({ data: { results: [] } });
+    const ids = Array.from({ length: 250 }, (_, i) => `c-${i}`);
+    await svc.getContactLifecycleStages(ids);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(3); // 100 + 100 + 50
+  });
+
+  it('skips (does not throw) a chunk whose read fails, resolving the rest', async () => {
+    mockAxiosPost
+      .mockRejectedValueOnce(new Error('500 boom'))
+      .mockResolvedValueOnce({ data: { results: [{ id: 'c-150', properties: { lifecyclestage: 'lead' } }] } });
+    const ids = Array.from({ length: 150 }, (_, i) => `c-${i}`).concat(['c-150']);
+    // 150 ids → chunk1 (100, fails) + chunk2 (51, ok)
+    const map = await svc.getContactLifecycleStages(ids);
+    expect(map.get('c-150')).toBe('lead');
+  });
+});

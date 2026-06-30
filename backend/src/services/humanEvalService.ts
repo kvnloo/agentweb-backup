@@ -1,5 +1,9 @@
 import AWS from 'aws-sdk';
 import { v4 as uuidv4 } from 'uuid';
+import { eventToItem, LOOP_EVENTS_TABLE } from '../loops/core/sensors/eventTableEventSource';
+import { asLoopId, asSubjectId, type NormalizedEvent } from '../loops/core/types';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { uploadFileToS3 } from '../utils/s3Utils';
 import { chatbotDb } from './chatbotService';
 import {
   getSlackUserDisplayName,
@@ -11,6 +15,8 @@ import { settingsService } from './settingsService';
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 export const HUMAN_EVAL_QUEUE_TABLE = `${TABLE_PREFIX}AW-HumanEvalQueue`;
+const HUMAN_EVAL_TELEMETRY_LOOP_ID = asLoopId('human-eval');
+const MAX_INLINE_IMAGE_BYTES = 15 * 1024 * 1024;
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || 'us-west-2',
@@ -109,6 +115,7 @@ interface SlackLike {
 
 interface ChatbotLike {
   addMessageToSession(sessionId: string, message: any): Promise<any>;
+  createOrReuseInteractiveShare(sessionId: string): Promise<string>;
 }
 
 interface LearningLike {
@@ -119,10 +126,108 @@ interface ActionRunnerLike {
   run(candidate: HumanEvalCandidate, feedback: HumanEvalFeedback): Promise<void>;
 }
 
+interface UploadInlineImageContext {
+  candidateId: string;
+  reviewType: HumanEvalReviewType;
+  userId?: string;
+  sessionId?: string;
+  agentRunId?: string;
+}
+
+interface UploadedInlineImage {
+  url: string;
+  key?: string;
+  byteLength: number;
+  mimeType: string;
+}
+
+interface HumanEvalAssetStoreLike {
+  uploadInlineImage(dataUri: string, context: UploadInlineImageContext): Promise<UploadedInlineImage>;
+}
+
+type HumanEvalAssetEvent =
+  | 'human_eval_asset_inline_image_detected'
+  | 'human_eval_asset_inline_image_uploaded'
+  | 'human_eval_asset_delivery_failed';
+
+type HumanEvalAssetTelemetryInfo = Partial<UploadInlineImageContext> & {
+  reason?: string;
+  errorClass?: string;
+  errorMessage?: string;
+  mimeType?: string;
+  byteLength?: number;
+  artifactKey?: string;
+};
+
+interface HumanEvalAssetTelemetryLike {
+  recordAssetEvent(eventType: HumanEvalAssetEvent, info: HumanEvalAssetTelemetryInfo): Promise<void>;
+}
+
 class HumanEvalActionRunner implements ActionRunnerLike {
   async run(candidate: HumanEvalCandidate, feedback: HumanEvalFeedback): Promise<void> {
     const { runHumanEvalFeedbackAction } = await import('./humanEvalActionService');
     await runHumanEvalFeedbackAction(candidate, feedback);
+  }
+}
+
+class HumanEvalS3AssetStore implements HumanEvalAssetStoreLike {
+  async uploadInlineImage(dataUri: string, context: UploadInlineImageContext): Promise<UploadedInlineImage> {
+    const parsed = parseInlineImageDataUri(dataUri);
+    if (!parsed) {
+      throw new Error('Unsupported inline image data URI');
+    }
+    if (parsed.buffer.length > MAX_INLINE_IMAGE_BYTES) {
+      throw new Error(`Inline image is too long (${parsed.buffer.length} bytes)`);
+    }
+
+    const filename = `human-eval-${context.reviewType}-${context.candidateId}.${extensionForMimeType(parsed.mimeType)}`;
+    const uploaded = await uploadFileToS3(
+      parsed.buffer,
+      filename,
+      context.userId || 'human-eval',
+      parsed.mimeType,
+    );
+    if (!uploaded.success || !uploaded.url) {
+      throw new Error(uploaded.error || 'S3 upload returned no URL');
+    }
+
+    return {
+      url: uploaded.url,
+      key: uploaded.key,
+      byteLength: parsed.buffer.length,
+      mimeType: parsed.mimeType,
+    };
+  }
+}
+
+class HumanEvalDynamoTelemetry implements HumanEvalAssetTelemetryLike {
+  async recordAssetEvent(eventType: HumanEvalAssetEvent, info: HumanEvalAssetTelemetryInfo): Promise<void> {
+    try {
+      const subjectId = info.candidateId || info.agentRunId || info.sessionId || info.userId || 'unknown';
+      const dimensions = cleanDimensions({
+        candidateId: info.candidateId,
+        reviewType: info.reviewType,
+        userId: info.userId,
+        sessionId: info.sessionId,
+        agentRunId: info.agentRunId,
+        reason: info.reason,
+        errorClass: info.errorClass,
+        errorMessage: info.errorMessage,
+        mimeType: info.mimeType,
+        byteLength: info.byteLength,
+        artifactKey: info.artifactKey,
+      });
+      const event: NormalizedEvent = {
+        subjectId: asSubjectId(subjectId),
+        eventType,
+        ts: new Date(),
+        dimensions,
+      };
+      const item = eventToItem(HUMAN_EVAL_TELEMETRY_LOOP_ID, event);
+      await dynamodb.put({ TableName: LOOP_EVENTS_TABLE, Item: item }).promise();
+    } catch (err) {
+      console.warn('[human-eval] asset telemetry failed (swallowed):', err instanceof Error ? err.message : err);
+    }
   }
 }
 
@@ -172,6 +277,8 @@ export class HumanEvalService {
     private readonly chatbot: ChatbotLike = chatbotDb,
     private readonly learning: LearningLike = new HumanEvalMemoryLearning(),
     private readonly actions: ActionRunnerLike = new HumanEvalActionRunner(),
+    private readonly assets: HumanEvalAssetStoreLike = new HumanEvalS3AssetStore(),
+    private readonly telemetry: HumanEvalAssetTelemetryLike = new HumanEvalDynamoTelemetry(),
   ) {}
 
   getReviewerForType(reviewType: HumanEvalReviewType): HumanEvalReviewer {
@@ -191,10 +298,11 @@ export class HumanEvalService {
     const reviewerSlackUserId = await this.getReviewerSlackUserId(reviewer);
     const candidateId = uuidv4();
     const now = new Date().toISOString();
-    const chatUrl = input.chatUrl || this.buildChatUrl(input.sessionId);
+    const preparedInput = await this.prepareCandidateInput(input, candidateId);
+    const chatUrl = await this.resolveChatUrl(preparedInput);
 
     const message = this.buildSlackMessage({
-      ...input,
+      ...preparedInput,
       candidateId,
       reviewer,
       reviewerSlackUserId,
@@ -212,11 +320,11 @@ export class HumanEvalService {
       userId: input.userId,
       sessionId: input.sessionId,
       agentRunId: input.agentRunId,
-      artifactUrl: input.artifactUrl,
+      artifactUrl: preparedInput.artifactUrl,
       chatUrl,
-      outputSummary: input.outputSummary.trim(),
-      originalRequest: input.originalRequest?.trim() || undefined,
-      action: input.action,
+      outputSummary: preparedInput.outputSummary.trim(),
+      originalRequest: preparedInput.originalRequest?.trim() || undefined,
+      action: preparedInput.action,
       slackChannel: posted.channel || slackChannel,
       slackMessageTs: posted.ts,
       feedback: [],
@@ -314,6 +422,125 @@ export class HumanEvalService {
     }).promise();
   }
 
+  private async prepareCandidateInput(
+    input: CreateHumanEvalCandidateInput,
+    candidateId: string,
+  ): Promise<CreateHumanEvalCandidateInput> {
+    const telemetryBase: UploadInlineImageContext = {
+      candidateId,
+      reviewType: input.reviewType,
+      userId: input.userId,
+      sessionId: input.sessionId,
+      agentRunId: input.agentRunId,
+    };
+
+    const prepared: CreateHumanEvalCandidateInput = {
+      ...input,
+      artifactUrl: input.artifactUrl?.trim() || undefined,
+      chatUrl: await this.sanitizeChatUrl(input.chatUrl, telemetryBase),
+      outputSummary: redactInlineImageData(input.outputSummary),
+      originalRequest: input.originalRequest ? redactInlineImageData(input.originalRequest) : undefined,
+    };
+
+    // Memoize uploads so a data URI duplicated across artifactUrl and action.artifactUrl
+    // (the auto image-revision case sends the same result.imageUrl into both) only hits S3 once.
+    const uploadCache = new Map<string, string>();
+
+    prepared.artifactUrl = await this.sanitizeArtifactReference(prepared.artifactUrl, telemetryBase, uploadCache);
+
+    // The nested action carries a second copy of the artifact (agent_mode_image_revision); run it
+    // through the same upload/fail-closed guard so a raw image binary never lands in the persisted item.
+    if (prepared.action?.type === 'agent_mode_image_revision' && prepared.action.artifactUrl) {
+      const safeActionArtifactUrl = await this.sanitizeArtifactReference(
+        prepared.action.artifactUrl.trim() || undefined,
+        telemetryBase,
+        uploadCache,
+      );
+      prepared.action = { ...prepared.action, artifactUrl: safeActionArtifactUrl };
+    }
+
+    return prepared;
+  }
+
+  // Converts a supported inline image data URI to an S3 URL, fails closed on any other data: URI or
+  // upload failure, and passes through ordinary URLs. Shared by the top-level artifact and the nested
+  // action artifact so neither can deliver a raw binary to Slack or persist one in the queue item.
+  private async sanitizeArtifactReference(
+    rawUrl: string | undefined,
+    telemetryBase: UploadInlineImageContext,
+    uploadCache: Map<string, string>,
+  ): Promise<string | undefined> {
+    if (!rawUrl) {
+      return undefined;
+    }
+
+    if (isInlineImageDataUri(rawUrl)) {
+      const cached = uploadCache.get(rawUrl);
+      if (cached) {
+        return cached;
+      }
+
+      await this.recordAssetTelemetry('human_eval_asset_inline_image_detected', telemetryBase);
+      try {
+        const uploaded = await this.assets.uploadInlineImage(rawUrl, telemetryBase);
+        uploadCache.set(rawUrl, uploaded.url);
+        await this.recordAssetTelemetry('human_eval_asset_inline_image_uploaded', {
+          ...telemetryBase,
+          mimeType: uploaded.mimeType,
+          byteLength: uploaded.byteLength,
+          artifactKey: uploaded.key,
+        });
+        return uploaded.url;
+      } catch (err) {
+        await this.recordAssetTelemetry('human_eval_asset_delivery_failed', {
+          ...telemetryBase,
+          reason: 'inline_image_upload_failed',
+          errorClass: classifyToolErrorClass(err),
+          errorMessage: errorMessage(err),
+        });
+        throw new Error('Human eval image artifact could not be uploaded before Slack delivery. Retry with a fetchable image URL.');
+      }
+    }
+
+    if (isDataUri(rawUrl)) {
+      await this.recordAssetTelemetry('human_eval_asset_delivery_failed', {
+        ...telemetryBase,
+        reason: 'unsupported_data_uri',
+      });
+      throw new Error('Human eval artifact must be a fetchable URL or supported data:image URI.');
+    }
+
+    return rawUrl;
+  }
+
+  // A chat link is never a data: URI. Drop one if present (so resolveChatUrl falls back to a real
+  // session share link) rather than rendering the raw binary into Slack or storing it on the item.
+  private async sanitizeChatUrl(
+    chatUrl: string | undefined,
+    telemetryBase: UploadInlineImageContext,
+  ): Promise<string | undefined> {
+    const trimmed = chatUrl?.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    if (isDataUri(trimmed)) {
+      await this.recordAssetTelemetry('human_eval_asset_delivery_failed', {
+        ...telemetryBase,
+        reason: 'unsupported_chat_url_data_uri',
+      });
+      return undefined;
+    }
+    return trimmed;
+  }
+
+  private async recordAssetTelemetry(eventType: HumanEvalAssetEvent, info: HumanEvalAssetTelemetryInfo): Promise<void> {
+    try {
+      await this.telemetry.recordAssetEvent(eventType, info);
+    } catch (err) {
+      console.warn('[human-eval] asset telemetry failed (swallowed):', err instanceof Error ? err.message : err);
+    }
+  }
+
   private async addFeedbackToSession(candidate: HumanEvalCandidate, feedback: HumanEvalFeedback): Promise<void> {
     if (!candidate.sessionId) return;
 
@@ -407,8 +634,19 @@ export class HumanEvalService {
     return `human_eval_thread_${channel}_${threadTs}`;
   }
 
-  private buildChatUrl(sessionId?: string): string | undefined {
-    if (!sessionId) return undefined;
+  private async resolveChatUrl(input: CreateHumanEvalCandidateInput): Promise<string | undefined> {
+    if (input.chatUrl?.trim()) return input.chatUrl.trim();
+    if (!input.sessionId) return undefined;
+
+    try {
+      return await this.chatbot.createOrReuseInteractiveShare(input.sessionId);
+    } catch (err: any) {
+      console.warn('[human-eval] failed to create interactive share link:', err?.message || err);
+      return this.buildDirectChatUrl(input.sessionId);
+    }
+  }
+
+  private buildDirectChatUrl(sessionId: string): string {
     const base = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
     return `${base}/agent-mode/${encodeURIComponent(sessionId)}`;
   }
@@ -455,6 +693,58 @@ function humanEvalActionLabel(action: HumanEvalAction): string {
 function truncate(value: string, max: number): string {
   const trimmed = value.trim();
   return trimmed.length > max ? `${trimmed.slice(0, max - 1)}...` : trimmed;
+}
+
+function isDataUri(value: string): boolean {
+  return /^data:/i.test(value.trim());
+}
+
+function isInlineImageDataUri(value: string): boolean {
+  return /^data:image\/[a-z0-9.+-]+;base64,/i.test(value.trim());
+}
+
+function parseInlineImageDataUri(value: string): { mimeType: string; buffer: Buffer } | null {
+  const match = value.trim().match(/^data:(image\/(?:png|jpe?g|webp|gif));base64,([\s\S]+)$/i);
+  if (!match) return null;
+
+  const mimeType = match[1].toLowerCase() === 'image/jpg' ? 'image/jpeg' : match[1].toLowerCase();
+  const base64 = match[2].replace(/\s/g, '');
+  if (!base64 || !/^[A-Za-z0-9+/]+={0,2}$/.test(base64)) return null;
+
+  const buffer = Buffer.from(base64, 'base64');
+  if (buffer.length === 0) return null;
+
+  return { mimeType, buffer };
+}
+
+function extensionForMimeType(mimeType: string): string {
+  switch (mimeType) {
+    case 'image/png':
+      return 'png';
+    case 'image/webp':
+      return 'webp';
+    case 'image/gif':
+      return 'gif';
+    case 'image/jpeg':
+    default:
+      return 'jpg';
+  }
+}
+
+function redactInlineImageData(value: string): string {
+  return value.replace(/data:image\/[a-z0-9.+-]+;base64,[a-z0-9+/=]+/gi, '[inline image data redacted; artifact uploaded separately]');
+}
+
+function cleanDimensions(
+  dimensions: Record<string, string | number | boolean | null | undefined>,
+): Record<string, string | number | boolean | null> {
+  return Object.fromEntries(
+    Object.entries(dimensions).filter(([, value]) => value !== undefined),
+  ) as Record<string, string | number | boolean | null>;
+}
+
+function errorMessage(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error)).slice(0, 300);
 }
 
 export const humanEvalService = new HumanEvalService();

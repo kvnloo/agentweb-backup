@@ -173,16 +173,18 @@ export async function runOnboardingStuckDetector(): Promise<DailyStuckReport> {
     const description = `${totalStuck} users currently stuck across ${orderedStages.length} onboarding stage(s); oldest has been idle ${oldestOverall.toFixed(1)}h. See Context for per-stage breakdown.`;
 
     try {
-      const { createOncallItem } = await import('../services/notionService');
-      const result = await createOncallItem({
+      const { fileAutoIssue } = await import('../services/intakeService');
+      const result = await fileAutoIssue({
         title,
         description,
-        additionalTags: ['Onboarding'],
-        context,
+        source: 'Onboarding stuck',
+        notionTags: ['Onboarding'],
+        notionContext: context,
       });
-      notionUrl = result.notionUrl || null;
+      // Linear path returns an issue identifier (no public URL); Notion returns a page id.
+      notionUrl = result.pageId ? `AGW-${result.pageId}` : null;
     } catch (err) {
-      console.error('[onboardingStuckDetector] Notion post failed:', err);
+      console.error('[onboardingStuckDetector] issue filing failed:', err);
       notionUrl = null;
     }
   }

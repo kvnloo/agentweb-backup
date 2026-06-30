@@ -6419,7 +6419,7 @@ emmaToolRegistry.register({
   name: 'coding_agent',
   definition: {
     name: 'coding_agent',
-    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to a STAGING draft branch (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code. For user-visible landing-page changes, pass typed acceptance_checks that prove the requested behavior on the preview page; the backend verifier runs them after the coding agent finishes and fails or blocks the tool if they do not pass. Do not use hard-coded human-looking benchmark copy; use user-requested content or opaque tokens where a test marker is needed. If the tool fails because acceptance failed, report the failed checks and ask for the missing input or run a narrower follow-up. Only call coding_agent ONCE per user request unless it explicitly fails. LOGO TIP: Always pass logo URLs directly in the task_description — the coding agent will use them in <img src="..."> tags. For public company logos use Google\'s favicon service (https://www.google.com/s2/favicons?domain={domain}&sz=128). For the user\'s own brand logo, look it up with read_brand_guidelines first and include the URL in the task.',
+    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to the reusable STAGING branch draft/agentweb-preview (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code. For user-visible landing-page changes, pass typed acceptance_checks that prove the requested behavior on the preview page; the backend verifier runs them after the coding agent finishes and fails or blocks the tool if they do not pass. Do not use hard-coded human-looking benchmark copy; use user-requested content or opaque tokens where a test marker is needed. If the tool fails because acceptance failed, report the failed checks and ask for the missing input or run a narrower follow-up. Only call coding_agent ONCE per user request unless it explicitly fails. LOGO TIP: Always pass logo URLs directly in the task_description — the coding agent will use them in <img src="..."> tags. For public company logos use Google\'s favicon service (https://www.google.com/s2/favicons?domain={domain}&sz=128). For the user\'s own brand logo, look it up with read_brand_guidelines first and include the URL in the task.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -6463,7 +6463,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    const { runCodingAgent } = await import('../services/codingAgentService');
+    const { LANDING_PAGE_PREVIEW_BRANCH, runCodingAgent } = await import('../services/codingAgentService');
     const executeMcpTool = context?.service
       ? async (toolName: string, toolArgs: any) => {
         return context.service.executeTool(
@@ -6476,9 +6476,10 @@ emmaToolRegistry.register({
       }
       : undefined;
 
-    // Use a draft branch for staging — derive from session ID
+    // Use one reusable staging branch per landing-page repo. The coding agent
+    // resets it to main at run start, preventing unbounded draft branch/PR growth.
     const sessionId = context?.sessionId || '';
-    const draftBranch = sessionId ? `draft/${sessionId.substring(0, 16)}` : undefined;
+    const draftBranch = LANDING_PAGE_PREVIEW_BRANCH;
 
     const result = await runCodingAgent(
       args.task_description,
@@ -6740,7 +6741,7 @@ emmaToolRegistry.register({
   name: 'report_product_issues',
   definition: {
     name: 'report_product_issues',
-    description: 'Report one or more product issues or bugs. Creates tracked items in the engineering sprint board and notifies the oncall team. Use this when users encounter errors, unexpected behavior, or want to request fixes. Batch multiple issues into a single call when possible.',
+    description: 'File product feedback for the team: BUGS (errors, unexpected behavior, broken output) AND FEATURE REQUESTS / enhancement ideas — including when nothing is broken and the user simply wants a new capability ("I want a feature where…", "I wish the app could…", "can you add…", "it would be great if…"). Creates a tracked item the user can follow: feature requests go on the public, votable roadmap; bugs are tracked privately so the user sees their own. Set `type` to "feature_request" or "bug". Batch multiple items into a single call when possible. Prefer filing over silently declining — if a request is a product capability you do not have, file it as a feature_request rather than just saying no.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -6775,6 +6776,11 @@ emmaToolRegistry.register({
               run_id: {
                 type: 'string',
                 description: 'Optional AgentRun id (from the AgentRun inspector / runtime telemetry). When given, the server automatically attaches the run dossier — verdict, failed tool calls with error class/message and the failing arguments — to the report. Strongly recommended when reporting an agent/tool failure.'
+              },
+              type: {
+                type: 'string',
+                enum: ['bug', 'feature_request'],
+                description: 'Whether this is a bug report or a feature request. Feature requests go to the public, votable roadmap; bugs are tracked privately (the user sees their own). Default: bug.'
               }
             },
             required: ['title', 'description']
@@ -6787,7 +6793,6 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     // Lazy imports to avoid pulling in heavy dependencies at module load time
-    const { createOncallItem } = await import('../services/notionService');
     const { resendService } = await import('../services/resendService');
 
     const userId = context?.userId;
@@ -6814,7 +6819,10 @@ emmaToolRegistry.register({
     }
     const isDelegatedAdmin = isDelegate && !!adminEmail;
 
-    const results: Array<{ title: string; success: boolean; issueId?: string; error?: string }> = [];
+    const results: Array<{ title: string; success: boolean; issueId?: string; error?: string; deduped?: boolean; url?: string; trackingUrl?: string }> = [];
+    // Public, user-facing board (what the customer can actually open). Per-result `url` is the
+    // internal tracker (Linear/Notion) for the team email; `trackingUrl`/`userUrl` is the user's link.
+    const FEATUREBASE_BOARD_URL = 'https://agentweb.featurebase.app/';
 
     // Fetch once before the loop to avoid N DynamoDB reads for a batch of issues
     const { settingsService } = await import('../services/settingsService');
@@ -6877,14 +6885,27 @@ emmaToolRegistry.register({
           issueContext['Reported By (Admin)'] = adminEmail;
         }
 
-        const result = await createOncallItem({
+        // Route user-filed intake through the shared intake service: dedup -> stack onto an
+        // existing public canonical, else create a new one (Featurebase-imported public post).
+        // The FEATUREBASE_INTAKE flag selects Linear vs Notion (migration switch, not a
+        // fallback). A hard failure here propagates to this loop's per-issue catch below,
+        // which records the issue as failed — we do NOT silently reroute to another tracker.
+        const itemType: 'feature_request' | 'bug' = issue.type === 'feature_request' ? 'feature_request' : 'bug';
+        const { fileUserIssue } = await import('../services/intakeService');
+        const filed = await fileUserIssue({
+          type: itemType,
           title: issue.title,
           description,
-          // External MCP clients (Claude Code etc.) are tagged distinctly so
-          // benchmark filters on Customer Reported stay clean.
-          additionalTags: [context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported'],
-          context: issueContext,
+          userEmail: user.email,
+          userName: user.displayName || user.email,
+          reportedByAdmin: isDelegatedAdmin && adminEmail ? adminEmail : undefined,
+          sessionId: context?.sessionId,
+          // External MCP clients (Claude Code etc.) are tagged distinctly so benchmark
+          // filters on Customer Reported stay clean (used on the flag-off Notion path).
+          notionTags: [context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported'],
+          notionContext: issueContext,
         });
+        const result = { pageId: filed.pageId, url: filed.trackerUrl, tracker: filed.tracker, deduped: filed.deduped, userUrl: filed.userUrl };
 
         // Never email the customer — internal team + admin (if known) only.
         const emailRecipients = adminEmail
@@ -6910,7 +6931,7 @@ emmaToolRegistry.register({
                 </tr>
                 ${isDelegatedAdmin && adminEmail ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Via delegation</strong></td><td style="padding: 6px 0;">${adminEmail}</td></tr>` : ''}
                 ${result.pageId ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Issue ID</strong></td><td style="padding: 6px 0; font-family: monospace;">AGW-${result.pageId}</td></tr>` : ''}
-                ${result.notionUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Notion</strong></td><td style="padding: 6px 0;"><a href="${result.notionUrl}" style="color: #4F46E5; font-weight: 600;">→ Open in Notion</a></td></tr>` : ''}
+                ${result.url ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>${result.tracker}</strong></td><td style="padding: 6px 0;"><a href="${result.url}" style="color: #4F46E5; font-weight: 600;">→ Open in ${result.tracker}</a></td></tr>` : ''}
                 ${issue.pageUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Page URL</strong></td><td style="padding: 6px 0;"><a href="${issue.pageUrl}" style="color: #4F46E5;">${issue.pageUrl}</a></td></tr>` : ''}
               </table>
 
@@ -6927,7 +6948,7 @@ emmaToolRegistry.register({
           replyTo: user.email,
         });
 
-        results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}` });
+        results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}`, deduped: result.deduped === true, url: result.url || undefined, trackingUrl: result.userUrl || undefined });
       } catch (err: any) {
         results.push({ title: issue.title, success: false, error: err.message });
       }
@@ -6935,9 +6956,26 @@ emmaToolRegistry.register({
 
     const successCount = results.filter(r => r.success).length;
     const failCount = results.filter(r => !r.success).length;
-    const summary = failCount === 0
-      ? `All ${successCount} issue(s) have been reported and tracked. The engineering team has been notified.`
-      : `${successCount} of ${results.length} issue(s) reported successfully. ${failCount} failed.`;
+    const dedupedCount = results.filter(r => r.success && r.deduped).length;
+    // Tell Emma how to talk to the user: deduped items are KNOWN requests the user's
+    // vote/report was added to (not newly filed), so she should say so rather than
+    // implying a brand-new ticket was created.
+    // Surface a clickable public-board link to the user (their item, even when it's a
+    // duplicate they were stacked onto). trackingUrl is the Featurebase board/post.
+    const trackingLinks = results.filter(r => r.success && r.trackingUrl).map(r => r.trackingUrl);
+    const linkLine = trackingLinks.length === 1
+      ? ` You can track it here: ${trackingLinks[0]}`
+      : (trackingLinks.length > 1 ? ` Track them on the roadmap: ${FEATUREBASE_BOARD_URL}` : '');
+    let summary: string;
+    if (failCount > 0) {
+      summary = `${successCount} of ${results.length} issue(s) reported successfully. ${failCount} failed.`;
+    } else if (dedupedCount === successCount && successCount > 0) {
+      summary = `This is already a known request that's being tracked — I've added your report/vote to the existing item and you'll be notified when its status changes. Nothing new was filed.${linkLine}`;
+    } else if (dedupedCount > 0) {
+      summary = `Tracked: ${successCount - dedupedCount} new item(s) filed, and ${dedupedCount} matched existing known request(s) (your report/vote was added to those). The engineering team has been notified.${linkLine}`;
+    } else {
+      summary = `All ${successCount} issue(s) have been reported and tracked. The engineering team has been notified.${linkLine}`;
+    }
 
     return {
       success: failCount === 0,

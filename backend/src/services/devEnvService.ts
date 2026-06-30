@@ -17,6 +17,27 @@ const iam = new AWS.IAM({ region: REGION });
 const NOTION_API = "https://api.notion.com/v1";
 const NOTION_VERSION = "2022-06-28";
 
+// A real EC2 instance ID looks like `i-0abc123...`. A dev-env Notion page that
+// never finished provisioning can carry a placeholder like "pending" instead.
+// Calling EC2 terminateInstances with such a value throws
+// InvalidInstanceID.Malformed on every webhook tick — the loop that filled the
+// prod disk on 2026-06-26. Require the `i-` prefix before any EC2 call (the real
+// bad value had no prefix); placeholders like "pending"/"launching" are rejected.
+const EC2_INSTANCE_ID_RE = /^i-[a-z0-9]+$/i;
+
+/**
+ * One-line summary of an error for logging. NEVER log the raw AWS-SDK/Axios
+ * error object — it serializes the full request `config` + `data`, which is how
+ * a tight retry loop turned into ~79 MB/day of stdout and filled the root disk.
+ */
+function errSummary(err: any): string {
+  if (!err) return "unknown error";
+  const code = err.code || err.name || err.response?.status;
+  const msg =
+    err.response?.data?.message || err.message || String(err);
+  return code ? `${code}: ${msg}` : msg;
+}
+
 // Cached Notion token (fetched from Secrets Manager on first use)
 let cachedNotionToken: string | null = null;
 
@@ -51,7 +72,11 @@ async function notionRequest(
     });
   } catch (err: any) {
     if (err.response) {
-      console.error(`[devEnv] Notion API error (${method.toUpperCase()} ${path}):`, JSON.stringify(err.response.data));
+      // Log only the Notion error message/code — not the full Axios error
+      // (which serializes the entire request config + body).
+      console.error(
+        `[devEnv] Notion API error (${method.toUpperCase()} ${path}): ${errSummary(err)}`
+      );
     }
     throw err;
   }
@@ -603,7 +628,7 @@ export async function launchEnvironment(
     });
     console.log(`[devEnv] Launch complete for ${instanceId} (${publicIp})`);
   } catch (error: any) {
-    console.error(`[devEnv] Launch failed for page ${notionPageId}:`, error);
+    console.error(`[devEnv] Launch failed for page ${notionPageId}: ${errSummary(error)}`);
     // Try to update Notion with error status
     try {
       await addNotionComment(
@@ -611,7 +636,7 @@ export async function launchEnvironment(
         `Dev environment launch failed: ${error.message || error}`
       );
     } catch (commentErr) {
-      console.error(`[devEnv] Failed to add error comment to Notion:`, commentErr);
+      console.error(`[devEnv] Failed to add error comment to Notion: ${errSummary(commentErr)}`);
     }
   }
 }
@@ -636,6 +661,23 @@ export async function teardownEnvironment(
       console.log(
         `[devEnv] No Instance ID on Notion page ${notionPageId}, nothing to tear down`
       );
+      return;
+    }
+
+    // A page that never finished provisioning can carry a placeholder (e.g.
+    // "pending") instead of a real `i-...` ID. Never hand that to EC2 — it throws
+    // InvalidInstanceID.Malformed and, because teardown re-fires on every webhook
+    // tick, loops forever. Clear the page so it stops re-triggering, then stop.
+    if (!EC2_INSTANCE_ID_RE.test(instanceId)) {
+      console.warn(
+        `[devEnv] Page ${notionPageId} has no real EC2 instance (instanceId="${instanceId}"); clearing without EC2 teardown`
+      );
+      await updateNotionPageProperties(notionPageId, {
+        instanceId: "",
+        publicIp: "",
+        sgId: "",
+        launchedBy: "",
+      });
       return;
     }
 
@@ -680,8 +722,7 @@ export async function teardownEnvironment(
     console.log(`[devEnv] Teardown complete for ${instanceId}`);
   } catch (error: any) {
     console.error(
-      `[devEnv] Teardown failed for page ${notionPageId}:`,
-      error
+      `[devEnv] Teardown failed for page ${notionPageId}: ${errSummary(error)}`
     );
     try {
       await addNotionComment(
@@ -689,7 +730,7 @@ export async function teardownEnvironment(
         `Dev environment teardown failed: ${error.message || error}`
       );
     } catch (commentErr) {
-      console.error(`[devEnv] Failed to add error comment to Notion:`, commentErr);
+      console.error(`[devEnv] Failed to add error comment to Notion: ${errSummary(commentErr)}`);
     }
   }
 }

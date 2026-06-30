@@ -525,6 +525,37 @@ export class HubSpotService {
   }
 
   /**
+   * Batch-fetch the current `lifecyclestage` for up to 100 contact IDs per
+   * request. Returns a Map of contactId → lifecyclestage (empty string when the
+   * contact has no stage set). Contacts not returned (e.g. deleted) are omitted.
+   * Chunk size is 100 (HubSpot batch/read limit). Partial chunk failures are
+   * logged and skipped so the rest still resolves — callers treat a missing id
+   * as "unknown original" and fall back to clearing it.
+   * Used by the lifecycle-stage two-step so a failed set can be rolled back to
+   * the contact's prior stage instead of being left blank.
+   */
+  async getContactLifecycleStages(contactIds: string[]): Promise<Map<string, string>> {
+    const CHUNK_SIZE = 100;
+    const stageMap = new Map<string, string>();
+    for (let i = 0; i < contactIds.length; i += CHUNK_SIZE) {
+      const chunk = contactIds.slice(i, i + CHUNK_SIZE);
+      try {
+        const res = await axiosInstance.post(
+          `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/batch/read`,
+          { properties: ['lifecyclestage'], inputs: chunk.map((id) => ({ id })) },
+          { headers: await this.authHeaders() },
+        );
+        for (const contact of (res.data as any)?.results ?? []) {
+          stageMap.set(String(contact.id), String(contact?.properties?.lifecyclestage ?? ''));
+        }
+      } catch (e: any) {
+        console.warn(`[HubSpot] getContactLifecycleStages batch failed for chunk starting at ${i}:`, e?.message);
+      }
+    }
+    return stageMap;
+  }
+
+  /**
    * Fetches a contact by ID and returns all its property values as a flat map.
    * Pass specific propertyNames to request only those fields; omit to fetch
    * the standard set (email, name, phone, jobtitle, company, linkedin).
@@ -567,6 +598,71 @@ export class HubSpotService {
     return ((res.data as any).results ?? [])
       .filter((p: any) => !p.archived)
       .map((p: any) => ({ name: p.name as string, label: p.label as string, type: p.type as string }));
+  }
+
+  /**
+   * Returns the enumeration options of a single contact property (value + label).
+   * Used to populate the lifecycle-stage picker: custom stages (e.g. "Ad Audience")
+   * have a generated internal value that differs from the label, and the API expects
+   * the internal value on write — so the UI must offer value/label pairs.
+   * Non-enumeration properties (or a missing property) return an empty list.
+   */
+  async getContactPropertyOptions(propertyName: string): Promise<Array<{ value: string; label: string }>> {
+    if (!propertyName?.trim()) throw new Error('propertyName is required');
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/crm/v3/properties/contacts/${encodeURIComponent(propertyName)}`,
+      { headers: await this.authHeaders() }
+    );
+    const options: any[] = (res.data as any)?.options ?? [];
+    return options
+      .filter((o: any) => !o?.hidden)
+      .map((o: any) => ({ value: String(o.value), label: String(o.label ?? o.value) }));
+  }
+
+  /**
+   * Creates a new custom option on the lifecyclestage contact property.
+   * Fetches all existing options (including hidden), appends the new one, and
+   * PATCHes the full list back — HubSpot's options field is a full replacement.
+   * Returns the new option's value (timestamp-based, guaranteed unique).
+   */
+  async createLifecycleStageOption(label: string): Promise<{ value: string; label: string }> {
+    if (!label?.trim()) throw new Error('label is required');
+
+    const res = await axiosInstance.get(
+      `${HUBSPOT_API_BASE}/crm/v3/properties/contacts/lifecyclestage`,
+      { headers: await this.authHeaders() }
+    );
+    const data = res.data as any;
+
+    if (data?.modificationMetadata?.readOnlyOptions) {
+      throw new Error('Lifecycle stage options are read-only on this portal and cannot be modified via API.');
+    }
+
+    const existingOptions: any[] = data?.options ?? [];
+    const maxOrder = existingOptions.reduce((max: number, o: any) => Math.max(max, o.displayOrder ?? 0), 0);
+    const value = Date.now().toString();
+
+    // Normalize existing options to only the fields HubSpot's PATCH accepts —
+    // the GET response may include internal-only fields that the write API rejects.
+    const normalizedOptions = existingOptions.map((o: any) => ({
+      label: String(o.label ?? o.value),
+      value: String(o.value),
+      displayOrder: Number(o.displayOrder ?? 0),
+      hidden: Boolean(o.hidden),
+    }));
+
+    await axiosInstance.patch(
+      `${HUBSPOT_API_BASE}/crm/v3/properties/contacts/lifecyclestage`,
+      {
+        options: [
+          ...normalizedOptions,
+          { label: label.trim(), value, displayOrder: maxOrder + 1, hidden: false },
+        ],
+      },
+      { headers: await this.authHeaders() }
+    );
+
+    return { value, label: label.trim() };
   }
 
   /**
@@ -1851,6 +1947,84 @@ export class HubSpotService {
     // A failed update (e.g. the deal was deleted) comes back as a 207 per-record
     // error, NOT a top-level non-2xx — surface it so the caller can isolate and
     // recreate/report it instead of treating the whole batch as a success.
+    throwIfBatchPartialFailure(res);
+  }
+
+  /**
+   * Posts a CSV of HubSpot contact IDs to the Imports API to flip their
+   * marketable status. `marketableContactImport: false` = non-marketing,
+   * `true` = marketing. The import is asynchronous — HubSpot processes it in
+   * the background; changes reflect within seconds to minutes.
+   * Returns the HubSpot import job ID for logging.
+   * POST /crm/v3/imports
+   */
+  async importContactsMarketableStatus(
+    contactIds: string[],
+    marketableContactImport: boolean,
+  ): Promise<string> {
+    if (contactIds.length === 0) throw new Error('contactIds must not be empty');
+
+    const csv = 'Record ID\n' + contactIds.join('\n');
+    const importRequest = {
+      name: `AgentWeb Marketing Status ${Date.now()}`,
+      importOperations: { '0-1': 'UPDATE' },
+      dateFormat: 'YEAR_MONTH_DAY',
+      marketableContactImport,
+      files: [{
+        fileName: 'contacts.csv',
+        fileFormat: 'CSV',
+        fileImportPage: {
+          hasHeader: true,
+          columnMappings: [{
+            columnObjectTypeId: '0-1',
+            columnName: 'Record ID',
+            propertyName: 'hs_object_id',
+            columnType: 'HUBSPOT_OBJECT_ID',
+          }],
+        },
+      }],
+    };
+
+    // Use native fetch instead of axios — axios doesn't auto-detect Node's
+    // native FormData (no getHeaders()), causing a 415 with missing boundary.
+    const form = new FormData();
+    form.append('importRequest', JSON.stringify(importRequest));
+    form.append('files', new Blob([csv], { type: 'text/csv' }), 'contacts.csv');
+
+    const { 'Content-Type': _ct, ...authOnlyHeaders } = await this.authHeaders();
+    const res = await fetch(`${HUBSPOT_API_BASE}/crm/v3/imports`, {
+      method: 'POST',
+      // Omit Content-Type — fetch sets it automatically with the multipart boundary.
+      headers: authOnlyHeaders as Record<string, string>,
+      body: form,
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => res.statusText);
+      throw new Error(`HubSpot Imports API ${res.status}: ${text}`);
+    }
+
+    const data = (await res.json()) as any;
+    return String(data?.id ?? '');
+  }
+
+  /**
+   * Batch update contacts by internal HubSpot contact ID.
+   * POST /crm/v3/objects/contacts/batch/update
+   */
+  async batchUpdateContacts(
+    inputs: Array<{ id: string; properties: Record<string, string> }>
+  ): Promise<void> {
+    if (inputs.length > 100) {
+      throw new Error(`batchUpdateContacts accepts at most 100 inputs per batch, got ${inputs.length}`);
+    }
+
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/batch/update`,
+      { inputs: inputs.map((i) => ({ id: i.id, properties: i.properties })) },
+      { headers: await this.authHeaders() }
+    );
+
     throwIfBatchPartialFailure(res);
   }
 
